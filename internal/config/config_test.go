@@ -34,19 +34,37 @@ func TestResolveAllowsOnlyNarrowing(t *testing.T) {
 	project := guardedProject()
 
 	resolved, err := Resolve(machine, project, TicketOverride{
-		MergeMode:    domain.MergeManual,
-		PhaseTimeout: 10 * time.Minute,
+		MergeMode:       domain.MergeManual,
+		PhaseTimeout:    10 * time.Minute,
+		MaxCostMicroUSD: 20_000_000,
 	})
 	if err != nil {
 		t.Fatalf("resolve narrowing: %v", err)
 	}
-	if resolved.MergeMode != domain.MergeManual || resolved.PhaseTimeout != 10*time.Minute {
+	if resolved.MergeMode != domain.MergeManual || resolved.PhaseTimeout != 10*time.Minute || resolved.MaxTicketCostMicroUSD != 20_000_000 {
 		t.Fatalf("unexpected resolved config: %+v", resolved)
 	}
 
 	_, err = Resolve(machine, project, TicketOverride{MergeMode: domain.MergeAutonomous})
 	if err == nil {
 		t.Fatal("expected autonomy widening to fail")
+	}
+	_, err = Resolve(machine, project, TicketOverride{MaxCostMicroUSD: machine.MaxTicketCostMicroUSD + 1})
+	if err == nil {
+		t.Fatal("expected cost widening to fail")
+	}
+}
+
+func TestResolveRejectsInvalidCostBounds(t *testing.T) {
+	machine := DefaultMachineLimits()
+	project := guardedProject()
+	project.MaxTicketCostMicroUSD = machine.MaxTicketCostMicroUSD + 1
+	if _, err := Resolve(machine, project, TicketOverride{}); err == nil {
+		t.Fatal("project cost above machine bound accepted")
+	}
+	project.MaxTicketCostMicroUSD = 0
+	if _, err := Resolve(machine, project, TicketOverride{MaxCostMicroUSD: -1}); err == nil {
+		t.Fatal("negative ticket cost accepted")
 	}
 }
 

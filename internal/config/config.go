@@ -39,38 +39,42 @@ type ProviderOrder struct {
 }
 
 type MachineLimits struct {
-	MaxConcurrentTickets int           `json:"max_concurrent_tickets"`
-	MaxPhaseTimeout      time.Duration `json:"max_phase_timeout"`
-	MaxTicketTimeout     time.Duration `json:"max_ticket_timeout"`
-	AllowAutonomous      bool          `json:"allow_autonomous"`
+	MaxConcurrentTickets  int           `json:"max_concurrent_tickets"`
+	MaxPhaseTimeout       time.Duration `json:"max_phase_timeout"`
+	MaxTicketTimeout      time.Duration `json:"max_ticket_timeout"`
+	MaxTicketCostMicroUSD int64         `json:"max_ticket_cost_micro_usd"`
+	AllowAutonomous       bool          `json:"allow_autonomous"`
 }
 
 func DefaultMachineLimits() MachineLimits {
 	return MachineLimits{
-		MaxConcurrentTickets: 2,
-		MaxPhaseTimeout:      45 * time.Minute,
-		MaxTicketTimeout:     4 * time.Hour,
-		AllowAutonomous:      false,
+		MaxConcurrentTickets:  2,
+		MaxPhaseTimeout:       45 * time.Minute,
+		MaxTicketTimeout:      4 * time.Hour,
+		MaxTicketCostMicroUSD: 100_000_000,
+		AllowAutonomous:       false,
 	}
 }
 
 type Project struct {
-	Name                 string           `json:"name"`
-	Repository           string           `json:"repository"`
-	BaseBranch           string           `json:"base_branch"`
-	MergeMode            domain.MergeMode `json:"merge_mode"`
-	MergeMethod          string           `json:"merge_method"`
-	MaxConcurrentTickets int              `json:"max_concurrent_tickets"`
-	PhaseTimeout         time.Duration    `json:"phase_timeout"`
-	TicketTimeout        time.Duration    `json:"ticket_timeout"`
-	Commands             Commands         `json:"commands"`
-	Providers            ProviderOrder    `json:"providers"`
+	Name                  string           `json:"name"`
+	Repository            string           `json:"repository"`
+	BaseBranch            string           `json:"base_branch"`
+	MergeMode             domain.MergeMode `json:"merge_mode"`
+	MergeMethod           string           `json:"merge_method"`
+	MaxConcurrentTickets  int              `json:"max_concurrent_tickets"`
+	PhaseTimeout          time.Duration    `json:"phase_timeout"`
+	TicketTimeout         time.Duration    `json:"ticket_timeout"`
+	MaxTicketCostMicroUSD int64            `json:"max_ticket_cost_micro_usd"`
+	Commands              Commands         `json:"commands"`
+	Providers             ProviderOrder    `json:"providers"`
 }
 
 type TicketOverride struct {
-	MergeMode     domain.MergeMode `json:"merge_mode,omitempty"`
-	PhaseTimeout  time.Duration    `json:"phase_timeout,omitempty"`
-	TicketTimeout time.Duration    `json:"ticket_timeout,omitempty"`
+	MergeMode       domain.MergeMode `json:"merge_mode,omitempty"`
+	PhaseTimeout    time.Duration    `json:"phase_timeout,omitempty"`
+	TicketTimeout   time.Duration    `json:"ticket_timeout,omitempty"`
+	MaxCostMicroUSD int64            `json:"max_cost_micro_usd,omitempty"`
 }
 
 type Effective struct {
@@ -81,6 +85,9 @@ type Effective struct {
 func Resolve(machine MachineLimits, project Project, ticket TicketOverride) (Effective, error) {
 	if err := validateMachine(machine); err != nil {
 		return Effective{}, err
+	}
+	if project.MaxTicketCostMicroUSD == 0 {
+		project.MaxTicketCostMicroUSD = machine.MaxTicketCostMicroUSD
 	}
 	if err := validateProject(machine, project); err != nil {
 		return Effective{}, err
@@ -107,6 +114,15 @@ func Resolve(machine MachineLimits, project Project, ticket TicketOverride) (Eff
 		}
 		resolved.TicketTimeout = ticket.TicketTimeout
 	}
+	if ticket.MaxCostMicroUSD > 0 {
+		if ticket.MaxCostMicroUSD > project.MaxTicketCostMicroUSD {
+			return Effective{}, fmt.Errorf("ticket cost ceiling exceeds project maximum")
+		}
+		resolved.MaxTicketCostMicroUSD = ticket.MaxCostMicroUSD
+	}
+	if ticket.MaxCostMicroUSD < 0 {
+		return Effective{}, fmt.Errorf("ticket cost ceiling cannot be negative")
+	}
 	return Effective{Project: resolved, Machine: machine}, nil
 }
 
@@ -128,6 +144,9 @@ func validateMachine(machine MachineLimits) error {
 	}
 	if machine.MaxPhaseTimeout > machine.MaxTicketTimeout {
 		return fmt.Errorf("machine phase timeout exceeds ticket timeout")
+	}
+	if machine.MaxTicketCostMicroUSD <= 0 {
+		return fmt.Errorf("machine cost ceiling must be positive")
 	}
 	return nil
 }
@@ -155,6 +174,9 @@ func validateProject(machine MachineLimits, project Project) error {
 	}
 	if project.PhaseTimeout <= 0 || project.PhaseTimeout > machine.MaxPhaseTimeout {
 		return fmt.Errorf("project phase timeout exceeds machine bounds")
+	}
+	if project.MaxTicketCostMicroUSD <= 0 || project.MaxTicketCostMicroUSD > machine.MaxTicketCostMicroUSD {
+		return fmt.Errorf("project cost ceiling exceeds machine bounds")
 	}
 	if project.TicketTimeout <= 0 || project.TicketTimeout > machine.MaxTicketTimeout || project.PhaseTimeout > project.TicketTimeout {
 		return fmt.Errorf("project ticket timeout exceeds machine bounds")
