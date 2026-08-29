@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""Validate a repository against its declared shared baseline."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+MANIFEST = Path(".agents/repo-standard.json")
+SUPPORTED_SCHEMA = 1
+SUPPORTED_BASELINE = 3
+SECRET_IGNORES = (
+    ".context/", ".env", ".env.*", "!.env.example", "!.env.*.example", "*.pem", "*.key",
+)
+VALID_PROFILES = {"service", "library", "toolkit"}
+PLACEHOLDER_VERIFY = re.compile(r"<[^>]+>|\b(?:todo|tbd|replace me)\b", re.I)
+EXEMPTIBLE_CHECKS = {
+    "documentation-root",
+    "git-flow-document",
+    "pull-request-template",
+    "conductor-config",
+    "config-review",
+}
+NON_EXEMPTIBLE_CHECKS = {
+    "schema",
+    "managed-integrity",
+    "path-safety",
+    "secret-redaction",
+    "feature-dependency",
+}
+AGENTS_START = "<!-- nysa-agents:repo-standard:start -->"
+AGENTS_END = "<!-- nysa-agents:repo-standard:end -->"
+IGNORE_START = "# nysa-agents:repo-standard:start"
+IGNORE_END = "# nysa-agents:repo-standard:end"
+DENIES = {
+    "Read(./.env)", "Read(./.env.*)", "Read(./**/*.pem)",
+    "Read(./**/*.key)", "Read(./**/credentials*.json)",
+}
+
+
+class Check:
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+        self.warnings: list[str] = []
+        self.exemptions: dict[str, str] = {}
+
+    def require(self, condition: bool, message: str, check_id: str | None = None) -> None:
+        if not condition:
+            if check_id and check_id in self.exemptions:
+                self.warnings.append(
+                    f"EXEMPT {check_id} ({self.exemptions[check_id]}): {message}"
+                )
+            else:
+                self.failures.append(message)
+
+    def warn(self, condition: bool, message: str) -> None:
+        if not condition:
+            self.warnings.append(message)
+
+
+def load_manifest(root: Path, check: Check) -> dict | None:
+    path = root / MANIFEST
+    if not path.is_file():
+        check.failures.append(f"missing {MANIFEST}")
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        check.failures.append(f"invalid {MANIFEST}: {exc}")
+        return None
+    if not isinstance(value, dict):
+        check.failures.append(f"{MANIFEST} must contain a JSON object")
+        return None
+    schema = value.get("schema_version")
+    if schema != SUPPORTED_SCHEMA:
+        check.failures.append(
+            f"unsupported schema_version {schema!r}; supported={SUPPORTED_SCHEMA}"
+        )
+        return None
+    return value
+
+
+def text(root: Path, rel: str) -> str:
+    try:
+        return (root / rel).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def enabled(features: dict, name: str) -> bool:
+    return features.get(name, False) is True
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def managed_block(value: str, start: str, end: str) -> str | None:
+    if value.count(start) != 1 or value.count(end) != 1:
+        return None
+    before, tail = value.split(start, 1)
+    del before
+    body, _ = tail.split(end, 1)
+    return f"{start}{body}{end}"
+
+
+def safe_relative(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not Path(value).is_absolute()
+        and ".." not in Path(value).parts
+        and "." not in Path(value).parts
+    )
+
+
+def contains_symlink(root: Path, rel: str) -> bool:
+    cursor = root
+    for part in Path(rel).parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return True
+    return False
+
+
+def configure_exceptions(manifest: dict, check: Check) -> None:
+    exceptions = manifest.get("exceptions", [])
+    if not isinstance(exceptions, list):
+        check.failures.append("exceptions must be a JSON array")
+        return
+    today = dt.date.today()
+    seen: set[str] = set()
+    for index, exception in enumerate(exceptions):
+        label = f"exceptions[{index}]"
+        if not isinstance(exception, dict):
+            check.failures.append(f"{label} must be an object")
+            continue
+        exception_id = exception.get("id")
+        target = exception.get("check")
+        reason = exception.get("reason")
+        expires = exception.get("expires")
+        if not isinstance(exception_id, str) or not exception_id:
+            check.failures.append(f"{label}.id is required")
+        elif exception_id in seen:
+            check.failures.append(f"duplicate exception id: {exception_id}")
+        else:
+            seen.add(exception_id)
+        if not isinstance(target, str) or not target:
+            check.failures.append(f"{label}.check is required")
+            continue
+        if target in NON_EXEMPTIBLE_CHECKS:
+            check.failures.append(f"{label}.check is non-exemptible: {target}")
+            continue
+        if target not in EXEMPTIBLE_CHECKS:
+            check.failures.append(f"{label}.check is unknown: {target}")
+            continue
+        if not isinstance(reason, str) or not reason.strip():
+            check.failures.append(f"{label}.reason is required")
+            continue
+        try:
+            expiry = dt.date.fromisoformat(expires)
+        except (TypeError, ValueError):
+            check.failures.append(f"{label}.expires must be YYYY-MM-DD")
+            continue
+        if expiry < today:
+            check.failures.append(f"{label} expired on {expires}")
+            continue
+        check.exemptions[target] = exception_id
+
+
+def validate(root: Path) -> Check:
+    check = Check()
+    manifest = load_manifest(root, check)
+    if manifest is None:
+        return check
+
+    configure_exceptions(manifest, check)
+
+    baseline = manifest.get("baseline_version")
+    check.require(
+        baseline == SUPPORTED_BASELINE,
+        f"baseline_version must be {SUPPORTED_BASELINE}; got {baseline!r}",
+    )
+    profile = manifest.get("profile")
+    check.require(profile in VALID_PROFILES, f"profile must be one of {sorted(VALID_PROFILES)}")
+
+    features = manifest.get("features", {})
+    check.require(isinstance(features, dict), "features must be a JSON object")
+    if not isinstance(features, dict):
+        features = {}
+
+    for required in ("AGENTS.md", "CLAUDE.md", "context/memory.md"):
+        check.require((root / required).is_file(), f"missing {required}")
+    if (root / "CLAUDE.md").is_file():
+        check.require(text(root, "CLAUDE.md").strip() == "@AGENTS.md", "CLAUDE.md must contain only @AGENTS.md")
+
+    memory = text(root, "context/memory.md")
+    check.require(bool(re.search(r"^## Current truth\b", memory, re.M)), "context/memory.md missing Current truth heading")
+    check.require(bool(re.search(r"^## Log\s*$", memory, re.M)), "context/memory.md missing Log heading")
+
+    default_branch = manifest.get("default_branch")
+    check.require(isinstance(default_branch, str) and bool(default_branch), "default_branch is required")
+    documentation_roots = manifest.get("documentation_roots")
+    check.require(
+        isinstance(documentation_roots, list) and bool(documentation_roots),
+        "documentation_roots must be a non-empty array",
+    )
+    if isinstance(documentation_roots, list):
+        for item in documentation_roots:
+            valid = isinstance(item, str) and bool(item) and not item.startswith("/") and ".." not in Path(item).parts
+            check.require(valid, f"invalid documentation root: {item!r}")
+            if valid:
+                check.require(
+                    f"`{item}/`" in text(root, "AGENTS.md"),
+                    f"AGENTS.md does not declare documentation root: {item}",
+                    "documentation-root",
+                )
+
+    agents = text(root, "AGENTS.md")
+    agent_block = managed_block(agents, AGENTS_START, AGENTS_END)
+    check.require(agent_block is not None, "AGENTS.md missing the managed repository baseline block")
+    for token, label in (
+        ("verification", "verification guidance"),
+        ("default branch", "default-branch guidance"),
+        ("redact", "credential redaction guidance"),
+        ("context/memory.md", "memory-routing guidance"),
+        ("documentation roots", "documentation-root guidance"),
+        ("scoped instruction", "scoped-instruction guidance"),
+    ):
+        check.require(token in (agent_block or "").lower(), f"AGENTS.md missing exact {label}")
+
+    ignore = text(root, ".gitignore")
+    check.require(bool(ignore), "missing or empty .gitignore")
+    for pattern in SECRET_IGNORES:
+        check.require(pattern in ignore.splitlines(), f".gitignore missing {pattern}")
+    ignored = set(subprocess.run(
+        ["git", "check-ignore", "--no-index", "--stdin"],
+        cwd=root,
+        input=".env\n.env.local\n.env.example\n.env.team.example\n",
+        text=True,
+        capture_output=True,
+    ).stdout.splitlines())
+    check.require({".env", ".env.local"}.issubset(ignored), "real environment files must be ignored")
+    check.require(
+        ignored.isdisjoint({".env.example", ".env.team.example"}),
+        "environment example files must remain trackable",
+    )
+
+    settings_path = root / ".claude/settings.json"
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        settings = {}
+    deny = settings.get("permissions", {}).get("deny", []) if isinstance(settings, dict) else []
+    check.require(isinstance(deny, list) and DENIES.issubset(set(deny)), ".claude/settings.json missing Claude Read denies")
+    marketplace = settings.get("extraKnownMarketplaces", {}).get("nysa-agents-plugin", {}) if isinstance(settings, dict) else {}
+    check.require(marketplace.get("autoUpdate") is True, ".claude/settings.json must enable marketplace autoUpdate")
+
+    managed = manifest.get("managed")
+    check.require(isinstance(managed, dict), "managed must be a JSON object")
+    if isinstance(managed, dict):
+        files = managed.get("files", {})
+        blocks = managed.get("blocks", {})
+        check.require(isinstance(files, dict), "managed.files must be an object")
+        check.require(isinstance(blocks, dict), "managed.blocks must be an object")
+        if isinstance(files, dict):
+            for rel, expected in files.items():
+                if not safe_relative(rel):
+                    check.failures.append(f"invalid managed file path: {rel!r}")
+                    continue
+                path = root / rel
+                check.require(not contains_symlink(root, rel), f"managed path is a symlink: {rel}")
+                check.require(isinstance(expected, str) and bool(re.fullmatch(r"[0-9a-f]{64}", expected)), f"invalid managed hash: {rel}")
+                try:
+                    actual = sha256(path.read_bytes())
+                except OSError:
+                    actual = None
+                check.require(actual == expected, f"managed file hash mismatch: {rel}")
+        if isinstance(blocks, dict):
+            marker_map = {
+                "AGENTS.md": (AGENTS_START, AGENTS_END),
+                ".gitignore": (IGNORE_START, IGNORE_END),
+            }
+            for rel, expected in blocks.items():
+                if not safe_relative(rel):
+                    check.failures.append(f"invalid managed block path: {rel!r}")
+                    continue
+                markers = marker_map.get(rel)
+                block = managed_block(text(root, rel), *markers) if markers else None
+                check.require(block is not None and sha256(block.encode()) == expected, f"managed block hash mismatch: {rel}")
+
+    if enabled(features, "secret_scan"):
+        scanner = root / "scripts/secret-scan"
+        check.require(scanner.is_file(), "secret_scan enabled but scripts/secret-scan is missing")
+        check.require(scanner.is_file() and scanner.stat().st_mode & 0o111 != 0, "scripts/secret-scan must be executable")
+
+    if enabled(features, "repo_check"):
+        checker = root / "scripts/repo-check"
+        check.require(checker.is_file(), "repo_check enabled but scripts/repo-check is missing")
+        check.require(checker.is_file() and checker.stat().st_mode & 0o111 != 0, "scripts/repo-check must be executable")
+
+    if enabled(features, "conductor"):
+        conductor = text(root, ".conductor/settings.toml")
+        check.require(bool(conductor), "conductor enabled but .conductor/settings.toml is missing", "conductor-config")
+        if conductor:
+            check.require(PLACEHOLDER_VERIFY.search(conductor) is None, "Conductor settings contain placeholders", "conductor-config")
+            for command in re.findall(r"(?:command|setup|archive)\s*=\s*[\"']([^\"']+)", conductor):
+                first = command.strip().split()[0] if command.strip() else ""
+                if first.startswith(("scripts/", "./")):
+                    target = root / first.removeprefix("./")
+                    check.require(target.is_file(), f"Conductor references missing local command: {first}", "conductor-config")
+    if enabled(features, "pull_request_template"):
+        template = text(root, ".github/pull_request_template.md")
+        check.require(bool(template), "pull_request_template enabled but template is missing", "pull-request-template")
+        for token in ("verification", "safety", "risk", "rollback", "docs", "memory"):
+            check.require(token in template.lower(), f"pull request template missing {token}", "pull-request-template")
+
+    if enabled(features, "local_pr_workflow"):
+        check.require(enabled(features, "artifact_check"), "local_pr_workflow requires artifact_check")
+        check.require(enabled(features, "pull_request_template"), "local_pr_workflow requires pull_request_template")
+    if enabled(features, "remote_full_ci"):
+        check.require(enabled(features, "local_pr_workflow"), "remote_full_ci requires local_pr_workflow")
+        check.require(enabled(features, "github_ci"), "remote_full_ci requires github_ci")
+
+    if enabled(features, "artifact_check"):
+        artifact = root / "scripts/artifact-check"
+        check.require(artifact.is_file(), "artifact_check enabled but scripts/artifact-check is missing")
+        check.require(artifact.is_file() and artifact.stat().st_mode & 0o111 != 0, "scripts/artifact-check must be executable")
+
+    if enabled(features, "config_review"):
+        check.require((root / ".claude/config-review.json").is_file(), "config_review enabled but .claude/config-review.json is missing", "config-review")
+
+    if enabled(features, "git_flow"):
+        git_flow = text(root, "docs/git-flow.md")
+        check.require(bool(git_flow), "git_flow enabled but docs/git-flow.md is missing", "git-flow-document")
+        for token in ("short-lived", "draft", "ready", "squash", "delete", "protection"):
+            check.require(token in git_flow.lower(), f"docs/git-flow.md missing {token} guidance", "git-flow-document")
+        agents = text(root, "AGENTS.md").lower()
+        check.require("branch" in agents and str(default_branch).lower() in agents, "git_flow enabled but AGENTS.md lacks branch/default guidance")
+        pattern = manifest.get("branch_pattern")
+        check.require(isinstance(pattern, str) and bool(pattern), "git_flow enabled but branch_pattern is missing")
+        compiled = None
+        if isinstance(pattern, str) and pattern:
+            try:
+                compiled = re.compile(pattern)
+            except re.error as exc:
+                check.failures.append(f"branch_pattern is invalid: {exc}")
+        branch = os.environ.get("GITHUB_HEAD_REF", "")
+        if not branch:
+            branch = subprocess.run(
+                ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+                cwd=root, text=True, capture_output=True,
+            ).stdout.strip()
+        if branch and branch != default_branch and compiled is not None:
+            check.require(bool(compiled.fullmatch(branch)), f"branch name violates branch_pattern: {branch}")
+
+    verify = manifest.get("verification_command")
+    check.require(isinstance(verify, str) and bool(verify.strip()), "verification_command is required")
+    if isinstance(verify, str) and verify.strip():
+        check.require(
+            PLACEHOLDER_VERIFY.search(verify) is None,
+            "verification_command must be concrete, not a placeholder",
+        )
+        check.require(verify in (agent_block or ""), "AGENTS.md must name the exact verification_command")
+
+    if enabled(features, "github_ci"):
+        workflow_dir = root / ".github/workflows"
+        workflows = [
+            path for pattern in ("*.yml", "*.yaml")
+            for path in workflow_dir.glob(pattern)
+        ] if workflow_dir.is_dir() else []
+        check.require(bool(workflows), "github_ci enabled but no GitHub Actions workflow exists")
+        required_tokens = ["fetch-depth: 0", "scripts/repo-check", "scripts/secret-scan"]
+        if isinstance(verify, str) and verify.strip() and PLACEHOLDER_VERIFY.search(verify) is None:
+            required_tokens.append(verify)
+        if enabled(features, "artifact_check"):
+            required_tokens.append("scripts/artifact-check")
+        compliant = []
+        for path in workflows:
+            workflow_text = path.read_text(encoding="utf-8", errors="replace")
+            if all(token in workflow_text for token in required_tokens):
+                compliant.append(path)
+        check.require(
+            bool(compliant),
+            "one GitHub Actions workflow must contain full-history checkout and every required check",
+        )
+
+    scoped = manifest.get("scoped_agents", [])
+    check.require(isinstance(scoped, list), "scoped_agents must be a JSON array")
+    if isinstance(scoped, list):
+        root_agents = text(root, "AGENTS.md")
+        for item in scoped:
+            if not isinstance(item, str) or not item or item.startswith("/") or ".." in Path(item).parts:
+                check.failures.append(f"invalid scoped_agents path: {item!r}")
+                continue
+            agent_path = root / item / "AGENTS.md"
+            shim_path = root / item / "CLAUDE.md"
+            check.require(agent_path.is_file(), f"missing {item}/AGENTS.md")
+            check.require(shim_path.is_file(), f"missing {item}/CLAUDE.md")
+            if agent_path.is_file():
+                check.require(agent_path.stat().st_size <= 4096, f"{item}/AGENTS.md exceeds 4KB")
+            if shim_path.is_file():
+                check.require(shim_path.read_text(encoding="utf-8").strip() == "@AGENTS.md", f"{item}/CLAUDE.md must contain only @AGENTS.md")
+            check.require(f"{item}/AGENTS.md" in root_agents, f"root AGENTS.md must map {item}/AGENTS.md")
+
+    return check
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path.cwd(), help="repository root (default: cwd)")
+    args = parser.parse_args()
+    root = args.root.resolve()
+    check = validate(root)
+    for warning in check.warnings:
+        print(f"WARN: {warning}")
+    for failure in check.failures:
+        print(f"FAIL: {failure}", file=sys.stderr)
+    if check.failures:
+        print(f"repo-check: {len(check.failures)} failure(s)", file=sys.stderr)
+        return 1
+    print("repo-check: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

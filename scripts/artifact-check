@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Reject changed files that commonly contain generated or local-only artifacts."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path, PurePosixPath
+import subprocess
+import sys
+
+
+BLOCKED_PARTS = {".context", "node_modules", "dist", "build", "coverage", "__pycache__"}
+BLOCKED_SUFFIXES = {".log", ".tmp", ".swp", ".pem", ".key"}
+
+
+def changed(root: Path, base: str | None, working_tree: bool) -> list[str]:
+    if working_tree:
+        paths: set[str] = set()
+        for command in (
+            ["git", "diff", "--name-only"],
+            ["git", "diff", "--cached", "--name-only"],
+            ["git", "ls-files", "--others", "--exclude-standard"],
+        ):
+            result = subprocess.run(command, cwd=root, text=True, capture_output=True)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or "git working-tree inspection failed")
+            paths.update(result.stdout.splitlines())
+        return sorted(paths)
+    if not base:
+        raise RuntimeError("--base is required unless --working-tree is used")
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=ACMR", f"{base}...HEAD"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "git diff failed")
+    return result.stdout.splitlines()
+
+
+def blocked(path: str) -> bool:
+    candidate = PurePosixPath(path)
+    return bool(BLOCKED_PARTS.intersection(candidate.parts)) or candidate.suffix.lower() in BLOCKED_SUFFIXES
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--base")
+    parser.add_argument("--working-tree", action="store_true")
+    args = parser.parse_args()
+    try:
+        paths = changed(args.root.resolve(), args.base, args.working_tree)
+    except RuntimeError as exc:
+        print(f"artifact-check: {exc}", file=sys.stderr)
+        return 2
+    failures = sorted(path for path in paths if blocked(path))
+    for path in failures:
+        print(f"FAIL: disallowed artifact path: {path}", file=sys.stderr)
+    if failures:
+        return 1
+    print("artifact-check: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

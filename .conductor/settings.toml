@@ -1,0 +1,25 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+[scripts]
+setup = "true"
+archive = "true"
+run_mode = "nonconcurrent"
+
+[scripts.run.app]
+command = "true"
+icon = "play"
+
+[scripts.run.tests]
+command = "go test ./..."
+icon = "test-tube"
+
+[git]
+delete_branch_on_archive = true
+archive_on_merge = true
+worktree_push_auto_setup_remote = true
+
+[prompts]
+rename_branch = """
+Follow the branch_pattern in .agents/repo-standard.json. Do not rename the
+current branch unless the user explicitly asks.
+"""

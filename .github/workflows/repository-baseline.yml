@@ -1,0 +1,35 @@
+name: repository-baseline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: scripts/repo-check
+      - name: Scan secrets
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |-
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            scripts/secret-scan --base "$BASE_SHA" --head "$HEAD_SHA"
+          else
+            scripts/secret-scan
+          fi
+      - run: scripts/artifact-check --base origin/main
+      - run: |-
+          go test ./...

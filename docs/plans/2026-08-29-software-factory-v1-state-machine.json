@@ -1,0 +1,441 @@
+{
+  "schema": "sf.state-machine.plan/v1",
+  "authority": "normative",
+  "default": "Any state/trigger pair not listed is forbidden.",
+  "selection": "For a listed state/trigger pair exactly one transition guard set must match; zero matches is a typed refusal and multiple matches is an invariant failure.",
+  "states": {
+    "queued": {"kind": "idle", "resume_allowed": false},
+    "planning": {"kind": "active", "resume_allowed": true},
+    "verifying": {"kind": "active", "resume_allowed": true},
+    "building": {"kind": "active", "resume_allowed": true},
+    "publishing": {"kind": "active", "resume_allowed": true},
+    "waiting_ci": {"kind": "wait", "resume_allowed": true},
+    "reviewing": {"kind": "active", "resume_allowed": true},
+    "waiting_approval": {"kind": "wait", "resume_allowed": true},
+    "waiting_manual_merge": {"kind": "wait", "resume_allowed": true},
+    "merging": {"kind": "active", "resume_allowed": true},
+    "reconciling": {"kind": "active", "resume_allowed": true},
+    "stopping": {"kind": "control", "resume_allowed": false},
+    "cancelling": {"kind": "control", "resume_allowed": false},
+    "paused": {"kind": "operator", "resume_allowed": true},
+    "blocked": {"kind": "operator", "resume_allowed": true},
+    "done": {"kind": "terminal", "resume_allowed": false},
+    "external_merged": {"kind": "terminal", "resume_allowed": false},
+    "cancelled": {"kind": "terminal", "resume_allowed": false}
+  },
+  "invalidation_sets": {
+    "candidate": ["proof_result", "github_checks", "final_review", "approval"],
+    "proof": ["verification_intent", "proof_result", "github_checks", "final_review", "approval"],
+    "acceptance": ["plan", "verification_intent", "proof_result", "github_checks", "final_review", "approval"]
+  },
+  "transitions": [
+    {
+      "id": "submit",
+      "from": ["none"],
+      "trigger": "submit_valid",
+      "guards": ["trusted_project", "ticket_digest_not_active_or_explicit_new"],
+      "to": "queued",
+      "phase_disposition": "none",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "start",
+      "from": ["queued"],
+      "trigger": "operator_start",
+      "guards": ["doctor_preflight_green", "capacity_available"],
+      "to": "planning",
+      "phase_disposition": "start_planning",
+      "allowed_effects": ["worktree_create"],
+      "invalidates": []
+    },
+    {
+      "id": "plan_pass",
+      "from": ["planning"],
+      "trigger": "phase_pass",
+      "guards": ["typed_plan_valid"],
+      "to": "verifying",
+      "phase_disposition": "complete_planning_start_verification",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "plan_questions",
+      "from": ["planning"],
+      "trigger": "needs_operator_input",
+      "guards": ["questions_bounded"],
+      "to": "paused",
+      "resume_state": "planning",
+      "phase_disposition": "pause",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "verification_pass",
+      "from": ["verifying"],
+      "trigger": "phase_pass",
+      "guards": ["independent_intent_valid", "prebuild_proof_valid", "verification_checkpoint_committed"],
+      "to": "building",
+      "phase_disposition": "complete_verification_start_build",
+      "allowed_effects": ["local_commit"],
+      "invalidates": []
+    },
+    {
+      "id": "verification_amended",
+      "from": ["verifying"],
+      "trigger": "amendment_accepted",
+      "guards": ["fresh_reviewer", "old_and_new_digest_bound", "correction_available"],
+      "to": "building",
+      "phase_disposition": "complete_verification_start_build",
+      "allowed_effects": ["local_commit"],
+      "invalidates": ["proof"]
+    },
+    {
+      "id": "build_pass",
+      "from": ["building"],
+      "trigger": "phase_pass",
+      "guards": ["proof_green", "diff_valid", "git_control_plane_valid", "candidate_checkpoint_committed"],
+      "to": "publishing",
+      "phase_disposition": "complete_build_start_publish",
+      "allowed_effects": ["local_commit"],
+      "invalidates": ["candidate"]
+    },
+    {
+      "id": "publish_pass",
+      "from": ["publishing"],
+      "trigger": "effects_confirmed",
+      "guards": ["remote_head_exact", "draft_pr_exact"],
+      "to": "waiting_ci",
+      "phase_disposition": "complete_publish",
+      "allowed_effects": ["branch_push", "draft_pr_create", "draft_pr_update"],
+      "invalidates": []
+    },
+    {
+      "id": "ci_pending",
+      "from": ["waiting_ci"],
+      "trigger": "checks_pending",
+      "guards": ["candidate_head_unchanged"],
+      "to": "waiting_ci",
+      "phase_disposition": "wait",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "ci_green",
+      "from": ["waiting_ci"],
+      "trigger": "checks_green",
+      "guards": ["required_check_set_exact", "candidate_head_unchanged"],
+      "to": "reviewing",
+      "phase_disposition": "start_final_review",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "ci_red_repair",
+      "from": ["waiting_ci"],
+      "trigger": "checks_red",
+      "guards": ["correction_available"],
+      "to": "building",
+      "phase_disposition": "start_build_repair",
+      "allowed_effects": [],
+      "invalidates": ["candidate"]
+    },
+    {
+      "id": "review_repair",
+      "from": ["reviewing"],
+      "trigger": "review_repair",
+      "guards": ["correction_available", "repair_owner_builder"],
+      "to": "building",
+      "phase_disposition": "start_build_repair",
+      "allowed_effects": [],
+      "invalidates": ["candidate"]
+    },
+    {
+      "id": "review_proof_repair",
+      "from": ["reviewing"],
+      "trigger": "review_repair",
+      "guards": ["correction_available", "repair_owner_verification"],
+      "to": "verifying",
+      "phase_disposition": "start_verification_amendment",
+      "allowed_effects": [],
+      "invalidates": ["proof"]
+    },
+    {
+      "id": "review_pass_guarded",
+      "from": ["reviewing"],
+      "trigger": "review_pass",
+      "guards": ["ticket_type_not_spike", "merge_mode_guarded", "all_nonapproval_gates_green"],
+      "to": "waiting_approval",
+      "phase_disposition": "complete_review",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "review_pass_manual",
+      "from": ["reviewing"],
+      "trigger": "review_pass",
+      "guards": ["ticket_type_not_spike", "merge_mode_manual", "all_nonapproval_gates_green"],
+      "to": "waiting_manual_merge",
+      "phase_disposition": "complete_review",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "review_pass_autonomous",
+      "from": ["reviewing"],
+      "trigger": "review_pass",
+      "guards": ["ticket_type_not_spike", "merge_mode_autonomous", "autonomy_eligible", "all_gates_green"],
+      "to": "merging",
+      "phase_disposition": "complete_review_start_merge",
+      "allowed_effects": ["pr_mark_ready", "merge_request"],
+      "invalidates": []
+    },
+    {
+      "id": "autonomy_blocked",
+      "from": ["reviewing"],
+      "trigger": "review_pass",
+      "guards": ["ticket_type_not_spike", "merge_mode_autonomous", "autonomy_ineligible"],
+      "to": "blocked",
+      "resume_state": "reviewing",
+      "phase_disposition": "block",
+      "allowed_effects": [],
+      "invalidates": [],
+      "next_action_policy": "restore_missing_gate_or_explicitly_narrow_to_guarded"
+    },
+    {
+      "id": "approve_guarded",
+      "from": ["waiting_approval"],
+      "trigger": "operator_approve",
+      "guards": ["operator_identity_authenticated", "approval_head_exact", "all_nonapproval_gates_green"],
+      "to": "merging",
+      "phase_disposition": "start_merge",
+      "allowed_effects": ["approval_record", "pr_mark_ready", "merge_request"],
+      "invalidates": []
+    },
+    {
+      "id": "reject_guarded",
+      "from": ["waiting_approval"],
+      "trigger": "operator_reject",
+      "guards": ["operator_identity_authenticated", "rejection_reason_bounded", "ticket_ceiling_available"],
+      "to": "building",
+      "phase_disposition": "start_operator_repair",
+      "allowed_effects": ["rejection_record"],
+      "invalidates": ["candidate"]
+    },
+    {
+      "id": "reject_manual",
+      "from": ["waiting_manual_merge"],
+      "trigger": "operator_reject",
+      "guards": ["operator_identity_authenticated", "rejection_reason_bounded", "ticket_ceiling_available"],
+      "to": "building",
+      "phase_disposition": "start_operator_repair",
+      "allowed_effects": ["rejection_record"],
+      "invalidates": ["candidate"]
+    },
+    {
+      "id": "external_merge_verified",
+      "from": ["queued", "planning", "verifying", "building", "publishing", "waiting_ci", "reviewing", "waiting_approval", "waiting_manual_merge", "merging", "reconciling", "stopping", "cancelling", "paused", "blocked"],
+      "trigger": "external_merge_observed",
+      "guards": ["merged_pr_identity_exact", "merged_source_head_equals_reviewed_head", "required_checks_green", "mode_completion_policy_satisfied"],
+      "to": "reconciling",
+      "phase_disposition": "observe_and_reconcile_external_completion",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "external_merge_unverified",
+      "from": ["queued", "planning", "verifying", "building", "publishing", "waiting_ci", "reviewing", "waiting_approval", "waiting_manual_merge", "merging", "reconciling", "stopping", "cancelling", "paused", "blocked"],
+      "trigger": "external_merge_observed",
+      "guards": ["merge_exists", "verified_external_completion_guards_not_all_satisfied"],
+      "to": "external_merged",
+      "phase_disposition": "terminal_unverified",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "merge_confirmed",
+      "from": ["merging"],
+      "trigger": "merge_observed",
+      "guards": ["source_head_equals_reviewed_head", "protected_branch_contains_merge"],
+      "to": "reconciling",
+      "phase_disposition": "complete_merge_start_reconcile",
+      "allowed_effects": ["merge_observation"],
+      "invalidates": []
+    },
+    {
+      "id": "reconcile_done",
+      "from": ["reconciling"],
+      "trigger": "reconcile_pass",
+      "guards": ["terminal_remote_truth_exact"],
+      "to": "done",
+      "phase_disposition": "terminal_verified",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "spike_done",
+      "from": ["reviewing"],
+      "trigger": "review_pass",
+      "guards": ["ticket_type_spike", "report_present", "no_merge_effect"],
+      "to": "done",
+      "phase_disposition": "terminal_report_only",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "bounded_phase_retry",
+      "from": ["planning", "verifying", "building", "publishing", "reviewing", "reconciling"],
+      "trigger": "phase_retryable_failure",
+      "guards": ["retry_available", "runner_epoch_current"],
+      "to": "$same",
+      "phase_disposition": "new_attempt",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "retry_exhausted",
+      "from": ["planning", "verifying", "building", "publishing", "waiting_ci", "reviewing", "merging", "reconciling"],
+      "trigger": "retry_or_correction_exhausted",
+      "guards": [],
+      "to": "paused",
+      "resume_state": "$from",
+      "phase_disposition": "pause",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "candidate_changed",
+      "from": ["publishing", "waiting_ci", "reviewing", "waiting_approval", "waiting_manual_merge", "merging"],
+      "trigger": "base_or_candidate_head_changed",
+      "guards": ["merge_not_observed", "refresh_budget_available"],
+      "to": "building",
+      "phase_disposition": "start_refresh_and_proof",
+      "allowed_effects": [],
+      "invalidates": ["candidate"]
+    },
+    {
+      "id": "pause_or_take",
+      "from": ["planning", "verifying", "building", "publishing", "waiting_ci", "reviewing", "waiting_approval", "waiting_manual_merge", "merging", "reconciling"],
+      "trigger": "operator_pause_or_take",
+      "guards": ["operator_identity_authenticated"],
+      "to": "stopping",
+      "resume_state": "$from",
+      "phase_disposition": "invalidate_runner_epoch_and_drain",
+      "allowed_effects": ["observe_inflight_effect"],
+      "invalidates": []
+    },
+    {
+      "id": "stopped",
+      "from": ["stopping"],
+      "trigger": "process_and_effects_drained",
+      "guards": ["no_live_writer", "no_unreconciled_mutation"],
+      "to": "paused",
+      "resume_state": "$stored",
+      "phase_disposition": "pause",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "resume_unchanged",
+      "from": ["paused"],
+      "trigger": "operator_resume",
+      "guards": ["operator_identity_authenticated", "takeover_diff_none", "branch_remote_identity_exact", "prerequisites_green"],
+      "to": "$resume_state",
+      "phase_disposition": "resume",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "resume_source_changes",
+      "from": ["paused"],
+      "trigger": "operator_resume",
+      "guards": ["operator_identity_authenticated", "takeover_source_diff_valid", "verification_files_unchanged", "branch_remote_identity_exact"],
+      "to": "building",
+      "phase_disposition": "adopt_operator_checkpoint_start_proof",
+      "allowed_effects": [],
+      "invalidates": ["candidate"]
+    },
+    {
+      "id": "resume_proof_changes",
+      "from": ["paused"],
+      "trigger": "operator_resume",
+      "guards": ["operator_identity_authenticated", "takeover_verification_diff_present", "branch_remote_identity_exact"],
+      "to": "verifying",
+      "phase_disposition": "start_operator_amendment_review",
+      "allowed_effects": [],
+      "invalidates": ["proof"]
+    },
+    {
+      "id": "resume_invalid_control_plane",
+      "from": ["paused"],
+      "trigger": "operator_resume",
+      "guards": ["operator_identity_authenticated", "branch_remote_or_git_control_plane_mismatch"],
+      "to": "blocked",
+      "resume_state": "$resume_state",
+      "phase_disposition": "block",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "retry_paused",
+      "from": ["paused"],
+      "trigger": "operator_retry",
+      "guards": ["operator_identity_authenticated", "pause_reason_retryable", "typed_prerequisites_satisfied", "runner_epoch_current"],
+      "to": "$resume_state",
+      "phase_disposition": "new_attempt",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "cancel",
+      "from": ["queued", "planning", "verifying", "building", "publishing", "waiting_ci", "reviewing", "waiting_approval", "waiting_manual_merge", "merging", "reconciling", "paused", "blocked", "stopping"],
+      "trigger": "operator_cancel",
+      "guards": ["operator_identity_authenticated", "merge_not_observed"],
+      "to": "cancelling",
+      "phase_disposition": "invalidate_runner_epoch_drain_and_reconcile",
+      "allowed_effects": ["observe_inflight_effect"],
+      "invalidates": []
+    },
+    {
+      "id": "cancelled",
+      "from": ["cancelling"],
+      "trigger": "process_and_effects_drained",
+      "guards": ["no_live_writer", "no_unreconciled_mutation"],
+      "to": "cancelled",
+      "phase_disposition": "terminal_cancelled",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "safety_or_host_block",
+      "from": ["queued", "planning", "verifying", "building", "publishing", "waiting_ci", "reviewing", "waiting_approval", "waiting_manual_merge", "merging", "reconciling", "stopping", "cancelling"],
+      "trigger": "typed_blocker",
+      "guards": ["no_unreconciled_external_mutation"],
+      "to": "blocked",
+      "resume_state": "$from",
+      "phase_disposition": "block",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "recover_blocked",
+      "from": ["blocked"],
+      "trigger": "operator_recover",
+      "guards": ["operator_identity_authenticated", "typed_prerequisites_satisfied", "no_live_writer", "runner_epoch_current"],
+      "to": "$resume_state",
+      "phase_disposition": "resume",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "recover_autonomy_as_guarded",
+      "from": ["blocked"],
+      "trigger": "operator_recover_as_guarded",
+      "guards": ["operator_identity_authenticated", "block_reason_autonomy_ineligible", "project_allows_guarded", "no_live_writer", "merge_not_observed"],
+      "to": "building",
+      "phase_disposition": "snapshot_guarded_override_and_restart_candidate_cycle",
+      "allowed_effects": [],
+      "invalidates": ["candidate"]
+    }
+  ]
+}

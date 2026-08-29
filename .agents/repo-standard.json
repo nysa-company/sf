@@ -1,0 +1,39 @@
+{
+  "baseline_version": 3,
+  "branch_pattern": "^(feat|fix|docs|chore|refactor|test|hotfix|spike)/[a-z0-9]+(?:-[a-z0-9]+)*$",
+  "default_branch": "main",
+  "documentation_roots": [
+    "docs"
+  ],
+  "exceptions": [],
+  "features": {
+    "artifact_check": true,
+    "conductor": true,
+    "config_review": false,
+    "git_flow": true,
+    "github_ci": true,
+    "local_pr_workflow": true,
+    "pull_request_template": true,
+    "remote_full_ci": false,
+    "repo_check": true,
+    "secret_scan": true
+  },
+  "managed": {
+    "blocks": {
+      ".gitignore": "c58171d8dc5fe3318c38df004e7bb1d7cc1ce56b7fe745e23a92757575a35508",
+      "AGENTS.md": "918b735d8c205ab798860a6df5e88f9a9ede150ce23be300876418e131fc37d4"
+    },
+    "files": {
+      ".conductor/settings.toml": "7d6c6d5396079d00a782330a32e03050bbc44288808f68ace685ce1850d02127",
+      ".github/pull_request_template.md": "ab378f0d77c2e8644e9839e12d5ab9490bcaaa5ef064b70882473e0ccb2c424d",
+      ".github/workflows/repository-baseline.yml": "9a93935282a4f3c3cdd2674ca96ef74f0fac3a29929a60e2ba424263ae4d9197",
+      "docs/git-flow.md": "3aff2ae40cda90c1180f381a28fe4c3e164e3748be9bf9b258256955865b0108",
+      "scripts/repo-check": "9199bc24c6dd518fecf5affc17f58bc144d910bef9d49027643db308f8ec9c27",
+      "scripts/secret-scan": "ebe73581c238ad4c32319f057dbdd5e982ff7547f65a8e96cdf7fe995ecbb4ab"
+    }
+  },
+  "profile": "toolkit",
+  "schema_version": 1,
+  "scoped_agents": [],
+  "verification_command": "go test ./..."
+}
