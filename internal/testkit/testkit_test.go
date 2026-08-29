@@ -127,7 +127,8 @@ func TestFakeGHSubprocessRecoveryCreatesOnePR(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture := buildFixture(t, "./cmd/fake-gh")
-	args := []string{"pr", "create", "--repo", "example/app", "--head", "example:sf/dev/nysa/SF-00000001-abc123", "--head-oid", "0123456789012345678901234567890123456789", "--base", "main", "--title", "title", "--body", "body", "--sf-owned", "true"}
+	body := "body\n\n<!-- sf:v1 repository=example/app head=example/app:sf/dev/nysa/SF-00000001-abc123 oid=0123456789012345678901234567890123456789 base=main -->"
+	args := []string{"pr", "create", "--repo", "example/app", "--head", "example:sf/dev/nysa/SF-00000001-abc123", "--base", "main", "--draft", "--title", "title", "--body", body}
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	var group sync.WaitGroup
@@ -159,6 +160,20 @@ func TestFakeGHSubprocessRecoveryCreatesOnePR(t *testing.T) {
 	want.FactoryOwned = true
 	if _, found, err := remote.FindPullRequest(context.Background(), want); err != nil || !found {
 		t.Fatalf("lost-response recovery did not find the one owned PR: found=%v err=%v", found, err)
+	}
+}
+
+func TestFakeGHRejectsFakeOnlyAndUnknownArguments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "remote.json")
+	remote, err := NewFakeGH(path, contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.SetAuthenticated(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := remote.Run([]string{"pr", "create", "--repo", "example/app", "--head", "example:branch", "--base", "main", "--draft", "--title", "title", "--body", "body", "--head-oid", strings.Repeat("a", 40)}); err == nil {
+		t.Fatal("fake-only head-oid flag was accepted")
 	}
 }
 

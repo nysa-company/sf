@@ -30,12 +30,13 @@ const (
 // includes head repository/ref/OID and the sf ownership bit; headRefName alone
 // is never enough to adopt or merge a PR.
 type PullRequest struct {
-	Identity contracts.PullRequestIdentity `json:"identity"`
-	Title    string                        `json:"title"`
-	Body     string                        `json:"body"`
-	Draft    bool                          `json:"draft"`
-	Merged   bool                          `json:"merged"`
-	Ready    bool                          `json:"ready"`
+	Identity    contracts.PullRequestIdentity `json:"identity"`
+	Title       string                        `json:"title"`
+	Body        string                        `json:"body"`
+	Draft       bool                          `json:"draft"`
+	Merged      bool                          `json:"merged"`
+	Ready       bool                          `json:"ready"`
+	MergeCommit string                        `json:"merge_commit,omitempty"`
 }
 
 type Mutation struct {
@@ -62,6 +63,7 @@ type FakeGHState struct {
 const (
 	fakeGHLockRetry    = 5 * time.Millisecond
 	fakeGHLockDeadline = 5 * time.Second
+	prJSONFields       = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest"
 )
 
 func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, error) {
@@ -330,6 +332,10 @@ func (f *FakeGH) MergeExactHead(_ context.Context, _ domain.ExternalEffectClaim,
 			return true, errors.New("fake-gh: merge failed before mutation")
 		}
 		f.state.PRs[index].Merged = true
+		// A hosted merge produces a new immutable merge result.  The fake keeps
+		// it distinct from the reviewed head so the boundary cannot mistake a
+		// head OID for protected-branch evidence.
+		f.state.PRs[index].MergeCommit = strings.Repeat("b", 40)
 		f.recordMutationLocked("pr_merge", identity)
 		return true, f.finishErrorLocked("pr_merge")
 	})
@@ -578,6 +584,9 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 	if argv[0] == "gh" {
 		argv = argv[1:]
 	}
+	if err := validateOfficialArgv(argv); err != nil {
+		return nil, err
+	}
 	if len(argv) >= 2 && argv[0] == "auth" && argv[1] == "status" {
 		if option(argv, "--json") != "" {
 			if err := f.AuthStatus(context.Background()); err != nil {
@@ -585,7 +594,7 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 			}
 			return json.Marshal(map[string]any{
 				"hosts": map[string]any{
-					"github.com": []map[string]any{{"login": "sf-test", "active": true, "state": "active", "scopes": "repo", "protocol": "https"}},
+					"github.com": []map[string]any{{"login": "sf-test", "active": true, "state": "success", "host": "github.com", "scopes": "repo", "gitProtocol": "https", "tokenSource": "fake"}},
 				},
 			})
 		}
@@ -613,6 +622,115 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 		}
 	}
 	return nil, errors.New("fake-gh: unsupported invocation")
+}
+
+// validateOfficialArgv deliberately accepts only the public gh CLI grammar
+// used by the adapter.  This makes a fake-only flag or a quiet argv drift fail
+// tests before it can look like a supported GitHub operation.
+func validateOfficialArgv(argv []string) error {
+	if len(argv) < 2 {
+		return errors.New("fake-gh: incomplete invocation")
+	}
+	key := argv[0] + " " + argv[1]
+	require := func(flag, value string) error {
+		if option(argv, flag) != value {
+			return fmt.Errorf("fake-gh: %s requires %s=%q", key, flag, value)
+		}
+		return nil
+	}
+	allowed := map[string]bool{}
+	switch key {
+	case "auth status":
+		allowed["--json"] = true
+		if err := require("--json", "hosts"); err != nil {
+			return err
+		}
+	case "repo view":
+		allowed["--repo"], allowed["--json"] = true, true
+		if err := require("--json", "nameWithOwner,url"); err != nil {
+			return err
+		}
+	case "pr create":
+		for _, flag := range []string{"--repo", "--head", "--base", "--draft", "--title", "--body"} {
+			allowed[flag] = true
+		}
+		if !hasFlag(argv, "--draft") || option(argv, "--repo") == "" || option(argv, "--head") == "" || option(argv, "--base") == "" || option(argv, "--title") == "" || option(argv, "--body") == "" {
+			return fmt.Errorf("fake-gh: incomplete %s", key)
+		}
+	case "pr list":
+		for _, flag := range []string{"--repo", "--state", "--limit", "--json"} {
+			allowed[flag] = true
+		}
+		if err := require("--state", "all"); err != nil {
+			return err
+		}
+		if err := require("--limit", "100"); err != nil {
+			return err
+		}
+		if err := require("--json", prJSONFields); err != nil {
+			return err
+		}
+	case "pr view":
+		allowed["--repo"], allowed["--json"] = true, true
+		if prNumber(argv) <= 0 {
+			return fmt.Errorf("fake-gh: %s requires a number", key)
+		}
+		if err := require("--json", prJSONFields); err != nil {
+			return err
+		}
+	case "pr edit":
+		for _, flag := range []string{"--repo", "--title", "--body"} {
+			allowed[flag] = true
+		}
+		if prNumber(argv) <= 0 || option(argv, "--repo") == "" || option(argv, "--title") == "" || option(argv, "--body") == "" {
+			return fmt.Errorf("fake-gh: incomplete %s", key)
+		}
+	case "pr ready":
+		allowed["--repo"] = true
+		if prNumber(argv) <= 0 || option(argv, "--repo") == "" {
+			return fmt.Errorf("fake-gh: incomplete %s", key)
+		}
+	case "pr checks":
+		allowed["--repo"], allowed["--json"] = true, true
+		if prNumber(argv) <= 0 {
+			return fmt.Errorf("fake-gh: %s requires a number", key)
+		}
+		if err := require("--json", "name,state,workflow,link,bucket"); err != nil {
+			return err
+		}
+	case "pr merge":
+		for _, flag := range []string{"--repo", "--match-head-commit", "--merge", "--squash", "--rebase"} {
+			allowed[flag] = true
+		}
+		if prNumber(argv) <= 0 || option(argv, "--repo") == "" || option(argv, "--match-head-commit") == "" || mergeMethod(argv) == "" {
+			return fmt.Errorf("fake-gh: incomplete %s", key)
+		}
+	default:
+		return errors.New("fake-gh: unsupported invocation")
+	}
+	for index := 2; index < len(argv); index++ {
+		arg := argv[index]
+		if !strings.HasPrefix(arg, "--") {
+			continue
+		}
+		name := arg
+		if before, _, ok := strings.Cut(arg, "="); ok {
+			name = before
+		}
+		if !allowed[name] {
+			return fmt.Errorf("fake-gh: unsupported flag %s", name)
+		}
+	}
+	return nil
+}
+
+func hasFlag(argv []string, wanted string) bool {
+	for _, arg := range argv {
+		if arg == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *FakeGH) runList(argv []string) ([]byte, error) {
@@ -842,16 +960,25 @@ func prJSON(pr PullRequest) map[string]any {
 		"headRefName":         identity.HeadRef,
 		"headRefOid":          identity.HeadOID,
 		"baseRefName":         identity.BaseRef,
+		"baseRefOid":          strings.Repeat("c", 40),
 		"isDraft":             draft,
 		"title":               pr.Title,
 		"body":                body,
-		"state":               "OPEN",
+		"state":               map[bool]string{true: "MERGED", false: "OPEN"}[merged],
 	}
 	if merged {
 		value["mergedAt"] = "2026-01-01T00:00:00Z"
+		mergeCommit := pr.MergeCommit
+		if mergeCommit == "" {
+			mergeCommit = strings.Repeat("b", 40)
+		}
+		value["mergeCommit"] = map[string]string{"oid": mergeCommit}
 	} else {
 		value["mergedAt"] = nil
+		value["mergeCommit"] = nil
 	}
+	value["autoMergeRequest"] = nil
+	value["mergeStateStatus"] = "CLEAN"
 	return value
 }
 

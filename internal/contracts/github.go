@@ -29,6 +29,20 @@ type RequiredCheck struct {
 	State      string
 }
 
+// ProtectedBranchVerifier is implemented by the Git boundary after it freshly
+// fetches the protected ref and proves merge-commit ancestry.
+type ProtectedBranchVerifier interface {
+	VerifyProtectedBranch(context.Context, RepositoryIdentity, string, string) (ProtectedBranchObservation, error)
+}
+
+type ProtectedBranchObservation struct {
+	Repository  RepositoryIdentity
+	BaseRef     string
+	MergeCommit string
+	BaseHeadOID string
+	Contains    bool
+}
+
 type GitHub interface {
 	AuthStatus(context.Context) error
 	Repository(context.Context, RepositoryIdentity) (RepositoryIdentity, error)

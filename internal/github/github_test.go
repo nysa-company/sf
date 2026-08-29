@@ -2,9 +2,11 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +15,12 @@ import (
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/testkit"
 )
+
+type verifierFunc func(context.Context, contracts.RepositoryIdentity, string, string) (contracts.ProtectedBranchObservation, error)
+
+func (f verifierFunc) VerifyProtectedBranch(ctx context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+	return f(ctx, repository, baseRef, mergeCommit)
+}
 
 func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdentity) {
 	t.Helper()
@@ -32,7 +40,9 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build fake-gh: %v\n%s", err, output)
 	}
-	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), ConfigDir: filepath.Join(root, "gh-config"), Env: []string{"SF_FAKE_GH_STATE=" + state}, ValidateClaim: func(context.Context, domain.ExternalEffectClaim) error { return nil }}
+	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), ConfigDir: filepath.Join(root, "gh-config"), Env: []string{"SF_FAKE_GH_STATE=" + state}, ValidateClaim: func(context.Context, domain.ExternalEffectClaim) error { return nil }, VerifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
+	})}
 	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
 	return client, fake, identity
 }
@@ -46,6 +56,19 @@ func TestContractMutationRequiresClaimValidator(t *testing.T) {
 	client.ValidateClaim = nil
 	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("missing validator=%v", err)
+	}
+}
+
+func TestAuthStatusAcceptsOfficialHostsStateShape(t *testing.T) {
+	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Run: func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		want := []string{"auth", "status", "--json", "hosts"}
+		if !reflect.DeepEqual(args, want) {
+			return nil, errors.New("unexpected auth argv")
+		}
+		return []byte(`{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"sf-test","tokenSource":"keyring","scopes":"repo","gitProtocol":"https"}]}}`), nil
+	}}
+	if err := client.AuthStatus(context.Background()); err != nil {
+		t.Fatalf("official auth status shape=%v", err)
 	}
 }
 
@@ -123,6 +146,160 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	}
 	if err := (ApprovalBinding{ReviewedHead: pr.Identity.HeadOID, CurrentHead: "changed"}).Validate(); !errors.Is(err, ErrApprovalInvalid) {
 		t.Fatalf("approval invalidation=%v", err)
+	}
+}
+
+func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
+	t.Run("unavailable verifier is never success", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		plan, _ := client.Plan(identity, "key")
+		claim, _ := client.Claim(plan)
+		pr, err := client.createOrAdopt(context.Background(), claim, "title", "body")
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.VerifyProtectedBranch = nil
+		if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+			t.Fatalf("missing proof verifier=%v", err)
+		}
+	})
+	t.Run("mismatched proof is never success", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		plan, _ := client.Plan(identity, "key")
+		claim, _ := client.Claim(plan)
+		pr, err := client.createOrAdopt(context.Background(), claim, "title", "body")
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.VerifyProtectedBranch = verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+			return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
+		})
+		if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+			t.Fatalf("mismatched proof=%v", err)
+		}
+	})
+}
+
+func TestMergeNeverTrustsCLIExitWithoutFreshMergedObservation(t *testing.T) {
+	client, _, identity := fixture(t)
+	identity.Number = 1
+	plan, _ := client.Plan(identity, "key")
+	claim, _ := client.Claim(plan)
+	pr := PRMatch{Identity: identity, State: "OPEN"}
+	for _, test := range []struct {
+		name string
+		wire map[string]any
+	}{
+		{name: "zero-exit-unmerged", wire: mergeWire(identity, "OPEN", "CLEAN", nil, nil)},
+		{name: "auto-or-queued", wire: mergeWire(identity, "OPEN", "QUEUED", nil, map[string]any{"enabledAt": "now"})},
+		{name: "missing-merge-commit", wire: mergeWire(identity, "MERGED", "CLEAN", "2026-01-01T00:00:00Z", nil)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := json.Marshal(test.wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.Run = func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+				if len(args) >= 2 && args[0] == "pr" && args[1] == "merge" {
+					return nil, nil // gh may report success for a non-merge operation.
+				}
+				if len(args) >= 2 && args[0] == "pr" && args[1] == "view" {
+					return payload, nil
+				}
+				return nil, errors.New("unexpected gh argv")
+			}
+			if _, err := client.merge(context.Background(), claim, pr, identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+				t.Fatalf("merge must reject %s: %v", test.name, err)
+			}
+		})
+	}
+}
+
+func TestOfficialGHArgvGolden(t *testing.T) {
+	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
+	created := identity
+	created.Number = 7
+	createdWire, err := json.Marshal(mergeWire(created, "OPEN", "CLEAN", nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]string
+	listCalls := 0
+	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Run: func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		got = append(got, append([]string(nil), args...))
+		switch args[0] + " " + args[1] {
+		case "pr list":
+			listCalls++
+			if listCalls == 1 {
+				return []byte("[]"), nil
+			}
+			return []byte("[" + string(createdWire) + "]"), nil
+		case "pr create":
+			return []byte("https://github.com/example/app/pull/7\n"), nil
+		default:
+			return nil, errors.New("unexpected command")
+		}
+	}}
+	claim := EffectClaim{Plan: EffectPlan{SemanticKey: "key", Identity: identity}, Claimed: true}
+	if _, err := client.createOrAdopt(context.Background(), claim, "title", "body"); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields},
+		{"pr", "create", "--repo", "example/app", "--head", "example:sf/dev/example/SF-44-random", "--base", "main", "--draft", "--title", "title", "--body", "body\n\n" + ownershipMarker(identity)},
+		{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("official gh argv\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
+	identity := contracts.PullRequestIdentity{Number: 7, Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
+	wire := mergeWire(identity, "MERGED", "CLEAN", "2026-01-01T00:00:00Z", nil)
+	wire["mergeCommit"] = map[string]string{"oid": strings.Repeat("b", 40)}
+	payload, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]string
+	verified := false
+	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Run: func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		got = append(got, append([]string(nil), args...))
+		if args[0] == "pr" && args[1] == "merge" {
+			return nil, nil
+		}
+		if args[0] == "pr" && args[1] == "view" {
+			return payload, nil
+		}
+		return nil, errors.New("unexpected command")
+	}, VerifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+		verified = repository == identity.Repository && baseRef == "main" && mergeCommit == strings.Repeat("b", 40)
+		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
+	})}
+	claim := EffectClaim{Plan: EffectPlan{SemanticKey: "key", Identity: identity}, Claimed: true}
+	if outcome, err := client.merge(context.Background(), claim, PRMatch{Identity: identity, State: "OPEN"}, identity.HeadOID, domain.MergeGuarded, "squash"); err != nil || outcome != MergeApplied || !verified {
+		t.Fatalf("proven merge outcome=%q verified=%v err=%v", outcome, verified, err)
+	}
+	want := [][]string{{"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("official merge argv\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func mergeWire(identity contracts.PullRequestIdentity, state, mergeState string, mergedAt, autoMerge any) map[string]any {
+	return map[string]any{
+		"number": identity.Number, "title": "title", "body": ownershipMarker(identity),
+		"headRepositoryOwner": map[string]string{"login": identity.HeadOwner},
+		"headRepository":      map[string]string{"nameWithOwner": identity.HeadOwner + "/" + identity.HeadRepository},
+		"headRefName":         identity.HeadRef, "headRefOid": identity.HeadOID, "baseRefName": identity.BaseRef, "baseRefOid": strings.Repeat("c", 40),
+		"isDraft": false, "mergedAt": mergedAt, "mergeCommit": nil, "state": state, "mergeStateStatus": mergeState, "autoMergeRequest": autoMerge,
 	}
 }
 

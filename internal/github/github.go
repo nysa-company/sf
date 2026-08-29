@@ -41,6 +41,10 @@ type Client struct {
 	Env           []string // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
 	Run           func(context.Context, string, []string, []string) ([]byte, error)
 	ValidateClaim func(context.Context, domain.ExternalEffectClaim) error
+	// VerifyProtectedBranch is supplied by the Git boundary.  It is the
+	// authority that freshly fetches the protected base ref and proves that the
+	// reported merge commit is contained by that exact ref.
+	VerifyProtectedBranch contracts.ProtectedBranchVerifier
 }
 
 type Principal struct{ Login string }
@@ -48,6 +52,11 @@ type PRMatch struct {
 	Identity             contracts.PullRequestIdentity
 	Draft, Merged, Ready bool
 	Title, Body          string
+	MergeCommit          string
+	BaseHeadOID          string
+	State                string
+	MergeState           string
+	AutoMerge            bool
 }
 type EffectPlan struct {
 	SemanticKey string
@@ -67,15 +76,23 @@ const (
 
 var _ contracts.GitHub = (*Client)(nil)
 
+type authHost struct {
+	Login       string `json:"login"`
+	Active      bool   `json:"active"`
+	State       string `json:"state"`
+	Host        string `json:"host"`
+	Scopes      string `json:"scopes"`
+	GitProtocol string `json:"gitProtocol"`
+	TokenSource string `json:"tokenSource"`
+	// Token is emitted only when --show-token is passed. The client does not
+	// pass that flag, but accepting the documented field keeps the decoded
+	// hosts shape stable without surfacing credentials.
+	Token string `json:"token"`
+}
+
 func (c Client) AuthStatus(ctx context.Context) error {
 	var auth struct {
-		Hosts map[string][]struct {
-			Login    string `json:"login"`
-			Active   bool   `json:"active"`
-			State    string `json:"state"`
-			Scopes   string `json:"scopes"`
-			Protocol string `json:"protocol"`
-		} `json:"hosts"`
+		Hosts map[string][]authHost `json:"hosts"`
 	}
 	if err := c.json(ctx, &auth, "auth", "status", "--json", "hosts"); err != nil {
 		return err
@@ -102,12 +119,37 @@ func (c Client) FindPullRequest(ctx context.Context, identity contracts.PullRequ
 	return match.Identity, true, nil
 }
 func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
+	if !validIdentity(identity) || !validTitle(title) || !validBody(body) {
+		return contracts.PullRequestIdentity{}, ErrPolicyRefusal
+	}
+	// Public effect calls always require a durable claim, including the
+	// idempotent adoption path.  The claim is checked again below immediately
+	// before a create mutation after the absence observation.
 	if err := c.validateClaim(ctx, durable, identity, "draft_pr", requestDigest("draft_pr", identity, title, body)); err != nil {
 		return contracts.PullRequestIdentity{}, err
 	}
-	plan := EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}
-	match, err := c.createOrAdopt(ctx, EffectClaim{Plan: plan, Claimed: true}, title, body)
-	return match.Identity, err
+	if match, err := c.Observe(ctx, identity); err == nil {
+		return match.Identity, nil
+	} else if !errors.Is(err, ErrNoMatchingPR) {
+		return contracts.PullRequestIdentity{}, err
+	}
+	// Validate after the exact absence observation and immediately before the
+	// only mutation, so a stale effect cannot create a replacement PR.
+	if err := c.validateClaim(ctx, durable, identity, "draft_pr", requestDigest("draft_pr", identity, title, body)); err != nil {
+		return contracts.PullRequestIdentity{}, err
+	}
+	markedBody := body + "\n\n" + ownershipMarker(identity)
+	_, runErr := c.run(ctx, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
+	// Both a delivered response and a lost response are reconciled by the same
+	// exact ownership observation; command output is never object evidence.
+	match, observeErr := c.Observe(ctx, identity)
+	if observeErr == nil {
+		return match.Identity, nil
+	}
+	if runErr != nil {
+		return contracts.PullRequestIdentity{}, runErr
+	}
+	return contracts.PullRequestIdentity{}, observeErr
 }
 func (c Client) UpdatePullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) error {
 	observed, err := c.Observe(ctx, identity)
@@ -124,13 +166,15 @@ func (c Client) RequiredChecks(ctx context.Context, identity contracts.PullReque
 	return c.checks(ctx, identity)
 }
 func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
-	if _, err := c.Observe(ctx, identity); err != nil {
+	observed, err := c.Observe(ctx, identity)
+	if err != nil {
 		return err
 	}
+	identity = observed.Identity
 	if err := c.validateClaim(ctx, durable, identity, "pr_ready", requestDigest("pr_ready", identity)); err != nil {
 		return err
 	}
-	_, err := c.run(ctx, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository))
+	_, err = c.run(ctx, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository))
 	if err == nil {
 		return nil
 	}
@@ -146,6 +190,9 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	if err != nil {
 		return err
 	}
+	if observed.Merged || observed.AutoMerge || queueState(observed.MergeState) || observed.State != "OPEN" {
+		return ErrPolicyRefusal
+	}
 	identity = observed.Identity
 	if err := c.validateClaim(ctx, durable, identity, "merge", requestDigest("merge", identity, headOID, method)); err != nil {
 		return err
@@ -153,7 +200,7 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	if !authorization.Approved || !authorization.GatesGreen || authorization.ReviewedHead != headOID || authorization.CurrentHead != headOID {
 		return ErrApprovalInvalid
 	}
-	_, err = c.merge(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, PRMatch{Identity: identity}, headOID, domain.MergeGuarded, method)
+	_, err = c.merge(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, observed, headOID, domain.MergeGuarded, method)
 	return err
 }
 
@@ -177,13 +224,7 @@ func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryId
 		return Principal{}, err
 	}
 	var auth struct {
-		Hosts map[string][]struct {
-			Login    string `json:"login"`
-			Active   bool   `json:"active"`
-			State    string `json:"state"`
-			Scopes   string `json:"scopes"`
-			Protocol string `json:"protocol"`
-		} `json:"hosts"`
+		Hosts map[string][]authHost `json:"hosts"`
 	}
 	if err := c.json(ctx, &auth, "auth", "status", "--json", "hosts"); err != nil {
 		return Principal{}, err
@@ -205,16 +246,10 @@ func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryId
 	return Principal{Login: login}, nil
 }
 
-func activeLogin(hosts map[string][]struct {
-	Login    string `json:"login"`
-	Active   bool   `json:"active"`
-	State    string `json:"state"`
-	Scopes   string `json:"scopes"`
-	Protocol string `json:"protocol"`
-}) (string, error) {
+func activeLogin(hosts map[string][]authHost) (string, error) {
 	active := ""
 	for _, host := range hosts["github.com"] {
-		if host.Active && host.Login != "" && (host.State == "" || host.State == "active") {
+		if host.Active && host.Login != "" && (host.Host == "" || host.Host == "github.com") && (host.State == "success" || host.State == "active") {
 			if active != "" {
 				return "", ErrMalformedResponse
 			}
@@ -261,7 +296,7 @@ func (c Client) Observe(ctx context.Context, want contracts.PullRequestIdentity)
 			return PRMatch{}, err
 		}
 		if sameExact(candidate, want) {
-			matches = append(matches, PRMatch{Identity: candidate, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft, Title: value.Title, Body: value.Body})
+			matches = append(matches, value.match(candidate))
 		}
 	}
 	switch len(matches) {
@@ -403,22 +438,33 @@ func (c Client) merge(ctx context.Context, claim EffectClaim, pr PRMatch, review
 	if mode == domain.MergeAutonomous {
 		return "", fmt.Errorf("%w: autonomous merge is unavailable without a passing native profile", ErrPolicyRefusal)
 	}
-	if mode != domain.MergeGuarded || !claim.Claimed || reviewedHead == "" || reviewedHead != pr.Identity.HeadOID || method != "merge" && method != "squash" && method != "rebase" {
+	if mode != domain.MergeGuarded || !claim.Claimed || pr.Merged || pr.AutoMerge || queueState(pr.MergeState) || pr.State != "" && pr.State != "OPEN" || reviewedHead == "" || reviewedHead != pr.Identity.HeadOID || method != "merge" && method != "squash" && method != "rebase" {
 		return "", ErrPolicyRefusal
 	}
 	args := []string{"pr", "merge", fmt.Sprint(pr.Identity.Number), "--repo", repoArg(pr.Identity.Repository), "--match-head-commit", reviewedHead, "--" + method}
-	if _, err := c.run(ctx, args...); err == nil {
-		return MergeApplied, nil
-	}
+	// A CLI exit status is never merge evidence.  In particular a dropped
+	// response, a successful queue enrollment, and a successful auto-merge
+	// request must all be distinguished by a fresh exact PR observation.
+	_, _ = c.run(ctx, args...)
 	observed, err := c.viewNumber(ctx, pr.Identity.Repository, pr.Identity.Number)
 	if err != nil {
 		return "", err
 	}
-	if observed.Merged && sameExact(observed.Identity, pr.Identity) && observed.Identity.HeadOID == reviewedHead {
-		return MergeApplied, nil
-	}
 	if observed.Merged {
-		return MergeExternal, ErrExternalMerged
+		if !sameExact(observed.Identity, pr.Identity) || observed.Identity.HeadOID != reviewedHead {
+			return MergeExternal, ErrExternalMerged
+		}
+		if observed.State != "MERGED" || observed.MergeCommit == "" || observed.Identity.BaseRef != pr.Identity.BaseRef || c.VerifyProtectedBranch == nil {
+			return "", ErrPolicyRefusal
+		}
+		proof, verifyErr := c.VerifyProtectedBranch.VerifyProtectedBranch(ctx, pr.Identity.Repository, pr.Identity.BaseRef, observed.MergeCommit)
+		if verifyErr != nil {
+			return "", verifyErr
+		}
+		if proof.Repository != pr.Identity.Repository || proof.BaseRef != pr.Identity.BaseRef || proof.MergeCommit != observed.MergeCommit || !validOID(observed.BaseHeadOID) || proof.BaseHeadOID != observed.BaseHeadOID || !proof.Contains {
+			return "", ErrPolicyRefusal
+		}
+		return MergeApplied, nil
 	}
 	return "", ErrPolicyRefusal
 }
@@ -444,7 +490,7 @@ func (c Client) view(ctx context.Context, identity contracts.PullRequestIdentity
 	if err != nil {
 		return PRMatch{}, err
 	}
-	return PRMatch{Identity: parsed, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft, Title: value.Title, Body: value.Body}, nil
+	return value.match(parsed), nil
 }
 
 func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryIdentity, number int) (PRMatch, error) {
@@ -456,10 +502,10 @@ func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryI
 	if err != nil {
 		return PRMatch{}, err
 	}
-	return PRMatch{Identity: parsed, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft, Title: value.Title, Body: value.Body}, nil
+	return value.match(parsed), nil
 }
 
-const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,isDraft,mergedAt,state"
+const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest"
 
 type prWire struct {
 	Number         int `json:"number"`
@@ -469,15 +515,32 @@ type prWire struct {
 	HeadRepositoryOwner struct {
 		Login string `json:"login"`
 	} `json:"headRepositoryOwner"`
-	HeadRef  string  `json:"headRefName"`
-	HeadOID  string  `json:"headRefOid"`
-	BaseRef  string  `json:"baseRefName"`
-	Draft    bool    `json:"isDraft"`
-	Title    string  `json:"title"`
-	Body     string  `json:"body"`
-	MergedAt *string `json:"mergedAt"`
-	State    string  `json:"state"`
+	HeadRef     string  `json:"headRefName"`
+	HeadOID     string  `json:"headRefOid"`
+	BaseRef     string  `json:"baseRefName"`
+	BaseOID     string  `json:"baseRefOid"`
+	Draft       bool    `json:"isDraft"`
+	Title       string  `json:"title"`
+	Body        string  `json:"body"`
+	MergedAt    *string `json:"mergedAt"`
+	MergeCommit *struct {
+		OID string `json:"oid"`
+	} `json:"mergeCommit"`
+	State            string          `json:"state"`
+	MergeState       string          `json:"mergeStateStatus"`
+	AutoMergeRequest json.RawMessage `json:"autoMergeRequest"`
 }
+
+func (p prWire) match(identity contracts.PullRequestIdentity) PRMatch {
+	mergeCommit := ""
+	if p.MergeCommit != nil && validOID(p.MergeCommit.OID) {
+		mergeCommit = p.MergeCommit.OID
+	}
+	return PRMatch{Identity: identity, Draft: p.Draft, Merged: p.MergedAt != nil, Ready: !p.Draft, Title: p.Title, Body: p.Body, MergeCommit: mergeCommit, BaseHeadOID: p.BaseOID, State: p.State, MergeState: p.MergeState, AutoMerge: presentJSON(p.AutoMergeRequest)}
+}
+
+func presentJSON(value json.RawMessage) bool { return len(value) > 0 && string(value) != "null" }
+func queueState(value string) bool           { return value == "QUEUED" || value == "ENQUEUED" }
 
 func (p prWire) identity(repository contracts.RepositoryIdentity) (contracts.PullRequestIdentity, error) {
 	owner, name, ok := strings.Cut(p.HeadRepository.NameWithOwner, "/")
