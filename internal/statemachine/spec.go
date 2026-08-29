@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/nysa-company/sf/docs/plans"
 	"github.com/nysa-company/sf/internal/domain"
 )
 
@@ -96,6 +97,12 @@ func LoadApproved(reader io.Reader) (Spec, error) {
 		return Spec{}, errors.New("state-machine artifact does not match the approved release digest")
 	}
 	return Load(bytes.NewReader(data))
+}
+
+// LoadEmbeddedApproved verifies the exact reviewed artifact compiled into the
+// binary. Foreground daemons therefore have no checkout-relative dependency.
+func LoadEmbeddedApproved() (Spec, error) {
+	return LoadApproved(bytes.NewReader(plans.StateMachine()))
 }
 
 func (s Spec) Validate() error {

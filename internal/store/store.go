@@ -139,19 +139,19 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	s := &Store{db: db, commit: commitTransaction}
 	if err := s.configure(ctx); err != nil {
 		db.Close()
-		return nil, err
+		return nil, normalizeBusy(ctx, err)
 	}
 	if err := s.integrity(ctx); err != nil {
 		db.Close()
-		return nil, err
+		return nil, normalizeBusy(ctx, err)
 	}
 	if err := s.migrate(ctx); err != nil {
 		db.Close()
-		return nil, err
+		return nil, normalizeBusy(ctx, err)
 	}
 	if err := s.validateSchema(ctx); err != nil {
 		db.Close()
-		return nil, err
+		return nil, normalizeBusy(ctx, err)
 	}
 	return s, nil
 }
@@ -165,7 +165,7 @@ func (s *Store) configure(ctx context.Context) error {
 		"PRAGMA busy_timeout=0",
 	} {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("configure sqlite (%s): %w", statement, err)
+			return fmt.Errorf("configure sqlite (%s): %w", statement, normalizeBusy(ctx, err))
 		}
 	}
 	return nil
@@ -470,6 +470,9 @@ func (s *Store) submitTicket(ctx context.Context, ticket Ticket, allowNew bool, 
 	if err := validateTicketInput(ticket); err != nil {
 		return Ticket{}, false, err
 	}
+	if leaderEpoch != 0 && ticket.State != "" && ticket.State != domain.StateQueued {
+		return Ticket{}, false, errors.New("normative submission must be none to queued")
+	}
 	var existingRef domain.TicketRef
 	created := false
 	err = s.write(ctx, func(conn *sql.Conn) error {
@@ -542,6 +545,9 @@ func insertTicketEvent(ctx context.Context, conn *sql.Conn, ticket Ticket, norma
 	}
 	if ticket.State == "" {
 		ticket.State = domain.StateQueued
+	}
+	if normative && ticket.State != domain.StateQueued {
+		return errors.New("normative submission must target queued")
 	}
 	if ticket.Version == 0 {
 		ticket.Version = 1
@@ -844,7 +850,7 @@ func (s *Store) ReconcileOrphans(ctx context.Context, channel domain.Channel, le
 				if changed, _ := updated.RowsAffected(); changed != 1 {
 					return ErrStaleFence
 				}
-				if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'workflow_ownership_unknown', 'planning', 'blocked', '{}', ?)`, channel, project, ticket, version+1, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'typed_blocker', 'planning', 'blocked', '{"code":"workflow_ownership_unknown"}', ?)`, channel, project, ticket, version+1, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 					return err
 				}
 				continue
@@ -857,6 +863,48 @@ func (s *Store) ReconcileOrphans(ctx context.Context, channel domain.Channel, le
 				return ErrStaleFence
 			}
 			if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'workflow_owner_recovered', 'planning', 'planning', '{}', ?)`, channel, project, ticket, version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	})
+}
+
+// BlockOrphanedWorkflows is the daemon-recovery variant of orphan handling.
+// A replacement daemon must not silently adopt a workflow whose previous
+// runner may still exist; it records a typed blocked state for explicit repair.
+func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Channel, leaderEpoch uint64) error {
+	return s.write(ctx, func(conn *sql.Conn) error {
+		var dbEpoch uint64
+		if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, channel).Scan(&dbEpoch); err != nil {
+			return err
+		}
+		if dbEpoch != leaderEpoch {
+			return ErrStaleFence
+		}
+		rows, err := conn.QueryContext(ctx, `SELECT project_id, id, version, runner_epoch FROM tickets t
+			WHERE channel=? AND state='planning' AND NOT EXISTS (
+				SELECT 1 FROM workflow_owners o WHERE o.channel=t.channel AND o.project_id=t.project_id AND o.ticket_id=t.id
+			)`, channel)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var project domain.ProjectID
+			var ticket domain.TicketID
+			var version, runner uint64
+			if err := rows.Scan(&project, &ticket, &version, &runner); err != nil {
+				return err
+			}
+			updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state='blocked', blocked_code='workflow_ownership_unknown', version=version+1 WHERE channel=? AND project_id=? AND id=? AND state='planning' AND version=? AND runner_epoch=?`, channel, project, ticket, version, runner)
+			if err != nil {
+				return err
+			}
+			if changed, _ := updated.RowsAffected(); changed != 1 {
+				return ErrStaleFence
+			}
+			if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'typed_blocker', 'planning', 'blocked', '{"code":"workflow_ownership_unknown"}', ?)`, channel, project, ticket, version+1, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 				return err
 			}
 		}

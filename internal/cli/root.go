@@ -22,13 +22,14 @@ import (
 )
 
 type app struct {
-	client  Client
-	out     io.Writer
-	errOut  io.Writer
-	json    bool
-	channel domain.Channel
-	last    *api.Response
-	ctx     context.Context
+	client    Client
+	out       io.Writer
+	errOut    io.Writer
+	json      bool
+	channel   domain.Channel
+	last      *api.Response
+	ctx       context.Context
+	runDaemon func(context.Context) error
 }
 
 // NewCommand returns the public CLI. The client is injected so command tests
@@ -67,7 +68,14 @@ func (a *app) command() *cobra.Command {
 
 // Execute runs a command and renders its one authoritative response.
 func Execute(ctx context.Context, args []string, out, errOut io.Writer, client Client) int {
+	return ExecuteWithDaemon(ctx, args, out, errOut, client, nil)
+}
+
+// ExecuteWithDaemon adds the local foreground lifecycle at the composition
+// root. cli itself remains independent of the daemon implementation.
+func ExecuteWithDaemon(ctx context.Context, args []string, out, errOut io.Writer, client Client, runDaemon func(context.Context) error) int {
 	a := newApp(client, out, errOut)
+	a.runDaemon = runDaemon
 	command := a.command()
 	command.SetArgs(args)
 	if err := command.ExecuteContext(ctx); err != nil {
@@ -202,10 +210,34 @@ func (a *app) statusCommand() *cobra.Command {
 		if len(args) == 1 {
 			ticket = args[0]
 		}
-		return a.emit(a.request("ticket.status", ticket, params(map[string]any{"watch": watch}, a.channel)))
+		if !watch {
+			return a.emit(a.request("ticket.status", ticket, params(map[string]any{"watch": false}, a.channel)))
+		}
+		return a.watchStatus(cmd.Context(), ticket)
 	}}
 	command.Flags().BoolVar(&watch, "watch", false, "follow status changes")
 	return command
+}
+
+const statusWatchInterval = 500 * time.Millisecond
+
+func (a *app) watchStatus(ctx context.Context, ticket string) error {
+	for {
+		response := a.request("ticket.status", ticket, params(map[string]any{"watch": false}, a.channel))
+		if err := a.emit(response); err != nil {
+			return err
+		}
+		if !response.OK {
+			return nil
+		}
+		timer := time.NewTimer(statusWatchInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
 }
 
 func (a *app) showCommand() *cobra.Command {
@@ -325,7 +357,18 @@ func (a *app) providersCommand() *cobra.Command {
 
 func (a *app) daemonCommand() *cobra.Command {
 	root := &cobra.Command{Use: "daemon", Args: cobra.NoArgs}
-	root.AddCommand(&cobra.Command{Use: "run", Short: "run the channel daemon in the foreground", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error { return a.emit(notConfigured("daemon run")) }})
+	root.AddCommand(&cobra.Command{Use: "run", Short: "run the channel daemon in the foreground", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		if a.runDaemon == nil {
+			return a.emit(notConfigured("daemon run"))
+		}
+		if err := a.runDaemon(cmd.Context()); err != nil {
+			return a.emit(failure("daemon_start_failed", "could not run the local daemon: "+err.Error(), []string{binaryName(), "doctor"}))
+		}
+		return a.emit(api.Response{Version: api.Version, RequestID: requestID(), OK: true, Mutation: api.Mutation{}, Data: json.RawMessage(`{"daemon":"stopped"}`)})
+	}})
+	root.AddCommand(&cobra.Command{Use: "status", Short: "read local daemon status", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		return a.emit(a.request("daemon.status", "", params(map[string]any{}, a.channel)))
+	}})
 	return root
 }
 

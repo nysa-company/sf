@@ -72,6 +72,9 @@ type Config struct {
 	// daemon's local storage/leader checks are required; no provider or Git
 	// integration is implied by that default.
 	Doctor func(context.Context, store.Project) error
+	// StartupTimeout bounds migrations, recovery, and all startup-only SQLite
+	// operations even when the process context is long-lived.
+	StartupTimeout time.Duration
 }
 
 type Daemon struct {
@@ -97,6 +100,8 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if err := validateConfig(configuration); err != nil {
 		return nil, err
 	}
+	startupCtx, cancel := boundedContext(ctx, configuration.StartupTimeout)
+	defer cancel()
 	if err := secureChannelPaths(configuration.Paths); err != nil {
 		return nil, err
 	}
@@ -106,21 +111,9 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if err := secureDatabaseFiles(configuration.Paths.Database); err != nil {
 		return nil, err
 	}
-	if err := validateNoSymlinkComponents(configuration.StateMachinePath); err != nil {
-		return nil, fmt.Errorf("validate normative state machine path: %w", err)
-	}
-
-	file, err := os.Open(configuration.StateMachinePath)
+	specification, err := loadSpecification(configuration.StateMachinePath)
 	if err != nil {
-		return nil, fmt.Errorf("open normative state machine: %w", err)
-	}
-	specification, loadErr := statemachine.LoadApproved(file)
-	closeErr := file.Close()
-	if loadErr != nil {
-		return nil, fmt.Errorf("load normative state machine: %w", loadErr)
-	}
-	if closeErr != nil {
-		return nil, fmt.Errorf("close normative state machine: %w", closeErr)
+		return nil, err
 	}
 
 	lease, err := leader.Acquire(filepath.Join(configuration.Paths.Root, "run", "leader.lock"), configuration.Channel, configuration.DaemonIdentity)
@@ -134,7 +127,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if err := lease.Validate(); err != nil {
 		return fail(err)
 	}
-	database, err := store.Open(ctx, configuration.Paths.Database)
+	database, err := store.Open(startupCtx, configuration.Paths.Database)
 	if err != nil {
 		return fail(err)
 	}
@@ -148,7 +141,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if err := lease.Validate(); err != nil {
 		return failStore(err)
 	}
-	epoch, err := database.AcquireLeader(ctx, configuration.Channel, configuration.DaemonIdentity)
+	epoch, err := database.AcquireLeader(startupCtx, configuration.Channel, configuration.DaemonIdentity)
 	if err != nil {
 		return failStore(fmt.Errorf("acquire durable leader epoch: %w", err))
 	}
@@ -156,9 +149,9 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		if project.Channel != configuration.Channel {
 			return failStore(fmt.Errorf("configured project %q belongs to another channel", project.ID))
 		}
-		durable, err := database.Project(ctx, project.Channel, project.ID)
+		durable, err := database.Project(startupCtx, project.Channel, project.ID)
 		if errors.Is(err, store.ErrNotFound) {
-			if err := database.CreateProject(ctx, project); err != nil {
+			if err := database.CreateProject(startupCtx, project); err != nil {
 				return failStore(fmt.Errorf("register project %q: %w", project.ID, err))
 			}
 			continue
@@ -182,7 +175,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if instance.ids == nil {
 		instance.ids = RandomTicketIDs{}
 	}
-	if err := instance.Recover(ctx); err != nil {
+	if err := instance.Recover(startupCtx); err != nil {
 		return failStore(fmt.Errorf("recover durable state: %w", err))
 	}
 	server, err := transport.Listen(configuration.Paths.Socket, uint32(os.Getuid()), instance)
@@ -205,7 +198,24 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 	if err := daemon.lease.Validate(); err != nil {
 		return err
 	}
+	if _, err := daemon.store.ReconcileEffects(ctx, daemon.channel, daemon.epoch); err != nil {
+		return fmt.Errorf("reconcile stranded effects: %w", err)
+	}
+	if _, err := daemon.store.FenceRecoveredRunners(ctx, daemon.channel, daemon.epoch); err != nil {
+		return fmt.Errorf("invalidate recovered runners: %w", err)
+	}
 	return daemon.engine.RecoverChannel(ctx, daemon.channel, daemon.epoch)
+}
+
+// Run owns a foreground daemon lifetime. It is deliberately separate from the
+// CLI package so cmd/sf can inject it without creating a cli<->daemon cycle.
+func Run(ctx context.Context, configuration Config) error {
+	daemon, err := Start(ctx, configuration)
+	if err != nil {
+		return err
+	}
+	defer daemon.Close()
+	return daemon.Serve(ctx)
 }
 
 func (daemon *Daemon) Close() error {
@@ -442,7 +452,7 @@ func (daemon *Daemon) success(request api.Request, mutation api.Mutation, value 
 }
 
 func (daemon *Daemon) failure(request api.Request, code, message string, retryable bool) api.Response {
-	argv := []string{"sf", "daemon", "status"}
+	argv := []string{"sf", "doctor"}
 	if code == "autonomous_unavailable" {
 		argv = []string{"sf", "submit", "<ticket.md>", "--project", "<project>"}
 	}
@@ -511,11 +521,15 @@ func submitErrorCode(err error) string {
 }
 
 func validateConfig(configuration Config) error {
-	if !configuration.Channel.Valid() || configuration.Paths.Root == "" || configuration.Paths.Database == "" || configuration.Paths.Socket == "" || configuration.StateMachinePath == "" || configuration.DaemonIdentity == "" {
-		return errors.New("channel, paths, state machine path, and daemon identity are required")
+	if !configuration.Channel.Valid() || configuration.Paths.Root == "" || configuration.Paths.Database == "" || configuration.Paths.Socket == "" || configuration.DaemonIdentity == "" {
+		return errors.New("channel, paths, and daemon identity are required")
 	}
-	for _, path := range []string{configuration.Paths.Root, configuration.Paths.Database, configuration.Paths.Socket, configuration.Paths.Logs, configuration.Paths.Events, configuration.Paths.Worktrees, configuration.Paths.Backups, configuration.StateMachinePath} {
-		if !filepath.IsAbs(path) {
+	paths := []string{configuration.Paths.Root, configuration.Paths.Database, configuration.Paths.Socket, configuration.Paths.Logs, configuration.Paths.Events, configuration.Paths.Worktrees, configuration.Paths.Backups}
+	if configuration.StateMachinePath != "" {
+		paths = append(paths, configuration.StateMachinePath)
+	}
+	for _, path := range paths {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 			return fmt.Errorf("daemon paths must be absolute")
 		}
 	}
@@ -528,12 +542,44 @@ func validateConfig(configuration Config) error {
 }
 
 func secureChannelPaths(paths config.ChannelPaths) error {
-	for _, path := range []string{paths.Root, filepath.Join(paths.Root, "run"), paths.Logs, paths.Events, paths.Worktrees, paths.Backups} {
+	for _, path := range []string{paths.Root, filepath.Join(paths.Root, "run"), filepath.Dir(paths.Socket), filepath.Dir(paths.Database), filepath.Dir(paths.Database + "-wal"), filepath.Dir(paths.Database + "-shm"), paths.Logs, paths.Events, paths.Worktrees, paths.Backups} {
 		if err := secureDirectory(path); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func loadSpecification(path string) (statemachine.Spec, error) {
+	if path == "" {
+		return statemachine.LoadEmbeddedApproved()
+	}
+	if err := validateNoSymlinkComponents(path); err != nil {
+		return statemachine.Spec{}, fmt.Errorf("validate normative state machine path: %w", err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return statemachine.Spec{}, fmt.Errorf("open normative state machine: %w", err)
+	}
+	specification, loadErr := statemachine.LoadApproved(file)
+	closeErr := file.Close()
+	if loadErr != nil {
+		return statemachine.Spec{}, fmt.Errorf("load normative state machine: %w", loadErr)
+	}
+	if closeErr != nil {
+		return statemachine.Spec{}, fmt.Errorf("close normative state machine: %w", closeErr)
+	}
+	return specification, nil
+}
+
+func boundedContext(parent context.Context, configured time.Duration) (context.Context, context.CancelFunc) {
+	if configured <= 0 {
+		configured = 5 * time.Second
+	}
+	if deadline, ok := parent.Deadline(); ok && time.Until(deadline) <= configured {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, configured)
 }
 
 func secureDirectory(path string) error {

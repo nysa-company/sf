@@ -117,11 +117,11 @@ func (e *Engine) Signal(ctx context.Context, request contracts.SignalRequest) (c
 }
 
 func (e *Engine) Recover(ctx context.Context, request contracts.RecoveryRequest) error {
-	return e.store.ReconcileOrphans(ctx, request.Channel, request.LeaderEpoch)
+	return e.store.BlockOrphanedWorkflows(ctx, request.Channel, request.LeaderEpoch)
 }
 
 func (e *Engine) RecoverChannel(ctx context.Context, channel domain.Channel, leaderEpoch uint64) error {
-	return e.store.ReconcileOrphans(ctx, channel, leaderEpoch)
+	return e.store.BlockOrphanedWorkflows(ctx, channel, leaderEpoch)
 }
 
 var _ contracts.WorkflowEngine = (*Engine)(nil)

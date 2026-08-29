@@ -19,6 +19,33 @@ var ErrLeaseCapacity = errors.New("lease capacity is exhausted")
 // workflow without an operator-visible state decision.
 var ErrStartState = errors.New("ticket cannot be started in its current state")
 
+// FenceRecoveredRunners advances every actively owned ticket runner under the
+// new durable leader. It never releases leases: only a later supervisor proof
+// may free capacity that could still belong to a live old process.
+func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channel, leaderEpoch uint64) (int64, error) {
+	if !channel.Valid() || leaderEpoch == 0 {
+		return 0, errors.New("valid channel and leader epoch are required")
+	}
+	var changed int64
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		var current uint64
+		if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, channel).Scan(&current); err != nil {
+			return err
+		}
+		if current != leaderEpoch {
+			return ErrStaleFence
+		}
+		result, err := conn.ExecContext(ctx, `UPDATE tickets SET runner_epoch=runner_epoch+1, version=version+1
+			WHERE channel=? AND state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling')`, channel)
+		if err != nil {
+			return err
+		}
+		changed, _ = result.RowsAffected()
+		return nil
+	})
+	return changed, err
+}
+
 // LeaseRequest describes one capacity dimension. Resource names are durable
 // semantic identities such as "machine", a canonical project ID, or a
 // qualified provider/version. Capacity is resolved from the frozen ticket

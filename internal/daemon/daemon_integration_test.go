@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -158,5 +159,90 @@ func TestForegroundRejectsWrongOperatorAndSecondLeader(t *testing.T) {
 	}
 	if !errors.Is(err, leader.ErrLeaderExists) {
 		t.Fatalf("second leader error=%v", err)
+	}
+}
+
+func TestRestartFencesPlanningRunnerWithoutDroppingItsLease(t *testing.T) {
+	d, paths, cancel := testDaemon(t)
+	dir := t.TempDir()
+	ticket := writeTicket(t, dir, "Restart fence")
+	if code, _, stderr := executeCLI(t, context.Background(), paths, "submit", ticket, "--project", "demo"); code != 0 || stderr != "" {
+		t.Fatalf("submit code=%d stderr=%q", code, stderr)
+	}
+	if code, _, stderr := executeCLI(t, context.Background(), paths, "start", "SF-test-1"); code != 0 || stderr != "" {
+		t.Fatalf("start code=%d stderr=%q", code, stderr)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelStable, Project: "demo", Ticket: "SF-test-1"}
+	before, err := d.store.Ticket(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The production path uses the embedded reviewed artifact and may start with
+	// no configured projects when the durable registration already exists.
+	restarted, err := Start(context.Background(), Config{Channel: domain.ChannelStable, Paths: paths, DaemonIdentity: "restart-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	after, err := restarted.store.Ticket(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.RunnerEpoch != before.RunnerEpoch+1 || after.Version != before.Version+1 {
+		t.Fatalf("recovery did not fence runner: before=%+v after=%+v", before, after)
+	}
+	leases, err := restarted.store.Leases(context.Background(), domain.ChannelStable)
+	if err != nil || len(leases) == 0 || leases[0].RunnerEpoch != before.RunnerEpoch {
+		t.Fatalf("recovery incorrectly released or rewrote stale leases: leases=%+v err=%v", leases, err)
+	}
+}
+
+func TestStartupBusyHonorsConfiguredDeadline(t *testing.T) {
+	d, paths, cancel := testDaemon(t)
+	cancel()
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = locked.Close() })
+	connection, err := locked.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.ExecContext(context.Background(), "BEGIN EXCLUSIVE"); err != nil {
+		t.Fatal(err)
+	}
+	defer connection.ExecContext(context.Background(), "ROLLBACK")
+	started := time.Now()
+	_, err = Start(context.Background(), Config{Channel: domain.ChannelStable, Paths: paths, DaemonIdentity: "busy-test", StartupTimeout: 40 * time.Millisecond})
+	if !errors.Is(err, store.ErrBusy) {
+		t.Fatalf("startup error=%v, want typed busy", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("startup outlived deadline: %s", elapsed)
+	}
+}
+
+func TestStartRejectsSymlinkedExactSocketParent(t *testing.T) {
+	root := t.TempDir()
+	external := t.TempDir()
+	if err := os.Symlink(external, filepath.Join(root, "socket-link")); err != nil {
+		t.Fatal(err)
+	}
+	paths := config.ChannelPaths{
+		Root: root, Database: filepath.Join(root, "sf.sqlite"), Socket: filepath.Join(root, "socket-link", "sf.sock"),
+		Logs: filepath.Join(root, "logs"), Events: filepath.Join(root, "events"), Worktrees: filepath.Join(root, "worktrees"), Backups: filepath.Join(root, "backups"),
+	}
+	if _, err := Start(context.Background(), Config{Channel: domain.ChannelStable, Paths: paths, DaemonIdentity: "symlink-test"}); err == nil {
+		t.Fatal("daemon accepted a symlinked socket parent")
 	}
 }

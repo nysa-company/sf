@@ -130,6 +130,29 @@ func TestSubmitRejectsSourceDigestMismatch(t *testing.T) {
 	}
 }
 
+func TestFencedSubmitOnlyPermitsNormativeNoneToQueued(t *testing.T) {
+	database, ctx := openTestStore(t)
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-submit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := []byte("# Exact transition\n\nOnly queued is valid.\n")
+	sum := sha256.Sum256(source)
+	input := Ticket{Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-normative"}, Source: source, SourceDigest: fmt.Sprintf("%x", sum[:]), Type: domain.TicketBug, MergeMode: domain.MergeGuarded, State: domain.StatePlanning}
+	if _, _, err := database.SubmitTicketFenced(ctx, input, false, leader); err == nil {
+		t.Fatal("fenced submit accepted a non-queued target")
+	}
+	input.State = ""
+	created, wasCreated, err := database.SubmitTicketFenced(ctx, input, false, leader)
+	if err != nil || !wasCreated || created.State != domain.StateQueued {
+		t.Fatalf("fenced submit=%+v created=%v err=%v", created, wasCreated, err)
+	}
+	events, err := database.Events(ctx, domain.ChannelDev, 0, 10)
+	if err != nil || len(events) != 1 || events[0].Trigger != "submit_valid" || events[0].From != domain.State("none") || events[0].To != domain.StateQueued {
+		t.Fatalf("events=%+v err=%v", events, err)
+	}
+}
+
 func TestMigrationAndActiveTicketConstraint(t *testing.T) {
 	database, ctx := openTestStore(t)
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-1"}
@@ -680,7 +703,7 @@ func TestRecoveryBlockWritesEventAndSchemaGuardsStartup(t *testing.T) {
 		t.Fatalf("blocked start=%v", err)
 	}
 	var events int
-	if err := database.db.QueryRow(`SELECT COUNT(*) FROM events WHERE ticket_id='SF-9' AND trigger='workflow_ownership_unknown'`).Scan(&events); err != nil || events != 1 {
+	if err := database.db.QueryRow(`SELECT COUNT(*) FROM events WHERE ticket_id='SF-9' AND trigger='typed_blocker'`).Scan(&events); err != nil || events != 1 {
 		t.Fatalf("recovery events=%d err=%v", events, err)
 	}
 

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/api"
 	"github.com/nysa-company/sf/internal/domain"
@@ -51,6 +52,29 @@ func TestLifecycleCommandUsesSocketClientAndChannelIdentity(t *testing.T) {
 	}
 	if params["channel"] != string(domain.ChannelStable) {
 		t.Fatalf("channel=%v", params["channel"])
+	}
+}
+
+func TestStatusWatchPollsUntilContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	var requests int
+	client := fakeClient(func(_ context.Context, request api.Request) (api.Response, error) {
+		requests++
+		if request.Method != "ticket.status" {
+			t.Fatalf("method=%q", request.Method)
+		}
+		var parameters map[string]any
+		if err := json.Unmarshal(request.Parameters, &parameters); err != nil || parameters["watch"] != false {
+			t.Fatalf("parameters=%s err=%v", request.Parameters, err)
+		}
+		return responseOK(), nil
+	})
+	if code := Execute(ctx, []string{"status", "SF-1", "--watch"}, &bytes.Buffer{}, &bytes.Buffer{}, client); code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	if requests != 1 {
+		t.Fatalf("watch requests=%d, want one bounded initial poll", requests)
 	}
 }
 
