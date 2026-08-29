@@ -183,10 +183,18 @@ func (f *FakeGH) Repository(_ context.Context, identity contracts.RepositoryIden
 func (f *FakeGH) FindPullRequest(_ context.Context, want contracts.PullRequestIdentity) (contracts.PullRequestIdentity, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var match *contracts.PullRequestIdentity
 	for _, pr := range f.state.PRs {
 		if identityMatches(pr.Identity, want) {
-			return pr.Identity, true, nil
+			if match != nil {
+				return contracts.PullRequestIdentity{}, false, errors.New("fake-gh: ambiguous matching pull requests")
+			}
+			identity := pr.Identity
+			match = &identity
 		}
+	}
+	if match != nil {
+		return *match, true, nil
 	}
 	return contracts.PullRequestIdentity{}, false, nil
 }

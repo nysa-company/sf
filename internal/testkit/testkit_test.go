@@ -81,6 +81,34 @@ func TestFakeGHSeparatesMutationFromResponseDeliveryAndBindsIdentity(t *testing.
 	}
 }
 
+func TestFakeGHRejectsAmbiguousIdentityLookup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "remote.json")
+	remote, err := NewFakeGH(path, contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.SetAuthenticated(true); err != nil {
+		t.Fatal(err)
+	}
+	base := contracts.PullRequestIdentity{
+		Repository:     contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"},
+		HeadOwner:      "example",
+		HeadRepository: "app",
+		HeadRef:        "sf/dev/nysa/SF-00000001-abc123",
+		BaseRef:        "main",
+	}
+	for _, oid := range []string{"0123456789012345678901234567890123456789", "abcdefabcdefabcdefabcdefabcdefabcdefabcd"} {
+		identity := base
+		identity.HeadOID = oid
+		if _, err := remote.CreateDraftPullRequest(context.Background(), identity, "title", "body", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, found, err := remote.FindPullRequest(context.Background(), base); err == nil || found {
+		t.Fatalf("ambiguous lookup = found=%v err=%v", found, err)
+	}
+}
+
 func TestCrashControllerIsOneShot(t *testing.T) {
 	crash := NewCrashController()
 	crash.Arm(AfterRemoteMutationBeforeResp)
