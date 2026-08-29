@@ -75,6 +75,38 @@ func (s State) Terminal() bool {
 	return s == StateDone || s == StateExternalMerged || s == StateCancelled
 }
 
+func AllStates() []State {
+	return []State{
+		StateQueued,
+		StatePlanning,
+		StateVerifying,
+		StateBuilding,
+		StatePublishing,
+		StateWaitingCI,
+		StateReviewing,
+		StateWaitingApproval,
+		StateWaitingManualMerge,
+		StateMerging,
+		StateReconciling,
+		StateStopping,
+		StateCancelling,
+		StatePaused,
+		StateBlocked,
+		StateDone,
+		StateExternalMerged,
+		StateCancelled,
+	}
+}
+
+func (s State) Valid() bool {
+	for _, candidate := range AllStates() {
+		if s == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 type Phase string
 
 const (
