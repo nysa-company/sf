@@ -115,9 +115,11 @@ func validRepoPath(path string) bool {
 // removed, system/global configuration disabled, and hooks disabled per call.
 // Run is replaceable only for exact-argv tests; production always uses git.
 type Runner struct {
-	Binary string
-	Home   string
-	Run    func(context.Context, string, []string, []string) ([]byte, error)
+	Binary      string
+	Home        string
+	GHBinary    string // absolute gh used only as Git's HTTPS credential helper
+	GHConfigDir string // explicit existing gh auth/config authority; never copied into HOME
+	Run         func(context.Context, string, []string, []string) ([]byte, error)
 }
 
 func (r Runner) command(ctx context.Context, directory string, args ...string) ([]byte, error) {
@@ -127,7 +129,12 @@ func (r Runner) command(ctx context.Context, directory string, args ...string) (
 	// The authenticated origin may be a local bare repository in hermetic tests
 	// and local-only installs. No arbitrary URL is accepted: every operation
 	// names origin after identity reauthentication.
+	ctx, cancel := boundedGitContext(ctx)
+	defer cancel()
 	argv := []string{"-C", directory, "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"}
+	if r.GHBinary != "" {
+		argv = append(argv, "-c", "credential.helper=!"+r.GHBinary+" auth git-credential")
+	}
 	argv = append(argv, args...)
 	env, err := r.environment(nil)
 	if err != nil {
@@ -151,7 +158,12 @@ func (r Runner) commandEnv(ctx context.Context, directory string, extra []string
 	if directory == "" {
 		return nil, fmt.Errorf("git directory is required")
 	}
+	ctx, cancel := boundedGitContext(ctx)
+	defer cancel()
 	argv := []string{"-C", directory, "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"}
+	if r.GHBinary != "" {
+		argv = append(argv, "-c", "credential.helper=!"+r.GHBinary+" auth git-credential")
+	}
 	argv = append(argv, args...)
 	env, err := r.environment(extra)
 	if err != nil {
@@ -188,6 +200,9 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	if r.Home == "" || !validAbsolutePath(r.Home) {
 		return nil, fmt.Errorf("runner requires an explicit absolute isolated HOME")
 	}
+	if (r.GHBinary == "") != (r.GHConfigDir == "") || (r.GHBinary != "" && (!validAbsolutePath(r.GHBinary) || !validAbsolutePath(r.GHConfigDir))) {
+		return nil, fmt.Errorf("HTTPS auth requires absolute gh binary and explicit gh config directory")
+	}
 	info, err := os.Stat(r.Home)
 	if err == nil && info.Mode().Perm()&0o077 != 0 {
 		return nil, fmt.Errorf("isolated HOME permissions are too broad")
@@ -199,6 +214,11 @@ func (r Runner) environment(extra []string) ([]string, error) {
 		return nil, err
 	}
 	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
+	if r.GHConfigDir != "" {
+		// HTTPS auth is delegated to the explicitly selected gh auth store. The
+		// private Git HOME remains credential-free; no token is copied into env.
+		env = append(env, "GH_CONFIG_DIR="+r.GHConfigDir, "GIT_ASKPASS_REQUIRE=force")
+	}
 	for _, entry := range extra {
 		key, _, _ := strings.Cut(entry, "=")
 		if (strings.HasPrefix(key, "GIT_") && !strings.HasPrefix(key, "GIT_AUTHOR_") && !strings.HasPrefix(key, "GIT_COMMITTER_")) || key == "HOME" {
@@ -207,6 +227,13 @@ func (r Runner) environment(extra []string) ([]string, error) {
 		env = append(env, entry)
 	}
 	return env, nil
+}
+
+func boundedGitContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := parent.Deadline(); ok {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, 2*time.Minute)
 }
 
 func runBounded(ctx context.Context, binary string, argv, env []string) ([]byte, error) {
@@ -262,7 +289,7 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	if !validAbsolutePath(worktree) || !validRef(baseRef) {
 		return Identity{}, fmt.Errorf("%w: invalid worktree path or base ref", ErrIdentityMismatch)
 	}
-	repository, err := r.one(ctx, worktree, "rev-parse", "--show-toplevel")
+	_, err := r.one(ctx, worktree, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return Identity{}, err
 	}
@@ -301,7 +328,9 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	if err != nil {
 		return Identity{}, err
 	}
-	canonicalRepo, err := filepath.EvalSymlinks(strings.TrimSpace(repository))
+	// A linked worktree's --show-toplevel is the worktree itself. The primary
+	// repository identity is the parent of the authenticated common .git dir.
+	canonicalRepo, err := filepath.EvalSymlinks(filepath.Dir(strings.TrimSpace(common)))
 	if err != nil {
 		return Identity{}, err
 	}
@@ -466,6 +495,34 @@ type Worktree struct {
 	Identity     Identity
 }
 
+// PreflightRepository proves that repository is the primary checkout. Snapshot
+// intentionally requires a linked-worktree .git file; callers creating a
+// worktree must use this separate primary-checkout preflight first.
+func (r Runner) PreflightRepository(ctx context.Context, repository, baseRef string) error {
+	if !validAbsolutePath(repository) || !validRef(baseRef) {
+		return fmt.Errorf("canonical repository path and base ref are required")
+	}
+	actual, err := r.one(ctx, repository, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return err
+	}
+	actual, err = filepath.EvalSymlinks(actual)
+	canonicalRepository, canonicalErr := filepath.EvalSymlinks(repository)
+	if err != nil || canonicalErr != nil || actual != canonicalRepository {
+		return fmt.Errorf("%w: primary repository path changed", ErrIdentityMismatch)
+	}
+	info, err := os.Lstat(filepath.Join(repository, ".git"))
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: primary repository .git directory required", ErrIdentityMismatch)
+	}
+	bare, err := r.one(ctx, repository, "rev-parse", "--is-bare-repository")
+	if err != nil || bare != "false" {
+		return fmt.Errorf("%w: bare repository refused", ErrIdentityMismatch)
+	}
+	_, err = r.one(ctx, repository, "rev-parse", "--verify", baseRef+"^{commit}")
+	return err
+}
+
 func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, baseRef string) (Worktree, error) {
 	if !validAbsolutePath(repository) || !validAbsolutePath(path) || !validRef(baseRef) {
 		return Worktree{}, fmt.Errorf("canonical repository/worktree paths and base ref are required")
@@ -474,6 +531,9 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 		return Worktree{}, fmt.Errorf("sf branch and absolute worktree path are required")
 	}
 	if _, err := validateBranch(branch); err != nil {
+		return Worktree{}, err
+	}
+	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
 		return Worktree{}, err
 	}
 	if _, err := r.command(ctx, repository, "worktree", "add", "-b", branch, path, baseRef); err != nil {
@@ -512,6 +572,13 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 	if state.Active || state.Taken || state.Quarantined || state.Foreign {
 		return fmt.Errorf("%w: active/taken/quarantined/foreign worktree is retained", ErrUnsafeWorktree)
 	}
+	canonicalRepository, err := filepath.EvalSymlinks(repository)
+	if err != nil || canonicalRepository != worktree.Identity.Repository {
+		return fmt.Errorf("%w: removal repository does not match authenticated identity", ErrIdentityMismatch)
+	}
+	if err := r.PreflightRepository(ctx, canonicalRepository, worktree.Identity.BaseRef); err != nil {
+		return err
+	}
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return err
 	}
@@ -519,7 +586,7 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 	if output, statusErr := r.command(ctx, worktree.Path, "status", "--porcelain=v1"); statusErr != nil || strings.TrimSpace(string(output)) != "" {
 		return fmt.Errorf("%w: worktree status is not clean", ErrUnsafeWorktree)
 	}
-	_, err := r.command(ctx, repository, "worktree", "remove", worktree.Path)
+	_, err = r.command(ctx, canonicalRepository, "worktree", "remove", worktree.Path)
 	return err
 }
 
@@ -668,7 +735,7 @@ type CommitRequest struct {
 }
 
 func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitRequest) (string, error) {
-	if request.EvidenceDigest == "" || request.Timestamp.IsZero() {
+	if !boundedCommitText(request.EvidenceDigest, 200) || (request.Message != "" && !boundedCommitText(request.Message, 4_000)) || request.Timestamp.IsZero() || !validRef(request.BaseRef) {
 		return "", fmt.Errorf("candidate evidence digest and timestamp are required")
 	}
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
@@ -678,6 +745,14 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 		return "", err
 	}
 	if _, err := r.command(ctx, worktree.Path, "add", "-A", "--"); err != nil {
+		return "", err
+	}
+	// The index is mutable control-plane state. Reauthenticate and validate the
+	// staged view after add so a racing change cannot bypass the first check.
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	if err := r.ValidateDiff(ctx, worktree.Path, request.BaseRef, request.Policy); err != nil {
 		return "", err
 	}
 	message := "sf candidate " + request.EvidenceDigest
@@ -695,7 +770,17 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if !validOID(head) {
 		return "", fmt.Errorf("%w: invalid committed object id", ErrIdentityMismatch)
 	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	if output, err := r.command(ctx, worktree.Path, "status", "--porcelain=v1"); err != nil || strings.TrimSpace(string(output)) != "" {
+		return "", fmt.Errorf("%w: post-commit worktree is not clean", ErrUnsafeWorktree)
+	}
 	return head, nil
+}
+
+func boundedCommitText(value string, maximum int) bool {
+	return value != "" && len(value) <= maximum && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00')
 }
 
 func (r Runner) Push(ctx context.Context, worktree Worktree) (string, error) {

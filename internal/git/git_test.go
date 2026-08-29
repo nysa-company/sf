@@ -359,3 +359,58 @@ func TestExactOIDRefPathAndChangedPathValidation(t *testing.T) {
 		t.Fatal("valid identity value refused")
 	}
 }
+
+func TestPreflightAndRemovalRequireAuthenticatedPrimaryRepository(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	if err := runner.PreflightRepository(ctx, repository, "main"); err != nil {
+		t.Fatal(err)
+	}
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(t.TempDir(), "other")
+	if err := os.Mkdir(other, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rawGit(t, other, "init", "-b", "main")
+	if err := runner.RemoveWorktree(ctx, other, worktree, WorktreeState{}); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("foreign primary removal=%v", err)
+	}
+}
+
+func TestCommitBoundsUntrustedEvidenceAndMessage(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-commit-bound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: strings.Repeat("x", 201), Timestamp: time.Now(), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err == nil {
+		t.Fatal("oversized evidence accepted")
+	}
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: "sha256:test", Message: "bad\x00message", Timestamp: time.Now(), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err == nil {
+		t.Fatal("unsafe message accepted")
+	}
+}
+
+func TestHTTPSCredentialHelperUsesExplicitGHConfigOnly(t *testing.T) {
+	var argv, env []string
+	runner := Runner{Home: filepath.Join(t.TempDir(), "git-home"), GHBinary: "/usr/bin/gh", GHConfigDir: filepath.Join(t.TempDir(), "gh-config"), Run: func(_ context.Context, _ string, gotArgv, gotEnv []string) ([]byte, error) {
+		argv, env = gotArgv, gotEnv
+		return []byte("ok\n"), nil
+	}}
+	if _, err := runner.one(context.Background(), "/repo", "status"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(argv, "\x00"), "credential.helper=!/usr/bin/gh auth git-credential") || !strings.Contains(strings.Join(env, "\n"), "GH_CONFIG_DIR="+runner.GHConfigDir) {
+		t.Fatalf("missing explicit HTTPS helper argv=%q env=%q", argv, env)
+	}
+}
