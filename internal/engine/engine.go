@@ -43,12 +43,12 @@ func New(database *store.Store, spec statemachine.Spec) *Engine {
 func (e *Engine) Close() error { return e.store.Close() }
 
 func (e *Engine) Start(ctx context.Context, request contracts.StartRequest) error {
-	_, err := e.store.StartOrAdopt(ctx, request.Ticket, request.WorkflowID, request.Fence)
+	_, err := e.store.StartOrAdopt(ctx, request.Ticket, request.TicketVersion, request.WorkflowID, request.Fence)
 	return err
 }
 
-func (e *Engine) StartOrAdopt(ctx context.Context, ref domain.TicketRef, stableWorkflowID string, fence domain.Fence) (store.Ticket, error) {
-	return e.store.StartOrAdopt(ctx, ref, stableWorkflowID, fence)
+func (e *Engine) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, stableWorkflowID string, fence domain.Fence) (store.Ticket, error) {
+	return e.store.StartOrAdopt(ctx, ref, expectedVersion, stableWorkflowID, fence)
 }
 
 func (e *Engine) Transition(ctx context.Context, request contracts.TransitionRequest) (contracts.TransitionResult, error) {
@@ -109,12 +109,11 @@ func invalidations(spec statemachine.Spec, sets []string) []string {
 	return result
 }
 
-func (e *Engine) Signal(ctx context.Context, request contracts.SignalRequest) error {
-	_, err := e.Transition(ctx, contracts.TransitionRequest{
+func (e *Engine) Signal(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return e.Transition(ctx, contracts.TransitionRequest{
 		Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From,
 		Trigger: request.Trigger, Fence: request.Fence, Attributes: request.Attributes,
 	})
-	return err
 }
 
 func (e *Engine) Recover(ctx context.Context, request contracts.RecoveryRequest) error {

@@ -41,7 +41,7 @@ func TestTransitionUsesNormativeStateMachineAndFencedStore(t *testing.T) {
 	}
 	runtime := New(database, spec)
 	var workflow contracts.WorkflowEngine = runtime
-	if err := workflow.Start(ctx, contracts.StartRequest{Ticket: ref, WorkflowID: "dev/nysa/SF-engine/planning", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1}}); err != nil {
+	if err := workflow.Start(ctx, contracts.StartRequest{Ticket: ref, TicketVersion: 1, WorkflowID: "dev/nysa/SF-engine/planning", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1}}); err != nil {
 		t.Fatal(err)
 	}
 	started, err := database.Ticket(ctx, ref)
@@ -59,8 +59,12 @@ func TestTransitionUsesNormativeStateMachineAndFencedStore(t *testing.T) {
 	if result.To != domain.StateVerifying || result.TicketVersion != started.Version+1 || result.EventID == "" {
 		t.Fatalf("unexpected transition result: %+v", result)
 	}
-	if err := workflow.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: result.TicketVersion, From: domain.StateVerifying, Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Attributes: map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}}); err != nil {
+	signal, err := workflow.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: result.TicketVersion, From: domain.StateVerifying, Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Attributes: map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if signal.EventID == "" || signal.To != domain.StateBuilding {
+		t.Fatalf("signal receipt=%+v", signal)
 	}
 	built, err := database.Ticket(ctx, ref)
 	if err != nil {

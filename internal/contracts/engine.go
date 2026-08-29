@@ -20,9 +20,10 @@ type TransitionRequest struct {
 // StartRequest carries a daemon-acquired durable fence. Runtime entry points
 // never invent it, so a replaced daemon cannot start stale work.
 type StartRequest struct {
-	Ticket     domain.TicketRef
-	WorkflowID string
-	Fence      domain.Fence
+	Ticket        domain.TicketRef
+	TicketVersion uint64
+	WorkflowID    string
+	Fence         domain.Fence
 }
 
 // SignalRequest is a fenced state-machine signal.
@@ -51,7 +52,7 @@ type TransitionResult struct {
 type WorkflowEngine interface {
 	Start(context.Context, StartRequest) error
 	Transition(context.Context, TransitionRequest) (TransitionResult, error)
-	Signal(context.Context, SignalRequest) error
+	Signal(context.Context, SignalRequest) (TransitionResult, error)
 	Recover(context.Context, RecoveryRequest) error
 	Close() error
 }

@@ -16,19 +16,21 @@ import (
 )
 
 var (
-	ErrBusy       = errors.New("sqlite write deadline exceeded")
-	ErrStaleFence = errors.New("ticket fence is stale")
-	ErrNotFound   = errors.New("store row not found")
-	ErrBlocked    = errors.New("ticket is blocked")
-	ErrEffectBusy = errors.New("effect already has a live claim")
-	ErrEffectKey  = errors.New("effect semantic key conflicts with durable record")
+	ErrBusy             = errors.New("sqlite write deadline exceeded")
+	ErrStaleFence       = errors.New("ticket fence is stale")
+	ErrNotFound         = errors.New("store row not found")
+	ErrBlocked          = errors.New("ticket is blocked")
+	ErrStaleObservation = errors.New("effect observation belongs to a stale ticket identity")
+	ErrEffectBusy       = errors.New("effect already has a live claim")
+	ErrEffectKey        = errors.New("effect semantic key conflicts with durable record")
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 var migrationChecksums = map[int]string{
 	1: migrationChecksum(migrationV1),
 	2: migrationChecksum(migrationV2),
+	3: migrationChecksum(migrationV3),
 }
 
 func migrationChecksum(statements []string) string {
@@ -40,7 +42,10 @@ func migrationChecksum(statements []string) string {
 	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db     *sql.DB
+	commit func(context.Context, *sql.Conn) error
+}
 
 type Project struct {
 	Channel domain.Channel
@@ -92,7 +97,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
-	s := &Store{db: db}
+	s := &Store{db: db, commit: commitTransaction}
 	if err := s.configure(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -146,6 +151,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			statements := migrationV1
 			if version == 2 {
 				statements = migrationV2
+			} else if version == 3 {
+				statements = migrationV3
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -183,8 +190,12 @@ func (s *Store) write(ctx context.Context, fn func(*sql.Conn) error) error {
 		if err == nil {
 			err = fn(conn)
 			if err == nil {
-				_, err = conn.ExecContext(ctx, "COMMIT")
-			} else {
+				err = s.commit(ctx, conn)
+			}
+			if err != nil {
+				// COMMIT can fail after BEGIN succeeded (including cancellation and
+				// disk faults). Always clear the transaction before returning this
+				// pooled connection to another caller.
 				_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 			}
 			conn.Close()
@@ -211,6 +222,11 @@ func (s *Store) write(ctx context.Context, fn func(*sql.Conn) error) error {
 			backoff *= 2
 		}
 	}
+}
+
+func commitTransaction(ctx context.Context, conn *sql.Conn) error {
+	_, err := conn.ExecContext(ctx, "COMMIT")
+	return err
 }
 
 func normalizeBusy(ctx context.Context, err error) error {
@@ -316,7 +332,7 @@ func (s *Store) AcquireLeader(ctx context.Context, channel domain.Channel, ident
 // StartOrAdopt atomically moves queued work to planning and records durable
 // ownership. If a previous process committed planning then died before
 // ownership, recovery supplies the same stable ID and creates exactly one row.
-func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, workflowID string, fence domain.Fence) (Ticket, error) {
+func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, workflowID string, fence domain.Fence) (Ticket, error) {
 	if workflowID == "" {
 		return Ticket{}, fmt.Errorf("stable workflow id is required")
 	}
@@ -335,7 +351,10 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, workflow
 		}
 		stateChanged := false
 		if state == domain.StateQueued {
-			result, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?, version=version+1, workflow_id=? WHERE channel=? AND project_id=? AND id=? AND version=? AND runner_epoch=?`, domain.StatePlanning, workflowID, ref.Channel, ref.Project, ref.Ticket, version, runner)
+			if version != expectedVersion {
+				return ErrStaleFence
+			}
+			result, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?, version=version+1, workflow_id=? WHERE channel=? AND project_id=? AND id=? AND version=? AND runner_epoch=?`, domain.StatePlanning, workflowID, ref.Channel, ref.Project, ref.Ticket, expectedVersion, runner)
 			if err != nil {
 				return err
 			}
@@ -350,6 +369,8 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, workflow
 			return fmt.Errorf("cannot start or adopt ticket in state %q", state)
 		} else if persistedWorkflowID == "" {
 			return fmt.Errorf("cannot adopt planning ticket without persisted workflow id")
+		} else if version != expectedVersion+1 {
+			return ErrStaleFence
 		} else if persistedWorkflowID != workflowID {
 			return fmt.Errorf("%w: workflow id does not match durable ticket identity", ErrStaleFence)
 		}
