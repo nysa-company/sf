@@ -71,9 +71,17 @@ func Listen(path string, expectedUID uint32, handler Handler) (*Server, error) {
 	// created above. The net package's automatic unlink could otherwise delete a
 	// replacement placed at the same path while the daemon is shutting down.
 	listener.SetUnlinkOnClose(false)
+	createdIdentity, err := socketIdentity(path)
+	if err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("identify created socket: %w", err)
+	}
 	cleanup := func() {
 		_ = listener.Close()
-		_ = os.Remove(path)
+		identity, identityErr := socketIdentity(path)
+		if identityErr == nil && identity == createdIdentity {
+			_ = os.Remove(path)
+		}
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		cleanup()

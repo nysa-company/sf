@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -110,4 +111,26 @@ func TestDoctorRejectsWorldReadableChannelRoot(t *testing.T) {
 		}
 	}
 	t.Fatal("expected channel root mode failure")
+}
+
+func TestDoctorDoesNotEchoRepositoryPath(t *testing.T) {
+	root := t.TempDir()
+	secretPath := filepath.Join(root, "repo-with-secret-token")
+	report := RunDoctor(context.Background(), DoctorDeps{
+		Channel:  domain.ChannelDev,
+		Binary:   "sf-dev",
+		Repo:     secretPath,
+		Paths:    config.ChannelPaths{Root: root},
+		Lookup:   func(string) (string, error) { return "/bin/tool", nil },
+		StatFS:   func(string) (*syscall.Statfs_t, error) { return &syscall.Statfs_t{Bavail: 100_000, Bsize: 4096}, nil },
+		Worktree: func(context.Context, string) error { return errors.New("not a worktree") },
+	})
+	response := reportResponse(report)
+	data := string(response.Data)
+	if strings.Contains(data, secretPath) {
+		t.Fatalf("doctor report leaked repository path: %s", data)
+	}
+	if response.NextAction == nil || len(response.NextAction.Argv) != 2 || response.NextAction.Argv[1] != "doctor" {
+		t.Fatalf("doctor action was not generic: %+v", response.NextAction)
+	}
 }

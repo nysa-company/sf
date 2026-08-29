@@ -145,11 +145,30 @@ func stableJSON(value any) string {
 func shellWords(argv []string) string {
 	words := make([]string, len(argv))
 	for index, arg := range argv {
-		if arg == "" || strings.ContainsAny(arg, " \t\n\"'") {
+		if !safeShellWord(arg) {
 			words[index] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
 		} else {
 			words[index] = arg
 		}
 	}
 	return strings.Join(words, " ")
+}
+
+// safeShellWord is deliberately narrower than the shell's portable word
+// grammar. Any character outside this allowlist is quoted, including all
+// expansion, redirection, command-substitution, and control characters.
+func safeShellWord(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' {
+			continue
+		}
+		if strings.ContainsRune("_-./:=,@+%", character) {
+			continue
+		}
+		return false
+	}
+	return true
 }

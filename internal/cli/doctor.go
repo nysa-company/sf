@@ -118,7 +118,7 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	} else if !filepath.IsAbs(deps.Repo) {
 		report.Checks = append(report.Checks, failedCheck("repository_worktree", "repository path must be absolute", deps.Binary, "doctor"))
 	} else if err := deps.Worktree(ctx, deps.Repo); err != nil {
-		report.Checks = append(report.Checks, failedCheck("repository_worktree", "selected repository is not a Git worktree", deps.Binary, "doctor", "--repo", deps.Repo))
+		report.Checks = append(report.Checks, failedCheck("repository_worktree", "selected repository is not a Git worktree", deps.Binary, "doctor"))
 	} else {
 		report.Checks = append(report.Checks, DoctorCheck{ID: "repository_worktree", Status: CheckPass, Summary: "selected repository is a Git worktree"})
 	}
