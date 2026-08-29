@@ -195,6 +195,33 @@ func TestConcurrentActiveTicketConstraint(t *testing.T) {
 	}
 }
 
+func TestTicketIdentityIsChannelUniqueAndProjectLookupIsDurable(t *testing.T) {
+	database, ctx := openTestStore(t)
+	if err := database.CreateProject(ctx, Project{Channel: domain.ChannelDev, ID: "other", Path: "/tmp/other", BaseRef: "trunk"}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-one-id"}
+	if err := database.CreateTicket(ctx, ticket(ref, "identity-a")); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := domain.TicketRef{Channel: domain.ChannelDev, Project: "other", Ticket: ref.Ticket}
+	if err := database.CreateTicket(ctx, ticket(duplicate, "identity-b")); err == nil {
+		t.Fatal("same channel ticket ID was accepted for a second project")
+	}
+	loaded, err := database.TicketByID(ctx, domain.ChannelDev, ref.Ticket)
+	if err != nil || loaded.Ref != ref {
+		t.Fatalf("ticket=%+v err=%v", loaded, err)
+	}
+	project, err := database.Project(ctx, domain.ChannelDev, "other")
+	if err != nil || project.Path != "/tmp/other" || project.BaseRef != "trunk" {
+		t.Fatalf("project=%+v err=%v", project, err)
+	}
+	projects, err := database.Projects(ctx, domain.ChannelDev)
+	if err != nil || len(projects) != 2 || projects[0].ID != "nysa" || projects[1].ID != "other" {
+		t.Fatalf("projects=%+v err=%v", projects, err)
+	}
+}
+
 func TestMigrationTransactionRollsBackOnInterruption(t *testing.T) {
 	database, ctx := openTestStore(t)
 	err := database.write(ctx, func(conn *sql.Conn) error {
@@ -614,7 +641,7 @@ func TestRecoveryBlockWritesEventAndSchemaGuardsStartup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL); INSERT INTO schema_migrations VALUES (1, 'now', '` + migrationChecksums[1] + `'); INSERT INTO schema_migrations VALUES (2, 'now', '` + migrationChecksums[2] + `'); INSERT INTO schema_migrations VALUES (3, 'now', '` + migrationChecksums[3] + `'); INSERT INTO schema_migrations VALUES (4, 'now', '` + migrationChecksums[4] + `'); INSERT INTO schema_migrations VALUES (5, 'now', '` + migrationChecksums[5] + `')`); err != nil {
+	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL); INSERT INTO schema_migrations VALUES (1, 'now', '` + migrationChecksums[1] + `'); INSERT INTO schema_migrations VALUES (2, 'now', '` + migrationChecksums[2] + `'); INSERT INTO schema_migrations VALUES (3, 'now', '` + migrationChecksums[3] + `'); INSERT INTO schema_migrations VALUES (4, 'now', '` + migrationChecksums[4] + `'); INSERT INTO schema_migrations VALUES (5, 'now', '` + migrationChecksums[5] + `'); INSERT INTO schema_migrations VALUES (6, 'now', '` + migrationChecksums[6] + `')`); err != nil {
 		t.Fatal(err)
 	}
 	_ = raw.Close()

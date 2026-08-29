@@ -28,7 +28,7 @@ var (
 	ErrEffectKey        = errors.New("effect semantic key conflicts with durable record")
 )
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 var migrationChecksums = map[int]string{
 	1: migrationChecksum(migrationV1),
@@ -36,6 +36,7 @@ var migrationChecksums = map[int]string{
 	3: migrationChecksum(migrationV3),
 	4: migrationChecksum(migrationV4),
 	5: migrationChecksum(migrationV5),
+	6: migrationChecksum(migrationV6),
 }
 
 func migrationChecksum(statements []string) string {
@@ -181,6 +182,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV4
 			} else if version == 5 {
 				statements = migrationV5
+			} else if version == 6 {
+				statements = migrationV6
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -283,6 +286,43 @@ func (s *Store) CreateProject(ctx context.Context, project Project) error {
 		_, err := conn.ExecContext(ctx, `INSERT INTO projects(channel, id, canonical_path, base_ref) VALUES (?, ?, ?, ?)`, project.Channel, project.ID, project.Path, project.BaseRef)
 		return err
 	})
+}
+
+// Project returns the immutable repository registration used by durable ticket
+// records. Callers must not treat a later configuration value as authority.
+func (s *Store) Project(ctx context.Context, channel domain.Channel, id domain.ProjectID) (Project, error) {
+	if !channel.Valid() || id == "" {
+		return Project{}, errors.New("valid project channel and id are required")
+	}
+	project := Project{Channel: channel, ID: id}
+	err := s.db.QueryRowContext(ctx, `SELECT canonical_path, base_ref FROM projects WHERE channel=? AND id=?`, channel, id).Scan(&project.Path, &project.BaseRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Project{}, ErrNotFound
+	}
+	if err != nil {
+		return Project{}, normalizeBusy(ctx, err)
+	}
+	return project, nil
+}
+
+func (s *Store) Projects(ctx context.Context, channel domain.Channel) ([]Project, error) {
+	if !channel.Valid() {
+		return nil, fmt.Errorf("invalid channel %q", channel)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, canonical_path, base_ref FROM projects WHERE channel=? ORDER BY id`, channel)
+	if err != nil {
+		return nil, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	var projects []Project
+	for rows.Next() {
+		project := Project{Channel: channel}
+		if err := rows.Scan(&project.ID, &project.Path, &project.BaseRef); err != nil {
+			return nil, err
+		}
+		projects = append(projects, project)
+	}
+	return projects, rows.Err()
 }
 
 func (s *Store) CreateTicket(ctx context.Context, ticket Ticket) error {
@@ -457,6 +497,23 @@ func (s *Store) Ticket(ctx context.Context, ref domain.TicketRef) (Ticket, error
 		return Ticket{}, fmt.Errorf("decode ticket creation time: %w", err)
 	}
 	return ticket, nil
+}
+
+// TicketByID resolves the channel-unique operator identity without guessing a
+// project from configuration or branch names.
+func (s *Store) TicketByID(ctx context.Context, channel domain.Channel, id domain.TicketID) (Ticket, error) {
+	if !channel.Valid() || id == "" {
+		return Ticket{}, errors.New("valid channel and ticket id are required")
+	}
+	var project domain.ProjectID
+	err := s.db.QueryRowContext(ctx, `SELECT project_id FROM tickets WHERE channel=? AND id=?`, channel, id).Scan(&project)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Ticket{}, ErrNotFound
+	}
+	if err != nil {
+		return Ticket{}, normalizeBusy(ctx, err)
+	}
+	return s.Ticket(ctx, domain.TicketRef{Channel: channel, Project: project, Ticket: id})
 }
 
 func (s *Store) Tickets(ctx context.Context, channel domain.Channel, project domain.ProjectID, limit int) ([]Ticket, error) {

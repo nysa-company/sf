@@ -130,6 +130,7 @@ var requiredIndexes = []indexRequirement{
 	{table: "projects", columns: []string{"channel", "canonical_path"}},
 	{table: "tickets", name: "active_ticket_source_digest", columns: []string{"channel", "project_id", "source_digest"}, partial: true},
 	{table: "tickets", name: "ticket_workflow_id", columns: []string{"channel", "workflow_id"}, partial: true},
+	{table: "tickets", name: "ticket_channel_id", columns: []string{"channel", "id"}},
 	{table: "workflow_owners", columns: []string{"channel", "workflow_id"}},
 	{table: "phase_runs", name: "one_active_phase_per_ticket", columns: []string{"channel", "project_id", "ticket_id"}, partial: true},
 	{table: "effects", name: "active_effect_claim", columns: []string{"channel", "project_id", "ticket_id", "effect_kind"}, partial: true},

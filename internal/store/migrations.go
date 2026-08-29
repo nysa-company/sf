@@ -139,3 +139,9 @@ var migrationV5 = []string{
 	`ALTER TABLE tickets ADD COLUMN max_duration_ns INTEGER NOT NULL DEFAULT 0 CHECK(max_duration_ns >= 0)`,
 	`ALTER TABLE tickets ADD COLUMN max_cost_micro_usd INTEGER NOT NULL DEFAULT 0 CHECK(max_cost_micro_usd >= 0)`,
 }
+
+// v6 makes the operator-facing SF identifier unambiguous within a channel, so
+// lifecycle commands never need a project argument to resolve a ticket.
+var migrationV6 = []string{
+	`CREATE UNIQUE INDEX ticket_channel_id ON tickets(channel, id)`,
+}
