@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -34,10 +33,11 @@ var (
 const maxResponse = 1 << 20
 
 type Client struct {
-	Binary string
-	Home   string
-	Env    []string // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
-	Run    func(context.Context, string, []string, []string) ([]byte, error)
+	Binary    string
+	Home      string
+	ConfigDir string   // explicit existing gh auth/config authority, never a temp substitute
+	Env       []string // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
+	Run       func(context.Context, string, []string, []string) ([]byte, error)
 }
 
 type Principal struct{ Login string }
@@ -442,6 +442,8 @@ func (c Client) json(ctx context.Context, destination any, args ...string) error
 	return nil
 }
 func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
+	ctx, cancel := boundedGHContext(ctx)
+	defer cancel()
 	env, err := c.environment()
 	if err != nil {
 		return nil, err
@@ -456,11 +458,9 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 		}
 		return output, nil
 	}
-	command := exec.CommandContext(ctx, c.binary(), args...)
-	command.Env = env
-	output, runErr := command.CombinedOutput()
-	if len(output) > maxResponse {
-		return nil, ErrResponseTooLarge
+	output, runErr := runBounded(ctx, c.binary(), args, env)
+	if errors.Is(runErr, ErrResponseTooLarge) {
+		return nil, runErr
 	}
 	if runErr != nil {
 		return nil, fmt.Errorf("gh command failed")
@@ -474,14 +474,10 @@ func (c Client) binary() string {
 	return "gh"
 }
 func (c Client) environment() ([]string, error) {
-	home := c.Home
-	if home == "" {
-		home = filepath.Join(os.TempDir(), "sf-gh-home")
+	if c.Home == "" || !filepath.IsAbs(c.Home) || c.ConfigDir == "" || !filepath.IsAbs(c.ConfigDir) {
+		return nil, ErrPolicyRefusal
 	}
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		return nil, err
-	}
-	env := []string{"HOME=" + home, "GH_CONFIG_DIR=" + filepath.Join(home, "gh"), "GH_PROMPT_DISABLED=1", "GIT_TERMINAL_PROMPT=0", "NO_COLOR=1"}
+	env := []string{"HOME=" + c.Home, "GH_CONFIG_DIR=" + c.ConfigDir, "GH_PROMPT_DISABLED=1", "GIT_TERMINAL_PROMPT=0", "NO_COLOR=1", "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
 	for _, entry := range c.Env {
 		if !strings.HasPrefix(entry, "SF_FAKE_GH_STATE=") {
 			return nil, ErrPolicyRefusal
@@ -489,4 +485,42 @@ func (c Client) environment() ([]string, error) {
 		env = append(env, entry)
 	}
 	return env, nil
+}
+
+func boundedGHContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := parent.Deadline(); ok {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, 2*time.Minute)
+}
+
+func runBounded(ctx context.Context, binary string, args, env []string) ([]byte, error) {
+	command := exec.CommandContext(ctx, binary, args...)
+	command.Env = env
+	buffer := &boundedBuffer{limit: maxResponse}
+	command.Stdout, command.Stderr = buffer, buffer
+	err := command.Run()
+	if buffer.exceeded {
+		return buffer.data, ErrResponseTooLarge
+	}
+	return buffer.data, err
+}
+
+type boundedBuffer struct {
+	data     []byte
+	limit    int
+	exceeded bool
+}
+
+func (b *boundedBuffer) Write(value []byte) (int, error) {
+	if len(b.data)+len(value) > b.limit {
+		remaining := b.limit - len(b.data)
+		if remaining > 0 {
+			b.data = append(b.data, value[:remaining]...)
+		}
+		b.exceeded = true
+		return len(value), nil
+	}
+	b.data = append(b.data, value...)
+	return len(value), nil
 }

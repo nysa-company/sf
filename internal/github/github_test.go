@@ -31,7 +31,7 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build fake-gh: %v\n%s", err, output)
 	}
-	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), Env: []string{"SF_FAKE_GH_STATE=" + state}}
+	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), ConfigDir: filepath.Join(root, "gh-config"), Env: []string{"SF_FAKE_GH_STATE=" + state}}
 	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: "0123456789abcdef", BaseRef: "main", FactoryOwned: true}
 	return client, fake, identity
 }
@@ -114,7 +114,7 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 }
 
 func TestStrictJSONBoundedSanitizedCommandBoundary(t *testing.T) {
-	client := Client{Home: t.TempDir(), Run: func(context.Context, string, []string, []string) ([]byte, error) {
+	client := Client{Home: t.TempDir(), ConfigDir: filepath.Join(t.TempDir(), "gh-config"), Run: func(context.Context, string, []string, []string) ([]byte, error) {
 		return []byte(`{"unknown":true}`), nil
 	}}
 	var value struct{}
