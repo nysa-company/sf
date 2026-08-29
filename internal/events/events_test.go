@@ -53,6 +53,17 @@ func TestProjectionRejectsOutOfOrderEvents(t *testing.T) {
 	}
 }
 
+func TestProjectionAcceptsOnlyNormativeSubmitFromNone(t *testing.T) {
+	record := Record{Schema: Schema, ID: 1, Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-1", TicketVersion: 1, Trigger: "submit_valid", From: domain.State("none"), To: domain.StateQueued, Payload: []byte(`{}`), CreatedAt: time.Now().UTC()}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("normative submit rejected: %v", err)
+	}
+	record.Trigger = "phase_pass"
+	if err := record.Validate(); err == nil {
+		t.Fatal("non-submit transition accepted from none")
+	}
+}
+
 func TestRebuildRejectsSymlinkedParentBeforeWriting(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target")

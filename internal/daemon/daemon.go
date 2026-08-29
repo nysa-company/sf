@@ -1,0 +1,660 @@
+// Package daemon owns the foreground, single-owner local daemon boundary.
+// It intentionally performs only durable local state changes; providers, Git,
+// GitHub, remotes, and autonomous execution belong to later phases.
+package daemon
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/nysa-company/sf/internal/api"
+	"github.com/nysa-company/sf/internal/config"
+	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/engine"
+	"github.com/nysa-company/sf/internal/leader"
+	"github.com/nysa-company/sf/internal/operator"
+	"github.com/nysa-company/sf/internal/statemachine"
+	"github.com/nysa-company/sf/internal/store"
+	"github.com/nysa-company/sf/internal/ticket"
+	"github.com/nysa-company/sf/internal/transport"
+)
+
+// TicketIDGenerator permits deterministic test identities without weakening
+// production's cryptographic random source.
+type TicketIDGenerator interface {
+	NewTicketID(channel domain.Channel) (domain.TicketID, error)
+}
+
+type RandomTicketIDs struct{ Reader io.Reader }
+
+func (generator RandomTicketIDs) NewTicketID(channel domain.Channel) (domain.TicketID, error) {
+	reader := generator.Reader
+	if reader == nil {
+		reader = rand.Reader
+	}
+	var bytes [16]byte
+	if _, err := io.ReadFull(reader, bytes[:]); err != nil {
+		return "", fmt.Errorf("read ticket randomness: %w", err)
+	}
+	// The SF prefix is the stable operator-facing identity; channel separation
+	// is provided by the per-channel store and is part of the durable reference.
+	_ = channel // channel separation is provided by the per-channel store.
+	return domain.TicketID("SF-" + hex.EncodeToString(bytes[:])), nil
+}
+
+type Clock interface{ Now() time.Time }
+type wallClock struct{}
+
+func (wallClock) Now() time.Time { return time.Now().UTC() }
+
+type Config struct {
+	Channel          domain.Channel
+	Paths            config.ChannelPaths
+	StateMachinePath string
+	DaemonIdentity   string
+	Projects         []store.Project
+	TicketIDs        TicketIDGenerator
+	Clock            Clock
+	Operator         operator.Authenticator
+	// Doctor is an injected local preflight. A nil doctor means only the
+	// daemon's local storage/leader checks are required; no provider or Git
+	// integration is implied by that default.
+	Doctor func(context.Context, store.Project) error
+}
+
+type Daemon struct {
+	channel domain.Channel
+	paths   config.ChannelPaths
+	lease   *leader.Lease
+	store   *store.Store
+	engine  *engine.Engine
+	spec    statemachine.Spec
+	doctor  func(context.Context, store.Project) error
+	server  *transport.Server
+	epoch   uint64
+	clock   Clock
+	ids     TicketIDGenerator
+	auth    operator.Authenticator
+	mu      sync.Mutex
+	closed  bool
+}
+
+// Start acquires the operating-system lease before it changes the durable
+// leader epoch. Recovery completes before the owner socket is exposed.
+func Start(ctx context.Context, configuration Config) (*Daemon, error) {
+	if err := validateConfig(configuration); err != nil {
+		return nil, err
+	}
+	if err := secureChannelPaths(configuration.Paths); err != nil {
+		return nil, err
+	}
+	if err := validateDatabasePath(configuration.Paths.Database); err != nil {
+		return nil, err
+	}
+	if err := secureDatabaseFiles(configuration.Paths.Database); err != nil {
+		return nil, err
+	}
+	if err := validateNoSymlinkComponents(configuration.StateMachinePath); err != nil {
+		return nil, fmt.Errorf("validate normative state machine path: %w", err)
+	}
+
+	file, err := os.Open(configuration.StateMachinePath)
+	if err != nil {
+		return nil, fmt.Errorf("open normative state machine: %w", err)
+	}
+	specification, loadErr := statemachine.LoadApproved(file)
+	closeErr := file.Close()
+	if loadErr != nil {
+		return nil, fmt.Errorf("load normative state machine: %w", loadErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close normative state machine: %w", closeErr)
+	}
+
+	lease, err := leader.Acquire(filepath.Join(configuration.Paths.Root, "run", "leader.lock"), configuration.Channel, configuration.DaemonIdentity)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(cause error) (*Daemon, error) {
+		_ = lease.Close()
+		return nil, cause
+	}
+	if err := lease.Validate(); err != nil {
+		return fail(err)
+	}
+	database, err := store.Open(ctx, configuration.Paths.Database)
+	if err != nil {
+		return fail(err)
+	}
+	failStore := func(cause error) (*Daemon, error) {
+		_ = database.Close()
+		return fail(cause)
+	}
+	if err := secureDatabaseFiles(configuration.Paths.Database); err != nil {
+		return failStore(err)
+	}
+	if err := lease.Validate(); err != nil {
+		return failStore(err)
+	}
+	epoch, err := database.AcquireLeader(ctx, configuration.Channel, configuration.DaemonIdentity)
+	if err != nil {
+		return failStore(fmt.Errorf("acquire durable leader epoch: %w", err))
+	}
+	for _, project := range configuration.Projects {
+		if project.Channel != configuration.Channel {
+			return failStore(fmt.Errorf("configured project %q belongs to another channel", project.ID))
+		}
+		durable, err := database.Project(ctx, project.Channel, project.ID)
+		if errors.Is(err, store.ErrNotFound) {
+			if err := database.CreateProject(ctx, project); err != nil {
+				return failStore(fmt.Errorf("register project %q: %w", project.ID, err))
+			}
+			continue
+		}
+		if err != nil {
+			return failStore(fmt.Errorf("read durable project %q: %w", project.ID, err))
+		}
+		if durable.Path != project.Path || durable.BaseRef != project.BaseRef {
+			return failStore(fmt.Errorf("configured project %q does not match durable registration", project.ID))
+		}
+	}
+
+	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator}
+	if instance.auth.ExpectedUID == 0 {
+		instance.auth.ExpectedUID = uint32(os.Getuid())
+	}
+	if instance.clock == nil {
+		instance.clock = wallClock{}
+	}
+	if instance.ids == nil {
+		instance.ids = RandomTicketIDs{}
+	}
+	if err := instance.Recover(ctx); err != nil {
+		return failStore(fmt.Errorf("recover durable state: %w", err))
+	}
+	server, err := transport.Listen(configuration.Paths.Socket, uint32(os.Getuid()), instance)
+	if err != nil {
+		return failStore(err)
+	}
+	instance.server = server
+	return instance, nil
+}
+
+func (daemon *Daemon) Serve(ctx context.Context) error {
+	err := daemon.server.Serve(ctx)
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+func (daemon *Daemon) Recover(ctx context.Context) error {
+	if err := daemon.lease.Validate(); err != nil {
+		return err
+	}
+	return daemon.engine.RecoverChannel(ctx, daemon.channel, daemon.epoch)
+}
+
+func (daemon *Daemon) Close() error {
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
+	if daemon.closed {
+		return nil
+	}
+	daemon.closed = true
+	var result error
+	if daemon.server != nil {
+		result = daemon.server.Close()
+	}
+	if err := daemon.engine.Close(); err != nil && result == nil {
+		result = err
+	}
+	if err := daemon.lease.Close(); err != nil && result == nil {
+		result = err
+	}
+	return result
+}
+
+func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request api.Request) api.Response {
+	if err := request.Validate(); err != nil {
+		return daemon.failure(request, "invalid_request", "request envelope is invalid", false)
+	}
+	identity, err := daemon.auth.Authenticate(peer.UID, request.OperatorLabel)
+	if err != nil {
+		return daemon.failure(request, "operator_identity_required", "the socket peer is not authenticated for this operator label", false)
+	}
+	switch request.Method {
+	case "ticket.submit":
+		return daemon.submit(ctx, request, identity)
+	case "ticket.status":
+		return daemon.statusTickets(ctx, request)
+	case "ticket.show":
+		return daemon.show(ctx, request)
+	case "ticket.start":
+		return daemon.startTicket(ctx, request, identity)
+	case "daemon.status":
+		return daemon.status(request)
+	default:
+		return daemon.failure(request, "not_ready", "this lifecycle operation is not enabled by the local daemon yet", false)
+	}
+}
+
+type submitParameters struct {
+	Project string         `json:"project"`
+	Source  string         `json:"source"`
+	New     bool           `json:"new"`
+	Channel domain.Channel `json:"channel"`
+}
+
+func (daemon *Daemon) submit(ctx context.Context, request api.Request, _ domain.OperatorIdentity) api.Response {
+	var parameters submitParameters
+	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Project == "" || parameters.Source == "" || parameters.Channel != daemon.channel {
+		return daemon.failure(request, "invalid_submit", "submit requires project and source", false)
+	}
+	parsed, err := ticket.Parse(strings.NewReader(parameters.Source))
+	if err != nil {
+		return daemon.failure(request, "invalid_ticket", "ticket source does not meet the local ticket format", false)
+	}
+	if parsed.MergeMode == domain.MergeAutonomous {
+		return daemon.failure(request, "autonomous_unavailable", "autonomous submission is disabled until an OS-enforced profile is qualified", false)
+	}
+	if err := daemon.lease.Validate(); err != nil {
+		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	}
+	id, err := daemon.ids.NewTicketID(daemon.channel)
+	if err != nil {
+		return daemon.failure(request, "ticket_id_unavailable", "could not allocate a ticket identity", true)
+	}
+	record := store.Ticket{Ref: domain.TicketRef{Channel: daemon.channel, Project: domain.ProjectID(parameters.Project), Ticket: id},
+		SourceDigest: parsed.Digest, Type: parsed.Type, MergeMode: parsed.MergeMode, Title: parsed.Title, Problem: parsed.Problem,
+		Acceptance: parsed.Acceptance, Source: parsed.Source, Priority: parsed.Priority, CreatedAt: daemon.clock.Now().UTC(),
+		MaxDuration: parsed.MaxDuration, MaxCostMicroUSD: parsed.MaxCostMicroUSD}
+	stored, created, err := daemon.store.SubmitTicketFenced(ctx, record, parameters.New, daemon.epoch)
+	if err != nil {
+		return daemon.failure(request, submitErrorCode(err), "ticket submission was not accepted", errors.Is(err, store.ErrBusy))
+	}
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_submit", Identity: string(stored.Ref.Ticket), Observed: !created}, ticketView(stored))
+}
+
+type ticketParameters struct {
+	Project string         `json:"project"`
+	Ticket  string         `json:"ticket"`
+	Channel domain.Channel `json:"channel"`
+}
+
+func (daemon *Daemon) show(ctx context.Context, request api.Request) api.Response {
+	ref, response := daemon.ticketRef(ctx, request)
+	if response != nil {
+		return *response
+	}
+	stored, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	return daemon.success(request, api.Mutation{}, ticketDetail(stored))
+}
+
+func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ domain.OperatorIdentity) api.Response {
+	ref, response := daemon.ticketRef(ctx, request)
+	if response != nil {
+		return *response
+	}
+	if err := daemon.lease.Validate(); err != nil {
+		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	}
+	stored, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	// These are intentionally local admission guards. Provider/Git/remote
+	// checks are not part of Phase 1 and cannot make a ticket autonomous. A
+	// planning ticket is a replay observation and does not select a second
+	// transition.
+	if stored.State == domain.StateQueued {
+		project, err := daemon.store.Project(ctx, daemon.channel, ref.Project)
+		if err != nil {
+			return daemon.failure(request, "unknown_project", "ticket project is not registered", false)
+		}
+		doctorGreen := true
+		if daemon.doctor != nil {
+			doctorGreen = daemon.doctor(ctx, project) == nil
+		}
+		capacityAvailable := true
+		leases, err := daemon.store.Leases(ctx, daemon.channel)
+		if err != nil {
+			return daemon.failure(request, "capacity_unavailable", "capacity could not be checked", errors.Is(err, store.ErrBusy))
+		}
+		for _, lease := range leases {
+			if lease.Scope == "global" || (lease.Scope == "project" && lease.Ref.Project == ref.Project) {
+				capacityAvailable = false
+				break
+			}
+		}
+		if _, err := daemon.spec.Select(string(stored.State), "operator_start", map[string]bool{"doctor_preflight_green": doctorGreen, "capacity_available": capacityAvailable}); err != nil {
+			if !doctorGreen {
+				return daemon.failure(request, "doctor_required", "local doctor preflight is not green", false)
+			}
+			return daemon.failure(request, "capacity_unavailable", "local capacity is already reserved", true)
+		}
+	}
+	workflowID := fmt.Sprintf("%s/%s/%s/planning", daemon.channel, ref.Project, ref.Ticket)
+	started, observed, err := daemon.store.StartWithOwnership(ctx, ref, stored.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, workflowID, []store.LeaseRequest{{Scope: "global", Resource: "machine", Capacity: 1}, {Scope: "project", Resource: string(ref.Project), Capacity: 1}}, daemon.clock.Now().UTC())
+	if err != nil {
+		code := "start_refused"
+		if errors.Is(err, store.ErrLeaseCapacity) {
+			code = "capacity_unavailable"
+		}
+		return daemon.failure(request, code, "ticket could not enter local planning state", errors.Is(err, store.ErrBusy))
+	}
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_start", Identity: workflowID, Observed: observed}, ticketView(started))
+}
+
+func (daemon *Daemon) ticketRef(ctx context.Context, request api.Request) (domain.TicketRef, *api.Response) {
+	var parameters ticketParameters
+	if err := decodeParameters(request.Parameters, &parameters); err != nil {
+		response := daemon.failure(request, "invalid_ticket_reference", "ticket reference parameters are invalid", false)
+		return domain.TicketRef{}, &response
+	}
+	if parameters.Channel != daemon.channel {
+		response := daemon.failure(request, "wrong_channel", "the request channel does not match this daemon", false)
+		return domain.TicketRef{}, &response
+	}
+	if parameters.Ticket == "" {
+		parameters.Ticket = request.Ticket
+	}
+	if parameters.Ticket == "" {
+		response := daemon.failure(request, "invalid_ticket_reference", "ticket is required", false)
+		return domain.TicketRef{}, &response
+	}
+	if parameters.Project == "" {
+		stored, err := daemon.store.TicketByID(ctx, daemon.channel, domain.TicketID(parameters.Ticket))
+		if err != nil {
+			response := daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+			return domain.TicketRef{}, &response
+		}
+		return stored.Ref, nil
+	}
+	ref := domain.TicketRef{Channel: daemon.channel, Project: domain.ProjectID(parameters.Project), Ticket: domain.TicketID(parameters.Ticket)}
+	if err := ref.Validate(); err != nil {
+		response := daemon.failure(request, "invalid_ticket_reference", "project and ticket are required", false)
+		return domain.TicketRef{}, &response
+	}
+	return ref, nil
+}
+
+func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request) api.Response {
+	var parameters struct {
+		Project string         `json:"project"`
+		Watch   bool           `json:"watch"`
+		Channel domain.Channel `json:"channel"`
+	}
+	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel {
+		return daemon.failure(request, "wrong_channel", "status requires the daemon channel", false)
+	}
+	if request.Ticket != "" {
+		ref, response := daemon.ticketRef(ctx, request)
+		if response != nil {
+			return *response
+		}
+		stored, err := daemon.store.Ticket(ctx, ref)
+		if err != nil {
+			return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+		}
+		return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "current_version": stored.Version, "ticket": ticketView(stored)})
+	}
+	items, err := daemon.store.Tickets(ctx, daemon.channel, domain.ProjectID(parameters.Project), 1000)
+	if err != nil {
+		return daemon.failure(request, "status_unavailable", "ticket status could not be read", errors.Is(err, store.ErrBusy))
+	}
+	views := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		views = append(views, ticketView(item))
+	}
+	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "leader_epoch": daemon.epoch, "tickets": views})
+}
+
+func (daemon *Daemon) status(request api.Request) api.Response {
+	if err := daemon.lease.Validate(); err != nil {
+		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	}
+	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "leader_epoch": daemon.epoch, "socket_ready": true})
+}
+
+func (daemon *Daemon) success(request api.Request, mutation api.Mutation, value any) api.Response {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return daemon.failure(request, "internal_encoding", "daemon could not encode the response", false)
+	}
+	return api.Response{Version: api.Version, RequestID: request.RequestID, OK: true, Mutation: mutation, Data: data}
+}
+
+func (daemon *Daemon) failure(request api.Request, code, message string, retryable bool) api.Response {
+	argv := []string{"sf", "daemon", "status"}
+	if code == "autonomous_unavailable" {
+		argv = []string{"sf", "submit", "<ticket.md>", "--project", "<project>"}
+	}
+	if code == "terminal_replay_requires_new" {
+		argv = []string{"sf", "submit", "<ticket.md>", "--project", "<project>", "--new"}
+	}
+	if code == "doctor_required" || code == "operator_identity_required" {
+		argv = []string{"sf", "doctor"}
+	}
+	if code == "unknown_project" || code == "invalid_submit" {
+		argv = []string{"sf", "init"}
+	}
+	if code == "not_ready" {
+		argv = []string{"sf", "daemon", "run"}
+	}
+	return api.Response{Version: api.Version, RequestID: request.RequestID, OK: false, Mutation: api.Mutation{}, Error: &api.Error{Code: code, Message: message, Retryable: retryable}, NextAction: &domain.NextAction{Code: code, Argv: argv}}
+}
+
+func ticketView(value store.Ticket) map[string]any {
+	return map[string]any{"channel": value.Ref.Channel, "project": value.Ref.Project, "ticket": value.Ref.Ticket, "state": value.State, "version": value.Version, "merge_mode": value.MergeMode, "created_at": value.CreatedAt.UTC().Format(time.RFC3339Nano)}
+}
+
+func ticketDetail(value store.Ticket) map[string]any {
+	view := ticketView(value)
+	view["title"] = value.Title
+	view["problem"] = value.Problem
+	view["acceptance"] = value.Acceptance
+	view["source_digest"] = value.SourceDigest
+	view["source"] = string(value.Source)
+	view["type"] = value.Type
+	view["priority"] = value.Priority
+	view["max_duration_ns"] = int64(value.MaxDuration)
+	view["max_cost_micro_usd"] = value.MaxCostMicroUSD
+	view["workflow_id"] = value.WorkflowID
+	view["blocked_code"] = value.BlockedCode
+	return view
+}
+
+func decodeParameters(raw json.RawMessage, destination any) error {
+	if len(raw) == 0 {
+		return errors.New("parameters are required")
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("parameters contain trailing data")
+	}
+	return nil
+}
+
+func submitErrorCode(err error) string {
+	switch {
+	case errors.Is(err, store.ErrTerminalReplay):
+		return "terminal_replay_requires_new"
+	case errors.Is(err, store.ErrNotFound):
+		return "unknown_project"
+	case errors.Is(err, store.ErrBusy):
+		return "store_busy"
+	default:
+		return "submit_refused"
+	}
+}
+
+func validateConfig(configuration Config) error {
+	if !configuration.Channel.Valid() || configuration.Paths.Root == "" || configuration.Paths.Database == "" || configuration.Paths.Socket == "" || configuration.StateMachinePath == "" || configuration.DaemonIdentity == "" {
+		return errors.New("channel, paths, state machine path, and daemon identity are required")
+	}
+	for _, path := range []string{configuration.Paths.Root, configuration.Paths.Database, configuration.Paths.Socket, configuration.Paths.Logs, configuration.Paths.Events, configuration.Paths.Worktrees, configuration.Paths.Backups, configuration.StateMachinePath} {
+		if !filepath.IsAbs(path) {
+			return fmt.Errorf("daemon paths must be absolute")
+		}
+	}
+	for _, path := range []string{configuration.Paths.Database, configuration.Paths.Socket, configuration.Paths.Logs, configuration.Paths.Events, configuration.Paths.Worktrees, configuration.Paths.Backups} {
+		if !pathWithin(configuration.Paths.Root, path) {
+			return errors.New("channel paths must remain below their channel root")
+		}
+	}
+	return nil
+}
+
+func secureChannelPaths(paths config.ChannelPaths) error {
+	for _, path := range []string{paths.Root, filepath.Join(paths.Root, "run"), paths.Logs, paths.Events, paths.Worktrees, paths.Backups} {
+		if err := secureDirectory(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func secureDirectory(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("directory path must be absolute")
+	}
+	clean := filepath.Clean(path)
+	volume := filepath.VolumeName(clean)
+	root := volume + string(filepath.Separator)
+	parts := strings.Split(strings.TrimPrefix(strings.TrimPrefix(clean, root), volume), string(filepath.Separator))
+	current := root
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := os.Mkdir(current, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+				return fmt.Errorf("create channel directory: %w", err)
+			}
+			info, err = os.Lstat(current)
+		}
+		if err != nil {
+			return fmt.Errorf("inspect channel directory: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			// macOS exposes /var as the conventional alias for /private/var;
+			// it is a system path component, not an application-controlled
+			// channel alias. All components below the configured root remain
+			// strictly no-symlink.
+			if allowedSystemAlias(current, info) {
+				continue
+			}
+			return errors.New("channel path is not a real directory")
+		}
+	}
+	info, err := os.Lstat(clean)
+	if err != nil {
+		return fmt.Errorf("inspect channel directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("channel path is not a real directory")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Getuid()) {
+		return fmt.Errorf("channel directory is not owned by the current user")
+	}
+	if err := os.Chmod(clean, 0o700); err != nil {
+		return fmt.Errorf("secure channel directory: %w", err)
+	}
+	return nil
+}
+
+// validateNoSymlinkComponents checks every existing component without
+// following links. It is used for immutable inputs where creation is not
+// appropriate (the state-machine artifact).
+func validateNoSymlinkComponents(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("path must be absolute")
+	}
+	clean := filepath.Clean(path)
+	root := filepath.VolumeName(clean) + string(filepath.Separator)
+	current := root
+	for _, part := range strings.Split(strings.TrimPrefix(clean, root), string(filepath.Separator)) {
+		if part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 && !allowedSystemAlias(current, info) {
+			return fmt.Errorf("path component is a symlink")
+		}
+	}
+	return nil
+}
+
+func allowedSystemAlias(path string, info os.FileInfo) bool {
+	return runtime.GOOS == "darwin" && (path == "/var" || path == "/tmp") && info.Mode()&os.ModeSymlink != 0
+}
+
+func validateDatabasePath(path string) error {
+	if err := validateNoSymlinkComponents(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("validate database parent: %w", err)
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect database path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("database path is not a regular file")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Getuid()) {
+		return errors.New("database is not owned by the current user")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("secure database: %w", err)
+	}
+	return nil
+}
+
+func secureDatabaseFiles(path string) error {
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		if err := validateDatabasePath(candidate); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func pathWithin(root, candidate string) bool {
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil || relative == "." {
+		return false
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}

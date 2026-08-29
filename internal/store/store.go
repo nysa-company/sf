@@ -443,6 +443,20 @@ func (s *Store) CreateTicket(ctx context.Context, ticket Ticket) error {
 // the same source digest. A terminal replay must opt into a newly generated
 // identity; the source bytes are never treated as mutable workflow state.
 func (s *Store) SubmitTicket(ctx context.Context, ticket Ticket, allowNew bool) (Ticket, bool, error) {
+	return s.submitTicket(ctx, ticket, allowNew, 0)
+}
+
+// SubmitTicketFenced is the daemon's submission boundary.  Unlike the legacy
+// helper above, it proves the durable leader epoch in the same write
+// transaction and records the normative submit_valid transition.
+func (s *Store) SubmitTicketFenced(ctx context.Context, ticket Ticket, allowNew bool, leaderEpoch uint64) (Ticket, bool, error) {
+	if leaderEpoch == 0 {
+		return Ticket{}, false, ErrStaleFence
+	}
+	return s.submitTicket(ctx, ticket, allowNew, leaderEpoch)
+}
+
+func (s *Store) submitTicket(ctx context.Context, ticket Ticket, allowNew bool, leaderEpoch uint64) (Ticket, bool, error) {
 	if err := ticket.Ref.Validate(); err != nil {
 		return Ticket{}, false, err
 	}
@@ -459,6 +473,15 @@ func (s *Store) SubmitTicket(ctx context.Context, ticket Ticket, allowNew bool) 
 	var existingRef domain.TicketRef
 	created := false
 	err = s.write(ctx, func(conn *sql.Conn) error {
+		if leaderEpoch != 0 {
+			var current uint64
+			if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ticket.Ref.Channel).Scan(&current); err != nil {
+				return err
+			}
+			if current != leaderEpoch {
+				return ErrStaleFence
+			}
+		}
 		var existingID domain.TicketID
 		var existingState domain.State
 		err := conn.QueryRowContext(ctx, `SELECT id, state FROM tickets WHERE channel=? AND project_id=? AND source_digest=? ORDER BY rowid DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.SourceDigest).Scan(&existingID, &existingState)
@@ -473,7 +496,7 @@ func (s *Store) SubmitTicket(ctx context.Context, ticket Ticket, allowNew bool) 
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if err := insertTicket(ctx, conn, ticket); err != nil {
+		if err := insertTicketEvent(ctx, conn, ticket, leaderEpoch != 0); err != nil {
 			return err
 		}
 		created = true
@@ -510,6 +533,10 @@ func validateTicketInput(ticket Ticket) error {
 }
 
 func insertTicket(ctx context.Context, conn *sql.Conn, ticket Ticket) error {
+	return insertTicketEvent(ctx, conn, ticket, false)
+}
+
+func insertTicketEvent(ctx context.Context, conn *sql.Conn, ticket Ticket, normative bool) error {
 	if err := validateTicketInput(ticket); err != nil {
 		return err
 	}
@@ -552,8 +579,12 @@ func insertTicket(ctx context.Context, conn *sql.Conn, ticket Ticket) error {
 	if err != nil {
 		return err
 	}
+	trigger, from := "ticket_submitted", "queued"
+	if normative {
+		trigger, from = "submit_valid", "none"
+	}
 	_, err = conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at)
-		VALUES (?, ?, ?, ?, 'ticket_submitted', 'queued', ?, '{}', ?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.Version, ticket.State, ticket.CreatedAt.Format(time.RFC3339Nano))
+		VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.Version, trigger, from, ticket.State, ticket.CreatedAt.Format(time.RFC3339Nano))
 	return err
 }
 

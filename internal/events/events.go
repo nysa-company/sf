@@ -40,7 +40,8 @@ func (record Record) Validate() error {
 	if record.Schema == "" {
 		record.Schema = Schema
 	}
-	if record.Schema != Schema || record.ID == 0 || !record.Channel.Valid() || record.Project == "" || record.Ticket == "" || record.TicketVersion == 0 || record.Trigger == "" || !record.From.Valid() || !record.To.Valid() || record.CreatedAt.IsZero() {
+	fromValid := record.From.Valid() || (record.Trigger == "submit_valid" && string(record.From) == "none")
+	if record.Schema != Schema || record.ID == 0 || !record.Channel.Valid() || record.Project == "" || record.Ticket == "" || record.TicketVersion == 0 || record.Trigger == "" || !fromValid || !record.To.Valid() || record.CreatedAt.IsZero() {
 		return errors.New("invalid typed event record")
 	}
 	if len(record.Payload) == 0 {

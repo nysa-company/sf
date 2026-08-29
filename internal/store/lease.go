@@ -15,6 +15,10 @@ import (
 
 var ErrLeaseCapacity = errors.New("lease capacity is exhausted")
 
+// ErrStartState identifies a queued ticket that cannot be admitted to a
+// workflow without an operator-visible state decision.
+var ErrStartState = errors.New("ticket cannot be started in its current state")
+
 // LeaseRequest describes one capacity dimension. Resource names are durable
 // semantic identities such as "machine", a canonical project ID, or a
 // qualified provider/version. Capacity is resolved from the frozen ticket
@@ -31,6 +35,81 @@ type Lease struct {
 	ScopeKey    string
 	RunnerEpoch uint64
 	AcquiredAt  time.Time
+}
+
+// StartWithOwnership admits a queued ticket, reserves every capacity
+// dimension, and establishes workflow ownership in one SQLite transaction.
+// A replay of the same start observes the existing planning owner and leases
+// without emitting another transition event.
+func (s *Store) StartWithOwnership(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, workflowID string, requests []LeaseRequest, at time.Time) (Ticket, bool, error) {
+	if err := ref.Validate(); err != nil {
+		return Ticket{}, false, err
+	}
+	if workflowID == "" || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return Ticket{}, false, errors.New("workflow identity and fence are required")
+	}
+	requests, err := validateLeaseRequests(requests)
+	if err != nil {
+		return Ticket{}, false, err
+	}
+	if at.IsZero() {
+		return Ticket{}, false, errors.New("start time is required")
+	}
+	observed := false
+	err = s.write(ctx, func(conn *sql.Conn) error {
+		var state domain.State
+		var version, runner uint64
+		var persistedWorkflow string
+		if err := conn.QueryRowContext(ctx, `SELECT state, version, runner_epoch, workflow_id FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &persistedWorkflow); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if err := s.currentFence(ctx, conn, ref.Channel, version, runner, fence); err != nil {
+			return err
+		}
+		if state == domain.StatePlanning {
+			if version != expectedVersion || persistedWorkflow != workflowID {
+				return ErrStaleFence
+			}
+			observed = true
+		} else {
+			if state != domain.StateQueued || version != expectedVersion {
+				return fmt.Errorf("%w: state=%s", ErrStartState, state)
+			}
+			for _, request := range requests {
+				lease, ok, err := acquireLease(ctx, conn, ref, runner, request, at.UTC())
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return fmt.Errorf("%w: scope=%s resource=%s capacity=%d", ErrLeaseCapacity, request.Scope, request.Resource, request.Capacity)
+				}
+				_ = lease
+			}
+			updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state='planning', version=version+1, workflow_id=? WHERE channel=? AND project_id=? AND id=? AND state='queued' AND version=? AND runner_epoch=?`, workflowID, ref.Channel, ref.Project, ref.Ticket, expectedVersion, runner)
+			if err != nil {
+				return err
+			}
+			if changed, _ := updated.RowsAffected(); changed != 1 {
+				return ErrStaleFence
+			}
+			version++
+			if _, err := conn.ExecContext(ctx, `INSERT INTO workflow_owners(channel, project_id, ticket_id, workflow_id, state, created_at) VALUES (?, ?, ?, ?, 'owned', ?)`, ref.Channel, ref.Project, ref.Ticket, workflowID, at.UTC().Format(time.RFC3339Nano)); err != nil {
+				return err
+			}
+			if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'operator_start', 'queued', 'planning', '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, at.UTC().Format(time.RFC3339Nano)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return Ticket{}, false, err
+	}
+	result, err := s.Ticket(ctx, ref)
+	return result, observed, err
 }
 
 // AcquireLeases admits a ticket to every requested capacity dimension in one
