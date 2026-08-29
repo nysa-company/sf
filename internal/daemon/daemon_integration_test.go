@@ -35,6 +35,10 @@ type testClock struct{ now time.Time }
 func (c testClock) Now() time.Time { return c.now }
 
 func testDaemon(t *testing.T) (*Daemon, config.ChannelPaths, context.CancelFunc) {
+	return testDaemonForChannel(t, domain.ChannelStable)
+}
+
+func testDaemonForChannel(t *testing.T, channel domain.Channel) (*Daemon, config.ChannelPaths, context.CancelFunc) {
 	t.Helper()
 	root, err := os.MkdirTemp("/tmp", "sfv2-")
 	if err != nil {
@@ -52,8 +56,8 @@ func testDaemon(t *testing.T) (*Daemon, config.ChannelPaths, context.CancelFunc)
 		return operator.Account{Username: "operator", UID: strconv.FormatUint(uint64(uid), 10)}, nil
 	}}
 	d, err := Start(context.Background(), Config{
-		Channel: domain.ChannelStable, Paths: paths, StateMachinePath: stateMachine, DaemonIdentity: "integration-test",
-		Projects:  []store.Project{{Channel: domain.ChannelStable, ID: "demo", Path: filepath.Join(root, "repo"), BaseRef: "main"}},
+		Channel: channel, Paths: paths, StateMachinePath: stateMachine, DaemonIdentity: "integration-test-" + string(channel),
+		Projects:  []store.Project{{Channel: channel, ID: "demo", Path: filepath.Join(root, "repo"), BaseRef: "main"}},
 		TicketIDs: &testIDs{}, Clock: testClock{now: time.Unix(100, 0).UTC()}, Operator: auth,
 	})
 	if err != nil {
@@ -63,6 +67,64 @@ func testDaemon(t *testing.T) (*Daemon, config.ChannelPaths, context.CancelFunc)
 	go func() { _ = d.Serve(serveCtx) }()
 	t.Cleanup(func() { cancel(); _ = d.Close() })
 	return d, paths, cancel
+}
+
+func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
+	for _, channel := range []domain.Channel{domain.ChannelStable, domain.ChannelDev} {
+		t.Run(string(channel), func(t *testing.T) {
+			d := &Daemon{channel: channel}
+			binary := "sf"
+			if channel == domain.ChannelDev {
+				binary = "sf-dev"
+			}
+			for code, want := range map[string][]string{
+				"autonomous_unavailable":       {binary, "providers", "qualify", "--help"},
+				"terminal_replay_requires_new": {binary, "submit", "--help"},
+				"unknown_project":              {binary, "init", "--help"},
+				"invalid_submit":               {binary, "submit", "--help"},
+				"not_ready":                    {binary, "--help"},
+				"other":                        {binary, "doctor"},
+			} {
+				response := d.failure(api.Request{Version: api.Version, RequestID: "failure-actions", Method: "ticket.submit"}, code, "failed", false)
+				if response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join(want, "\x00") {
+					t.Fatalf("%s action=%+v want=%+v", code, response.NextAction, want)
+				}
+				if strings.Contains(strings.Join(response.NextAction.Argv, " "), "<") {
+					t.Fatalf("%s action includes a placeholder: %+v", code, response.NextAction.Argv)
+				}
+				if err := response.Validate(); err != nil {
+					t.Fatalf("%s response failed validation: %v", code, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSubmitRejectsUnregisteredProjectBeforeTicketPersistence(t *testing.T) {
+	for _, channel := range []domain.Channel{domain.ChannelStable, domain.ChannelDev} {
+		t.Run(string(channel), func(t *testing.T) {
+			d, _, _ := testDaemonForChannel(t, channel)
+			request := api.Request{
+				Version: api.Version, RequestID: "missing-project", Method: "ticket.submit",
+				Parameters: []byte(`{"channel":"` + string(channel) + `","project":"missing","source":"# Missing project\n\nKeep the behavior deterministic.\n"}`),
+			}
+			response := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, request)
+			binary := "sf"
+			if channel == domain.ChannelDev {
+				binary = "sf-dev"
+			}
+			if response.OK || response.Error == nil || response.Error.Code != "unknown_project" || response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join([]string{binary, "init", "--help"}, "\x00") {
+				t.Fatalf("missing-project response=%+v", response)
+			}
+			tickets, err := d.store.Tickets(context.Background(), channel, "missing", 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(tickets) != 0 {
+				t.Fatalf("unregistered project persisted tickets: %+v", tickets)
+			}
+		})
+	}
 }
 
 func writeTicket(t *testing.T, dir, title string) string {
@@ -139,6 +201,35 @@ func TestForegroundDaemonStatusAndNormativeEvents(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Fatalf("unexpected events before submit: %+v", events)
+	}
+}
+
+func TestDaemonSocketFallbackRetainsTheChannelExecutable(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "sfv2-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	server, err := transport.ListenWithExecutable(filepath.Join(root, "sf.sock"), uint32(os.Getuid()), transport.HandlerFunc(func(context.Context, transport.Peer, api.Request) api.Response {
+		return api.Response{OK: false}
+	}), "sf-dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = server.Close()
+		<-done
+	})
+	response, err := transport.Call(context.Background(), filepath.Join(root, "sf.sock"), api.Request{Version: api.Version, RequestID: "invalid-response", Method: "ticket.submit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != "internal_response_invalid" || response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join([]string{"sf-dev", "doctor"}, "\x00") {
+		t.Fatalf("invalid response fallback=%+v", response)
 	}
 }
 

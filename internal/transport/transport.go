@@ -37,6 +37,7 @@ type Server struct {
 	path        string
 	expectedUID uint32
 	handler     Handler
+	executable  string
 	identity    fileIdentity
 	closeOnce   sync.Once
 	workers     sync.WaitGroup
@@ -49,11 +50,24 @@ type fileIdentity struct {
 }
 
 func Listen(path string, expectedUID uint32, handler Handler) (*Server, error) {
+	return listen(path, expectedUID, handler, "sf")
+}
+
+// ListenWithExecutable configures the recovery action for a channel-specific
+// daemon. The generic listener keeps its stable default for non-daemon users.
+func ListenWithExecutable(path string, expectedUID uint32, handler Handler, executable string) (*Server, error) {
+	return listen(path, expectedUID, handler, executable)
+}
+
+func listen(path string, expectedUID uint32, handler Handler, executable string) (*Server, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("socket path must be absolute")
 	}
 	if handler == nil {
 		return nil, fmt.Errorf("socket handler is required")
+	}
+	if executable == "" {
+		return nil, fmt.Errorf("socket recovery executable is required")
 	}
 	if err := ensureSocketParent(filepath.Dir(path)); err != nil {
 		return nil, err
@@ -98,6 +112,7 @@ func Listen(path string, expectedUID uint32, handler Handler) (*Server, error) {
 		path:        path,
 		expectedUID: expectedUID,
 		handler:     handler,
+		executable:  executable,
 		identity:    identity,
 		limit:       make(chan struct{}, 16),
 	}, nil
@@ -175,7 +190,7 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 			OK:         false,
 			Mutation:   api.Mutation{},
 			Error:      &api.Error{Code: "internal_response_invalid", Message: "daemon produced an invalid response"},
-			NextAction: &domain.NextAction{Code: "internal_response_invalid", Argv: []string{"sf", "doctor"}},
+			NextAction: &domain.NextAction{Code: "internal_response_invalid", Argv: []string{server.executable, "doctor"}},
 		}
 	}
 	_ = api.Encode(connection, response)

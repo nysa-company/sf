@@ -178,7 +178,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if err := instance.Recover(startupCtx); err != nil {
 		return failStore(fmt.Errorf("recover durable state: %w", err))
 	}
-	server, err := transport.Listen(configuration.Paths.Socket, uint32(os.Getuid()), instance)
+	server, err := transport.ListenWithExecutable(configuration.Paths.Socket, uint32(os.Getuid()), instance, instance.executable())
 	if err != nil {
 		return failStore(err)
 	}
@@ -277,6 +277,12 @@ func (daemon *Daemon) submit(ctx context.Context, request api.Request, _ domain.
 	parsed, err := ticket.Parse(strings.NewReader(parameters.Source))
 	if err != nil {
 		return daemon.failure(request, "invalid_ticket", "ticket source does not meet the local ticket format", false)
+	}
+	if _, err := daemon.store.Project(ctx, daemon.channel, domain.ProjectID(parameters.Project)); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return daemon.failure(request, "unknown_project", "ticket project is not registered", false)
+		}
+		return daemon.failure(request, submitErrorCode(err), "ticket project registration could not be read", errors.Is(err, store.ErrBusy))
 	}
 	if parsed.MergeMode == domain.MergeAutonomous {
 		return daemon.failure(request, "autonomous_unavailable", "autonomous submission is disabled until an OS-enforced profile is qualified", false)
@@ -452,23 +458,37 @@ func (daemon *Daemon) success(request api.Request, mutation api.Mutation, value 
 }
 
 func (daemon *Daemon) failure(request api.Request, code, message string, retryable bool) api.Response {
-	argv := []string{"sf", "doctor"}
+	binary := daemon.executable()
+	argv := []string{binary, "doctor"}
 	if code == "autonomous_unavailable" {
-		argv = []string{"sf", "submit", "<ticket.md>", "--project", "<project>"}
+		argv = []string{binary, "providers", "qualify", "--help"}
 	}
 	if code == "terminal_replay_requires_new" {
-		argv = []string{"sf", "submit", "<ticket.md>", "--project", "<project>", "--new"}
+		argv = []string{binary, "submit", "--help"}
 	}
 	if code == "doctor_required" || code == "operator_identity_required" {
-		argv = []string{"sf", "doctor"}
+		argv = []string{binary, "doctor"}
 	}
-	if code == "unknown_project" || code == "invalid_submit" {
-		argv = []string{"sf", "init"}
+	if code == "unknown_project" {
+		argv = []string{binary, "init", "--help"}
+	}
+	if code == "invalid_submit" {
+		argv = []string{binary, "submit", "--help"}
 	}
 	if code == "not_ready" {
-		argv = []string{"sf", "daemon", "run"}
+		argv = []string{binary, "--help"}
 	}
 	return api.Response{Version: api.Version, RequestID: request.RequestID, OK: false, Mutation: api.Mutation{}, Error: &api.Error{Code: code, Message: message, Retryable: retryable}, NextAction: &domain.NextAction{Code: code, Argv: argv}}
+}
+
+// executable is derived from the daemon's durable channel, never the caller's
+// process name. A client must be able to run the returned action against the
+// same isolated socket and state root that produced the response.
+func (daemon *Daemon) executable() string {
+	if daemon.channel == domain.ChannelDev {
+		return "sf-dev"
+	}
+	return "sf"
 }
 
 func ticketView(value store.Ticket) map[string]any {
