@@ -421,6 +421,9 @@ func TestRecoveryBlockWritesEventAndSchemaGuardsStartup(t *testing.T) {
 	if err != nil || blocked.State != domain.StateBlocked || blocked.BlockedCode != "workflow_ownership_unknown" {
 		t.Fatalf("blocked=%+v err=%v", blocked, err)
 	}
+	if _, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-9/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: blocked.RunnerEpoch}); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("blocked start=%v", err)
+	}
 	var events int
 	if err := database.db.QueryRow(`SELECT COUNT(*) FROM events WHERE ticket_id='SF-9' AND trigger='workflow_ownership_unknown'`).Scan(&events); err != nil || events != 1 {
 		t.Fatalf("recovery events=%d err=%v", events, err)

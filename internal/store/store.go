@@ -19,6 +19,7 @@ var (
 	ErrBusy       = errors.New("sqlite write deadline exceeded")
 	ErrStaleFence = errors.New("ticket fence is stale")
 	ErrNotFound   = errors.New("store row not found")
+	ErrBlocked    = errors.New("ticket is blocked")
 	ErrEffectBusy = errors.New("effect already has a live claim")
 	ErrEffectKey  = errors.New("effect semantic key conflicts with durable record")
 )
@@ -343,6 +344,8 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, workflow
 			}
 			version++
 			stateChanged = true
+		} else if state == domain.StateBlocked {
+			return fmt.Errorf("%w: ticket requires an explicit recovery transition", ErrBlocked)
 		} else if state != domain.StatePlanning {
 			return fmt.Errorf("cannot start or adopt ticket in state %q", state)
 		} else if persistedWorkflowID == "" {
