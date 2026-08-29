@@ -279,7 +279,7 @@ func defaultOperatorLabel() string {
 	if current, err := user.Current(); err == nil && current != nil && current.Username != "" {
 		return current.Username
 	}
-	return "uid:" + strconv.Itoa(os.Geteuid())
+	return ""
 }
 
 func (a *app) doctorCommand() *cobra.Command {
