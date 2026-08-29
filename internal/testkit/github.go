@@ -311,7 +311,7 @@ func (f *FakeGH) MarkReady(_ context.Context, _ domain.ExternalEffectClaim, iden
 	})
 }
 
-func (f *FakeGH) MergeExactHead(_ context.Context, _ domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, headOID, method string) error {
+func (f *FakeGH) MergeExactHead(_ context.Context, _ domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, headOID, method string, _ domain.MergeAuthorization) error {
 	return f.withState(func() (bool, error) {
 		index, err := f.findLocked(identity)
 		if err != nil {
@@ -621,7 +621,7 @@ func (f *FakeGH) runList(argv []string) ([]byte, error) {
 			if repo := option(argv, "--repo"); repo != "" && repo != pr.Identity.Repository.Owner+"/"+pr.Identity.Repository.Name {
 				continue
 			}
-			results = append(results, prJSON(pr.Identity, pr.Draft, pr.Merged, pr.Ready))
+			results = append(results, prJSON(pr))
 		}
 		return false, nil
 	})
@@ -758,7 +758,7 @@ func (f *FakeGH) runView(argv []string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(prJSON(pr.Identity, pr.Draft, pr.Merged, pr.Ready))
+	return json.Marshal(prJSON(pr))
 }
 
 func (f *FakeGH) runEdit(argv []string) ([]byte, error) {
@@ -772,6 +772,19 @@ func (f *FakeGH) runEdit(argv []string) ([]byte, error) {
 
 func (f *FakeGH) runReady(argv []string) ([]byte, error) {
 	identity := identityFromArgs(argv, prNumber(argv))
+	if identity.HeadRef == "" {
+		if err := f.withState(func() (bool, error) {
+			for _, candidate := range f.state.PRs {
+				if candidate.Identity.Number == identity.Number && sameRepository(candidate.Identity.Repository, identity.Repository) {
+					identity = candidate.Identity
+					return false, nil
+				}
+			}
+			return false, errors.New("fake-gh: pull request identity not found")
+		}); err != nil {
+			return nil, err
+		}
+	}
 	if err := f.MarkReady(context.Background(), domain.ExternalEffectClaim{}, identity); err != nil {
 		return nil, err
 	}
@@ -795,7 +808,7 @@ func (f *FakeGH) runMerge(argv []string) ([]byte, error) {
 	identity := identityFromArgs(argv, prNumber(argv))
 	headOID := option(argv, "--match-head-commit")
 	identity.HeadOID = headOID
-	if err := f.MergeExactHead(context.Background(), domain.ExternalEffectClaim{}, identity, headOID, mergeMethod(argv)); err != nil {
+	if err := f.MergeExactHead(context.Background(), domain.ExternalEffectClaim{}, identity, headOID, mergeMethod(argv), domain.MergeAuthorization{}); err != nil {
 		return nil, err
 	}
 	return []byte("{}"), nil
@@ -812,7 +825,12 @@ func mergeMethod(argv []string) string {
 	return ""
 }
 
-func prJSON(identity contracts.PullRequestIdentity, draft, merged, ready bool) map[string]any {
+func prJSON(pr PullRequest) map[string]any {
+	identity, draft, merged := pr.Identity, pr.Draft, pr.Merged
+	body := pr.Body
+	if body == "" {
+		body = ownershipMarkerForFake(identity)
+	}
 	value := map[string]any{
 		"number":              identity.Number,
 		"headRepository":      map[string]string{"nameWithOwner": identity.HeadOwner + "/" + identity.HeadRepository},
@@ -821,8 +839,8 @@ func prJSON(identity contracts.PullRequestIdentity, draft, merged, ready bool) m
 		"headRefOid":          identity.HeadOID,
 		"baseRefName":         identity.BaseRef,
 		"isDraft":             draft,
-		"title":               "title",
-		"body":                ownershipMarkerForFake(identity),
+		"title":               pr.Title,
+		"body":                body,
 		"state":               "OPEN",
 	}
 	if merged {

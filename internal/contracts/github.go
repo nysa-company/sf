@@ -37,5 +37,5 @@ type GitHub interface {
 	UpdatePullRequest(context.Context, domain.ExternalEffectClaim, PullRequestIdentity, string, string) error
 	RequiredChecks(context.Context, PullRequestIdentity) ([]RequiredCheck, error)
 	MarkReady(context.Context, domain.ExternalEffectClaim, PullRequestIdentity) error
-	MergeExactHead(context.Context, domain.ExternalEffectClaim, PullRequestIdentity, string, string) error
+	MergeExactHead(context.Context, domain.ExternalEffectClaim, PullRequestIdentity, string, string, domain.MergeAuthorization) error
 }

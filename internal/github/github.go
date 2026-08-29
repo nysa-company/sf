@@ -45,6 +45,7 @@ type Principal struct{ Login string }
 type PRMatch struct {
 	Identity             contracts.PullRequestIdentity
 	Draft, Merged, Ready bool
+	Title, Body          string
 }
 type EffectPlan struct {
 	SemanticKey string
@@ -125,9 +126,13 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 	}
 	return err
 }
-func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, headOID, method string) error {
+
+func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, headOID, method string, authorization domain.MergeAuthorization) error {
 	if err := c.validateClaim(ctx, durable, identity, "merge"); err != nil {
 		return err
+	}
+	if !authorization.Approved || !authorization.GatesGreen || authorization.ReviewedHead != headOID || authorization.CurrentHead != headOID {
+		return ErrApprovalInvalid
 	}
 	_, err := c.merge(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, PRMatch{Identity: identity}, headOID, domain.MergeGuarded, method)
 	return err
@@ -199,7 +204,7 @@ func (c Client) Observe(ctx context.Context, want contracts.PullRequestIdentity)
 			return PRMatch{}, err
 		}
 		if sameExact(candidate, want) {
-			matches = append(matches, PRMatch{Identity: candidate, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft})
+			matches = append(matches, PRMatch{Identity: candidate, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft, Title: value.Title, Body: value.Body})
 		}
 	}
 	switch len(matches) {
@@ -213,7 +218,7 @@ func (c Client) Observe(ctx context.Context, want contracts.PullRequestIdentity)
 }
 
 func (c Client) createOrAdopt(ctx context.Context, claim EffectClaim, title, body string) (PRMatch, error) {
-	if !claim.Claimed {
+	if !claim.Claimed || !validTitle(title) || !validBody(body) {
 		return PRMatch{}, ErrPolicyRefusal
 	}
 	if match, err := c.Observe(ctx, claim.Plan.Identity); err == nil {
@@ -232,15 +237,16 @@ func (c Client) createOrAdopt(ctx context.Context, claim EffectClaim, title, bod
 }
 
 func (c Client) updateOrObserve(ctx context.Context, claim EffectClaim, current PRMatch, title, body string) error {
-	if !claim.Claimed || !sameExact(current.Identity, claim.Plan.Identity) {
+	if !claim.Claimed || !sameExact(current.Identity, claim.Plan.Identity) || !validTitle(title) || !validBody(body) {
 		return ErrPolicyRefusal
 	}
 	_, err := c.run(ctx, "pr", "edit", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--title", title, "--body", body+"\n\n"+ownershipMarker(current.Identity))
 	if err == nil {
 		return nil
 	}
+	markedBody := body + "\n\n" + ownershipMarker(current.Identity)
 	observed, observeErr := c.Observe(ctx, current.Identity)
-	if observeErr == nil && observed.Identity.Number == current.Identity.Number {
+	if observeErr == nil && observed.Identity.Number == current.Identity.Number && observed.Title == title && observed.Body == markedBody {
 		return nil
 	}
 	return err
@@ -381,7 +387,7 @@ func (c Client) view(ctx context.Context, identity contracts.PullRequestIdentity
 	if err != nil {
 		return PRMatch{}, err
 	}
-	return PRMatch{Identity: parsed, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft}, nil
+	return PRMatch{Identity: parsed, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft, Title: value.Title, Body: value.Body}, nil
 }
 
 func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryIdentity, number int) (PRMatch, error) {
@@ -393,7 +399,7 @@ func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryI
 	if err != nil {
 		return PRMatch{}, err
 	}
-	return PRMatch{Identity: parsed, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft}, nil
+	return PRMatch{Identity: parsed, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft, Title: value.Title, Body: value.Body}, nil
 }
 
 const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,isDraft,mergedAt,state"
@@ -431,7 +437,7 @@ func sameExact(left, right contracts.PullRequestIdentity) bool {
 	return left.Repository == right.Repository && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.HeadOID == right.HeadOID && left.BaseRef == right.BaseRef && left.FactoryOwned && right.FactoryOwned && (right.Number == 0 || left.Number == right.Number)
 }
 func validRepository(value contracts.RepositoryIdentity) error {
-	if value.Host != "github.com" || value.Owner == "" || value.Name == "" {
+	if value.Host != "github.com" || !validRepositoryPart(value.Owner) || !validRepositoryPart(value.Name) {
 		return ErrPolicyRefusal
 	}
 	return nil
@@ -459,6 +465,21 @@ func validRef(value string) bool {
 }
 func bounded(value string, maximum int) bool {
 	return value != "" && len(value) <= maximum && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00')
+}
+func validRepositoryPart(value string) bool {
+	if !bounded(value, 100) {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+func validTitle(value string) bool { return bounded(value, 256) }
+func validBody(value string) bool {
+	return len(value) <= 64<<10 && !strings.ContainsRune(value, '\x00')
 }
 
 func (c Client) json(ctx context.Context, destination any, args ...string) error {

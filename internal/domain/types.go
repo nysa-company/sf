@@ -168,6 +168,13 @@ type ExternalEffectClaim struct {
 	ClaimEpoch    uint64
 }
 
+type MergeAuthorization struct {
+	ReviewedHead string
+	CurrentHead  string
+	Approved     bool
+	GatesGreen   bool
+}
+
 type ProviderIdentity struct {
 	Provider string
 	Model    string

@@ -126,6 +126,40 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	}
 }
 
+func TestUpdateAndReadyReconcileOnlyExactObservedState(t *testing.T) {
+	client, fake, identity := fixture(t)
+	plan, _ := client.Plan(identity, "update")
+	claim, _ := client.Claim(plan)
+	pr, err := client.createOrAdopt(context.Background(), claim, "before", "before body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetResponse("pr_edit", testkit.ResponseDropAfterCall); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.updateOrObserve(context.Background(), claim, pr, "after", "after body"); err != nil {
+		t.Fatalf("update reconciliation=%v", err)
+	}
+	if err := fake.SetResponse("pr_ready", testkit.ResponseDropAfterCall); err != nil {
+		t.Fatal(err)
+	}
+	durable := domain.ExternalEffectClaim{SemanticKey: "ready", Kind: "pr_ready"}
+	if err := client.MarkReady(context.Background(), durable, pr.Identity); err != nil {
+		t.Fatalf("ready reconciliation=%v", err)
+	}
+}
+
+func TestChecksAllowExtrasButFailureDominatesPending(t *testing.T) {
+	actual := []contracts.RequiredCheck{{Name: "required", ExternalID: "one", State: "SUCCESS"}, {Name: "extra", ExternalID: "two", State: "PENDING"}}
+	if err := evaluateChecks(actual, []CheckIdentity{{Name: "required", ExternalID: "one"}}); !errors.Is(err, ErrChecksPending) {
+		t.Fatalf("extra pending=%v", err)
+	}
+	actual[1].State = "FAILURE"
+	if err := evaluateChecks(actual, []CheckIdentity{{Name: "required", ExternalID: "one"}}); !errors.Is(err, ErrChecksFailed) {
+		t.Fatalf("failure precedence=%v", err)
+	}
+}
+
 func TestStrictJSONBoundedSanitizedCommandBoundary(t *testing.T) {
 	client := Client{Home: t.TempDir(), ConfigDir: filepath.Join(t.TempDir(), "gh-config"), Run: func(context.Context, string, []string, []string) ([]byte, error) {
 		return []byte(`{"unknown":true}`), nil
