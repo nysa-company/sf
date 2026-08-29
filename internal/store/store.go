@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -20,17 +22,19 @@ var (
 	ErrStaleFence       = errors.New("ticket fence is stale")
 	ErrNotFound         = errors.New("store row not found")
 	ErrBlocked          = errors.New("ticket is blocked")
+	ErrTerminalReplay   = errors.New("terminal ticket replay requires an explicit new ticket")
 	ErrStaleObservation = errors.New("effect observation belongs to a stale ticket identity")
 	ErrEffectBusy       = errors.New("effect already has a live claim")
 	ErrEffectKey        = errors.New("effect semantic key conflicts with durable record")
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 var migrationChecksums = map[int]string{
 	1: migrationChecksum(migrationV1),
 	2: migrationChecksum(migrationV2),
 	3: migrationChecksum(migrationV3),
+	4: migrationChecksum(migrationV4),
 }
 
 func migrationChecksum(statements []string) string {
@@ -65,6 +69,23 @@ type Ticket struct {
 	Type         domain.TicketType
 	MergeMode    domain.MergeMode
 	BlockedCode  string
+	Title        string
+	Problem      string
+	Acceptance   []string
+	Source       []byte
+	Priority     string
+	CreatedAt    time.Time
+}
+
+type Event struct {
+	ID            uint64
+	Ref           domain.TicketRef
+	TicketVersion uint64
+	Trigger       string
+	From          domain.State
+	To            domain.State
+	Payload       string
+	CreatedAt     time.Time
 }
 
 type Transition struct {
@@ -153,6 +174,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV2
 			} else if version == 3 {
 				statements = migrationV3
+			} else if version == 4 {
+				statements = migrationV4
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -274,15 +297,122 @@ func (s *Store) CreateTicket(ctx context.Context, ticket Ticket) error {
 		ticket.RunnerEpoch = 1
 	}
 	return s.write(ctx, func(conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, `INSERT INTO tickets(
-			channel, project_id, id, source_digest, ticket_type, merge_mode, state,
-			resume_state, version, runner_epoch, workflow_id, blocked_code
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.SourceDigest,
-			ticket.Type, ticket.MergeMode, ticket.State, nullableState(ticket.ResumeState),
-			ticket.Version, ticket.RunnerEpoch, ticket.WorkflowID, ticket.BlockedCode)
-		return err
+		return insertTicket(ctx, conn, ticket)
 	})
+}
+
+// SubmitTicket creates the immutable ticket or returns the active ticket with
+// the same source digest. A terminal replay must opt into a newly generated
+// identity; the source bytes are never treated as mutable workflow state.
+func (s *Store) SubmitTicket(ctx context.Context, ticket Ticket, allowNew bool) (Ticket, bool, error) {
+	if err := ticket.Ref.Validate(); err != nil {
+		return Ticket{}, false, err
+	}
+	if len(ticket.Source) == 0 {
+		return Ticket{}, false, errors.New("ticket source bytes are required")
+	}
+	decodedDigest, err := hex.DecodeString(ticket.SourceDigest)
+	if err != nil || len(decodedDigest) != sha256.Size || hex.EncodeToString(decodedDigest) != ticket.SourceDigest {
+		return Ticket{}, false, errors.New("ticket source digest must be a canonical SHA-256 digest")
+	}
+	if err := validateTicketInput(ticket); err != nil {
+		return Ticket{}, false, err
+	}
+	var existingRef domain.TicketRef
+	created := false
+	err = s.write(ctx, func(conn *sql.Conn) error {
+		var existingID domain.TicketID
+		var existingState domain.State
+		err := conn.QueryRowContext(ctx, `SELECT id, state FROM tickets WHERE channel=? AND project_id=? AND source_digest=? ORDER BY rowid DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.SourceDigest).Scan(&existingID, &existingState)
+		if err == nil {
+			existingRef = domain.TicketRef{Channel: ticket.Ref.Channel, Project: ticket.Ref.Project, Ticket: existingID}
+			if !existingState.Terminal() {
+				return nil
+			}
+			if !allowNew {
+				return ErrTerminalReplay
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err := insertTicket(ctx, conn, ticket); err != nil {
+			return err
+		}
+		created = true
+		existingRef = ticket.Ref
+		return nil
+	})
+	if err != nil {
+		return Ticket{}, false, err
+	}
+	result, err := s.Ticket(ctx, existingRef)
+	return result, created, err
+}
+
+func validateTicketInput(ticket Ticket) error {
+	if ticket.SourceDigest == "" || !ticket.Type.Valid() || !ticket.MergeMode.Valid() {
+		return fmt.Errorf("ticket source digest, type, and merge mode are required")
+	}
+	if len(ticket.Source) > 0 {
+		sum := sha256.Sum256(ticket.Source)
+		if fmt.Sprintf("%x", sum[:]) != ticket.SourceDigest {
+			return errors.New("ticket source bytes do not match source digest")
+		}
+	}
+	if ticket.Priority == "" {
+		ticket.Priority = "normal"
+	}
+	if ticket.Priority != "low" && ticket.Priority != "normal" && ticket.Priority != "high" {
+		return fmt.Errorf("invalid ticket priority %q", ticket.Priority)
+	}
+	return nil
+}
+
+func insertTicket(ctx context.Context, conn *sql.Conn, ticket Ticket) error {
+	if err := validateTicketInput(ticket); err != nil {
+		return err
+	}
+	if ticket.State == "" {
+		ticket.State = domain.StateQueued
+	}
+	if ticket.Version == 0 {
+		ticket.Version = 1
+	}
+	if ticket.RunnerEpoch == 0 {
+		ticket.RunnerEpoch = 1
+	}
+	if ticket.Priority == "" {
+		ticket.Priority = "normal"
+	}
+	if ticket.CreatedAt.IsZero() {
+		ticket.CreatedAt = time.Now().UTC()
+	}
+	if ticket.Acceptance == nil {
+		ticket.Acceptance = []string{}
+	}
+	if ticket.Source == nil {
+		ticket.Source = []byte{}
+	}
+	acceptance, err := json.Marshal(ticket.Acceptance)
+	if err != nil {
+		return fmt.Errorf("encode ticket acceptance: %w", err)
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO tickets(
+			channel, project_id, id, source_digest, ticket_type, merge_mode, state,
+			resume_state, version, runner_epoch, workflow_id, blocked_code,
+			title, problem, acceptance_json, source_bytes, priority, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.SourceDigest,
+		ticket.Type, ticket.MergeMode, ticket.State, nullableState(ticket.ResumeState),
+		ticket.Version, ticket.RunnerEpoch, ticket.WorkflowID, ticket.BlockedCode,
+		ticket.Title, ticket.Problem, string(acceptance), ticket.Source, ticket.Priority,
+		ticket.CreatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at)
+		VALUES (?, ?, ?, ?, 'ticket_submitted', 'queued', ?, '{}', ?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.Version, ticket.State, ticket.CreatedAt.Format(time.RFC3339Nano))
+	return err
 }
 
 func (s *Store) Ticket(ctx context.Context, ref domain.TicketRef) (Ticket, error) {
@@ -292,10 +422,14 @@ func (s *Store) Ticket(ctx context.Context, ref domain.TicketRef) (Ticket, error
 	var ticket Ticket
 	ticket.Ref = ref
 	var resume sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT state, resume_state, version, runner_epoch, workflow_id, source_digest, ticket_type, merge_mode, blocked_code
+	var acceptance string
+	var createdAt string
+	err := s.db.QueryRowContext(ctx, `SELECT state, resume_state, version, runner_epoch, workflow_id, source_digest, ticket_type, merge_mode, blocked_code,
+		title, problem, acceptance_json, source_bytes, priority, created_at
 		FROM tickets WHERE channel = ? AND project_id = ? AND id = ?`, ref.Channel, ref.Project, ref.Ticket).Scan(
 		&ticket.State, &resume, &ticket.Version, &ticket.RunnerEpoch, &ticket.WorkflowID,
 		&ticket.SourceDigest, &ticket.Type, &ticket.MergeMode, &ticket.BlockedCode,
+		&ticket.Title, &ticket.Problem, &acceptance, &ticket.Source, &ticket.Priority, &createdAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Ticket{}, ErrNotFound
@@ -306,7 +440,83 @@ func (s *Store) Ticket(ctx context.Context, ref domain.TicketRef) (Ticket, error
 	if resume.Valid {
 		ticket.ResumeState = domain.State(resume.String)
 	}
+	if err := json.Unmarshal([]byte(acceptance), &ticket.Acceptance); err != nil {
+		return Ticket{}, fmt.Errorf("decode ticket acceptance: %w", err)
+	}
+	if ticket.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt); err != nil {
+		return Ticket{}, fmt.Errorf("decode ticket creation time: %w", err)
+	}
 	return ticket, nil
+}
+
+func (s *Store) Tickets(ctx context.Context, channel domain.Channel, project domain.ProjectID, limit int) ([]Ticket, error) {
+	if !channel.Valid() {
+		return nil, fmt.Errorf("invalid channel %q", channel)
+	}
+	if limit <= 0 || limit > 10_000 {
+		return nil, errors.New("ticket query limit must be between 1 and 10000")
+	}
+	query := `SELECT project_id, id FROM tickets WHERE channel=?`
+	arguments := []any{channel}
+	if project != "" {
+		query += ` AND project_id=?`
+		arguments = append(arguments, project)
+	}
+	query += ` ORDER BY rowid DESC LIMIT ?`
+	arguments = append(arguments, limit)
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return nil, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	var refs []domain.TicketRef
+	for rows.Next() {
+		var ref domain.TicketRef
+		ref.Channel = channel
+		if err := rows.Scan(&ref.Project, &ref.Ticket); err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	result := make([]Ticket, 0, len(refs))
+	for _, ref := range refs {
+		ticket, err := s.Ticket(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, ticket)
+	}
+	return result, nil
+}
+
+func (s *Store) Events(ctx context.Context, channel domain.Channel, afterID uint64, limit int) ([]Event, error) {
+	if !channel.Valid() || limit <= 0 || limit > 100_000 {
+		return nil, errors.New("valid channel and event limit between 1 and 100000 are required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at
+		FROM events WHERE channel=? AND id>? ORDER BY id LIMIT ?`, channel, afterID, limit)
+	if err != nil {
+		return nil, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	var result []Event
+	for rows.Next() {
+		var event Event
+		event.Ref.Channel = channel
+		var createdAt string
+		if err := rows.Scan(&event.ID, &event.Ref.Project, &event.Ref.Ticket, &event.TicketVersion, &event.Trigger, &event.From, &event.To, &event.Payload, &createdAt); err != nil {
+			return nil, err
+		}
+		var err error
+		if event.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt); err != nil {
+			return nil, fmt.Errorf("decode event creation time: %w", err)
+		}
+		result = append(result, event)
+	}
+	return result, rows.Err()
 }
 
 // AcquireLeader increments the channel epoch. A daemon lock is enforced by the

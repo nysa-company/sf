@@ -2,10 +2,14 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,6 +35,98 @@ func openTestStore(t *testing.T) (*Store, context.Context) {
 
 func ticket(ref domain.TicketRef, digest string) Ticket {
 	return Ticket{Ref: ref, SourceDigest: digest, Type: domain.TicketBug, MergeMode: domain.MergeGuarded}
+}
+
+func TestSubmitPersistsImmutableSourceAndRequiresNewAfterTerminal(t *testing.T) {
+	database, ctx := openTestStore(t)
+	source := []byte("# Fix reminders\n\nDuplicates occur.\n\n## Acceptance\n- One reminder\n")
+	sum := sha256.Sum256(source)
+	digest := fmt.Sprintf("%x", sum[:])
+	acceptance := []string{"One reminder"}
+	firstRef := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-source-1"}
+	input := Ticket{
+		Ref: firstRef, SourceDigest: digest, Type: domain.TicketBug, MergeMode: domain.MergeGuarded,
+		Title: "Fix reminders", Problem: "Duplicates occur.", Acceptance: acceptance,
+		Source: source, Priority: "high",
+	}
+	created, wasCreated, err := database.SubmitTicket(ctx, input, false)
+	if err != nil || !wasCreated || created.Ref != firstRef {
+		t.Fatalf("created=%+v wasCreated=%v err=%v", created, wasCreated, err)
+	}
+	source[0] = 'X'
+	acceptance[0] = "mutated"
+	loaded, err := database.Ticket(ctx, firstRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(loaded.Source) == string(source) || !reflect.DeepEqual(loaded.Acceptance, []string{"One reminder"}) || loaded.Title != "Fix reminders" || loaded.Priority != "high" {
+		t.Fatalf("immutable ticket changed: %+v source=%q", loaded, loaded.Source)
+	}
+
+	duplicate := input
+	duplicate.Ref.Ticket = "SF-source-duplicate"
+	duplicate.Source = loaded.Source
+	duplicate.Acceptance = loaded.Acceptance
+	existing, wasCreated, err := database.SubmitTicket(ctx, duplicate, false)
+	if err != nil || wasCreated || existing.Ref != firstRef {
+		t.Fatalf("active duplicate=%+v wasCreated=%v err=%v", existing, wasCreated, err)
+	}
+
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-submit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Transition(ctx, Transition{
+		Ref: firstRef, ExpectedVersion: loaded.Version, From: domain.StateQueued, To: domain.StateDone,
+		Trigger: "test_terminal", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: loaded.RunnerEpoch}, EventPayload: "{}",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	terminalReplay := duplicate
+	terminalReplay.Ref.Ticket = "SF-source-2"
+	if _, _, err := database.SubmitTicket(ctx, terminalReplay, false); !errors.Is(err, ErrTerminalReplay) {
+		t.Fatalf("terminal replay error=%v", err)
+	}
+	second, wasCreated, err := database.SubmitTicket(ctx, terminalReplay, true)
+	if err != nil || !wasCreated || second.Ref.Ticket != "SF-source-2" {
+		t.Fatalf("new terminal replay=%+v wasCreated=%v err=%v", second, wasCreated, err)
+	}
+	tickets, err := database.Tickets(ctx, domain.ChannelDev, "nysa", 10)
+	if err != nil || len(tickets) != 2 {
+		t.Fatalf("tickets=%d err=%v", len(tickets), err)
+	}
+	events, err := database.Events(ctx, domain.ChannelDev, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) < 3 || events[0].Trigger != "ticket_submitted" {
+		t.Fatalf("events=%+v", events)
+	}
+	for index := 1; index < len(events); index++ {
+		if events[index].ID <= events[index-1].ID {
+			t.Fatalf("events out of order: %+v", events)
+		}
+	}
+}
+
+func TestSubmitRejectsSourceDigestMismatch(t *testing.T) {
+	database, ctx := openTestStore(t)
+	input := Ticket{
+		Ref:          domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-bad-source"},
+		SourceDigest: "not-the-digest", Source: []byte("ticket"), Type: domain.TicketBug, MergeMode: domain.MergeGuarded,
+	}
+	if _, _, err := database.SubmitTicket(ctx, input, false); err == nil {
+		t.Fatal("mismatched immutable source accepted")
+	}
+	input.Source = nil
+	if _, _, err := database.SubmitTicket(ctx, input, false); err == nil {
+		t.Fatal("missing immutable source accepted")
+	}
+	input.Source = []byte("ticket")
+	input.SourceDigest = strings.Repeat("A", 64)
+	if _, _, err := database.SubmitTicket(ctx, input, false); err == nil {
+		t.Fatal("non-canonical source digest accepted")
+	}
 }
 
 func TestMigrationAndActiveTicketConstraint(t *testing.T) {
@@ -518,7 +614,7 @@ func TestRecoveryBlockWritesEventAndSchemaGuardsStartup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL); INSERT INTO schema_migrations VALUES (1, 'now', '` + migrationChecksums[1] + `'); INSERT INTO schema_migrations VALUES (2, 'now', '` + migrationChecksums[2] + `'); INSERT INTO schema_migrations VALUES (3, 'now', '` + migrationChecksums[3] + `')`); err != nil {
+	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL); INSERT INTO schema_migrations VALUES (1, 'now', '` + migrationChecksums[1] + `'); INSERT INTO schema_migrations VALUES (2, 'now', '` + migrationChecksums[2] + `'); INSERT INTO schema_migrations VALUES (3, 'now', '` + migrationChecksums[3] + `'); INSERT INTO schema_migrations VALUES (4, 'now', '` + migrationChecksums[4] + `')`); err != nil {
 		t.Fatal(err)
 	}
 	_ = raw.Close()

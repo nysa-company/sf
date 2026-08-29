@@ -120,3 +120,15 @@ var migrationV3 = []string{
 	`CREATE UNIQUE INDEX current_approval_per_head
 		ON approvals(channel, project_id, ticket_id, reviewed_head, operator_uid) WHERE invalidated = 0`,
 }
+
+// v4 makes the immutable local Markdown ticket and its parsed display fields
+// part of the sole SQLite authority. Empty defaults preserve private dev rows
+// created before ticket ingestion was wired.
+var migrationV4 = []string{
+	`ALTER TABLE tickets ADD COLUMN title TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE tickets ADD COLUMN problem TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE tickets ADD COLUMN acceptance_json TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE tickets ADD COLUMN source_bytes BLOB NOT NULL DEFAULT X''`,
+	`ALTER TABLE tickets ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high'))`,
+	`ALTER TABLE tickets ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'`,
+}
