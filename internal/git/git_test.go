@@ -150,6 +150,15 @@ func TestWorktreeRemovalAndDiffHostileFixturesRefuse(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(path, "src", "nested")); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(path, "src", "executable"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.ValidateDiff(ctx, path, "main", DiffPolicy{AllowedPaths: []string{"src"}}); !errors.Is(err, ErrUnsafeWorktree) {
+		t.Fatalf("executable-mode validation=%v", err)
+	}
+	if err := os.Remove(filepath.Join(path, "src", "executable")); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(path, "src", "untracked"), []byte("dirty"), 0o600); err != nil {
 		t.Fatal(err)
 	}
