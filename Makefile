@@ -1,4 +1,4 @@
-.PHONY: build build-dev test check
+.PHONY: build build-dev test test-native-profile check
 
 build:
 	mkdir -p bin
@@ -10,6 +10,9 @@ build-dev:
 
 test:
 	go test ./...
+
+test-native-profile:
+	spikes/native-profile/run.sh
 
 check: test
 	./scripts/repo-check

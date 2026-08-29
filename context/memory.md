@@ -8,6 +8,10 @@
 - DBOS failed its bounded SQLite deadline gate; v1 uses one custom Go engine.
 - Guarded mode is first; autonomy waits for the guarded pilot and native proof.
 - Docker and Colima are not prerequisites or silent fallbacks.
+- On macOS 26.6.2, the native-profile spike rejects `sandbox-exec` for
+  autonomous execution: a `setsid`/double-fork child can retain worktree write
+  access after its supervisor returns. Guarded/manual remain the trusted
+  provider/repository baseline.
 - No remote, Nysa mutation, or legacy retirement is currently authorized.
 
 ## Log
@@ -32,3 +36,10 @@ contract. Per the approved one-day rule, DBOS is rejected for v1 and will not
 be a production dependency or receive another proof attempt. The custom Go
 engine described in `docs/decisions/0001-workflow-engine.md` is the only runtime
 path.
+
+### 2026-08-29 — Native-profile capability verdict
+
+The bounded Seatbelt (`sandbox-exec`) probe demonstrates selected credential,
+Git-control, network, package, and launchd denials, but fails the detached
+writer lifecycle probe. It records `autonomous_eligible=false`; no Docker or
+Colima fallback was installed or proposed. See ADR 0002.
