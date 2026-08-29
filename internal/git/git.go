@@ -9,14 +9,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -27,73 +26,89 @@ var (
 	ErrIdentityMismatch = errors.New("git repository identity mismatch")
 	ErrUnsafeWorktree   = errors.New("git worktree is unsafe")
 	ErrUnexpectedRemote = errors.New("remote branch head is unexpected")
+	ErrOutputBound      = errors.New("git output exceeded bound")
 )
 
-// Allocator persists an unguessable branch per channel/project/ticket. A
-// separate 0600 record is used instead of a process-local map so restarts and
-// concurrent daemons reuse exactly the same ref.
-type Allocator struct{ Root string }
+const maxGitOutput = 1 << 20
 
-func (a Allocator) Allocate(channel domain.Channel, project domain.ProjectID, ticket domain.TicketID) (string, error) {
-	if !channel.Valid() || project == "" || ticket == "" || a.Root == "" {
-		return "", fmt.Errorf("allocator requires channel, project, ticket, and root")
-	}
-	dir := filepath.Join(a.Root, "branches", string(channel), safePart(string(project)))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, safePart(string(ticket))+".ref")
-	if data, err := os.ReadFile(path); err == nil {
-		return validateBranch(strings.TrimSpace(string(data)))
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", err
-	}
-	for {
-		var random [16]byte
-		if _, err := rand.Read(random[:]); err != nil {
-			return "", fmt.Errorf("random branch suffix: %w", err)
-		}
-		branch := fmt.Sprintf("sf/%s/%s/%s-%s", channel, safePart(string(project)), safePart(string(ticket)), hex.EncodeToString(random[:]))
-		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if errors.Is(err, os.ErrExist) {
-			data, readErr := os.ReadFile(path)
-			if readErr == nil {
-				return validateBranch(strings.TrimSpace(string(data)))
-			}
-			continue
-		}
-		if err != nil {
-			return "", err
-		}
-		_, writeErr := file.WriteString(branch + "\n")
-		closeErr := file.Close()
-		if writeErr != nil || closeErr != nil {
-			return "", errors.Join(writeErr, closeErr)
-		}
-		return branch, nil
-	}
+// BranchAuthority is implemented by the daemon's SQLite-backed store. Git
+// never creates a second persistence authority for ticket branch identity.
+type BranchAuthority interface {
+	LoadOrStoreBranch(context.Context, string, string) (string, error)
 }
 
-func safePart(value string) string {
-	var out strings.Builder
-	for _, r := range value {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' {
-			out.WriteRune(r)
-		} else {
-			out.WriteByte('-')
-		}
+type Allocator struct {
+	Authority BranchAuthority
+	Random    io.Reader
+}
+
+func (a Allocator) Allocate(ctx context.Context, channel domain.Channel, project domain.ProjectID, ticket domain.TicketID) (string, error) {
+	if !channel.Valid() || project == "" || ticket == "" || a.Authority == nil {
+		return "", fmt.Errorf("allocator requires channel, project, ticket, and SQLite branch authority")
 	}
-	if out.Len() == 0 {
-		return "ticket"
+	random := a.Random
+	if random == nil {
+		random = rand.Reader
 	}
-	return out.String()
+	var suffix [16]byte
+	if _, err := io.ReadFull(random, suffix[:]); err != nil {
+		return "", fmt.Errorf("random branch suffix: %w", err)
+	}
+	proposed := fmt.Sprintf("sf/%s/%s/%s-%s", channel, digestPart(string(project)), digestPart(string(ticket)), hex.EncodeToString(suffix[:]))
+	stored, err := a.Authority.LoadOrStoreBranch(ctx, string(channel)+"\x00"+string(project)+"\x00"+string(ticket), proposed)
+	if err != nil {
+		return "", err
+	}
+	return validateBranch(stored)
+}
+
+func digestPart(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:8])
 }
 
 func validateBranch(branch string) (string, error) {
-	if !strings.HasPrefix(branch, "sf/") || strings.Contains(branch, "..") || strings.ContainsAny(branch, " ~^:?*[\\") || strings.HasSuffix(branch, "/") {
+	if !strings.HasPrefix(branch, "sf/") || !validRef(branch) {
 		return "", fmt.Errorf("invalid persisted branch %q", branch)
 	}
 	return branch, nil
+}
+
+func validRef(ref string) bool {
+	if ref == "" || strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") ||
+		strings.Contains(ref, "..") || strings.Contains(ref, "@{") || strings.Contains(ref, "//") ||
+		strings.ContainsAny(ref, " ~^:?*[\\\x00\r\n") {
+		return false
+	}
+	for _, component := range strings.Split(ref, "/") {
+		if component == "" || component == "." || component == ".." || strings.HasSuffix(component, ".lock") {
+			return false
+		}
+	}
+	return true
+}
+
+func validOID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	if strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func validAbsolutePath(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path && path != string(filepath.Separator)
+}
+
+func validRepoPath(path string) bool {
+	if path == "" || strings.Contains(path, "\\") || strings.HasPrefix(path, "/") || strings.Contains(path, "\x00") {
+		return false
+	}
+	converted := filepath.FromSlash(path)
+	return filepath.IsLocal(converted) && filepath.Clean(converted) == converted
 }
 
 // Runner executes Git with a private HOME, all inherited GIT_* variables
@@ -109,9 +124,6 @@ func (r Runner) command(ctx context.Context, directory string, args ...string) (
 	if directory == "" {
 		return nil, fmt.Errorf("git directory is required")
 	}
-	if err := os.MkdirAll(r.home(), 0o700); err != nil {
-		return nil, err
-	}
 	// The authenticated origin may be a local bare repository in hermetic tests
 	// and local-only installs. No arbitrary URL is accepted: every operation
 	// names origin after identity reauthentication.
@@ -122,13 +134,15 @@ func (r Runner) command(ctx context.Context, directory string, args ...string) (
 		return nil, err
 	}
 	if r.Run != nil {
-		return r.Run(ctx, r.binary(), argv, env)
+		output, err := r.Run(ctx, r.binary(), argv, env)
+		if len(output) > maxGitOutput {
+			return output[:maxGitOutput], ErrOutputBound
+		}
+		return output, err
 	}
-	command := exec.CommandContext(ctx, r.binary(), argv...)
-	command.Env = env
-	output, err := command.CombinedOutput()
+	output, err := runBounded(ctx, r.binary(), argv, env)
 	if err != nil {
-		return output, fmt.Errorf("git %s: %w", strings.Join(argv, " "), err)
+		return output, fmt.Errorf("git command failed: %w", err)
 	}
 	return output, nil
 }
@@ -144,40 +158,47 @@ func (r Runner) commandEnv(ctx context.Context, directory string, extra []string
 		return nil, err
 	}
 	if r.Run != nil {
-		return r.Run(ctx, r.binary(), argv, env)
+		output, err := r.Run(ctx, r.binary(), argv, env)
+		if len(output) > maxGitOutput {
+			return output[:maxGitOutput], ErrOutputBound
+		}
+		return output, err
 	}
-	command := exec.CommandContext(ctx, r.binary(), argv...)
-	command.Env = env
-	output, err := command.CombinedOutput()
+	output, err := runBounded(ctx, r.binary(), argv, env)
 	if err != nil {
-		return output, fmt.Errorf("git %s: %w", strings.Join(argv, " "), err)
+		return output, fmt.Errorf("git command failed: %w", err)
 	}
 	return output, nil
 }
 
 func (r Runner) home() string {
-	if r.Home != "" {
-		return r.Home
-	}
-	return filepath.Join(os.TempDir(), "sf-git-home")
+	return r.Home
 }
 func (r Runner) binary() string {
 	if r.Binary != "" {
 		return r.Binary
 	}
-	return "git"
+	return "/usr/bin/git"
 }
 
 func (r Runner) environment(extra []string) ([]string, error) {
-	env := make([]string, 0, len(os.Environ())+6)
-	for _, entry := range os.Environ() {
-		key, _, _ := strings.Cut(entry, "=")
-		if key == "HOME" || strings.HasPrefix(key, "GIT_") {
-			continue
-		}
-		env = append(env, entry)
+	if !validAbsolutePath(r.binary()) {
+		return nil, fmt.Errorf("runner requires an explicit absolute git binary")
 	}
-	env = append(env, "HOME="+r.home(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	if r.Home == "" || !validAbsolutePath(r.Home) {
+		return nil, fmt.Errorf("runner requires an explicit absolute isolated HOME")
+	}
+	info, err := os.Stat(r.Home)
+	if err == nil && info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("isolated HOME permissions are too broad")
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if err := os.MkdirAll(r.Home, 0o700); err != nil {
+		return nil, err
+	}
+	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
 	for _, entry := range extra {
 		key, _, _ := strings.Cut(entry, "=")
 		if (strings.HasPrefix(key, "GIT_") && !strings.HasPrefix(key, "GIT_AUTHOR_") && !strings.HasPrefix(key, "GIT_COMMITTER_")) || key == "HOME" {
@@ -186,6 +207,37 @@ func (r Runner) environment(extra []string) ([]string, error) {
 		env = append(env, entry)
 	}
 	return env, nil
+}
+
+func runBounded(ctx context.Context, binary string, argv, env []string) ([]byte, error) {
+	command := exec.CommandContext(ctx, binary, argv...)
+	command.Env = env
+	buffer := &boundedBuffer{limit: maxGitOutput}
+	command.Stdout, command.Stderr = buffer, buffer
+	err := command.Run()
+	if buffer.exceeded {
+		return buffer.data, ErrOutputBound
+	}
+	return buffer.data, err
+}
+
+type boundedBuffer struct {
+	data     []byte
+	limit    int
+	exceeded bool
+}
+
+func (b *boundedBuffer) Write(value []byte) (int, error) {
+	if len(b.data)+len(value) > b.limit {
+		remaining := b.limit - len(b.data)
+		if remaining > 0 {
+			b.data = append(b.data, value[:remaining]...)
+		}
+		b.exceeded = true
+		return len(value), nil
+	}
+	b.data = append(b.data, value...)
+	return len(value), nil
 }
 
 // Identity is recorded before untrusted work and reauthenticated before every
@@ -206,6 +258,9 @@ type Identity struct {
 func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identity, error) {
 	if err := rejectGitEnvironment(os.Environ()); err != nil {
 		return Identity{}, err
+	}
+	if !validAbsolutePath(worktree) || !validRef(baseRef) {
+		return Identity{}, fmt.Errorf("%w: invalid worktree path or base ref", ErrIdentityMismatch)
 	}
 	repository, err := r.one(ctx, worktree, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -254,7 +309,17 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	if err != nil {
 		return Identity{}, err
 	}
-	return Identity{Repository: canonicalRepo, Worktree: canonicalWorktree, GitFile: string(gitFile), CommonDir: strings.TrimSpace(common), Origin: strings.TrimSpace(origin), BaseRef: baseRef, BaseHead: strings.TrimSpace(baseHead), HeadRef: headRef, ConfigHash: digest(config), HooksHash: hooksHash}, nil
+	baseHead = strings.TrimSpace(baseHead)
+	headRef = strings.TrimSpace(headRef)
+	common = strings.TrimSpace(common)
+	if !validOID(baseHead) || !validBranchOrHeadRef(headRef) || !validAbsolutePath(common) || !validAbsolutePath(canonicalRepo) || !validAbsolutePath(canonicalWorktree) {
+		return Identity{}, fmt.Errorf("%w: invalid git identity value", ErrIdentityMismatch)
+	}
+	return Identity{Repository: canonicalRepo, Worktree: canonicalWorktree, GitFile: string(gitFile), CommonDir: common, Origin: strings.TrimSpace(origin), BaseRef: baseRef, BaseHead: baseHead, HeadRef: headRef, ConfigHash: digest(config), HooksHash: hooksHash}, nil
+}
+
+func validBranchOrHeadRef(value string) bool {
+	return validRef(value) && !strings.HasPrefix(value, "refs/")
 }
 
 func (r Runner) Reauthenticate(ctx context.Context, expected Identity) error {
@@ -327,15 +392,25 @@ func rejectGitEnvironment(env []string) error {
 }
 
 func safeOrigin(raw string) (string, error) {
+	if validAbsolutePath(raw) {
+		resolved, err := filepath.EvalSymlinks(raw)
+		if err != nil {
+			return "", err
+		}
+		if !validAbsolutePath(resolved) {
+			return "", fmt.Errorf("%w: noncanonical local origin refused", ErrIdentityMismatch)
+		}
+		return resolved, nil
+	}
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme == "" {
-		return raw, nil // SCP-like Git syntax has no URL userinfo component.
+	if err != nil || parsed.Scheme == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
+		return "", fmt.Errorf("%w: noncanonical origin refused", ErrIdentityMismatch)
 	}
 	if parsed.User != nil {
 		if _, hasPassword := parsed.User.Password(); hasPassword {
 			return "", fmt.Errorf("%w: credential-bearing origin refused", ErrIdentityMismatch)
 		}
-		parsed.User = nil
+		return "", fmt.Errorf("%w: credential-bearing origin refused", ErrIdentityMismatch)
 	}
 	return parsed.String(), nil
 }
@@ -364,6 +439,9 @@ func treeDigest(root string) (string, error) {
 		if err != nil {
 			return err
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: hook symlink refused", ErrIdentityMismatch)
+		}
 		_, _ = hash.Write([]byte(rel))
 		_, _ = hash.Write([]byte{0})
 		_, _ = hash.Write([]byte(info.Mode().String()))
@@ -389,7 +467,10 @@ type Worktree struct {
 }
 
 func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, baseRef string) (Worktree, error) {
-	if !strings.HasPrefix(branch, "sf/") || !filepath.IsAbs(path) {
+	if !validAbsolutePath(repository) || !validAbsolutePath(path) || !validRef(baseRef) {
+		return Worktree{}, fmt.Errorf("canonical repository/worktree paths and base ref are required")
+	}
+	if !strings.HasPrefix(branch, "sf/") {
 		return Worktree{}, fmt.Errorf("sf branch and absolute worktree path are required")
 	}
 	if _, err := validateBranch(branch); err != nil {
@@ -425,7 +506,7 @@ func (r Runner) RetainWorktree(ctx context.Context, worktree Worktree) (Identity
 }
 
 func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree Worktree, state WorktreeState) error {
-	if !strings.HasPrefix(worktree.Branch, "sf/") {
+	if _, err := validateBranch(worktree.Branch); err != nil {
 		return fmt.Errorf("%w: foreign branch is retained", ErrUnsafeWorktree)
 	}
 	if state.Active || state.Taken || state.Quarantined || state.Foreign {
@@ -449,10 +530,18 @@ type DiffPolicy struct {
 }
 
 func (r Runner) ValidateDiff(ctx context.Context, worktree, baseRef string, policy DiffPolicy) error {
-	if len(policy.AllowedPaths) == 0 {
+	if !validAbsolutePath(worktree) || !validRef(baseRef) || len(policy.AllowedPaths) == 0 {
 		return fmt.Errorf("allowed paths are required")
 	}
+	for _, allowedPath := range policy.AllowedPaths {
+		if !validRepoPath(strings.Trim(allowedPath, "/")) {
+			return fmt.Errorf("%w: invalid allowed path", ErrUnsafeWorktree)
+		}
+	}
 	if policy.ExpectedHead != "" {
+		if !validOID(policy.ExpectedHead) {
+			return fmt.Errorf("%w: invalid expected head", ErrUnsafeWorktree)
+		}
 		head, err := r.one(ctx, worktree, "rev-parse", "HEAD")
 		if err != nil {
 			return err
@@ -487,6 +576,9 @@ func (r Runner) ValidateDiff(ctx context.Context, worktree, baseRef string, poli
 	paths = append(paths, splitNUL(staged)...)
 	paths = append(paths, splitNUL(untracked)...)
 	for _, path := range paths {
+		if !validRepoPath(path) {
+			return fmt.Errorf("%w: invalid changed path", ErrUnsafeWorktree)
+		}
 		if !allowed(path, policy.AllowedPaths) {
 			return fmt.Errorf("%w: changed path %s is not allowed", ErrUnsafeWorktree, path)
 		}
@@ -494,12 +586,15 @@ func (r Runner) ValidateDiff(ctx context.Context, worktree, baseRef string, poli
 	if err := validateFiles(worktree, policy, paths); err != nil {
 		return err
 	}
-	return validateTree(worktree, policy)
+	return validateSpecialFiles(worktree)
 }
 
 func validateFiles(worktree string, policy DiffPolicy, changed []string) error {
 	seenCase := map[string]string{}
 	for _, path := range changed {
+		if !validRepoPath(path) {
+			return fmt.Errorf("%w: invalid changed path", ErrUnsafeWorktree)
+		}
 		lower := strings.ToLower(path)
 		if previous, ok := seenCase[lower]; ok && previous != path {
 			return fmt.Errorf("%w: case collision %s and %s", ErrUnsafeWorktree, previous, path)
@@ -526,8 +621,7 @@ func validateFiles(worktree string, policy DiffPolicy, changed []string) error {
 	return nil
 }
 
-func validateTree(worktree string, policy DiffPolicy) error {
-	seenCase := map[string]string{}
+func validateSpecialFiles(worktree string) error {
 	return filepath.WalkDir(worktree, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -542,25 +636,12 @@ func validateTree(worktree string, policy DiffPolicy) error {
 		if rel == ".git" {
 			return nil
 		}
-		lower := strings.ToLower(filepath.ToSlash(rel))
-		if previous, ok := seenCase[lower]; ok && previous != rel {
-			return fmt.Errorf("%w: case collision %s and %s", ErrUnsafeWorktree, previous, rel)
-		}
-		seenCase[lower] = rel
 		info, err := os.Lstat(path)
 		if err != nil {
 			return err
 		}
-		if info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+		if !info.IsDir() && info.Mode()&os.ModeSymlink == 0 && !info.Mode().IsRegular() {
 			return fmt.Errorf("%w: unsafe file type %s", ErrUnsafeWorktree, rel)
-		}
-		if !info.IsDir() && !policy.AllowExecutable && info.Mode().Perm()&0o111 != 0 {
-			return fmt.Errorf("%w: executable mode %s", ErrUnsafeWorktree, rel)
-		}
-		if !info.IsDir() {
-			if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
-				return fmt.Errorf("%w: hardlink %s", ErrUnsafeWorktree, rel)
-			}
 		}
 		return nil
 	})
@@ -607,16 +688,29 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if _, err := r.commandEnv(ctx, worktree.Path, []string{"GIT_AUTHOR_NAME=sf", "GIT_AUTHOR_EMAIL=sf@localhost", "GIT_COMMITTER_NAME=sf", "GIT_COMMITTER_EMAIL=sf@localhost", "GIT_AUTHOR_DATE=" + timestamp, "GIT_COMMITTER_DATE=" + timestamp}, "commit", "--no-verify", "-m", message); err != nil {
 		return "", err
 	}
-	return r.one(ctx, worktree.Path, "rev-parse", "HEAD")
+	head, err := r.one(ctx, worktree.Path, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	if !validOID(head) {
+		return "", fmt.Errorf("%w: invalid committed object id", ErrIdentityMismatch)
+	}
+	return head, nil
 }
 
 func (r Runner) Push(ctx context.Context, worktree Worktree) (string, error) {
+	if _, err := validateBranch(worktree.Branch); err != nil {
+		return "", err
+	}
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
 	local, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", worktree.Branch+"^{commit}")
 	if err != nil {
 		return "", err
+	}
+	if !validOID(local) {
+		return "", fmt.Errorf("%w: invalid local object id", ErrIdentityMismatch)
 	}
 	remote, err := r.remoteHead(ctx, worktree.Path, worktree.Branch)
 	if err != nil {
@@ -626,6 +720,9 @@ func (r Runner) Push(ctx context.Context, worktree Worktree) (string, error) {
 		return local, nil
 	}
 	if remote != "" {
+		if !validOID(remote) {
+			return "", fmt.Errorf("%w: invalid remote object id", ErrUnexpectedRemote)
+		}
 		observationRef := "refs/sf/observed/" + digest([]byte(worktree.Branch + remote))[7:]
 		if _, err := r.command(ctx, worktree.Path, "fetch", "--no-tags", "origin", "refs/heads/"+worktree.Branch+":"+observationRef); err != nil {
 			return "", fmt.Errorf("%w: cannot observe remote %s", ErrUnexpectedRemote, remote)
@@ -664,19 +761,8 @@ func (r Runner) remoteHead(ctx context.Context, directory, branch string) (strin
 	if len(fields) != 2 || fields[1] != "refs/heads/"+branch {
 		return "", fmt.Errorf("%w: ambiguous remote observation", ErrUnexpectedRemote)
 	}
+	if !validOID(fields[0]) {
+		return "", fmt.Errorf("%w: invalid remote object id", ErrUnexpectedRemote)
+	}
 	return fields[0], nil
-}
-
-var allocatorMu sync.Mutex
-
-func (a Allocator) LockedAllocate(channel domain.Channel, project domain.ProjectID, ticket domain.TicketID) (string, error) {
-	allocatorMu.Lock()
-	defer allocatorMu.Unlock()
-	return a.Allocate(channel, project, ticket)
-}
-
-func sorted(values []string) []string {
-	result := append([]string(nil), values...)
-	sort.Strings(result)
-	return result
 }

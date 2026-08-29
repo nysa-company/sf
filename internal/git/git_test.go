@@ -1,6 +1,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -13,6 +14,23 @@ import (
 
 	"github.com/nysa-company/sf/internal/domain"
 )
+
+type memoryBranchAuthority struct{ branches map[string]string }
+
+func (a *memoryBranchAuthority) LoadOrStoreBranch(_ context.Context, key, proposed string) (string, error) {
+	if existing := a.branches[key]; existing != "" {
+		return existing, nil
+	}
+	a.branches[key] = proposed
+	return proposed, nil
+}
+
+func allocatorForTest() Allocator {
+	return Allocator{
+		Authority: &memoryBranchAuthority{branches: map[string]string{}},
+		Random:    bytes.NewReader(bytes.Repeat([]byte{0x42}, 128)),
+	}
+}
 
 func rawGit(t *testing.T, directory string, args ...string) string {
 	t.Helper()
@@ -50,28 +68,28 @@ func fixture(t *testing.T) (context.Context, Runner, string, string) {
 	return ctx, Runner{Home: filepath.Join(root, "git-home")}, repository, remote
 }
 
-func TestAllocatorPersistsCryptoRandomTicketBranch(t *testing.T) {
-	allocator := Allocator{Root: t.TempDir()}
-	first, err := allocator.Allocate(domain.ChannelDev, "nysa", "SF-29")
+func TestAllocatorDelegatesBranchPersistenceToAuthority(t *testing.T) {
+	allocator := allocatorForTest()
+	first, err := allocator.Allocate(context.Background(), domain.ChannelDev, "nysa", "SF-29")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := allocator.Allocate(domain.ChannelDev, "nysa", "SF-29")
+	second, err := allocator.Allocate(context.Background(), domain.ChannelDev, "nysa", "SF-29")
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, err := allocator.Allocate(domain.ChannelStable, "nysa", "SF-29")
+	other, err := allocator.Allocate(context.Background(), domain.ChannelStable, "nysa", "SF-29")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != second || first == other || !strings.HasPrefix(first, "sf/dev/nysa/SF-29-") || len(strings.Split(first, "-")) < 2 {
+	if first != second || first == other || !strings.HasPrefix(first, "sf/dev/") || len(strings.Split(first, "-")) < 2 {
 		t.Fatalf("branch identities first=%q second=%q other=%q", first, second, other)
 	}
 }
 
 func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
-	branch, err := (Allocator{Root: t.TempDir()}).Allocate(domain.ChannelDev, "project", "SF-43")
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-43")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +123,7 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 
 func TestWorktreeRemovalAndDiffHostileFixturesRefuse(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
-	branch, err := (Allocator{Root: t.TempDir()}).Allocate(domain.ChannelDev, "project", "SF-41")
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-41")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +190,7 @@ func TestWorktreeRemovalAndDiffHostileFixturesRefuse(t *testing.T) {
 
 func TestIdentityRejectsControlPlaneEnvironment(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
-	branch, err := (Allocator{Root: t.TempDir()}).Allocate(domain.ChannelDev, "project", "SF-env")
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-env")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +206,7 @@ func TestIdentityRejectsControlPlaneEnvironment(t *testing.T) {
 
 func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 	ctx, runner, repository, remote := fixture(t)
-	branch, err := (Allocator{Root: t.TempDir()}).Allocate(domain.ChannelDev, "project", "SF-remote")
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-remote")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,8 +249,9 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 func TestRunnerExactArgvScrubsHooksAndCredentialEnvironment(t *testing.T) {
 	var got []string
 	var environment []string
-	runner := Runner{Home: t.TempDir(), Run: func(_ context.Context, binary string, argv, env []string) ([]byte, error) {
-		if binary != "git" {
+	t.Setenv("SF_HOST_SECRET", "must-not-reach-git")
+	runner := Runner{Home: filepath.Join(t.TempDir(), "isolated-home"), Run: func(_ context.Context, binary string, argv, env []string) ([]byte, error) {
+		if binary != "/usr/bin/git" {
 			t.Fatalf("binary=%q", binary)
 		}
 		got, environment = argv, env
@@ -246,12 +265,97 @@ func TestRunnerExactArgvScrubsHooksAndCredentialEnvironment(t *testing.T) {
 		t.Fatalf("argv=%q", got)
 	}
 	joined := strings.Join(environment, "\n")
-	for _, forbidden := range []string{"GIT_DIR=", "GIT_WORK_TREE=", "GIT_CONFIG=", "HOME="} {
-		if forbidden != "HOME=" && strings.Contains(joined, forbidden) {
+	for _, forbidden := range []string{"GIT_DIR=", "GIT_WORK_TREE=", "GIT_CONFIG=", "SF_HOST_SECRET="} {
+		if strings.Contains(joined, forbidden) {
 			t.Fatalf("environment leaks %s", forbidden)
 		}
 	}
 	if !strings.Contains(joined, "HOME="+runner.Home) || !strings.Contains(joined, "GIT_TERMINAL_PROMPT=0") {
 		t.Fatalf("environment missing isolation: %q", joined)
+	}
+}
+
+func TestRunnerRequiresSecureAbsoluteHomeAndBoundsSeamOutput(t *testing.T) {
+	if _, err := (Runner{}).one(context.Background(), "/repo", "rev-parse", "HEAD"); err == nil {
+		t.Fatal("empty HOME was accepted")
+	}
+	home := filepath.Join(t.TempDir(), "broad-home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Runner{Home: home}).one(context.Background(), "/repo", "rev-parse", "HEAD"); err == nil {
+		t.Fatal("broad HOME was accepted")
+	}
+	runner := Runner{Home: filepath.Join(t.TempDir(), "isolated-home"), Run: func(context.Context, string, []string, []string) ([]byte, error) {
+		return bytes.Repeat([]byte("x"), maxGitOutput+1), nil
+	}}
+	if _, err := runner.one(context.Background(), "/repo", "rev-parse", "HEAD"); !errors.Is(err, ErrOutputBound) {
+		t.Fatalf("bounded output=%v", err)
+	}
+}
+
+func TestOriginAndHooksRefuseAmbiguityAndSymlinkEscape(t *testing.T) {
+	for _, origin := range []string{
+		"git@example.test:owner/repository.git",
+		"https://token@example.test/owner/repository.git",
+		"https://example.test/owner/repository.git?token=x",
+		"relative/repository.git",
+	} {
+		if _, err := safeOrigin(origin); !errors.Is(err, ErrIdentityMismatch) {
+			t.Fatalf("origin %q err=%v", origin, err)
+		}
+	}
+	root := t.TempDir()
+	if err := os.Symlink(filepath.Join(t.TempDir(), "outside"), filepath.Join(root, "hook")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := treeDigest(root); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("hook symlink=%v", err)
+	}
+}
+
+func TestDiffAllowsPreexistingExecutableAndSymlinkButRejectsChangedOnes(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	if err := os.WriteFile(filepath.Join(repository, "src", "baseline-executable"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("main.txt", filepath.Join(repository, "src", "baseline-link")); err != nil {
+		t.Fatal(err)
+	}
+	rawGit(t, repository, "add", ".")
+	rawGit(t, repository, "commit", "-m", "baseline fixtures")
+	rawGit(t, repository, "push", "origin", "main:refs/heads/main")
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.ValidateDiff(ctx, worktree.Path, "main", DiffPolicy{AllowedPaths: []string{"src"}}); err != nil {
+		t.Fatalf("preexisting baseline files were rejected: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "new-executable"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.ValidateDiff(ctx, worktree.Path, "main", DiffPolicy{AllowedPaths: []string{"src"}}); !errors.Is(err, ErrUnsafeWorktree) {
+		t.Fatalf("changed executable=%v", err)
+	}
+}
+
+func TestExactOIDRefPathAndChangedPathValidation(t *testing.T) {
+	if validOID("deadbeef") || validRef("main..bad") || validRepoPath("../escape") || validRepoPath("dir\\escape") {
+		t.Fatal("unsafe identity value accepted")
+	}
+	if !validOID(strings.Repeat("a", 40)) || !validRef("refs/heads/main") || !validRepoPath("src/main.go") {
+		t.Fatal("valid identity value refused")
 	}
 }
