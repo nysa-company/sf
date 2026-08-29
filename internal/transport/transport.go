@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/api"
+	"github.com/nysa-company/sf/internal/domain"
 )
 
 var ErrSocketExists = errors.New("socket path already exists")
@@ -162,16 +163,19 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 	if err != nil {
 		return
 	}
-	response := server.handler.Handle(ctx, Peer{UID: uid}, request)
+	handlerCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	response := server.handler.Handle(handlerCtx, Peer{UID: uid}, request)
 	response.Version = api.Version
 	response.RequestID = request.RequestID
 	if err := response.Validate(); err != nil {
 		response = api.Response{
-			Version:   api.Version,
-			RequestID: request.RequestID,
-			OK:        false,
-			Mutation:  api.Mutation{},
-			Error:     &api.Error{Code: "internal_response_invalid", Message: "daemon produced an invalid response"},
+			Version:    api.Version,
+			RequestID:  request.RequestID,
+			OK:         false,
+			Mutation:   api.Mutation{},
+			Error:      &api.Error{Code: "internal_response_invalid", Message: "daemon produced an invalid response"},
+			NextAction: &domain.NextAction{Code: "internal_response_invalid", Argv: []string{"sf", "doctor"}},
 		}
 	}
 	_ = api.Encode(connection, response)

@@ -34,6 +34,7 @@ func TestResponseRequiresConsistentOutcome(t *testing.T) {
 	responses := []Response{
 		{Version: Version, RequestID: "1", OK: true, Error: &Error{Code: "bad"}},
 		{Version: Version, RequestID: "1", OK: false},
+		{Version: Version, RequestID: "1", OK: false, Error: &Error{Code: "bad"}},
 		{Version: Version, RequestID: "1", OK: false, Error: &Error{Code: "bad"}, NextAction: &domain.NextAction{}},
 	}
 	for _, response := range responses {

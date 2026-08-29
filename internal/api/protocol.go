@@ -75,7 +75,10 @@ func (response Response) Validate() error {
 	if !response.OK && response.Error == nil {
 		return fmt.Errorf("failed response requires an error")
 	}
-	if response.NextAction != nil && len(response.NextAction.Argv) == 0 {
+	if !response.OK && response.NextAction == nil {
+		return fmt.Errorf("failed response requires one executable next action")
+	}
+	if response.NextAction != nil && (response.NextAction.Code == "" || len(response.NextAction.Argv) == 0 || response.NextAction.Argv[0] == "") {
 		return fmt.Errorf("next action requires executable argv")
 	}
 	return nil
