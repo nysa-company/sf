@@ -10,10 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
+
+	"github.com/nysa-company/sf/internal/testkit"
 )
 
 const (
@@ -141,40 +141,11 @@ func writeJSON(value result) {
 }
 
 func writeRelative(name string, content []byte) error {
-	clean := filepath.Clean(name)
-	if filepath.IsAbs(name) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("write path must be relative")
-	}
 	root, err := os.Getwd()
 	if err != nil {
 		return err
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(root, clean)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	if !within(resolvedRoot, resolvedParent) {
-		return fmt.Errorf("write path escapes worktree through symlink")
-	}
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("write path is a symlink")
-	} else if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return os.WriteFile(path, content, 0o644)
-}
-
-func within(root, path string) bool {
-	rel, err := filepath.Rel(root, path)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	return testkit.WriteFixtureFile(root, name, content)
 }
 
 func ignoreTERM() {

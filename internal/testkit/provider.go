@@ -65,7 +65,7 @@ func NewScriptedProvider(identity domain.ProviderIdentity) *ScriptedProvider {
 func (p *ScriptedProvider) Name() string { return p.Identity.Provider }
 
 func (p *ScriptedProvider) Probe(context.Context) (domain.ProviderIdentity, error) {
-	if p.Identity.Provider == "" || p.Identity.Version == "" {
+	if p.Identity.Provider == "" || p.Identity.Model == "" || p.Identity.Family == "" || p.Identity.Version == "" {
 		return domain.ProviderIdentity{}, errors.New("testkit: incomplete provider identity")
 	}
 	return p.Identity, nil
@@ -175,6 +175,14 @@ func (p *ScriptedProvider) Run(ctx context.Context, input contracts.PhaseInput) 
 }
 
 func writeWithin(root, name string, content []byte) error {
+	return WriteFixtureFile(root, name, content)
+}
+
+// WriteFixtureFile writes a test fixture file only after walking each parent
+// component without following symlinks. It intentionally fails before creating
+// a child of a symlinked directory, so hostile fixtures cannot mutate outside
+// their worktree even on a rejected write.
+func WriteFixtureFile(root, name string, content []byte) error {
 	if root == "" || filepath.IsAbs(name) {
 		return errors.New("testkit: invalid fixture path")
 	}
@@ -195,17 +203,15 @@ func writeWithin(root, name string, content []byte) error {
 		return errors.New("testkit: fixture worktree is not a directory")
 	}
 
-	path := filepath.Join(rootPath, clean)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create fixture directory: %w", err)
+	parts := strings.Split(clean, string(filepath.Separator))
+	parent := resolvedRoot
+	for _, part := range parts[:len(parts)-1] {
+		parent, err = fixtureDirectory(parent, part)
+		if err != nil {
+			return err
+		}
 	}
-	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(path))
-	if err != nil {
-		return fmt.Errorf("resolve fixture parent: %w", err)
-	}
-	if !pathWithin(resolvedRoot, resolvedParent) {
-		return errors.New("testkit: fixture path escapes worktree through symlink")
-	}
+	path := filepath.Join(parent, parts[len(parts)-1])
 	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("testkit: fixture path is a symlink")
 	} else if err != nil && !os.IsNotExist(err) {
@@ -214,7 +220,23 @@ func writeWithin(root, name string, content []byte) error {
 	return os.WriteFile(path, content, 0o644)
 }
 
-func pathWithin(root, path string) bool {
-	rel, err := filepath.Rel(root, path)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+func fixtureDirectory(parent, component string) (string, error) {
+	path := filepath.Join(parent, component)
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		if err := os.Mkdir(path, 0o755); err != nil && !os.IsExist(err) {
+			return "", fmt.Errorf("create fixture directory: %w", err)
+		}
+		info, err = os.Lstat(path)
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect fixture directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("testkit: fixture path escapes worktree through symlink")
+	}
+	if !info.IsDir() {
+		return "", errors.New("testkit: fixture path parent is not a directory")
+	}
+	return path, nil
 }

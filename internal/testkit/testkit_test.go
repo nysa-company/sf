@@ -191,10 +191,10 @@ func TestScriptedProviderWritesInSortedOrderAndRejectsSymlinkEscape(t *testing.T
 	if err := os.Symlink(outside, filepath.Join(worktree, "a")); err != nil {
 		t.Fatal(err)
 	}
-	provider := NewScriptedProvider(domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Version: "v1"})
+	provider := NewScriptedProvider(domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "v1"})
 	provider.Default = ProviderStep{WriteFiles: map[string][]byte{
-		"z.txt": []byte("must not be written before a failing path\n"),
-		"a/out": []byte("must not escape\n"),
+		"z.txt":        []byte("must not be written before a failing path\n"),
+		"a/newdir/out": []byte("must not escape\n"),
 	}}
 	_, err := provider.Run(context.Background(), contracts.PhaseInput{
 		Ticket:   domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-1"},
@@ -206,6 +206,32 @@ func TestScriptedProviderWritesInSortedOrderAndRejectsSymlinkEscape(t *testing.T
 	}
 	if _, err := os.Stat(filepath.Join(worktree, "z.txt")); !os.IsNotExist(err) {
 		t.Fatalf("nondeterministic partial write occurred before rejected path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "newdir")); !os.IsNotExist(err) {
+		t.Fatalf("symlinked parent was mutated before rejection: %v", err)
+	}
+}
+
+func TestScriptedProviderProbeRequiresCompleteIdentity(t *testing.T) {
+	complete := domain.ProviderIdentity{Provider: "fixture", Model: "model", Family: "family", Version: "v1"}
+	for _, missing := range []string{"provider", "model", "family", "version"} {
+		identity := complete
+		switch missing {
+		case "provider":
+			identity.Provider = ""
+		case "model":
+			identity.Model = ""
+		case "family":
+			identity.Family = ""
+		case "version":
+			identity.Version = ""
+		}
+		if _, err := NewScriptedProvider(identity).Probe(context.Background()); err == nil {
+			t.Fatalf("Probe accepted identity missing %s", missing)
+		}
+	}
+	if got, err := NewScriptedProvider(complete).Probe(context.Background()); err != nil || got != complete {
+		t.Fatalf("Probe complete identity = %#v, err=%v", got, err)
 	}
 }
 
@@ -219,19 +245,26 @@ func TestFakeProviderRejectsEscapingWritesAndBoundsChildren(t *testing.T) {
 	command := exec.Command(fixture, "--write=../escape")
 	command.Dir = worktree
 	output, err := command.CombinedOutput()
-	if err == nil || !strings.Contains(string(output), "write path must be relative") {
+	if err == nil || !strings.Contains(string(output), "fixture path escapes worktree") {
 		t.Fatalf("escaping write result: err=%v output=%q", err, output)
 	}
 	if _, err := os.Stat(escape); !os.IsNotExist(err) {
 		t.Fatalf("escaping write created %s: %v", escape, err)
 	}
-	if err := os.Symlink(filepath.Dir(worktree), filepath.Join(worktree, "link")); err != nil {
+	outside := filepath.Join(filepath.Dir(worktree), "outside")
+	if err := os.Mkdir(outside, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	command = exec.Command(fixture, "--write=link/escape")
+	if err := os.Symlink(outside, filepath.Join(worktree, "link")); err != nil {
+		t.Fatal(err)
+	}
+	command = exec.Command(fixture, "--write=link/newdir/escape")
 	command.Dir = worktree
 	if output, err = command.CombinedOutput(); err == nil || !strings.Contains(string(output), "escapes worktree through symlink") {
 		t.Fatalf("symlink write result: err=%v output=%q", err, output)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "newdir")); !os.IsNotExist(err) {
+		t.Fatalf("subprocess symlinked parent was mutated before rejection: %v", err)
 	}
 	command = exec.Command(fixture, "--duration=3s")
 	if output, err = command.CombinedOutput(); err == nil || !strings.Contains(string(output), "duration must be") {
