@@ -58,14 +58,19 @@ semantics. A next action always contains a non-empty argv.
 ## Direct setup and diagnostics
 
 `doctor`, `auth status`, `auth login`, `init`, and `providers qualify` are direct
-local setup/diagnostic commands. In this development shell they report
+local setup/diagnostic commands. Doctor performs read-only checks for the
+channel root, socket, disk space, Git/gh executables, and an optional
+repository worktree. It reports typed check records, keeps
+`autonomous_eligible` false, and never treats missing Docker or Colima as an
+error. The auth/init/qualification commands currently report
 `not_configured` with a safe next action; they do not contact a provider, call
 `gh`, ask for a token, start a daemon, or mutate workflow state. A production
 implementation may wire these commands to the approved local setup adapters
 without changing their response grammar.
 
-`daemon run` is the foreground entry point for development and tests. Its
-socket-backed lifecycle commands use the channel-specific owner-only socket.
+`daemon run` is the foreground entry point for development and tests (for
+example, `sf-dev daemon run`). Its socket-backed lifecycle commands use the
+channel-specific owner-only socket.
 
 ## Operator identity
 

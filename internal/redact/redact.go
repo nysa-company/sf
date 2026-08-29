@@ -5,12 +5,13 @@ package redact
 import (
 	"encoding/json"
 	"regexp"
+	"sort"
 	"strings"
 )
 
 var (
-	assignment  = regexp.MustCompile(`(?i)\b(token|password|passwd|secret|api[_-]?key|private[_-]?key|authorization|credential)\b\s*[:=]\s*([^\s,;}&]+)`)
-	header      = regexp.MustCompile(`(?i)\b(authorization|proxy-authorization)\s*:\s*([^\r\n\s]+(?:\s+[^\r\n\s]+)?)`)
+	assignment  = regexp.MustCompile(`(?i)((?:^|[^a-z0-9_])(?:[a-z0-9_]*[_-])?(token|password|passwd|secret|api[_-]?key|private[_-]?key|authorization|credential|session|cookie)\b\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}&]+)`)
+	header      = regexp.MustCompile(`(?i)(\b(authorization|proxy-authorization)\s*:\s*)(?:\r?\n[ \t]+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n\s]+(?:\s+[^\r\n\s]+)?)`)
 	urlUserInfo = regexp.MustCompile(`(?i)(https?://)([^/@\s:]+):([^/@\s]+)@`)
 	urlQuery    = regexp.MustCompile(`(?i)([?&](?:token|password|secret|api[_-]?key|access_token|refresh_token)=)([^&\s]+)`)
 )
@@ -32,16 +33,26 @@ func NewPolicy(home string, roots map[string]string) Policy {
 }
 
 func (p Policy) String(value string) string {
-	for path, label := range p.Roots {
+	paths := make([]string, 0, len(p.Roots))
+	for path := range p.Roots {
 		if path != "" {
-			value = strings.ReplaceAll(value, path, label)
+			paths = append(paths, path)
 		}
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		if len(paths[i]) != len(paths[j]) {
+			return len(paths[i]) > len(paths[j])
+		}
+		return paths[i] < paths[j]
+	})
+	for _, path := range paths {
+		value = strings.ReplaceAll(value, path, p.Roots[path])
 	}
 	if p.Home != "" {
 		value = strings.ReplaceAll(value, p.Home, "$HOME")
 	}
 	value = header.ReplaceAllString(value, `${1}: [REDACTED]`)
-	value = assignment.ReplaceAllString(value, `${1}=[REDACTED]`)
+	value = assignment.ReplaceAllString(value, `${1}[REDACTED]`)
 	value = urlUserInfo.ReplaceAllString(value, `${1}[REDACTED]@`)
 	value = urlQuery.ReplaceAllString(value, `${1}[REDACTED]`)
 	return value
@@ -53,7 +64,9 @@ func String(value string) string { return (Policy{}).String(value) }
 // Invalid JSON is treated as text and redacted without attempting to parse it.
 func (p Policy) JSON(data []byte) []byte {
 	var value any
-	if err := json.Unmarshal(data, &value); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
 		return []byte(p.String(string(data)))
 	}
 	redacted := redactValue(p, value)
@@ -88,7 +101,7 @@ func redactValue(policy Policy, value any) any {
 
 func isSecretKey(key string) bool {
 	key = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), " ", "_"))
-	for _, word := range []string{"token", "password", "passwd", "secret", "api_key", "private_key", "authorization", "credential"} {
+	for _, word := range []string{"token", "password", "passwd", "secret", "api_key", "private_key", "authorization", "credential", "session", "cookie"} {
 		if key == word || strings.Contains(key, word) {
 			return true
 		}

@@ -52,3 +52,22 @@ func TestProjectionRejectsOutOfOrderEvents(t *testing.T) {
 		t.Fatal("expected ordering error")
 	}
 }
+
+func TestRebuildRejectsSymlinkedParentBeforeWriting(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(link, "events.ndjson")
+	if err := (Projector{}).Rebuild(context.Background(), fixtureEvents(), path); err == nil {
+		t.Fatal("expected symlinked parent rejection")
+	}
+	if _, err := os.Stat(filepath.Join(target, "events.ndjson")); !os.IsNotExist(err) {
+		t.Fatalf("symlink target was written: %v", err)
+	}
+}

@@ -12,6 +12,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
@@ -101,7 +103,7 @@ func (p Projector) Rebuild(ctx context.Context, source Source, path string) erro
 	if path == "" || filepath.IsAbs(path) == false {
 		return errors.New("event projection path must be absolute")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := validateProjectionPath(path); err != nil {
 		return err
 	}
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".events-*")
@@ -119,6 +121,10 @@ func (p Projector) Rebuild(ctx context.Context, source Source, path string) erro
 		_ = temporary.Close()
 		return err
 	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
 	if err := temporary.Close(); err != nil {
 		return err
 	}
@@ -126,4 +132,51 @@ func (p Projector) Rebuild(ctx context.Context, source Source, path string) erro
 		return err
 	}
 	return os.Rename(temporaryPath, path)
+}
+
+// validateProjectionPath refuses symlinked path components before creating a
+// temporary file. The containing directory must be owned by this user; system
+// ancestors (for example /Users or /tmp) are allowed to be root-owned while
+// still being checked for symlink traversal.
+func validateProjectionPath(path string) error {
+	parent := filepath.Dir(filepath.Clean(path))
+	for current := parent; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("event projection parent is unavailable: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if !allowedSystemSymlink(current) {
+				return errors.New("event projection parent contains a symlink")
+			}
+		} else if !info.IsDir() {
+			return errors.New("event projection parent is not a directory")
+		}
+		if current == filepath.Dir(current) {
+			break
+		}
+	}
+	parentInfo, err := os.Lstat(parent)
+	if err != nil {
+		return err
+	}
+	if owner, ok := projectionOwner(parentInfo); !ok || owner != uint32(os.Geteuid()) {
+		return errors.New("event projection parent is not owned by the current user")
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("event projection target is a symlink")
+	}
+	return nil
+}
+
+func allowedSystemSymlink(path string) bool {
+	return runtime.GOOS == "darwin" && (path == "/tmp" || path == "/var")
+}
+
+func projectionOwner(info os.FileInfo) (uint32, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return uint32(stat.Uid), true
 }
