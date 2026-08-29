@@ -139,12 +139,14 @@ func (r TicketRef) Validate() error {
 }
 
 type CandidateSnapshot struct {
-	Generation          uint64
-	BaseSHA             string
-	HeadSHA             string
-	TreeSHA             string
-	ProofDigest         string
-	CommandPolicyDigest string
+	Generation               uint64
+	BaseSHA                  string
+	HeadSHA                  string
+	TreeSHA                  string
+	SourceDigest             string
+	VerificationIntentDigest string
+	ProofDigest              string
+	CommandPolicyDigest      string
 }
 
 type Fence struct {
