@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -88,5 +89,70 @@ func TestJSONRenderingPreservesResponseEnvelope(t *testing.T) {
 	}
 	if !decoded.OK || decoded.Version != api.Version || string(decoded.Data) != `{"state":"queued"}` {
 		t.Fatalf("decoded=%+v", decoded)
+	}
+}
+
+func TestSocketRequestReceivesExecuteContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var received context.Context
+	client := fakeClient(func(got context.Context, _ api.Request) (api.Response, error) {
+		received = got
+		return api.Response{}, errors.New("canceled")
+	})
+	if code := Execute(ctx, []string{"status", "SF-1"}, &bytes.Buffer{}, &bytes.Buffer{}, client); code != int(ExitWait) {
+		t.Fatalf("exit=%d", code)
+	}
+	if received == nil || !errors.Is(received.Err(), context.Canceled) {
+		t.Fatalf("request context was not propagated: %v", received)
+	}
+}
+
+func TestInvalidDaemonFailureGetsSafeInternalJSONResponse(t *testing.T) {
+	client := fakeClient(func(context.Context, api.Request) (api.Response, error) {
+		return api.Response{Version: api.Version, RequestID: "request", Mutation: api.Mutation{}, Error: &api.Error{Code: "blocked_process", Message: "blocked"}}, nil
+	})
+	var output bytes.Buffer
+	if code := Execute(context.Background(), []string{"start", "SF-1", "--json"}, &output, &bytes.Buffer{}, client); code != int(ExitInternal) {
+		t.Fatalf("exit=%d output=%s", code, output.String())
+	}
+	var response api.Response
+	if err := json.Unmarshal(output.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != "internal_error" || response.NextAction == nil || len(response.NextAction.Argv) == 0 {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestIncompatibleDaemonEnvelopeGetsCompatibilityExit(t *testing.T) {
+	client := fakeClient(func(context.Context, api.Request) (api.Response, error) {
+		return api.Response{Version: "sf.local/v0", RequestID: "request", Mutation: api.Mutation{}, OK: true}, nil
+	})
+	var output bytes.Buffer
+	if code := Execute(context.Background(), []string{"status", "SF-1", "--json"}, &output, &bytes.Buffer{}, client); code != int(ExitCompatibility) {
+		t.Fatalf("exit=%d output=%s", code, output.String())
+	}
+	var response api.Response
+	if err := json.Unmarshal(output.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != "protocol_incompatible" {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestRequestIDsAreNotTimestampOnly(t *testing.T) {
+	first, second := requestID(), requestID()
+	if first == second || !strings.HasPrefix(first, "cli-") {
+		t.Fatalf("request IDs are not unique: %q %q", first, second)
+	}
+}
+
+func TestSetupFlagsAreRequired(t *testing.T) {
+	for _, args := range [][]string{{"init"}, {"providers", "qualify"}} {
+		if code := Execute(context.Background(), args, &bytes.Buffer{}, &bytes.Buffer{}, nil); code != int(ExitInput) {
+			t.Errorf("args=%v exit=%d", args, code)
+		}
 	}
 }

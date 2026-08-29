@@ -2,11 +2,14 @@ package cli
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -23,6 +26,7 @@ type app struct {
 	json    bool
 	channel domain.Channel
 	last    *api.Response
+	ctx     context.Context
 }
 
 // NewCommand returns the public CLI. The client is injected so command tests
@@ -42,7 +46,7 @@ func newApp(client Client, out, errOut io.Writer) *app {
 	if !channel.Valid() {
 		channel = domain.ChannelStable
 	}
-	return &app{client: client, out: out, errOut: errOut, channel: channel}
+	return &app{client: client, out: out, errOut: errOut, channel: channel, ctx: context.Background()}
 }
 
 func (a *app) command() *cobra.Command {
@@ -53,6 +57,7 @@ func (a *app) command() *cobra.Command {
 		SilenceUsage:  true,
 		Args:          cobra.NoArgs,
 	}
+	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) { a.ctx = cmd.Context() }
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "render the versioned JSON response")
 	root.AddCommand(a.submitCommand(), a.startCommand(), a.statusCommand(), a.showCommand(), a.logsCommand(), a.controlCommand("pause"), a.controlCommand("resume"), a.recoverCommand(), a.controlCommand("cancel"), a.retryCommand(), a.controlCommand("take"), a.approveCommand(), a.rejectCommand(), a.doctorCommand(), a.authCommand(), a.initCommand(), a.providersCommand(), a.daemonCommand(), a.simpleSetupCommand("config"), a.simpleSetupCommand("update"), a.simpleSetupCommand("rollback"), a.versionCommand())
 	return root
@@ -86,17 +91,45 @@ func (a *app) request(method, ticket string, params any) api.Response {
 	if values, ok := params.(map[string]any); ok {
 		operator, _ = values["operator"].(string)
 	}
-	response, err := a.client.Call(context.Background(), api.Request{Version: api.Version, RequestID: requestID(), Method: method, Ticket: ticket, OperatorLabel: operator, Parameters: data})
+	response, err := a.client.Call(a.context(), api.Request{Version: api.Version, RequestID: requestID(), Method: method, Ticket: ticket, OperatorLabel: operator, Parameters: data})
 	if err != nil {
 		return failure("daemon_unavailable", "the local daemon is unavailable", []string{binaryName(), "daemon", "run"})
 	}
+	if err := validateCLIResponse(response); err != nil {
+		code := "internal_error"
+		if response.Version != "" && response.Version != api.Version {
+			code = "protocol_incompatible"
+		}
+		return failure(code, "the daemon returned an invalid response: "+err.Error(), []string{binaryName(), "--help"})
+	}
 	return response
+}
+
+func (a *app) context() context.Context {
+	if a.ctx != nil {
+		return a.ctx
+	}
+	return context.Background()
 }
 
 func (a *app) emit(response api.Response) error {
 	copy := response
 	a.last = &copy
-	return Render(a.out, response, a.json)
+	if err := Render(a.out, response, a.json); err == nil {
+		return nil
+	} else {
+		code := "internal_error"
+		if response.Version != "" && response.Version != api.Version {
+			code = "protocol_incompatible"
+		}
+		fallback := failure(code, "could not render the daemon response: "+err.Error(), []string{binaryName(), "--help"})
+		a.last = &fallback
+		// The response has already been classified as an internal/compatibility
+		// failure. A second writer failure must not be reclassified as a Cobra
+		// input error (or trigger a second response envelope).
+		_ = Render(a.out, fallback, a.json)
+		return nil
+	}
 }
 
 func failure(code, message string, argv []string) api.Response {
@@ -107,7 +140,18 @@ func notConfigured(command string) api.Response {
 	return failure("not_configured", command+" is not configured in this build", []string{binaryName(), "--help"})
 }
 
-func requestID() string { return fmt.Sprintf("cli-%d", time.Now().UnixNano()) }
+var fallbackRequestSequence uint64
+
+func requestID() string {
+	var random [16]byte
+	if _, err := cryptorand.Read(random[:]); err == nil {
+		return fmt.Sprintf("cli-%x", random)
+	}
+	// Keep the fallback unique within a process and include process/time
+	// entropy for callers running without a functioning system CSPRNG.
+	sequence := atomic.AddUint64(&fallbackRequestSequence, 1)
+	return "cli-fallback-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "-" + strconv.FormatInt(int64(os.Getpid()), 36) + "-" + strconv.FormatUint(sequence, 36)
+}
 
 func binaryName() string {
 	name := filepath.Base(os.Args[0])
@@ -216,10 +260,8 @@ func (a *app) rejectCommand() *cobra.Command {
 func (a *app) doctorCommand() *cobra.Command {
 	var repo string
 	command := &cobra.Command{Use: "doctor", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		response := notConfigured("doctor")
-		response.Error.Code = "doctor_not_configured"
-		response.Error.Message = "doctor is not configured in this build; no checks or mutations were run"
-		return a.emit(response)
+		report := RunDoctor(cmd.Context(), DoctorDeps{Channel: a.channel, Repo: repo})
+		return a.emit(reportResponse(report))
 	}}
 	command.Flags().StringVar(&repo, "repo", "", "trusted repository path")
 	return command
@@ -237,6 +279,8 @@ func (a *app) initCommand() *cobra.Command {
 	command := &cobra.Command{Use: "init --project <name> --repo <path>", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error { return a.emit(notConfigured("init")) }}
 	command.Flags().StringVar(&project, "project", "", "project name")
 	command.Flags().StringVar(&repo, "repo", "", "trusted repository path")
+	_ = command.MarkFlagRequired("project")
+	_ = command.MarkFlagRequired("repo")
 	return command
 }
 
@@ -246,13 +290,15 @@ func (a *app) providersCommand() *cobra.Command {
 	qualify := &cobra.Command{Use: "qualify --builder <provider> --reviewer <provider>", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error { return a.emit(notConfigured("providers qualify")) }}
 	qualify.Flags().StringVar(&builder, "builder", "", "builder provider")
 	qualify.Flags().StringVar(&reviewer, "reviewer", "", "independent reviewer provider")
+	_ = qualify.MarkFlagRequired("builder")
+	_ = qualify.MarkFlagRequired("reviewer")
 	root.AddCommand(qualify)
 	return root
 }
 
 func (a *app) daemonCommand() *cobra.Command {
 	root := &cobra.Command{Use: "daemon", Args: cobra.NoArgs}
-	root.AddCommand(&cobra.Command{Use: "run", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error { return a.emit(notConfigured("daemon run")) }})
+	root.AddCommand(&cobra.Command{Use: "run", Short: "run the channel daemon in the foreground", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error { return a.emit(notConfigured("daemon run")) }})
 	return root
 }
 

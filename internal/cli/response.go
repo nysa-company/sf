@@ -33,7 +33,7 @@ func exitCode(response api.Response) ExitCode {
 	switch response.Error.Code {
 	case "invalid_command", "invalid_ticket", "invalid_argument":
 		return ExitInput
-	case "operator_action_required", "provider_auth_missing", "blocked_process", "uncertain_effect", "not_configured", "doctor_not_configured":
+	case "operator_action_required", "provider_auth_missing", "blocked_process", "uncertain_effect", "not_configured", "doctor_not_configured", "doctor_failed":
 		return ExitAction
 	case "daemon_unavailable", "provider_waiting", "checks_pending":
 		return ExitWait
@@ -55,10 +55,27 @@ func nextAction(response api.Response) *domain.NextAction {
 	return &copy
 }
 
+// validateCLIResponse tightens the wire envelope for a command boundary. The
+// API validator permits a failed response without next_action so that daemon
+// decoding can remain a structural check; the CLI must never expose such a
+// response to an operator or automation.
+func validateCLIResponse(response api.Response) error {
+	if err := response.Validate(); err != nil {
+		return err
+	}
+	if !response.OK {
+		action := nextAction(response)
+		if action == nil || strings.TrimSpace(action.Argv[0]) == "" {
+			return errors.New("failed response requires one non-empty executable next action")
+		}
+	}
+	return nil
+}
+
 // Render writes either the human response or the exact API response JSON. It
 // does not derive separate semantics for the two formats.
 func Render(writer io.Writer, response api.Response, jsonOutput bool) error {
-	if err := response.Validate(); err != nil {
+	if err := validateCLIResponse(response); err != nil {
 		return err
 	}
 	if jsonOutput {
@@ -94,6 +111,14 @@ func Render(writer io.Writer, response api.Response, jsonOutput bool) error {
 	} else {
 		if _, err := io.WriteString(writer, "Mutation: none\n"); err != nil {
 			return err
+		}
+	}
+	if len(response.Data) > 0 && string(response.Data) != "null" {
+		var value any
+		if err := json.Unmarshal(response.Data, &value); err == nil {
+			if _, err := fmt.Fprintf(writer, "Data: %s\n", stableJSON(value)); err != nil {
+				return err
+			}
 		}
 	}
 	if action := nextAction(response); action != nil {
