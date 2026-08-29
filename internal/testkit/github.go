@@ -583,7 +583,11 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 			if err := f.AuthStatus(context.Background()); err != nil {
 				return nil, err
 			}
-			return json.Marshal(map[string]any{"hosts": map[string]any{"github.com": []map[string]string{{"login": "sf-test"}}}})
+			return json.Marshal(map[string]any{
+				"hosts": map[string]any{
+					"github.com": []map[string]any{{"login": "sf-test", "active": true, "state": "active", "scopes": "repo", "protocol": "https"}},
+				},
+			})
 		}
 		return []byte("authenticated\n"), f.AuthStatus(context.Background())
 	}

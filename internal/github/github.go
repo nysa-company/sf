@@ -5,6 +5,8 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,13 +70,17 @@ var _ contracts.GitHub = (*Client)(nil)
 func (c Client) AuthStatus(ctx context.Context) error {
 	var auth struct {
 		Hosts map[string][]struct {
-			Login string `json:"login"`
+			Login    string `json:"login"`
+			Active   bool   `json:"active"`
+			State    string `json:"state"`
+			Scopes   string `json:"scopes"`
+			Protocol string `json:"protocol"`
 		} `json:"hosts"`
 	}
 	if err := c.json(ctx, &auth, "auth", "status", "--json", "hosts"); err != nil {
 		return err
 	}
-	if len(auth.Hosts["github.com"]) != 1 || auth.Hosts["github.com"][0].Login == "" {
+	if _, err := activeLogin(auth.Hosts); err != nil {
 		return ErrMalformedResponse
 	}
 	return nil
@@ -96,7 +102,7 @@ func (c Client) FindPullRequest(ctx context.Context, identity contracts.PullRequ
 	return match.Identity, true, nil
 }
 func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
-	if err := c.validateClaim(ctx, durable, identity, "draft_pr"); err != nil {
+	if err := c.validateClaim(ctx, durable, identity, "draft_pr", requestDigest("draft_pr", identity, title, body)); err != nil {
 		return contracts.PullRequestIdentity{}, err
 	}
 	plan := EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}
@@ -104,16 +110,24 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 	return match.Identity, err
 }
 func (c Client) UpdatePullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) error {
-	if err := c.validateClaim(ctx, durable, identity, "pr_update"); err != nil {
+	observed, err := c.Observe(ctx, identity)
+	if err != nil {
 		return err
 	}
-	return c.updateOrObserve(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, PRMatch{Identity: identity}, title, body)
+	identity = observed.Identity
+	if err := c.validateClaim(ctx, durable, identity, "pr_update", requestDigest("pr_update", identity, title, body)); err != nil {
+		return err
+	}
+	return c.updateOrObserve(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, observed, title, body)
 }
 func (c Client) RequiredChecks(ctx context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
 	return c.checks(ctx, identity)
 }
 func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
-	if err := c.validateClaim(ctx, durable, identity, "pr_ready"); err != nil {
+	if _, err := c.Observe(ctx, identity); err != nil {
+		return err
+	}
+	if err := c.validateClaim(ctx, durable, identity, "pr_ready", requestDigest("pr_ready", identity)); err != nil {
 		return err
 	}
 	_, err := c.run(ctx, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository))
@@ -128,21 +142,34 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 }
 
 func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, headOID, method string, authorization domain.MergeAuthorization) error {
-	if err := c.validateClaim(ctx, durable, identity, "merge"); err != nil {
+	observed, err := c.Observe(ctx, identity)
+	if err != nil {
+		return err
+	}
+	identity = observed.Identity
+	if err := c.validateClaim(ctx, durable, identity, "merge", requestDigest("merge", identity, headOID, method)); err != nil {
 		return err
 	}
 	if !authorization.Approved || !authorization.GatesGreen || authorization.ReviewedHead != headOID || authorization.CurrentHead != headOID {
 		return ErrApprovalInvalid
 	}
-	_, err := c.merge(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, PRMatch{Identity: identity}, headOID, domain.MergeGuarded, method)
+	_, err = c.merge(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, PRMatch{Identity: identity}, headOID, domain.MergeGuarded, method)
 	return err
 }
 
-func (c Client) validateClaim(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, requiredKind string) error {
-	if c.ValidateClaim == nil || claim.SemanticKey == "" || claim.Kind != requiredKind || !validIdentity(identity) {
+func (c Client) validateClaim(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, requiredKind, digest string) error {
+	if c.ValidateClaim == nil || claim.SemanticKey == "" || claim.Kind != requiredKind || claim.RequestDigest != digest || !validIdentity(identity) {
 		return ErrPolicyRefusal
 	}
 	return c.ValidateClaim(ctx, claim)
+}
+func requestDigest(operation string, identity contracts.PullRequestIdentity, values ...string) string {
+	input := operation + "\x00" + repoArg(identity.Repository) + "\x00" + identity.HeadOwner + "\x00" + identity.HeadRepository + "\x00" + identity.HeadRef + "\x00" + identity.HeadOID + "\x00" + identity.BaseRef
+	for _, value := range values {
+		input += "\x00" + value
+	}
+	sum := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(sum[:])
 }
 
 func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryIdentity) (Principal, error) {
@@ -151,13 +178,18 @@ func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryId
 	}
 	var auth struct {
 		Hosts map[string][]struct {
-			Login string `json:"login"`
+			Login    string `json:"login"`
+			Active   bool   `json:"active"`
+			State    string `json:"state"`
+			Scopes   string `json:"scopes"`
+			Protocol string `json:"protocol"`
 		} `json:"hosts"`
 	}
 	if err := c.json(ctx, &auth, "auth", "status", "--json", "hosts"); err != nil {
 		return Principal{}, err
 	}
-	if len(auth.Hosts["github.com"]) != 1 || auth.Hosts["github.com"][0].Login == "" {
+	login, err := activeLogin(auth.Hosts)
+	if err != nil {
 		return Principal{}, ErrMalformedResponse
 	}
 	var repo struct {
@@ -170,7 +202,29 @@ func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryId
 	if repo.NameWithOwner != repository.Owner+"/"+repository.Name || repo.URL == "" {
 		return Principal{}, fmt.Errorf("%w: repository preflight mismatch", ErrPolicyRefusal)
 	}
-	return Principal{Login: auth.Hosts["github.com"][0].Login}, nil
+	return Principal{Login: login}, nil
+}
+
+func activeLogin(hosts map[string][]struct {
+	Login    string `json:"login"`
+	Active   bool   `json:"active"`
+	State    string `json:"state"`
+	Scopes   string `json:"scopes"`
+	Protocol string `json:"protocol"`
+}) (string, error) {
+	active := ""
+	for _, host := range hosts["github.com"] {
+		if host.Active && host.Login != "" && (host.State == "" || host.State == "active") {
+			if active != "" {
+				return "", ErrMalformedResponse
+			}
+			active = host.Login
+		}
+	}
+	if active == "" {
+		return "", ErrMalformedResponse
+	}
+	return active, nil
 }
 
 func (c Client) Plan(identity contracts.PullRequestIdentity, semanticKey string) (EffectPlan, error) {
@@ -194,8 +248,11 @@ func (c Client) Observe(ctx context.Context, want contracts.PullRequestIdentity)
 		return PRMatch{}, ErrPolicyRefusal
 	}
 	var values []prWire
-	if err := c.json(ctx, &values, "pr", "list", "--repo", repoArg(want.Repository), "--state", "all", "--json", prFields); err != nil {
+	if err := c.json(ctx, &values, "pr", "list", "--repo", repoArg(want.Repository), "--state", "all", "--limit", "100", "--json", prFields); err != nil {
 		return PRMatch{}, err
+	}
+	if len(values) == 100 {
+		return PRMatch{}, ErrAmbiguousPR
 	}
 	var matches []PRMatch
 	for _, value := range values {
@@ -528,10 +585,10 @@ func (c Client) binary() string {
 	if c.Binary != "" {
 		return c.Binary
 	}
-	return "gh"
+	return ""
 }
 func (c Client) environment() ([]string, error) {
-	if c.Home == "" || !filepath.IsAbs(c.Home) || c.ConfigDir == "" || !filepath.IsAbs(c.ConfigDir) {
+	if c.Home == "" || !filepath.IsAbs(c.Home) || c.ConfigDir == "" || !filepath.IsAbs(c.ConfigDir) || c.Binary == "" || !filepath.IsAbs(c.Binary) {
 		return nil, ErrPolicyRefusal
 	}
 	env := []string{"HOME=" + c.Home, "GH_CONFIG_DIR=" + c.ConfigDir, "GH_PROMPT_DISABLED=1", "GIT_TERMINAL_PROMPT=0", "NO_COLOR=1", "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
@@ -545,7 +602,7 @@ func (c Client) environment() ([]string, error) {
 }
 
 func boundedGHContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if _, ok := parent.Deadline(); ok {
+	if deadline, ok := parent.Deadline(); ok && time.Until(deadline) <= 2*time.Minute {
 		return parent, func() {}
 	}
 	return context.WithTimeout(parent, 2*time.Minute)

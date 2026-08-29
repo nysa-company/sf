@@ -39,7 +39,7 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 
 func TestContractMutationRequiresClaimValidator(t *testing.T) {
 	client, _, identity := fixture(t)
-	claim := domain.ExternalEffectClaim{SemanticKey: "k", Kind: "draft_pr"}
+	claim := domain.ExternalEffectClaim{SemanticKey: "k", Kind: "draft_pr", RequestDigest: requestDigest("draft_pr", identity, "title", "body")}
 	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); err != nil {
 		t.Fatalf("validated claim=%v", err)
 	}
@@ -143,7 +143,7 @@ func TestUpdateAndReadyReconcileOnlyExactObservedState(t *testing.T) {
 	if err := fake.SetResponse("pr_ready", testkit.ResponseDropAfterCall); err != nil {
 		t.Fatal(err)
 	}
-	durable := domain.ExternalEffectClaim{SemanticKey: "ready", Kind: "pr_ready"}
+	durable := domain.ExternalEffectClaim{SemanticKey: "ready", Kind: "pr_ready", RequestDigest: requestDigest("pr_ready", pr.Identity)}
 	if err := client.MarkReady(context.Background(), durable, pr.Identity); err != nil {
 		t.Fatalf("ready reconciliation=%v", err)
 	}
@@ -161,7 +161,7 @@ func TestChecksAllowExtrasButFailureDominatesPending(t *testing.T) {
 }
 
 func TestStrictJSONBoundedSanitizedCommandBoundary(t *testing.T) {
-	client := Client{Home: t.TempDir(), ConfigDir: filepath.Join(t.TempDir(), "gh-config"), Run: func(context.Context, string, []string, []string) ([]byte, error) {
+	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: filepath.Join(t.TempDir(), "gh-config"), Run: func(context.Context, string, []string, []string) ([]byte, error) {
 		return []byte(`{"unknown":true}`), nil
 	}}
 	var value struct{}
