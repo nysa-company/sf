@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -18,9 +19,25 @@ var (
 	ErrBusy       = errors.New("sqlite write deadline exceeded")
 	ErrStaleFence = errors.New("ticket fence is stale")
 	ErrNotFound   = errors.New("store row not found")
+	ErrEffectBusy = errors.New("effect already has a live claim")
+	ErrEffectKey  = errors.New("effect semantic key conflicts with durable record")
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
+
+var migrationChecksums = map[int]string{
+	1: migrationChecksum(migrationV1),
+	2: migrationChecksum(migrationV2),
+}
+
+func migrationChecksum(statements []string) string {
+	hash := sha256.New()
+	for _, statement := range statements {
+		_, _ = hash.Write([]byte(statement))
+		_, _ = hash.Write([]byte{0})
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil))
+}
 
 type Store struct{ db *sql.DB }
 
@@ -79,7 +96,15 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.integrity(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := s.migrate(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := s.validateSchema(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -114,18 +139,32 @@ func (s *Store) migrate(ctx context.Context) error {
 	if current > schemaVersion {
 		return fmt.Errorf("database schema %d is newer than supported %d", current, schemaVersion)
 	}
-	if current == schemaVersion {
-		return nil
-	}
-	return s.write(ctx, func(conn *sql.Conn) error {
-		for _, statement := range migrationV1 {
-			if _, err := conn.ExecContext(ctx, statement); err != nil {
-				return fmt.Errorf("run migration %d: %w", schemaVersion, err)
+	for version := current + 1; version <= schemaVersion; version++ {
+		version := version
+		if err := s.write(ctx, func(conn *sql.Conn) error {
+			statements := migrationV1
+			if version == 2 {
+				statements = migrationV2
 			}
+			for _, statement := range statements {
+				if _, err := conn.ExecContext(ctx, statement); err != nil {
+					return fmt.Errorf("run migration %d: %w", version, err)
+				}
+			}
+			if version == 1 {
+				_, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, version, time.Now().UTC().Format(time.RFC3339Nano))
+				return err
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE schema_migrations SET checksum=? WHERE version=1`, migrationChecksums[1]); err != nil {
+				return err
+			}
+			_, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)`, version, time.Now().UTC().Format(time.RFC3339Nano), migrationChecksums[version])
+			return err
+		}); err != nil {
+			return err
 		}
-		_, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, schemaVersion, time.Now().UTC().Format(time.RFC3339Nano))
-		return err
-	})
+	}
+	return nil
 }
 
 // write begins an IMMEDIATE transaction and retries only locally, only while
@@ -151,11 +190,14 @@ func (s *Store) write(ctx context.Context, fn func(*sql.Conn) error) error {
 			if err == nil {
 				return nil
 			}
+			if ctx.Err() != nil {
+				return fmt.Errorf("%w: %v", ErrBusy, ctx.Err())
+			}
 		} else if conn != nil {
 			conn.Close()
 		}
 		if !isBusy(err) {
-			return err
+			return normalizeBusy(ctx, err)
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -168,6 +210,16 @@ func (s *Store) write(ctx context.Context, fn func(*sql.Conn) error) error {
 			backoff *= 2
 		}
 	}
+}
+
+func normalizeBusy(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %v", ErrBusy, ctx.Err())
+	}
+	if isBusy(err) {
+		return fmt.Errorf("%w: %v", ErrBusy, err)
+	}
+	return err
 }
 
 func isBusy(err error) bool {
@@ -232,7 +284,7 @@ func (s *Store) Ticket(ctx context.Context, ref domain.TicketRef) (Ticket, error
 		return Ticket{}, ErrNotFound
 	}
 	if err != nil {
-		return Ticket{}, err
+		return Ticket{}, normalizeBusy(ctx, err)
 	}
 	if resume.Valid {
 		ticket.ResumeState = domain.State(resume.String)
@@ -336,7 +388,7 @@ func (s *Store) ReconcileOrphans(ctx context.Context, channel domain.Channel, le
 		if dbEpoch != leaderEpoch {
 			return ErrStaleFence
 		}
-		rows, err := conn.QueryContext(ctx, `SELECT project_id, id, workflow_id, version FROM tickets t
+		rows, err := conn.QueryContext(ctx, `SELECT project_id, id, workflow_id, version, runner_epoch FROM tickets t
 			WHERE channel=? AND state='planning' AND NOT EXISTS (
 				SELECT 1 FROM workflow_owners o WHERE o.channel=t.channel AND o.project_id=t.project_id AND o.ticket_id=t.id
 			)`, channel)
@@ -348,17 +400,31 @@ func (s *Store) ReconcileOrphans(ctx context.Context, channel domain.Channel, le
 			var project domain.ProjectID
 			var ticket domain.TicketID
 			var workflow string
-			var version uint64
-			if err := rows.Scan(&project, &ticket, &workflow, &version); err != nil {
+			var version, runner uint64
+			if err := rows.Scan(&project, &ticket, &workflow, &version, &runner); err != nil {
 				return err
 			}
 			if workflow == "" {
-				if _, err := conn.ExecContext(ctx, `UPDATE tickets SET state='blocked', blocked_code='workflow_ownership_unknown', version=version+1 WHERE channel=? AND project_id=? AND id=?`, channel, project, ticket); err != nil {
+				updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state='blocked', blocked_code='workflow_ownership_unknown', version=version+1 WHERE channel=? AND project_id=? AND id=? AND state='planning' AND version=? AND runner_epoch=?`, channel, project, ticket, version, runner)
+				if err != nil {
+					return err
+				}
+				if changed, _ := updated.RowsAffected(); changed != 1 {
+					return ErrStaleFence
+				}
+				if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'workflow_ownership_unknown', 'planning', 'blocked', '{}', ?)`, channel, project, ticket, version+1, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 					return err
 				}
 				continue
 			}
-			if _, err := conn.ExecContext(ctx, `INSERT INTO workflow_owners(channel, project_id, ticket_id, workflow_id, state, created_at) VALUES (?, ?, ?, ?, 'owned', ?)`, channel, project, ticket, workflow, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			inserted, err := conn.ExecContext(ctx, `INSERT INTO workflow_owners(channel, project_id, ticket_id, workflow_id, state, created_at) SELECT ?, ?, ?, ?, 'owned', ? WHERE EXISTS (SELECT 1 FROM tickets WHERE channel=? AND project_id=? AND id=? AND state='planning' AND version=? AND runner_epoch=?)`, channel, project, ticket, workflow, time.Now().UTC().Format(time.RFC3339Nano), channel, project, ticket, version, runner)
+			if err != nil {
+				return err
+			}
+			if changed, _ := inserted.RowsAffected(); changed != 1 {
+				return ErrStaleFence
+			}
+			if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'workflow_owner_recovered', 'planning', 'planning', '{}', ?)`, channel, project, ticket, version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 				return err
 			}
 		}
@@ -436,17 +502,20 @@ func (s *Store) InvalidateRunner(ctx context.Context, ref domain.TicketRef, expe
 
 // RecordPhaseCompletion is idempotent. The unique phase attempt means a
 // recovered process cannot create a second completed attempt for the same work.
-func (s *Store) RecordPhaseCompletion(ctx context.Context, ref domain.TicketRef, phase domain.Phase, attempt int, fence domain.Fence) (bool, error) {
+func (s *Store) RecordPhaseCompletion(ctx context.Context, ref domain.TicketRef, phase domain.Phase, attempt int, expectedVersion uint64, fence domain.Fence) (bool, error) {
 	inserted := false
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var version, runner uint64
 		if err := conn.QueryRowContext(ctx, `SELECT version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&version, &runner); err != nil {
 			return err
 		}
+		if version != expectedVersion {
+			return ErrStaleFence
+		}
 		if err := s.currentFence(ctx, conn, ref.Channel, version, runner, fence); err != nil {
 			return err
 		}
-		result, err := conn.ExecContext(ctx, `INSERT INTO phase_runs(channel, project_id, ticket_id, phase, attempt, state, leader_epoch, runner_epoch, completed_at) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?) ON CONFLICT(channel, project_id, ticket_id, phase, attempt) DO NOTHING`, ref.Channel, ref.Project, ref.Ticket, phase, attempt, fence.LeaderEpoch, fence.RunnerEpoch, time.Now().UTC().Format(time.RFC3339Nano))
+		result, err := conn.ExecContext(ctx, `INSERT INTO phase_runs(channel, project_id, ticket_id, phase, attempt, state, leader_epoch, runner_epoch, expected_ticket_version, completed_at) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?) ON CONFLICT(channel, project_id, ticket_id, phase, attempt) DO NOTHING`, ref.Channel, ref.Project, ref.Ticket, phase, attempt, fence.LeaderEpoch, fence.RunnerEpoch, expectedVersion, time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}

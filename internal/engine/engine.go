@@ -5,7 +5,6 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 
@@ -43,17 +42,9 @@ func New(database *store.Store, spec statemachine.Spec) *Engine {
 
 func (e *Engine) Close() error { return e.store.Close() }
 
-func (e *Engine) Start(ctx context.Context, ref domain.TicketRef, stableWorkflowID string) error {
-	ticket, err := e.store.Ticket(ctx, ref)
-	if err != nil {
-		return err
-	}
-	if ticket.State != domain.StateQueued {
-		return fmt.Errorf("start ticket: expected queued, got %s", ticket.State)
-	}
-	// The leader epoch is acquired by the daemon. It is intentionally explicit:
-	// an engine cannot invent a fence after a stale daemon restart.
-	return fmt.Errorf("start ticket requires daemon fence; use StartOrAdopt")
+func (e *Engine) Start(ctx context.Context, request contracts.StartRequest) error {
+	_, err := e.store.StartOrAdopt(ctx, request.Ticket, request.WorkflowID, request.Fence)
+	return err
 }
 
 func (e *Engine) StartOrAdopt(ctx context.Context, ref domain.TicketRef, stableWorkflowID string, fence domain.Fence) (store.Ticket, error) {
@@ -97,15 +88,37 @@ func (e *Engine) Transition(ctx context.Context, request contracts.TransitionReq
 	if err != nil {
 		return contracts.TransitionResult{}, err
 	}
-	return contracts.TransitionResult{To: target, TicketVersion: result.Version, EventID: fmt.Sprint(result.EventID)}, nil
+	return contracts.TransitionResult{To: target, TicketVersion: result.Version, Invalidated: invalidations(e.spec, transition.Invalidates), EventID: fmt.Sprint(result.EventID)}, nil
 }
 
-func (e *Engine) Signal(context.Context, domain.TicketRef, string, map[string]string) error {
-	return errors.New("signals require daemon authentication and are not implemented in the storage lane")
+func invalidations(spec statemachine.Spec, sets []string) []string {
+	seen := make(map[string]bool)
+	var result []string
+	for _, set := range sets {
+		values, ok := spec.InvalidationSets[set]
+		if !ok {
+			values = []string{set}
+		}
+		for _, value := range values {
+			if !seen[value] {
+				seen[value] = true
+				result = append(result, value)
+			}
+		}
+	}
+	return result
 }
 
-func (e *Engine) Recover(ctx context.Context) error {
-	return errors.New("recovery requires daemon leader epoch; use RecoverChannel")
+func (e *Engine) Signal(ctx context.Context, request contracts.SignalRequest) error {
+	_, err := e.Transition(ctx, contracts.TransitionRequest{
+		Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From,
+		Trigger: request.Trigger, Fence: request.Fence, Attributes: request.Attributes,
+	})
+	return err
+}
+
+func (e *Engine) Recover(ctx context.Context, request contracts.RecoveryRequest) error {
+	return e.store.ReconcileOrphans(ctx, request.Channel, request.LeaderEpoch)
 }
 
 func (e *Engine) RecoverChannel(ctx context.Context, channel domain.Channel, leaderEpoch uint64) error {

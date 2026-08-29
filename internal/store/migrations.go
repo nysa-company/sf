@@ -87,3 +87,28 @@ var migrationV1 = []string{
 	`CREATE TABLE IF NOT EXISTS plans (channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, digest TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(channel, project_id, ticket_id))`,
 	`CREATE TABLE IF NOT EXISTS verifications (channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, intent_digest TEXT NOT NULL, proof_digest TEXT NOT NULL, PRIMARY KEY(channel, project_id, ticket_id))`,
 }
+
+// v2 upgrades the first private development schema. Rebuilding the two
+// artifact tables is required because SQLite cannot add a foreign key with
+// ALTER TABLE. This remains a single transaction, so an interrupted upgrade
+// leaves the v1 shape intact.
+var migrationV2 = []string{
+	`ALTER TABLE schema_migrations ADD COLUMN checksum TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE phase_runs ADD COLUMN expected_ticket_version INTEGER NOT NULL DEFAULT 0`,
+	`CREATE TABLE plans_v2 (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, digest TEXT NOT NULL, body TEXT NOT NULL,
+		PRIMARY KEY(channel, project_id, ticket_id),
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id)
+	)`,
+	`INSERT INTO plans_v2(channel, project_id, ticket_id, digest, body) SELECT channel, project_id, ticket_id, digest, body FROM plans`,
+	`DROP TABLE plans`,
+	`ALTER TABLE plans_v2 RENAME TO plans`,
+	`CREATE TABLE verifications_v2 (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, intent_digest TEXT NOT NULL, proof_digest TEXT NOT NULL,
+		PRIMARY KEY(channel, project_id, ticket_id),
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id)
+	)`,
+	`INSERT INTO verifications_v2(channel, project_id, ticket_id, intent_digest, proof_digest) SELECT channel, project_id, ticket_id, intent_digest, proof_digest FROM verifications`,
+	`DROP TABLE verifications`,
+	`ALTER TABLE verifications_v2 RENAME TO verifications`,
+}
