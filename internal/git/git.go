@@ -103,6 +103,23 @@ func validAbsolutePath(path string) bool {
 	return filepath.IsAbs(path) && filepath.Clean(path) == path && path != string(filepath.Separator)
 }
 
+// credential.helper values beginning with ! are executed by Git through a
+// shell. Keep the configured executable path deliberately boring so an
+// otherwise absolute path cannot add shell syntax to that fixed helper.
+func validHelperPath(path string) bool {
+	if !validAbsolutePath(path) {
+		return false
+	}
+	for _, value := range path {
+		if (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+			(value >= '0' && value <= '9') || strings.ContainsRune("/._+-", value) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func validRepoPath(path string) bool {
 	if path == "" || strings.Contains(path, "\\") || strings.HasPrefix(path, "/") || strings.Contains(path, "\x00") {
 		return false
@@ -200,18 +217,33 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	if r.Home == "" || !validAbsolutePath(r.Home) {
 		return nil, fmt.Errorf("runner requires an explicit absolute isolated HOME")
 	}
-	if (r.GHBinary == "") != (r.GHConfigDir == "") || (r.GHBinary != "" && (!validAbsolutePath(r.GHBinary) || !validAbsolutePath(r.GHConfigDir))) {
+	if (r.GHBinary == "") != (r.GHConfigDir == "") || (r.GHBinary != "" && (!validHelperPath(r.GHBinary) || !validAbsolutePath(r.GHConfigDir))) {
 		return nil, fmt.Errorf("HTTPS auth requires absolute gh binary and explicit gh config directory")
 	}
-	info, err := os.Stat(r.Home)
-	if err == nil && info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("isolated HOME permissions are too broad")
+	info, err := os.Lstat(r.Home)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return nil, fmt.Errorf("isolated HOME must be a real directory")
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			return nil, fmt.Errorf("isolated HOME permissions are too broad")
+		}
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	if err := os.MkdirAll(r.Home, 0o700); err != nil {
 		return nil, err
+	}
+	if r.GHBinary != "" {
+		binaryInfo, binaryErr := os.Stat(r.GHBinary)
+		configInfo, configErr := os.Stat(r.GHConfigDir)
+		if binaryErr != nil || !binaryInfo.Mode().IsRegular() || binaryInfo.Mode().Perm()&0o111 == 0 {
+			return nil, fmt.Errorf("HTTPS auth gh binary is unavailable or not executable")
+		}
+		if configErr != nil || !configInfo.IsDir() {
+			return nil, fmt.Errorf("HTTPS auth config directory is unavailable")
+		}
 	}
 	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
 	if r.GHConfigDir != "" {
@@ -230,10 +262,11 @@ func (r Runner) environment(extra []string) ([]string, error) {
 }
 
 func boundedGitContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if _, ok := parent.Deadline(); ok {
-		return parent, func() {}
+	const maximum = 2 * time.Minute
+	if deadline, ok := parent.Deadline(); ok && time.Until(deadline) <= maximum {
+		return context.WithCancel(parent)
 	}
-	return context.WithTimeout(parent, 2*time.Minute)
+	return context.WithTimeout(parent, maximum)
 }
 
 func runBounded(ctx context.Context, binary string, argv, env []string) ([]byte, error) {
@@ -432,7 +465,7 @@ func safeOrigin(raw string) (string, error) {
 		return resolved, nil
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
 		return "", fmt.Errorf("%w: noncanonical origin refused", ErrIdentityMismatch)
 	}
 	if parsed.User != nil {
@@ -735,7 +768,7 @@ type CommitRequest struct {
 }
 
 func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitRequest) (string, error) {
-	if !boundedCommitText(request.EvidenceDigest, 200) || (request.Message != "" && !boundedCommitText(request.Message, 4_000)) || request.Timestamp.IsZero() || !validRef(request.BaseRef) {
+	if !validEvidenceDigest(request.EvidenceDigest) || (request.Message != "" && !boundedCommitText(request.Message, 4_000)) || request.Timestamp.IsZero() || !validRef(request.BaseRef) {
 		return "", fmt.Errorf("candidate evidence digest and timestamp are required")
 	}
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
@@ -773,6 +806,11 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
+	postCommitPolicy := request.Policy
+	postCommitPolicy.ExpectedHead = head
+	if err := r.ValidateDiff(ctx, worktree.Path, request.BaseRef, postCommitPolicy); err != nil {
+		return "", fmt.Errorf("%w: post-commit candidate validation failed: %v", ErrUnsafeWorktree, err)
+	}
 	if output, err := r.command(ctx, worktree.Path, "status", "--porcelain=v1"); err != nil || strings.TrimSpace(string(output)) != "" {
 		return "", fmt.Errorf("%w: post-commit worktree is not clean", ErrUnsafeWorktree)
 	}
@@ -781,6 +819,15 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 
 func boundedCommitText(value string, maximum int) bool {
 	return value != "" && len(value) <= maximum && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00')
+}
+
+func validEvidenceDigest(value string) bool {
+	if len(value) != len("sha256:")+sha256.Size*2 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	encoded := strings.TrimPrefix(value, "sha256:")
+	decoded, err := hex.DecodeString(encoded)
+	return err == nil && len(decoded) == sha256.Size && strings.ToLower(encoded) == encoded
 }
 
 func (r Runner) Push(ctx context.Context, worktree Worktree) (string, error) {

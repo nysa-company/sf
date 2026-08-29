@@ -101,7 +101,7 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: "sha256:candidate", Timestamp: time.Unix(1, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(1, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("one\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: "sha256:one", Timestamp: time.Unix(2, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil {
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("one")), Timestamp: time.Unix(2, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runner.Push(ctx, worktree); err != nil {
@@ -238,7 +238,7 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "src", "local.txt"), []byte("local\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: "sha256:local", Timestamp: time.Unix(3, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil {
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("local")), Timestamp: time.Unix(3, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runner.Push(ctx, worktree); !errors.Is(err, ErrUnexpectedRemote) {
@@ -300,6 +300,7 @@ func TestRunnerRequiresSecureAbsoluteHomeAndBoundsSeamOutput(t *testing.T) {
 func TestOriginAndHooksRefuseAmbiguityAndSymlinkEscape(t *testing.T) {
 	for _, origin := range []string{
 		"git@example.test:owner/repository.git",
+		"http://example.test/owner/repository.git",
 		"https://token@example.test/owner/repository.git",
 		"https://example.test/owner/repository.git?token=x",
 		"relative/repository.git",
@@ -396,21 +397,108 @@ func TestCommitBoundsUntrustedEvidenceAndMessage(t *testing.T) {
 	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: strings.Repeat("x", 201), Timestamp: time.Now(), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err == nil {
 		t.Fatal("oversized evidence accepted")
 	}
-	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: "sha256:test", Message: "bad\x00message", Timestamp: time.Now(), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err == nil {
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: "sha256:test", Timestamp: time.Now(), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err == nil {
+		t.Fatal("noncanonical evidence digest accepted")
+	}
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("test")), Message: "bad\x00message", Timestamp: time.Now(), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err == nil {
 		t.Fatal("unsafe message accepted")
 	}
 }
 
+func TestCommitRevalidatesResultingTreeAfterStagingRace(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-post-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	injected := false
+	runner.Run = func(ctx context.Context, binary string, argv, env []string) ([]byte, error) {
+		if !injected && slicesContain(argv, "commit") {
+			injected = true
+			if err := os.WriteFile(filepath.Join(worktree.Path, "outside.txt"), []byte("raced\n"), 0o600); err != nil {
+				return nil, err
+			}
+			stage := exec.CommandContext(ctx, binary, "-C", worktree.Path, "add", "--", "outside.txt")
+			stage.Env = env
+			if output, err := stage.CombinedOutput(); err != nil {
+				return output, err
+			}
+		}
+		command := exec.CommandContext(ctx, binary, argv...)
+		command.Env = env
+		return command.CombinedOutput()
+	}
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(4, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); !errors.Is(err, ErrUnsafeWorktree) {
+		t.Fatalf("post-commit staged race=%v", err)
+	}
+	if !injected {
+		t.Fatal("staging race fixture did not run")
+	}
+}
+
+func slicesContain(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestHTTPSCredentialHelperUsesExplicitGHConfigOnly(t *testing.T) {
 	var argv, env []string
-	runner := Runner{Home: filepath.Join(t.TempDir(), "git-home"), GHBinary: "/usr/bin/gh", GHConfigDir: filepath.Join(t.TempDir(), "gh-config"), Run: func(_ context.Context, _ string, gotArgv, gotEnv []string) ([]byte, error) {
+	root := t.TempDir()
+	ghBinary := filepath.Join(root, "gh")
+	ghConfig := filepath.Join(root, "gh-config")
+	if err := os.WriteFile(ghBinary, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(ghConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := Runner{Home: filepath.Join(root, "git-home"), GHBinary: ghBinary, GHConfigDir: ghConfig, Run: func(_ context.Context, _ string, gotArgv, gotEnv []string) ([]byte, error) {
 		argv, env = gotArgv, gotEnv
 		return []byte("ok\n"), nil
 	}}
 	if _, err := runner.one(context.Background(), "/repo", "status"); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(argv, "\x00"), "credential.helper=!/usr/bin/gh auth git-credential") || !strings.Contains(strings.Join(env, "\n"), "GH_CONFIG_DIR="+runner.GHConfigDir) {
+	if !strings.Contains(strings.Join(argv, "\x00"), "credential.helper=!"+ghBinary+" auth git-credential") || !strings.Contains(strings.Join(env, "\n"), "GH_CONFIG_DIR="+runner.GHConfigDir) {
 		t.Fatalf("missing explicit HTTPS helper argv=%q env=%q", argv, env)
+	}
+}
+
+func TestGitDeadlineIsCappedAndCredentialHelperRejectsShellSyntax(t *testing.T) {
+	root := t.TempDir()
+	parent, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
+	defer cancel()
+	runner := Runner{Home: filepath.Join(root, "git-home"), Run: func(ctx context.Context, _ string, _ []string, _ []string) ([]byte, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > 2*time.Minute+time.Second {
+			t.Fatalf("git deadline was not capped: %v", deadline)
+		}
+		return []byte("ok\n"), nil
+	}}
+	if _, err := runner.one(parent, "/repo", "status"); err != nil {
+		t.Fatal(err)
+	}
+	unsafeBinary := filepath.Join(root, "gh;touch-pwned")
+	if err := os.WriteFile(unsafeBinary, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(root, "gh-config")
+	if err := os.Mkdir(config, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unsafe := Runner{Home: filepath.Join(root, "other-home"), GHBinary: unsafeBinary, GHConfigDir: config, Run: runner.Run}
+	if _, err := unsafe.one(context.Background(), "/repo", "status"); err == nil {
+		t.Fatal("shell-bearing credential helper path was accepted")
 	}
 }
