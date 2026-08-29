@@ -579,6 +579,12 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 		argv = argv[1:]
 	}
 	if len(argv) >= 2 && argv[0] == "auth" && argv[1] == "status" {
+		if option(argv, "--json") != "" {
+			if err := f.AuthStatus(context.Background()); err != nil {
+				return nil, err
+			}
+			return json.Marshal(map[string]string{"login": "sf-test"})
+		}
 		return []byte("authenticated\n"), f.AuthStatus(context.Background())
 	}
 	if len(argv) >= 2 && argv[0] == "repo" && argv[1] == "view" {
@@ -590,6 +596,8 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 			return f.runCreate(argv)
 		case "view":
 			return f.runView(argv)
+		case "list":
+			return f.runList(argv)
 		case "edit":
 			return f.runEdit(argv)
 		case "ready":
@@ -601,6 +609,26 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 		}
 	}
 	return nil, errors.New("fake-gh: unsupported invocation")
+}
+
+func (f *FakeGH) runList(argv []string) ([]byte, error) {
+	var results []map[string]any
+	err := f.withState(func() (bool, error) {
+		if err := f.requireAuthLocked(); err != nil {
+			return false, err
+		}
+		for _, pr := range f.state.PRs {
+			if repo := option(argv, "--repo"); repo != "" && repo != pr.Identity.Repository.Owner+"/"+pr.Identity.Repository.Name {
+				continue
+			}
+			results = append(results, prJSON(pr.Identity, pr.Draft, pr.Merged, pr.Ready))
+		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(results)
 }
 
 func option(argv []string, name string) string {
@@ -675,6 +703,18 @@ func (f *FakeGH) runView(argv []string) ([]byte, error) {
 	identity := identityFromArgs(argv, number)
 	var pr PullRequest
 	err := f.withState(func() (bool, error) {
+		if number > 0 && identity.HeadRef == "" {
+			if err := f.requireAuthLocked(); err != nil {
+				return false, err
+			}
+			for _, candidate := range f.state.PRs {
+				if candidate.Identity.Number == number && sameRepository(candidate.Identity.Repository, identity.Repository) {
+					pr = candidate
+					return false, nil
+				}
+			}
+			return false, errors.New("fake-gh: pull request identity not found")
+		}
 		index, err := f.findLocked(identity)
 		if err != nil {
 			return false, err
