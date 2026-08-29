@@ -1,0 +1,57 @@
+#!/bin/sh
+# Hermetic smoke test for the source-build tutorial. It intentionally only
+# reads text; no command in the tutorial is executed and no credential store
+# or network is touched.
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+doc="$root/docs/tutorials/source-build-foreground.md"
+
+fail() {
+	echo "docs-smoke: $*" >&2
+	exit 1
+}
+
+[ -f "$doc" ] || fail "missing $doc"
+
+for required in \
+	'cd /absolute/path/to/sf-source' \
+	'make build-dev' \
+	'./bin/sf-dev auth status' \
+	'./bin/sf-dev auth login github' \
+	'./bin/sf-dev auth login cursor' \
+	'./bin/sf-dev auth login claude' \
+	'./bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app' \
+	'./bin/sf-dev daemon run' \
+	'./bin/sf-dev providers qualify --builder cursor --reviewer claude' \
+	'./bin/sf-dev doctor --repo /absolute/path/to/nysa-app' \
+	'./bin/sf-dev submit ./tickets/fix-duplicate-reminders.md --project nysa' \
+	'./bin/sf-dev start SF-00000001' \
+	'./bin/sf-dev status SF-00000001 --watch'; do
+	grep -F -- "$required" "$doc" >/dev/null || fail "missing approved command: $required"
+done
+
+line() { grep -nF -- "$1" "$doc" | head -n 1 | cut -d: -f1; }
+build_line=$(line 'make build-dev')
+auth_line=$(line './bin/sf-dev auth status')
+init_line=$(line './bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app')
+daemon_line=$(line './bin/sf-dev daemon run')
+qualify_line=$(line './bin/sf-dev providers qualify --builder cursor --reviewer claude')
+doctor_line=$(line './bin/sf-dev doctor --repo /absolute/path/to/nysa-app')
+submit_line=$(line './bin/sf-dev submit ./tickets/fix-duplicate-reminders.md --project nysa')
+start_line=$(line './bin/sf-dev start SF-00000001')
+[ "$build_line" -lt "$auth_line" ] || fail 'build must precede auth'
+[ "$auth_line" -lt "$init_line" ] || fail 'auth must precede init'
+[ "$init_line" -lt "$daemon_line" ] || fail 'init must precede daemon startup'
+[ "$daemon_line" -lt "$qualify_line" ] || fail 'daemon startup must precede qualification'
+[ "$qualify_line" -lt "$doctor_line" ] || fail 'qualification must precede doctor'
+[ "$doctor_line" -lt "$submit_line" ] || fail 'doctor must precede submit'
+[ "$submit_line" -lt "$start_line" ] || fail 'submit must precede start'
+
+for forbidden in 'gh auth token' 'Authorization:' 'curl ' 'wget ' 'git clone ' '--danger-full-access'; do
+	grep -F -- "$forbidden" "$doc" >/dev/null && fail "unsafe or network-bearing text: $forbidden"
+done
+
+grep -F -- 'does not send a displayed token' "$doc" >/dev/null || fail 'credential boundary missing'
+grep -F -- 'does not invoke `gh`, a provider, a daemon, a network' "$doc" >/dev/null || fail 'hermetic check contract missing'
+echo 'docs-smoke: PASS (read-only, credential-free, network-free)'

@@ -1,0 +1,16 @@
+{
+  "schema": "sf.testkit.provider-script/v1",
+  "identity": {
+    "provider": "fixture-provider",
+    "model": "fixture-model",
+    "family": "fixture-family",
+    "version": "0.1.0"
+  },
+  "steps": {
+    "planning": {"behavior": "valid", "outcome": "completed"},
+    "verification": {"behavior": "valid", "outcome": "completed"},
+    "build": {"behavior": "partial", "outcome": "partial"},
+    "review": {"behavior": "valid", "outcome": "approved"}
+  },
+  "process_scenarios": ["ignore-term", "setsid", "double-fork"]
+}
