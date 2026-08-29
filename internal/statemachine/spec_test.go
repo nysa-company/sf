@@ -1,6 +1,7 @@
 package statemachine
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -31,6 +32,28 @@ func TestApprovedSpecMatchesDomain(t *testing.T) {
 	}
 	if got, want := len(spec.Transitions), 40; got != want {
 		t.Fatalf("transitions=%d want=%d", got, want)
+	}
+}
+
+func TestApprovedArtifactDigestAndBoundedDecoder(t *testing.T) {
+	path := filepath.Join("..", "..", "docs", "plans", "2026-08-29-software-factory-v1-state-machine.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadApproved(bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	mutated := append([]byte(nil), data...)
+	mutated[len(mutated)-2] ^= 1
+	if _, err := LoadApproved(bytes.NewReader(mutated)); err == nil {
+		t.Fatal("edited normative artifact was accepted")
+	}
+	if _, err := Load(bytes.NewReader(append(data, []byte(` {}`)...))); err == nil {
+		t.Fatal("trailing JSON value was accepted")
+	}
+	if _, err := Load(bytes.NewReader(bytes.Repeat([]byte("x"), MaxSpecBytes+1))); err == nil {
+		t.Fatal("oversized state machine was accepted")
 	}
 }
 

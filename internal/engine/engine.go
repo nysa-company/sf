@@ -25,7 +25,7 @@ func Open(ctx context.Context, databasePath, stateMachinePath string) (*Engine, 
 		return nil, fmt.Errorf("open normative state machine: %w", err)
 	}
 	defer file.Close()
-	spec, err := statemachine.Load(file)
+	spec, err := statemachine.LoadApproved(file)
 	if err != nil {
 		return nil, err
 	}

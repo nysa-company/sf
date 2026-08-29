@@ -3,6 +3,9 @@
 package statemachine
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +19,11 @@ import (
 var (
 	ErrNoTransition        = errors.New("no transition guard matched")
 	ErrAmbiguousTransition = errors.New("multiple transition guards matched")
+)
+
+const (
+	MaxSpecBytes   = 1 << 20
+	ApprovedSHA256 = "d136f0ce1dab7dd0380ca2ccef5083ae589145357bab8325cdf7fa3b2fe11260"
 )
 
 type StateDefinition struct {
@@ -47,16 +55,47 @@ type Spec struct {
 }
 
 func Load(reader io.Reader) (Spec, error) {
-	decoder := json.NewDecoder(reader)
+	data, err := io.ReadAll(io.LimitReader(reader, MaxSpecBytes+1))
+	if err != nil {
+		return Spec{}, fmt.Errorf("read state-machine spec: %w", err)
+	}
+	if len(data) > MaxSpecBytes {
+		return Spec{}, fmt.Errorf("state-machine spec exceeds %d bytes", MaxSpecBytes)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var spec Spec
 	if err := decoder.Decode(&spec); err != nil {
 		return Spec{}, fmt.Errorf("decode state-machine spec: %w", err)
 	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return Spec{}, errors.New("state-machine spec contains multiple JSON values")
+		}
+		return Spec{}, fmt.Errorf("decode trailing state-machine data: %w", err)
+	}
 	if err := spec.Validate(); err != nil {
 		return Spec{}, err
 	}
 	return spec, nil
+}
+
+// LoadApproved binds runtime authority to the reviewed normative artifact.
+// A structurally valid but locally edited transition table is not accepted.
+func LoadApproved(reader io.Reader) (Spec, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, MaxSpecBytes+1))
+	if err != nil {
+		return Spec{}, fmt.Errorf("read approved state-machine spec: %w", err)
+	}
+	if len(data) > MaxSpecBytes {
+		return Spec{}, fmt.Errorf("state-machine spec exceeds %d bytes", MaxSpecBytes)
+	}
+	digest := sha256.Sum256(data)
+	if hex.EncodeToString(digest[:]) != ApprovedSHA256 {
+		return Spec{}, errors.New("state-machine artifact does not match the approved release digest")
+	}
+	return Load(bytes.NewReader(data))
 }
 
 func (s Spec) Validate() error {
