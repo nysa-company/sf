@@ -1,21 +1,24 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"os"
 
+	"github.com/nysa-company/sf/internal/cli"
+	"github.com/nysa-company/sf/internal/config"
+	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/version"
 )
 
 func main() {
-	os.Exit(run(os.Args[1:]))
-}
-
-func run(args []string) int {
-	if len(args) == 1 && args[0] == "version" {
-		fmt.Printf("sf %s (%s, %s)\n", version.Version, version.Commit, version.Channel)
-		return 0
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
 	}
-	fmt.Fprintln(os.Stderr, "sf: implementation bootstrap; try 'sf version'")
-	return 2
+	channel := domain.Channel(version.Channel)
+	if !channel.Valid() {
+		channel = domain.ChannelStable
+	}
+	paths, _ := config.PathsFor(home, channel)
+	os.Exit(cli.Execute(context.Background(), os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}))
 }
