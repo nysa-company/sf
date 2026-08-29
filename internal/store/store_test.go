@@ -186,6 +186,16 @@ func TestStartOrAdoptRepairsStateWithoutOwner(t *testing.T) {
 	if adopted.WorkflowID != "dev/nysa/SF-3/planning" {
 		t.Fatalf("workflow id=%q", adopted.WorkflowID)
 	}
+	var startEvents int
+	if err := database.db.QueryRow(`SELECT COUNT(*) FROM events WHERE channel='dev' AND project_id='nysa' AND ticket_id='SF-3' AND trigger='start_or_adopt'`).Scan(&startEvents); err != nil {
+		t.Fatal(err)
+	}
+	if startEvents != 1 {
+		t.Fatalf("start events=%d want=1", startEvents)
+	}
+	if _, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-3/other", domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("changed workflow identity error=%v", err)
+	}
 }
 
 func TestStaleRunnerCannotTransition(t *testing.T) {

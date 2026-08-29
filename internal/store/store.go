@@ -269,8 +269,9 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, workflow
 	}
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var state domain.State
+		var persistedWorkflowID string
 		var version, runner uint64
-		if err := conn.QueryRowContext(ctx, `SELECT state, version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner); err != nil {
+		if err := conn.QueryRowContext(ctx, `SELECT state, version, runner_epoch, workflow_id FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &persistedWorkflowID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -279,6 +280,7 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, workflow
 		if err := s.currentFence(ctx, conn, ref.Channel, version, runner, fence); err != nil {
 			return err
 		}
+		stateChanged := false
 		if state == domain.StateQueued {
 			result, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?, version=version+1, workflow_id=? WHERE channel=? AND project_id=? AND id=? AND version=? AND runner_epoch=?`, domain.StatePlanning, workflowID, ref.Channel, ref.Project, ref.Ticket, version, runner)
 			if err != nil {
@@ -288,12 +290,29 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, workflow
 				return ErrStaleFence
 			}
 			version++
+			stateChanged = true
 		} else if state != domain.StatePlanning {
 			return fmt.Errorf("cannot start or adopt ticket in state %q", state)
+		} else if persistedWorkflowID == "" {
+			return fmt.Errorf("cannot adopt planning ticket without persisted workflow id")
+		} else if persistedWorkflowID != workflowID {
+			return fmt.Errorf("%w: workflow id does not match durable ticket identity", ErrStaleFence)
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO workflow_owners(channel, project_id, ticket_id, workflow_id, state, created_at)
-			VALUES (?, ?, ?, ?, 'owned', ?) ON CONFLICT(channel, project_id, ticket_id) DO UPDATE SET workflow_id=excluded.workflow_id, state='owned'`, ref.Channel, ref.Project, ref.Ticket, workflowID, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			VALUES (?, ?, ?, ?, 'owned', ?) ON CONFLICT(channel, project_id, ticket_id) DO NOTHING`, ref.Channel, ref.Project, ref.Ticket, workflowID, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
+		}
+		var ownedWorkflowID string
+		if err := conn.QueryRowContext(ctx, `SELECT workflow_id FROM workflow_owners WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&ownedWorkflowID); err != nil {
+			return err
+		}
+		if ownedWorkflowID != workflowID {
+			return fmt.Errorf("%w: workflow owner does not match durable ticket identity", ErrStaleFence)
+		}
+		// A replay that finds a planning ticket with its owner already present is
+		// a read/confirmation, not a second transition or event.
+		if !stateChanged {
+			return nil
 		}
 		_, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at)
 			VALUES (?, ?, ?, ?, 'start_or_adopt', ?, ?, '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, state, domain.StatePlanning, time.Now().UTC().Format(time.RFC3339Nano))
