@@ -12,6 +12,11 @@ The approved normative design is in
 - Git and GitHub mutations cross narrow fenced interfaces and reconcile remote
   truth before any retry.
 
+The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
+one custom Go state engine over the application schema; DBOS is retained only
+as a reproducible rejected spike. See
+[`decisions/0001-workflow-engine.md`](decisions/0001-workflow-engine.md).
+
 ## Boundaries
 
 The CLI is a thin client over an owner-only Unix socket, except direct local
