@@ -33,9 +33,9 @@ type GitHub interface {
 	AuthStatus(context.Context) error
 	Repository(context.Context, RepositoryIdentity) (RepositoryIdentity, error)
 	FindPullRequest(context.Context, PullRequestIdentity) (PullRequestIdentity, bool, error)
-	CreateDraftPullRequest(context.Context, PullRequestIdentity, string, string, string) (PullRequestIdentity, error)
-	UpdatePullRequest(context.Context, PullRequestIdentity, string, string) error
+	CreateDraftPullRequest(context.Context, domain.ExternalEffectClaim, PullRequestIdentity, string, string) (PullRequestIdentity, error)
+	UpdatePullRequest(context.Context, domain.ExternalEffectClaim, PullRequestIdentity, string, string) error
 	RequiredChecks(context.Context, PullRequestIdentity) ([]RequiredCheck, error)
-	MarkReady(context.Context, PullRequestIdentity, domain.Fence) error
-	MergeExactHead(context.Context, PullRequestIdentity, string, string, domain.Fence) error
+	MarkReady(context.Context, domain.ExternalEffectClaim, PullRequestIdentity) error
+	MergeExactHead(context.Context, domain.ExternalEffectClaim, PullRequestIdentity, string, string) error
 }

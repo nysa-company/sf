@@ -65,7 +65,7 @@ func TestFakeGHSeparatesMutationFromResponseDeliveryAndBindsIdentity(t *testing.
 		HeadOID:        "0123456789012345678901234567890123456789",
 		BaseRef:        "main",
 	}
-	if _, err := remote.CreateDraftPullRequest(context.Background(), identity, "title", "body", ""); err == nil {
+	if _, err := remote.CreateDraftPullRequest(context.Background(), domain.ExternalEffectClaim{}, identity, "title", "body"); err == nil {
 		t.Fatal("expected dropped response")
 	}
 	if got := remote.MutationCount("pr_create"); got != 1 {
@@ -109,7 +109,7 @@ func TestFakeGHRequiresOwnedRecoveryAndRejectsHumanLookalike(t *testing.T) {
 		t.Fatalf("human-owned lookalike adopted: found=%v err=%v", found, err)
 	}
 	identity.FactoryOwned = false
-	if _, err := remote.CreateDraftPullRequest(context.Background(), identity, "title", "body", ""); err == nil || !strings.Contains(err.Error(), "human-owned") {
+	if _, err := remote.CreateDraftPullRequest(context.Background(), domain.ExternalEffectClaim{}, identity, "title", "body"); err == nil || !strings.Contains(err.Error(), "human-owned") {
 		t.Fatalf("human-owned lookalike did not block a factory create: %v", err)
 	}
 }

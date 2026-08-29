@@ -155,6 +155,19 @@ type Fence struct {
 	ClaimEpoch  uint64
 }
 
+// ExternalEffectClaim is the opaque-to-adapters proof that SQLite granted one
+// current executor permission to cross an external mutation boundary.
+type ExternalEffectClaim struct {
+	SemanticKey   string
+	Ref           TicketRef
+	Kind          string
+	RequestDigest string
+	TicketVersion uint64
+	LeaderEpoch   uint64
+	RunnerEpoch   uint64
+	ClaimEpoch    uint64
+}
+
 type ProviderIdentity struct {
 	Provider string
 	Model    string

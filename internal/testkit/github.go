@@ -226,7 +226,7 @@ func (f *FakeGH) FindPullRequest(_ context.Context, want contracts.PullRequestId
 	return match, found, err
 }
 
-func (f *FakeGH) CreateDraftPullRequest(_ context.Context, identity contracts.PullRequestIdentity, title, body, _ string) (contracts.PullRequestIdentity, error) {
+func (f *FakeGH) CreateDraftPullRequest(_ context.Context, _ domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
 	var result contracts.PullRequestIdentity
 	var operationErr error
 	err := f.withState(func() (bool, error) {
@@ -262,7 +262,7 @@ func (f *FakeGH) CreateDraftPullRequest(_ context.Context, identity contracts.Pu
 	return result, err
 }
 
-func (f *FakeGH) UpdatePullRequest(_ context.Context, identity contracts.PullRequestIdentity, title, body string) error {
+func (f *FakeGH) UpdatePullRequest(_ context.Context, _ domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) error {
 	return f.withState(func() (bool, error) {
 		index, err := f.findLocked(identity)
 		if err != nil {
@@ -293,7 +293,7 @@ func (f *FakeGH) RequiredChecks(_ context.Context, identity contracts.PullReques
 	return checks, err
 }
 
-func (f *FakeGH) MarkReady(_ context.Context, identity contracts.PullRequestIdentity, _ domain.Fence) error {
+func (f *FakeGH) MarkReady(_ context.Context, _ domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
 	return f.withState(func() (bool, error) {
 		index, err := f.findLocked(identity)
 		if err != nil {
@@ -311,7 +311,7 @@ func (f *FakeGH) MarkReady(_ context.Context, identity contracts.PullRequestIden
 	})
 }
 
-func (f *FakeGH) MergeExactHead(_ context.Context, identity contracts.PullRequestIdentity, headOID, method string, _ domain.Fence) error {
+func (f *FakeGH) MergeExactHead(_ context.Context, _ domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, headOID, method string) error {
 	return f.withState(func() (bool, error) {
 		index, err := f.findLocked(identity)
 		if err != nil {
@@ -583,7 +583,7 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 			if err := f.AuthStatus(context.Background()); err != nil {
 				return nil, err
 			}
-			return json.Marshal(map[string]string{"login": "sf-test"})
+			return json.Marshal(map[string]any{"hosts": map[string]any{"github.com": []map[string]string{{"login": "sf-test"}}}})
 		}
 		return []byte("authenticated\n"), f.AuthStatus(context.Background())
 	}
@@ -691,11 +691,44 @@ func identityFromArgs(argv []string, number int) contracts.PullRequestIdentity {
 
 func (f *FakeGH) runCreate(argv []string) ([]byte, error) {
 	identity := identityFromArgs(argv, 0)
-	pr, err := f.CreateDraftPullRequest(context.Background(), identity, option(argv, "--title"), option(argv, "--body"), "")
+	identityFromMarker(&identity, option(argv, "--body"))
+	pr, err := f.CreateDraftPullRequest(context.Background(), domain.ExternalEffectClaim{}, identity, option(argv, "--title"), option(argv, "--body"))
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(prJSON(pr, true, false, false))
+	return []byte("https://github.com/" + pr.Repository.Owner + "/" + pr.Repository.Name + "/pull/" + strconv.Itoa(pr.Number) + "\n"), nil
+}
+
+func identityFromMarker(identity *contracts.PullRequestIdentity, body string) {
+	start := strings.LastIndex(body, "<!-- sf:v1 ")
+	if start < 0 {
+		return
+	}
+	fields := strings.Fields(strings.TrimSuffix(body[start+len("<!-- sf:v1 "):], " -->"))
+	for _, field := range fields {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "oid":
+			identity.HeadOID = value
+		case "base":
+			identity.BaseRef = value
+		case "head":
+			ownerRepo, ref, ok := strings.Cut(value, ":")
+			if !ok {
+				continue
+			}
+			owner, repo, ok := strings.Cut(ownerRepo, "/")
+			if ok {
+				identity.HeadOwner = owner
+				identity.HeadRepository = repo
+				identity.HeadRef = ref
+			}
+		}
+	}
+	identity.FactoryOwned = identity.HeadOID != ""
 }
 
 func (f *FakeGH) runView(argv []string) ([]byte, error) {
@@ -731,7 +764,7 @@ func (f *FakeGH) runView(argv []string) ([]byte, error) {
 func (f *FakeGH) runEdit(argv []string) ([]byte, error) {
 	number := prNumber(argv)
 	identity := identityFromArgs(argv, number)
-	if err := f.UpdatePullRequest(context.Background(), identity, option(argv, "--title"), option(argv, "--body")); err != nil {
+	if err := f.UpdatePullRequest(context.Background(), domain.ExternalEffectClaim{}, identity, option(argv, "--title"), option(argv, "--body")); err != nil {
 		return nil, err
 	}
 	return []byte("{}"), nil
@@ -739,7 +772,7 @@ func (f *FakeGH) runEdit(argv []string) ([]byte, error) {
 
 func (f *FakeGH) runReady(argv []string) ([]byte, error) {
 	identity := identityFromArgs(argv, prNumber(argv))
-	if err := f.MarkReady(context.Background(), identity, domain.Fence{}); err != nil {
+	if err := f.MarkReady(context.Background(), domain.ExternalEffectClaim{}, identity); err != nil {
 		return nil, err
 	}
 	return []byte("{}"), nil
@@ -751,14 +784,18 @@ func (f *FakeGH) runChecks(argv []string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(checks)
+	values := make([]map[string]string, 0, len(checks))
+	for _, check := range checks {
+		values = append(values, map[string]string{"name": check.Name, "state": check.State, "workflow": "", "link": check.ExternalID, "bucket": ""})
+	}
+	return json.Marshal(values)
 }
 
 func (f *FakeGH) runMerge(argv []string) ([]byte, error) {
 	identity := identityFromArgs(argv, prNumber(argv))
 	headOID := option(argv, "--match-head-commit")
 	identity.HeadOID = headOID
-	if err := f.MergeExactHead(context.Background(), identity, headOID, mergeMethod(argv), domain.Fence{}); err != nil {
+	if err := f.MergeExactHead(context.Background(), domain.ExternalEffectClaim{}, identity, headOID, mergeMethod(argv)); err != nil {
 		return nil, err
 	}
 	return []byte("{}"), nil
@@ -776,16 +813,26 @@ func mergeMethod(argv []string) string {
 }
 
 func prJSON(identity contracts.PullRequestIdentity, draft, merged, ready bool) map[string]any {
-	return map[string]any{
-		"number":         identity.Number,
-		"repository":     map[string]string{"nameWithOwner": identity.Repository.Owner + "/" + identity.Repository.Name},
-		"headRepository": map[string]string{"nameWithOwner": identity.HeadOwner + "/" + identity.HeadRepository},
-		"headRefName":    identity.HeadRef,
-		"headRefOid":     identity.HeadOID,
-		"baseRefName":    identity.BaseRef,
-		"isDraft":        draft,
-		"sfOwned":        identity.FactoryOwned,
-		"merged":         merged,
-		"ready":          ready,
+	value := map[string]any{
+		"number":              identity.Number,
+		"headRepository":      map[string]string{"nameWithOwner": identity.HeadOwner + "/" + identity.HeadRepository},
+		"headRepositoryOwner": map[string]string{"login": identity.HeadOwner},
+		"headRefName":         identity.HeadRef,
+		"headRefOid":          identity.HeadOID,
+		"baseRefName":         identity.BaseRef,
+		"isDraft":             draft,
+		"title":               "title",
+		"body":                ownershipMarkerForFake(identity),
+		"state":               "OPEN",
 	}
+	if merged {
+		value["mergedAt"] = "2026-01-01T00:00:00Z"
+	} else {
+		value["mergedAt"] = nil
+	}
+	return value
+}
+
+func ownershipMarkerForFake(value contracts.PullRequestIdentity) string {
+	return "<!-- sf:v1 repository=" + value.Repository.Owner + "/" + value.Repository.Name + " head=" + value.HeadOwner + "/" + value.HeadRepository + ":" + value.HeadRef + " oid=" + value.HeadOID + " base=" + value.BaseRef + " -->"
 }

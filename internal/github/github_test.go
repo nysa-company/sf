@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,9 +32,21 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build fake-gh: %v\n%s", err, output)
 	}
-	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), ConfigDir: filepath.Join(root, "gh-config"), Env: []string{"SF_FAKE_GH_STATE=" + state}}
-	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: "0123456789abcdef", BaseRef: "main", FactoryOwned: true}
+	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), ConfigDir: filepath.Join(root, "gh-config"), Env: []string{"SF_FAKE_GH_STATE=" + state}, ValidateClaim: func(context.Context, domain.ExternalEffectClaim) error { return nil }}
+	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
 	return client, fake, identity
+}
+
+func TestContractMutationRequiresClaimValidator(t *testing.T) {
+	client, _, identity := fixture(t)
+	claim := domain.ExternalEffectClaim{SemanticKey: "k", Kind: "draft_pr"}
+	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); err != nil {
+		t.Fatalf("validated claim=%v", err)
+	}
+	client.ValidateClaim = nil
+	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrPolicyRefusal) {
+		t.Fatalf("missing validator=%v", err)
+	}
 }
 
 func TestPreflightCreateLostResponseAndExactAdoption(t *testing.T) {
@@ -53,14 +66,14 @@ func TestPreflightCreateLostResponseAndExactAdoption(t *testing.T) {
 	if err := fake.SetResponse("pr_create", testkit.ResponseDropAfterCall); err != nil {
 		t.Fatal(err)
 	}
-	pr, err := client.CreateOrAdopt(context.Background(), claim, "title", "<!-- sf:owned -->")
+	pr, err := client.createOrAdopt(context.Background(), claim, "title", "<!-- sf:owned -->")
 	if err != nil || pr.Identity.Number != 1 || !pr.Draft {
 		t.Fatalf("create/adopt=%+v err=%v", pr, err)
 	}
 	if fake.MutationCount("pr_create") != 1 {
 		t.Fatalf("create mutations=%d", fake.MutationCount("pr_create"))
 	}
-	if _, err := client.CreateOrAdopt(context.Background(), claim, "title", "<!-- sf:owned -->"); err != nil {
+	if _, err := client.createOrAdopt(context.Background(), claim, "title", "<!-- sf:owned -->"); err != nil {
 		t.Fatalf("idempotent adopt=%v", err)
 	}
 	if err := fake.InjectPullRequestForTest(testkit.PullRequest{Identity: pr.Identity, Draft: true}); err != nil {
@@ -75,7 +88,7 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	client, fake, identity := fixture(t)
 	plan, _ := client.Plan(identity, "key")
 	claim, _ := client.Claim(plan)
-	pr, err := client.CreateOrAdopt(context.Background(), claim, "title", "body")
+	pr, err := client.createOrAdopt(context.Background(), claim, "title", "body")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,16 +105,16 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "1"}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksFailed) {
 		t.Fatalf("strict checks=%v", err)
 	}
-	if _, err := client.Merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeManual, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+	if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeManual, "merge"); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("manual merge=%v", err)
 	}
-	if _, err := client.Merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeAutonomous, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+	if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeAutonomous, "merge"); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("autonomous merge=%v", err)
 	}
 	if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
 		t.Fatal(err)
 	}
-	outcome, err := client.Merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeGuarded, "squash")
+	outcome, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeGuarded, "squash")
 	if err != nil || outcome != MergeApplied {
 		t.Fatalf("guarded merge=%q err=%v", outcome, err)
 	}

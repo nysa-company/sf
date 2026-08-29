@@ -33,11 +33,12 @@ var (
 const maxResponse = 1 << 20
 
 type Client struct {
-	Binary    string
-	Home      string
-	ConfigDir string   // explicit existing gh auth/config authority, never a temp substitute
-	Env       []string // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
-	Run       func(context.Context, string, []string, []string) ([]byte, error)
+	Binary        string
+	Home          string
+	ConfigDir     string   // explicit existing gh auth/config authority, never a temp substitute
+	Env           []string // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
+	Run           func(context.Context, string, []string, []string) ([]byte, error)
+	ValidateClaim func(context.Context, domain.ExternalEffectClaim) error
 }
 
 type Principal struct{ Login string }
@@ -65,12 +66,14 @@ var _ contracts.GitHub = (*Client)(nil)
 
 func (c Client) AuthStatus(ctx context.Context) error {
 	var auth struct {
-		Login string `json:"login"`
+		Hosts map[string][]struct {
+			Login string `json:"login"`
+		} `json:"hosts"`
 	}
-	if err := c.json(ctx, &auth, "auth", "status", "--json", "login"); err != nil {
+	if err := c.json(ctx, &auth, "auth", "status", "--json", "hosts"); err != nil {
 		return err
 	}
-	if auth.Login == "" {
+	if len(auth.Hosts["github.com"]) != 1 || auth.Hosts["github.com"][0].Login == "" {
 		return ErrMalformedResponse
 	}
 	return nil
@@ -91,57 +94,50 @@ func (c Client) FindPullRequest(ctx context.Context, identity contracts.PullRequ
 	}
 	return match.Identity, true, nil
 }
-func (c Client) CreateDraftPullRequest(ctx context.Context, identity contracts.PullRequestIdentity, title, body, semanticKey string) (contracts.PullRequestIdentity, error) {
-	if semanticKey == "" {
-		semanticKey = "github-pr:" + identity.HeadOID
-	}
-	plan, err := c.Plan(identity, semanticKey)
-	if err != nil {
+func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
+	if err := c.validateClaim(ctx, durable, identity, "draft_pr"); err != nil {
 		return contracts.PullRequestIdentity{}, err
 	}
-	claim, err := c.Claim(plan)
-	if err != nil {
-		return contracts.PullRequestIdentity{}, err
-	}
-	match, err := c.CreateOrAdopt(ctx, claim, title, body)
+	plan := EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}
+	match, err := c.createOrAdopt(ctx, EffectClaim{Plan: plan, Claimed: true}, title, body)
 	return match.Identity, err
 }
-func (c Client) UpdatePullRequest(ctx context.Context, identity contracts.PullRequestIdentity, title, body string) error {
-	plan, err := c.Plan(identity, "github-pr-update:"+identity.HeadOID)
-	if err != nil {
+func (c Client) UpdatePullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) error {
+	if err := c.validateClaim(ctx, durable, identity, "pr_update"); err != nil {
 		return err
 	}
-	claim, err := c.Claim(plan)
-	if err != nil {
-		return err
-	}
-	return c.UpdateOrObserve(ctx, claim, PRMatch{Identity: identity}, title, body)
+	return c.updateOrObserve(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, PRMatch{Identity: identity}, title, body)
 }
 func (c Client) RequiredChecks(ctx context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
 	return c.checks(ctx, identity)
 }
-func (c Client) MarkReady(ctx context.Context, identity contracts.PullRequestIdentity, _ domain.Fence) error {
-	_, err := c.run(ctx, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--head-oid", identity.HeadOID, "--sf-owned", "true")
+func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
+	if err := c.validateClaim(ctx, durable, identity, "pr_ready"); err != nil {
+		return err
+	}
+	_, err := c.run(ctx, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository))
 	if err == nil {
 		return nil
 	}
-	_, observeErr := c.Observe(ctx, identity)
-	if observeErr == nil {
+	observed, observeErr := c.Observe(ctx, identity)
+	if observeErr == nil && observed.Ready && !observed.Draft {
 		return nil
 	}
 	return err
 }
-func (c Client) MergeExactHead(ctx context.Context, identity contracts.PullRequestIdentity, headOID, method string, _ domain.Fence) error {
-	plan, err := c.Plan(identity, "github-merge:"+headOID)
-	if err != nil {
+func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, headOID, method string) error {
+	if err := c.validateClaim(ctx, durable, identity, "merge"); err != nil {
 		return err
 	}
-	claim, err := c.Claim(plan)
-	if err != nil {
-		return err
-	}
-	_, err = c.Merge(ctx, claim, PRMatch{Identity: identity}, headOID, domain.MergeGuarded, method)
+	_, err := c.merge(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, PRMatch{Identity: identity}, headOID, domain.MergeGuarded, method)
 	return err
+}
+
+func (c Client) validateClaim(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, requiredKind string) error {
+	if c.ValidateClaim == nil || claim.SemanticKey == "" || claim.Kind != requiredKind || !validIdentity(identity) {
+		return ErrPolicyRefusal
+	}
+	return c.ValidateClaim(ctx, claim)
 }
 
 func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryIdentity) (Principal, error) {
@@ -149,12 +145,14 @@ func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryId
 		return Principal{}, err
 	}
 	var auth struct {
-		Login string `json:"login"`
+		Hosts map[string][]struct {
+			Login string `json:"login"`
+		} `json:"hosts"`
 	}
-	if err := c.json(ctx, &auth, "auth", "status", "--json", "login"); err != nil {
+	if err := c.json(ctx, &auth, "auth", "status", "--json", "hosts"); err != nil {
 		return Principal{}, err
 	}
-	if auth.Login == "" {
+	if len(auth.Hosts["github.com"]) != 1 || auth.Hosts["github.com"][0].Login == "" {
 		return Principal{}, ErrMalformedResponse
 	}
 	var repo struct {
@@ -167,7 +165,7 @@ func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryId
 	if repo.NameWithOwner != repository.Owner+"/"+repository.Name || repo.URL == "" {
 		return Principal{}, fmt.Errorf("%w: repository preflight mismatch", ErrPolicyRefusal)
 	}
-	return Principal{Login: auth.Login}, nil
+	return Principal{Login: auth.Hosts["github.com"][0].Login}, nil
 }
 
 func (c Client) Plan(identity contracts.PullRequestIdentity, semanticKey string) (EffectPlan, error) {
@@ -201,7 +199,7 @@ func (c Client) Observe(ctx context.Context, want contracts.PullRequestIdentity)
 			return PRMatch{}, err
 		}
 		if sameExact(candidate, want) {
-			matches = append(matches, PRMatch{Identity: candidate, Draft: value.Draft, Merged: value.Merged, Ready: value.Ready})
+			matches = append(matches, PRMatch{Identity: candidate, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft})
 		}
 	}
 	switch len(matches) {
@@ -214,7 +212,7 @@ func (c Client) Observe(ctx context.Context, want contracts.PullRequestIdentity)
 	}
 }
 
-func (c Client) CreateOrAdopt(ctx context.Context, claim EffectClaim, title, body string) (PRMatch, error) {
+func (c Client) createOrAdopt(ctx context.Context, claim EffectClaim, title, body string) (PRMatch, error) {
 	if !claim.Claimed {
 		return PRMatch{}, ErrPolicyRefusal
 	}
@@ -223,30 +221,26 @@ func (c Client) CreateOrAdopt(ctx context.Context, claim EffectClaim, title, bod
 	} else if !errors.Is(err, ErrNoMatchingPR) {
 		return PRMatch{}, err
 	}
-	var created prWire
-	err := c.json(ctx, &created, "pr", "create", "--repo", repoArg(claim.Plan.Identity.Repository), "--head", claim.Plan.Identity.HeadOwner+":"+claim.Plan.Identity.HeadRef, "--base", claim.Plan.Identity.BaseRef, "--head-oid", claim.Plan.Identity.HeadOID, "--sf-owned", "true", "--draft", "--title", title, "--body", body, "--json", prFields)
+	markedBody := body + "\n\n" + ownershipMarker(claim.Plan.Identity)
+	_, err := c.run(ctx, "pr", "create", "--repo", repoArg(claim.Plan.Identity.Repository), "--head", claim.Plan.Identity.HeadOwner+":"+claim.Plan.Identity.HeadRef, "--base", claim.Plan.Identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
 	if err != nil {
 		// A dropped response is indistinguishable from a network error. Read
 		// first and adopt only the one exact, factory-marked remote object.
 		return c.Observe(ctx, claim.Plan.Identity)
 	}
-	identity, err := created.identity(claim.Plan.Identity.Repository)
-	if err != nil || !sameExact(identity, claim.Plan.Identity) {
-		return PRMatch{}, fmt.Errorf("%w: create identity mismatch", ErrMalformedResponse)
-	}
-	return PRMatch{Identity: identity, Draft: created.Draft, Merged: created.Merged, Ready: created.Ready}, nil
+	return c.Observe(ctx, claim.Plan.Identity)
 }
 
-func (c Client) UpdateOrObserve(ctx context.Context, claim EffectClaim, current PRMatch, title, body string) error {
+func (c Client) updateOrObserve(ctx context.Context, claim EffectClaim, current PRMatch, title, body string) error {
 	if !claim.Claimed || !sameExact(current.Identity, claim.Plan.Identity) {
 		return ErrPolicyRefusal
 	}
-	_, err := c.run(ctx, "pr", "edit", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--title", title, "--body", body)
+	_, err := c.run(ctx, "pr", "edit", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--title", title, "--body", body+"\n\n"+ownershipMarker(current.Identity))
 	if err == nil {
 		return nil
 	}
-	_, observeErr := c.Observe(ctx, current.Identity)
-	if observeErr == nil {
+	observed, observeErr := c.Observe(ctx, current.Identity)
+	if observeErr == nil && observed.Identity.Number == current.Identity.Number {
 		return nil
 	}
 	return err
@@ -289,29 +283,43 @@ func (c Client) WaitChecks(ctx context.Context, identity contracts.PullRequestId
 }
 
 func (c Client) checks(ctx context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
-	var checks []contracts.RequiredCheck
-	if err := c.json(ctx, &checks, "pr", "checks", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--head-oid", identity.HeadOID, "--sf-owned", "true", "--json", "name,externalId,state"); err != nil {
+	var wire []checkWire
+	if err := c.json(ctx, &wire, "pr", "checks", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--json", "name,state,workflow,link,bucket"); err != nil {
 		return nil, err
+	}
+	checks := make([]contracts.RequiredCheck, 0, len(wire))
+	for _, check := range wire {
+		identity := check.Link
+		if check.Workflow != "" || check.Bucket != "" {
+			identity = check.Workflow + "\x00" + check.Link + "\x00" + check.Bucket
+		}
+		checks = append(checks, contracts.RequiredCheck{Name: check.Name, State: check.State, ExternalID: identity})
 	}
 	return checks, nil
 }
 
+type checkWire struct {
+	Name     string `json:"name"`
+	State    string `json:"state"`
+	Workflow string `json:"workflow"`
+	Link     string `json:"link"`
+	Bucket   string `json:"bucket"`
+}
+
 func evaluateChecks(actual []contracts.RequiredCheck, required []CheckIdentity) error {
-	if len(actual) != len(required) {
-		return ErrChecksFailed
-	}
 	seen := map[string]bool{}
+	pending := false
 	for _, check := range actual {
 		key := check.Name + "\x00" + check.ExternalID
 		if seen[key] {
 			return ErrChecksFailed
 		}
 		seen[key] = true
-		if check.State == "PENDING" || check.State == "QUEUED" || check.State == "IN_PROGRESS" {
-			return ErrChecksPending
-		}
-		if check.State != "SUCCESS" {
+		if check.State != "SUCCESS" && check.State != "PENDING" && check.State != "QUEUED" && check.State != "IN_PROGRESS" {
 			return ErrChecksFailed
+		}
+		if check.State == "PENDING" || check.State == "QUEUED" || check.State == "IN_PROGRESS" {
+			pending = true
 		}
 	}
 	for _, check := range required {
@@ -319,10 +327,13 @@ func evaluateChecks(actual []contracts.RequiredCheck, required []CheckIdentity) 
 			return ErrChecksFailed
 		}
 	}
+	if pending {
+		return ErrChecksPending
+	}
 	return nil
 }
 
-func (c Client) Merge(ctx context.Context, claim EffectClaim, pr PRMatch, reviewedHead string, mode domain.MergeMode, method string) (MergeOutcome, error) {
+func (c Client) merge(ctx context.Context, claim EffectClaim, pr PRMatch, reviewedHead string, mode domain.MergeMode, method string) (MergeOutcome, error) {
 	if mode == domain.MergeManual {
 		return "", fmt.Errorf("%w: manual mode never mutates readiness or merge", ErrPolicyRefusal)
 	}
@@ -363,14 +374,14 @@ func (a ApprovalBinding) Validate() error {
 
 func (c Client) view(ctx context.Context, identity contracts.PullRequestIdentity) (PRMatch, error) {
 	var value prWire
-	if err := c.json(ctx, &value, "pr", "view", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--head-oid", identity.HeadOID, "--sf-owned", "true", "--json", prFields); err != nil {
+	if err := c.json(ctx, &value, "pr", "view", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--json", prFields); err != nil {
 		return PRMatch{}, err
 	}
 	parsed, err := value.identity(identity.Repository)
 	if err != nil {
 		return PRMatch{}, err
 	}
-	return PRMatch{Identity: parsed, Draft: value.Draft, Merged: value.Merged, Ready: value.Ready}, nil
+	return PRMatch{Identity: parsed, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft}, nil
 }
 
 func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryIdentity, number int) (PRMatch, error) {
@@ -382,34 +393,39 @@ func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryI
 	if err != nil {
 		return PRMatch{}, err
 	}
-	return PRMatch{Identity: parsed, Draft: value.Draft, Merged: value.Merged, Ready: value.Ready}, nil
+	return PRMatch{Identity: parsed, Draft: value.Draft, Merged: value.MergedAt != nil, Ready: !value.Draft}, nil
 }
 
-const prFields = "number,repository,headRepository,headRefName,headRefOid,baseRefName,isDraft,sfOwned,merged,ready"
+const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,isDraft,mergedAt,state"
 
 type prWire struct {
-	Number     int `json:"number"`
-	Repository struct {
-		NameWithOwner string `json:"nameWithOwner"`
-	} `json:"repository"`
+	Number         int `json:"number"`
 	HeadRepository struct {
 		NameWithOwner string `json:"nameWithOwner"`
 	} `json:"headRepository"`
-	HeadRef      string `json:"headRefName"`
-	HeadOID      string `json:"headRefOid"`
-	BaseRef      string `json:"baseRefName"`
-	Draft        bool   `json:"isDraft"`
-	FactoryOwned bool   `json:"sfOwned"`
-	Merged       bool   `json:"merged"`
-	Ready        bool   `json:"ready"`
+	HeadRepositoryOwner struct {
+		Login string `json:"login"`
+	} `json:"headRepositoryOwner"`
+	HeadRef  string  `json:"headRefName"`
+	HeadOID  string  `json:"headRefOid"`
+	BaseRef  string  `json:"baseRefName"`
+	Draft    bool    `json:"isDraft"`
+	Title    string  `json:"title"`
+	Body     string  `json:"body"`
+	MergedAt *string `json:"mergedAt"`
+	State    string  `json:"state"`
 }
 
 func (p prWire) identity(repository contracts.RepositoryIdentity) (contracts.PullRequestIdentity, error) {
 	owner, name, ok := strings.Cut(p.HeadRepository.NameWithOwner, "/")
-	if !ok || owner == "" || name == "" || !p.FactoryOwned || p.Number <= 0 || p.HeadRef == "" || p.HeadOID == "" || p.BaseRef == "" {
+	if !ok || owner == "" || name == "" || p.HeadRepositoryOwner.Login != owner || p.Number <= 0 || p.HeadRef == "" || !validOID(p.HeadOID) || !validRef(p.HeadRef) || !validRef(p.BaseRef) {
 		return contracts.PullRequestIdentity{}, ErrMalformedResponse
 	}
-	return contracts.PullRequestIdentity{Repository: repository, Number: p.Number, HeadOwner: owner, HeadRepository: name, HeadRef: p.HeadRef, HeadOID: p.HeadOID, BaseRef: p.BaseRef, FactoryOwned: true}, nil
+	identity := contracts.PullRequestIdentity{Repository: repository, Number: p.Number, HeadOwner: owner, HeadRepository: name, HeadRef: p.HeadRef, HeadOID: p.HeadOID, BaseRef: p.BaseRef, FactoryOwned: true}
+	if !strings.Contains(p.Body, ownershipMarker(identity)) {
+		return contracts.PullRequestIdentity{}, ErrNoMatchingPR
+	}
+	return identity, nil
 }
 func sameExact(left, right contracts.PullRequestIdentity) bool {
 	return left.Repository == right.Repository && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.HeadOID == right.HeadOID && left.BaseRef == right.BaseRef && left.FactoryOwned && right.FactoryOwned && (right.Number == 0 || left.Number == right.Number)
@@ -421,9 +437,29 @@ func validRepository(value contracts.RepositoryIdentity) error {
 	return nil
 }
 func validIdentity(value contracts.PullRequestIdentity) bool {
-	return validRepository(value.Repository) == nil && value.HeadOwner != "" && value.HeadRepository != "" && value.HeadRef != "" && value.HeadOID != "" && value.BaseRef != "" && value.FactoryOwned
+	return validRepository(value.Repository) == nil && bounded(value.HeadOwner, 100) && bounded(value.HeadRepository, 100) && validRef(value.HeadRef) && validOID(value.HeadOID) && validRef(value.BaseRef) && value.FactoryOwned
 }
 func repoArg(value contracts.RepositoryIdentity) string { return value.Owner + "/" + value.Name }
+func ownershipMarker(value contracts.PullRequestIdentity) string {
+	return "<!-- sf:v1 repository=" + repoArg(value.Repository) + " head=" + value.HeadOwner + "/" + value.HeadRepository + ":" + value.HeadRef + " oid=" + value.HeadOID + " base=" + value.BaseRef + " -->"
+}
+func validOID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+func validRef(value string) bool {
+	return bounded(value, 255) && !strings.HasPrefix(value, "/") && !strings.HasSuffix(value, "/") && !strings.Contains(value, "..") && !strings.ContainsAny(value, " ~^:?*[\\\r\n")
+}
+func bounded(value string, maximum int) bool {
+	return value != "" && len(value) <= maximum && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00')
+}
 
 func (c Client) json(ctx context.Context, destination any, args ...string) error {
 	output, err := c.run(ctx, args...)
