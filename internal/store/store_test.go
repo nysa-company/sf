@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -115,6 +116,51 @@ func TestMigrationTransactionRollsBackOnInterruption(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatal("interrupted migration left partial schema")
+	}
+}
+
+func TestInterruptedV2MigrationLeavesV1SchemaUntouched(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v1.sqlite")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range migrationV1 {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'now'); INSERT INTO plans(channel, project_id, ticket_id, digest, body) VALUES ('dev', 'missing', 'ticket', 'digest', 'body')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(ctx, path); err == nil {
+		t.Fatal("migration with invalid legacy artifact succeeded")
+	}
+	raw, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var migrations int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&migrations); err != nil || migrations != 1 {
+		t.Fatalf("migration rows=%d err=%v", migrations, err)
+	}
+	var oldPlans, partialPlans int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='plans'`).Scan(&oldPlans); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='plans_v2'`).Scan(&partialPlans); err != nil {
+		t.Fatal(err)
+	}
+	if oldPlans != 1 || partialPlans != 0 {
+		t.Fatalf("migration rollback plans=%d partial=%d", oldPlans, partialPlans)
 	}
 }
 
@@ -240,12 +286,176 @@ func TestCompletedPhaseDoesNotReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}
-	first, err := database.RecordPhaseCompletion(ctx, ref, domain.PhasePlanning, 1, fence)
+	first, err := database.RecordPhaseCompletion(ctx, ref, domain.PhasePlanning, 1, started.Version, fence)
 	if err != nil || !first {
 		t.Fatalf("first completion=%v err=%v", first, err)
 	}
-	second, err := database.RecordPhaseCompletion(ctx, ref, domain.PhasePlanning, 1, fence)
+	second, err := database.RecordPhaseCompletion(ctx, ref, domain.PhasePlanning, 1, started.Version, fence)
 	if err != nil || second {
 		t.Fatalf("second completion=%v err=%v", second, err)
 	}
+}
+
+func TestLatePhaseCompletionIsFencedByTicketVersion(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-6"}
+	if err := database.CreateTicket(ctx, ticket(ref, "digest-6")); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-6/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanced, err := database.Transition(ctx, Transition{Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: "{}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.RecordPhaseCompletion(ctx, ref, domain.PhasePlanning, 1, started.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch})
+	if !errors.Is(err, ErrStaleFence) || advanced.Version == started.Version {
+		t.Fatalf("late phase completion=%v", err)
+	}
+}
+
+func TestEffectClaimsReconcileAndFenceLateResponse(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-7"}
+	if err := database.CreateTicket(ctx, ticket(ref, "digest-7")); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-7/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := EffectFence{SemanticKey: "dev/nysa/SF-7/publish/1/branch_push/main", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
+	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: base.SemanticKey, Ref: ref, Kind: "branch_push", TicketVersion: base.TicketVersion, Fence: base.Fence, RequestDigest: "request-1"}); err != nil {
+		t.Fatal(err)
+	}
+	claims := make(chan EffectClaim, 2)
+	errs := make(chan error, 2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() {
+			<-start
+			claim, err := database.ClaimEffect(ctx, base)
+			claims <- claim
+			errs <- err
+		}()
+	}
+	close(start)
+	var claimed EffectClaim
+	for range 2 {
+		claim := <-claims
+		err := <-errs
+		if err == nil && claim.Claimed {
+			claimed = claim
+		} else if !errors.Is(err, ErrEffectBusy) {
+			t.Fatalf("claim error=%v", err)
+		}
+	}
+	if !claimed.Claimed || claimed.Effect.ClaimEpoch != 1 {
+		t.Fatalf("claim=%+v", claimed)
+	}
+	oldFence := base
+	oldFence.Fence.ClaimEpoch = claimed.Effect.ClaimEpoch
+	newLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncertain, err := database.ReconcileEffects(ctx, domain.ChannelDev, newLeader)
+	if err != nil || len(uncertain) != 1 || uncertain[0].State != EffectUncertain || uncertain[0].ClaimEpoch <= oldFence.Fence.ClaimEpoch {
+		t.Fatalf("reconcile=%+v err=%v", uncertain, err)
+	}
+	if _, err := database.ConfirmEffect(ctx, oldFence, "late-response"); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("late response=%v", err)
+	}
+	recovered := EffectFence{SemanticKey: base.SemanticKey, Ref: ref, TicketVersion: uncertain[0].TicketVersion, Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: uncertain[0].RunnerEpoch, ClaimEpoch: uncertain[0].ClaimEpoch}}
+	confirmed, err := database.ConfirmEffect(ctx, recovered, "remote-main@abc")
+	if err != nil || confirmed.State != EffectConfirmed || confirmed.ObservedIdentity != "remote-main@abc" {
+		t.Fatalf("confirm=%+v err=%v", confirmed, err)
+	}
+}
+
+func TestEffectSemanticKeyCannotBeReplannedDifferently(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-8"}
+	if err := database.CreateTicket(ctx, ticket(ref, "digest-8")); err != nil {
+		t.Fatal(err)
+	}
+	leader, _ := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-a")
+	started, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-8/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := EffectPlan{SemanticKey: "key-8", Ref: ref, Kind: "worktree_create", TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, RequestDigest: "one"}
+	if _, err := database.PlanEffect(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	plan.RequestDigest = "two"
+	if _, err := database.PlanEffect(ctx, plan); !errors.Is(err, ErrEffectKey) {
+		t.Fatalf("semantic conflict=%v", err)
+	}
+}
+
+func TestRecoveryBlockWritesEventAndSchemaGuardsStartup(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-9"}
+	if err := database.CreateTicket(ctx, ticket(ref, "digest-9")); err != nil {
+		t.Fatal(err)
+	}
+	leader, _ := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-a")
+	if _, err := database.db.Exec(`UPDATE tickets SET state='planning' WHERE channel='dev' AND project_id='nysa' AND id='SF-9'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ReconcileOrphans(ctx, domain.ChannelDev, leader); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := database.Ticket(ctx, ref)
+	if err != nil || blocked.State != domain.StateBlocked || blocked.BlockedCode != "workflow_ownership_unknown" {
+		t.Fatalf("blocked=%+v err=%v", blocked, err)
+	}
+	var events int
+	if err := database.db.QueryRow(`SELECT COUNT(*) FROM events WHERE ticket_id='SF-9' AND trigger='workflow_ownership_unknown'`).Scan(&events); err != nil || events != 1 {
+		t.Fatalf("recovery events=%d err=%v", events, err)
+	}
+
+	corrupt := filepath.Join(t.TempDir(), "corrupt.sqlite")
+	if err := os.WriteFile(corrupt, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(ctx, corrupt); err == nil {
+		t.Fatal("corrupt sqlite opened")
+	}
+	missing := filepath.Join(t.TempDir(), "missing.sqlite")
+	raw, err := sql.Open("sqlite", missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL); INSERT INTO schema_migrations VALUES (1, 'now', '` + migrationChecksums[1] + `'); INSERT INTO schema_migrations VALUES (2, 'now', '` + migrationChecksums[2] + `')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.Close()
+	if _, err := Open(ctx, missing); err == nil {
+		t.Fatal("missing schema shape opened")
+	}
+}
+
+func TestOnlineBackupCanBeOpened(t *testing.T) {
+	database, ctx := openTestStore(t)
+	path := filepath.Join(t.TempDir(), "backup.sqlite")
+	if err := database.Backup(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
 }
