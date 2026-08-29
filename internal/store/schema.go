@@ -51,6 +51,11 @@ func (s *Store) validateSchema(ctx context.Context) error {
 			return err
 		}
 	}
+	for _, index := range requiredIndexes {
+		if err := hasIndex(ctx, s.db, index); err != nil {
+			return err
+		}
+	}
 	rows, err := s.db.QueryContext(ctx, "PRAGMA foreign_key_check")
 	if err != nil {
 		return fmt.Errorf("foreign key check: %w", err)
@@ -98,8 +103,11 @@ func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error 
 }
 
 var requiredSchema = map[string][]string{
+	"schema_migrations": {"version", "applied_at", "checksum"},
+	"daemon_instances":  {"channel", "leader_epoch", "identity"},
 	"projects":          {"channel", "id", "canonical_path"},
 	"tickets":           {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id"},
+	"workflow_owners":   {"channel", "project_id", "ticket_id", "workflow_id"},
 	"phase_runs":        {"phase", "attempt", "expected_ticket_version"},
 	"events":            {"ticket_version", "trigger", "from_state", "to_state"},
 	"effects":           {"semantic_key", "claim_epoch", "observed_identity"},
@@ -109,6 +117,93 @@ var requiredSchema = map[string][]string{
 	"leases":            {"scope", "scope_key", "runner_epoch"},
 	"plans":             {"ticket_id", "digest", "body"},
 	"verifications":     {"ticket_id", "intent_digest", "proof_digest"},
+}
+
+type indexRequirement struct {
+	table   string
+	name    string
+	columns []string
+	partial bool
+}
+
+var requiredIndexes = []indexRequirement{
+	{table: "projects", columns: []string{"channel", "canonical_path"}},
+	{table: "tickets", name: "active_ticket_source_digest", columns: []string{"channel", "project_id", "source_digest"}, partial: true},
+	{table: "tickets", name: "ticket_workflow_id", columns: []string{"channel", "workflow_id"}, partial: true},
+	{table: "workflow_owners", columns: []string{"channel", "workflow_id"}},
+	{table: "phase_runs", name: "one_active_phase_per_ticket", columns: []string{"channel", "project_id", "ticket_id"}, partial: true},
+	{table: "effects", name: "active_effect_claim", columns: []string{"channel", "project_id", "ticket_id", "effect_kind"}, partial: true},
+	{table: "approvals", name: "current_approval_per_head", columns: []string{"channel", "project_id", "ticket_id", "reviewed_head", "operator_uid"}, partial: true},
+	{table: "worktrees", columns: []string{"channel", "path"}},
+	{table: "worktrees", columns: []string{"channel", "branch_ref"}},
+	{table: "provider_attempts", columns: []string{"channel", "project_id", "ticket_id", "phase", "attempt", "provider"}},
+}
+
+func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA index_list("+required.table+")")
+	if err != nil {
+		return fmt.Errorf("inspect indexes for %s: %w", required.table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var seq int
+		var name, origin string
+		var unique, partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return err
+		}
+		if unique != 1 || partial != boolInt(required.partial) || (required.name != "" && name != required.name) {
+			continue
+		}
+		columns, err := indexColumns(ctx, db, name)
+		if err != nil {
+			return err
+		}
+		if sameColumns(columns, required.columns) {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("required %sunique index on %s(%v) is missing", map[bool]string{true: "partial ", false: ""}[required.partial], required.table, required.columns)
+}
+
+func indexColumns(ctx context.Context, db *sql.DB, index string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "PRAGMA index_info("+index+")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var seqno, cid int
+		var name string
+		if err := rows.Scan(&seqno, &cid, &name); err != nil {
+			return nil, err
+		}
+		columns = append(columns, name)
+	}
+	return columns, rows.Err()
+}
+
+func sameColumns(actual, expected []string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range actual {
+		if actual[index] != expected[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func hasColumns(ctx context.Context, db *sql.DB, table string, required ...string) error {

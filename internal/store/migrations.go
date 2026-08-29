@@ -112,3 +112,11 @@ var migrationV2 = []string{
 	`DROP TABLE verifications`,
 	`ALTER TABLE verifications_v2 RENAME TO verifications`,
 }
+
+// v3 preserves original effect ticket identity during recovery and makes a
+// current operator decision mutually exclusive for a reviewed ticket head.
+var migrationV3 = []string{
+	`DROP INDEX current_approval_per_head`,
+	`CREATE UNIQUE INDEX current_approval_per_head
+		ON approvals(channel, project_id, ticket_id, reviewed_head, operator_uid) WHERE invalidated = 0`,
+}

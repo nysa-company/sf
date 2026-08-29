@@ -193,6 +193,20 @@ func TestBusyDeadlineIsApplicationOwned(t *testing.T) {
 	}
 }
 
+func TestCommitFailureRollsBackBeforePoolReuse(t *testing.T) {
+	database, ctx := openTestStore(t)
+	injected := errors.New("injected commit failure")
+	database.commit = func(context.Context, *sql.Conn) error { return injected }
+	err := database.CreateProject(ctx, Project{Channel: domain.ChannelDev, ID: "commit-fail", Path: "/tmp/commit-fail", BaseRef: "main"})
+	if !errors.Is(err, injected) {
+		t.Fatalf("commit error=%v", err)
+	}
+	database.commit = commitTransaction
+	if err := database.CreateProject(ctx, Project{Channel: domain.ChannelDev, ID: "after-rollback", Path: "/tmp/after-rollback", BaseRef: "main"}); err != nil {
+		t.Fatalf("pooled connection retained failed transaction: %v", err)
+	}
+}
+
 func TestStartOrAdoptRepairsStateWithoutOwner(t *testing.T) {
 	database, ctx := openTestStore(t)
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-3"}
@@ -204,7 +218,7 @@ func TestStartOrAdoptRepairsStateWithoutOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1}
-	started, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-3/planning", fence)
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-3/planning", fence)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,12 +239,15 @@ func TestStartOrAdoptRepairsStateWithoutOwner(t *testing.T) {
 	if owners != 1 {
 		t.Fatalf("workflow owners=%d want=1", owners)
 	}
-	adopted, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-3/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch})
+	adopted, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-3/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if adopted.WorkflowID != "dev/nysa/SF-3/planning" {
 		t.Fatalf("workflow id=%q", adopted.WorkflowID)
+	}
+	if _, err := database.StartOrAdopt(ctx, ref, started.Version, "dev/nysa/SF-3/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("start with post-transition version=%v", err)
 	}
 	var startEvents int
 	if err := database.db.QueryRow(`SELECT COUNT(*) FROM events WHERE channel='dev' AND project_id='nysa' AND ticket_id='SF-3' AND trigger='start_or_adopt'`).Scan(&startEvents); err != nil {
@@ -239,7 +256,7 @@ func TestStartOrAdoptRepairsStateWithoutOwner(t *testing.T) {
 	if startEvents != 1 {
 		t.Fatalf("start events=%d want=1", startEvents)
 	}
-	if _, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-3/other", domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}); !errors.Is(err, ErrStaleFence) {
+	if _, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-3/other", domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}); !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("changed workflow identity error=%v", err)
 	}
 }
@@ -254,7 +271,7 @@ func TestStaleRunnerCannotTransition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	started, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-4/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-4/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +298,7 @@ func TestCompletedPhaseDoesNotReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	started, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-5/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-5/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +323,7 @@ func TestLatePhaseCompletionIsFencedByTicketVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	started, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-6/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-6/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +347,7 @@ func TestEffectClaimsReconcileAndFenceLateResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	started, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-7/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-7/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +407,7 @@ func TestEffectSemanticKeyCannotBeReplannedDifferently(t *testing.T) {
 		t.Fatal(err)
 	}
 	leader, _ := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-a")
-	started, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-8/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-8/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,6 +418,66 @@ func TestEffectSemanticKeyCannotBeReplannedDifferently(t *testing.T) {
 	plan.RequestDigest = "two"
 	if _, err := database.PlanEffect(ctx, plan); !errors.Is(err, ErrEffectKey) {
 		t.Fatalf("semantic conflict=%v", err)
+	}
+}
+
+func TestStaleEffectObservationRetainsOriginalTicketIdentity(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-8-stale"}
+	if err := database.CreateTicket(ctx, ticket(ref, "digest-8-stale")); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-8-stale/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := EffectFence{SemanticKey: "key-8-stale", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
+	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: base.SemanticKey, Ref: ref, Kind: "branch_push", TicketVersion: started.Version, Fence: base.Fence, RequestDigest: "request"}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := database.ClaimEffect(ctx, base)
+	if err != nil || !claim.Claimed {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	if _, err := database.Transition(ctx, Transition{Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: base.Fence, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	newLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncertain, err := database.ReconcileEffects(ctx, domain.ChannelDev, newLeader)
+	if err != nil || len(uncertain) != 1 || uncertain[0].TicketVersion != started.Version || uncertain[0].RunnerEpoch != started.RunnerEpoch {
+		t.Fatalf("recovery rewrote effect identity: %+v err=%v", uncertain, err)
+	}
+	recovered := EffectFence{SemanticKey: base.SemanticKey, Ref: ref, TicketVersion: uncertain[0].TicketVersion, Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: uncertain[0].RunnerEpoch, ClaimEpoch: uncertain[0].ClaimEpoch}}
+	if _, err := database.ConfirmEffect(ctx, recovered, "remote@abc"); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("stale confirmation=%v", err)
+	}
+	evidence, err := database.RecordStaleObservation(ctx, EffectObservation{EffectFence: recovered, Present: true, Identity: "remote@abc"})
+	if !errors.Is(err, ErrStaleObservation) || evidence.State != EffectUncertain || evidence.ObservedIdentity != "remote@abc" {
+		t.Fatalf("stale evidence=%+v err=%v", evidence, err)
+	}
+	if _, err := database.ConfirmEffect(ctx, recovered, ""); err == nil {
+		t.Fatal("empty confirmation identity succeeded")
+	}
+}
+
+func TestCurrentApprovalDecisionIsMutuallyExclusive(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-approval"}
+	if err := database.CreateTicket(ctx, ticket(ref, "digest-approval")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.Exec(`INSERT INTO approvals(channel, project_id, ticket_id, reviewed_head, operator_uid, decision, created_at) VALUES ('dev', 'nysa', 'SF-approval', 'head', 501, 'approved', 'now')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.Exec(`INSERT INTO approvals(channel, project_id, ticket_id, reviewed_head, operator_uid, decision, created_at) VALUES ('dev', 'nysa', 'SF-approval', 'head', 501, 'rejected', 'now')`); err == nil {
+		t.Fatal("conflicting current approval decision succeeded")
 	}
 }
 
@@ -421,7 +498,7 @@ func TestRecoveryBlockWritesEventAndSchemaGuardsStartup(t *testing.T) {
 	if err != nil || blocked.State != domain.StateBlocked || blocked.BlockedCode != "workflow_ownership_unknown" {
 		t.Fatalf("blocked=%+v err=%v", blocked, err)
 	}
-	if _, err := database.StartOrAdopt(ctx, ref, "dev/nysa/SF-9/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: blocked.RunnerEpoch}); !errors.Is(err, ErrBlocked) {
+	if _, err := database.StartOrAdopt(ctx, ref, blocked.Version, "dev/nysa/SF-9/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: blocked.RunnerEpoch}); !errors.Is(err, ErrBlocked) {
 		t.Fatalf("blocked start=%v", err)
 	}
 	var events int
@@ -441,7 +518,7 @@ func TestRecoveryBlockWritesEventAndSchemaGuardsStartup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL); INSERT INTO schema_migrations VALUES (1, 'now', '` + migrationChecksums[1] + `'); INSERT INTO schema_migrations VALUES (2, 'now', '` + migrationChecksums[2] + `')`); err != nil {
+	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL); INSERT INTO schema_migrations VALUES (1, 'now', '` + migrationChecksums[1] + `'); INSERT INTO schema_migrations VALUES (2, 'now', '` + migrationChecksums[2] + `'); INSERT INTO schema_migrations VALUES (3, 'now', '` + migrationChecksums[3] + `')`); err != nil {
 		t.Fatal(err)
 	}
 	_ = raw.Close()

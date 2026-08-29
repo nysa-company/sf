@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
@@ -144,11 +145,53 @@ func (s *Store) FailEffect(ctx context.Context, fence EffectFence) (Effect, erro
 // eligible for a new, incremented claim. Unknown observations leave it
 // uncertain, so time alone never permits another executor.
 func (s *Store) ObserveEffect(ctx context.Context, observation EffectObservation) (Effect, error) {
+	if observation.Present && strings.TrimSpace(observation.Identity) == "" {
+		return Effect{}, fmt.Errorf("observed identity is required to confirm an effect")
+	}
 	state := EffectFailed
 	if observation.Present {
 		state = EffectConfirmed
 	}
 	return s.finishEffect(ctx, observation.EffectFence, state, observation.Identity)
+}
+
+// RecordStaleObservation preserves evidence discovered after recovery when a
+// ticket advanced while the external result was lost. It deliberately leaves
+// the effect uncertain: the evidence is useful for reconciliation, but cannot
+// confirm an effect or advance a newer ticket identity.
+func (s *Store) RecordStaleObservation(ctx context.Context, observation EffectObservation) (Effect, error) {
+	if strings.TrimSpace(observation.Identity) == "" {
+		return Effect{}, fmt.Errorf("observed identity is required for stale observation")
+	}
+	var effect Effect
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		current, err := effectFrom(ctx, conn, observation.SemanticKey)
+		if err != nil {
+			return err
+		}
+		if current.Ref != observation.Ref || current.State != EffectUncertain || current.LeaderEpoch != observation.Fence.LeaderEpoch || current.ClaimEpoch != observation.Fence.ClaimEpoch {
+			return ErrStaleFence
+		}
+		var leader, version, runner uint64
+		if err := conn.QueryRowContext(ctx, `SELECT d.leader_epoch, t.version, t.runner_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, observation.Ref.Channel, observation.Ref.Project, observation.Ref.Ticket).Scan(&leader, &version, &runner); err != nil {
+			return err
+		}
+		if leader != observation.Fence.LeaderEpoch {
+			return ErrStaleFence
+		}
+		if version == current.TicketVersion && runner == current.RunnerEpoch {
+			return fmt.Errorf("stale observation requires a changed ticket identity")
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE effects SET observed_identity=? WHERE semantic_key=? AND state='uncertain' AND leader_epoch=? AND claim_epoch=?`, observation.Identity, observation.SemanticKey, observation.Fence.LeaderEpoch, observation.Fence.ClaimEpoch); err != nil {
+			return err
+		}
+		effect, err = effectFrom(ctx, conn, observation.SemanticKey)
+		return err
+	})
+	if err != nil {
+		return effect, err
+	}
+	return effect, ErrStaleObservation
 }
 
 func (s *Store) finishEffect(ctx context.Context, fence EffectFence, state EffectState, identity string) (Effect, error) {
@@ -198,13 +241,11 @@ func (s *Store) ReconcileEffects(ctx context.Context, channel domain.Channel, le
 			return ErrStaleFence
 		}
 		// Recovery revokes the crashed claimant and gives the observing leader a
-		// fresh claim epoch. This permits a read-only observation to be recorded
-		// while preventing a late response from the old leader from confirming.
+		// fresh claim epoch. It must retain the ticket identity that crossed the
+		// external boundary: a later ticket transition cannot be reinterpreted as
+		// the identity of an old effect.
 		if _, err := conn.ExecContext(ctx, `UPDATE effects
-			SET state='uncertain', leader_epoch=?,
-				runner_epoch=(SELECT runner_epoch FROM tickets WHERE tickets.channel=effects.channel AND tickets.project_id=effects.project_id AND tickets.id=effects.ticket_id),
-				ticket_version=(SELECT version FROM tickets WHERE tickets.channel=effects.channel AND tickets.project_id=effects.project_id AND tickets.id=effects.ticket_id),
-				claim_epoch=claim_epoch+1
+			SET state='uncertain', leader_epoch=?, claim_epoch=claim_epoch+1
 			WHERE channel=? AND state IN ('executing','uncertain')`, leaderEpoch, channel); err != nil {
 			return err
 		}
