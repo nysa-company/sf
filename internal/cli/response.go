@@ -31,11 +31,11 @@ func exitCode(response api.Response) ExitCode {
 		return ExitInternal
 	}
 	switch response.Error.Code {
-	case "invalid_command", "invalid_ticket", "invalid_argument":
+	case "invalid_command", "invalid_ticket", "invalid_argument", "invalid_repository", "invalid_configuration":
 		return ExitInput
-	case "operator_action_required", "provider_auth_missing", "blocked_process", "uncertain_effect", "not_configured", "doctor_not_configured", "doctor_failed":
+	case "operator_action_required", "provider_auth_missing", "blocked_process", "uncertain_effect", "not_configured", "doctor_not_configured", "doctor_failed", "project_conflict", "init_failed", "unknown_project":
 		return ExitAction
-	case "daemon_unavailable", "provider_waiting", "checks_pending":
+	case "daemon_unavailable", "provider_waiting", "checks_pending", "store_busy":
 		return ExitWait
 	case "policy_refusal", "safety_blocked", "unqualified_provider":
 		return ExitPolicy

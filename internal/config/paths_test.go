@@ -17,8 +17,11 @@ func TestStableAndDevPathsAreDisjoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stable.Root == dev.Root || stable.Database == dev.Database || stable.Socket == dev.Socket {
+	if stable.Root == dev.Root || stable.Database == dev.Database || stable.Machine == dev.Machine || stable.Socket == dev.Socket || stable.Worktrees == dev.Worktrees {
 		t.Fatalf("channel paths overlap: stable=%+v dev=%+v", stable, dev)
+	}
+	if filepath.Dir(stable.Machine) != stable.Root || filepath.Dir(dev.Machine) != dev.Root {
+		t.Fatal("machine configuration escapes its channel root")
 	}
 	if stable.Root != filepath.Join(home, "Library", "Application Support", "sf", "stable") {
 		t.Fatalf("stable root=%s", stable.Root)

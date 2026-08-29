@@ -94,3 +94,20 @@ func TestSnapshotIsStable(t *testing.T) {
 		t.Fatal("configuration snapshot is not deterministic")
 	}
 }
+
+func TestResolveRejectsUnsafeProjectAndProviderIdentities(t *testing.T) {
+	machine := DefaultMachineLimits()
+	for name, mutate := range map[string]func(*Project){
+		"project path component": func(project *Project) { project.Name = "../nysa" },
+		"unsafe base":            func(project *Project) { project.BaseBranch = "refs/heads/../main" },
+		"provider flag":          func(project *Project) { project.Providers.Builder = []string{"--dangerously-skip"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			project := guardedProject()
+			mutate(&project)
+			if _, err := Resolve(machine, project, TicketOverride{}); err == nil {
+				t.Fatal("unsafe identity was accepted")
+			}
+		})
+	}
+}

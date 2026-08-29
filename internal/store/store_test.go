@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -219,6 +220,60 @@ func TestTicketIdentityIsChannelUniqueAndProjectLookupIsDurable(t *testing.T) {
 	projects, err := database.Projects(ctx, domain.ChannelDev)
 	if err != nil || len(projects) != 2 || projects[0].ID != "nysa" || projects[1].ID != "other" {
 		t.Fatalf("projects=%+v err=%v", projects, err)
+	}
+}
+
+func TestRegisterProjectIsExactIdempotentAndSnapshotsOnStart(t *testing.T) {
+	database, ctx := openTestStore(t)
+	snapshot := []byte(`{"name":"configured"}`)
+	digestBytes := sha256.Sum256(snapshot)
+	project := Project{
+		Channel: domain.ChannelDev, ID: "configured", Path: "/tmp/configured", BaseRef: "main",
+		ConfigGeneration: 1, ConfigDigest: fmt.Sprintf("%x", digestBytes[:]), ConfigSnapshot: snapshot,
+	}
+	created, err := database.RegisterProject(ctx, project)
+	if err != nil || !created {
+		t.Fatalf("created=%v err=%v", created, err)
+	}
+	created, err = database.RegisterProject(ctx, project)
+	if err != nil || created {
+		t.Fatalf("idempotent created=%v err=%v", created, err)
+	}
+
+	conflict := project
+	conflict.BaseRef = "trunk"
+	if _, err := database.RegisterProject(ctx, conflict); !errors.Is(err, ErrProjectConflict) {
+		t.Fatalf("conflict error=%v", err)
+	}
+	badDigest := project
+	badDigest.ID = "bad-digest"
+	badDigest.ConfigDigest = strings.Repeat("0", 64)
+	if _, err := database.RegisterProject(ctx, badDigest); err == nil {
+		t.Fatal("mismatched project snapshot digest was accepted")
+	}
+
+	loadedProject, err := database.Project(ctx, domain.ChannelDev, project.ID)
+	if err != nil || loadedProject.ConfigGeneration != 1 || loadedProject.ConfigDigest != project.ConfigDigest || !bytes.Equal(loadedProject.ConfigSnapshot, snapshot) {
+		t.Fatalf("project=%+v err=%v", loadedProject, err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: project.ID, Ticket: "SF-config-snapshot"}
+	if err := database.CreateTicket(ctx, ticket(ref, "config-snapshot")); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := database.Ticket(ctx, ref)
+	if err != nil || queued.ConfigGeneration != 0 || len(queued.ConfigSnapshot) != 0 {
+		t.Fatalf("queued=%+v err=%v", queued, err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "config-daemon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, queued.Version, "sf/dev/configured/SF-config-snapshot", domain.Fence{LeaderEpoch: leader, RunnerEpoch: queued.RunnerEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.ConfigGeneration != 1 || started.ConfigDigest != project.ConfigDigest || !bytes.Equal(started.ConfigSnapshot, snapshot) {
+		t.Fatalf("started config=%+v", started)
 	}
 }
 

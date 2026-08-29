@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -16,12 +17,17 @@ type Command struct {
 }
 
 func (c Command) Validate(name string) error {
-	if len(c.Argv) == 0 || strings.TrimSpace(c.Argv[0]) == "" {
+	if len(c.Argv) == 0 || len(c.Argv) > 64 || strings.TrimSpace(c.Argv[0]) == "" {
 		return fmt.Errorf("command %s requires a non-empty argv", name)
 	}
+	total := 0
 	for _, arg := range c.Argv {
 		if strings.ContainsRune(arg, '\x00') {
 			return fmt.Errorf("command %s contains a NUL byte", name)
+		}
+		total += len(arg)
+		if total > 16*1024 {
+			return fmt.Errorf("command %s exceeds the argv size limit", name)
 		}
 	}
 	return nil
@@ -53,6 +59,32 @@ func DefaultMachineLimits() MachineLimits {
 		MaxTicketTimeout:      4 * time.Hour,
 		MaxTicketCostMicroUSD: 100_000_000,
 		AllowAutonomous:       false,
+	}
+}
+
+// DefaultProject is the conservative local walking-skeleton configuration.
+// Repository configuration can narrow these values, but Resolve always keeps
+// the machine limits authoritative.
+func DefaultProject(name, repository string) Project {
+	return Project{
+		Name:                  name,
+		Repository:            repository,
+		BaseBranch:            "main",
+		MergeMode:             domain.MergeGuarded,
+		MergeMethod:           "squash",
+		MaxConcurrentTickets:  2,
+		PhaseTimeout:          45 * time.Minute,
+		TicketTimeout:         4 * time.Hour,
+		MaxTicketCostMicroUSD: 100_000_000,
+		Commands: Commands{
+			Verify: Command{Argv: []string{"make", "test-focused"}},
+			Review: Command{Argv: []string{"make", "test"}},
+		},
+		Providers: ProviderOrder{
+			Planner:  []string{"cursor", "claude", "codex"},
+			Builder:  []string{"cursor", "claude", "codex"},
+			Reviewer: []string{"claude", "codex", "cursor"},
+		},
 	}
 }
 
@@ -152,10 +184,10 @@ func validateMachine(machine MachineLimits) error {
 }
 
 func validateProject(machine MachineLimits, project Project) error {
-	if strings.TrimSpace(project.Name) == "" || strings.TrimSpace(project.Repository) == "" {
+	if !projectNamePattern.MatchString(project.Name) || strings.TrimSpace(project.Repository) == "" {
 		return fmt.Errorf("project name and repository are required")
 	}
-	if strings.TrimSpace(project.BaseBranch) == "" {
+	if !validBaseBranch(project.BaseBranch) {
 		return fmt.Errorf("project base branch is required")
 	}
 	if !project.MergeMode.Valid() {
@@ -190,7 +222,41 @@ func validateProject(machine MachineLimits, project Project) error {
 	if len(project.Providers.Planner) == 0 || len(project.Providers.Builder) == 0 || len(project.Providers.Reviewer) == 0 {
 		return fmt.Errorf("planner, builder, and reviewer provider orders are required")
 	}
+	for role, providers := range map[string][]string{
+		"planner": project.Providers.Planner, "builder": project.Providers.Builder, "reviewer": project.Providers.Reviewer,
+	} {
+		seen := make(map[string]struct{}, len(providers))
+		for _, provider := range providers {
+			if !providerNamePattern.MatchString(provider) {
+				return fmt.Errorf("%s provider %q is invalid", role, provider)
+			}
+			if _, exists := seen[provider]; exists {
+				return fmt.Errorf("%s provider %q is duplicated", role, provider)
+			}
+			seen[provider] = struct{}{}
+		}
+	}
 	return nil
+}
+
+var (
+	projectNamePattern  = regexp.MustCompile(`^[a-z][a-z0-9-]{0,47}$`)
+	providerNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,47}$`)
+)
+
+func validBaseBranch(value string) bool {
+	if value == "" || len(value) > 255 || strings.HasPrefix(value, "-") || strings.HasPrefix(value, ".") || strings.HasPrefix(value, "refs/") || strings.HasSuffix(value, ".") || strings.HasSuffix(value, "/") || strings.HasSuffix(value, ".lock") {
+		return false
+	}
+	if strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.ContainsAny(value, " ~^:?*[\\\x00\r\n\t") || strings.Contains(value, "//") {
+		return false
+	}
+	for _, component := range strings.Split(value, "/") {
+		if component == "" || strings.HasPrefix(component, ".") || strings.HasSuffix(component, ".") || strings.HasSuffix(component, ".lock") {
+			return false
+		}
+	}
+	return true
 }
 
 func mergeRank(mode domain.MergeMode) int {

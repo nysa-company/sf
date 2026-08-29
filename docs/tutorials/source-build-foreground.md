@@ -33,6 +33,14 @@ make build-dev
 ./bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app
 ```
 
+`init` reads an optional `.sf/config.toml` but does not create or modify that
+file. It canonicalizes the Git worktree root, verifies the configured local
+base branch, creates only the dev channel's owner-only state directory, and
+records a durable configuration generation. Running the exact command again
+is an idempotent observation. A different repository or changed configuration
+under the same project name is refused rather than silently replacing the
+registration.
+
 `auth login` starts the official interactive login flow in your terminal. It
 does not send a displayed token to the daemon. `auth status` reports only a
 safe account label, credential state, and remediation.

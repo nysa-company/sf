@@ -219,3 +219,20 @@ var migrationV7 = []string{
 	`CREATE INDEX candidate_snapshot_current ON candidate_snapshots(channel, project_id, ticket_id, generation DESC)`,
 	`CREATE INDEX invalidation_receipt_ticket ON invalidation_receipts(channel, project_id, ticket_id, generation)`,
 }
+
+// v8 makes configuration authority durable. A project points at its current
+// immutable generation, while a ticket copies the exact canonical bytes and
+// digest when queued work first enters planning. Later registration therefore
+// cannot change an active ticket's command or provider authority.
+var migrationV8 = []string{
+	`ALTER TABLE projects ADD COLUMN current_config_generation INTEGER NOT NULL DEFAULT 0 CHECK(current_config_generation >= 0)`,
+	`CREATE TABLE project_configurations (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation > 0),
+		digest TEXT NOT NULL CHECK(length(digest)=64), snapshot_bytes BLOB NOT NULL CHECK(length(snapshot_bytes) BETWEEN 1 AND 65536), created_at TEXT NOT NULL,
+		PRIMARY KEY(channel, project_id, generation), UNIQUE(channel, project_id, digest),
+		FOREIGN KEY(channel, project_id) REFERENCES projects(channel, id)
+	)`,
+	`ALTER TABLE tickets ADD COLUMN config_generation INTEGER NOT NULL DEFAULT 0 CHECK(config_generation >= 0)`,
+	`ALTER TABLE tickets ADD COLUMN config_digest TEXT NOT NULL DEFAULT '' CHECK(config_digest='' OR length(config_digest)=64)`,
+	`ALTER TABLE tickets ADD COLUMN config_snapshot_bytes BLOB NOT NULL DEFAULT X'' CHECK(length(config_snapshot_bytes) <= 65536)`,
+}

@@ -11,6 +11,10 @@ The approved normative design is in
 - NDJSON events and logs are readable projections, never recovery inputs.
 - Git and GitHub mutations cross narrow fenced interfaces and reconcile remote
   truth before any retry.
+- Project configuration is parsed strictly, resolved beneath machine policy,
+  and stored as immutable canonical bytes plus a digest. A queued ticket copies
+  the exact current generation when it first enters planning, so a later file
+  edit cannot change that ticket's command or provider authority.
 
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
 one custom Go state engine over the application schema; DBOS is retained only

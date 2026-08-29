@@ -68,6 +68,7 @@ func (s *Store) validateSchema(ctx context.Context) error {
 }
 
 var requiredForeignKeys = map[string]string{
+	"project_configurations": "projects",
 	"tickets":                "projects",
 	"phase_runs":             "tickets",
 	"events":                 "tickets",
@@ -110,8 +111,9 @@ func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error 
 var requiredSchema = map[string][]string{
 	"schema_migrations":      {"version", "applied_at", "checksum"},
 	"daemon_instances":       {"channel", "leader_epoch", "identity"},
-	"projects":               {"channel", "id", "canonical_path"},
-	"tickets":                {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd"},
+	"projects":               {"channel", "id", "canonical_path", "current_config_generation"},
+	"project_configurations": {"channel", "project_id", "generation", "digest", "snapshot_bytes", "created_at"},
+	"tickets":                {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd", "config_generation", "config_digest", "config_snapshot_bytes"},
 	"workflow_owners":        {"channel", "project_id", "ticket_id", "workflow_id"},
 	"phase_runs":             {"phase", "attempt", "expected_ticket_version"},
 	"events":                 {"ticket_version", "trigger", "from_state", "to_state"},
@@ -138,6 +140,7 @@ type indexRequirement struct {
 
 var requiredIndexes = []indexRequirement{
 	{table: "projects", columns: []string{"channel", "canonical_path"}},
+	{table: "project_configurations", columns: []string{"channel", "project_id", "digest"}},
 	{table: "tickets", name: "active_ticket_source_digest", columns: []string{"channel", "project_id", "source_digest"}, partial: true},
 	{table: "tickets", name: "ticket_workflow_id", columns: []string{"channel", "workflow_id"}, partial: true},
 	{table: "tickets", name: "ticket_channel_id", columns: []string{"channel", "id"}},

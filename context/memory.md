@@ -13,6 +13,9 @@
   access after its supervisor returns. Guarded/manual remain the trusted
   provider/repository baseline.
 - No remote, Nysa mutation, or legacy retirement is currently authorized.
+- `sf init` now performs native-only canonical repository registration. Stable
+  and dev configuration generations are stored in separate SQLite databases,
+  and tickets snapshot exact canonical configuration bytes at start.
 
 ## Log
 
@@ -51,3 +54,12 @@ portable lock for every operation, persists with unique atomic temporary files,
 and requires factory ownership for PR recovery. Provider fixtures sort writes,
 reject lexical and symlink worktree escapes, and keep escaped-child probes
 observable with a two-second maximum lifetime.
+
+### 2026-08-29 — Durable local project configuration
+
+Project and machine TOML parsing is strict and bounded. `sf init` validates the
+local Git root and base branch, creates only owner-private channel paths, and
+registers one immutable configuration generation idempotently. SQLite schema
+v8 copies that generation's canonical bytes and digest into a ticket when it
+enters planning, preventing later repository configuration changes from
+changing active-ticket authority.

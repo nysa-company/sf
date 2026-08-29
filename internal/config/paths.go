@@ -10,6 +10,7 @@ import (
 type ChannelPaths struct {
 	Root      string
 	Database  string
+	Machine   string
 	Socket    string
 	Logs      string
 	Events    string
@@ -28,6 +29,7 @@ func PathsFor(home string, channel domain.Channel) (ChannelPaths, error) {
 	return ChannelPaths{
 		Root:      root,
 		Database:  filepath.Join(root, "sf.sqlite"),
+		Machine:   filepath.Join(root, "machine.toml"),
 		Socket:    filepath.Join(root, "run", "sf.sock"),
 		Logs:      filepath.Join(root, "logs"),
 		Events:    filepath.Join(root, "events"),

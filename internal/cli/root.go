@@ -301,7 +301,9 @@ func (a *app) authCommand() *cobra.Command {
 
 func (a *app) initCommand() *cobra.Command {
 	var project, repo string
-	command := &cobra.Command{Use: "init --project <name> --repo <path>", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error { return a.emit(notConfigured("init")) }}
+	command := &cobra.Command{Use: "init --project <name> --repo <path>", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		return a.emit(RunInit(cmd.Context(), InitRequest{Channel: a.channel, Project: project, Repo: repo}))
+	}}
 	command.Flags().StringVar(&project, "project", "", "project name")
 	command.Flags().StringVar(&repo, "repo", "", "trusted repository path")
 	_ = command.MarkFlagRequired("project")
