@@ -68,16 +68,21 @@ func (s *Store) validateSchema(ctx context.Context) error {
 }
 
 var requiredForeignKeys = map[string]string{
-	"tickets":           "projects",
-	"phase_runs":        "tickets",
-	"events":            "tickets",
-	"effects":           "tickets",
-	"approvals":         "tickets",
-	"worktrees":         "tickets",
-	"provider_attempts": "tickets",
-	"leases":            "tickets",
-	"plans":             "tickets",
-	"verifications":     "tickets",
+	"tickets":                "projects",
+	"phase_runs":             "tickets",
+	"events":                 "tickets",
+	"effects":                "tickets",
+	"approvals":              "tickets",
+	"worktrees":              "tickets",
+	"provider_attempts":      "tickets",
+	"leases":                 "tickets",
+	"plans":                  "tickets",
+	"verifications":          "tickets",
+	"verification_revisions": "tickets",
+	"candidate_snapshots":    "tickets",
+	"invalidation_receipts":  "candidate_snapshots",
+	"ticket_counters":        "tickets",
+	"ticket_budget_uses":     "tickets",
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {
@@ -103,20 +108,25 @@ func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error 
 }
 
 var requiredSchema = map[string][]string{
-	"schema_migrations": {"version", "applied_at", "checksum"},
-	"daemon_instances":  {"channel", "leader_epoch", "identity"},
-	"projects":          {"channel", "id", "canonical_path"},
-	"tickets":           {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd"},
-	"workflow_owners":   {"channel", "project_id", "ticket_id", "workflow_id"},
-	"phase_runs":        {"phase", "attempt", "expected_ticket_version"},
-	"events":            {"ticket_version", "trigger", "from_state", "to_state"},
-	"effects":           {"semantic_key", "claim_epoch", "observed_identity"},
-	"approvals":         {"reviewed_head", "operator_uid", "invalidated"},
-	"worktrees":         {"path", "branch_ref"},
-	"provider_attempts": {"phase", "attempt", "provider"},
-	"leases":            {"scope", "scope_key", "runner_epoch"},
-	"plans":             {"ticket_id", "digest", "body"},
-	"verifications":     {"ticket_id", "intent_digest", "proof_digest"},
+	"schema_migrations":      {"version", "applied_at", "checksum"},
+	"daemon_instances":       {"channel", "leader_epoch", "identity"},
+	"projects":               {"channel", "id", "canonical_path"},
+	"tickets":                {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd"},
+	"workflow_owners":        {"channel", "project_id", "ticket_id", "workflow_id"},
+	"phase_runs":             {"phase", "attempt", "expected_ticket_version"},
+	"events":                 {"ticket_version", "trigger", "from_state", "to_state"},
+	"effects":                {"semantic_key", "claim_epoch", "observed_identity"},
+	"approvals":              {"reviewed_head", "operator_uid", "invalidated"},
+	"worktrees":              {"path", "branch_ref"},
+	"provider_attempts":      {"phase", "attempt", "provider"},
+	"leases":                 {"scope", "scope_key", "runner_epoch"},
+	"plans":                  {"ticket_id", "digest", "body"},
+	"verifications":          {"ticket_id", "intent_digest", "proof_digest", "current_revision"},
+	"verification_revisions": {"revision", "intent_bytes", "proof_bytes", "owned_files_json", "checkpoint_id"},
+	"candidate_snapshots":    {"generation", "base_sha", "head_sha", "tree_sha", "command_policy_digest"},
+	"invalidation_receipts":  {"generation", "kind", "reason"},
+	"ticket_counters":        {"kind", "used", "limit_count"},
+	"ticket_budget_uses":     {"kind", "request_id", "ticket_version"},
 }
 
 type indexRequirement struct {
@@ -138,6 +148,9 @@ var requiredIndexes = []indexRequirement{
 	{table: "worktrees", columns: []string{"channel", "path"}},
 	{table: "worktrees", columns: []string{"channel", "branch_ref"}},
 	{table: "provider_attempts", columns: []string{"channel", "project_id", "ticket_id", "phase", "attempt", "provider"}},
+	{table: "verification_revisions", columns: []string{"channel", "project_id", "ticket_id", "intent_digest", "proof_digest", "checkpoint_id"}},
+	{table: "candidate_snapshots", columns: []string{"channel", "project_id", "ticket_id", "generation"}},
+	{table: "invalidation_receipts", columns: []string{"channel", "project_id", "ticket_id", "generation", "kind"}},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {

@@ -145,3 +145,77 @@ var migrationV5 = []string{
 var migrationV6 = []string{
 	`CREATE UNIQUE INDEX ticket_channel_id ON tickets(channel, id)`,
 }
+
+// v7 adds the fenced evidence authority. Evidence is deliberately normalized:
+// large opaque transcripts stay outside SQLite, while bounded typed artifacts,
+// identities, and invalidation receipts remain in the sole recovery authority.
+var migrationV7 = []string{
+	`ALTER TABLE plans ADD COLUMN artifact_bytes BLOB NOT NULL DEFAULT X''`,
+	`ALTER TABLE plans ADD COLUMN ticket_version INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE plans ADD COLUMN leader_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE plans ADD COLUMN runner_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE plans ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'`,
+	`ALTER TABLE verifications ADD COLUMN current_revision INTEGER NOT NULL DEFAULT 0`,
+	`CREATE TABLE verification_revisions (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		revision INTEGER NOT NULL CHECK(revision > 0), ticket_version INTEGER NOT NULL CHECK(ticket_version > 0),
+		leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > 0),
+		intent_digest TEXT NOT NULL, intent_bytes BLOB NOT NULL, proof_digest TEXT NOT NULL, proof_bytes BLOB NOT NULL,
+		owned_files_json TEXT NOT NULL, checkpoint_id TEXT NOT NULL,
+		amends_revision INTEGER, amendment_reason TEXT NOT NULL DEFAULT '', requester TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+		PRIMARY KEY(channel, project_id, ticket_id, revision),
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id),
+		CHECK((amends_revision IS NULL AND amendment_reason='' AND requester='') OR (amends_revision IS NOT NULL AND amendment_reason<>'' AND requester<>''))
+	)`,
+	`CREATE TABLE candidate_snapshots (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		generation INTEGER NOT NULL CHECK(generation > 0), ticket_version INTEGER NOT NULL CHECK(ticket_version > 0),
+		leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > 0),
+		base_sha TEXT NOT NULL, head_sha TEXT NOT NULL, tree_sha TEXT NOT NULL, source_digest TEXT NOT NULL,
+		verification_intent_digest TEXT NOT NULL, proof_digest TEXT NOT NULL, command_policy_digest TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY(channel, project_id, ticket_id, generation),
+		UNIQUE(channel, project_id, ticket_id, head_sha),
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id)
+	)`,
+	`CREATE TABLE invalidation_receipts (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		generation INTEGER NOT NULL CHECK(generation > 0), kind TEXT NOT NULL CHECK(kind IN ('plan','verification_intent','proof_result','github_checks','final_review','approval')),
+		ticket_version INTEGER NOT NULL CHECK(ticket_version > 0), reason TEXT NOT NULL, created_at TEXT NOT NULL,
+		PRIMARY KEY(channel, project_id, ticket_id, generation, kind),
+		FOREIGN KEY(channel, project_id, ticket_id, generation) REFERENCES candidate_snapshots(channel, project_id, ticket_id, generation)
+	)`,
+	`ALTER TABLE phase_runs ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE phase_runs ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE phase_runs ADD COLUMN family TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE phase_runs ADD COLUMN provider_version TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE phase_runs ADD COLUMN worktree_identity TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE phase_runs ADD COLUMN base_sha TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE phase_runs ADD COLUMN started_at TEXT`,
+	`ALTER TABLE phase_runs ADD COLUMN failed_at TEXT`,
+	`ALTER TABLE phase_runs ADD COLUMN outcome TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE phase_runs ADD COLUMN usage_json TEXT NOT NULL DEFAULT '{}'`,
+	`ALTER TABLE worktrees ADD COLUMN identity_json TEXT NOT NULL DEFAULT '{}'`,
+	`ALTER TABLE worktrees ADD COLUMN base_sha TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE worktrees ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE worktrees ADD COLUMN ticket_version INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE worktrees ADD COLUMN leader_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE worktrees ADD COLUMN runner_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE approvals ADD COLUMN ticket_version INTEGER NOT NULL DEFAULT 0`,
+	`CREATE TABLE ticket_counters (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		kind TEXT NOT NULL CHECK(kind IN ('correction','fallback')), used INTEGER NOT NULL DEFAULT 0 CHECK(used >= 0),
+		limit_count INTEGER NOT NULL CHECK((kind='correction' AND limit_count=2) OR (kind='fallback' AND limit_count=1)),
+		PRIMARY KEY(channel, project_id, ticket_id, kind),
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id), CHECK(used <= limit_count)
+	)`,
+	`CREATE TABLE ticket_budget_uses (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('correction','fallback')),
+		request_id TEXT NOT NULL, ticket_version INTEGER NOT NULL CHECK(ticket_version > 0), leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > 0), created_at TEXT NOT NULL,
+		PRIMARY KEY(channel, project_id, ticket_id, kind, request_id),
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id)
+	)`,
+	`CREATE UNIQUE INDEX verification_revision_identity ON verification_revisions(channel, project_id, ticket_id, intent_digest, proof_digest, checkpoint_id)`,
+	`CREATE INDEX candidate_snapshot_current ON candidate_snapshots(channel, project_id, ticket_id, generation DESC)`,
+	`CREATE INDEX invalidation_receipt_ticket ON invalidation_receipts(channel, project_id, ticket_id, generation)`,
+}
