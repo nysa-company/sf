@@ -63,3 +63,7 @@ registers one immutable configuration generation idempotently. SQLite schema
 v8 copies that generation's canonical bytes and digest into a ticket when it
 enters planning, preventing later repository configuration changes from
 changing active-ticket authority.
+
+SQLite schema v9 is also the only authority for a ticket's unguessable
+channel-prefixed Git branch. Concurrent allocation replays return the one
+durable value, and allocations are foreign-key bound to real tickets.

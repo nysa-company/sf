@@ -15,6 +15,9 @@ The approved normative design is in
   and stored as immutable canonical bytes plus a digest. A queued ticket copies
   the exact current generation when it first enters planning, so a later file
   edit cannot change that ticket's command or provider authority.
+- Each ticket's unguessable channel-prefixed branch is allocated once through
+  SQLite and protected by ticket and channel uniqueness. Git does not own a
+  second branch-name ledger.
 
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
 one custom Go state engine over the application schema; DBOS is retained only

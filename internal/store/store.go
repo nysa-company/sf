@@ -30,9 +30,10 @@ var (
 	ErrEvidenceConflict = errors.New("evidence conflicts with durable record")
 	ErrBudgetExhausted  = errors.New("bounded ticket budget is exhausted")
 	ErrProjectConflict  = errors.New("project registration conflicts with durable record")
+	ErrBranchConflict   = errors.New("branch allocation conflicts with durable record")
 )
 
-const schemaVersion = 8
+const schemaVersion = 9
 
 var migrationChecksums = map[int]string{
 	1: migrationChecksum(migrationV1),
@@ -43,6 +44,7 @@ var migrationChecksums = map[int]string{
 	6: migrationChecksum(migrationV6),
 	7: migrationChecksum(migrationV7),
 	8: migrationChecksum(migrationV8),
+	9: migrationChecksum(migrationV9),
 }
 
 func migrationChecksum(statements []string) string {
@@ -200,6 +202,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV7
 			} else if version == 8 {
 				statements = migrationV8
+			} else if version == 9 {
+				statements = migrationV9
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {

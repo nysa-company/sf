@@ -236,3 +236,15 @@ var migrationV8 = []string{
 	`ALTER TABLE tickets ADD COLUMN config_digest TEXT NOT NULL DEFAULT '' CHECK(config_digest='' OR length(config_digest)=64)`,
 	`ALTER TABLE tickets ADD COLUMN config_snapshot_bytes BLOB NOT NULL DEFAULT X'' CHECK(length(config_snapshot_bytes) <= 65536)`,
 }
+
+// v9 persists the unguessable, channel-prefixed branch identity allocated for
+// each ticket. Git receives only this SQLite-backed authority; it never keeps
+// an independent branch-name ledger.
+var migrationV9 = []string{
+	`CREATE TABLE branch_allocations (
+		authority_key TEXT PRIMARY KEY, channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		branch_ref TEXT NOT NULL, created_at TEXT NOT NULL,
+		UNIQUE(channel, project_id, ticket_id), UNIQUE(channel, branch_ref),
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id)
+	)`,
+}

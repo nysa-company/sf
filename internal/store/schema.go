@@ -84,6 +84,7 @@ var requiredForeignKeys = map[string]string{
 	"invalidation_receipts":  "candidate_snapshots",
 	"ticket_counters":        "tickets",
 	"ticket_budget_uses":     "tickets",
+	"branch_allocations":     "tickets",
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {
@@ -129,6 +130,7 @@ var requiredSchema = map[string][]string{
 	"invalidation_receipts":  {"generation", "kind", "reason"},
 	"ticket_counters":        {"kind", "used", "limit_count"},
 	"ticket_budget_uses":     {"kind", "request_id", "ticket_version"},
+	"branch_allocations":     {"authority_key", "channel", "project_id", "ticket_id", "branch_ref", "created_at"},
 }
 
 type indexRequirement struct {
@@ -154,6 +156,8 @@ var requiredIndexes = []indexRequirement{
 	{table: "verification_revisions", columns: []string{"channel", "project_id", "ticket_id", "intent_digest", "proof_digest", "checkpoint_id"}},
 	{table: "candidate_snapshots", columns: []string{"channel", "project_id", "ticket_id", "generation"}},
 	{table: "invalidation_receipts", columns: []string{"channel", "project_id", "ticket_id", "generation", "kind"}},
+	{table: "branch_allocations", columns: []string{"channel", "project_id", "ticket_id"}},
+	{table: "branch_allocations", columns: []string{"channel", "branch_ref"}},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {
