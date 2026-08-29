@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
@@ -168,10 +169,12 @@ func params(values map[string]any, channel domain.Channel) map[string]any {
 
 func (a *app) submitCommand() *cobra.Command {
 	var project string
+	var allowNew bool
 	command := &cobra.Command{Use: "submit <ticket.md> --project <name>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return a.emit(a.request("ticket.submit", "", params(map[string]any{"path": args[0], "project": project}, a.channel)))
+		return a.emit(a.request("ticket.submit", "", params(map[string]any{"path": args[0], "project": project, "new": allowNew}, a.channel)))
 	}}
 	command.Flags().StringVar(&project, "project", "", "registered project name")
+	command.Flags().BoolVar(&allowNew, "new", false, "create a new identity when the same ticket already finished")
 	_ = command.MarkFlagRequired("project")
 	return command
 }
@@ -213,21 +216,22 @@ func (a *app) logsCommand() *cobra.Command {
 }
 
 func (a *app) controlCommand(name string) *cobra.Command {
-	var operator string
+	operator := defaultOperatorLabel()
 	command := &cobra.Command{Use: name + " <ticket> --operator <identity>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		return a.emit(a.request("ticket."+name, args[0], params(map[string]any{"operator": operator}, a.channel)))
 	}}
-	command.Flags().StringVar(&operator, "operator", "", "authenticated operator identity")
+	command.Flags().StringVar(&operator, "operator", operator, "authenticated operator identity")
 	return command
 }
 
 func (a *app) recoverCommand() *cobra.Command {
-	var mode, operator string
+	var mode string
+	operator := defaultOperatorLabel()
 	command := &cobra.Command{Use: "recover <ticket>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		return a.emit(a.request("ticket.recover", args[0], params(map[string]any{"mode": mode, "operator": operator}, a.channel)))
 	}}
 	command.Flags().StringVar(&mode, "mode", "", "optional recovery mode (guarded)")
-	command.Flags().StringVar(&operator, "operator", "", "authenticated operator identity")
+	command.Flags().StringVar(&operator, "operator", operator, "authenticated operator identity")
 	return command
 }
 
@@ -238,23 +242,34 @@ func (a *app) retryCommand() *cobra.Command {
 }
 
 func (a *app) approveCommand() *cobra.Command {
-	var operator string
+	operator := defaultOperatorLabel()
 	command := &cobra.Command{Use: "approve <ticket> --operator <identity>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		return a.emit(a.request("ticket.approve", args[0], params(map[string]any{"operator": operator}, a.channel)))
 	}}
-	command.Flags().StringVar(&operator, "operator", "", "authenticated operator identity")
+	command.Flags().StringVar(&operator, "operator", operator, "authenticated operator identity")
 	return command
 }
 
 func (a *app) rejectCommand() *cobra.Command {
-	var operator, reason string
+	var reason string
+	operator := defaultOperatorLabel()
 	command := &cobra.Command{Use: "reject <ticket> --operator <identity> --reason <text>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if len(reason) > 4096 {
+			return a.emit(failure("invalid_argument", "rejection reason exceeds 4096 bytes", []string{binaryName(), "reject", args[0], "--reason", "<short-reason>"}))
+		}
 		return a.emit(a.request("ticket.reject", args[0], params(map[string]any{"operator": operator, "reason": reason}, a.channel)))
 	}}
-	command.Flags().StringVar(&operator, "operator", "", "authenticated operator identity")
+	command.Flags().StringVar(&operator, "operator", operator, "authenticated operator identity")
 	command.Flags().StringVar(&reason, "reason", "", "bounded rejection reason")
 	_ = command.MarkFlagRequired("reason")
 	return command
+}
+
+func defaultOperatorLabel() string {
+	if current, err := user.Current(); err == nil && current != nil && current.Username != "" {
+		return current.Username
+	}
+	return "uid:" + strconv.Itoa(os.Geteuid())
 }
 
 func (a *app) doctorCommand() *cobra.Command {

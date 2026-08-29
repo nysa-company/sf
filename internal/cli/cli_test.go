@@ -66,6 +66,29 @@ func TestMutatingOperatorLabelIsForwardedToDaemon(t *testing.T) {
 	}
 }
 
+func TestOperatorDefaultsAndSubmitNewAreForwarded(t *testing.T) {
+	var requests []api.Request
+	client := fakeClient(func(_ context.Context, request api.Request) (api.Response, error) {
+		requests = append(requests, request)
+		return responseOK(), nil
+	})
+	if code := Execute(context.Background(), []string{"pause", "SF-1"}, &bytes.Buffer{}, &bytes.Buffer{}, client); code != 0 {
+		t.Fatalf("pause exit=%d", code)
+	}
+	if requests[0].OperatorLabel == "" {
+		t.Fatal("default operator label was not forwarded")
+	}
+	if code := Execute(context.Background(), []string{"submit", "ticket.md", "--project", "nysa", "--new"}, &bytes.Buffer{}, &bytes.Buffer{}, client); code != 0 {
+		t.Fatalf("submit exit=%d", code)
+	}
+	var parameters struct {
+		New bool `json:"new"`
+	}
+	if err := json.Unmarshal(requests[1].Parameters, &parameters); err != nil || !parameters.New {
+		t.Fatalf("parameters=%s err=%v", requests[1].Parameters, err)
+	}
+}
+
 func TestErrorResponseHasOneExecutableNextActionAndMappedExit(t *testing.T) {
 	response := api.Response{Version: api.Version, RequestID: "request", Mutation: api.Mutation{}, Error: &api.Error{Code: "provider_auth_missing", Message: "provider login is unavailable"}, NextAction: &domain.NextAction{Code: "auth", Argv: []string{"sf-dev", "auth", "login", "cursor"}}}
 	client := fakeClient(func(_ context.Context, _ api.Request) (api.Response, error) { return response, nil })
@@ -89,6 +112,18 @@ func TestJSONRenderingPreservesResponseEnvelope(t *testing.T) {
 	}
 	if !decoded.OK || decoded.Version != api.Version || string(decoded.Data) != `{"state":"queued"}` {
 		t.Fatalf("decoded=%+v", decoded)
+	}
+}
+
+func TestNextActionJSONUsesNormativeLowercaseFields(t *testing.T) {
+	response := failure("blocked_process", "blocked", []string{"sf", "recover", "SF-1"})
+	var output bytes.Buffer
+	if err := Render(&output, response, true); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	if !strings.Contains(text, `"next_action":{"code":"blocked_process","argv":[`) || strings.Contains(text, `"Code"`) || strings.Contains(text, `"Argv"`) {
+		t.Fatalf("non-normative response=%s", text)
 	}
 }
 

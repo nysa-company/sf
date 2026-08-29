@@ -169,6 +169,6 @@ type OperatorIdentity struct {
 }
 
 type NextAction struct {
-	Code string
-	Argv []string
+	Code string   `json:"code"`
+	Argv []string `json:"argv"`
 }
