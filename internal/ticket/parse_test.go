@@ -26,13 +26,30 @@ func TestParseMinimalTicket(t *testing.T) {
 }
 
 func TestParseStrictFrontMatter(t *testing.T) {
-	source := "---\r\ntype: bug\r\nmerge: manual\r\npriority: high\r\n---\r\n# Fix\r\n\r\nBroken.\r\n## Acceptance\r\n- Regression fails before the fix.\r\n"
+	source := "---\r\ntype: bug\r\nmerge: manual\r\npriority: high\r\nmax_duration: 90m\r\nmax_cost_usd: 20.125\r\n---\r\n# Fix\r\n\r\nBroken.\r\n## Acceptance\r\n- Regression fails before the fix.\r\n"
 	parsed, err := Parse(strings.NewReader(source))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if parsed.Type != domain.TicketBug || parsed.MergeMode != domain.MergeManual || parsed.Priority != "high" {
+	if parsed.Type != domain.TicketBug || parsed.MergeMode != domain.MergeManual || parsed.Priority != "high" || parsed.MaxDuration.String() != "1h30m0s" || parsed.MaxCostMicroUSD != 20_125_000 {
 		t.Fatalf("unexpected front matter: %+v", parsed)
+	}
+}
+
+func TestParseAllowsPlannerToSupplyAcceptance(t *testing.T) {
+	for name, source := range map[string]string{
+		"section omitted": "# Clarify reminder behavior\n\nThe expected delivery behavior needs implementation.\n",
+		"section empty":   "# Clarify reminder behavior\n\nThe expected delivery behavior needs implementation.\n\n## Acceptance\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			parsed, err := Parse(strings.NewReader(source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(parsed.Acceptance) != 0 {
+				t.Fatalf("acceptance=%v", parsed.Acceptance)
+			}
+		})
 	}
 }
 
@@ -42,7 +59,10 @@ func TestParseRejectsUnsafeOrAmbiguousInput(t *testing.T) {
 		"duplicate key": "---\ntype: bug\ntype: feature\n---\n# T\nP\n## Acceptance\n- A\n",
 		"yaml alias":    "---\ntype: *bug\n---\n# T\nP\n## Acceptance\n- A\n",
 		"second title":  "# T\nP\n# Inject\n## Acceptance\n- A\n",
-		"missing proof": "# T\nP\n## Acceptance\n",
+		"bad duration":  "---\nmax_duration: forever\n---\n# T\nP\n",
+		"zero duration": "---\nmax_duration: 0s\n---\n# T\nP\n",
+		"bad cost":      "---\nmax_cost_usd: 1.1234567\n---\n# T\nP\n",
+		"negative cost": "---\nmax_cost_usd: -1\n---\n# T\nP\n",
 		"spike auto":    "---\ntype: spike\nmerge: autonomous\n---\n# T\nP\n## Acceptance\n- Report\n",
 	}
 	for name, source := range tests {

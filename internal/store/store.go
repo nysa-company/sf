@@ -28,13 +28,14 @@ var (
 	ErrEffectKey        = errors.New("effect semantic key conflicts with durable record")
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 var migrationChecksums = map[int]string{
 	1: migrationChecksum(migrationV1),
 	2: migrationChecksum(migrationV2),
 	3: migrationChecksum(migrationV3),
 	4: migrationChecksum(migrationV4),
+	5: migrationChecksum(migrationV5),
 }
 
 func migrationChecksum(statements []string) string {
@@ -59,22 +60,24 @@ type Project struct {
 }
 
 type Ticket struct {
-	Ref          domain.TicketRef
-	State        domain.State
-	ResumeState  domain.State
-	Version      uint64
-	RunnerEpoch  uint64
-	WorkflowID   string
-	SourceDigest string
-	Type         domain.TicketType
-	MergeMode    domain.MergeMode
-	BlockedCode  string
-	Title        string
-	Problem      string
-	Acceptance   []string
-	Source       []byte
-	Priority     string
-	CreatedAt    time.Time
+	Ref             domain.TicketRef
+	State           domain.State
+	ResumeState     domain.State
+	Version         uint64
+	RunnerEpoch     uint64
+	WorkflowID      string
+	SourceDigest    string
+	Type            domain.TicketType
+	MergeMode       domain.MergeMode
+	BlockedCode     string
+	Title           string
+	Problem         string
+	Acceptance      []string
+	Source          []byte
+	Priority        string
+	CreatedAt       time.Time
+	MaxDuration     time.Duration
+	MaxCostMicroUSD int64
 }
 
 type Event struct {
@@ -176,6 +179,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV3
 			} else if version == 4 {
 				statements = migrationV4
+			} else if version == 5 {
+				statements = migrationV5
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -365,6 +370,9 @@ func validateTicketInput(ticket Ticket) error {
 	if ticket.Priority != "low" && ticket.Priority != "normal" && ticket.Priority != "high" {
 		return fmt.Errorf("invalid ticket priority %q", ticket.Priority)
 	}
+	if ticket.MaxDuration < 0 || ticket.MaxCostMicroUSD < 0 {
+		return errors.New("ticket ceilings cannot be negative")
+	}
 	return nil
 }
 
@@ -400,13 +408,14 @@ func insertTicket(ctx context.Context, conn *sql.Conn, ticket Ticket) error {
 	_, err = conn.ExecContext(ctx, `INSERT INTO tickets(
 			channel, project_id, id, source_digest, ticket_type, merge_mode, state,
 			resume_state, version, runner_epoch, workflow_id, blocked_code,
-			title, problem, acceptance_json, source_bytes, priority, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			title, problem, acceptance_json, source_bytes, priority, created_at,
+			max_duration_ns, max_cost_micro_usd
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.SourceDigest,
 		ticket.Type, ticket.MergeMode, ticket.State, nullableState(ticket.ResumeState),
 		ticket.Version, ticket.RunnerEpoch, ticket.WorkflowID, ticket.BlockedCode,
 		ticket.Title, ticket.Problem, string(acceptance), ticket.Source, ticket.Priority,
-		ticket.CreatedAt.Format(time.RFC3339Nano))
+		ticket.CreatedAt.Format(time.RFC3339Nano), int64(ticket.MaxDuration), ticket.MaxCostMicroUSD)
 	if err != nil {
 		return err
 	}
@@ -425,11 +434,12 @@ func (s *Store) Ticket(ctx context.Context, ref domain.TicketRef) (Ticket, error
 	var acceptance string
 	var createdAt string
 	err := s.db.QueryRowContext(ctx, `SELECT state, resume_state, version, runner_epoch, workflow_id, source_digest, ticket_type, merge_mode, blocked_code,
-		title, problem, acceptance_json, source_bytes, priority, created_at
+		title, problem, acceptance_json, source_bytes, priority, created_at, max_duration_ns, max_cost_micro_usd
 		FROM tickets WHERE channel = ? AND project_id = ? AND id = ?`, ref.Channel, ref.Project, ref.Ticket).Scan(
 		&ticket.State, &resume, &ticket.Version, &ticket.RunnerEpoch, &ticket.WorkflowID,
 		&ticket.SourceDigest, &ticket.Type, &ticket.MergeMode, &ticket.BlockedCode,
 		&ticket.Title, &ticket.Problem, &acceptance, &ticket.Source, &ticket.Priority, &createdAt,
+		&ticket.MaxDuration, &ticket.MaxCostMicroUSD,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Ticket{}, ErrNotFound

@@ -47,7 +47,7 @@ func TestSubmitPersistsImmutableSourceAndRequiresNewAfterTerminal(t *testing.T) 
 	input := Ticket{
 		Ref: firstRef, SourceDigest: digest, Type: domain.TicketBug, MergeMode: domain.MergeGuarded,
 		Title: "Fix reminders", Problem: "Duplicates occur.", Acceptance: acceptance,
-		Source: source, Priority: "high",
+		Source: source, Priority: "high", MaxDuration: 90 * time.Minute, MaxCostMicroUSD: 20_125_000,
 	}
 	created, wasCreated, err := database.SubmitTicket(ctx, input, false)
 	if err != nil || !wasCreated || created.Ref != firstRef {
@@ -59,7 +59,7 @@ func TestSubmitPersistsImmutableSourceAndRequiresNewAfterTerminal(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(loaded.Source) == string(source) || !reflect.DeepEqual(loaded.Acceptance, []string{"One reminder"}) || loaded.Title != "Fix reminders" || loaded.Priority != "high" {
+	if string(loaded.Source) == string(source) || !reflect.DeepEqual(loaded.Acceptance, []string{"One reminder"}) || loaded.Title != "Fix reminders" || loaded.Priority != "high" || loaded.MaxDuration != 90*time.Minute || loaded.MaxCostMicroUSD != 20_125_000 {
 		t.Fatalf("immutable ticket changed: %+v source=%q", loaded, loaded.Source)
 	}
 
@@ -614,7 +614,7 @@ func TestRecoveryBlockWritesEventAndSchemaGuardsStartup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL); INSERT INTO schema_migrations VALUES (1, 'now', '` + migrationChecksums[1] + `'); INSERT INTO schema_migrations VALUES (2, 'now', '` + migrationChecksums[2] + `'); INSERT INTO schema_migrations VALUES (3, 'now', '` + migrationChecksums[3] + `'); INSERT INTO schema_migrations VALUES (4, 'now', '` + migrationChecksums[4] + `')`); err != nil {
+	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL); INSERT INTO schema_migrations VALUES (1, 'now', '` + migrationChecksums[1] + `'); INSERT INTO schema_migrations VALUES (2, 'now', '` + migrationChecksums[2] + `'); INSERT INTO schema_migrations VALUES (3, 'now', '` + migrationChecksums[3] + `'); INSERT INTO schema_migrations VALUES (4, 'now', '` + migrationChecksums[4] + `'); INSERT INTO schema_migrations VALUES (5, 'now', '` + migrationChecksums[5] + `')`); err != nil {
 		t.Fatal(err)
 	}
 	_ = raw.Close()

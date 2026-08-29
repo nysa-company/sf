@@ -106,7 +106,7 @@ var requiredSchema = map[string][]string{
 	"schema_migrations": {"version", "applied_at", "checksum"},
 	"daemon_instances":  {"channel", "leader_epoch", "identity"},
 	"projects":          {"channel", "id", "canonical_path"},
-	"tickets":           {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at"},
+	"tickets":           {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd"},
 	"workflow_owners":   {"channel", "project_id", "ticket_id", "workflow_id"},
 	"phase_runs":        {"phase", "attempt", "expected_ticket_version"},
 	"events":            {"ticket_version", "trigger", "from_state", "to_state"},

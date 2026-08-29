@@ -132,3 +132,10 @@ var migrationV4 = []string{
 	`ALTER TABLE tickets ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high'))`,
 	`ALTER TABLE tickets ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'`,
 }
+
+// v5 persists the optional ticket-local ceilings in integer units. The daemon
+// still resolves them against stricter project and machine policy before work.
+var migrationV5 = []string{
+	`ALTER TABLE tickets ADD COLUMN max_duration_ns INTEGER NOT NULL DEFAULT 0 CHECK(max_duration_ns >= 0)`,
+	`ALTER TABLE tickets ADD COLUMN max_cost_micro_usd INTEGER NOT NULL DEFAULT 0 CHECK(max_cost_micro_usd >= 0)`,
+}
