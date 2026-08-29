@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -57,6 +59,11 @@ type FakeGHState struct {
 	Deliveries      []string                          `json:"deliveries"`
 }
 
+const (
+	fakeGHLockRetry    = 5 * time.Millisecond
+	fakeGHLockDeadline = 5 * time.Second
+)
+
 func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, error) {
 	if path == "" {
 		return nil, errors.New("testkit: fake-gh state path is required")
@@ -68,8 +75,8 @@ func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, e
 		Checks:          make(map[int][]contracts.RequiredCheck),
 		ResponseScripts: make(map[string][]ResponseMode),
 	}
-	f := &FakeGH{path: path, state: state}
-	if err := f.save(); err != nil {
+	f := &FakeGH{path: path}
+	if err := f.initialize(state); err != nil {
 		return nil, err
 	}
 	return f, nil
@@ -95,7 +102,7 @@ func OpenFakeGH(path string) (*FakeGH, error) {
 	if state.ResponseScripts == nil {
 		state.ResponseScripts = make(map[string][]ResponseMode)
 	}
-	return &FakeGH{path: path, state: state}, nil
+	return &FakeGH{path: path}, nil
 }
 
 type FakeGH struct {
@@ -107,196 +114,225 @@ type FakeGH struct {
 var _ contracts.GitHub = (*FakeGH)(nil)
 
 func (f *FakeGH) Snapshot() FakeGHState {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return cloneState(f.state)
+	var snapshot FakeGHState
+	_ = f.withState(func() (bool, error) {
+		snapshot = cloneState(f.state)
+		return false, nil
+	})
+	return snapshot
 }
 
 func (f *FakeGH) SetAuthenticated(value bool) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.state.Authenticated = value
-	return f.saveLocked()
+	return f.withState(func() (bool, error) {
+		f.state.Authenticated = value
+		return true, nil
+	})
 }
 
 func (f *FakeGH) SetResponse(operation string, modes ...ResponseMode) error {
 	if operation == "" {
 		return errors.New("testkit: response operation is required")
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.state.ResponseScripts[operation] = append([]ResponseMode(nil), modes...)
-	return f.saveLocked()
+	return f.withState(func() (bool, error) {
+		f.state.ResponseScripts[operation] = append([]ResponseMode(nil), modes...)
+		return true, nil
+	})
 }
 
 func (f *FakeGH) SetChecks(number int, checks ...contracts.RequiredCheck) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.state.Checks[number] = append([]contracts.RequiredCheck(nil), checks...)
-	return f.saveLocked()
+	return f.withState(func() (bool, error) {
+		f.state.Checks[number] = append([]contracts.RequiredCheck(nil), checks...)
+		return true, nil
+	})
+}
+
+// InjectPullRequestForTest models remote state the factory did not create,
+// including hostile or impossible-looking API responses used to prove that
+// recovery never adopts a human-owned lookalike.
+func (f *FakeGH) InjectPullRequestForTest(pr PullRequest) error {
+	return f.withState(func() (bool, error) {
+		f.state.PRs = append(f.state.PRs, pr)
+		if pr.Identity.Number >= f.state.NextPR {
+			f.state.NextPR = pr.Identity.Number + 1
+		}
+		return true, nil
+	})
 }
 
 func (f *FakeGH) MutationCount(operation string) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	count := 0
-	for _, mutation := range f.state.Mutations {
-		if mutation.Operation == operation {
-			count++
+	_ = f.withState(func() (bool, error) {
+		for _, mutation := range f.state.Mutations {
+			if mutation.Operation == operation {
+				count++
+			}
 		}
-	}
+		return false, nil
+	})
 	return count
 }
 
 func (f *FakeGH) DeliveryCount(operation string) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	count := 0
-	for _, delivery := range f.state.Deliveries {
-		if delivery == operation {
-			count++
+	_ = f.withState(func() (bool, error) {
+		for _, delivery := range f.state.Deliveries {
+			if delivery == operation {
+				count++
+			}
 		}
-	}
+		return false, nil
+	})
 	return count
 }
 
 func (f *FakeGH) Name() string { return "fake-gh" }
 
 func (f *FakeGH) AuthStatus(context.Context) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if !f.state.Authenticated {
-		return errors.New("fake-gh: authentication required")
-	}
-	return nil
+	return f.withState(func() (bool, error) { return false, f.requireAuthLocked() })
 }
 
 func (f *FakeGH) Repository(_ context.Context, identity contracts.RepositoryIdentity) (contracts.RepositoryIdentity, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if !sameRepository(identity, f.state.Repository) {
-		return contracts.RepositoryIdentity{}, errors.New("fake-gh: repository identity mismatch")
-	}
-	return f.state.Repository, nil
+	var result contracts.RepositoryIdentity
+	err := f.withState(func() (bool, error) {
+		if !sameRepository(identity, f.state.Repository) {
+			return false, errors.New("fake-gh: repository identity mismatch")
+		}
+		result = f.state.Repository
+		return false, nil
+	})
+	return result, err
 }
 
 func (f *FakeGH) FindPullRequest(_ context.Context, want contracts.PullRequestIdentity) (contracts.PullRequestIdentity, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var match *contracts.PullRequestIdentity
-	for _, pr := range f.state.PRs {
-		if identityMatches(pr.Identity, want) {
-			if match != nil {
-				return contracts.PullRequestIdentity{}, false, errors.New("fake-gh: ambiguous matching pull requests")
+	if !want.FactoryOwned {
+		return contracts.PullRequestIdentity{}, false, errors.New("fake-gh: factory-owned lookup is required")
+	}
+	var match contracts.PullRequestIdentity
+	found := false
+	err := f.withState(func() (bool, error) {
+		for _, pr := range f.state.PRs {
+			if identityMatches(pr.Identity, want) {
+				if found {
+					match = contracts.PullRequestIdentity{}
+					found = false
+					return false, errors.New("fake-gh: ambiguous matching pull requests")
+				}
+				match = pr.Identity
+				found = true
 			}
-			identity := pr.Identity
-			match = &identity
 		}
-	}
-	if match != nil {
-		return *match, true, nil
-	}
-	return contracts.PullRequestIdentity{}, false, nil
+		return false, nil
+	})
+	return match, found, err
 }
 
 func (f *FakeGH) CreateDraftPullRequest(_ context.Context, identity contracts.PullRequestIdentity, title, body, _ string) (contracts.PullRequestIdentity, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if err := f.requireAuthLocked(); err != nil {
-		return contracts.PullRequestIdentity{}, err
-	}
-	if err := f.validateIdentityLocked(identity); err != nil {
-		return contracts.PullRequestIdentity{}, err
-	}
-	for _, existing := range f.state.PRs {
-		if identityMatches(existing.Identity, identity) {
-			return contracts.PullRequestIdentity{}, errors.New("fake-gh: matching pull request already exists")
+	var result contracts.PullRequestIdentity
+	var operationErr error
+	err := f.withState(func() (bool, error) {
+		if err := f.requireAuthLocked(); err != nil {
+			return false, err
 		}
-	}
-	if mode, err := f.beforeMutationLocked("pr_create"); err != nil {
-		return contracts.PullRequestIdentity{}, err
-	} else if mode == ResponseErrorBefore {
-		f.consumeResponseLocked("pr_create")
-		return contracts.PullRequestIdentity{}, errors.New("fake-gh: create failed before mutation")
-	}
-	if identity.Number == 0 {
-		identity.Number = f.state.NextPR
-		f.state.NextPR++
-	}
-	identity.FactoryOwned = true
-	f.state.PRs = append(f.state.PRs, PullRequest{Identity: identity, Title: title, Body: body, Draft: true})
-	return f.finishMutationLocked("pr_create", identity)
+		if err := f.validateIdentityLocked(identity); err != nil {
+			return false, err
+		}
+		for _, existing := range f.state.PRs {
+			if samePRSourceAndBase(existing.Identity, identity) {
+				if !existing.Identity.FactoryOwned {
+					return false, errors.New("fake-gh: human-owned pull request conflicts with the factory identity")
+				}
+				return false, errors.New("fake-gh: matching pull request already exists")
+			}
+		}
+		if mode, err := f.beforeMutationLocked("pr_create"); err != nil {
+			return false, err
+		} else if mode == ResponseErrorBefore {
+			f.consumeResponseLocked("pr_create")
+			return true, errors.New("fake-gh: create failed before mutation")
+		}
+		if identity.Number == 0 {
+			identity.Number = f.state.NextPR
+			f.state.NextPR++
+		}
+		identity.FactoryOwned = true
+		f.state.PRs = append(f.state.PRs, PullRequest{Identity: identity, Title: title, Body: body, Draft: true})
+		result, operationErr = f.finishMutationLocked("pr_create", identity)
+		return true, operationErr
+	})
+	return result, err
 }
 
 func (f *FakeGH) UpdatePullRequest(_ context.Context, identity contracts.PullRequestIdentity, title, body string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	index, err := f.findLocked(identity)
-	if err != nil {
-		return err
-	}
-	if mode, err := f.beforeMutationLocked("pr_edit"); err != nil {
-		return err
-	} else if mode == ResponseErrorBefore {
-		f.consumeResponseLocked("pr_edit")
-		return errors.New("fake-gh: edit failed before mutation")
-	}
-	f.state.PRs[index].Title, f.state.PRs[index].Body = title, body
-	f.recordMutationLocked("pr_edit", identity)
-	return f.finishErrorLocked("pr_edit")
+	return f.withState(func() (bool, error) {
+		index, err := f.findLocked(identity)
+		if err != nil {
+			return false, err
+		}
+		if mode, err := f.beforeMutationLocked("pr_edit"); err != nil {
+			return false, err
+		} else if mode == ResponseErrorBefore {
+			f.consumeResponseLocked("pr_edit")
+			return true, errors.New("fake-gh: edit failed before mutation")
+		}
+		f.state.PRs[index].Title, f.state.PRs[index].Body = title, body
+		f.recordMutationLocked("pr_edit", identity)
+		return true, f.finishErrorLocked("pr_edit")
+	})
 }
 
 func (f *FakeGH) RequiredChecks(_ context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	index, err := f.findLocked(identity)
-	if err != nil {
-		return nil, err
-	}
-	checks := f.state.Checks[f.state.PRs[index].Identity.Number]
-	return append([]contracts.RequiredCheck(nil), checks...), nil
+	var checks []contracts.RequiredCheck
+	err := f.withState(func() (bool, error) {
+		index, err := f.findLocked(identity)
+		if err != nil {
+			return false, err
+		}
+		checks = append([]contracts.RequiredCheck(nil), f.state.Checks[f.state.PRs[index].Identity.Number]...)
+		return false, nil
+	})
+	return checks, err
 }
 
 func (f *FakeGH) MarkReady(_ context.Context, identity contracts.PullRequestIdentity, _ domain.Fence) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	index, err := f.findLocked(identity)
-	if err != nil {
-		return err
-	}
-	if mode, err := f.beforeMutationLocked("pr_ready"); err != nil {
-		return err
-	} else if mode == ResponseErrorBefore {
-		f.consumeResponseLocked("pr_ready")
-		return errors.New("fake-gh: ready failed before mutation")
-	}
-	f.state.PRs[index].Draft, f.state.PRs[index].Ready = false, true
-	f.recordMutationLocked("pr_ready", identity)
-	return f.finishErrorLocked("pr_ready")
+	return f.withState(func() (bool, error) {
+		index, err := f.findLocked(identity)
+		if err != nil {
+			return false, err
+		}
+		if mode, err := f.beforeMutationLocked("pr_ready"); err != nil {
+			return false, err
+		} else if mode == ResponseErrorBefore {
+			f.consumeResponseLocked("pr_ready")
+			return true, errors.New("fake-gh: ready failed before mutation")
+		}
+		f.state.PRs[index].Draft, f.state.PRs[index].Ready = false, true
+		f.recordMutationLocked("pr_ready", identity)
+		return true, f.finishErrorLocked("pr_ready")
+	})
 }
 
 func (f *FakeGH) MergeExactHead(_ context.Context, identity contracts.PullRequestIdentity, headOID, method string, _ domain.Fence) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	index, err := f.findLocked(identity)
-	if err != nil {
-		return err
-	}
-	if headOID == "" || headOID != f.state.PRs[index].Identity.HeadOID || headOID != identity.HeadOID {
-		return errors.New("fake-gh: exact reviewed head mismatch")
-	}
-	if method != "merge" && method != "squash" && method != "rebase" {
-		return errors.New("fake-gh: unsupported merge method")
-	}
-	if mode, err := f.beforeMutationLocked("pr_merge"); err != nil {
-		return err
-	} else if mode == ResponseErrorBefore {
-		f.consumeResponseLocked("pr_merge")
-		return errors.New("fake-gh: merge failed before mutation")
-	}
-	f.state.PRs[index].Merged = true
-	f.recordMutationLocked("pr_merge", identity)
-	return f.finishErrorLocked("pr_merge")
+	return f.withState(func() (bool, error) {
+		index, err := f.findLocked(identity)
+		if err != nil {
+			return false, err
+		}
+		if headOID == "" || headOID != f.state.PRs[index].Identity.HeadOID || headOID != identity.HeadOID {
+			return false, errors.New("fake-gh: exact reviewed head mismatch")
+		}
+		if method != "merge" && method != "squash" && method != "rebase" {
+			return false, errors.New("fake-gh: unsupported merge method")
+		}
+		if mode, err := f.beforeMutationLocked("pr_merge"); err != nil {
+			return false, err
+		} else if mode == ResponseErrorBefore {
+			f.consumeResponseLocked("pr_merge")
+			return true, errors.New("fake-gh: merge failed before mutation")
+		}
+		f.state.PRs[index].Merged = true
+		f.recordMutationLocked("pr_merge", identity)
+		return true, f.finishErrorLocked("pr_merge")
+	})
 }
 
 func (f *FakeGH) requireAuthLocked() error {
@@ -326,6 +362,9 @@ func (f *FakeGH) findLocked(identity contracts.PullRequestIdentity) (int, error)
 }
 
 func identityMatches(actual, want contracts.PullRequestIdentity) bool {
+	if !actual.FactoryOwned {
+		return false
+	}
 	if want.Number != 0 && actual.Number != want.Number {
 		return false
 	}
@@ -337,10 +376,15 @@ func identityMatches(actual, want contracts.PullRequestIdentity) bool {
 			return false
 		}
 	}
-	if want.FactoryOwned && !actual.FactoryOwned {
-		return false
-	}
 	return true
+}
+
+func samePRSourceAndBase(a, b contracts.PullRequestIdentity) bool {
+	return sameRepository(a.Repository, b.Repository) &&
+		a.HeadOwner == b.HeadOwner &&
+		a.HeadRepository == b.HeadRepository &&
+		a.HeadRef == b.HeadRef &&
+		a.BaseRef == b.BaseRef
 }
 
 func sameRepository(a, b contracts.RepositoryIdentity) bool {
@@ -359,13 +403,11 @@ func (f *FakeGH) consumeResponseLocked(operation string) {
 	script := f.state.ResponseScripts[operation]
 	if len(script) > 0 {
 		f.state.ResponseScripts[operation] = script[1:]
-		_ = f.saveLocked()
 	}
 }
 
 func (f *FakeGH) recordMutationLocked(operation string, identity contracts.PullRequestIdentity) {
 	f.state.Mutations = append(f.state.Mutations, Mutation{Operation: operation, Number: identity.Number, HeadOID: identity.HeadOID})
-	_ = f.saveLocked()
 }
 
 func (f *FakeGH) finishMutationLocked(operation string, identity contracts.PullRequestIdentity) (contracts.PullRequestIdentity, error) {
@@ -377,9 +419,6 @@ func (f *FakeGH) finishMutationLocked(operation string, identity contracts.PullR
 	f.state.Mutations = append(f.state.Mutations, Mutation{Operation: operation, Number: identity.Number, HeadOID: identity.HeadOID})
 	if mode == ResponseDeliver {
 		f.state.Deliveries = append(f.state.Deliveries, operation)
-	}
-	if err := f.saveLocked(); err != nil {
-		return contracts.PullRequestIdentity{}, err
 	}
 	switch mode {
 	case ResponseDropAfterCall:
@@ -400,34 +439,126 @@ func (f *FakeGH) finishErrorLocked(operation string) error {
 	if mode == ResponseDeliver {
 		f.state.Deliveries = append(f.state.Deliveries, operation)
 	}
-	if err := f.saveLocked(); err != nil {
-		return err
-	}
 	if mode == ResponseDropAfterCall || mode == ResponseErrorAfter {
 		return errors.New("fake-gh: response lost after mutation")
 	}
 	return nil
 }
 
-func (f *FakeGH) save() error {
+func (f *FakeGH) initialize(state FakeGHState) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.saveLocked()
-}
-
-func (f *FakeGH) saveLocked() error {
 	if err := os.MkdirAll(filepath.Dir(f.path), 0o755); err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(f.state, "", "  ")
+	release, err := acquireFakeGHLock(f.path)
 	if err != nil {
 		return err
 	}
-	tmp := f.path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+	defer func() { _ = release() }()
+	if _, err := os.Lstat(f.path); err == nil {
+		return errors.New("testkit: fake-gh state already exists")
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	return os.Rename(tmp, f.path)
+	if err := saveFakeGHState(f.path, state); err != nil {
+		return err
+	}
+	f.state = cloneState(state)
+	return nil
+}
+
+// withState serializes every durable fake-remote operation across processes.
+// A lock is never stolen: a stuck fixture yields a bounded explicit error
+// instead of risking an ambiguous or duplicate external effect.
+func (f *FakeGH) withState(operation func() (changed bool, err error)) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	release, err := acquireFakeGHLock(f.path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = release() }()
+	state, err := loadFakeGHState(f.path)
+	if err != nil {
+		return err
+	}
+	f.state = state
+	changed, operationErr := operation()
+	if changed {
+		if err := saveFakeGHState(f.path, f.state); err != nil {
+			return err
+		}
+	}
+	return operationErr
+}
+
+func loadFakeGHState(path string) (FakeGHState, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return FakeGHState{}, err
+	}
+	var state FakeGHState
+	if err := json.Unmarshal(b, &state); err != nil {
+		return FakeGHState{}, fmt.Errorf("testkit: decode fake-gh state: %w", err)
+	}
+	if state.Schema != "sf.testkit.fake-gh/v1" {
+		return FakeGHState{}, fmt.Errorf("testkit: unsupported fake-gh schema %q", state.Schema)
+	}
+	if state.Checks == nil {
+		state.Checks = make(map[int][]contracts.RequiredCheck)
+	}
+	if state.ResponseScripts == nil {
+		state.ResponseScripts = make(map[string][]ResponseMode)
+	}
+	return state, nil
+}
+
+func acquireFakeGHLock(path string) (func() error, error) {
+	lockPath := path + ".lock"
+	deadline := time.Now().Add(fakeGHLockDeadline)
+	for {
+		err := os.Mkdir(lockPath, 0o700)
+		if err == nil {
+			return func() error { return os.Remove(lockPath) }, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, fmt.Errorf("testkit: acquire fake-gh lock: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("testkit: fake-gh state lock remained held for %s; verify no fixture process owns %s", fakeGHLockDeadline, lockPath)
+		}
+		time.Sleep(fakeGHLockRetry)
+	}
+}
+
+func saveFakeGHState(path string, state FakeGHState) error {
+	b, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func cloneState(state FakeGHState) FakeGHState {
@@ -542,14 +673,18 @@ func (f *FakeGH) runCreate(argv []string) ([]byte, error) {
 func (f *FakeGH) runView(argv []string) ([]byte, error) {
 	number := prNumber(argv)
 	identity := identityFromArgs(argv, number)
-	f.mu.Lock()
-	index, err := f.findLocked(identity)
+	var pr PullRequest
+	err := f.withState(func() (bool, error) {
+		index, err := f.findLocked(identity)
+		if err != nil {
+			return false, err
+		}
+		pr = f.state.PRs[index]
+		return false, nil
+	})
 	if err != nil {
-		f.mu.Unlock()
 		return nil, err
 	}
-	pr := f.state.PRs[index]
-	f.mu.Unlock()
 	return json.Marshal(prJSON(pr.Identity, pr.Draft, pr.Merged, pr.Ready))
 }
 

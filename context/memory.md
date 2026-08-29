@@ -43,3 +43,11 @@ The bounded Seatbelt (`sandbox-exec`) probe demonstrates selected credential,
 Git-control, network, package, and launchd denials, but fails the detached
 writer lifecycle probe. It records `autonomous_eligible=false`; no Docker or
 Colima fallback was installed or proposed. See ADR 0002.
+
+### 2026-08-29 — Fixture boundary hardening
+
+The deterministic fake GitHub remote reloads durable state under a bounded
+portable lock for every operation, persists with unique atomic temporary files,
+and requires factory ownership for PR recovery. Provider fixtures sort writes,
+reject lexical and symlink worktree escapes, and keep escaped-child probes
+observable with a two-second maximum lifetime.

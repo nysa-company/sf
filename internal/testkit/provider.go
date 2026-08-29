@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -123,7 +124,13 @@ func (p *ScriptedProvider) Run(ctx context.Context, input contracts.PhaseInput) 
 	if err := ctx.Err(); err != nil {
 		return contracts.PhaseResult{}, err
 	}
-	for path, content := range step.WriteFiles {
+	paths := make([]string, 0, len(step.WriteFiles))
+	for path := range step.WriteFiles {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		content := step.WriteFiles[path]
 		if err := writeWithin(input.Worktree, path, content); err != nil {
 			return contracts.PhaseResult{}, err
 		}
@@ -175,9 +182,39 @@ func writeWithin(root, name string, content []byte) error {
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return errors.New("testkit: fixture path escapes worktree")
 	}
-	path := filepath.Join(root, clean)
+	rootPath, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve fixture worktree: %w", err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(rootPath)
+	if err != nil {
+		return fmt.Errorf("resolve fixture worktree: %w", err)
+	}
+	rootInfo, err := os.Stat(resolvedRoot)
+	if err != nil || !rootInfo.IsDir() {
+		return errors.New("testkit: fixture worktree is not a directory")
+	}
+
+	path := filepath.Join(rootPath, clean)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create fixture directory: %w", err)
 	}
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("resolve fixture parent: %w", err)
+	}
+	if !pathWithin(resolvedRoot, resolvedParent) {
+		return errors.New("testkit: fixture path escapes worktree through symlink")
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("testkit: fixture path is a symlink")
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect fixture path: %w", err)
+	}
 	return os.WriteFile(path, content, 0o644)
+}
+
+func pathWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

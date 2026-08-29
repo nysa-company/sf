@@ -11,8 +11,14 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+)
+
+const (
+	defaultFixtureDuration = 500 * time.Millisecond
+	maximumFixtureDuration = 2 * time.Second
 )
 
 type result struct {
@@ -32,9 +38,13 @@ func main() {
 	scriptPath := flag.String("script", os.Getenv("SF_FAKE_PROVIDER_SCRIPT"), "optional JSON script")
 	phase := flag.String("phase", os.Getenv("SF_FAKE_PROVIDER_PHASE"), "script step to run")
 	scenario := flag.String("scenario", "normal", "normal,ignore-term,setsid,double-fork")
-	duration := flag.Duration("duration", 30*time.Second, "bounded fixture lifetime")
+	duration := flag.Duration("duration", defaultFixtureDuration, "bounded fixture lifetime (maximum 2s)")
 	write := flag.String("write", "", "optional worktree-relative file to write")
 	flag.Parse()
+	if *duration <= 0 || *duration > maximumFixtureDuration {
+		fmt.Fprintf(os.Stderr, "fake-provider: duration must be between 1ns and %s\n", maximumFixtureDuration)
+		os.Exit(2)
+	}
 	if *scriptPath != "" {
 		var fixture script
 		data, err := os.ReadFile(*scriptPath)
@@ -83,11 +93,7 @@ func main() {
 	}
 
 	if *write != "" {
-		if filepath.IsAbs(*write) || filepath.Clean(*write) == ".." {
-			fmt.Fprintln(os.Stderr, "fake-provider: write path must be relative")
-			os.Exit(2)
-		}
-		if err := os.WriteFile(*write, []byte("partial fixture\n"), 0o644); err != nil {
+		if err := writeRelative(*write, []byte("partial fixture\n")); err != nil {
 			fmt.Fprintln(os.Stderr, "fake-provider:", err)
 			os.Exit(2)
 		}
@@ -134,6 +140,43 @@ func writeJSON(value result) {
 	_ = json.NewEncoder(os.Stdout).Encode(value)
 }
 
+func writeRelative(name string, content []byte) error {
+	clean := filepath.Clean(name)
+	if filepath.IsAbs(name) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("write path must be relative")
+	}
+	root, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(root, clean)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	if !within(resolvedRoot, resolvedParent) {
+		return fmt.Errorf("write path escapes worktree through symlink")
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("write path is a symlink")
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.WriteFile(path, content, 0o644)
+}
+
+func within(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 func ignoreTERM() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGTERM)
@@ -150,7 +193,7 @@ func forkChild(duration time.Duration) error {
 		return err
 	}
 	child := exec.Command(self, "--behavior=hang", "--duration="+duration.String())
-	child.Env = append(os.Environ(), "SF_FAKE_PROVIDER_CHILD=1", "SF_FAKE_PROVIDER_FORK_STAGE=1", "SF_FAKE_PROVIDER_SETSID=1")
+	child.Env = childEnvironment("1")
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
 	if err := child.Start(); err != nil {
@@ -165,10 +208,22 @@ func forkGrandchild(duration time.Duration) error {
 		return err
 	}
 	child := exec.Command(self, "--behavior=hang", "--duration="+duration.String())
-	child.Env = append(os.Environ(), "SF_FAKE_PROVIDER_CHILD=1", "SF_FAKE_PROVIDER_FORK_STAGE=2", "SF_FAKE_PROVIDER_SETSID=1")
+	child.Env = childEnvironment("2")
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	return child.Start()
+	if err := child.Start(); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "fake-provider: escaped-child-pid=%d lifetime=%s\n", child.Process.Pid, duration)
+	return nil
+}
+
+func childEnvironment(stage string) []string {
+	return []string{
+		"SF_FAKE_PROVIDER_CHILD=1",
+		"SF_FAKE_PROVIDER_FORK_STAGE=" + stage,
+		"SF_FAKE_PROVIDER_SETSID=1",
+	}
 }
 
 func runChild(duration time.Duration) {
@@ -177,5 +232,7 @@ func runChild(duration time.Duration) {
 	if os.Getenv("SF_FAKE_PROVIDER_SETSID") == "1" {
 		_, _ = syscall.Setsid()
 	}
+	fmt.Fprintf(os.Stderr, "fake-provider: escaped-child-start pid=%d lifetime=%s\n", os.Getpid(), duration)
 	time.Sleep(duration)
+	fmt.Fprintf(os.Stderr, "fake-provider: escaped-child-exit pid=%d\n", os.Getpid())
 }

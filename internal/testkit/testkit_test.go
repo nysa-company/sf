@@ -2,7 +2,12 @@ package testkit
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,6 +75,7 @@ func TestFakeGHSeparatesMutationFromResponseDeliveryAndBindsIdentity(t *testing.
 		t.Fatalf("delivery count = %d, want 0", got)
 	}
 	identity.Number = 1
+	identity.FactoryOwned = true
 	found, ok, err := remote.FindPullRequest(context.Background(), identity)
 	if err != nil || !ok || found.HeadOID != identity.HeadOID || !found.FactoryOwned {
 		t.Fatalf("full identity lookup = %#v, found=%v, err=%v", found, ok, err)
@@ -79,6 +85,203 @@ func TestFakeGHSeparatesMutationFromResponseDeliveryAndBindsIdentity(t *testing.
 	if _, ok, err := remote.FindPullRequest(context.Background(), wrongHead); err != nil || ok {
 		t.Fatalf("fork identity unexpectedly adopted: found=%v err=%v", ok, err)
 	}
+}
+
+func TestFakeGHRequiresOwnedRecoveryAndRejectsHumanLookalike(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "remote.json")
+	remote, err := NewFakeGH(path, contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.SetAuthenticated(true); err != nil {
+		t.Fatal(err)
+	}
+	identity := fakePRIdentity()
+	identity.Number = 7
+	if err := remote.InjectPullRequestForTest(PullRequest{Identity: identity, Draft: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := remote.FindPullRequest(context.Background(), identity); err == nil {
+		t.Fatal("lookup without factory ownership unexpectedly succeeded")
+	}
+	identity.FactoryOwned = true
+	if _, found, err := remote.FindPullRequest(context.Background(), identity); err != nil || found {
+		t.Fatalf("human-owned lookalike adopted: found=%v err=%v", found, err)
+	}
+	identity.FactoryOwned = false
+	if _, err := remote.CreateDraftPullRequest(context.Background(), identity, "title", "body", ""); err == nil || !strings.Contains(err.Error(), "human-owned") {
+		t.Fatalf("human-owned lookalike did not block a factory create: %v", err)
+	}
+}
+
+func TestFakeGHSubprocessRecoveryCreatesOnePR(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "remote.json")
+	remote, err := NewFakeGH(path, contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.SetAuthenticated(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.SetResponse("pr_create", ResponseDropAfterCall); err != nil {
+		t.Fatal(err)
+	}
+	fixture := buildFixture(t, "./cmd/fake-gh")
+	args := []string{"pr", "create", "--repo", "example/app", "--head", "example:sf/dev/nysa/SF-00000001-abc123", "--head-oid", "0123456789012345678901234567890123456789", "--base", "main", "--title", "title", "--body", "body", "--sf-owned", "true"}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			command := exec.Command(fixture, args...)
+			command.Env = append(os.Environ(), "SF_FAKE_GH_STATE="+path)
+			_, err := command.CombinedOutput()
+			results <- err
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	for err := range results {
+		if err == nil {
+			t.Fatal("lost-response create unexpectedly reported success")
+		}
+	}
+	state := remote.Snapshot()
+	if len(state.PRs) != 1 || remote.MutationCount("pr_create") != 1 || remote.DeliveryCount("pr_create") != 0 {
+		t.Fatalf("concurrent recovery state = %#v", state)
+	}
+	want := fakePRIdentity()
+	want.Number = 1
+	want.FactoryOwned = true
+	if _, found, err := remote.FindPullRequest(context.Background(), want); err != nil || !found {
+		t.Fatalf("lost-response recovery did not find the one owned PR: found=%v err=%v", found, err)
+	}
+}
+
+func TestWriteWithinRejectsHostileSymlinkWithoutMutatingSentinel(t *testing.T) {
+	root := repositoryRoot(t)
+	hostile := filepath.Join(root, "testdata", "hostile-repository")
+	target := filepath.Join(root, "testdata", "parent-sentinel")
+	if link, err := os.Readlink(filepath.Join(hostile, "parent-sentinel")); err != nil || link != "../parent-sentinel" {
+		t.Fatalf("hostile fixture symlink = %q, err=%v", link, err)
+	}
+	before, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeWithin(hostile, "parent-sentinel", []byte("must not write\n")); err == nil {
+		t.Fatal("symlink escape unexpectedly accepted")
+	}
+	after, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("controlled sentinel mutated: %q", after)
+	}
+}
+
+func TestScriptedProviderWritesInSortedOrderAndRejectsSymlinkEscape(t *testing.T) {
+	worktree := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(worktree, "a")); err != nil {
+		t.Fatal(err)
+	}
+	provider := NewScriptedProvider(domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Version: "v1"})
+	provider.Default = ProviderStep{WriteFiles: map[string][]byte{
+		"z.txt": []byte("must not be written before a failing path\n"),
+		"a/out": []byte("must not escape\n"),
+	}}
+	_, err := provider.Run(context.Background(), contracts.PhaseInput{
+		Ticket:   domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-1"},
+		Phase:    domain.PhaseBuild,
+		Worktree: worktree,
+	})
+	if err == nil {
+		t.Fatal("symlink escape unexpectedly accepted")
+	}
+	if _, err := os.Stat(filepath.Join(worktree, "z.txt")); !os.IsNotExist(err) {
+		t.Fatalf("nondeterministic partial write occurred before rejected path: %v", err)
+	}
+}
+
+func TestFakeProviderRejectsEscapingWritesAndBoundsChildren(t *testing.T) {
+	fixture := buildFixture(t, "./cmd/fake-provider")
+	worktree := filepath.Join(t.TempDir(), "worktree")
+	if err := os.Mkdir(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	escape := filepath.Join(filepath.Dir(worktree), "escape")
+	command := exec.Command(fixture, "--write=../escape")
+	command.Dir = worktree
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "write path must be relative") {
+		t.Fatalf("escaping write result: err=%v output=%q", err, output)
+	}
+	if _, err := os.Stat(escape); !os.IsNotExist(err) {
+		t.Fatalf("escaping write created %s: %v", escape, err)
+	}
+	if err := os.Symlink(filepath.Dir(worktree), filepath.Join(worktree, "link")); err != nil {
+		t.Fatal(err)
+	}
+	command = exec.Command(fixture, "--write=link/escape")
+	command.Dir = worktree
+	if output, err = command.CombinedOutput(); err == nil || !strings.Contains(string(output), "escapes worktree through symlink") {
+		t.Fatalf("symlink write result: err=%v output=%q", err, output)
+	}
+	command = exec.Command(fixture, "--duration=3s")
+	if output, err = command.CombinedOutput(); err == nil || !strings.Contains(string(output), "duration must be") {
+		t.Fatalf("overlong duration result: err=%v output=%q", err, output)
+	}
+	started := time.Now()
+	command = exec.Command(fixture, "--scenario=double-fork", "--duration=50ms")
+	output, err = command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("bounded double-fork: %v (%s)", err, output)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("escaped child exceeded bounded cleanup window: %s", elapsed)
+	}
+	for _, marker := range []string{"escaped-child-pid=", "escaped-child-start", "escaped-child-exit"} {
+		if !strings.Contains(string(output), marker) {
+			t.Fatalf("missing bounded-child marker %q in %q", marker, output)
+		}
+	}
+}
+
+func fakePRIdentity() contracts.PullRequestIdentity {
+	return contracts.PullRequestIdentity{
+		Repository:     contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"},
+		HeadOwner:      "example",
+		HeadRepository: "app",
+		HeadRef:        "sf/dev/nysa/SF-00000001-abc123",
+		HeadOID:        "0123456789012345678901234567890123456789",
+		BaseRef:        "main",
+	}
+}
+
+func repositoryRoot(t *testing.T) string {
+	t.Helper()
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate test source")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(source), "..", ".."))
+}
+
+func buildFixture(t *testing.T, packagePath string) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), filepath.Base(packagePath))
+	command := exec.Command("go", "build", "-o", binary, packagePath)
+	command.Dir = repositoryRoot(t)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build fixture %s: %v (%s)", packagePath, err, output)
+	}
+	return binary
 }
 
 func TestFakeGHRejectsAmbiguousIdentityLookup(t *testing.T) {
@@ -100,11 +303,13 @@ func TestFakeGHRejectsAmbiguousIdentityLookup(t *testing.T) {
 	for _, oid := range []string{"0123456789012345678901234567890123456789", "abcdefabcdefabcdefabcdefabcdefabcdefabcd"} {
 		identity := base
 		identity.HeadOID = oid
-		if _, err := remote.CreateDraftPullRequest(context.Background(), identity, "title", "body", ""); err != nil {
+		identity.FactoryOwned = true
+		if err := remote.InjectPullRequestForTest(PullRequest{Identity: identity, Title: "title", Body: "body", Draft: true}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, found, err := remote.FindPullRequest(context.Background(), base); err == nil || found {
+	base.FactoryOwned = true
+	if _, found, err := remote.FindPullRequest(context.Background(), base); err == nil || !strings.Contains(err.Error(), "ambiguous") || found {
 		t.Fatalf("ambiguous lookup = found=%v err=%v", found, err)
 	}
 }
