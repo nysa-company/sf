@@ -17,6 +17,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/api"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/ticket"
 	"github.com/nysa-company/sf/internal/version"
 )
 
@@ -171,7 +172,16 @@ func (a *app) submitCommand() *cobra.Command {
 	var project string
 	var allowNew bool
 	command := &cobra.Command{Use: "submit <ticket.md> --project <name>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return a.emit(a.request("ticket.submit", "", params(map[string]any{"path": args[0], "project": project, "new": allowNew}, a.channel)))
+		file, err := os.Open(args[0])
+		if err != nil {
+			return a.emit(failure("invalid_ticket", "ticket file could not be opened", []string{binaryName(), "submit", args[0], "--project", project}))
+		}
+		parsed, parseErr := ticket.Parse(file)
+		closeErr := file.Close()
+		if parseErr != nil || closeErr != nil {
+			return a.emit(failure("invalid_ticket", "ticket file does not meet the local Markdown contract", []string{binaryName(), "submit", args[0], "--project", project}))
+		}
+		return a.emit(a.request("ticket.submit", "", params(map[string]any{"source": string(parsed.Source), "project": project, "new": allowNew}, a.channel)))
 	}}
 	command.Flags().StringVar(&project, "project", "", "registered project name")
 	command.Flags().BoolVar(&allowNew, "new", false, "create a new identity when the same ticket already finished")

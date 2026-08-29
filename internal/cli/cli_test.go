@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -78,13 +80,18 @@ func TestOperatorDefaultsAndSubmitNewAreForwarded(t *testing.T) {
 	if requests[0].OperatorLabel == "" {
 		t.Fatal("default operator label was not forwarded")
 	}
-	if code := Execute(context.Background(), []string{"submit", "ticket.md", "--project", "nysa", "--new"}, &bytes.Buffer{}, &bytes.Buffer{}, client); code != 0 {
+	path := filepath.Join(t.TempDir(), "ticket.md")
+	if err := os.WriteFile(path, []byte("# Test ticket\n\nProblem to solve.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := Execute(context.Background(), []string{"submit", path, "--project", "nysa", "--new"}, &bytes.Buffer{}, &bytes.Buffer{}, client); code != 0 {
 		t.Fatalf("submit exit=%d", code)
 	}
 	var parameters struct {
-		New bool `json:"new"`
+		New    bool   `json:"new"`
+		Source string `json:"source"`
 	}
-	if err := json.Unmarshal(requests[1].Parameters, &parameters); err != nil || !parameters.New {
+	if err := json.Unmarshal(requests[1].Parameters, &parameters); err != nil || !parameters.New || parameters.Source != "# Test ticket\n\nProblem to solve.\n" {
 		t.Fatalf("parameters=%s err=%v", requests[1].Parameters, err)
 	}
 }
