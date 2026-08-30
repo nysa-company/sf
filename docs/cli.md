@@ -69,8 +69,11 @@ Doctor performs read-only checks for the
 channel root, socket, disk space, Git/gh executables, and an optional
 repository worktree. It reports typed check records, keeps
 `autonomous_eligible` false, and never treats missing Docker or Colima as an
-error. The auth and qualification commands remain local adapter work in
-progress; they do not copy or display tokens.
+error. `auth status` probes only the four allowlisted official CLIs (`gh`,
+`cursor-agent`, `claude`, and `codex`) with bounded, discarded output. `auth
+login <provider>` delegates to that CLI's official interactive flow and then
+re-probes status; sf never accepts, captures, or stores a credential byte. The
+qualification command remains local adapter work in progress.
 
 `daemon run` is the foreground entry point for development and tests (for
 example, `sf-dev daemon run`). Its socket-backed lifecycle commands use the

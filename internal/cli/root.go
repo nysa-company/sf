@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/nysa-company/sf/internal/api"
+	localauth "github.com/nysa-company/sf/internal/auth"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/ticket"
 	"github.com/nysa-company/sf/internal/version"
@@ -326,8 +327,17 @@ func (a *app) doctorCommand() *cobra.Command {
 
 func (a *app) authCommand() *cobra.Command {
 	root := &cobra.Command{Use: "auth", Args: cobra.NoArgs}
-	root.AddCommand(&cobra.Command{Use: "status", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error { return a.emit(notConfigured("auth status")) }})
-	root.AddCommand(&cobra.Command{Use: "login <provider>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error { return a.emit(notConfigured("auth login " + args[0])) }})
+	root.AddCommand(&cobra.Command{Use: "status", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		manager := localauth.NewManager()
+		return a.emit(RunAuthStatus(cmd.Context(), a.channel, manager))
+	}})
+	root.AddCommand(&cobra.Command{Use: "login <provider>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		manager := localauth.NewManager()
+		// Provider interaction is deliberately on stderr so --json retains one
+		// machine-readable response on stdout. The exchange is never captured.
+		terminal := localauth.Terminal{In: os.Stdin, Out: a.errOut, Err: a.errOut}
+		return a.emit(RunAuthLogin(cmd.Context(), a.channel, args[0], terminal, manager))
+	}})
 	return root
 }
 
