@@ -79,8 +79,9 @@ type PhaseResult struct {
 // must re-authenticate this witness against the current worktree before the
 // evidence write.
 type VerificationCheckpoint struct {
-	ID     string
-	Commit store.CommitObservation
+	ID            string
+	Commit        store.CommitObservation
+	CommandResult contracts.RepositoryCommandResultKey
 }
 
 // VerificationCheckpointMaterializer reconstructs a checkpoint witness from
@@ -340,7 +341,11 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 			if parseErr != nil {
 				return false, true, parseErr
 			}
-			if err := w.persistVerification(ctx, ticket, fence, PhaseRequest{}, planIdentity, artifact, reusable.Key); err != nil {
+			replayRequest, requestErr := w.request(ctx, ticket, fence, domain.PhaseVerification, &plan, nil, nil)
+			if requestErr != nil {
+				return false, true, requestErr
+			}
+			if err := w.persistVerification(ctx, ticket, fence, replayRequest, planIdentity, artifact, reusable.Key); err != nil {
 				return false, true, err
 			}
 			verification, err = w.Evidence.CurrentVerification(ctx, ticket.Ref)
@@ -364,7 +369,11 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 		if parseErr != nil {
 			return false, true, parseErr
 		}
-		if err := w.persistVerification(ctx, ticket, fence, PhaseRequest{}, planIdentity, artifact, reusable.Key); err != nil {
+		replayRequest, requestErr := w.request(ctx, ticket, fence, domain.PhaseVerification, &plan, nil, nil)
+		if requestErr != nil {
+			return false, true, requestErr
+		}
+		if err := w.persistVerification(ctx, ticket, fence, replayRequest, planIdentity, artifact, reusable.Key); err != nil {
 			return false, true, err
 		}
 		if err := w.signalVerification(ctx, ticket, fence); err != nil {
@@ -667,11 +676,8 @@ func (w Worker) persistVerification(ctx context.Context, ticket store.Ticket, fe
 	if loadErr != nil || wantErr != nil || string(loaded) != string(want) {
 		return ErrStaleEvidence
 	}
-	if request.Phase == "" {
-		request, err = w.request(ctx, ticket, fence, domain.PhaseVerification, nil, nil, nil)
-		if err != nil {
-			return err
-		}
+	if request.Phase != domain.PhaseVerification || request.Ticket.Ref != ticket.Ref || request.Ticket.Version != ticket.Version || request.Fence != fence || request.Plan == nil {
+		return ErrStaleEvidence
 	}
 	if w.CheckpointMaterializer == nil || w.Checkpoint == nil {
 		return ErrCheckpointRequired
@@ -681,6 +687,9 @@ func (w Worker) persistVerification(ctx context.Context, ticket store.Ticket, fe
 		return err
 	}
 	if checkpoint.ID == "" || checkpoint.ID != checkpoint.Commit.CommitOID || checkpoint.Commit.ParentOID == "" || checkpoint.Commit.TreeOID == "" {
+		return ErrCheckpointRequired
+	}
+	if checkpoint.CommandResult.SemanticKey == "" || checkpoint.CommandResult.ClaimEpoch == 0 {
 		return ErrCheckpointRequired
 	}
 	intent, err := canonicalVerificationIntent(artifact)
@@ -709,7 +718,7 @@ func (w Worker) persistVerification(ctx context.Context, ticket store.Ticket, fe
 	if err = w.Checkpoint.AuthenticateVerificationCheckpoint(ctx, request, artifact, checkpoint); err != nil {
 		return err
 	}
-	_, err = w.Evidence.RecordVerification(ctx, store.VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: artifact.OwnedFiles, CheckpointID: checkpoint.ID, ProviderResult: &key, Checkpoint: checkpoint.Commit})
+	_, err = w.Evidence.RecordVerification(ctx, store.VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: artifact.OwnedFiles, CheckpointID: checkpoint.ID, ProviderResult: &key, Checkpoint: checkpoint.Commit, CommandResult: checkpoint.CommandResult})
 	return err
 }
 

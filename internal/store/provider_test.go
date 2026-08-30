@@ -860,6 +860,170 @@ func TestProviderFinishRejectsUsageBeyondTicketCeiling(t *testing.T) {
 	}
 }
 
+// This is the Store-side counterpart to the coordinator race tests.  Reuse is
+// a lifecycle fact, not a caller-side cache: every executable phase must only
+// be reusable after the exact completed attempt has its immutable result.
+func TestCurrentCompletedProviderAttemptReuseAdmissionAcrossRoles(t *testing.T) {
+	cases := []struct {
+		name       string
+		phase      domain.Phase
+		role       string
+		state      domain.State
+		artifact   []byte
+		validation func(Ticket) phaseartifact.Validation
+		binding    func(ProviderQualification, ProviderQualification) contracts.RuntimeBinding
+	}{
+		{
+			name: "planner", phase: domain.PhasePlanning, role: "planner", state: domain.StatePlanning,
+			artifact:   []byte(`{"schema":"sf.planner/v1","acceptance":["a"],"proof":{"kind":"acceptance","command":["go","test"],"details":"d"},"paths":["internal"],"commands":[["go","test"]],"risks":["r"]}`),
+			validation: func(ticket Ticket) phaseartifact.Validation { return phaseartifact.Validation{TicketType: ticket.Type} },
+			binding:    func(builder, _ ProviderQualification) contracts.RuntimeBinding { return runtime(builder) },
+		},
+		{
+			name: "verification reviewer", phase: domain.PhaseVerification, role: "reviewer", state: domain.StateVerifying,
+			artifact: []byte(`{"schema":"sf.verification/v1","acceptance_digest":"accepted","proof_kind":"acceptance","owned_files":["internal/proof_test.go"],"command":["go","test","./..."],"prebuild_outcome":"red","evidence_digest":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}`),
+			validation: func(ticket Ticket) phaseartifact.Validation {
+				return phaseartifact.Validation{TicketType: ticket.Type, AcceptanceDigest: "accepted"}
+			},
+			binding: func(_, reviewer ProviderQualification) contracts.RuntimeBinding { return runtime(reviewer) },
+		},
+		{
+			name: "build builder", phase: domain.PhaseBuild, role: "builder", state: domain.StateBuilding,
+			artifact:   []byte(`{"schema":"sf.builder/v1","summary":"done","changed_files":["internal/feature.go"],"commands":[["go","test","./..."]]}`),
+			validation: func(ticket Ticket) phaseartifact.Validation { return phaseartifact.Validation{TicketType: ticket.Type} },
+			binding:    func(builder, _ ProviderQualification) contracts.RuntimeBinding { return runtime(builder) },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			digest := setupProviderProject(t, db, ctx)
+			leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "reuse-"+tc.name)
+			ticket := setupProviderTicket(t, db, ctx, "SF-reuse-"+strings.ReplaceAll(tc.name, " ", "-"), leader)
+			if tc.state != domain.StatePlanning {
+				ticket = providerState(t, db, ctx, ticket, leader, tc.state)
+			}
+			builder, reviewer := setupProviderPair(t, db, ctx)
+			fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+			request := supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: tc.phase, Role: tc.role, Binding: tc.binding(builder, reviewer), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+			claim, err := db.BeginProviderAttempt(ctx, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.RecordProviderLaunch(ctx, claim, contracts.ProviderLaunch{PID: int(claim.ID), PGID: int(claim.ID), BootIdentity: "reuse", ProcessStartIdentity: fmt.Sprintf("reuse-%d", claim.ID), Worktree: claim.Worktree}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: tc.artifact, UsageTrusted: true, UsageUnits: 1}, tc.validation(ticket), time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			key, reusable, err := db.ReuseCurrentCompletedProviderAttempt(ctx, ticket.Ref, tc.phase, tc.role, ticket.Version, fence)
+			want := ProviderAttemptResultKey{AttemptID: claim.ID, Ref: ticket.Ref, Phase: tc.phase, Attempt: claim.Attempt}
+			if err != nil || !reusable || key != want {
+				t.Fatalf("reusable key=%+v reusable=%v err=%v want=%+v", key, reusable, err, want)
+			}
+			if _, err := db.BeginProviderAttempt(ctx, request); !errors.Is(err, ErrProviderAttemptReusable) {
+				t.Fatalf("second exact admission=%v", err)
+			}
+			wrongRole := "builder"
+			if tc.role == wrongRole {
+				wrongRole = "reviewer"
+			}
+			if key, reusable, err := db.ReuseCurrentCompletedProviderAttempt(ctx, ticket.Ref, tc.phase, wrongRole, ticket.Version, fence); err != nil || reusable || key != (ProviderAttemptResultKey{}) {
+				t.Fatalf("wrong role reuse key=%+v reusable=%v err=%v", key, reusable, err)
+			}
+			if _, reusable, err := db.ReuseCurrentCompletedProviderAttempt(ctx, ticket.Ref, tc.phase, tc.role, ticket.Version+1, fence); reusable || !errors.Is(err, ErrStaleFence) {
+				t.Fatalf("wrong version reusable=%v err=%v", reusable, err)
+			}
+			if _, reusable, err := db.ReuseCurrentCompletedProviderAttempt(ctx, ticket.Ref, tc.phase, tc.role, ticket.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch + 1}); reusable || !errors.Is(err, ErrStaleFence) {
+				t.Fatalf("wrong fence reusable=%v err=%v", reusable, err)
+			}
+		})
+	}
+}
+
+func TestCurrentCompletedProviderAttemptReuseDoesNotMaskFailedOrMissingResult(t *testing.T) {
+	for _, outcome := range []string{"failed", "missing_result"} {
+		t.Run(outcome, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			digest := setupProviderProject(t, db, ctx)
+			leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "reuse-"+outcome)
+			ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-reuse-"+outcome, leader), leader, domain.StateBuilding)
+			builder, _ := setupProviderPair(t, db, ctx)
+			fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+			request := supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+			claim, err := db.BeginProviderAttempt(ctx, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if outcome == "failed" {
+				if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "failed", 1, time.Now().UTC()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if key, reusable, err := db.ReuseCurrentCompletedProviderAttempt(ctx, ticket.Ref, domain.PhaseBuild, "builder", ticket.Version, fence); err != nil || reusable || key != (ProviderAttemptResultKey{}) {
+				t.Fatalf("non-result reuse key=%+v reusable=%v err=%v", key, reusable, err)
+			}
+			if outcome == "failed" {
+				if _, err := db.BeginProviderAttempt(ctx, request); err != nil {
+					t.Fatalf("failed result should permit normal retry: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// A duplicate can only be manufactured by corrupting the append-only Store;
+// normal Begin admission makes the second completed claim impossible.  Keep
+// that mutation isolated here and require the reuse scan to fail closed rather
+// than silently selecting either artifact.
+func TestCurrentCompletedProviderAttemptReuseRejectsTamperedDuplicate(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "reuse-duplicate")
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-reuse-duplicate", leader), leader, domain.StateBuilding)
+	builder, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	request := supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+	first, err := db.BeginProviderAttempt(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishProviderAttempt(ctx, first, proof(t, first), ticket.Version, fence, "failed", "failed", 1, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.BeginProviderAttempt(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordProviderLaunch(ctx, second, contracts.ProviderLaunch{PID: int(second.ID), PGID: int(second.ID), BootIdentity: "duplicate", ProcessStartIdentity: "duplicate-second", Worktree: second.Worktree}); err != nil {
+		t.Fatal(err)
+	}
+	raw := contracts.PhaseResult{Provider: second.Binding.Identity, Artifact: []byte(`{"schema":"sf.builder/v1","summary":"done","changed_files":["main.go"],"commands":[["go","test"]]}`), UsageTrusted: true, UsageUnits: 1}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, second, proof(t, second), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: ticket.Type}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	// The simulated corrupt copy remains internally shaped like a completed
+	// lifecycle, but has a different immutable first-attempt input.  This is
+	// deliberately raw SQL only for the isolated tamper case.
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempts SET state='completed',outcome='completed',launch_state='drained',finished_at=? WHERE id=?`, now(), first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE phase_runs SET state='completed',outcome='completed',completed_at=? WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=?`, now(), ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, domain.PhaseBuild, first.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO provider_attempt_results(provider_attempt_id,channel,project_id,ticket_id,phase,role,attempt,provider,model,family,provider_version,request_digest,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha,raw_artifact,raw_sha256,typed_artifact,typed_sha256,validation,validation_sha256,transcript_sha256,created_at)
+		SELECT a.id,a.channel,a.project_id,a.ticket_id,a.phase,a.role,a.attempt,a.provider,a.model,a.family,a.version,i.request_digest,a.leader_epoch,a.runner_epoch,a.expected_ticket_version,a.repository_path,a.worktree_path,a.worktree_identity,a.base_sha,r.raw_artifact,r.raw_sha256,r.typed_artifact,r.typed_sha256,r.validation,r.validation_sha256,r.transcript_sha256,?
+		FROM provider_attempts a JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id JOIN provider_attempt_results r ON r.provider_attempt_id=? WHERE a.id=?`, now(), second.ID, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, reusable, err := db.ReuseCurrentCompletedProviderAttempt(ctx, ticket.Ref, domain.PhaseBuild, "builder", ticket.Version, fence); reusable || !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("duplicate reuse reusable=%v err=%v", reusable, err)
+	}
+	if _, err := db.BeginProviderAttempt(ctx, request); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("duplicate Begin admission=%v", err)
+	}
+}
+
 func TestFailProviderAttemptBudgetMarksLaunchDrained(t *testing.T) {
 	db, ctx := openTestStore(t)
 	digest := setupProviderProject(t, db, ctx)

@@ -16,6 +16,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/engine"
+	gitboundary "github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/phaseartifact"
 	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
@@ -114,7 +115,7 @@ func TestWorkerRealStoreFailsClosedWithoutCommandResultWiring(t *testing.T) {
 			continue
 		}
 		if i == 2 {
-			if !errors.Is(err, store.ErrEvidenceConflict) {
+			if !errors.Is(err, ErrCheckpointRequired) {
 				t.Fatalf("run %d accepted unbound reviewer evidence: %v", i, err)
 			}
 			current, readErr := db.Ticket(ctx, ref)
@@ -225,27 +226,57 @@ func TestWorkerPlanningRecoveryRebindsOnlyExactRecoveredPlanResult(t *testing.T)
 		if err != nil {
 			t.Fatal(err)
 		}
-		newer, err := fixture.runner.Run(fixture.ctx, request)
-		if err != nil || newer.ProviderResult == *oldPlan.Document.ProviderResult {
-			t.Fatalf("newer planner result=%+v old=%+v err=%v", newer, *oldPlan.Document.ProviderResult, err)
-		}
-		fixture.recover(t)
-		current, err := fixture.db.Ticket(fixture.ctx, fixture.ref)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); !errors.Is(err, ErrStaleEvidence) {
-			t.Fatalf("mismatched recovered plan error=%v", err)
-		}
-		after, err := fixture.db.Ticket(fixture.ctx, fixture.ref)
-		if err != nil || after.State != domain.StatePlanning || after.Version != current.Version {
-			t.Fatalf("mismatched replay advanced ticket before=%+v after=%+v err=%v", current, after, err)
+		if _, err := fixture.runner.Run(fixture.ctx, request); !errors.Is(err, store.ErrProviderAttemptReusable) {
+			t.Fatalf("new planner completion escaped atomic reuse admission: %v", err)
 		}
 		if fixture.runner.calls[domain.PhasePlanning] != 2 {
-			t.Fatalf("Planner reran after mismatched recovery: calls=%d", fixture.runner.calls[domain.PhasePlanning])
+			t.Fatalf("planner call was not attempted: calls=%d", fixture.runner.calls[domain.PhasePlanning])
 		}
 	})
+}
+
+// A reviewer completion can be returned by providercoord's Begin-time reuse
+// path after another runner already completed it.  Worker consumes only the
+// immutable key, so model the lost response here: the first runner has
+// completed the exact Store result but returns an error before Worker sees it.
+func TestWorkerPersistsAndTransitionsReusedReviewerResult(t *testing.T) {
+	fixture := newRealPlanningRecoveryFixture(t)
+	defer fixture.db.Close()
+
+	if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil {
+		t.Fatal("expected injected planner response loss")
+	}
+	fixture.recover(t)
+	plan, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence)
+	if err != nil || !plan.Transitioned || !plan.Replayed || plan.State != domain.StateVerifying {
+		t.Fatalf("plan replay=%+v err=%v", plan, err)
+	}
+	fixture.runner.failAfter = map[domain.Phase]bool{domain.PhaseVerification: true}
+	if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil || !strings.Contains(err.Error(), "injected crash after durable verification result") {
+		t.Fatalf("reviewer did not leave reusable completion: %v", err)
+	}
+	ticket, err := fixture.db.Ticket(fixture.ctx, fixture.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ticket.State != domain.StateVerifying {
+		t.Fatalf("ticket after lost reviewer response=%+v", ticket)
+	}
+	reusable, err := fixture.db.LatestReusableProviderAttempt(fixture.ctx, store.LatestReusableProviderAttemptRequest{Ref: fixture.ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fixture.fence})
+	if err != nil || reusable.Key.AttemptID == 0 || reusable.Result.Claim.Role != "reviewer" {
+		t.Fatalf("reviewer reusable=%+v err=%v", reusable, err)
+	}
+	result, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence)
+	if err != nil || !result.Transitioned || !result.Replayed || result.State != domain.StateBuilding {
+		t.Fatalf("reviewer reuse transition=%+v err=%v", result, err)
+	}
+	verification, err := fixture.db.CurrentVerification(fixture.ctx, fixture.ref)
+	if err != nil || verification.ProviderResult != reusable.Key || verification.TicketVersion != ticket.Version || verification.Fence != fixture.fence {
+		t.Fatalf("verification=%+v reusable=%+v err=%v", verification, reusable, err)
+	}
+	if fixture.runner.calls[domain.PhaseVerification] != 1 {
+		t.Fatalf("reviewer reran after reusable result: calls=%d", fixture.runner.calls[domain.PhaseVerification])
+	}
 }
 
 type realPlanningRecoveryFixture struct {
@@ -266,9 +297,15 @@ func newRealPlanningRecoveryFixture(t *testing.T) *realPlanningRecoveryFixture {
 		t.Fatal(err)
 	}
 	const projectPath = "/tmp/workflow-worker-plan-recovery"
-	config := []byte(`{"providers":"real-test"}`)
-	configDigest := realDigest(string(config))
-	if err := db.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "plan-recovery", Path: projectPath, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: configDigest, ConfigSnapshot: config}); err != nil {
+	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("plan-recovery", projectPath), config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, configDigest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "plan-recovery", Path: projectPath, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: configDigest, ConfigSnapshot: snapshot}); err != nil {
 		t.Fatal(err)
 	}
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "plan-recovery", Ticket: "SF-plan-recovery"}
@@ -284,7 +321,8 @@ func newRealPlanningRecoveryFixture(t *testing.T) *realPlanningRecoveryFixture {
 		t.Fatal(err)
 	}
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}
-	if err := db.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: fence, Path: projectPath + "/SF-plan-recovery", Branch: "dev/plan-recovery/SF-plan-recovery", IdentityJSON: []byte(`{"repository":"/tmp/workflow-worker-plan-recovery"}`), BaseSHA: realOID("a"), HeadSHA: realOID("b")}); err != nil {
+	worktreePath, branch := projectPath+"/SF-plan-recovery", "dev/plan-recovery/SF-plan-recovery"
+	if err := db.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: fence, Path: worktreePath, Branch: branch, IdentityJSON: realWorktreeIdentity(t, projectPath, worktreePath, branch), BaseSHA: realOID("a"), HeadSHA: realOID("b")}); err != nil {
 		t.Fatal(err)
 	}
 	planner := realQualification(t, db, "44444444444444444444444444444444", "planner")
@@ -304,7 +342,7 @@ func newRealPlanningRecoveryFixture(t *testing.T) *realPlanningRecoveryFixture {
 	runner := &realRunner{db: db, repository: projectPath, configDigest: configDigest, bindings: map[domain.Phase]contracts.RuntimeBinding{domain.PhasePlanning: realBinding(planner), domain.PhaseVerification: realBinding(reviewer), domain.PhaseBuild: realBinding(builder)}, signer: signer}
 	machine := engine.New(db, spec)
 	runtime := &realFaultEngine{StateMachine: machine, failPlanSignal: true}
-	checkpoint := &realCheckpoint{}
+	checkpoint := &realCheckpoint{db: db, withCommand: true}
 	candidate := &realCandidate{}
 	return &realPlanningRecoveryFixture{ctx: ctx, db: db, ref: ref, fence: fence, worker: Worker{Evidence: db, Engine: runtime, Runner: runner, Checkpoint: checkpoint, Candidate: candidate, CheckpointMaterializer: checkpoint, CandidateMaterializer: candidate}, runner: runner, machine: machine}
 }
@@ -456,11 +494,85 @@ func (r *realRunner) artifact(req PhaseRequest) ([]byte, []string) {
 	}
 }
 
-type realCheckpoint struct{ materializations, authentications int }
+// realVerificationCommandEvidence exercises the same public Store command
+// lifecycle that production repository materialization must supply.  The
+// worker only receives its immutable result key through VerificationCheckpoint.
+func realVerificationCommandEvidence(ctx context.Context, db *store.Store, request PhaseRequest, artifact phaseartifact.Verification, provider store.ProviderAttemptResultKey) (contracts.RepositoryCommandResultKey, error) {
+	if db == nil {
+		return contracts.RepositoryCommandResultKey{}, errors.New("Store required for command evidence")
+	}
+	project, err := db.Project(ctx, request.Ticket.Ref.Channel, request.Ticket.Ref.Project)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	intent, err := workflowprompt.CanonicalVerificationIntentBytes(artifact)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	proof, err := workflowprompt.CanonicalVerificationProofBytes(artifact)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	argv, err := json.Marshal([]string{"go", "test", "./..."})
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	commandDigest := "sha256:" + realDigest(string(argv))
+	policy, spec, executable := "sha256:"+strings.Repeat("1", 64), "sha256:"+strings.Repeat("2", 64), "sha256:"+strings.Repeat("3", 64)
+	evidenceRequest := store.RepositoryCommandEvidenceRequest{Purpose: store.RepositoryCommandPurposePrebuildVerification, Ref: request.Ticket.Ref, TicketVersion: request.Ticket.Version, LeaderEpoch: request.Fence.LeaderEpoch, RunnerEpoch: request.Fence.RunnerEpoch, ProviderResult: provider, VerificationIntentDigest: realDigest(string(intent)), ProofDigest: realDigest(string(proof)), ConfigCommandDigest: commandDigest, Worktree: request.Worktree.Path, WorktreeIdentity: string(request.Worktree.IdentityJSON), BaseSHA: request.Worktree.BaseSHA, PolicyDigest: policy, SpecDigest: spec, ExecutablePath: "/usr/bin/true", ExecutableDigest: executable}
+	_, requestDigest, err := store.CanonicalRepositoryCommandEvidenceRequest(evidenceRequest)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	semantic, err := store.RepositoryCommandEvidenceSemanticKey(evidenceRequest)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	command := store.RepositoryCommandIntent{EffectFence: store.EffectFence{SemanticKey: semantic, Ref: request.Ticket.Ref, TicketVersion: request.Ticket.Version, Fence: request.Fence}, RequestDigest: requestDigest, Repository: project.Path, Worktree: request.Worktree.Path, WorktreeIdentity: string(request.Worktree.IdentityJSON), Branch: request.Worktree.Branch, BaseRef: project.BaseRef, BaseSHA: request.Worktree.BaseSHA, CommandDigest: commandDigest, SpecDigest: spec, PolicyDigest: policy, ExecutablePath: "/usr/bin/true", ExecutableDigest: executable}
+	if _, err := db.PlanEffect(ctx, store.EffectPlan{SemanticKey: semantic, Ref: request.Ticket.Ref, Kind: "repository_command", TicketVersion: request.Ticket.Version, Fence: request.Fence, RequestDigest: requestDigest}); err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	claim, err := db.IssueRepositoryCommandClaim(ctx, command)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	launch := contracts.RepositoryCommandLaunch{PID: 654, PGID: 654, BootIdentity: "worker", ProcessStartIdentity: "worker-verification"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 1, Duration: time.Millisecond, Observed: true, ObservedAt: time.Now().UTC()}); err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	if err := lease.Release(); err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	return contracts.RepositoryCommandResultKey{SemanticKey: claim.SemanticKey, ClaimEpoch: claim.ClaimEpoch}, nil
+}
 
-func (r *realCheckpoint) MaterializeVerificationCheckpoint(context.Context, PhaseRequest, phaseartifact.Verification, store.ProviderAttemptResultKey) (VerificationCheckpoint, error) {
+type realCheckpoint struct {
+	db                                *store.Store
+	withCommand                       bool
+	materializations, authentications int
+}
+
+func (r *realCheckpoint) MaterializeVerificationCheckpoint(ctx context.Context, request PhaseRequest, artifact phaseartifact.Verification, key store.ProviderAttemptResultKey) (VerificationCheckpoint, error) {
 	r.materializations++
-	return VerificationCheckpoint{ID: realOID("c"), Commit: store.CommitObservation{CommitOID: realOID("c"), ParentOID: realOID("a"), TreeOID: realOID("d")}}, nil
+	checkpoint := VerificationCheckpoint{ID: realOID("c"), Commit: store.CommitObservation{CommitOID: realOID("c"), ParentOID: realOID("a"), TreeOID: realOID("d")}}
+	if r.withCommand {
+		command, err := realVerificationCommandEvidence(ctx, r.db, request, artifact, key)
+		if err != nil {
+			return VerificationCheckpoint{}, err
+		}
+		checkpoint.CommandResult = command
+	}
+	return checkpoint, nil
 }
 func (r *realCheckpoint) AuthenticateVerificationCheckpoint(context.Context, PhaseRequest, phaseartifact.Verification, VerificationCheckpoint) error {
 	r.authentications++
@@ -479,6 +591,14 @@ func (r *realCandidate) AuthenticateCandidate(context.Context, PhaseRequest, wor
 }
 func realOID(v string) string    { return strings.Repeat(v, 40) }
 func realDigest(v string) string { s := sha256.Sum256([]byte(v)); return hex.EncodeToString(s[:]) }
+func realWorktreeIdentity(t *testing.T, repository, worktree, branch string) []byte {
+	t.Helper()
+	identity, err := workflowprompt.MarshalCanonicalWorktreeIdentity(gitboundary.Identity{Repository: repository, RepositoryDev: 1, RepositoryIno: 2, Worktree: worktree, WorktreeDev: 3, WorktreeIno: 4, GitFile: "gitdir: " + repository + "/.git/worktrees/real\n", GitFileDev: 5, GitFileIno: 6, CommonDir: repository + "/.git", CommonDirDev: 7, CommonDirIno: 8, Origin: "https://example.invalid/real", PushOrigin: "https://example.invalid/real", BaseRef: "main", BaseHead: realOID("a"), HeadRef: branch, ConfigHash: "sha256:" + strings.Repeat("b", 64), HooksHash: "sha256:" + strings.Repeat("c", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}
 func realQualification(t *testing.T, db *store.Store, run, name string) store.ProviderQualification {
 	t.Helper()
 	q, _, err := db.RecordProviderQualification(context.Background(), store.ProviderQualification{Channel: domain.ChannelDev, RunID: run, Provider: domain.ProviderIdentity{Provider: name, Model: name + "-model", Family: name + "-family", Version: "1.0.0"}, BinaryDigest: strings.Repeat("a", 64), PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Date(2026, 8, 29, 18, 0, 0, 0, time.UTC)})

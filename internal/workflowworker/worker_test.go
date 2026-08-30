@@ -201,7 +201,7 @@ func (fakeCheckpoint) AuthenticateVerificationCheckpoint(context.Context, PhaseR
 type fakeCheckpointMaterializer struct{}
 
 func (fakeCheckpointMaterializer) MaterializeVerificationCheckpoint(_ context.Context, _ PhaseRequest, _ phaseartifact.Verification, _ store.ProviderAttemptResultKey) (VerificationCheckpoint, error) {
-	return VerificationCheckpoint{ID: oid, Commit: store.CommitObservation{CommitOID: oid, ParentOID: oid, TreeOID: oid}}, nil
+	return VerificationCheckpoint{ID: oid, Commit: store.CommitObservation{CommitOID: oid, ParentOID: oid, TreeOID: oid}, CommandResult: contracts.RepositoryCommandResultKey{SemanticKey: "test-command", ClaimEpoch: 1}}, nil
 }
 
 func (r *fakeRunner) Run(_ context.Context, req PhaseRequest) (PhaseResult, error) {

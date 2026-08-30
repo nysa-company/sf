@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -132,8 +133,10 @@ func TestCoordinatorReusesOnlyExactCompletedResult(t *testing.T) {
 
 type blockingBindingProvider struct {
 	*testkit.ScriptedProvider
-	entered chan struct{}
-	release chan struct{}
+	entered     chan struct{}
+	release     chan struct{}
+	mu          sync.Mutex
+	invocations int
 }
 
 func (p *blockingBindingProvider) Binding(ctx context.Context) (contracts.RuntimeBinding, error) {
@@ -147,6 +150,38 @@ func (p *blockingBindingProvider) Binding(ctx context.Context) (contracts.Runtim
 		return contracts.RuntimeBinding{}, ctx.Err()
 	}
 	return p.ScriptedProvider.Binding(ctx)
+}
+
+func (p *blockingBindingProvider) Invocation(ctx context.Context, input contracts.PhaseInput) (contracts.Invocation, error) {
+	p.mu.Lock()
+	p.invocations++
+	p.mu.Unlock()
+	return p.ScriptedProvider.Invocation(ctx, input)
+}
+
+func (p *blockingBindingProvider) InvocationCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.invocations
+}
+
+type countingSupervisor struct {
+	*testkit.Supervisor
+	mu   sync.Mutex
+	runs int
+}
+
+func (s *countingSupervisor) Run(ctx context.Context, request contracts.DrainRequest, invocation contracts.Invocation, input contracts.PhaseInput) (contracts.CommandResult, error) {
+	s.mu.Lock()
+	s.runs++
+	s.mu.Unlock()
+	return s.Supervisor.Run(ctx, request, invocation, input)
+}
+
+func (s *countingSupervisor) RunCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runs
 }
 
 func TestCoordinatorBeginRaceReusesCompletionWithoutSecondLaunch(t *testing.T) {
@@ -184,6 +219,105 @@ func TestCoordinatorBeginRaceReusesCompletionWithoutSecondLaunch(t *testing.T) {
 	attempts, err := database.ProviderAttempts(context.Background(), ref)
 	if err != nil || len(attempts) != 1 {
 		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+}
+
+// TestCoordinatorReviewerBeginRaceReusesCompletionWithoutSecondLaunch covers
+// the race that matters to the verification worker: a second runner has
+// already observed that CurrentVerification is absent, but has not yet opened
+// Store admission when the first reviewer completes.  The binding barrier is
+// deliberately after Coordinator's optimistic reuse read and before Begin.
+func TestCoordinatorReviewerBeginRaceReusesCompletionWithoutSecondLaunch(t *testing.T) {
+	ctx := context.Background()
+	supervisorB := &countingSupervisor{Supervisor: testkit.NewSupervisor()}
+	database, planning, coordinator, ref, primary := newCoordinatorFixture(t, supervisorB)
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
+	planningResult := coordinator.Run(ctx, planning)
+	if planningResult.Code != Completed {
+		t.Fatalf("planning=%+v", planningResult)
+	}
+	_, planner, err := database.LoadCurrentProviderAttemptResult(ctx, planningResult.ProviderResult, planning.ExpectedVersion, planning.Fence)
+	if err != nil || planner.Planner == nil {
+		t.Fatalf("planner result=%+v parsed=%+v err=%v", planningResult, planner, err)
+	}
+	if _, err := database.RecordPlan(ctx, store.PlanArtifact{Ref: ref, ExpectedVersion: planning.ExpectedVersion, Fence: planning.Fence, Document: store.PlanDocument{
+		Planner: planner.Planner, ProviderResult: &planningResult.ProviderResult,
+		Acceptance: planner.Planner.Acceptance, ProofKind: string(planner.Planner.Proof.Kind), Paths: planner.Planner.Paths, Commands: planner.Planner.Commands, Risks: planner.Planner.Risks,
+	}}); err != nil {
+		t.Fatalf("record plan: %v", err)
+	}
+	if _, err := database.TransitionPlan(ctx, store.Transition{Ref: ref, ExpectedVersion: planning.ExpectedVersion, Fence: planning.Fence, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass"}); err != nil {
+		t.Fatalf("transition plan: %v", err)
+	}
+	verifying, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer := planning
+	reviewer.Role = RoleReviewer
+	reviewer.ExpectedVersion = verifying.Version
+	reviewer.Fence = domain.Fence{LeaderEpoch: planning.Fence.LeaderEpoch, RunnerEpoch: verifying.RunnerEpoch}
+	reviewer.Input.Phase = domain.PhaseVerification
+	reviewer.Input.Prompt = "review"
+	// plannerArtifact owns x. The verification artifact must remain under the
+	// same Store-derived boundary; an old fixture used internal/... here and
+	// therefore correctly failed ValidateMutationPaths.
+	reviewer.Input.AllowedPaths = append([]string(nil), planner.Planner.Paths...)
+	reviewer.Validation = phaseartifact.Validation{TicketType: verifying.Type, AcceptanceDigest: planner.Digest}
+
+	plain := testkit.NewScriptedProvider(id("claude", "claude-family"))
+	plain.Add(domain.PhaseVerification, testkit.ProviderStep{Artifact: reviewerArtifact(planner.Digest, "x/reviewer_test.go"), ChangedFiles: nil})
+	registry := NewRegistry()
+	if err := registry.Register(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	a, err := New(registry, map[Role]Route{RoleReviewer: {Primary: "claude"}}, database, nil, testkit.NewSupervisor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The selected reviewer qualification is claude in newCoordinatorFixture.
+	// Share its immutable binding with B while counting only B's potential
+	// external execution.
+	base, ok := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	if !ok {
+		t.Fatal("fixture reviewer provider changed type")
+	}
+	blocked := &blockingBindingProvider{ScriptedProvider: base, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	coordinator.registry.providers["claude"] = blocked
+	coordinator.routes[RoleReviewer] = Route{Primary: "claude", Capacity: 1}
+	runsBeforeB := supervisorB.RunCount()
+
+	resultB := make(chan Result, 1)
+	go func() { resultB <- coordinator.Run(ctx, reviewer) }()
+	select {
+	case <-blocked.entered:
+	case <-time.After(time.Second):
+		t.Fatal("B did not reach binding barrier")
+	}
+	if got, err := database.CurrentVerification(ctx, ref); err == nil {
+		t.Fatalf("verification unexpectedly exists before A completion: %+v", got)
+	}
+	resultA := a.Run(ctx, reviewer)
+	if resultA.Code != Completed {
+		t.Fatalf("A=%+v", resultA)
+	}
+	close(blocked.release)
+	result := <-resultB
+	if result.Code != Completed || result.ProviderResult != resultA.ProviderResult {
+		t.Fatalf("B=%+v A=%+v", result, resultA)
+	}
+	if calls := blocked.CallsSnapshot(); len(calls) != 0 {
+		t.Fatalf("B parsed/launched provider despite Store reuse: %v", calls)
+	}
+	if blocked.InvocationCount() != 0 || supervisorB.RunCount() != runsBeforeB {
+		t.Fatalf("B invocation=%d supervisor runs=%d before=%d", blocked.InvocationCount(), supervisorB.RunCount(), runsBeforeB)
+	}
+	attempts, err := database.ProviderAttempts(ctx, ref)
+	if err != nil || len(attempts) != 2 { // planner + exactly one reviewer
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+	if attempts[1].Phase != domain.PhaseVerification || attempts[1].Role != string(RoleReviewer) || attempts[1].ID != resultA.ProviderResult.AttemptID {
+		t.Fatalf("reviewer attempt=%+v result=%+v", attempts[1], resultA)
 	}
 }
 
@@ -488,6 +622,11 @@ func id(name, family string) domain.ProviderIdentity {
 }
 func plannerArtifact() []byte {
 	return []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"x"},"paths":["x"],"commands":[["go","test"]],"risks":["x"]}`)
+}
+
+func reviewerArtifact(acceptanceDigest, ownedFile string) []byte {
+	return []byte(fmt.Sprintf(`{"schema":"sf.verification/v1","acceptance_digest":%q,"proof_kind":"acceptance","owned_files":[%q],"command":["go","test","./..."],"prebuild_outcome":"red","evidence_digest":"%s"}`,
+		acceptanceDigest, ownedFile, strings.Repeat("e", 64)))
 }
 func recordQual(t *testing.T, db *store.Store, p *testkit.ScriptedProvider) {
 	t.Helper()
