@@ -115,7 +115,7 @@ func TestWorkerRealStoreFailsClosedWithoutCommandResultWiring(t *testing.T) {
 			continue
 		}
 		if i == 2 {
-			if !errors.Is(err, ErrCheckpointRequired) {
+			if !errors.Is(err, ErrCommandResultRequired) {
 				t.Fatalf("run %d accepted unbound reviewer evidence: %v", i, err)
 			}
 			current, readErr := db.Ticket(ctx, ref)

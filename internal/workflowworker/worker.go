@@ -17,13 +17,14 @@ import (
 )
 
 var (
-	ErrCanceled             = errors.New("workflow worker canceled")
-	ErrNoPhaseRunner        = errors.New("workflow phase runner is not configured")
-	ErrCandidateRequired    = errors.New("builder did not provide a Store-authenticated candidate witness")
-	ErrCheckpointRequired   = errors.New("verification did not provide an authenticated checkpoint witness")
-	ErrAmendmentUnsupported = errors.New("verification amendment requires an authenticated Store amendment request")
-	ErrStaleEvidence        = errors.New("phase evidence is not current for this ticket fence")
-	ErrUnsupportedState     = errors.New("workflow worker cannot execute this ticket state")
+	ErrCanceled              = errors.New("workflow worker canceled")
+	ErrNoPhaseRunner         = errors.New("workflow phase runner is not configured")
+	ErrCandidateRequired     = errors.New("builder did not provide a Store-authenticated candidate witness")
+	ErrCheckpointRequired    = errors.New("verification did not provide an authenticated checkpoint witness")
+	ErrCommandResultRequired = errors.New("phase did not provide an authenticated repository command result")
+	ErrAmendmentUnsupported  = errors.New("verification amendment requires an authenticated Store amendment request")
+	ErrStaleEvidence         = errors.New("phase evidence is not current for this ticket fence")
+	ErrUnsupportedState      = errors.New("workflow worker cannot execute this ticket state")
 )
 
 // Evidence is the deliberately small Store surface needed by the walking
@@ -109,6 +110,7 @@ type CandidateWitness struct {
 	Commit              store.CommitObservation
 	CommandPolicyDigest string
 	Reason              string
+	CommandResult       contracts.RepositoryCommandResultKey
 }
 
 // CandidateMaterializer reconstructs the candidate commit boundary for an
@@ -660,7 +662,7 @@ func (w Worker) storedVerificationIdentity(ctx context.Context, ticket store.Tic
 	if err != nil {
 		return workflowprompt.VerificationIdentity{}, err
 	}
-	if err := w.Checkpoint.AuthenticateVerificationCheckpoint(ctx, request, artifact, VerificationCheckpoint{ID: verification.Revision.CheckpointID, Commit: verification.Checkpoint}); err != nil {
+	if err := w.Checkpoint.AuthenticateVerificationCheckpoint(ctx, request, artifact, VerificationCheckpoint{ID: verification.Revision.CheckpointID, Commit: verification.Checkpoint, CommandResult: verification.CommandBinding.Key}); err != nil {
 		return workflowprompt.VerificationIdentity{}, err
 	}
 	return identity, nil
@@ -690,7 +692,7 @@ func (w Worker) persistVerification(ctx context.Context, ticket store.Ticket, fe
 		return ErrCheckpointRequired
 	}
 	if checkpoint.CommandResult.SemanticKey == "" || checkpoint.CommandResult.ClaimEpoch == 0 {
-		return ErrCheckpointRequired
+		return ErrCommandResultRequired
 	}
 	intent, err := canonicalVerificationIntent(artifact)
 	if err != nil {
@@ -743,6 +745,9 @@ func (w Worker) persistCandidate(ctx context.Context, ticket store.Ticket, fence
 	if witness.Reason == "" || witness.CommandPolicyDigest == "" || witness.Commit.CommitOID == "" || witness.Commit.TreeOID == "" {
 		return ErrCandidateRequired
 	}
+	if witness.CommandResult.SemanticKey == "" || witness.CommandResult.ClaimEpoch == 0 {
+		return ErrCommandResultRequired
+	}
 	if err = w.Candidate.AuthenticateCandidate(ctx, request, plan, verification, builder, witness); err != nil {
 		return err
 	}
@@ -750,7 +755,7 @@ func (w Worker) persistCandidate(ctx context.Context, ticket store.Ticket, fence
 	if err != nil {
 		return err
 	}
-	_, err = w.Evidence.RecordCandidate(ctx, store.CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, BuilderResult: key, Commit: witness.Commit, Reason: witness.Reason, Snapshot: domain.CandidateSnapshot{BaseSHA: request.Worktree.BaseSHA, HeadSHA: witness.Commit.CommitOID, TreeSHA: witness.Commit.TreeOID, SourceDigest: ticket.SourceDigest, VerificationIntentDigest: stored.Revision.IntentDigest, ProofDigest: stored.Revision.ProofDigest, CommandPolicyDigest: witness.CommandPolicyDigest, BuilderEvidenceDigest: digest}})
+	_, err = w.Evidence.RecordCandidate(ctx, store.CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, BuilderResult: key, Commit: witness.Commit, Reason: witness.Reason, CommandResult: witness.CommandResult, Snapshot: domain.CandidateSnapshot{BaseSHA: request.Worktree.BaseSHA, HeadSHA: witness.Commit.CommitOID, TreeSHA: witness.Commit.TreeOID, SourceDigest: ticket.SourceDigest, VerificationIntentDigest: stored.Revision.IntentDigest, ProofDigest: stored.Revision.ProofDigest, CommandPolicyDigest: witness.CommandPolicyDigest, BuilderEvidenceDigest: digest}})
 	return err
 }
 
@@ -778,7 +783,7 @@ func (w Worker) authenticateStoredCandidate(ctx context.Context, ticket store.Ti
 	if err != nil {
 		return err
 	}
-	if witness.Commit.CommitOID != candidate.Commit.CommitOID || witness.Commit.TreeOID != candidate.Commit.TreeOID || witness.Commit.ParentOID != candidate.Commit.ParentOID || witness.CommandPolicyDigest != candidate.Snapshot.CommandPolicyDigest {
+	if witness.CommandResult != candidate.CommandBinding.Key || witness.Commit.CommitOID != candidate.Commit.CommitOID || witness.Commit.TreeOID != candidate.Commit.TreeOID || witness.Commit.ParentOID != candidate.Commit.ParentOID || witness.CommandPolicyDigest != candidate.Snapshot.CommandPolicyDigest {
 		return ErrStaleEvidence
 	}
 	return w.Candidate.AuthenticateCandidate(ctx, request, plan, verification, *parsed.Builder, witness)

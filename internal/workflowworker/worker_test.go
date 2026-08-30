@@ -201,7 +201,7 @@ func (fakeCheckpoint) AuthenticateVerificationCheckpoint(context.Context, PhaseR
 type fakeCheckpointMaterializer struct{}
 
 func (fakeCheckpointMaterializer) MaterializeVerificationCheckpoint(_ context.Context, _ PhaseRequest, _ phaseartifact.Verification, _ store.ProviderAttemptResultKey) (VerificationCheckpoint, error) {
-	return VerificationCheckpoint{ID: oid, Commit: store.CommitObservation{CommitOID: oid, ParentOID: oid, TreeOID: oid}, CommandResult: contracts.RepositoryCommandResultKey{SemanticKey: "test-command", ClaimEpoch: 1}}, nil
+	return VerificationCheckpoint{ID: oid, Commit: store.CommitObservation{CommitOID: oid, ParentOID: oid, TreeOID: oid}, CommandResult: contracts.RepositoryCommandResultKey{SemanticKey: "command", ClaimEpoch: 1}}, nil
 }
 
 func (r *fakeRunner) Run(_ context.Context, req PhaseRequest) (PhaseResult, error) {
@@ -275,7 +275,7 @@ func (fakeCandidate) AuthenticateCandidate(context.Context, PhaseRequest, workfl
 type fakeCandidateMaterializer struct{}
 
 func (fakeCandidateMaterializer) MaterializeCandidate(context.Context, PhaseRequest, workflowprompt.PlanIdentity, workflowprompt.VerificationIdentity, phaseartifact.Builder, store.ProviderAttemptResultKey) (CandidateWitness, error) {
-	return CandidateWitness{Commit: store.CommitObservation{CommitOID: oid, ParentOID: oid, TreeOID: oid}, CommandPolicyDigest: digest, Reason: "candidate"}, nil
+	return CandidateWitness{Commit: store.CommitObservation{CommitOID: oid, ParentOID: oid, TreeOID: oid}, CommandPolicyDigest: digest, Reason: "candidate", CommandResult: contracts.RepositoryCommandResultKey{SemanticKey: "command", ClaimEpoch: 1}}, nil
 }
 
 func TestPlannerPassAndQuestions(t *testing.T) {
