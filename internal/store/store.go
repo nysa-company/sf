@@ -51,7 +51,7 @@ var (
 	ErrRepositoryCommandLease  = errors.New("repository command lease is unavailable or stale")
 )
 
-const schemaVersion = 34
+const schemaVersion = 35
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -88,6 +88,7 @@ var migrationChecksums = map[int]string{
 	32: migrationChecksum(migrationV32),
 	33: migrationChecksum(migrationV33),
 	34: migrationChecksum(migrationV34),
+	35: migrationChecksum(migrationV35),
 }
 
 func migrationChecksum(statements []string) string {
@@ -402,6 +403,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV33
 			} else if version == 34 {
 				statements = migrationV34
+			} else if version == 35 {
+				statements = migrationV35
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {

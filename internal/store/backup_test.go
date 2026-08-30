@@ -95,11 +95,175 @@ func TestRepositoryCommandV33UpgradeAndRequiredSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	if got := rawSchemaVersion(t, path); got != 34 {
-		t.Fatalf("migrated schema=%d want=34", got)
+	if got := rawSchemaVersion(t, path); got != 35 {
+		t.Fatalf("migrated schema=%d want=35", got)
 	}
 	if err := database.validateSchema(ctx); err != nil {
 		t.Fatalf("v33 required schema: %v", err)
+	}
+}
+
+func TestV35BlocksOnlyUnboundLegacyWorkflowArtifacts(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v34.sqlite")
+	createDatabaseAtVersion(t, path, 34)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `PRAGMA foreign_keys=ON; INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('dev','v35','/v35','main')`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	for _, fixture := range []struct {
+		id    string
+		state string
+		bound bool
+		fresh bool
+	}{
+		{id: "SF-v35-plan-legacy", state: "planning"},
+		{id: "SF-v35-verify-legacy", state: "verifying"},
+		{id: "SF-v35-build-legacy", state: "building"},
+		{id: "SF-v35-verify-no-artifacts", state: "verifying", fresh: true},
+		{id: "SF-v35-plan-bound", state: "planning", bound: true},
+		{id: "SF-v35-verify-bound", state: "verifying", bound: true},
+		{id: "SF-v35-build-bound", state: "building", bound: true},
+		{id: "SF-v35-plan-fresh", state: "planning", bound: true},
+	} {
+		seedV35WorkflowFixture(t, raw, fixture.id, fixture.state, fixture.bound, fixture.fresh || strings.HasSuffix(fixture.id, "-fresh"))
+	}
+	seedV35WorkflowFixture(t, raw, "SF-v35-verify-plan-bound", "planning", true, false)
+	if _, err := raw.Exec(`UPDATE tickets SET state='verifying' WHERE channel='dev' AND project_id='v35' AND id='SF-v35-verify-plan-bound'`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	seedV35WorkflowFixture(t, raw, "SF-v35-build-no-candidate", "verifying", true, false)
+	if _, err := raw.Exec(`UPDATE tickets SET state='building' WHERE channel='dev' AND project_id='v35' AND id='SF-v35-build-no-candidate'`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := OpenChannel(ctx, path, filepath.Join(t.TempDir(), "backups"), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if got := rawSchemaVersion(t, path); got != 35 {
+		t.Fatalf("migrated schema=%d want=35", got)
+	}
+	for _, legacy := range []struct{ id, state string }{
+		{id: "SF-v35-plan-legacy", state: "planning"},
+		{id: "SF-v35-verify-legacy", state: "verifying"},
+		{id: "SF-v35-build-legacy", state: "building"},
+		{id: "SF-v35-verify-no-artifacts", state: "verifying"},
+	} {
+		id, state := legacy.id, legacy.state
+		var gotState, resume, code, payload string
+		var version int
+		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='dev' AND project_id='v35' AND id=?`, id).Scan(&gotState, &resume, &code, &version); err != nil {
+			t.Fatal(err)
+		}
+		if gotState != "blocked" || resume != state || code != "legacy_workflow_evidence_unverifiable" || version != 2 {
+			t.Fatalf("legacy %s ticket=%s/%s/%s/v%d", state, gotState, resume, code, version)
+		}
+		if err := database.db.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel='dev' AND project_id='v35' AND ticket_id=? AND trigger='typed_blocker' AND from_state=? AND to_state='blocked'`, id, state).Scan(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload != `{"code":"legacy_workflow_evidence_unverifiable","reason":"legacy workflow evidence is unverifiable","next_action":"start a fresh ticket"}` {
+			t.Fatalf("legacy %s payload=%s", state, payload)
+		}
+		var eventCount int
+		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel='dev' AND project_id='v35' AND ticket_id=? AND trigger='typed_blocker'`, id).Scan(&eventCount); err != nil || eventCount != 1 {
+			t.Fatalf("legacy %s blocker events=%d err=%v", state, eventCount, err)
+		}
+	}
+	for _, id := range []string{"SF-v35-plan-bound", "SF-v35-verify-bound", "SF-v35-build-bound", "SF-v35-plan-fresh", "SF-v35-verify-plan-bound", "SF-v35-build-no-candidate"} {
+		var state, resume, code string
+		var version int
+		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='dev' AND project_id='v35' AND id=?`, id).Scan(&state, &resume, &code, &version); err != nil {
+			t.Fatal(err)
+		}
+		if state == "blocked" || resume != "" || code != "" || version != 1 {
+			t.Fatalf("bound/fresh ticket %s changed to %s/%s/%s/v%d", id, state, resume, code, version)
+		}
+		var eventCount int
+		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel='dev' AND project_id='v35' AND ticket_id=? AND trigger='typed_blocker'`, id).Scan(&eventCount); err != nil || eventCount != 0 {
+			t.Fatalf("bound/fresh ticket %s blocker events=%d err=%v", id, eventCount, err)
+		}
+	}
+}
+
+func seedV35WorkflowFixture(t *testing.T, raw *sql.DB, id, state string, bound, fresh bool) {
+	t.Helper()
+	if _, err := raw.Exec(`INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES('dev','v35',?,?, 'feature','guarded',?,1,1,?)`, id, "source/"+id, state, "v35/"+id); err != nil {
+		t.Fatal(err)
+	}
+	if fresh {
+		return
+	}
+	insertResult := func(phase, role string, attempt int) int64 {
+		result, err := raw.Exec(`INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,usage_units,started_at,finished_at,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha) VALUES('dev','v35',?,?,?,?,?,?,'1','completed',?,'completed',0,'now','now',1,1,1,'/v35','/v35/worktree','identity','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`, id, phase, attempt, "provider", "model", "family", role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attemptID, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		if _, err := raw.Exec(`INSERT INTO provider_attempt_results(provider_attempt_id,channel,project_id,ticket_id,phase,role,attempt,provider,model,family,provider_version,request_digest,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha,raw_artifact,raw_sha256,typed_artifact,typed_sha256,validation,validation_sha256,transcript_sha256,created_at) VALUES(?,'dev','v35',?,?,?,?,'provider','model','family','1',?,1,1,1,'/v35','/v35/worktree','identity','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',X'7B7D',?,X'7B7D',?,X'7B7D',?,'','now')`, attemptID, id, phase, role, attempt, digest, digest, digest, digest); err != nil {
+			t.Fatal(err)
+		}
+		return attemptID
+	}
+	insertPlan := func(withBinding bool) {
+		if _, err := raw.Exec(`INSERT INTO plans(channel,project_id,ticket_id,digest,body,artifact_bytes,ticket_version,leader_epoch,runner_epoch,created_at) VALUES('dev','v35',?,'plan','{}',X'7B7D',1,1,1,'now')`, id); err != nil {
+			t.Fatal(err)
+		}
+		if withBinding {
+			attemptID := insertResult("planning", "planner", 1)
+			if _, err := raw.Exec(`INSERT INTO plan_result_bindings(channel,project_id,ticket_id,plan_digest,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt) VALUES('dev','v35',?,'plan',1,1,1,?,1)`, id, attemptID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	insertVerification := func(withReviewerBinding bool) {
+		const checkpoint = "cccccccccccccccccccccccccccccccccccccccc"
+		if _, err := raw.Exec(`INSERT INTO verification_revisions(channel,project_id,ticket_id,revision,ticket_version,leader_epoch,runner_epoch,intent_digest,intent_bytes,proof_digest,proof_bytes,owned_files_json,checkpoint_id,amends_revision,amendment_reason,requester,created_at) VALUES('dev','v35',?,1,1,1,1,'intent',X'7B7D','proof',X'7B7D','[]',?,NULL,'','','now'); INSERT INTO verifications(channel,project_id,ticket_id,intent_digest,proof_digest,current_revision) VALUES('dev','v35',?,'intent','proof',1)`, id, checkpoint, id); err != nil {
+			t.Fatal(err)
+		}
+		if withReviewerBinding {
+			attemptID := insertResult("verification", "reviewer", 1)
+			if _, err := raw.Exec(`INSERT INTO verification_result_bindings(channel,project_id,ticket_id,revision,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid) VALUES('dev','v35',?,1,1,1,1,?,1,?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')`, id, attemptID, checkpoint); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	switch state {
+	case "planning":
+		insertPlan(bound)
+	case "verifying":
+		insertPlan(true)
+		insertVerification(bound)
+	case "building":
+		// A building ticket requires a valid reviewer binding before the
+		// candidate's builder binding is considered. Seed that prerequisite
+		// for both fixtures so the unbound case isolates the missing builder
+		// evidence.
+		insertPlan(true)
+		insertVerification(true)
+		if _, err := raw.Exec(`INSERT INTO candidate_snapshots(channel,project_id,ticket_id,generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest,created_at) VALUES('dev','v35',?,1,1,1,1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','dddddddddddddddddddddddddddddddddddddddd','source','intent','proof','policy','builder','now')`, id); err != nil {
+			t.Fatal(err)
+		}
+		if bound {
+			attemptID := insertResult("build", "builder", 2)
+			if _, err := raw.Exec(`INSERT INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES('dev','v35',?,1,1,1,1,?,2,'cccccccccccccccccccccccccccccccccccccccc')`, id, attemptID); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }
 
@@ -596,6 +760,8 @@ func testMigration(version int) []string {
 		return migrationV33
 	case 34:
 		return migrationV34
+	case 35:
+		return migrationV35
 	default:
 		return nil
 	}

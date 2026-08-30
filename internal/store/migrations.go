@@ -635,3 +635,111 @@ var migrationV34 = []string{
 	`CREATE TRIGGER candidate_result_bindings_immutable_update BEFORE UPDATE ON candidate_result_bindings BEGIN SELECT RAISE(ABORT,'candidate result binding is append-only'); END`,
 	`CREATE TRIGGER candidate_result_bindings_immutable_delete BEFORE DELETE ON candidate_result_bindings BEGIN SELECT RAISE(ABORT,'candidate result binding is append-only'); END`,
 }
+
+// v35 is the blank-factory boundary for the v34 workflow-evidence bindings.
+// A legacy phase artifact cannot be asserted as a current recovery fact merely
+// because its older projection resembles one. Preserve a ticket only when its
+// existing phase artifact has the exact completed result binding required by
+// v34; otherwise make the operator boundary explicit and require a fresh
+// ticket. Each migration version runs in one SQLite write transaction, so the
+// blocked state and its explaining event commit together.
+var migrationV35 = []string{
+	`UPDATE tickets
+		SET state='blocked', resume_state=state, blocked_code='legacy_workflow_evidence_unverifiable', version=version+1
+		WHERE state='planning' AND EXISTS(
+			SELECT 1 FROM plans p
+			WHERE p.channel=tickets.channel AND p.project_id=tickets.project_id AND p.ticket_id=tickets.id
+			AND NOT EXISTS(
+				SELECT 1 FROM plan_result_bindings b
+				JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id
+				JOIN provider_attempts a ON a.id=r.provider_attempt_id
+					AND a.attempt=b.provider_attempt
+					AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id
+					AND a.phase='planning' AND a.role='planner' AND a.state='completed' AND a.outcome='completed'
+				WHERE b.channel=p.channel AND b.project_id=p.project_id AND b.ticket_id=p.ticket_id AND b.plan_digest=p.digest
+			)
+		)`,
+	`UPDATE tickets
+		SET state='blocked', resume_state=state, blocked_code='legacy_workflow_evidence_unverifiable', version=version+1
+		WHERE state='verifying' AND (
+			NOT EXISTS(
+				SELECT 1 FROM plans p
+				WHERE p.channel=tickets.channel AND p.project_id=tickets.project_id AND p.ticket_id=tickets.id
+				AND EXISTS(
+					SELECT 1 FROM plan_result_bindings b
+					JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id
+					JOIN provider_attempts a ON a.id=r.provider_attempt_id
+						AND a.attempt=b.provider_attempt
+						AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id
+						AND a.phase='planning' AND a.role='planner' AND a.state='completed' AND a.outcome='completed'
+					WHERE b.channel=p.channel AND b.project_id=p.project_id AND b.ticket_id=p.ticket_id AND b.plan_digest=p.digest
+				)
+			)
+			OR EXISTS(
+				SELECT 1 FROM verifications v JOIN verification_revisions vr
+				ON vr.channel=v.channel AND vr.project_id=v.project_id AND vr.ticket_id=v.ticket_id AND vr.revision=v.current_revision
+				WHERE v.channel=tickets.channel AND v.project_id=tickets.project_id AND v.ticket_id=tickets.id
+				AND NOT EXISTS(
+					SELECT 1 FROM verification_result_bindings b
+					JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id
+					JOIN provider_attempts a ON a.id=r.provider_attempt_id
+						AND a.attempt=b.provider_attempt
+						AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id
+						AND a.phase='verification' AND a.role='reviewer' AND a.state='completed' AND a.outcome='completed'
+					WHERE b.channel=vr.channel AND b.project_id=vr.project_id AND b.ticket_id=vr.ticket_id AND b.revision=vr.revision
+						AND b.checkpoint_commit_oid=vr.checkpoint_id
+				)
+			)
+		)`,
+	`UPDATE tickets
+		SET state='blocked', resume_state=state, blocked_code='legacy_workflow_evidence_unverifiable', version=version+1
+		WHERE state='building' AND (
+			NOT EXISTS(
+				SELECT 1 FROM plans p
+				WHERE p.channel=tickets.channel AND p.project_id=tickets.project_id AND p.ticket_id=tickets.id
+				AND EXISTS(
+					SELECT 1 FROM plan_result_bindings b
+					JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id
+					JOIN provider_attempts a ON a.id=r.provider_attempt_id
+						AND a.attempt=b.provider_attempt
+						AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id
+						AND a.phase='planning' AND a.role='planner' AND a.state='completed' AND a.outcome='completed'
+					WHERE b.channel=p.channel AND b.project_id=p.project_id AND b.ticket_id=p.ticket_id AND b.plan_digest=p.digest
+				)
+			)
+			OR
+			NOT EXISTS(
+				SELECT 1 FROM verifications v JOIN verification_revisions vr
+				ON vr.channel=v.channel AND vr.project_id=v.project_id AND vr.ticket_id=v.ticket_id AND vr.revision=v.current_revision
+				WHERE v.channel=tickets.channel AND v.project_id=tickets.project_id AND v.ticket_id=tickets.id
+				AND EXISTS(
+					SELECT 1 FROM verification_result_bindings b
+					JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id
+					JOIN provider_attempts a ON a.id=r.provider_attempt_id
+						AND a.attempt=b.provider_attempt
+						AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id
+						AND a.phase='verification' AND a.role='reviewer' AND a.state='completed' AND a.outcome='completed'
+					WHERE b.channel=vr.channel AND b.project_id=vr.project_id AND b.ticket_id=vr.ticket_id AND b.revision=vr.revision
+						AND b.checkpoint_commit_oid=vr.checkpoint_id
+				)
+			)
+			OR EXISTS(
+				SELECT 1 FROM candidate_snapshots c
+				WHERE c.channel=tickets.channel AND c.project_id=tickets.project_id AND c.ticket_id=tickets.id
+					AND c.generation=(SELECT MAX(latest.generation) FROM candidate_snapshots latest WHERE latest.channel=c.channel AND latest.project_id=c.project_id AND latest.ticket_id=c.ticket_id)
+					AND NOT EXISTS(
+						SELECT 1 FROM candidate_result_bindings b
+						JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id
+						JOIN provider_attempts a ON a.id=r.provider_attempt_id
+							AND a.attempt=b.provider_attempt
+							AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id
+							AND a.phase='build' AND a.role='builder' AND a.state='completed' AND a.outcome='completed'
+						WHERE b.channel=c.channel AND b.project_id=c.project_id AND b.ticket_id=c.ticket_id AND b.generation=c.generation
+					)
+			)
+		)`,
+	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at)
+		SELECT channel,project_id,id,version,'typed_blocker',resume_state,'blocked','{"code":"legacy_workflow_evidence_unverifiable","reason":"legacy workflow evidence is unverifiable","next_action":"start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		FROM tickets
+		WHERE state='blocked' AND blocked_code='legacy_workflow_evidence_unverifiable' AND resume_state IN ('planning','verifying','building')`,
+}
