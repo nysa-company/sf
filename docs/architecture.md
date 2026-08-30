@@ -15,6 +15,10 @@ The approved normative design is in
   ordinary fast-forward Git push. HTTPS and GraphQL publication remain
   disabled; the optional port-443 SSH path uses the packaged `sf-ssh` helper,
   a pinned GitHub host-key asset, and an explicitly supplied SSH agent socket.
+  `make build` packages these together as `bin/sf-ssh` and
+  `bin/github_known_hosts`; production configuration supplies those absolute
+  paths plus the agent socket to `git.Runner`. The build performs no service
+  installation, channel-state mutation, or network operation.
 
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
 one custom Go state engine over the application schema; DBOS is retained only

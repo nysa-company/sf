@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -319,6 +320,31 @@ func TestWorktreeRemovalAndDiffHostileFixturesRefuse(t *testing.T) {
 	}
 }
 
+func TestValidateDiffRejectsChangedPathThroughHostileSymlinkParent(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-symlink-parent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Rename(filepath.Join(worktree.Path, "src"), filepath.Join(worktree.Path, "src-real")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(worktree.Path, "src")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "foreign.txt"), []byte("foreign"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.ValidateDiff(ctx, worktree.Path, "main", DiffPolicy{AllowedPaths: []string{"src"}}); !errors.Is(err, ErrUnsafeWorktree) {
+		t.Fatalf("symlink-parent candidate accepted: %v", err)
+	}
+}
+
 func TestIdentityRejectsControlPlaneEnvironment(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-env")
@@ -539,6 +565,90 @@ func TestCommitBoundsUntrustedEvidenceAndMessage(t *testing.T) {
 	}
 	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("test")), Message: "bad\x00message", Timestamp: time.Now(), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err == nil {
 		t.Fatal("unsafe message accepted")
+	}
+}
+
+func TestCommitDoesNotAdoptSpoofWithMatchingParentAndSubject(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-spoof")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	evidence := digest([]byte("candidate"))
+	// Construct a commit with the same tree, parent and subject but a different
+	// committer identity/timestamp. The old parent+subject reconciliation would
+	// have adopted it; exact commit-tree replay must reject it.
+	rawGit(t, worktree.Path, "add", "--", "src/main.txt")
+	tree := rawGit(t, worktree.Path, "write-tree")
+	spoof := exec.Command("git", "-C", worktree.Path, "commit-tree", tree, "-p", worktree.Identity.BaseHead, "-m", "sf candidate "+evidence)
+	spoof.Env = append(os.Environ(), "GIT_AUTHOR_NAME=attacker", "GIT_AUTHOR_EMAIL=attacker@example.test", "GIT_COMMITTER_NAME=attacker", "GIT_COMMITTER_EMAIL=attacker@example.test", "GIT_AUTHOR_DATE=1970-01-01T00:00:02Z", "GIT_COMMITTER_DATE=1970-01-01T00:00:02Z")
+	output, err := spoof.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawGit(t, worktree.Path, "update-ref", "refs/heads/"+branch, strings.TrimSpace(string(output)), worktree.Identity.BaseHead)
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: evidence, Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); !errors.Is(err, ErrUnsafeWorktree) {
+		t.Fatalf("spoof commit adopted: %v", err)
+	}
+}
+
+func TestPushRefusesMovedRemoteBaseBeforeCandidatePublication(t *testing.T) {
+	ctx, runner, repository, remote := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-base-moved")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(8, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(t.TempDir(), "other")
+	rawGit(t, t.TempDir(), "clone", remote, other)
+	rawGit(t, other, "config", "user.name", "other")
+	rawGit(t, other, "config", "user.email", "other@example.test")
+	if err := os.WriteFile(filepath.Join(other, "base.txt"), []byte("moved\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rawGit(t, other, "add", "base.txt")
+	rawGit(t, other, "commit", "-m", "move base")
+	rawGit(t, other, "push", "origin", "main")
+	if _, err := runner.Push(ctx, worktree, head); !errors.Is(err, ErrUnexpectedRemote) {
+		t.Fatalf("moved base push=%v", err)
+	}
+	if remoteHead := rawGit(t, repository, "ls-remote", "--heads", "origin", "refs/heads/"+branch); remoteHead != "" {
+		t.Fatalf("candidate published despite moved base: %q", remoteHead)
+	}
+}
+
+func TestBoundedBufferConcurrentWriters(t *testing.T) {
+	buffer := &boundedBuffer{limit: 1 << 16}
+	var wait sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for j := 0; j < 64; j++ {
+				_, _ = buffer.Write([]byte("x"))
+			}
+		}()
+	}
+	wait.Wait()
+	if len(buffer.data) != 32*64 || buffer.exceeded {
+		t.Fatalf("concurrent buffer=%d exceeded=%v", len(buffer.data), buffer.exceeded)
 	}
 }
 

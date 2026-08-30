@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 // PinnedKnownHosts is shipped with sf from GitHub's published SSH key list.
@@ -27,8 +28,11 @@ var repoName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][
 // helper. SSH is deliberately a path, never a command string.
 type Request struct{ SSHBinary, KnownHosts, AgentSocket, Repository string }
 
-// ValidateInvocation accepts only Git's receive-pack transport to the GitHub
-// port-443 endpoint. Any option Git supplies is checked then discarded.
+// ValidateInvocation accepts only the two Git smart transports that sf needs
+// at the pinned GitHub port-443 endpoint. Git spells the path in an ssh URL
+// with a leading slash (for example, "git-receive-pack '/owner/repo.git'").
+// It is important that this parser model Git's real argv, rather than a
+// friendlier shell spelling: this executable is the trust boundary.
 func ValidateInvocation(argv []string, want string) error {
 	if want == "" || !repoName.MatchString(want+".git") {
 		return fmt.Errorf("%w: repository", ErrRefused)
@@ -50,7 +54,8 @@ func ValidateInvocation(argv []string, want string) error {
 			return fmt.Errorf("%w: option", ErrRefused)
 		}
 	}
-	if port != "443" || len(argv) != 2 || argv[0] != "git@ssh.github.com" || argv[1] != "git-receive-pack '"+want+".git'" {
+	if port != "443" || len(argv) != 2 || argv[0] != "git@ssh.github.com" ||
+		(argv[1] != "git-receive-pack '/"+want+".git'" && argv[1] != "git-upload-pack '/"+want+".git'") {
 		return fmt.Errorf("%w: host or command", ErrRefused)
 	}
 	return nil
@@ -70,7 +75,7 @@ func Command(request Request, gitArgv []string) ([]string, []string, error) {
 	}
 	for _, path := range []string{request.SSHBinary, request.KnownHosts} {
 		info, err := os.Lstat(path)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 {
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || !ownedByCurrentUser(info) || linkCount(info) != 1 || !secureParents(path, false) {
 			return nil, nil, fmt.Errorf("%w: unsafe file", ErrRefused)
 		}
 	}
@@ -79,9 +84,54 @@ func Command(request Request, gitArgv []string) ([]string, []string, error) {
 		return nil, nil, fmt.Errorf("%w: unpinned github host keys", ErrRefused)
 	}
 	info, err := os.Lstat(request.AgentSocket)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm()&0o022 != 0 || !ownedByCurrentUser(info) || !secureParents(request.AgentSocket, true) {
 		return nil, nil, fmt.Errorf("%w: unsafe agent", ErrRefused)
 	}
-	args := []string{"-F", "/dev/null", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + request.KnownHosts, "-o", "GlobalKnownHostsFile=/dev/null", "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no", "-o", "PreferredAuthentications=publickey", "-o", "ProxyCommand=none", "-o", "ProxyJump=none", "-o", "RequestTTY=no", "-o", "ClearAllForwardings=yes", "-p", "443", "git@ssh.github.com", "git-receive-pack '" + request.Repository + ".git'"}
+	service := "git-receive-pack"
+	if strings.HasPrefix(gitArgv[len(gitArgv)-1], "git-upload-pack ") {
+		service = "git-upload-pack"
+	}
+	args := []string{"-F", "/dev/null", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + request.KnownHosts, "-o", "GlobalKnownHostsFile=/dev/null", "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no", "-o", "PreferredAuthentications=publickey", "-o", "ProxyCommand=none", "-o", "ProxyJump=none", "-o", "RequestTTY=no", "-o", "ClearAllForwardings=yes", "-p", "443", "git@ssh.github.com", service + " '/" + request.Repository + ".git'"}
 	return args, []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "SSH_AUTH_SOCK=" + request.AgentSocket}, nil
+}
+
+func ownedByCurrentUser(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && int(stat.Uid) == os.Getuid()
+}
+
+func ownedByCurrentUserOrRoot(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && (int(stat.Uid) == os.Getuid() || stat.Uid == 0)
+}
+
+func linkCount(info os.FileInfo) uint64 {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return uint64(stat.Nlink)
+}
+
+// secureParents rejects symlinked or group/world-writable non-sticky parent
+// components. A private user-owned directory below /private/tmp is valid on
+// macOS: launchd agent sockets conventionally live there, while the sticky
+// system component itself cannot be replaced by another user.
+func secureParents(path string, allowSticky bool) bool {
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		info, err := os.Lstat(dir)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return false
+		}
+		mode := info.Mode().Perm()
+		if mode&0o022 != 0 && !(allowSticky && info.Mode()&os.ModeSticky != 0) {
+			return false
+		}
+		if mode&0o022 == 0 && !ownedByCurrentUserOrRoot(info) && dir != "/" {
+			return false
+		}
+		if dir == "/" {
+			return true
+		}
+	}
 }

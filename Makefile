@@ -3,10 +3,16 @@
 build:
 	mkdir -p bin
 	go build -trimpath -o bin/sf ./cmd/sf
+	go build -trimpath -o bin/sf-ssh ./cmd/sf-ssh
+	cp internal/gitssh/github_known_hosts bin/github_known_hosts
+	chmod 0644 bin/github_known_hosts
 
 build-dev:
 	mkdir -p bin
 	go build -trimpath -ldflags "-X github.com/nysa-company/sf/internal/version.Channel=dev" -o bin/sf-dev ./cmd/sf
+	go build -trimpath -ldflags "-X github.com/nysa-company/sf/internal/version.Channel=dev" -o bin/sf-ssh-dev ./cmd/sf-ssh
+	cp internal/gitssh/github_known_hosts bin/github_known_hosts
+	chmod 0644 bin/github_known_hosts
 
 test:
 	go test ./...
@@ -14,7 +20,7 @@ test:
 test-native-profile:
 	spikes/native-profile/run.sh
 
-check: test
+check: test build build-dev
 	./scripts/repo-check
 	./scripts/secret-scan
 	./scripts/artifact-check --working-tree

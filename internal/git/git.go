@@ -396,15 +396,64 @@ func (r Runner) environment(extra []string) ([]string, error) {
 		return nil, err
 	}
 	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
+	seen := map[string]bool{}
 	for _, entry := range extra {
-		key, _, _ := strings.Cut(entry, "=")
-		allowedSSH := (key == "GIT_SSH" && entry == "GIT_SSH="+r.SSHHelper) || (key == "GIT_SSH_VARIANT" && entry == "GIT_SSH_VARIANT=ssh") || (key == "SF_GIT_SSH_BINARY" && entry == "SF_GIT_SSH_BINARY="+r.SSHBinary) || (key == "SF_GIT_SSH_KNOWN_HOSTS" && entry == "SF_GIT_SSH_KNOWN_HOSTS="+r.SSHKnownHosts) || (key == "SSH_AUTH_SOCK" && entry == "SSH_AUTH_SOCK="+r.SSHAgentSock) || (key == "SF_GIT_SSH_REPOSITORY" && strings.HasPrefix(entry, "SF_GIT_SSH_REPOSITORY="))
-		if (strings.HasPrefix(key, "GIT_") && !strings.HasPrefix(key, "GIT_AUTHOR_") && !strings.HasPrefix(key, "GIT_COMMITTER_") && !allowedSSH) || key == "HOME" {
+		key, value, found := strings.Cut(entry, "=")
+		if !found || seen[key] || !validExtraEnvironment(r, key, value) {
 			return nil, fmt.Errorf("credential or git environment override refused")
 		}
+		seen[key] = true
 		env = append(env, entry)
 	}
 	return env, nil
+}
+
+// validExtraEnvironment is deliberately positive-only. In particular, an
+// arbitrary non-GIT name is not harmless: loader, proxy and shell-startup
+// variables all alter a child process before Git gets a chance to apply its
+// own configuration hardening.
+func validExtraEnvironment(r Runner, key, value string) bool {
+	switch key {
+	case "GIT_SSH":
+		return value == r.SSHHelper
+	case "GIT_SSH_VARIANT":
+		return value == "ssh"
+	case "SF_GIT_SSH_BINARY":
+		return value == r.SSHBinary
+	case "SF_GIT_SSH_KNOWN_HOSTS":
+		return value == r.SSHKnownHosts
+	case "SSH_AUTH_SOCK":
+		return value == r.SSHAgentSock
+	case "SF_GIT_SSH_REPOSITORY":
+		return repoNameForSSH(value)
+	case "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME":
+		return value == "sf"
+	case "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL":
+		return value == "sf@localhost"
+	case "GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE":
+		_, err := time.Parse(time.RFC3339, value)
+		return err == nil && strings.HasSuffix(value, "Z")
+	default:
+		return false
+	}
+}
+
+func repoNameForSSH(value string) bool {
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || len(part) > 100 {
+			return false
+		}
+		for _, ch := range part {
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '.' || ch == '_' || ch == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func boundedGitContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -522,9 +571,12 @@ type boundedBuffer struct {
 	exceeded bool
 	stop     func()
 	once     sync.Once
+	mu       sync.Mutex
 }
 
 func (b *boundedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if len(b.data)+len(value) > b.limit {
 		remaining := b.limit - len(b.data)
 		if remaining > 0 {
@@ -1491,6 +1543,9 @@ func validateChangedPaths(policy DiffPolicy, paths []string) error {
 
 func validateFiles(worktree string, policy DiffPolicy, changed []string) error {
 	for _, path := range changed {
+		if err := rejectSymlinkComponents(worktree, path); err != nil {
+			return err
+		}
 		full := filepath.Join(worktree, filepath.FromSlash(path))
 		info, err := os.Lstat(full)
 		if errors.Is(err, os.ErrNotExist) {
@@ -1507,6 +1562,32 @@ func validateFiles(worktree string, policy DiffPolicy, changed []string) error {
 		}
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
 			return fmt.Errorf("%w: hardlink %s", ErrUnsafeWorktree, path)
+		}
+	}
+	return nil
+}
+
+// rejectSymlinkComponents prevents a clean-looking final lstat from silently
+// traversing a pre-existing symlinked parent. The caller subsequently checks
+// the leaf's type/link count; together the two checks keep candidate bytes in
+// the authenticated worktree under the guarded/supervisor threat model.
+func rejectSymlinkComponents(worktree, candidate string) error {
+	current := worktree
+	parts := strings.Split(filepath.FromSlash(candidate), string(filepath.Separator))
+	for i, part := range parts {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		} // deletion
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: symlink component %s", ErrUnsafeWorktree, candidate)
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return fmt.Errorf("%w: non-directory component %s", ErrUnsafeWorktree, candidate)
 		}
 	}
 	return nil
@@ -1665,10 +1746,7 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if head, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD"); err != nil || head != request.ExpectedParent {
 		return "", fmt.Errorf("%w: candidate parent changed immediately before commit", ErrUnsafeWorktree)
 	}
-	message := "sf candidate " + request.EvidenceDigest
-	if request.Message != "" {
-		message += "\n\n" + request.Message
-	}
+	message := candidateMessage(request)
 	timestamp := request.Timestamp.UTC().Format(time.RFC3339)
 	tree, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "write-tree")
 	if err != nil || !validOID(tree) {
@@ -1686,7 +1764,7 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if head, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD"); err != nil || head != request.ExpectedParent {
 		return "", fmt.Errorf("%w: candidate parent changed before commit-tree", ErrUnsafeWorktree)
 	}
-	newHead, err := r.oneEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, []string{"GIT_AUTHOR_NAME=sf", "GIT_AUTHOR_EMAIL=sf@localhost", "GIT_COMMITTER_NAME=sf", "GIT_COMMITTER_EMAIL=sf@localhost", "GIT_AUTHOR_DATE=" + timestamp, "GIT_COMMITTER_DATE=" + timestamp}, "commit-tree", tree, "-p", request.ExpectedParent, "-m", message)
+	newHead, err := r.oneEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, deterministicCommitEnv(timestamp), "commit-tree", tree, "-p", request.ExpectedParent, "-m", message)
 	if err != nil || !validOID(newHead) {
 		return "", fmt.Errorf("%w: candidate commit could not be created", ErrUnsafeWorktree)
 	}
@@ -1733,14 +1811,32 @@ func (r Runner) reconcileCommit(ctx context.Context, worktree Worktree, request 
 	if len(fields) != 2 || fields[0] != head || fields[1] != request.ExpectedParent {
 		return head, false, nil
 	}
-	subject, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "log", "-1", "--format=%s", "HEAD")
+	tree, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD^{tree}")
+	if err != nil || !validOID(tree) {
+		return "", false, err
+	}
+	// Reconstruct the object, rather than comparing a parent and subject. A Git
+	// commit OID binds its hash algorithm, tree, all parents, complete message,
+	// author/committer identity and timestamps. This also makes a lost-response
+	// adoption deterministic and rejects a visually equivalent spoof.
+	expected, err := r.oneEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno,
+		deterministicCommitEnv(request.Timestamp.UTC().Format(time.RFC3339)), "commit-tree", tree, "-p", request.ExpectedParent, "-m", candidateMessage(request))
 	if err != nil {
 		return "", false, err
 	}
-	if subject == "sf candidate "+request.EvidenceDigest {
-		return head, true, nil
+	return head, expected == head, nil
+}
+
+func candidateMessage(request CommitRequest) string {
+	message := "sf candidate " + request.EvidenceDigest
+	if request.Message != "" {
+		message += "\n\n" + request.Message
 	}
-	return head, false, nil
+	return message
+}
+
+func deterministicCommitEnv(timestamp string) []string {
+	return []string{"GIT_AUTHOR_NAME=sf", "GIT_AUTHOR_EMAIL=sf@localhost", "GIT_COMMITTER_NAME=sf", "GIT_COMMITTER_EMAIL=sf@localhost", "GIT_AUTHOR_DATE=" + timestamp, "GIT_COMMITTER_DATE=" + timestamp}
 }
 
 func boundedCommitText(value string, maximum int) bool {
@@ -1756,77 +1852,77 @@ func validEvidenceDigest(value string) bool {
 	return err == nil && len(decoded) == sha256.Size && strings.ToLower(encoded) == encoded
 }
 
-// Push publishes exactly expectedHead. Callers must carry the candidate SHA
-// from the durable commit/effect record; Push never chooses a moving local
-// head on their behalf.
+// PushRequest carries both durable sides of the publication fence. Empty
+// ExpectedPriorHead means the ticket branch must not exist (except an exact
+// retry already at ExpectedHead); callers that have observed a prior candidate
+// branch must carry it exactly rather than accepting a fast-forwardable ref.
+type PushRequest struct{ ExpectedHead, ExpectedPriorHead string }
+
+// Push is retained for existing callers; new effect owners should use
+// PushWithRequest to persist the candidate-branch observation explicitly.
 func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string) (string, error) {
+	return r.PushWithRequest(ctx, worktree, PushRequest{ExpectedHead: expectedHead})
+}
+
+func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request PushRequest) (string, error) {
 	if _, err := validateBranch(worktree.Branch); err != nil {
 		return "", err
 	}
-	if !validOID(expectedHead) {
+	if !validOID(request.ExpectedHead) || (request.ExpectedPriorHead != "" && !validOID(request.ExpectedPriorHead)) {
 		return "", fmt.Errorf("%w: invalid expected candidate head", ErrUnexpectedRemote)
 	}
 	if strings.HasPrefix(worktree.Identity.PushOrigin, "https://") {
 		return "", ErrHTTPSCredentialBoundary
 	}
-	sshEnv, sshPush, err := r.githubSSHPushEnvironment(worktree.Identity.PushOrigin)
+	sshEnv, _, err := r.githubSSHPushEnvironment(worktree.Identity.PushOrigin)
 	if err != nil {
 		return "", err
 	}
-	_, err = r.provePushHead(ctx, worktree, expectedHead)
+	_, err = r.provePushHead(ctx, worktree, request.ExpectedHead)
 	if err != nil {
 		return "", err
 	}
-	// Git's receive-pack advertises and atomically checks the destination ref
-	// during push. Keeping the helper receive-pack-only avoids opening a second
-	// remote command surface for ls-remote/fetch. A lost response is left to the
-	// durable effect owner: repeating this exact ordinary refspec is idempotent
-	// (the server reports it up-to-date) and can never rewrite history.
-	if sshPush {
-		if _, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, sshEnv, "push", worktree.Identity.PushOrigin, expectedHead+":refs/heads/"+worktree.Branch); err != nil {
+	// Every publication starts from a fresh remote observation. The local
+	// snapshot alone is insufficient: another actor may have moved BaseRef
+	// after the worktree was made but before this irreversible effect.
+	baseEnv, _, err := r.githubSSHPushEnvironment(worktree.Identity.Origin)
+	if err != nil {
+		return "", err
+	}
+	remoteBase, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
+	if err != nil || remoteBase != worktree.Identity.BaseHead {
+		if err != nil {
 			return "", err
 		}
-		return expectedHead, nil
+		return "", fmt.Errorf("%w: remote base moved", ErrUnexpectedRemote)
 	}
 	remote, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, sshEnv)
 	if err != nil {
 		return "", err
 	}
-	if remote == expectedHead {
-		return expectedHead, nil
+	if remote == request.ExpectedHead {
+		return request.ExpectedHead, nil
 	}
-	if remote != "" {
-		if !validOID(remote) {
-			return "", fmt.Errorf("%w: invalid remote object id", ErrUnexpectedRemote)
-		}
-		observationRef := "refs/sf/observed/" + digest([]byte(worktree.Branch + remote))[7:]
-		if _, err := r.provePushHead(ctx, worktree, expectedHead); err != nil {
-			return "", err
-		}
-		if _, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, sshEnv, "fetch", "--no-tags", worktree.Identity.PushOrigin, "refs/heads/"+worktree.Branch+":"+observationRef); err != nil {
-			return "", fmt.Errorf("%w: cannot observe remote %s", ErrUnexpectedRemote, remote)
-		}
-		if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "merge-base", "--is-ancestor", remote, expectedHead); err != nil {
-			return "", fmt.Errorf("%w: %s is not ancestor of %s", ErrUnexpectedRemote, remote, expectedHead)
-		}
+	if remote != request.ExpectedPriorHead {
+		return "", fmt.Errorf("%w: candidate branch does not match durable observation", ErrUnexpectedRemote)
 	}
 	// Reauthenticate and prove the exact candidate immediately before push.
-	if _, err := r.provePushHead(ctx, worktree, expectedHead); err != nil {
+	if _, err := r.provePushHead(ctx, worktree, request.ExpectedHead); err != nil {
 		return "", err
 	}
-	refspec := expectedHead + ":refs/heads/" + worktree.Branch
+	refspec := request.ExpectedHead + ":refs/heads/" + worktree.Branch
 	if worktree.Identity.PushOrigin == "" {
 		return "", fmt.Errorf("%w: authenticated push URL is missing", ErrIdentityMismatch)
 	}
 	if _, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, sshEnv, "push", worktree.Identity.PushOrigin, refspec); err != nil {
 		// The server may have accepted the ref while the response was lost. Only
 		// reconcile success when the exact expected candidate is observed.
-		if _, proveErr := r.provePushHead(ctx, worktree, expectedHead); proveErr != nil {
+		if _, proveErr := r.provePushHead(ctx, worktree, request.ExpectedHead); proveErr != nil {
 			return "", err
 		}
 		observed, observeErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, sshEnv)
-		if observeErr == nil && observed == expectedHead {
-			return expectedHead, nil
+		if observeErr == nil && observed == request.ExpectedHead {
+			return request.ExpectedHead, nil
 		}
 		return "", err
 	}
@@ -1834,10 +1930,10 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 	if err != nil {
 		return "", err
 	}
-	if observed != expectedHead {
+	if observed != request.ExpectedHead {
 		return "", fmt.Errorf("%w: push did not converge", ErrUnexpectedRemote)
 	}
-	return expectedHead, nil
+	return request.ExpectedHead, nil
 }
 
 func (r Runner) githubSSHPushEnvironment(origin string) ([]string, bool, error) {
