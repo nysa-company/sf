@@ -154,6 +154,16 @@ func TestGitMutationLeaseReleaseIsBoundedWhenSQLiteIsBusy(t *testing.T) {
 	if err == nil || time.Since(started) > 3*time.Second {
 		t.Fatalf("release err=%v elapsed=%s", err, time.Since(started))
 	}
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcquireGitMutation(ctx, claim); !errors.Is(err, ErrGitMutationLease) {
+		t.Fatalf("failed release admitted another writer: %v", err)
+	}
+	var retained int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM git_mutation_leases WHERE repository_path=? AND state='active'`, intent.Repository).Scan(&retained); err != nil || retained != 1 {
+		t.Fatalf("failed release did not retain active exclusion count=%d err=%v", retained, err)
+	}
 }
 
 func TestGitMutationClaimRefusesCreateWithUnallocatedIdentity(t *testing.T) {

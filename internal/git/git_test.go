@@ -54,8 +54,15 @@ type memoryBranchAuthority struct{ branches map[string]string }
 
 type testMutationAuthority struct{ err error }
 type testMutationLease struct{ err error }
-type releaseFailMutationAuthority struct{}
-type releaseFailMutationLease struct{}
+
+// releaseFailMutationAuthority models a durable release failure: the first
+// mutation ran, but its repository exclusion remains active and refuses every
+// later writer until recovery resolves it.
+type releaseFailMutationAuthority struct {
+	blocked  bool
+	checkErr error
+}
+type releaseFailMutationLease struct{ authority *releaseFailMutationAuthority }
 
 type factMutationAuthority struct{ lease *factMutationLease }
 type factMutationLease struct {
@@ -76,11 +83,21 @@ func (l testMutationLease) RecordPreparedCommit(_ context.Context, _, _ string) 
 func (l testMutationLease) RecordPushPriorRemote(_ context.Context, _ string) error {
 	return l.err
 }
-func (releaseFailMutationAuthority) AcquireGitMutation(context.Context, contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
-	return releaseFailMutationLease{}, nil
+func (a *releaseFailMutationAuthority) AcquireGitMutation(context.Context, contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
+	if a.blocked {
+		return nil, errors.New("durable repository writer remains active")
+	}
+	return releaseFailMutationLease{authority: a}, nil
 }
-func (releaseFailMutationLease) Check(context.Context) error { return nil }
-func (releaseFailMutationLease) Release() error              { return errors.New("durable lease delete blocked") }
+func (l releaseFailMutationLease) Check(context.Context) error { return l.authority.checkErr }
+func (l releaseFailMutationLease) Release() error {
+	l.authority.blocked = true
+	return errors.New("durable lease delete blocked")
+}
+func (releaseFailMutationLease) RecordPreparedCommit(context.Context, string, string) error {
+	return nil
+}
+func (releaseFailMutationLease) RecordPushPriorRemote(context.Context, string) error { return nil }
 func (a factMutationAuthority) AcquireGitMutation(_ context.Context, _ contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
 	return a.lease, nil
 }
@@ -1413,7 +1430,8 @@ func TestMutationsRequireExternalLeaseAndDoNotCreateWorktree(t *testing.T) {
 
 func TestCreateWorktreeSurfacesDurableLeaseReleaseFailure(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
-	runner.MutationAuthority = releaseFailMutationAuthority{}
+	authority := &releaseFailMutationAuthority{}
+	runner.MutationAuthority = authority
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-release-failure")
 	if err != nil {
 		t.Fatal(err)
@@ -1425,6 +1443,137 @@ func TestCreateWorktreeSurfacesDurableLeaseReleaseFailure(t *testing.T) {
 	}
 	if _, statErr := os.Stat(path); statErr != nil {
 		t.Fatalf("authenticated path unexpectedly disappeared: %v", statErr)
+	}
+	secondPath := filepath.Join(t.TempDir(), "second-worktree")
+	secondBranch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-release-failure-blocked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.CreateWorktree(ctx, repository, secondPath, secondBranch, "main", createClaim(t, repository, secondPath, secondBranch, "main")); !errors.Is(err, ErrIdentityMismatch) || !authority.blocked {
+		t.Fatalf("ambiguous release admitted another writer: blocked=%v err=%v", authority.blocked, err)
+	}
+}
+
+func TestMutationLeaseCheckCleanupSurfacesReleaseFailure(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	authority := &releaseFailMutationAuthority{checkErr: errors.New("lease fence changed")}
+	runner.MutationAuthority = authority
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-release-check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main")); !errors.Is(err, ErrIdentityMismatch) || !errors.Is(err, ErrMutationLeaseRelease) || !authority.blocked {
+		t.Fatalf("failed check hid ambiguous durable release: blocked=%v err=%v", authority.blocked, err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed lease check changed filesystem: %v", err)
+	}
+}
+
+func TestMutatingOperationsDoNotSurfaceSuccessAfterDurableLeaseReleaseFailure(t *testing.T) {
+	t.Run("remove worktree", func(t *testing.T) {
+		ctx, runner, repository, _, worktree := releaseFailureWorktree(t, "remove")
+		authority := &releaseFailMutationAuthority{}
+		runner.MutationAuthority = authority
+		if err := runner.RemoveWorktree(ctx, repository, worktree, WorktreeState{}, removeClaim(worktree)); !errors.Is(err, ErrMutationLeaseRelease) {
+			t.Fatalf("remove hid lease release failure: %v", err)
+		}
+		if _, err := os.Lstat(worktree.Path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("remove effect did not happen: %v", err)
+		}
+		assertReleaseFailureBlocksWriter(t, ctx, &runner, repository, authority, "remove")
+	})
+
+	t.Run("commit", func(t *testing.T) {
+		ctx, runner, _, _, worktree := releaseFailureWorktree(t, "commit")
+		if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		authority := &releaseFailMutationAuthority{}
+		runner.MutationAuthority = authority
+		request := CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(21, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)}
+		if head, err := runner.Commit(ctx, worktree, request); head != "" || !errors.Is(err, ErrMutationLeaseRelease) {
+			t.Fatalf("commit surfaced success after release failure: head=%q err=%v", head, err)
+		}
+		if actual := rawGit(t, worktree.Path, "rev-parse", "HEAD"); actual == worktree.Identity.BaseHead {
+			t.Fatal("commit effect did not happen")
+		}
+		if _, err := runner.Commit(ctx, worktree, request); !errors.Is(err, ErrIdentityMismatch) || !authority.blocked {
+			t.Fatalf("ambiguous commit release admitted another writer: blocked=%v err=%v", authority.blocked, err)
+		}
+	})
+
+	t.Run("push response loss", func(t *testing.T) {
+		ctx, runner, repository, _, worktree := releaseFailureWorktree(t, "push")
+		if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(22, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		authority := &releaseFailMutationAuthority{}
+		runner.MutationAuthority = authority
+		request := PushRequest{ExpectedHead: head, MutationClaim: pushClaim(worktree, head)}
+		if published, err := runner.PushWithRequest(ctx, worktree, request); published != "" || !errors.Is(err, ErrMutationLeaseRelease) {
+			t.Fatalf("push response loss surfaced success: head=%q err=%v", published, err)
+		}
+		if remote := rawGit(t, repository, "ls-remote", "--heads", "origin", "refs/heads/"+worktree.Branch); remote == "" {
+			t.Fatal("push response-loss fixture did not mutate remote")
+		}
+		if _, err := runner.PushWithRequest(ctx, worktree, request); !errors.Is(err, ErrIdentityMismatch) || !authority.blocked {
+			t.Fatalf("ambiguous push release admitted another writer: blocked=%v err=%v", authority.blocked, err)
+		}
+	})
+
+	t.Run("protected branch fetch", func(t *testing.T) {
+		ctx, runner, repository, remote, worktree := releaseFailureWorktree(t, "protected")
+		if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("merge\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("merge")), Timestamp: time.Unix(23, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rawGit(t, repository, "merge", "--ff-only", worktree.Branch)
+		rawGit(t, repository, "push", "origin", "main")
+		authority := &releaseFailMutationAuthority{}
+		runner.MutationAuthority = authority
+		witness := contracts.ProtectedBranchWitness{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Origin: remote, ProtectedRef: "main", OriginalBaseOID: worktree.Identity.BaseHead, MergeOID: head, MutationClaim: protectedFetchClaim(worktree, worktree.Identity.BaseHead, head)}
+		if err := runner.VerifyProtectedBranch(ctx, witness); !errors.Is(err, ErrMutationLeaseRelease) {
+			t.Fatalf("protected fetch hid lease release failure: %v", err)
+		}
+		if err := runner.VerifyProtectedBranch(ctx, witness); !errors.Is(err, ErrIdentityMismatch) || !authority.blocked {
+			t.Fatalf("ambiguous protected-fetch release admitted another writer: blocked=%v err=%v", authority.blocked, err)
+		}
+	})
+}
+
+func releaseFailureWorktree(t *testing.T, suffix string) (context.Context, Runner, string, string, Worktree) {
+	t.Helper()
+	ctx, runner, repository, remote := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", domain.TicketID("SF-release-"+suffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ctx, runner, repository, remote, worktree
+}
+
+func assertReleaseFailureBlocksWriter(t *testing.T, ctx context.Context, runner *Runner, repository string, authority *releaseFailMutationAuthority, suffix string) {
+	t.Helper()
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", domain.TicketID("SF-release-blocked-"+suffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main")); !errors.Is(err, ErrIdentityMismatch) || !authority.blocked {
+		t.Fatalf("ambiguous release admitted another writer: blocked=%v err=%v", authority.blocked, err)
 	}
 }
 

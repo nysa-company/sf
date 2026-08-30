@@ -488,10 +488,34 @@ func (r Runner) acquireMutation(ctx context.Context, claim contracts.GitMutation
 		return nil, fmt.Errorf("%w: mutation authority returned no lease", ErrIdentityMismatch)
 	}
 	if err := lease.Check(ctx); err != nil {
-		_ = lease.Release()
-		return nil, fmt.Errorf("%w: mutation lease is not current: %v", ErrIdentityMismatch, err)
+		checkErr := fmt.Errorf("%w: mutation lease is not current: %v", ErrIdentityMismatch, err)
+		if releaseErr := releaseMutationLease(lease); releaseErr != nil {
+			return nil, errors.Join(checkErr, releaseErr)
+		}
+		return nil, checkErr
 	}
 	return lease, nil
+}
+
+// releaseMutationLease deliberately preserves the Store lease when its
+// bounded durable delete fails. The still-active (or recovery-quarantined)
+// row remains the repository-writer exclusion; callers must never surface a
+// successful Git result while that exclusion's finalization is uncertain.
+func releaseMutationLease(lease contracts.GitMutationLease) error {
+	if err := lease.Release(); err != nil {
+		return fmt.Errorf("%w: %v", ErrMutationLeaseRelease, err)
+	}
+	return nil
+}
+
+func mergeMutationLeaseRelease(returnedErr error, lease contracts.GitMutationLease) error {
+	if releaseErr := releaseMutationLease(lease); releaseErr != nil {
+		if returnedErr == nil {
+			return releaseErr
+		}
+		return errors.Join(returnedErr, releaseErr)
+	}
+	return returnedErr
 }
 
 func requireMutationLease(ctx context.Context, lease contracts.GitMutationLease) error {
@@ -1686,13 +1710,9 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 		return Worktree{}, err
 	}
 	defer func() {
-		if releaseErr := lease.Release(); releaseErr != nil {
-			releaseErr = fmt.Errorf("%w: %v", ErrMutationLeaseRelease, releaseErr)
-			if returnedErr == nil {
-				result, returnedErr = Worktree{}, releaseErr
-			} else {
-				returnedErr = errors.Join(returnedErr, releaseErr)
-			}
+		returnedErr = mergeMutationLeaseRelease(returnedErr, lease)
+		if returnedErr != nil {
+			result = Worktree{}
 		}
 	}()
 	ctx = withMutationLease(ctx, lease)
@@ -1925,7 +1945,7 @@ func (r Runner) RetainWorktree(ctx context.Context, worktree Worktree) (Identity
 	return worktree.Identity, nil
 }
 
-func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree Worktree, state WorktreeState, claim contracts.GitMutationClaim) error {
+func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree Worktree, state WorktreeState, claim contracts.GitMutationClaim) (returnedErr error) {
 	if _, err := validateBranch(worktree.Branch); err != nil {
 		return fmt.Errorf("%w: foreign branch is retained", ErrUnsafeWorktree)
 	}
@@ -1954,7 +1974,7 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 	if err != nil {
 		return err
 	}
-	defer lease.Release()
+	defer func() { returnedErr = mergeMutationLeaseRelease(returnedErr, lease) }()
 	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return err
@@ -2230,7 +2250,7 @@ type CommitRequest struct {
 	MutationClaim           contracts.GitMutationClaim
 }
 
-func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitRequest) (string, error) {
+func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitRequest) (head string, returnedErr error) {
 	if !validEvidenceDigest(request.EvidenceDigest) || (request.Message != "" && !boundedCommitText(request.Message, 4_000)) || request.Timestamp.IsZero() || !validRef(request.BaseRef) || !validOID(request.ExpectedParent) {
 		return "", fmt.Errorf("candidate evidence digest and timestamp are required")
 	}
@@ -2244,7 +2264,12 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err != nil {
 		return "", err
 	}
-	defer lease.Release()
+	defer func() {
+		returnedErr = mergeMutationLeaseRelease(returnedErr, lease)
+		if returnedErr != nil {
+			head = ""
+		}
+	}()
 	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return "", err
@@ -2280,7 +2305,7 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
-	head, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD")
+	head, err = r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD")
 	if err != nil || head != request.ExpectedParent {
 		return "", fmt.Errorf("%w: candidate parent changed before commit", ErrUnsafeWorktree)
 	}
@@ -2433,7 +2458,7 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 	return r.PushWithRequest(ctx, worktree, PushRequest{ExpectedHead: expectedHead, MutationClaim: claim})
 }
 
-func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request PushRequest) (string, error) {
+func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request PushRequest) (head string, returnedErr error) {
 	if _, err := validateBranch(worktree.Branch); err != nil {
 		return "", err
 	}
@@ -2448,7 +2473,12 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 	if err != nil {
 		return "", err
 	}
-	defer lease.Release()
+	defer func() {
+		returnedErr = mergeMutationLeaseRelease(returnedErr, lease)
+		if returnedErr != nil {
+			head = ""
+		}
+	}()
 	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return "", err
@@ -2720,7 +2750,7 @@ func (r Runner) remoteHeadEnv(ctx context.Context, directory string, expectedDev
 // proof namespace. The fetch is a deliberately narrow mutation guarded by the
 // caller's durable lease; no FETCH_HEAD is written and the retained proof ref
 // is collision-safe (derived from the full durable witness).
-func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.ProtectedBranchWitness) error {
+func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.ProtectedBranchWitness) (returnedErr error) {
 	if !validAbsolutePath(witness.Repository) || !validAbsolutePath(witness.Worktree) || !validRef(witness.ProtectedRef) || !validOID(witness.OriginalBaseOID) || !validOID(witness.MergeOID) {
 		return fmt.Errorf("%w: invalid protected-branch witness", ErrIdentityMismatch)
 	}
@@ -2756,7 +2786,7 @@ func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.Pro
 	if err != nil {
 		return err
 	}
-	defer lease.Release()
+	defer func() { returnedErr = mergeMutationLeaseRelease(returnedErr, lease) }()
 	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return err
