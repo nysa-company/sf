@@ -184,25 +184,52 @@ type MergeAuthorization struct {
 // time so a restart can distinguish an observed manual merge from a different
 // branch history.
 type MergeIntent struct {
-	Ref                TicketRef
-	SemanticKey        string
-	RequestDigest      string
-	TicketVersion      uint64
-	LeaderEpoch        uint64
-	RunnerEpoch        uint64
-	ClaimEpoch         uint64
-	RepositoryHost     string
-	RepositoryOwner    string
-	RepositoryName     string
-	PullRequestNumber  int
-	HeadOID            string
-	BaseRef            string
-	OriginalBaseOID    string
-	ProtectionRuleID   string
-	StrictStatusChecks bool
-	AdminEnforced      bool
-	ActiveRulesetCount uint32
-	Method             string
+	Ref               TicketRef
+	SemanticKey       string
+	RequestDigest     string
+	TicketVersion     uint64
+	LeaderEpoch       uint64
+	RunnerEpoch       uint64
+	ClaimEpoch        uint64
+	RepositoryHost    string
+	RepositoryOwner   string
+	RepositoryName    string
+	PullRequestNumber int
+	HeadOID           string
+	BaseRef           string
+	OriginalBaseOID   string
+	ProtectionRuleID  string
+	// ProtectionKind records whether the witnessed merge gate was classic
+	// branch protection or an exact repository ruleset. Empty is retained only
+	// for pre-v30 classic rows.
+	ProtectionKind         string
+	ProtectionChecksDigest string
+	StrictStatusChecks     bool
+	AdminEnforced          bool
+	ActiveRulesetCount     uint32
+	Method                 string
+}
+
+// ValidateProtectionWitness keeps the persisted protection shape explicit.
+// The detailed repository and merge fields are validated at their boundaries;
+// this method is deliberately limited to the witness that distinguishes a
+// classic rule from a repository ruleset.
+func (intent MergeIntent) ValidateProtectionWitness() error {
+	if intent.ActiveRulesetCount == 0 {
+		if (intent.ProtectionKind == "" || intent.ProtectionKind == "classic") && intent.ProtectionChecksDigest == "" {
+			return nil
+		}
+		return fmt.Errorf("invalid classic protection witness")
+	}
+	if intent.ActiveRulesetCount != 1 || intent.ProtectionKind != "ruleset" || len(intent.ProtectionChecksDigest) != 64 {
+		return fmt.Errorf("invalid ruleset protection witness")
+	}
+	for _, value := range intent.ProtectionChecksDigest {
+		if !(value >= '0' && value <= '9' || value >= 'a' && value <= 'f') {
+			return fmt.Errorf("invalid ruleset protection checks digest")
+		}
+	}
+	return nil
 }
 
 type ProviderIdentity struct {

@@ -270,7 +270,7 @@ func createLegacySchema(t *testing.T, path string, target int) *sql.DB {
 	}
 	for version := 1; version <= target; version++ {
 		statements := testMigration(version)
-		if len(statements) == 0 {
+		if len(statements) == 0 && version != 28 {
 			_ = raw.Close()
 			t.Fatalf("missing legacy migration %d", version)
 		}
@@ -362,6 +362,87 @@ func TestV19ToV20MigrationPreservesButRefusesUnsafeLegacyMergeIntent(t *testing.
 		return "unexpected", nil
 	})); err == nil || called {
 		t.Fatalf("unsafe legacy recovery err=%v observer_called=%v", err, called)
+	}
+}
+
+func TestV29ToV30MigrationPreservesClassicMergeIntent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v29.sqlite")
+	raw := createLegacySchema(t, path, 29)
+	statements := []string{
+		`INSERT INTO projects(channel, id, canonical_path, base_ref) VALUES ('dev', 'nysa', '/tmp/nysa', 'main')`,
+		`INSERT INTO tickets(channel, project_id, id, source_digest, ticket_type, merge_mode, state, version, runner_epoch, workflow_id) VALUES ('dev', 'nysa', 'SF-v30', 'legacy', 'bug', 'guarded', 'publishing', 3, 2, 'workflow')`,
+		`INSERT INTO effects(semantic_key, channel, project_id, ticket_id, effect_kind, state, ticket_version, leader_epoch, runner_epoch, claim_epoch, request_digest) VALUES ('merge/v30', 'dev', 'nysa', 'SF-v30', 'merge', 'executing', 3, 4, 2, 5, 'digest')`,
+		`INSERT INTO merge_intents(semantic_key, channel, project_id, ticket_id, request_digest, ticket_version, leader_epoch, runner_epoch, claim_epoch, repository_host, repository_owner, repository_name, pull_request_number, head_oid, base_ref, original_base_oid, protection_rule_id, strict_status_checks, admin_enforced, active_ruleset_count, method, created_at) VALUES ('merge/v30', 'dev', 'nysa', 'SF-v30', 'digest', 3, 4, 2, 5, 'github.com', 'example', 'app', 7, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'main', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'rule-main', 1, 1, 0, 'squash', 'legacy')`,
+	}
+	for _, statement := range statements {
+		if _, err := raw.Exec(statement); err != nil {
+			_ = raw.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := hasColumns(ctx, database.db, "merge_intents", "protection_kind", "protection_checks_digest"); err != nil {
+		t.Fatalf("v30 merge intent columns: %v", err)
+	}
+	intent, found, err := database.MergeIntent(ctx, "merge/v30")
+	if err != nil || !found || intent.ProtectionKind != "" || intent.ProtectionChecksDigest != "" || validMergeIntent(intent) != nil {
+		t.Fatalf("v30 classic intent=%+v found=%v err=%v", intent, found, err)
+	}
+}
+
+func TestValidMergeIntentRulesetWitnessRoundTripAndTamper(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-ruleset-intent"}
+	if err := database.CreateTicket(ctx, ticket(ref, "ruleset-intent")); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "ruleset-intent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-ruleset-intent/merge", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := EffectFence{SemanticKey: "merge/ruleset-intent", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
+	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: fence.SemanticKey, Ref: ref, Kind: "merge", TicketVersion: fence.TicketVersion, Fence: fence.Fence, RequestDigest: "ruleset-digest"}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := database.ClaimEffect(ctx, fence)
+	if err != nil || !claim.Claimed {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	intent := domain.MergeIntent{Ref: ref, SemanticKey: claim.Effect.SemanticKey, RequestDigest: claim.Effect.RequestDigest, TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 7, HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "42", ProtectionKind: "ruleset", ProtectionChecksDigest: strings.Repeat("a", 64), StrictStatusChecks: true, AdminEnforced: true, ActiveRulesetCount: 1, Method: "squash"}
+	if err := database.RecordMergeIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	stored, found, err := database.MergeIntent(ctx, intent.SemanticKey)
+	if err != nil || !found || stored != intent {
+		t.Fatalf("ruleset round trip=%+v found=%v err=%v", stored, found, err)
+	}
+	if _, err := database.db.ExecContext(ctx, `UPDATE merge_intents SET protection_checks_digest='not-a-digest' WHERE semantic_key=?`, intent.SemanticKey); err != nil {
+		t.Fatal(err)
+	}
+	tampered, found, err := database.MergeIntent(ctx, intent.SemanticKey)
+	if err != nil || !found || validMergeIntent(tampered) == nil {
+		t.Fatalf("tampered ruleset intent=%+v found=%v err=%v", tampered, found, err)
+	}
+	for _, invalid := range []domain.MergeIntent{
+		func() domain.MergeIntent { value := intent; value.ProtectionKind = "classic"; return value }(),
+		func() domain.MergeIntent { value := intent; value.ActiveRulesetCount = 2; return value }(),
+		func() domain.MergeIntent { value := intent; value.Method = "octopus"; return value }(),
+	} {
+		if err := validMergeIntent(invalid); err == nil {
+			t.Fatalf("invalid ruleset merge intent accepted: %+v", invalid)
+		}
 	}
 }
 

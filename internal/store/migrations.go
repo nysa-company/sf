@@ -533,3 +533,12 @@ var migrationV29 = []string{
 	`UPDATE phase_runs SET state='failed',outcome='invalid_artifact',completed_at=COALESCE(completed_at,started_at) WHERE state='completed' AND outcome IN ('completed','passed') AND NOT EXISTS(SELECT 1 FROM provider_attempts a JOIN provider_attempt_results r ON r.provider_attempt_id=a.id WHERE a.channel=phase_runs.channel AND a.project_id=phase_runs.project_id AND a.ticket_id=phase_runs.ticket_id AND a.phase=phase_runs.phase AND a.attempt=phase_runs.attempt AND a.provider=phase_runs.provider AND a.model=phase_runs.model AND a.family=phase_runs.family AND a.version=phase_runs.provider_version AND a.leader_epoch=phase_runs.leader_epoch AND a.runner_epoch=phase_runs.runner_epoch AND a.expected_ticket_version=phase_runs.expected_ticket_version AND a.worktree_identity=phase_runs.worktree_identity AND a.base_sha=phase_runs.base_sha AND a.state='completed' AND a.outcome='completed')`,
 	`DELETE FROM leases WHERE scope='provider' AND EXISTS(SELECT 1 FROM provider_attempts a WHERE a.channel=leases.channel AND a.project_id=leases.project_id AND a.ticket_id=leases.ticket_id AND a.runner_epoch=leases.runner_epoch AND a.provider_lease_key=leases.scope_key AND a.state='failed' AND a.outcome='invalid_artifact')`,
 }
+
+// v30 records whether a guarded merge used classic branch protection or an
+// exact repository ruleset, plus the canonical required-check witness for the
+// latter. Existing merge intents remain classic and deliberately have no
+// ruleset check digest.
+var migrationV30 = []string{
+	`ALTER TABLE merge_intents ADD COLUMN protection_kind TEXT NOT NULL DEFAULT '' CHECK(protection_kind IN ('','classic','ruleset'))`,
+	`ALTER TABLE merge_intents ADD COLUMN protection_checks_digest TEXT NOT NULL DEFAULT ''`,
+}

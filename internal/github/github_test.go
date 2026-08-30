@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -892,6 +893,179 @@ func TestStrictProtectionPinsRulesRESTToGitHubDespiteDefaultHost(t *testing.T) {
 	})}
 	if _, err := client.strictProtection(context.Background(), contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, "main"); err != nil {
 		t.Fatalf("github-pinned rules request=%v", err)
+	}
+}
+
+func exactRepositoryRuleset() testkit.FakeRuleset {
+	return testkit.FakeRuleset{
+		ID: 42, Target: "branch", Source: "example/app", SourceType: "Repository", Enforcement: "active",
+		Conditions: &testkit.FakeRulesetConditions{RefName: &testkit.FakeRulesetRefCondition{Include: []string{"refs/heads/main"}, Exclude: []string{}}},
+		Rules: []testkit.FakeRulesetRule{
+			{Type: "pull_request", Parameters: map[string]any{"allowed_merge_methods": []any{"squash"}}},
+			{Type: "required_status_checks", Parameters: map[string]any{"strict_required_status_checks_policy": true, "required_status_checks": []any{map[string]any{"context": "ci"}, map[string]any{"context": "test-immutability"}}}},
+		},
+		BypassActors: []any{},
+	}
+}
+
+func TestStrictProtectionAcceptsExactRepositoryRuleset(t *testing.T) {
+	client, fake, identity := fixture(t)
+	if err := fake.SetRulesetsForTest(exactRepositoryRuleset()); err != nil {
+		t.Fatal(err)
+	}
+	witness, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash")
+	if err != nil || witness.Kind != "ruleset" || witness.ID != "42" || witness.ActiveRulesetCount != 1 || len(witness.Checks) != 2 || witness.ChecksDigest == "" {
+		t.Fatalf("ruleset witness=%+v err=%v", witness, err)
+	}
+}
+
+func TestMergeBindsRulesetCheckDigestIntoIntent(t *testing.T) {
+	client, fake, identity := fixture(t)
+	if err := fake.SetRulesetsForTest(exactRepositoryRuleset()); err != nil {
+		t.Fatal(err)
+	}
+	pr := createDraft(t, client, identity, "title", "body")
+	if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
+		t.Fatal(err)
+	}
+	var recorded domain.MergeIntent
+	client.mergeIntents = intentRecorderFunc(func(_ context.Context, intent domain.MergeIntent) error {
+		recorded = intent
+		return nil
+	})
+	if err := client.MergeExactHead(context.Background(), testClaim("merge", pr.Identity, pr.Identity.HeadOID, "squash"), pr.Identity, pr.Identity.HeadOID, "squash", testAuthorization(pr.Identity)); err != nil {
+		t.Fatal(err)
+	}
+	if recorded.ProtectionKind != "ruleset" || recorded.ProtectionRuleID != "42" || recorded.ProtectionChecksDigest == "" || recorded.ActiveRulesetCount != 1 || recorded.ValidateProtectionWitness() != nil {
+		t.Fatalf("ruleset merge intent=%+v", recorded)
+	}
+}
+
+func TestStrictProtectionRulesetFailsClosedForWeakOrAmbiguousPolicy(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*testkit.FakeRuleset)
+	}{
+		{"bypass", func(rule *testkit.FakeRuleset) { rule.BypassActors = []any{map[string]any{"actor_id": 1}} }},
+		{"wrong-ref", func(rule *testkit.FakeRuleset) { rule.Conditions.RefName.Include = []string{"refs/heads/release"} }},
+		{"broad-ref", func(rule *testkit.FakeRuleset) { rule.Conditions.RefName.Include = []string{"refs/heads/*"} }},
+		{"wrong-scope", func(rule *testkit.FakeRuleset) { rule.SourceType = "Organization" }},
+		{"wrong-source", func(rule *testkit.FakeRuleset) { rule.Source = "other/app" }},
+		{"wrong-method", func(rule *testkit.FakeRuleset) { rule.Rules[0].Parameters["allowed_merge_methods"] = []any{"merge"} }},
+		{"malformed-method", func(rule *testkit.FakeRuleset) {
+			rule.Rules[0].Parameters["allowed_merge_methods"] = []any{"squash", "octopus"}
+		}},
+		{"duplicate-pr", func(rule *testkit.FakeRuleset) { rule.Rules = append(rule.Rules, rule.Rules[0]) }},
+		{"duplicate-check-rule", func(rule *testkit.FakeRuleset) { rule.Rules = append(rule.Rules, rule.Rules[1]) }},
+		{"non-strict-checks", func(rule *testkit.FakeRuleset) {
+			rule.Rules[1].Parameters["strict_required_status_checks_policy"] = false
+		}},
+		{"unknown-rule", func(rule *testkit.FakeRuleset) {
+			rule.Rules = append(rule.Rules, testkit.FakeRulesetRule{Type: "required_signatures", Parameters: map[string]any{}})
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			client, fake, identity := fixture(t)
+			ruleset := exactRepositoryRuleset()
+			test.mutate(&ruleset)
+			if err := fake.SetRulesetsForTest(ruleset); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+				t.Fatalf("unsafe ruleset accepted: %v", err)
+			}
+		})
+	}
+
+	t.Run("ambiguous-relevant-rulesets", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		first, second := exactRepositoryRuleset(), exactRepositoryRuleset()
+		second.ID = 43
+		if err := fake.SetRulesetsForTest(first, second); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+			t.Fatalf("ambiguous rulesets accepted: %v", err)
+		}
+	})
+	for _, enforcement := range []string{"active", "evaluate"} {
+		t.Run("applicable-organization-ruleset-"+enforcement, func(t *testing.T) {
+			client, fake, identity := fixture(t)
+			repositoryRule, organizationRule := exactRepositoryRuleset(), exactRepositoryRuleset()
+			organizationRule.ID = 43
+			organizationRule.SourceType = "Organization"
+			organizationRule.Source = "example"
+			organizationRule.Enforcement = enforcement
+			if err := fake.SetRulesetsForTest(repositoryRule, organizationRule); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+				t.Fatalf("applicable organization ruleset accepted: %v", err)
+			}
+		})
+	}
+	t.Run("inactive-organization-ruleset", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		repositoryRule, organizationRule := exactRepositoryRuleset(), exactRepositoryRuleset()
+		organizationRule.ID = 43
+		organizationRule.SourceType = "Organization"
+		organizationRule.Source = "example"
+		organizationRule.Enforcement = "disabled"
+		if err := fake.SetRulesetsForTest(repositoryRule, organizationRule); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); err != nil {
+			t.Fatalf("inactive organization ruleset blocked exact witness: %v", err)
+		}
+	})
+}
+
+func TestStrictProtectionCanonicalizesIntegrationIDsAndRefusesMalformedValues(t *testing.T) {
+	client, fake, identity := fixture(t)
+	ruleset := exactRepositoryRuleset()
+	ruleset.Rules[1].Parameters["required_status_checks"] = []any{map[string]any{"context": "lint", "integration_id": 2}, map[string]any{"context": "ci", "integration_id": 1}}
+	if err := fake.SetRulesetsForTest(ruleset); err != nil {
+		t.Fatal(err)
+	}
+	first, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleset.Rules[1].Parameters["required_status_checks"] = []any{map[string]any{"context": "ci", "integration_id": 1}, map[string]any{"context": "lint", "integration_id": 2}}
+	if err := fake.SetRulesetsForTest(ruleset); err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash")
+	if err != nil || !sameProtectionWitness(first, second) || first.ChecksDigest != second.ChecksDigest {
+		t.Fatalf("integration check order changed first=%+v second=%+v err=%v", first, second, err)
+	}
+	for name, integration := range map[string]any{"string": "1", "zero": 0, "fraction": 1.5, "negative": -1} {
+		t.Run(name, func(t *testing.T) {
+			ruleset.Rules[1].Parameters["required_status_checks"] = []any{map[string]any{"context": "ci", "integration_id": integration}}
+			if err := fake.SetRulesetsForTest(ruleset); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+				t.Fatalf("malformed integration id accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestStrictProtectionRefusesFullRulesetPage(t *testing.T) {
+	client, fake, identity := fixture(t)
+	rulesets := make([]testkit.FakeRuleset, 100)
+	for index := range rulesets {
+		rulesets[index] = exactRepositoryRuleset()
+		rulesets[index].ID = int64(index + 1)
+		rulesets[index].Conditions.RefName.Include = []string{fmt.Sprintf("refs/heads/other-%d", index)}
+	}
+	if err := fake.SetRulesetsForTest(rulesets...); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+		t.Fatalf("full ruleset page accepted: %v", err)
 	}
 }
 

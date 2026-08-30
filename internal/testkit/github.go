@@ -47,6 +47,34 @@ type Mutation struct {
 	HeadOID   string `json:"head_oid,omitempty"`
 }
 
+// FakeRuleset mirrors the repository-ruleset payload consumed by the bounded
+// GitHub adapter. Rule parameters remain generic so malformed wire shapes can
+// be tested without making the fake more permissive than GitHub.
+type FakeRuleset struct {
+	ID           int64                  `json:"id"`
+	Target       string                 `json:"target"`
+	Source       string                 `json:"source"`
+	SourceType   string                 `json:"source_type"`
+	Enforcement  string                 `json:"enforcement"`
+	Conditions   *FakeRulesetConditions `json:"conditions"`
+	Rules        []FakeRulesetRule      `json:"rules"`
+	BypassActors []any                  `json:"bypass_actors"`
+}
+
+type FakeRulesetConditions struct {
+	RefName *FakeRulesetRefCondition `json:"ref_name"`
+}
+
+type FakeRulesetRefCondition struct {
+	Include []string `json:"include"`
+	Exclude []string `json:"exclude"`
+}
+
+type FakeRulesetRule struct {
+	Type       string         `json:"type"`
+	Parameters map[string]any `json:"parameters"`
+}
+
 // FakeGHState is JSON-serializable so a fake-gh subprocess can share it with
 // an integration test. Mutations are recorded separately from response
 // deliveries: a dropped response still leaves one applied remote mutation.
@@ -61,6 +89,8 @@ type FakeGHState struct {
 	StrictStatusChecks          bool                              `json:"strict_status_checks"`
 	AdminEnforced               bool                              `json:"admin_enforced"`
 	ActiveRulesetCount          int                               `json:"active_ruleset_count"`
+	ClassicProtection           bool                              `json:"classic_protection"`
+	Rulesets                    []FakeRuleset                     `json:"rulesets,omitempty"`
 	BypassPullRequestAllowances int                               `json:"bypass_pull_request_allowances"`
 	BypassForcePushAllowances   int                               `json:"bypass_force_push_allowances"`
 	MergeQueued                 bool                              `json:"merge_queued"`
@@ -88,6 +118,7 @@ func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, e
 		BaseHeadOID:        strings.Repeat("c", 40),
 		StrictStatusChecks: true,
 		AdminEnforced:      true,
+		ClassicProtection:  true,
 		NextPR:             1,
 		Checks:             make(map[int][]contracts.RequiredCheck),
 		ResponseScripts:    make(map[string][]ResponseMode),
@@ -129,6 +160,18 @@ func (f *FakeGH) SetProtectionWitnessForTest(strict, admin bool, bypassAllowance
 	}
 	return f.withState(func() (bool, error) {
 		f.state.StrictStatusChecks, f.state.AdminEnforced, f.state.BypassPullRequestAllowances, f.state.ActiveRulesetCount = strict, admin, bypassAllowances, rulesets
+		f.state.ClassicProtection = rulesets == 0
+		return true, nil
+	})
+}
+
+// SetRulesetsForTest installs a complete repository-ruleset list and disables
+// the classic branch-protection witness.
+func (f *FakeGH) SetRulesetsForTest(rulesets ...FakeRuleset) error {
+	return f.withState(func() (bool, error) {
+		f.state.Rulesets = append([]FakeRuleset(nil), rulesets...)
+		f.state.ActiveRulesetCount = len(rulesets)
+		f.state.ClassicProtection = false
 		return true, nil
 	})
 }
@@ -184,6 +227,9 @@ func OpenFakeGH(path string) (*FakeGH, error) {
 	}
 	if state.ResponseScripts == nil {
 		state.ResponseScripts = make(map[string][]ResponseMode)
+	}
+	if !state.ClassicProtection && state.ActiveRulesetCount == 0 && len(state.Rulesets) == 0 {
+		state.ClassicProtection = true
 	}
 	if !fakeOID(state.BaseHeadOID) {
 		state.BaseHeadOID = strings.Repeat("c", 40)
@@ -446,7 +492,8 @@ func (f *FakeGH) mergeUnchecked(identity contracts.PullRequestIdentity, headOID,
 		if f.state.PRs[index].Draft {
 			return false, errors.New("fake-gh: draft pull request cannot merge")
 		}
-		if !f.state.StrictStatusChecks || !f.state.AdminEnforced || f.state.BypassPullRequestAllowances != 0 || f.state.BypassForcePushAllowances != 0 || f.state.ActiveRulesetCount != 0 {
+		validRuleset := f.state.ActiveRulesetCount == 1 && len(f.state.Rulesets) == 1 && f.state.Rulesets[0].Enforcement == "active"
+		if !f.state.StrictStatusChecks || !f.state.AdminEnforced || f.state.BypassPullRequestAllowances != 0 || f.state.BypassForcePushAllowances != 0 || (f.state.ActiveRulesetCount != 0 && !validRuleset) {
 			return false, errors.New("fake-gh: strict protected-base enforcement is required")
 		}
 		if method != "merge" && method != "squash" && method != "rebase" {
@@ -688,6 +735,9 @@ func loadFakeGHState(path string) (FakeGHState, error) {
 	if state.ResponseScripts == nil {
 		state.ResponseScripts = make(map[string][]ResponseMode)
 	}
+	if !state.ClassicProtection && state.ActiveRulesetCount == 0 && len(state.Rulesets) == 0 {
+		state.ClassicProtection = true
+	}
 	if !fakeOID(state.BaseHeadOID) {
 		state.BaseHeadOID = strings.Repeat("c", 40)
 	}
@@ -783,15 +833,34 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 		}
 		return []byte(`[]`), nil
 	}
+	if len(argv) >= 5 && argv[0] == "api" && option(argv, "--hostname") == "github.com" && option(argv, "--method") == "GET" && strings.Contains(argv[len(argv)-1], "/rulesets") {
+		snapshot := f.Snapshot()
+		path := argv[len(argv)-1]
+		if strings.Contains(path, "/rulesets/") {
+			repositoryPath := snapshot.Repository.Owner + "/" + snapshot.Repository.Name
+			id := strings.TrimPrefix(strings.Split(path, "?")[0], "repos/"+repositoryPath+"/rulesets/")
+			for _, ruleset := range snapshot.Rulesets {
+				if fmt.Sprint(ruleset.ID) == id {
+					return json.Marshal(ruleset)
+				}
+			}
+			return []byte(`{}`), nil
+		}
+		return json.Marshal(snapshot.Rulesets)
+	}
 	if len(argv) >= 2 && argv[0] == "api" && argv[1] == "--hostname" {
 		if strings.Contains(graphqlQuery(argv), "branchProtectionRule") {
 			snapshot := f.Snapshot()
-			return json.Marshal(map[string]any{
+			value := map[string]any{
 				"data": map[string]any{"repository": map[string]any{"ref": map[string]any{"branchProtectionRule": map[string]any{
 					"id": "fake-rule-main", "pattern": "main", "requiresStrictStatusChecks": snapshot.StrictStatusChecks, "isAdminEnforced": snapshot.AdminEnforced,
 					"bypassPullRequestAllowances": map[string]int{"totalCount": snapshot.BypassPullRequestAllowances}, "bypassForcePushAllowances": map[string]int{"totalCount": snapshot.BypassForcePushAllowances},
 				}}}},
-			})
+			}
+			if !snapshot.ClassicProtection {
+				value["data"].(map[string]any)["repository"].(map[string]any)["ref"] = nil
+			}
+			return json.Marshal(value)
 		}
 		if f.Snapshot().MergeQueued {
 			return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":{"position":1}}}}}`), nil
@@ -875,7 +944,7 @@ func validateOfficialArgv(argv []string) error {
 	switch key {
 	case "api --hostname":
 		// Exact GraphQL lookup or a github.com-pinned active-rules REST lookup.
-		if len(argv) >= 6 && argv[2] == "github.com" && argv[3] == "--method" && argv[4] == "GET" && strings.HasPrefix(argv[5], "repos/") && strings.Contains(argv[5], "/rules/branches/") && strings.HasSuffix(argv[5], "?per_page=1&page=1") {
+		if len(argv) >= 6 && argv[2] == "github.com" && argv[3] == "--method" && argv[4] == "GET" && strings.HasPrefix(argv[5], "repos/") && ((strings.Contains(argv[5], "/rules/branches/") && strings.HasSuffix(argv[5], "?per_page=1&page=1")) || strings.Contains(argv[5], "/rulesets")) {
 			allowed["--method"] = true
 			break
 		}
