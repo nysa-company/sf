@@ -298,6 +298,24 @@ func TestRegisterProjectIsExactIdempotentAndSnapshotsOnStart(t *testing.T) {
 	if started.ConfigGeneration != 1 || started.ConfigDigest != project.ConfigDigest || !bytes.Equal(started.ConfigSnapshot, snapshot) {
 		t.Fatalf("started config=%+v", started)
 	}
+
+	ownedRef := domain.TicketRef{Channel: domain.ChannelDev, Project: project.ID, Ticket: "SF-owned-config-snapshot"}
+	if err := database.CreateTicket(ctx, ticket(ownedRef, "owned-config-snapshot")); err != nil {
+		t.Fatal(err)
+	}
+	ownedQueued, err := database.Ticket(ctx, ownedRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, observed, err := database.StartWithOwnership(ctx, ownedRef, ownedQueued.Version,
+		domain.Fence{LeaderEpoch: leader, RunnerEpoch: ownedQueued.RunnerEpoch},
+		"sf/dev/configured/SF-owned-config-snapshot", []LeaseRequest{{Scope: "global", Resource: "machine", Capacity: 2}}, time.Now().UTC())
+	if err != nil || observed {
+		t.Fatalf("owned=%+v observed=%v err=%v", owned, observed, err)
+	}
+	if owned.ConfigGeneration != 1 || owned.ConfigDigest != project.ConfigDigest || !bytes.Equal(owned.ConfigSnapshot, snapshot) {
+		t.Fatalf("owned start config=%+v", owned)
+	}
 }
 
 func TestMigrationTransactionRollsBackOnInterruption(t *testing.T) {

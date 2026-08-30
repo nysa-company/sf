@@ -115,7 +115,13 @@ func (s *Store) StartWithOwnership(ctx context.Context, ref domain.TicketRef, ex
 				}
 				_ = lease
 			}
-			updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state='planning', version=version+1, workflow_id=? WHERE channel=? AND project_id=? AND id=? AND state='queued' AND version=? AND runner_epoch=?`, workflowID, ref.Channel, ref.Project, ref.Ticket, expectedVersion, runner)
+			updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state='planning', version=version+1, workflow_id=?,
+				config_generation=(SELECT current_config_generation FROM projects WHERE channel=? AND id=?),
+				config_digest=COALESCE((SELECT c.digest FROM projects p JOIN project_configurations c ON c.channel=p.channel AND c.project_id=p.id AND c.generation=p.current_config_generation WHERE p.channel=? AND p.id=?), ''),
+				config_snapshot_bytes=COALESCE((SELECT c.snapshot_bytes FROM projects p JOIN project_configurations c ON c.channel=p.channel AND c.project_id=p.id AND c.generation=p.current_config_generation WHERE p.channel=? AND p.id=?), X'')
+				WHERE channel=? AND project_id=? AND id=? AND state='queued' AND version=? AND runner_epoch=?`, workflowID,
+				ref.Channel, ref.Project, ref.Channel, ref.Project, ref.Channel, ref.Project,
+				ref.Channel, ref.Project, ref.Ticket, expectedVersion, runner)
 			if err != nil {
 				return err
 			}
