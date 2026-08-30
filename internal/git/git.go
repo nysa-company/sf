@@ -32,11 +32,10 @@ var (
 	ErrUnexpectedRemote    = errors.New("remote branch head is unexpected")
 	ErrOutputBound         = errors.New("git output exceeded bound")
 	ErrWorktreeQuarantined = errors.New("created worktree could not be safely cleaned up")
-	// ErrHTTPSCredentialBoundary deliberately keeps HTTPS publication disabled
-	// until it has an argv-only credential bridge. Git credential.helper is a
-	// shell command interface, including its absolute-path form, so it cannot
-	// implement the repository command policy by itself.
-	ErrHTTPSCredentialBoundary = errors.New("HTTPS git publication requires an argv-only credential boundary")
+	// ErrHTTPSCredentialBoundary marks a refused GitHub HTTPS credential path.
+	// The accepted path is one packaged helper configured from code-owned argv;
+	// no ticket, provider, repository config, or caller text may choose it.
+	ErrHTTPSCredentialBoundary = errors.New("HTTPS git publication requires the packaged credential boundary")
 	// ErrGitHubRefCASUnavailable is returned before any gh command starts. The
 	// GitHub Git Data ref APIs expose create and force/fast-forward update, but
 	// no expected-old-SHA precondition. A read followed by either mutation would
@@ -173,11 +172,12 @@ func validRepoPath(path string) bool {
 type Runner struct {
 	Binary string
 	Home   string
-	// GHBinary and GHConfigDir are retained only to reject old configuration.
-	// Git credential.helper executes an effective shell command, so this
-	// boundary intentionally has no HTTPS credential-helper integration.
-	GHBinary    string
-	GHConfigDir string
+	// Canonical GitHub HTTPS remotes use one packaged credential helper. Git
+	// does invoke credential helpers through its command runner, so sf accepts
+	// only this trusted absolute helper path and supplies no caller text.
+	CredentialHelper string
+	GHBinary         string
+	GHConfigDir      string
 	// SSH fields enable only the fixed sf-ssh helper for the port-443 GitHub
 	// SSH URL. They are not passed to ordinary repository commands.
 	SSHHelper     string
@@ -352,6 +352,9 @@ func (r Runner) commandEnvExpected(ctx context.Context, directory string, expect
 		gitDirectory = "."
 	}
 	argv := r.commandArgs(gitDirectory, args...)
+	if helper := credentialHelperFromEnvironment(extra); helper != "" {
+		argv = append(argv, "-c", "credential.useHttpPath=true", "-c", "credential.helper="+helper)
+	}
 	argv = append(argv, args...)
 	if r.Run != nil {
 		output, err := r.Run(ctx, r.binary(), argv, env)
@@ -379,6 +382,15 @@ func (r Runner) commandEnvExpected(ctx context.Context, directory string, expect
 		return output, fmt.Errorf("git command failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return output, nil
+}
+
+func credentialHelperFromEnvironment(extra []string) string {
+	for _, entry := range extra {
+		if key, value, found := strings.Cut(entry, "="); found && key == "SF_GIT_CREDENTIAL_HELPER" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (r Runner) commandArgs(gitDirectory string, args ...string) []string {
@@ -460,9 +472,6 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	}
 	if r.Run == nil && r.binary() != "/usr/bin/git" {
 		return nil, fmt.Errorf("runner requires pinned /usr/bin/git")
-	}
-	if r.GHBinary != "" || r.GHConfigDir != "" {
-		return nil, ErrHTTPSCredentialBoundary
 	}
 	if r.Run == nil && !validAbsolutePath(r.execHelper()) {
 		return nil, fmt.Errorf("runner requires packaged absolute git execution helper")
@@ -573,6 +582,14 @@ func validExtraEnvironment(r Runner, key, value string) bool {
 	case "SSH_AUTH_SOCK":
 		return value == r.SSHAgentSock
 	case "SF_GIT_SSH_REPOSITORY":
+		return repoNameForSSH(value)
+	case "SF_GIT_CREDENTIAL_HELPER":
+		return value == r.CredentialHelper && safeCredentialHelperPath(value)
+	case "SF_GIT_GH_BINARY":
+		return value == r.GHBinary
+	case "SF_GIT_GH_CONFIG_DIR":
+		return value == r.GHConfigDir
+	case "SF_GIT_HTTPS_REPOSITORY":
 		return repoNameForSSH(value)
 	case "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME":
 		return value == "sf"
@@ -1107,8 +1124,8 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 	if err != nil {
 		return Identity{}, err
 	}
-	if strings.HasPrefix(origin, "https://") || (validAbsolutePath(origin) && !r.TestLocalTransport) {
-		return Identity{}, fmt.Errorf("%w: HTTPS and non-hermetic local origins are refused", ErrIdentityMismatch)
+	if validAbsolutePath(origin) && !r.TestLocalTransport {
+		return Identity{}, fmt.Errorf("%w: non-hermetic local origins are refused", ErrIdentityMismatch)
 	}
 	pushURLs, err := r.command(ctx, worktree, "remote", "get-url", "--all", "--push", "origin")
 	if err != nil {
@@ -1122,8 +1139,8 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 	if err != nil {
 		return Identity{}, err
 	}
-	if strings.HasPrefix(pushOrigin, "https://") || (validAbsolutePath(pushOrigin) && !r.TestLocalTransport) {
-		return Identity{}, fmt.Errorf("%w: HTTPS and non-hermetic local push origins are refused", ErrIdentityMismatch)
+	if validAbsolutePath(pushOrigin) && !r.TestLocalTransport {
+		return Identity{}, fmt.Errorf("%w: non-hermetic local push origins are refused", ErrIdentityMismatch)
 	}
 	pushOriginDev, pushOriginIno, err := localOriginIdentity(pushOrigin)
 	if err != nil {
@@ -1352,7 +1369,14 @@ func safeOrigin(raw string) (string, error) {
 		}
 		return "", fmt.Errorf("%w: credential-bearing origin refused", ErrIdentityMismatch)
 	}
-	return parsed.String(), nil
+	if parsed.Host != "github.com" || parsed.Path == "" || !validGitHubRepoPath(strings.TrimPrefix(parsed.Path, "/")) {
+		return "", fmt.Errorf("%w: noncanonical github HTTPS origin refused", ErrIdentityMismatch)
+	}
+	canonical := "https://github.com/" + strings.TrimPrefix(parsed.Path, "/")
+	if raw != canonical {
+		return "", fmt.Errorf("%w: noncanonical github HTTPS origin refused", ErrIdentityMismatch)
+	}
+	return canonical, nil
 }
 
 func validGitHubRepoPath(value string) bool {
@@ -1500,8 +1524,8 @@ func (r Runner) PreflightRepository(ctx context.Context, repository, baseRef str
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(origin, "https://") || (validAbsolutePath(origin) && !r.TestLocalTransport) {
-		return fmt.Errorf("%w: HTTPS and non-hermetic local origins are refused", ErrIdentityMismatch)
+	if validAbsolutePath(origin) && !r.TestLocalTransport {
+		return fmt.Errorf("%w: non-hermetic local origins are refused", ErrIdentityMismatch)
 	}
 	_, err = r.one(ctx, repository, "rev-parse", "--verify", baseRef+"^{commit}")
 	return err
@@ -2284,10 +2308,7 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 	if !validOID(request.ExpectedHead) || (request.ExpectedPriorHead != "" && !validOID(request.ExpectedPriorHead)) {
 		return "", fmt.Errorf("%w: invalid expected candidate head", ErrUnexpectedRemote)
 	}
-	if strings.HasPrefix(worktree.Identity.PushOrigin, "https://") {
-		return "", ErrHTTPSCredentialBoundary
-	}
-	sshEnv, _, err := r.githubSSHPushEnvironment(worktree.Identity.PushOrigin)
+	transportEnv, _, err := r.githubTransportEnvironment(worktree.Identity.PushOrigin)
 	if err != nil {
 		return "", err
 	}
@@ -2298,7 +2319,7 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 	// Every publication starts from a fresh remote observation. The local
 	// snapshot alone is insufficient: another actor may have moved BaseRef
 	// after the worktree was made but before this irreversible effect.
-	baseEnv, _, err := r.githubSSHPushEnvironment(worktree.Identity.Origin)
+	baseEnv, _, err := r.githubTransportEnvironment(worktree.Identity.Origin)
 	if err != nil {
 		return "", err
 	}
@@ -2309,7 +2330,7 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 		}
 		return "", fmt.Errorf("%w: remote base moved", ErrUnexpectedRemote)
 	}
-	remote, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, sshEnv)
+	remote, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, transportEnv)
 	if err != nil {
 		return "", err
 	}
@@ -2339,13 +2360,13 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return "", err
 	}
-	if _, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, sshEnv, "push", worktree.Identity.PushOrigin, refspec); err != nil {
+	if _, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, transportEnv, "push", worktree.Identity.PushOrigin, refspec); err != nil {
 		// The server may have accepted the ref while the response was lost. Only
 		// reconcile success when the exact expected candidate is observed.
 		if _, proveErr := r.provePushHead(ctx, worktree, request.ExpectedHead); proveErr != nil {
 			return "", err
 		}
-		observed, observeErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, sshEnv)
+		observed, observeErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, transportEnv)
 		if observeErr == nil && observed == request.ExpectedHead {
 			baseAfter, baseErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
 			if baseErr != nil {
@@ -2358,7 +2379,7 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 		}
 		return "", err
 	}
-	observed, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, sshEnv)
+	observed, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, transportEnv)
 	if err != nil {
 		return "", err
 	}
@@ -2380,7 +2401,7 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 	return request.ExpectedHead, nil
 }
 
-func (r Runner) githubSSHPushEnvironment(origin string) ([]string, bool, error) {
+func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error) {
 	if validAbsolutePath(origin) {
 		if !r.TestLocalTransport {
 			return nil, false, fmt.Errorf("%w: local transport is test-only", ErrIdentityMismatch)
@@ -2388,8 +2409,45 @@ func (r Runner) githubSSHPushEnvironment(origin string) ([]string, bool, error) 
 		return nil, false, nil
 	}
 	parsed, err := url.Parse(origin)
-	if err != nil || parsed.Scheme != "ssh" || parsed.User == nil || parsed.User.Username() != "git" || parsed.Hostname() != "ssh.github.com" || parsed.Port() != "443" || !validGitHubRepoPath(strings.TrimPrefix(parsed.Path, "/")) {
-		return nil, false, fmt.Errorf("%w: only canonical GitHub SSH publication is supported", ErrIdentityMismatch)
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: canonical GitHub transport is required", ErrIdentityMismatch)
+	}
+	if parsed.Scheme == "https" {
+		canonical, canonicalErr := safeOrigin(origin)
+		if canonicalErr != nil || canonical != origin {
+			return nil, false, fmt.Errorf("%w: canonical GitHub HTTPS transport is required", ErrIdentityMismatch)
+		}
+		for _, item := range []struct{ path, name string }{{r.CredentialHelper, "credential helper"}, {r.GHBinary, "gh binary"}, {r.GHConfigDir, "gh config directory"}} {
+			if !validAbsolutePath(item.path) {
+				return nil, false, fmt.Errorf("%w: %s is required", ErrHTTPSCredentialBoundary, item.name)
+			}
+		}
+		// Git's credential-helper protocol evaluates the configured helper via
+		// its command runner. A strict path alphabet makes the otherwise static
+		// code-owned value non-interpretable as shell syntax.
+		if !safeCredentialHelperPath(r.CredentialHelper) {
+			return nil, false, fmt.Errorf("%w: credential helper path is not shell-inert", ErrHTTPSCredentialBoundary)
+		}
+		if !r.TestLocalTransport {
+			helper, helperErr := openTrustedExecutable(r.CredentialHelper)
+			if helperErr != nil {
+				return nil, false, helperErr
+			}
+			_ = helper.Close()
+			gh, ghErr := openTrustedExecutable(r.GHBinary)
+			if ghErr != nil {
+				return nil, false, ghErr
+			}
+			_ = gh.Close()
+			if !trustedGitDirectory(r.GHConfigDir) {
+				return nil, false, fmt.Errorf("%w: gh config directory is unsafe", ErrHTTPSCredentialBoundary)
+			}
+		}
+		repository := strings.TrimSuffix(strings.TrimPrefix(parsed.Path, "/"), ".git")
+		return []string{"SF_GIT_CREDENTIAL_HELPER=" + r.CredentialHelper, "SF_GIT_GH_BINARY=" + r.GHBinary, "SF_GIT_GH_CONFIG_DIR=" + r.GHConfigDir, "SF_GIT_HTTPS_REPOSITORY=" + repository}, true, nil
+	}
+	if parsed.Scheme != "ssh" || parsed.User == nil || parsed.User.Username() != "git" || parsed.Hostname() != "ssh.github.com" || parsed.Port() != "443" || !validGitHubRepoPath(strings.TrimPrefix(parsed.Path, "/")) {
+		return nil, false, fmt.Errorf("%w: only canonical GitHub HTTPS or SSH publication is supported", ErrIdentityMismatch)
 	}
 	for _, item := range []struct{ path, name string }{{r.SSHHelper, "ssh helper"}, {r.SSHBinary, "ssh binary"}, {r.SSHKnownHosts, "known hosts"}, {r.SSHAgentSock, "agent socket"}} {
 		if !validAbsolutePath(item.path) {
@@ -2411,6 +2469,23 @@ func (r Runner) githubSSHPushEnvironment(origin string) ([]string, bool, error) 
 		}
 	}
 	return []string{"GIT_SSH=" + r.SSHHelper, "GIT_SSH_VARIANT=ssh", "SF_GIT_SSH_BINARY=" + r.SSHBinary, "SF_GIT_SSH_KNOWN_HOSTS=" + r.SSHKnownHosts, "SF_GIT_SSH_REPOSITORY=" + strings.TrimSuffix(strings.TrimPrefix(parsed.Path, "/"), ".git"), "SSH_AUTH_SOCK=" + r.SSHAgentSock}, true, nil
+}
+
+func trustedGitDirectory(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() && info.Mode().Perm()&0o022 == 0 && ownedByCurrentOrRoot(info)
+}
+
+func safeCredentialHelperPath(path string) bool {
+	if !validAbsolutePath(path) {
+		return false
+	}
+	for _, character := range path {
+		if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '/' || character == '.' || character == '_' || character == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // PublishGitHub validates the exact local candidate and the durable mutation
@@ -2515,8 +2590,8 @@ func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.Pro
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(origin, "https://") || (validAbsolutePath(origin) && !r.TestLocalTransport) {
-		return fmt.Errorf("%w: HTTPS and non-hermetic local protected origins are refused", ErrIdentityMismatch)
+	if validAbsolutePath(origin) && !r.TestLocalTransport {
+		return fmt.Errorf("%w: non-hermetic local protected origins are refused", ErrIdentityMismatch)
 	}
 	identity, err := r.snapshotExpected(ctx, witness.Repository, witness.Worktree, witness.ProtectedRef)
 	if err != nil {
@@ -2525,7 +2600,7 @@ func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.Pro
 	if identity.Repository != witness.Repository || identity.Origin != origin {
 		return fmt.Errorf("%w: protected-branch repository or origin changed", ErrIdentityMismatch)
 	}
-	extra, _, err := r.githubSSHPushEnvironment(origin)
+	extra, _, err := r.githubTransportEnvironment(origin)
 	if err != nil {
 		return err
 	}

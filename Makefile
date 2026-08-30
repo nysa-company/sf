@@ -13,6 +13,7 @@ build:
 	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=stable" -o "$(BIN_DIR)/sf" ./cmd/sf
 	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=stable" -o "$(BIN_DIR)/sf-ssh" ./cmd/sf-ssh
 	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=stable" -o "$(BIN_DIR)/sf-git-exec" ./cmd/sf-git-exec
+	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=stable" -o "$(BIN_DIR)/sf-git-credential" ./cmd/sf-git-credential
 	cp internal/gitssh/github_known_hosts "$(BIN_DIR)/github_known_hosts"
 	chmod 0644 "$(BIN_DIR)/github_known_hosts"
 
@@ -21,6 +22,7 @@ build-dev:
 	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(DEV_VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=dev" -o "$(BIN_DIR)/sf-dev" ./cmd/sf
 	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(DEV_VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=dev" -o "$(BIN_DIR)/sf-ssh-dev" ./cmd/sf-ssh
 	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(DEV_VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=dev" -o "$(BIN_DIR)/sf-git-exec-dev" ./cmd/sf-git-exec
+	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(DEV_VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=dev" -o "$(BIN_DIR)/sf-git-credential-dev" ./cmd/sf-git-credential
 	cp internal/gitssh/github_known_hosts "$(BIN_DIR)/github_known_hosts"
 	chmod 0644 "$(BIN_DIR)/github_known_hosts"
 

@@ -565,6 +565,8 @@ func TestOriginAndHooksRefuseAmbiguityAndSymlinkEscape(t *testing.T) {
 		"http://example.test/owner/repository.git",
 		"https://token@example.test/owner/repository.git",
 		"https://example.test/owner/repository.git?token=x",
+		"https://github.com/owner/repository",
+		"https://GITHUB.com/owner/repository.git",
 		"relative/repository.git",
 	} {
 		if _, err := safeOrigin(origin); !errors.Is(err, ErrIdentityMismatch) {
@@ -866,25 +868,56 @@ func slicesContainPrefix(values []string, prefix string) bool {
 	return false
 }
 
-func TestHTTPSCredentialHelperConfigurationFailsClosed(t *testing.T) {
+func TestGitHubHTTPSTransportUsesOnlyPackagedCredentialBridge(t *testing.T) {
 	root := t.TempDir()
-	runner := Runner{Home: filepath.Join(root, "git-home"), GHBinary: filepath.Join(root, "gh"), GHConfigDir: filepath.Join(root, "gh-config")}
-	if _, err := runner.one(context.Background(), root, "status"); !errors.Is(err, ErrHTTPSCredentialBoundary) {
-		t.Fatalf("credential helper configuration=%v", err)
+	var gotArgv, gotEnv []string
+	runner := Runner{
+		Binary:             "/usr/bin/git",
+		Home:               filepath.Join(root, "home"),
+		CredentialHelper:   filepath.Join(root, "sf-git-credential"),
+		GHBinary:           filepath.Join(root, "gh"),
+		GHConfigDir:        filepath.Join(root, "gh-config"),
+		TestLocalTransport: true,
+		Run: func(_ context.Context, _ string, argv, environment []string) ([]byte, error) {
+			gotArgv = append([]string(nil), argv...)
+			gotEnv = append([]string(nil), environment...)
+			return []byte("fixture\n"), nil
+		},
 	}
-	if strings.Contains(strings.Join((Runner{}).commandArgs("."), "\x00"), "credential.helper=!") {
-		t.Fatal("shell-form credential helper remains in git argv")
+	env, enabled, err := runner.githubTransportEnvironment("https://github.com/owner/repository.git")
+	if err != nil || !enabled {
+		t.Fatalf("https environment enabled=%v err=%v", enabled, err)
 	}
-	branch := "sf/dev/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef"
-	if _, err := (Runner{}).Push(context.Background(), Worktree{Branch: branch, Identity: Identity{PushOrigin: "https://example.test/owner/repository.git"}}, strings.Repeat("a", 40), contracts.GitMutationClaim{}); !errors.Is(err, ErrHTTPSCredentialBoundary) {
-		t.Fatalf("HTTPS publication did not fail closed: %v", err)
+	joined := strings.Join(env, "\x00")
+	for _, want := range []string{"SF_GIT_CREDENTIAL_HELPER=" + runner.CredentialHelper, "SF_GIT_GH_BINARY=" + runner.GHBinary, "SF_GIT_GH_CONFIG_DIR=" + runner.GHConfigDir, "SF_GIT_HTTPS_REPOSITORY=owner/repository"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q from %q", want, joined)
+		}
+	}
+	if _, err := runner.commandEnv(context.Background(), root, env, "ls-remote", "https://github.com/owner/repository.git", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(gotArgv, "\x00"), "credential.helper=!") || !slicesContain(gotArgv, "credential.helper="+runner.CredentialHelper) || !slicesContain(gotArgv, "credential.useHttpPath=true") {
+		t.Fatalf("credential helper argv=%q", gotArgv)
+	}
+	if !slicesContain(gotEnv, "SF_GIT_HTTPS_REPOSITORY=owner/repository") || slicesContainPrefix(gotEnv, "GITHUB_TOKEN=") || slicesContainPrefix(gotEnv, "GH_TOKEN=") {
+		t.Fatalf("credential helper environment=%q", gotEnv)
+	}
+	for _, origin := range []string{"https://example.test/owner/repository.git", "https://github.com/owner/repository", "https://token@github.com/owner/repository.git"} {
+		if _, _, err := runner.githubTransportEnvironment(origin); err == nil {
+			t.Fatalf("unsafe HTTPS origin accepted: %s", origin)
+		}
+	}
+	runner.CredentialHelper = filepath.Join(root, "helper;unsafe")
+	if _, _, err := runner.githubTransportEnvironment("https://github.com/owner/repository.git"); !errors.Is(err, ErrHTTPSCredentialBoundary) {
+		t.Fatalf("shell-active helper path=%v", err)
 	}
 }
 
 func TestGitHubSSHTransportUsesOnlyExactHelperEnvironment(t *testing.T) {
 	root := t.TempDir()
 	runner := Runner{SSHHelper: filepath.Join(root, "sf-ssh"), SSHBinary: filepath.Join(root, "ssh"), SSHKnownHosts: filepath.Join(root, "known-hosts"), SSHAgentSock: filepath.Join(root, "agent.sock"), TestLocalTransport: true}
-	env, enabled, err := runner.githubSSHPushEnvironment("ssh://git@ssh.github.com:443/owner/repository.git")
+	env, enabled, err := runner.githubTransportEnvironment("ssh://git@ssh.github.com:443/owner/repository.git")
 	if err != nil || !enabled {
 		t.Fatalf("ssh environment enabled=%v err=%v", enabled, err)
 	}
@@ -897,7 +930,7 @@ func TestGitHubSSHTransportUsesOnlyExactHelperEnvironment(t *testing.T) {
 	if strings.Contains(joined, "COMMAND") || strings.Contains(joined, "github.com") {
 		t.Fatalf("unconstrained ssh transport: %q", joined)
 	}
-	if _, _, err := runner.githubSSHPushEnvironment("ssh://git@github.com:22/owner/repository.git"); err == nil {
+	if _, _, err := runner.githubTransportEnvironment("ssh://git@github.com:22/owner/repository.git"); err == nil {
 		t.Fatal("non-pinned SSH host accepted")
 	}
 }
@@ -1385,7 +1418,7 @@ func TestProductionRefusesLocalOrigin(t *testing.T) {
 	}
 }
 
-func TestAuthenticationRefusesHTTPSBeforeWorktreeEffect(t *testing.T) {
+func TestAuthenticationAcceptsCanonicalGitHubHTTPSWithoutContactingRemote(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
 	rawGit(t, repository, "remote", "set-url", "origin", "https://github.com/owner/repository.git")
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-https-origin")
@@ -1393,11 +1426,9 @@ func TestAuthenticationRefusesHTTPSBeforeWorktreeEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main")); !errors.Is(err, ErrIdentityMismatch) {
-		t.Fatalf("HTTPS create=%v", err)
-	}
-	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("HTTPS origin created worktree: %v", err)
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if err != nil || worktree.Identity.Origin != "https://github.com/owner/repository.git" || worktree.Identity.PushOrigin != worktree.Identity.Origin {
+		t.Fatalf("HTTPS create=%+v err=%v", worktree, err)
 	}
 }
 
