@@ -25,6 +25,8 @@ import (
 
 var ErrUnclear = errors.New("provider process drain is unclear")
 
+const maxDrainDuration = 30 * time.Second
+
 // LaunchRecorder persists the exact child identity before the gate is opened.
 // Implementations must fail closed; a supervisor never releases a child after
 // recorder failure.
@@ -292,6 +294,9 @@ func validCodexInvocation(invocation contracts.Invocation, identity domain.Provi
 }
 
 func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, invocation contracts.Invocation, input contracts.PhaseInput) (contracts.CommandResult, error) {
+	if s == nil || s.SoftDrain <= 0 || s.HardDrain <= 0 || s.SoftDrain > maxDrainDuration || s.HardDrain > maxDrainDuration {
+		return contracts.CommandResult{}, errors.New("provider drain durations exceed the machine bound")
+	}
 	if len(invocation.Argv) == 0 || !filepath.IsAbs(invocation.Argv[0]) || input.Worktree == "" || filepath.Clean(input.Worktree) != input.Worktree {
 		return contracts.CommandResult{}, errors.New("guarded argv and worktree required")
 	}
@@ -424,8 +429,14 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	case runErr = <-wait:
 	case <-ctx.Done():
 		runErr = ctx.Err()
-		_ = s.terminate(r)
-		<-wait
+		if terminateErr := s.terminate(r); terminateErr != nil {
+			return contracts.CommandResult{}, terminateErr
+		}
+		select {
+		case <-wait:
+		case <-time.After(maxDrainDuration):
+			return contracts.CommandResult{}, ErrUnclear
+		}
 	}
 	if err := s.proveGone(r); err != nil {
 		return contracts.CommandResult{}, err
@@ -606,6 +617,9 @@ func privateExistingDirectory(path string) error {
 	return nil
 }
 func (s *Supervisor) Drain(ctx context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
+	if s == nil || s.SoftDrain <= 0 || s.HardDrain <= 0 || s.SoftDrain > maxDrainDuration || s.HardDrain > maxDrainDuration {
+		return contracts.DrainProof{}, ErrUnclear
+	}
 	s.mu.Lock()
 	r := s.runs[key(request)]
 	s.mu.Unlock()
@@ -625,6 +639,9 @@ func (s *Supervisor) Drain(ctx context.Context, request contracts.DrainRequest) 
 // DrainPersisted is restart recovery: it accepts only the exact durable
 // PID/PGID identity published through the launch gate.
 func (s *Supervisor) DrainPersisted(ctx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) (contracts.DrainProof, error) {
+	if s == nil || s.SoftDrain <= 0 || s.HardDrain <= 0 || s.SoftDrain > maxDrainDuration || s.HardDrain > maxDrainDuration {
+		return contracts.DrainProof{}, ErrUnclear
+	}
 	if launch.PID <= 0 || launch.PGID <= 0 || launch.PID != launch.PGID || launch.BootIdentity == "" || launch.ProcessStartIdentity == "" {
 		return contracts.DrainProof{}, ErrUnclear
 	}
@@ -636,10 +653,9 @@ func (s *Supervisor) DrainPersisted(ctx context.Context, request contracts.Drain
 		return s.Signer.ProveDrained(request) // reboot proves every old group gone.
 	}
 	if leaderErr := syscall.Kill(launch.PID, 0); leaderErr == syscall.ESRCH {
-		groupErr := syscall.Kill(-launch.PGID, 0)
-		if missingLeaderGroupGone(leaderErr, groupErr) {
-			return s.Signer.ProveDrained(request) // leader and every group member are gone.
-		}
+		// A missing leader plus an absent old group is not proof that a child
+		// escaped with setsid/double-fork. Without an independent durable
+		// descendant witness, retain quarantine rather than releasing it.
 		return contracts.DrainProof{}, ErrUnclear
 	} else if leaderErr != nil {
 		return contracts.DrainProof{}, ErrUnclear
@@ -690,6 +706,17 @@ func persistedIdentityMatches(launch contracts.ProviderLaunch, observed string, 
 	return launch.PID > 0 && launch.PID == launch.PGID && launch.BootIdentity != "" && launch.ProcessStartIdentity != "" && observed == launch.ProcessStartIdentity && observedPGID == launch.PGID
 }
 func (s *Supervisor) terminate(r *run) error {
+	if r == nil || r.identity.PID <= 0 || r.identity.PGID != r.identity.PID {
+		return ErrUnclear
+	}
+	select {
+	case <-r.done:
+		return nil
+	default:
+	}
+	if err := validateLiveIdentity(r.identity); err != nil {
+		return err
+	}
 	_ = signalGroup(r.identity.PGID, syscall.SIGTERM)
 	select {
 	case <-r.done:
@@ -703,6 +730,24 @@ func (s *Supervisor) terminate(r *run) error {
 	case <-time.After(s.HardDrain):
 		return ErrUnclear
 	}
+}
+
+func validateLiveIdentity(identity Identity) error {
+	if identity.PID <= 0 || identity.PGID != identity.PID || identity.BootIdentity == "" || identity.ProcessStartIdentity == "" {
+		return ErrUnclear
+	}
+	if err := syscall.Kill(identity.PID, 0); err != nil {
+		return ErrUnclear
+	}
+	pgid, err := syscall.Getpgid(identity.PID)
+	if err != nil || pgid != identity.PGID {
+		return ErrUnclear
+	}
+	start, err := processStartIdentity(identity.PID)
+	if err != nil || start != identity.ProcessStartIdentity {
+		return ErrUnclear
+	}
+	return nil
 }
 func (s *Supervisor) proveGone(r *run) error {
 	select {

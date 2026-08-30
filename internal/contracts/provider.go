@@ -51,6 +51,13 @@ type PhaseResult struct {
 	// pricing or reservation policy.
 	TokenUsageTrusted bool
 	TokenUsage        int64
+	// Individual provider-reported counters are retained for observability.
+	// They are never interpreted as currency and are not used for budget
+	// enforcement without a separately snapshotted pricing policy.
+	TokenInputTokens     int64
+	TokenCachedTokens    int64
+	TokenOutputTokens    int64
+	TokenReasoningTokens int64
 }
 
 // Invocation is an argv-only adapter proposal. The supervisor is the sole

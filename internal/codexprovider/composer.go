@@ -88,7 +88,16 @@ func defaultProfiles() []Config {
 			authHome = filepath.Join(home, ".codex")
 		}
 	}
+	// The supported independent pair is explicit in code and can be overridden
+	// only by the operator's local configuration environment. Qualification is
+	// still mandatory for both identities; defaults never imply readiness.
 	builderModel, reviewerModel := os.Getenv("SF_CODEX_BUILDER_MODEL"), os.Getenv("SF_CODEX_REVIEWER_MODEL")
+	if builderModel == "" {
+		builderModel = "gpt-5.6-luna"
+	}
+	if reviewerModel == "" {
+		reviewerModel = "gpt-5.5"
+	}
 	builderFamily, builderOK := familyForModel(builderModel)
 	reviewerFamily, reviewerOK := familyForModel(reviewerModel)
 	if !builderOK || !reviewerOK || builderFamily == reviewerFamily {

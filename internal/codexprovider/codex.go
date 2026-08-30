@@ -88,6 +88,61 @@ type QualificationFixture interface {
 	Run(context.Context, *Adapter) ([]string, error)
 }
 
+// sealedQualificationFixture is intentionally unimplementable outside this
+// package: the unexported method prevents an adapter (or a project config) from
+// manufacturing a passing qualification fixture merely by copying its public
+// digest.  Production qualification uses LocalQualificationFixture; tests may
+// use an in-package deterministic fixture.
+type sealedQualificationFixture interface {
+	QualificationFixture
+	qualificationFixtureSeal()
+}
+
+// LocalQualificationFixture runs the bounded, credential-free qualification
+// probes owned by this adapter.  It never invokes `codex exec`, and therefore
+// never spends model tokens.  The caller still chooses the channel and stores
+// the resulting verdict durably through Qualify.
+func LocalQualificationFixture() QualificationFixture { return localQualificationFixture{} }
+
+type localQualificationFixture struct{}
+
+func (localQualificationFixture) Digest() string            { return fixtureDigest() }
+func (localQualificationFixture) qualificationFixtureSeal() {}
+
+func (localQualificationFixture) Run(ctx context.Context, adapter *Adapter) ([]string, error) {
+	if adapter == nil || adapter.runner == nil {
+		return []string{"configuration"}, ErrUnsafeConfiguration
+	}
+	// ProbeRunner is deliberately the same bounded runner used for version and
+	// auth probes. These checks inspect the installed CLI and Seatbelt profile;
+	// they do not call a model or touch the network outside the denied command.
+	probe := func(name string, args []string, env []string, expect func(auth.ProbeResult) bool) error {
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		result, err := adapter.runner.Probe(probeCtx, adapter.executable, args, env, maxProbeOutput)
+		if err != nil || !expect(result) {
+			return fmt.Errorf("qualification probe %s failed", name)
+		}
+		return nil
+	}
+	// `codex sandbox` is a local command runner, not `codex exec`; no model is
+	// selected and stdin is not supplied. Read-only and workspace-write are
+	// measured independently so a profile accidentally widening access fails.
+	readOnly := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":read-only"`, "-c", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="read"}`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/bin/sh", "-c", "test -r /etc/hosts && ! test -w /etc/hosts"}
+	if err := probe("sandbox_read", readOnly, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode == 0 }); err != nil {
+		return []string{"sandbox_read"}, nil
+	}
+	writeDenied := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":read-only"`, "-c", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="read"}`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/bin/sh", "-c", "test -w /etc/hosts"}
+	if err := probe("sandbox_write_denied", writeDenied, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode != 0 }); err != nil {
+		return []string{"sandbox_write_denied"}, nil
+	}
+	workspace := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":workspace"`, "-c", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="write"}`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/bin/sh", "-c", "test -w ."}
+	if err := probe("sandbox_workspace_write", workspace, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode == 0 }); err != nil {
+		return []string{"sandbox_workspace_write"}, nil
+	}
+	return nil, nil
+}
+
 // Qualify records a guarded-only verdict after identity, version, binary
 // digest, supported exec flags, authentication availability, and the pinned
 // hostile-fixture digest have all been observed. Autonomous eligibility is
@@ -95,6 +150,9 @@ type QualificationFixture interface {
 // proof exists.
 func Qualify(ctx context.Context, database *store.Store, channel domain.Channel, adapter *Adapter, fixture QualificationFixture) (store.ProviderQualification, error) {
 	if database == nil || !channel.Valid() || adapter == nil || fixture == nil || fixture.Digest() != fixtureDigest() {
+		return store.ProviderQualification{}, ErrUnsafeConfiguration
+	}
+	if _, sealed := fixture.(sealedQualificationFixture); !sealed {
 		return store.ProviderQualification{}, ErrUnsafeConfiguration
 	}
 	binding, err := adapter.Binding(ctx)
@@ -105,7 +163,10 @@ func Qualify(ctx context.Context, database *store.Store, channel domain.Channel,
 	if fixtureErr != nil {
 		failed = append(failed, "fixture_execution")
 	}
-	failed = normalizeProbes(failed)
+	failed, err = normalizeProbes(failed)
+	if err != nil {
+		return store.ProviderQualification{}, err
+	}
 	profile, reason := store.QualificationGuarded, ""
 	if len(failed) != 0 {
 		profile, reason = store.QualificationDisabled, "hostile_fixture_failed"
@@ -251,7 +312,7 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	if result.ExitCode != 0 {
 		return contracts.PhaseResult{}, fmt.Errorf("codex exec exited %d", result.ExitCode)
 	}
-	transcript, usage, usageTrusted, err := parseJSONL(result.Stdout, result.Stderr)
+	transcript, usage, usageTrusted, usageDetail, err := parseJSONL(result.Stdout, result.Stderr)
 	if err != nil {
 		return contracts.PhaseResult{}, err
 	}
@@ -262,7 +323,7 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	// Codex reports token counts, not an authoritative monetary charge. Keep
 	// them observable but leave the micro-USD charge untrusted until a
 	// snapshotted pricing/reservation policy exists.
-	return contracts.PhaseResult{Outcome: "completed", Artifact: artifact, Transcript: transcript, Provider: input.Provider, TokenUsageTrusted: usageTrusted, TokenUsage: usage}, nil
+	return contracts.PhaseResult{Outcome: "completed", Artifact: artifact, Transcript: transcript, Provider: input.Provider, TokenUsageTrusted: usageTrusted, TokenUsage: usage, TokenInputTokens: usageDetail.input, TokenCachedTokens: usageDetail.cached, TokenOutputTokens: usageDetail.output, TokenReasoningTokens: usageDetail.reasoning}, nil
 }
 
 func (a *Adapter) version(ctx context.Context) (string, error) {
@@ -382,41 +443,50 @@ func qualificationRunID() (string, error) {
 	return hex.EncodeToString(value[:]), nil
 }
 
-func normalizeProbes(values []string) []string {
+func normalizeProbes(values []string) ([]string, error) {
+	known := map[string]struct{}{
+		"configuration": {}, "sandbox_read": {}, "sandbox_write_denied": {}, "sandbox_workspace_write": {},
+		"version": {}, "capabilities": {}, "authentication": {}, "fixture_execution": {},
+		"binary": {}, "network": {}, "root_denied": {}, "auth_denied": {}, "argv": {}, "jsonl": {},
+	}
 	set := map[string]struct{}{}
 	for _, value := range values {
-		if len(value) == 0 || len(value) > 64 {
-			continue
+		if len(value) == 0 || len(value) > 64 || !qualificationProbeName.MatchString(value) {
+			return nil, ErrUnsafeConfiguration
 		}
-		valid := value[0] >= 'a' && value[0] <= 'z'
-		for _, character := range value[1:] {
-			valid = valid && (character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_')
+		if _, ok := known[value]; !ok {
+			return nil, ErrUnsafeConfiguration
 		}
-		if valid {
-			set[value] = struct{}{}
-		}
+		set[value] = struct{}{}
 	}
 	result := make([]string, 0, len(set))
 	for value := range set {
 		result = append(result, value)
 	}
 	sort.Strings(result)
-	return result
+	return result, nil
 }
 
-func parseJSONL(stdout, stderr []byte) (string, int64, bool, error) {
+var qualificationProbeName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+
+type tokenUsage struct {
+	input, cached, output, reasoning int64
+}
+
+func parseJSONL(stdout, stderr []byte) (string, int64, bool, tokenUsage, error) {
 	if len(stdout) == 0 || len(stdout) > maxJSONL {
-		return "", 0, false, ErrOutputTooLarge
+		return "", 0, false, tokenUsage{}, ErrOutputTooLarge
 	}
 	lines := bytes.Split(bytes.TrimSpace(stdout), []byte{'\n'})
 	if len(lines) == 0 || len(lines) > maxEvents {
-		return "", 0, false, ErrMalformedJSONL
+		return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 	}
 	var usage int64
+	var detail tokenUsage
 	usageTrusted := false
 	for _, line := range lines {
 		if len(line) == 0 || len(line) > maxJSONL {
-			return "", 0, false, ErrMalformedJSONL
+			return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 		}
 		var event struct {
 			Type string `json:"type"`
@@ -429,47 +499,49 @@ func parseJSONL(stdout, stderr []byte) (string, int64, bool, error) {
 		}
 		decoder := json.NewDecoder(bytes.NewReader(line))
 		if err := decoder.Decode(&event); err != nil || event.Type == "" {
-			return "", 0, false, ErrMalformedJSONL
+			return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 		}
 		var extra any
 		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-			return "", 0, false, ErrMalformedJSONL
+			return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 		}
 		if event.Type == "error" {
-			return "", 0, false, errors.New("codex returned a structured error")
+			return "", 0, false, tokenUsage{}, errors.New("codex returned a structured error")
 		}
 		if event.Type == "turn.completed" && len(event.Usage) != 0 {
-			units, valid := parseUsage(event.Usage)
+			units, input, cached, output, reasoning, valid := parseUsage(event.Usage)
 			if !valid || usageTrusted {
-				return "", 0, false, ErrMalformedJSONL
+				return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 			}
-			usage, usageTrusted = units, true
+			usage, detail, usageTrusted = units, tokenUsage{input: input, cached: cached, output: output, reasoning: reasoning}, true
 		}
 	}
 	transcript := redact.String(string(stdout) + "\n" + string(stderr))
 	if len(transcript) > maxJSONL {
 		transcript = transcript[:maxJSONL]
 	}
-	return transcript, usage, usageTrusted, nil
+	return transcript, usage, usageTrusted, detail, nil
 }
 
-func parseUsage(raw json.RawMessage) (int64, bool) {
+func parseUsage(raw json.RawMessage) (int64, int64, int64, int64, int64, bool) {
 	if len(raw) == 0 || len(raw) > 4096 {
-		return 0, false
+		return 0, 0, 0, 0, 0, false
 	}
 	var value struct {
-		InputTokens  json.Number `json:"input_tokens"`
-		OutputTokens json.Number `json:"output_tokens"`
-		TotalTokens  json.Number `json:"total_tokens"`
+		InputTokens     json.Number `json:"input_tokens"`
+		CachedTokens    json.Number `json:"cached_input_tokens"`
+		OutputTokens    json.Number `json:"output_tokens"`
+		ReasoningTokens json.Number `json:"reasoning_tokens"`
+		TotalTokens     json.Number `json:"total_tokens"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
-		return 0, false
+		return 0, 0, 0, 0, 0, false
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return 0, false
+		return 0, 0, 0, 0, 0, false
 	}
 	parse := func(number json.Number) (int64, bool) {
 		if number == "" {
@@ -479,19 +551,21 @@ func parseUsage(raw json.RawMessage) (int64, bool) {
 		return result, err == nil && result >= 0
 	}
 	input, okInput := parse(value.InputTokens)
+	cached, okCached := parse(value.CachedTokens)
 	output, okOutput := parse(value.OutputTokens)
+	reasoning, okReasoning := parse(value.ReasoningTokens)
 	total, okTotal := parse(value.TotalTokens)
-	if !okInput || !okOutput || !okTotal || input > 1<<50 || output > 1<<50 || total > 1<<50 {
-		return 0, false
+	if !okInput || !okCached || !okOutput || !okReasoning || !okTotal || input > 1<<50 || cached > 1<<50 || output > 1<<50 || reasoning > 1<<50 || total > 1<<50 {
+		return 0, 0, 0, 0, 0, false
 	}
 	if value.TotalTokens != "" {
-		if value.InputTokens != "" && value.OutputTokens != "" && total != input+output {
-			return 0, false
+		if value.InputTokens != "" && value.OutputTokens != "" && total != input+cached+output {
+			return 0, 0, 0, 0, 0, false
 		}
-		return total, total > 0
+		return total, input, cached, output, reasoning, total > 0
 	}
-	if value.InputTokens == "" || value.OutputTokens == "" || input+output <= 0 {
-		return 0, false
+	if value.InputTokens == "" || value.OutputTokens == "" || input+cached+output <= 0 {
+		return 0, 0, 0, 0, 0, false
 	}
-	return input + output, true
+	return input + cached + output, input, cached, output, reasoning, true
 }

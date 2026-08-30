@@ -52,7 +52,8 @@ type fixture struct {
 	err    error
 }
 
-func (f fixture) Digest() string { return fixtureDigest() }
+func (f fixture) Digest() string            { return fixtureDigest() }
+func (f fixture) qualificationFixtureSeal() {}
 func (f fixture) Run(context.Context, *Adapter) ([]string, error) {
 	return append([]string(nil), f.failed...), f.err
 }
@@ -91,9 +92,9 @@ func TestCodexParseRejectsMalformedOversizedAndNonzeroOutput(t *testing.T) {
 	adapter, _ := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
 	identity, _ := adapter.Probe(context.Background())
 	input := contracts.PhaseInput{Provider: identity}
-	valid := []byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"schema\\\":\\\"sf.builder/v1\\\"}\"},\"future\":true}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":8,\"total_tokens\":20}}\n")
+	valid := []byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"intermediate\"},\"future\":true}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"final is in output-last-message\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"cached_input_tokens\":3,\"output_tokens\":8,\"reasoning_tokens\":5,\"total_tokens\":23}}\n")
 	result, err := adapter.Parse(context.Background(), input, contracts.CommandResult{ExitCode: 0, Stdout: valid, OutputLastMessage: []byte(`{"schema":"sf.builder/v1"}`), Stderr: []byte("progress password=keep-out")})
-	if err != nil || string(result.Artifact) != `{"schema":"sf.builder/v1"}` || result.UsageTrusted || result.UsageUnits != 0 || !result.TokenUsageTrusted || result.TokenUsage != 20 || strings.Contains(result.Transcript, "keep-out") {
+	if err != nil || string(result.Artifact) != `{"schema":"sf.builder/v1"}` || result.UsageTrusted || result.UsageUnits != 0 || !result.TokenUsageTrusted || result.TokenUsage != 23 || result.TokenInputTokens != 12 || result.TokenCachedTokens != 3 || result.TokenOutputTokens != 8 || result.TokenReasoningTokens != 5 || strings.Contains(result.Transcript, "keep-out") {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	for _, command := range []contracts.CommandResult{
@@ -176,9 +177,12 @@ func TestCodexQualificationBindsFixtureAndBinaryDigest(t *testing.T) {
 	if err != nil || passed.Profile != store.QualificationGuarded || passed.Provider.Provider != "codex" || passed.FixtureDigest != fixtureDigest() {
 		t.Fatalf("passed=%+v err=%v", passed, err)
 	}
-	failed, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, fixture{failed: []string{"network", "network", "bad-value"}})
+	failed, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, fixture{failed: []string{"network", "network"}})
 	if err != nil || failed.Profile != store.QualificationDisabled || !reflect.DeepEqual(failed.FailedProbes, []string{"network"}) {
 		t.Fatalf("failed=%+v err=%v", failed, err)
+	}
+	if _, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, fixture{failed: []string{"unknown_probe"}}); !errors.Is(err, ErrUnsafeConfiguration) {
+		t.Fatalf("unknown probe accepted: %v", err)
 	}
 	if _, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, wrongFixture{}); !errors.Is(err, ErrUnsafeConfiguration) {
 		t.Fatalf("fixture digest mismatch err=%v", err)
@@ -196,6 +200,7 @@ func TestCodexQualificationBindsFixtureAndBinaryDigest(t *testing.T) {
 type wrongFixture struct{}
 
 func (wrongFixture) Digest() string                                  { return strings.Repeat("0", 64) }
+func (wrongFixture) qualificationFixtureSeal()                       {}
 func (wrongFixture) Run(context.Context, *Adapter) ([]string, error) { return nil, nil }
 
 func TestCodexRejectsHostileWorktreeAndPrompt(t *testing.T) {
