@@ -95,6 +95,15 @@ type faultingSupervisor struct {
 	onDrain func()
 }
 
+type ambiguousRunSupervisor struct{ *testkit.Supervisor }
+
+func (s ambiguousRunSupervisor) Run(context.Context, contracts.DrainRequest, contracts.Invocation, contracts.PhaseInput) (contracts.CommandResult, error) {
+	return contracts.CommandResult{}, errors.New("supervisor failed after possible pre-exec child creation")
+}
+func (s ambiguousRunSupervisor) Drain(context.Context, contracts.DrainRequest) (contracts.DrainProof, error) {
+	return contracts.DrainProof{}, errors.New("operator drain proof required")
+}
+
 func (s faultingSupervisor) Drain(ctx context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
 	if s.onDrain != nil {
 		s.onDrain()
@@ -105,7 +114,7 @@ func (s faultingSupervisor) Drain(ctx context.Context, request contracts.DrainRe
 func TestPersistenceFailureLatchesCoordinatorAndPreservesActiveClaim(t *testing.T) {
 	var database *store.Store
 	supervisor := &faultingSupervisor{Supervisor: testkit.NewSupervisor()}
-	database, request, coordinator, ref := newCoordinatorFixture(t, supervisor)
+	database, request, coordinator, ref, _ := newCoordinatorFixture(t, supervisor)
 	supervisor.onDrain = func() {
 		database.SetWriteFaultForTest(func() error { return errors.New("injected quarantine write failure") })
 	}
@@ -123,7 +132,7 @@ func TestPersistenceFailureLatchesCoordinatorAndPreservesActiveClaim(t *testing.
 	}
 }
 
-func newCoordinatorFixture(t *testing.T, supervisor contracts.ProcessSupervisor) (*store.Store, Request, *Coordinator, domain.TicketRef) {
+func newCoordinatorFixture(t *testing.T, supervisor contracts.ProcessSupervisor) (*store.Store, Request, *Coordinator, domain.TicketRef, *testkit.ScriptedProvider) {
 	t.Helper()
 	ctx := context.Background()
 	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "db.sqlite"))
@@ -176,7 +185,32 @@ func newCoordinatorFixture(t *testing.T, supervisor contracts.ProcessSupervisor)
 		t.Fatal(err)
 	}
 	request := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: `{"repository":"/tmp/p"}`, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: 200 * time.Millisecond, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}}
-	return database, request, coordinator, ref
+	return database, request, coordinator, ref, primary
+}
+
+func TestInvocationFailureClosesPreLaunchClaimWithoutQuarantine(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.InvocationErr = errors.New("adapter rejected input before launch")
+	result := coordinator.Run(context.Background(), request)
+	if len(result.Attempts) == 0 || result.Attempts[0].ErrorCode != "provider_invocation_failed" {
+		t.Fatalf("invocation failure receipt=%+v", result)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) == 0 || attempts[0].State != "failed" || attempts[0].Outcome != "invocation_failed" {
+		t.Fatalf("pre-launch attempt=%+v err=%v", attempts, err)
+	}
+}
+
+func TestSupervisorRunAmbiguityRemainsQuarantinedForOperatorRecovery(t *testing.T) {
+	database, request, coordinator, ref, _ := newCoordinatorFixture(t, ambiguousRunSupervisor{Supervisor: testkit.NewSupervisor()})
+	result := coordinator.Run(context.Background(), request)
+	if !result.NeedsOperator {
+		t.Fatalf("ambiguous supervisor failure was not escalated: %+v", result)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "quarantined" || attempts[0].Outcome != "undrained" {
+		t.Fatalf("post-spawn ambiguity was released instead of quarantined: %+v err=%v", attempts, err)
+	}
 }
 
 func recordQualForFixture(database *store.Store, provider *testkit.ScriptedProvider) error {

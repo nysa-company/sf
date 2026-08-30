@@ -256,17 +256,29 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		}
 		input = claim.Input
 		invocation, invokeErr := p.Invocation(attemptCtx, input)
+		if invokeErr != nil {
+			// Invocation is adapter-only and occurs before the supervisor owns a
+			// child. This is the sole definite no-process failure path; every
+			// supervisor.Run error remains quarantined because pre-exec may have
+			// already created a provider process group.
+			cancel()
+			finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			finishErr := c.store.FailProviderAttemptBeforeLaunch(finishCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
+			finishCancel()
+			receipts = append(receipts, Receipt{Attempt: claim.Attempt, Provider: binding.Identity, ErrorCode: "provider_invocation_failed"})
+			if finishErr != nil {
+				c.markPersistenceFailure(finishErr)
+				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: true}
+			}
+			continue
+		}
 		var raw contracts.PhaseResult
 		var runErr error
-		if invokeErr != nil {
-			runErr = invokeErr
+		commandResult, commandErr := c.supervisor.Run(attemptCtx, drainRequest(claim), invocation, input)
+		if commandErr != nil {
+			runErr = commandErr
 		} else {
-			commandResult, commandErr := c.supervisor.Run(attemptCtx, drainRequest(claim), invocation, input)
-			if commandErr != nil {
-				runErr = commandErr
-			} else {
-				raw, runErr = p.Parse(attemptCtx, input, commandResult)
-			}
+			raw, runErr = p.Parse(attemptCtx, input, commandResult)
 		}
 		cancel()
 		cancelled := ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)

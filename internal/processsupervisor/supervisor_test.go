@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -101,6 +100,17 @@ func TestDrainContextHonorsCallerDeadlineAndTotalBudget(t *testing.T) {
 	}
 }
 
+func TestDrainContextRejectsDurationsAboveTotalMachineCap(t *testing.T) {
+	supervisor, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor.SoftDrain, supervisor.HardDrain = 20*time.Second, 20*time.Second
+	if _, _, err := supervisor.drainContext(context.Background()); !errors.Is(err, ErrUnclear) {
+		t.Fatalf("20s+20s drain exceeded total cap but was accepted: %v", err)
+	}
+}
+
 func TestDrainPersistedLeaderGoneAfterSetsidRemainsUnclear(t *testing.T) {
 	supervisor, err := New(nil)
 	if err != nil {
@@ -185,12 +195,8 @@ func TestRecoveryLivenessRules(t *testing.T) {
 	if !bootIdentityChanged("linux:old-boot", "linux:new-boot") {
 		t.Fatal("reboot did not prove the old process namespace dead")
 	}
-	if !missingLeaderGroupGone(syscall.ESRCH, syscall.ESRCH) {
-		t.Fatal("missing leader with no group members did not release")
-	}
-	if missingLeaderGroupGone(syscall.ESRCH, nil) || missingLeaderGroupGone(syscall.ESRCH, errors.New("foreign group")) {
-		t.Fatal("surviving or foreign group was released")
-	}
+	// A missing leader is deliberately ambiguous: v1 has no durable witness
+	// for a setsid/double-fork writer outside the recorded process group.
 }
 
 func TestReadBoundedFileDoesNotFollowCredentialSymlink(t *testing.T) {

@@ -397,6 +397,45 @@ func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttempt
 	})
 }
 
+// FailProviderAttemptBeforeLaunch releases a claim only when adapter
+// invocation failed before any process was handed to the supervisor. Any
+// supervisor.Run error remains ambiguous because a child may have crossed the
+// pre-exec gate; callers must quarantine that path and leave recovery to an
+// operator-backed drain proof.
+func (s *Store) FailProviderAttemptBeforeLaunch(ctx context.Context, claim ProviderAttemptClaim, expected uint64, fence domain.Fence, at time.Time) error {
+	if claim.ID <= 0 || claim.ExpectedVersion != expected || claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch || claim.RequestDigest == "" || at.IsZero() {
+		return ErrProviderAttempt
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		var version, runner uint64
+		if err := conn.QueryRowContext(ctx, `SELECT version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&version, &runner); err != nil {
+			return err
+		}
+		if version != expected {
+			return ErrStaleFence
+		}
+		if err := s.currentFence(ctx, conn, claim.Ref.Channel, version, runner, fence); err != nil {
+			return err
+		}
+		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='failed',outcome='invocation_failed',finished_at=?,launch_state='drained' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=? AND provider_lease_key=? AND state='active' AND launch_state='launching' AND process_pid=0 AND process_pgid=0 AND process_boot_identity='' AND process_start_identity='' AND EXISTS(SELECT 1 FROM provider_attempt_inputs WHERE provider_attempt_id=provider_attempts.id AND request_digest=?)`, at.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest, claim.LeaseKey, claim.RequestDigest)
+		if err != nil {
+			return err
+		}
+		if n, _ := row.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		row, err = conn.ExecContext(ctx, `UPDATE phase_runs SET state='failed',completed_at=?,outcome='invocation_failed' WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND state='active' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND provider=? AND model=? AND family=? AND provider_version=?`, at.UTC().Format(time.RFC3339Nano), claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version)
+		if err != nil {
+			return err
+		}
+		if n, _ := row.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		_, err = conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND scope='provider' AND scope_key=? AND project_id=? AND ticket_id=? AND runner_epoch=?`, claim.Ref.Channel, claim.LeaseKey, claim.Ref.Project, claim.Ref.Ticket, claim.RunnerEpoch)
+		return err
+	})
+}
+
 // QuarantineProviderAttempt keeps a fenced claim and its capacity reserved
 // when the supervisor cannot prove that the provider is drained. It is
 // intentionally terminal only for the attempt row; the active phase remains

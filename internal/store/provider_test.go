@@ -147,6 +147,33 @@ func TestBeginProviderAttemptRejectsInvalidDirectLaunchInput(t *testing.T) {
 	}
 }
 
+func TestFailProviderAttemptBeforeLaunchClosesExactClaimAndReleasesLease(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "invocation-failure")
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-invocation-failure", leader), leader, domain.StateBuilding)
+	builder, _ := setupProviderPair(t, db, ctx)
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FailProviderAttemptBeforeLaunch(ctx, claim, ticket.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "failed" || attempts[0].Outcome != "invocation_failed" {
+		t.Fatalf("attempt=%+v err=%v", attempts, err)
+	}
+	var phaseState, phaseOutcome string
+	if err := db.db.QueryRowContext(ctx, `SELECT state,outcome FROM phase_runs WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&phaseState, &phaseOutcome); err != nil || phaseState != "failed" || phaseOutcome != "invocation_failed" {
+		t.Fatalf("phase=%s/%s err=%v", phaseState, phaseOutcome, err)
+	}
+	leases, err := db.Leases(ctx, domain.ChannelDev)
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("pre-launch provider lease was retained: %+v err=%v", leases, err)
+	}
+}
+
 func TestReviewerMayBeFreshTwiceButNeverShareBuilderFamily(t *testing.T) {
 	db, ctx := openTestStore(t)
 	digest := setupProviderProject(t, db, ctx)

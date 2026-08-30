@@ -56,13 +56,14 @@ type ProviderStep struct {
 // network. It records calls and consumes one step per phase, making fallback
 // and retry counts directly assertable.
 type ScriptedProvider struct {
-	mu       sync.Mutex
-	Identity domain.ProviderIdentity
-	Steps    map[domain.Phase][]ProviderStep
-	Default  ProviderStep
-	Calls    []domain.Phase
-	Clock    *FakeClock
-	Crash    *CrashController
+	mu            sync.Mutex
+	Identity      domain.ProviderIdentity
+	Steps         map[domain.Phase][]ProviderStep
+	Default       ProviderStep
+	Calls         []domain.Phase
+	InvocationErr error
+	Clock         *FakeClock
+	Crash         *CrashController
 }
 
 // Supervisor is a deterministic test process supervisor. Production runners
@@ -134,6 +135,9 @@ func (p *ScriptedProvider) next(phase domain.Phase) ProviderStep {
 }
 
 func (p *ScriptedProvider) Invocation(context.Context, contracts.PhaseInput) (contracts.Invocation, error) {
+	if p.InvocationErr != nil {
+		return contracts.Invocation{}, p.InvocationErr
+	}
 	return contracts.Invocation{Argv: []string{"fixture-provider"}}, nil
 }
 

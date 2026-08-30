@@ -308,7 +308,7 @@ func validCodexInvocation(invocation contracts.Invocation, identity domain.Provi
 }
 
 func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, invocation contracts.Invocation, input contracts.PhaseInput) (contracts.CommandResult, error) {
-	if s == nil || s.SoftDrain <= 0 || s.HardDrain <= 0 || s.SoftDrain > maxDrainDuration || s.HardDrain > maxDrainDuration {
+	if s == nil || !validDrainDurations(s.SoftDrain, s.HardDrain) {
 		return contracts.CommandResult{}, errors.New("provider drain durations exceed the machine bound")
 	}
 	if len(invocation.Argv) == 0 || !filepath.IsAbs(invocation.Argv[0]) || input.Worktree == "" || filepath.Clean(input.Worktree) != input.Worktree {
@@ -804,11 +804,15 @@ func validRequestDigest(value string) bool {
 // drainContext is the single wall-clock budget for TERM, KILL, stream drain,
 // and final group observation. Caller cancellation always wins.
 func (s *Supervisor) drainContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
-	if s.SoftDrain <= 0 || s.HardDrain <= 0 || s.SoftDrain > maxDrainDuration || s.HardDrain > maxDrainDuration || ctx == nil || ctx.Err() != nil {
+	if !validDrainDurations(s.SoftDrain, s.HardDrain) || ctx == nil || ctx.Err() != nil {
 		return nil, nil, ErrUnclear
 	}
 	bounded, cancel := context.WithTimeout(ctx, s.SoftDrain+s.HardDrain)
 	return bounded, cancel, nil
+}
+
+func validDrainDurations(soft, hard time.Duration) bool {
+	return soft > 0 && hard > 0 && soft <= maxDrainDuration && hard <= maxDrainDuration && soft <= maxDrainDuration-hard
 }
 
 func (s *Supervisor) terminate(r *run) error {
