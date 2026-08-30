@@ -63,37 +63,48 @@ func TestRepositoryStrictSandboxBlocksDoubleForkAndSetsid(t *testing.T) {
 	}
 }
 
-func TestRepositoryStrictSandboxAllowsReadOnlyGoToolchainRepository(t *testing.T) {
+func TestRepositoryStrictSandboxAllowsReadOnlyGoRepository(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("repository command product boundary is macOS")
 	}
-	goPath, err := resolveFixedExecutable("go")
-	if err != nil {
-		t.Skipf("approved Go unavailable: %v", err)
+	if os.Getenv("SF_REPOSITORY_STRICT_GO_HELPER") == "1" {
+		repository := os.Getenv("SF_REPOSITORY_STRICT_GO_REPOSITORY")
+		contents, err := os.ReadFile(filepath.Join(repository, "go.mod"))
+		if err != nil || !strings.Contains(string(contents), "module ") {
+			t.Fatalf("confined Go helper could not read repository module: %v", err)
+		}
+		_, _ = os.Stdout.WriteString("go-repository-read-ok\n")
+		return
 	}
 	repository, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	goRoot := filepath.Dir(filepath.Dir(goPath))
-	profile, err := repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: repository, Worktree: repository, GitFile: filepath.Join(repository, ".git"), CommonDir: filepath.Join(repository, ".git"), Executable: goPath, Toolchain: goRoot})
+	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// `go env GOMOD` is a no-fork, read-only toolchain operation which must
-	// resolve the checked-in module marker from the confined repository. It is
-	// the narrow strict-profile capability used by the Go-only v1 boundary; the
-	// actual `go test` driver remains outside Seatbelt only while compiling,
-	// before each generated test binary crosses the durable sandbox gate.
-	cmd := exec.Command(repositorySandboxExec, "-p", profile, goPath, "env", "GOMOD")
-	cmd.Dir = repository
-	cmd.Env = []string{"HOME=" + t.TempDir(), "PATH=/usr/bin:/bin", "GOROOT=" + goRoot, "GOTOOLCHAIN=local", "GOENV=off", "GOWORK=off", "GOPROXY=off", "GOSUMDB=off"}
+	self, err = filepath.EvalSymlinks(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	private := t.TempDir()
+	profile, err := repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: repository, Worktree: repository, GitFile: filepath.Join(repository, ".git"), CommonDir: filepath.Join(repository, ".git"), Home: private, Temporary: private, Executable: self})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The helper is this already-compiled Go test binary, the same shape that
+	// the production gate executes after Go has compiled a test. It needs no
+	// Go driver, GOROOT, module cache, network, or process-fork allowance.
+	cmd := exec.Command(repositorySandboxExec, "-p", profile, self, "-test.run=^TestRepositoryStrictSandboxAllowsReadOnlyGoRepository$")
+	cmd.Dir = "/"
+	cmd.Env = []string{"HOME=" + private, "TMPDIR=" + private, "SF_REPOSITORY_STRICT_GO_HELPER=1", "SF_REPOSITORY_STRICT_GO_REPOSITORY=" + repository}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("read-only Go toolchain did not run inside strict sandbox: %v: %s", err, out)
+		t.Fatalf("read-only confined Go helper did not run inside strict sandbox: %v: %s", err, out)
 	}
-	if got := strings.TrimSpace(string(out)); got != filepath.Join(repository, "go.mod") {
-		t.Fatalf("strict sandbox Go repository read=%q want %q", got, filepath.Join(repository, "go.mod"))
+	if !strings.Contains(string(out), "go-repository-read-ok") {
+		t.Fatalf("strict sandbox Go helper did not prove repository read: %q", out)
 	}
 }
 
