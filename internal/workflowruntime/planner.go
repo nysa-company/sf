@@ -115,7 +115,7 @@ func (r PlannerRunner) RunArtifact(ctx context.Context, request workflowworker.P
 	if err := validateWorktree(request, project); err != nil {
 		return PlannerResult{}, err
 	}
-	if request.Ticket.MergeMode == domain.MergeAutonomous || effective.MergeMode == domain.MergeAutonomous {
+	if !permittedMode(request.Ticket.MergeMode) || !permittedMode(effective.MergeMode) {
 		return PlannerResult{}, ErrUnsupportedMode
 	}
 	if len(effective.Providers.Planner) != 1 || effective.Providers.Planner[0] != "codex" {
@@ -144,11 +144,12 @@ func (r PlannerRunner) RunArtifact(ctx context.Context, request workflowworker.P
 		return PlannerResult{}, ErrPlannerNotReady
 	}
 	key := coordResult.ProviderResult
+	validation := phaseartifact.Validation{TicketType: request.Ticket.Type}
 	result, parsed, err := r.Store.LoadHistoricalProviderAttemptResult(ctx, key)
-	if err != nil || key.Ref != request.Ticket.Ref || key.Phase != domain.PhasePlanning || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.Ref != request.Ticket.Ref || result.Claim.Phase != domain.PhasePlanning || result.Claim.Role != string(workflowprompt.RolePlanner) || result.Claim.ExpectedVersion != request.Ticket.Version || result.Claim.LeaderEpoch != request.Fence.LeaderEpoch || result.Claim.RunnerEpoch != request.Fence.RunnerEpoch || result.Claim.Repository != project.Path || result.Claim.Worktree != request.Worktree.Path || result.Claim.WorktreeIdentity != string(request.Worktree.IdentityJSON) || result.Claim.BaseSHA != request.Worktree.BaseSHA || parsed.Phase != domain.PhasePlanning || parsed.Planner == nil || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes {
+	if err != nil || key.Ref != request.Ticket.Ref || key.Phase != domain.PhasePlanning || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.Ref != request.Ticket.Ref || result.Claim.Phase != domain.PhasePlanning || result.Claim.Role != string(workflowprompt.RolePlanner) || result.Claim.ExpectedVersion != request.Ticket.Version || result.Claim.LeaderEpoch != request.Fence.LeaderEpoch || result.Claim.RunnerEpoch != request.Fence.RunnerEpoch || result.Claim.Repository != project.Path || result.Claim.Worktree != request.Worktree.Path || result.Claim.WorktreeIdentity != string(request.Worktree.IdentityJSON) || result.Claim.BaseSHA != request.Worktree.BaseSHA || !matchesLaunchInput(result.Claim, key, input) || !matchesValidation(result.Validation, validation) || parsed.Phase != domain.PhasePlanning || parsed.Planner == nil || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes {
 		return PlannerResult{}, ErrProviderResultInvalid
 	}
-	if parsed.Provider.Provider != "codex" {
+	if parsed.Provider != result.Claim.Binding.Identity || parsed.Provider.Provider != "codex" {
 		return PlannerResult{}, ErrProviderResultInvalid
 	}
 	return PlannerResult{Key: key, RawArtifact: append([]byte(nil), result.RawArtifact...)}, nil

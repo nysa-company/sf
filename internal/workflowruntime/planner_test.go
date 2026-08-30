@@ -37,11 +37,15 @@ type fakePlannerCoordinator struct {
 	request providercoord.Request
 	result  providercoord.Result
 	calls   int
+	onRun   func(providercoord.Request)
 }
 
 func (f *fakePlannerCoordinator) Run(_ context.Context, request providercoord.Request) providercoord.Result {
 	f.calls++
 	f.request = request
+	if f.onRun != nil {
+		f.onRun(request)
+	}
 	return f.result
 }
 
@@ -68,10 +72,21 @@ func plannerFixture(t *testing.T) (workflowworker.PhaseRequest, *fakePlannerStor
 	key := store.ProviderAttemptResultKey{AttemptID: 11, Ref: ref, Phase: domain.PhasePlanning, Attempt: 1}
 	planner := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"accept"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofAcceptance, Command: []string{"go", "test", "./..."}, Details: "proof"}, Paths: []string{"."}, Commands: [][]string{{"go", "test", "./..."}}, Risks: []string{}, Questions: []phaseartifact.Question{}}
 	raw, _ := json.Marshal(planner)
-	result := store.ProviderAttemptResult{AttemptID: key.AttemptID, RawArtifact: raw, Claim: store.ProviderAttemptClaim{ID: key.AttemptID, Ref: ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: ticket.Version, LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch, Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: string(identityJSON), BaseSHA: identity.BaseHead, Binding: contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: "m", Family: "f", Version: "v"}}}}
+	result := store.ProviderAttemptResult{AttemptID: key.AttemptID, RawArtifact: raw, Claim: store.ProviderAttemptClaim{ID: key.AttemptID, Ref: ref, Phase: domain.PhasePlanning, Role: "planner", Attempt: key.Attempt, ExpectedVersion: ticket.Version, LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch, Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: string(identityJSON), BaseSHA: identity.BaseHead, Binding: contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: "m", Family: "f", Version: "v"}}}}
 	parsed := phaseartifact.Parsed{Phase: domain.PhasePlanning, Provider: result.Claim.Binding.Identity, Planner: &planner}
 	evidence := &fakePlannerStore{project: store.Project{Channel: ref.Channel, ID: ref.Project, Path: "/repo", BaseRef: "main"}, result: result, parsed: parsed}
 	coordinator := &fakePlannerCoordinator{result: providercoord.Result{Code: providercoord.Completed, ProviderResult: key}}
+	coordinator.onRun = func(request providercoord.Request) {
+		input := request.Input
+		input.Provider = result.Claim.Binding.Identity
+		input.AuthMode = result.Claim.Binding.AuthMode
+		input.Attempt = key.Attempt
+		input.LeaderEpoch, input.RunnerEpoch, input.ExpectedVersion = fence.LeaderEpoch, fence.RunnerEpoch, ticket.Version
+		payload, requestDigest, _ := contracts.CanonicalPhaseInput(input)
+		input.RequestDigest = requestDigest
+		validation, _, _ := phaseartifact.CanonicalValidation(request.Validation)
+		evidence.result.Claim.Input, evidence.result.Claim.RequestDigest, evidence.result.Claim.RequestPayload, evidence.result.Validation = input, requestDigest, payload, validation
+	}
 	return workflowworker.PhaseRequest{Ticket: ticket, Worktree: store.StoredWorktree{Path: "/worktree", Branch: identity.HeadRef, State: "registered", IdentityJSON: identityJSON, BaseSHA: identity.BaseHead, TicketVersion: ticket.Version, Fence: fence}, Phase: domain.PhasePlanning, Fence: fence}, evidence, coordinator
 }
 
