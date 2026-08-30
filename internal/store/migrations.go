@@ -380,3 +380,38 @@ var migrationV20 = []string{
 	`ALTER TABLE merge_intents ADD COLUMN admin_enforced INTEGER NOT NULL DEFAULT 0 CHECK(admin_enforced IN (0,1))`,
 	`ALTER TABLE merge_intents ADD COLUMN active_ruleset_count INTEGER NOT NULL DEFAULT 0 CHECK(active_ruleset_count >= 0)`,
 }
+
+// v21 adds the sole durable authority for Git mutations. A mutation intent is
+// issued only from an already-planned effect, and its complete claim is
+// immutable. Repository exclusion is deliberately not
+// time based: a crashed Git child remains held until startup has proved the
+// recorded process group drained or quarantined it.
+var migrationV21 = []string{
+	`CREATE TABLE git_mutation_intents (
+		semantic_key TEXT PRIMARY KEY,
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		request_digest TEXT NOT NULL, ticket_version INTEGER NOT NULL,
+		leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL, claim_epoch INTEGER NOT NULL,
+		repository_path TEXT NOT NULL, worktree_path TEXT NOT NULL, branch_ref TEXT NOT NULL,
+		operation TEXT NOT NULL, base_ref TEXT NOT NULL, expected_base_oid TEXT NOT NULL, expected_head_oid TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		FOREIGN KEY(semantic_key) REFERENCES effects(semantic_key),
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id)
+	)`,
+	`CREATE TABLE git_mutation_leases (
+		repository_path TEXT PRIMARY KEY,
+		semantic_key TEXT NOT NULL UNIQUE, nonce BLOB NOT NULL UNIQUE CHECK(length(nonce)=32),
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		request_digest TEXT NOT NULL, ticket_version INTEGER NOT NULL,
+		leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL, claim_epoch INTEGER NOT NULL,
+		worktree_path TEXT NOT NULL, branch_ref TEXT NOT NULL, operation TEXT NOT NULL,
+		base_ref TEXT NOT NULL, expected_base_oid TEXT NOT NULL, expected_head_oid TEXT NOT NULL,
+		state TEXT NOT NULL CHECK(state IN ('active','quarantined')),
+		launch_state TEXT NOT NULL CHECK(launch_state IN ('unrecorded','launching','released','drained','quarantined')),
+		process_pid INTEGER NOT NULL DEFAULT 0, process_pgid INTEGER NOT NULL DEFAULT 0,
+		process_boot_identity TEXT NOT NULL DEFAULT '', process_start_identity TEXT NOT NULL DEFAULT '',
+		acquired_at TEXT NOT NULL, launched_at TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY(semantic_key) REFERENCES git_mutation_intents(semantic_key)
+	)`,
+	`CREATE INDEX git_mutation_lease_recovery ON git_mutation_leases(channel, state, launch_state)`,
+}

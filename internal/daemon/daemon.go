@@ -1,6 +1,6 @@
-// Package daemon owns the foreground, single-owner local daemon boundary.
-// It intentionally performs only durable local state changes; providers, Git,
-// GitHub, remotes, and autonomous execution belong to later phases.
+// Package daemon owns the foreground, single-owner local daemon boundary. It
+// coordinates durable recovery and admits provider or repository capabilities
+// only through explicitly supplied, fail-closed runtime components.
 package daemon
 
 import (
@@ -114,6 +114,10 @@ type Config struct {
 	RecoveryDrainer    interface {
 		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
+	// GitMutationDrainer is the startup-only verifier for persisted Git helper
+	// process groups. A missing verifier is acceptable only when no Git lease
+	// exists; otherwise recovery refuses before socket/listener exposure.
+	GitMutationDrainer contracts.GitMutationDrainer
 	// ProviderCoordinatorFactory composes configured, qualified adapters after
 	// the daemon opens the authoritative Store. A nil factory leaves provider
 	// execution unavailable rather than inventing an adapter.
@@ -138,6 +142,7 @@ type Daemon struct {
 	recoveryDrainer interface {
 		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
+	gitMutationDrainer  contracts.GitMutationDrainer
 	providerCoordinator *providercoord.Coordinator
 	mu                  sync.Mutex
 	closed              bool
@@ -241,7 +246,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		}
 	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, providerCoordinator: coordinator}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, providerCoordinator: coordinator}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -289,6 +294,12 @@ func (daemon *Daemon) Epoch() uint64 { return daemon.epoch }
 func (daemon *Daemon) Recover(ctx context.Context) error {
 	if err := daemon.lease.Validate(); err != nil {
 		return err
+	}
+	// Git helper children can have crossed a mutable repository boundary. Drain
+	// their exact persisted identity before effects are reconciled/fenced and
+	// before any later composition can admit provider or repository writers.
+	if err := daemon.store.RecoverGitMutationLeases(ctx, daemon.channel, daemon.epoch, daemon.gitMutationDrainer); err != nil {
+		return fmt.Errorf("recover stranded git mutations: %w", err)
 	}
 	if _, err := daemon.store.ReconcileEffects(ctx, daemon.channel, daemon.epoch); err != nil {
 		return fmt.Errorf("reconcile stranded effects: %w", err)

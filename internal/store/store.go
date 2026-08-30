@@ -41,9 +41,11 @@ var (
 	ErrProviderCapacity      = errors.New("provider route capacity is exhausted")
 	ErrProviderAttempt       = errors.New("provider attempt cannot be admitted")
 	ErrProviderDrain         = errors.New("provider process has not drained")
+	ErrGitMutationIntent     = errors.New("git mutation intent is not a current executing effect")
+	ErrGitMutationLease      = errors.New("git mutation lease is unavailable or stale")
 )
 
-const schemaVersion = 20
+const schemaVersion = 21
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -66,6 +68,7 @@ var migrationChecksums = map[int]string{
 	18: migrationChecksum(migrationV18),
 	19: migrationChecksum(migrationV19),
 	20: migrationChecksum(migrationV20),
+	21: migrationChecksum(migrationV21),
 }
 
 func migrationChecksum(statements []string) string {
@@ -323,6 +326,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV19
 			} else if version == 20 {
 				statements = migrationV20
+			} else if version == 21 {
+				statements = migrationV21
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {

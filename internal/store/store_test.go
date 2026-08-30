@@ -65,6 +65,28 @@ func TestRequiredSchemaChecksBothMergeIntentParents(t *testing.T) {
 	}
 }
 
+func TestRequiredSchemaChecksGitAuthorityParents(t *testing.T) {
+	database, ctx := openTestStore(t)
+	want := map[foreignKeyRequirement]bool{
+		{table: "git_mutation_intents", target: "tickets"}:             false,
+		{table: "git_mutation_intents", target: "effects"}:             false,
+		{table: "git_mutation_leases", target: "git_mutation_intents"}: false,
+	}
+	for _, required := range requiredForeignKeys {
+		if _, ok := want[required]; ok {
+			want[required] = true
+		}
+	}
+	for required, covered := range want {
+		if !covered {
+			t.Fatalf("%s -> %s is not a required schema constraint", required.table, required.target)
+		}
+		if err := hasForeignKey(ctx, database.db, required.table, required.target); err != nil {
+			t.Fatalf("%s -> %s: %v", required.table, required.target, err)
+		}
+	}
+}
+
 func TestTransitionRejectsInvalidEventPayloadBeforeMutation(t *testing.T) {
 	database, ctx := openTestStore(t)
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-event-payload"}

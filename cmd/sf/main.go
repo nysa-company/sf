@@ -12,6 +12,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/processsupervisor"
 	"github.com/nysa-company/sf/internal/providercoord"
 	"github.com/nysa-company/sf/internal/store"
@@ -57,6 +58,7 @@ func main() {
 			RecoveryAuthorityKey: supervisor.PublicKey(),
 			ProviderSupervisor:   supervisor,
 			RecoveryDrainer:      supervisor,
+			GitMutationDrainer:   git.MutationDrainer{},
 			ProviderCoordinatorFactory: func(database *store.Store, process contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
 				// Real provider adapters are intentionally not bundled. An empty
 				// qualified registry keeps production fail-closed until explicit

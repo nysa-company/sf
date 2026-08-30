@@ -59,6 +59,30 @@ type GitMutationLease interface {
 	Release() error
 }
 
+// GitMutationLaunchLease is implemented by the production SQLite lease.  A
+// Git child remains behind its supervisor gate until RecordGitMutationLaunch
+// commits; FinishGitMutationLaunch is permitted only after the parent has
+// observed that exact process group exit.  Test-only leases need not implement
+// this extension.
+type GitMutationLaunchLease interface {
+	GitMutationLease
+	RecordGitMutationLaunch(context.Context, GitMutationLaunch) error
+	FinishGitMutationLaunch(context.Context, GitMutationLaunch) error
+}
+
+type GitMutationLaunch struct {
+	PID, PGID            int
+	BootIdentity         string
+	ProcessStartIdentity string
+}
+
+// GitMutationDrainer is the startup-only OS identity verifier.  It must not
+// signal a PID/group unless boot, start identity, and PGID match the durable
+// launch; an unclear result leaves the repository quarantined.
+type GitMutationDrainer interface {
+	DrainGitMutation(context.Context, GitMutationLaunch) error
+}
+
 // GitMutationAuthority is implemented by the daemon/store supervisor, never
 // by git.Runner. Acquiring a lease must prove that no provider or repository
 // command capable of writing the named repository is live, and prevent a new

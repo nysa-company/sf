@@ -13,7 +13,16 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 6 || strings.Join(os.Args[1:6], "\x00") != "--worktree-fd=3\x00--git-dir-fd=4\x00--common-dir-fd=5\x00--\x00/usr/bin/git" {
+	if len(os.Args) < 6 || strings.Join(os.Args[1:4], "\x00") != "--worktree-fd=3\x00--git-dir-fd=4\x00--common-dir-fd=5" {
+		refuse("invalid invocation")
+	}
+	gate := false
+	start := 4
+	if len(os.Args) > start && os.Args[start] == "--gate-fd=6" {
+		gate = true
+		start++
+	}
+	if len(os.Args) <= start+1 || os.Args[start] != "--" || os.Args[start+1] != "/usr/bin/git" {
 		refuse("invalid invocation")
 	}
 	if err := validateCapabilities(); err != nil {
@@ -22,7 +31,13 @@ func main() {
 	if err := unix.Fchdir(3); err != nil {
 		refuse("directory capability refused")
 	}
-	if err := unix.Exec(os.Args[5], os.Args[5:], os.Environ()); err != nil {
+	if gate {
+		value := []byte{0}
+		if _, err := os.NewFile(uintptr(6), "gate").Read(value); err != nil || value[0] != 1 {
+			refuse("gate refused")
+		}
+	}
+	if err := unix.Exec(os.Args[start+1], os.Args[start+1:], os.Environ()); err != nil {
 		fmt.Fprintln(os.Stderr, "sf-git-exec: exec failed")
 		os.Exit(127)
 	}

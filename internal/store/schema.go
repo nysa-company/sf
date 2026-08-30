@@ -95,6 +95,9 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "provider_pair_selections", target: "provider_qualifications"},
 	{table: "merge_intents", target: "tickets"},
 	{table: "merge_intents", target: "effects"},
+	{table: "git_mutation_intents", target: "tickets"},
+	{table: "git_mutation_intents", target: "effects"},
+	{table: "git_mutation_leases", target: "git_mutation_intents"},
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {
@@ -145,6 +148,8 @@ var requiredSchema = map[string][]string{
 	"provider_pair_selections":     {"channel", "builder_qualification_id", "reviewer_qualification_id", "selected_at"},
 	"merge_intents":                {"semantic_key", "original_base_oid", "head_oid", "base_ref", "protection_rule_id", "strict_status_checks", "admin_enforced", "active_ruleset_count"},
 	"external_mutation_quarantine": {"singleton", "reason", "observed_at"},
+	"git_mutation_intents":         {"semantic_key", "request_digest", "ticket_version", "leader_epoch", "runner_epoch", "claim_epoch", "repository_path", "worktree_path", "branch_ref", "operation", "base_ref", "expected_base_oid", "expected_head_oid"},
+	"git_mutation_leases":          {"repository_path", "semantic_key", "nonce", "state", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity"},
 }
 
 type indexRequirement struct {
@@ -152,6 +157,9 @@ type indexRequirement struct {
 	name    string
 	columns []string
 	partial bool
+	// nonUnique is explicit because all pre-v21 requirements protect durable
+	// uniqueness; the Git recovery index is a named lookup accelerator.
+	nonUnique bool
 }
 
 var requiredIndexes = []indexRequirement{
@@ -173,6 +181,7 @@ var requiredIndexes = []indexRequirement{
 	{table: "invalidation_receipts", columns: []string{"channel", "project_id", "ticket_id", "generation", "kind"}},
 	{table: "branch_allocations", columns: []string{"channel", "project_id", "ticket_id"}},
 	{table: "branch_allocations", columns: []string{"channel", "branch_ref"}},
+	{table: "git_mutation_leases", name: "git_mutation_lease_recovery", columns: []string{"channel", "state", "launch_state"}, nonUnique: true},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {
@@ -188,7 +197,11 @@ func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error 
 		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
 			return err
 		}
-		if unique != 1 || partial != boolInt(required.partial) || (required.name != "" && name != required.name) {
+		expectedUnique := 1
+		if required.nonUnique {
+			expectedUnique = 0
+		}
+		if unique != expectedUnique || partial != boolInt(required.partial) || (required.name != "" && name != required.name) {
 			continue
 		}
 		columns, err := indexColumns(ctx, db, name)
@@ -202,7 +215,11 @@ func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error 
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return fmt.Errorf("required %sunique index on %s(%v) is missing", map[bool]string{true: "partial ", false: ""}[required.partial], required.table, required.columns)
+	kind := "unique "
+	if required.nonUnique {
+		kind = ""
+	}
+	return fmt.Errorf("required %s%sindex on %s(%v) is missing", map[bool]string{true: "partial ", false: ""}[required.partial], kind, required.table, required.columns)
 }
 
 func indexColumns(ctx context.Context, db *sql.DB, index string) ([]string, error) {
