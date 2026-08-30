@@ -54,6 +54,7 @@ type memoryBranchAuthority struct{ branches map[string]string }
 
 type testMutationAuthority struct{ err error }
 type testMutationLease struct{ err error }
+type countingMutationAuthority struct{ acquisitions int }
 
 // releaseFailMutationAuthority models a durable release failure: the first
 // mutation ran, but its repository exclusion remains active and refuses every
@@ -82,6 +83,10 @@ func (testMutationLease) Release() error                                        
 func (l testMutationLease) RecordPreparedCommit(_ context.Context, _, _ string) error { return l.err }
 func (l testMutationLease) RecordPushPriorRemote(_ context.Context, _ string) error {
 	return l.err
+}
+func (a *countingMutationAuthority) AcquireGitMutation(context.Context, contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
+	a.acquisitions++
+	return testMutationLease{}, nil
 }
 func (a *releaseFailMutationAuthority) AcquireGitMutation(context.Context, contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
 	if a.blocked {
@@ -325,6 +330,8 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 
 func TestCreateWorktreeAdoptsExistingAuthenticatedPath(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
+	authority := &countingMutationAuthority{}
+	runner.MutationAuthority = authority
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-adopt")
 	if err != nil {
 		t.Fatal(err)
@@ -340,6 +347,9 @@ func TestCreateWorktreeAdoptsExistingAuthenticatedPath(t *testing.T) {
 	}
 	if first.Identity != second.Identity || first.Path != second.Path {
 		t.Fatalf("adopted identity changed: first=%+v second=%+v", first, second)
+	}
+	if authority.acquisitions != 2 {
+		t.Fatalf("response-loss adoption did not reacquire exact durable authority: acquisitions=%d", authority.acquisitions)
 	}
 }
 
@@ -1443,6 +1453,9 @@ func TestCreateWorktreeSurfacesDurableLeaseReleaseFailure(t *testing.T) {
 	}
 	if _, statErr := os.Stat(path); statErr != nil {
 		t.Fatalf("authenticated path unexpectedly disappeared: %v", statErr)
+	}
+	if adopted, retryErr := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main")); adopted != (Worktree{}) || !errors.Is(retryErr, ErrIdentityMismatch) || !authority.blocked {
+		t.Fatalf("same-path retry adopted a worktree behind an ambiguous lease: worktree=%+v blocked=%v err=%v", adopted, authority.blocked, retryErr)
 	}
 	secondPath := filepath.Join(t.TempDir(), "second-worktree")
 	secondBranch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-release-failure-blocked")

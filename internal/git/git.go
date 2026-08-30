@@ -1686,10 +1686,7 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	path = filepath.Join(canonicalParent, filepath.Base(path))
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&os.ModeSymlink == 0 && info.IsDir() {
-			identity, snapErr := r.snapshotExpected(ctx, repository, path, baseRef)
-			if snapErr == nil && identity.HeadRef == branch {
-				return Worktree{Path: path, Branch: branch, Identity: identity}, nil
-			}
+			return r.adoptExistingWorktree(ctx, repository, path, branch, baseRef, claim)
 		}
 		return Worktree{}, fmt.Errorf("%w: canonical worktree path already exists", ErrIdentityMismatch)
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -1742,6 +1739,42 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 		return Worktree{}, err
 	}
 	_ = createdPath.Close()
+	return Worktree{Path: path, Branch: branch, Identity: identity}, nil
+}
+
+// adoptExistingWorktree is the response-loss path for a prior create.  The
+// directory alone is never authority: an unresolved prior durable lease must
+// continue to exclude writers, while an exact create claim whose earlier lease
+// was cleanly released may be acquired and reauthenticated without running
+// worktree add a second time.
+func (r Runner) adoptExistingWorktree(ctx context.Context, repository, path, branch, baseRef string, claim contracts.GitMutationClaim) (result Worktree, returnedErr error) {
+	identity, err := r.snapshotExpected(ctx, repository, path, baseRef)
+	if err != nil || identity.HeadRef != branch {
+		return Worktree{}, fmt.Errorf("%w: canonical worktree path already exists", ErrIdentityMismatch)
+	}
+	lease, err := r.acquireSuppliedMutation(ctx, claim, contracts.GitMutationClaim{Repository: repository, Worktree: path, Branch: branch, Operation: "create-worktree", BaseRef: baseRef, ExpectedBaseOID: identity.BaseHead, ExpectedHeadOID: identity.BaseHead})
+	if err != nil {
+		return Worktree{}, err
+	}
+	defer func() {
+		returnedErr = mergeMutationLeaseRelease(returnedErr, lease)
+		if returnedErr != nil {
+			result = Worktree{}
+		}
+	}()
+	ctx = withMutationLease(ctx, lease)
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return Worktree{}, err
+	}
+	// Re-observe after the durable authority check. A base or identity movement
+	// in that gap cannot be adopted as a prior exact creation.
+	identity, err = r.snapshotExpected(ctx, repository, path, baseRef)
+	if err != nil || identity.HeadRef != branch || identity.BaseHead != claim.ExpectedBaseOID {
+		return Worktree{}, fmt.Errorf("%w: existing worktree no longer proves the create claim", ErrIdentityMismatch)
+	}
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return Worktree{}, err
+	}
 	return Worktree{Path: path, Branch: branch, Identity: identity}, nil
 }
 
