@@ -654,6 +654,27 @@ func TestHTTPSCredentialHelperConfigurationFailsClosed(t *testing.T) {
 	}
 }
 
+func TestGitHubSSHTransportUsesOnlyExactHelperEnvironment(t *testing.T) {
+	root := t.TempDir()
+	runner := Runner{SSHHelper: filepath.Join(root, "sf-ssh"), SSHBinary: filepath.Join(root, "ssh"), SSHKnownHosts: filepath.Join(root, "known-hosts"), SSHAgentSock: filepath.Join(root, "agent.sock")}
+	env, enabled, err := runner.githubSSHPushEnvironment("ssh://git@ssh.github.com:443/owner/repository.git")
+	if err != nil || !enabled {
+		t.Fatalf("ssh environment enabled=%v err=%v", enabled, err)
+	}
+	joined := strings.Join(env, "\x00")
+	for _, want := range []string{"GIT_SSH=" + runner.SSHHelper, "GIT_SSH_VARIANT=ssh", "SF_GIT_SSH_REPOSITORY=owner/repository", "SSH_AUTH_SOCK=" + runner.SSHAgentSock} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q from %q", want, joined)
+		}
+	}
+	if strings.Contains(joined, "COMMAND") || strings.Contains(joined, "github.com") {
+		t.Fatalf("unconstrained ssh transport: %q", joined)
+	}
+	if _, _, err := runner.githubSSHPushEnvironment("ssh://git@github.com:22/owner/repository.git"); err == nil {
+		t.Fatal("non-pinned SSH host accepted")
+	}
+}
+
 func TestGitHubPublicationFailsClosedAfterExactLocalCandidateProof(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-github-publish")

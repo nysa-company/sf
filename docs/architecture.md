@@ -11,6 +11,10 @@ The approved normative design is in
 - NDJSON events and logs are readable projections, never recovery inputs.
 - Git and GitHub mutations cross narrow fenced interfaces and reconcile remote
   truth before any retry.
+- GitHub publication preserves the exact local candidate SHA through an
+  ordinary fast-forward Git push. HTTPS and GraphQL publication remain
+  disabled; the optional port-443 SSH path uses the packaged `sf-ssh` helper,
+  a pinned GitHub host-key asset, and an explicitly supplied SSH agent socket.
 
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
 one custom Go state engine over the application schema; DBOS is retained only

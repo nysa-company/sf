@@ -176,7 +176,13 @@ type Runner struct {
 	// boundary intentionally has no HTTPS credential-helper integration.
 	GHBinary    string
 	GHConfigDir string
-	Run         func(context.Context, string, []string, []string) ([]byte, error)
+	// SSH fields enable only the fixed sf-ssh helper for the port-443 GitHub
+	// SSH URL. They are not passed to ordinary repository commands.
+	SSHHelper     string
+	SSHBinary     string
+	SSHKnownHosts string
+	SSHAgentSock  string
+	Run           func(context.Context, string, []string, []string) ([]byte, error)
 }
 
 // commandConfigKeys are repository-local settings that can cause Git to run
@@ -392,7 +398,8 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
 	for _, entry := range extra {
 		key, _, _ := strings.Cut(entry, "=")
-		if (strings.HasPrefix(key, "GIT_") && !strings.HasPrefix(key, "GIT_AUTHOR_") && !strings.HasPrefix(key, "GIT_COMMITTER_")) || key == "HOME" {
+		allowedSSH := (key == "GIT_SSH" && entry == "GIT_SSH="+r.SSHHelper) || (key == "GIT_SSH_VARIANT" && entry == "GIT_SSH_VARIANT=ssh") || (key == "SF_GIT_SSH_BINARY" && entry == "SF_GIT_SSH_BINARY="+r.SSHBinary) || (key == "SF_GIT_SSH_KNOWN_HOSTS" && entry == "SF_GIT_SSH_KNOWN_HOSTS="+r.SSHKnownHosts) || (key == "SSH_AUTH_SOCK" && entry == "SSH_AUTH_SOCK="+r.SSHAgentSock) || (key == "SF_GIT_SSH_REPOSITORY" && strings.HasPrefix(entry, "SF_GIT_SSH_REPOSITORY="))
+		if (strings.HasPrefix(key, "GIT_") && !strings.HasPrefix(key, "GIT_AUTHOR_") && !strings.HasPrefix(key, "GIT_COMMITTER_") && !allowedSSH) || key == "HOME" {
 			return nil, fmt.Errorf("credential or git environment override refused")
 		}
 		env = append(env, entry)
@@ -948,8 +955,14 @@ func safeOrigin(raw string) (string, error) {
 		return resolved, nil
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "ssh") || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
 		return "", fmt.Errorf("%w: noncanonical origin refused", ErrIdentityMismatch)
+	}
+	if parsed.Scheme == "ssh" {
+		if parsed.User == nil || parsed.User.Username() != "git" || parsed.Hostname() != "ssh.github.com" || parsed.Port() != "443" || !validGitHubRepoPath(strings.TrimPrefix(parsed.Path, "/")) {
+			return "", fmt.Errorf("%w: noncanonical github ssh origin refused", ErrIdentityMismatch)
+		}
+		return parsed.String(), nil
 	}
 	if parsed.User != nil {
 		if _, hasPassword := parsed.User.Password(); hasPassword {
@@ -958,6 +971,24 @@ func safeOrigin(raw string) (string, error) {
 		return "", fmt.Errorf("%w: credential-bearing origin refused", ErrIdentityMismatch)
 	}
 	return parsed.String(), nil
+}
+
+func validGitHubRepoPath(value string) bool {
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 || !strings.HasSuffix(parts[1], ".git") {
+		return false
+	}
+	for _, item := range []string{parts[0], strings.TrimSuffix(parts[1], ".git")} {
+		if item == "" || len(item) > 100 {
+			return false
+		}
+		for _, ch := range item {
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '.' || ch == '_' || ch == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
 func digest(data []byte) string {
 	sum := sha256.Sum256(data)
@@ -1738,11 +1769,26 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 	if strings.HasPrefix(worktree.Identity.PushOrigin, "https://") {
 		return "", ErrHTTPSCredentialBoundary
 	}
-	_, err := r.provePushHead(ctx, worktree, expectedHead)
+	sshEnv, sshPush, err := r.githubSSHPushEnvironment(worktree.Identity.PushOrigin)
 	if err != nil {
 		return "", err
 	}
-	remote, err := r.remoteHead(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch)
+	_, err = r.provePushHead(ctx, worktree, expectedHead)
+	if err != nil {
+		return "", err
+	}
+	// Git's receive-pack advertises and atomically checks the destination ref
+	// during push. Keeping the helper receive-pack-only avoids opening a second
+	// remote command surface for ls-remote/fetch. A lost response is left to the
+	// durable effect owner: repeating this exact ordinary refspec is idempotent
+	// (the server reports it up-to-date) and can never rewrite history.
+	if sshPush {
+		if _, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, sshEnv, "push", worktree.Identity.PushOrigin, expectedHead+":refs/heads/"+worktree.Branch); err != nil {
+			return "", err
+		}
+		return expectedHead, nil
+	}
+	remote, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, sshEnv)
 	if err != nil {
 		return "", err
 	}
@@ -1757,7 +1803,7 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 		if _, err := r.provePushHead(ctx, worktree, expectedHead); err != nil {
 			return "", err
 		}
-		if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "fetch", "--no-tags", worktree.Identity.PushOrigin, "refs/heads/"+worktree.Branch+":"+observationRef); err != nil {
+		if _, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, sshEnv, "fetch", "--no-tags", worktree.Identity.PushOrigin, "refs/heads/"+worktree.Branch+":"+observationRef); err != nil {
 			return "", fmt.Errorf("%w: cannot observe remote %s", ErrUnexpectedRemote, remote)
 		}
 		if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "merge-base", "--is-ancestor", remote, expectedHead); err != nil {
@@ -1772,19 +1818,19 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 	if worktree.Identity.PushOrigin == "" {
 		return "", fmt.Errorf("%w: authenticated push URL is missing", ErrIdentityMismatch)
 	}
-	if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "push", worktree.Identity.PushOrigin, refspec); err != nil {
+	if _, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, sshEnv, "push", worktree.Identity.PushOrigin, refspec); err != nil {
 		// The server may have accepted the ref while the response was lost. Only
 		// reconcile success when the exact expected candidate is observed.
 		if _, proveErr := r.provePushHead(ctx, worktree, expectedHead); proveErr != nil {
 			return "", err
 		}
-		observed, observeErr := r.remoteHead(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch)
+		observed, observeErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, sshEnv)
 		if observeErr == nil && observed == expectedHead {
 			return expectedHead, nil
 		}
 		return "", err
 	}
-	observed, err := r.remoteHead(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch)
+	observed, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, sshEnv)
 	if err != nil {
 		return "", err
 	}
@@ -1792,6 +1838,22 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 		return "", fmt.Errorf("%w: push did not converge", ErrUnexpectedRemote)
 	}
 	return expectedHead, nil
+}
+
+func (r Runner) githubSSHPushEnvironment(origin string) ([]string, bool, error) {
+	if validAbsolutePath(origin) {
+		return nil, false, nil
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme != "ssh" || parsed.User == nil || parsed.User.Username() != "git" || parsed.Hostname() != "ssh.github.com" || parsed.Port() != "443" || !validGitHubRepoPath(strings.TrimPrefix(parsed.Path, "/")) {
+		return nil, false, fmt.Errorf("%w: only canonical GitHub SSH publication is supported", ErrIdentityMismatch)
+	}
+	for _, item := range []struct{ path, name string }{{r.SSHHelper, "ssh helper"}, {r.SSHBinary, "ssh binary"}, {r.SSHKnownHosts, "known hosts"}, {r.SSHAgentSock, "agent socket"}} {
+		if !validAbsolutePath(item.path) {
+			return nil, false, fmt.Errorf("%w: %s is required", ErrHTTPSCredentialBoundary, item.name)
+		}
+	}
+	return []string{"GIT_SSH=" + r.SSHHelper, "GIT_SSH_VARIANT=ssh", "SF_GIT_SSH_BINARY=" + r.SSHBinary, "SF_GIT_SSH_KNOWN_HOSTS=" + r.SSHKnownHosts, "SF_GIT_SSH_REPOSITORY=" + strings.TrimSuffix(strings.TrimPrefix(parsed.Path, "/"), ".git"), "SSH_AUTH_SOCK=" + r.SSHAgentSock}, true, nil
 }
 
 // PublishGitHub validates the exact local candidate and the durable mutation
@@ -1864,7 +1926,10 @@ func (r Runner) provePushHead(ctx context.Context, worktree Worktree, expectedHe
 }
 
 func (r Runner) remoteHead(ctx context.Context, directory string, expectedDev, expectedIno uint64, origin, branch string) (string, error) {
-	output, err := r.commandExpected(ctx, directory, expectedDev, expectedIno, "ls-remote", "--heads", origin, "refs/heads/"+branch)
+	return r.remoteHeadEnv(ctx, directory, expectedDev, expectedIno, origin, branch, nil)
+}
+func (r Runner) remoteHeadEnv(ctx context.Context, directory string, expectedDev, expectedIno uint64, origin, branch string, extra []string) (string, error) {
+	output, err := r.commandEnvExpected(ctx, directory, expectedDev, expectedIno, extra, "ls-remote", "--heads", origin, "refs/heads/"+branch)
 	if err != nil {
 		return "", err
 	}
