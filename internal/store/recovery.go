@@ -59,15 +59,36 @@ func (s *Store) recoverySnapshot(ctx context.Context, intent domain.MergeIntent)
 	}
 	live := EffectFence{SemanticKey: prior.SemanticKey, Ref: prior.Ref, TicketVersion: version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: runner, ClaimEpoch: prior.ClaimEpoch}}
 	if prior.State == EffectConfirmed {
-		if prior.TicketVersion != version || prior.RunnerEpoch != runner || prior.LeaderEpoch != leader || version != intent.TicketVersion+1 || runner != intent.RunnerEpoch+1 {
+		// A confirmed observation may survive another daemon crash before the
+		// workflow consumes it. Every startup fence advances ticket version and
+		// runner epoch together, while an ordinary workflow transition advances
+		// version only. Accept any positive, equal recovery delta from the
+		// immutable launch intent, and either the exact confirming fence or a
+		// later equally advanced recovery fence.
+		if !equalRecoveryAdvance(intent.TicketVersion, intent.RunnerEpoch, prior.TicketVersion, prior.RunnerEpoch) ||
+			!sameOrLaterRecoveryFence(prior, version, runner, leader) {
 			return mergeRecoverySnapshot{}, ErrStaleFence
 		}
 		return mergeRecoverySnapshot{prior: prior, live: live}, nil
 	}
-	if prior.State != EffectUncertain || prior.TicketVersion != intent.TicketVersion || prior.RunnerEpoch != intent.RunnerEpoch || prior.LeaderEpoch != leader || version != prior.TicketVersion+1 || runner != prior.RunnerEpoch+1 {
+	if prior.State != EffectUncertain || prior.TicketVersion != intent.TicketVersion || prior.RunnerEpoch != intent.RunnerEpoch || prior.LeaderEpoch != leader || !equalRecoveryAdvance(prior.TicketVersion, prior.RunnerEpoch, version, runner) {
 		return mergeRecoverySnapshot{}, ErrStaleFence
 	}
 	return mergeRecoverySnapshot{prior: prior, live: live}, nil
+}
+
+// equalRecoveryAdvance distinguishes one or more startup fences from normal
+// state progression: recovery increments version and runner together, whereas
+// a workflow transition increments only version.
+func equalRecoveryAdvance(fromVersion, fromRunner, toVersion, toRunner uint64) bool {
+	return toVersion > fromVersion && toRunner > fromRunner && toVersion-fromVersion == toRunner-fromRunner
+}
+
+func sameOrLaterRecoveryFence(effect Effect, version, runner, leader uint64) bool {
+	if version == effect.TicketVersion && runner == effect.RunnerEpoch {
+		return leader == effect.LeaderEpoch
+	}
+	return leader > effect.LeaderEpoch && equalRecoveryAdvance(effect.TicketVersion, effect.RunnerEpoch, version, runner)
 }
 
 func recoveryLinked(intent domain.MergeIntent, effect Effect) error {
@@ -99,7 +120,7 @@ func (s *Store) confirmRecoveredMerge(ctx context.Context, intent domain.MergeIn
 		if err := conn.QueryRowContext(ctx, `SELECT version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&version, &runner); err != nil {
 			return err
 		}
-		if version != snapshot.live.TicketVersion || runner != snapshot.live.Fence.RunnerEpoch || version != current.TicketVersion+1 || runner != current.RunnerEpoch+1 {
+		if version != snapshot.live.TicketVersion || runner != snapshot.live.Fence.RunnerEpoch || !equalRecoveryAdvance(current.TicketVersion, current.RunnerEpoch, version, runner) {
 			return ErrStaleFence
 		}
 		if err := s.currentFence(ctx, conn, intent.Ref.Channel, version, runner, snapshot.live.Fence); err != nil {

@@ -402,6 +402,21 @@ func TestRecoverMergeIntentUsesCurrentUncertainFence(t *testing.T) {
 	if err := simulateFenceRecoveredRunner(ctx, database, ref); err != nil {
 		t.Fatalf("fence recovered runner=%v", err)
 	}
+	// Crash once more before observing GitHub. ReconcileEffects advances only
+	// the effect leader/claim while FenceRecoveredRunners advances version and
+	// runner together. Recovery must not depend on there having been exactly
+	// one restart.
+	secondLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-recovery-again")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncertain, err = database.ReconcileEffects(ctx, domain.ChannelDev, secondLeader)
+	if err != nil || len(uncertain) != 1 || uncertain[0].State != EffectUncertain {
+		t.Fatalf("second reconcile=%+v err=%v", uncertain, err)
+	}
+	if err := simulateFenceRecoveredRunner(ctx, database, ref); err != nil {
+		t.Fatalf("second fence recovered runner=%v", err)
+	}
 	calls := 0
 	observer := mergeIntentObserverFunc(func(_ context.Context, got domain.MergeIntent) (string, error) {
 		calls++
@@ -417,6 +432,23 @@ func TestRecoverMergeIntentUsesCurrentUncertainFence(t *testing.T) {
 	again, err := database.RecoverMergeIntent(ctx, intent.SemanticKey, observer)
 	if err != nil || again.State != EffectConfirmed || calls != 1 {
 		t.Fatalf("idempotent=%+v calls=%d err=%v", again, calls, err)
+	}
+	// A third crash after the observation is durable but before the merging
+	// state advances must keep the confirmation reusable without another
+	// external observation.
+	thirdLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-after-confirm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effects, err := database.ReconcileEffects(ctx, domain.ChannelDev, thirdLeader); err != nil || len(effects) != 0 {
+		t.Fatalf("confirmed reconcile=%+v err=%v", effects, err)
+	}
+	if err := simulateFenceRecoveredRunner(ctx, database, ref); err != nil {
+		t.Fatalf("confirmed fence recovered runner=%v", err)
+	}
+	afterRestart, err := database.RecoverMergeIntent(ctx, intent.SemanticKey, observer)
+	if err != nil || afterRestart.State != EffectConfirmed || calls != 1 {
+		t.Fatalf("post-confirm restart=%+v calls=%d err=%v", afterRestart, calls, err)
 	}
 }
 
