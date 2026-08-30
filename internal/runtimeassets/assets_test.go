@@ -64,6 +64,8 @@ func TestResolveCoreRejectsUnsafeExecutableFacts(t *testing.T) {
 		{"not-executable", 0o600},
 		{"group-writable", 0o720},
 		{"world-writable", 0o702},
+		{"setuid", 0o700 | os.ModeSetuid},
+		{"setgid", 0o700 | os.ModeSetgid},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root := privateDirectory(t)
