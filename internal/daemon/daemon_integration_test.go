@@ -643,6 +643,10 @@ func TestRestartFencesPlanningRunnerWithoutDroppingItsLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	beforeLeases, err := d.store.Leases(context.Background(), domain.ChannelStable)
+	if err != nil || len(beforeLeases) == 0 {
+		t.Fatalf("before restart leases=%+v err=%v", beforeLeases, err)
+	}
 	cancel()
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
@@ -663,8 +667,57 @@ func TestRestartFencesPlanningRunnerWithoutDroppingItsLease(t *testing.T) {
 		t.Fatalf("recovery did not fence runner: before=%+v after=%+v", before, after)
 	}
 	leases, err := restarted.store.Leases(context.Background(), domain.ChannelStable)
-	if err != nil || len(leases) == 0 || leases[0].RunnerEpoch != before.RunnerEpoch {
-		t.Fatalf("recovery incorrectly released or rewrote stale leases: leases=%+v err=%v", leases, err)
+	if err != nil || len(leases) != len(beforeLeases) {
+		t.Fatalf("recovery changed capacity occupancy: leases=%+v err=%v", leases, err)
+	}
+	for index, lease := range leases {
+		if lease.Ref != beforeLeases[index].Ref || lease.Scope != beforeLeases[index].Scope || lease.ScopeKey != beforeLeases[index].ScopeKey || !lease.AcquiredAt.Equal(beforeLeases[index].AcquiredAt) || lease.RunnerEpoch != after.RunnerEpoch {
+			t.Fatalf("recovery did not transfer exact lease: before=%+v after=%+v", beforeLeases[index], lease)
+		}
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	secondRestart, err := Start(context.Background(), Config{Channel: domain.ChannelStable, Paths: paths, DaemonIdentity: "restart-test-second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = secondRestart.Close() })
+	afterSecondRestart, err := secondRestart.store.Ticket(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterSecondRestart.RunnerEpoch != after.RunnerEpoch+1 || afterSecondRestart.Version != after.Version+1 {
+		t.Fatalf("second recovery did not fence runner: first=%+v second=%+v", after, afterSecondRestart)
+	}
+	secondLeases, err := secondRestart.store.Leases(context.Background(), domain.ChannelStable)
+	if err != nil || len(secondLeases) != len(leases) {
+		t.Fatalf("second recovery changed capacity occupancy: leases=%+v err=%v", secondLeases, err)
+	}
+	for index, lease := range secondLeases {
+		if lease.Scope != leases[index].Scope || lease.ScopeKey != leases[index].ScopeKey || !lease.AcquiredAt.Equal(leases[index].AcquiredAt) || lease.RunnerEpoch != afterSecondRestart.RunnerEpoch {
+			t.Fatalf("second recovery was not idempotent transfer: first=%+v second=%+v", leases[index], lease)
+		}
+	}
+}
+
+func TestRestartRefusesAmbiguousLeaseAdoptionBeforeSocketExposure(t *testing.T) {
+	d, paths, cancel := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-restart-ambiguous-lease")
+	if _, err := d.store.AcquireLeases(context.Background(), started.Ref, started.Version, domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: started.RunnerEpoch}, []store.LeaseRequest{{Scope: "provider", Resource: "recovery-provider", Capacity: 1}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Start(context.Background(), Config{Channel: domain.ChannelStable, Paths: paths, DaemonIdentity: "restart-ambiguous-lease"})
+	if !errors.Is(err, store.ErrLeaseAdoption) {
+		t.Fatalf("startup error=%v, want lease adoption refusal", err)
+	}
+	if _, err := os.Lstat(paths.Socket); !os.IsNotExist(err) {
+		t.Fatalf("socket was exposed despite ambiguous adoption: %v", err)
 	}
 }
 

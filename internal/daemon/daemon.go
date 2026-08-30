@@ -340,6 +340,26 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 			return fmt.Errorf("recover provider attempt %d: %w", claim.ID, err)
 		}
 	}
+	// Every provider and repository writer has now been reconciled, fenced, and
+	// drained. Retain admitted global/project capacity across the runner-fence
+	// change by moving each exact stale ownership record to its replacement
+	// runner. StaleLeases is ordered, making the recovery side effects stable
+	// and ensuring any ambiguous group stops startup before socket exposure.
+	stale, err := daemon.store.StaleLeases(ctx, daemon.channel, daemon.epoch)
+	if err != nil {
+		return fmt.Errorf("read invalidated lease ownership: %w", err)
+	}
+	for index := 0; index < len(stale); {
+		group := stale[index]
+		next := index + 1
+		for next < len(stale) && stale[next].Ref == group.Ref && stale[next].RunnerEpoch == group.RunnerEpoch {
+			next++
+		}
+		if _, err := daemon.store.AdoptInvalidatedLeases(ctx, group.Ref, group.RunnerEpoch, daemon.epoch); err != nil {
+			return fmt.Errorf("adopt invalidated leases for %s/%s runner %d: %w", group.Ref.Project, group.Ref.Ticket, group.RunnerEpoch, err)
+		}
+		index = next
+	}
 	return daemon.engine.RecoverChannel(ctx, daemon.channel, daemon.epoch)
 }
 

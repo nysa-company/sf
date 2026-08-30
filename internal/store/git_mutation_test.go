@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -185,6 +186,36 @@ func TestGitMutationClaimIsIssuedOnlyFromExactDurableIntent(t *testing.T) {
 	}
 	if _, err := db.IssueGitMutationClaim(ctx, intent); !errors.Is(err, ErrGitMutationIntent) {
 		t.Fatalf("reissued executing effect=%v", err)
+	}
+}
+
+func TestAdoptInvalidatedLeasesRefusesActiveOrQuarantinedGitWriter(t *testing.T) {
+	for _, state := range []string{"active", "quarantined"} {
+		t.Run(state, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			intent := gitIntentFixture(t, db, ctx, "SF-git-adopt-"+state)
+			if _, err := db.AcquireLeases(ctx, intent.Ref, intent.TicketVersion, intent.Fence, []LeaseRequest{{Scope: "global", Resource: "machine", Capacity: 1}}, time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			claim, err := db.IssueGitMutationClaim(ctx, intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.AcquireGitMutation(ctx, claim); err != nil {
+				t.Fatal(err)
+			}
+			if state == "quarantined" {
+				if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_leases SET state='quarantined',launch_state='quarantined' WHERE repository_path=?`, intent.Repository); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := db.InvalidateRunner(ctx, intent.Ref, intent.TicketVersion, intent.Fence); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.AdoptInvalidatedLeases(ctx, intent.Ref, intent.Fence.RunnerEpoch, intent.Fence.LeaderEpoch); !errors.Is(err, ErrLeaseAdoption) {
+				t.Fatalf("%s Git writer adoption=%v", state, err)
+			}
+		})
 	}
 }
 
