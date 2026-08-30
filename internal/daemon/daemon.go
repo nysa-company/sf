@@ -122,6 +122,9 @@ type Config struct {
 	// the daemon opens the authoritative Store. A nil factory leaves provider
 	// execution unavailable rather than inventing an adapter.
 	ProviderCoordinatorFactory func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error)
+	// ProviderQualifier is invoked only through this authenticated foreground
+	// daemon, after its supervisor key is current in SQLite.
+	ProviderQualifier func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
 }
 
 type Daemon struct {
@@ -144,6 +147,7 @@ type Daemon struct {
 	}
 	gitMutationDrainer  contracts.GitMutationDrainer
 	providerCoordinator *providercoord.Coordinator
+	providerQualifier   func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
 	mu                  sync.Mutex
 	closed              bool
 
@@ -215,7 +219,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 			return failStore(errors.New("provider supervisor does not support durable launch recording"))
 		}
 		setter.SetLaunchRecorder(func(recordCtx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) error {
-			claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest, PolicyDigest: request.PolicyDigest}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}
+			claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest, PolicyDigest: request.PolicyDigest, AuthDigest: request.AuthDigest, AuthMode: request.AuthMode}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA, RequestDigest: request.RequestDigest}
 			return database.RecordProviderLaunch(recordCtx, claim, launch)
 		})
 	}
@@ -246,7 +250,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		}
 	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, providerCoordinator: coordinator}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, providerCoordinator: coordinator, providerQualifier: configuration.ProviderQualifier}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -320,7 +324,7 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 				}
 				return fmt.Errorf("quarantined provider attempt %d without a provable launch identity: %w", claim.ID, store.ErrProviderDrain)
 			}
-			req := contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA}
+			req := drainRequestForProviderClaim(claim.ProviderAttemptClaim)
 			proof, drainErr := daemon.recoveryDrainer.DrainPersisted(ctx, req, launch)
 			if drainErr != nil {
 				if err := daemon.store.QuarantineRecoveredProviderAttemptClaim(ctx, claim, daemon.epoch, daemon.clock.Now()); err != nil {
@@ -361,6 +365,10 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 		index = next
 	}
 	return daemon.engine.RecoverChannel(ctx, daemon.channel, daemon.epoch)
+}
+
+func drainRequestForProviderClaim(claim store.ProviderAttemptClaim) contracts.DrainRequest {
+	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, AuthDigest: claim.Binding.AuthDigest, AuthMode: claim.Binding.AuthMode, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA, RequestDigest: claim.RequestDigest}
 }
 
 // Run owns a foreground daemon lifetime. It is deliberately separate from the
@@ -424,6 +432,8 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		response = daemon.controlTicket(ctx, request, identity, "cancel")
 	case "daemon.status":
 		response = daemon.status(request, identity)
+	case "provider.qualify":
+		response = daemon.qualifyProvider(ctx, request)
 	default:
 		response = daemon.failure(request, "not_ready", "this lifecycle operation is not enabled by the local daemon yet", false)
 	}
@@ -433,6 +443,40 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		}
 	}
 	return response
+}
+
+func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) api.Response {
+	if daemon.providerQualifier == nil {
+		return daemon.failure(request, "provider_unavailable", "provider qualification is not configured for this daemon", false)
+	}
+	var parameters struct {
+		Builder  string `json:"builder"`
+		Reviewer string `json:"reviewer"`
+	}
+	if err := json.Unmarshal(request.Parameters, &parameters); err != nil || parameters.Builder != "codex" || parameters.Reviewer != "codex" {
+		return daemon.failure(request, "invalid_argument", "builder and reviewer must name the local Codex provider", false)
+	}
+	value, err := daemon.providerQualifier(ctx, daemon.store, daemon.channel, parameters.Builder, parameters.Reviewer)
+	if err != nil {
+		response := daemon.failure(request, "unqualified_provider", "local Codex qualification failed without invoking a model: "+safeQualificationError(err), false)
+		if encoded, encodeErr := json.Marshal(value); encodeErr == nil {
+			response.Data = encoded
+		}
+		return response
+	}
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "provider.qualify", Identity: string(daemon.channel), Observed: true}, value)
+}
+
+func safeQualificationError(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "bounded probe did not complete"
+	}
+	for _, value := range []string{"unsafe", "unavailable", "capability", "authentication", "attestation", "qualified", "leader", "supervisor", "qualification"} {
+		if strings.Contains(strings.ToLower(err.Error()), value) {
+			return err.Error()
+		}
+	}
+	return "guarded probe refused"
 }
 
 func (daemon *Daemon) projectEvents(ctx context.Context) error {
@@ -858,6 +902,9 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	verb := strings.TrimPrefix(request.Method, "ticket.")
 	if code == "autonomous_unavailable" {
 		argv = []string{binary, "providers", "qualify", "--help"}
+	}
+	if code == "unqualified_provider" {
+		argv = []string{binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"}
 	}
 	if code == "terminal_replay_requires_new" {
 		argv = []string{binary, "submit", "--help"}

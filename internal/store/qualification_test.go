@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/processsupervisor"
 )
 
 func TestProviderQualificationIsExactSanitizedAndIdempotent(t *testing.T) {
@@ -34,6 +36,47 @@ func TestProviderQualificationIsExactSanitizedAndIdempotent(t *testing.T) {
 	var rows int
 	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_qualifications WHERE channel='dev'`).Scan(&rows); err != nil || rows != 1 {
 		t.Fatalf("rows=%d err=%v", rows, err)
+	}
+}
+
+func TestCodexQualificationRequiresCurrentSupervisorAttestation(t *testing.T) {
+	database, ctx := openTestStore(t)
+	input := qualificationValue("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "codex", "openai-gpt-5.6", QualificationGuarded)
+	input.Provider.Model, input.Provider.Version = "gpt-5.6-luna", "1.2.3"
+	input.ProbeDigest = strings.Repeat("d", 64)
+	if _, _, err := database.RecordProviderQualification(ctx, input); err == nil {
+		t.Fatal("unsigned Codex qualification was accepted")
+	}
+	supervisor, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "qualification-test")
+	if err != nil || database.SetRecoveryAuthority(ctx, domain.ChannelDev, leader, supervisor.PublicKey()) != nil {
+		t.Fatalf("set current supervisor: leader=%d err=%v", leader, err)
+	}
+	input.AuthMode = "chatgpt_subscription"
+	attestation, err := supervisor.AttestQualification(contracts.QualificationAttestation{Channel: input.Channel, RunID: input.RunID, Identity: input.Provider, BinaryDigest: input.BinaryDigest, PolicyDigest: input.PolicyDigest, FixtureDigest: input.FixtureDigest, AuthDigest: strings.Repeat("e", 64), AuthMode: input.AuthMode, ProbeDigest: input.ProbeDigest, Profile: contracts.ProfileGuarded, CreatedUnixNanos: input.CreatedAt.UnixNano(), LeaderEpoch: leader, Nonce: input.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, _, err := database.RecordAttestedProviderQualification(ctx, input, attestation)
+	if err != nil || stored.AttestedLeaderEpoch != leader || len(stored.AttestationSignature) != 64 {
+		t.Fatalf("attested qualification=%+v err=%v", stored, err)
+	}
+	other, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "qualification-restart")
+	if err != nil || database.SetRecoveryAuthority(ctx, domain.ChannelDev, newLeader, other.PublicKey()) != nil {
+		t.Fatalf("rotate current supervisor: leader=%d err=%v", newLeader, err)
+	}
+	input.RunID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	input.CreatedAt = input.CreatedAt.Add(time.Second)
+	attestation.RunID, attestation.CreatedUnixNanos, attestation.Nonce = input.RunID, input.CreatedAt.UnixNano(), input.RunID
+	if _, _, err := database.RecordAttestedProviderQualification(ctx, input, attestation); err == nil {
+		t.Fatal("stale supervisor signature was accepted")
 	}
 }
 
@@ -97,7 +140,7 @@ func TestNewVerdictInvalidatesPairAndStaleOrDisabledRecordsCannotBeSelected(t *t
 
 func TestFailedProviderVersionDisablesOtherModelsUntilFreshPass(t *testing.T) {
 	database, ctx := openTestStore(t)
-	firstModel := qualificationValue("11111111111111111111111111111111", "codex", "family-one", QualificationGuarded)
+	firstModel := qualificationValue("11111111111111111111111111111111", "fixture", "family-one", QualificationGuarded)
 	firstModel.Provider.Model = "model-one"
 	first, _, _ := database.RecordProviderQualification(ctx, firstModel)
 	reviewerInput := qualificationValue("22222222222222222222222222222222", "claude", "review-family", QualificationGuarded)
@@ -105,7 +148,7 @@ func TestFailedProviderVersionDisablesOtherModelsUntilFreshPass(t *testing.T) {
 	if _, _, err := database.SelectProviderPair(ctx, domain.ChannelDev, first.ID, reviewer.ID, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	failure := qualificationValue("33333333333333333333333333333333", "codex", "family-two", QualificationDisabled)
+	failure := qualificationValue("33333333333333333333333333333333", "fixture", "family-two", QualificationDisabled)
 	failure.Provider.Model = "model-two"
 	failure.FailedProbes = []string{"network"}
 	failure.ReasonCode = "hostile_fixture_failed"
@@ -138,7 +181,7 @@ func TestSameFamilyAndCrossChannelPairsAreRefused(t *testing.T) {
 	if _, _, err := database.SelectProviderPair(ctx, domain.ChannelDev, first.ID, second.ID, time.Now().UTC()); !errors.Is(err, ErrProviderPairRefused) {
 		t.Fatalf("same-family err=%v", err)
 	}
-	stable := qualificationValue("33333333333333333333333333333333", "codex", "other-family", QualificationGuarded)
+	stable := qualificationValue("33333333333333333333333333333333", "fixture", "other-family", QualificationGuarded)
 	stable.Channel = domain.ChannelStable
 	stableRecord, _, err := database.RecordProviderQualification(ctx, stable)
 	if err != nil {

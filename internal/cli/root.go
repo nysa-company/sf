@@ -376,7 +376,9 @@ func (a *app) initCommand() *cobra.Command {
 func (a *app) providersCommand() *cobra.Command {
 	root := &cobra.Command{Use: "providers", Args: cobra.NoArgs}
 	var builder, reviewer string
-	qualify := &cobra.Command{Use: "qualify --builder <provider> --reviewer <provider>", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error { return a.emit(notConfigured("providers qualify")) }}
+	qualify := &cobra.Command{Use: "qualify --builder <provider> --reviewer <provider>", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		return a.emit(a.request("provider.qualify", "", params(map[string]any{"builder": builder, "reviewer": reviewer}, a.channel)))
+	}}
 	qualify.Flags().StringVar(&builder, "builder", "", "builder provider")
 	qualify.Flags().StringVar(&reviewer, "reviewer", "", "independent reviewer provider")
 	_ = qualify.MarkFlagRequired("builder")

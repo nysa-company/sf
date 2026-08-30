@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 )
 
@@ -31,10 +32,18 @@ type ProviderQualification struct {
 	BinaryDigest  string
 	PolicyDigest  string
 	FixtureDigest string
+	AuthDigest    string
+	AuthMode      string
 	Profile       QualificationProfile
 	FailedProbes  []string
 	ReasonCode    string
 	CreatedAt     time.Time
+	// Codex guarded records are admitted only through the daemon's current
+	// supervisor key. These values are non-secret audit evidence, never a
+	// provider transcript or credential.
+	ProbeDigest          string
+	AttestedLeaderEpoch  uint64
+	AttestationSignature []byte
 }
 
 type ProviderPair struct {
@@ -73,6 +82,35 @@ var (
 )
 
 func (s *Store) RecordProviderQualification(ctx context.Context, input ProviderQualification) (ProviderQualification, bool, error) {
+	if input.Provider.Provider == "codex" && input.Profile == QualificationGuarded {
+		return ProviderQualification{}, false, errors.New("Codex guarded qualification requires a supervisor attestation")
+	}
+	return s.recordProviderQualification(ctx, input, nil)
+}
+
+// RecordAttestedProviderQualification is the sole production entrypoint for
+// a passing Codex qualification. It verifies an exact signature from the
+// currently fenced daemon supervisor before SQLite admits the row.
+func (s *Store) RecordAttestedProviderQualification(ctx context.Context, input ProviderQualification, attestation contracts.QualificationAttestation) (ProviderQualification, bool, error) {
+	if input.Provider.Provider != "codex" || input.Profile != QualificationGuarded || !sameQualificationAttestation(input, attestation) {
+		return ProviderQualification{}, false, errors.New("invalid Codex qualification attestation")
+	}
+	input.ProbeDigest = attestation.ProbeDigest
+	input.AuthDigest = attestation.AuthDigest
+	input.AuthMode = attestation.AuthMode
+	// The leader is read and signature-verified inside the same SQLite write
+	// transaction as the insert. A concurrent daemon takeover therefore makes
+	// this observation fail rather than accepting a stale supervisor key.
+	input.AttestedLeaderEpoch = 1
+	input.AttestationSignature = append([]byte(nil), attestation.Signature...)
+	return s.recordProviderQualification(ctx, input, &attestation)
+}
+
+func sameQualificationAttestation(input ProviderQualification, value contracts.QualificationAttestation) bool {
+	return input.Channel == value.Channel && input.RunID == value.RunID && input.Provider == value.Identity && input.BinaryDigest == value.BinaryDigest && input.PolicyDigest == value.PolicyDigest && input.FixtureDigest == value.FixtureDigest && input.ProbeDigest == value.ProbeDigest && input.AuthMode == value.AuthMode && value.AuthDigest != "" && input.CreatedAt.UnixNano() == value.CreatedUnixNanos && value.Profile == contracts.ProfileGuarded
+}
+
+func (s *Store) recordProviderQualification(ctx context.Context, input ProviderQualification, attestation *contracts.QualificationAttestation) (ProviderQualification, bool, error) {
 	normalized, failedJSON, err := normalizeQualification(input)
 	if err != nil {
 		return ProviderQualification{}, false, err
@@ -80,6 +118,14 @@ func (s *Store) RecordProviderQualification(ctx context.Context, input ProviderQ
 	created := false
 	var result ProviderQualification
 	err = s.write(ctx, func(conn *sql.Conn) error {
+		if attestation != nil {
+			var leader uint64
+			var key []byte
+			if err := conn.QueryRowContext(ctx, `SELECT leader_epoch,recovery_public_key FROM daemon_instances WHERE channel=?`, normalized.Channel).Scan(&leader, &key); err != nil || leader == 0 || attestation.LeaderEpoch != leader || !contracts.VerifyQualificationAttestation(key, *attestation) {
+				return errors.New("Codex qualification attestation is not signed by the current supervisor")
+			}
+			normalized.AttestedLeaderEpoch = leader
+		}
 		existing, queryErr := qualificationByRun(ctx, conn, normalized.Channel, normalized.RunID)
 		if queryErr == nil {
 			if !sameQualification(existing, normalized) {
@@ -94,10 +140,10 @@ func (s *Store) RecordProviderQualification(ctx context.Context, input ProviderQ
 		createdAt := normalized.CreatedAt.UTC().Format(time.RFC3339Nano)
 		row, insertErr := conn.ExecContext(ctx, `INSERT INTO provider_qualifications(
 			channel, run_id, provider, model, family, provider_version, binary_digest, policy_digest, fixture_digest,
-			profile, failed_probes_json, reason_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			profile, failed_probes_json, reason_code, created_at, auth_digest, auth_mode, probe_digest, attested_leader_epoch, attestation_signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			normalized.Channel, normalized.RunID, normalized.Provider.Provider, normalized.Provider.Model, normalized.Provider.Family,
 			normalized.Provider.Version, normalized.BinaryDigest, normalized.PolicyDigest, normalized.FixtureDigest,
-			normalized.Profile, string(failedJSON), normalized.ReasonCode, createdAt)
+			normalized.Profile, string(failedJSON), normalized.ReasonCode, createdAt, normalized.AuthDigest, normalized.AuthMode, normalized.ProbeDigest, normalized.AttestedLeaderEpoch, normalized.AttestationSignature)
 		if insertErr != nil {
 			return insertErr
 		}
@@ -141,7 +187,7 @@ func (s *Store) LatestProviderQualification(ctx context.Context, channel domain.
 		return ProviderQualification{}, errors.New("invalid provider qualification identity")
 	}
 	value, err := scanQualification(s.db.QueryRowContext(ctx, `SELECT id, channel, run_id, provider, model, family, provider_version,
-		binary_digest, policy_digest, fixture_digest, profile, failed_probes_json, reason_code, created_at
+		binary_digest, policy_digest, fixture_digest, profile, failed_probes_json, reason_code, created_at, auth_digest, auth_mode, probe_digest, attested_leader_epoch, attestation_signature
 		FROM provider_qualifications WHERE channel=? AND provider=? AND model=? AND family=? AND provider_version=? ORDER BY id DESC LIMIT 1`,
 		channel, identity.Provider, identity.Model, identity.Family, identity.Version))
 	if err != nil {
@@ -231,6 +277,16 @@ func normalizeQualification(input ProviderQualification) (ProviderQualification,
 		return ProviderQualification{}, nil, errors.New("invalid provider qualification")
 	}
 	input.CreatedAt = input.CreatedAt.UTC()
+	if input.AttestationSignature == nil {
+		input.AttestationSignature = []byte{}
+	}
+	if input.Provider.Provider == "codex" && input.Profile == QualificationGuarded {
+		if input.AuthMode != "chatgpt_subscription" || !lowerHex(input.AuthDigest, 32) || !lowerHex(input.ProbeDigest, 32) || input.AttestedLeaderEpoch == 0 || len(input.AttestationSignature) != 64 {
+			return ProviderQualification{}, nil, errors.New("Codex qualification attestation evidence is invalid")
+		}
+	} else if input.AuthDigest != "" || input.AuthMode != "" || input.ProbeDigest != "" || input.AttestedLeaderEpoch != 0 || len(input.AttestationSignature) != 0 {
+		return ProviderQualification{}, nil, errors.New("unexpected qualification attestation evidence")
+	}
 	input.FailedProbes = append([]string(nil), input.FailedProbes...)
 	if input.FailedProbes == nil {
 		input.FailedProbes = []string{}
@@ -258,6 +314,43 @@ func normalizeQualification(input ProviderQualification) (ProviderQualification,
 		return ProviderQualification{}, nil, errors.New("failed qualification probes exceed limit")
 	}
 	return input, failedJSON, nil
+}
+
+// LeaderEpoch is the currently fenced daemon epoch. Qualification binds this
+// exact value before signing, so a later daemon restart cannot reuse it.
+func (s *Store) LeaderEpoch(ctx context.Context, channel domain.Channel) (uint64, error) {
+	if !channel.Valid() {
+		return 0, ErrNotFound
+	}
+	var epoch uint64
+	if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, channel).Scan(&epoch); err != nil {
+		return 0, normalizeNotFound(ctx, err)
+	}
+	if epoch == 0 {
+		return 0, ErrNotFound
+	}
+	return epoch, nil
+}
+
+// QualificationCurrent verifies that a Codex qualification is still signed by
+// the daemon leader currently recorded for this channel. It is deliberately
+// rechecked at composition and paid-attempt admission, not merely at insert.
+func (s *Store) QualificationCurrent(ctx context.Context, channel domain.Channel, value ProviderQualification) bool {
+	if value.Provider.Provider != "codex" {
+		return true
+	}
+	var epoch uint64
+	var key []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch,recovery_public_key FROM daemon_instances WHERE channel=?`, channel).Scan(&epoch, &key); err != nil {
+		return false
+	}
+	return value.AttestedLeaderEpoch == epoch && contracts.VerifyQualificationAttestation(key, contracts.QualificationAttestation{
+		Channel: value.Channel, RunID: value.RunID, Identity: value.Provider,
+		BinaryDigest: value.BinaryDigest, PolicyDigest: value.PolicyDigest, FixtureDigest: value.FixtureDigest,
+		AuthDigest: value.AuthDigest, AuthMode: value.AuthMode, ProbeDigest: value.ProbeDigest,
+		Profile: contracts.ProfileGuarded, CreatedUnixNanos: value.CreatedAt.UnixNano(), LeaderEpoch: value.AttestedLeaderEpoch,
+		Nonce: value.RunID, Signature: value.AttestationSignature,
+	})
 }
 
 func validateProviderIdentity(identity domain.ProviderIdentity) error {
@@ -291,7 +384,7 @@ func qualificationByRun(ctx context.Context, query interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, channel domain.Channel, runID string) (ProviderQualification, error) {
 	return scanQualification(query.QueryRowContext(ctx, `SELECT id, channel, run_id, provider, model, family, provider_version,
-		binary_digest, policy_digest, fixture_digest, profile, failed_probes_json, reason_code, created_at
+		binary_digest, policy_digest, fixture_digest, profile, failed_probes_json, reason_code, created_at, auth_digest, auth_mode, probe_digest, attested_leader_epoch, attestation_signature
 		FROM provider_qualifications WHERE channel=? AND run_id=?`, channel, runID))
 }
 
@@ -299,7 +392,7 @@ func currentQualificationByID(ctx context.Context, query interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, channel domain.Channel, id int64) (ProviderQualification, error) {
 	return scanQualification(query.QueryRowContext(ctx, `SELECT q.id, q.channel, q.run_id, q.provider, q.model, q.family, q.provider_version,
-		q.binary_digest, q.policy_digest, q.fixture_digest, q.profile, q.failed_probes_json, q.reason_code, q.created_at
+		q.binary_digest, q.policy_digest, q.fixture_digest, q.profile, q.failed_probes_json, q.reason_code, q.created_at, q.auth_digest, q.auth_mode, q.probe_digest, q.attested_leader_epoch, q.attestation_signature
 		FROM provider_qualifications q WHERE q.channel=? AND q.id=? AND NOT EXISTS (
 			SELECT 1 FROM provider_qualifications newer WHERE newer.channel=q.channel AND newer.provider=q.provider AND newer.model=q.model
 			AND newer.family=q.family AND newer.provider_version=q.provider_version AND newer.id>q.id) AND NOT EXISTS (
@@ -311,7 +404,7 @@ func scanQualification(row *sql.Row) (ProviderQualification, error) {
 	var value ProviderQualification
 	var failedJSON, created string
 	if err := row.Scan(&value.ID, &value.Channel, &value.RunID, &value.Provider.Provider, &value.Provider.Model, &value.Provider.Family,
-		&value.Provider.Version, &value.BinaryDigest, &value.PolicyDigest, &value.FixtureDigest, &value.Profile, &failedJSON, &value.ReasonCode, &created); err != nil {
+		&value.Provider.Version, &value.BinaryDigest, &value.PolicyDigest, &value.FixtureDigest, &value.Profile, &failedJSON, &value.ReasonCode, &created, &value.AuthDigest, &value.AuthMode, &value.ProbeDigest, &value.AttestedLeaderEpoch, &value.AttestationSignature); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ProviderQualification{}, ErrNotFound
 		}
@@ -330,8 +423,9 @@ func scanQualification(row *sql.Row) (ProviderQualification, error) {
 
 func sameQualification(left, right ProviderQualification) bool {
 	return left.Channel == right.Channel && left.RunID == right.RunID && left.Provider == right.Provider && left.BinaryDigest == right.BinaryDigest &&
-		left.PolicyDigest == right.PolicyDigest && left.FixtureDigest == right.FixtureDigest && left.Profile == right.Profile &&
-		strings.Join(left.FailedProbes, "\x00") == strings.Join(right.FailedProbes, "\x00") && left.ReasonCode == right.ReasonCode && left.CreatedAt.Equal(right.CreatedAt)
+		left.PolicyDigest == right.PolicyDigest && left.FixtureDigest == right.FixtureDigest && left.AuthDigest == right.AuthDigest && left.AuthMode == right.AuthMode && left.Profile == right.Profile &&
+		strings.Join(left.FailedProbes, "\x00") == strings.Join(right.FailedProbes, "\x00") && left.ReasonCode == right.ReasonCode && left.CreatedAt.Equal(right.CreatedAt) &&
+		left.ProbeDigest == right.ProbeDigest && left.AttestedLeaderEpoch == right.AttestedLeaderEpoch && string(left.AttestationSignature) == string(right.AttestationSignature)
 }
 
 func normalizeNotFound(ctx context.Context, err error) error {

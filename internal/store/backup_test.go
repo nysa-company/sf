@@ -2,11 +2,17 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 )
 
@@ -76,6 +82,256 @@ func TestPrivateSchemaV10UpgradesThroughProviderMigrations(t *testing.T) {
 	}
 	if got := rawSchemaVersion(t, path); got != schemaVersion {
 		t.Fatalf("migrated schema=%d want=%d", got, schemaVersion)
+	}
+}
+
+func TestV26ClosesPhaseRunForV25LegacyProviderClaim(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v24.sqlite")
+	createDatabaseAtVersion(t, path, 24)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.ExecContext(ctx, `INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('dev','legacy','/legacy','main'); INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES('dev','legacy','SF-v26','source','feature','guarded','building',1,1,'legacy-v26'); INSERT INTO phase_runs(channel,project_id,ticket_id,phase,attempt,state,leader_epoch,runner_epoch,expected_ticket_version,outcome,started_at) VALUES('dev','legacy','SF-v26','build',1,'active',1,1,1,'running','now'); INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,started_at) VALUES('dev','legacy','SF-v26','build',1,'legacy','model','family','1','running','builder','active','now')`)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := OpenChannel(ctx, path, filepath.Join(t.TempDir(), "backups"), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var providerState, phaseState, phaseOutcome string
+	if err := database.db.QueryRowContext(ctx, `SELECT state FROM provider_attempts WHERE project_id='legacy' AND ticket_id='SF-v26'`).Scan(&providerState); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.QueryRowContext(ctx, `SELECT state,outcome FROM phase_runs WHERE project_id='legacy' AND ticket_id='SF-v26'`).Scan(&phaseState, &phaseOutcome); err != nil {
+		t.Fatal(err)
+	}
+	if providerState != "failed" || phaseState != "failed" || phaseOutcome != "legacy_unverifiable" {
+		t.Fatalf("legacy lifecycle was left active: provider=%s phase=%s/%s", providerState, phaseState, phaseOutcome)
+	}
+}
+
+func TestV27ReconcilesOrphanAndMismatchedActivePhaseRuns(t *testing.T) {
+	for _, scenario := range []struct {
+		name     string
+		version  int
+		provider bool
+		mismatch bool
+	}{
+		{name: "v24 orphan", version: 24},
+		{name: "v25 mismatched provider", version: 25, provider: true, mismatch: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.sqlite")
+			createDatabaseAtVersion(t, path, scenario.version)
+			seedMigrationPhase(t, path, scenario.provider, scenario.mismatch)
+			database, err := OpenChannel(context.Background(), path, filepath.Join(t.TempDir(), "backups"), domain.ChannelDev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			var state, outcome string
+			if err := database.db.QueryRow(`SELECT state,outcome FROM phase_runs WHERE channel='dev' AND project_id='migration' AND ticket_id='SF-v27' AND attempt=1`).Scan(&state, &outcome); err != nil || state != "failed" || outcome != "legacy_unverifiable" {
+				t.Fatalf("unprovable phase remained active: %s/%s err=%v", state, outcome, err)
+			}
+			if _, err := database.db.Exec(`INSERT INTO phase_runs(channel,project_id,ticket_id,phase,attempt,state,leader_epoch,runner_epoch,expected_ticket_version,provider,model,family,provider_version,worktree_identity,base_sha,started_at,outcome) VALUES('dev','migration','SF-v27','build',2,'active',1,1,1,'provider','model','family','1','identity','` + strings.Repeat("a", 40) + `','now','running')`); err != nil {
+				t.Fatalf("closed orphan still blocked subsequent phase attempt: %v", err)
+			}
+		})
+	}
+}
+
+func TestV27PreservesProvableV25ActiveAttempt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.sqlite")
+	createDatabaseAtVersion(t, path, 25)
+	seedMigrationPhase(t, path, true, false)
+	database, err := OpenChannel(context.Background(), path, filepath.Join(t.TempDir(), "backups"), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var phaseState, attemptState string
+	if err := database.db.QueryRow(`SELECT state FROM phase_runs WHERE channel='dev' AND project_id='migration' AND ticket_id='SF-v27'`).Scan(&phaseState); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.QueryRow(`SELECT state FROM provider_attempts WHERE channel='dev' AND project_id='migration' AND ticket_id='SF-v27'`).Scan(&attemptState); err != nil {
+		t.Fatal(err)
+	}
+	if phaseState != "active" || attemptState != "active" {
+		t.Fatalf("provable v25 claim was not preserved: phase=%s attempt=%s", phaseState, attemptState)
+	}
+}
+
+func seedMigrationPhase(t *testing.T, path string, provider, mismatch bool) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	base := strings.Repeat("a", 40)
+	if _, err := raw.Exec(`INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('dev','migration','/migration','main'); INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES('dev','migration','SF-v27','source','feature','guarded','building',1,1,'migration-v27'); INSERT INTO phase_runs(channel,project_id,ticket_id,phase,attempt,state,leader_epoch,runner_epoch,expected_ticket_version,provider,model,family,provider_version,worktree_identity,base_sha,started_at,outcome) VALUES('dev','migration','SF-v27','build',1,'active',1,1,1,'provider','model','family','1','identity','` + base + `','now','running')`); err != nil {
+		t.Fatal(err)
+	}
+	if !provider {
+		return
+	}
+	model := "model"
+	if mismatch {
+		model = "other-model"
+	}
+	binding := contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "provider", Model: model, Family: "family", Version: "1"}, BinaryDigest: strings.Repeat("d", 64), PolicyDigest: strings.Repeat("e", 64), FixtureDigest: strings.Repeat("f", 64), AuthDigest: strings.Repeat("b", 64)}
+	if _, err := raw.Exec(`INSERT INTO provider_qualifications(channel,run_id,provider,model,family,provider_version,binary_digest,policy_digest,fixture_digest,profile,failed_probes_json,reason_code,created_at,auth_digest,probe_digest,auth_mode) VALUES('dev','11111111111111111111111111111111','provider',?,'family','1',?,?,?,'qualified_guarded','[]','','now',?,'','')`, model, binding.BinaryDigest, binding.PolicyDigest, binding.FixtureDigest, binding.AuthDigest); err != nil {
+		t.Fatal(err)
+	}
+	result, err := raw.Exec(`INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,started_at,qualification_id,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha,supervisor_key,auth_digest,auth_mode,binding_digest,provider_lease_key,launch_state) VALUES('dev','migration','SF-v27','build',1,'provider','` + model + `','family','1','running','builder','active','now',1,1,1,1,'/migration','/migration','identity','` + base + `',X'0102030405060708091011121314151617181920212223242526272829303132','` + binding.AuthDigest + `','','` + bindingDigest(binding) + `','provider/key','launching')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := contracts.PhaseInput{Ticket: domain.TicketRef{Channel: domain.ChannelDev, Project: "migration", Ticket: "SF-v27"}, Phase: domain.PhaseBuild, Attempt: 1, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, Prompt: "migration", Repository: "/migration", Worktree: "/migration", WorktreeIdentity: "identity", BaseSHA: base, AllowedPaths: []string{"."}, Provider: domain.ProviderIdentity{Provider: "provider", Model: model, Family: "family", Version: "1"}, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}
+	payload, digest, err := contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO provider_attempt_inputs(provider_attempt_id,request_digest,canonical_input,created_at) VALUES(?,?,?,'now')`, id, digest, payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO leases(channel,project_id,scope,scope_key,ticket_id,runner_epoch,acquired_at) VALUES('dev','migration','provider','provider/key','SF-v27',1,'now')`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV28ReconcilesInvalidV25CanonicalInputsBeforeAnyRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *sql.DB)
+	}{
+		{"wrong digest", func(t *testing.T, raw *sql.DB) {
+			if _, err := raw.Exec(`DROP TRIGGER provider_attempt_inputs_immutable_update; UPDATE provider_attempt_inputs SET request_digest=?`, strings.Repeat("0", 64)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"noncanonical bytes", func(t *testing.T, raw *sql.DB) {
+			var payload []byte
+			if err := raw.QueryRow(`SELECT canonical_input FROM provider_attempt_inputs`).Scan(&payload); err != nil {
+				t.Fatal(err)
+			}
+			payload = append([]byte(" \n"), payload...)
+			sum := sha256.Sum256(payload)
+			if _, err := raw.Exec(`DROP TRIGGER provider_attempt_inputs_immutable_update; UPDATE provider_attempt_inputs SET canonical_input=?,request_digest=?`, payload, fmt.Sprintf("%x", sum)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"missing prompt", func(t *testing.T, raw *sql.DB) {
+			var payload []byte
+			if err := raw.QueryRow(`SELECT canonical_input FROM provider_attempt_inputs`).Scan(&payload); err != nil {
+				t.Fatal(err)
+			}
+			input, err := contracts.DecodeCanonicalPhaseInput(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input.Prompt = ""
+			payload, digest, err := contracts.CanonicalPhaseInput(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(`DROP TRIGGER provider_attempt_inputs_immutable_update; UPDATE provider_attempt_inputs SET canonical_input=?,request_digest=?`, payload, digest); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.sqlite")
+			createDatabaseAtVersion(t, path, 25)
+			seedMigrationPhase(t, path, true, false)
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, raw)
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			database, err := Open(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			var attemptState, providerOutcome, phaseState, phaseOutcome string
+			if err := database.db.QueryRow(`SELECT state,outcome FROM provider_attempts WHERE ticket_id='SF-v27'`).Scan(&attemptState, &providerOutcome); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.db.QueryRow(`SELECT state,outcome FROM phase_runs WHERE ticket_id='SF-v27'`).Scan(&phaseState, &phaseOutcome); err != nil {
+				t.Fatal(err)
+			}
+			if attemptState != "failed" || providerOutcome != "legacy_unverifiable" || phaseState != "failed" || phaseOutcome != "legacy_unverifiable" {
+				t.Fatalf("invalid input was not terminal: provider=%s/%s phase=%s/%s", attemptState, providerOutcome, phaseState, phaseOutcome)
+			}
+			var leases int
+			if err := database.db.QueryRow(`SELECT COUNT(*) FROM leases WHERE scope='provider' AND scope_key='provider/key'`).Scan(&leases); err != nil || leases != 0 {
+				t.Fatalf("unlaunched invalid claim retained lease=%d err=%v", leases, err)
+			}
+			// The released capacity is observable through actual Store admission,
+			// not merely by inspecting the lease table.
+			digest := setupProviderProject(t, database, context.Background())
+			leader, _ := database.AcquireLeader(context.Background(), domain.ChannelDev, "v28-test")
+			ticket := setupProviderTicket(t, database, context.Background(), "SF-v28-next", leader)
+			builder, _ := setupProviderPair(t, database, context.Background())
+			ticket = providerState(t, database, context.Background(), ticket, leader, domain.StateBuilding)
+			if _, err := database.BeginProviderAttempt(context.Background(), supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); err != nil {
+				t.Fatalf("subsequent Begin remained blocked: %v", err)
+			}
+		})
+	}
+}
+
+func TestV28QuarantinesReleasedInvalidInputAndSurfacesRecoveryBlocker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.sqlite")
+	createDatabaseAtVersion(t, path, 25)
+	seedMigrationPhase(t, path, true, false)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`DROP TRIGGER provider_attempt_inputs_immutable_update; UPDATE provider_attempt_inputs SET request_digest=?; UPDATE provider_attempts SET launch_state='released',process_pid=123,process_pgid=123,process_boot_identity='boot',process_start_identity='start'`, strings.Repeat("0", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var attemptState, phaseState string
+	if err := database.db.QueryRow(`SELECT state FROM provider_attempts WHERE ticket_id='SF-v27'`).Scan(&attemptState); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.QueryRow(`SELECT state FROM phase_runs WHERE ticket_id='SF-v27'`).Scan(&phaseState); err != nil {
+		t.Fatal(err)
+	}
+	if attemptState != "quarantined" || phaseState != "active" {
+		t.Fatalf("released invalid input was not fail-closed: attempt=%s phase=%s", attemptState, phaseState)
+	}
+	var leases int
+	if err := database.db.QueryRow(`SELECT COUNT(*) FROM leases WHERE scope='provider' AND scope_key='provider/key'`).Scan(&leases); err != nil || leases != 1 {
+		t.Fatalf("released invalid claim lost its lease=%d err=%v", leases, err)
+	}
+	if _, err := database.ActiveProviderAttempts(context.Background(), domain.ChannelDev); !errors.Is(err, ErrProviderRecoveryBlocked) {
+		t.Fatalf("invalid released claim did not surface typed recovery blocker: %v", err)
 	}
 }
 
@@ -245,6 +501,22 @@ func testMigration(version int) []string {
 		return migrationV19
 	case 20:
 		return migrationV20
+	case 21:
+		return migrationV21
+	case 22:
+		return migrationV22
+	case 23:
+		return migrationV23
+	case 24:
+		return migrationV24
+	case 25:
+		return migrationV25
+	case 26:
+		return migrationV26
+	case 27:
+		return migrationV27
+	case 28:
+		return migrationV28
 	default:
 		return nil
 	}

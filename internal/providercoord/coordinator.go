@@ -58,6 +58,7 @@ type Receipt struct {
 	Provider                         domain.ProviderIdentity
 	ArtifactDigest, TranscriptDigest string
 	UsageUnits                       int64
+	TokenUsage                       int64
 	ErrorCode                        string
 }
 type Result struct {
@@ -86,7 +87,10 @@ func (r *Registry) Register(ctx context.Context, p contracts.Provider) error {
 		return errors.New("provider required")
 	}
 	id, e := p.Probe(ctx)
-	if e != nil || id.Provider != p.Name() {
+	// Name is a local route key; identity.Provider remains the durable,
+	// operator-visible executable/provider name. This permits two configured
+	// model-family profiles of one executable without claiming two binaries.
+	if e != nil || id.Provider == "" || id.Model == "" || id.Family == "" || id.Version == "" {
 		return errors.New("provider identity probe failed")
 	}
 	binding, e := p.Binding(ctx)
@@ -110,6 +114,9 @@ func validBinding(binding contracts.RuntimeBinding) bool {
 		if len(digest) != 64 || strings.ToLower(digest) != digest || strings.Trim(digest, "0123456789abcdef") != "" {
 			return false
 		}
+	}
+	if binding.Identity.Provider == "codex" && binding.AuthMode != "chatgpt_subscription" {
+		return false
 	}
 	return binding.Identity.Provider != "" && binding.Identity.Model != "" && binding.Identity.Family != "" && binding.Identity.Version != ""
 }
@@ -161,7 +168,7 @@ func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Cloc
 		return nil, errors.New("process supervisor must support durable launch recording")
 	}
 	setter.SetLaunchRecorder(func(ctx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) error {
-		claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest, PolicyDigest: request.PolicyDigest}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}
+		claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest, PolicyDigest: request.PolicyDigest, AuthDigest: request.AuthDigest, AuthMode: request.AuthMode}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA, RequestDigest: request.RequestDigest}
 		return database.RecordProviderLaunch(ctx, claim, launch)
 	})
 	return &Coordinator{registry: reg, routes: copy, store: database, clock: clock, supervisor: supervisor}, nil
@@ -205,7 +212,11 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			continue
 		}
 		binding, err := p.Binding(ctx)
-		if err != nil || binding.Identity.Provider != name {
+		// Route names may distinguish separately pinned model/family profiles
+		// of one underlying provider executable. The durable identity remains
+		// in binding.Identity and is validated by Store; do not compare it to
+		// the local registry route alias.
+		if err != nil || p.Name() != name {
 			continue
 		}
 		remaining := ticket.CreatedAt.Add(ticket.MaxDuration).Sub(c.clock.Now())
@@ -217,7 +228,11 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			timeout = remaining
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest, Repository: r.Input.Repository, Worktree: r.Input.Worktree, WorktreeIdentity: r.Input.WorktreeIdentity, BaseSHA: r.Input.BaseSHA, SupervisorKey: c.supervisor.PublicKey()})
+		claimInput := r.Input
+		claimInput.Timeout = timeout
+		claimInput.Provider, claimInput.AuthMode = binding.Identity, binding.AuthMode
+		claimInput.LeaderEpoch, claimInput.RunnerEpoch, claimInput.ExpectedVersion = r.Fence.LeaderEpoch, r.Fence.RunnerEpoch, r.ExpectedVersion
+		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest, Repository: r.Input.Repository, Worktree: r.Input.Worktree, WorktreeIdentity: r.Input.WorktreeIdentity, BaseSHA: r.Input.BaseSHA, SupervisorKey: c.supervisor.PublicKey(), Input: claimInput})
 		if err != nil {
 			cancel()
 			if errors.Is(err, store.ErrProviderCapacity) {
@@ -226,20 +241,44 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			continue
 		}
 		input := r.Input
-		input.Provider = binding.Identity
 		input.Timeout = timeout
+		if !bindClaimToInput(&input, claim, r, binding.Identity) {
+			// The Store claim is the sole authority for launch identity. A
+			// caller-provided PhaseInput must never be allowed to drift from it.
+			cancel()
+			finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			quarantineErr := c.store.QuarantineProviderAttempt(finishCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
+			finishCancel()
+			if quarantineErr != nil {
+				c.markPersistenceFailure(quarantineErr)
+			}
+			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: quarantineErr != nil}
+		}
+		input = claim.Input
 		invocation, invokeErr := p.Invocation(attemptCtx, input)
+		if invokeErr != nil {
+			// Invocation is adapter-only and occurs before the supervisor owns a
+			// child. This is the sole definite no-process failure path; every
+			// supervisor.Run error remains quarantined because pre-exec may have
+			// already created a provider process group.
+			cancel()
+			finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			finishErr := c.store.FailProviderAttemptBeforeLaunch(finishCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
+			finishCancel()
+			receipts = append(receipts, Receipt{Attempt: claim.Attempt, Provider: binding.Identity, ErrorCode: "provider_invocation_failed"})
+			if finishErr != nil {
+				c.markPersistenceFailure(finishErr)
+				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: true}
+			}
+			continue
+		}
 		var raw contracts.PhaseResult
 		var runErr error
-		if invokeErr != nil {
-			runErr = invokeErr
+		commandResult, commandErr := c.supervisor.Run(attemptCtx, drainRequest(claim), invocation, input)
+		if commandErr != nil {
+			runErr = commandErr
 		} else {
-			commandResult, commandErr := c.supervisor.Run(attemptCtx, drainRequest(claim), invocation, input)
-			if commandErr != nil {
-				runErr = commandErr
-			} else {
-				raw, runErr = p.Parse(attemptCtx, input, commandResult)
-			}
+			raw, runErr = p.Parse(attemptCtx, input, commandResult)
 		}
 		cancel()
 		cancelled := ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
@@ -262,7 +301,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		if cancelled {
 			state, outcome = "cancelled", "cancelled"
 		}
-		valid := !cancelled && runErr == nil && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0
+		valid := !cancelled && runErr == nil && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0 && changedFilesAllowed(raw.ChangedFiles, input.AllowedPaths)
 		var parsed phaseartifact.Parsed
 		if valid {
 			parsed, err = phaseartifact.Parse(input.Phase, raw, r.Validation)
@@ -273,6 +312,9 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			}
 		}
 		receipt := Receipt{Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), UsageUnits: max(raw.UsageUnits, 0)}
+		if raw.TokenUsageTrusted {
+			receipt.TokenUsage = max(raw.TokenUsage, 0)
+		}
 		if runErr != nil {
 			receipt.ErrorCode = "provider_error"
 		} else if !valid {
@@ -374,14 +416,54 @@ func (c *Coordinator) RecoverClaim(ctx context.Context, claim store.ProviderAtte
 }
 
 func drainRequest(claim store.ProviderAttemptClaim) contracts.DrainRequest {
-	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA}
+	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, AuthDigest: claim.Binding.AuthDigest, AuthMode: claim.Binding.AuthMode, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA, RequestDigest: claim.RequestDigest}
+}
+
+// bindClaimToInput is the last coordinator-side authentication point before
+// an adapter invocation. BeginProviderAttempt returns the durable claim, so
+// all execution identity fields are copied from that claim rather than being
+// trusted from a caller's PhaseInput. Non-zero claim fields supplied by a
+// caller are checked first to catch a split-brain request instead of silently
+// overwriting it.
+func bindClaimToInput(input *contracts.PhaseInput, claim store.ProviderAttemptClaim, request Request, identity domain.ProviderIdentity) bool {
+	if input == nil || claim.Role != string(request.Role) || claim.LeaderEpoch != request.Fence.LeaderEpoch || claim.RunnerEpoch != request.Fence.RunnerEpoch || claim.ExpectedVersion != request.ExpectedVersion || claim.Binding.Identity != identity || claim.RequestDigest == "" || !contracts.PhaseInputDigestMatches(claim.Input, claim.RequestDigest) {
+		return false
+	}
+	expected := *input
+	if expected.Provider == (domain.ProviderIdentity{}) {
+		expected.Provider = identity
+	}
+	if expected.AuthMode == "" {
+		expected.AuthMode = claim.Binding.AuthMode
+	}
+	if expected.Attempt == 0 {
+		expected.Attempt = claim.Attempt
+	}
+	if expected.LeaderEpoch == 0 {
+		expected.LeaderEpoch = claim.LeaderEpoch
+	}
+	if expected.RunnerEpoch == 0 {
+		expected.RunnerEpoch = claim.RunnerEpoch
+	}
+	if expected.ExpectedVersion == 0 {
+		expected.ExpectedVersion = claim.ExpectedVersion
+	}
+	_, expectedDigest, err := contracts.CanonicalPhaseInput(expected)
+	if err != nil || expectedDigest != claim.RequestDigest {
+		return false
+	}
+	*input = claim.Input
+	return true
 }
 func validate(r Request) error {
 	if !r.Role.valid() || r.Input.Ticket.Validate() != nil || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.ConfigDigest == "" || len(r.ConfigDigest) != 64 || r.Input.Profile != contracts.ProfileGuarded || r.Input.Timeout <= 0 || r.Input.Timeout > 10*time.Minute || strings.TrimSpace(r.Input.Prompt) == "" || len(r.Input.Prompt) > 64<<10 || !cleanAbs(r.Input.Repository) || !cleanAbs(r.Input.Worktree) || r.Input.WorktreeIdentity == "" || len(r.Input.BaseSHA) != 40 || len(r.Input.Schema) == 0 || len(r.Input.Schema) > 1<<20 {
 		return errors.New("invalid request")
 	}
-	if r.Input.Provider != (domain.ProviderIdentity{}) {
+	if r.Input.Provider != (domain.ProviderIdentity{}) || r.Input.AuthMode != "" || r.Input.RequestDigest != "" {
 		return errors.New("provider registry owns identity")
+	}
+	if !allowedPathPrefixes(r.Input.AllowedPaths) {
+		return errors.New("invalid allowed paths")
 	}
 	if r.Input.Phase != phase(r.Role) && !(r.Role == RoleReviewer && (r.Input.Phase == domain.PhaseVerification || r.Input.Phase == domain.PhaseReview)) {
 		return errors.New("role phase mismatch")
@@ -398,6 +480,45 @@ func phase(r Role) domain.Phase {
 	return domain.PhaseReview
 }
 func cleanAbs(v string) bool { return filepath.IsAbs(v) && filepath.Clean(v) == v && v != "/" }
+
+// Codex's sandbox has a worktree-root permission, not a per-path allowlist.
+// The worktree is therefore the trusted repository scope; this check is the
+// fail-closed authority before a provider result can be accepted.
+func allowedPathPrefixes(paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, path := range paths {
+		if path == "" || filepath.IsAbs(path) || filepath.Clean(path) != path || (path != "." && (path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)))) || seen[path] {
+			return false
+		}
+		seen[path] = true
+	}
+	return true
+}
+
+func changedFilesAllowed(changed, allowed []string) bool {
+	if !allowedPathPrefixes(allowed) {
+		return false
+	}
+	for _, file := range changed {
+		if file == "" || filepath.IsAbs(file) || filepath.Clean(file) != file || file == "." || file == ".." || strings.HasPrefix(file, ".."+string(filepath.Separator)) {
+			return false
+		}
+		ok := false
+		for _, prefix := range allowed {
+			if prefix == "." || file == prefix || strings.HasPrefix(file, prefix+string(filepath.Separator)) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
 func max(v int64, x int64) int64 {
 	if v < x {
 		return x

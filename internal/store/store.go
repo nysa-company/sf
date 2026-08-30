@@ -41,11 +41,15 @@ var (
 	ErrProviderCapacity      = errors.New("provider route capacity is exhausted")
 	ErrProviderAttempt       = errors.New("provider attempt cannot be admitted")
 	ErrProviderDrain         = errors.New("provider process has not drained")
-	ErrGitMutationIntent     = errors.New("git mutation intent is not a current executing effect")
-	ErrGitMutationLease      = errors.New("git mutation lease is unavailable or stale")
+	// ErrProviderRecoveryBlocked means a durable provider row is intentionally
+	// quarantined because its immutable launch authority is invalid. It is
+	// distinct from a normal drained recovery: an operator must resolve it.
+	ErrProviderRecoveryBlocked = errors.New("provider recovery is blocked by an invalid immutable launch claim")
+	ErrGitMutationIntent       = errors.New("git mutation intent is not a current executing effect")
+	ErrGitMutationLease        = errors.New("git mutation lease is unavailable or stale")
 )
 
-const schemaVersion = 21
+const schemaVersion = 28
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -69,6 +73,13 @@ var migrationChecksums = map[int]string{
 	19: migrationChecksum(migrationV19),
 	20: migrationChecksum(migrationV20),
 	21: migrationChecksum(migrationV21),
+	22: migrationChecksum(migrationV22),
+	23: migrationChecksum(migrationV23),
+	24: migrationChecksum(migrationV24),
+	25: migrationChecksum(migrationV25),
+	26: migrationChecksum(migrationV26),
+	27: migrationChecksum(migrationV27),
+	28: migrationChecksum(migrationV28),
 }
 
 func migrationChecksum(statements []string) string {
@@ -224,6 +235,13 @@ func open(ctx context.Context, path string, policy openPolicy) (*Store, error) {
 		db.Close()
 		return nil, normalizeBusy(ctx, err)
 	}
+	// SQL migrations can establish only shape-level invariants. Re-run this
+	// Go-level canonical-input audit on every writable open before callers can
+	// trust or recover any provider claim.
+	if err := s.reconcileProviderAttemptInputs(ctx); err != nil {
+		db.Close()
+		return nil, normalizeBusy(ctx, err)
+	}
 	if err := s.validateSchema(ctx); err != nil {
 		db.Close()
 		return nil, normalizeBusy(ctx, err)
@@ -329,6 +347,20 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV20
 			} else if version == 21 {
 				statements = migrationV21
+			} else if version == 22 {
+				statements = migrationV22
+			} else if version == 23 {
+				statements = migrationV23
+			} else if version == 24 {
+				statements = migrationV24
+			} else if version == 25 {
+				statements = migrationV25
+			} else if version == 26 {
+				statements = migrationV26
+			} else if version == 27 {
+				statements = migrationV27
+			} else if version == 28 {
+				statements = migrationV28
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {

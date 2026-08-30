@@ -17,6 +17,7 @@ import (
 	"github.com/nysa-company/sf/internal/api"
 	"github.com/nysa-company/sf/internal/cli"
 	"github.com/nysa-company/sf/internal/config"
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/events"
 	"github.com/nysa-company/sf/internal/leader"
@@ -718,6 +719,14 @@ func TestRestartRefusesAmbiguousLeaseAdoptionBeforeSocketExposure(t *testing.T) 
 	}
 	if _, err := os.Lstat(paths.Socket); !os.IsNotExist(err) {
 		t.Fatalf("socket was exposed despite ambiguous adoption: %v", err)
+	}
+}
+
+func TestRecoverDrainRequestPreservesChatGPTSubscriptionAuthMode(t *testing.T) {
+	claim := store.ProviderAttemptClaim{ID: 41, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-auth-recovery"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 2, Binding: contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: "gpt-5.6", Family: "openai", Version: "1"}, BinaryDigest: strings.Repeat("a", 64), PolicyDigest: strings.Repeat("b", 64), AuthDigest: strings.Repeat("c", 64), AuthMode: "chatgpt_subscription"}, LeaseKey: "provider/codex", BindingDigest: strings.Repeat("d", 64), LeaderEpoch: 3, RunnerEpoch: 4, ExpectedVersion: 5, Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: strings.Repeat("e", 40), RequestDigest: strings.Repeat("f", 64)}
+	req := drainRequestForProviderClaim(claim)
+	if req.AuthMode != "chatgpt_subscription" || req.RequestDigest != claim.RequestDigest {
+		t.Fatalf("recovery request lost authenticated launch fields: %+v", req)
 	}
 }
 

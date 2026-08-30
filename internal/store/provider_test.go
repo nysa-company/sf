@@ -22,6 +22,9 @@ func supervised(t *testing.T, request ProviderAttemptRequest) ProviderAttemptReq
 	request.WorktreeIdentity = `{"repository":"/tmp/provider"}`
 	request.BaseSHA = strings.Repeat("a", 40)
 	request.SupervisorKey = providerTestSigner.PublicKey()
+	if request.Input.Ticket == (domain.TicketRef{}) {
+		request.Input = contracts.PhaseInput{Ticket: request.Ref, Phase: request.Phase, LeaderEpoch: request.Fence.LeaderEpoch, RunnerEpoch: request.Fence.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Prompt: "provider test", Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA, AllowedPaths: []string{"."}, Provider: request.Binding.Identity, AuthMode: request.Binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}
+	}
 	return request
 }
 func proof(t *testing.T, claim ProviderAttemptClaim) contracts.DrainProof {
@@ -90,6 +93,84 @@ func TestRecordProviderLaunchBindsTheEntireClaimAndStartIdentity(t *testing.T) {
 	wrong.Attempt++
 	if err := db.RecordProviderLaunch(ctx, wrong, launch); !errors.Is(err, ErrStaleFence) && !errors.Is(err, ErrProviderAttempt) {
 		t.Fatalf("wrong attempt recorded: %v", err)
+	}
+}
+
+func TestProviderAttemptLaunchInputIsAppendOnly(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "launch-input-immutable")
+	ticket := setupProviderTicket(t, db, ctx, "SF-launch-input", leader)
+	builder, _ := setupProviderPair(t, db, ctx)
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateBuilding)
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claim.RequestDigest) != 64 || !contracts.PhaseInputDigestMatches(claim.Input, claim.RequestDigest) || string(claim.RequestPayload) == "" {
+		t.Fatalf("store did not issue complete launch input claim: %+v", claim)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempt_inputs SET request_digest=? WHERE provider_attempt_id=?`, strings.Repeat("0", 64), claim.ID); err == nil {
+		t.Fatal("launch input record was mutable")
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM provider_attempt_inputs WHERE provider_attempt_id=?`, claim.ID); err == nil {
+		t.Fatal("launch input record was deletable")
+	}
+}
+
+func TestBeginProviderAttemptRejectsInvalidDirectLaunchInput(t *testing.T) {
+	for name, mutate := range map[string]func(*ProviderAttemptRequest){
+		"prompt":   func(r *ProviderAttemptRequest) { r.Input.Prompt = " " },
+		"schema":   func(r *ProviderAttemptRequest) { r.Input.Schema = []byte("not-json") },
+		"paths":    func(r *ProviderAttemptRequest) { r.Input.AllowedPaths = []string{"../escape"} },
+		"profile":  func(r *ProviderAttemptRequest) { r.Input.Profile = contracts.ProfileAutonomous },
+		"timeout":  func(r *ProviderAttemptRequest) { r.Input.Timeout = 46 * time.Minute },
+		"ticket":   func(r *ProviderAttemptRequest) { r.Input.Ticket.Ticket = "SF-other" },
+		"phase":    func(r *ProviderAttemptRequest) { r.Input.Phase = domain.PhasePlanning },
+		"fence":    func(r *ProviderAttemptRequest) { r.Input.RunnerEpoch++ },
+		"worktree": func(r *ProviderAttemptRequest) { r.Input.Worktree = "/tmp/other" },
+		"provider": func(r *ProviderAttemptRequest) { r.Input.Provider.Model = "other" },
+		"auth":     func(r *ProviderAttemptRequest) { r.Input.AuthMode = "other" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			digest := setupProviderProject(t, db, ctx)
+			leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "invalid-input")
+			ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-direct-input", leader), leader, domain.StateBuilding)
+			builder, _ := setupProviderPair(t, db, ctx)
+			request := supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+			mutate(&request)
+			if _, err := db.BeginProviderAttempt(ctx, request); !errors.Is(err, ErrProviderAttempt) {
+				t.Fatalf("invalid %s direct input admitted: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestFailProviderAttemptBeforeLaunchClosesExactClaimAndReleasesLease(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "invocation-failure")
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-invocation-failure", leader), leader, domain.StateBuilding)
+	builder, _ := setupProviderPair(t, db, ctx)
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FailProviderAttemptBeforeLaunch(ctx, claim, ticket.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "failed" || attempts[0].Outcome != "invocation_failed" {
+		t.Fatalf("attempt=%+v err=%v", attempts, err)
+	}
+	var phaseState, phaseOutcome string
+	if err := db.db.QueryRowContext(ctx, `SELECT state,outcome FROM phase_runs WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&phaseState, &phaseOutcome); err != nil || phaseState != "failed" || phaseOutcome != "invocation_failed" {
+		t.Fatalf("phase=%s/%s err=%v", phaseState, phaseOutcome, err)
+	}
+	leases, err := db.Leases(ctx, domain.ChannelDev)
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("pre-launch provider lease was retained: %+v err=%v", leases, err)
 	}
 }
 

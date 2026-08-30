@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/nysa-company/sf/internal/cli"
+	"github.com/nysa-company/sf/internal/codexprovider"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
@@ -60,10 +61,10 @@ func main() {
 			RecoveryDrainer:      supervisor,
 			GitMutationDrainer:   git.MutationDrainer{},
 			ProviderCoordinatorFactory: func(database *store.Store, process contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
-				// Real provider adapters are intentionally not bundled. An empty
-				// qualified registry keeps production fail-closed until explicit
-				// provider qualification/configuration is implemented.
-				return providercoord.New(providercoord.NewRegistry(), nil, database, nil, process)
+				return codexprovider.Compose(context.Background(), channel, database, process)
+			},
+			ProviderQualifier: func(qualifyCtx context.Context, database *store.Store, value domain.Channel, builder, reviewer string) (any, error) {
+				return codexprovider.QualifyLocalPair(qualifyCtx, database, value, builder, reviewer, supervisor)
 			},
 		})
 	}

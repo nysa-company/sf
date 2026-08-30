@@ -24,6 +24,17 @@ import (
 	"github.com/nysa-company/sf/internal/store"
 )
 
+func bindSupervisorTestInput(t *testing.T, request *contracts.DrainRequest) contracts.PhaseInput {
+	t.Helper()
+	input := contracts.PhaseInput{Ticket: request.Ref, Phase: request.Phase, Attempt: request.Attempt, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Prompt: "supervisor fixture", Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA, AllowedPaths: []string{"."}, Provider: request.Identity, AuthMode: request.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}
+	_, digest, err := contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.RequestDigest, request.RequestDigest = digest, digest
+	return input
+}
+
 func TestCompiledDevGateRestartDrainsRecordedGroupBeforeCallerContinues(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "sf-dev")
 	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")
@@ -37,13 +48,14 @@ func TestCompiledDevGateRestartDrainsRecordedGroupBeforeCallerContinues(t *testi
 	}
 	owner.Executable = binary
 	launches := make(chan contracts.ProviderLaunch, 1)
-	request := contracts.DrainRequest{ClaimID: 9, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-gate-restart"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64), Worktree: t.TempDir()}
+	request := contracts.DrainRequest{ClaimID: 9, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-gate-restart"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64), Repository: "/repo", Worktree: t.TempDir(), WorktreeIdentity: "identity", BaseSHA: "base"}
 	binaryDigest, err := owner.RegisterExecutable(request.Identity, "/bin/sh")
 	if err != nil {
 		t.Fatalf("register fixture executable: %v", err)
 	}
 	request.BinaryDigest = binaryDigest
 	request.PolicyDigest = owner.PolicyDigest()
+	input := bindSupervisorTestInput(t, &request)
 	owner.SetLaunchRecorder(func(_ context.Context, got contracts.DrainRequest, launch contracts.ProviderLaunch) error {
 		if got != request {
 			return fmt.Errorf("unexpected launch request")
@@ -53,7 +65,7 @@ func TestCompiledDevGateRestartDrainsRecordedGroupBeforeCallerContinues(t *testi
 	})
 	finished := make(chan error, 1)
 	go func() {
-		_, err := owner.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 10"}}, contracts.PhaseInput{Worktree: t.TempDir()})
+		_, err := owner.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 10"}}, input)
 		finished <- err
 	}()
 	var launch contracts.ProviderLaunch
@@ -101,9 +113,10 @@ func TestCompiledDevRunRetainsClaimUntilNormalDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := contracts.DrainRequest{ClaimID: 10, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-normal-drain"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: identity, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64), BinaryDigest: binaryDigest, PolicyDigest: supervisor.PolicyDigest(), Worktree: t.TempDir()}
+	request := contracts.DrainRequest{ClaimID: 10, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-normal-drain"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: identity, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64), BinaryDigest: binaryDigest, PolicyDigest: supervisor.PolicyDigest(), Repository: "/repo", Worktree: t.TempDir(), WorktreeIdentity: "identity", BaseSHA: "base"}
+	input := bindSupervisorTestInput(t, &request)
 	supervisor.SetLaunchRecorder(func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error { return nil })
-	if _, err := supervisor.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "exit 0"}}, contracts.PhaseInput{Worktree: request.Worktree}); err != nil {
+	if _, err := supervisor.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "exit 0"}}, input); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := supervisor.Drain(context.Background(), request); err != nil {
@@ -116,6 +129,10 @@ func TestCompiledDevRunRetainsClaimUntilNormalDrain(t *testing.T) {
 
 func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T) {
 	home, err := os.MkdirTemp("/tmp", "sfh-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err = filepath.EvalSymlinks(home)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +244,7 @@ func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T)
 	}
 	coordinatorDone := make(chan providercoord.Result, 1)
 	go func() {
-		coordinatorDone <- coordinator.Run(context.Background(), providercoord.Request{Role: providercoord.RoleBuilder, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, Prompt: "integration", Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Timeout: 5 * time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("schema")}})
+		coordinatorDone <- coordinator.Run(context.Background(), providercoord.Request{Role: providercoord.RoleBuilder, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, Prompt: "integration", Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Timeout: 5 * time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}})
 	}()
 	var launch contracts.ProviderLaunch
 	deadline := time.Now().Add(5 * time.Second)
@@ -354,11 +371,14 @@ func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *te
 		bootIdentity = launch.BootIdentity
 		return nil
 	})
-	if _, err := owner.Run(context.Background(), contracts.DrainRequest{
+	request := contracts.DrainRequest{
 		ClaimID: 1, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-identity-probe"},
 		Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"},
-		LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/identity-probe", BindingDigest: strings.Repeat("a", 64), BinaryDigest: binaryDigest, PolicyDigest: owner.PolicyDigest(), Worktree: t.TempDir(),
-	}, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 0.1"}}, contracts.PhaseInput{Worktree: t.TempDir()}); err != nil {
+		LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/identity-probe", BindingDigest: strings.Repeat("a", 64), BinaryDigest: binaryDigest, PolicyDigest: owner.PolicyDigest(), Repository: "/repo", Worktree: t.TempDir(), WorktreeIdentity: "identity", BaseSHA: "base",
+	}
+	input := bindSupervisorTestInput(t, &request)
+	if _, err := owner.Run(context.Background(), request,
+		contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 0.1"}}, input); err != nil {
 		t.Fatalf("capture boot identity: %v", err)
 	}
 	if bootIdentity == "" {
@@ -446,7 +466,8 @@ func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *te
 	}
 	auth := sha256.Sum256([]byte("auth"))
 	binding := contracts.RuntimeBinding{Identity: builder.Provider, BinaryDigest: builder.BinaryDigest, PolicyDigest: builder.PolicyDigest, FixtureDigest: builder.FixtureDigest, AuthDigest: fmt.Sprintf("%x", auth)}
-	claim, err := writer.BeginProviderAttempt(context.Background(), store.ProviderAttemptRequest{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(), Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), SupervisorKey: owner.PublicKey()})
+	claimInput := contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch, ExpectedVersion: ticket.Version, Prompt: "foreign recovery fixture", Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}
+	claim, err := writer.BeginProviderAttempt(context.Background(), store.ProviderAttemptRequest{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(), Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), SupervisorKey: owner.PublicKey(), Input: claimInput})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,6 +605,97 @@ func TestProductionForegroundDaemonServesAnotherCLIClient(t *testing.T) {
 	}
 	if err := foreground.Wait(); err != nil {
 		t.Fatalf("foreground daemon exit: %v", err)
+	}
+}
+
+func TestCompiledDevQualificationUsesDaemonAttestationAndNeverExecutesModel(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("qualification fails closed without macOS sandbox-exec")
+	}
+	home, err := os.MkdirTemp("/tmp", "sfh-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	authHome := filepath.Join(home, ".codex")
+	if err := os.Mkdir(authHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authHome, "auth.json"), []byte(`{"account":"fixture"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fakeCodex := filepath.Join(bin, "codex")
+	// The fake accepts only capability/help and locally sandboxed probe shapes.
+	// Any real `codex exec` model invocation exits nonzero, so a green
+	// qualification proves this path did not make a model call.
+	fake := `#!/bin/sh
+case "$1" in
+  --version) echo 'codex 1.2.3'; exit 0 ;;
+  login) [ "$2" = status ] && { echo 'Logged in using ChatGPT'; exit 0; }; exit 98 ;;
+  exec) [ "$2" = '--help' ] && { echo '--json --output-schema --output-last-message --ephemeral --ignore-user-config --ignore-rules --config --model -C'; exit 0; }; exit 97 ;;
+  sandbox) case "$*" in
+    *curl*) for arg in "$@"; do url="$arg"; done; /usr/bin/curl -fsS --connect-timeout 1 "$url"; exit $? ;;
+    *CODEX_HOME*) test -r "$CODEX_HOME/auth.json"; exit $? ;;
+    *'test -r /etc/hosts'*) exit 0 ;;
+    *'test -w /etc/hosts'*) exit 1 ;;
+    *) exit 0 ;;
+  esac ;;
+esac
+exit 98
+`
+	if err := os.WriteFile(fakeCodex, []byte(fake), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), "sf-dev")
+	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sf-dev: %v\n%s", err, output)
+	}
+	paths, err := config.PathsFor(home, domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := append(os.Environ(), "HOME="+home, "CODEX_HOME="+authHome, "PATH="+bin+":/usr/bin:/bin")
+	foreground := exec.Command(binary, "daemon", "run")
+	foreground.Env = environment
+	var daemonOutput bytes.Buffer
+	foreground.Stdout, foreground.Stderr = &daemonOutput, &daemonOutput
+	if err := foreground.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if foreground.ProcessState == nil || !foreground.ProcessState.Exited() {
+			_ = foreground.Process.Signal(os.Interrupt)
+			_, _ = foreground.Process.Wait()
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Lstat(paths.Socket); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dev daemon did not create socket: %s", daemonOutput.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	qualify := exec.Command(binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex", "--json")
+	qualify.Env = environment
+	output, err := qualify.CombinedOutput()
+	if err != nil {
+		t.Fatalf("qualified local Codex pair: %v\n%s\ndaemon=%s", err, output, daemonOutput.String())
+	}
+	if !strings.Contains(string(output), `"independent":true`) || !strings.Contains(string(output), `"model_call_made":false`) || strings.Contains(string(output), `"auth.json"`) {
+		t.Fatalf("unsafe qualification response: %s", output)
 	}
 }
 

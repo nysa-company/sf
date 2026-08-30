@@ -4,6 +4,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -19,20 +22,65 @@ const (
 )
 
 type PhaseInput struct {
-	Ticket     domain.TicketRef
-	Phase      domain.Phase
-	Prompt     string
-	Repository string
-	Worktree   string
+	Ticket domain.TicketRef
+	Phase  domain.Phase
+	// The following fields are copied from the Store-issued provider claim by
+	// the coordinator immediately before launch. They make the input handed to
+	// the provider and supervisor an authenticated view of that claim rather
+	// than a second caller-controlled set of fence values.
+	Attempt         int
+	LeaderEpoch     uint64
+	RunnerEpoch     uint64
+	ExpectedVersion uint64
+	Prompt          string
+	Repository      string
+	Worktree        string
 	// WorktreeIdentity and BaseSHA are the exact durable Git/worktree
 	// identity authenticated by the store, never merely a caller path.
 	WorktreeIdentity string
 	BaseSHA          string
 	AllowedPaths     []string
 	Provider         domain.ProviderIdentity
-	Timeout          time.Duration
-	Profile          ExecutionProfile
-	Schema           []byte
+	// AuthMode is copied from the just-observed RuntimeBinding. It is an
+	// admission value, never a credential or provider-controlled transcript.
+	AuthMode string
+	Timeout  time.Duration
+	Profile  ExecutionProfile
+	Schema   []byte
+	// RequestDigest authenticates this exact launch input. It is issued by the
+	// Store with the provider attempt and is not part of its own digest.
+	RequestDigest string
+}
+
+// CanonicalPhaseInput returns the stable, complete representation of the
+// phase input a provider is permitted to receive.  Keeping this in contracts
+// lets the store issue a digest without trusting the coordinator or adapter
+// to serialize the request the same way.
+func CanonicalPhaseInput(input PhaseInput) ([]byte, string, error) {
+	input.RequestDigest = ""
+	payload, err := json.Marshal(input)
+	if err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(payload)
+	return payload, hex.EncodeToString(sum[:]), nil
+}
+
+func PhaseInputDigestMatches(input PhaseInput, digest string) bool {
+	_, actual, err := CanonicalPhaseInput(input)
+	return err == nil && len(digest) == 64 && actual == digest
+}
+
+func DecodeCanonicalPhaseInput(payload []byte) (PhaseInput, error) {
+	var input PhaseInput
+	if err := json.Unmarshal(payload, &input); err != nil {
+		return PhaseInput{}, err
+	}
+	canonical, _, err := CanonicalPhaseInput(input)
+	if err != nil || string(canonical) != string(payload) {
+		return PhaseInput{}, errors.New("phase input is not canonical")
+	}
+	return input, nil
 }
 
 type PhaseResult struct {
@@ -41,15 +89,55 @@ type PhaseResult struct {
 	Transcript   string
 	Provider     domain.ProviderIdentity
 	ChangedFiles []string
+	// UsageTrusted and UsageUnits describe a trusted monetary charge in
+	// micro-USD. They alone may be charged against Ticket.MaxCostMicroUSD.
+	// A provider-reported token count must never be placed here.
 	UsageTrusted bool
 	UsageUnits   int64
+	// TokenUsage is optional provider observability. It is separate because
+	// tokens cannot be compared to a monetary ceiling without an immutable
+	// pricing or reservation policy.
+	TokenUsageTrusted bool
+	TokenUsage        int64
+	// Individual provider-reported counters are retained for observability.
+	// They are never interpreted as currency and are not used for budget
+	// enforcement without a separately snapshotted pricing policy.
+	TokenInputTokens      int64
+	TokenCachedTokens     int64
+	TokenCacheWriteTokens int64
+	TokenOutputTokens     int64
+	TokenReasoningTokens  int64
 }
 
 // Invocation is an argv-only adapter proposal. The supervisor is the sole
 // component allowed to start it; adapters never receive os/exec authority.
 type Invocation struct {
 	Argv []string
+	// Stdin is a bounded adapter-supplied payload. The supervisor owns the
+	// pipe and never inherits the daemon terminal.
+	Stdin []byte
+	// OutputSchema is materialized by the supervisor in its private temporary
+	// directory. Argv must contain OutputSchemaPlaceholder exactly once when
+	// this field is non-empty.
+	OutputSchema []byte
+	// CaptureLastMessage requests a supervisor-owned private output file. It
+	// must be represented exactly once by OutputLastMessagePlaceholder in argv.
+	CaptureLastMessage bool
+	// AuthHome is an adapter-approved credential directory that is not
+	// group/world writable. It is deliberately not persisted and is exposed
+	// only under the provider's documented environment variable by the
+	// supervisor.
+	AuthHome string
 }
+
+// OutputSchemaPlaceholder is replaced by the supervisor with a private,
+// absolute schema file immediately before exec. It prevents an adapter from
+// writing schema material into a ticket worktree.
+const OutputSchemaPlaceholder = "__SF_OUTPUT_SCHEMA__"
+
+// OutputLastMessagePlaceholder is replaced by a private, bounded file path
+// immediately before exec. Providers must not select their own artifact path.
+const OutputLastMessagePlaceholder = "__SF_OUTPUT_LAST_MESSAGE__"
 
 // RuntimeBinding is re-probed immediately before a paid invocation. Its
 // digests are opaque SHA-256 values; credentials themselves never cross this
@@ -60,6 +148,10 @@ type RuntimeBinding struct {
 	PolicyDigest  string
 	FixtureDigest string
 	AuthDigest    string
+	// AuthMode is a bounded, non-secret credential class. Codex is admitted
+	// only for the explicitly supported subscription mode; an API/metered
+	// login must never be mistaken for a zero-cost attempt.
+	AuthMode string
 }
 
 // DrainRequest identifies exactly one provider process group. Supervisors must
@@ -78,14 +170,18 @@ type DrainRequest struct {
 	BindingDigest    string
 	BinaryDigest     string
 	PolicyDigest     string
+	AuthDigest       string
+	AuthMode         string
 	Repository       string
 	Worktree         string
 	WorktreeIdentity string
 	BaseSHA          string
+	RequestDigest    string
 }
 
-// DrainResult is supplied by the process supervisor after cancellation or
-// recovery. A false value keeps the durable claim quarantined.
+// DrainProof attests only that the recorded supervised process group drained.
+// Guarded v1 trusts the qualified local provider and does not represent this
+// as hostile same-UID process-tree containment.
 type DrainProof struct {
 	publicKey ed25519.PublicKey
 	signature []byte
@@ -102,6 +198,59 @@ type DrainResult struct{ Drained bool }
 type DrainSigner struct {
 	publicKey  ed25519.PublicKey
 	privateKey ed25519.PrivateKey
+}
+
+// QualificationAttestation is the non-secret evidence that a currently
+// running supervisor observed a local, guarded qualification.  It is kept
+// deliberately small: probe output and credentials never enter SQLite; their
+// canonical SHA-256 digests are what the signature binds.
+type QualificationAttestation struct {
+	Channel          domain.Channel
+	RunID            string
+	Identity         domain.ProviderIdentity
+	BinaryDigest     string
+	PolicyDigest     string
+	FixtureDigest    string
+	AuthDigest       string
+	AuthMode         string
+	ProbeDigest      string
+	Profile          ExecutionProfile
+	CreatedUnixNanos int64
+	LeaderEpoch      uint64
+	Nonce            string
+	Signature        []byte
+}
+
+// SignQualification attests to an exact, already bounded qualification
+// observation.  The same supervisor key is durably published by the daemon
+// for process-recovery proof, so Store can reject a signature from a stale or
+// unrelated local process.
+func (s *DrainSigner) SignQualification(value QualificationAttestation) (QualificationAttestation, error) {
+	if s == nil || len(s.privateKey) != ed25519.PrivateKeySize || !validQualificationAttestation(value) {
+		return QualificationAttestation{}, errors.New("qualification signer unavailable or attestation invalid")
+	}
+	value.Signature = ed25519.Sign(s.privateKey, qualificationPayload(value))
+	return value, nil
+}
+
+func VerifyQualificationAttestation(publicKey []byte, value QualificationAttestation) bool {
+	return len(publicKey) == ed25519.PublicKeySize && validQualificationAttestation(value) && len(value.Signature) == ed25519.SignatureSize && ed25519.Verify(ed25519.PublicKey(publicKey), qualificationPayload(value), value.Signature)
+}
+
+func validQualificationAttestation(value QualificationAttestation) bool {
+	if !value.Channel.Valid() || value.RunID == "" || value.Identity.Provider == "" || value.Identity.Model == "" || value.Identity.Family == "" || value.Identity.Version == "" || value.AuthMode == "" || len(value.AuthMode) > 64 || value.CreatedUnixNanos <= 0 || value.LeaderEpoch == 0 || value.Nonce == "" || value.Profile != ProfileGuarded {
+		return false
+	}
+	for _, digest := range []string{value.BinaryDigest, value.PolicyDigest, value.FixtureDigest, value.AuthDigest, value.ProbeDigest} {
+		if len(digest) != 64 {
+			return false
+		}
+	}
+	return true
+}
+
+func qualificationPayload(value QualificationAttestation) []byte {
+	return []byte("sf-qualification/v2\x00" + string(value.Channel) + "\x00" + value.RunID + "\x00" + value.Identity.Provider + "\x00" + value.Identity.Model + "\x00" + value.Identity.Family + "\x00" + value.Identity.Version + "\x00" + value.BinaryDigest + "\x00" + value.PolicyDigest + "\x00" + value.FixtureDigest + "\x00" + value.AuthDigest + "\x00" + value.AuthMode + "\x00" + value.ProbeDigest + "\x00" + string(value.Profile) + "\x00" + fmt.Sprintf("%d", value.CreatedUnixNanos) + "\x00" + fmt.Sprintf("%d", value.LeaderEpoch) + "\x00" + value.Nonce)
 }
 
 func NewDrainSigner() (*DrainSigner, error) {
@@ -128,7 +277,7 @@ func VerifyDrainProof(publicKey []byte, request DrainRequest, proof DrainProof) 
 	return len(publicKey) == ed25519.PublicKeySize && string(publicKey) == string(proof.publicKey) && proof.request == request && ed25519.Verify(ed25519.PublicKey(publicKey), drainPayload(request), proof.signature)
 }
 func drainPayload(r DrainRequest) []byte {
-	return []byte(fmt.Sprintf("%d", r.ClaimID) + "\x00" + string(r.Ref.Channel) + "\x00" + string(r.Ref.Project) + "\x00" + string(r.Ref.Ticket) + "\x00" + string(r.Phase) + "\x00" + r.Role + "\x00" + r.Identity.Provider + "\x00" + r.Identity.Model + "\x00" + r.Identity.Family + "\x00" + r.Identity.Version + "\x00" + r.LeaseKey + "\x00" + r.BindingDigest + "\x00" + r.BinaryDigest + "\x00" + r.PolicyDigest + "\x00" + r.Repository + "\x00" + r.Worktree + "\x00" + r.WorktreeIdentity + "\x00" + r.BaseSHA + "\x00" + fmtUint(r.LeaderEpoch) + "\x00" + fmtUint(r.RunnerEpoch) + "\x00" + fmtUint(r.ExpectedVersion) + "\x00" + fmtInt(r.Attempt))
+	return []byte(fmt.Sprintf("%d", r.ClaimID) + "\x00" + string(r.Ref.Channel) + "\x00" + string(r.Ref.Project) + "\x00" + string(r.Ref.Ticket) + "\x00" + string(r.Phase) + "\x00" + r.Role + "\x00" + r.Identity.Provider + "\x00" + r.Identity.Model + "\x00" + r.Identity.Family + "\x00" + r.Identity.Version + "\x00" + r.LeaseKey + "\x00" + r.BindingDigest + "\x00" + r.BinaryDigest + "\x00" + r.PolicyDigest + "\x00" + r.AuthDigest + "\x00" + r.AuthMode + "\x00" + r.Repository + "\x00" + r.Worktree + "\x00" + r.WorktreeIdentity + "\x00" + r.BaseSHA + "\x00" + r.RequestDigest + "\x00" + fmtUint(r.LeaderEpoch) + "\x00" + fmtUint(r.RunnerEpoch) + "\x00" + fmtUint(r.ExpectedVersion) + "\x00" + fmtInt(r.Attempt))
 }
 func fmtUint(v uint64) string { return fmt.Sprintf("%d", v) }
 func fmtInt(v int) string     { return fmt.Sprintf("%d", v) }
