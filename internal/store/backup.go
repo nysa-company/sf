@@ -145,5 +145,13 @@ func validateBackupFile(path string) error {
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("sync completed backup: %w", err)
 	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("open backup directory for sync: %w", err)
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("sync backup directory: %w", err)
+	}
 	return nil
 }
