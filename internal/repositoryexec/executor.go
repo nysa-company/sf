@@ -110,10 +110,10 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 	// A cancellation/deadline is control-plane authority, not command evidence.
 	// The supervisor may have reaped the child and therefore return an observed
 	// non-zero result, but recording it would let cancellation masquerade as a
-	// provider-declared red verification result. Persist uncertainty instead and
-	// release the already-drained exact lease so control recovery is not wedged.
-	if repositoryCommandCanceled(ctx, runErr) {
-		if err := markCanceledRepositoryCommand(e.Authority, lease, req.Claim); err != nil {
+	// provider-declared red verification result. Retire the exact drained lease,
+	// intent, and effect atomically without recording a result.
+	if result.Observed && repositoryCommandCanceled(ctx, runErr) {
+		if err := retireObservedCanceledRepositoryCommand(e.Authority, lease, req.Claim); err != nil {
 			return result, err
 		}
 		if runErr != nil {
@@ -182,22 +182,18 @@ func repositoryCommandCanceled(ctx context.Context, runErr error) bool {
 	return ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
 }
 
-func markCanceledRepositoryCommand(authority contracts.RepositoryCommandAuthority, lease contracts.RepositoryCommandLease, claim contracts.RepositoryCommandClaim) error {
+func retireObservedCanceledRepositoryCommand(authority contracts.RepositoryCommandAuthority, lease contracts.RepositoryCommandLease, claim contracts.RepositoryCommandClaim) error {
 	recorder, ok := authority.(contracts.RepositoryCommandResultRecorder)
 	if !ok {
 		_ = lease.Quarantine()
 		return ErrInvalidBinding
 	}
 	persistCtx, cancel := repositoryPersistenceContext()
-	err := recorder.MarkRepositoryCommandUncertain(persistCtx, claim, "repository command canceled before durable completion")
+	err := recorder.RetireObservedCanceledRepositoryCommand(persistCtx, claim)
 	cancel()
 	if err != nil {
 		_ = lease.Quarantine()
-		return fmt.Errorf("persist repository cancellation uncertainty: %w", err)
-	}
-	if err := lease.Release(); err != nil {
-		_ = lease.Quarantine()
-		return err
+		return fmt.Errorf("retire observed canceled repository command: %w", err)
 	}
 	return nil
 }

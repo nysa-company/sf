@@ -178,6 +178,7 @@ type RepositoryCommandAuthority interface {
 
 type RepositoryCommandResultRecorder interface {
 	CompleteRepositoryCommand(context.Context, RepositoryCommandClaim, CommandResult) error
+	RetireObservedCanceledRepositoryCommand(context.Context, RepositoryCommandClaim) error
 	MarkRepositoryCommandUncertain(context.Context, RepositoryCommandClaim, string) error
 	ReconcileStaleRepositoryCommandObservation(context.Context, RepositoryCommandClaim, CommandResult) error
 }

@@ -272,6 +272,49 @@ func loadRepositoryCommandResult(ctx context.Context, q repositoryResultQuerier,
 
 var _ contracts.RepositoryCommandResultRecorder = (*Store)(nil)
 
+// RetireObservedCanceledRepositoryCommand is the narrow terminal path for a
+// caller-canceled command whose supervisor has nevertheless reaped and
+// authenticated the exact child. Cancellation is not reusable command
+// evidence, but retaining an uncertain effect after deleting its drained lease
+// would permanently block control recovery. Retire all three exact records in
+// one transaction instead; a later retry must issue a fresh claim epoch.
+func (s *Store) RetireObservedCanceledRepositoryCommand(ctx context.Context, claim contracts.RepositoryCommandClaim) error {
+	if !validRepositoryCommandClaim(claim) {
+		return ErrRepositoryCommandIntent
+	}
+	return s.write(ctx, func(c *sql.Conn) error {
+		if err := s.assertRepositoryCommandCurrent(ctx, c, claim); err != nil {
+			return err
+		}
+		var active int
+		if err := c.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE repository_path=? AND semantic_key=? AND channel=? AND project_id=? AND ticket_id=? AND request_digest=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=? AND worktree_path=? AND worktree_identity=? AND branch_ref=? AND base_ref=? AND base_sha=? AND command_digest=? AND spec_digest=? AND policy_digest=? AND executable_path=? AND executable_digest=? AND state='active' AND launch_state='drained'`, claim.Repository, claim.SemanticKey, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch, claim.Worktree, claim.WorktreeIdentity, claim.Branch, claim.BaseRef, claim.BaseSHA, claim.CommandDigest, claim.SpecDigest, claim.PolicyDigest, claim.ExecutablePath, claim.ExecutableDigest).Scan(&active); err != nil || active != 1 {
+			return ErrRepositoryCommandLease
+		}
+		updated, err := c.ExecContext(ctx, `UPDATE effects SET state='failed',observed_identity='canceled:repository-command-observed' WHERE semantic_key=? AND state='executing' AND claim_epoch=? AND request_digest=?`, claim.SemanticKey, claim.ClaimEpoch, claim.RequestDigest)
+		if err != nil {
+			return err
+		}
+		if n, _ := updated.RowsAffected(); n != 1 {
+			return ErrRepositoryCommandIntent
+		}
+		deletedLease, err := c.ExecContext(ctx, `DELETE FROM repository_command_leases WHERE repository_path=? AND semantic_key=? AND nonce IN (SELECT nonce FROM repository_command_leases WHERE repository_path=? AND semantic_key=? AND state='active' AND launch_state='drained') AND state='active' AND launch_state='drained'`, claim.Repository, claim.SemanticKey, claim.Repository, claim.SemanticKey)
+		if err != nil {
+			return err
+		}
+		if n, _ := deletedLease.RowsAffected(); n != 1 {
+			return ErrRepositoryCommandLease
+		}
+		deletedIntent, err := c.ExecContext(ctx, `DELETE FROM repository_command_intents WHERE semantic_key=? AND channel=? AND project_id=? AND ticket_id=? AND request_digest=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=? AND repository_path=? AND worktree_path=? AND worktree_identity=? AND branch_ref=? AND base_ref=? AND base_sha=? AND command_digest=? AND spec_digest=? AND policy_digest=? AND executable_path=? AND executable_digest=?`, claim.SemanticKey, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch, claim.Repository, claim.Worktree, claim.WorktreeIdentity, claim.Branch, claim.BaseRef, claim.BaseSHA, claim.CommandDigest, claim.SpecDigest, claim.PolicyDigest, claim.ExecutablePath, claim.ExecutableDigest)
+		if err != nil {
+			return err
+		}
+		if n, _ := deletedIntent.RowsAffected(); n != 1 {
+			return ErrRepositoryCommandIntent
+		}
+		return nil
+	})
+}
+
 func (s *Store) MarkRepositoryCommandUncertain(ctx context.Context, claim contracts.RepositoryCommandClaim, reason string) error {
 	if !validRepositoryCommandClaim(claim) || reason == "" {
 		return ErrRepositoryCommandIntent

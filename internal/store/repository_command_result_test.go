@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
+	"github.com/nysa-company/sf/internal/domain"
 )
 
 func drainedResult(t *testing.T, db *Store, ctx context.Context, lease contracts.RepositoryCommandLease, claim contracts.RepositoryCommandClaim, result contracts.CommandResult) contracts.RepositoryCommandResultKey {
@@ -239,17 +240,10 @@ func TestRepositoryCommandUncertainAndStalePathsNeverMintResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A canceled supervisor run is still observed and drained. It must become
-	// uncertainty without a terminal result, while releasing this exact lease.
-	pid := int(atomic.AddInt64(&repositoryCommandTestPID, 1))
-	launch := contracts.RepositoryCommandLaunch{PID: pid, PGID: pid, BootIdentity: "boot", ProcessStartIdentity: "canceled"}
-	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
-		t.Fatal(err)
-	}
-	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
-		t.Fatal(err)
-	}
 	if err := db.MarkRepositoryCommandUncertain(ctx, claim, "process identity unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Quarantine(); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Observed: true, ObservedAt: time.Now().UTC()}); err == nil {
@@ -262,7 +256,92 @@ func TestRepositoryCommandUncertainAndStalePathsNeverMintResult(t *testing.T) {
 	if _, err := db.LoadRepositoryCommandResult(ctx, contracts.RepositoryCommandResultKey{SemanticKey: claim.SemanticKey, ClaimEpoch: claim.ClaimEpoch}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("uncertain command result became loadable evidence: %v", err)
 	}
-	if err := lease.Release(); err != nil {
+	var state string
+	var leases, intents int
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM effects WHERE semantic_key=?`, claim.SemanticKey).Scan(&state); err != nil || state != string(EffectUncertain) {
+		t.Fatalf("unobserved effect state=%q err=%v", state, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE semantic_key=? AND state='quarantined'`, claim.SemanticKey).Scan(&leases); err != nil || leases != 1 {
+		t.Fatalf("unobserved quarantine leases=%d err=%v", leases, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_intents WHERE semantic_key=?`, claim.SemanticKey).Scan(&intents); err != nil || intents != 1 {
+		t.Fatalf("unobserved intents=%d err=%v", intents, err)
+	}
+}
+
+func TestRepositoryCommandObservedCancellationRetiresDrainedLeaseWithoutResult(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "observed-cancel")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
 		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := int(atomic.AddInt64(&repositoryCommandTestPID, 1))
+	launch := contracts.RepositoryCommandLaunch{PID: pid, PGID: pid, BootIdentity: "boot", ProcessStartIdentity: "observed-canceled"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RetireObservedCanceledRepositoryCommand(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.LoadRepositoryCommandResult(ctx, contracts.RepositoryCommandResultKey{SemanticKey: claim.SemanticKey, ClaimEpoch: claim.ClaimEpoch}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("observed cancellation became loadable result evidence: %v", err)
+	}
+	var state string
+	var leases, intents int
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM effects WHERE semantic_key=?`, claim.SemanticKey).Scan(&state); err != nil || state != string(EffectFailed) {
+		t.Fatalf("observed cancellation effect state=%q err=%v", state, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE semantic_key=?`, claim.SemanticKey).Scan(&leases); err != nil || leases != 0 {
+		t.Fatalf("observed cancellation leases=%d err=%v", leases, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_intents WHERE semantic_key=?`, claim.SemanticKey).Scan(&intents); err != nil || intents != 0 {
+		t.Fatalf("observed cancellation intents=%d err=%v", intents, err)
+	}
+	retry, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil || retry.ClaimEpoch <= claim.ClaimEpoch {
+		t.Fatalf("observed cancellation did not permit a fresh claim: claim=%+v err=%v", retry, err)
+	}
+}
+
+func TestRepositoryCommandObservedCancellationDoesNotWedgeControl(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "observed-cancel-control")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := int(atomic.AddInt64(&repositoryCommandTestPID, 1))
+	launch := contracts.RepositoryCommandLaunch{PID: pid, PGID: pid, BootIdentity: "boot", ProcessStartIdentity: "observed-cancel-control"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RetireObservedCanceledRepositoryCommand(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	control, err := db.TransitionAndInvalidateRunner(ctx, Transition{Ref: claim.TicketRef, ExpectedVersion: claim.TicketVersion, From: domain.StatePlanning, To: domain.StateStopping, ResumeState: domain.StatePlanning, Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch}, EventPayload: "{}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopping, err := db.Ticket(ctx, claim.TicketRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CompleteControlTransition(ctx, Transition{Ref: claim.TicketRef, ExpectedVersion: control.Version, From: domain.StateStopping, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+		t.Fatalf("control stayed blocked after observed cancellation retirement: %v", err)
 	}
 }

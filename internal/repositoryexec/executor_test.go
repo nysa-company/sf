@@ -40,8 +40,8 @@ func (l *cancellationLease) Quarantine() error {
 }
 
 type cancellationAuthority struct {
-	completeCalls  int
-	uncertainCalls int
+	completeCalls int
+	retireCalls   int
 }
 
 func (a *cancellationAuthority) AcquireRepositoryCommand(context.Context, contracts.RepositoryCommandClaim) (contracts.RepositoryCommandLease, error) {
@@ -51,8 +51,11 @@ func (a *cancellationAuthority) CompleteRepositoryCommand(context.Context, contr
 	a.completeCalls++
 	return nil
 }
+func (a *cancellationAuthority) RetireObservedCanceledRepositoryCommand(context.Context, contracts.RepositoryCommandClaim) error {
+	a.retireCalls++
+	return nil
+}
 func (a *cancellationAuthority) MarkRepositoryCommandUncertain(context.Context, contracts.RepositoryCommandClaim, string) error {
-	a.uncertainCalls++
 	return nil
 }
 func (a *cancellationAuthority) ReconcileStaleRepositoryCommandObservation(context.Context, contracts.RepositoryCommandClaim, contracts.CommandResult) error {
@@ -114,11 +117,11 @@ func TestCanceledObservedCommandNeverCompletesRepositoryEvidence(t *testing.T) {
 	authority := &cancellationAuthority{}
 	lease := &cancellationLease{}
 	claim := contracts.RepositoryCommandClaim{SemanticKey: "canceled-observed"}
-	if err := markCanceledRepositoryCommand(authority, lease, claim); err != nil {
+	if err := retireObservedCanceledRepositoryCommand(authority, lease, claim); err != nil {
 		t.Fatal(err)
 	}
-	if authority.completeCalls != 0 || authority.uncertainCalls != 1 || !lease.released || lease.quarantined {
-		t.Fatalf("canceled observed command completion=%d uncertainty=%d released=%v quarantined=%v", authority.completeCalls, authority.uncertainCalls, lease.released, lease.quarantined)
+	if authority.completeCalls != 0 || authority.retireCalls != 1 || lease.released || lease.quarantined {
+		t.Fatalf("canceled observed command completion=%d retirement=%d released=%v quarantined=%v", authority.completeCalls, authority.retireCalls, lease.released, lease.quarantined)
 	}
 	// A nonzero, observed completion on a live fence remains ordinary durable
 	// evidence; only cancellation/deadline diverts to uncertainty.
