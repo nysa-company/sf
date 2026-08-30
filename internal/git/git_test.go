@@ -64,6 +64,12 @@ func (a testMutationAuthority) AcquireGitMutation(_ context.Context, _ contracts
 func (l testMutationLease) Check(context.Context) error { return l.err }
 func (testMutationLease) Release() error                { return nil }
 
+func testClaim(_ context.Context, binding contracts.GitMutationClaim) (contracts.GitMutationClaim, error) {
+	binding.TicketRef, binding.SemanticKey, binding.RequestDigest = "SF-test", "git/SF-test", digest([]byte("test-claim"))
+	binding.TicketVersion, binding.LeaderEpoch, binding.RunnerEpoch, binding.ClaimEpoch = 1, 1, 1, 1
+	return binding, nil
+}
+
 func (a *memoryBranchAuthority) LoadBranch(_ context.Context, key string) (string, error) {
 	return a.branches[key], nil
 }
@@ -164,7 +170,7 @@ func fixture(t *testing.T) (context.Context, Runner, string, string) {
 	rawGit(t, repository, "commit", "-m", "base")
 	rawGit(t, repository, "remote", "add", "origin", remote)
 	rawGit(t, repository, "push", "origin", "main:refs/heads/main")
-	return ctx, Runner{Home: filepath.Join(root, "git-home"), ExecHelper: testExecHelper, TestLocalTransport: true, MutationAuthority: testMutationAuthority{}}, repository, remote
+	return ctx, Runner{Home: filepath.Join(root, "git-home"), ExecHelper: testExecHelper, TestLocalTransport: true, MutationAuthority: testMutationAuthority{}, MutationClaimProvider: testClaim}, repository, remote
 }
 
 func TestAllocatorDelegatesBranchPersistenceToAuthority(t *testing.T) {
@@ -287,7 +293,7 @@ func TestCleanupUsesIndependentContextAfterCancellation(t *testing.T) {
 	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	err = runner.cleanupCreatedWorktree(canceled, repository, path, branch, "main", pinned)
+	err = runner.cleanupCreatedWorktree(canceled, repository, path, branch, "main", pinned, testMutationLease{})
 	_ = pinned.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -1285,6 +1291,45 @@ func TestProductionRefusesLocalOrigin(t *testing.T) {
 	}
 	if _, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main"); !errors.Is(err, ErrIdentityMismatch) {
 		t.Fatalf("production local origin=%v", err)
+	}
+}
+
+func TestAuthenticationRefusesHTTPSBeforeWorktreeEffect(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	rawGit(t, repository, "remote", "set-url", "origin", "https://github.com/owner/repository.git")
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-https-origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main"); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("HTTPS create=%v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("HTTPS origin created worktree: %v", err)
+	}
+}
+
+func TestSuppliedMutationClaimMustExactlyBindCommit(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-claim-bind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := testClaim(ctx, contracts.GitMutationClaim{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: branch, Operation: "commit", BaseRef: "main", ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: strings.Repeat("a", 40)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(11, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: claim})
+	if !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("mismatched durable claim=%v", err)
 	}
 }
 

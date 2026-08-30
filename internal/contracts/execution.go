@@ -34,10 +34,20 @@ type CommandExecutor interface {
 // This is what turns the trusted-repository assumption into an enforceable
 // production integration point instead of a Runner-local boolean.
 type GitMutationClaim struct {
-	Repository string
-	Worktree   string
-	Branch     string
-	Operation  string
+	TicketRef       string
+	SemanticKey     string
+	RequestDigest   string
+	TicketVersion   uint64
+	LeaderEpoch     uint64
+	RunnerEpoch     uint64
+	ClaimEpoch      uint64
+	Repository      string
+	Worktree        string
+	Branch          string
+	Operation       string
+	BaseRef         string
+	ExpectedBaseOID string
+	ExpectedHeadOID string
 }
 
 // GitMutationLease remains valid only while the supervisor's exclusion is
@@ -65,6 +75,7 @@ type ProtectedBranchWitness struct {
 	ProtectedRef    string
 	OriginalBaseOID string
 	MergeOID        string
+	MutationClaim   GitMutationClaim
 }
 
 type ProtectedBranchVerifier interface {

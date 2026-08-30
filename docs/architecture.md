@@ -21,13 +21,16 @@ The approved normative design is in
   `git.Runner`. `sf-git-exec` performs an fd-pinned `fchdir` and confirms the
   live worktree `.git` pointer, linked-worktree gitdir, and common directory
   against inherited descriptors immediately before Git exec. Every Git
-  mutation additionally requires a non-self-attested supervisor mutation
-  lease which holds the repository's no-live-writer exclusion from that final
-  authentication through the effect. macOS does not accept `/dev/fd/N` as
+  mutation additionally requires a caller-supplied, fenced durable mutation
+  claim and non-self-attested supervisor lease which holds the repository's
+  no-live-writer exclusion from that final authentication through the effect.
+  macOS does not accept `/dev/fd/N` as
   `GIT_DIR` (and this host also rejects it as an executable path), so this is a
   trusted-repository boundary rather than a claim to isolate a malicious
   concurrent same-UID process. Production rejects local origins; they exist
-  only under the explicit hermetic test transport.
+  only under the explicit hermetic test transport. The SQLite supervisor is
+  the pending production implementation of this claim/lease contract; until
+  it is wired, Git mutations fail closed.
   An ordinary candidate-ref push has no server-side CAS for a separate base
   ref: sf observes BaseRef before and after that bounded publication effect
   and treats any movement as stale rather than final. The build performs no service
