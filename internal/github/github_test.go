@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -1177,11 +1178,40 @@ func TestRunBoundedKillsProcessGroupOnDeadline(t *testing.T) {
 }
 
 func TestRunBoundedClosesRetainedPipeFromEscapedDescendant(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	started := time.Now()
-	script := "import os,time\nif os.fork()==0:\n if os.fork()==0:\n  os.setsid(); print('escaped-child-pid='+str(os.getpid()), flush=True); time.sleep(5)\n os._exit(0)\ntime.sleep(5)"
-	output, err := runBounded(ctx, "/usr/bin/python3", []string{"-c", script}, []string{"PATH=/usr/bin:/bin"})
+	ready := filepath.Join(t.TempDir(), "escaped-child-ready")
+	script := "import os,time\nif os.fork()==0:\n if os.fork()==0:\n  os.setsid(); print('escaped-child-pid='+str(os.getpid()), flush=True); open(os.environ['SF_TEST_READY'],'w').close(); time.sleep(5)\n os._exit(0)\ntime.sleep(5)"
+	type boundedResult struct {
+		output []byte
+		err    error
+	}
+	done := make(chan boundedResult, 1)
+	go func() {
+		output, err := runBounded(ctx, "/usr/bin/python3", []string{"-c", script}, []string{"PATH=/usr/bin:/bin", "SF_TEST_READY=" + ready})
+		done <- boundedResult{output: output, err: err}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		select {
+		case result := <-done:
+			t.Fatalf("hostile fixture exited before readiness: err=%v output=%q", result.err, result.output)
+		default:
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			result := <-done
+			t.Fatalf("hostile fixture did not become ready: err=%v output=%q", result.err, result.output)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	result := <-done
+	output, err := result.output, result.err
 	if !errors.Is(err, ErrProcessCleanup) || time.Since(started) > 2*time.Second {
 		t.Fatalf("escaped retained pipe err=%v elapsed=%s output=%q", err, time.Since(started), output)
 	}
