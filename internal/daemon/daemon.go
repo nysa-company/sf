@@ -159,7 +159,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if err := lease.Validate(); err != nil {
 		return fail(err)
 	}
-	database, err := store.Open(startupCtx, configuration.Paths.Database)
+	database, err := store.OpenChannel(startupCtx, configuration.Paths.Database, configuration.Paths.Backups, configuration.Channel)
 	if err != nil {
 		return fail(err)
 	}

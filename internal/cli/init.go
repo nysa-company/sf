@@ -76,7 +76,7 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 	if err := verifyBaseRef(ctx, repository, effective.BaseBranch); err != nil {
 		return initFailure("invalid_repository", "configured base branch is unavailable in the local repository", []string{binary, "doctor", "--repo", repository}, false)
 	}
-	database, err := store.Open(ctx, paths.Database)
+	database, err := store.OpenChannel(ctx, paths.Database, paths.Backups, request.Channel)
 	if err != nil {
 		return initFailure("init_failed", "local state could not be opened", []string{binary, "doctor"}, true)
 	}

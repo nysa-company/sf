@@ -134,6 +134,17 @@ type TransitionResult struct {
 // intentionally zero: writes use retryWrite and always honor the caller's
 // context rather than letting a driver-owned timeout outlive it.
 func Open(ctx context.Context, path string) (*Store, error) {
+	return open(ctx, path, openPolicy{})
+}
+
+func open(ctx context.Context, path string, policy openPolicy) (*Store, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, fmt.Errorf("sqlite path must be absolute and clean")
+	}
+	existed, err := existingDatabase(path)
+	if err != nil {
+		return nil, err
+	}
 	// modernc applies _pragma values to every pooled connection. A standalone
 	// PRAGMA foreign_keys call would configure only whichever connection happened
 	// to execute it, silently weakening foreign-key enforcement under load.
@@ -145,6 +156,21 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
 	s := &Store{db: db, commit: commitTransaction}
+	storedVersion, recognized, err := inspectStoredSchema(ctx, db)
+	if err != nil {
+		db.Close()
+		return nil, normalizeBusy(ctx, err)
+	}
+	if storedVersion > schemaVersion {
+		db.Close()
+		return nil, fmt.Errorf("database schema %d is newer than supported %d", storedVersion, schemaVersion)
+	}
+	if existed && recognized && storedVersion < schemaVersion && policy.backupBeforeMigration {
+		if err := s.backupBeforeMigration(ctx, policy.backupDir, storedVersion, schemaVersion, policy.now); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("backup schema %d before migration: %w", storedVersion, err)
+		}
+	}
 	if err := s.configure(ctx); err != nil {
 		db.Close()
 		return nil, normalizeBusy(ctx, err)

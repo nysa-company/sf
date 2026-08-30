@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 )
 
@@ -259,9 +261,21 @@ func hasColumns(ctx context.Context, db *sql.DB, table string, required ...strin
 // The destination must not already exist; SQLite's VACUUM INTO preserves the
 // source database while readers and short writes continue normally.
 func (s *Store) Backup(ctx context.Context, destination string) error {
-	if destination == "" || filepath.Clean(destination) == "." {
-		return fmt.Errorf("backup destination is required")
+	if !filepath.IsAbs(destination) || filepath.Clean(destination) != destination || destination == string(filepath.Separator) {
+		return fmt.Errorf("backup destination must be absolute and clean")
 	}
-	_, err := s.db.ExecContext(ctx, "VACUUM INTO ?", destination)
-	return normalizeBusy(ctx, err)
+	if err := validateBackupDirectory(filepath.Dir(destination)); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return fmt.Errorf("backup destination already exists")
+		}
+		return fmt.Errorf("inspect backup destination: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO ?", destination); err != nil {
+		_ = os.Remove(destination)
+		return normalizeBusy(ctx, err)
+	}
+	return validateBackupFile(destination)
 }

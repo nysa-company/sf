@@ -775,7 +775,11 @@ func TestRecoveryBlockWritesEventAndSchemaGuardsStartup(t *testing.T) {
 
 func TestOnlineBackupCanBeOpened(t *testing.T) {
 	database, ctx := openTestStore(t)
-	path := filepath.Join(t.TempDir(), "backup.sqlite")
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "backup.sqlite")
 	if err := database.Backup(ctx, path); err != nil {
 		t.Fatal(err)
 	}
