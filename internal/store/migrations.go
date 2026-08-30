@@ -317,3 +317,13 @@ var migrationV13 = []string{
 	`CREATE TRIGGER provider_attempt_state_outcome_update BEFORE UPDATE OF state,outcome ON provider_attempts WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome='completed') OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='quarantined' AND NEW.outcome IN ('undrained','undrained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid provider state/outcome'); END`,
 	`CREATE TRIGGER phase_run_state_outcome_update BEFORE UPDATE OF state,outcome ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome='completed') OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
 }
+
+// v14 reserves durable launch lifecycle fields. A launch that dies before its
+// PID/PGID is recorded remains unrecoverable and is quarantined, never freed.
+var migrationV14 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN launch_state TEXT NOT NULL DEFAULT 'legacy_unverifiable' CHECK(launch_state IN ('launching','released','drained','quarantined','legacy_unverifiable'))`,
+	`ALTER TABLE provider_attempts ADD COLUMN process_pid INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE provider_attempts ADD COLUMN process_pgid INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE provider_attempts ADD COLUMN process_started_at TEXT NOT NULL DEFAULT ''`,
+	`UPDATE provider_attempts SET launch_state=CASE WHEN state IN ('active','quarantined') THEN 'quarantined' ELSE 'legacy_unverifiable' END`,
+}

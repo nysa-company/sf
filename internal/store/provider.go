@@ -57,6 +57,25 @@ type ProviderAttempt struct {
 	StartedAt, FinishedAt time.Time
 }
 
+// RecordProviderLaunch is the pre-exec gate's durable publication point. The
+// wrapper remains blocked until this exact PID/PGID record commits.
+func (s *Store) RecordProviderLaunch(ctx context.Context, claim ProviderAttemptClaim, pid, pgid int, started time.Time) error {
+	if claim.ID <= 0 || pid <= 0 || pgid <= 0 || started.IsZero() {
+		return ErrProviderAttempt
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET process_pid=?,process_pgid=?,process_started_at=?,launch_state='released' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND state='active' AND launch_state='launching' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=?`, pid, pgid, started.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest)
+		if err != nil {
+			return err
+		}
+		n, _ := row.RowsAffected()
+		if n != 1 {
+			return ErrStaleFence
+		}
+		return nil
+	})
+}
+
 // ValidateFinalReviewEvidence binds a final Reviewer launch to the newest
 // durable candidate. Caller-supplied head/proof values are only hints until
 // this check proves they match SQLite authority.
@@ -231,7 +250,7 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 			return err
 		}
 		bindingDigest := bindingDigest(r.Binding)
-		row, err := conn.ExecContext(ctx, `INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,usage_units,started_at,finished_at,qualification_id,binding_digest,provider_lease_key,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha,supervisor_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, prior, r.Binding.Identity.Provider, r.Binding.Identity.Model, r.Binding.Identity.Family, r.Binding.Identity.Version, outcome, r.Role, "active", 0, r.At.UTC().Format(time.RFC3339Nano), "", qualification.ID, bindingDigest, lease.ScopeKey, r.Fence.LeaderEpoch, r.Fence.RunnerEpoch, r.ExpectedVersion, r.Repository, r.Worktree, r.WorktreeIdentity, r.BaseSHA, r.SupervisorKey)
+		row, err := conn.ExecContext(ctx, `INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,usage_units,started_at,finished_at,qualification_id,binding_digest,provider_lease_key,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha,supervisor_key,launch_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, prior, r.Binding.Identity.Provider, r.Binding.Identity.Model, r.Binding.Identity.Family, r.Binding.Identity.Version, outcome, r.Role, "active", 0, r.At.UTC().Format(time.RFC3339Nano), "", qualification.ID, bindingDigest, lease.ScopeKey, r.Fence.LeaderEpoch, r.Fence.RunnerEpoch, r.ExpectedVersion, r.Repository, r.Worktree, r.WorktreeIdentity, r.BaseSHA, r.SupervisorKey, "launching")
 		if err != nil {
 			return err
 		}

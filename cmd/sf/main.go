@@ -15,6 +15,22 @@ import (
 )
 
 func main() {
+	if len(os.Args) >= 3 && os.Args[1] == "__provider_gate" {
+		// FD 3 is held by the supervisor until the launch PID/PGID is durably
+		// recorded. EOF means the parent died before authority was published.
+		gate := os.NewFile(uintptr(3), "provider-launch-gate")
+		if gate == nil {
+			os.Exit(125)
+		}
+		var one [1]byte
+		if _, err := gate.Read(one[:]); err != nil {
+			os.Exit(125)
+		}
+		if err := syscall.Exec(os.Args[2], os.Args[2:], os.Environ()); err != nil {
+			os.Exit(126)
+		}
+		return
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = ""

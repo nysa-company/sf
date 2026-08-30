@@ -41,7 +41,7 @@ var (
 	ErrProviderDrain         = errors.New("provider process has not drained")
 )
 
-const schemaVersion = 13
+const schemaVersion = 14
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -57,6 +57,7 @@ var migrationChecksums = map[int]string{
 	11: migrationChecksum(migrationV11),
 	12: migrationChecksum(migrationV12),
 	13: migrationChecksum(migrationV13),
+	14: migrationChecksum(migrationV14),
 }
 
 func migrationChecksum(statements []string) string {
@@ -251,6 +252,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV12
 			} else if version == 13 {
 				statements = migrationV13
+			} else if version == 14 {
+				statements = migrationV14
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
