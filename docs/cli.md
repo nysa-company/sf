@@ -79,6 +79,16 @@ qualification command remains local adapter work in progress.
 example, `sf-dev daemon run`). Its socket-backed lifecycle commands use the
 channel-specific owner-only socket.
 
+The current foreground daemon implements `submit`, `start`, `status`, `show`,
+`pause`, and `cancel`. Pause and cancel first commit the authenticated control
+intent and invalidate the runner fence, then wait for the injected runtime to
+prove writers drained; cancellation also observes external merge state before
+and after that drain. Capacity is released only with the final durable
+`paused`/`cancelled` transition. `take`, `resume`, `recover`, `retry`, approval,
+rejection, and logs still fail closed with `not_ready` until their complete
+worktree/effect evidence is wired; listing a command above is the stable CLI
+surface, not a claim that its lifecycle is already enabled.
+
 ## Operator identity
 
 The daemon authenticates the socket peer. An omitted operator is resolved by

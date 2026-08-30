@@ -21,6 +21,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/api"
 	"github.com/nysa-company/sf/internal/config"
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/engine"
 	"github.com/nysa-company/sf/internal/events"
@@ -61,6 +62,28 @@ type wallClock struct{}
 
 func (wallClock) Now() time.Time { return time.Now().UTC() }
 
+// RuntimeController is the narrow operator-control handoff to the process and
+// remote-effect runtime. Drain must return true only after every writer owned
+// by the ticket is gone or quarantined in a way that forbids continuation.
+// MergeObserved is read-only and is checked both before cancellation and after
+// draining so a concurrent external merge cannot be mislabeled cancelled.
+type RuntimeController interface {
+	Drain(context.Context, domain.TicketRef) (bool, error)
+	MergeObserved(context.Context, domain.TicketRef) (bool, error)
+}
+
+// idleRuntimeController is safe only for the current composition, which has
+// no provider/Git/GitHub runner. A later composition that can launch work must
+// inject its real supervisor and effect observer.
+type idleRuntimeController struct{}
+
+func (idleRuntimeController) Drain(context.Context, domain.TicketRef) (bool, error) {
+	return true, nil
+}
+func (idleRuntimeController) MergeObserved(context.Context, domain.TicketRef) (bool, error) {
+	return false, nil
+}
+
 type Config struct {
 	Channel          domain.Channel
 	Paths            config.ChannelPaths
@@ -70,6 +93,7 @@ type Config struct {
 	TicketIDs        TicketIDGenerator
 	Clock            Clock
 	Operator         operator.Authenticator
+	Controller       RuntimeController
 	// Doctor is an injected local preflight. A nil doctor means only the
 	// daemon's local storage/leader checks are required; no provider or Git
 	// integration is implied by that default.
@@ -92,6 +116,7 @@ type Daemon struct {
 	clock   Clock
 	ids     TicketIDGenerator
 	auth    operator.Authenticator
+	control RuntimeController
 	mu      sync.Mutex
 	closed  bool
 
@@ -172,7 +197,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	}
 
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -187,6 +212,9 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	}
 	if instance.ids == nil {
 		instance.ids = RandomTicketIDs{}
+	}
+	if instance.control == nil {
+		instance.control = idleRuntimeController{}
 	}
 	if err := instance.Recover(startupCtx); err != nil {
 		return failStore(fmt.Errorf("recover durable state: %w", err))
@@ -278,6 +306,10 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		response = daemon.show(ctx, request)
 	case "ticket.start":
 		response = daemon.startTicket(ctx, request, identity)
+	case "ticket.pause":
+		response = daemon.controlTicket(ctx, request, identity, "pause")
+	case "ticket.cancel":
+		response = daemon.controlTicket(ctx, request, identity, "cancel")
 	case "daemon.status":
 		response = daemon.status(request)
 	default:
@@ -452,6 +484,148 @@ func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ do
 	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_start", Identity: workflowID, Observed: observed}, ticketView(started))
 }
 
+type controlParameters struct {
+	Operator string         `json:"operator"`
+	Channel  domain.Channel `json:"channel"`
+}
+
+func (daemon *Daemon) controlTicket(ctx context.Context, request api.Request, identity domain.OperatorIdentity, intent string) api.Response {
+	var parameters controlParameters
+	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) {
+		return daemon.failure(request, "invalid_control", "control requires the authenticated operator and daemon channel", false)
+	}
+	ref, response := daemon.ticketRefByID(ctx, request)
+	if response != nil {
+		return *response
+	}
+	stored, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	if intent == "cancel" && stored.State == domain.StateCancelled {
+		return daemon.controlSuccess(request, stored, intent, true)
+	}
+	if intent != "cancel" && stored.State == domain.StatePaused {
+		return daemon.controlSuccess(request, stored, intent, true)
+	}
+	if err := daemon.lease.Validate(); err != nil {
+		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	}
+	eventPayload, err := json.Marshal(map[string]any{"intent": intent, "operator": identity.Label, "operator_uid": identity.UID})
+	if err != nil {
+		return daemon.failure(request, "internal_encoding", "operator control metadata could not be encoded", false)
+	}
+
+	if intent == "cancel" && stored.State != domain.StateCancelling {
+		merged, err := daemon.control.MergeObserved(ctx, ref)
+		if err != nil {
+			return daemon.controlFailure(request, stored, intent, "external_state_unavailable", "merge state could not be observed before cancellation", true, false)
+		}
+		if merged {
+			return daemon.controlFailure(request, stored, intent, "external_merge_observed", "the ticket has an external merge that must be reconciled", false, false)
+		}
+		result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{
+			Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: "operator_cancel",
+			Fence:        domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch},
+			Attributes:   map[string]string{"operator_identity_authenticated": "true", "merge_not_observed": "true"},
+			EventPayload: string(eventPayload),
+		})
+		if err != nil {
+			return daemon.controlFailure(request, stored, intent, "invalid_transition", "ticket cannot be cancelled from its current state", false, false)
+		}
+		confirmed, readErr := daemon.store.Ticket(ctx, ref)
+		if readErr != nil || confirmed.Version != result.TicketVersion || confirmed.State != domain.StateCancelling {
+			return daemon.controlFailure(request, stored, intent, "control_state_unavailable", "cancellation state could not be confirmed", true, true)
+		}
+		stored = confirmed
+	} else if intent != "cancel" && stored.State != domain.StateStopping {
+		result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{
+			Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: "operator_pause_or_take",
+			Fence:        domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch},
+			Attributes:   map[string]string{"operator_identity_authenticated": "true"},
+			EventPayload: string(eventPayload),
+		})
+		if err != nil {
+			return daemon.controlFailure(request, stored, intent, "invalid_transition", "ticket cannot be paused from its current state", false, false)
+		}
+		confirmed, readErr := daemon.store.Ticket(ctx, ref)
+		if readErr != nil || confirmed.Version != result.TicketVersion || confirmed.State != domain.StateStopping {
+			return daemon.controlFailure(request, stored, intent, "control_state_unavailable", "stopping state could not be confirmed", true, true)
+		}
+		stored = confirmed
+	}
+	return daemon.finishControl(ctx, request, stored, intent)
+}
+
+func (daemon *Daemon) finishControl(ctx context.Context, request api.Request, stored store.Ticket, intent string) api.Response {
+	drained, err := daemon.control.Drain(ctx, stored.Ref)
+	if err != nil {
+		return daemon.controlFailure(request, stored, intent, "control_drain_failed", "the ticket runtime could not be drained", true, true)
+	}
+	if !drained {
+		return daemon.controlFailure(request, stored, intent, "blocked_process", "a ticket writer is still live or quarantined", false, true)
+	}
+	if intent == "cancel" {
+		merged, err := daemon.control.MergeObserved(ctx, stored.Ref)
+		if err != nil {
+			return daemon.controlFailure(request, stored, intent, "external_state_unavailable", "merge state could not be re-observed after draining", true, true)
+		}
+		if merged {
+			return daemon.controlFailure(request, stored, intent, "external_merge_observed", "an external merge appeared while cancellation drained", false, true)
+		}
+	}
+	target := domain.StatePaused
+	if intent == "cancel" {
+		target = domain.StateCancelled
+	}
+	result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{
+		Ticket: stored.Ref, TicketVersion: stored.Version, From: stored.State, Trigger: "process_and_effects_drained",
+		Fence:        domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch},
+		Attributes:   map[string]string{"no_live_writer": "true", "no_unreconciled_mutation": "true"},
+		EventPayload: `{"drained":true,"intent":"` + intent + `"}`,
+	})
+	if err != nil {
+		code, message := "control_completion_failed", "drained control state could not be committed"
+		if errors.Is(err, store.ErrControlNotDrained) {
+			code, message = "uncertain_effect", "an external effect must be reconciled before control can complete"
+		}
+		return daemon.controlFailure(request, stored, intent, code, message, errors.Is(err, store.ErrBusy), true)
+	}
+	finished, err := daemon.store.Ticket(ctx, stored.Ref)
+	if err != nil || finished.State != target || finished.Version != result.TicketVersion {
+		return daemon.controlFailure(request, stored, intent, "control_state_unavailable", "completed control state could not be confirmed", true, true)
+	}
+	return daemon.controlSuccess(request, finished, intent, false)
+}
+
+func (daemon *Daemon) ticketRefByID(ctx context.Context, request api.Request) (domain.TicketRef, *api.Response) {
+	if request.Ticket == "" {
+		response := daemon.failure(request, "invalid_ticket_reference", "ticket is required", false)
+		return domain.TicketRef{}, &response
+	}
+	stored, err := daemon.store.TicketByID(ctx, daemon.channel, domain.TicketID(request.Ticket))
+	if err != nil {
+		response := daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+		return domain.TicketRef{}, &response
+	}
+	return stored.Ref, nil
+}
+
+func (daemon *Daemon) controlSuccess(request api.Request, stored store.Ticket, intent string, observed bool) api.Response {
+	view := ticketView(stored)
+	view["control"] = intent
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_" + intent, Identity: string(stored.Ref.Ticket), Observed: observed}, view)
+}
+
+func (daemon *Daemon) controlFailure(request api.Request, stored store.Ticket, intent, code, message string, retryable, attempted bool) api.Response {
+	response := daemon.failure(request, code, message, retryable)
+	response.Mutation = api.Mutation{Attempted: attempted, Kind: "ticket_" + intent, Identity: string(stored.Ref.Ticket)}
+	if stored.Ref.Ticket != "" {
+		response.Data, _ = json.Marshal(ticketView(stored))
+	}
+	return response
+}
+
 func leaseCapacities(project store.Project) (int, int, error) {
 	if project.ConfigGeneration == 0 && len(project.ConfigSnapshot) == 0 && project.ConfigDigest == "" {
 		defaults := config.DefaultMachineLimits()
@@ -549,6 +723,7 @@ func (daemon *Daemon) success(request api.Request, mutation api.Mutation, value 
 func (daemon *Daemon) failure(request api.Request, code, message string, retryable bool) api.Response {
 	binary := daemon.executable()
 	argv := []string{binary, "doctor"}
+	verb := strings.TrimPrefix(request.Method, "ticket.")
 	if code == "autonomous_unavailable" {
 		argv = []string{binary, "providers", "qualify", "--help"}
 	}
@@ -563,6 +738,17 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	}
 	if code == "invalid_submit" {
 		argv = []string{binary, "submit", "--help"}
+	}
+	if code == "invalid_control" || code == "invalid_ticket_reference" {
+		if verb != "" && verb != request.Method {
+			argv = []string{binary, verb, "--help"}
+		}
+	}
+	if request.Ticket != "" {
+		switch code {
+		case "ticket_not_found", "invalid_transition", "external_state_unavailable", "external_merge_observed", "control_state_unavailable", "control_drain_failed", "blocked_process", "uncertain_effect", "control_completion_failed":
+			argv = []string{binary, "status", request.Ticket}
+		}
 	}
 	if code == "not_ready" {
 		argv = []string{binary, "--help"}

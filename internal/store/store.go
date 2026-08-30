@@ -958,6 +958,12 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	if !transition.To.Valid() || !transition.From.Valid() || transition.Trigger == "" {
 		return TransitionResult{}, fmt.Errorf("valid from/to state and trigger are required")
 	}
+	if transition.EventPayload == "" {
+		transition.EventPayload = "{}"
+	}
+	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
+		return TransitionResult{}, errors.New("transition event payload must be bounded JSON")
+	}
 	var result TransitionResult
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var version, runner uint64

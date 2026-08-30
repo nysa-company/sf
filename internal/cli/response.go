@@ -31,11 +31,11 @@ func exitCode(response api.Response) ExitCode {
 		return ExitInternal
 	}
 	switch response.Error.Code {
-	case "invalid_command", "invalid_ticket", "invalid_argument", "invalid_repository", "invalid_configuration":
+	case "invalid_command", "invalid_ticket", "invalid_argument", "invalid_repository", "invalid_configuration", "invalid_control", "invalid_ticket_reference":
 		return ExitInput
-	case "operator_action_required", "provider_auth_missing", "provider_unavailable", "auth_login_failed", "blocked_process", "uncertain_effect", "not_configured", "doctor_not_configured", "doctor_failed", "project_conflict", "init_failed", "unknown_project":
+	case "operator_action_required", "provider_auth_missing", "provider_unavailable", "auth_login_failed", "blocked_process", "uncertain_effect", "external_merge_observed", "invalid_transition", "control_drain_failed", "control_completion_failed", "not_configured", "doctor_not_configured", "doctor_failed", "project_conflict", "init_failed", "unknown_project":
 		return ExitAction
-	case "daemon_unavailable", "provider_waiting", "checks_pending", "store_busy", "projection_unavailable":
+	case "daemon_unavailable", "provider_waiting", "checks_pending", "store_busy", "projection_unavailable", "external_state_unavailable", "control_state_unavailable":
 		return ExitWait
 	case "policy_refusal", "safety_blocked", "unqualified_provider":
 		return ExitPolicy

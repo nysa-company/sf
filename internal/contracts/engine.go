@@ -15,6 +15,9 @@ type TransitionRequest struct {
 	Fence         domain.Fence
 	ObservedAt    time.Time
 	Attributes    map[string]string
+	// EventPayload is bounded, pre-redacted authority metadata selected by the
+	// trusted caller. Provider output must never be copied into this field.
+	EventPayload string
 }
 
 // StartRequest carries a daemon-acquired durable fence. Runtime entry points
@@ -34,6 +37,7 @@ type SignalRequest struct {
 	Trigger       string
 	Fence         domain.Fence
 	Attributes    map[string]string
+	EventPayload  string
 }
 
 // RecoveryRequest limits reconciliation to a leader-owned channel.

@@ -84,7 +84,10 @@ func (e *Engine) Transition(ctx context.Context, request contracts.TransitionReq
 	persisted := store.Transition{
 		Ref: request.Ticket, ExpectedVersion: request.TicketVersion, From: request.From,
 		To: target, ResumeState: resume, Trigger: request.Trigger, Fence: request.Fence,
-		EventPayload: "{}",
+		EventPayload: request.EventPayload,
+	}
+	if persisted.EventPayload == "" {
+		persisted.EventPayload = "{}"
 	}
 	var result store.TransitionResult
 	if transition.ID == "stopped" || transition.ID == "cancelled" {
@@ -121,7 +124,7 @@ func invalidations(spec statemachine.Spec, sets []string) []string {
 func (e *Engine) Signal(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
 	return e.Transition(ctx, contracts.TransitionRequest{
 		Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From,
-		Trigger: request.Trigger, Fence: request.Fence, Attributes: request.Attributes,
+		Trigger: request.Trigger, Fence: request.Fence, Attributes: request.Attributes, EventPayload: request.EventPayload,
 	})
 }
 

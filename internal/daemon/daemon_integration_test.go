@@ -36,6 +36,25 @@ type testClock struct{ now time.Time }
 
 func (c testClock) Now() time.Time { return c.now }
 
+type testRuntimeController struct {
+	drain func(context.Context, domain.TicketRef) (bool, error)
+	merge func(context.Context, domain.TicketRef) (bool, error)
+}
+
+func (controller testRuntimeController) Drain(ctx context.Context, ref domain.TicketRef) (bool, error) {
+	if controller.drain == nil {
+		return true, nil
+	}
+	return controller.drain(ctx, ref)
+}
+
+func (controller testRuntimeController) MergeObserved(ctx context.Context, ref domain.TicketRef) (bool, error) {
+	if controller.merge == nil {
+		return false, nil
+	}
+	return controller.merge(ctx, ref)
+}
+
 func testDaemon(t *testing.T) (*Daemon, config.ChannelPaths, context.CancelFunc) {
 	return testDaemonForChannel(t, domain.ChannelStable)
 }
@@ -98,6 +117,21 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 					t.Fatalf("%s response failed validation: %v", code, err)
 				}
 			}
+			for code, want := range map[string][]string{
+				"invalid_control":            {binary, "pause", "--help"},
+				"invalid_ticket_reference":   {binary, "pause", "--help"},
+				"invalid_transition":         {binary, "status", "SF-action"},
+				"external_merge_observed":    {binary, "status", "SF-action"},
+				"external_state_unavailable": {binary, "status", "SF-action"},
+				"blocked_process":            {binary, "status", "SF-action"},
+				"uncertain_effect":           {binary, "status", "SF-action"},
+			} {
+				request := api.Request{Version: api.Version, RequestID: "control-actions", Method: "ticket.pause", Ticket: "SF-action"}
+				response := d.failure(request, code, "failed", false)
+				if response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join(want, "\x00") {
+					t.Fatalf("%s control action=%+v want=%+v", code, response.NextAction, want)
+				}
+			}
 		})
 	}
 }
@@ -141,6 +175,182 @@ func TestDaemonAdmissionUsesConfiguredTwoTicketDefault(t *testing.T) {
 		if index == 3 && (response.OK || response.Error == nil || response.Error.Code != "capacity_unavailable") {
 			t.Fatalf("third ticket did not hit capacity: %+v", response)
 		}
+	}
+}
+
+func createAndStartControlTicket(t *testing.T, daemon *Daemon, id domain.TicketID) store.Ticket {
+	t.Helper()
+	ref := domain.TicketRef{Channel: daemon.channel, Project: "demo", Ticket: id}
+	if err := daemon.store.CreateTicket(context.Background(), store.Ticket{Ref: ref, SourceDigest: "control-" + string(id), Type: domain.TicketBug, MergeMode: domain.MergeGuarded}); err != nil {
+		t.Fatal(err)
+	}
+	request := api.Request{Version: api.Version, RequestID: "start-" + string(id), Method: "ticket.start", Ticket: string(id), Parameters: json.RawMessage(`{"channel":"` + string(daemon.channel) + `","project":"demo"}`)}
+	response := daemon.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, request)
+	if !response.OK {
+		t.Fatalf("start response=%+v", response)
+	}
+	started, err := daemon.store.Ticket(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return started
+}
+
+func daemonControl(daemon *Daemon, id domain.TicketID, intent string) api.Response {
+	return daemon.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{
+		Version: api.Version, RequestID: intent + "-" + string(id), Method: "ticket." + intent,
+		Ticket: string(id), OperatorLabel: "operator",
+		Parameters: json.RawMessage(`{"channel":"` + string(daemon.channel) + `","operator":"operator"}`),
+	})
+}
+
+func TestDaemonPauseDrainsThenCommitsAndReplays(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-pause")
+	var drains int
+	d.control = testRuntimeController{drain: func(_ context.Context, ref domain.TicketRef) (bool, error) {
+		drains++
+		if ref != started.Ref {
+			t.Fatalf("drain ref=%+v want=%+v", ref, started.Ref)
+		}
+		return true, nil
+	}}
+	response := daemonControl(d, started.Ref.Ticket, "pause")
+	if !response.OK || !response.Mutation.Attempted || response.Mutation.Observed {
+		t.Fatalf("pause response=%+v", response)
+	}
+	paused, err := d.store.Ticket(context.Background(), started.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paused.State != domain.StatePaused || paused.ResumeState != domain.StatePlanning || paused.RunnerEpoch != started.RunnerEpoch+1 || paused.Version != started.Version+2 {
+		t.Fatalf("paused=%+v started=%+v", paused, started)
+	}
+	leases, err := d.store.Leases(context.Background(), d.channel)
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("leases=%+v err=%v", leases, err)
+	}
+	events, err := d.store.Events(context.Background(), d.channel, 0, 20)
+	if err != nil || len(events) < 3 {
+		t.Fatalf("events=%+v err=%v", events, err)
+	}
+	intentEvent := events[len(events)-2]
+	if intentEvent.Trigger != "operator_pause_or_take" || !strings.Contains(intentEvent.Payload, `"intent":"pause"`) || !strings.Contains(intentEvent.Payload, `"operator":"operator"`) || !strings.Contains(intentEvent.Payload, `"operator_uid":`) {
+		t.Fatalf("control intent event=%+v", intentEvent)
+	}
+	if drainedEvent := events[len(events)-1]; drainedEvent.Trigger != "process_and_effects_drained" || drainedEvent.Payload != `{"drained":true,"intent":"pause"}` {
+		t.Fatalf("drained event=%+v", drainedEvent)
+	}
+	replay := daemonControl(d, started.Ref.Ticket, "pause")
+	if !replay.OK || !replay.Mutation.Observed || drains != 1 {
+		t.Fatalf("replay=%+v drains=%d", replay, drains)
+	}
+}
+
+func TestDaemonPauseRemainsStoppingUntilRuntimeDrains(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-blocked-pause")
+	drained := false
+	d.control = testRuntimeController{drain: func(context.Context, domain.TicketRef) (bool, error) { return drained, nil }}
+	response := daemonControl(d, started.Ref.Ticket, "pause")
+	if response.OK || response.Error == nil || response.Error.Code != "blocked_process" || !response.Mutation.Attempted {
+		t.Fatalf("undrained response=%+v", response)
+	}
+	stopping, err := d.store.Ticket(context.Background(), started.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopping.State != domain.StateStopping || stopping.RunnerEpoch != started.RunnerEpoch+1 {
+		t.Fatalf("stopping=%+v started=%+v", stopping, started)
+	}
+	if leases, err := d.store.Leases(context.Background(), d.channel); err != nil || len(leases) != 2 {
+		t.Fatalf("undrained leases=%+v err=%v", leases, err)
+	}
+	drained = true
+	response = daemonControl(d, started.Ref.Ticket, "pause")
+	if !response.OK {
+		t.Fatalf("completed response=%+v", response)
+	}
+	paused, err := d.store.Ticket(context.Background(), started.Ref)
+	if err != nil || paused.State != domain.StatePaused {
+		t.Fatalf("paused=%+v err=%v", paused, err)
+	}
+}
+
+func TestDaemonCancelChecksMergeBeforeAndAfterDrain(t *testing.T) {
+	t.Run("merge already observed does not mutate", func(t *testing.T) {
+		d, _, _ := testDaemon(t)
+		started := createAndStartControlTicket(t, d, "SF-cancel-premerge")
+		var drains int
+		d.control = testRuntimeController{
+			drain: func(context.Context, domain.TicketRef) (bool, error) { drains++; return true, nil },
+			merge: func(context.Context, domain.TicketRef) (bool, error) { return true, nil },
+		}
+		response := daemonControl(d, started.Ref.Ticket, "cancel")
+		if response.OK || response.Error == nil || response.Error.Code != "external_merge_observed" || response.Mutation.Attempted || drains != 0 {
+			t.Fatalf("response=%+v drains=%d", response, drains)
+		}
+		stored, err := d.store.Ticket(context.Background(), started.Ref)
+		if err != nil || stored.State != domain.StatePlanning || stored.Version != started.Version || stored.RunnerEpoch != started.RunnerEpoch {
+			t.Fatalf("stored=%+v err=%v started=%+v", stored, err, started)
+		}
+	})
+
+	t.Run("merge racing drain leaves cancellation incomplete", func(t *testing.T) {
+		d, _, _ := testDaemon(t)
+		started := createAndStartControlTicket(t, d, "SF-cancel-race")
+		observations := 0
+		d.control = testRuntimeController{
+			drain: func(context.Context, domain.TicketRef) (bool, error) { return true, nil },
+			merge: func(context.Context, domain.TicketRef) (bool, error) {
+				observations++
+				return observations >= 2, nil
+			},
+		}
+		response := daemonControl(d, started.Ref.Ticket, "cancel")
+		if response.OK || response.Error == nil || response.Error.Code != "external_merge_observed" || !response.Mutation.Attempted || observations != 2 {
+			t.Fatalf("response=%+v observations=%d", response, observations)
+		}
+		stored, err := d.store.Ticket(context.Background(), started.Ref)
+		if err != nil || stored.State != domain.StateCancelling || stored.RunnerEpoch != started.RunnerEpoch+1 {
+			t.Fatalf("stored=%+v err=%v started=%+v", stored, err, started)
+		}
+		response = daemonControl(d, started.Ref.Ticket, "cancel")
+		if response.OK || response.Error == nil || response.Error.Code != "external_merge_observed" {
+			t.Fatalf("repeat after observed merge=%+v", response)
+		}
+		stored, err = d.store.Ticket(context.Background(), started.Ref)
+		if err != nil || stored.State != domain.StateCancelling {
+			t.Fatalf("repeat stored=%+v err=%v", stored, err)
+		}
+	})
+
+	t.Run("absence through drain completes cancellation", func(t *testing.T) {
+		d, _, _ := testDaemon(t)
+		started := createAndStartControlTicket(t, d, "SF-cancel")
+		var observations int
+		d.control = testRuntimeController{
+			drain: func(context.Context, domain.TicketRef) (bool, error) { return true, nil },
+			merge: func(context.Context, domain.TicketRef) (bool, error) { observations++; return false, nil },
+		}
+		response := daemonControl(d, started.Ref.Ticket, "cancel")
+		if !response.OK || observations != 2 {
+			t.Fatalf("response=%+v observations=%d", response, observations)
+		}
+		stored, err := d.store.Ticket(context.Background(), started.Ref)
+		if err != nil || stored.State != domain.StateCancelled || stored.RunnerEpoch != started.RunnerEpoch+1 {
+			t.Fatalf("stored=%+v err=%v started=%+v", stored, err, started)
+		}
+	})
+}
+
+func TestDaemonControlPreconditionFailureReportsNoMutation(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-control-read")
+	d.control = testRuntimeController{merge: func(context.Context, domain.TicketRef) (bool, error) { return false, errors.New("unavailable") }}
+	response := daemonControl(d, started.Ref.Ticket, "cancel")
+	if response.OK || response.Error == nil || response.Error.Code != "external_state_unavailable" || response.Mutation.Attempted {
+		t.Fatalf("response=%+v", response)
 	}
 }
 

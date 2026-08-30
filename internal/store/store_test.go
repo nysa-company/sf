@@ -38,6 +38,33 @@ func ticket(ref domain.TicketRef, digest string) Ticket {
 	return Ticket{Ref: ref, SourceDigest: digest, Type: domain.TicketBug, MergeMode: domain.MergeGuarded}
 }
 
+func TestTransitionRejectsInvalidEventPayloadBeforeMutation(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-event-payload"}
+	if err := database.CreateTicket(ctx, ticket(ref, "event-payload")); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "event-payload-daemon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.Transition(ctx, Transition{
+		Ref: ref, ExpectedVersion: before.Version, From: domain.StateQueued, To: domain.StateDone,
+		Trigger: "invalid_payload", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: before.RunnerEpoch}, EventPayload: "not-json",
+	})
+	if err == nil {
+		t.Fatal("invalid transition event payload was accepted")
+	}
+	after, err := database.Ticket(ctx, ref)
+	if err != nil || after.State != before.State || after.Version != before.Version {
+		t.Fatalf("after=%+v before=%+v err=%v", after, before, err)
+	}
+}
+
 func TestSubmitPersistsImmutableSourceAndRequiresNewAfterTerminal(t *testing.T) {
 	database, ctx := openTestStore(t)
 	source := []byte("# Fix reminders\n\nDuplicates occur.\n\n## Acceptance\n- One reminder\n")
