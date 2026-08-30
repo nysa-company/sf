@@ -44,6 +44,15 @@ func ticket(ref domain.TicketRef, digest string) Ticket {
 	return Ticket{Ref: ref, SourceDigest: digest, Type: domain.TicketBug, MergeMode: domain.MergeGuarded}
 }
 
+// simulateFenceRecoveredRunner mirrors the root daemon's
+// FenceRecoveredRunners transition. This GitHub-boundary worktree intentionally
+// does not include daemon/lease composition, but recovery must consume the
+// resulting live ticket version and runner epoch exactly.
+func simulateFenceRecoveredRunner(ctx context.Context, database *Store, ref domain.TicketRef) error {
+	_, err := database.db.ExecContext(ctx, `UPDATE tickets SET runner_epoch=runner_epoch+1, version=version+1 WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket)
+	return err
+}
+
 func TestSubmitPersistsImmutableSourceAndRequiresNewAfterTerminal(t *testing.T) {
 	database, ctx := openTestStore(t)
 	source := []byte("# Fix reminders\n\nDuplicates occur.\n\n## Acceptance\n- One reminder\n")
@@ -307,6 +316,9 @@ func TestRecoverMergeIntentUsesCurrentUncertainFence(t *testing.T) {
 	if err != nil || len(uncertain) != 1 || uncertain[0].State != EffectUncertain {
 		t.Fatalf("reconcile=%+v err=%v", uncertain, err)
 	}
+	if err := simulateFenceRecoveredRunner(ctx, database, ref); err != nil {
+		t.Fatalf("fence recovered runner=%v", err)
+	}
 	calls := 0
 	observer := mergeIntentObserverFunc(func(_ context.Context, got domain.MergeIntent) (string, error) {
 		calls++
@@ -348,6 +360,12 @@ func TestRecoverMergeIntentRejectsStaleTamperedAndRacedFence(t *testing.T) {
 	}
 	newLeader, _ := database.AcquireLeader(ctx, domain.ChannelDev, "recovery")
 	_, _ = database.ReconcileEffects(ctx, domain.ChannelDev, newLeader)
+	if _, err := database.RecoverMergeIntent(ctx, intent.SemanticKey, observer); !errors.Is(err, ErrStaleFence) || called {
+		t.Fatalf("unfenced recovery err=%v called=%v", err, called)
+	}
+	if err := simulateFenceRecoveredRunner(ctx, database, ref); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := database.db.Exec(`UPDATE effects SET request_digest='tampered' WHERE semantic_key=?`, intent.SemanticKey); err != nil {
 		t.Fatal(err)
 	}
