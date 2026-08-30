@@ -21,15 +21,16 @@ import (
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/executionpolicy"
 	gitboundary "github.com/nysa-company/sf/internal/git"
+	"github.com/nysa-company/sf/internal/goclosure"
 )
 
-func TestRepositoryCommandRejectsCustomExecutableNamedGit(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "git")
+func TestRepositoryCommandRejectsCustomExecutableNamedGo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "go")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := resolveFixedExecutable(path); err == nil {
-		t.Fatal("custom executable named git was accepted")
+		t.Fatal("custom executable named go was accepted")
 	}
 }
 
@@ -117,7 +118,7 @@ func TestRepositoryGoDependencyClosureRequiresVendorForExternalModules(t *testin
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.test/proof\n\ngo 1.25\n\nrequire example.test/dep v1.0.0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repositoryGoDependencyClosure(root); !errors.Is(err, ErrSubprocessRecipeUnsupported) {
+	if _, err := goclosure.Validate(root); !errors.Is(err, goclosure.ErrUnvendored) {
 		t.Fatalf("unvendored module error=%v", err)
 	}
 	if err := os.Mkdir(filepath.Join(root, "vendor"), 0o700); err != nil {
@@ -126,7 +127,7 @@ func TestRepositoryGoDependencyClosureRequiresVendorForExternalModules(t *testin
 	if err := os.WriteFile(filepath.Join(root, "vendor", "modules.txt"), []byte("# example.test/dep v1.0.0\n## explicit\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if useVendor, err := repositoryGoDependencyClosure(root); err != nil || !useVendor {
+	if useVendor, err := goclosure.Validate(root); err != nil || !useVendor {
 		t.Fatalf("vendored closure useVendor=%v err=%v", useVendor, err)
 	}
 }

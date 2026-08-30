@@ -55,6 +55,68 @@ func TestLoadProjectAutoDetectsGoRepository(t *testing.T) {
 	}
 }
 
+func TestLoadProjectGoDetectionRequiresBoundedLocalClosure(t *testing.T) {
+	tests := map[string]struct {
+		goMod  string
+		vendor bool
+		want   bool
+	}{
+		"dependency free":         {goMod: "module example.test/proof\n\ngo 1.25\n", want: true},
+		"external without vendor": {goMod: "module example.test/proof\n\ngo 1.25\n\nrequire example.test/dep v1.0.0\n", want: false},
+		"valid vendor":            {goMod: "module example.test/proof\n\ngo 1.25\n\nrequire example.test/dep v1.0.0\n", vendor: true, want: true},
+		"malformed marker":        {goMod: "require example.test/dep v1.0.0\n", want: false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			repository := t.TempDir()
+			if err := os.WriteFile(filepath.Join(repository, "go.mod"), []byte(test.goMod), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if test.vendor {
+				if err := os.Mkdir(filepath.Join(repository, "vendor"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(repository, "vendor", "modules.txt"), []byte("# example.test/dep v1.0.0\n## explicit\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _, _, err := LoadProject(repository, "proof", DefaultMachineLimits())
+			if test.want && err != nil {
+				t.Fatal(err)
+			}
+			if !test.want && (!errors.Is(err, ErrCommandDetection) || !strings.Contains(err.Error(), "CI takeover")) {
+				t.Fatalf("closure refusal=%v", err)
+			}
+		})
+	}
+}
+
+func TestLoadProjectGoDetectionRefusesSymlinkedAndOversizedClosureMarkers(t *testing.T) {
+	t.Run("symlinked go mod", func(t *testing.T) {
+		repository := t.TempDir()
+		target := filepath.Join(t.TempDir(), "go.mod")
+		if err := os.WriteFile(target, []byte("module example.test/proof\n\ngo 1.25\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(repository, "go.mod")); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := LoadProject(repository, "proof", DefaultMachineLimits()); !errors.Is(err, ErrCommandDetection) {
+			t.Fatalf("symlinked go.mod error=%v", err)
+		}
+	})
+	t.Run("oversized go mod", func(t *testing.T) {
+		repository := t.TempDir()
+		contents := "module example.test/proof\n\ngo 1.25\n" + strings.Repeat("# padding\n", int((1<<20)/10)+1)
+		if err := os.WriteFile(filepath.Join(repository, "go.mod"), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := LoadProject(repository, "proof", DefaultMachineLimits()); !errors.Is(err, ErrCommandDetection) {
+			t.Fatalf("oversized go.mod error=%v", err)
+		}
+	})
+}
+
 func TestLoadProjectDetectionRefusesAmbiguousUnsupportedMissingScriptsAndSymlinks(t *testing.T) {
 	tests := map[string]func(string) error{
 		"ambiguous": func(repository string) error {

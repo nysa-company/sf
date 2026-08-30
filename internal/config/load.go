@@ -13,6 +13,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/goclosure"
 )
 
 const MaxFileBytes = 64 * 1024
@@ -207,6 +208,12 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 		return Commands{}, detectionError("repository contains both go.mod and package.json; add explicit commands to .sf/config.toml")
 	}
 	if goMod {
+		if _, err := goclosure.Validate(repository); err != nil {
+			if errors.Is(err, goclosure.ErrUnvendored) {
+				return Commands{}, detectionError("Go dependencies require checked-in vendor/modules.txt for local v1 verification; use operator or credential-free CI takeover")
+			}
+			return Commands{}, detectionError("go.mod is not a bounded dependency-free or vendored local verification closure; use operator or credential-free CI takeover")
+		}
 		command := Command{Argv: []string{"go", "test", "./..."}}
 		return Commands{Verify: command, Review: command}, nil
 	}

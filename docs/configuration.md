@@ -32,10 +32,12 @@ omitted, `sf init` selects a conservative command pair from the repository:
 - A regular `package.json` remains an operator or credential-free CI takeover
   shape in v1; npm commands are not locally executable repository commands.
 
-Repositories that match neither shape, match both, contain malformed metadata,
-or use symlinked marker files are refused with an actionable `sf config --help`
-(or `sf-dev config --help`) next step. An explicit file may select another exact argv pair, still
-without shell interpretation.
+Repositories that match neither shape, match both, contain malformed or
+unvendored Go metadata, or use symlinked marker files are refused with an
+actionable `sf config --help` (or `sf-dev config --help`) next step. An
+explicit file may record another exact argv pair without shell interpretation,
+but that is CI/operator metadata: the local repository executor still refuses
+everything except the exact dependency-closed Go recipe.
 
 Example explicit configuration:
 

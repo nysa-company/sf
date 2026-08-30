@@ -24,6 +24,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/executionpolicy"
 	gitboundary "github.com/nysa-company/sf/internal/git"
+	"github.com/nysa-company/sf/internal/goclosure"
 )
 
 const repositoryOutputLimit = 64 << 10
@@ -90,9 +91,12 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if !filepath.IsAbs(spec.Directory) || filepath.Clean(spec.Directory) != spec.Directory {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	useVendor, err := repositoryGoDependencyClosure(spec.Directory)
+	useVendor, err := goclosure.Validate(spec.Directory)
 	if err != nil {
-		return contracts.CommandResult{}, err
+		if errors.Is(err, goclosure.ErrUnvendored) {
+			return contracts.CommandResult{}, ErrSubprocessRecipeUnsupported
+		}
+		return contracts.CommandResult{}, ErrUnclear
 	}
 	resolved, err := resolveFixedExecutable(spec.Argv[0])
 	if err != nil {
@@ -443,10 +447,10 @@ func resolveFixedExecutable(name string) (string, error) {
 		return "", exec.ErrNotFound
 	}
 	tool := filepath.Base(name)
-	if tool != "git" && tool != "go" {
+	if tool != "go" {
 		return "", exec.ErrNotFound
 	}
-	for _, candidate := range approvedRepositoryExecutables(tool) {
+	for _, candidate := range approvedRepositoryGoExecutables() {
 		resolved, err := filepath.EvalSymlinks(candidate)
 		if err != nil {
 			continue
@@ -465,21 +469,11 @@ func resolveFixedExecutable(name string) (string, error) {
 	return "", exec.ErrNotFound
 }
 
-// approvedRepositoryExecutables is intentionally code-owned. A digest binds
-// the selected binary to an intent; this list prevents a private executable
-// merely named "git" or "go" from becoming eligible for that binding.
-func approvedRepositoryExecutables(tool string) []string {
-	switch tool {
-	case "git":
-		// /usr/bin/git is a macOS developer-tools trampoline. The actual
-		// binary must be bound and staged; otherwise the trampoline performs a
-		// second path-based exec after the digest check.
-		return []string{"/Library/Developer/CommandLineTools/usr/bin/git", "/Applications/Xcode.app/Contents/Developer/usr/bin/git", "/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"}
-	case "go":
-		return []string{"/usr/local/go/bin/go", "/usr/local/bin/go", "/opt/homebrew/bin/go"}
-	default:
-		return nil
-	}
+// approvedRepositoryGoExecutables is intentionally code-owned. A digest binds
+// the selected Go driver to an intent; this list prevents a private executable
+// merely named "go" from becoming eligible for that binding.
+func approvedRepositoryGoExecutables() []string {
+	return []string{"/usr/local/go/bin/go", "/usr/local/bin/go", "/opt/homebrew/bin/go"}
 }
 
 // RepositoryExecutableDigest binds the approved executable file to the claim.
@@ -714,41 +708,6 @@ func parseRepositoryIdentity(claim contracts.RepositoryCommandClaim) (gitboundar
 		}
 	}
 	return identity, nil
-}
-
-// repositoryGoDependencyClosure deliberately supports only a dependency-free
-// module or a checked-in Go vendor closure. GOPROXY is disabled regardless;
-// an external requirement without vendor is an operator/CI takeover, never a
-// reason to read an ambient module cache or reach the network.
-func repositoryGoDependencyClosure(worktree string) (bool, error) {
-	goMod := filepath.Join(worktree, "go.mod")
-	info, err := os.Lstat(goMod)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > 1<<20 {
-		return false, ErrUnclear
-	}
-	contents, err := os.ReadFile(goMod)
-	if err != nil {
-		return false, ErrUnclear
-	}
-	requires := false
-	for _, raw := range strings.Split(string(contents), "\n") {
-		line := strings.TrimSpace(strings.SplitN(raw, "//", 2)[0])
-		if line == "require (" || strings.HasPrefix(line, "require ") {
-			requires = true
-		}
-		if strings.HasPrefix(line, "replace ") || strings.HasPrefix(line, "exclude ") {
-			return false, ErrUnclear
-		}
-	}
-	if !requires {
-		return false, nil
-	}
-	modules := filepath.Join(worktree, "vendor", "modules.txt")
-	entry, err := os.Lstat(modules)
-	if err != nil || entry.Mode()&os.ModeSymlink != 0 || !entry.Mode().IsRegular() || entry.Size() == 0 || entry.Size() > 8<<20 {
-		return false, ErrSubprocessRecipeUnsupported
-	}
-	return true, nil
 }
 
 func matchesDirectoryIdentity(info os.FileInfo, dev, ino uint64) bool {
