@@ -363,6 +363,7 @@ func TestObserverParsersRejectMalformedAndAcceptCanonicalShapes(t *testing.T) {
 	for _, data := range []string{
 		"\n",
 		row + row,
+		oid40 + " refs/heads/" + branch + "\n",
 		oid40 + "\trefs/heads/" + branch + "^{},\n",
 		oid40 + "\trefs/heads/other\n",
 		oid40 + "\trefs/heads/" + branch + " extra\n",

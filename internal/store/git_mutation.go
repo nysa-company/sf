@@ -48,6 +48,7 @@ type GitMutationRecovery struct {
 	Claim               contracts.GitMutationClaim
 	Nonce               []byte
 	State               string
+	LaunchState         string
 	Launch              contracts.GitMutationLaunch
 	PreparedCommitOID   string
 	PreparedTreeOID     string
@@ -461,7 +462,7 @@ func (s *Store) ActiveGitMutationLeases(ctx context.Context, channel domain.Chan
 	if !channel.Valid() {
 		return nil, ErrGitMutationLease
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT semantic_key,nonce,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,state,process_pid,process_pgid,process_boot_identity,process_start_identity,prepared_commit_oid,prepared_tree_oid,prior_remote_observed,prior_remote_oid FROM git_mutation_leases WHERE channel=? ORDER BY repository_path`, channel)
+	rows, err := s.db.QueryContext(ctx, `SELECT semantic_key,nonce,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,state,launch_state,process_pid,process_pgid,process_boot_identity,process_start_identity,prepared_commit_oid,prepared_tree_oid,prior_remote_observed,prior_remote_oid FROM git_mutation_leases WHERE channel=? ORDER BY repository_path`, channel)
 	if err != nil {
 		return nil, normalizeBusy(ctx, err)
 	}
@@ -469,7 +470,7 @@ func (s *Store) ActiveGitMutationLeases(ctx context.Context, channel domain.Chan
 	for rows.Next() {
 		var r GitMutationRecovery
 		var project, ticket string
-		if err := rows.Scan(&r.Claim.SemanticKey, &r.Nonce, &project, &ticket, &r.Claim.RequestDigest, &r.Claim.TicketVersion, &r.Claim.LeaderEpoch, &r.Claim.RunnerEpoch, &r.Claim.ClaimEpoch, &r.Claim.Repository, &r.Claim.Worktree, &r.Claim.Branch, &r.Claim.Operation, &r.Claim.BaseRef, &r.Claim.ExpectedBaseOID, &r.Claim.ExpectedHeadOID, &r.State, &r.Launch.PID, &r.Launch.PGID, &r.Launch.BootIdentity, &r.Launch.ProcessStartIdentity, &r.PreparedCommitOID, &r.PreparedTreeOID, &r.PriorRemoteObserved, &r.PriorRemoteOID); err != nil {
+		if err := rows.Scan(&r.Claim.SemanticKey, &r.Nonce, &project, &ticket, &r.Claim.RequestDigest, &r.Claim.TicketVersion, &r.Claim.LeaderEpoch, &r.Claim.RunnerEpoch, &r.Claim.ClaimEpoch, &r.Claim.Repository, &r.Claim.Worktree, &r.Claim.Branch, &r.Claim.Operation, &r.Claim.BaseRef, &r.Claim.ExpectedBaseOID, &r.Claim.ExpectedHeadOID, &r.State, &r.LaunchState, &r.Launch.PID, &r.Launch.PGID, &r.Launch.BootIdentity, &r.Launch.ProcessStartIdentity, &r.PreparedCommitOID, &r.PreparedTreeOID, &r.PriorRemoteObserved, &r.PriorRemoteOID); err != nil {
 			return nil, err
 		}
 		r.Claim.TicketRef = domain.TicketRef{Channel: channel, Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
@@ -556,6 +557,7 @@ func (s *Store) RecoverGitMutationLeases(ctx context.Context, channel domain.Cha
 			})
 			return ErrGitMutationLease
 		}
+		quarantined := false
 		if err := s.write(ctx, func(conn *sql.Conn) error {
 			var current uint64
 			if e := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, channel).Scan(&current); e != nil {
@@ -564,16 +566,61 @@ func (s *Store) RecoverGitMutationLeases(ctx context.Context, channel domain.Cha
 			if current != leader {
 				return ErrStaleFence
 			}
-			row, e := conn.ExecContext(ctx, `DELETE FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND process_pid=? AND process_pgid=? AND process_boot_identity=? AND process_start_identity=?`, lease.Claim.Repository, lease.Claim.SemanticKey, lease.Nonce, lease.Launch.PID, lease.Launch.PGID, lease.Launch.BootIdentity, lease.Launch.ProcessStartIdentity)
+			// Draining necessarily happens outside SQLite. Re-check every durable
+			// recovery input under this final writer transaction, so a fact or
+			// intent change in that window cannot be silently deleted.
+			row, e := conn.ExecContext(ctx, `DELETE FROM git_mutation_leases
+				WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active'
+				AND channel=? AND project_id=? AND ticket_id=? AND request_digest=?
+				AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?
+				AND worktree_path=? AND branch_ref=? AND operation=? AND base_ref=? AND expected_base_oid=? AND expected_head_oid=?
+				AND launch_state=?
+				AND process_pid=? AND process_pgid=? AND process_boot_identity=? AND process_start_identity=?
+				AND prepared_commit_oid=? AND prepared_tree_oid=? AND prior_remote_observed=? AND prior_remote_oid=?
+				AND EXISTS (SELECT 1 FROM git_mutation_intents i JOIN effects e ON e.semantic_key=i.semantic_key
+					WHERE i.semantic_key=git_mutation_leases.semantic_key
+					AND i.channel=? AND i.project_id=? AND i.ticket_id=? AND i.request_digest=?
+					AND i.ticket_version=? AND i.leader_epoch=? AND i.runner_epoch=? AND i.claim_epoch=?
+					AND i.repository_path=? AND i.worktree_path=? AND i.branch_ref=? AND i.operation=? AND i.base_ref=?
+					AND i.expected_base_oid=? AND i.expected_head_oid=?
+					AND i.prepared_commit_oid=? AND i.prepared_tree_oid=? AND i.prior_remote_observed=? AND i.prior_remote_oid=?
+					AND e.channel=? AND e.project_id=? AND e.ticket_id=? AND e.effect_kind=?
+					AND e.state IN ('executing','uncertain') AND e.request_digest=? AND e.ticket_version=?
+					AND e.leader_epoch=? AND e.runner_epoch=? AND e.claim_epoch=?)`,
+				lease.Claim.Repository, lease.Claim.SemanticKey, lease.Nonce,
+				lease.Claim.TicketRef.Channel, lease.Claim.TicketRef.Project, lease.Claim.TicketRef.Ticket, lease.Claim.RequestDigest,
+				lease.Claim.TicketVersion, lease.Claim.LeaderEpoch, lease.Claim.RunnerEpoch, lease.Claim.ClaimEpoch,
+				lease.Claim.Worktree, lease.Claim.Branch, lease.Claim.Operation, lease.Claim.BaseRef, lease.Claim.ExpectedBaseOID, lease.Claim.ExpectedHeadOID,
+				lease.LaunchState, lease.Launch.PID, lease.Launch.PGID, lease.Launch.BootIdentity, lease.Launch.ProcessStartIdentity,
+				lease.PreparedCommitOID, lease.PreparedTreeOID, lease.PriorRemoteObserved, lease.PriorRemoteOID,
+				lease.Claim.TicketRef.Channel, lease.Claim.TicketRef.Project, lease.Claim.TicketRef.Ticket, lease.Claim.RequestDigest,
+				lease.Claim.TicketVersion, lease.Claim.LeaderEpoch, lease.Claim.RunnerEpoch, lease.Claim.ClaimEpoch,
+				lease.Claim.Repository, lease.Claim.Worktree, lease.Claim.Branch, lease.Claim.Operation, lease.Claim.BaseRef,
+				lease.Claim.ExpectedBaseOID, lease.Claim.ExpectedHeadOID,
+				lease.PreparedCommitOID, lease.PreparedTreeOID, lease.PriorRemoteObserved, lease.PriorRemoteOID,
+				lease.Claim.TicketRef.Channel, lease.Claim.TicketRef.Project, lease.Claim.TicketRef.Ticket, "git/"+lease.Claim.Operation,
+				lease.Claim.RequestDigest, lease.Claim.TicketVersion, lease.Claim.LeaderEpoch, lease.Claim.RunnerEpoch, lease.Claim.ClaimEpoch)
 			if e != nil {
 				return e
 			}
 			if n, _ := row.RowsAffected(); n != 1 {
-				return ErrGitMutationLease
+				// Preserve the exact post-drain row for operator reconciliation;
+				// never discard a lease whose validation snapshot no longer holds.
+				if _, e := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET state='quarantined',launch_state='quarantined' WHERE repository_path=? AND semantic_key=? AND nonce=?`, lease.Claim.Repository, lease.Claim.SemanticKey, lease.Nonce); e != nil {
+					return e
+				}
+				// Commit quarantine before surfacing failure; returning an error from
+				// this callback would roll its protective state back with the final
+				// IMMEDIATE transaction.
+				quarantined = true
+				return nil
 			}
 			return nil
 		}); err != nil {
 			return err
+		}
+		if quarantined {
+			return ErrGitMutationLease
 		}
 	}
 	return nil

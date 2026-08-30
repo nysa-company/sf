@@ -557,4 +557,56 @@ func TestGitMutationRecoveryRequiresExactRecordedDrain(t *testing.T) {
 	_ = lease
 }
 
+func TestGitMutationRecoveryQuarantinesFactChangesDuringDrain(t *testing.T) {
+	for name, mutate := range map[string]func(t *testing.T, db *Store, ctx context.Context, intent GitMutationIntent){
+		"lease": func(t *testing.T, db *Store, ctx context.Context, intent GitMutationIntent) {
+			t.Helper()
+			if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_leases SET prepared_commit_oid=?,prepared_tree_oid=? WHERE repository_path=?`, strings.Repeat("b", 40), strings.Repeat("c", 40), intent.Repository); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"intent": func(t *testing.T, db *Store, ctx context.Context, intent GitMutationIntent) {
+			t.Helper()
+			if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_intents SET prepared_commit_oid=?,prepared_tree_oid=? WHERE semantic_key=?`, strings.Repeat("b", 40), strings.Repeat("c", 40), intent.SemanticKey); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			intent := gitIntentFixture(t, db, ctx, "SF-git-drain-race-"+name)
+			claim, err := db.IssueGitMutationClaim(ctx, intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := db.AcquireGitMutation(ctx, claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			launchLease, ok := lease.(contracts.GitMutationLaunchLease)
+			if !ok {
+				t.Fatal("store lease does not record launches")
+			}
+			launch := contracts.GitMutationLaunch{PID: 77, PGID: 77, BootIdentity: "boot-race", ProcessStartIdentity: "start-race"}
+			if err := launchLease.RecordGitMutationLaunch(ctx, launch); err != nil {
+				t.Fatal(err)
+			}
+			err = db.RecoverGitMutationLeases(ctx, domain.ChannelDev, intent.Fence.LeaderEpoch, gitDrainerFunc(func(_ context.Context, got contracts.GitMutationLaunch) error {
+				if got != launch {
+					t.Fatalf("launch=%+v", got)
+				}
+				mutate(t, db, ctx, intent)
+				return nil
+			}))
+			if !errors.Is(err, ErrGitMutationLease) {
+				t.Fatalf("fact mutation during drain was accepted: %v", err)
+			}
+			var state, launchState string
+			if err := db.db.QueryRowContext(ctx, `SELECT state,launch_state FROM git_mutation_leases WHERE repository_path=?`, intent.Repository).Scan(&state, &launchState); err != nil || state != "quarantined" || launchState != "quarantined" {
+				t.Fatalf("post-drain fact race lease not retained/quarantined: state=%q launch=%q err=%v", state, launchState, err)
+			}
+		})
+	}
+}
+
 var _ contracts.GitMutationAuthority = (*Store)(nil)

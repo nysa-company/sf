@@ -207,8 +207,7 @@ func parseRemoteBranchOutput(output []byte, branch string) (string, error) {
 		return "", fmt.Errorf("%w: duplicate or extra remote branch rows", ErrUnexpectedRemote)
 	}
 	fields := strings.Fields(text)
-	if len(fields) != 2 || !validOID(fields[0]) || fields[1] != target ||
-		(text != fields[0]+"\t"+fields[1] && text != fields[0]+" "+fields[1]) {
+	if len(fields) != 2 || !validOID(fields[0]) || fields[1] != target || text != fields[0]+"\t"+fields[1] {
 		return "", fmt.Errorf("%w: malformed remote branch observation", ErrUnexpectedRemote)
 	}
 	return fields[0], nil
