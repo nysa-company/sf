@@ -200,6 +200,8 @@ type MergeIntent struct {
 	OriginalBaseOID    string
 	ProtectionRuleID   string
 	StrictStatusChecks bool
+	AdminEnforced      bool
+	ActiveRulesetCount uint32
 	Method             string
 }
 

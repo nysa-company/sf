@@ -69,7 +69,7 @@ func (g *ExternalMutationGate) RunExternalMutation(ctx context.Context, claim do
 		return nil, err
 	}
 	result, err := start(ctx)
-	if errors.Is(err, contracts.ErrExternalCleanupUncertain) {
+	if errors.Is(err, contracts.ErrExternalCleanupUncertain) || errors.Is(err, contracts.ErrExternalCleanupQuarantineFatal) {
 		// Do not release the serialization gate while an external writer may
 		// still exist. This quarantines every later mutation until the process
 		// supervisor has repaired the host and the store is restarted.

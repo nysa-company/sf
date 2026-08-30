@@ -59,6 +59,8 @@ type FakeGHState struct {
 	// pretending a PR's historical baseRefOid is the live protected ref.
 	BaseHeadOID                 string                            `json:"base_head_oid"`
 	StrictStatusChecks          bool                              `json:"strict_status_checks"`
+	AdminEnforced               bool                              `json:"admin_enforced"`
+	ActiveRulesetCount          int                               `json:"active_ruleset_count"`
 	BypassPullRequestAllowances int                               `json:"bypass_pull_request_allowances"`
 	NextPR                      int                               `json:"next_pr"`
 	PRs                         []PullRequest                     `json:"prs"`
@@ -83,6 +85,7 @@ func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, e
 		Repository:         repository,
 		BaseHeadOID:        strings.Repeat("c", 40),
 		StrictStatusChecks: true,
+		AdminEnforced:      true,
 		NextPR:             1,
 		Checks:             make(map[int][]contracts.RequiredCheck),
 		ResponseScripts:    make(map[string][]ResponseMode),
@@ -114,6 +117,16 @@ func (f *FakeGH) SetBranchProtectionForTest(strict bool, bypassAllowances int) e
 	return f.withState(func() (bool, error) {
 		f.state.StrictStatusChecks = strict
 		f.state.BypassPullRequestAllowances = bypassAllowances
+		return true, nil
+	})
+}
+
+func (f *FakeGH) SetProtectionWitnessForTest(strict, admin bool, bypassAllowances, rulesets int) error {
+	if bypassAllowances < 0 || rulesets < 0 {
+		return errors.New("testkit: protection count cannot be negative")
+	}
+	return f.withState(func() (bool, error) {
+		f.state.StrictStatusChecks, f.state.AdminEnforced, f.state.BypassPullRequestAllowances, f.state.ActiveRulesetCount = strict, admin, bypassAllowances, rulesets
 		return true, nil
 	})
 }
@@ -399,7 +412,7 @@ func (f *FakeGH) mergeUnchecked(identity contracts.PullRequestIdentity, headOID,
 		if f.state.PRs[index].Draft {
 			return false, errors.New("fake-gh: draft pull request cannot merge")
 		}
-		if !f.state.StrictStatusChecks || f.state.BypassPullRequestAllowances != 0 {
+		if !f.state.StrictStatusChecks || !f.state.AdminEnforced || f.state.BypassPullRequestAllowances != 0 || f.state.ActiveRulesetCount != 0 {
 			return false, errors.New("fake-gh: strict protected-base enforcement is required")
 		}
 		if method != "merge" && method != "squash" && method != "rebase" {
@@ -733,7 +746,7 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 	if len(argv) >= 2 && argv[0] == "api" && argv[1] == "--hostname" {
 		if strings.Contains(graphqlQuery(argv), "branchProtectionRules") {
 			snapshot := f.Snapshot()
-			return json.Marshal(map[string]any{"data": map[string]any{"repository": map[string]any{"branchProtectionRules": map[string]any{"nodes": []map[string]any{{"id": "fake-rule-main", "pattern": "main", "requiresStrictStatusChecks": snapshot.StrictStatusChecks, "bypassPullRequestAllowances": map[string]int{"totalCount": snapshot.BypassPullRequestAllowances}}}}}}})
+			return json.Marshal(map[string]any{"data": map[string]any{"repository": map[string]any{"ref": map[string]any{"rules": map[string]int{"totalCount": snapshot.ActiveRulesetCount}}, "branchProtectionRules": map[string]any{"nodes": []map[string]any{{"id": "fake-rule-main", "pattern": "main", "requiresStrictStatusChecks": snapshot.StrictStatusChecks, "isAdminEnforced": snapshot.AdminEnforced, "bypassPullRequestAllowances": map[string]int{"totalCount": snapshot.BypassPullRequestAllowances}}}}}}})
 		}
 		return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}`), nil
 	}

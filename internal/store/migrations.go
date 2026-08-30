@@ -156,3 +156,8 @@ var migrationV6 = []string{
 		singleton INTEGER PRIMARY KEY CHECK(singleton=1), reason TEXT NOT NULL, observed_at TEXT NOT NULL
 	)`,
 }
+
+var migrationV7 = []string{
+	`ALTER TABLE merge_intents ADD COLUMN admin_enforced INTEGER NOT NULL DEFAULT 0 CHECK(admin_enforced IN (0,1))`,
+	`ALTER TABLE merge_intents ADD COLUMN active_ruleset_count INTEGER NOT NULL DEFAULT 0 CHECK(active_ruleset_count >= 0)`,
+}

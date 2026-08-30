@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -37,6 +38,7 @@ var (
 	ErrCreateUncertain         = errors.New("github pull request creation is uncertain; reconcile before retrying")
 	ErrGuardedMergeUnavailable = errors.New("sf-managed guarded merge is unavailable without server-enforced strict protected-base checks; observe a manual merge instead")
 	ErrProcessCleanup          = contracts.ErrExternalCleanupUncertain
+	ErrCleanupQuarantineFatal  = contracts.ErrExternalCleanupQuarantineFatal
 )
 
 const maxResponse = 1 << 20
@@ -57,6 +59,7 @@ type Client struct {
 	verifyProtectedBranch contracts.ProtectedBranchVerifier
 	mergeIntents          contracts.MergeIntentRecorder
 	quarantiner           contracts.ExternalMutationQuarantiner
+	cleanupLatched        *atomic.Bool
 }
 
 type Principal struct{ Login string }
@@ -117,7 +120,7 @@ func NewClient(binary, home, configDir string, runner SupervisedCommandRunner, v
 	if binary == "" || !filepath.IsAbs(binary) || home == "" || !filepath.IsAbs(home) || configDir == "" || !filepath.IsAbs(configDir) || runner == nil || validate == nil || guard == nil || verifier == nil || intents == nil || quarantiner == nil {
 		return nil, ErrPolicyRefusal
 	}
-	return &Client{binaryPath: binary, home: home, configDir: configDir, runner: runner, validateClaimFn: validate, mutationGuard: guard, verifyProtectedBranch: verifier, mergeIntents: intents, quarantiner: quarantiner}, nil
+	return &Client{binaryPath: binary, home: home, configDir: configDir, runner: runner, validateClaimFn: validate, mutationGuard: guard, verifyProtectedBranch: verifier, mergeIntents: intents, quarantiner: quarantiner, cleanupLatched: &atomic.Bool{}}, nil
 }
 
 // NewStoreClient is the production composition point: SQLite supplies both
@@ -129,6 +132,17 @@ func NewStoreClient(binary, home, configDir string, runner SupervisedCommandRunn
 		return nil, ErrPolicyRefusal
 	}
 	return NewClient(binary, home, configDir, runner, database.ValidateExternalEffectClaim, database.ExternalMutationGuard(), verifier, database, database)
+}
+
+// NewStoreClientWithGitVerifier is the concrete daemon composition. It keeps
+// SQLite's durable guard and the independently fetched Git proof together;
+// tests can still inject a verifier without requiring a remote.
+func NewStoreClientWithGitVerifier(binary, home, configDir string, runner SupervisedCommandRunner, database *store.Store, worktree, remote, gitBinary string) (*Client, error) {
+	verifier, err := NewProtectedBranchGitVerifier(worktree, remote, gitBinary)
+	if err != nil {
+		return nil, err
+	}
+	return NewStoreClient(binary, home, configDir, runner, database, verifier)
 }
 
 type authHost struct {
@@ -322,7 +336,7 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	if err != nil {
 		return err
 	}
-	if err := c.mergeIntents.RecordMergeIntent(ctx, domain.MergeIntent{Ref: durable.Ref, SemanticKey: durable.SemanticKey, RequestDigest: durable.RequestDigest, TicketVersion: durable.TicketVersion, LeaderEpoch: durable.LeaderEpoch, RunnerEpoch: durable.RunnerEpoch, ClaimEpoch: durable.ClaimEpoch, RepositoryHost: identity.Repository.Host, RepositoryOwner: identity.Repository.Owner, RepositoryName: identity.Repository.Name, PullRequestNumber: identity.Number, HeadOID: headOID, BaseRef: identity.BaseRef, OriginalBaseOID: baseOID, ProtectionRuleID: protection.ID, StrictStatusChecks: true, Method: method}); err != nil {
+	if err := c.mergeIntents.RecordMergeIntent(ctx, domain.MergeIntent{Ref: durable.Ref, SemanticKey: durable.SemanticKey, RequestDigest: durable.RequestDigest, TicketVersion: durable.TicketVersion, LeaderEpoch: durable.LeaderEpoch, RunnerEpoch: durable.RunnerEpoch, ClaimEpoch: durable.ClaimEpoch, RepositoryHost: identity.Repository.Host, RepositoryOwner: identity.Repository.Owner, RepositoryName: identity.Repository.Name, PullRequestNumber: identity.Number, HeadOID: headOID, BaseRef: identity.BaseRef, OriginalBaseOID: baseOID, ProtectionRuleID: protection.ID, StrictStatusChecks: true, AdminEnforced: protection.AdminEnforced, ActiveRulesetCount: uint32(protection.ActiveRulesetCount), Method: method}); err != nil {
 		return err
 	}
 	args := []string{"pr", "merge", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--match-head-commit", headOID, "--" + method}
@@ -336,7 +350,7 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 			return nil, ErrPolicyRefusal
 		}
 		freshProtection, err := c.strictProtection(runCtx, identity.Repository, identity.BaseRef)
-		if err != nil || freshProtection.ID != protection.ID {
+		if err != nil || freshProtection != protection {
 			return nil, ErrGuardedMergeUnavailable
 		}
 		return c.run(runCtx, args...)
@@ -679,7 +693,11 @@ func exactBaseBinding(authorization domain.MergeAuthorization) (string, bool) {
 	return base, validOID(base) && authorization.CurrentBaseSHA == base && authorization.ReviewedBaseHeadOID == base && authorization.CurrentBaseHeadOID == base
 }
 
-type strictProtectionWitness struct{ ID string }
+type strictProtectionWitness struct {
+	ID                 string
+	AdminEnforced      bool
+	ActiveRulesetCount int
+}
 
 // strictProtection proves the server-side invariant relied on at merge time:
 // GitHub must reject a PR that is not up to date with its protected base. The
@@ -690,11 +708,17 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 	var response struct {
 		Data *struct {
 			Repository *struct {
+				Ref *struct {
+					Rules struct {
+						TotalCount int `json:"totalCount"`
+					} `json:"rules"`
+				} `json:"ref"`
 				BranchProtectionRules struct {
 					Nodes []struct {
 						ID                          string `json:"id"`
 						Pattern                     string `json:"pattern"`
 						RequiresStrictStatusChecks  bool   `json:"requiresStrictStatusChecks"`
+						IsAdminEnforced             bool   `json:"isAdminEnforced"`
 						BypassPullRequestAllowances struct {
 							TotalCount int `json:"totalCount"`
 						} `json:"bypassPullRequestAllowances"`
@@ -703,16 +727,16 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 			} `json:"repository"`
 		} `json:"data"`
 	}
-	query := "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern requiresStrictStatusChecks bypassPullRequestAllowances(first:1){totalCount}}}}}"
-	if err := c.json(ctx, &response, "api", "--hostname", "github.com", "graphql", "-f", "query="+query, "-F", "owner="+repository.Owner, "-F", "name="+repository.Name); err != nil {
+	query := "query($owner:String!,$name:String!,$ref:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$ref){rules(first:100){totalCount}} branchProtectionRules(first:100){nodes{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount}}}}}"
+	if err := c.json(ctx, &response, "api", "--hostname", "github.com", "graphql", "-f", "query="+query, "-F", "owner="+repository.Owner, "-F", "name="+repository.Name, "-F", "ref=refs/heads/"+baseRef); err != nil {
 		return strictProtectionWitness{}, err
 	}
-	if response.Data == nil || response.Data.Repository == nil {
+	if response.Data == nil || response.Data.Repository == nil || response.Data.Repository.Ref == nil || response.Data.Repository.Ref.Rules.TotalCount != 0 {
 		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 	}
 	for _, rule := range response.Data.Repository.BranchProtectionRules.Nodes {
-		if rule.Pattern == baseRef && rule.ID != "" && rule.RequiresStrictStatusChecks && rule.BypassPullRequestAllowances.TotalCount == 0 {
-			return strictProtectionWitness{ID: rule.ID}, nil
+		if rule.Pattern == baseRef && rule.ID != "" && rule.RequiresStrictStatusChecks && rule.IsAdminEnforced && rule.BypassPullRequestAllowances.TotalCount == 0 {
+			return strictProtectionWitness{ID: rule.ID, AdminEnforced: true, ActiveRulesetCount: 0}, nil
 		}
 	}
 	return strictProtectionWitness{}, ErrGuardedMergeUnavailable
@@ -734,6 +758,24 @@ func (c Client) reconcileStrictMerge(ctx context.Context, identity contracts.Pul
 		return ErrPolicyRefusal
 	}
 	return nil
+}
+
+// ObserveMergeIntent is the restart-safe recovery adapter. It reconstructs no
+// authority from a digest: all repository, fence, head, base and protection
+// facts came from the durable MergeIntent and are checked before confirmation.
+func (c Client) ObserveMergeIntent(ctx context.Context, intent domain.MergeIntent) (string, error) {
+	if intent.RepositoryHost != "github.com" || !intent.StrictStatusChecks || !intent.AdminEnforced || intent.ActiveRulesetCount != 0 {
+		return "", ErrPolicyRefusal
+	}
+	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: intent.RepositoryHost, Owner: intent.RepositoryOwner, Name: intent.RepositoryName}, Number: intent.PullRequestNumber, HeadOID: intent.HeadOID, BaseRef: intent.BaseRef, FactoryOwned: true}
+	observed, err := c.viewNumber(ctx, identity.Repository, identity.Number)
+	if err != nil || !observed.Merged || observed.Identity.Repository != identity.Repository || observed.Identity.Number != identity.Number || observed.Identity.HeadOID != intent.HeadOID || observed.Identity.BaseRef != intent.BaseRef || !observed.Identity.FactoryOwned || observed.MergeCommit == "" {
+		return "", ErrExternalMerged
+	}
+	if err := c.reconcileStrictMerge(ctx, observed.Identity, intent.HeadOID, intent.OriginalBaseOID); err != nil {
+		return "", err
+	}
+	return identity.Repository.Owner + "/" + identity.Repository.Name + "@" + observed.MergeCommit, nil
 }
 
 // sameMergeIdentity intentionally excludes BaseOID. GitHub may report the
@@ -927,6 +969,15 @@ func (c Client) json(ctx context.Context, destination any, args ...string) error
 	return nil
 }
 func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
+	if c.cleanupLatched != nil && c.cleanupLatched.Load() {
+		return nil, ErrCleanupQuarantineFatal
+	}
+	if status, ok := c.quarantiner.(contracts.ExternalMutationQuarantineStatus); ok {
+		quarantined, err := status.ExternalMutationsQuarantined(ctx)
+		if err != nil || quarantined {
+			return nil, ErrProcessCleanup
+		}
+	}
 	ctx, cancel := boundedGHContext(ctx)
 	defer cancel()
 	env, err := c.environment()
@@ -937,8 +988,7 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 		output, runErr := c.runner.Run(ctx, c.binary(), args, env)
 		proof, cleanupErr := c.runner.Cleanup(ctx)
 		if cleanupErr != nil || !proof.valid() || errors.Is(runErr, ErrProcessCleanup) {
-			c.quarantineCleanup()
-			return nil, ErrProcessCleanup
+			return nil, c.quarantineCleanup()
 		}
 		if len(output) > maxResponse {
 			return nil, ErrResponseTooLarge
@@ -954,13 +1004,19 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	return nil, ErrPolicyRefusal
 }
 
-func (c Client) quarantineCleanup() {
+func (c Client) quarantineCleanup() error {
+	if c.cleanupLatched != nil {
+		c.cleanupLatched.Store(true)
+	}
 	if c.quarantiner == nil {
-		return
+		return ErrCleanupQuarantineFatal
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = c.quarantiner.QuarantineExternalMutations(ctx)
+	if err := c.quarantiner.QuarantineExternalMutations(ctx); err != nil {
+		return fmt.Errorf("%w: %v", ErrCleanupQuarantineFatal, err)
+	}
+	return ErrProcessCleanup
 }
 
 func isChecksPending(args []string, err error) bool {

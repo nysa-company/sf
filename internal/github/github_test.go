@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -791,9 +792,13 @@ func TestMergeRequiresStrictServerProtectionWithoutBypass(t *testing.T) {
 		name   string
 		strict bool
 		bypass int
+		admin  bool
+		rules  int
 	}{
-		{name: "non-strict", strict: false},
-		{name: "bypass allowance", strict: true, bypass: 1},
+		{name: "non-strict", strict: false, admin: true},
+		{name: "bypass allowance", strict: true, admin: true, bypass: 1},
+		{name: "admin bypass", strict: true, admin: false},
+		{name: "active ruleset", strict: true, admin: true, rules: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client, fake, identity := fixture(t)
@@ -801,7 +806,7 @@ func TestMergeRequiresStrictServerProtectionWithoutBypass(t *testing.T) {
 			if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
 				t.Fatal(err)
 			}
-			if err := fake.SetBranchProtectionForTest(test.strict, test.bypass); err != nil {
+			if err := fake.SetProtectionWitnessForTest(test.strict, test.admin, test.bypass, test.rules); err != nil {
 				t.Fatal(err)
 			}
 			claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "squash")
@@ -812,6 +817,18 @@ func TestMergeRequiresStrictServerProtectionWithoutBypass(t *testing.T) {
 				t.Fatalf("unsafe protection launched merge %d times", got)
 			}
 		})
+	}
+}
+
+func TestCleanupQuarantineWriteFailureLatchesProcess(t *testing.T) {
+	var ran int
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: contradictoryCleanupRunner{}, cleanupLatched: &atomic.Bool{}, quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return errors.New("disk unavailable") })}
+	if _, err := client.run(context.Background(), "auth", "status"); !errors.Is(err, ErrCleanupQuarantineFatal) {
+		t.Fatalf("write failure=%v", err)
+	}
+	client.runner = commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) { ran++; return nil, nil })
+	if _, err := client.run(context.Background(), "auth", "status"); !errors.Is(err, ErrCleanupQuarantineFatal) || ran != 0 {
+		t.Fatalf("latched process ran=%d err=%v", ran, err)
 	}
 }
 
@@ -903,7 +920,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		}
 		if args[0] == "api" {
 			if strings.Contains(strings.Join(args, "\x00"), "branchProtectionRules") {
-				return []byte(`{"data":{"repository":{"branchProtectionRules":{"nodes":[{"id":"rule-main","pattern":"main","requiresStrictStatusChecks":true,"bypassPullRequestAllowances":{"totalCount":0}}]}}}}`), nil
+				return []byte(`{"data":{"repository":{"ref":{"rules":{"totalCount":0}},"branchProtectionRules":{"nodes":[{"id":"rule-main","pattern":"main","requiresStrictStatusChecks":true,"isAdminEnforced":true,"bypassPullRequestAllowances":{"totalCount":0}}]}}}}`), nil
 			}
 			if len(args) == 2 && args[1] == "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random" {
 				return []byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`), nil
@@ -938,7 +955,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		t.Fatalf("guarded merge verified=%v err=%v", verified, err)
 	}
 	queue := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}
-	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern requiresStrictStatusChecks bypassPullRequestAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app"}
+	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$ref:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$ref){rules(first:100){totalCount}} branchProtectionRules(first:100){nodes{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app", "-F", "ref=refs/heads/main"}
 	view := []string{"pr", "view", "7", "--repo", "example/app", "--json", prFields}
 	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, queue, protection, view, queue, protection, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, view}
 	if !reflect.DeepEqual(got, want) {

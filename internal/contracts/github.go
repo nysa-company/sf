@@ -12,6 +12,7 @@ import (
 // gate until a supervisor supplies an unambiguous drained (not quarantined)
 // proof.
 var ErrExternalCleanupUncertain = errors.New("external process cleanup is uncertain")
+var ErrExternalCleanupQuarantineFatal = errors.New("external cleanup quarantine could not be persisted")
 
 type RepositoryIdentity struct {
 	Host  string
@@ -74,11 +75,21 @@ type MergeIntentRecorder interface {
 	RecordMergeIntent(context.Context, domain.MergeIntent) error
 }
 
+// MergeIntentObserver performs restart reconciliation from the complete
+// durable witness and returns the observed immutable merge identity.
+type MergeIntentObserver interface {
+	ObserveMergeIntent(context.Context, domain.MergeIntent) (string, error)
+}
+
 // ExternalMutationQuarantiner durably blocks later launches after any
 // supervised command reports uncertain cleanup, including read observations
 // that occur before a durable mutation handoff.
 type ExternalMutationQuarantiner interface {
 	QuarantineExternalMutations(context.Context) error
+}
+
+type ExternalMutationQuarantineStatus interface {
+	ExternalMutationsQuarantined(context.Context) (bool, error)
 }
 
 type GitHub interface {

@@ -28,7 +28,7 @@ var (
 	ErrEffectKey        = errors.New("effect semantic key conflicts with durable record")
 )
 
-const schemaVersion = 6
+const schemaVersion = 7
 
 var migrationChecksums = map[int]string{
 	1: migrationChecksum(migrationV1),
@@ -37,6 +37,7 @@ var migrationChecksums = map[int]string{
 	4: migrationChecksum(migrationV4),
 	5: migrationChecksum(migrationV5),
 	6: migrationChecksum(migrationV6),
+	7: migrationChecksum(migrationV7),
 }
 
 func migrationChecksum(statements []string) string {
@@ -187,6 +188,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV5
 			} else if version == 6 {
 				statements = migrationV6
+			} else if version == 7 {
+				statements = migrationV7
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
