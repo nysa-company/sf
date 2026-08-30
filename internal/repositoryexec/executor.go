@@ -178,6 +178,23 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 	return result, runErr
 }
 
+// RetireUnleased settles an exact issued claim when Run failed before the
+// repository lease/child launch boundary. Persistence deliberately outlives
+// the caller so cancellation cannot strand the executing effect.
+func RetireUnleased(authority contracts.RepositoryCommandAuthority, claim contracts.RepositoryCommandClaim) error {
+	retirer, ok := authority.(contracts.RepositoryCommandUnleasedRetirer)
+	if !ok {
+		return ErrInvalidBinding
+	}
+	persistCtx, cancel := repositoryPersistenceContext()
+	err := retirer.RetireUnleasedRepositoryCommand(persistCtx, claim)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("retire unleased repository command: %w", err)
+	}
+	return nil
+}
+
 func repositoryCommandCanceled(ctx context.Context, runErr error) bool {
 	return ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
 }

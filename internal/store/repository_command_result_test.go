@@ -71,6 +71,61 @@ func TestRepositoryCommandResultExactReplayAndAtomicRollback(t *testing.T) {
 	}
 }
 
+func TestRetireUnleasedRepositoryCommandAllowsImmediateRetry(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "unleased-retry")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RetireUnleasedRepositoryCommand(ctx, claim); err != nil {
+		t.Fatalf("retire unleased claim: %v", err)
+	}
+	if err := db.RetireUnleasedRepositoryCommand(ctx, claim); err != nil {
+		t.Fatalf("idempotent retire: %v", err)
+	}
+	effect, err := db.Effect(ctx, claim.SemanticKey)
+	if err != nil || effect.State != EffectFailed {
+		t.Fatalf("failed effect state=%v err=%v", effect.State, err)
+	}
+	retry, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatalf("immediate retry: %v", err)
+	}
+	if retry.ClaimEpoch == claim.ClaimEpoch {
+		t.Fatalf("retry reused claim epoch %d", retry.ClaimEpoch)
+	}
+}
+
+func TestRetireUnleasedRepositoryCommandRefusesAnyAcquiredLease(t *testing.T) {
+	for _, quarantined := range []bool{false, true} {
+		name := "active"
+		if quarantined {
+			name = "quarantined"
+		}
+		t.Run(name, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			intent := repositoryCommandIntentFixture(t, db, ctx, "unleased-"+name)
+			claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := db.AcquireRepositoryCommand(ctx, claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if quarantined {
+				if err := lease.Quarantine(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.RetireUnleasedRepositoryCommand(ctx, claim); !errors.Is(err, ErrRepositoryCommandLease) {
+				t.Fatalf("retired %s lease: %v", name, err)
+			}
+		})
+	}
+}
+
 func TestRepositoryCommandResultAuthenticatedHistoricalLoadAndTampering(t *testing.T) {
 	for _, tamper := range []struct {
 		name string

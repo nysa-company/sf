@@ -272,6 +272,60 @@ func loadRepositoryCommandResult(ctx context.Context, q repositoryResultQuerier,
 
 var _ contracts.RepositoryCommandResultRecorder = (*Store)(nil)
 
+// RetireUnleasedRepositoryCommand is the narrow terminal path for a claim
+// whose executor failed before AcquireRepositoryCommand.  The exact intent
+// and executing effect are removed together only when no lease exists; this
+// proves that no child crossed the repository boundary and permits the same
+// deterministic request to be retried in-process.  It intentionally does not
+// require the old ticket fence: an already-invalidated claim still has no
+// external command boundary to recover.
+func (s *Store) RetireUnleasedRepositoryCommand(ctx context.Context, claim contracts.RepositoryCommandClaim) error {
+	if s == nil || !validRepositoryCommandClaim(claim) {
+		return ErrRepositoryCommandIntent
+	}
+	return s.write(ctx, func(c *sql.Conn) error {
+		var leases int
+		if err := c.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE semantic_key=?`, claim.SemanticKey).Scan(&leases); err != nil {
+			return err
+		}
+		if leases != 0 {
+			return ErrRepositoryCommandLease
+		}
+		if err := repositoryCommandIntentMatches(ctx, c, claim); err != nil {
+			if !errors.Is(err, ErrRepositoryCommandIntent) {
+				return err
+			}
+			// A concurrent recovery may have completed this exact retirement.
+			effect, effectErr := effectFrom(ctx, c, claim.SemanticKey)
+			if effectErr == nil && effect.State == EffectFailed && effect.ClaimEpoch == claim.ClaimEpoch {
+				return nil
+			}
+			return err
+		}
+		effect, err := effectFrom(ctx, c, claim.SemanticKey)
+		if err != nil || effect.Ref != claim.TicketRef || effect.Kind != "repository_command" || effect.RequestDigest != claim.RequestDigest || effect.State != EffectExecuting || effect.TicketVersion != claim.TicketVersion || effect.LeaderEpoch != claim.LeaderEpoch || effect.RunnerEpoch != claim.RunnerEpoch || effect.ClaimEpoch != claim.ClaimEpoch {
+			return ErrRepositoryCommandIntent
+		}
+		updated, err := c.ExecContext(ctx, `UPDATE effects SET state='failed',observed_identity='failed:repository-command-unleased' WHERE semantic_key=? AND state='executing' AND claim_epoch=? AND request_digest=?`, claim.SemanticKey, claim.ClaimEpoch, claim.RequestDigest)
+		if err != nil {
+			return err
+		}
+		if n, _ := updated.RowsAffected(); n != 1 {
+			return ErrRepositoryCommandIntent
+		}
+		deleted, err := c.ExecContext(ctx, `DELETE FROM repository_command_intents WHERE semantic_key=? AND channel=? AND project_id=? AND ticket_id=? AND request_digest=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=? AND repository_path=? AND worktree_path=? AND worktree_identity=? AND branch_ref=? AND base_ref=? AND base_sha=? AND command_digest=? AND spec_digest=? AND policy_digest=? AND executable_path=? AND executable_digest=?`, claim.SemanticKey, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch, claim.Repository, claim.Worktree, claim.WorktreeIdentity, claim.Branch, claim.BaseRef, claim.BaseSHA, claim.CommandDigest, claim.SpecDigest, claim.PolicyDigest, claim.ExecutablePath, claim.ExecutableDigest)
+		if err != nil {
+			return err
+		}
+		if n, _ := deleted.RowsAffected(); n != 1 {
+			return ErrRepositoryCommandIntent
+		}
+		return nil
+	})
+}
+
+var _ contracts.RepositoryCommandUnleasedRetirer = (*Store)(nil)
+
 // RetireObservedCanceledRepositoryCommand is the narrow terminal path for a
 // caller-canceled command whose supervisor has nevertheless reaped and
 // authenticated the exact child. Cancellation is not reusable command

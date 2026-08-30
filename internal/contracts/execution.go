@@ -182,6 +182,13 @@ type RepositoryCommandResultRecorder interface {
 	MarkRepositoryCommandUncertain(context.Context, RepositoryCommandClaim, string) error
 	ReconcileStaleRepositoryCommandObservation(context.Context, RepositoryCommandClaim, CommandResult) error
 }
+
+// RepositoryCommandUnleasedRetirer settles an issued claim that failed before
+// AcquireRepositoryCommand. No child could cross the repository boundary in
+// that state, so the exact intent may be retired and retried safely.
+type RepositoryCommandUnleasedRetirer interface {
+	RetireUnleasedRepositoryCommand(context.Context, RepositoryCommandClaim) error
+}
 type RepositoryCommandDrainer interface {
 	DrainRepositoryCommand(context.Context, RepositoryCommandLaunch) error
 }

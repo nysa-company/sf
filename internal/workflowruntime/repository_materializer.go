@@ -36,7 +36,7 @@ type RepositoryMaterializer struct {
 }
 
 func (m RepositoryMaterializer) MaterializeVerificationCheckpoint(ctx context.Context, request workflowworker.PhaseRequest, artifact phaseartifact.Verification, key store.ProviderAttemptResultKey) (workflowworker.VerificationCheckpoint, error) {
-	if request.Phase != "verification" {
+	if m.Store == nil || request.Phase != "verification" {
 		return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
 	}
 	provider, parsed, err := m.Store.LoadHistoricalProviderAttemptResult(ctx, key)
@@ -55,7 +55,7 @@ func (m RepositoryMaterializer) MaterializeVerificationCheckpoint(ctx context.Co
 }
 
 func (m RepositoryMaterializer) AuthenticateVerificationCheckpoint(ctx context.Context, request workflowworker.PhaseRequest, _ phaseartifact.Verification, checkpoint workflowworker.VerificationCheckpoint) error {
-	if checkpoint.ID == "" || checkpoint.ID != checkpoint.Commit.CommitOID || checkpoint.CommandResult.SemanticKey == "" || checkpoint.CommandResult.ClaimEpoch == 0 {
+	if m.Store == nil || checkpoint.ID == "" || checkpoint.ID != checkpoint.Commit.CommitOID || checkpoint.CommandResult.SemanticKey == "" || checkpoint.CommandResult.ClaimEpoch == 0 {
 		return ErrRepositoryMaterialization
 	}
 	observed, err := m.observe(ctx, request)
@@ -67,7 +67,7 @@ func (m RepositoryMaterializer) AuthenticateVerificationCheckpoint(ctx context.C
 }
 
 func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, request workflowworker.PhaseRequest, plan workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, key store.ProviderAttemptResultKey) (workflowworker.CandidateWitness, error) {
-	if request.Phase != "build" || request.Verification == nil {
+	if m.Store == nil || request.Phase != "build" || request.Verification == nil {
 		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
 	}
 	provider, parsed, err := m.Store.LoadHistoricalProviderAttemptResult(ctx, key)
@@ -100,7 +100,7 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 }
 
 func (m RepositoryMaterializer) AuthenticateCandidate(ctx context.Context, request workflowworker.PhaseRequest, _ workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, _ phaseartifact.Builder, witness workflowworker.CandidateWitness) error {
-	if witness.CommandResult.SemanticKey == "" || witness.CommandResult.ClaimEpoch == 0 || witness.Commit.ParentOID != verification.CheckpointID {
+	if m.Store == nil || witness.CommandResult.SemanticKey == "" || witness.CommandResult.ClaimEpoch == 0 || witness.Commit.ParentOID != verification.CheckpointID {
 		return ErrRepositoryMaterialization
 	}
 	observed, err := m.observe(ctx, request)
@@ -205,6 +205,9 @@ func (m RepositoryMaterializer) runCommand(ctx context.Context, request workflow
 	result, loadErr := m.Store.LoadRepositoryCommandResult(ctx, key)
 	if loadErr != nil {
 		if runErr != nil {
+			if retireErr := repositoryexec.RetireUnleased(executor.Authority, claim); retireErr != nil {
+				return key, store.RepositoryCommandResult{}, errors.Join(runErr, retireErr)
+			}
 			return key, store.RepositoryCommandResult{}, runErr
 		}
 		return key, store.RepositoryCommandResult{}, loadErr
@@ -248,7 +251,9 @@ func (m RepositoryMaterializer) commit(ctx context.Context, request workflowwork
 		return store.CommitObservation{}, err
 	}
 	if _, err = runner.Commit(ctx, worktree, git.CommitRequest{EvidenceDigest: evidence, Timestamp: time.Unix(0, 0).UTC(), BaseRef: worktree.Identity.BaseRef, ExpectedParent: parent, Policy: git.DiffPolicy{AllowedPaths: paths, ProtectedPaths: protected}, MutationClaim: claim}); err != nil {
-		m.settleCommitFailure(ctx, claim)
+		if settleErr := m.settleCommitFailure(ctx, claim); settleErr != nil {
+			return store.CommitObservation{}, errors.Join(err, settleErr)
+		}
 		return store.CommitObservation{}, err
 	}
 	observed, err := runner.ObserveCommit(ctx, worktree)
@@ -311,23 +316,32 @@ func containsPath(paths []string, path string) bool {
 	}
 	return false
 }
-func (m RepositoryMaterializer) settleCommitFailure(ctx context.Context, claim contracts.GitMutationClaim) {
-	facts, err := m.Store.GitMutationIntentFacts(ctx, claim.SemanticKey)
+func (m RepositoryMaterializer) settleCommitFailure(_ context.Context, claim contracts.GitMutationClaim) error {
+	persistCtx, cancel := materializerPersistenceContext()
+	defer cancel()
+	facts, err := m.Store.GitMutationIntentFacts(persistCtx, claim.SemanticKey)
 	if err != nil || facts.Claim != claim {
-		return
+		if err == nil {
+			return ErrRepositoryMaterialization
+		}
+		return err
 	}
 	fence := store.EffectFence{SemanticKey: claim.SemanticKey, Ref: claim.TicketRef, TicketVersion: claim.TicketVersion, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}
 	if facts.PreparedCommitOID != "" || facts.PreparedTreeOID != "" {
 		// A recorded prepared tuple means update-ref may have crossed. Preserve
 		// it for the startup observer rather than retrying a potentially visible
 		// mutation in-process.
-		_, _ = m.Store.MarkEffectUncertain(ctx, fence)
-		return
+		_, err = m.Store.MarkEffectUncertain(persistCtx, fence)
+		return err
 	}
 	// No visible ref mutation can precede RecordPreparedCommit. Retire both the
 	// exact child intent and effect so the deterministic key can be issued
 	// again; merely marking the effect failed leaves the unique intent behind.
-	_ = m.Store.RetireUnpreparedGitCommit(ctx, claim)
+	return m.Store.RetireUnpreparedGitCommit(persistCtx, claim)
+}
+
+func materializerPersistenceContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
 }
 
 func commitDigest(kind string, request workflowworker.PhaseRequest, provider store.ProviderAttemptResultKey, command contracts.RepositoryCommandResultKey, resultDigest string, value any) string {
