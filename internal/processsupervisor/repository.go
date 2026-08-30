@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +30,12 @@ const repositoryOutputLimit = 64 << 10
 const repositoryInputLimit = 1 << 20
 const repositoryToolchainFileLimit = 32768
 const repositoryToolchainByteLimit = 512 << 20
+const repositoryToolchainEntryLimit = 65536
+const repositoryToolchainDepthLimit = 64
+const repositoryToolchainStageLimit = 30 * time.Second
+const repositoryExecutableByteLimit int64 = 64 << 20
+const repositoryExecutableStageLimit = 10 * time.Second
+const repositoryTestGroupByteLimit = 64 << 10
 
 // repositoryTestGroupLimit matches the durable Store limit.  A wrapper is
 // never acknowledged beyond this bound: an unrecorded test group could not be
@@ -527,9 +532,9 @@ func stageExecutable(path, expectedDigest string) (string, error) {
 		return "", err
 	}
 	hash := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(out, hash), io.LimitReader(source, 64<<20+1))
+	n, copyErr := copyRepositoryBytes(io.MultiWriter(out, hash), source, repositoryExecutableByteLimit, time.Now().Add(repositoryExecutableStageLimit))
 	closeErr := out.Close()
-	if copyErr != nil || closeErr != nil || n > 64<<20 || sourceSizeOver(path, 64<<20) || expectedDigest != "sha256:"+hex.EncodeToString(hash.Sum(nil)) {
+	if copyErr != nil || closeErr != nil || n > repositoryExecutableByteLimit || sourceSizeOver(path, repositoryExecutableByteLimit) || expectedDigest != "sha256:"+hex.EncodeToString(hash.Sum(nil)) {
 		_ = os.RemoveAll(dir)
 		return "", ErrUnclear
 	}
@@ -542,11 +547,54 @@ func executableDigest(path string) (string, error) {
 		return "", err
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > repositoryExecutableByteLimit {
+		return "", ErrUnclear
+	}
 	sum := sha256.New()
-	if _, err := io.Copy(sum, file); err != nil {
-		return "", err
+	n, err := copyRepositoryBytes(sum, file, repositoryExecutableByteLimit, time.Now().Add(repositoryExecutableStageLimit))
+	if err != nil || n != info.Size() || n > repositoryExecutableByteLimit {
+		return "", ErrUnclear
 	}
 	return "sha256:" + hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+// copyRepositoryBytes has a fixed buffer and checks the staging deadline
+// between every bounded read/write. It also reads one byte past the byte cap,
+// so a file that grows after Stat is rejected rather than silently truncated.
+func copyRepositoryBytes(destination io.Writer, source io.Reader, limit int64, deadline time.Time) (int64, error) {
+	if limit < 0 {
+		return 0, ErrUnclear
+	}
+	buffer := make([]byte, 32<<10)
+	var copied int64
+	for {
+		if !time.Now().Before(deadline) {
+			return 0, ErrUnclear
+		}
+		readSize := len(buffer)
+		remaining := limit - copied
+		if remaining < int64(readSize) {
+			readSize = int(remaining + 1)
+		}
+		n, readErr := source.Read(buffer[:readSize])
+		if n > 0 {
+			if int64(n) > remaining {
+				return 0, ErrUnclear
+			}
+			written, writeErr := destination.Write(buffer[:n])
+			if writeErr != nil || written != n || !time.Now().Before(deadline) {
+				return 0, ErrUnclear
+			}
+			copied += int64(n)
+		}
+		if readErr == io.EOF {
+			return copied, nil
+		}
+		if readErr != nil {
+			return 0, ErrUnclear
+		}
+	}
 }
 
 // stageRepositoryGate closes the otherwise dangerous self-reexec pathname
@@ -593,57 +641,116 @@ func stageGoToolchain(root string) (string, error) {
 		return "", err
 	}
 	destinationRoot := filepath.Join(base, "goroot")
-	deadline := time.Now().Add(30 * time.Second)
-	var files int
+	deadline := time.Now().Add(repositoryToolchainStageLimit)
+	var entries, files int
 	var copied int64
-	err = filepath.WalkDir(root, func(source string, entry fs.DirEntry, walkErr error) error {
-		if time.Now().After(deadline) {
-			return ErrUnclear
-		}
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(root, source)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return ErrUnclear
-		}
-		destination := destinationRoot
-		if rel != "." {
-			destination = filepath.Join(destinationRoot, rel)
-		}
-		info, err := entry.Info()
-		if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
-			return ErrUnclear
-		}
-		if entry.IsDir() {
-			// The stage is private because its top-level parent is 0700. Keep
-			// nested directories owner-writable while WalkDir copies children.
-			return os.MkdirAll(destination, 0o700)
-		}
-		if !info.Mode().IsRegular() {
-			return ErrUnclear
-		}
-		files++
-		copied += info.Size()
-		if files > repositoryToolchainFileLimit || copied > repositoryToolchainByteLimit {
+	copyFile := func(source, destination string, info os.FileInfo) error {
+		if files >= repositoryToolchainFileLimit || info.Size() < 0 || info.Size() > repositoryToolchainByteLimit-copied {
 			return ErrUnclear
 		}
 		sourceFile, err := os.Open(source)
 		if err != nil {
 			return err
 		}
-		defer sourceFile.Close()
 		destinationFile, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm()&0o555)
 		if err != nil {
+			_ = sourceFile.Close()
 			return err
 		}
-		_, copyErr := io.Copy(destinationFile, sourceFile)
-		closeErr := destinationFile.Close()
-		if copyErr != nil {
-			return copyErr
+		var written int64
+		buffer := make([]byte, 32<<10)
+		for {
+			if !time.Now().Before(deadline) {
+				_ = sourceFile.Close()
+				_ = destinationFile.Close()
+				return ErrUnclear
+			}
+			n, readErr := sourceFile.Read(buffer)
+			if n > 0 {
+				if int64(n) > repositoryToolchainByteLimit-copied-written {
+					_ = sourceFile.Close()
+					_ = destinationFile.Close()
+					return ErrUnclear
+				}
+				m, writeErr := destinationFile.Write(buffer[:n])
+				if writeErr != nil || m != n {
+					_ = sourceFile.Close()
+					_ = destinationFile.Close()
+					return ErrUnclear
+				}
+				written += int64(n)
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				_ = sourceFile.Close()
+				_ = destinationFile.Close()
+				return ErrUnclear
+			}
 		}
-		return closeErr
-	})
+		sourceCloseErr := sourceFile.Close()
+		closeErr := destinationFile.Close()
+		if sourceCloseErr != nil || closeErr != nil || written != info.Size() || !time.Now().Before(deadline) {
+			return ErrUnclear
+		}
+		files++
+		copied += written
+		return nil
+	}
+	var walk func(source, destination string, depth int) error
+	walk = func(source, destination string, depth int) error {
+		if !time.Now().Before(deadline) {
+			return ErrUnclear
+		}
+		if depth > repositoryToolchainDepthLimit {
+			return ErrUnclear
+		}
+		info, err := os.Lstat(source)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
+			return ErrUnclear
+		}
+		entries++
+		if entries > repositoryToolchainEntryLimit {
+			return ErrUnclear
+		}
+		if info.IsDir() {
+			// The stage is private because its top-level parent is 0700. Keep
+			// nested directories owner-writable while the bounded walker copies
+			// children. ReadDir's fixed batch avoids allocating an adversarial
+			// directory's entire child list before the entry cap is checked.
+			if err := os.Mkdir(destination, 0o700); err != nil {
+				return err
+			}
+			dir, err := os.Open(source)
+			if err != nil {
+				return err
+			}
+			defer dir.Close()
+			for {
+				children, readErr := dir.ReadDir(128)
+				for _, child := range children {
+					if child.Name() == "." || child.Name() == ".." || strings.Contains(child.Name(), string(filepath.Separator)) {
+						return ErrUnclear
+					}
+					if err := walk(filepath.Join(source, child.Name()), filepath.Join(destination, child.Name()), depth+1); err != nil {
+						return err
+					}
+				}
+				if readErr == io.EOF {
+					return nil
+				}
+				if readErr != nil {
+					return readErr
+				}
+			}
+		}
+		if !info.Mode().IsRegular() {
+			return ErrUnclear
+		}
+		return copyFile(source, destination, info)
+	}
+	err = walk(root, destinationRoot, 0)
 	if err != nil {
 		_ = os.RemoveAll(base)
 		return "", err
@@ -803,10 +910,36 @@ func (g *repositoryTestGroups) stoppingNow() bool {
 func (g *repositoryTestGroups) add(v contracts.RepositoryCommandLaunch) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if len(g.groups) >= repositoryTestGroupLimit {
+	if !boundedRepositoryTestGroups(append(g.groups, v)) {
 		return false
 	}
 	g.groups = append(g.groups, v)
+	return true
+}
+
+func repositoryTestGroupBytes(v contracts.RepositoryCommandLaunch) (int, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return 0, err
+	}
+	return len(raw), nil
+}
+
+func boundedRepositoryTestGroups(groups []contracts.RepositoryCommandLaunch) bool {
+	if len(groups) > repositoryTestGroupLimit {
+		return false
+	}
+	var total int
+	for _, group := range groups {
+		if !validRepositoryLaunch(group) {
+			return false
+		}
+		n, err := repositoryTestGroupBytes(group)
+		if err != nil || n > repositoryTestGroupByteLimit || total > repositoryTestGroupByteLimit-n {
+			return false
+		}
+		total += n
+	}
 	return true
 }
 func (g *repositoryTestGroups) fail(err error) {
@@ -943,8 +1076,24 @@ func (d RepositoryCommandDrainer) DrainRepositoryCommand(ctx context.Context, l 
 }
 
 func (d RepositoryCommandDrainer) DrainRepositoryCommandTree(ctx context.Context, primary contracts.RepositoryCommandLaunch, groups []contracts.RepositoryCommandLaunch) error {
-	if !validRepositoryLaunch(primary) || len(groups) > repositoryTestGroupLimit || d.SoftDrain > 30*time.Second || d.HardDrain > 30*time.Second {
+	if !validRepositoryLaunch(primary) || !boundedRepositoryTestGroups(groups) || !boundedRepositoryTestGroups([]contracts.RepositoryCommandLaunch{primary}) || d.SoftDrain > 30*time.Second || d.HardDrain > 30*time.Second {
 		return ErrUnclear
+	}
+	soft, hard := d.SoftDrain, d.HardDrain
+	if soft <= 0 {
+		soft = 2 * time.Second
+	}
+	if hard <= 0 {
+		hard = 2 * time.Second
+	}
+	// Recovery has one budget for the Store load, every persisted group, and
+	// both drain phases.  Do not give each tracked group a fresh timeout.
+	deadline := time.Now().Add(soft + hard)
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
+		deadline = callerDeadline
+	}
+	if err := repositoryDrainContextErr(ctx, deadline); err != nil {
+		return err
 	}
 	launches := append([]contracts.RepositoryCommandLaunch{primary}, groups...)
 	for _, launch := range launches {
@@ -956,25 +1105,31 @@ func (d RepositoryCommandDrainer) DrainRepositoryCommandTree(ctx context.Context
 	if err != nil {
 		return ErrUnclear
 	}
+	if err := repositoryDrainContextErr(ctx, deadline); err != nil {
+		return err
+	}
 	// A boot identifier is an OS-lifetime witness. A process from the prior
 	// boot cannot still exist, so no old PID or PGID is ever signalled.
 	if boot != primary.BootIdentity {
 		return nil
 	}
-	live, err := inspectRepositoryGroups(launches)
+	live, err := inspectRepositoryGroups(ctx, deadline, launches)
 	if err != nil {
 		return err
 	}
 	for _, launch := range live {
+		if err := repositoryDrainContextErr(ctx, deadline); err != nil {
+			return err
+		}
 		if err := signalGroup(launch.PGID, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 			return ErrUnclear
 		}
 	}
-	soft := d.SoftDrain
-	if soft <= 0 {
-		soft = 2 * time.Second
+	softDeadline := time.Now().Add(soft)
+	if deadline.Before(softDeadline) {
+		softDeadline = deadline
 	}
-	if err := waitRepositoryGroups(ctx, launches, time.Now().Add(soft)); err == nil {
+	if err := waitRepositoryGroups(ctx, launches, softDeadline); err == nil {
 		return nil
 	} else if !errors.Is(err, errRepositoryGroupsStillLive) {
 		return err
@@ -983,20 +1138,19 @@ func (d RepositoryCommandDrainer) DrainRepositoryCommandTree(ctx context.Context
 	// Re-authenticate every leader immediately before KILL. If a leader has
 	// vanished while its old group remains, the PGID could now name an
 	// unrelated group; that is ambiguity, not permission to signal it.
-	live, err = inspectRepositoryGroups(launches)
+	live, err = inspectRepositoryGroups(ctx, deadline, launches)
 	if err != nil {
 		return err
 	}
 	for _, launch := range live {
+		if err := repositoryDrainContextErr(ctx, deadline); err != nil {
+			return err
+		}
 		if err := signalGroup(launch.PGID, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 			return ErrUnclear
 		}
 	}
-	hard := d.HardDrain
-	if hard <= 0 {
-		hard = 2 * time.Second
-	}
-	return waitRepositoryGroups(ctx, launches, time.Now().Add(hard))
+	return waitRepositoryGroups(ctx, launches, deadline)
 }
 
 func (d RepositoryCommandDrainer) currentBootIdentity() (string, error) {
@@ -1012,9 +1166,12 @@ var errRepositoryGroupsStillLive = errors.New("repository command groups still l
 // missing leader plus a live group is not authenticated and therefore cannot
 // be signalled. A missing leader and ESRCH for its exact group is the narrow
 // proof that this recorded wrapper group is gone.
-func inspectRepositoryGroups(launches []contracts.RepositoryCommandLaunch) ([]contracts.RepositoryCommandLaunch, error) {
+func inspectRepositoryGroups(ctx context.Context, deadline time.Time, launches []contracts.RepositoryCommandLaunch) ([]contracts.RepositoryCommandLaunch, error) {
 	live := make([]contracts.RepositoryCommandLaunch, 0, len(launches))
 	for _, launch := range launches {
+		if err := repositoryDrainContextErr(ctx, deadline); err != nil {
+			return nil, err
+		}
 		start, startErr := processStartIdentity(launch.PID)
 		groupErr := syscall.Kill(-launch.PGID, 0)
 		if startErr != nil {
@@ -1046,7 +1203,7 @@ func waitRepositoryGroups(ctx context.Context, launches []contracts.RepositoryCo
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		live, err := inspectRepositoryGroups(launches)
+		live, err := inspectRepositoryGroups(ctx, deadline, launches)
 		if err != nil {
 			return err
 		}
@@ -1062,6 +1219,18 @@ func waitRepositoryGroups(ctx context.Context, launches []contracts.RepositoryCo
 		case <-ticker.C:
 		}
 	}
+}
+
+func repositoryDrainContextErr(ctx context.Context, deadline time.Time) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	if !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 func validRepositoryLaunch(l contracts.RepositoryCommandLaunch) bool {
 	return l.PID > 0 && l.PGID == l.PID && l.BootIdentity != "" && l.ProcessStartIdentity != ""

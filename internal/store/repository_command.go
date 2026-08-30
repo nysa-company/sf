@@ -38,9 +38,20 @@ type RepositoryCommandRecovery struct {
 	LaunchState string
 	Launch      contracts.RepositoryCommandLaunch
 	Groups      []contracts.RepositoryCommandLaunch
+	// groupOverflow is intentionally internal: the only safe disposition for
+	// malformed tracked-group persistence is durable quarantine during startup
+	// recovery, never exposing the rows to a caller.
+	groupOverflow   bool
+	primaryOverflow bool
 }
 
 const repositoryCommandProcessGroupLimit = 64
+
+// This is the encoded representation passed from the Store to recovery.  It
+// keeps a malformed durable row from turning startup recovery into an
+// unbounded allocation, while leaving ample room for the normal Darwin boot
+// and process-start witnesses.
+const repositoryCommandProcessGroupByteLimit = 64 << 10
 
 func validRepositoryCommandIntent(i RepositoryCommandIntent) bool {
 	return i.Ref.Validate() == nil && i.SemanticKey != "" && validClaimDigest(i.RequestDigest) && i.TicketVersion > 0 && i.Fence.LeaderEpoch > 0 && i.Fence.RunnerEpoch > 0 && validStorePath(i.Repository) && validStorePath(i.Worktree) && validRepositoryWorktreeIdentity(i.WorktreeIdentity, i.Repository, i.Worktree, i.Branch, i.BaseRef, i.BaseSHA) && validClaimDigest(i.CommandDigest) && validClaimDigest(i.SpecDigest) && validClaimDigest(i.PolicyDigest) && validStorePath(i.ExecutablePath) && validClaimDigest(i.ExecutableDigest)
@@ -208,8 +219,34 @@ func (l *repositoryCommandLease) Quarantine() error {
 func validRepositoryCommandLaunch(v contracts.RepositoryCommandLaunch) bool {
 	return v.PID > 0 && v.PGID > 0 && v.PID == v.PGID && v.BootIdentity != "" && v.ProcessStartIdentity != ""
 }
+
+func repositoryCommandLaunchBytes(v contracts.RepositoryCommandLaunch) (int, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return 0, err
+	}
+	return len(raw), nil
+}
+
+func boundedRepositoryCommandGroups(groups []contracts.RepositoryCommandLaunch) bool {
+	if len(groups) > repositoryCommandProcessGroupLimit {
+		return false
+	}
+	var total int
+	for _, group := range groups {
+		if !validRepositoryCommandLaunch(group) {
+			return false
+		}
+		n, err := repositoryCommandLaunchBytes(group)
+		if err != nil || n > repositoryCommandProcessGroupByteLimit || total > repositoryCommandProcessGroupByteLimit-n {
+			return false
+		}
+		total += n
+	}
+	return true
+}
 func (l *repositoryCommandLease) RecordRepositoryCommandLaunch(ctx context.Context, v contracts.RepositoryCommandLaunch) error {
-	if l == nil || l.store == nil || !validRepositoryCommandLaunch(v) {
+	if l == nil || l.store == nil || !validRepositoryCommandLaunch(v) || !boundedRepositoryCommandGroups([]contracts.RepositoryCommandLaunch{v}) {
 		return ErrRepositoryCommandLease
 	}
 	return l.store.write(ctx, func(c *sql.Conn) error {
@@ -248,7 +285,7 @@ func (l *repositoryCommandLease) FinishRepositoryCommandLaunch(ctx context.Conte
 // acknowledges the wrapper. Recovery consequently knows every group that can
 // outlive the trusted Go driver.
 func (l *repositoryCommandLease) RecordRepositoryCommandProcessGroup(ctx context.Context, v contracts.RepositoryCommandLaunch) error {
-	if l == nil || l.store == nil || !validRepositoryCommandLaunch(v) {
+	if l == nil || l.store == nil || !validRepositoryCommandLaunch(v) || !boundedRepositoryCommandGroups([]contracts.RepositoryCommandLaunch{v}) {
 		return ErrRepositoryCommandLease
 	}
 	return l.store.write(ctx, func(c *sql.Conn) error {
@@ -266,22 +303,31 @@ func (l *repositoryCommandLease) RecordRepositoryCommandProcessGroup(ctx context
 		if exists != 0 {
 			return nil
 		}
-		if err := c.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_process_groups WHERE repository_path=? AND semantic_key=? AND nonce=?`, l.claim.Repository, l.claim.SemanticKey, l.nonce).Scan(&n); err != nil {
-			return err
-		}
-		if n >= repositoryCommandProcessGroupLimit {
+		groups, err := repositoryCommandGroupsFrom(ctx, c, l.claim.Repository, l.claim.SemanticKey, l.nonce)
+		if err != nil || !boundedRepositoryCommandGroups(append(groups, v)) {
 			return ErrRepositoryCommandLease
 		}
-		_, err := c.ExecContext(ctx, `INSERT INTO repository_command_process_groups(repository_path,semantic_key,nonce,process_pid,process_pgid,process_boot_identity,process_start_identity) VALUES(?,?,?,?,?,?,?) ON CONFLICT(repository_path,process_pid,process_start_identity) DO NOTHING`, l.claim.Repository, l.claim.SemanticKey, l.nonce, v.PID, v.PGID, v.BootIdentity, v.ProcessStartIdentity)
+		_, err = c.ExecContext(ctx, `INSERT INTO repository_command_process_groups(repository_path,semantic_key,nonce,process_pid,process_pgid,process_boot_identity,process_start_identity) VALUES(?,?,?,?,?,?,?) ON CONFLICT(repository_path,process_pid,process_start_identity) DO NOTHING`, l.claim.Repository, l.claim.SemanticKey, l.nonce, v.PID, v.PGID, v.BootIdentity, v.ProcessStartIdentity)
 		return err
 	})
 }
 
 func (s *Store) ActiveRepositoryCommandLeases(ctx context.Context, channel domain.Channel) ([]RepositoryCommandRecovery, error) {
+	return s.activeRepositoryCommandLeases(ctx, channel, false)
+}
+
+// activeRepositoryCommandLeases can retain an over-limit row solely long
+// enough for recovery to quarantine it.  Public callers always receive an
+// error for such a row and never an unbounded group slice.
+func (s *Store) activeRepositoryCommandLeases(ctx context.Context, channel domain.Channel, recoverOverflow bool) ([]RepositoryCommandRecovery, error) {
 	if !channel.Valid() {
 		return nil, ErrRepositoryCommandLease
 	}
-	rows, e := s.db.QueryContext(ctx, `SELECT semantic_key,nonce,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,worktree_identity,branch_ref,base_ref,base_sha,command_digest,spec_digest,policy_digest,executable_path,executable_digest,state,launch_state,process_pid,process_pgid,process_boot_identity,process_start_identity FROM repository_command_leases WHERE channel=? ORDER BY repository_path`, channel)
+	rows, e := s.db.QueryContext(ctx, `SELECT semantic_key,nonce,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,worktree_identity,branch_ref,base_ref,base_sha,command_digest,spec_digest,policy_digest,executable_path,executable_digest,state,launch_state,process_pid,process_pgid,
+		CASE WHEN length(CAST(process_boot_identity AS BLOB))+length(CAST(process_start_identity AS BLOB))<=? THEN process_boot_identity ELSE '' END,
+		CASE WHEN length(CAST(process_boot_identity AS BLOB))+length(CAST(process_start_identity AS BLOB))<=? THEN process_start_identity ELSE '' END,
+		CASE WHEN length(CAST(process_boot_identity AS BLOB))+length(CAST(process_start_identity AS BLOB))<=? THEN 0 ELSE 1 END
+		FROM repository_command_leases WHERE channel=? ORDER BY repository_path`, repositoryCommandProcessGroupByteLimit, repositoryCommandProcessGroupByteLimit, repositoryCommandProcessGroupByteLimit, channel)
 	if e != nil {
 		return nil, e
 	}
@@ -290,12 +336,26 @@ func (s *Store) ActiveRepositoryCommandLeases(ctx context.Context, channel domai
 	for rows.Next() {
 		var r RepositoryCommandRecovery
 		var project, ticket string
-		if e := rows.Scan(&r.Claim.SemanticKey, &r.Nonce, &project, &ticket, &r.Claim.RequestDigest, &r.Claim.TicketVersion, &r.Claim.LeaderEpoch, &r.Claim.RunnerEpoch, &r.Claim.ClaimEpoch, &r.Claim.Repository, &r.Claim.Worktree, &r.Claim.WorktreeIdentity, &r.Claim.Branch, &r.Claim.BaseRef, &r.Claim.BaseSHA, &r.Claim.CommandDigest, &r.Claim.SpecDigest, &r.Claim.PolicyDigest, &r.Claim.ExecutablePath, &r.Claim.ExecutableDigest, &r.State, &r.LaunchState, &r.Launch.PID, &r.Launch.PGID, &r.Launch.BootIdentity, &r.Launch.ProcessStartIdentity); e != nil {
+		var primaryOverflow int
+		if e := rows.Scan(&r.Claim.SemanticKey, &r.Nonce, &project, &ticket, &r.Claim.RequestDigest, &r.Claim.TicketVersion, &r.Claim.LeaderEpoch, &r.Claim.RunnerEpoch, &r.Claim.ClaimEpoch, &r.Claim.Repository, &r.Claim.Worktree, &r.Claim.WorktreeIdentity, &r.Claim.Branch, &r.Claim.BaseRef, &r.Claim.BaseSHA, &r.Claim.CommandDigest, &r.Claim.SpecDigest, &r.Claim.PolicyDigest, &r.Claim.ExecutablePath, &r.Claim.ExecutableDigest, &r.State, &r.LaunchState, &r.Launch.PID, &r.Launch.PGID, &r.Launch.BootIdentity, &r.Launch.ProcessStartIdentity, &primaryOverflow); e != nil {
 			return nil, e
 		}
+		r.primaryOverflow = primaryOverflow != 0 || (r.LaunchState != "unrecorded" && !boundedRepositoryCommandGroups([]contracts.RepositoryCommandLaunch{r.Launch}))
 		r.Claim.TicketRef = domain.TicketRef{Channel: channel, Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
+		if r.primaryOverflow {
+			if recoverOverflow {
+				out = append(out, r)
+				continue
+			}
+			return nil, ErrRepositoryCommandLease
+		}
 		groups, x := s.repositoryCommandGroups(ctx, r.Claim.Repository, r.Claim.SemanticKey, r.Nonce)
 		if x != nil {
+			if recoverOverflow {
+				r.groupOverflow = true
+				out = append(out, r)
+				continue
+			}
 			return nil, x
 		}
 		r.Groups = groups
@@ -305,12 +365,30 @@ func (s *Store) ActiveRepositoryCommandLeases(ctx context.Context, channel domai
 }
 
 func (s *Store) repositoryCommandGroups(ctx context.Context, repository, semanticKey string, nonce []byte) ([]contracts.RepositoryCommandLaunch, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT process_pid,process_pgid,process_boot_identity,process_start_identity FROM repository_command_process_groups WHERE repository_path=? AND semantic_key=? AND nonce=? ORDER BY process_pid`, repository, semanticKey, nonce)
+	return repositoryCommandGroupsFrom(ctx, s.db, repository, semanticKey, nonce)
+}
+
+type repositoryCommandGroupQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func repositoryCommandGroupsFrom(ctx context.Context, q repositoryCommandGroupQueryer, repository, semanticKey string, nonce []byte) ([]contracts.RepositoryCommandLaunch, error) {
+	// Measure raw durable TEXT before scanning it. JSON can only expand this
+	// small bounded input; a larger value is quarantined without allocating it.
+	var count, rawBytes int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(length(CAST(process_boot_identity AS BLOB))+length(CAST(process_start_identity AS BLOB))),0) FROM repository_command_process_groups WHERE repository_path=? AND semantic_key=? AND nonce=?`, repository, semanticKey, nonce).Scan(&count, &rawBytes); err != nil {
+		return nil, err
+	}
+	if count < 0 || count > repositoryCommandProcessGroupLimit || rawBytes < 0 || rawBytes > repositoryCommandProcessGroupByteLimit {
+		return nil, ErrRepositoryCommandLease
+	}
+	rows, err := q.QueryContext(ctx, `SELECT process_pid,process_pgid,process_boot_identity,process_start_identity FROM repository_command_process_groups WHERE repository_path=? AND semantic_key=? AND nonce=? ORDER BY process_pid`, repository, semanticKey, nonce)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var groups []contracts.RepositoryCommandLaunch
+	groups := make([]contracts.RepositoryCommandLaunch, 0, count)
 	for rows.Next() {
 		if len(groups) >= repositoryCommandProcessGroupLimit {
 			return nil, ErrRepositoryCommandLease
@@ -324,16 +402,25 @@ func (s *Store) repositoryCommandGroups(ctx context.Context, repository, semanti
 		}
 		groups = append(groups, group)
 	}
-	return groups, rows.Err()
+	if err := rows.Err(); err != nil || len(groups) != count || !boundedRepositoryCommandGroups(groups) {
+		return nil, ErrRepositoryCommandLease
+	}
+	return groups, nil
 }
 func (s *Store) RecoverRepositoryCommandLeases(ctx context.Context, channel domain.Channel, leader uint64, d contracts.RepositoryCommandDrainer) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	leases, e := s.ActiveRepositoryCommandLeases(ctx, channel)
+	leases, e := s.activeRepositoryCommandLeases(ctx, channel, true)
 	if e != nil {
 		return e
 	}
 	for _, l := range leases {
+		if l.groupOverflow || l.primaryOverflow {
+			if err := s.quarantineRecoveredRepositoryCommand(ctx, channel, leader, l); err != nil {
+				return err
+			}
+			continue
+		}
 		// The child gate opens only after RecordRepositoryCommandLaunch commits.
 		// An unrecorded lease therefore proves that no repository code started;
 		// retire it explicitly rather than trying to infer a nonexistent PID.

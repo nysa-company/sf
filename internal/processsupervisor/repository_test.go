@@ -100,6 +100,23 @@ func TestRepositoryCommandDrainerUsesOneSharedGroupDeadline(t *testing.T) {
 	}
 }
 
+func TestRepositoryCommandDrainerRejectsOversizedSerializedGroupInput(t *testing.T) {
+	primary := contracts.RepositoryCommandLaunch{PID: 999999, PGID: 999999, BootIdentity: "boot", ProcessStartIdentity: "start"}
+	group := contracts.RepositoryCommandLaunch{PID: 999998, PGID: 999998, BootIdentity: strings.Repeat("x", repositoryTestGroupByteLimit), ProcessStartIdentity: "start"}
+	if err := (RepositoryCommandDrainer{}).DrainRepositoryCommandTree(context.Background(), primary, []contracts.RepositoryCommandLaunch{group}); err == nil {
+		t.Fatal("oversized tracked-group input was accepted")
+	}
+}
+
+func TestRepositoryCommandDrainerHonorsExpiredRecoveryBudget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	launch := contracts.RepositoryCommandLaunch{PID: 999999, PGID: 999999, BootIdentity: "boot", ProcessStartIdentity: "start"}
+	if err := (RepositoryCommandDrainer{bootIdentity: func() (string, error) { return "boot", nil }}).DrainRepositoryCommand(ctx, launch); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expired recovery budget was ignored: %v", err)
+	}
+}
+
 func TestRepositoryCommandDrainerFailsClosedOnUnclearIdentity(t *testing.T) {
 	d := RepositoryCommandDrainer{}
 	if err := d.DrainRepositoryCommand(context.Background(), contracts.RepositoryCommandLaunch{PID: 42, PGID: 42}); err == nil {
@@ -186,6 +203,27 @@ func TestRepositoryCommandStagesExecutableBeforeFinalPathReplacement(t *testing.
 	got, err := os.ReadFile(staged)
 	if err != nil || string(got) != string(original) {
 		t.Fatalf("staged executable changed after source replacement: %q err=%v", got, err)
+	}
+}
+
+func TestStageGoToolchainRejectsExcessiveDepth(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "go"), []byte("tool"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	path := root
+	for i := 0; i <= repositoryToolchainDepthLimit; i++ {
+		path = filepath.Join(path, "d")
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := stageGoToolchain(root); !errors.Is(err, ErrUnclear) {
+		t.Fatalf("excessively deep Go root staged: %v", err)
 	}
 }
 

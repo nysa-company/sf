@@ -442,3 +442,61 @@ func TestRepositoryCommandRejectsMoreThanBoundedTrackedGroups(t *testing.T) {
 		t.Fatalf("bounded recovery groups=%+v err=%v", active, err)
 	}
 }
+
+func TestRepositoryCommandPrimaryLaunchOverflowQuarantinesDuringRecovery(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "primary-overflow")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overflow := contracts.RepositoryCommandLaunch{PID: 80, PGID: 80, BootIdentity: strings.Repeat("x", repositoryCommandProcessGroupByteLimit), ProcessStartIdentity: "start"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, overflow); !errors.Is(err, ErrRepositoryCommandLease) {
+		t.Fatalf("oversized primary launch persisted: %v", err)
+	}
+	launch := contracts.RepositoryCommandLaunch{PID: 81, PGID: 81, BootIdentity: "boot", ProcessStartIdentity: "start"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE repository_command_leases SET process_boot_identity=? WHERE repository_path=?`, strings.Repeat("x", repositoryCommandProcessGroupByteLimit+1), claim.Repository); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ActiveRepositoryCommandLeases(ctx, claim.TicketRef.Channel); !errors.Is(err, ErrRepositoryCommandLease) {
+		t.Fatalf("oversized primary launch loaded: %v", err)
+	}
+	if err := db.RecoverRepositoryCommandLeases(ctx, claim.TicketRef.Channel, claim.LeaderEpoch, repositoryRecoveryDrainer{}); err != nil {
+		t.Fatal(err)
+	}
+	var state, launchState string
+	if err := db.db.QueryRowContext(ctx, `SELECT state,launch_state FROM repository_command_leases WHERE repository_path=?`, claim.Repository).Scan(&state, &launchState); err != nil {
+		t.Fatal(err)
+	}
+	if state != "quarantined" || launchState != "quarantined" {
+		t.Fatalf("overflow lease state=%q launch_state=%q", state, launchState)
+	}
+}
+
+func TestRepositoryCommandRejectsOversizedTrackedGroupBeforePersistence(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "tracked-bytes")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, contracts.RepositoryCommandLaunch{PID: 91, PGID: 91, BootIdentity: "boot", ProcessStartIdentity: "start"}); err != nil {
+		t.Fatal(err)
+	}
+	recorder := lease.(contracts.RepositoryCommandGroupRecorder)
+	overflow := contracts.RepositoryCommandLaunch{PID: 92, PGID: 92, BootIdentity: strings.Repeat("x", repositoryCommandProcessGroupByteLimit), ProcessStartIdentity: "start"}
+	if err := recorder.RecordRepositoryCommandProcessGroup(ctx, overflow); !errors.Is(err, ErrRepositoryCommandLease) {
+		t.Fatalf("oversized tracked group persisted: %v", err)
+	}
+}
