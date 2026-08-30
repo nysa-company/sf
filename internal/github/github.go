@@ -760,6 +760,10 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 	if err := c.json(ctx, &activeRules, "api", "--hostname", "github.com", "--method", "GET", endpoint); err != nil || len(activeRules) >= 100 {
 		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 	}
+	listedDetails, err := c.auditEvaluateRulesets(ctx, repository, baseRef)
+	if err != nil {
+		return strictProtectionWitness{}, err
+	}
 	// GitHub's exact-branch rules endpoint returns every active rule that
 	// applies to this ref, including inherited organization/enterprise rules.
 	// It avoids treating a lossy ruleset-list summary or wildcard matching as
@@ -798,7 +802,8 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 	if len(requestedMethod) == 1 {
 		method = requestedMethod[0]
 	}
-	return c.rulesetProtection(ctx, repository, baseRef, method, selected)
+	detail, hasListed := listedDetails[selected.ID]
+	return c.rulesetProtection(ctx, repository, baseRef, method, selected, detail, hasListed)
 }
 
 func lenRulesetRules(rules []appliedBranchRule) int {
@@ -816,8 +821,16 @@ type rulesetRefCondition struct {
 	Exclude []string `json:"exclude"`
 }
 
+type rulesetNameCondition struct {
+	Include   []string `json:"include"`
+	Exclude   []string `json:"exclude"`
+	Protected *bool    `json:"protected"`
+}
+
 type rulesetConditions struct {
-	RefName *rulesetRefCondition `json:"ref_name"`
+	RefName          *rulesetRefCondition  `json:"ref_name"`
+	RepositoryName   *rulesetNameCondition `json:"repository_name"`
+	OrganizationName *rulesetNameCondition `json:"organization_name"`
 }
 
 type rulesetRule struct {
@@ -853,14 +866,139 @@ type rulesetWire struct {
 	CurrentUserCanBypass string `json:"current_user_can_bypass"`
 }
 
+// rulesetSummaryWire is the documented list payload. Conditions, bypass
+// actors, and rules exist only on the detail endpoint, so they must never be
+// inferred from this summary.
+type rulesetSummaryWire struct {
+	ID          int64         `json:"id"`
+	Name        string        `json:"name"`
+	Target      string        `json:"target"`
+	Source      string        `json:"source"`
+	SourceType  string        `json:"source_type"`
+	Enforcement string        `json:"enforcement"`
+	NodeID      string        `json:"node_id"`
+	Links       *rulesetLinks `json:"_links"`
+	CreatedAt   string        `json:"created_at"`
+	UpdatedAt   string        `json:"updated_at"`
+}
+
+func (c Client) auditEvaluateRulesets(ctx context.Context, repository contracts.RepositoryIdentity, baseRef string) (map[int64]rulesetWire, error) {
+	var listed []rulesetSummaryWire
+	endpoint := "repos/" + repoArg(repository) + "/rulesets?includes_parents=true&targets=branch&per_page=100&page=1"
+	if err := c.json(ctx, &listed, "api", "--hostname", "github.com", "--method", "GET", endpoint); err != nil || len(listed) >= 100 {
+		return nil, ErrGuardedMergeUnavailable
+	}
+	seen := make(map[int64]bool, len(listed))
+	details := make(map[int64]rulesetWire)
+	for _, summary := range listed {
+		if !validRulesetSummary(summary) || seen[summary.ID] {
+			return nil, ErrGuardedMergeUnavailable
+		}
+		seen[summary.ID] = true
+		switch summary.Enforcement {
+		case "disabled":
+			continue
+		case "active":
+			// The exact-branch endpoint is the active authority; avoid a
+			// potentially unbounded detail fan-out for unrelated active rules.
+			continue
+		case "enabled", "evaluate":
+			var detail rulesetWire
+			if err := c.json(ctx, &detail, "api", "--hostname", "github.com", "--method", "GET", "repos/"+repoArg(repository)+"/rulesets/"+fmt.Sprint(summary.ID)+"?includes_parents=true"); err != nil || !validRulesetMetadata(detail) || !sameRulesetSummary(summary, detail) {
+				return nil, ErrGuardedMergeUnavailable
+			}
+			// The list API spells active rules "enabled" in its documented
+			// response. Detail is the authority for whether this summary is an
+			// active policy (already covered by the exact-branch endpoint) or
+			// an evaluate policy that needs conservative applicability auditing.
+			switch detail.Enforcement {
+			case "active":
+				if summary.Enforcement == "evaluate" {
+					return nil, ErrGuardedMergeUnavailable
+				}
+				details[summary.ID] = detail
+			case "evaluate":
+				if evaluateRulesetMayApply(detail, baseRef) {
+					return nil, ErrGuardedMergeUnavailable
+				}
+			default:
+				return nil, ErrGuardedMergeUnavailable
+			}
+		default:
+			return nil, ErrGuardedMergeUnavailable
+		}
+	}
+	return details, nil
+}
+
+func validRulesetSummary(value rulesetSummaryWire) bool {
+	if value.ID <= 0 || !bounded(value.Name, 256) || value.Target != "branch" || !bounded(value.Source, 256) || !validRulesetSourceType(value.SourceType) || !bounded(value.NodeID, 512) || value.Links == nil || value.Links.Self == nil || value.Links.HTML == nil || !bounded(value.Links.Self.Href, 4096) || !bounded(value.Links.HTML.Href, 4096) {
+		return false
+	}
+	_, createdErr := time.Parse(time.RFC3339, value.CreatedAt)
+	_, updatedErr := time.Parse(time.RFC3339, value.UpdatedAt)
+	return createdErr == nil && updatedErr == nil
+}
+
+func validRulesetSourceType(value string) bool {
+	return value == "Repository" || value == "Organization" || value == "Enterprise"
+}
+
+func sameRulesetSummary(summary rulesetSummaryWire, detail rulesetWire) bool {
+	return summary.ID == detail.ID && summary.Name == detail.Name && summary.Target == detail.Target && summary.Source == detail.Source && summary.SourceType == detail.SourceType && summary.NodeID == detail.NodeID && summary.CreatedAt == detail.CreatedAt && summary.UpdatedAt == detail.UpdatedAt
+}
+
+// The list endpoint intentionally omits conditions. An evaluate policy is
+// ignored only when its detail names exact different refs; every wildcard,
+// special token, missing condition, or unknown pattern remains potentially
+// applicable and therefore blocks a guarded merge.
+func evaluateRulesetMayApply(detail rulesetWire, baseRef string) bool {
+	if detail.Target != "branch" || detail.Conditions == nil || detail.Conditions.RefName == nil || len(detail.Conditions.RefName.Include) == 0 {
+		return true
+	}
+	for _, exclude := range detail.Conditions.RefName.Exclude {
+		if !validRulesetRefPattern(exclude) {
+			return true
+		}
+	}
+	wanted := "refs/heads/" + baseRef
+	for _, include := range detail.Conditions.RefName.Include {
+		if !validRulesetRefPattern(include) || include == wanted || strings.HasPrefix(include, "~") || strings.ContainsAny(include, "*?[") {
+			return true
+		}
+	}
+	return false
+}
+
+func validRulesetRefPattern(value string) bool {
+	if value == "~ALL" || value == "~DEFAULT_BRANCH" {
+		return true
+	}
+	if !strings.HasPrefix(value, "refs/heads/") {
+		return false
+	}
+	ref := strings.TrimPrefix(value, "refs/heads/")
+	if validRef(ref) {
+		return true
+	}
+	// A GitHub ref glob is inherently potentially applicable. We only need to
+	// distinguish a syntactically plausible glob from malformed wire data.
+	return bounded(ref, 255) && strings.ContainsAny(ref, "*?[") && !strings.HasPrefix(ref, "/") && !strings.HasSuffix(ref, "/") && !strings.Contains(ref, "..") && !strings.ContainsAny(ref, " ~^:\\\r\n")
+}
+
 type appliedRulesetRef struct {
 	ID                 int64
 	SourceType, Source string
 }
 
-func (c Client) rulesetProtection(ctx context.Context, repository contracts.RepositoryIdentity, baseRef, method string, expected appliedRulesetRef) (strictProtectionWitness, error) {
-	var detail rulesetWire
-	if err := c.json(ctx, &detail, "api", "--hostname", "github.com", "--method", "GET", "repos/"+repoArg(repository)+"/rulesets/"+fmt.Sprint(expected.ID)); err != nil || detail.ID != expected.ID || !validRulesetMetadata(detail) {
+func (c Client) rulesetProtection(ctx context.Context, repository contracts.RepositoryIdentity, baseRef, method string, expected appliedRulesetRef, listed rulesetWire, hasListed bool) (strictProtectionWitness, error) {
+	detail := listed
+	if !hasListed {
+		if err := c.json(ctx, &detail, "api", "--hostname", "github.com", "--method", "GET", "repos/"+repoArg(repository)+"/rulesets/"+fmt.Sprint(expected.ID)); err != nil {
+			return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+		}
+	}
+	if detail.ID != expected.ID || !validRulesetMetadata(detail) {
 		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 	}
 	if detail.Target != "branch" || detail.SourceType != expected.SourceType || detail.Source != expected.Source || detail.SourceType != "Repository" || detail.Source != repository.Owner+"/"+repository.Name || detail.Enforcement != "active" || detail.Conditions == nil || detail.Conditions.RefName == nil || len(detail.Conditions.RefName.Include) != 1 || detail.Conditions.RefName.Include[0] != "refs/heads/"+baseRef || len(detail.Conditions.RefName.Exclude) != 0 || detail.BypassActors == nil || len(detail.BypassActors) != 0 || detail.CurrentUserCanBypass != "never" {
@@ -917,7 +1055,7 @@ func (c Client) rulesetProtection(ctx context.Context, repository contracts.Repo
 }
 
 func validRulesetMetadata(value rulesetWire) bool {
-	if value.ID <= 0 || !bounded(value.Name, 256) || !bounded(value.Source, 256) || !bounded(value.SourceType, 64) || !bounded(value.NodeID, 512) || value.Links == nil || value.Links.Self == nil || value.Links.HTML == nil || !bounded(value.Links.Self.Href, 4096) || !bounded(value.Links.HTML.Href, 4096) {
+	if value.ID <= 0 || !bounded(value.Name, 256) || !bounded(value.Source, 256) || !validRulesetSourceType(value.SourceType) || !bounded(value.NodeID, 512) || value.Links == nil || value.Links.Self == nil || value.Links.HTML == nil || !bounded(value.Links.Self.Href, 4096) || !bounded(value.Links.HTML.Href, 4096) {
 		return false
 	}
 	_, createdErr := time.Parse(time.RFC3339, value.CreatedAt)

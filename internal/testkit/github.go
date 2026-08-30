@@ -901,7 +901,15 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 			}
 			return []byte(`{}`), nil
 		}
-		return json.Marshal(snapshot.Rulesets)
+		summaries := make([]map[string]any, 0, len(snapshot.Rulesets))
+		for _, ruleset := range snapshot.Rulesets {
+			enforcement := ruleset.Enforcement
+			if enforcement == "active" {
+				enforcement = "enabled"
+			}
+			summaries = append(summaries, map[string]any{"id": ruleset.ID, "name": ruleset.Name, "target": ruleset.Target, "source_type": ruleset.SourceType, "source": ruleset.Source, "enforcement": enforcement, "node_id": ruleset.NodeID, "_links": ruleset.Links, "created_at": ruleset.CreatedAt, "updated_at": ruleset.UpdatedAt})
+		}
+		return json.Marshal(summaries)
 	}
 	if len(argv) >= 2 && argv[0] == "api" && argv[1] == "--hostname" {
 		if strings.Contains(graphqlQuery(argv), "branchProtectionRule") {
@@ -999,7 +1007,7 @@ func validateOfficialArgv(argv []string) error {
 	switch key {
 	case "api --hostname":
 		// Exact GraphQL lookup or a github.com-pinned active-rules REST lookup.
-		if len(argv) >= 6 && argv[2] == "github.com" && argv[3] == "--method" && argv[4] == "GET" && strings.HasPrefix(argv[5], "repos/") && ((strings.Contains(argv[5], "/rules/branches/") && strings.HasSuffix(argv[5], "?per_page=100&page=1")) || strings.Contains(argv[5], "/rulesets")) {
+		if len(argv) >= 6 && argv[2] == "github.com" && argv[3] == "--method" && argv[4] == "GET" && strings.HasPrefix(argv[5], "repos/") && ((strings.Contains(argv[5], "/rules/branches/") && strings.HasSuffix(argv[5], "?per_page=100&page=1")) || strings.Contains(argv[5], "/rulesets/") || strings.HasSuffix(argv[5], "/rulesets?includes_parents=true&targets=branch&per_page=100&page=1")) {
 			allowed["--method"] = true
 			break
 		}

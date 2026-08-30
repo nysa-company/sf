@@ -1006,7 +1006,7 @@ func TestStrictProtectionRulesetFailsClosedForWeakOrAmbiguousPolicy(t *testing.T
 			t.Fatalf("applicable active organization ruleset accepted: %v", err)
 		}
 	})
-	t.Run("evaluate-organization-ruleset-is-not-enforced", func(t *testing.T) {
+	t.Run("evaluate-organization-ruleset-is-audited", func(t *testing.T) {
 		client, fake, identity := fixture(t)
 		repositoryRule, organizationRule := exactRepositoryRuleset(), exactRepositoryRuleset()
 		organizationRule.ID = 43
@@ -1016,8 +1016,8 @@ func TestStrictProtectionRulesetFailsClosedForWeakOrAmbiguousPolicy(t *testing.T
 		if err := fake.SetRulesetsForTest(repositoryRule, organizationRule); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); err != nil {
-			t.Fatalf("evaluate-only parent blocked exact active witness: %v", err)
+		if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+			t.Fatalf("applicable evaluate parent accepted: %v", err)
 		}
 	})
 	t.Run("inactive-organization-ruleset", func(t *testing.T) {
@@ -1032,6 +1032,71 @@ func TestStrictProtectionRulesetFailsClosedForWeakOrAmbiguousPolicy(t *testing.T
 		}
 		if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); err != nil {
 			t.Fatalf("inactive organization ruleset blocked exact witness: %v", err)
+		}
+	})
+}
+
+func TestEvaluateRulesetSummaryAuditFailsClosed(t *testing.T) {
+	newEvaluateParent := func() testkit.FakeRuleset {
+		ruleset := exactRepositoryRuleset()
+		ruleset.ID, ruleset.SourceType, ruleset.Source, ruleset.Enforcement = 43, "Organization", "example", "evaluate"
+		return ruleset
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*testkit.FakeRuleset)
+		refuse bool
+	}{
+		{"default-branch", func(rule *testkit.FakeRuleset) { rule.Conditions.RefName.Include = []string{"~DEFAULT_BRANCH"} }, true},
+		{"all-branches", func(rule *testkit.FakeRuleset) { rule.Conditions.RefName.Include = []string{"~ALL"} }, true},
+		{"wildcard", func(rule *testkit.FakeRuleset) { rule.Conditions.RefName.Include = []string{"refs/heads/release/*"} }, true},
+		{"unknown-pattern", func(rule *testkit.FakeRuleset) { rule.Conditions.RefName.Include = []string{"refs/tags/v1"} }, true},
+		{"malformed-include", func(rule *testkit.FakeRuleset) { rule.Conditions.RefName.Include = []string{"refs/heads/release "} }, true},
+		{"malformed-exclude", func(rule *testkit.FakeRuleset) { rule.Conditions.RefName.Exclude = []string{"refs/heads/release\r"} }, true},
+		{"unrelated-exact-ref", func(rule *testkit.FakeRuleset) { rule.Conditions.RefName.Include = []string{"refs/heads/release"} }, false},
+		{"disabled", func(rule *testkit.FakeRuleset) { rule.Enforcement = "disabled" }, false},
+		{"unknown-enforcement", func(rule *testkit.FakeRuleset) { rule.Enforcement = "future" }, true},
+		{"unknown-source", func(rule *testkit.FakeRuleset) { rule.SourceType = "Future" }, true},
+		{"non-branch-target", func(rule *testkit.FakeRuleset) { rule.Target = "tag" }, true},
+		{"malformed-summary-metadata", func(rule *testkit.FakeRuleset) { rule.Name = "bad\x00name" }, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, fake, identity := fixture(t)
+			repositoryRule, parent := exactRepositoryRuleset(), newEvaluateParent()
+			test.mutate(&parent)
+			if err := fake.SetRulesetsForTest(repositoryRule, parent); err != nil {
+				t.Fatal(err)
+			}
+			_, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash")
+			if test.refuse && !errors.Is(err, ErrGuardedMergeUnavailable) {
+				t.Fatalf("unsafe evaluate summary accepted: %v", err)
+			}
+			if !test.refuse && err != nil {
+				t.Fatalf("safe evaluate summary refused: %v", err)
+			}
+		})
+	}
+	t.Run("full-page", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		rulesets := make([]testkit.FakeRuleset, 100)
+		for index := range rulesets {
+			rulesets[index] = newEvaluateParent()
+			rulesets[index].ID = int64(index + 1)
+			rulesets[index].Enforcement = "disabled"
+		}
+		if err := fake.SetRulesetsForTest(rulesets...); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+			t.Fatalf("full summary page accepted: %v", err)
+		}
+	})
+	t.Run("unknown-field", func(t *testing.T) {
+		client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), runner: commandRunnerFunc(func(_ context.Context, _ string, _ []string, _ []string) ([]byte, error) {
+			return []byte(`[{"id":42,"name":"exact","target":"branch","source":"example/app","source_type":"Repository","enforcement":"enabled","node_id":"RRS_fake_42","_links":{"self":{"href":"https://api.github.com/repos/example/app/rulesets/42"},"html":{"href":"https://github.com/example/app/rules/42"}},"created_at":"2023-07-15T08:43:03Z","updated_at":"2023-08-23T16:29:47Z","unexpected":true}]`), nil
+		})}
+		if _, err := client.auditEvaluateRulesets(context.Background(), contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, "main"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+			t.Fatalf("unknown summary field accepted: %v", err)
 		}
 	})
 }
@@ -1114,7 +1179,7 @@ func TestRulesetDetailMetadataIsExplicitAndFailClosed(t *testing.T) {
 			}
 			return nil, errors.New("unexpected command")
 		})}
-		if _, err := client.rulesetProtection(context.Background(), contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, "main", "squash", appliedRulesetRef{ID: 42, SourceType: "Repository", Source: "example/app"}); !errors.Is(err, ErrGuardedMergeUnavailable) {
+		if _, err := client.rulesetProtection(context.Background(), contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, "main", "squash", appliedRulesetRef{ID: 42, SourceType: "Repository", Source: "example/app"}, rulesetWire{}, false); !errors.Is(err, ErrGuardedMergeUnavailable) {
 			t.Fatalf("unknown detail field accepted: %v", err)
 		}
 	})
@@ -1318,8 +1383,9 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 	queue := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}
 	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$qualifiedRef:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedRef){branchProtectionRule{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app", "-F", "qualifiedRef=refs/heads/main"}
 	rules := []string{"api", "--hostname", "github.com", "--method", "GET", "repos/example/app/rules/branches/main?per_page=100&page=1"}
+	rulesetAudit := []string{"api", "--hostname", "github.com", "--method", "GET", "repos/example/app/rulesets?includes_parents=true&targets=branch&per_page=100&page=1"}
 	view := []string{"pr", "view", "7", "--repo", "example/app", "--json", prFields}
-	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, queue, protection, rules, view, queue, protection, rules, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, view}
+	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, queue, protection, rules, rulesetAudit, view, queue, protection, rules, rulesetAudit, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, view}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("official merge argv\n got: %#v\nwant: %#v", got, want)
 	}
