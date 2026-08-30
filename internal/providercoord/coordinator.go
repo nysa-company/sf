@@ -2,6 +2,7 @@
 package providercoord
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -205,6 +206,14 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			return Result{Code: NeedsOperator, NeedsOperator: true}
 		}
 	}
+	if key, reusable, reuseErr := c.store.ReuseCurrentCompletedProviderAttempt(ctx, r.Input.Ticket, r.Input.Phase, string(r.Role), r.ExpectedVersion, r.Fence); reuseErr != nil {
+		return Result{Code: NeedsOperator, NeedsOperator: true}
+	} else if reusable {
+		if result, ok := c.reusedResult(ctx, r, key); ok {
+			return result
+		}
+		return Result{Code: NeedsOperator, NeedsOperator: true}
+	}
 	route, ok := c.routes[r.Role]
 	if !ok {
 		return Result{Code: NeedsOperator, NeedsOperator: true}
@@ -247,6 +256,16 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest, Repository: r.Input.Repository, Worktree: r.Input.Worktree, WorktreeIdentity: r.Input.WorktreeIdentity, BaseSHA: r.Input.BaseSHA, SupervisorKey: c.supervisor.PublicKey(), Input: claimInput})
 		if err != nil {
 			cancel()
+			if errors.Is(err, store.ErrProviderAttemptReusable) {
+				key, reusable, reuseErr := c.store.ReuseCurrentCompletedProviderAttempt(ctx, r.Input.Ticket, r.Input.Phase, string(r.Role), r.ExpectedVersion, r.Fence)
+				if reuseErr == nil && reusable {
+					if result, ok := c.reusedResult(ctx, r, key); ok {
+						result.Attempts, result.CostUsed = receipts, spent
+						return result
+					}
+				}
+				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			}
 			if errors.Is(err, store.ErrProviderCapacity) {
 				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
@@ -439,6 +458,30 @@ func (c *Coordinator) RecoverClaim(ctx context.Context, claim store.ProviderAtte
 
 func drainRequest(claim store.ProviderAttemptClaim) contracts.DrainRequest {
 	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, AuthDigest: claim.Binding.AuthDigest, AuthMode: claim.Binding.AuthMode, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA, RequestDigest: claim.RequestDigest}
+}
+
+func (c *Coordinator) reusedResult(ctx context.Context, request Request, key store.ProviderAttemptResultKey) (Result, bool) {
+	result, parsed, err := c.store.LoadCurrentProviderAttemptResult(ctx, key, request.ExpectedVersion, request.Fence)
+	if err != nil || result.Claim.Role != string(request.Role) || !reusedInputMatches(request, result.Claim) {
+		return Result{}, false
+	}
+	canonical, _, err := phaseartifact.CanonicalValidation(request.Validation)
+	if err != nil || !bytes.Equal(canonical, result.Validation) {
+		return Result{}, false
+	}
+	return Result{Code: Completed, ProviderResult: key, Parsed: &parsed}, true
+}
+
+func reusedInputMatches(request Request, claim store.ProviderAttemptClaim) bool {
+	input := request.Input
+	input.Provider, input.AuthMode, input.Attempt = claim.Binding.Identity, claim.Binding.AuthMode, claim.Attempt
+	input.LeaderEpoch, input.RunnerEpoch, input.ExpectedVersion = claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion
+	if claim.Input.Timeout <= 0 || claim.Input.Timeout > input.Timeout {
+		return false
+	}
+	input.Timeout = claim.Input.Timeout
+	_, digest, err := contracts.CanonicalPhaseInput(input)
+	return err == nil && digest == claim.RequestDigest && contracts.PhaseInputDigestMatches(claim.Input, claim.RequestDigest)
 }
 
 // bindClaimToInput is the last coordinator-side authentication point before

@@ -40,7 +40,11 @@ var (
 	ErrReadOnly              = errors.New("store is read-only")
 	ErrProviderCapacity      = errors.New("provider route capacity is exhausted")
 	ErrProviderAttempt       = errors.New("provider attempt cannot be admitted")
-	ErrProviderDrain         = errors.New("provider process has not drained")
+	// ErrProviderAttemptReusable means BeginProviderAttempt found one exact,
+	// immutable completed result under the current admission fence. It carries
+	// no launch authority; callers must reload the key through Store.
+	ErrProviderAttemptReusable = errors.New("provider attempt has a reusable completed result")
+	ErrProviderDrain           = errors.New("provider process has not drained")
 	// ErrProviderRecoveryBlocked means a durable provider row is intentionally
 	// quarantined because its immutable launch authority is invalid. It is
 	// distinct from a normal drained recovery: an operator must resolve it.

@@ -99,7 +99,7 @@ func TestPlanTransitionConsumesNewestSameFencePlannerResult(t *testing.T) {
 		}
 		return claim
 	}
-	p1, p2 := start(), start()
+	p1 := start()
 	_, parsed, err := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: p1.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: p1.Attempt})
 	if err != nil {
 		t.Fatal(err)
@@ -108,10 +108,7 @@ func TestPlanTransitionConsumesNewestSameFencePlannerResult(t *testing.T) {
 	makePlan := func(claim ProviderAttemptClaim) PlanArtifact {
 		return PlanArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Document: PlanDocument{Planner: &plan, ProviderResult: &ProviderAttemptResultKey{AttemptID: claim.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: claim.Attempt}, Acceptance: plan.Acceptance, ProofKind: string(plan.Proof.Kind), Paths: plan.Paths, Commands: plan.Commands, Risks: plan.Risks}}
 	}
-	if _, err := db.RecordPlan(ctx, makePlan(p1)); !errors.Is(err, ErrEvidenceConflict) {
-		t.Fatalf("old planner accepted: %v", err)
-	}
-	if _, err := db.RecordPlan(ctx, makePlan(p2)); err != nil {
+	if _, err := db.RecordPlan(ctx, makePlan(p1)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.TransitionPlan(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); err != nil {
@@ -154,7 +151,6 @@ func TestVerificationAndCandidateTransitionsConsumeNewestSameFenceResult(t *test
 	fence.RunnerEpoch = ticket.RunnerEpoch
 	verify := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: pid.Digest, ProofKind: phaseartifact.ProofAcceptance, OwnedFiles: []string{"internal"}, Command: []string{"go", "test", "./..."}, PrebuildOutcome: "red", EvidenceDigest: sha256Digest([]byte("v"))}
 	verifyRaw, _ := json.Marshal(verify)
-	r1 := launch(domain.PhaseVerification, "reviewer", runtime(reviewer), verifyRaw, phaseartifact.Validation{TicketType: ticket.Type, AcceptanceDigest: pid.Digest})
 	r2 := launch(domain.PhaseVerification, "reviewer", runtime(reviewer), verifyRaw, phaseartifact.Validation{TicketType: ticket.Type, AcceptanceDigest: pid.Digest})
 	intent, _ := workflowprompt.CanonicalVerificationIntentBytes(verify)
 	proofBytes, _ := workflowprompt.CanonicalVerificationProofBytes(verify)
@@ -166,9 +162,6 @@ func TestVerificationAndCandidateTransitionsConsumeNewestSameFenceResult(t *test
 	}
 	vr := func(c ProviderAttemptClaim) VerificationArtifact {
 		return VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proofBytes, OwnedFiles: verify.OwnedFiles, CheckpointID: ck, ProviderResult: &ProviderAttemptResultKey{AttemptID: c.ID, Ref: ticket.Ref, Phase: domain.PhaseVerification, Attempt: c.Attempt}, Checkpoint: CommitObservation{CommitOID: ck, ParentOID: strings.Repeat("a", 40), TreeOID: strings.Repeat("d", 40)}, CommandResult: verifyCommand}
-	}
-	if _, e := db.RecordVerification(ctx, vr(r1)); !errors.Is(e, ErrEvidenceConflict) {
-		t.Fatalf("old reviewer=%v", e)
 	}
 	rev, e := db.RecordVerification(ctx, vr(r2))
 	if e != nil {
@@ -184,9 +177,8 @@ func TestVerificationAndCandidateTransitionsConsumeNewestSameFenceResult(t *test
 		t.Fatal(e)
 	}
 	buildRaw := []byte(`{"schema":"sf.builder/v1","summary":"b","changed_files":["internal/x.go"],"commands":[["go","test"]]}`)
-	b1 := launch(domain.PhaseBuild, "builder", runtime(builder), buildRaw, phaseartifact.Validation{TicketType: ticket.Type})
 	b2 := launch(domain.PhaseBuild, "builder", runtime(builder), buildRaw, phaseartifact.Validation{TicketType: ticket.Type})
-	_, parsed, e := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: b1.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: b1.Attempt})
+	_, parsed, e := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: b2.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: b2.Attempt})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -199,9 +191,6 @@ func TestVerificationAndCandidateTransitionsConsumeNewestSameFenceResult(t *test
 		return CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snap, BuilderResult: ProviderAttemptResultKey{AttemptID: c.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: c.Attempt}, Commit: CommitObservation{CommitOID: snap.HeadSHA, ParentOID: ck, TreeOID: snap.TreeSHA}, Reason: "r", CommandResult: candidateCommand}
 	}
 	before := eventCount(t, db, ctx, ticket.Ref)
-	if _, e = db.RecordCandidate(ctx, ce(b1)); !errors.Is(e, ErrEvidenceConflict) {
-		t.Fatalf("old builder=%v", e)
-	}
 	if _, e = db.RecordCandidate(ctx, ce(b2)); e != nil {
 		t.Fatal(e)
 	}

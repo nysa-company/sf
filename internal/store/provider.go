@@ -350,6 +350,82 @@ func (s *Store) reconcileProviderAttemptInputs(ctx context.Context) error {
 	})
 }
 
+// ReuseCurrentCompletedProviderAttempt atomically observes one exact completed
+// result under the caller's live fence. It is intentionally independent of a
+// provider binding so Coordinator can avoid even adapter Binding/Invocation
+// work when another runner completed between phase read-side checks and launch.
+func (s *Store) ReuseCurrentCompletedProviderAttempt(ctx context.Context, ref domain.TicketRef, phase domain.Phase, role string, expected uint64, fence domain.Fence) (ProviderAttemptResultKey, bool, error) {
+	if ref.Validate() != nil || !validProviderPhase(phase) || !validProviderRole(role) || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return ProviderAttemptResultKey{}, false, ErrProviderAttempt
+	}
+	var key ProviderAttemptResultKey
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		if err := s.assertTicketFence(ctx, conn, ref, expected, fence); err != nil {
+			return err
+		}
+		var ids []struct {
+			id      int64
+			attempt int
+		}
+		rows, err := conn.QueryContext(ctx, `SELECT r.provider_attempt_id,a.attempt FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id AND a.channel=r.channel AND a.project_id=r.project_id AND a.ticket_id=r.ticket_id AND a.phase=r.phase AND a.role=r.role AND a.attempt=r.attempt AND a.leader_epoch=r.leader_epoch AND a.runner_epoch=r.runner_epoch AND a.expected_ticket_version=r.expected_ticket_version JOIN phase_runs p ON p.channel=r.channel AND p.project_id=r.project_id AND p.ticket_id=r.ticket_id AND p.phase=r.phase AND p.attempt=r.attempt AND p.provider=r.provider AND p.model=r.model AND p.family=r.family AND p.provider_version=r.provider_version AND p.leader_epoch=r.leader_epoch AND p.runner_epoch=r.runner_epoch AND p.expected_ticket_version=r.expected_ticket_version AND p.worktree_identity=r.worktree_identity AND p.base_sha=r.base_sha WHERE r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase=? AND r.role=? AND r.expected_ticket_version=? AND r.leader_epoch=? AND r.runner_epoch=? AND a.state='completed' AND a.outcome='completed' AND p.state='completed' AND p.outcome='completed'`, ref.Channel, ref.Project, ref.Ticket, phase, role, expected, fence.LeaderEpoch, fence.RunnerEpoch)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var v struct {
+				id      int64
+				attempt int
+			}
+			if err := rows.Scan(&v.id, &v.attempt); err != nil {
+				return err
+			}
+			ids = append(ids, v)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(ids) > 1 {
+			return ErrEvidenceConflict
+		}
+		if len(ids) == 1 {
+			key = ProviderAttemptResultKey{AttemptID: ids[0].id, Ref: ref, Phase: phase, Attempt: ids[0].attempt}
+		}
+		return nil
+	})
+	if err != nil {
+		return ProviderAttemptResultKey{}, false, err
+	}
+	return key, key.AttemptID != 0, nil
+}
+
+func (s *Store) reuseCurrentCompletedProviderAttempt(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, phase domain.Phase, role string, expected uint64, fence domain.Fence) (ProviderAttemptResultKey, bool, error) {
+	var id int64
+	var attempt int
+	rows, err := conn.QueryContext(ctx, `SELECT r.provider_attempt_id,a.attempt FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id AND a.channel=r.channel AND a.project_id=r.project_id AND a.ticket_id=r.ticket_id AND a.phase=r.phase AND a.role=r.role AND a.attempt=r.attempt AND a.leader_epoch=r.leader_epoch AND a.runner_epoch=r.runner_epoch AND a.expected_ticket_version=r.expected_ticket_version JOIN phase_runs p ON p.channel=r.channel AND p.project_id=r.project_id AND p.ticket_id=r.ticket_id AND p.phase=r.phase AND p.attempt=r.attempt AND p.provider=r.provider AND p.model=r.model AND p.family=r.family AND p.provider_version=r.provider_version AND p.leader_epoch=r.leader_epoch AND p.runner_epoch=r.runner_epoch AND p.expected_ticket_version=r.expected_ticket_version AND p.worktree_identity=r.worktree_identity AND p.base_sha=r.base_sha WHERE r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase=? AND r.role=? AND r.expected_ticket_version=? AND r.leader_epoch=? AND r.runner_epoch=? AND a.state='completed' AND a.outcome='completed' AND p.state='completed' AND p.outcome='completed'`, ref.Channel, ref.Project, ref.Ticket, phase, role, expected, fence.LeaderEpoch, fence.RunnerEpoch)
+	if err != nil {
+		return ProviderAttemptResultKey{}, false, err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(&id, &attempt); err != nil {
+			return ProviderAttemptResultKey{}, false, err
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return ProviderAttemptResultKey{}, false, err
+	}
+	if count > 1 {
+		return ProviderAttemptResultKey{}, false, ErrEvidenceConflict
+	}
+	if count == 0 {
+		return ProviderAttemptResultKey{}, false, nil
+	}
+	return ProviderAttemptResultKey{AttemptID: id, Ref: ref, Phase: phase, Attempt: attempt}, true, nil
+}
+
 func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptRequest) (ProviderAttemptClaim, error) {
 	if r.Ref.Validate() != nil || !validProviderPhase(r.Phase) || !validProviderRole(r.Role) || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.Capacity < 1 || r.Capacity > 16 || r.At.IsZero() || !validRuntimeBinding(r.Binding) || !validProviderAttemptInput(r) {
 		return ProviderAttemptClaim{}, ErrProviderAttempt
@@ -382,6 +458,11 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		if projectPath != r.Repository || durablePath != r.Worktree || durableIdentity != r.WorktreeIdentity || durableBase != r.BaseSHA {
 			return ErrEvidenceConflict
 		}
+		if _, reusable, reuseErr := s.reuseCurrentCompletedProviderAttempt(ctx, conn, r.Ref, r.Phase, r.Role, r.ExpectedVersion, r.Fence); reuseErr != nil {
+			return reuseErr
+		} else if reusable {
+			return ErrProviderAttemptReusable
+		}
 		// Provider admission is one side of the repository writer exclusion.
 		// It is checked in this same IMMEDIATE transaction as the eventual
 		// provider-attempt insert, so a Git writer cannot
@@ -394,8 +475,12 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 			return ErrProviderAttempt
 		}
 		var activeCommandWriter int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE repository_path=? AND state IN ('active','quarantined')`, r.Repository).Scan(&activeCommandWriter); err != nil { return err }
-		if activeCommandWriter != 0 { return ErrProviderAttempt }
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE repository_path=? AND state IN ('active','quarantined')`, r.Repository).Scan(&activeCommandWriter); err != nil {
+			return err
+		}
+		if activeCommandWriter != 0 {
+			return ErrProviderAttempt
+		}
 		if r.Phase == domain.PhaseReview && r.Role == "reviewer" {
 			if err := validateFinalReviewEvidence(ctx, conn, r.Ref, r.ExpectedVersion, r.Fence, r.ExpectedHead, r.ExpectedProof); err != nil {
 				return err
