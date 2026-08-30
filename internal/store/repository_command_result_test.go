@@ -239,6 +239,16 @@ func TestRepositoryCommandUncertainAndStalePathsNeverMintResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A canceled supervisor run is still observed and drained. It must become
+	// uncertainty without a terminal result, while releasing this exact lease.
+	pid := int(atomic.AddInt64(&repositoryCommandTestPID, 1))
+	launch := contracts.RepositoryCommandLaunch{PID: pid, PGID: pid, BootIdentity: "boot", ProcessStartIdentity: "canceled"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.MarkRepositoryCommandUncertain(ctx, claim, "process identity unavailable"); err != nil {
 		t.Fatal(err)
 	}
@@ -248,6 +258,9 @@ func TestRepositoryCommandUncertainAndStalePathsNeverMintResult(t *testing.T) {
 	var n int
 	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_results WHERE semantic_key=?`, claim.SemanticKey).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("uncertain result rows=%d err=%v", n, err)
+	}
+	if _, err := db.LoadRepositoryCommandResult(ctx, contracts.RepositoryCommandResultKey{SemanticKey: claim.SemanticKey, ClaimEpoch: claim.ClaimEpoch}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("uncertain command result became loadable evidence: %v", err)
 	}
 	if err := lease.Release(); err != nil {
 		t.Fatal(err)

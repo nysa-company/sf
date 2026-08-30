@@ -18,6 +18,47 @@ func (neverAuthority) AcquireRepositoryCommand(context.Context, contracts.Reposi
 	return nil, errors.New("must not acquire")
 }
 
+type cancellationLease struct {
+	released    bool
+	quarantined bool
+}
+
+func (l *cancellationLease) Check(context.Context) error { return nil }
+func (l *cancellationLease) Release() error {
+	l.released = true
+	return nil
+}
+func (l *cancellationLease) RecordRepositoryCommandLaunch(context.Context, contracts.RepositoryCommandLaunch) error {
+	return nil
+}
+func (l *cancellationLease) FinishRepositoryCommandLaunch(context.Context, contracts.RepositoryCommandLaunch) error {
+	return nil
+}
+func (l *cancellationLease) Quarantine() error {
+	l.quarantined = true
+	return nil
+}
+
+type cancellationAuthority struct {
+	completeCalls  int
+	uncertainCalls int
+}
+
+func (a *cancellationAuthority) AcquireRepositoryCommand(context.Context, contracts.RepositoryCommandClaim) (contracts.RepositoryCommandLease, error) {
+	return nil, errors.New("not used")
+}
+func (a *cancellationAuthority) CompleteRepositoryCommand(context.Context, contracts.RepositoryCommandClaim, contracts.CommandResult) error {
+	a.completeCalls++
+	return nil
+}
+func (a *cancellationAuthority) MarkRepositoryCommandUncertain(context.Context, contracts.RepositoryCommandClaim, string) error {
+	a.uncertainCalls++
+	return nil
+}
+func (a *cancellationAuthority) ReconcileStaleRepositoryCommandObservation(context.Context, contracts.RepositoryCommandClaim, contracts.CommandResult) error {
+	return nil
+}
+
 func TestCommandDigestAndSpecDigestChangeOnEveryLaunchInput(t *testing.T) {
 	p, err := executionpolicy.NewCommandSnapshot([]string{"go", "test", "./..."})
 	if err != nil {
@@ -61,5 +102,27 @@ func TestNPMRecipeNeverAcquiresRepositoryLease(t *testing.T) {
 	}
 	if err := (processsupervisor.RepositoryCommandSupervisor{}).Preflight(contracts.CommandSpec{Argv: []string{"npm", "test"}, Profile: contracts.ProfileGuarded}); err == nil {
 		t.Fatal("npm preflight was executable")
+	}
+}
+
+func TestCanceledObservedCommandNeverCompletesRepositoryEvidence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !repositoryCommandCanceled(ctx, nil) || !repositoryCommandCanceled(context.Background(), context.DeadlineExceeded) {
+		t.Fatal("cancellation/deadline was not recognized")
+	}
+	authority := &cancellationAuthority{}
+	lease := &cancellationLease{}
+	claim := contracts.RepositoryCommandClaim{SemanticKey: "canceled-observed"}
+	if err := markCanceledRepositoryCommand(authority, lease, claim); err != nil {
+		t.Fatal(err)
+	}
+	if authority.completeCalls != 0 || authority.uncertainCalls != 1 || !lease.released || lease.quarantined {
+		t.Fatalf("canceled observed command completion=%d uncertainty=%d released=%v quarantined=%v", authority.completeCalls, authority.uncertainCalls, lease.released, lease.quarantined)
+	}
+	// A nonzero, observed completion on a live fence remains ordinary durable
+	// evidence; only cancellation/deadline diverts to uncertainty.
+	if repositoryCommandCanceled(context.Background(), errors.New("exit status 1")) {
+		t.Fatal("ordinary nonzero exit was treated as cancellation")
 	}
 }

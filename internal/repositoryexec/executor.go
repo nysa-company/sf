@@ -107,6 +107,20 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 		return contracts.CommandResult{}, err
 	}
 	result, runErr := e.Supervisor.Run(ctx, req.Claim, req.Spec, req.Policy, lease)
+	// A cancellation/deadline is control-plane authority, not command evidence.
+	// The supervisor may have reaped the child and therefore return an observed
+	// non-zero result, but recording it would let cancellation masquerade as a
+	// provider-declared red verification result. Persist uncertainty instead and
+	// release the already-drained exact lease so control recovery is not wedged.
+	if repositoryCommandCanceled(ctx, runErr) {
+		if err := markCanceledRepositoryCommand(e.Authority, lease, req.Claim); err != nil {
+			return result, err
+		}
+		if runErr != nil {
+			return result, runErr
+		}
+		return result, ctx.Err()
+	}
 	// Once a lease is acquired, an unobserved result is always uncertain. Do
 	// not infer success from CommandResult's zero-valued exit code.
 	if !result.Observed {
@@ -162,6 +176,30 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 		return result, releaseErr
 	}
 	return result, runErr
+}
+
+func repositoryCommandCanceled(ctx context.Context, runErr error) bool {
+	return ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
+}
+
+func markCanceledRepositoryCommand(authority contracts.RepositoryCommandAuthority, lease contracts.RepositoryCommandLease, claim contracts.RepositoryCommandClaim) error {
+	recorder, ok := authority.(contracts.RepositoryCommandResultRecorder)
+	if !ok {
+		_ = lease.Quarantine()
+		return ErrInvalidBinding
+	}
+	persistCtx, cancel := repositoryPersistenceContext()
+	err := recorder.MarkRepositoryCommandUncertain(persistCtx, claim, "repository command canceled before durable completion")
+	cancel()
+	if err != nil {
+		_ = lease.Quarantine()
+		return fmt.Errorf("persist repository cancellation uncertainty: %w", err)
+	}
+	if err := lease.Release(); err != nil {
+		_ = lease.Quarantine()
+		return err
+	}
+	return nil
 }
 
 // repositoryPersistenceContext intentionally does not inherit caller
