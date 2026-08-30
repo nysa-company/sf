@@ -89,6 +89,14 @@ rejection, and logs still fail closed with `not_ready` until their complete
 worktree/effect evidence is wired; listing a command above is the stable CLI
 surface, not a claim that its lifecycle is already enabled.
 
+Single-ticket `status` and `show` authenticate durable plan, verification,
+candidate, worktree, phase-attempt, and operator-decision checkpoints before
+displaying their bounded metadata. They include the socket-authenticated
+operator and current runner epoch. Raw provider transcripts, proof bodies,
+credential material, and worktree identity bytes are never returned; corrupt
+evidence fails closed as `evidence_conflict` instead of disappearing from the
+view.
+
 ## Operator identity
 
 The daemon authenticates the socket peer. An omitted operator is resolved by

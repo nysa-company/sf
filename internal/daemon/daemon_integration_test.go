@@ -354,6 +354,63 @@ func TestDaemonControlPreconditionFailureReportsNoMutation(t *testing.T) {
 	}
 }
 
+func TestDaemonShowAndStatusExposeBoundedAuthenticatedEvidence(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-evidence-view")
+	digest, err := d.store.RecordPlan(context.Background(), store.PlanArtifact{
+		Ref: started.Ref, ExpectedVersion: started.Version,
+		Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch},
+		Document: store.PlanDocument{
+			Acceptance: []string{"a durable result exists"}, ProofKind: "regression",
+			Paths: []string{"internal/example.go"}, Commands: []string{"go test ./..."}, Risks: []string{"stale state"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	show := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{
+		Version: api.Version, RequestID: "show-evidence", Method: "ticket.show", Ticket: string(started.Ref.Ticket),
+		OperatorLabel: "operator", Parameters: json.RawMessage(`{"channel":"stable","project":"demo","ticket":"SF-evidence-view"}`),
+	})
+	if !show.OK || !strings.Contains(string(show.Data), `"digest":"`+digest+`"`) || !strings.Contains(string(show.Data), `"proof_kind":"regression"`) || !strings.Contains(string(show.Data), `"operator":{"label":"operator"`) || strings.Contains(string(show.Data), "identity_json") {
+		t.Fatalf("show=%+v data=%s", show, show.Data)
+	}
+	status := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{
+		Version: api.Version, RequestID: "status-evidence", Method: "ticket.status", Ticket: string(started.Ref.Ticket),
+		OperatorLabel: "operator", Parameters: json.RawMessage(`{"channel":"stable","project":"","watch":false}`),
+	})
+	if !status.OK || !strings.Contains(string(status.Data), `"runner_epoch":`) || !strings.Contains(string(status.Data), `"phase_attempts":[]`) || !strings.Contains(string(status.Data), `"merge_mode":"guarded"`) {
+		t.Fatalf("status=%+v data=%s", status, status.Data)
+	}
+}
+
+func TestDaemonRefusesToHideCorruptDurableEvidence(t *testing.T) {
+	d, paths, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-evidence-conflict")
+	if _, err := d.store.RecordPlan(context.Background(), store.PlanArtifact{
+		Ref: started.Ref, ExpectedVersion: started.Version,
+		Fence:    domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch},
+		Document: store.PlanDocument{Acceptance: []string{"one"}, ProofKind: "focused", Paths: []string{"x.go"}, Commands: []string{"go test ./..."}, Risks: []string{"one"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.ExecContext(context.Background(), `UPDATE plans SET artifact_bytes='{}' WHERE channel='stable' AND project_id='demo' AND ticket_id='SF-evidence-conflict'`); err != nil {
+		t.Fatal(err)
+	}
+	response := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{
+		Version: api.Version, RequestID: "show-conflict", Method: "ticket.show", Ticket: string(started.Ref.Ticket),
+		OperatorLabel: "operator", Parameters: json.RawMessage(`{"channel":"stable","project":"demo","ticket":"SF-evidence-conflict"}`),
+	})
+	if response.OK || response.Error == nil || response.Error.Code != "evidence_conflict" || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != "sf doctor" {
+		t.Fatalf("corrupt evidence response=%+v", response)
+	}
+}
+
 func TestSubmitRejectsUnregisteredProjectBeforeTicketPersistence(t *testing.T) {
 	for _, channel := range []domain.Channel{domain.ChannelStable, domain.ChannelDev} {
 		t.Run(string(channel), func(t *testing.T) {

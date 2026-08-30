@@ -301,9 +301,9 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 	case "ticket.submit":
 		response = daemon.submit(ctx, request, identity)
 	case "ticket.status":
-		response = daemon.statusTickets(ctx, request)
+		response = daemon.statusTickets(ctx, request, identity)
 	case "ticket.show":
-		response = daemon.show(ctx, request)
+		response = daemon.show(ctx, request, identity)
 	case "ticket.start":
 		response = daemon.startTicket(ctx, request, identity)
 	case "ticket.pause":
@@ -311,7 +311,7 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 	case "ticket.cancel":
 		response = daemon.controlTicket(ctx, request, identity, "cancel")
 	case "daemon.status":
-		response = daemon.status(request)
+		response = daemon.status(request, identity)
 	default:
 		response = daemon.failure(request, "not_ready", "this lifecycle operation is not enabled by the local daemon yet", false)
 	}
@@ -402,7 +402,7 @@ type ticketParameters struct {
 	Channel domain.Channel `json:"channel"`
 }
 
-func (daemon *Daemon) show(ctx context.Context, request api.Request) api.Response {
+func (daemon *Daemon) show(ctx context.Context, request api.Request, identity domain.OperatorIdentity) api.Response {
 	ref, response := daemon.ticketRef(ctx, request)
 	if response != nil {
 		return *response
@@ -411,7 +411,14 @@ func (daemon *Daemon) show(ctx context.Context, request api.Request) api.Respons
 	if err != nil {
 		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
 	}
-	return daemon.success(request, api.Mutation{}, ticketDetail(stored))
+	view := ticketDetail(stored)
+	evidence, err := daemon.evidenceView(ctx, stored.Ref)
+	if err != nil {
+		return daemon.failure(request, evidenceErrorCode(err), "durable workflow evidence could not be authenticated", errors.Is(err, store.ErrBusy))
+	}
+	view["evidence"] = evidence
+	view["operator"] = operatorView(identity)
+	return daemon.success(request, api.Mutation{}, view)
 }
 
 func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ domain.OperatorIdentity) api.Response {
@@ -674,7 +681,7 @@ func (daemon *Daemon) ticketRef(ctx context.Context, request api.Request) (domai
 	return ref, nil
 }
 
-func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request) api.Response {
+func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, identity domain.OperatorIdentity) api.Response {
 	var parameters struct {
 		Project string         `json:"project"`
 		Watch   bool           `json:"watch"`
@@ -684,15 +691,28 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request) ap
 		return daemon.failure(request, "wrong_channel", "status requires the daemon channel", false)
 	}
 	if request.Ticket != "" {
-		ref, response := daemon.ticketRef(ctx, request)
-		if response != nil {
-			return *response
+		var ref domain.TicketRef
+		if parameters.Project == "" {
+			stored, err := daemon.store.TicketByID(ctx, daemon.channel, domain.TicketID(request.Ticket))
+			if err != nil {
+				return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+			}
+			ref = stored.Ref
+		} else {
+			ref = domain.TicketRef{Channel: daemon.channel, Project: domain.ProjectID(parameters.Project), Ticket: domain.TicketID(request.Ticket)}
+			if err := ref.Validate(); err != nil {
+				return daemon.failure(request, "invalid_ticket_reference", "project and ticket are required", false)
+			}
 		}
 		stored, err := daemon.store.Ticket(ctx, ref)
 		if err != nil {
 			return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
 		}
-		return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "current_version": stored.Version, "ticket": ticketView(stored)})
+		evidence, err := daemon.evidenceView(ctx, stored.Ref)
+		if err != nil {
+			return daemon.failure(request, evidenceErrorCode(err), "durable workflow evidence could not be authenticated", errors.Is(err, store.ErrBusy))
+		}
+		return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "current_version": stored.Version, "operator": operatorView(identity), "ticket": ticketView(stored), "evidence": evidence})
 	}
 	items, err := daemon.store.Tickets(ctx, daemon.channel, domain.ProjectID(parameters.Project), 1000)
 	if err != nil {
@@ -702,14 +722,14 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request) ap
 	for _, item := range items {
 		views = append(views, ticketView(item))
 	}
-	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "leader_epoch": daemon.epoch, "tickets": views})
+	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "leader_epoch": daemon.epoch, "operator": operatorView(identity), "tickets": views})
 }
 
-func (daemon *Daemon) status(request api.Request) api.Response {
+func (daemon *Daemon) status(request api.Request, identity domain.OperatorIdentity) api.Response {
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
 	}
-	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "leader_epoch": daemon.epoch, "socket_ready": true, "event_projection_ready": !daemon.eventProjectionPending()})
+	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "leader_epoch": daemon.epoch, "operator": operatorView(identity), "socket_ready": true, "event_projection_ready": !daemon.eventProjectionPending()})
 }
 
 func (daemon *Daemon) success(request api.Request, mutation api.Mutation, value any) api.Response {
@@ -767,7 +787,11 @@ func (daemon *Daemon) executable() string {
 }
 
 func ticketView(value store.Ticket) map[string]any {
-	return map[string]any{"channel": value.Ref.Channel, "project": value.Ref.Project, "ticket": value.Ref.Ticket, "state": value.State, "version": value.Version, "merge_mode": value.MergeMode, "created_at": value.CreatedAt.UTC().Format(time.RFC3339Nano)}
+	return map[string]any{"channel": value.Ref.Channel, "project": value.Ref.Project, "ticket": value.Ref.Ticket, "state": value.State, "resume_state": value.ResumeState, "version": value.Version, "runner_epoch": value.RunnerEpoch, "merge_mode": value.MergeMode, "blocked_code": value.BlockedCode, "created_at": value.CreatedAt.UTC().Format(time.RFC3339Nano)}
+}
+
+func operatorView(identity domain.OperatorIdentity) map[string]any {
+	return map[string]any{"uid": identity.UID, "username": identity.Username, "label": identity.Label}
 }
 
 func ticketDetail(value store.Ticket) map[string]any {
