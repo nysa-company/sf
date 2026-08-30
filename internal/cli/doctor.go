@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/nysa-company/sf/internal/api"
 	localauth "github.com/nysa-company/sf/internal/auth"
@@ -17,6 +18,7 @@ import (
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/redact"
 	"github.com/nysa-company/sf/internal/store"
+	"github.com/nysa-company/sf/internal/transport"
 )
 
 const doctorSchema = "sf.doctor/v1"
@@ -79,6 +81,10 @@ type DoctorDeps struct {
 	AuthStatus func(context.Context) []localauth.Status
 	Pair       func(context.Context, domain.Channel) (store.ProviderPair, error)
 	Attempts   func(context.Context, domain.Channel) ([]store.ProviderAttempt, error)
+	// DaemonStatus is an optional read-only protocol handshake. It is called
+	// only when the socket passed the filesystem checks, so a fresh install
+	// remains usable without a running daemon.
+	DaemonStatus func(context.Context, config.ChannelPaths) error
 }
 
 func (deps DoctorDeps) defaults() DoctorDeps {
@@ -145,6 +151,26 @@ func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
 		defer database.Close()
 		return database.ActiveProviderAttempts(ctx, selected)
 	}
+	deps.DaemonStatus = func(ctx context.Context, paths config.ChannelPaths) error {
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		response, err := transport.Call(probeCtx, paths.Socket, api.Request{
+			Version: api.Version, RequestID: requestID(), Method: "daemon.status", Parameters: json.RawMessage(`{}`),
+		})
+		if err != nil {
+			return err
+		}
+		if !response.OK || response.Version != api.Version {
+			return errors.New("daemon did not complete a compatible status handshake")
+		}
+		var value struct {
+			Channel domain.Channel `json:"channel"`
+		}
+		if err := json.Unmarshal(response.Data, &value); err != nil || value.Channel != deps.Channel {
+			return errors.New("daemon channel identity does not match")
+		}
+		return nil
+	}
 	return deps
 }
 
@@ -162,7 +188,15 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	}
 
 	report.Checks = append(report.Checks, checkRoot(deps))
-	report.Checks = append(report.Checks, checkSocket(deps))
+	socketCheck := checkSocket(deps)
+	report.Checks = append(report.Checks, socketCheck)
+	if socketCheck.Status == CheckPass && deps.DaemonStatus != nil {
+		if err := deps.DaemonStatus(ctx, deps.Paths); err != nil {
+			report.Checks = append(report.Checks, failedCheck("daemon_status", "daemon socket did not complete a compatible status handshake", deps.Binary, "doctor"))
+		} else {
+			report.Checks = append(report.Checks, DoctorCheck{ID: "daemon_status", Status: CheckPass, Summary: "running daemon completed a compatible status handshake"})
+		}
+	}
 	report.Checks = append(report.Checks, checkDisk(deps))
 	report.Checks = append(report.Checks, checkExecutable(deps, "git", "Git executable is available"))
 	if deps.Repo == "" {

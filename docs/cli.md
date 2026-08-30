@@ -17,7 +17,7 @@ sf pause <ticket> --operator <identity>
 sf resume <ticket> --operator <identity>
 sf recover <ticket> [--mode guarded] [--operator <identity>]
 sf cancel <ticket> --operator <identity>
-sf retry <ticket>
+sf retry <ticket> [--operator <identity>]
 sf take <ticket> --operator <identity>
 sf approve <ticket> --operator <identity>
 sf reject <ticket> --operator <identity> --reason <text>
@@ -85,15 +85,22 @@ observability while the trusted incremental subscription charge is zero.
 example, `sf-dev daemon run`). Its socket-backed lifecycle commands use the
 channel-specific owner-only socket.
 
-The current foreground daemon implements `submit`, `start`, `status`, `show`,
+The public Cobra surface includes every primary verb above, but the foreground
+daemon currently enables only `submit`, `start`, `status`, `show`, `logs`,
 `pause`, and `cancel`. Pause and cancel first commit the authenticated control
 intent and invalidate the runner fence, then wait for the injected runtime to
 prove writers drained; cancellation also observes external merge state before
 and after that drain. Capacity is released only with the final durable
 `paused`/`cancelled` transition. `take`, `resume`, `recover`, `retry`, approval,
-rejection, and logs still fail closed with `not_ready` until their complete
-worktree/effect evidence is wired; listing a command above is the stable CLI
-surface, not a claim that its lifecycle is already enabled.
+and rejection fail closed with `not_ready` until their complete worktree/effect
+evidence and workflow handlers are wired. Listing a command is therefore the
+stable CLI surface, not a claim that its lifecycle backend is enabled.
+
+`status` and `show` expose durable ticket/evidence metadata. Human output uses
+product labels when those fields are present; `--json` remains the versioned
+response envelope. `logs` reads bounded redacted durable events and `--follow`
+polls with an event cursor. Provider transcripts and credentials are never
+returned by the logs API.
 
 Single-ticket `status` and `show` authenticate durable plan, verification,
 candidate, worktree, phase-attempt, and operator-decision checkpoints before

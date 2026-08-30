@@ -265,3 +265,147 @@ func TestSetupFlagsAreRequired(t *testing.T) {
 		}
 	}
 }
+
+func TestLifecycleVerbsForwardTheirMethodsChannelAndOperator(t *testing.T) {
+	ticketPath := filepath.Join(t.TempDir(), "ticket.md")
+	if err := os.WriteFile(ticketPath, []byte("# Test ticket\n\nProblem text.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		args   []string
+		method string
+		ticket string
+	}{
+		{name: "submit", args: []string{"submit", ticketPath, "--project", "demo"}, method: "ticket.submit"},
+		{name: "start", args: []string{"start", "SF-1"}, method: "ticket.start", ticket: "SF-1"},
+		{name: "status", args: []string{"status", "SF-1"}, method: "ticket.status", ticket: "SF-1"},
+		{name: "show", args: []string{"show", "SF-1"}, method: "ticket.show", ticket: "SF-1"},
+		{name: "logs", args: []string{"logs", "SF-1", "--phase", "build"}, method: "ticket.logs", ticket: "SF-1"},
+		{name: "pause", args: []string{"pause", "SF-1", "--operator", "sofia"}, method: "ticket.pause", ticket: "SF-1"},
+		{name: "resume", args: []string{"resume", "SF-1", "--operator", "sofia"}, method: "ticket.resume", ticket: "SF-1"},
+		{name: "recover", args: []string{"recover", "SF-1", "--mode", "guarded", "--operator", "sofia"}, method: "ticket.recover", ticket: "SF-1"},
+		{name: "cancel", args: []string{"cancel", "SF-1", "--operator", "sofia"}, method: "ticket.cancel", ticket: "SF-1"},
+		{name: "retry", args: []string{"retry", "SF-1", "--operator", "sofia"}, method: "ticket.retry", ticket: "SF-1"},
+		{name: "take", args: []string{"take", "SF-1", "--operator", "sofia"}, method: "ticket.take", ticket: "SF-1"},
+		{name: "approve", args: []string{"approve", "SF-1", "--operator", "sofia"}, method: "ticket.approve", ticket: "SF-1"},
+		{name: "reject", args: []string{"reject", "SF-1", "--operator", "sofia", "--reason", "needs tests"}, method: "ticket.reject", ticket: "SF-1"},
+		{name: "providers qualify", args: []string{"providers", "qualify", "--builder", "cursor", "--reviewer", "claude"}, method: "provider.qualify"},
+		{name: "daemon status", args: []string{"daemon", "status"}, method: "daemon.status"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var got api.Request
+			client := fakeClient(func(_ context.Context, request api.Request) (api.Response, error) {
+				got = request
+				return responseOK(), nil
+			})
+			if code := Execute(context.Background(), test.args, &bytes.Buffer{}, &bytes.Buffer{}, client); code != 0 {
+				t.Fatalf("exit=%d", code)
+			}
+			if got.Method != test.method || got.Ticket != test.ticket {
+				t.Fatalf("request=%+v", got)
+			}
+			var parameters map[string]any
+			if err := json.Unmarshal(got.Parameters, &parameters); err != nil {
+				t.Fatal(err)
+			}
+			if parameters["channel"] != string(domain.ChannelStable) {
+				t.Fatalf("channel=%v parameters=%s", parameters["channel"], got.Parameters)
+			}
+			operatorCommands := map[string]bool{"pause": true, "resume": true, "recover": true, "cancel": true, "retry": true, "take": true, "approve": true, "reject": true}
+			if operatorCommands[test.name] && parameters["operator"] != "sofia" {
+				t.Fatalf("operator=%v parameters=%s", parameters["operator"], got.Parameters)
+			}
+			if test.name == "reject" && parameters["reason"] != "needs tests" {
+				t.Fatalf("reason=%v", parameters["reason"])
+			}
+			if test.name == "providers qualify" && (parameters["builder"] != "cursor" || parameters["reviewer"] != "claude") {
+				t.Fatalf("provider parameters=%v", parameters)
+			}
+		})
+	}
+}
+
+func TestRetryTooLongReasonNeverSuggestsPlaceholder(t *testing.T) {
+	// Keep a long value on reject's local validation path to ensure its action
+	// remains an executable command rather than a substitution template.
+	var output bytes.Buffer
+	if code := Execute(context.Background(), []string{"reject", "SF-1", "--reason", strings.Repeat("x", 4097)}, &output, &bytes.Buffer{}, nil); code != int(ExitInput) {
+		t.Fatalf("exit=%d output=%q", code, output.String())
+	}
+	if strings.Contains(output.String(), "<short-reason>") || !strings.Contains(output.String(), "Next: "+binaryName()+" reject --help") {
+		t.Fatalf("output=%q", output.String())
+	}
+}
+
+func TestHumanRendererProjectsKnownTicketAndLogShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want []string
+	}{
+		{name: "ticket", data: `{"channel":"dev","project":"nysa","ticket":"SF-1","state":"waiting_approval","merge_mode":"guarded"}`, want: []string{"SF-1", "Channel: dev", "State: waiting_approval", "Merge mode: guarded"}},
+		{name: "detail", data: `{"channel":"stable","project":"nysa","ticket":"SF-2","state":"done","title":"Fix reminders","problem":"A bounded problem.","acceptance":["one"]}`, want: []string{"SF-2  Fix reminders", "Problem: A bounded problem.", "Acceptance: 1 item(s)"}},
+		{name: "logs", data: `{"channel":"dev","ticket":"SF-3","events":[{"id":4,"from":"planning","to":"verifying"}]}`, want: []string{"Logs: SF-3", "#4 planning -> verifying"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := api.Response{Version: api.Version, RequestID: "human", OK: true, Data: json.RawMessage(test.data)}
+			var output bytes.Buffer
+			if err := Render(&output, response, false); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(output.String(), want) {
+					t.Fatalf("output=%q missing %q", output.String(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestJSONRenderingIsUnchangedForAdditiveData(t *testing.T) {
+	response := api.Response{Version: api.Version, RequestID: "json", OK: true, Data: json.RawMessage(`{"channel":"dev","ticket":"SF-1","new_field":{"opaque":true}}`)}
+	var output bytes.Buffer
+	if err := Render(&output, response, true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"new_field":{"opaque":true}`) {
+		t.Fatalf("json=%q", output.String())
+	}
+}
+
+func TestUnknownCommandAndDaemonUnavailableHaveStableActions(t *testing.T) {
+	var output, errOutput bytes.Buffer
+	if code := Execute(context.Background(), []string{"wat"}, &output, &errOutput, nil); code != int(ExitInput) || !strings.Contains(errOutput.String(), "Error: invalid_command:") || !strings.Contains(errOutput.String(), "Next: "+binaryName()+" --help") {
+		t.Fatalf("unknown code=%d stdout=%q stderr=%q", code, output.String(), errOutput.String())
+	}
+	output.Reset()
+	if code := Execute(context.Background(), []string{"status", "SF-1"}, &output, &bytes.Buffer{}, nil); code != int(ExitWait) || !strings.Contains(output.String(), "Next: "+binaryName()+" daemon run") {
+		t.Fatalf("daemon code=%d output=%q", code, output.String())
+	}
+}
+
+func TestHelpAndUnknownCommandUseStableOutputContracts(t *testing.T) {
+	var help, helpErr bytes.Buffer
+	if code := Execute(context.Background(), []string{"--help"}, &help, &helpErr, nil); code != int(ExitOK) {
+		t.Fatalf("help exit=%d stdout=%q stderr=%q", code, help.String(), helpErr.String())
+	}
+	for _, verb := range []string{"submit", "status", "show", "logs", "retry", "doctor"} {
+		if !strings.Contains(help.String(), verb) {
+			t.Errorf("help missing %q: %s", verb, help.String())
+		}
+	}
+	var unknownJSON, unknownErr bytes.Buffer
+	if code := Execute(context.Background(), []string{"unknown", "--json"}, &unknownJSON, &unknownErr, nil); code != int(ExitInput) {
+		t.Fatalf("unknown exit=%d stdout=%q stderr=%q", code, unknownJSON.String(), unknownErr.String())
+	}
+	var response api.Response
+	if err := json.Unmarshal(unknownErr.Bytes(), &response); err != nil {
+		t.Fatalf("unknown response=%q err=%v", unknownErr.String(), err)
+	}
+	if response.Error == nil || response.Error.Code != "invalid_command" || response.NextAction == nil || len(response.NextAction.Argv) == 0 {
+		t.Fatalf("unknown response=%+v", response)
+	}
+}

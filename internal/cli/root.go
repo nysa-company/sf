@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,8 @@ func (a *app) command() *cobra.Command {
 		SilenceUsage:  true,
 		Args:          cobra.NoArgs,
 	}
+	root.SetOut(a.out)
+	root.SetErr(a.errOut)
 	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) { a.ctx = cmd.Context() }
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "render the versioned JSON response")
 	root.AddCommand(a.submitCommand(), a.startCommand(), a.statusCommand(), a.showCommand(), a.logsCommand(), a.controlCommand("pause"), a.controlCommand("resume"), a.recoverCommand(), a.controlCommand("cancel"), a.retryCommand(), a.controlCommand("take"), a.approveCommand(), a.rejectCommand(), a.doctorCommand(), a.authCommand(), a.initCommand(), a.providersCommand(), a.daemonCommand(), a.simpleSetupCommand("config"), a.simpleSetupCommand("update"), a.simpleSetupCommand("rollback"), a.versionCommand())
@@ -79,6 +82,15 @@ func ExecuteWithDaemon(ctx context.Context, args []string, out, errOut io.Writer
 	a.runDaemon = runDaemon
 	command := a.command()
 	command.SetArgs(args)
+	// unknownCommand runs before Cobra parses flags so an unknown token can be
+	// rendered as a typed response. Preserve the caller's requested format in
+	// that early path as well.
+	a.json = jsonFlagRequested(args)
+	if unknownCommand(command, args) {
+		response := failure("invalid_command", "unknown command", []string{binaryName(), "--help"})
+		_ = Render(errOut, response, a.json)
+		return int(exitCode(response))
+	}
 	if err := command.ExecuteContext(ctx); err != nil {
 		response := failure("invalid_command", err.Error(), []string{binaryName(), "--help"})
 		_ = Render(errOut, response, a.json)
@@ -88,6 +100,46 @@ func ExecuteWithDaemon(ctx context.Context, args []string, out, errOut io.Writer
 		return int(ExitOK)
 	}
 	return int(exitCode(*a.last))
+}
+
+func jsonFlagRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "--json" || arg == "--json=true" {
+			return true
+		}
+	}
+	return false
+}
+
+// unknownCommand compensates for Cobra's helpful-but-successful root help
+// behavior when an otherwise unknown token is supplied to a non-runnable root.
+// It deliberately stops after a runnable command so ticket paths and flag
+// values are never mistaken for subcommands.
+func unknownCommand(root *cobra.Command, args []string) bool {
+	current := root
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if arg == "help" || arg == "completion" {
+			return false
+		}
+		var next *cobra.Command
+		for _, candidate := range current.Commands() {
+			if candidate.Name() == arg || candidate.HasAlias(arg) {
+				next = candidate
+				break
+			}
+		}
+		if next == nil {
+			return true
+		}
+		current = next
+		if current.Runnable() {
+			return false
+		}
+	}
+	return false
 }
 
 func (a *app) request(method, ticket string, params any) api.Response {
@@ -337,9 +389,12 @@ func (a *app) recoverCommand() *cobra.Command {
 }
 
 func (a *app) retryCommand() *cobra.Command {
-	return &cobra.Command{Use: "retry <ticket>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return a.emit(a.request("ticket.retry", args[0], params(map[string]any{}, a.channel)))
+	operator := defaultOperatorLabel()
+	command := &cobra.Command{Use: "retry <ticket>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		return a.emit(a.request("ticket.retry", args[0], params(map[string]any{"operator": operator}, a.channel)))
 	}}
+	command.Flags().StringVar(&operator, "operator", operator, "authenticated operator identity")
+	return command
 }
 
 func (a *app) approveCommand() *cobra.Command {
@@ -356,7 +411,7 @@ func (a *app) rejectCommand() *cobra.Command {
 	operator := defaultOperatorLabel()
 	command := &cobra.Command{Use: "reject <ticket> --operator <identity> --reason <text>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if len(reason) > 4096 {
-			return a.emit(failure("invalid_argument", "rejection reason exceeds 4096 bytes", []string{binaryName(), "reject", args[0], "--reason", "<short-reason>"}))
+			return a.emit(failure("invalid_argument", "rejection reason exceeds 4096 bytes", []string{binaryName(), "reject", "--help"}))
 		}
 		return a.emit(a.request("ticket.reject", args[0], params(map[string]any{"operator": operator, "reason": reason}, a.channel)))
 	}}

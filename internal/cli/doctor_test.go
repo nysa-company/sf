@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,7 +36,11 @@ func TestDoctorHumanOutputIncludesTypedFailureDetails(t *testing.T) {
 }
 
 func TestDoctorUsesInjectedReadOnlyRegistryAndDisablesAutonomy(t *testing.T) {
-	root := t.TempDir()
+	root, err := os.MkdirTemp("/tmp", "sf-dx-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +141,65 @@ func TestDoctorDoesNotEchoRepositoryPath(t *testing.T) {
 	}
 	if response.NextAction == nil || len(response.NextAction.Argv) != 2 || response.NextAction.Argv[1] != "doctor" {
 		t.Fatalf("doctor action was not generic: %+v", response.NextAction)
+	}
+}
+
+func TestDoctorUsesReadOnlyDaemonHandshakeWhenSocketIsPresent(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "sf-dx-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(root, "run", "sf.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A regular file is sufficient to exercise the injectable handshake after
+	// filesystem validation without starting a daemon or opening a socket.
+	if err := os.WriteFile(socket, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	deps := healthyDoctorDeps(t)
+	deps.Paths = config.ChannelPaths{Root: root, Socket: socket}
+	deps.DaemonStatus = func(context.Context, config.ChannelPaths) error {
+		called = true
+		return nil
+	}
+	report := RunDoctor(context.Background(), deps)
+	if called {
+		t.Fatal("daemon handshake ran for an invalid socket")
+	}
+	if check := doctorCheckByID(t, report, "daemon_socket"); check.Status != CheckFail {
+		t.Fatalf("socket check=%+v", check)
+	}
+
+	// Use an actual owner-only Unix socket for the positive branch. Doctor's
+	// injected probe remains read-only and does not require daemon internals.
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(root, "run", "sf2.sock"), Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	validSocket := listener.Addr().String()
+	if err := os.Chmod(validSocket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deps.Paths.Socket = validSocket
+	called = false
+	deps.DaemonStatus = func(context.Context, config.ChannelPaths) error {
+		called = true
+		return nil
+	}
+	report = RunDoctor(context.Background(), deps)
+	if !called {
+		t.Fatal("daemon handshake did not run for a valid socket")
+	}
+	if check := doctorCheckByID(t, report, "daemon_status"); check.Status != CheckPass {
+		t.Fatalf("daemon status check=%+v", check)
 	}
 }
 
