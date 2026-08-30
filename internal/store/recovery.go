@@ -14,6 +14,9 @@ func (s *Store) RecoverMergeIntent(ctx context.Context, semanticKey string, obse
 	if err != nil || !found || observer == nil {
 		return Effect{}, ErrNotFound
 	}
+	if err := validMergeIntent(intent); err != nil {
+		return Effect{}, err
+	}
 	identity, err := observer.ObserveMergeIntent(ctx, intent)
 	if err != nil {
 		return Effect{}, err

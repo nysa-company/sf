@@ -19,6 +19,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+type mergeIntentObserverFunc func(context.Context, domain.MergeIntent) (string, error)
+
+func (f mergeIntentObserverFunc) ObserveMergeIntent(ctx context.Context, intent domain.MergeIntent) (string, error) {
+	return f(ctx, intent)
+}
+
 func openTestStore(t *testing.T) (*Store, context.Context) {
 	t.Helper()
 	ctx := context.Background()
@@ -257,6 +263,13 @@ func TestV6ToV7MigrationPreservesButRefusesUnsafeLegacyMergeIntent(t *testing.T)
 	}
 	if err := validMergeIntent(intent); err == nil {
 		t.Fatal("legacy merge witness without administrator enforcement was accepted")
+	}
+	called := false
+	if _, err := database.RecoverMergeIntent(ctx, "merge/v6", mergeIntentObserverFunc(func(context.Context, domain.MergeIntent) (string, error) {
+		called = true
+		return "unexpected", nil
+	})); err == nil || called {
+		t.Fatalf("unsafe legacy recovery err=%v observer_called=%v", err, called)
 	}
 }
 

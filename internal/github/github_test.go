@@ -839,6 +839,58 @@ func TestMergeRequiresStrictServerProtectionWithoutBypass(t *testing.T) {
 	})
 }
 
+func TestStrictProtectionTrustsOnlyAppliedRefRule(t *testing.T) {
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, "\x00"), "graphql") {
+			if !strings.Contains(strings.Join(args, "\x00"), "ref(qualifiedName:$qualifiedRef){branchProtectionRule") {
+				return nil, errors.New("did not request applied ref rule")
+			}
+			// The actual ref rule is weak. The query assertion above ensures this
+			// response cannot be replaced by an unordered duplicate-rule scan.
+			return []byte(`{"data":{"repository":{"ref":{"branchProtectionRule":{"id":"applied","pattern":"main","requiresStrictStatusChecks":false,"isAdminEnforced":true,"bypassPullRequestAllowances":{"totalCount":0},"bypassForcePushAllowances":{"totalCount":0}}}}}}`), nil
+		}
+		return []byte(`[]`), nil
+	})}
+	if _, err := client.strictProtection(context.Background(), contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, "main"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+		t.Fatalf("weak applied rule=%v", err)
+	}
+}
+
+func TestStrictProtectionRefusesNullAppliedRule(t *testing.T) {
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, "\x00"), "graphql") {
+			return []byte(`{"data":{"repository":{"ref":null}}}`), nil
+		}
+		return []byte(`[]`), nil
+	})}
+	if _, err := client.strictProtection(context.Background(), contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, "main"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+		t.Fatalf("null applied rule=%v", err)
+	}
+}
+
+func TestStrictProtectionPinsRulesRESTToGitHubDespiteDefaultHost(t *testing.T) {
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, "\x00"), "graphql") {
+			return []byte(`{"data":{"repository":{"ref":{"branchProtectionRule":{"id":"rule","pattern":"main","requiresStrictStatusChecks":true,"isAdminEnforced":true,"bypassPullRequestAllowances":{"totalCount":0},"bypassForcePushAllowances":{"totalCount":0}}}}}}`), nil
+		}
+		// This runner models a machine whose implicit gh host is a GHE server:
+		// only an explicit github.com request receives the empty GitHub ruleset.
+		hostPinned := false
+		for index, arg := range args {
+			if arg == "--hostname" && index+1 < len(args) && args[index+1] == "github.com" {
+				hostPinned = true
+			}
+		}
+		if !hostPinned {
+			return []byte(`[{"type":"ghe-rule"}]`), nil
+		}
+		return []byte(`[]`), nil
+	})}
+	if _, err := client.strictProtection(context.Background(), contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, "main"); err != nil {
+		t.Fatalf("github-pinned rules request=%v", err)
+	}
+}
+
 func TestMergeFinalHandoffRefusesChangedSafetyWitness(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -980,10 +1032,10 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 			return nil, nil
 		}
 		if args[0] == "api" {
-			if strings.Contains(strings.Join(args, "\x00"), "branchProtectionRules") {
-				return []byte(`{"data":{"repository":{"branchProtectionRules":{"nodes":[{"id":"rule-main","pattern":"main","requiresStrictStatusChecks":true,"isAdminEnforced":true,"bypassPullRequestAllowances":{"totalCount":0},"bypassForcePushAllowances":{"totalCount":0}}]}}}}`), nil
+			if strings.Contains(strings.Join(args, "\x00"), "branchProtectionRule") {
+				return []byte(`{"data":{"repository":{"ref":{"branchProtectionRule":{"id":"rule-main","pattern":"main","requiresStrictStatusChecks":true,"isAdminEnforced":true,"bypassPullRequestAllowances":{"totalCount":0},"bypassForcePushAllowances":{"totalCount":0}}}}}}`), nil
 			}
-			if len(args) == 4 && args[1] == "--method" && args[2] == "GET" {
+			if len(args) == 6 && args[1] == "--hostname" && args[2] == "github.com" && args[3] == "--method" && args[4] == "GET" {
 				return []byte(`[]`), nil
 			}
 			if len(args) == 2 && args[1] == "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random" {
@@ -1019,8 +1071,8 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		t.Fatalf("guarded merge verified=%v err=%v", verified, err)
 	}
 	queue := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}
-	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app"}
-	rules := []string{"api", "--method", "GET", "repos/example/app/rules/branches/main?per_page=1&page=1"}
+	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$qualifiedRef:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedRef){branchProtectionRule{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app", "-F", "qualifiedRef=refs/heads/main"}
+	rules := []string{"api", "--hostname", "github.com", "--method", "GET", "repos/example/app/rules/branches/main?per_page=1&page=1"}
 	view := []string{"pr", "view", "7", "--repo", "example/app", "--json", prFields}
 	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, queue, protection, rules, view, queue, protection, rules, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, view}
 	if !reflect.DeepEqual(got, want) {

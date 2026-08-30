@@ -697,8 +697,8 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 	var response struct {
 		Data *struct {
 			Repository *struct {
-				BranchProtectionRules struct {
-					Nodes []struct {
+				Ref *struct {
+					BranchProtectionRule *struct {
 						ID                          string `json:"id"`
 						Pattern                     string `json:"pattern"`
 						RequiresStrictStatusChecks  bool   `json:"requiresStrictStatusChecks"`
@@ -709,27 +709,26 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 						BypassForcePushAllowances struct {
 							TotalCount int `json:"totalCount"`
 						} `json:"bypassForcePushAllowances"`
-					} `json:"nodes"`
-				} `json:"branchProtectionRules"`
+					} `json:"branchProtectionRule"`
+				} `json:"ref"`
 			} `json:"repository"`
 		} `json:"data"`
 	}
-	query := "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}"
-	if err := c.json(ctx, &response, "api", "--hostname", "github.com", "graphql", "-f", "query="+query, "-F", "owner="+repository.Owner, "-F", "name="+repository.Name); err != nil {
+	query := "query($owner:String!,$name:String!,$qualifiedRef:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedRef){branchProtectionRule{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}"
+	if err := c.json(ctx, &response, "api", "--hostname", "github.com", "graphql", "-f", "query="+query, "-F", "owner="+repository.Owner, "-F", "name="+repository.Name, "-F", "qualifiedRef=refs/heads/"+baseRef); err != nil {
 		return strictProtectionWitness{}, err
 	}
-	if response.Data == nil || response.Data.Repository == nil {
+	if response.Data == nil || response.Data.Repository == nil || response.Data.Repository.Ref == nil || response.Data.Repository.Ref.BranchProtectionRule == nil {
 		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 	}
 	var activeRules []json.RawMessage
 	endpoint := "repos/" + repoArg(repository) + "/rules/branches/" + url.PathEscape(baseRef) + "?per_page=1&page=1"
-	if err := c.json(ctx, &activeRules, "api", "--method", "GET", endpoint); err != nil || len(activeRules) != 0 {
+	if err := c.json(ctx, &activeRules, "api", "--hostname", "github.com", "--method", "GET", endpoint); err != nil || len(activeRules) != 0 {
 		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 	}
-	for _, rule := range response.Data.Repository.BranchProtectionRules.Nodes {
-		if rule.Pattern == baseRef && rule.ID != "" && rule.RequiresStrictStatusChecks && rule.IsAdminEnforced && rule.BypassPullRequestAllowances.TotalCount == 0 && rule.BypassForcePushAllowances.TotalCount == 0 {
-			return strictProtectionWitness{ID: rule.ID, AdminEnforced: true, ActiveRulesetCount: 0}, nil
-		}
+	rule := response.Data.Repository.Ref.BranchProtectionRule
+	if rule.Pattern == baseRef && rule.ID != "" && rule.RequiresStrictStatusChecks && rule.IsAdminEnforced && rule.BypassPullRequestAllowances.TotalCount == 0 && rule.BypassForcePushAllowances.TotalCount == 0 {
+		return strictProtectionWitness{ID: rule.ID, AdminEnforced: true, ActiveRulesetCount: 0}, nil
 	}
 	return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 }

@@ -777,16 +777,21 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 	if len(argv) >= 2 && argv[0] == "repo" && argv[1] == "view" {
 		return f.runRepoView(argv)
 	}
-	if len(argv) >= 3 && argv[0] == "api" && argv[1] == "--method" && strings.Contains(argv[3], "/rules/branches/") {
+	if len(argv) >= 5 && argv[0] == "api" && option(argv, "--hostname") == "github.com" && option(argv, "--method") == "GET" && strings.Contains(argv[len(argv)-1], "/rules/branches/") {
 		if f.Snapshot().ActiveRulesetCount != 0 {
 			return []byte(`[{"type":"pull_request"}]`), nil
 		}
 		return []byte(`[]`), nil
 	}
 	if len(argv) >= 2 && argv[0] == "api" && argv[1] == "--hostname" {
-		if strings.Contains(graphqlQuery(argv), "branchProtectionRules") {
+		if strings.Contains(graphqlQuery(argv), "branchProtectionRule") {
 			snapshot := f.Snapshot()
-			return json.Marshal(map[string]any{"data": map[string]any{"repository": map[string]any{"branchProtectionRules": map[string]any{"nodes": []map[string]any{{"id": "fake-rule-main", "pattern": "main", "requiresStrictStatusChecks": snapshot.StrictStatusChecks, "isAdminEnforced": snapshot.AdminEnforced, "bypassPullRequestAllowances": map[string]int{"totalCount": snapshot.BypassPullRequestAllowances}, "bypassForcePushAllowances": map[string]int{"totalCount": snapshot.BypassForcePushAllowances}}}}}}})
+			return json.Marshal(map[string]any{
+				"data": map[string]any{"repository": map[string]any{"ref": map[string]any{"branchProtectionRule": map[string]any{
+					"id": "fake-rule-main", "pattern": "main", "requiresStrictStatusChecks": snapshot.StrictStatusChecks, "isAdminEnforced": snapshot.AdminEnforced,
+					"bypassPullRequestAllowances": map[string]int{"totalCount": snapshot.BypassPullRequestAllowances}, "bypassForcePushAllowances": map[string]int{"totalCount": snapshot.BypassForcePushAllowances},
+				}}}},
+			})
 		}
 		if f.Snapshot().MergeQueued {
 			return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":{"position":1}}}}}`), nil
@@ -869,7 +874,11 @@ func validateOfficialArgv(argv []string) error {
 	allowed := map[string]bool{}
 	switch key {
 	case "api --hostname":
-		// Exact GraphQL queue lookup; fake supports only the production shape.
+		// Exact GraphQL lookup or a github.com-pinned active-rules REST lookup.
+		if len(argv) >= 6 && argv[2] == "github.com" && argv[3] == "--method" && argv[4] == "GET" && strings.HasPrefix(argv[5], "repos/") && strings.Contains(argv[5], "/rules/branches/") && strings.HasSuffix(argv[5], "?per_page=1&page=1") {
+			allowed["--method"] = true
+			break
+		}
 		if len(argv) < 6 || argv[2] != "github.com" || argv[3] != "graphql" {
 			return fmt.Errorf("fake-gh: incomplete %s", key)
 		}
