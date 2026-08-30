@@ -78,7 +78,11 @@ func createWorktreeGitIntentFixture(t *testing.T, db *Store, ctx context.Context
 	if stored, err := db.LoadOrStoreBranch(ctx, key, branch); err != nil || stored != branch {
 		t.Fatalf("allocate branch=%q err=%v", stored, err)
 	}
-	intent := GitMutationIntent{EffectFence: EffectFence{SemanticKey: "git/" + ticketID + "/create-worktree", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}, RequestDigest: gitDigest("c"), Repository: "/tmp/nysa", Worktree: "/tmp/sf-worktrees/" + ticketID, Branch: branch, Operation: "create-worktree", BaseRef: "main", ExpectedBaseOID: strings.Repeat("a", 40), ExpectedHeadOID: strings.Repeat("a", 40)}
+	worktree, err := db.TicketWorktreePath(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := GitMutationIntent{EffectFence: EffectFence{SemanticKey: "git/" + ticketID + "/create-worktree", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}, RequestDigest: gitDigest("c"), Repository: "/tmp/nysa", Worktree: worktree, Branch: branch, Operation: "create-worktree", BaseRef: "main", ExpectedBaseOID: strings.Repeat("a", 40), ExpectedHeadOID: strings.Repeat("a", 40)}
 	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: ref, Kind: "git/create-worktree", TicketVersion: started.Version, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
 		t.Fatal(err)
 	}
@@ -105,6 +109,7 @@ func TestGitMutationClaimRefusesCreateWithUnallocatedIdentity(t *testing.T) {
 	db, ctx := openTestStore(t)
 	for name, mutate := range map[string]func(*GitMutationIntent){
 		"repository": func(intent *GitMutationIntent) { intent.Repository = "/tmp/other" },
+		"worktree":   func(intent *GitMutationIntent) { intent.Worktree = "/tmp/other" },
 		"branch": func(intent *GitMutationIntent) {
 			intent.Branch = "sf/dev/aaaaaaaa/aaaaaaaa-cccccccccccccccccccccccccccccccc"
 		},
@@ -117,6 +122,21 @@ func TestGitMutationClaimRefusesCreateWithUnallocatedIdentity(t *testing.T) {
 				t.Fatalf("unallocated create identity accepted: %v", err)
 			}
 		})
+	}
+}
+
+func TestGitMutationClaimRefusesUnknownOperation(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := unplannedGitIntentFixture(t, db, ctx, "SF-git-unknown-operation")
+	intent.Operation = "arbitrary-git"
+	if _, err := db.PlanEffect(ctx, EffectPlan{
+		SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "git/" + intent.Operation,
+		TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: intent.RequestDigest,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.IssueGitMutationClaim(ctx, intent); !errors.Is(err, ErrGitMutationIntent) {
+		t.Fatalf("unknown Git operation accepted: %v", err)
 	}
 }
 

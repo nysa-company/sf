@@ -20,12 +20,16 @@ import (
 // corresponding effect executing.
 type GitMutationIntent struct {
 	EffectFence
-	RequestDigest   string
-	Repository      string
-	Worktree        string
-	Branch          string
-	Operation       string
-	BaseRef         string
+	RequestDigest string
+	Repository    string
+	Worktree      string
+	Branch        string
+	Operation     string
+	BaseRef       string
+	// ExpectedBaseOID and ExpectedHeadOID are exact observations proposed by
+	// the trusted Git coordinator. SQLite makes them immutable and fenced; the
+	// Git runner independently re-reads and compares them immediately before it
+	// acquires this claim. Store does not claim to observe repository objects.
 	ExpectedBaseOID string
 	ExpectedHeadOID string
 }
@@ -48,8 +52,17 @@ type GitMutationRecovery struct {
 func validGitIntent(i GitMutationIntent) bool {
 	return i.Ref.Validate() == nil && i.SemanticKey != "" && validClaimDigest(i.RequestDigest) && i.TicketVersion != 0 &&
 		i.Fence.LeaderEpoch != 0 && i.Fence.RunnerEpoch != 0 && validStorePath(i.Repository) && validStorePath(i.Worktree) &&
-		i.Branch != "" && i.Operation != "" && i.BaseRef != "" && validStoreOID(i.ExpectedBaseOID) &&
+		i.Branch != "" && validGitOperation(i.Operation) && i.BaseRef != "" && validStoreOID(i.ExpectedBaseOID) &&
 		(i.ExpectedHeadOID == "" || validStoreOID(i.ExpectedHeadOID))
+}
+
+func validGitOperation(operation string) bool {
+	switch operation {
+	case "create-worktree", "remove-worktree", "commit", "push", "protected-ref-fetch":
+		return true
+	default:
+		return false
+	}
 }
 
 func validStorePath(v string) bool {
@@ -78,6 +91,23 @@ func validClaimDigest(v string) bool {
 	return true
 }
 
+// TicketWorktreePath returns the one pre-registration path that this channel
+// Store can authorize for a ticket. The database lives directly beneath the
+// channel root, so deriving the path here keeps stable/dev isolation and path
+// authority independent of a caller-supplied intent. Git still authenticates
+// the directory and repository identity before and after creation.
+func (s *Store) TicketWorktreePath(ref domain.TicketRef) (string, error) {
+	if s == nil || ref.Validate() != nil || !validStorePath(s.worktreeRoot) || filepath.Dir(s.worktreeRoot) == string(filepath.Separator) {
+		return "", ErrGitMutationIntent
+	}
+	path := filepath.Join(s.worktreeRoot, string(ref.Project), string(ref.Ticket))
+	relative, err := filepath.Rel(s.worktreeRoot, path)
+	if err != nil || relative == "." || !filepath.IsLocal(relative) || !validStorePath(path) {
+		return "", ErrGitMutationIntent
+	}
+	return path, nil
+}
+
 // IssueGitMutationClaim atomically establishes the external effect claim and
 // persists its complete immutable Git binding.  It is the only minting path;
 // AcquireGitMutation merely verifies this record and cannot elevate arbitrary
@@ -98,11 +128,14 @@ func (s *Store) IssueGitMutationClaim(ctx context.Context, intent GitMutationInt
 			// before a worktree identity can be registered. Bind it to the durable
 			// project and ticket branch allocation instead of requiring the row
 			// that this very operation is responsible for creating.
+			worktree, err = s.TicketWorktreePath(intent.Ref)
+			if err != nil {
+				return ErrGitMutationIntent
+			}
 			err = conn.QueryRowContext(ctx, `SELECT p.canonical_path,b.branch_ref,p.base_ref
 				FROM projects p JOIN branch_allocations b ON b.channel=p.channel AND b.project_id=p.id
 				WHERE p.channel=? AND p.id=? AND b.ticket_id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).
 				Scan(&repository, &branch, &baseRef)
-			worktree = intent.Worktree
 		} else {
 			err = conn.QueryRowContext(ctx, `SELECT p.canonical_path,w.path,w.branch_ref,p.base_ref
 				FROM projects p JOIN worktrees w ON w.channel=p.channel AND w.project_id=p.id
@@ -327,7 +360,7 @@ func (s *Store) RecoverGitMutationLeases(ctx context.Context, channel domain.Cha
 }
 
 func validContractClaim(c contracts.GitMutationClaim) bool {
-	return c.TicketRef.Validate() == nil && c.SemanticKey != "" && validClaimDigest(c.RequestDigest) && c.TicketVersion != 0 && c.LeaderEpoch != 0 && c.RunnerEpoch != 0 && c.ClaimEpoch != 0 && validStorePath(c.Repository) && validStorePath(c.Worktree) && c.Branch != "" && c.Operation != "" && c.BaseRef != "" && validStoreOID(c.ExpectedBaseOID) && (c.ExpectedHeadOID == "" || validStoreOID(c.ExpectedHeadOID))
+	return c.TicketRef.Validate() == nil && c.SemanticKey != "" && validClaimDigest(c.RequestDigest) && c.TicketVersion != 0 && c.LeaderEpoch != 0 && c.RunnerEpoch != 0 && c.ClaimEpoch != 0 && validStorePath(c.Repository) && validStorePath(c.Worktree) && c.Branch != "" && validGitOperation(c.Operation) && c.BaseRef != "" && validStoreOID(c.ExpectedBaseOID) && (c.ExpectedHeadOID == "" || validStoreOID(c.ExpectedHeadOID))
 }
 func (s *Store) assertGitIntentCurrent(ctx context.Context, conn *sql.Conn, c contracts.GitMutationClaim) error {
 	if err := s.assertTicketFence(ctx, conn, c.TicketRef, c.TicketVersion, domain.Fence{LeaderEpoch: c.LeaderEpoch, RunnerEpoch: c.RunnerEpoch}); err != nil {

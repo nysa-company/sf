@@ -1374,6 +1374,28 @@ func TestMutationsRequireExternalLeaseAndDoNotCreateWorktree(t *testing.T) {
 	}
 }
 
+func TestCreateWorktreeReobservesBaseBeforeUsingStoreClaim(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-create-base-claim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	claim := createClaim(t, repository, path, branch, "main")
+	wrongBase := strings.Repeat("a", 40)
+	if wrongBase == claim.ExpectedBaseOID {
+		wrongBase = strings.Repeat("b", 40)
+	}
+	claim.ExpectedBaseOID = wrongBase
+	claim.ExpectedHeadOID = claim.ExpectedBaseOID
+	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main", claim); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("caller-observed base mismatch was not refused: %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("base-mismatched claim changed filesystem: %v", err)
+	}
+}
+
 func TestMutationLeaseRefusalPrecedesCommitEffect(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-refused-lease")

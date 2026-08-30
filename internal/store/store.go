@@ -81,12 +81,13 @@ func migrationChecksum(statements []string) string {
 }
 
 type Store struct {
-	db         *sql.DB
-	commit     func(context.Context, *sql.Conn) error
-	readOnly   bool
-	faultMu    sync.RWMutex
-	writeFault func() error
-	mutations  *ExternalMutationGate
+	db           *sql.DB
+	commit       func(context.Context, *sql.Conn) error
+	readOnly     bool
+	worktreeRoot string
+	faultMu      sync.RWMutex
+	writeFault   func() error
+	mutations    *ExternalMutationGate
 }
 
 // SetWriteFaultForTest injects a deterministic write failure. It is reserved
@@ -193,7 +194,7 @@ func open(ctx context.Context, path string, policy openPolicy) (*Store, error) {
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
-	s := &Store{db: db, commit: commitTransaction}
+	s := &Store{db: db, commit: commitTransaction, worktreeRoot: filepath.Join(filepath.Dir(path), "worktrees")}
 	s.mutations = &ExternalMutationGate{store: s, gate: make(chan struct{}, 1), revoked: make(map[domain.TicketRef]mutationRevocation)}
 	s.mutations.gate <- struct{}{}
 	storedVersion, recognized, err := inspectStoredSchema(ctx, db)
@@ -248,7 +249,7 @@ func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 	// startup. query_only and mode=ro still make every connection non-mutating.
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
-	value := &Store{db: db, commit: commitTransaction, readOnly: true}
+	value := &Store{db: db, commit: commitTransaction, readOnly: true, worktreeRoot: filepath.Join(filepath.Dir(path), "worktrees")}
 	if err := value.validateSchema(ctx); err != nil {
 		_ = db.Close()
 		return nil, normalizeBusy(ctx, err)
