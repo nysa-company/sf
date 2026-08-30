@@ -81,3 +81,50 @@ func TestTransitionUsesNormativeStateMachineAndFencedStore(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestControlDispositionInvalidatesRunnerAtomically(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "control.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "nysa", Path: "/tmp/nysa", BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-control"}
+	if err := database.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "digest", Type: domain.TicketBug, MergeMode: domain.MergeGuarded}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "control-engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, queued.Version, "dev/nysa/SF-control/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: queued.RunnerEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := statemachine.LoadEmbeddedApproved()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := New(database, spec)
+	result, err := runtime.Signal(ctx, contracts.SignalRequest{
+		Ticket: ref, TicketVersion: started.Version, From: domain.StatePlanning, Trigger: "operator_pause_or_take",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Attributes: map[string]string{"operator_identity_authenticated": "true"},
+	})
+	if err != nil || result.To != domain.StateStopping {
+		t.Fatalf("control result=%+v err=%v", result, err)
+	}
+	after, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != domain.StateStopping || after.ResumeState != domain.StatePlanning || after.RunnerEpoch != started.RunnerEpoch+1 || after.Version != result.TicketVersion {
+		t.Fatalf("after=%+v result=%+v", after, result)
+	}
+}

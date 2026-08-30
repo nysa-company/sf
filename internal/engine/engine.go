@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -80,11 +81,17 @@ func (e *Engine) Transition(ctx context.Context, request contracts.TransitionReq
 	if transition.ResumeState == "$stored" {
 		resume = ticket.ResumeState
 	}
-	result, err := e.store.Transition(ctx, store.Transition{
+	persisted := store.Transition{
 		Ref: request.Ticket, ExpectedVersion: request.TicketVersion, From: request.From,
 		To: target, ResumeState: resume, Trigger: request.Trigger, Fence: request.Fence,
 		EventPayload: "{}",
-	})
+	}
+	var result store.TransitionResult
+	if strings.HasPrefix(transition.PhaseDisposition, "invalidate_runner_epoch") {
+		result, err = e.store.TransitionAndInvalidateRunner(ctx, persisted)
+	} else {
+		result, err = e.store.Transition(ctx, persisted)
+	}
 	if err != nil {
 		return contracts.TransitionResult{}, err
 	}
