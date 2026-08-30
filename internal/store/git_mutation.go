@@ -593,7 +593,10 @@ func validGitMutationFacts(operation, base, expectedHead, preparedCommit, prepar
 	}
 	switch operation {
 	case "commit":
-		return priorObserved == 0 && priorOID == "" && ((preparedCommit == "" && preparedTree == "") || validGitOIDWidth(base, preparedCommit, preparedTree))
+		// OIDs are individually optional to support other fact shapes, but a
+		// prepared commit is an inseparable commit/tree tuple. Never let the
+		// optional-width helper turn a partial tuple into a valid fact.
+		return priorObserved == 0 && priorOID == "" && ((preparedCommit == "" && preparedTree == "") || (preparedCommit != "" && preparedTree != "" && validGitOIDWidth(base, preparedCommit, preparedTree)))
 	case "push":
 		return preparedCommit == "" && preparedTree == "" && (priorObserved == 0 && priorOID == "" || priorObserved == 1 && validGitOIDWidth(base, priorOID))
 	default:

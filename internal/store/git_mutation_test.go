@@ -276,6 +276,12 @@ func TestGitMutationRecoveryFactsAreOneWayAndVisibleToRecovery(t *testing.T) {
 	if err != nil || loaded.PreparedCommitOID != commit || loaded.PreparedTreeOID != tree {
 		t.Fatalf("released intent facts=%+v err=%v", loaded, err)
 	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_intents SET prepared_tree_oid='' WHERE semantic_key=?`, intent.SemanticKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GitMutationIntentFacts(ctx, intent.SemanticKey); !errors.Is(err, ErrGitMutationIntent) {
+		t.Fatalf("partial intent commit fact accepted: %v", err)
+	}
 	if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_intents SET prepared_tree_oid='not-an-oid' WHERE semantic_key=?`, intent.SemanticKey); err != nil {
 		t.Fatal(err)
 	}
