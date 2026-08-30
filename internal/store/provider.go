@@ -107,6 +107,24 @@ type LatestReusableProviderAttemptResult struct {
 	Recovered bool
 }
 
+// LoadCurrentProviderAttemptResult authenticates an exact completed result
+// against the live ticket and leader fence.  It is the only worker-facing
+// route for a PhaseRunner's opaque result key; callers never supply Parsed
+// provider output as transition authority.
+func (s *Store) LoadCurrentProviderAttemptResult(ctx context.Context, key ProviderAttemptResultKey, expected uint64, fence domain.Fence) (ProviderAttemptResult, phaseartifact.Parsed, error) {
+	result, parsed, err := s.LoadHistoricalProviderAttemptResult(ctx, key)
+	if err != nil {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, err
+	}
+	if result.Claim.ExpectedVersion != expected || result.Claim.LeaderEpoch != fence.LeaderEpoch || result.Claim.RunnerEpoch != fence.RunnerEpoch {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+	}
+	if err := s.AssertTicketFence(ctx, key.Ref, expected, fence); err != nil {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, err
+	}
+	return result, parsed, nil
+}
+
 func rawDigest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 func validSHA256(value string) bool {
 	return len(value) == 64 && strings.ToLower(value) == value && strings.Trim(value, "0123456789abcdef") == ""
@@ -752,7 +770,7 @@ func (s *Store) LoadHistoricalProviderAttemptResult(ctx context.Context, key Pro
 // row when that newest row is malformed or stale: doing so would let a restart
 // adopt evidence after a later provider attempt superseded it.
 func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request LatestReusableProviderAttemptRequest) (LatestReusableProviderAttemptResult, error) {
-	if request.Ref.Validate() != nil || request.ExpectedVersion == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 || !((request.Phase == domain.PhasePlanning && request.Role == "planner") || (request.Phase == domain.PhaseReview && request.Role == "reviewer")) {
+	if request.Ref.Validate() != nil || request.ExpectedVersion == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 || !((request.Phase == domain.PhasePlanning && request.Role == "planner") || (request.Phase == domain.PhaseVerification && request.Role == "verification") || (request.Phase == domain.PhaseReview && request.Role == "reviewer")) {
 		return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
 	}
 	var key ProviderAttemptResultKey
@@ -804,7 +822,7 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 		}
 		result.Result, result.Parsed = currentResult, currentParsed
 	} else {
-		allowedState := (request.Phase == domain.PhasePlanning && live.State == domain.StatePlanning) || (request.Phase == domain.PhaseReview && live.State == domain.StateReviewing)
+		allowedState := (request.Phase == domain.PhasePlanning && live.State == domain.StatePlanning) || (request.Phase == domain.PhaseVerification && live.State == domain.StateVerifying) || (request.Phase == domain.PhaseReview && live.State == domain.StateReviewing)
 		if !allowedState || live.Version <= historical.Claim.ExpectedVersion || live.RunnerEpoch <= historical.Claim.RunnerEpoch || live.Version-historical.Claim.ExpectedVersion != live.RunnerEpoch-historical.Claim.RunnerEpoch {
 			return LatestReusableProviderAttemptResult{}, ErrStaleFence
 		}
@@ -816,6 +834,12 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	}
 	if request.Phase == domain.PhasePlanning {
 		if result.Parsed.Planner == nil {
+			return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
+		}
+		return result, nil
+	}
+	if request.Phase == domain.PhaseVerification {
+		if result.Parsed.Verify == nil {
 			return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
 		}
 		return result, nil

@@ -590,6 +590,13 @@ func (p PlanIdentity) validate(ticket Ticket) (phaseartifact.Planner, error) {
 	return *parsed.Planner, nil
 }
 
+// ValidatePlanIdentity is the worker-facing semantic gate for a stored plan.
+// Keeping this wrapper here prevents orchestration code from reconstructing a
+// second, subtly different phaseartifact validation path.
+func ValidatePlanIdentity(ticket Ticket, plan PlanIdentity) (phaseartifact.Planner, error) {
+	return plan.validate(ticket)
+}
+
 func (v VerificationIdentity) validate(ticket Ticket, plan PlanIdentity) (phaseartifact.Verification, error) {
 	if err := validateDigest("verification plan digest", v.PlanDigest); err != nil {
 		return phaseartifact.Verification{}, err
@@ -635,6 +642,12 @@ func (v VerificationIdentity) validate(ticket Ticket, plan PlanIdentity) (phasea
 		return phaseartifact.Verification{}, errors.New("verification owned-file identity does not match artifact")
 	}
 	return *parsed.Verify, nil
+}
+
+// ValidateVerificationIdentity is the worker-facing semantic gate for an
+// exact accepted plan and its pre-build verification artifact.
+func ValidateVerificationIdentity(ticket Ticket, plan PlanIdentity, verification VerificationIdentity) (phaseartifact.Verification, error) {
+	return verification.validate(ticket, plan)
 }
 
 func canonicalBytes(value any) []byte { data, _ := json.Marshal(value); return data }

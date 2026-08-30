@@ -57,6 +57,31 @@ type StoredWorktree struct {
 	Fence         domain.Fence
 }
 
+// AssertTicketFence is a narrow pre-provider admission check.  It proves the
+// caller's ticket version, runner epoch, and live leader epoch immediately
+// before invoking an external PhaseRunner; provider admission must repeat its
+// own check, but the worker never starts a runner on an already stale fence.
+func (s *Store) AssertTicketFence(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence) error {
+	if ref.Validate() != nil || expectedVersion == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return ErrStaleFence
+	}
+	ticket, err := s.Ticket(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if ticket.Version != expectedVersion || ticket.RunnerEpoch != fence.RunnerEpoch {
+		return ErrStaleFence
+	}
+	var leader uint64
+	if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&leader); err != nil {
+		return normalizeBusy(ctx, err)
+	}
+	if leader != fence.LeaderEpoch {
+		return ErrStaleFence
+	}
+	return nil
+}
+
 // StoredPhaseAttempt is one durable provider phase attempt.
 type StoredPhaseAttempt struct {
 	Phase           domain.Phase

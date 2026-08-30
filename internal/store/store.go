@@ -1169,6 +1169,89 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	return result, err
 }
 
+// TransitionCandidate atomically consumes one exact candidate generation with
+// the build transition.  A worker must not validate "latest" in one read and
+// signal in another: a newer same-version candidate could otherwise replace
+// the proof between those operations.
+func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, candidate domain.CandidateSnapshot) (TransitionResult, error) {
+	if err := transition.Ref.Validate(); err != nil || transition.From != domain.StateBuilding || transition.To == "" || transition.Trigger == "" || validateCandidate(candidate) != nil {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	if transition.EventPayload == "" {
+		transition.EventPayload = "{}"
+	}
+	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
+		return TransitionResult{}, err
+	}
+	var result TransitionResult
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		var version, runner uint64
+		var actual domain.State
+		if err := conn.QueryRowContext(ctx, `SELECT state,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&actual, &version, &runner); err != nil {
+			return err
+		}
+		if actual != transition.From || version != transition.ExpectedVersion {
+			return ErrStaleFence
+		}
+		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
+			return err
+		}
+		var stored domain.CandidateSnapshot
+		var cv, cl, cr uint64
+		err := conn.QueryRowContext(ctx, `SELECT generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY generation DESC LIMIT 1`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&stored.Generation, &cv, &cl, &cr, &stored.BaseSHA, &stored.HeadSHA, &stored.TreeSHA, &stored.SourceDigest, &stored.VerificationIntentDigest, &stored.ProofDigest, &stored.CommandPolicyDigest, &stored.BuilderEvidenceDigest)
+		if err != nil {
+			return ErrEvidenceConflict
+		}
+		if stored != candidate || cv != version || cl != transition.Fence.LeaderEpoch || cr != transition.Fence.RunnerEpoch {
+			return ErrEvidenceConflict
+		}
+		// candidate_snapshots deliberately avoids a mutable provider-result
+		// column. RecordCandidate therefore emits this bounded, Store-authored
+		// append-only binding event. Requiring it here makes a valid-looking
+		// direct snapshot insertion insufficient for a transition.
+		var payload string
+		if err := conn.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='candidate_recorded' ORDER BY id DESC LIMIT 1`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version).Scan(&payload); err != nil {
+			return ErrEvidenceConflict
+		}
+		var binding struct {
+			Generation            uint64 `json:"generation"`
+			Head                  string `json:"head"`
+			BuilderAttemptID      int64  `json:"builder_attempt_id"`
+			BuilderAttempt        int    `json:"builder_attempt"`
+			BuilderEvidenceDigest string `json:"builder_evidence_digest"`
+			CommandPolicyDigest   string `json:"command_policy_digest"`
+		}
+		if json.Unmarshal([]byte(payload), &binding) != nil || binding.Generation != candidate.Generation || binding.Head != candidate.HeadSHA || binding.BuilderAttemptID <= 0 || binding.BuilderAttempt <= 0 || binding.BuilderEvidenceDigest != candidate.BuilderEvidenceDigest || binding.CommandPolicyDigest != candidate.CommandPolicyDigest {
+			return ErrEvidenceConflict
+		}
+		var source, base, intent, proof string
+		if err := conn.QueryRowContext(ctx, `SELECT t.source_digest,w.base_sha,v.intent_digest,v.proof_digest FROM tickets t JOIN worktrees w ON w.channel=t.channel AND w.project_id=t.project_id AND w.ticket_id=t.id JOIN verifications v ON v.channel=t.channel AND v.project_id=t.project_id AND v.ticket_id=t.id WHERE t.channel=? AND t.project_id=? AND t.id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&source, &base, &intent, &proof); err != nil {
+			return ErrEvidenceConflict
+		}
+		if source != candidate.SourceDigest || base != candidate.BaseSHA || intent != candidate.VerificationIntentDigest || proof != candidate.ProofDigest {
+			return ErrEvidenceConflict
+		}
+		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?,resume_state=?,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state='building' AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version, runner)
+		if err != nil {
+			return err
+		}
+		if n, _ := updated.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, transition.Trigger, transition.From, transition.To, transition.EventPayload, time.Now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return err
+		}
+		result.Version = version + 1
+		result.EventID, _ = created.LastInsertId()
+		return nil
+	})
+	return result, err
+}
+
 func (s *Store) InvalidateRunner(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence) (Ticket, error) {
 	if err := s.DrainExternalMutations(ctx, ref); err != nil {
 		return Ticket{}, err

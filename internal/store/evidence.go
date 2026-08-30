@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
+	"github.com/nysa-company/sf/internal/workflowprompt"
 )
 
 const (
@@ -24,11 +26,16 @@ const (
 // PlanDocument is the bounded, typed Planner output retained for recovery and
 // review. It is intentionally not a provider transcript.
 type PlanDocument struct {
-	Acceptance []string   `json:"acceptance"`
-	ProofKind  string     `json:"proof_kind"`
-	Paths      []string   `json:"paths"`
-	Commands   [][]string `json:"commands"`
-	Risks      []string   `json:"risks"`
+	// Planner is the complete canonical Planner artifact.  The older summary
+	// fields remain readable for pre-worker records, but new workflow-worker
+	// records must carry this exact artifact and its immutable provider result.
+	Planner        *phaseartifact.Planner    `json:"planner,omitempty"`
+	ProviderResult *ProviderAttemptResultKey `json:"provider_result,omitempty"`
+	Acceptance     []string                  `json:"acceptance"`
+	ProofKind      string                    `json:"proof_kind"`
+	Paths          []string                  `json:"paths"`
+	Commands       [][]string                `json:"commands"`
+	Risks          []string                  `json:"risks"`
 }
 
 type PlanArtifact struct {
@@ -49,6 +56,11 @@ type VerificationArtifact struct {
 	AmendsRevision  uint64
 	Reason          string
 	Requester       string
+	// ProviderResult is checked at admission.  The immutable provider result
+	// remains the canonical full Verification artifact; intent/proof are only
+	// its durable projections.
+	ProviderResult *ProviderAttemptResultKey
+	Checkpoint     CommitObservation
 }
 
 type VerificationRevision struct {
@@ -134,6 +146,28 @@ func (s *Store) RecordPlan(ctx context.Context, artifact PlanArtifact) (string, 
 	if err != nil {
 		return "", err
 	}
+	if artifact.Document.Planner != nil || artifact.Document.ProviderResult != nil {
+		if artifact.Document.Planner == nil || artifact.Document.ProviderResult == nil {
+			return "", ErrEvidenceConflict
+		}
+		result, parsed, loadErr := s.LoadHistoricalProviderAttemptResult(ctx, *artifact.Document.ProviderResult)
+		if loadErr != nil || result.Claim.Role != "planner" || result.Claim.Phase != domain.PhasePlanning || result.Claim.Ref != artifact.Ref || parsed.Planner == nil {
+			return "", ErrEvidenceConflict
+		}
+		current := result.Claim.ExpectedVersion == artifact.ExpectedVersion && result.Claim.LeaderEpoch == artifact.Fence.LeaderEpoch && result.Claim.RunnerEpoch == artifact.Fence.RunnerEpoch
+		if !current {
+			reusable, reuseErr := s.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: artifact.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: artifact.ExpectedVersion, Fence: artifact.Fence})
+			if reuseErr != nil || reusable.Key != *artifact.Document.ProviderResult || !reusable.Recovered {
+				return "", ErrEvidenceConflict
+			}
+			result, parsed = reusable.Result, reusable.Parsed
+		}
+		canonical, _, canonicalErr := phaseartifact.CanonicalTypedArtifact(phaseartifact.Parsed{Phase: domain.PhasePlanning, Provider: parsed.Provider, Planner: artifact.Document.Planner})
+		stored, _, storedErr := phaseartifact.CanonicalTypedArtifact(phaseartifact.Parsed{Phase: domain.PhasePlanning, Provider: parsed.Provider, Planner: parsed.Planner})
+		if canonicalErr != nil || storedErr != nil || !bytes.Equal(canonical, stored) {
+			return "", ErrEvidenceConflict
+		}
+	}
 	digest := sha256Digest(body)
 	err = s.write(ctx, func(conn *sql.Conn) error {
 		if err := s.assertTicketFence(ctx, conn, artifact.Ref, artifact.ExpectedVersion, artifact.Fence); err != nil {
@@ -170,8 +204,19 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 	if err := validBlob(artifact.Proof, "verification proof"); err != nil {
 		return VerificationRevision{}, err
 	}
-	if err := validOwnedFiles(artifact.OwnedFiles); err != nil || !validOID(artifact.CheckpointID) {
+	if err := validOwnedFiles(artifact.OwnedFiles); err != nil || !validOID(artifact.CheckpointID) || artifact.Checkpoint.CommitOID != "" && (artifact.Checkpoint.CommitOID != artifact.CheckpointID || artifact.Checkpoint.ParentOID == "" || artifact.Checkpoint.TreeOID == "") {
 		return VerificationRevision{}, fmt.Errorf("bounded verification checkpoint and owned files are required")
+	}
+	if artifact.ProviderResult != nil {
+		result, parsed, loadErr := s.LoadHistoricalProviderAttemptResult(ctx, *artifact.ProviderResult)
+		if loadErr != nil || result.Claim.Role != "verification" || result.Claim.Phase != domain.PhaseVerification || result.Claim.Ref != artifact.Ref || result.Claim.ExpectedVersion != artifact.ExpectedVersion || result.Claim.LeaderEpoch != artifact.Fence.LeaderEpoch || result.Claim.RunnerEpoch != artifact.Fence.RunnerEpoch || parsed.Verify == nil {
+			return VerificationRevision{}, ErrEvidenceConflict
+		}
+		intent, intentErr := workflowprompt.CanonicalVerificationIntentBytes(*parsed.Verify)
+		proof, proofErr := workflowprompt.CanonicalVerificationProofBytes(*parsed.Verify)
+		if intentErr != nil || proofErr != nil || !bytes.Equal(intent, artifact.Intent) || !bytes.Equal(proof, artifact.Proof) || !equalStringSlices(parsed.Verify.OwnedFiles, artifact.OwnedFiles) {
+			return VerificationRevision{}, ErrEvidenceConflict
+		}
 	}
 	if (artifact.AmendsRevision == 0) != (artifact.Reason == "" && artifact.Requester == "") {
 		return VerificationRevision{}, fmt.Errorf("verification amendment must bind revision, reason, and requester")
@@ -344,7 +389,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if _, err := conn.ExecContext(ctx, `UPDATE approvals SET invalidated=1 WHERE channel=? AND project_id=? AND ticket_id=? AND invalidated=0 AND reviewed_head<>?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, evidence.Snapshot.HeadSHA); err != nil {
 			return err
 		}
-		return evidenceEvent(ctx, conn, evidence.Ref, evidence.ExpectedVersion, "candidate_recorded", map[string]any{"generation": evidence.Snapshot.Generation, "head": evidence.Snapshot.HeadSHA})
+		return evidenceEvent(ctx, conn, evidence.Ref, evidence.ExpectedVersion, "candidate_recorded", map[string]any{"generation": evidence.Snapshot.Generation, "head": evidence.Snapshot.HeadSHA, "builder_attempt_id": evidence.BuilderResult.AttemptID, "builder_attempt": evidence.BuilderResult.Attempt, "builder_evidence_digest": evidence.Snapshot.BuilderEvidenceDigest, "command_policy_digest": evidence.Snapshot.CommandPolicyDigest})
 	})
 	return receipts, err
 }
@@ -583,6 +628,18 @@ func validBlob(value []byte, name string) error {
 		return fmt.Errorf("%s exceeds byte bound", name)
 	}
 	return nil
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 func validJSON(value []byte) bool {
 	return len(value) > 0 && len(value) <= maxEvidenceJSON && json.Valid(value)

@@ -70,6 +70,39 @@ func TestEvidencePlanVerificationCandidateAndApprovalFences(t *testing.T) {
 	}
 }
 
+func TestTransitionCandidateRefusesReplacementGenerationAtomically(t *testing.T) {
+	database, ctx, ref, version, fence := evidenceFixture(t)
+	if _, err := database.db.ExecContext(ctx, `UPDATE tickets SET state='building' WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: version, Fence: fence, Path: "/tmp/candidate-race", Branch: "dev/candidate-race", IdentityJSON: []byte(`{"repository":"/tmp/candidate-race"}`), BaseSHA: evidenceOID("a"), HeadSHA: evidenceOID("b")}); err != nil {
+		t.Fatal(err)
+	}
+	verification, err := database.RecordVerification(ctx, VerificationArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Intent: []byte("intent"), Proof: []byte("proof"), OwnedFiles: []string{"internal"}, CheckpointID: evidenceOID("c")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := domain.CandidateSnapshot{Generation: 1, BaseSHA: evidenceOID("a"), HeadSHA: evidenceOID("d"), TreeSHA: evidenceOID("e"), SourceDigest: "evidence-digest", VerificationIntentDigest: verification.IntentDigest, ProofDigest: verification.ProofDigest, CommandPolicyDigest: evidenceDigest("policy"), BuilderEvidenceDigest: evidenceDigest("builder")}
+	for _, candidate := range []domain.CandidateSnapshot{base, func() domain.CandidateSnapshot {
+		v := base
+		v.Generation = 2
+		v.HeadSHA = evidenceOID("f")
+		v.TreeSHA = evidenceOID("0")
+		return v
+	}()} {
+		if _, err := database.db.ExecContext(ctx, `INSERT INTO candidate_snapshots(channel,project_id,ticket_id,generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, candidate.Generation, version, fence.LeaderEpoch, fence.RunnerEpoch, candidate.BaseSHA, candidate.HeadSHA, candidate.TreeSHA, candidate.SourceDigest, candidate.VerificationIntentDigest, candidate.ProofDigest, candidate.CommandPolicyDigest, candidate.BuilderEvidenceDigest, now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := database.TransitionCandidate(ctx, Transition{Ref: ref, ExpectedVersion: version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}, base); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("candidate replacement err=%v", err)
+	}
+	current, err := database.Ticket(ctx, ref)
+	if err != nil || current.State != domain.StateBuilding || current.Version != version {
+		t.Fatalf("ticket=%+v err=%v", current, err)
+	}
+}
+
 func TestPlanEvidencePreservesArgvAndRejectsFlattenedCommands(t *testing.T) {
 	database, ctx, ref, version, fence := evidenceFixture(t)
 	document := PlanDocument{

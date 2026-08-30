@@ -128,6 +128,44 @@ func (e *Engine) Signal(ctx context.Context, request contracts.SignalRequest) (c
 	})
 }
 
+// SignalCandidate consumes the exact candidate in the same SQLite write as
+// the state transition.  It is intentionally separate from Signal so no
+// caller can accidentally turn a candidate-bound build pass into a generic
+// transition after a stale read.
+func (e *Engine) SignalCandidate(ctx context.Context, request contracts.SignalRequest, candidate domain.CandidateSnapshot) (contracts.TransitionResult, error) {
+	guards := make(map[string]bool, len(request.Attributes))
+	for key, value := range request.Attributes {
+		guards[key] = value == "true"
+	}
+	transition, err := e.spec.Select(string(request.From), request.Trigger, guards)
+	if err != nil {
+		return contracts.TransitionResult{}, err
+	}
+	ticket, err := e.store.Ticket(ctx, request.Ticket)
+	if err != nil {
+		return contracts.TransitionResult{}, err
+	}
+	if ticket.State != request.From || ticket.Version != request.TicketVersion {
+		return contracts.TransitionResult{}, store.ErrStaleFence
+	}
+	target, err := statemachine.ResolveTarget(transition.To, string(request.From), string(ticket.ResumeState), string(ticket.ResumeState))
+	if err != nil {
+		return contracts.TransitionResult{}, err
+	}
+	resume := domain.State(transition.ResumeState)
+	if transition.ResumeState == "$from" {
+		resume = request.From
+	}
+	if transition.ResumeState == "$stored" {
+		resume = ticket.ResumeState
+	}
+	result, err := e.store.TransitionCandidate(ctx, store.Transition{Ref: request.Ticket, ExpectedVersion: request.TicketVersion, From: request.From, To: target, ResumeState: resume, Trigger: request.Trigger, Fence: request.Fence, EventPayload: request.EventPayload}, candidate)
+	if err != nil {
+		return contracts.TransitionResult{}, err
+	}
+	return contracts.TransitionResult{To: target, TicketVersion: result.Version, Invalidated: invalidations(e.spec, transition.Invalidates), EventID: fmt.Sprint(result.EventID)}, nil
+}
+
 func (e *Engine) Recover(ctx context.Context, request contracts.RecoveryRequest) error {
 	return e.store.BlockOrphanedWorkflows(ctx, request.Channel, request.LeaderEpoch)
 }
