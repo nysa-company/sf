@@ -96,6 +96,10 @@ type RuntimeDependencies struct {
 // projection have completed, and before the owner socket is exposed.
 type WorkflowRuntimeFactory func(RuntimeDependencies) (WorkflowRuntime, error)
 
+// ErrAlreadyServing keeps the foreground lifecycle single-owner. A second
+// Serve call must not be allowed to outlive the call that joins the runtime.
+var ErrAlreadyServing = errors.New("daemon serve lifecycle already started")
+
 // idleRuntimeController is safe only for the current composition, which has
 // no provider/Git/GitHub runner. A later composition that can launch work must
 // inject its real supervisor and effect observer.
@@ -191,6 +195,7 @@ type Daemon struct {
 	runtime                  WorkflowRuntime
 	mu                       sync.Mutex
 	closed                   bool
+	serving                  bool
 
 	projectionMu      sync.Mutex
 	projector         events.Projector
@@ -366,7 +371,22 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 }
 
 func (daemon *Daemon) Serve(ctx context.Context) error {
-	err := daemon.server.Serve(ctx)
+	daemon.mu.Lock()
+	if daemon.closed || daemon.serving {
+		daemon.mu.Unlock()
+		return ErrAlreadyServing
+	}
+	// A daemon has one foreground serving lifetime. Keep this set after Serve
+	// returns so a caller cannot reopen the listener after its runtime has
+	// already been joined.
+	daemon.serving = true
+	server := daemon.server
+	daemon.mu.Unlock()
+
+	if server == nil {
+		return errors.New("daemon socket is unavailable")
+	}
+	err := server.Serve(ctx)
 	runtimeErr := daemon.closeRuntime()
 	if runtimeErr != nil {
 		if err != nil {
@@ -519,8 +539,19 @@ func Run(ctx context.Context, configuration Config) error {
 	if err != nil {
 		return err
 	}
-	defer daemon.Close()
-	return daemon.Serve(ctx)
+	return runForeground(ctx, daemon)
+}
+
+type foregroundDaemon interface {
+	Serve(context.Context) error
+	Close() error
+}
+
+// runForeground preserves both the serving result and every normal shutdown
+// error. A defer would silently discard Close failures after a clean context
+// cancellation, leaving the caller unable to distinguish complete teardown.
+func runForeground(ctx context.Context, daemon foregroundDaemon) error {
+	return errors.Join(daemon.Serve(ctx), daemon.Close())
 }
 
 func (daemon *Daemon) Close() error {

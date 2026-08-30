@@ -29,6 +29,14 @@ type fakeWorkflowRuntime struct {
 	fence    domain.Fence
 }
 
+type foregroundDaemonFunc struct {
+	serve func(context.Context) error
+	close func() error
+}
+
+func (d foregroundDaemonFunc) Serve(ctx context.Context) error { return d.serve(ctx) }
+func (d foregroundDaemonFunc) Close() error                    { return d.close() }
+
 func (r *fakeWorkflowRuntime) Start(ctx context.Context, fence domain.Fence) error {
 	r.mu.Lock()
 	r.ctx, r.fence = ctx, fence
@@ -227,6 +235,79 @@ func TestRuntimeUsesProcessContextAfterStartupAndStopsOnCancellation(t *testing.
 	case <-runtimeCtx.Done():
 	case <-time.After(time.Second):
 		t.Fatal("runtime context did not observe process cancellation")
+	}
+}
+
+func TestRunForegroundReturnsNormalContextShutdownAndJoinedErrors(t *testing.T) {
+	t.Run("context cancellation with clean close", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := runForeground(ctx, foregroundDaemonFunc{
+			serve: func(got context.Context) error {
+				if !errors.Is(got.Err(), context.Canceled) {
+					t.Fatalf("serve context=%v", got.Err())
+				}
+				return nil
+			},
+			close: func() error { return nil },
+		})
+		if err != nil {
+			t.Fatalf("clean context shutdown=%v", err)
+		}
+	})
+
+	t.Run("serve and close errors", func(t *testing.T) {
+		serveErr := errors.New("serve failed")
+		closeErr := errors.New("close failed")
+		err := runForeground(context.Background(), foregroundDaemonFunc{
+			serve: func(context.Context) error { return serveErr },
+			close: func() error { return closeErr },
+		})
+		if !errors.Is(err, serveErr) || !errors.Is(err, closeErr) {
+			t.Fatalf("joined foreground error=%v", err)
+		}
+	})
+}
+
+func TestDaemonServeRejectsConcurrentLifecycleWithoutStoppingRuntime(t *testing.T) {
+	runtime := &fakeWorkflowRuntime{closed: make(chan struct{})}
+	cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntime, error) { return runtime, nil })
+	daemon, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+
+	serveCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- daemon.Serve(serveCtx) }()
+	// A successful socket request proves the first Serve owns the listener
+	// before the second call attempts to enter the lifecycle.
+	if _, err := transport.Call(context.Background(), paths.Socket, api.Request{Version: api.Version, RequestID: "serve-owner", Method: "daemon.status", Parameters: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.Serve(context.Background()); !errors.Is(err, ErrAlreadyServing) {
+		t.Fatalf("second Serve error=%v", err)
+	}
+	select {
+	case <-runtime.closed:
+		t.Fatal("rejected Serve stopped the runtime")
+	default:
+	}
+	cancel()
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Serve error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Serve did not stop")
+	}
+	select {
+	case <-runtime.closed:
+	case <-time.After(time.Second):
+		t.Fatal("first Serve did not join runtime")
 	}
 }
 
