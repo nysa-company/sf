@@ -381,6 +381,10 @@ func TestCompleteProviderAttemptSuccessPersistsAndReparses(t *testing.T) {
 	if receipts, err := db.RecordCandidate(ctx, evidence); err != nil || len(receipts) != 4 {
 		t.Fatalf("candidate receipts=%+v err=%v", receipts, err)
 	}
+	storedCandidate, err := db.LatestCandidate(ctx, ticket.Ref)
+	if err != nil || storedCandidate.Snapshot != snapshot || storedCandidate.TicketVersion != ticket.Version || storedCandidate.Fence != fence {
+		t.Fatalf("first candidate round-trip=%+v err=%v", storedCandidate, err)
+	}
 	if receipts, err := db.RecordCandidate(ctx, evidence); err != nil || len(receipts) != 0 {
 		t.Fatalf("candidate replay receipts=%+v err=%v", receipts, err)
 	}
@@ -399,6 +403,10 @@ func TestCompleteProviderAttemptSuccessPersistsAndReparses(t *testing.T) {
 	next.Commit.CommitOID, next.Commit.TreeOID = next.Snapshot.HeadSHA, next.Snapshot.TreeSHA
 	if receipts, err := db.RecordCandidate(ctx, next); err != nil || len(receipts) != 4 {
 		t.Fatalf("next candidate receipts=%+v err=%v", receipts, err)
+	}
+	storedCandidate, err = db.LatestCandidate(ctx, ticket.Ref)
+	if err != nil || storedCandidate.Snapshot.Generation != 2 || storedCandidate.Snapshot.HeadSHA != next.Snapshot.HeadSHA || storedCandidate.Snapshot.TreeSHA != next.Snapshot.TreeSHA || storedCandidate.Snapshot.BuilderEvidenceDigest != next.Snapshot.BuilderEvidenceDigest || storedCandidate.TicketVersion != ticket.Version || storedCandidate.Fence != fence {
+		t.Fatalf("second candidate round-trip=%+v err=%v", storedCandidate, err)
 	}
 	decisions, err := db.OperatorDecisions(ctx, ticket.Ref)
 	if err != nil || len(decisions) != 1 || !decisions[0].Invalidated {
@@ -521,6 +529,12 @@ func TestHistoricalProviderResultSurvivesTransitionAndLeaderRestart(t *testing.T
 	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-historical-result", leader), leader, domain.StatePlanning)
 	planner, _ := setupProviderPair(t, db, ctx)
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	if _, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: ticket.Version, Fence: fence}); !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("builder reuse admitted=%v", err)
+	}
+	if _, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence}); !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("verification reuse admitted=%v", err)
+	}
 	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
 	if err != nil {
 		t.Fatal(err)
@@ -574,6 +588,70 @@ func TestHistoricalProviderResultSurvivesTransitionAndLeaderRestart(t *testing.T
 	}
 	if newLeader == leader {
 		t.Fatal("leader did not advance")
+	}
+}
+
+func TestLatestReusableReviewerExactAndRestartRecovery(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "reviewer-reuse")
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-reviewer-reuse", leader), leader, domain.StateBuilding)
+	builder, reviewer := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	bclaim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	braw := contracts.PhaseResult{Provider: bclaim.Binding.Identity, Artifact: []byte(`{"schema":"sf.builder/v1","summary":"done","changed_files":["main.go"],"commands":[["go","test"]]}`), UsageTrusted: true, UsageUnits: 1}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, bclaim, proof(t, bclaim), ticket.Version, fence, braw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	_, parsed, err := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: bclaim.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: bclaim.Attempt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := sha256Digest([]byte("review-source"))
+	if _, err := db.db.ExecContext(ctx, `UPDATE tickets SET source_digest=? WHERE channel=? AND project_id=? AND id=?`, source, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	rev, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: []byte("intent"), Proof: []byte("proof"), OwnedFiles: []string{"verify.go"}, CheckpointID: strings.Repeat("d", 40)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bd, _ := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
+	snap := domain.CandidateSnapshot{BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: source, VerificationIntentDigest: rev.IntentDigest, ProofDigest: rev.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: bd}
+	ce := CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snap, BuilderResult: ProviderAttemptResultKey{AttemptID: bclaim.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: bclaim.Attempt}, Commit: CommitObservation{CommitOID: snap.HeadSHA, ParentOID: strings.Repeat("d", 40), TreeOID: snap.TreeSHA}, Reason: "candidate"}
+	if _, err := db.RecordCandidate(ctx, ce); err != nil {
+		t.Fatal(err)
+	}
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateReviewing)
+	fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	rclaim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseReview, Role: "reviewer", Binding: runtime(reviewer), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(), ExpectedHead: snap.HeadSHA, ExpectedProof: snap.ProofDigest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rraw := contracts.PhaseResult{Provider: rclaim.Binding.Identity, Artifact: []byte(`{"schema":"sf.reviewer/v1","decision":"pass","findings":[],"reviewed_head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","proof_digest":"` + snap.ProofDigest + `"}`), UsageTrusted: true, UsageUnits: 1}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, rclaim, proof(t, rclaim), ticket.Version, fence, rraw, phaseartifact.Validation{TicketType: domain.TicketFeature, ExpectedReviewedHead: snap.HeadSHA, ExpectedProofDigest: snap.ProofDigest}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	request := LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseReview, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence}
+	if got, err := db.LatestReusableProviderAttempt(ctx, request); err != nil || got.Recovered || got.Parsed.Reviewer == nil {
+		t.Fatalf("exact reviewer=%+v err=%v", got, err)
+	}
+	advanced, err := db.InvalidateRunner(ctx, ticket.Ref, ticket.Version, fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader, _ = db.AcquireLeader(ctx, domain.ChannelDev, "reviewer-restart")
+	request.ExpectedVersion, request.Fence = advanced.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: advanced.RunnerEpoch}
+	if got, err := db.LatestReusableProviderAttempt(ctx, request); err != nil || !got.Recovered {
+		t.Fatalf("recovered reviewer=%+v err=%v", got, err)
+	}
+	if _, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: advanced.Version, Fence: request.Fence, Intent: []byte("intent-two"), Proof: []byte("proof-two"), OwnedFiles: []string{"verify.go"}, CheckpointID: strings.Repeat("e", 40), AmendsRevision: rev.Revision, Reason: "changed", Requester: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.LatestReusableProviderAttempt(ctx, request); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("stale review proof accepted=%v", err)
 	}
 }
 
