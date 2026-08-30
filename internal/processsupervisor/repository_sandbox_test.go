@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -70,16 +71,68 @@ func TestRepositoryStrictSandboxAllowsReadOnlyGit(t *testing.T) {
 	if err != nil {
 		t.Skipf("approved Git unavailable: %v", err)
 	}
-	repository, err := os.Getwd()
+	repository, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile, err := repositoryStrictSandboxProfile(repository, gitPath)
+	gitFile := filepath.Join(repository, ".git")
+	gitFileRaw, err := os.ReadFile(gitFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commonDir := filepath.Join(repository, ".git")
+	if target, ok := strings.CutPrefix(strings.TrimSpace(string(gitFileRaw)), "gitdir: "); ok {
+		commonDir = filepath.Dir(filepath.Dir(strings.TrimSpace(target)))
+	}
+	profile, err := repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: repository, Worktree: repository, GitFile: gitFile, CommonDir: commonDir, Executable: gitPath})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(repositorySandboxExec, "-p", profile, gitPath, "-C", repository, "status", "--porcelain=v1")
+	cmd.Dir = "/"
+	gitHome := t.TempDir()
+	cmd.Env = append(os.Environ(), "HOME="+gitHome, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_ATTR_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("read-only Git did not run inside strict sandbox: %v: %s", err, out)
+	}
+}
+
+func TestRepositoryStrictSandboxDeniesSeparateWorktreeAndHostWrites(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("repository command product boundary is macOS")
+	}
+	perl, err := exec.LookPath("perl")
+	if err != nil {
+		t.Skip("perl fixture unavailable")
+	}
+	root := t.TempDir()
+	repository := root + "/repository"
+	worktree := root + "/worktree"
+	private := root + "/private"
+	host := root + "/host"
+	for _, path := range []string{repository, worktree, worktree + "/.git", private, host} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sentinel := host + "/credential-sentinel"
+	if err := os.WriteFile(sentinel, []byte("non-secret sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: repository, Worktree: worktree, GitFile: worktree + "/.git", CommonDir: repository + "/.git", Home: private, Temporary: private, Executable: perl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := `sub probe { my ($name,$mode,$path)=@_; if (open(my $f,$mode,$path)) { close($f); print "$name-ok\n" } else { print "$name-denied\n" } } probe("source-write",">",$ARGV[0]."/source"); probe("worktree-write",">",$ARGV[1]."/source"); probe("git-write",">",$ARGV[1]."/.git/config"); probe("outside-write",">",$ARGV[2]."/outside"); probe("credential-read","<",$ARGV[3]);`
+	cmd := exec.Command(repositorySandboxExec, "-p", profile, perl, "-e", fixture, repository, worktree, host, sentinel)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("strict fixture failed: %v: %s", err, out)
+	}
+	text := string(out)
+	for _, want := range []string{"source-write-denied", "worktree-write-denied", "git-write-denied", "outside-write-denied", "credential-read-denied"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("strict profile allowed prohibited operation %q: %s", want, text)
+		}
 	}
 }

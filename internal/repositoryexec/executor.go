@@ -99,6 +99,9 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 	if err := req.Policy.Authorize(req.Spec.Argv); err != nil {
 		return contracts.CommandResult{}, err
 	}
+	if err := e.Supervisor.Preflight(req.Spec); err != nil {
+		return contracts.CommandResult{}, err
+	}
 	if !filepath.IsAbs(req.Claim.Repository) || filepath.Clean(req.Claim.Repository) != req.Claim.Repository || !filepath.IsAbs(req.Claim.Worktree) || filepath.Clean(req.Claim.Worktree) != req.Claim.Worktree {
 		return contracts.CommandResult{}, ErrInvalidBinding
 	}

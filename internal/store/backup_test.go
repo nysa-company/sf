@@ -85,6 +85,24 @@ func TestPrivateSchemaV10UpgradesThroughProviderMigrations(t *testing.T) {
 	}
 }
 
+func TestRepositoryCommandV33UpgradeAndRequiredSchema(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "dev.sqlite")
+	createDatabaseAtVersion(t, path, 32)
+	database, err := OpenChannel(ctx, path, filepath.Join(root, "unused-backups"), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if got := rawSchemaVersion(t, path); got != 33 {
+		t.Fatalf("migrated schema=%d want=33", got)
+	}
+	if err := validateSchema(ctx, database.db); err != nil {
+		t.Fatalf("v33 required schema: %v", err)
+	}
+}
+
 func TestV26ClosesPhaseRunForV25LegacyProviderClaim(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "v24.sqlite")

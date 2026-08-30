@@ -3,12 +3,15 @@ package repositoryexec
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"testing"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/executionpolicy"
+	"github.com/nysa-company/sf/internal/processsupervisor"
 )
 
 type neverAuthority struct{}
@@ -51,5 +54,28 @@ func TestRunRejectsShellAndNeverCallsAuthority(t *testing.T) {
 	_, err = (Executor{Authority: neverAuthority{}}).Run(context.Background(), Request{Claim: claim, Spec: contracts.CommandSpec{Argv: []string{"sh", "-c", "echo secret"}, Directory: claim.Worktree, Timeout: 1, Stdin: bytes.NewReader(nil)}, Policy: p})
 	if err == nil {
 		t.Fatal("shell command was accepted")
+	}
+}
+
+func TestNPMRecipeFailsClosedBeforeLeaseAcquisition(t *testing.T) {
+	policy, err := executionpolicy.NewCommandSnapshot([]string{"npm", "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree := t.TempDir()
+	spec := contracts.CommandSpec{Argv: []string{"npm", "test"}, Directory: worktree, Timeout: 5, Profile: contracts.ProfileGuarded}
+	commandDigest, err := CommandDigest(spec.Argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin := sha256.Sum256(nil)
+	specDigest, err := SpecDigest(spec, "sha256:"+hex.EncodeToString(stdin[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := contracts.RepositoryCommandClaim{Repository: worktree, Worktree: worktree, PolicyDigest: policy.Digest(), CommandDigest: commandDigest, SpecDigest: specDigest}
+	_, err = (Executor{Authority: neverAuthority{}}).Run(context.Background(), Request{Claim: claim, Spec: spec, Policy: policy})
+	if !errors.Is(err, processsupervisor.ErrSubprocessRecipeUnsupported) {
+		t.Fatalf("npm recipe error=%v", err)
 	}
 }

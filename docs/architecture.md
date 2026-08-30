@@ -74,6 +74,18 @@ Autonomous mode additionally requires the exact provider and repository-command
 executor to pass an OS-enforced macOS profile. Docker and Colima are deferred,
 not hidden fallbacks.
 
+The local guarded repository-command executor is intentionally narrow: its only
+Go recipe is `go test ./...`, with no caller flags, CGO, downloads, module
+updates, overlays, compiler/linker selection, or output paths. It also records
+the exact Nysa-local intents `npm test` and `npm run build`, never arbitrary npm
+arguments or CI/install/download commands. The current macOS primitive cannot
+prove inherited containment for npm/Node's shell process tree, so those npm
+recipes fail before a lease or child process starts and require operator
+takeover. Test binaries run under a default-deny profile and cannot fork or
+exec; tests that require subprocesses require an explicit operator takeover.
+This is a local guarded baseline, not evidence that ADR 0002's autonomous
+capability has changed.
+
 ## Change rule
 
 Candidate head, base, operator source, or command-policy changes invalidate

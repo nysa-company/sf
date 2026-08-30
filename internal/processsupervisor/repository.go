@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +28,12 @@ import (
 const repositoryOutputLimit = 64 << 10
 const repositoryInputLimit = 1 << 20
 
+// ErrSubprocessRecipeUnsupported is deliberately precise: npm/Node scripts
+// necessarily create a shell/process tree, while ADR 0002's macOS primitive
+// cannot prove inherited containment for that tree. The guarded executor must
+// stop before it obtains a repository lease or launches a child.
+var ErrSubprocessRecipeUnsupported = errors.New("repository npm recipe requires operator takeover: the guarded macOS profile cannot yet prove Node/npm subprocess containment")
+
 // RepositoryCommandSupervisor is the sole os/exec boundary for exact,
 // credential-free repository commands. The child is held behind the sf gate
 // until its Store lease has durably recorded the process identity.
@@ -42,6 +49,17 @@ type RepositoryCommandSupervisor struct {
 	// replacement race.  It is intentionally unexported so production callers
 	// cannot turn it into a launch hook.
 	beforeWorktreeOpen func()
+}
+
+// Preflight rejects syntactically valid but presently unexecutable typed
+// recipes before the Store grants exclusion. This preserves a durable planner
+// policy for Nysa without claiming that the current Seatbelt profile safely
+// contains npm's shell/Node process tree.
+func (s RepositoryCommandSupervisor) Preflight(spec contracts.CommandSpec) error {
+	if len(spec.Argv) > 0 && filepath.Base(spec.Argv[0]) == "npm" {
+		return ErrSubprocessRecipeUnsupported
+	}
+	return nil
 }
 
 func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.RepositoryCommandClaim, spec contracts.CommandSpec, policy executionpolicy.CommandSnapshot, lease contracts.RepositoryCommandLease) (contracts.CommandResult, error) {
@@ -111,8 +129,6 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if claim.SpecDigest != "sha256:"+hex.EncodeToString(specSum[:]) {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	runCtx, cancel := context.WithTimeout(ctx, spec.Timeout)
-	defer cancel()
 	self := s.Executable
 	if self == "" {
 		self, err = os.Executable()
@@ -131,11 +147,31 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	}
 	defer os.RemoveAll(home)
 	defer os.RemoveAll(tmp)
-	staged, err := stageExecutable(resolved, claim.ExecutableDigest)
-	if err != nil {
-		return contracts.CommandResult{}, fmt.Errorf("stage repository executable: %w", err)
+	isGo := filepath.Base(resolved) == "go"
+	var staged, stagedToolchain string
+	if isGo {
+		goRoot := filepath.Dir(filepath.Dir(resolved))
+		rootBinary, rootErr := filepath.EvalSymlinks(filepath.Join(goRoot, "bin", "go"))
+		if rootErr != nil || rootBinary != resolved {
+			return contracts.CommandResult{}, ErrUnclear
+		}
+		stagedToolchain, err = stageGoToolchain(goRoot)
+		if err != nil {
+			return contracts.CommandResult{}, fmt.Errorf("stage Go toolchain: %w", err)
+		}
+		defer os.RemoveAll(filepath.Dir(stagedToolchain))
+		staged = filepath.Join(stagedToolchain, "bin", "go")
+		stagedDigest, digestErr := executableDigest(staged)
+		if digestErr != nil || stagedDigest != claim.ExecutableDigest {
+			return contracts.CommandResult{}, ErrUnclear
+		}
+	} else {
+		staged, err = stageExecutable(resolved, claim.ExecutableDigest)
+		if err != nil {
+			return contracts.CommandResult{}, fmt.Errorf("stage repository executable: %w", err)
+		}
+		defer os.RemoveAll(filepath.Dir(staged))
 	}
-	defer os.RemoveAll(filepath.Dir(staged))
 	env, err := executionpolicy.MinimalEnvironment(home, tmp)
 	if err != nil {
 		return contracts.CommandResult{}, err
@@ -156,27 +192,27 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if s.GitRunner.ExecHelper == "" || s.GitRunner.Home == "" {
 		return contracts.CommandResult{}, ErrUnclear
 	}
+	// Staging is a local supervisor preparation step. Start the command timeout
+	// only once the immutable gate/toolchain is ready, so a slow private copy
+	// cannot consume the ticket's configured verification budget.
+	runCtx, cancel := context.WithTimeout(ctx, spec.Timeout)
+	defer cancel()
 	if err := s.GitRunner.Reauthenticate(runCtx, identity); err != nil {
 		return contracts.CommandResult{}, fmt.Errorf("reauthenticate repository command worktree: %w", err)
 	}
-	isGo := filepath.Base(resolved) == "go"
 	isGoTest := isGo && len(spec.Argv) >= 2 && spec.Argv[1] == "test"
 	if isGo {
-		goRoot := filepath.Dir(filepath.Dir(resolved))
-		rootBinary, rootErr := filepath.EvalSymlinks(filepath.Join(goRoot, "bin", "go"))
-		if rootErr != nil || rootBinary != resolved {
-			return contracts.CommandResult{}, ErrUnclear
-		}
-		// The authenticated Go binary is staged to close the final pathname
-		// race. A moved Go binary cannot infer its installation root, so bind
-		// its verified original GOROOT explicitly; this value is derived from
-		// (and rechecked against) the exact executable claim, never caller env.
-		// The Go driver is a fixed staged binary. It must compile/package test
-		// code, so it cannot itself carry the strict no-exec profile used by
-		// test binaries. Disable every Go-controlled download/toolchain path;
-		// arbitrary test code crosses the strict sandbox below before running.
-		env = append(env, "GOROOT="+goRoot, "GOPROXY=off", "GOSUMDB=off", "GOTOOLCHAIN=local")
+		// The whole Go root, including compiler/linker tools, is copied into a
+		// private owner-only stage before the driver sees repository input. CGO
+		// and every module/tool-selection escape are disabled by the exact policy
+		// recipe plus this environment.
+		env = append(env, "GOROOT="+stagedToolchain, "CGO_ENABLED=0", "GOPROXY=off", "GOSUMDB=off", "GONOSUMDB=*", "GOTOOLCHAIN=local", "GOENV=off", "GOWORK=off", "GOTELEMETRY=off")
 	}
+	self, err = stageRepositoryGate(self)
+	if err != nil {
+		return contracts.CommandResult{}, fmt.Errorf("stage repository gate: %w", err)
+	}
+	defer os.RemoveAll(filepath.Dir(self))
 	var sandboxProfile string
 	launchArgs := append([]string(nil), spec.Argv[1:]...)
 	if isGoTest {
@@ -185,9 +221,24 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		// -count=1 makes a verification actually execute rather than trust a
 		// prior Go cache result.
 		launchArgs = append([]string{"test", "-p=1", "-count=1", "-exec=" + self + " __repository_command_test_gate"}, spec.Argv[2:]...)
-		env = append(env, "SF_REPOSITORY_SANDBOX_REPOSITORY="+claim.Repository)
+		gitFile, err := repositoryGitFilePath(identity)
+		if err != nil {
+			return contracts.CommandResult{}, ErrUnclear
+		}
+		env = append(env,
+			"SF_REPOSITORY_SANDBOX_REPOSITORY="+claim.Repository,
+			"SF_REPOSITORY_SANDBOX_WORKTREE="+claim.Worktree,
+			"SF_REPOSITORY_SANDBOX_GIT_FILE="+gitFile,
+			"SF_REPOSITORY_SANDBOX_COMMON_DIR="+identity.CommonDir,
+			"SF_REPOSITORY_SANDBOX_HOME="+home,
+			"SF_REPOSITORY_SANDBOX_TMP="+tmp,
+		)
 	} else if !isGo {
-		sandboxProfile, err = repositoryStrictSandboxProfile(claim.Repository, staged)
+		gitFile, pathErr := repositoryGitFilePath(identity)
+		if pathErr != nil {
+			return contracts.CommandResult{}, ErrUnclear
+		}
+		sandboxProfile, err = repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: claim.Repository, Worktree: claim.Worktree, GitFile: gitFile, CommonDir: identity.CommonDir, Home: home, Temporary: tmp, Executable: staged})
 	}
 	if err != nil {
 		return contracts.CommandResult{}, ErrUnclear
@@ -331,7 +382,17 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		}
 	}
 	if reportsDone != nil {
-		<-reportsDone
+		select {
+		case <-reportsDone:
+		case <-time.After(s.drainHard() + 250*time.Millisecond):
+			// A missing acknowledgement/report is process-lifecycle ambiguity,
+			// not an excuse to infer that the primary driver's old process group
+			// proves the separately grouped wrapper died. Keep the repository
+			// quarantined for startup repair/recovery.
+			terminateRepositoryGroups(groups.snapshot(), syscall.SIGKILL)
+			_ = lease.Quarantine()
+			return contracts.CommandResult{}, ErrUnclear
+		}
 		if groups.err() != nil {
 			terminateRepositoryGroups(groups.snapshot(), syscall.SIGKILL)
 			_ = lease.Quarantine()
@@ -471,6 +532,126 @@ func stageExecutable(path, expectedDigest string) (string, error) {
 		return "", ErrUnclear
 	}
 	return destination, nil
+}
+
+func executableDigest(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, file); err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+// stageRepositoryGate closes the otherwise dangerous self-reexec pathname
+// window. The current daemon image is already trusted; the helper it spawns is
+// an owner-only, digest-checked private copy and is never executed by its
+// original pathname.
+func stageRepositoryGate(path string) (string, error) {
+	if path == "" {
+		return "", ErrUnclear
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	if err := authenticateRepositorySourceExecutable(resolved); err != nil {
+		return "", err
+	}
+	digest, err := executableDigest(resolved)
+	if err != nil {
+		return "", err
+	}
+	return stageExecutable(resolved, digest)
+}
+
+// stageGoToolchain copies the complete exact Go root into a private directory.
+// The driver otherwise finds compiler/linker tools by mutable paths below
+// GOROOT after its own executable was staged. CGO is disabled separately, but
+// staging the whole root also prevents a replacement of Go's native tools from
+// becoming pre-test authority.
+func stageGoToolchain(root string) (string, error) {
+	if !cleanAbsolute(root) {
+		return "", ErrUnclear
+	}
+	rootInfo, err := os.Lstat(root)
+	if err != nil || rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() || rootInfo.Mode().Perm()&0o022 != 0 || !trustedOwner(rootInfo) {
+		return "", ErrUnclear
+	}
+	base, err := os.MkdirTemp("", "sf-go-toolchain-")
+	if err != nil {
+		return "", err
+	}
+	if err := os.Chmod(base, 0o700); err != nil {
+		_ = os.RemoveAll(base)
+		return "", err
+	}
+	destinationRoot := filepath.Join(base, "goroot")
+	err = filepath.WalkDir(root, func(source string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(root, source)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return ErrUnclear
+		}
+		destination := destinationRoot
+		if rel != "." {
+			destination = filepath.Join(destinationRoot, rel)
+		}
+		info, err := entry.Info()
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
+			return ErrUnclear
+		}
+		if entry.IsDir() {
+			// The stage is private because its top-level parent is 0700. Keep
+			// nested directories owner-writable while WalkDir copies children.
+			return os.MkdirAll(destination, 0o700)
+		}
+		if !info.Mode().IsRegular() {
+			return ErrUnclear
+		}
+		sourceFile, err := os.Open(source)
+		if err != nil {
+			return err
+		}
+		defer sourceFile.Close()
+		destinationFile, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm()&0o555)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(destinationFile, sourceFile)
+		closeErr := destinationFile.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+	if err != nil {
+		_ = os.RemoveAll(base)
+		return "", err
+	}
+	goBinary := filepath.Join(destinationRoot, "bin", "go")
+	if err := authenticateRepositorySourceExecutable(goBinary); err != nil {
+		_ = os.RemoveAll(base)
+		return "", err
+	}
+	return destinationRoot, nil
+}
+
+func repositoryGitFilePath(identity gitboundary.Identity) (string, error) {
+	if !cleanAbsolute(identity.Worktree) {
+		return "", ErrUnclear
+	}
+	path := filepath.Join(identity.Worktree, ".git")
+	if filepath.Clean(path) != path {
+		return "", ErrUnclear
+	}
+	return path, nil
 }
 
 func sourceSizeOver(path string, limit int64) bool {

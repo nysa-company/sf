@@ -97,6 +97,8 @@ func MinimalEnvironment(home, temporary string) ([]string, error) {
 		"PAGER":               "cat",
 		"PATH":                "/usr/bin:/bin:/usr/sbin:/sbin",
 		"TMPDIR":              temporary,
+		"GIT_CONFIG_GLOBAL":   "/dev/null",
+		"GIT_ATTR_NOSYSTEM":   "1",
 	}
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -181,23 +183,39 @@ func EvaluateRepositoryCommand(argv []string) CommandDecision {
 	case "git":
 		return evaluateReadOnlyGit(argv)
 	case "go":
-		if len(argv) < 2 {
-			return deny("go_subcommand_required", "a bounded Go verification subcommand is required")
-		}
-		switch argv[1] {
-		case "test", "vet", "build", "list":
-			for _, argument := range argv[2:] {
-				if argument == "-exec" || strings.HasPrefix(argument, "-exec=") || argument == "-toolexec" || strings.HasPrefix(argument, "-toolexec=") || argument == "-p" || strings.HasPrefix(argument, "-p=") || argument == "-count" || strings.HasPrefix(argument, "-count=") {
-					return deny("go_wrapper_forbidden", "Go executable wrappers are forbidden")
-				}
-			}
-			return CommandDecision{Allowed: true, Code: "allowed_go_verification", Reason: "bounded Go verification command"}
-		default:
-			return deny("go_command_forbidden", "only go test, vet, build, and list are eligible")
-		}
+		return evaluateGoVerification(argv)
+	case "npm":
+		return evaluateNPMVerification(argv)
 	default:
 		return deny("repository_command_not_allowlisted", "only exact read-only Git and Go verification commands are eligible")
 	}
+}
+
+// evaluateGoVerification is intentionally a recipe, not a flag denylist.  The
+// Go driver runs before a test binary can enter Seatbelt, so flags which select
+// an output, module mode, overlay, compiler, linker, cgo, or external tool
+// would become pre-sandbox authority.  v1 therefore supports exactly one
+// hermetic recipe.  Repositories whose tests need another command (including
+// subprocess-using tests) require explicit operator takeover.
+func evaluateGoVerification(argv []string) CommandDecision {
+	if len(argv) != 3 || argv[1] != "test" || argv[2] != "./..." {
+		return deny("go_recipe_forbidden", "only the hermetic recipe `go test ./...` is eligible; flags, tool selection, outputs, module changes, cgo, and subprocess-dependent tests require operator takeover")
+	}
+	return CommandDecision{Allowed: true, Code: "allowed_go_test_recipe", Reason: "exact hermetic Go test recipe"}
+}
+
+// evaluateNPMVerification admits only durable, declarative project recipes.
+// It never accepts npm flags, install/audit/download commands, workspace
+// selectors, or a caller-defined script name.  The supervisor currently fails
+// these recipes closed before lease acquisition because Seatbelt cannot prove a
+// complete process tree for npm's Node/shell subprocess chain; retaining the
+// typed recipe lets the planner bind Nysa's configured intent without silently
+// broadening it into arbitrary npm argv.
+func evaluateNPMVerification(argv []string) CommandDecision {
+	if (len(argv) == 2 && argv[1] == "test") || (len(argv) == 3 && argv[1] == "run" && argv[2] == "build") {
+		return CommandDecision{Allowed: true, Code: "allowed_npm_recipe", Reason: "exact local NPM verification recipe"}
+	}
+	return deny("npm_recipe_forbidden", "only exact `npm test` and `npm run build` recipes are eligible; installs, CI-only scripts, flags, workspace selectors, downloads, and arbitrary subprocesses require operator takeover")
 }
 
 func evaluateReadOnlyGit(argv []string) CommandDecision {
