@@ -222,6 +222,23 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		if projectPath != r.Repository || durablePath != r.Worktree || durableIdentity != r.WorktreeIdentity || durableBase != r.BaseSHA {
 			return ErrEvidenceConflict
 		}
+		// Provider admission is one side of the repository writer exclusion.
+		// It is checked in this same IMMEDIATE transaction as the eventual
+		// provider-attempt insert, so a Git or credential-free writer cannot
+		// slip between a read-only preflight and process launch.
+		var activeRepositoryWriter int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM git_mutation_leases WHERE repository_path=?`, r.Repository).Scan(&activeRepositoryWriter); err != nil {
+			return err
+		}
+		if activeRepositoryWriter != 0 {
+			return ErrProviderAttempt
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_writer_leases WHERE repository_path=?`, r.Repository).Scan(&activeRepositoryWriter); err != nil {
+			return err
+		}
+		if activeRepositoryWriter != 0 {
+			return ErrProviderAttempt
+		}
 		if r.Phase == domain.PhaseReview && r.Role == "reviewer" {
 			if err := validateFinalReviewEvidence(ctx, conn, r.Ref, r.ExpectedVersion, r.Fence, r.ExpectedHead, r.ExpectedProof); err != nil {
 				return err

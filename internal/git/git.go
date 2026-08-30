@@ -196,6 +196,20 @@ type Runner struct {
 	Run                func(context.Context, string, []string, []string) ([]byte, error)
 }
 
+type mutationLeaseContextKey struct{}
+
+func withMutationLease(ctx context.Context, lease contracts.GitMutationLease) context.Context {
+	if _, ok := lease.(contracts.GitMutationLaunchLease); !ok {
+		return ctx
+	}
+	return context.WithValue(ctx, mutationLeaseContextKey{}, lease)
+}
+func mutationLaunchLease(ctx context.Context) contracts.GitMutationLaunchLease {
+	value, _ := ctx.Value(mutationLeaseContextKey{}).(contracts.GitMutationLease)
+	lease, _ := value.(contracts.GitMutationLaunchLease)
+	return lease
+}
+
 // commandConfigKeys are repository-local settings that can cause Git to run
 // another program or redirect an effect. The factory owns the command surface;
 // these settings therefore fail closed even when they were present before a
@@ -756,11 +770,27 @@ func runBounded(ctx context.Context, helper, binary string, argv, env []string, 
 	// macOS rejects execve("/dev/fd/N") for this binary, so the trusted
 	// repository contract supplies the final exclusion between this immediate
 	// authentication and exec. The pathname is verified again after Git exits.
-	command := exec.CommandContext(ctx, helper, append([]string{"--worktree-fd=3", "--git-dir-fd=4", "--common-dir-fd=5", "--", binary}, argv...)...)
+	args := []string{"--worktree-fd=3", "--git-dir-fd=4", "--common-dir-fd=5"}
+	lease := mutationLaunchLease(ctx)
+	var gateRead, gateWrite *os.File
+	if lease != nil {
+		gateRead, gateWrite, err = os.Pipe()
+		if err != nil {
+			return nil, err
+		}
+		defer gateWrite.Close()
+		args = append(args, "--gate-fd=6")
+	}
+	args = append(args, "--", binary)
+	args = append(args, argv...)
+	command := exec.CommandContext(ctx, helper, args...)
 	// ExtraFiles maps the authenticated O_DIRECTORY fd to descriptor 3 before
 	// the helper fchdir+execs Git. No mutable worktree spelling is used by the
 	// child after the caller has opened it.
 	command.ExtraFiles = directories
+	if gateRead != nil {
+		command.ExtraFiles = append(command.ExtraFiles, gateRead)
+	}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.WaitDelay = 750 * time.Millisecond
 	command.Env = env
@@ -790,7 +820,32 @@ func runBounded(ctx context.Context, helper, binary string, argv, env []string, 
 	}
 	buffer := &boundedBuffer{limit: maxGitOutput, stop: func() { killGroup(syscall.SIGKILL) }}
 	command.Stdout, command.Stderr = buffer, buffer
-	err = command.Run()
+	if lease == nil {
+		err = command.Run()
+	} else {
+		err = command.Start()
+		if err == nil {
+			_ = gateRead.Close()
+			launch, identityErr := gitLaunchIdentity(command.Process.Pid)
+			if identityErr != nil || lease.RecordGitMutationLaunch(ctx, launch) != nil {
+				killGroup(syscall.SIGKILL)
+				_ = command.Wait()
+				return buffer.data, fmt.Errorf("%w: could not durably gate git child", ErrIdentityMismatch)
+			}
+			if _, err = gateWrite.Write([]byte{1}); err == nil {
+				err = gateWrite.Close()
+			}
+			if err == nil {
+				err = command.Wait()
+			} else {
+				killGroup(syscall.SIGKILL)
+				_ = command.Wait()
+			}
+			if finishErr := lease.FinishGitMutationLaunch(context.Background(), launch); finishErr != nil {
+				return buffer.data, fmt.Errorf("%w: git child completion was not durable", ErrIdentityMismatch)
+			}
+		}
+	}
 	currentFile, openErr := openTrustedExecutable(helper)
 	if openErr != nil {
 		return buffer.data, fmt.Errorf("%w: execution helper changed during git command", ErrIdentityMismatch)
@@ -1524,6 +1579,7 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 		return Worktree{}, err
 	}
 	defer lease.Release()
+	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return Worktree{}, err
 	}
@@ -1566,6 +1622,7 @@ func (r Runner) cleanupCreatedWorktree(ctx context.Context, repository, path, br
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	cleanupCtx = withMutationLease(cleanupCtx, lease)
 	if err := createdPath.verify(); err != nil {
 		return err
 	}
@@ -1748,6 +1805,7 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 		return err
 	}
 	defer lease.Release()
+	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return err
 	}
@@ -2037,6 +2095,7 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 		return "", err
 	}
 	defer lease.Release()
+	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return "", err
 	}
@@ -2265,6 +2324,7 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 		return "", err
 	}
 	defer lease.Release()
+	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return "", err
 	}
@@ -2484,6 +2544,7 @@ func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.Pro
 		return err
 	}
 	defer lease.Release()
+	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return err
 	}
