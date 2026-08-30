@@ -190,14 +190,13 @@ type Runner struct {
 	// MutationAuthority is supplied by the daemon supervisor. A nil authority
 	// refuses every Git mutation; read-only inspection remains available.
 	MutationAuthority contracts.GitMutationAuthority
-	// MutationClaimProvider is an integration seam for the durable store. It
-	// receives the exact Git binding and must return the caller's persisted
-	// ticket/fence claim; Runner never fills ticket or fence fields itself.
-	MutationClaimProvider func(context.Context, contracts.GitMutationClaim) (contracts.GitMutationClaim, error)
 	// TestLocalTransport permits local bare origins only in hermetic tests. It
 	// must never be enabled by production configuration.
 	TestLocalTransport bool
-	Run                func(context.Context, string, []string, []string) ([]byte, error)
+	// TestMutationClaim is only for hermetic package fixtures. Production must
+	// leave it zero and pass the complete durable claim to each mutation API.
+	TestMutationClaim contracts.GitMutationClaim
+	Run               func(context.Context, string, []string, []string) ([]byte, error)
 }
 
 // commandConfigKeys are repository-local settings that can cause Git to run
@@ -404,31 +403,18 @@ func (r Runner) binary() string {
 func (r Runner) execHelper() string { return r.ExecHelper }
 
 func validMutationClaim(claim contracts.GitMutationClaim) bool {
-	return claim.TicketRef != "" && claim.SemanticKey != "" && validEvidenceDigest(claim.RequestDigest) && claim.TicketVersion != 0 &&
+	return claim.TicketRef.Validate() == nil && claim.SemanticKey != "" && validEvidenceDigest(claim.RequestDigest) && claim.TicketVersion != 0 &&
 		claim.LeaderEpoch != 0 && claim.RunnerEpoch != 0 && claim.ClaimEpoch != 0 && validAbsolutePath(claim.Repository) &&
 		claim.Operation != "" && validRef(claim.BaseRef) && validOID(claim.ExpectedBaseOID)
 }
 
-func (r Runner) mutationClaim(ctx context.Context, binding contracts.GitMutationClaim) (contracts.GitMutationClaim, error) {
-	if r.MutationClaimProvider == nil {
-		return contracts.GitMutationClaim{}, fmt.Errorf("%w: no caller mutation claim", ErrIdentityMismatch)
-	}
-	return r.MutationClaimProvider(ctx, binding)
-}
-
-func (r Runner) acquireBoundMutation(ctx context.Context, binding contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
-	claim, err := r.mutationClaim(ctx, binding)
-	if err != nil {
-		return nil, err
-	}
-	return r.acquireMutation(ctx, claim, binding.Repository, binding.Worktree, binding.Branch, binding.Operation, binding.BaseRef, binding.ExpectedBaseOID, binding.ExpectedHeadOID)
-}
-
 func (r Runner) acquireSuppliedMutation(ctx context.Context, supplied, binding contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
-	if supplied.TicketRef != "" {
-		return r.acquireMutation(ctx, supplied, binding.Repository, binding.Worktree, binding.Branch, binding.Operation, binding.BaseRef, binding.ExpectedBaseOID, binding.ExpectedHeadOID)
+	if supplied.TicketRef.Validate() != nil && r.TestLocalTransport && r.TestMutationClaim.TicketRef.Validate() == nil {
+		supplied = r.TestMutationClaim
+		supplied.Repository, supplied.Worktree, supplied.Branch, supplied.Operation = binding.Repository, binding.Worktree, binding.Branch, binding.Operation
+		supplied.BaseRef, supplied.ExpectedBaseOID, supplied.ExpectedHeadOID = binding.BaseRef, binding.ExpectedBaseOID, binding.ExpectedHeadOID
 	}
-	return r.acquireBoundMutation(ctx, binding)
+	return r.acquireMutation(ctx, supplied, binding.Repository, binding.Worktree, binding.Branch, binding.Operation, binding.BaseRef, binding.ExpectedBaseOID, binding.ExpectedHeadOID)
 }
 
 func (r Runner) acquireMutation(ctx context.Context, claim contracts.GitMutationClaim, repository, worktree, branch, operation, baseRef, baseOID, headOID string) (contracts.GitMutationLease, error) {
@@ -1492,7 +1478,7 @@ func canonicalExistingRepository(path string) (string, error) {
 	return canonical, nil
 }
 
-func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, baseRef string) (Worktree, error) {
+func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, baseRef string, claim contracts.GitMutationClaim) (Worktree, error) {
 	if !validAbsolutePath(repository) || !validAbsolutePath(path) || !validRef(baseRef) {
 		return Worktree{}, fmt.Errorf("canonical repository/worktree paths and base ref are required")
 	}
@@ -1541,7 +1527,7 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	if err != nil || !validOID(baseHead) {
 		return Worktree{}, fmt.Errorf("%w: invalid creation base", ErrIdentityMismatch)
 	}
-	lease, err := r.acquireBoundMutation(ctx, contracts.GitMutationClaim{Repository: repository, Worktree: path, Branch: branch, Operation: "create-worktree", BaseRef: baseRef, ExpectedBaseOID: baseHead, ExpectedHeadOID: baseHead})
+	lease, err := r.acquireSuppliedMutation(ctx, claim, contracts.GitMutationClaim{Repository: repository, Worktree: path, Branch: branch, Operation: "create-worktree", BaseRef: baseRef, ExpectedBaseOID: baseHead, ExpectedHeadOID: baseHead})
 	if err != nil {
 		return Worktree{}, err
 	}
@@ -1550,6 +1536,9 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 		return Worktree{}, err
 	}
 	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
+		return Worktree{}, err
+	}
+	if err := requireMutationLease(ctx, lease); err != nil {
 		return Worktree{}, err
 	}
 	if _, err := r.commandExpected(ctx, repository, repositoryDev, repositoryIno, "worktree", "add", "-b", branch, path, "--", baseRef); err != nil {
@@ -1737,7 +1726,7 @@ func (r Runner) RetainWorktree(ctx context.Context, worktree Worktree) (Identity
 	return worktree.Identity, nil
 }
 
-func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree Worktree, state WorktreeState) error {
+func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree Worktree, state WorktreeState, claim contracts.GitMutationClaim) error {
 	if _, err := validateBranch(worktree.Branch); err != nil {
 		return fmt.Errorf("%w: foreign branch is retained", ErrUnsafeWorktree)
 	}
@@ -1762,7 +1751,7 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 	if output, statusErr := r.command(ctx, worktree.Path, "status", "--porcelain=v1"); statusErr != nil || strings.TrimSpace(string(output)) != "" {
 		return fmt.Errorf("%w: worktree status is not clean", ErrUnsafeWorktree)
 	}
-	lease, err := r.acquireBoundMutation(ctx, contracts.GitMutationClaim{Repository: canonicalRepository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "remove-worktree", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: worktree.Identity.BaseHead})
+	lease, err := r.acquireSuppliedMutation(ctx, claim, contracts.GitMutationClaim{Repository: canonicalRepository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "remove-worktree", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: worktree.Identity.BaseHead})
 	if err != nil {
 		return err
 	}
@@ -1785,6 +1774,9 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 		return fmt.Errorf("%w: removal worktree identity changed", ErrIdentityMismatch)
 	}
 	if err := pinnedWorktree.verify(); err != nil {
+		return err
+	}
+	if err := requireMutationLease(ctx, lease); err != nil {
 		return err
 	}
 	_, err = r.commandExpected(ctx, canonicalRepository, repositoryDev, repositoryIno, "worktree", "remove", "--", worktree.Path)
@@ -2492,7 +2484,8 @@ func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.Pro
 		}
 		return fmt.Errorf("%w: protected ref is absent", ErrUnexpectedRemote)
 	}
-	proofKey := sha256.Sum256([]byte(witness.MutationClaim.TicketRef + "\x00" + witness.MutationClaim.SemanticKey + "\x00" + witness.ProtectedRef + "\x00" + witness.OriginalBaseOID + "\x00" + witness.MergeOID))
+	ticket := witness.MutationClaim.TicketRef
+	proofKey := sha256.Sum256([]byte(string(ticket.Channel) + "\x00" + string(ticket.Project) + "\x00" + string(ticket.Ticket) + "\x00" + witness.MutationClaim.SemanticKey + "\x00" + witness.ProtectedRef + "\x00" + witness.OriginalBaseOID + "\x00" + witness.MergeOID))
 	proofRef := "refs/sf/protected-proof/" + hex.EncodeToString(proofKey[:])
 	lease, err := r.acquireSuppliedMutation(ctx, witness.MutationClaim, contracts.GitMutationClaim{Repository: identity.Repository, Worktree: identity.Worktree, Branch: identity.HeadRef, Operation: "protected-ref-fetch", BaseRef: witness.ProtectedRef, ExpectedBaseOID: witness.OriginalBaseOID, ExpectedHeadOID: witness.MergeOID})
 	if err != nil {
@@ -2529,6 +2522,16 @@ func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.Pro
 	}
 	if _, err := r.commandExpected(ctx, identity.Worktree, identity.WorktreeDev, identity.WorktreeIno, "merge-base", "--is-ancestor", witness.MergeOID, fetched); err != nil {
 		return fmt.Errorf("%w: protected ref does not contain reported merge", ErrUnexpectedRemote)
+	}
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return err
+	}
+	current, err := r.remoteHeadEnv(ctx, identity.Worktree, identity.WorktreeDev, identity.WorktreeIno, origin, witness.ProtectedRef, extra)
+	if err != nil || current != fetched {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: protected ref moved while proving merge", ErrUnexpectedRemote)
 	}
 	return nil
 }

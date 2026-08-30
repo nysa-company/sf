@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"time"
+
+	"github.com/nysa-company/sf/internal/domain"
 )
 
 type CommandSpec struct {
@@ -34,7 +36,7 @@ type CommandExecutor interface {
 // This is what turns the trusted-repository assumption into an enforceable
 // production integration point instead of a Runner-local boolean.
 type GitMutationClaim struct {
-	TicketRef       string
+	TicketRef       domain.TicketRef
 	SemanticKey     string
 	RequestDigest   string
 	TicketVersion   uint64

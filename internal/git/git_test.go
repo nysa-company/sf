@@ -65,9 +65,34 @@ func (l testMutationLease) Check(context.Context) error { return l.err }
 func (testMutationLease) Release() error                { return nil }
 
 func testClaim(_ context.Context, binding contracts.GitMutationClaim) (contracts.GitMutationClaim, error) {
-	binding.TicketRef, binding.SemanticKey, binding.RequestDigest = "SF-test", "git/SF-test", digest([]byte("test-claim"))
+	binding.TicketRef, binding.SemanticKey, binding.RequestDigest = domain.TicketRef{Channel: domain.ChannelDev, Project: "project", Ticket: "SF-test"}, "git/SF-test", digest([]byte("test-claim"))
 	binding.TicketVersion, binding.LeaderEpoch, binding.RunnerEpoch, binding.ClaimEpoch = 1, 1, 1, 1
 	return binding, nil
+}
+
+func createClaim(t *testing.T, repository, path, branch, base string) contracts.GitMutationClaim {
+	t.Helper()
+	canonical, err := filepath.EvalSymlinks(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository = canonical
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path = filepath.Join(parent, filepath.Base(path))
+	baseOID := rawGit(t, repository, "rev-parse", base+"^{commit}")
+	claim, err := testClaim(context.Background(), contracts.GitMutationClaim{Repository: repository, Worktree: path, Branch: branch, Operation: "create-worktree", BaseRef: base, ExpectedBaseOID: baseOID, ExpectedHeadOID: baseOID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claim
+}
+
+func removeClaim(worktree Worktree) contracts.GitMutationClaim {
+	claim, _ := testClaim(context.Background(), contracts.GitMutationClaim{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "remove-worktree", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: worktree.Identity.BaseHead})
+	return claim
 }
 
 func (a *memoryBranchAuthority) LoadBranch(_ context.Context, key string) (string, error) {
@@ -170,7 +195,8 @@ func fixture(t *testing.T) (context.Context, Runner, string, string) {
 	rawGit(t, repository, "commit", "-m", "base")
 	rawGit(t, repository, "remote", "add", "origin", remote)
 	rawGit(t, repository, "push", "origin", "main:refs/heads/main")
-	return ctx, Runner{Home: filepath.Join(root, "git-home"), ExecHelper: testExecHelper, TestLocalTransport: true, MutationAuthority: testMutationAuthority{}, MutationClaimProvider: testClaim}, repository, remote
+	testClaimValue, _ := testClaim(ctx, contracts.GitMutationClaim{})
+	return ctx, Runner{Home: filepath.Join(root, "git-home"), ExecHelper: testExecHelper, TestLocalTransport: true, TestMutationClaim: testClaimValue, MutationAuthority: testMutationAuthority{}}, repository, remote
 }
 
 func TestAllocatorDelegatesBranchPersistenceToAuthority(t *testing.T) {
@@ -199,7 +225,7 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,11 +262,11 @@ func TestCreateWorktreeAdoptsExistingAuthenticatedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	first, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	first, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	second, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +305,7 @@ func TestCleanupUsesIndependentContextAfterCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	_, err = runner.CreateWorktree(ctx, repository, path, branch, "main")
+	_, err = runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +339,7 @@ func TestWorktreeRemovalAndDiffHostileFixturesRefuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,10 +391,10 @@ func TestWorktreeRemovalAndDiffHostileFixturesRefuse(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "src", "untracked"), []byte("dirty"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runner.RemoveWorktree(ctx, repository, worktree, WorktreeState{}); !errors.Is(err, ErrUnsafeWorktree) {
+	if err := runner.RemoveWorktree(ctx, repository, worktree, WorktreeState{}, removeClaim(worktree)); !errors.Is(err, ErrUnsafeWorktree) {
 		t.Fatalf("dirty remove=%v", err)
 	}
-	if err := runner.RemoveWorktree(ctx, repository, worktree, WorktreeState{Taken: true}); !errors.Is(err, ErrUnsafeWorktree) {
+	if err := runner.RemoveWorktree(ctx, repository, worktree, WorktreeState{Taken: true}, removeClaim(worktree)); !errors.Is(err, ErrUnsafeWorktree) {
 		t.Fatalf("taken remove=%v", err)
 	}
 }
@@ -379,7 +405,10 @@ func TestValidateDiffRejectsChangedPathThroughHostileSymlinkParent(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +433,10 @@ func TestIdentityRejectsControlPlaneEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +453,7 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +582,7 @@ func TestDiffAllowsPreexistingExecutableAndSymlinkButRejectsChangedOnes(t *testi
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +618,10 @@ func TestPreflightAndRemovalRequireAuthenticatedPrimaryRepository(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +630,7 @@ func TestPreflightAndRemovalRequireAuthenticatedPrimaryRepository(t *testing.T) 
 		t.Fatal(err)
 	}
 	rawGit(t, other, "init", "-b", "main")
-	if err := runner.RemoveWorktree(ctx, other, worktree, WorktreeState{}); !errors.Is(err, ErrIdentityMismatch) {
+	if err := runner.RemoveWorktree(ctx, other, worktree, WorktreeState{}, removeClaim(worktree)); !errors.Is(err, ErrIdentityMismatch) {
 		t.Fatalf("foreign primary removal=%v", err)
 	}
 }
@@ -606,7 +641,10 @@ func TestCommitBoundsUntrustedEvidenceAndMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -627,7 +665,10 @@ func TestCommitDoesNotAdoptSpoofWithMatchingParentAndSubject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +699,10 @@ func TestPushRefusesMovedRemoteBaseBeforeCandidatePublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,7 +755,10 @@ func TestCommitRevalidatesResultingTreeAfterStagingRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -749,7 +796,10 @@ func TestCommitRejectsIndexRaceBeforeWriteTreeWithoutAdvancingBranch(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -844,7 +894,10 @@ func TestGitHubPublicationFailsClosedAfterExactLocalCandidateProof(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -875,7 +928,10 @@ func TestGitHubPublicationRefusesMismatchedBaseBeforeClaimValidation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -915,7 +971,10 @@ func TestValidateDiffRenameIncludesDeletedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -936,7 +995,7 @@ func TestSnapshotRejectsGitPointerSymlinkAndHardlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -975,7 +1034,10 @@ func TestInspectRejectsWorktreePathRebinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -991,7 +1053,10 @@ func TestSnapshotBindsRequestedRepositoryAndTopLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1010,7 +1075,10 @@ func TestSnapshotRejectsHooksRootSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1036,7 +1104,7 @@ func TestRemoveRejectsWorktreeReplacementAtEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1058,7 +1126,7 @@ func TestRemoveRejectsWorktreeReplacementAtEffect(t *testing.T) {
 		command.Env = env
 		return command.CombinedOutput()
 	}
-	if err := runner.RemoveWorktree(ctx, repository, worktree, WorktreeState{}); !errors.Is(err, ErrIdentityMismatch) {
+	if err := runner.RemoveWorktree(ctx, repository, worktree, WorktreeState{}, removeClaim(worktree)); !errors.Is(err, ErrIdentityMismatch) {
 		t.Fatalf("worktree replacement reached removal effect: %v", err)
 	}
 	if !replaced {
@@ -1098,7 +1166,7 @@ func TestCreateWorktreeCleansAfterSnapshotAuthenticationFailure(t *testing.T) {
 		return command.CombinedOutput()
 	}
 	sabotage = true
-	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main"); err == nil {
+	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main")); err == nil {
 		t.Fatal("snapshot authentication failure was accepted")
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
@@ -1138,7 +1206,7 @@ func TestSnapshotRejectsCommandBearingRepositoryConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 		path := filepath.Join(t.TempDir(), "worktree")
-		worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+		worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 		if !errors.Is(err, ErrIdentityMismatch) || worktree.Path != "" {
 			t.Fatalf("command-bearing config %q accepted: worktree=%+v err=%v", key, worktree, err)
 		}
@@ -1161,7 +1229,10 @@ func TestSnapshotBindsPushURLAndUsesItForPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1248,7 +1319,7 @@ func TestMutationsRequireExternalLeaseAndDoNotCreateWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main"); !errors.Is(err, ErrIdentityMismatch) {
+	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main")); !errors.Is(err, ErrIdentityMismatch) {
 		t.Fatalf("proofless create=%v", err)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
@@ -1262,7 +1333,10 @@ func TestMutationLeaseRefusalPrecedesCommitEffect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1289,7 +1363,10 @@ func TestProductionRefusesLocalOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main"); !errors.Is(err, ErrIdentityMismatch) {
+	if _, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}(); !errors.Is(err, ErrIdentityMismatch) {
 		t.Fatalf("production local origin=%v", err)
 	}
 }
@@ -1302,7 +1379,7 @@ func TestAuthenticationRefusesHTTPSBeforeWorktreeEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "worktree")
-	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main"); !errors.Is(err, ErrIdentityMismatch) {
+	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main")); !errors.Is(err, ErrIdentityMismatch) {
 		t.Fatalf("HTTPS create=%v", err)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
@@ -1316,7 +1393,10 @@ func TestSuppliedMutationClaimMustExactlyBindCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1339,7 +1419,10 @@ func TestVerifyProtectedBranchFreshWitness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	worktree, err := func() (Worktree, error) {
+		p := filepath.Join(t.TempDir(), "worktree")
+		return runner.CreateWorktree(ctx, repository, p, branch, "main", createClaim(t, repository, p, branch, "main"))
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
