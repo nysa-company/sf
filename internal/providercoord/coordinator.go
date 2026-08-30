@@ -168,7 +168,7 @@ func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Cloc
 		return nil, errors.New("process supervisor must support durable launch recording")
 	}
 	setter.SetLaunchRecorder(func(ctx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) error {
-		claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest, PolicyDigest: request.PolicyDigest, AuthDigest: request.AuthDigest, AuthMode: request.AuthMode}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}
+		claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest, PolicyDigest: request.PolicyDigest, AuthDigest: request.AuthDigest, AuthMode: request.AuthMode}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA, RequestDigest: request.RequestDigest}
 		return database.RecordProviderLaunch(ctx, claim, launch)
 	})
 	return &Coordinator{registry: reg, routes: copy, store: database, clock: clock, supervisor: supervisor}, nil
@@ -228,7 +228,9 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			timeout = remaining
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest, Repository: r.Input.Repository, Worktree: r.Input.Worktree, WorktreeIdentity: r.Input.WorktreeIdentity, BaseSHA: r.Input.BaseSHA, SupervisorKey: c.supervisor.PublicKey()})
+		claimInput := r.Input
+		claimInput.Timeout = timeout
+		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest, Repository: r.Input.Repository, Worktree: r.Input.Worktree, WorktreeIdentity: r.Input.WorktreeIdentity, BaseSHA: r.Input.BaseSHA, SupervisorKey: c.supervisor.PublicKey(), Input: claimInput})
 		if err != nil {
 			cancel()
 			if errors.Is(err, store.ErrProviderCapacity) {
@@ -237,6 +239,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			continue
 		}
 		input := r.Input
+		input.Timeout = timeout
 		if !bindClaimToInput(&input, claim, r, binding.Identity) {
 			// The Store claim is the sole authority for launch identity. A
 			// caller-provided PhaseInput must never be allowed to drift from it.
@@ -249,9 +252,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			}
 			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: quarantineErr != nil}
 		}
-		input.Provider = binding.Identity
-		input.AuthMode = binding.AuthMode
-		input.Timeout = timeout
+		input = claim.Input
 		invocation, invokeErr := p.Invocation(attemptCtx, input)
 		var raw contracts.PhaseResult
 		var runErr error
@@ -286,7 +287,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		if cancelled {
 			state, outcome = "cancelled", "cancelled"
 		}
-		valid := !cancelled && runErr == nil && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0
+		valid := !cancelled && runErr == nil && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0 && changedFilesAllowed(raw.ChangedFiles, input.AllowedPaths)
 		var parsed phaseartifact.Parsed
 		if valid {
 			parsed, err = phaseartifact.Parse(input.Phase, raw, r.Validation)
@@ -401,7 +402,7 @@ func (c *Coordinator) RecoverClaim(ctx context.Context, claim store.ProviderAtte
 }
 
 func drainRequest(claim store.ProviderAttemptClaim) contracts.DrainRequest {
-	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, AuthDigest: claim.Binding.AuthDigest, AuthMode: claim.Binding.AuthMode, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA}
+	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, AuthDigest: claim.Binding.AuthDigest, AuthMode: claim.Binding.AuthMode, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA, RequestDigest: claim.RequestDigest}
 }
 
 // bindClaimToInput is the last coordinator-side authentication point before
@@ -411,24 +412,44 @@ func drainRequest(claim store.ProviderAttemptClaim) contracts.DrainRequest {
 // caller are checked first to catch a split-brain request instead of silently
 // overwriting it.
 func bindClaimToInput(input *contracts.PhaseInput, claim store.ProviderAttemptClaim, request Request, identity domain.ProviderIdentity) bool {
-	if input == nil || (input.Provider != (domain.ProviderIdentity{}) && input.Provider != identity) || (input.AuthMode != "" && input.AuthMode != claim.Binding.AuthMode) || claim.Ref != input.Ticket || claim.Phase != input.Phase || claim.Role != string(request.Role) || claim.Ref != request.Input.Ticket || claim.Phase != request.Input.Phase || claim.LeaderEpoch != request.Fence.LeaderEpoch || claim.RunnerEpoch != request.Fence.RunnerEpoch || claim.ExpectedVersion != request.ExpectedVersion || claim.Worktree != input.Worktree || claim.Worktree != request.Input.Worktree || claim.Repository != input.Repository || claim.Repository != request.Input.Repository || claim.WorktreeIdentity != input.WorktreeIdentity || claim.WorktreeIdentity != request.Input.WorktreeIdentity || claim.BaseSHA != input.BaseSHA || claim.BaseSHA != request.Input.BaseSHA || claim.Binding.Identity != identity {
+	if input == nil || claim.Role != string(request.Role) || claim.LeaderEpoch != request.Fence.LeaderEpoch || claim.RunnerEpoch != request.Fence.RunnerEpoch || claim.ExpectedVersion != request.ExpectedVersion || claim.Binding.Identity != identity || claim.RequestDigest == "" || !contracts.PhaseInputDigestMatches(claim.Input, claim.RequestDigest) {
 		return false
 	}
-	if (input.Attempt != 0 && input.Attempt != claim.Attempt) || (input.LeaderEpoch != 0 && input.LeaderEpoch != claim.LeaderEpoch) || (input.RunnerEpoch != 0 && input.RunnerEpoch != claim.RunnerEpoch) || (input.ExpectedVersion != 0 && input.ExpectedVersion != claim.ExpectedVersion) {
+	expected := *input
+	if expected.Provider == (domain.ProviderIdentity{}) {
+		expected.Provider = identity
+	}
+	if expected.AuthMode == "" {
+		expected.AuthMode = claim.Binding.AuthMode
+	}
+	if expected.Attempt == 0 {
+		expected.Attempt = claim.Attempt
+	}
+	if expected.LeaderEpoch == 0 {
+		expected.LeaderEpoch = claim.LeaderEpoch
+	}
+	if expected.RunnerEpoch == 0 {
+		expected.RunnerEpoch = claim.RunnerEpoch
+	}
+	if expected.ExpectedVersion == 0 {
+		expected.ExpectedVersion = claim.ExpectedVersion
+	}
+	_, expectedDigest, err := contracts.CanonicalPhaseInput(expected)
+	if err != nil || expectedDigest != claim.RequestDigest {
 		return false
 	}
-	input.Attempt = claim.Attempt
-	input.LeaderEpoch = claim.LeaderEpoch
-	input.RunnerEpoch = claim.RunnerEpoch
-	input.ExpectedVersion = claim.ExpectedVersion
+	*input = claim.Input
 	return true
 }
 func validate(r Request) error {
 	if !r.Role.valid() || r.Input.Ticket.Validate() != nil || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.ConfigDigest == "" || len(r.ConfigDigest) != 64 || r.Input.Profile != contracts.ProfileGuarded || r.Input.Timeout <= 0 || r.Input.Timeout > 10*time.Minute || strings.TrimSpace(r.Input.Prompt) == "" || len(r.Input.Prompt) > 64<<10 || !cleanAbs(r.Input.Repository) || !cleanAbs(r.Input.Worktree) || r.Input.WorktreeIdentity == "" || len(r.Input.BaseSHA) != 40 || len(r.Input.Schema) == 0 || len(r.Input.Schema) > 1<<20 {
 		return errors.New("invalid request")
 	}
-	if r.Input.Provider != (domain.ProviderIdentity{}) {
+	if r.Input.Provider != (domain.ProviderIdentity{}) || r.Input.AuthMode != "" || r.Input.RequestDigest != "" {
 		return errors.New("provider registry owns identity")
+	}
+	if !allowedPathPrefixes(r.Input.AllowedPaths) {
+		return errors.New("invalid allowed paths")
 	}
 	if r.Input.Phase != phase(r.Role) && !(r.Role == RoleReviewer && (r.Input.Phase == domain.PhaseVerification || r.Input.Phase == domain.PhaseReview)) {
 		return errors.New("role phase mismatch")
@@ -445,6 +466,45 @@ func phase(r Role) domain.Phase {
 	return domain.PhaseReview
 }
 func cleanAbs(v string) bool { return filepath.IsAbs(v) && filepath.Clean(v) == v && v != "/" }
+
+// Codex's sandbox has a worktree-root permission, not a per-path allowlist.
+// The worktree is therefore the trusted repository scope; this check is the
+// fail-closed authority before a provider result can be accepted.
+func allowedPathPrefixes(paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, path := range paths {
+		if path == "" || filepath.IsAbs(path) || filepath.Clean(path) != path || (path != "." && (path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)))) || seen[path] {
+			return false
+		}
+		seen[path] = true
+	}
+	return true
+}
+
+func changedFilesAllowed(changed, allowed []string) bool {
+	if !allowedPathPrefixes(allowed) {
+		return false
+	}
+	for _, file := range changed {
+		if file == "" || filepath.IsAbs(file) || filepath.Clean(file) != file || file == "." || file == ".." || strings.HasPrefix(file, ".."+string(filepath.Separator)) {
+			return false
+		}
+		ok := false
+		for _, prefix := range allowed {
+			if prefix == "." || file == prefix || strings.HasPrefix(file, prefix+string(filepath.Separator)) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
 func max(v int64, x int64) int64 {
 	if v < x {
 		return x

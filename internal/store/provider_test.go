@@ -22,6 +22,9 @@ func supervised(t *testing.T, request ProviderAttemptRequest) ProviderAttemptReq
 	request.WorktreeIdentity = `{"repository":"/tmp/provider"}`
 	request.BaseSHA = strings.Repeat("a", 40)
 	request.SupervisorKey = providerTestSigner.PublicKey()
+	if request.Input.Ticket == (domain.TicketRef{}) {
+		request.Input = contracts.PhaseInput{Ticket: request.Ref, Phase: request.Phase, Prompt: "provider test", Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA, AllowedPaths: []string{"."}, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}
+	}
 	return request
 }
 func proof(t *testing.T, claim ProviderAttemptClaim) contracts.DrainProof {
@@ -90,6 +93,28 @@ func TestRecordProviderLaunchBindsTheEntireClaimAndStartIdentity(t *testing.T) {
 	wrong.Attempt++
 	if err := db.RecordProviderLaunch(ctx, wrong, launch); !errors.Is(err, ErrStaleFence) && !errors.Is(err, ErrProviderAttempt) {
 		t.Fatalf("wrong attempt recorded: %v", err)
+	}
+}
+
+func TestProviderAttemptLaunchInputIsAppendOnly(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "launch-input-immutable")
+	ticket := setupProviderTicket(t, db, ctx, "SF-launch-input", leader)
+	builder, _ := setupProviderPair(t, db, ctx)
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateBuilding)
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claim.RequestDigest) != 64 || !contracts.PhaseInputDigestMatches(claim.Input, claim.RequestDigest) || string(claim.RequestPayload) == "" {
+		t.Fatalf("store did not issue complete launch input claim: %+v", claim)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempt_inputs SET request_digest=? WHERE provider_attempt_id=?`, strings.Repeat("0", 64), claim.ID); err == nil {
+		t.Fatal("launch input record was mutable")
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM provider_attempt_inputs WHERE provider_attempt_id=?`, claim.ID); err == nil {
+		t.Fatal("launch input record was deletable")
 	}
 }
 

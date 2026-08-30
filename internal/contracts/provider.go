@@ -4,6 +4,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -44,6 +47,40 @@ type PhaseInput struct {
 	Timeout  time.Duration
 	Profile  ExecutionProfile
 	Schema   []byte
+	// RequestDigest authenticates this exact launch input. It is issued by the
+	// Store with the provider attempt and is not part of its own digest.
+	RequestDigest string
+}
+
+// CanonicalPhaseInput returns the stable, complete representation of the
+// phase input a provider is permitted to receive.  Keeping this in contracts
+// lets the store issue a digest without trusting the coordinator or adapter
+// to serialize the request the same way.
+func CanonicalPhaseInput(input PhaseInput) ([]byte, string, error) {
+	input.RequestDigest = ""
+	payload, err := json.Marshal(input)
+	if err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(payload)
+	return payload, hex.EncodeToString(sum[:]), nil
+}
+
+func PhaseInputDigestMatches(input PhaseInput, digest string) bool {
+	_, actual, err := CanonicalPhaseInput(input)
+	return err == nil && len(digest) == 64 && actual == digest
+}
+
+func DecodeCanonicalPhaseInput(payload []byte) (PhaseInput, error) {
+	var input PhaseInput
+	if err := json.Unmarshal(payload, &input); err != nil {
+		return PhaseInput{}, err
+	}
+	canonical, _, err := CanonicalPhaseInput(input)
+	if err != nil || string(canonical) != string(payload) {
+		return PhaseInput{}, errors.New("phase input is not canonical")
+	}
+	return input, nil
 }
 
 type PhaseResult struct {
@@ -139,6 +176,7 @@ type DrainRequest struct {
 	Worktree         string
 	WorktreeIdentity string
 	BaseSHA          string
+	RequestDigest    string
 }
 
 // DrainResult is supplied by the process supervisor after cancellation or
@@ -238,7 +276,7 @@ func VerifyDrainProof(publicKey []byte, request DrainRequest, proof DrainProof) 
 	return len(publicKey) == ed25519.PublicKeySize && string(publicKey) == string(proof.publicKey) && proof.request == request && ed25519.Verify(ed25519.PublicKey(publicKey), drainPayload(request), proof.signature)
 }
 func drainPayload(r DrainRequest) []byte {
-	return []byte(fmt.Sprintf("%d", r.ClaimID) + "\x00" + string(r.Ref.Channel) + "\x00" + string(r.Ref.Project) + "\x00" + string(r.Ref.Ticket) + "\x00" + string(r.Phase) + "\x00" + r.Role + "\x00" + r.Identity.Provider + "\x00" + r.Identity.Model + "\x00" + r.Identity.Family + "\x00" + r.Identity.Version + "\x00" + r.LeaseKey + "\x00" + r.BindingDigest + "\x00" + r.BinaryDigest + "\x00" + r.PolicyDigest + "\x00" + r.AuthDigest + "\x00" + r.AuthMode + "\x00" + r.Repository + "\x00" + r.Worktree + "\x00" + r.WorktreeIdentity + "\x00" + r.BaseSHA + "\x00" + fmtUint(r.LeaderEpoch) + "\x00" + fmtUint(r.RunnerEpoch) + "\x00" + fmtUint(r.ExpectedVersion) + "\x00" + fmtInt(r.Attempt))
+	return []byte(fmt.Sprintf("%d", r.ClaimID) + "\x00" + string(r.Ref.Channel) + "\x00" + string(r.Ref.Project) + "\x00" + string(r.Ref.Ticket) + "\x00" + string(r.Phase) + "\x00" + r.Role + "\x00" + r.Identity.Provider + "\x00" + r.Identity.Model + "\x00" + r.Identity.Family + "\x00" + r.Identity.Version + "\x00" + r.LeaseKey + "\x00" + r.BindingDigest + "\x00" + r.BinaryDigest + "\x00" + r.PolicyDigest + "\x00" + r.AuthDigest + "\x00" + r.AuthMode + "\x00" + r.Repository + "\x00" + r.Worktree + "\x00" + r.WorktreeIdentity + "\x00" + r.BaseSHA + "\x00" + r.RequestDigest + "\x00" + fmtUint(r.LeaderEpoch) + "\x00" + fmtUint(r.RunnerEpoch) + "\x00" + fmtUint(r.ExpectedVersion) + "\x00" + fmtInt(r.Attempt))
 }
 func fmtUint(v uint64) string { return fmt.Sprintf("%d", v) }
 func fmtInt(v int) string     { return fmt.Sprintf("%d", v) }

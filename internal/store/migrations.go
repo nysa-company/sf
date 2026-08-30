@@ -438,3 +438,19 @@ var migrationV24 = []string{
 	`ALTER TABLE provider_qualifications ADD COLUMN auth_mode TEXT NOT NULL DEFAULT '' CHECK(length(auth_mode) <= 64)`,
 	`ALTER TABLE provider_attempts ADD COLUMN auth_mode TEXT NOT NULL DEFAULT '' CHECK(length(auth_mode) <= 64)`,
 }
+
+// v25 is the append-only authority for the complete provider launch input.
+// Older active claims cannot prove the prompt/schema/path/profile/timeout
+// that was launched, so they are deliberately made unrecoverable.
+var migrationV25 = []string{
+	`CREATE TABLE provider_attempt_inputs (
+		provider_attempt_id INTEGER PRIMARY KEY,
+		request_digest TEXT NOT NULL CHECK(length(request_digest)=64),
+		canonical_input BLOB NOT NULL CHECK(length(canonical_input) BETWEEN 2 AND 2097152),
+		created_at TEXT NOT NULL,
+		FOREIGN KEY(provider_attempt_id) REFERENCES provider_attempts(id)
+	)`,
+	`CREATE TRIGGER provider_attempt_inputs_immutable_update BEFORE UPDATE ON provider_attempt_inputs BEGIN SELECT RAISE(ABORT,'provider attempt input is immutable'); END`,
+	`CREATE TRIGGER provider_attempt_inputs_immutable_delete BEFORE DELETE ON provider_attempt_inputs BEGIN SELECT RAISE(ABORT,'provider attempt input is append-only'); END`,
+	`UPDATE provider_attempts SET state='failed',outcome='legacy_unverifiable',finished_at=CASE WHEN finished_at='' THEN started_at ELSE finished_at END,launch_state='legacy_unverifiable' WHERE state IN ('active','quarantined')`,
+}

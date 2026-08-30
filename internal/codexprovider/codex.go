@@ -334,7 +334,7 @@ func (a *Adapter) Invocation(_ context.Context, input contracts.PhaseInput) (con
 	if input.Worktree == "" || !filepath.IsAbs(input.Worktree) || filepath.Clean(input.Worktree) != input.Worktree || input.Worktree == "/" {
 		return contracts.Invocation{}, errors.New("Codex worktree must be an absolute clean path")
 	}
-	if len(input.Prompt) == 0 || len(input.Prompt) > 64<<10 || strings.ContainsRune(input.Prompt, '\x00') || len(input.Schema) == 0 || len(input.Schema) > 1<<20 || !json.Valid(input.Schema) {
+	if len(input.Prompt) == 0 || len(input.Prompt) > 64<<10 || strings.ContainsRune(input.Prompt, '\x00') || len(input.Schema) == 0 || len(input.Schema) > 1<<20 || !json.Valid(input.Schema) || (input.RequestDigest != "" && !contracts.PhaseInputDigestMatches(input, input.RequestDigest)) {
 		return contracts.Invocation{}, errors.New("Codex phase input is invalid")
 	}
 	parent, workspaceAccess, ok := permissionProfileForPhase(input.Phase)

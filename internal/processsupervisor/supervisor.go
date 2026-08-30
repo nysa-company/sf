@@ -316,7 +316,7 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	if request.ClaimID <= 0 || request.Ref.Validate() != nil || request.Phase == "" || (request.Role != "planner" && request.Role != "builder" && request.Role != "reviewer") || request.Attempt <= 0 || request.LeaderEpoch == 0 || request.RunnerEpoch == 0 || request.ExpectedVersion == 0 || request.LeaseKey == "" || request.BindingDigest == "" || request.BinaryDigest == "" || request.PolicyDigest == "" || request.Repository == "" || request.Worktree == "" || request.WorktreeIdentity == "" || request.BaseSHA == "" {
 		return contracts.CommandResult{}, errors.New("complete provider claim identity is required")
 	}
-	if !requestMatchesInput(request, input) {
+	if !requestMatchesInput(request, input) || (request.RequestDigest != "" && !contracts.PhaseInputDigestMatches(input, request.RequestDigest)) {
 		return contracts.CommandResult{}, errors.New("provider claim does not match phase input")
 	}
 	s.mu.Lock()
@@ -647,7 +647,7 @@ func readBoundedFile(path string, limit int64) ([]byte, bool, error) {
 }
 
 func requestMatchesInput(request contracts.DrainRequest, input contracts.PhaseInput) bool {
-	if request.Repository == "" || request.WorktreeIdentity == "" || request.BaseSHA == "" || request.Ref != input.Ticket || request.Phase != input.Phase || request.Identity != input.Provider || request.AuthMode != input.AuthMode || request.Repository != input.Repository || request.Worktree != input.Worktree || request.WorktreeIdentity != input.WorktreeIdentity || request.BaseSHA != input.BaseSHA || request.Attempt != input.Attempt || request.LeaderEpoch != input.LeaderEpoch || request.RunnerEpoch != input.RunnerEpoch || request.ExpectedVersion != input.ExpectedVersion {
+	if request.Repository == "" || request.WorktreeIdentity == "" || request.BaseSHA == "" || request.Ref != input.Ticket || request.Phase != input.Phase || request.Identity != input.Provider || request.AuthMode != input.AuthMode || request.Repository != input.Repository || request.Worktree != input.Worktree || request.WorktreeIdentity != input.WorktreeIdentity || request.BaseSHA != input.BaseSHA || request.Attempt != input.Attempt || request.LeaderEpoch != input.LeaderEpoch || request.RunnerEpoch != input.RunnerEpoch || request.ExpectedVersion != input.ExpectedVersion || (request.RequestDigest != "" && input.RequestDigest != request.RequestDigest) {
 		return false
 	}
 	switch request.Role {

@@ -281,8 +281,16 @@ func recordQual(t *testing.T, db *store.Store, p *testkit.ScriptedProvider) {
 func TestBindClaimToInputRejectsDurableIdentityDrift(t *testing.T) {
 	identity := domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"}
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "project", Ticket: "SF-claim-binding"}
-	request := Request{Role: RoleBuilder, ExpectedVersion: 5, Fence: domain.Fence{LeaderEpoch: 3, RunnerEpoch: 4}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: "base"}}
-	claim := store.ProviderAttemptClaim{ID: 7, Ref: ref, Phase: domain.PhaseBuild, Role: "builder", Attempt: 2, Binding: contracts.RuntimeBinding{Identity: identity}, LeaderEpoch: 3, RunnerEpoch: 4, ExpectedVersion: 5, Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: "base"}
+	request := Request{Role: RoleBuilder, ExpectedVersion: 5, Fence: domain.Fence{LeaderEpoch: 3, RunnerEpoch: 4}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, Prompt: "build", Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: "base", AllowedPaths: []string{"src"}, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}}
+	launch := request.Input
+	launch.Provider, launch.AuthMode = identity, "chatgpt_subscription"
+	launch.Attempt, launch.LeaderEpoch, launch.RunnerEpoch, launch.ExpectedVersion = 2, 3, 4, 5
+	_, requestDigest, err := contracts.CanonicalPhaseInput(launch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch.RequestDigest = requestDigest
+	claim := store.ProviderAttemptClaim{ID: 7, Ref: ref, Phase: domain.PhaseBuild, Role: "builder", Attempt: 2, Binding: contracts.RuntimeBinding{Identity: identity, AuthMode: "chatgpt_subscription"}, LeaderEpoch: 3, RunnerEpoch: 4, ExpectedVersion: 5, Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: "base", Input: launch, RequestDigest: requestDigest}
 	input := request.Input
 	if !bindClaimToInput(&input, claim, request, identity) || input.Attempt != claim.Attempt || input.LeaderEpoch != claim.LeaderEpoch || input.RunnerEpoch != claim.RunnerEpoch || input.ExpectedVersion != claim.ExpectedVersion {
 		t.Fatalf("matching claim was not bound: input=%+v", input)
@@ -294,6 +302,11 @@ func TestBindClaimToInputRejectsDurableIdentityDrift(t *testing.T) {
 		"worktree":   func(value *contracts.PhaseInput) { value.Worktree = "/other" },
 		"identity":   func(value *contracts.PhaseInput) { value.WorktreeIdentity = "other" },
 		"base":       func(value *contracts.PhaseInput) { value.BaseSHA = "other" },
+		"prompt":     func(value *contracts.PhaseInput) { value.Prompt = "other" },
+		"schema":     func(value *contracts.PhaseInput) { value.Schema = []byte(`{"type":"array"}`) },
+		"paths":      func(value *contracts.PhaseInput) { value.AllowedPaths = []string{"other"} },
+		"profile":    func(value *contracts.PhaseInput) { value.Profile = contracts.ProfileAutonomous },
+		"timeout":    func(value *contracts.PhaseInput) { value.Timeout++ },
 		"attempt":    func(value *contracts.PhaseInput) { value.Attempt = claim.Attempt + 1 },
 		"leader":     func(value *contracts.PhaseInput) { value.LeaderEpoch++ },
 		"runner":     func(value *contracts.PhaseInput) { value.RunnerEpoch++ },
@@ -304,6 +317,25 @@ func TestBindClaimToInputRejectsDurableIdentityDrift(t *testing.T) {
 			mutate(&changed)
 			if bindClaimToInput(&changed, claim, request, identity) {
 				t.Fatal("durable claim accepted mismatched phase input")
+			}
+		})
+	}
+}
+
+func TestChangedFilesMustStayWithinClaimedAllowedPrefixes(t *testing.T) {
+	for name, value := range map[string]struct {
+		changed []string
+		allowed bool
+	}{
+		"exact prefix":       {changed: []string{"src/main.go"}, allowed: true},
+		"nested prefix":      {changed: []string{"src/internal/main.go"}, allowed: true},
+		"sibling is denied":  {changed: []string{"src-old/main.go"}, allowed: false},
+		"escape is denied":   {changed: []string{"../outside"}, allowed: false},
+		"absolute is denied": {changed: []string{"/outside"}, allowed: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := changedFilesAllowed(value.changed, []string{"src"}); got != value.allowed {
+				t.Fatalf("changed=%q allowed=%v", value.changed, got)
 			}
 		})
 	}
