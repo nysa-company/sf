@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,12 +28,6 @@ import (
 
 const repositoryOutputLimit = 64 << 10
 const repositoryInputLimit = 1 << 20
-
-// ErrSubprocessRecipeUnsupported is deliberately precise: npm/Node scripts
-// necessarily create a shell/process tree, while ADR 0002's macOS primitive
-// cannot prove inherited containment for that tree. The guarded executor must
-// stop before it obtains a repository lease or launches a child.
-var ErrSubprocessRecipeUnsupported = errors.New("repository npm recipe requires operator takeover: the guarded macOS profile cannot yet prove Node/npm subprocess containment")
 
 // RepositoryCommandSupervisor is the sole os/exec boundary for exact,
 // credential-free repository commands. The child is held behind the sf gate
@@ -51,16 +46,10 @@ type RepositoryCommandSupervisor struct {
 	beforeWorktreeOpen func()
 }
 
-// Preflight rejects syntactically valid but presently unexecutable typed
-// recipes before the Store grants exclusion. This preserves a durable planner
-// policy for Nysa without claiming that the current Seatbelt profile safely
-// contains npm's shell/Node process tree.
-func (s RepositoryCommandSupervisor) Preflight(spec contracts.CommandSpec) error {
-	if len(spec.Argv) > 0 && filepath.Base(spec.Argv[0]) == "npm" {
-		return ErrSubprocessRecipeUnsupported
-	}
-	return nil
-}
+// Preflight is a deliberately side-effect-free compatibility hook. Typed
+// recipes are admitted only after Run stages the complete selected toolchain
+// and applies the inherited default-deny profile.
+func (s RepositoryCommandSupervisor) Preflight(contracts.CommandSpec) error { return nil }
 
 func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.RepositoryCommandClaim, spec contracts.CommandSpec, policy executionpolicy.CommandSnapshot, lease contracts.RepositoryCommandLease) (contracts.CommandResult, error) {
 	if lease == nil || spec.Profile != contracts.ProfileGuarded || len(spec.Argv) == 0 || spec.Directory != claim.Worktree || spec.Timeout <= 0 || spec.Timeout > 45*time.Minute || s.SoftDrain > 30*time.Second || s.HardDrain > 30*time.Second || policy.Authorize(spec.Argv) != nil || policy.Digest() != claim.PolicyDigest {
@@ -95,12 +84,8 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if claim.ExecutablePath != resolved {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	fileBytes, err := os.ReadFile(resolved)
-	if err != nil {
-		return contracts.CommandResult{}, err
-	}
-	fileSum := sha256.Sum256(fileBytes)
-	if claim.ExecutableDigest != "sha256:"+hex.EncodeToString(fileSum[:]) {
+	selectedDigest, err := repositoryExecutableDigest(resolved)
+	if err != nil || claim.ExecutableDigest != selectedDigest {
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	identity, err := parseRepositoryIdentity(claim)
@@ -145,10 +130,24 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		_ = os.RemoveAll(home)
 		return contracts.CommandResult{}, err
 	}
+	// macOS exposes /var through /private/var. Seatbelt path matching follows
+	// the canonical form, so normalize supervisor-owned directories before
+	// placing them in the default-deny profile or environment.
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		return contracts.CommandResult{}, err
+	}
+	tmp, err = filepath.EvalSymlinks(tmp)
+	if err != nil {
+		return contracts.CommandResult{}, err
+	}
 	defer os.RemoveAll(home)
 	defer os.RemoveAll(tmp)
 	isGo := filepath.Base(resolved) == "go"
+	_, npmRootErr := nodeToolchainRoot(resolved)
+	isNPM := npmRootErr == nil
 	var staged, stagedToolchain string
+	var npmClosure nodeToolchainClosure
 	if isGo {
 		goRoot := filepath.Dir(filepath.Dir(resolved))
 		rootBinary, rootErr := filepath.EvalSymlinks(filepath.Join(goRoot, "bin", "go"))
@@ -162,9 +161,16 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		defer os.RemoveAll(filepath.Dir(stagedToolchain))
 		staged = filepath.Join(stagedToolchain, "bin", "go")
 		stagedDigest, digestErr := executableDigest(staged)
-		if digestErr != nil || stagedDigest != claim.ExecutableDigest {
+		sourceDigest, sourceDigestErr := executableFileDigest(resolved)
+		if digestErr != nil || sourceDigestErr != nil || stagedDigest != sourceDigest {
 			return contracts.CommandResult{}, ErrUnclear
 		}
+	} else if isNPM {
+		npmClosure, err = resolveNodeToolchainClosure(resolved)
+		if err != nil || npmClosure.Digest != claim.ExecutableDigest {
+			return contracts.CommandResult{}, ErrUnclear
+		}
+		staged, stagedToolchain = resolved, npmClosure.Root
 	} else {
 		staged, err = stageExecutable(resolved, claim.ExecutableDigest)
 		if err != nil {
@@ -207,6 +213,19 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		// and every module/tool-selection escape are disabled by the exact policy
 		// recipe plus this environment.
 		env = append(env, "GOROOT="+stagedToolchain, "CGO_ENABLED=0", "GOPROXY=off", "GOSUMDB=off", "GONOSUMDB=*", "GOTOOLCHAIN=local", "GOENV=off", "GOWORK=off", "GOTELEMETRY=off")
+	} else if isNPM {
+		// Do not let npm discover a host-global prefix/config/cache or fetch a
+		// package. The default-deny Seatbelt profile independently denies
+		// network and every non-private write path; these knobs make normal npm
+		// behavior deterministic before it reaches that kernel boundary.
+		env = append(env,
+			"PATH="+filepath.Join(stagedToolchain, "bin")+":/usr/bin:/bin:/usr/sbin:/sbin",
+			"NPM_CONFIG_AUDIT=false", "NPM_CONFIG_FUND=false", "NPM_CONFIG_UPDATE_NOTIFIER=false",
+			"NPM_CONFIG_OFFLINE=true", "NPM_CONFIG_PREFER_OFFLINE=true",
+			"NPM_CONFIG_CACHE="+filepath.Join(tmp, "npm-cache"),
+			"NPM_CONFIG_USERCONFIG="+filepath.Join(home, "npmrc"), "NPM_CONFIG_GLOBALCONFIG=/dev/null",
+			"OPENSSL_CONF=/dev/null",
+		)
 	}
 	self, err = stageRepositoryGate(self)
 	if err != nil {
@@ -238,7 +257,7 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		if pathErr != nil {
 			return contracts.CommandResult{}, ErrUnclear
 		}
-		sandboxProfile, err = repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: claim.Repository, Worktree: claim.Worktree, GitFile: gitFile, CommonDir: identity.CommonDir, Home: home, Temporary: tmp, Executable: staged})
+		sandboxProfile, err = repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: claim.Repository, Worktree: claim.Worktree, GitFile: gitFile, CommonDir: identity.CommonDir, Home: home, Temporary: tmp, Executable: staged, Toolchain: stagedToolchain, DependencyPaths: npmClosure.DependencyPaths, AllowProcessTree: isNPM})
 	}
 	if err != nil {
 		return contracts.CommandResult{}, ErrUnclear
@@ -283,6 +302,13 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr repositoryBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if isNPM {
+		// Recompute every Node/npm closure member after profile construction and
+		// immediately before the gate starts. A mismatch is a pre-launch refusal.
+		if !nodeClosureMatches(resolved, npmClosure, claim.ExecutableDigest) {
+			return contracts.CommandResult{}, ErrUnclear
+		}
+	}
 	started := time.Now()
 	if err := cmd.Start(); err != nil {
 		gateRead.Close()
@@ -452,14 +478,28 @@ func resolveFixedExecutable(name string) (string, error) {
 	if name == "" {
 		return "", exec.ErrNotFound
 	}
+	if filepath.IsAbs(name) {
+		resolved, err := filepath.EvalSymlinks(name)
+		if err != nil {
+			return "", exec.ErrNotFound
+		}
+		if _, nodeErr := nodeToolchainRoot(resolved); nodeErr == nil {
+			return resolved, nil
+		}
+	}
 	tool := filepath.Base(name)
-	if tool != "git" && tool != "go" {
+	if tool != "git" && tool != "go" && tool != "npm" {
 		return "", exec.ErrNotFound
 	}
 	for _, candidate := range approvedRepositoryExecutables(tool) {
 		resolved, err := filepath.EvalSymlinks(candidate)
 		if err != nil {
 			continue
+		}
+		if tool == "npm" {
+			if _, err := nodeToolchainRoot(resolved); err != nil {
+				continue
+			}
 		}
 		if filepath.IsAbs(name) {
 			provided, err := filepath.EvalSymlinks(name)
@@ -487,9 +527,358 @@ func approvedRepositoryExecutables(tool string) []string {
 		return []string{"/Library/Developer/CommandLineTools/usr/bin/git", "/Applications/Xcode.app/Contents/Developer/usr/bin/git", "/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"}
 	case "go":
 		return []string{"/usr/local/go/bin/go", "/usr/local/bin/go", "/opt/homebrew/bin/go"}
+	case "npm":
+		return []string{"/opt/homebrew/bin/npm", "/usr/local/bin/npm"}
 	default:
 		return nil
 	}
+}
+
+// RepositoryExecutableDigest binds an npm claim to the complete immutable
+// Node/npm closure rather than only npm-cli.js. Other approved commands are
+// single staged files and retain their ordinary file digest.
+func RepositoryExecutableDigest(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	return repositoryExecutableDigest(resolved)
+}
+
+func repositoryExecutableDigest(resolved string) (string, error) {
+	if root, err := nodeToolchainRoot(resolved); err == nil {
+		closure, err := resolveNodeToolchainClosureForRoot(root)
+		if err != nil {
+			return "", err
+		}
+		return closure.Digest, nil
+	}
+	return executableFileDigest(resolved)
+}
+
+type nodeToolchainClosure struct {
+	Root            string
+	Digest          string
+	DependencyPaths []string
+}
+
+func resolveNodeToolchainClosure(entry string) (nodeToolchainClosure, error) {
+	root, err := nodeToolchainRoot(entry)
+	if err != nil {
+		return nodeToolchainClosure{}, err
+	}
+	return resolveNodeToolchainClosureForRoot(root)
+}
+
+// resolveNodeToolchainClosure is bounded to a qualified Node 22 root and the
+// transitive Mach-O dependencies of its node binary. It never treats an otool
+// result as a broad filesystem grant: only checked absolute dependency files
+// are later passed to Seatbelt as literals.
+func resolveNodeToolchainClosureForRoot(root string) (nodeToolchainClosure, error) {
+	rootDigest, err := nodeToolchainDigest(root)
+	if err != nil {
+		return nodeToolchainClosure{}, err
+	}
+	node := filepath.Join(root, "bin", "node")
+	probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	probe := exec.CommandContext(probeCtx, node, "--version")
+	probe.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + root, "TMPDIR=" + root}
+	version, err := probe.Output()
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(version)), "v22.") {
+		return nodeToolchainClosure{}, ErrUnclear
+	}
+	paths, err := nodeMachOClosure(root, node)
+	if err != nil {
+		return nodeToolchainClosure{}, err
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("node-root\x00" + root + "\x00" + rootDigest + "\x00"))
+	for _, path := range paths {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil || !trustedNodeDependency(path, resolved) || authenticateRepositorySourceDependency(resolved) != nil {
+			return nodeToolchainClosure{}, ErrUnclear
+		}
+		info, err := os.Stat(resolved)
+		if err != nil {
+			return nodeToolchainClosure{}, err
+		}
+		_, _ = hash.Write([]byte("dependency\x00" + path + "\x00" + resolved + "\x00" + info.Mode().String() + "\x00" + strconv.FormatInt(info.Size(), 10) + "\x00"))
+		if err := hashFile(hash, resolved); err != nil {
+			return nodeToolchainClosure{}, err
+		}
+	}
+	// Seatbelt must grant each versioned dylib directory so dyld can resolve
+	// internal symlinks. Bind the whole enumerated directory as well: an added
+	// sibling cannot become a pre-launch loader input without changing this
+	// closure digest.
+	directories := map[string]bool{}
+	for _, path := range paths {
+		resolved, err := filepath.EvalSymlinks(filepath.Dir(path))
+		if err != nil || !cleanAbsolute(resolved) {
+			return nodeToolchainClosure{}, ErrUnclear
+		}
+		directories[resolved] = true
+	}
+	dirs := make([]string, 0, len(directories))
+	for directory := range directories {
+		dirs = append(dirs, directory)
+	}
+	sort.Strings(dirs)
+	for _, directory := range dirs {
+		digest, err := dependencyDirectoryDigest(directory)
+		if err != nil {
+			return nodeToolchainClosure{}, fmt.Errorf("authenticate Node dependency directory %s: %w", directory, err)
+		}
+		_, _ = hash.Write([]byte("dependency-directory\x00" + directory + "\x00" + digest + "\x00"))
+	}
+	return nodeToolchainClosure{Root: root, Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil)), DependencyPaths: paths}, nil
+}
+
+func dependencyDirectoryDigest(root string) (string, error) {
+	info, err := os.Lstat(root)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
+		return "", ErrUnclear
+	}
+	hash := sha256.New()
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return ErrUnclear
+		}
+		info, err := entry.Info()
+		if err != nil || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
+			return ErrUnclear
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			target, err := filepath.EvalSymlinks(path)
+			if err != nil || !pathWithin(root, target) {
+				return ErrUnclear
+			}
+			targetInfo, err := os.Stat(target)
+			if err != nil || targetInfo.Mode().Perm()&0o022 != 0 || !trustedOwner(targetInfo) {
+				return ErrUnclear
+			}
+			_, _ = hash.Write([]byte("L\x00" + rel + "\x00" + target + "\x00"))
+			if targetInfo.IsDir() {
+				// WalkDir reaches the real sibling directory separately; record the
+				// link identity without traversing it twice.
+				return nil
+			}
+			if !targetInfo.Mode().IsRegular() {
+				return ErrUnclear
+			}
+			return hashFile(hash, target)
+		}
+		if entry.IsDir() {
+			_, _ = hash.Write([]byte("D\x00" + rel + "\x00" + info.Mode().String() + "\x00"))
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return ErrUnclear
+		}
+		_, _ = hash.Write([]byte("F\x00" + rel + "\x00" + info.Mode().String() + "\x00" + strconv.FormatInt(info.Size(), 10) + "\x00"))
+		return hashFile(hash, path)
+	})
+	if err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func nodeMachOClosure(root, node string) ([]string, error) {
+	queue := []string{node}
+	seen := map[string]bool{}
+	allowed := map[string]bool{}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		resolved, err := filepath.EvalSymlinks(current)
+		if err != nil || seen[resolved] {
+			continue
+		}
+		seen[resolved] = true
+		dependencies, err := machODependencies(resolved)
+		if err != nil {
+			return nil, fmt.Errorf("inspect Node dependency %s: %w", resolved, err)
+		}
+		rpaths, err := machORpaths(resolved)
+		if err != nil {
+			return nil, fmt.Errorf("inspect Node rpaths %s: %w", resolved, err)
+		}
+		for _, dependency := range dependencies {
+			candidate, err := resolveMachODependency(resolved, rpaths, dependency)
+			if err != nil {
+				return nil, fmt.Errorf("resolve Node dependency %s from %s: %w", dependency, resolved, err)
+			}
+			// System libraries live inside the code-owned macOS paths already
+			// explicit in the profile. They are neither Homebrew grants nor
+			// mutable Node closure members.
+			if strings.HasPrefix(candidate, "/System/") || strings.HasPrefix(candidate, "/usr/lib/") {
+				continue
+			}
+			resolvedCandidate, err := filepath.EvalSymlinks(candidate)
+			if err != nil || !trustedNodeDependency(candidate, resolvedCandidate) {
+				return nil, fmt.Errorf("untrusted Node dependency %s resolved %s: %w", candidate, resolvedCandidate, ErrUnclear)
+			}
+			allowed[candidate] = true
+			allowed[resolvedCandidate] = true
+			queue = append(queue, resolvedCandidate)
+		}
+	}
+	paths := make([]string, 0, len(allowed))
+	for path := range allowed {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func machORpaths(path string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/usr/bin/otool", "-l", path).Output()
+	if err != nil || len(output) > 256<<10 {
+		return nil, ErrUnclear
+	}
+	var result []string
+	wantPath := false
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "cmd LC_RPATH" {
+			wantPath = true
+			continue
+		}
+		if wantPath && strings.HasPrefix(line, "path ") {
+			path, _, ok := strings.Cut(strings.TrimPrefix(line, "path "), " (offset ")
+			if !ok || path == "" {
+				return nil, ErrUnclear
+			}
+			result = append(result, path)
+			wantPath = false
+		}
+	}
+	return result, nil
+}
+
+func machODependencies(path string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/usr/bin/otool", "-L", path).Output()
+	if err != nil || len(output) > 128<<10 {
+		return nil, ErrUnclear
+	}
+	var result []string
+	for _, line := range strings.Split(string(output), "\n")[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		dependency, _, ok := strings.Cut(line, " (")
+		if !ok || dependency == "" {
+			return nil, ErrUnclear
+		}
+		result = append(result, dependency)
+	}
+	return result, nil
+}
+
+func resolveMachODependency(current string, rpaths []string, dependency string) (string, error) {
+	switch {
+	case strings.HasPrefix(dependency, "/"):
+		return dependency, nil
+	case strings.HasPrefix(dependency, "@loader_path/"):
+		return filepath.Join(filepath.Dir(current), strings.TrimPrefix(dependency, "@loader_path/")), nil
+	case strings.HasPrefix(dependency, "@rpath/"):
+		name := strings.TrimPrefix(dependency, "@rpath/")
+		for _, rpath := range append([]string{"@loader_path/../lib"}, rpaths...) {
+			var directory string
+			switch {
+			case strings.HasPrefix(rpath, "@loader_path/"):
+				directory = filepath.Join(filepath.Dir(current), strings.TrimPrefix(rpath, "@loader_path/"))
+			case strings.HasPrefix(rpath, "/"):
+				directory = rpath
+			default:
+				return "", ErrUnclear
+			}
+			candidate := filepath.Join(directory, name)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate, nil
+			}
+		}
+		return "", ErrUnclear
+	default:
+		return "", ErrUnclear
+	}
+}
+
+func trustedNodeDependency(path, resolved string) bool {
+	if pathWithin("/opt/homebrew/Cellar", resolved) || pathWithin("/usr/local/Cellar", resolved) || pathWithin("/usr/local/lib/nodejs", resolved) {
+		return strings.HasPrefix(path, "/opt/homebrew/opt/") || strings.HasPrefix(path, "/usr/local/opt/") || pathWithin("/opt/homebrew/Cellar", path) || pathWithin("/usr/local/Cellar", path) || pathWithin("/usr/local/lib/nodejs", path)
+	}
+	return false
+}
+
+func authenticateRepositorySourceDependency(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
+		return ErrUnclear
+	}
+	return nil
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func nodeClosureMatches(entry string, expected nodeToolchainClosure, expectedDigest string) bool {
+	fresh, err := resolveNodeToolchainClosure(entry)
+	return err == nil && fresh.Digest == expectedDigest && fresh.Digest == expected.Digest && equalStringSlices(fresh.DependencyPaths, expected.DependencyPaths)
+}
+
+func executableFileDigest(path string) (string, error) {
+	digest, err := executableDigest(path)
+	if err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
+func nodeToolchainRoot(entry string) (string, error) {
+	const npmSuffix = "/lib/node_modules/npm/bin/npm-cli.js"
+	if !strings.HasSuffix(entry, npmSuffix) || !cleanAbsolute(entry) {
+		return "", ErrUnclear
+	}
+	root := strings.TrimSuffix(entry, npmSuffix)
+	if !trustedNodeToolchainRoot(root) {
+		return "", ErrUnclear
+	}
+	for _, required := range []string{filepath.Join(root, "bin", "node"), entry} {
+		if err := authenticateRepositorySourceExecutable(required); err != nil {
+			return "", err
+		}
+	}
+	return root, nil
+}
+
+func trustedNodeToolchainRoot(root string) bool {
+	for _, prefix := range []string{"/opt/homebrew/Cellar/node@22/", "/usr/local/Cellar/node@22/", "/usr/local/lib/nodejs/"} {
+		if strings.HasPrefix(root, prefix) && cleanAbsolute(root) {
+			return true
+		}
+	}
+	return false
 }
 func (s RepositoryCommandSupervisor) drainSoft() time.Duration {
 	if s.SoftDrain > 0 {
@@ -641,6 +1030,75 @@ func stageGoToolchain(root string) (string, error) {
 		return "", err
 	}
 	return destinationRoot, nil
+}
+
+// nodeToolchainDigest authenticates the whole Node/npm closure in a stable
+// lexical order. npm-cli.js is only a launcher: binding just that file would
+// leave Node and npm's JavaScript dependency graph mutable after planning.
+func nodeToolchainDigest(root string) (string, error) {
+	if !trustedNodeToolchainRoot(root) {
+		return "", ErrUnclear
+	}
+	hash := sha256.New()
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return ErrUnclear
+		}
+		info, err := entry.Info()
+		if err != nil || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
+			return ErrUnclear
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			target, err := filepath.EvalSymlinks(path)
+			if err != nil || !pathWithin(root, target) {
+				return ErrUnclear
+			}
+			targetInfo, err := os.Stat(target)
+			if err != nil || !targetInfo.Mode().IsRegular() || targetInfo.Mode().Perm()&0o022 != 0 || !trustedOwner(targetInfo) {
+				return ErrUnclear
+			}
+			_, _ = hash.Write([]byte("L\x00" + rel + "\x00" + strings.TrimPrefix(target, root+string(filepath.Separator)) + "\x00"))
+			return hashFile(hash, target)
+		}
+		if entry.IsDir() {
+			_, _ = hash.Write([]byte("D\x00" + rel + "\x00"))
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return ErrUnclear
+		}
+		_, _ = hash.Write([]byte("F\x00" + rel + "\x00"))
+		return hashFile(hash, path)
+	})
+	if err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func hashFile(hash io.Writer, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := io.Copy(hash, f); err != nil {
+		return err
+	}
+	_, err = hash.Write([]byte{0})
+	return err
+}
+
+func pathWithin(root, path string) bool {
+	if !cleanAbsolute(root) || !cleanAbsolute(path) {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func repositoryGitFilePath(identity gitboundary.Identity) (string, error) {

@@ -49,12 +49,7 @@ func CommandDigest(argv []string) (string, error) {
 }
 
 func ExecutableDigest(path string) (string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	s := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(s[:]), nil
+	return processsupervisor.RepositoryExecutableDigest(path)
 }
 
 // SpecDigest binds every launch-affecting field. Stdin is hashed by the

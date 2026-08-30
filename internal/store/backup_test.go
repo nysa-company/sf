@@ -98,7 +98,7 @@ func TestRepositoryCommandV33UpgradeAndRequiredSchema(t *testing.T) {
 	if got := rawSchemaVersion(t, path); got != 33 {
 		t.Fatalf("migrated schema=%d want=33", got)
 	}
-	if err := validateSchema(ctx, database.db); err != nil {
+	if err := database.validateSchema(ctx); err != nil {
 		t.Fatalf("v33 required schema: %v", err)
 	}
 }
