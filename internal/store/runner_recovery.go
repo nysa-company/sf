@@ -30,6 +30,9 @@ func validateWaitingRecoveryLedger(ctx context.Context, q interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, ref domain.TicketRef, baselineVersion, baselineRunner, baselineLeader, liveVersion, liveRunner, liveLeader uint64) error {
+	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
+		return err
+	}
 	if _, found, err := loadRunnerRecoveryAt(ctx, q, ref, baselineVersion); err != nil {
 		return err
 	} else if found {
@@ -104,6 +107,9 @@ func validRunnerRecovery(value RunnerRecoveryLedger) bool {
 func loadRunnerRecoveryAt(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, ref domain.TicketRef, version uint64) (RunnerRecoveryLedger, bool, error) {
+	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
+		return RunnerRecoveryLedger{}, false, err
+	}
 	var value RunnerRecoveryLedger
 	var createdAt string
 	err := q.QueryRowContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&value.PriorTicketVersion, &value.PriorRunnerEpoch, &value.PriorLeaderEpoch, &value.TicketVersion, &value.RunnerEpoch, &value.LeaderEpoch, &value.RecoveryDigest, &createdAt)
@@ -124,6 +130,9 @@ func loadRunnerRecoveryAt(ctx context.Context, q interface {
 func loadLatestRunnerRecovery(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, ref domain.TicketRef) (RunnerRecoveryLedger, bool, error) {
+	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
+		return RunnerRecoveryLedger{}, false, err
+	}
 	var value RunnerRecoveryLedger
 	var createdAt string
 	err := q.QueryRowContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY ticket_version DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket).Scan(&value.PriorTicketVersion, &value.PriorRunnerEpoch, &value.PriorLeaderEpoch, &value.TicketVersion, &value.RunnerEpoch, &value.LeaderEpoch, &value.RecoveryDigest, &createdAt)
@@ -139,6 +148,22 @@ func loadLatestRunnerRecovery(ctx context.Context, q interface {
 		return RunnerRecoveryLedger{}, false, ErrPublicationEvidence
 	}
 	return value, true, nil
+}
+
+// validateRunnerRecoveryCardinality enforces the ticket-wide, lifetime cap.
+// Publication recovery has a later semantic baseline, but no phase is allowed
+// to mint a second 64-row recovery budget.
+func validateRunnerRecoveryCardinality(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef) error {
+	var count int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&count); err != nil {
+		return err
+	}
+	if count > 64 {
+		return ErrPublicationEvidence
+	}
+	return nil
 }
 
 func parseRunnerRecoveryTime(raw string) (time.Time, error) {

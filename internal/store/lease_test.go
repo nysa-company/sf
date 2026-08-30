@@ -129,6 +129,56 @@ func TestLeaseCapacityIsBoundedUnderConcurrency(t *testing.T) {
 	}
 }
 
+func TestFenceRecoveredRunnersRollsBackAllTicketsAtGlobalLedgerCap(t *testing.T) {
+	database, ctx := openTestStore(t)
+	setupProviderProject(t, database, ctx)
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "global-ledger-cap-0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capped := setupProviderTicket(t, database, ctx, "SF-z-capped", leader)
+	for recovery := 1; recovery <= 64; recovery++ {
+		leader, err = database.AcquireLeader(ctx, domain.ChannelDev, fmt.Sprintf("global-ledger-cap-%d", recovery))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := database.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err != nil || changed != 1 {
+			t.Fatalf("cap seed recovery %d changed=%d err=%v", recovery, changed, err)
+		}
+	}
+	uncapped := setupProviderTicket(t, database, ctx, "SF-a-uncapped", leader)
+	beforeCapped, err := database.Ticket(ctx, capped.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeUncapped, err := database.Ticket(ctx, uncapped.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader, err = database.AcquireLeader(ctx, domain.ChannelDev, "global-ledger-cap-refusal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err == nil {
+		t.Fatal("global recovery cap accepted a new leader")
+	}
+	afterCapped, err := database.Ticket(ctx, capped.Ref)
+	if err != nil || afterCapped.Version != beforeCapped.Version || afterCapped.RunnerEpoch != beforeCapped.RunnerEpoch {
+		t.Fatalf("capped ticket mutated before=%+v after=%+v err=%v", beforeCapped, afterCapped, err)
+	}
+	afterUncapped, err := database.Ticket(ctx, uncapped.Ref)
+	if err != nil || afterUncapped.Version != beforeUncapped.Version || afterUncapped.RunnerEpoch != beforeUncapped.RunnerEpoch {
+		t.Fatalf("uncapped ticket escaped startup rollback before=%+v after=%+v err=%v", beforeUncapped, afterUncapped, err)
+	}
+	var cappedRows, uncappedRows int
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, capped.Ref.Channel, capped.Ref.Project, capped.Ref.Ticket).Scan(&cappedRows); err != nil || cappedRows != 64 {
+		t.Fatalf("capped ledger rows=%d err=%v", cappedRows, err)
+	}
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, uncapped.Ref.Channel, uncapped.Ref.Project, uncapped.Ref.Ticket).Scan(&uncappedRows); err != nil || uncappedRows != 0 {
+		t.Fatalf("uncapped ledger rows=%d err=%v", uncappedRows, err)
+	}
+}
+
 func staleCapacityFixture(t *testing.T, scopes []LeaseRequest) (*Store, context.Context, domain.TicketRef, uint64, uint64, []Lease) {
 	t.Helper()
 	database, ctx := openTestStore(t)

@@ -84,10 +84,11 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					return ErrStaleFence
 				}
 			}
-			// Runner recovery is also an append-only, bounded authority. A
-			// same-leader lost-response returned above is the only replay allowed
-			// at the cap; a new leader must not grow a chain that readers refuse.
-			recoveryFloor := uint64(0)
+			// Runner recovery is also an append-only, bounded authority. Its cap
+			// is lifetime-wide for the ticket: publication's waiting-ci semantic
+			// chain starts at the transition, but must not reset the finite
+			// recovery resource consumed before that transition. A same-leader
+			// lost-response returned above is the only replay allowed at the cap.
 			if ticket.state == domain.StateWaitingCI {
 				publication, found, err := loadPublicationEvidenceRow(ctx, conn, ref)
 				if err != nil || !found {
@@ -96,10 +97,9 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
 					return ErrPublicationEvidence
 				}
-				recoveryFloor = publication.CurrentTicketVersion + 1 // exact waiting-ci transition version
 			}
 			var recoveryCount int
-			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, channel, ticket.project, ticket.id, recoveryFloor).Scan(&recoveryCount); err != nil {
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, channel, ticket.project, ticket.id).Scan(&recoveryCount); err != nil {
 				return err
 			}
 			if recoveryCount >= 64 {
