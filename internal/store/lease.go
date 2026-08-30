@@ -15,6 +15,10 @@ import (
 
 var ErrLeaseCapacity = errors.New("lease capacity is exhausted")
 
+// ErrLeaseAdoption keeps capacity held when the ownership of an invalidated
+// lease cannot be proven safe to transfer to a replacement runner.
+var ErrLeaseAdoption = errors.New("invalidated leases cannot be adopted")
+
 // ErrStartState identifies a queued ticket that cannot be admitted to a
 // workflow without an operator-visible state decision.
 var ErrStartState = errors.New("ticket cannot be started in its current state")
@@ -311,6 +315,79 @@ func (s *Store) ReleaseInvalidatedLeases(ctx context.Context, ref domain.TicketR
 		return nil
 	})
 	return released, err
+}
+
+// AdoptInvalidatedLeases transfers a recovered ticket's durable global and
+// project capacity from one invalidated runner to its current runner. It is a
+// startup-only repair: it neither frees a slot nor changes its scope identity
+// or acquisition time. Provider capacity is deliberately never transferable.
+//
+// The transfer is fail-closed. In particular, an active or quarantined
+// provider attempt or Git mutation lease for the ticket means an old process
+// could still be writing, so no capacity ownership is changed.
+func (s *Store) AdoptInvalidatedLeases(ctx context.Context, ref domain.TicketRef, staleRunner, leaderEpoch uint64) (int64, error) {
+	if err := ref.Validate(); err != nil {
+		return 0, err
+	}
+	if staleRunner == 0 || leaderEpoch == 0 {
+		return 0, errors.New("stale runner and leader epochs are required")
+	}
+	var adopted int64
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		var currentLeader, currentRunner uint64
+		if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&currentLeader); err != nil {
+			return err
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&currentRunner); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if currentLeader != leaderEpoch || currentRunner <= staleRunner {
+			return ErrStaleFence
+		}
+
+		var found, unsupported int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(CASE WHEN scope NOT IN ('global','project') THEN 1 ELSE 0 END), 0)
+			FROM leases WHERE channel=? AND project_id=? AND ticket_id=? AND runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, staleRunner).Scan(&found, &unsupported); err != nil {
+			return err
+		}
+		if unsupported != 0 {
+			return ErrLeaseAdoption
+		}
+		// A prior successful transfer leaves no rows for this stale epoch. This
+		// is the intentional replay result for a crash after commit.
+		if found == 0 {
+			return nil
+		}
+
+		var providerWriters, gitWriters int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempts
+			WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`, ref.Channel, ref.Project, ref.Ticket).Scan(&providerWriters); err != nil {
+			return err
+		}
+		if providerWriters != 0 {
+			return ErrLeaseAdoption
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM git_mutation_leases
+			WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`, ref.Channel, ref.Project, ref.Ticket).Scan(&gitWriters); err != nil {
+			return err
+		}
+		if gitWriters != 0 {
+			return ErrLeaseAdoption
+		}
+
+		result, err := conn.ExecContext(ctx, `UPDATE leases SET runner_epoch=?
+			WHERE channel=? AND project_id=? AND ticket_id=? AND runner_epoch=? AND scope IN ('global','project')`,
+			currentRunner, ref.Channel, ref.Project, ref.Ticket, staleRunner)
+		if err != nil {
+			return err
+		}
+		adopted, _ = result.RowsAffected()
+		return nil
+	})
+	return adopted, err
 }
 
 func (s *Store) Leases(ctx context.Context, channel domain.Channel) ([]Lease, error) {

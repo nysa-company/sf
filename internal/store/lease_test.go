@@ -128,3 +128,91 @@ func TestLeaseCapacityIsBoundedUnderConcurrency(t *testing.T) {
 		t.Fatalf("leases=%+v err=%v", leases, err)
 	}
 }
+
+func staleCapacityFixture(t *testing.T, scopes []LeaseRequest) (*Store, context.Context, domain.TicketRef, uint64, uint64, []Lease) {
+	t.Helper()
+	database, ctx := openTestStore(t)
+	ref := createLeaseTicket(t, database, 90)
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "lease-adoption")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	leases, err := database.AcquireLeases(ctx, ref, 1, domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1}, scopes, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := database.InvalidateRunner(ctx, ref, 1, domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return database, ctx, ref, leader, current.RunnerEpoch, leases
+}
+
+func TestAdoptInvalidatedLeasesTransfersCapacityWithoutChangingSlots(t *testing.T) {
+	database, ctx, ref, leader, currentRunner, before := staleCapacityFixture(t, []LeaseRequest{
+		{Scope: "global", Resource: "machine", Capacity: 1},
+		{Scope: "project", Resource: "nysa", Capacity: 1},
+	})
+	adopted, err := database.AdoptInvalidatedLeases(ctx, ref, 1, leader)
+	if err != nil || adopted != 2 {
+		t.Fatalf("adopted=%d err=%v", adopted, err)
+	}
+	after, err := database.Leases(ctx, domain.ChannelDev)
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("leases=%+v err=%v", after, err)
+	}
+	for index, lease := range after {
+		if lease.Ref != ref || lease.RunnerEpoch != currentRunner || lease.Scope != before[index].Scope || lease.ScopeKey != before[index].ScopeKey || !lease.AcquiredAt.Equal(before[index].AcquiredAt) {
+			t.Fatalf("lease[%d]=%+v before=%+v", index, lease, before[index])
+		}
+	}
+	// Ownership moves, rather than freeing capacity for a second ticket.
+	second := createLeaseTicket(t, database, 91)
+	if _, err := database.AcquireLeases(ctx, second, 1, domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1}, []LeaseRequest{{Scope: "global", Resource: "machine", Capacity: 1}}, time.Now().UTC()); !errors.Is(err, ErrLeaseCapacity) {
+		t.Fatalf("adoption freed capacity: %v", err)
+	}
+	adopted, err = database.AdoptInvalidatedLeases(ctx, ref, 1, leader)
+	if err != nil || adopted != 0 {
+		t.Fatalf("adoption replay adopted=%d err=%v", adopted, err)
+	}
+}
+
+func TestAdoptInvalidatedLeasesFencesLeaderAndRunner(t *testing.T) {
+	database, ctx, ref, leader, _, _ := staleCapacityFixture(t, []LeaseRequest{{Scope: "global", Resource: "machine", Capacity: 1}})
+	if _, err := database.AdoptInvalidatedLeases(ctx, ref, 1, leader+1); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("stale leader adoption=%v", err)
+	}
+	if _, err := database.AdoptInvalidatedLeases(ctx, ref, 2, leader); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("non-stale runner adoption=%v", err)
+	}
+	if _, err := database.AdoptInvalidatedLeases(ctx, ref, 1, leader); err != nil {
+		t.Fatalf("exact stale adoption=%v", err)
+	}
+}
+
+func TestAdoptInvalidatedLeasesRefusesProviderScopesAndLiveProviderAttempts(t *testing.T) {
+	t.Run("provider scope", func(t *testing.T) {
+		database, ctx, ref, leader, _, _ := staleCapacityFixture(t, []LeaseRequest{{Scope: "provider", Resource: "provider/v1", Capacity: 1}})
+		if _, err := database.AdoptInvalidatedLeases(ctx, ref, 1, leader); !errors.Is(err, ErrLeaseAdoption) {
+			t.Fatalf("provider scope adoption=%v", err)
+		}
+	})
+	t.Run("active or quarantined attempt", func(t *testing.T) {
+		for _, state := range []string{"active", "quarantined"} {
+			t.Run(state, func(t *testing.T) {
+				database, ctx, ref, leader, _, _ := staleCapacityFixture(t, []LeaseRequest{{Scope: "global", Resource: "machine", Capacity: 1}})
+				outcome, launch := "running", "launching"
+				if state == "quarantined" {
+					outcome, launch = "undrained_recovery", "quarantined"
+				}
+				if _, err := database.db.ExecContext(ctx, `INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,usage_units,started_at,finished_at,launch_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, "planning", 1, "test", "model", "family", "v1", outcome, "planner", state, 0, time.Now().UTC().Format(time.RFC3339Nano), "", launch); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := database.AdoptInvalidatedLeases(ctx, ref, 1, leader); !errors.Is(err, ErrLeaseAdoption) {
+					t.Fatalf("%s provider adoption=%v", state, err)
+				}
+			})
+		}
+	})
+}
