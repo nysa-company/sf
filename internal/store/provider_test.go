@@ -126,7 +126,7 @@ func TestProviderRecoveryRequiresDrainAndReleasesOnlyOldClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RecoverProviderAttempts(ctx, ticket.Ref, ticket.RunnerEpoch, leader, false, time.Now().UTC()); !errors.Is(err, ErrProviderDrain) {
+	if err := db.recoverProviderAttempts(ctx, ticket.Ref, ticket.RunnerEpoch, leader, time.Now().UTC()); err != nil {
 		t.Fatalf("undrained=%v", err)
 	}
 	claims, err := db.ProviderAttempts(ctx, ticket.Ref)
@@ -137,7 +137,8 @@ func TestProviderRecoveryRequiresDrainAndReleasesOnlyOldClaim(t *testing.T) {
 	if err != nil || len(leases) != 1 {
 		t.Fatalf("undrained leases=%+v err=%v", leases, err)
 	}
-	if err := db.RecoverProviderAttempts(ctx, ticket.Ref, ticket.RunnerEpoch, leader, true, time.Now().UTC()); err != nil {
+	claims, _ = db.ActiveProviderAttempts(ctx, domain.ChannelDev)
+	if err := db.RecoverProviderAttemptClaimWithProof(ctx, claims[0], leader, proof(t, claims[0].ProviderAttemptClaim), time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
@@ -170,7 +171,7 @@ func TestProviderRecoveryAcrossLeaderRestartUsesOriginalClaimEpoch(t *testing.T)
 	if claims[0].LeaderEpoch != oldLeader {
 		t.Fatalf("claim leader epoch changed before recovery: %+v", claims[0])
 	}
-	if err := db.RecoverProviderAttemptClaim(ctx, claims[0], newLeader, true, time.Now().UTC()); err != nil {
+	if err := db.RecoverProviderAttemptClaimWithProof(ctx, claims[0], newLeader, proof(t, claims[0].ProviderAttemptClaim), time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)

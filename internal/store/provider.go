@@ -410,49 +410,20 @@ func (s *Store) FailProviderAttemptBudget(ctx context.Context, claim ProviderAtt
 	})
 }
 
-// RecoverProviderAttempts releases only claims whose old process group has
-// been proven drained. Without that proof it fails closed and leaves capacity.
-func (s *Store) RecoverProviderAttempts(ctx context.Context, ref domain.TicketRef, staleRunner, leader uint64, drained bool, at time.Time) error {
+// recoverProviderAttempts is retained only for local quarantine bookkeeping;
+// it never releases a lease. Exact release is proof-only below.
+func (s *Store) recoverProviderAttempts(ctx context.Context, ref domain.TicketRef, staleRunner, leader uint64, at time.Time) error {
 	if ref.Validate() != nil || staleRunner == 0 || leader == 0 || at.IsZero() {
 		return ErrProviderAttempt
 	}
-	if !drained {
-		err := s.quarantineProviderAttempts(ctx, ref, staleRunner, leader, at)
-		if err != nil {
-			return err
-		}
-		return ErrProviderDrain
-	}
-	return s.write(ctx, func(conn *sql.Conn) error {
-		var currentLeader, currentRunner uint64
-		if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&currentLeader); err != nil {
-			return err
-		}
-		if currentLeader != leader {
-			return ErrStaleFence
-		}
-		if err := conn.QueryRowContext(ctx, `SELECT runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&currentRunner); err != nil {
-			return err
-		}
-		if currentRunner == staleRunner {
-			return ErrProviderDrain
-		}
-		if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='cancelled',outcome='drained_recovery',finished_at=? WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined') AND leader_epoch=? AND runner_epoch=?`, at.UTC().Format(time.RFC3339Nano), ref.Channel, ref.Project, ref.Ticket, leader, staleRunner); err != nil {
-			return err
-		}
-		if _, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='cancelled',completed_at=?,outcome='drained_recovery' WHERE channel=? AND project_id=? AND ticket_id=? AND state='active' AND leader_epoch=? AND runner_epoch=?`, at.UTC().Format(time.RFC3339Nano), ref.Channel, ref.Project, ref.Ticket, leader, staleRunner); err != nil {
-			return err
-		}
-		_, err := conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND project_id=? AND ticket_id=? AND runner_epoch=? AND scope='provider'`, ref.Channel, ref.Project, ref.Ticket, staleRunner)
-		return err
-	})
+	return s.quarantineProviderAttempts(ctx, ref, staleRunner, leader, at)
 }
 
 // RecoverProviderAttemptClaim is the restart-safe recovery primitive. Unlike
 // the legacy ref-based helper, it carries the original leader epoch and every
 // persisted claim identity, so a new leader can release only this exact old
 // runner after the supervisor proves that runner drained.
-func (s *Store) RecoverProviderAttemptClaim(ctx context.Context, claim ProviderAttempt, leader uint64, drained bool, at time.Time) error {
+func (s *Store) recoverProviderAttemptClaim(ctx context.Context, claim ProviderAttempt, leader uint64, at time.Time) error {
 	if claim.Ref.Validate() != nil || claim.ID <= 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ExpectedVersion == 0 || claim.BindingDigest == "" || claim.LeaseKey == "" || leader == 0 || at.IsZero() {
 		return ErrProviderAttempt
 	}
@@ -477,14 +448,6 @@ func (s *Store) RecoverProviderAttemptClaim(ctx context.Context, claim ProviderA
 			}
 			return err
 		}
-		if !drained {
-			if state == "active" {
-				if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='quarantined',outcome='undrained_recovery' WHERE id=? AND state='active'`, claim.ID); err != nil {
-					return err
-				}
-			}
-			return ErrProviderDrain
-		}
 		if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='cancelled',outcome='drained_recovery',finished_at=? WHERE id=? AND state IN ('active','quarantined')`, at.UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
 			return err
 		}
@@ -507,7 +470,7 @@ func (s *Store) RecoverProviderAttemptClaimWithProof(ctx context.Context, claim 
 	if !contracts.VerifyDrainProof(claim.SupervisorKey, drainRequestForClaim(claim.ProviderAttemptClaim), proof) {
 		return ErrProviderDrain
 	}
-	return s.RecoverProviderAttemptClaim(ctx, claim, leader, true, at)
+	return s.recoverProviderAttemptClaim(ctx, claim, leader, at)
 }
 
 func (s *Store) quarantineProviderAttempts(ctx context.Context, ref domain.TicketRef, staleRunner, leader uint64, at time.Time) error {
