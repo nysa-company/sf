@@ -80,13 +80,13 @@ func DefaultProject(name, repository string) Project {
 		TicketTimeout:         4 * time.Hour,
 		MaxTicketCostMicroUSD: 100_000_000,
 		Commands: Commands{
-			Verify: Command{Argv: []string{"make", "test-focused"}},
-			Review: Command{Argv: []string{"make", "test"}},
+			Verify: Command{Argv: []string{"go", "test", "./..."}},
+			Review: Command{Argv: []string{"go", "test", "./..."}},
 		},
 		Providers: ProviderOrder{
-			Planner:  []string{"cursor", "claude", "codex"},
-			Builder:  []string{"cursor", "claude", "codex"},
-			Reviewer: []string{"claude", "codex", "cursor"},
+			Planner:  []string{"codex"},
+			Builder:  []string{"codex"},
+			Reviewer: []string{"codex"},
 		},
 	}
 }

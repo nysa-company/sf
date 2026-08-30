@@ -71,7 +71,11 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 	}
 	effective, snapshot, digest, err := config.LoadProject(repository, request.Project, machine)
 	if err != nil {
-		return initFailure("invalid_configuration", err.Error(), initHelp, false)
+		next := initHelp
+		if errors.Is(err, config.ErrCommandDetection) {
+			next = []string{binary, "config", "--help"}
+		}
+		return initFailure("invalid_configuration", err.Error(), next, false)
 	}
 	if err := verifyBaseRef(ctx, repository, effective.BaseBranch); err != nil {
 		return initFailure("invalid_repository", "configured base branch is unavailable in the local repository", []string{binary, "doctor", "--repo", repository}, false)

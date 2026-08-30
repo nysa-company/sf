@@ -24,7 +24,19 @@ max_ticket_cost_usd = 25
 allow_autonomous = false
 ```
 
-The optional project file is `<repository>/.sf/config.toml`:
+The optional project file is `<repository>/.sf/config.toml`. When it is
+omitted, `sf init` selects a conservative command pair from the repository:
+
+- A regular `go.mod` selects `go test ./...` for verification and review.
+- A regular `package.json` with both `scripts.test` and `scripts.build`
+  selects `npm test` and `npm run build`.
+
+Repositories that match neither shape, match both, contain malformed metadata,
+or use symlinked marker files are refused with an actionable `sf config --help`
+(or `sf-dev config --help`) next step. An explicit file may select another exact argv pair, still
+without shell interpretation.
+
+Example explicit configuration:
 
 ```toml
 base_branch = "main"
@@ -40,9 +52,9 @@ verify = ["make", "test-focused"]
 review = ["make", "test"]
 
 [providers]
-planner = ["cursor", "claude", "codex"]
-builder = ["cursor", "claude", "codex"]
-reviewer = ["claude", "codex", "cursor"]
+planner = ["codex"]
+builder = ["codex"]
+reviewer = ["codex"]
 ```
 
 Commands are exact argv arrays and are never evaluated by a shell. Repository

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,9 @@ import (
 
 func TestLoadProjectDefaultsWithoutRepositoryFile(t *testing.T) {
 	repository := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repository, "go.mod"), []byte("module example.test\n\ngo 1.25\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	effective, snapshot, digest, err := LoadProject(repository, "nysa", DefaultMachineLimits())
 	if err != nil {
 		t.Fatal(err)
@@ -21,6 +25,94 @@ func TestLoadProjectDefaultsWithoutRepositoryFile(t *testing.T) {
 	}
 	if len(snapshot) == 0 || len(digest) != 64 {
 		t.Fatalf("snapshot=%q digest=%q", snapshot, digest)
+	}
+}
+
+func TestLoadProjectAutoDetectsNysaPackageScripts(t *testing.T) {
+	repository := t.TempDir()
+	packageJSON := `{"name":"nysa-app","private":true,"workspaces":["packages/*"],"scripts":{"test":"npm run test:all","build":"npm run build:all","lint":"eslint ."},"engines":{"node":">=22"}}`
+	if err := os.WriteFile(filepath.Join(repository, "package.json"), []byte(packageJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	effective, _, _, err := LoadProject(repository, "nysa", DefaultMachineLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := effective.Commands.Verify.Argv; len(got) != 2 || got[0] != "npm" || got[1] != "test" {
+		t.Fatalf("verify argv=%q", got)
+	}
+	if got := effective.Commands.Review.Argv; len(got) != 3 || got[0] != "npm" || got[1] != "run" || got[2] != "build" {
+		t.Fatalf("review argv=%q", got)
+	}
+	if strings.Join(effective.Providers.Planner, ",") != "codex" || strings.Join(effective.Providers.Builder, ",") != "codex" || strings.Join(effective.Providers.Reviewer, ",") != "codex" {
+		t.Fatalf("provider defaults=%+v", effective.Providers)
+	}
+}
+
+func TestLoadProjectAutoDetectsGoRepository(t *testing.T) {
+	repository := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repository, "go.mod"), []byte("module example.test\n\ngo 1.25\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	effective, _, _, err := LoadProject(repository, "go-project", DefaultMachineLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, command := range map[string]Command{"verify": effective.Commands.Verify, "review": effective.Commands.Review} {
+		if got := command.Argv; len(got) != 3 || got[0] != "go" || got[1] != "test" || got[2] != "./..." {
+			t.Fatalf("%s argv=%q", name, got)
+		}
+	}
+}
+
+func TestLoadProjectDetectionRefusesAmbiguousUnsupportedMissingScriptsAndSymlinks(t *testing.T) {
+	tests := map[string]func(string) error{
+		"ambiguous": func(repository string) error {
+			if err := os.WriteFile(filepath.Join(repository, "go.mod"), []byte("module example.test\n"), 0o600); err != nil {
+				return err
+			}
+			return os.WriteFile(filepath.Join(repository, "package.json"), []byte(`{"scripts":{"test":"ok","build":"ok"}}`), 0o600)
+		},
+		"unsupported": func(string) error { return nil },
+		"missing scripts": func(repository string) error {
+			return os.WriteFile(filepath.Join(repository, "package.json"), []byte(`{"name":"missing"}`), 0o600)
+		},
+		"symlink": func(repository string) error {
+			target := filepath.Join(t.TempDir(), "package.json")
+			if err := os.WriteFile(target, []byte(`{"scripts":{"test":"ok","build":"ok"}}`), 0o600); err != nil {
+				return err
+			}
+			return os.Symlink(target, filepath.Join(repository, "package.json"))
+		},
+	}
+	for name, prepare := range tests {
+		t.Run(name, func(t *testing.T) {
+			repository := t.TempDir()
+			if err := prepare(repository); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, _, err := LoadProject(repository, "project", DefaultMachineLimits()); err == nil || !errors.Is(err, ErrCommandDetection) || !strings.Contains(err.Error(), "add explicit commands") {
+				t.Fatalf("detection error=%v", err)
+			}
+		})
+	}
+}
+
+func TestLoadProjectExplicitCommandsOverrideRepositoryDetection(t *testing.T) {
+	repository := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repository, "go.mod"), []byte("module example.test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(repository, ".sf"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configuration := "[commands]\nverify=[\"npm\",\"test\"]\nreview=[\"npm\",\"run\",\"build\"]\n"
+	if err := os.WriteFile(filepath.Join(repository, ".sf", "config.toml"), []byte(configuration), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	effective, _, _, err := LoadProject(repository, "project", DefaultMachineLimits())
+	if err != nil || effective.Commands.Verify.Argv[0] != "npm" {
+		t.Fatalf("explicit effective=%+v err=%v", effective, err)
 	}
 }
 

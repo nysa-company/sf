@@ -110,6 +110,17 @@ func TestRunInitMachinePolicyNarrowsDefaultProject(t *testing.T) {
 	}
 }
 
+func TestRunInitReportsActionableConfigForUnsupportedRepository(t *testing.T) {
+	repository := initializedRepository(t)
+	if err := os.Remove(filepath.Join(repository, "go.mod")); err != nil {
+		t.Fatal(err)
+	}
+	response := RunInit(context.Background(), InitRequest{Channel: domain.ChannelDev, Project: "unsupported", Repo: repository, Home: t.TempDir()})
+	if response.OK || response.Error == nil || response.Error.Code != "invalid_configuration" || response.NextAction == nil || len(response.NextAction.Argv) != 3 || response.NextAction.Argv[0] != "sf-dev" || response.NextAction.Argv[1] != "config" || response.NextAction.Argv[2] != "--help" {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
 func assertInitFailure(t *testing.T, response api.Response, code, binary string) {
 	t.Helper()
 	if response.OK || response.Error == nil || response.Error.Code != code || response.NextAction == nil || len(response.NextAction.Argv) == 0 || response.NextAction.Argv[0] != binary {
@@ -125,6 +136,9 @@ func initializedRepository(t *testing.T) string {
 	repository := t.TempDir()
 	runGitTest(t, repository, "init", "-b", "main")
 	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "go.mod"), []byte("module example.test\n\ngo 1.25\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	runGitTest(t, repository, "add", "README.md")

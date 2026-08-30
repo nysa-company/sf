@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,11 @@ import (
 )
 
 const MaxFileBytes = 64 * 1024
+
+// ErrCommandDetection identifies a repository whose command contract needs an
+// explicit .sf/config.toml. The CLI turns it into a channel-correct next
+// action; callers can still distinguish it from malformed explicit config.
+var ErrCommandDetection = errors.New("project command detection failed")
 
 type machineDocument struct {
 	MaxConcurrentTickets *int    `toml:"max_concurrent_tickets"`
@@ -104,10 +110,22 @@ func LoadProject(repository, name string, machine MachineLimits) (Effective, []b
 	if err != nil {
 		return Effective{}, nil, "", err
 	}
+	var document projectDocument
 	if exists {
-		var document projectDocument
 		if err := decodeStrict(data, &document); err != nil {
 			return Effective{}, nil, "", fmt.Errorf("parse project configuration: %w", err)
+		}
+		if document.Commands == nil || document.Commands.Verify == nil || document.Commands.Review == nil {
+			detected, detectErr := detectRepositoryCommands(repository)
+			if detectErr != nil {
+				return Effective{}, nil, "", detectErr
+			}
+			if document.Commands == nil || document.Commands.Verify == nil {
+				project.Commands.Verify = detected.Verify
+			}
+			if document.Commands == nil || document.Commands.Review == nil {
+				project.Commands.Review = detected.Review
+			}
 		}
 		if document.BaseBranch != nil {
 			project.BaseBranch = *document.BaseBranch
@@ -158,6 +176,12 @@ func LoadProject(repository, name string, machine MachineLimits) (Effective, []b
 				project.Providers.Reviewer = append([]string(nil), document.Providers.Reviewer...)
 			}
 		}
+	} else {
+		detected, detectErr := detectRepositoryCommands(repository)
+		if detectErr != nil {
+			return Effective{}, nil, "", detectErr
+		}
+		project.Commands = detected
 	}
 	effective, err := Resolve(machine, project, TicketOverride{})
 	if err != nil {
@@ -165,6 +189,95 @@ func LoadProject(repository, name string, machine MachineLimits) (Effective, []b
 	}
 	snapshot, digest, err := Snapshot(effective)
 	return effective, snapshot, digest, err
+}
+
+// detectRepositoryCommands selects only a small, typed walking-skeleton
+// default. It intentionally refuses to guess for repositories whose build
+// contract is not obvious; an explicit .sf/config.toml can opt into another
+// argv-only command without adding shell interpretation.
+func detectRepositoryCommands(repository string) (Commands, error) {
+	goMod, err := regularRepositoryFile(filepath.Join(repository, "go.mod"), "go.mod")
+	if err != nil {
+		return Commands{}, err
+	}
+	packageJSON, err := regularRepositoryFile(filepath.Join(repository, "package.json"), "package.json")
+	if err != nil {
+		return Commands{}, err
+	}
+	if goMod && packageJSON {
+		return Commands{}, detectionError("repository contains both go.mod and package.json; add explicit commands to .sf/config.toml")
+	}
+	if goMod {
+		command := Command{Argv: []string{"go", "test", "./..."}}
+		return Commands{Verify: command, Review: command}, nil
+	}
+	if packageJSON {
+		data, err := readBoundedRepositoryFile(filepath.Join(repository, "package.json"), MaxFileBytes)
+		if err != nil {
+			return Commands{}, detectionError("package.json could not be parsed; add explicit commands to .sf/config.toml")
+		}
+		var document struct {
+			Scripts map[string]json.RawMessage `json:"scripts"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		if err := decoder.Decode(&document); err != nil {
+			return Commands{}, detectionError("package.json is malformed; add explicit commands to .sf/config.toml")
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			return Commands{}, detectionError("package.json contains trailing data; add explicit commands to .sf/config.toml")
+		}
+		if _, ok := document.Scripts["test"]; !ok {
+			return Commands{}, detectionError("package.json has no scripts.test; add explicit commands to .sf/config.toml")
+		}
+		if _, ok := document.Scripts["build"]; !ok {
+			return Commands{}, detectionError("package.json has no scripts.build; add explicit commands to .sf/config.toml")
+		}
+		return Commands{Verify: Command{Argv: []string{"npm", "test"}}, Review: Command{Argv: []string{"npm", "run", "build"}}}, nil
+	}
+	return Commands{}, detectionError("repository type is unsupported; add explicit commands to .sf/config.toml")
+}
+
+func regularRepositoryFile(path, name string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, detectionError("inspect " + name + " failed; add explicit commands to .sf/config.toml")
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return false, detectionError(name + " must be a regular non-symlink file; add explicit commands to .sf/config.toml")
+	}
+	if !info.Mode().IsRegular() {
+		return false, detectionError(name + " must be a regular file; add explicit commands to .sf/config.toml")
+	}
+	return true, nil
+}
+
+func readBoundedRepositoryFile(path string, limit int64) ([]byte, error) {
+	before, err := os.Lstat(path)
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return nil, errors.New("repository marker is not a regular non-symlink file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		return nil, errors.New("repository marker changed while opening")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil || int64(len(data)) > limit {
+		return nil, errors.New("repository file exceeds bound")
+	}
+	return data, nil
+}
+
+func detectionError(message string) error {
+	return fmt.Errorf("%w: %s", ErrCommandDetection, message)
 }
 
 func readOptionalConfig(path string) ([]byte, bool, error) {
