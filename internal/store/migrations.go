@@ -358,3 +358,25 @@ var migrationV18 = []string{
 	`CREATE TRIGGER phase_run_state_outcome_insert BEFORE INSERT ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome IN ('completed','passed')) OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
 	`CREATE TRIGGER phase_run_state_outcome_update BEFORE UPDATE OF state,outcome ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome IN ('completed','passed')) OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
 }
+
+// v19 keeps structured merge reconciliation evidence and makes cleanup
+// uncertainty survive restart rather than trusting an in-memory gate latch.
+var migrationV19 = []string{
+	`CREATE TABLE merge_intents (
+		semantic_key TEXT PRIMARY KEY, channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		request_digest TEXT NOT NULL, ticket_version INTEGER NOT NULL, leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL, claim_epoch INTEGER NOT NULL,
+		repository_host TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, pull_request_number INTEGER NOT NULL,
+		head_oid TEXT NOT NULL, base_ref TEXT NOT NULL, original_base_oid TEXT NOT NULL, protection_rule_id TEXT NOT NULL, strict_status_checks INTEGER NOT NULL CHECK(strict_status_checks IN (0,1)), method TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id),
+		FOREIGN KEY(semantic_key) REFERENCES effects(semantic_key)
+	)`,
+	`CREATE TABLE external_mutation_quarantine (
+		singleton INTEGER PRIMARY KEY CHECK(singleton=1), reason TEXT NOT NULL, observed_at TEXT NOT NULL
+	)`,
+}
+
+var migrationV20 = []string{
+	`ALTER TABLE merge_intents ADD COLUMN admin_enforced INTEGER NOT NULL DEFAULT 0 CHECK(admin_enforced IN (0,1))`,
+	`ALTER TABLE merge_intents ADD COLUMN active_ruleset_count INTEGER NOT NULL DEFAULT 0 CHECK(active_ruleset_count >= 0)`,
+}

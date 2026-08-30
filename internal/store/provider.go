@@ -420,7 +420,7 @@ func (s *Store) FailProviderAttemptBudget(ctx context.Context, claim ProviderAtt
 		if err := s.currentFence(ctx, conn, claim.Ref.Channel, version, runner, fence); err != nil {
 			return err
 		}
-		result, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='failed',outcome='budget_exhausted',usage_units=0,finished_at=? WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND state='active'`, at.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion)
+		result, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='failed',outcome='budget_exhausted',usage_units=0,finished_at=?,launch_state='drained' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND state='active'`, at.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion)
 		if err != nil {
 			return err
 		}

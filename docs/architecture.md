@@ -10,7 +10,16 @@ The approved normative design is in
 - The JSON state machine in `docs/plans` is the transition authority.
 - NDJSON events and logs are readable projections, never recovery inputs.
 - Git and GitHub mutations cross narrow fenced interfaces and reconcile remote
-  truth before any retry.
+  truth before any retry. Guarded merge binds the reviewed local base SHA and
+  GitHub base-ref OID to one exact witness. Because `gh pr merge` exposes only
+  an expected-head CAS, sf permits its managed guarded merge only when a
+  freshly observed exact protected-branch rule requires strict status checks
+  and has no pull-request or force-push bypass allowances; GitHub then enforces
+  an up-to-date base at the server-side merge. Otherwise sf refuses to mutate
+  and leaves manual merge observation available. The durable merge intent
+  records the base and protection witnesses; reconciliation proves ancestry
+  from the original base rather than expecting the protected branch tip to
+  remain old.
 - Project configuration is parsed strictly, resolved beneath machine policy,
   and stored as immutable canonical bytes plus a digest. A queued ticket copies
   the exact current generation when it first enters planning, so a later file

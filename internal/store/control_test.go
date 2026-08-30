@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync"
@@ -108,6 +109,132 @@ func TestCompleteControlTransitionClosesPhaseAndReleasesCapacity(t *testing.T) {
 	var ownerState string
 	if err := database.db.QueryRowContext(ctx, `SELECT state FROM workflow_owners WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&ownerState); err != nil || ownerState != string(domain.StatePaused) {
 		t.Fatalf("owner state=%q err=%v", ownerState, err)
+	}
+}
+
+func providerControlFixture(t *testing.T) (*Store, context.Context, uint64, Ticket, ProviderAttemptClaim) {
+	t.Helper()
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-provider-control", leader)
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateBuilding)
+	builder, _ := setupProviderPair(t, db, ctx)
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version,
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch},
+		Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder),
+		ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db, ctx, leader, ticket, claim
+}
+
+func stopProviderControl(t *testing.T, db *Store, ctx context.Context, leader uint64, ticket Ticket) (TransitionResult, Ticket) {
+	t.Helper()
+	result, err := db.TransitionAndInvalidateRunner(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: ticket.State, To: domain.StateStopping,
+		ResumeState: ticket.State, Trigger: "operator_pause_or_take",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, EventPayload: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopping, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result, stopping
+}
+
+func TestCompleteControlTransitionPreservesActiveProviderClaim(t *testing.T) {
+	db, ctx, leader, ticket, claim := providerControlFixture(t)
+	control, stopping := stopProviderControl(t, db, ctx, leader, ticket)
+	_, err := db.CompleteControlTransition(ctx, Transition{
+		Ref: stopping.Ref, ExpectedVersion: control.Version, From: domain.StateStopping, To: domain.StatePaused,
+		ResumeState: ticket.State, Trigger: "process_and_effects_drained",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}",
+	})
+	if !errors.Is(err, ErrControlNotDrained) {
+		t.Fatalf("active provider claim was accepted: %v", err)
+	}
+	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
+	if err != nil || len(attempts) != 1 || attempts[0].ID != claim.ID || attempts[0].State != "active" {
+		t.Fatalf("active provider claim changed: %+v err=%v", attempts, err)
+	}
+	phases, err := db.PhaseAttempts(ctx, ticket.Ref)
+	if err != nil || len(phases) != 1 || phases[0].State != "active" {
+		t.Fatalf("active phase changed: %+v err=%v", phases, err)
+	}
+	leases, err := db.Leases(ctx, domain.ChannelDev)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("provider lease changed: %+v err=%v", leases, err)
+	}
+}
+
+func TestCompleteControlTransitionPreservesQuarantinedProviderClaim(t *testing.T) {
+	db, ctx, leader, ticket, claim := providerControlFixture(t)
+	oldFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	if err := db.QuarantineProviderAttempt(ctx, claim, ticket.Version, oldFence, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	control, stopping := stopProviderControl(t, db, ctx, leader, ticket)
+	_, err := db.CompleteControlTransition(ctx, Transition{
+		Ref: stopping.Ref, ExpectedVersion: control.Version, From: domain.StateStopping, To: domain.StatePaused,
+		ResumeState: ticket.State, Trigger: "process_and_effects_drained",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}",
+	})
+	if !errors.Is(err, ErrControlNotDrained) {
+		t.Fatalf("quarantined provider claim was accepted: %v", err)
+	}
+	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
+	if err != nil || len(attempts) != 1 || attempts[0].ID != claim.ID || attempts[0].State != "quarantined" || attempts[0].Outcome != "undrained" {
+		t.Fatalf("quarantined provider claim changed: %+v err=%v", attempts, err)
+	}
+	phases, err := db.PhaseAttempts(ctx, ticket.Ref)
+	if err != nil || len(phases) != 1 || phases[0].State != "active" {
+		t.Fatalf("quarantined phase changed: %+v err=%v", phases, err)
+	}
+	leases, err := db.Leases(ctx, domain.ChannelDev)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("quarantined provider lease changed: %+v err=%v", leases, err)
+	}
+}
+
+func TestCompleteControlTransitionAfterProviderFinalization(t *testing.T) {
+	db, ctx, leader, ticket, claim := providerControlFixture(t)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "cancelled", "cancelled", 0, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	control, stopping := stopProviderControl(t, db, ctx, leader, ticket)
+	completed, err := db.CompleteControlTransition(ctx, Transition{
+		Ref: stopping.Ref, ExpectedVersion: control.Version, From: domain.StateStopping, To: domain.StatePaused,
+		ResumeState: ticket.State, Trigger: "process_and_effects_drained",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Version == 0 {
+		t.Fatal("control completion did not advance the ticket")
+	}
+	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "cancelled" || attempts[0].Outcome != "cancelled" {
+		t.Fatalf("finalized provider claim=%+v err=%v", attempts, err)
+	}
+	var launchState string
+	if err := db.db.QueryRowContext(ctx, `SELECT launch_state FROM provider_attempts WHERE id=?`, claim.ID).Scan(&launchState); err != nil || launchState != "drained" {
+		t.Fatalf("finalized launch state=%q err=%v", launchState, err)
+	}
+	leases, err := db.Leases(ctx, domain.ChannelDev)
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("finalized provider lease=%+v err=%v", leases, err)
 	}
 }
 

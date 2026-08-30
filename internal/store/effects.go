@@ -57,6 +57,33 @@ type EffectClaim struct {
 	Claimed bool
 }
 
+func (claim EffectClaim) ExternalClaim() domain.ExternalEffectClaim {
+	effect := claim.Effect
+	return domain.ExternalEffectClaim{SemanticKey: effect.SemanticKey, Ref: effect.Ref, Kind: effect.Kind, RequestDigest: effect.RequestDigest, TicketVersion: effect.TicketVersion, LeaderEpoch: effect.LeaderEpoch, RunnerEpoch: effect.RunnerEpoch, ClaimEpoch: effect.ClaimEpoch}
+}
+
+// ValidateExternalEffectClaim is called immediately before an adapter starts a
+// mutation. It proves the durable effect remains executing and every ticket,
+// leader, runner, and claim epoch is still current.
+func (s *Store) ValidateExternalEffectClaim(ctx context.Context, claim domain.ExternalEffectClaim) error {
+	if err := claim.Ref.Validate(); err != nil || claim.SemanticKey == "" || claim.Kind == "" || claim.RequestDigest == "" || claim.TicketVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ClaimEpoch == 0 {
+		return ErrStaleFence
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		if err := s.assertTicketFence(ctx, conn, claim.Ref, claim.TicketVersion, domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}); err != nil {
+			return err
+		}
+		effect, err := effectFrom(ctx, conn, claim.SemanticKey)
+		if err != nil {
+			return err
+		}
+		if effect.Ref != claim.Ref || effect.Kind != claim.Kind || effect.RequestDigest != claim.RequestDigest || effect.State != EffectExecuting || effect.TicketVersion != claim.TicketVersion || effect.LeaderEpoch != claim.LeaderEpoch || effect.RunnerEpoch != claim.RunnerEpoch || effect.ClaimEpoch != claim.ClaimEpoch {
+			return ErrStaleFence
+		}
+		return nil
+	})
+}
+
 type EffectObservation struct {
 	EffectFence
 	Present  bool

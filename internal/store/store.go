@@ -43,7 +43,7 @@ var (
 	ErrProviderDrain         = errors.New("provider process has not drained")
 )
 
-const schemaVersion = 18
+const schemaVersion = 20
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -64,6 +64,8 @@ var migrationChecksums = map[int]string{
 	16: migrationChecksum(migrationV16),
 	17: migrationChecksum(migrationV17),
 	18: migrationChecksum(migrationV18),
+	19: migrationChecksum(migrationV19),
+	20: migrationChecksum(migrationV20),
 }
 
 func migrationChecksum(statements []string) string {
@@ -81,6 +83,7 @@ type Store struct {
 	readOnly   bool
 	faultMu    sync.RWMutex
 	writeFault func() error
+	mutations  *ExternalMutationGate
 }
 
 // SetWriteFaultForTest injects a deterministic write failure. It is reserved
@@ -188,6 +191,8 @@ func open(ctx context.Context, path string, policy openPolicy) (*Store, error) {
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
 	s := &Store{db: db, commit: commitTransaction}
+	s.mutations = &ExternalMutationGate{store: s, gate: make(chan struct{}, 1), revoked: make(map[domain.TicketRef]mutationRevocation)}
+	s.mutations.gate <- struct{}{}
 	storedVersion, recognized, err := inspectStoredSchema(ctx, db)
 	if err != nil {
 		db.Close()
@@ -314,6 +319,10 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV17
 			} else if version == 18 {
 				statements = migrationV18
+			} else if version == 19 {
+				statements = migrationV19
+			} else if version == 20 {
+				statements = migrationV20
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -839,6 +848,9 @@ func (s *Store) AcquireLeader(ctx context.Context, channel domain.Channel, ident
 	if !channel.Valid() || identity == "" {
 		return 0, fmt.Errorf("valid channel and daemon identity are required")
 	}
+	if err := s.DrainChannelExternalMutations(ctx, channel); err != nil {
+		return 0, err
+	}
 	var epoch uint64
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx, `INSERT INTO daemon_instances(channel, leader_epoch, identity, updated_at)
@@ -859,6 +871,9 @@ func (s *Store) AcquireLeader(ctx context.Context, channel domain.Channel, ident
 func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, workflowID string, fence domain.Fence) (Ticket, error) {
 	if workflowID == "" {
 		return Ticket{}, fmt.Errorf("stable workflow id is required")
+	}
+	if err := s.DrainExternalMutations(ctx, ref); err != nil {
+		return Ticket{}, err
 	}
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var state domain.State
@@ -1041,6 +1056,9 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
 		return TransitionResult{}, errors.New("transition event payload must be bounded JSON")
 	}
+	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
+		return TransitionResult{}, err
+	}
 	var result TransitionResult
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var version, runner uint64
@@ -1076,6 +1094,9 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 }
 
 func (s *Store) InvalidateRunner(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence) (Ticket, error) {
+	if err := s.DrainExternalMutations(ctx, ref); err != nil {
+		return Ticket{}, err
+	}
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var version, runner uint64
 		if err := conn.QueryRowContext(ctx, `SELECT version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&version, &runner); err != nil {

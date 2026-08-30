@@ -155,6 +155,56 @@ type Fence struct {
 	ClaimEpoch  uint64
 }
 
+// ExternalEffectClaim is the opaque-to-adapters proof that SQLite granted one
+// current executor permission to cross an external mutation boundary.
+type ExternalEffectClaim struct {
+	SemanticKey   string
+	Ref           TicketRef
+	Kind          string
+	RequestDigest string
+	TicketVersion uint64
+	LeaderEpoch   uint64
+	RunnerEpoch   uint64
+	ClaimEpoch    uint64
+}
+
+type MergeAuthorization struct {
+	ReviewedHead        string
+	CurrentHead         string
+	ReviewedBaseSHA     string
+	CurrentBaseSHA      string
+	ReviewedBaseHeadOID string
+	CurrentBaseHeadOID  string
+	Approved            bool
+	GatesGreen          bool
+}
+
+// MergeIntent is durable reconciliation evidence, not merely a hash of a
+// request.  It records the original protected-base witness selected at review
+// time so a restart can distinguish an observed manual merge from a different
+// branch history.
+type MergeIntent struct {
+	Ref                TicketRef
+	SemanticKey        string
+	RequestDigest      string
+	TicketVersion      uint64
+	LeaderEpoch        uint64
+	RunnerEpoch        uint64
+	ClaimEpoch         uint64
+	RepositoryHost     string
+	RepositoryOwner    string
+	RepositoryName     string
+	PullRequestNumber  int
+	HeadOID            string
+	BaseRef            string
+	OriginalBaseOID    string
+	ProtectionRuleID   string
+	StrictStatusChecks bool
+	AdminEnforced      bool
+	ActiveRulesetCount uint32
+	Method             string
+}
+
 type ProviderIdentity struct {
 	Provider string
 	Model    string

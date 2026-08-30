@@ -48,8 +48,8 @@ func (s *Store) validateSchema(ctx context.Context) error {
 			return err
 		}
 	}
-	for table, target := range requiredForeignKeys {
-		if err := hasForeignKey(ctx, s.db, table, target); err != nil {
+	for _, required := range requiredForeignKeys {
+		if err := hasForeignKey(ctx, s.db, required.table, required.target); err != nil {
 			return err
 		}
 	}
@@ -69,25 +69,32 @@ func (s *Store) validateSchema(ctx context.Context) error {
 	return rows.Err()
 }
 
-var requiredForeignKeys = map[string]string{
-	"project_configurations":   "projects",
-	"tickets":                  "projects",
-	"phase_runs":               "tickets",
-	"events":                   "tickets",
-	"effects":                  "tickets",
-	"approvals":                "tickets",
-	"worktrees":                "tickets",
-	"provider_attempts":        "tickets",
-	"leases":                   "tickets",
-	"plans":                    "tickets",
-	"verifications":            "tickets",
-	"verification_revisions":   "tickets",
-	"candidate_snapshots":      "tickets",
-	"invalidation_receipts":    "candidate_snapshots",
-	"ticket_counters":          "tickets",
-	"ticket_budget_uses":       "tickets",
-	"branch_allocations":       "tickets",
-	"provider_pair_selections": "provider_qualifications",
+type foreignKeyRequirement struct {
+	table  string
+	target string
+}
+
+var requiredForeignKeys = []foreignKeyRequirement{
+	{table: "project_configurations", target: "projects"},
+	{table: "tickets", target: "projects"},
+	{table: "phase_runs", target: "tickets"},
+	{table: "events", target: "tickets"},
+	{table: "effects", target: "tickets"},
+	{table: "approvals", target: "tickets"},
+	{table: "worktrees", target: "tickets"},
+	{table: "provider_attempts", target: "tickets"},
+	{table: "leases", target: "tickets"},
+	{table: "plans", target: "tickets"},
+	{table: "verifications", target: "tickets"},
+	{table: "verification_revisions", target: "tickets"},
+	{table: "candidate_snapshots", target: "tickets"},
+	{table: "invalidation_receipts", target: "candidate_snapshots"},
+	{table: "ticket_counters", target: "tickets"},
+	{table: "ticket_budget_uses", target: "tickets"},
+	{table: "branch_allocations", target: "tickets"},
+	{table: "provider_pair_selections", target: "provider_qualifications"},
+	{table: "merge_intents", target: "tickets"},
+	{table: "merge_intents", target: "effects"},
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {
@@ -113,29 +120,31 @@ func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error 
 }
 
 var requiredSchema = map[string][]string{
-	"schema_migrations":        {"version", "applied_at", "checksum"},
-	"daemon_instances":         {"channel", "leader_epoch", "identity"},
-	"projects":                 {"channel", "id", "canonical_path", "current_config_generation"},
-	"project_configurations":   {"channel", "project_id", "generation", "digest", "snapshot_bytes", "created_at"},
-	"tickets":                  {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd", "config_generation", "config_digest", "config_snapshot_bytes"},
-	"workflow_owners":          {"channel", "project_id", "ticket_id", "workflow_id"},
-	"phase_runs":               {"phase", "attempt", "expected_ticket_version", "provider", "model", "family", "provider_version", "started_at", "outcome"},
-	"events":                   {"ticket_version", "trigger", "from_state", "to_state"},
-	"effects":                  {"semantic_key", "claim_epoch", "observed_identity"},
-	"approvals":                {"reviewed_head", "operator_uid", "invalidated"},
-	"worktrees":                {"path", "branch_ref"},
-	"provider_attempts":        {"phase", "attempt", "provider", "role", "state", "usage_units", "started_at", "finished_at", "qualification_id", "binding_digest", "provider_lease_key", "leader_epoch", "runner_epoch", "expected_ticket_version", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "worktree_path"},
-	"leases":                   {"scope", "scope_key", "runner_epoch"},
-	"plans":                    {"ticket_id", "digest", "body"},
-	"verifications":            {"ticket_id", "intent_digest", "proof_digest", "current_revision"},
-	"verification_revisions":   {"revision", "intent_bytes", "proof_bytes", "owned_files_json", "checkpoint_id"},
-	"candidate_snapshots":      {"generation", "base_sha", "head_sha", "tree_sha", "command_policy_digest"},
-	"invalidation_receipts":    {"generation", "kind", "reason"},
-	"ticket_counters":          {"kind", "used", "limit_count"},
-	"ticket_budget_uses":       {"kind", "request_id", "ticket_version"},
-	"branch_allocations":       {"authority_key", "channel", "project_id", "ticket_id", "branch_ref", "created_at"},
-	"provider_qualifications":  {"id", "channel", "run_id", "provider", "model", "family", "provider_version", "binary_digest", "policy_digest", "fixture_digest", "profile", "failed_probes_json", "reason_code", "created_at"},
-	"provider_pair_selections": {"channel", "builder_qualification_id", "reviewer_qualification_id", "selected_at"},
+	"schema_migrations":            {"version", "applied_at", "checksum"},
+	"daemon_instances":             {"channel", "leader_epoch", "identity"},
+	"projects":                     {"channel", "id", "canonical_path", "current_config_generation"},
+	"project_configurations":       {"channel", "project_id", "generation", "digest", "snapshot_bytes", "created_at"},
+	"tickets":                      {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd", "config_generation", "config_digest", "config_snapshot_bytes"},
+	"workflow_owners":              {"channel", "project_id", "ticket_id", "workflow_id"},
+	"phase_runs":                   {"phase", "attempt", "expected_ticket_version", "provider", "model", "family", "provider_version", "started_at", "outcome"},
+	"events":                       {"ticket_version", "trigger", "from_state", "to_state"},
+	"effects":                      {"semantic_key", "claim_epoch", "observed_identity"},
+	"approvals":                    {"reviewed_head", "operator_uid", "invalidated"},
+	"worktrees":                    {"path", "branch_ref"},
+	"provider_attempts":            {"phase", "attempt", "provider", "role", "state", "usage_units", "started_at", "finished_at", "qualification_id", "binding_digest", "provider_lease_key", "leader_epoch", "runner_epoch", "expected_ticket_version", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "worktree_path"},
+	"leases":                       {"scope", "scope_key", "runner_epoch"},
+	"plans":                        {"ticket_id", "digest", "body"},
+	"verifications":                {"ticket_id", "intent_digest", "proof_digest", "current_revision"},
+	"verification_revisions":       {"revision", "intent_bytes", "proof_bytes", "owned_files_json", "checkpoint_id"},
+	"candidate_snapshots":          {"generation", "base_sha", "head_sha", "tree_sha", "command_policy_digest"},
+	"invalidation_receipts":        {"generation", "kind", "reason"},
+	"ticket_counters":              {"kind", "used", "limit_count"},
+	"ticket_budget_uses":           {"kind", "request_id", "ticket_version"},
+	"branch_allocations":           {"authority_key", "channel", "project_id", "ticket_id", "branch_ref", "created_at"},
+	"provider_qualifications":      {"id", "channel", "run_id", "provider", "model", "family", "provider_version", "binary_digest", "policy_digest", "fixture_digest", "profile", "failed_probes_json", "reason_code", "created_at"},
+	"provider_pair_selections":     {"channel", "builder_qualification_id", "reviewer_qualification_id", "selected_at"},
+	"merge_intents":                {"semantic_key", "original_base_oid", "head_oid", "base_ref", "protection_rule_id", "strict_status_checks", "admin_enforced", "active_ruleset_count"},
+	"external_mutation_quarantine": {"singleton", "reason", "observed_at"},
 }
 
 type indexRequirement struct {

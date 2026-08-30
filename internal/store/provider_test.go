@@ -296,6 +296,38 @@ func TestProviderFinishRejectsUsageBeyondTicketCeiling(t *testing.T) {
 	}
 }
 
+func TestFailProviderAttemptBudgetMarksLaunchDrained(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "budget-launch-state")
+	ticket := setupProviderTicket(t, db, ctx, "SF-budget-launch-state", leader)
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateBuilding)
+	builder, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild,
+		Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FailProviderAttemptBudget(ctx, claim, proof(t, claim), ticket.Version, fence, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "failed" || attempts[0].Outcome != "budget_exhausted" {
+		t.Fatalf("budget attempt=%+v err=%v", attempts, err)
+	}
+	var launchState string
+	if err := db.db.QueryRowContext(ctx, `SELECT launch_state FROM provider_attempts WHERE id=?`, claim.ID).Scan(&launchState); err != nil || launchState != "drained" {
+		t.Fatalf("budget launch state=%q err=%v", launchState, err)
+	}
+	leases, err := db.Leases(ctx, domain.ChannelDev)
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("budget provider lease=%+v err=%v", leases, err)
+	}
+}
+
 func TestFinalReviewValidationUsesDurableCandidateAndVerification(t *testing.T) {
 	db, ctx := openTestStore(t)
 	setupProviderProject(t, db, ctx)

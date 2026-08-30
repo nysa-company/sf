@@ -117,6 +117,20 @@ func (s *Store) CompleteControlTransition(ctx context.Context, transition Transi
 		if unreconciled != 0 {
 			return ErrControlNotDrained
 		}
+		// Provider claims carry their own supervisor proof and recovery
+		// identity. Control completion cannot safely infer that proof from a
+		// ticket-level drain, so leave the phase, claim, and provider lease
+		// intact until the coordinator finalizes the exact claim (or recovery
+		// proves it drained).
+		var providerClaims int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempts
+			WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`,
+			transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&providerClaims); err != nil {
+			return err
+		}
+		if providerClaims != 0 {
+			return ErrControlNotDrained
+		}
 		at := time.Now().UTC().Format(time.RFC3339Nano)
 		if _, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='cancelled',completed_at=COALESCE(completed_at,?),outcome='cancelled'
 			WHERE channel=? AND project_id=? AND ticket_id=? AND state='active'`, at, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket); err != nil {
