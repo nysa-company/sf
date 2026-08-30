@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/nysa-company/sf/internal/contracts"
 )
 
 // CommitObservation is the immutable identity of the currently checked-out
@@ -13,6 +15,38 @@ type CommitObservation struct {
 	CommitOID string
 	ParentOID string
 	TreeOID   string
+}
+
+// RegisteredWorktreeResolver supplies an already registered, authenticated
+// worktree identity to the read-only prepared-commit adapter. The resolver is
+// intentionally injected so git remains independent of SQLite; production
+// composition resolves the row from Store and validates its canonical JSON.
+type RegisteredWorktreeResolver func(context.Context, contracts.GitMutationClaim) (Worktree, error)
+
+// PreparedCommitObserver adapts Runner.ObserveCommit to the daemon's narrow
+// restart observer contract. It has no mutation method and never invokes the
+// Runner's stage/commit/update-ref paths.
+type PreparedCommitObserver struct {
+	Runner  Runner
+	Resolve RegisteredWorktreeResolver
+}
+
+func (o PreparedCommitObserver) ObservePreparedCommit(ctx context.Context, claim contracts.GitMutationClaim) (contracts.PreparedCommitObservation, error) {
+	if claim.Operation != "commit" || o.Resolve == nil {
+		return contracts.PreparedCommitObservation{}, fmt.Errorf("%w: prepared commit observer requires a commit claim and registered worktree resolver", ErrIdentityMismatch)
+	}
+	worktree, err := o.Resolve(ctx, claim)
+	if err != nil {
+		return contracts.PreparedCommitObservation{}, err
+	}
+	if worktree.Path != claim.Worktree || worktree.Branch != claim.Branch || worktree.Identity.Repository != claim.Repository || worktree.Identity.BaseRef != claim.BaseRef || worktree.Identity.BaseHead != claim.ExpectedBaseOID {
+		return contracts.PreparedCommitObservation{}, fmt.Errorf("%w: registered worktree does not bind prepared commit claim", ErrIdentityMismatch)
+	}
+	observed, err := o.Runner.ObserveCommit(ctx, worktree)
+	if err != nil {
+		return contracts.PreparedCommitObservation{}, err
+	}
+	return contracts.PreparedCommitObservation{CommitOID: observed.CommitOID, ParentOID: observed.ParentOID, TreeOID: observed.TreeOID}, nil
 }
 
 // RemoteBranchObservation records the exact head of one authenticated remote

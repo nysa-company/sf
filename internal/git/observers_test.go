@@ -215,6 +215,39 @@ func TestObserveCommitRejectsRootAndMerge(t *testing.T) {
 	})
 }
 
+func TestPreparedCommitObserverUsesRegisteredWorktreeReadOnly(t *testing.T) {
+	ctx, runner, worktree, _ := observerWorktree(t)
+	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "prepared-observer.txt"), []byte("prepared\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rawGit(t, worktree.Path, "add", "--", "src/prepared-observer.txt")
+	rawGit(t, worktree.Path, "commit", "-m", "prepared observer")
+	claim := contracts.GitMutationClaim{Operation: "commit", Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Branch, BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead}
+	resolved := false
+	adapter := PreparedCommitObserver{Runner: runner, Resolve: func(context.Context, contracts.GitMutationClaim) (Worktree, error) {
+		resolved = true
+		return worktree, nil
+	}}
+	observed, err := adapter.ObservePreparedCommit(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := rawGit(t, worktree.Path, "rev-parse", "HEAD^{commit}")
+	if !resolved || observed.CommitOID != want || observed.ParentOID == "" || observed.TreeOID == "" {
+		t.Fatalf("resolved=%v observation=%+v want commit=%s", resolved, observed, want)
+	}
+}
+
+func TestPreparedCommitObserverRejectsResolverIdentityMismatch(t *testing.T) {
+	ctx, runner, worktree, _ := observerWorktree(t)
+	claim := contracts.GitMutationClaim{Operation: "commit", Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Branch, BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead}
+	worktree.Branch = "sf/dev/aaaaaaaa/aaaaaaaa-cccccccccccccccccccccccccccccccc"
+	adapter := PreparedCommitObserver{Runner: runner, Resolve: func(context.Context, contracts.GitMutationClaim) (Worktree, error) { return worktree, nil }}
+	if _, err := adapter.ObservePreparedCommit(ctx, claim); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("mismatched resolver identity err=%v", err)
+	}
+}
+
 func TestObserveRemoteBranchAbsencePresenceAndAuthority(t *testing.T) {
 	ctx, runner, worktree, repository := observerWorktree(t)
 	authority := &observerCountingAuthority{}

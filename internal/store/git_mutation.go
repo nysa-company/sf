@@ -521,10 +521,23 @@ func (s *Store) GitMutationIntentFacts(ctx context.Context, semanticKey string) 
 	if s == nil || semanticKey == "" {
 		return GitMutationIntentFacts{}, ErrGitMutationIntent
 	}
+	return gitMutationIntentFactsFrom(ctx, s.db, semanticKey)
+}
+
+// gitMutationIntentFactsFrom is also used by the final reconciliation write
+// transaction. A read performed through Store.db immediately before that
+// transaction would leave a race in which the intent or effect changed before
+// confirmation.
+func gitMutationIntentFactsFrom(ctx context.Context, query interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, semanticKey string) (GitMutationIntentFacts, error) {
+	if semanticKey == "" {
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
 	var out GitMutationIntentFacts
 	var project, ticket string
 	var prior int
-	err := s.db.QueryRowContext(ctx, `SELECT i.channel,i.project_id,i.ticket_id,i.request_digest,i.ticket_version,i.leader_epoch,i.runner_epoch,i.claim_epoch,i.repository_path,i.worktree_path,i.branch_ref,i.operation,i.base_ref,i.expected_base_oid,i.expected_head_oid,i.prepared_commit_oid,i.prepared_tree_oid,i.prior_remote_observed,i.prior_remote_oid,e.channel,e.project_id,e.ticket_id,e.effect_kind,e.state,e.request_digest,e.ticket_version,e.leader_epoch,e.runner_epoch,e.claim_epoch,e.observed_identity
+	err := query.QueryRowContext(ctx, `SELECT i.channel,i.project_id,i.ticket_id,i.request_digest,i.ticket_version,i.leader_epoch,i.runner_epoch,i.claim_epoch,i.repository_path,i.worktree_path,i.branch_ref,i.operation,i.base_ref,i.expected_base_oid,i.expected_head_oid,i.prepared_commit_oid,i.prepared_tree_oid,i.prior_remote_observed,i.prior_remote_oid,e.channel,e.project_id,e.ticket_id,e.effect_kind,e.state,e.request_digest,e.ticket_version,e.leader_epoch,e.runner_epoch,e.claim_epoch,e.observed_identity
 		FROM git_mutation_intents i JOIN effects e ON e.semantic_key=i.semantic_key WHERE i.semantic_key=?`, semanticKey).
 		Scan(&out.Claim.TicketRef.Channel, &project, &ticket, &out.Claim.RequestDigest, &out.Claim.TicketVersion, &out.Claim.LeaderEpoch, &out.Claim.RunnerEpoch, &out.Claim.ClaimEpoch, &out.Claim.Repository, &out.Claim.Worktree, &out.Claim.Branch, &out.Claim.Operation, &out.Claim.BaseRef, &out.Claim.ExpectedBaseOID, &out.Claim.ExpectedHeadOID, &out.PreparedCommitOID, &out.PreparedTreeOID, &prior, &out.PriorRemoteOID, &out.Effect.Ref.Channel, &out.Effect.Ref.Project, &out.Effect.Ref.Ticket, &out.Effect.Kind, &out.Effect.State, &out.Effect.RequestDigest, &out.Effect.TicketVersion, &out.Effect.LeaderEpoch, &out.Effect.RunnerEpoch, &out.Effect.ClaimEpoch, &out.ObservedIdentity)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -542,6 +555,12 @@ func (s *Store) GitMutationIntentFacts(ctx context.Context, semanticKey string) 
 	if !validGitMutationFacts(out.Claim.Operation, out.Claim.ExpectedBaseOID, out.Claim.ExpectedHeadOID, out.PreparedCommitOID, out.PreparedTreeOID, prior, out.PriorRemoteOID) {
 		return GitMutationIntentFacts{}, ErrGitMutationIntent
 	}
+	if out.Claim.Operation == "commit" && out.Effect.State == EffectConfirmed && out.Effect.ObservedIdentity != out.PreparedCommitOID {
+		// A confirmed commit is only linked to this immutable intent when the
+		// exact prepared object was recorded as its observed identity. This
+		// keeps the widened post-fence linkage from accepting a tampered result.
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
 	out.PriorRemoteObserved = prior == 1
 	return out, nil
 }
@@ -557,7 +576,14 @@ func linkedGitRecoveryEffect(claim contracts.GitMutationClaim, effect Effect) bo
 		if effect.State == EffectUncertain {
 			return effect.LeaderEpoch >= claim.LeaderEpoch && effect.ClaimEpoch >= claim.ClaimEpoch
 		}
-		return effect.LeaderEpoch == claim.LeaderEpoch && effect.ClaimEpoch == claim.ClaimEpoch
+		// A recovered commit/worktree may be confirmed under the new leader
+		// before FenceRecoveredRunners advances the ticket. A later startup
+		// must still recognize that exact immutable claim as settled; requiring
+		// the original leader/claim pair here would turn a legitimate confirmed
+		// result into a false quarantine. The intent binding, request digest, and
+		// confirmed identity are validated by the caller before this linkage is
+		// used, so this is not an avenue for accepting a different effect.
+		return effect.LeaderEpoch >= claim.LeaderEpoch && effect.ClaimEpoch >= claim.ClaimEpoch
 	}
 	return effect.LeaderEpoch > claim.LeaderEpoch && effect.ClaimEpoch > claim.ClaimEpoch && equalRecoveryAdvance(claim.TicketVersion, claim.RunnerEpoch, effect.TicketVersion, effect.RunnerEpoch)
 }

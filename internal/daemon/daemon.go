@@ -25,6 +25,7 @@ import (
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/engine"
 	"github.com/nysa-company/sf/internal/events"
+	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/leader"
 	"github.com/nysa-company/sf/internal/operator"
 	"github.com/nysa-company/sf/internal/providercoord"
@@ -118,6 +119,14 @@ type Config struct {
 	// process groups. A missing verifier is acceptable only when no Git lease
 	// exists; otherwise recovery refuses before socket/listener exposure.
 	GitMutationDrainer contracts.GitMutationDrainer
+	// PreparedCommitObserver is a read-only adapter used after Git lease and
+	// effect recovery. It must authenticate a registered worktree before
+	// observing HEAD; a missing adapter leaves a prepared commit uncertain.
+	PreparedCommitObserver contracts.PreparedCommitObserver
+	// GitRunner supplies the read-only Runner used by the default registered
+	// worktree adapter. A nil runner is acceptable only when there are no
+	// uncertain prepared commits or an explicit observer is supplied.
+	GitRunner *git.Runner
 	// RepositoryCommandDrainer proves persisted credential-free command
 	// identities before effects, runners, or the socket are exposed.
 	RepositoryCommandDrainer contracts.RepositoryCommandDrainer
@@ -149,6 +158,7 @@ type Daemon struct {
 		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
 	gitMutationDrainer       contracts.GitMutationDrainer
+	preparedCommitObserver   contracts.PreparedCommitObserver
 	repositoryCommandDrainer contracts.RepositoryCommandDrainer
 	providerCoordinator      *providercoord.Coordinator
 	providerQualifier        func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
@@ -253,8 +263,12 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 			return failStore(fmt.Errorf("compose provider coordinator: %w", err))
 		}
 	}
+	preparedCommitObserver := configuration.PreparedCommitObserver
+	if preparedCommitObserver == nil && configuration.GitRunner != nil {
+		preparedCommitObserver = git.PreparedCommitObserver{Runner: *configuration.GitRunner, Resolve: registeredWorktreeResolver(database)}
+	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinator: coordinator, providerQualifier: configuration.ProviderQualifier}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, preparedCommitObserver: preparedCommitObserver, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinator: coordinator, providerQualifier: configuration.ProviderQualifier}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -319,8 +333,12 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 	if err := daemon.store.RecoverRepositoryCommandLeases(ctx, daemon.channel, daemon.epoch, daemon.repositoryCommandDrainer); err != nil {
 		return fmt.Errorf("recover stranded repository commands: %w", err)
 	}
-	if _, err := daemon.store.ReconcileEffects(ctx, daemon.channel, daemon.epoch); err != nil {
+	uncertainEffects, err := daemon.store.ReconcileEffects(ctx, daemon.channel, daemon.epoch)
+	if err != nil {
 		return fmt.Errorf("reconcile stranded effects: %w", err)
+	}
+	if err := daemon.reconcilePreparedCommits(ctx, uncertainEffects); err != nil {
+		return fmt.Errorf("reconcile prepared git commits: %w", err)
 	}
 	if _, err := daemon.store.FenceRecoveredRunners(ctx, daemon.channel, daemon.epoch); err != nil {
 		return fmt.Errorf("invalidate recovered runners: %w", err)
@@ -387,6 +405,36 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 		index = next
 	}
 	return daemon.engine.RecoverChannel(ctx, daemon.channel, daemon.epoch)
+}
+
+// reconcilePreparedCommits is deliberately between generic effect recovery
+// and runner fencing. ReconcileEffects gives each stranded effect its current
+// recovery leader/claim, while the ticket still carries the exact pre-fence
+// runner identity needed to prove the prepared commit's expected parent.
+func (daemon *Daemon) reconcilePreparedCommits(ctx context.Context, effects []store.Effect) error {
+	for _, effect := range effects {
+		if effect.Kind != "git/commit" {
+			continue
+		}
+		facts, err := daemon.store.GitMutationIntentFacts(ctx, effect.SemanticKey)
+		if err != nil {
+			return errors.Join(store.ErrPreparedCommitRecovery, err)
+		}
+		if facts.Claim.Operation != "commit" || facts.Effect.State != store.EffectUncertain || facts.PreparedCommitOID == "" || facts.PreparedTreeOID == "" {
+			return store.ErrPreparedCommitRecovery
+		}
+		if daemon.preparedCommitObserver == nil {
+			return errors.Join(store.ErrPreparedCommitRecovery, errors.New("prepared commit observer is not configured"))
+		}
+		observation, err := daemon.preparedCommitObserver.ObservePreparedCommit(ctx, facts.Claim)
+		if err != nil {
+			return errors.Join(store.ErrPreparedCommitRecovery, err)
+		}
+		if _, err := daemon.store.ConfirmRecoveredPreparedCommit(ctx, facts.Claim, observation); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func drainRequestForProviderClaim(claim store.ProviderAttemptClaim) contracts.DrainRequest {

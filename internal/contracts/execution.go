@@ -112,6 +112,23 @@ type GitMutationAuthority interface {
 	AcquireGitMutation(context.Context, GitMutationClaim) (GitMutationLease, error)
 }
 
+// PreparedCommitObservation is the read-only identity of a commit recovered
+// from a durable Git mutation intent. The parent is part of the observation so
+// a commit created against a different branch head can never be accepted.
+type PreparedCommitObservation struct {
+	CommitOID string
+	ParentOID string
+	TreeOID   string
+}
+
+// PreparedCommitObserver is the narrow restart-reconciliation capability for
+// a prepared commit. Implementations must authenticate the registered
+// worktree and perform reads only; this contract has no stage, commit, or
+// ref-update capability by design.
+type PreparedCommitObserver interface {
+	ObservePreparedCommit(context.Context, GitMutationClaim) (PreparedCommitObservation, error)
+}
+
 // RepositoryCommandClaim is a Store-issued, immutable binding for a
 // credential-free command. The command boundary cannot mint or broaden it.
 type RepositoryCommandClaim struct {
