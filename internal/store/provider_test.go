@@ -372,18 +372,40 @@ func TestCompleteProviderAttemptSuccessPersistsAndReparses(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot := domain.CandidateSnapshot{Generation: 1, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: source, VerificationIntentDigest: revision.IntentDigest, ProofDigest: revision.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: builderDigest}
-	evidence := CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snapshot, BuilderResult: ProviderAttemptResultKey{AttemptID: claim.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: claim.Attempt}, Commit: CommitObservation{CommitOID: snapshot.HeadSHA, ParentOID: snapshot.BaseSHA, TreeOID: snapshot.TreeSHA}, Reason: "candidate created"}
+	evidence := CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snapshot, BuilderResult: ProviderAttemptResultKey{AttemptID: claim.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: claim.Attempt}, Commit: CommitObservation{CommitOID: snapshot.HeadSHA, ParentOID: strings.Repeat("d", 40), TreeOID: snapshot.TreeSHA}, Reason: "candidate created"}
+	wrongParent := evidence
+	wrongParent.Commit.ParentOID = snapshot.BaseSHA
+	if _, err := db.RecordCandidate(ctx, wrongParent); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("protected base accepted as implementation parent: %v", err)
+	}
 	if receipts, err := db.RecordCandidate(ctx, evidence); err != nil || len(receipts) != 4 {
 		t.Fatalf("candidate receipts=%+v err=%v", receipts, err)
 	}
 	if receipts, err := db.RecordCandidate(ctx, evidence); err != nil || len(receipts) != 0 {
 		t.Fatalf("candidate replay receipts=%+v err=%v", receipts, err)
 	}
-	if _, err := db.db.ExecContext(ctx, `INSERT INTO candidate_snapshots(channel,project_id,ticket_id,generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, 2, ticket.Version, fence.LeaderEpoch, fence.RunnerEpoch, snapshot.BaseSHA, strings.Repeat("e", 40), strings.Repeat("f", 40), snapshot.SourceDigest, snapshot.VerificationIntentDigest, snapshot.ProofDigest, snapshot.CommandPolicyDigest, snapshot.BuilderEvidenceDigest, now()); err != nil {
+	zero := evidence
+	zero.Snapshot.Generation = 0
+	if receipts, err := db.RecordCandidate(ctx, zero); err != nil || len(receipts) != 0 {
+		t.Fatalf("zero-generation candidate replay receipts=%+v err=%v", receipts, err)
+	}
+	if err := db.RecordOperatorDecision(ctx, OperatorDecision{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, ReviewedHead: snapshot.HeadSHA, OperatorUID: 501, Decision: "approved"}); err != nil {
 		t.Fatal(err)
 	}
+	next := evidence
+	next.Snapshot.Generation = 0
+	next.Snapshot.HeadSHA = strings.Repeat("e", 40)
+	next.Snapshot.TreeSHA = strings.Repeat("f", 40)
+	next.Commit.CommitOID, next.Commit.TreeOID = next.Snapshot.HeadSHA, next.Snapshot.TreeSHA
+	if receipts, err := db.RecordCandidate(ctx, next); err != nil || len(receipts) != 4 {
+		t.Fatalf("next candidate receipts=%+v err=%v", receipts, err)
+	}
+	decisions, err := db.OperatorDecisions(ctx, ticket.Ref)
+	if err != nil || len(decisions) != 1 || !decisions[0].Invalidated {
+		t.Fatalf("approval invalidation=%+v err=%v", decisions, err)
+	}
 	if _, err := db.RecordCandidate(ctx, evidence); !errors.Is(err, ErrEvidenceConflict) {
-		t.Fatalf("older candidate replay=%v", err)
+		t.Fatalf("older explicit generation replay=%v", err)
 	}
 	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempt_results SET raw_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE provider_attempt_id=?`, claim.ID); err == nil {
 		t.Fatal("immutable result updated")
@@ -395,6 +417,16 @@ func TestCompleteProviderAttemptSuccessPersistsAndReparses(t *testing.T) {
 	conflict.Artifact = []byte(`{"schema":"sf.builder/v1","summary":"different","changed_files":["main.go"],"commands":[["go","test","./..."]]}`)
 	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, conflict, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); !errors.Is(err, ErrProviderAttempt) {
 		t.Fatalf("conflicting replay=%v", err)
+	}
+	advanced, err := db.InvalidateRunner(ctx, ticket.Ref, ticket.Version, fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleBuilder := evidence
+	staleBuilder.ExpectedVersion = advanced.Version
+	staleBuilder.Fence.RunnerEpoch = advanced.RunnerEpoch
+	if _, err := db.RecordCandidate(ctx, staleBuilder); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("builder result survived runner recovery: %v", err)
 	}
 	if _, err := db.db.ExecContext(ctx, `UPDATE daemon_instances SET leader_epoch=leader_epoch+1 WHERE channel=?`, ticket.Ref.Channel); err != nil {
 		t.Fatal(err)

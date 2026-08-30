@@ -235,7 +235,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 	if err := evidence.Ref.Validate(); err != nil {
 		return nil, err
 	}
-	if err := validateCandidate(evidence.Snapshot); err != nil || !boundedText(evidence.Reason, 2_000) || evidence.BuilderResult.AttemptID <= 0 || evidence.BuilderResult.Ref != evidence.Ref || evidence.BuilderResult.Phase != domain.PhaseBuild || evidence.BuilderResult.Attempt <= 0 || !validOID(evidence.Commit.CommitOID) || !validOID(evidence.Commit.ParentOID) || !validOID(evidence.Commit.TreeOID) || evidence.Commit.CommitOID != evidence.Snapshot.HeadSHA || evidence.Commit.ParentOID != evidence.Snapshot.BaseSHA || evidence.Commit.TreeOID != evidence.Snapshot.TreeSHA {
+	if err := validateCandidate(evidence.Snapshot); err != nil || !boundedText(evidence.Reason, 2_000) || evidence.BuilderResult.AttemptID <= 0 || evidence.BuilderResult.Ref != evidence.Ref || evidence.BuilderResult.Phase != domain.PhaseBuild || evidence.BuilderResult.Attempt <= 0 || !validOID(evidence.Commit.CommitOID) || !validOID(evidence.Commit.ParentOID) || !validOID(evidence.Commit.TreeOID) || evidence.Commit.CommitOID != evidence.Snapshot.HeadSHA || evidence.Commit.TreeOID != evidence.Snapshot.TreeSHA {
 		return nil, fmt.Errorf("valid bounded candidate evidence and reason are required")
 	}
 	// Immutable provider evidence is authenticated before opening the write
@@ -243,7 +243,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 	// attempt, so a later malformed or failed completion cannot be skipped while
 	// waiting for the writer.
 	builder, parsed, err := s.LoadHistoricalProviderAttemptResult(ctx, evidence.BuilderResult)
-	if err != nil || builder.Claim.Role != "builder" || builder.Claim.Phase != domain.PhaseBuild || parsed.Builder == nil {
+	if err != nil || builder.Claim.Role != "builder" || builder.Claim.Phase != domain.PhaseBuild || builder.Claim.ExpectedVersion != evidence.ExpectedVersion || builder.Claim.LeaderEpoch != evidence.Fence.LeaderEpoch || builder.Claim.RunnerEpoch != evidence.Fence.RunnerEpoch || parsed.Builder == nil {
 		return nil, ErrEvidenceConflict
 	}
 	builderDigest, err := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
@@ -290,7 +290,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		}
 		var intent, proof, owned, checkpoint string
 		var intentBytes, proofBytes []byte
-		if err := conn.QueryRowContext(ctx, `SELECT r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&intent, &intentBytes, &proof, &proofBytes, &owned, &checkpoint); err != nil || intent != evidence.Snapshot.VerificationIntentDigest || proof != evidence.Snapshot.ProofDigest || sha256Digest(intentBytes) != intent || sha256Digest(proofBytes) != proof || !validOID(checkpoint) {
+		if err := conn.QueryRowContext(ctx, `SELECT r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&intent, &intentBytes, &proof, &proofBytes, &owned, &checkpoint); err != nil || intent != evidence.Snapshot.VerificationIntentDigest || proof != evidence.Snapshot.ProofDigest || sha256Digest(intentBytes) != intent || sha256Digest(proofBytes) != proof || !validOID(checkpoint) || evidence.Commit.ParentOID != checkpoint {
 			return ErrEvidenceConflict
 		}
 		var ownedFiles []string
@@ -300,6 +300,17 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		var current uint64
 		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation), 0) FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&current); err != nil {
 			return err
+		}
+		if evidence.Snapshot.Generation == 0 && current > 0 {
+			var existing domain.CandidateSnapshot
+			if err := conn.QueryRowContext(ctx, `SELECT generation,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? AND generation=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, current).Scan(&existing.Generation, &existing.BaseSHA, &existing.HeadSHA, &existing.TreeSHA, &existing.SourceDigest, &existing.VerificationIntentDigest, &existing.ProofDigest, &existing.CommandPolicyDigest, &existing.BuilderEvidenceDigest); err != nil {
+				return ErrEvidenceConflict
+			}
+			candidate := evidence.Snapshot
+			candidate.Generation = current
+			if existing == candidate {
+				return nil
+			}
 		}
 		if evidence.Snapshot.Generation == 0 {
 			evidence.Snapshot.Generation = current + 1

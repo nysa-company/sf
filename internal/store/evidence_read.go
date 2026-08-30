@@ -45,11 +45,13 @@ type StoredCandidate struct {
 // StoredWorktree is SQLite's registration of a ticket worktree. The Git
 // boundary must still re-prove this identity before every use.
 type StoredWorktree struct {
-	Path          string
-	Branch        string
-	State         string
-	IdentityJSON  []byte
-	BaseSHA       string
+	Path         string
+	Branch       string
+	State        string
+	IdentityJSON []byte
+	BaseSHA      string
+	// HeadSHA is the immutable registration-time witness, not the current
+	// candidate head. Candidate adoption binds its commit observation directly.
 	HeadSHA       string
 	TicketVersion uint64
 	Fence         domain.Fence

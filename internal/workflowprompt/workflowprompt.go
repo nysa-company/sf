@@ -474,6 +474,9 @@ func NewVerificationIdentity(artifact phaseartifact.Verification, intentDigest, 
 	if err := validateDigest("verification proof digest", proofDigest); err != nil {
 		return VerificationIdentity{}, err
 	}
+	if err := validateOID("verification checkpoint", checkpointID); err != nil {
+		return VerificationIdentity{}, err
+	}
 	if intentDigest != derivedIntent {
 		return VerificationIdentity{}, errors.New("verification intent digest does not match canonical intent")
 	}
@@ -600,7 +603,7 @@ func (v VerificationIdentity) validate(ticket Ticket, plan PlanIdentity) (phasea
 	if v.PlanDigest != v.Artifact.AcceptanceDigest || v.PlanDigest != plan.Digest {
 		return phaseartifact.Verification{}, errors.New("verification plan digest does not match accepted plan")
 	}
-	if err := bounded("verification checkpoint", v.CheckpointID, MaxIdentityText, false); err != nil {
+	if err := validateOID("verification checkpoint", v.CheckpointID); err != nil {
 		return phaseartifact.Verification{}, err
 	}
 	if err := validatePaths("verification owned files", v.OwnedFiles, 1, false); err != nil {

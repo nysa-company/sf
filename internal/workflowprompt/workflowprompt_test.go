@@ -86,11 +86,18 @@ func testVerification() VerificationIdentity {
 	if err != nil {
 		panic(err)
 	}
-	identity, err := NewVerificationIdentity(artifact, intentDigest, proofDigest, "checkpoint-1")
+	identity, err := NewVerificationIdentity(artifact, intentDigest, proofDigest, testOID)
 	if err != nil {
 		panic(err)
 	}
 	return identity
+}
+
+func TestNewVerificationIdentityRejectsNonOIDCheckpoint(t *testing.T) {
+	value := testVerification()
+	if _, err := NewVerificationIdentity(value.Artifact, value.IntentDigest, value.ProofDigest, "legacy-checkpoint"); err == nil {
+		t.Fatal("non-OID verification checkpoint was accepted")
+	}
 }
 
 func testCandidate() CandidateIdentity {
