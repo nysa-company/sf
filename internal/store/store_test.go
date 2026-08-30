@@ -273,6 +273,108 @@ func TestV6ToV7MigrationPreservesButRefusesUnsafeLegacyMergeIntent(t *testing.T)
 	}
 }
 
+func TestRecoverMergeIntentUsesCurrentUncertainFence(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-merge-recovery"}
+	if err := database.CreateTicket(ctx, ticket(ref, "merge-recovery")); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-launch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-merge-recovery/merge", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := EffectFence{SemanticKey: "merge/recovery", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
+	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: base.SemanticKey, Ref: ref, Kind: "merge", TicketVersion: base.TicketVersion, Fence: base.Fence, RequestDigest: "merge-digest"}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := database.ClaimEffect(ctx, base)
+	if err != nil || !claim.Claimed {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	intent := domain.MergeIntent{Ref: ref, SemanticKey: claim.Effect.SemanticKey, RequestDigest: claim.Effect.RequestDigest, TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 7, HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "rule-main", StrictStatusChecks: true, AdminEnforced: true, Method: "squash"}
+	if err := database.RecordMergeIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	newLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncertain, err := database.ReconcileEffects(ctx, domain.ChannelDev, newLeader)
+	if err != nil || len(uncertain) != 1 || uncertain[0].State != EffectUncertain {
+		t.Fatalf("reconcile=%+v err=%v", uncertain, err)
+	}
+	calls := 0
+	observer := mergeIntentObserverFunc(func(_ context.Context, got domain.MergeIntent) (string, error) {
+		calls++
+		if got != intent {
+			t.Fatalf("intent changed: %+v", got)
+		}
+		return "example/app@merge", nil
+	})
+	confirmed, err := database.RecoverMergeIntent(ctx, intent.SemanticKey, observer)
+	if err != nil || confirmed.State != EffectConfirmed || confirmed.ObservedIdentity != "example/app@merge" || calls != 1 {
+		t.Fatalf("recover=%+v calls=%d err=%v", confirmed, calls, err)
+	}
+	again, err := database.RecoverMergeIntent(ctx, intent.SemanticKey, observer)
+	if err != nil || again.State != EffectConfirmed || calls != 1 {
+		t.Fatalf("idempotent=%+v calls=%d err=%v", again, calls, err)
+	}
+}
+
+func TestRecoverMergeIntentRejectsStaleTamperedAndRacedFence(t *testing.T) {
+	// An executing launch cannot be confirmed as recovery evidence.
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-merge-stale"}
+	if err := database.CreateTicket(ctx, ticket(ref, "stale")); err != nil {
+		t.Fatal(err)
+	}
+	leader, _ := database.AcquireLeader(ctx, domain.ChannelDev, "daemon")
+	started, _ := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-merge-stale/merge", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	base := EffectFence{SemanticKey: "merge/stale", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
+	_, _ = database.PlanEffect(ctx, EffectPlan{SemanticKey: base.SemanticKey, Ref: ref, Kind: "merge", TicketVersion: base.TicketVersion, Fence: base.Fence, RequestDigest: "digest"})
+	claim, _ := database.ClaimEffect(ctx, base)
+	intent := domain.MergeIntent{Ref: ref, SemanticKey: "merge/stale", RequestDigest: "digest", TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 1, HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "rule", StrictStatusChecks: true, AdminEnforced: true, Method: "merge"}
+	if err := database.RecordMergeIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	observer := mergeIntentObserverFunc(func(context.Context, domain.MergeIntent) (string, error) { called = true; return "x", nil })
+	if _, err := database.RecoverMergeIntent(ctx, intent.SemanticKey, observer); !errors.Is(err, ErrStaleFence) || called {
+		t.Fatalf("executing recovery err=%v called=%v", err, called)
+	}
+	newLeader, _ := database.AcquireLeader(ctx, domain.ChannelDev, "recovery")
+	_, _ = database.ReconcileEffects(ctx, domain.ChannelDev, newLeader)
+	if _, err := database.db.Exec(`UPDATE effects SET request_digest='tampered' WHERE semantic_key=?`, intent.SemanticKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.RecoverMergeIntent(ctx, intent.SemanticKey, observer); !errors.Is(err, ErrStaleFence) || called {
+		t.Fatalf("tampered recovery err=%v called=%v", err, called)
+	}
+	if _, err := database.db.Exec(`UPDATE effects SET request_digest=? WHERE semantic_key=?`, intent.RequestDigest, intent.SemanticKey); err != nil {
+		t.Fatal(err)
+	}
+	called = false
+	observer = mergeIntentObserverFunc(func(context.Context, domain.MergeIntent) (string, error) {
+		called = true
+		leaderRace, err := database.AcquireLeader(ctx, domain.ChannelDev, "racing-recovery")
+		if err != nil {
+			return "", err
+		}
+		_, err = database.ReconcileEffects(ctx, domain.ChannelDev, leaderRace)
+		if err != nil {
+			return "", err
+		}
+		return "example/app@raced", nil
+	})
+	if _, err := database.RecoverMergeIntent(ctx, intent.SemanticKey, observer); !errors.Is(err, ErrStaleFence) || !called {
+		t.Fatalf("raced recovery err=%v called=%v", err, called)
+	}
+}
+
 func TestConcurrentActiveTicketConstraint(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "concurrent.sqlite")
