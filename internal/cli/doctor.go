@@ -194,8 +194,10 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	report.Checks = append(report.Checks, checkRoot(deps))
 	socketCheck := checkSocket(deps)
 	report.Checks = append(report.Checks, socketCheck)
-	if socketCheck.Status == CheckPass && deps.DaemonStatus != nil {
-		if err := deps.DaemonStatus(ctx, deps.Paths); err != nil {
+	if socketCheck.Status == CheckPass {
+		if deps.DaemonStatus == nil {
+			report.Checks = append(report.Checks, DoctorCheck{ID: "daemon_status", Status: CheckNotRun, Summary: "daemon status handshake was not configured"})
+		} else if err := deps.DaemonStatus(ctx, deps.Paths); err != nil {
 			// The socket is present but unhealthy. `doctor` would repeat this
 			// exact probe; daemon status is the bounded executable diagnostic
 			// action, while daemon run is reserved for an absent socket.
@@ -322,7 +324,7 @@ func doctorQualification(role string, value store.ProviderQualification) DoctorP
 }
 
 func guardedEligibilityChecksPass(report DoctorReport) bool {
-	mandatory := []string{"channel_root", "disk_space", "git_executable", "gh_executable", "provider_pair", "github_auth", "builder_auth", "reviewer_auth"}
+	mandatory := []string{"channel_root", "disk_space", "git_executable", "gh_executable", "authority_database", "provider_recovery", "authentication", "provider_pair", "github_auth", "builder_auth", "reviewer_auth"}
 	for _, check := range report.Checks {
 		if check.ID == "repository_worktree" && check.Status != CheckNotRun {
 			mandatory = append(mandatory, check.ID)
@@ -342,8 +344,10 @@ func doctorChecksPass(report DoctorReport, ids ...string) bool {
 		found := false
 		for _, check := range report.Checks {
 			if check.ID == id {
-				found = check.Status == CheckPass
-				break
+				found = true
+				if check.Status != CheckPass {
+					return false
+				}
 			}
 		}
 		if !found {
@@ -362,6 +366,8 @@ func checkAuthentication(ctx context.Context, deps DoctorDeps, pair store.Provid
 	report.Authentication = views
 	if !valid {
 		report.Checks = append(report.Checks, failedCheck("authentication", "authentication probe results were incomplete or invalid", deps.Binary, "auth", "status"))
+	} else {
+		report.Checks = append(report.Checks, DoctorCheck{ID: "authentication", Status: CheckPass, Summary: "authentication inventory is complete and safely verified"})
 	}
 	report.Checks = append(report.Checks, requiredAuthCheck(deps.Binary, "github_auth", "GitHub", localauth.GitHub, byProvider))
 	if !pairAvailable {

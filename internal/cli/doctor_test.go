@@ -93,6 +93,76 @@ func TestDoctorGuardedEligibilityRequiresMandatoryHostChecks(t *testing.T) {
 	}
 }
 
+func TestDoctorGuardedEligibilityRejectsQuarantinedProvider(t *testing.T) {
+	deps := healthyDoctorDeps(t)
+	deps.Pair = func(context.Context, domain.Channel) (store.ProviderPair, error) { return qualifiedDoctorPair(), nil }
+	deps.AuthStatus = completeDoctorAuth
+	deps.Attempts = func(context.Context, domain.Channel) ([]store.ProviderAttempt, error) {
+		return []store.ProviderAttempt{{State: "quarantined"}}, nil
+	}
+	report := RunDoctor(context.Background(), deps)
+	if report.GuardedEligible {
+		t.Fatalf("quarantined provider was treated as eligible: %+v", report)
+	}
+	if check := doctorCheckByID(t, report, "provider_recovery"); check.Status != CheckFail {
+		t.Fatalf("provider recovery check=%+v", check)
+	}
+}
+
+func TestDoctorGuardedEligibilityRejectsDuplicateAuthenticationInventory(t *testing.T) {
+	deps := healthyDoctorDeps(t)
+	deps.Pair = func(context.Context, domain.Channel) (store.ProviderPair, error) { return qualifiedDoctorPair(), nil }
+	deps.AuthStatus = func(context.Context) []localauth.Status {
+		statuses := completeDoctorAuth(context.Background())
+		return append(statuses, authenticatedDoctorStatus(localauth.GitHub, "gh", "gh 1.0"))
+	}
+	deps.Attempts = func(context.Context, domain.Channel) ([]store.ProviderAttempt, error) { return nil, nil }
+	report := RunDoctor(context.Background(), deps)
+	if report.GuardedEligible {
+		t.Fatalf("duplicate authentication inventory was treated as eligible: %+v", report)
+	}
+	if check := doctorCheckByID(t, report, "authentication"); check.Status != CheckFail {
+		t.Fatalf("authentication check=%+v", check)
+	}
+}
+
+func TestDoctorGuardedEligibilityRequiresAuthorityAndRecoveryInspection(t *testing.T) {
+	tests := []struct {
+		name            string
+		pair            func(context.Context, domain.Channel) (store.ProviderPair, error)
+		attempts        func(context.Context, domain.Channel) ([]store.ProviderAttempt, error)
+		authorityStatus CheckStatus
+		pairStatus      CheckStatus
+		recoveryStatus  CheckStatus
+	}{
+		{name: "not-run", pair: nil, attempts: nil, authorityStatus: CheckNotRun, pairStatus: CheckNotRun, recoveryStatus: CheckNotRun},
+		{name: "inspection-failure", pair: func(context.Context, domain.Channel) (store.ProviderPair, error) {
+			return store.ProviderPair{}, errors.New("authority unavailable")
+		}, attempts: func(context.Context, domain.Channel) ([]store.ProviderAttempt, error) {
+			return nil, errors.New("recovery unavailable")
+		}, authorityStatus: CheckFail, pairStatus: CheckNotRun, recoveryStatus: CheckNotRun},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			deps := healthyDoctorDeps(t)
+			deps.Pair, deps.Attempts, deps.AuthStatus = test.pair, test.attempts, completeDoctorAuth
+			report := RunDoctor(context.Background(), deps)
+			if report.GuardedEligible {
+				t.Fatalf("incomplete authority/recovery inspection was eligible: %+v", report)
+			}
+			if check := doctorCheckByID(t, report, "authority_database"); check.Status != test.authorityStatus {
+				t.Fatalf("authority check=%+v", check)
+			}
+			if check := doctorCheckByID(t, report, "provider_pair"); check.Status != test.pairStatus {
+				t.Fatalf("provider pair check=%+v", check)
+			}
+			if check := doctorCheckByID(t, report, "provider_recovery"); check.Status != test.recoveryStatus {
+				t.Fatalf("provider recovery check=%+v", check)
+			}
+		})
+	}
+}
+
 func TestDoctorFailedHumanGoldenIncludesEveryAction(t *testing.T) {
 	report := DoctorReport{
 		Schema: doctorSchema, Channel: domain.ChannelDev,
@@ -347,6 +417,7 @@ func TestDoctorReportsSelectedPairAndRequiredAuthentication(t *testing.T) {
 			{Provider: localauth.Codex, Executable: "codex", State: localauth.StateUnavailable},
 		}
 	}
+	deps.Attempts = func(context.Context, domain.Channel) ([]store.ProviderAttempt, error) { return nil, nil }
 	report := RunDoctor(context.Background(), deps)
 	if report.ProviderPair == nil || !report.ProviderPair.Independent {
 		t.Fatalf("provider pair=%+v", report.ProviderPair)
@@ -430,6 +501,15 @@ func healthyDoctorDeps(t *testing.T) DoctorDeps {
 		Pair: func(context.Context, domain.Channel) (store.ProviderPair, error) {
 			return store.ProviderPair{}, store.ErrNotFound
 		},
+	}
+}
+
+func completeDoctorAuth(context.Context) []localauth.Status {
+	return []localauth.Status{
+		authenticatedDoctorStatus(localauth.GitHub, "gh", "gh 1.0"),
+		authenticatedDoctorStatus(localauth.Cursor, "cursor-agent", "cursor 1.0"),
+		authenticatedDoctorStatus(localauth.Claude, "claude", "claude 1.0"),
+		{Provider: localauth.Codex, Executable: "codex", State: localauth.StateUnavailable},
 	}
 }
 
