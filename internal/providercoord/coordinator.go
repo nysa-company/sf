@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
@@ -30,6 +31,11 @@ type Route struct {
 	Capacity          int
 }
 type Outcome string
+
+// ErrPersistenceFatal means durable provider state could not be finalized.
+// Once observed, this coordinator refuses all later launches because the
+// active claim and process ownership are no longer safely knowable.
+var ErrPersistenceFatal = errors.New("provider coordinator persistence failure is fatal")
 
 const (
 	Completed       Outcome = "completed"
@@ -60,6 +66,9 @@ type Result struct {
 	Attempts      []Receipt
 	NeedsOperator bool
 	CostUsed      int64
+	// PersistenceFailure distinguishes an operator stop caused by uncertain
+	// durable state from an ordinary provider/admission failure.
+	PersistenceFailure bool
 }
 type Clock interface{ Now() time.Time }
 type wallClock struct{}
@@ -117,6 +126,9 @@ type Coordinator struct {
 	store      *store.Store
 	clock      Clock
 	supervisor contracts.ProcessSupervisor
+	fatal      atomic.Bool
+	fatalMu    sync.Mutex
+	fatalErr   error
 }
 
 func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Clock, supervisor contracts.ProcessSupervisor) (*Coordinator, error) {
@@ -149,7 +161,7 @@ func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Cloc
 		return nil, errors.New("process supervisor must support durable launch recording")
 	}
 	setter.SetLaunchRecorder(func(ctx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) error {
-		claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}
+		claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest, PolicyDigest: request.PolicyDigest}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}
 		return database.RecordProviderLaunch(ctx, claim, launch)
 	})
 	return &Coordinator{registry: reg, routes: copy, store: database, clock: clock, supervisor: supervisor}, nil
@@ -159,6 +171,9 @@ func (role Role) valid() bool {
 }
 
 func (c *Coordinator) Run(ctx context.Context, r Request) Result {
+	if c.persistenceFailure() != nil {
+		return Result{Code: NeedsOperator, NeedsOperator: true, PersistenceFailure: true}
+	}
 	if err := validate(r); err != nil {
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	}
@@ -236,9 +251,12 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		drainCancel()
 		if drainErr != nil {
 			quarantineCtx, quarantineCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = c.store.QuarantineProviderAttempt(quarantineCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
+			quarantineErr := c.store.QuarantineProviderAttempt(quarantineCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
 			quarantineCancel()
-			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			if quarantineErr != nil {
+				c.markPersistenceFailure(quarantineErr)
+			}
+			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: quarantineErr != nil}
 		}
 		state, outcome := "failed", "failed"
 		if cancelled {
@@ -269,11 +287,16 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		if finishErr != nil {
 			if errors.Is(finishErr, store.ErrBudgetExhausted) {
 				quarantineCtx, quarantineCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = c.store.FailProviderAttemptBudget(quarantineCtx, claim, drain, r.ExpectedVersion, r.Fence, c.clock.Now())
+				budgetErr := c.store.FailProviderAttemptBudget(quarantineCtx, claim, drain, r.ExpectedVersion, r.Fence, c.clock.Now())
 				quarantineCancel()
+				if budgetErr != nil {
+					c.markPersistenceFailure(budgetErr)
+					return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: true}
+				}
 				return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
-			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			c.markPersistenceFailure(finishErr)
+			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: true}
 		}
 		spent += max(raw.UsageUnits, 0)
 		if !raw.UsageTrusted {
@@ -290,6 +313,26 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		}
 	}
 	return Result{Code: Failed, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+}
+
+func (c *Coordinator) markPersistenceFailure(err error) {
+	if err == nil {
+		return
+	}
+	c.fatalMu.Lock()
+	if c.fatal.CompareAndSwap(false, true) {
+		c.fatalErr = errors.Join(ErrPersistenceFatal, err)
+	}
+	c.fatalMu.Unlock()
+}
+
+func (c *Coordinator) persistenceFailure() error {
+	if !c.fatal.Load() {
+		return nil
+	}
+	c.fatalMu.Lock()
+	defer c.fatalMu.Unlock()
+	return c.fatalErr
 }
 
 // Recover drains a provider before releasing an old fenced claim. It does not
@@ -331,7 +374,7 @@ func (c *Coordinator) RecoverClaim(ctx context.Context, claim store.ProviderAtte
 }
 
 func drainRequest(claim store.ProviderAttemptClaim) contracts.DrainRequest {
-	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA}
+	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA}
 }
 func validate(r Request) error {
 	if !r.Role.valid() || r.Input.Ticket.Validate() != nil || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.ConfigDigest == "" || len(r.ConfigDigest) != 64 || r.Input.Profile != contracts.ProfileGuarded || r.Input.Timeout <= 0 || r.Input.Timeout > 10*time.Minute || strings.TrimSpace(r.Input.Prompt) == "" || len(r.Input.Prompt) > 64<<10 || !cleanAbs(r.Input.Repository) || !cleanAbs(r.Input.Worktree) || r.Input.WorktreeIdentity == "" || len(r.Input.BaseSHA) != 40 || len(r.Input.Schema) == 0 || len(r.Input.Schema) > 1<<20 {

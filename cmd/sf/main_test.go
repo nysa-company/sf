@@ -38,9 +38,12 @@ func TestCompiledDevGateRestartDrainsRecordedGroupBeforeCallerContinues(t *testi
 	owner.Executable = binary
 	launches := make(chan contracts.ProviderLaunch, 1)
 	request := contracts.DrainRequest{ClaimID: 9, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-gate-restart"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64), Worktree: t.TempDir()}
-	if _, err := owner.RegisterExecutable(request.Identity, "/bin/sh"); err != nil {
+	binaryDigest, err := owner.RegisterExecutable(request.Identity, "/bin/sh")
+	if err != nil {
 		t.Fatalf("register fixture executable: %v", err)
 	}
+	request.BinaryDigest = binaryDigest
+	request.PolicyDigest = owner.PolicyDigest()
 	owner.SetLaunchRecorder(func(_ context.Context, got contracts.DrainRequest, launch contracts.ProviderLaunch) error {
 		if got != request {
 			return fmt.Errorf("unexpected launch request")
@@ -78,6 +81,36 @@ func TestCompiledDevGateRestartDrainsRecordedGroupBeforeCallerContinues(t *testi
 	}
 	if err := syscall.Kill(-launch.PGID, 0); err != syscall.ESRCH {
 		t.Fatalf("provider group still exists: %v", err)
+	}
+}
+
+func TestCompiledDevRunRetainsClaimUntilNormalDrain(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "sf-dev")
+	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sf-dev: %v\n%s", err, output)
+	}
+	supervisor, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor.Executable = binary
+	identity := domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}
+	binaryDigest, err := supervisor.RegisterExecutable(identity, "/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := contracts.DrainRequest{ClaimID: 10, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-normal-drain"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: identity, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64), BinaryDigest: binaryDigest, PolicyDigest: supervisor.PolicyDigest(), Worktree: t.TempDir()}
+	supervisor.SetLaunchRecorder(func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error { return nil })
+	if _, err := supervisor.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "exit 0"}}, contracts.PhaseInput{Worktree: request.Worktree}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := supervisor.Drain(context.Background(), request); err != nil {
+		t.Fatalf("completed run was not retained for normal drain: %v", err)
+	}
+	if _, err := supervisor.Drain(context.Background(), request); err == nil {
+		t.Fatal("drain proof remained reusable after cleanup")
 	}
 }
 
@@ -120,7 +153,9 @@ func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T)
 		t.Fatal(err)
 	}
 	owner.Executable = binary
-	if _, err := owner.RegisterExecutable(domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}, "/bin/sh"); err != nil {
+	fixtureIdentity := domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}
+	binaryDigest, err := owner.RegisterExecutable(fixtureIdentity, "/bin/sh")
+	if err != nil {
 		t.Fatalf("register fixture executable: %v", err)
 	}
 	_, thisFile, _, _ := runtime.Caller(0)
@@ -153,7 +188,7 @@ func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T)
 	ticket.Version = transition.Version
 	ticket.State = domain.StateBuilding
 	builderIdentity := domain.ProviderIdentity{Provider: "builder", Model: "builder-model", Family: "builder-family", Version: "1"}
-	binaryDigest, err := owner.RegisterExecutable(builderIdentity, "/bin/sh")
+	binaryDigest, err = owner.RegisterExecutable(builderIdentity, "/bin/sh")
 	if err != nil {
 		t.Fatalf("register fixture executable: %v", err)
 	}
@@ -162,7 +197,11 @@ func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T)
 		if name == builderIdentity.Provider {
 			binary = binaryDigest
 		}
-		return store.ProviderQualification{Channel: domain.ChannelDev, RunID: run, Provider: domain.ProviderIdentity{Provider: name, Model: name + "-model", Family: family, Version: "1"}, BinaryDigest: binary, PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()}
+		policy := strings.Repeat("b", 64)
+		if name == builderIdentity.Provider {
+			policy = owner.PolicyDigest()
+		}
+		return store.ProviderQualification{Channel: domain.ChannelDev, RunID: run, Provider: domain.ProviderIdentity{Provider: name, Model: name + "-model", Family: family, Version: "1"}, BinaryDigest: binary, PolicyDigest: policy, FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()}
 	}
 	builder, _, err := writer.RecordProviderQualification(context.Background(), qual("11111111111111111111111111111111", "builder", "builder-family"))
 	if err != nil {
@@ -305,7 +344,9 @@ func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *te
 		t.Fatal(err)
 	}
 	owner.Executable = binary
-	if _, err := owner.RegisterExecutable(domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}, "/bin/sh"); err != nil {
+	fixtureIdentity := domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}
+	binaryDigest, err := owner.RegisterExecutable(fixtureIdentity, "/bin/sh")
+	if err != nil {
 		t.Fatalf("register fixture executable: %v", err)
 	}
 	var bootIdentity string
@@ -316,7 +357,7 @@ func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *te
 	if _, err := owner.Run(context.Background(), contracts.DrainRequest{
 		ClaimID: 1, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-identity-probe"},
 		Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"},
-		LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/identity-probe", BindingDigest: strings.Repeat("a", 64), Worktree: t.TempDir(),
+		LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/identity-probe", BindingDigest: strings.Repeat("a", 64), BinaryDigest: binaryDigest, PolicyDigest: owner.PolicyDigest(), Worktree: t.TempDir(),
 	}, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 0.1"}}, contracts.PhaseInput{Worktree: t.TempDir()}); err != nil {
 		t.Fatalf("capture boot identity: %v", err)
 	}
@@ -377,7 +418,7 @@ func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *te
 	ticket.Version = transition.Version
 	ticket.State = domain.StateBuilding
 	builderIdentity := domain.ProviderIdentity{Provider: "builder", Model: "builder-model", Family: "builder-family", Version: "1"}
-	binaryDigest, err := owner.RegisterExecutable(builderIdentity, "/bin/sh")
+	binaryDigest, err = owner.RegisterExecutable(builderIdentity, "/bin/sh")
 	if err != nil {
 		t.Fatalf("register fixture executable: %v", err)
 	}
@@ -386,7 +427,11 @@ func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *te
 		if name == builderIdentity.Provider {
 			binary = binaryDigest
 		}
-		return store.ProviderQualification{Channel: domain.ChannelDev, RunID: run, Provider: domain.ProviderIdentity{Provider: name, Model: name + "-model", Family: family, Version: "1"}, BinaryDigest: binary, PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()}
+		policy := strings.Repeat("b", 64)
+		if name == builderIdentity.Provider {
+			policy = owner.PolicyDigest()
+		}
+		return store.ProviderQualification{Channel: domain.ChannelDev, RunID: run, Provider: domain.ProviderIdentity{Provider: name, Model: name + "-model", Family: family, Version: "1"}, BinaryDigest: binary, PolicyDigest: policy, FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()}
 	}
 	builder, _, err := writer.RecordProviderQualification(context.Background(), qual("33333333333333333333333333333333", "builder", "builder-family"))
 	if err != nil {

@@ -49,7 +49,6 @@ type PhaseResult struct {
 // component allowed to start it; adapters never receive os/exec authority.
 type Invocation struct {
 	Argv []string
-	Env  []string
 }
 
 // RuntimeBinding is re-probed immediately before a paid invocation. Its
@@ -78,6 +77,7 @@ type DrainRequest struct {
 	LeaseKey         string
 	BindingDigest    string
 	BinaryDigest     string
+	PolicyDigest     string
 	Repository       string
 	Worktree         string
 	WorktreeIdentity string
@@ -128,7 +128,7 @@ func VerifyDrainProof(publicKey []byte, request DrainRequest, proof DrainProof) 
 	return len(publicKey) == ed25519.PublicKeySize && string(publicKey) == string(proof.publicKey) && proof.request == request && ed25519.Verify(ed25519.PublicKey(publicKey), drainPayload(request), proof.signature)
 }
 func drainPayload(r DrainRequest) []byte {
-	return []byte(fmt.Sprintf("%d", r.ClaimID) + "\x00" + string(r.Ref.Channel) + "\x00" + string(r.Ref.Project) + "\x00" + string(r.Ref.Ticket) + "\x00" + string(r.Phase) + "\x00" + r.Role + "\x00" + r.Identity.Provider + "\x00" + r.Identity.Model + "\x00" + r.Identity.Family + "\x00" + r.Identity.Version + "\x00" + r.LeaseKey + "\x00" + r.BindingDigest + "\x00" + r.BinaryDigest + "\x00" + r.Repository + "\x00" + r.Worktree + "\x00" + r.WorktreeIdentity + "\x00" + r.BaseSHA + "\x00" + fmtUint(r.LeaderEpoch) + "\x00" + fmtUint(r.RunnerEpoch) + "\x00" + fmtUint(r.ExpectedVersion) + "\x00" + fmtInt(r.Attempt))
+	return []byte(fmt.Sprintf("%d", r.ClaimID) + "\x00" + string(r.Ref.Channel) + "\x00" + string(r.Ref.Project) + "\x00" + string(r.Ref.Ticket) + "\x00" + string(r.Phase) + "\x00" + r.Role + "\x00" + r.Identity.Provider + "\x00" + r.Identity.Model + "\x00" + r.Identity.Family + "\x00" + r.Identity.Version + "\x00" + r.LeaseKey + "\x00" + r.BindingDigest + "\x00" + r.BinaryDigest + "\x00" + r.PolicyDigest + "\x00" + r.Repository + "\x00" + r.Worktree + "\x00" + r.WorktreeIdentity + "\x00" + r.BaseSHA + "\x00" + fmtUint(r.LeaderEpoch) + "\x00" + fmtUint(r.RunnerEpoch) + "\x00" + fmtUint(r.ExpectedVersion) + "\x00" + fmtInt(r.Attempt))
 }
 func fmtUint(v uint64) string { return fmt.Sprintf("%d", v) }
 func fmtInt(v int) string     { return fmt.Sprintf("%d", v) }

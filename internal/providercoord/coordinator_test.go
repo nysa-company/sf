@@ -3,6 +3,7 @@ package providercoord
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -87,6 +88,105 @@ type refusingSupervisor struct{ *testkit.Supervisor }
 
 func (s refusingSupervisor) Drain(context.Context, contracts.DrainRequest) (contracts.DrainProof, error) {
 	return contracts.DrainProof{}, fmt.Errorf("tracked process group remains live")
+}
+
+type faultingSupervisor struct {
+	*testkit.Supervisor
+	onDrain func()
+}
+
+func (s faultingSupervisor) Drain(ctx context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
+	if s.onDrain != nil {
+		s.onDrain()
+	}
+	return contracts.DrainProof{}, fmt.Errorf("tracked process group remains live")
+}
+
+func TestPersistenceFailureLatchesCoordinatorAndPreservesActiveClaim(t *testing.T) {
+	var database *store.Store
+	supervisor := &faultingSupervisor{Supervisor: testkit.NewSupervisor()}
+	database, request, coordinator, ref := newCoordinatorFixture(t, supervisor)
+	supervisor.onDrain = func() {
+		database.SetWriteFaultForTest(func() error { return errors.New("injected quarantine write failure") })
+	}
+	first := coordinator.Run(context.Background(), request)
+	if !first.NeedsOperator || !first.PersistenceFailure {
+		t.Fatalf("persistence failure was not surfaced: %+v", first)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "active" {
+		t.Fatalf("active claim was not preserved after failed quarantine: %+v err=%v", attempts, err)
+	}
+	second := coordinator.Run(context.Background(), request)
+	if !second.NeedsOperator || second.Code != NeedsOperator {
+		t.Fatalf("latched coordinator admitted a later run: %+v", second)
+	}
+}
+
+func newCoordinatorFixture(t *testing.T, supervisor contracts.ProcessSupervisor) (*store.Store, Request, *Coordinator, domain.TicketRef) {
+	t.Helper()
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	root := t.TempDir()
+	raw := []byte("frozen")
+	sum := sha256.Sum256(raw)
+	digest := fmt.Sprintf("%x", sum)
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "p", Path: "/tmp/p", BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: raw}); err != nil {
+		t.Fatal(err)
+	}
+	leader, _ := database.AcquireLeader(ctx, domain.ChannelDev, "persistence-test")
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "SF-persistence"}
+	if err := database.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "source", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := database.StartOrAdopt(ctx, ref, 1, "dev/p/SF-persistence", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Path: root, Branch: "dev/p/SF-persistence", IdentityJSON: []byte(`{"repository":"/tmp/p"}`), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
+		t.Fatal(err)
+	}
+	primary := testkit.NewScriptedProvider(id("cursor", "cursor-family"))
+	primary.Add(domain.PhasePlanning, testkit.ProviderStep{Behavior: testkit.ProviderHang})
+	fallback := testkit.NewScriptedProvider(id("claude", "claude-family"))
+	if err := recordQualForFixture(database, primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordQualForFixture(database, fallback); err != nil {
+		t.Fatal(err)
+	}
+	primaryQualification, _ := database.LatestProviderQualification(ctx, domain.ChannelDev, id("cursor", "cursor-family"))
+	fallbackQualification, _ := database.LatestProviderQualification(ctx, domain.ChannelDev, id("claude", "claude-family"))
+	if _, _, err := database.SelectProviderSet(ctx, domain.ChannelDev, primaryQualification.ID, primaryQualification.ID, fallbackQualification.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewRegistry()
+	if err := registry.Register(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(ctx, fallback); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := New(registry, map[Role]Route{RolePlanner: {Primary: "cursor", Fallback: "claude"}}, database, nil, supervisor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: `{"repository":"/tmp/p"}`, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: 200 * time.Millisecond, Profile: contracts.ProfileGuarded, Schema: []byte("schema")}}
+	return database, request, coordinator, ref
+}
+
+func recordQualForFixture(database *store.Store, provider *testkit.ScriptedProvider) error {
+	binding, err := provider.Binding(context.Background())
+	if err != nil {
+		return err
+	}
+	runSum := sha256.Sum256([]byte(binding.Identity.Provider + binding.Identity.Model + binding.Identity.Version))
+	_, _, err = database.RecordProviderQualification(context.Background(), store.ProviderQualification{Channel: domain.ChannelDev, RunID: fmt.Sprintf("%x", runSum)[:32], Provider: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()})
+	return err
 }
 
 func (p *undrainedProvider) Drain(_ context.Context, request contracts.DrainRequest) (contracts.DrainResult, error) {

@@ -22,6 +22,7 @@ func TestRunKeyRequiresExactClaimIdentity(t *testing.T) {
 		"leader":            func(request *contracts.DrainRequest) { request.LeaderEpoch++ },
 		"runner":            func(request *contracts.DrainRequest) { request.RunnerEpoch++ },
 		"binding":           func(request *contracts.DrainRequest) { request.BindingDigest = "other" },
+		"policy":            func(request *contracts.DrainRequest) { request.PolicyDigest = "other" },
 		"worktree":          func(request *contracts.DrainRequest) { request.Worktree = "/other" },
 		"worktree identity": func(request *contracts.DrainRequest) { request.WorktreeIdentity = "other" },
 	} {
@@ -46,13 +47,41 @@ func TestRunRequiresRegisteredMatchingExecutable(t *testing.T) {
 	if _, err := supervisor.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh"}}, input); err == nil {
 		t.Fatal("unregistered executable was accepted")
 	}
-	if _, err := supervisor.RegisterExecutable(identity, "/bin/sh"); err != nil {
+	binaryDigest, err := supervisor.RegisterExecutable(identity, "/bin/sh")
+	if err != nil {
 		t.Fatal(err)
 	}
+	request.BinaryDigest = binaryDigest
+	request.PolicyDigest = supervisor.PolicyDigest()
 	for _, path := range []string{"/bin/echo"} {
 		if _, err := supervisor.Run(context.Background(), request, contracts.Invocation{Argv: []string{path}}, input); err == nil {
 			t.Fatalf("mismatched executable %q was accepted", path)
 		}
+	}
+}
+
+func TestRunRequiresBothDurableBindingDigests(t *testing.T) {
+	supervisor, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := domain.ProviderIdentity{Provider: "fixture", Model: "model", Family: "family", Version: "v1"}
+	binaryDigest, err := supervisor.RegisterExecutable(identity, "/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := contracts.DrainRequest{ClaimID: 1, Identity: identity, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "SF-digest"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "lease", BindingDigest: "binding", BinaryDigest: binaryDigest, PolicyDigest: supervisor.PolicyDigest(), Worktree: t.TempDir()}
+	for name, mutate := range map[string]func(*contracts.DrainRequest){
+		"binary": func(r *contracts.DrainRequest) { r.BinaryDigest = "" },
+		"policy": func(r *contracts.DrainRequest) { r.PolicyDigest = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := request
+			mutate(&changed)
+			if _, err := supervisor.Run(context.Background(), changed, contracts.Invocation{Argv: []string{"/bin/sh"}}, contracts.PhaseInput{Worktree: changed.Worktree}); err == nil {
+				t.Fatal("execution without complete binding digests was accepted")
+			}
+		})
 	}
 }
 

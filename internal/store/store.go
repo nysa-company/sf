@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
@@ -73,9 +74,29 @@ func migrationChecksum(statements []string) string {
 }
 
 type Store struct {
-	db       *sql.DB
-	commit   func(context.Context, *sql.Conn) error
-	readOnly bool
+	db         *sql.DB
+	commit     func(context.Context, *sql.Conn) error
+	readOnly   bool
+	faultMu    sync.RWMutex
+	writeFault func() error
+}
+
+// SetWriteFaultForTest injects a deterministic write failure. It is reserved
+// for package/integration tests that verify fail-closed persistence handling.
+func (s *Store) SetWriteFaultForTest(fault func() error) {
+	s.faultMu.Lock()
+	s.writeFault = fault
+	s.faultMu.Unlock()
+}
+
+func (s *Store) injectedWriteFault() error {
+	s.faultMu.RLock()
+	fault := s.writeFault
+	s.faultMu.RUnlock()
+	if fault != nil {
+		return fault()
+	}
+	return nil
 }
 
 type Project struct {
@@ -293,6 +314,9 @@ func (s *Store) write(ctx context.Context, fn func(*sql.Conn) error) error {
 	}
 	backoff := time.Millisecond
 	for {
+		if err := s.injectedWriteFault(); err != nil {
+			return err
+		}
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("%w: %v", ErrBusy, err)
 		}

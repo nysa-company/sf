@@ -40,7 +40,6 @@ type Identity struct {
 type Supervisor struct {
 	Signer   *contracts.DrainSigner
 	Recorder LaunchRecorder
-	Env      []string
 	trusted  map[domain.ProviderIdentity]trustedExecutable
 	// Executable is the sf binary that implements __provider_gate. It is only
 	// overridden by compiled-boundary tests; production uses os.Executable.
@@ -50,8 +49,9 @@ type Supervisor struct {
 	runs                 map[requestKey]*run
 }
 type trustedExecutable struct {
-	path   string
-	digest string
+	path         string
+	digest       string
+	policyDigest string
 }
 type run struct {
 	identity Identity
@@ -65,7 +65,7 @@ func New(recorder LaunchRecorder) (*Supervisor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Supervisor{Signer: signer, Recorder: recorder, Env: []string{"PATH=/usr/bin:/bin"}, trusted: map[domain.ProviderIdentity]trustedExecutable{}, SoftDrain: 2 * time.Second, HardDrain: 2 * time.Second, runs: map[requestKey]*run{}}, nil
+	return &Supervisor{Signer: signer, Recorder: recorder, trusted: map[domain.ProviderIdentity]trustedExecutable{}, SoftDrain: 2 * time.Second, HardDrain: 2 * time.Second, runs: map[requestKey]*run{}}, nil
 }
 func (s *Supervisor) PublicKey() []byte { return s.Signer.PublicKey() }
 func (s *Supervisor) SetLaunchRecorder(recorder func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error) {
@@ -90,9 +90,20 @@ func (s *Supervisor) RegisterExecutable(identity domain.ProviderIdentity, path s
 		return "", err
 	}
 	s.mu.Lock()
+	trusted.policyDigest = environmentPolicyDigest()
 	s.trusted[identity] = trusted
 	s.mu.Unlock()
 	return trusted.digest, nil
+}
+
+// PolicyDigest is the digest of the supervisor-owned environment policy. It
+// lets the durable provider binding pin the policy without persisting any
+// per-run secret or temporary directory name.
+func (s *Supervisor) PolicyDigest() string { return environmentPolicyDigest() }
+
+func environmentPolicyDigest() string {
+	sum := sha256.Sum256([]byte("PATH=/usr/bin:/bin\x00LANG=C\x00HOME=<private>\x00TMPDIR=<private>"))
+	return hex.EncodeToString(sum[:])
 }
 
 func authenticateExecutable(path string) (trustedExecutable, error) {
@@ -163,6 +174,7 @@ type requestKey struct {
 	LeaseKey         string
 	BindingDigest    string
 	BinaryDigest     string
+	PolicyDigest     string
 	Repository       string
 	Worktree         string
 	WorktreeIdentity string
@@ -170,14 +182,14 @@ type requestKey struct {
 }
 
 func key(r contracts.DrainRequest) requestKey {
-	return requestKey{ClaimID: r.ClaimID, Identity: r.Identity, Ref: r.Ref, Phase: r.Phase, Role: r.Role, Attempt: r.Attempt, LeaderEpoch: r.LeaderEpoch, RunnerEpoch: r.RunnerEpoch, ExpectedVersion: r.ExpectedVersion, LeaseKey: r.LeaseKey, BindingDigest: r.BindingDigest, BinaryDigest: r.BinaryDigest, Repository: r.Repository, Worktree: r.Worktree, WorktreeIdentity: r.WorktreeIdentity, BaseSHA: r.BaseSHA}
+	return requestKey{ClaimID: r.ClaimID, Identity: r.Identity, Ref: r.Ref, Phase: r.Phase, Role: r.Role, Attempt: r.Attempt, LeaderEpoch: r.LeaderEpoch, RunnerEpoch: r.RunnerEpoch, ExpectedVersion: r.ExpectedVersion, LeaseKey: r.LeaseKey, BindingDigest: r.BindingDigest, BinaryDigest: r.BinaryDigest, PolicyDigest: r.PolicyDigest, Repository: r.Repository, Worktree: r.Worktree, WorktreeIdentity: r.WorktreeIdentity, BaseSHA: r.BaseSHA}
 }
 
 func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, invocation contracts.Invocation, input contracts.PhaseInput) (contracts.CommandResult, error) {
 	if len(invocation.Argv) == 0 || !filepath.IsAbs(invocation.Argv[0]) || input.Worktree == "" || filepath.Clean(input.Worktree) != input.Worktree {
 		return contracts.CommandResult{}, errors.New("guarded argv and worktree required")
 	}
-	if request.ClaimID <= 0 || request.Ref.Validate() != nil || request.Phase == "" || (request.Role != "planner" && request.Role != "builder" && request.Role != "reviewer") || request.Attempt <= 0 || request.LeaderEpoch == 0 || request.RunnerEpoch == 0 || request.ExpectedVersion == 0 || request.LeaseKey == "" || request.BindingDigest == "" || request.Worktree == "" {
+	if request.ClaimID <= 0 || request.Ref.Validate() != nil || request.Phase == "" || (request.Role != "planner" && request.Role != "builder" && request.Role != "reviewer") || request.Attempt <= 0 || request.LeaderEpoch == 0 || request.RunnerEpoch == 0 || request.ExpectedVersion == 0 || request.LeaseKey == "" || request.BindingDigest == "" || request.BinaryDigest == "" || request.PolicyDigest == "" || request.Worktree == "" {
 		return contracts.CommandResult{}, errors.New("complete provider claim identity is required")
 	}
 	s.mu.Lock()
@@ -197,6 +209,9 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	if request.BinaryDigest != "" && request.BinaryDigest != trusted.digest {
 		return contracts.CommandResult{}, errors.New("provider executable digest does not match claim")
 	}
+	if request.PolicyDigest != "" && request.PolicyDigest != trusted.policyDigest {
+		return contracts.CommandResult{}, errors.New("provider environment policy does not match claim")
+	}
 	providerPath := trusted.path
 	var executable *os.File
 	if runtime.GOOS == "linux" {
@@ -215,6 +230,11 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 			return contracts.CommandResult{}, err
 		}
 	}
+	environment, cleanupEnvironment, err := vettedEnvironment()
+	if err != nil {
+		return contracts.CommandResult{}, err
+	}
+	defer cleanupEnvironment()
 	gateRead, gateWrite, err := os.Pipe()
 	if err != nil {
 		return contracts.CommandResult{}, err
@@ -223,7 +243,7 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	argv := append([]string{"__provider_gate", providerPath}, invocation.Argv[1:]...)
 	cmd := exec.Command(self, argv...)
 	cmd.Dir = input.Worktree
-	cmd.Env = append(append([]string(nil), s.Env...), invocation.Env...)
+	cmd.Env = environment
 	cmd.ExtraFiles = []*os.File{gateRead} // FD 3: wrapper exits on EOF before release.
 	if executable != nil {
 		cmd.ExtraFiles = append(cmd.ExtraFiles, executable) // FD 4: pinned provider.
@@ -251,6 +271,12 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	}
 	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: startIdentity}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{})}
 	s.mu.Lock()
+	if _, exists := s.runs[key(request)]; exists {
+		s.mu.Unlock()
+		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
+		_ = cmd.Wait()
+		return contracts.CommandResult{}, errors.New("provider claim is already running")
+	}
 	s.runs[key(request)] = r
 	s.mu.Unlock()
 	s.mu.Lock()
@@ -261,13 +287,20 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 		_ = cmd.Wait()
 		close(r.done)
 		close(r.streams)
+		s.removeRun(request, r)
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	// Durable identity exists; the only release is closing the inherited gate.
 	if _, err := gateWrite.Write([]byte{1}); err != nil {
+		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
+		_ = cmd.Wait()
+		s.removeRun(request, r)
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	if err := gateWrite.Close(); err != nil {
+		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
+		_ = cmd.Wait()
+		s.removeRun(request, r)
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	wait := make(chan error, 1)
@@ -288,6 +321,51 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	}
 	return contracts.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), ExitCode: 0}, nil
 }
+
+func (s *Supervisor) removeRun(request contracts.DrainRequest, target *run) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current := s.runs[key(request)]; current == target {
+		delete(s.runs, key(request))
+	}
+}
+
+func vettedEnvironment() ([]string, func(), error) {
+	home, err := os.MkdirTemp("", "sf-provider-home-")
+	if err != nil {
+		return nil, func() {}, err
+	}
+	tmp, err := os.MkdirTemp("", "sf-provider-tmp-")
+	if err != nil {
+		_ = os.RemoveAll(home)
+		return nil, func() {}, err
+	}
+	if err := privateDirectory(home); err != nil {
+		_ = os.RemoveAll(home)
+		_ = os.RemoveAll(tmp)
+		return nil, func() {}, err
+	}
+	if err := privateDirectory(tmp); err != nil {
+		_ = os.RemoveAll(home)
+		_ = os.RemoveAll(tmp)
+		return nil, func() {}, err
+	}
+	return []string{"PATH=/usr/bin:/bin", "LANG=C", "HOME=" + home, "TMPDIR=" + tmp}, func() {
+		_ = os.RemoveAll(home)
+		_ = os.RemoveAll(tmp)
+	}, nil
+}
+
+func privateDirectory(path string) error {
+	if err := os.Chmod(path, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || !trustedOwner(info) {
+		return errors.New("provider environment directory is not private")
+	}
+	return nil
+}
 func (s *Supervisor) Drain(ctx context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
 	s.mu.Lock()
 	r := s.runs[key(request)]
@@ -301,6 +379,7 @@ func (s *Supervisor) Drain(ctx context.Context, request contracts.DrainRequest) 
 	if err := s.proveGone(r); err != nil {
 		return contracts.DrainProof{}, err
 	}
+	s.removeRun(request, r)
 	return s.Signer.ProveDrained(request)
 }
 
