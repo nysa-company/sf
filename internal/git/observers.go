@@ -86,7 +86,16 @@ func (r Runner) ObserveCommit(ctx context.Context, worktree Worktree) (CommitObs
 	}
 	// Deriving the tree from the captured commit makes the tuple intrinsically
 	// consistent even if HEAD is moved and moved back while this read runs.
-	// Re-read HEAD as well so an ordinary move that remains in place is refused.
+	// The final identity check below closes the authenticated path and
+	// repository/config boundary after the complete read set. Keep the final
+	// HEAD read after this potentially lengthy reauthentication: otherwise HEAD
+	// could move while the identity is being checked and remain undetected.
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return CommitObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return CommitObservation{}, err
+	}
 	finalCommitOutput, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno,
 		"rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
@@ -101,14 +110,6 @@ func (r Runner) ObserveCommit(ctx context.Context, worktree Worktree) (CommitObs
 	}
 	if finalCommitOID != commitOID {
 		return CommitObservation{}, fmt.Errorf("%w: HEAD changed during commit observation", ErrUnexpectedRemote)
-	}
-	// The final identity check below closes the authenticated path and
-	// repository/config boundary after the complete read set.
-	if err := r.InspectWorktree(ctx, worktree); err != nil {
-		return CommitObservation{}, err
-	}
-	if err := ctx.Err(); err != nil {
-		return CommitObservation{}, err
 	}
 
 	return CommitObservation{CommitOID: commitOID, ParentOID: parentOID, TreeOID: treeOID}, nil

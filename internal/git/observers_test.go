@@ -54,7 +54,7 @@ func TestObserveCommitReturnsExactSingleParentAndTree(t *testing.T) {
 	}
 }
 
-func observerInjectedRunner(t *testing.T, worktree Worktree, commit, parent, tree string, finalCommit string) (Runner, *observerCountingAuthority, *[][]string) {
+func observerInjectedRunner(t *testing.T, worktree Worktree, commit, parent, tree string, finalCommit string) (Runner, *observerCountingAuthority, *[][]string, *bool) {
 	t.Helper()
 	base := Runner{Home: filepath.Join(t.TempDir(), "git-home"), ExecHelper: testExecHelper, TestLocalTransport: true}
 	config, err := base.command(context.Background(), worktree.Path, "config", "--null", "--list", "--show-origin")
@@ -67,6 +67,8 @@ func observerInjectedRunner(t *testing.T, worktree Worktree, commit, parent, tre
 	}
 	var calls [][]string
 	head := []string{commit, finalCommit}
+	identityPasses := 0
+	moveDuringFinalReauth := false
 	base.Run = func(_ context.Context, _ string, argv, _ []string) ([]byte, error) {
 		calls = append(calls, append([]string(nil), argv...))
 		suffix := func(want ...string) bool {
@@ -82,6 +84,10 @@ func observerInjectedRunner(t *testing.T, worktree Worktree, commit, parent, tre
 		}
 		switch {
 		case suffix("rev-parse", "--show-toplevel"):
+			identityPasses++
+			if identityPasses == 2 && moveDuringFinalReauth {
+				head[0] = strings.Repeat("f", 40)
+			}
 			return []byte(worktree.Path + "\n"), nil
 		case suffix("rev-parse", "--path-format=absolute", "--git-common-dir"):
 			return []byte(worktree.Identity.CommonDir + "\n"), nil
@@ -116,7 +122,7 @@ func observerInjectedRunner(t *testing.T, worktree Worktree, commit, parent, tre
 	}
 	authority := &observerCountingAuthority{}
 	base.MutationAuthority = authority
-	return base, authority, &calls
+	return base, authority, &calls, &moveDuringFinalReauth
 }
 
 func TestObserveCommitInjectedRunnerUsesReadOnlyExactArgvAndFreshHead(t *testing.T) {
@@ -124,7 +130,7 @@ func TestObserveCommitInjectedRunnerUsesReadOnlyExactArgvAndFreshHead(t *testing
 	commit := strings.Repeat("c", 40)
 	parent := strings.Repeat("d", 40)
 	tree := strings.Repeat("e", 40)
-	runner, authority, calls := observerInjectedRunner(t, worktree, commit, parent, tree, commit)
+	runner, authority, calls, _ := observerInjectedRunner(t, worktree, commit, parent, tree, commit)
 	worktree.Identity.ConfigHash = realRunnerIdentityConfigHash(t, realRunner, worktree)
 	got, err := runner.ObserveCommit(ctx, worktree)
 	if err != nil {
@@ -168,9 +174,14 @@ func TestObserveCommitInjectedRunnerUsesReadOnlyExactArgvAndFreshHead(t *testing
 		}
 	}
 	other := strings.Repeat("f", 40)
-	staleRunner, _, _ := observerInjectedRunner(t, worktree, commit, parent, tree, other)
+	staleRunner, _, _, _ := observerInjectedRunner(t, worktree, commit, parent, tree, other)
 	if _, err := staleRunner.ObserveCommit(ctx, worktree); !errors.Is(err, ErrUnexpectedRemote) {
 		t.Fatalf("HEAD movement accepted: %v", err)
+	}
+	movingRunner, _, _, moveDuringReauth := observerInjectedRunner(t, worktree, commit, parent, tree, commit)
+	*moveDuringReauth = true
+	if _, err := movingRunner.ObserveCommit(ctx, worktree); !errors.Is(err, ErrUnexpectedRemote) {
+		t.Fatalf("HEAD movement during final reauthentication accepted: %v", err)
 	}
 }
 
@@ -238,6 +249,16 @@ func TestObserveRemoteBranchRejectsUnboundBranchAndOrigin(t *testing.T) {
 	}
 	if _, err := runner.ObserveRemoteBranch(ctx, worktree, "https://github.com/other/repository.git", worktree.Branch); !errors.Is(err, ErrIdentityMismatch) {
 		t.Fatalf("origin mismatch error=%v", err)
+	}
+}
+
+func TestSafeOriginRejectsCredentialBearingSSHOrigin(t *testing.T) {
+	_, err := safeOrigin("ssh://git:secret@ssh.github.com:443/owner/repository.git")
+	if !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("credential-bearing SSH origin accepted: %v", err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("SSH credential leaked in error: %v", err)
 	}
 }
 

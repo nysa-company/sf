@@ -1361,6 +1361,9 @@ func safeOrigin(raw string) (string, error) {
 		if parsed.User == nil || parsed.User.Username() != "git" || parsed.Hostname() != "ssh.github.com" || parsed.Port() != "443" || !validGitHubRepoPath(strings.TrimPrefix(parsed.Path, "/")) {
 			return "", fmt.Errorf("%w: noncanonical github ssh origin refused", ErrIdentityMismatch)
 		}
+		if _, hasPassword := parsed.User.Password(); hasPassword {
+			return "", fmt.Errorf("%w: noncanonical github ssh origin refused", ErrIdentityMismatch)
+		}
 		return parsed.String(), nil
 	}
 	if parsed.User != nil {
