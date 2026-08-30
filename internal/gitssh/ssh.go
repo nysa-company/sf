@@ -73,9 +73,14 @@ func Command(request Request, gitArgv []string) ([]string, []string, error) {
 			return nil, nil, fmt.Errorf("%w: %s", ErrRefused, item.name)
 		}
 	}
-	for _, path := range []string{request.SSHBinary, request.KnownHosts} {
+	for _, item := range []struct {
+		path      string
+		allowRoot bool
+	}{{request.SSHBinary, true}, {request.KnownHosts, true}} {
+		path := item.path
 		info, err := os.Lstat(path)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || !ownedByCurrentUser(info) || linkCount(info) != 1 || !secureParents(path, false) {
+		ownerOK := err == nil && (ownedByCurrentUser(info) || (item.allowRoot && ownedByCurrentUserOrRoot(info)))
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || !ownerOK || linkCount(info) != 1 || !secureParents(path, false) {
 			return nil, nil, fmt.Errorf("%w: unsafe file", ErrRefused)
 		}
 	}

@@ -16,6 +16,39 @@ import (
 	"github.com/nysa-company/sf/internal/domain"
 )
 
+var testExecHelper string
+
+func TestMain(m *testing.M) {
+	root, err := os.Getwd()
+	if err != nil {
+		os.Exit(2)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
+			break
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			os.Exit(2)
+		}
+		root = parent
+	}
+	dir, err := os.MkdirTemp("", "sf-git-exec-")
+	if err != nil {
+		os.Exit(2)
+	}
+	testExecHelper = filepath.Join(dir, "sf-git-exec")
+	build := exec.Command("go", "build", "-o", testExecHelper, "./cmd/sf-git-exec")
+	build.Dir = root
+	if err := build.Run(); err != nil {
+		_ = os.RemoveAll(dir)
+		os.Exit(2)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 type memoryBranchAuthority struct{ branches map[string]string }
 
 func (a *memoryBranchAuthority) LoadBranch(_ context.Context, key string) (string, error) {
@@ -118,7 +151,7 @@ func fixture(t *testing.T) (context.Context, Runner, string, string) {
 	rawGit(t, repository, "commit", "-m", "base")
 	rawGit(t, repository, "remote", "add", "origin", remote)
 	rawGit(t, repository, "push", "origin", "main:refs/heads/main")
-	return ctx, Runner{Home: filepath.Join(root, "git-home")}, repository, remote
+	return ctx, Runner{Home: filepath.Join(root, "git-home"), ExecHelper: testExecHelper}, repository, remote
 }
 
 func TestAllocatorDelegatesBranchPersistenceToAuthority(t *testing.T) {
@@ -207,10 +240,11 @@ func TestGitCancellationKillsProcessGroup(t *testing.T) {
 	if err := os.Mkdir(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	rawGit(t, directory, "init")
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	_, err := (Runner{Binary: script, Home: filepath.Join(root, "home")}).one(ctx, directory, "status")
+	_, err := (Runner{Binary: script, Home: filepath.Join(root, "home"), ExecHelper: testExecHelper}).one(ctx, directory, "status")
 	if err == nil {
 		t.Fatal("canceled git command succeeded")
 	}
@@ -1144,6 +1178,40 @@ func TestCommandRejectsDirectoryReplacementDuringRun(t *testing.T) {
 	}}
 	if _, err := runner.one(context.Background(), directory, "status"); !errors.Is(err, ErrIdentityMismatch) {
 		t.Fatalf("directory replacement accepted: %v", err)
+	}
+}
+
+func TestFDExecutionGateKeepsOriginalDirectoryAfterRename(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "authenticated")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := openPinnedDirectory(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pinned.Close()
+	moved := directory + ".moved"
+	if err := os.Rename(directory, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(directory, "foreign")
+	if err := os.WriteFile(foreign, []byte("do not touch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := runBounded(context.Background(), testExecHelper, "/bin/pwd", nil, []string{"PATH=/usr/bin:/bin"}, []*os.File{pinned.file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(string(output)), filepath.Base(moved)) {
+		t.Fatalf("gate cwd=%q want suffix %q", output, filepath.Base(moved))
+	}
+	if data, err := os.ReadFile(foreign); err != nil || string(data) != "do not touch" {
+		t.Fatalf("foreign replacement touched: %q %v", data, err)
 	}
 }
 

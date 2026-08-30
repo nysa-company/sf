@@ -182,7 +182,10 @@ type Runner struct {
 	SSHBinary     string
 	SSHKnownHosts string
 	SSHAgentSock  string
-	Run           func(context.Context, string, []string, []string) ([]byte, error)
+	// ExecHelper is the packaged sf-git-exec capability gate. Production Git
+	// commands never use Cmd.Dir's mutable pathname once this is configured.
+	ExecHelper string
+	Run        func(context.Context, string, []string, []string) ([]byte, error)
 }
 
 // commandConfigKeys are repository-local settings that can cause Git to run
@@ -282,12 +285,12 @@ func (r Runner) commandExpected(ctx context.Context, directory string, expectedD
 		}
 		return output, err
 	}
-	output, err := runBounded(ctx, r.binary(), argv, env, directory)
+	output, err := runBounded(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file})
 	if verifyErr := pinned.verify(); verifyErr != nil {
 		return output, verifyErr
 	}
 	if err != nil {
-		return output, fmt.Errorf("git command failed: %w", err)
+		return output, fmt.Errorf("git command failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return output, nil
 }
@@ -330,12 +333,12 @@ func (r Runner) commandEnvExpected(ctx context.Context, directory string, expect
 		}
 		return output, err
 	}
-	output, err := runBounded(ctx, r.binary(), argv, env, directory)
+	output, err := runBounded(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file})
 	if verifyErr := pinned.verify(); verifyErr != nil {
 		return output, verifyErr
 	}
 	if err != nil {
-		return output, fmt.Errorf("git command failed: %w", err)
+		return output, fmt.Errorf("git command failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return output, nil
 }
@@ -370,9 +373,20 @@ func (r Runner) binary() string {
 	return "/usr/bin/git"
 }
 
+func (r Runner) execHelper() string { return r.ExecHelper }
+
 func (r Runner) environment(extra []string) ([]string, error) {
 	if !validAbsolutePath(r.binary()) {
 		return nil, fmt.Errorf("runner requires an explicit absolute git binary")
+	}
+	if r.Run == nil && !validAbsolutePath(r.execHelper()) {
+		return nil, fmt.Errorf("runner requires packaged absolute git execution helper")
+	}
+	if r.Run == nil {
+		info, openErr := os.Lstat(r.execHelper())
+		if openErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || !ownedByCurrentOrRoot(info) || linkCountIsNotOne(info) {
+			return nil, fmt.Errorf("runner execution helper is unsafe")
+		}
 	}
 	if r.Home == "" || !validAbsolutePath(r.Home) {
 		return nil, fmt.Errorf("runner requires an explicit absolute isolated HOME")
@@ -406,6 +420,16 @@ func (r Runner) environment(extra []string) ([]string, error) {
 		env = append(env, entry)
 	}
 	return env, nil
+}
+
+func ownedByCurrentOrRoot(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && (int(stat.Uid) == os.Getuid() || stat.Uid == 0)
+}
+
+func linkCountIsNotOne(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return !ok || stat.Nlink != 1
 }
 
 // validExtraEnvironment is deliberately positive-only. In particular, an
@@ -526,9 +550,56 @@ func (p *pinnedDirectory) ino() uint64 {
 	return 0
 }
 
-func runBounded(ctx context.Context, binary string, argv, env []string, directory string) ([]byte, error) {
-	command := exec.CommandContext(ctx, binary, argv...)
-	command.Dir = directory
+// openGitCapabilities pins the worktree's .git indirection and common object
+// directory before invoking Git. The inherited descriptors are passed as
+// /dev/fd paths, so replacing either pathname after this point cannot redirect
+// object, ref, or worktree mutations.
+func openGitCapabilities(directory string) (*os.File, *os.File, error) {
+	pointer := filepath.Join(directory, ".git")
+	info, err := os.Lstat(pointer)
+	if err != nil {
+		return nil, nil, err
+	}
+	gitPath := pointer
+	commonPath := pointer
+	if info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+		data, err := os.ReadFile(pointer)
+		if err != nil {
+			return nil, nil, err
+		}
+		text := strings.TrimSpace(string(data))
+		if !strings.HasPrefix(text, "gitdir: ") {
+			return nil, nil, fmt.Errorf("%w: malformed git pointer", ErrIdentityMismatch)
+		}
+		gitPath = strings.TrimSpace(strings.TrimPrefix(text, "gitdir: "))
+		if !validAbsolutePath(gitPath) {
+			return nil, nil, fmt.Errorf("%w: noncanonical git pointer", ErrIdentityMismatch)
+		}
+		commonPath = filepath.Dir(filepath.Dir(gitPath))
+	} else if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, nil, fmt.Errorf("%w: unsafe git directory", ErrIdentityMismatch)
+	}
+	gitDir, err := openPinnedDirectory(gitPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	commonDir, err := openPinnedDirectory(commonPath)
+	if err != nil {
+		_ = gitDir.Close()
+		return nil, nil, err
+	}
+	return gitDir.file, commonDir.file, nil
+}
+
+func runBounded(ctx context.Context, helper, binary string, argv, env []string, directories []*os.File) ([]byte, error) {
+	if len(directories) != 1 || directories[0] == nil {
+		return nil, fmt.Errorf("pinned command directory is required")
+	}
+	command := exec.CommandContext(ctx, helper, append([]string{"--fd=3", "--", binary}, argv...)...)
+	// ExtraFiles maps the authenticated O_DIRECTORY fd to descriptor 3 before
+	// the helper fchdir+execs Git. No mutable worktree spelling is used by the
+	// child after the caller has opened it.
+	command.ExtraFiles = directories
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.WaitDelay = 750 * time.Millisecond
 	command.Env = env
@@ -668,6 +739,22 @@ func localOriginIdentity(path string) (uint64, uint64, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return 0, 0, fmt.Errorf("%w: local origin identity unavailable", ErrIdentityMismatch)
+	}
+	// A local origin is permitted only for hermetic/local operation and must be
+	// an actual bare repository root, not an arbitrary directory that Git could
+	// reinterpret through config or a replacement path.
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return 0, 0, fmt.Errorf("%w: local origin must be a real bare repository", ErrIdentityMismatch)
+	}
+	head, err := os.Lstat(filepath.Join(resolved, "HEAD"))
+	if err != nil || head.Mode()&os.ModeSymlink != 0 || !head.Mode().IsRegular() {
+		return 0, 0, fmt.Errorf("%w: local origin HEAD is unsafe", ErrIdentityMismatch)
+	}
+	for _, name := range []string{"objects", "refs"} {
+		entry, err := os.Lstat(filepath.Join(resolved, name))
+		if err != nil || entry.Mode()&os.ModeSymlink != 0 || !entry.IsDir() {
+			return 0, 0, fmt.Errorf("%w: local origin is not bare", ErrIdentityMismatch)
+		}
 	}
 	return uint64(stat.Dev), uint64(stat.Ino), nil
 }
@@ -1932,6 +2019,18 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 	}
 	if observed != request.ExpectedHead {
 		return "", fmt.Errorf("%w: push did not converge", ErrUnexpectedRemote)
+	}
+	// Git's ordinary candidate-ref push cannot atomically compare-and-swap a
+	// separately protected base ref. Treat this as a bounded, non-final effect:
+	// observe BaseRef again immediately after convergence and surface a stale
+	// base if it moved. Callers must invalidate publication and must not launch
+	// PR/review/merge work from this result until a fresh candidate is made.
+	remoteBaseAfter, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	if remoteBaseAfter != worktree.Identity.BaseHead {
+		return "", fmt.Errorf("%w: remote base moved during candidate publication", ErrUnexpectedRemote)
 	}
 	return request.ExpectedHead, nil
 }

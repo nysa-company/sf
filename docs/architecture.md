@@ -16,8 +16,13 @@ The approved normative design is in
   disabled; the optional port-443 SSH path uses the packaged `sf-ssh` helper,
   a pinned GitHub host-key asset, and an explicitly supplied SSH agent socket.
   `make build` packages these together as `bin/sf-ssh` and
-  `bin/github_known_hosts`; production configuration supplies those absolute
-  paths plus the agent socket to `git.Runner`. The build performs no service
+  `bin/github_known_hosts`, alongside `bin/sf-git-exec`; production
+  configuration supplies their absolute paths plus the agent socket to
+  `git.Runner`. `sf-git-exec` performs an fd-pinned `fchdir` before Git exec,
+  so replacing the checked worktree pathname cannot retarget the child cwd.
+  An ordinary candidate-ref push has no server-side CAS for a separate base
+  ref: sf observes BaseRef before and after that bounded publication effect
+  and treats any movement as stale rather than final. The build performs no service
   installation, channel-state mutation, or network operation.
 
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
