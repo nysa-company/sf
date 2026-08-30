@@ -496,3 +496,9 @@ var migrationV27 = []string{
 	 )`,
 	`DELETE FROM leases WHERE scope='provider' AND EXISTS(SELECT 1 FROM provider_attempts a WHERE a.channel=leases.channel AND a.project_id=leases.project_id AND a.ticket_id=leases.ticket_id AND a.runner_epoch=leases.runner_epoch AND a.provider_lease_key=leases.scope_key AND a.state='failed' AND a.outcome='legacy_unverifiable')`,
 }
+
+// v28 is a schema marker for the Go-level immutable provider-input audit.
+// The audit deliberately runs at every writable Store open: SQLite JSON shape
+// predicates cannot prove canonical encoding, SHA-256 authority, or all
+// PhaseInput admission semantics.
+var migrationV28 = []string{}

@@ -156,7 +156,7 @@ func (s *Store) ActiveProviderAttempts(ctx context.Context, channel domain.Chann
 	if !channel.Valid() {
 		return nil, errors.New("valid channel is required")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.project_id,a.ticket_id,a.phase,a.attempt,a.provider,a.model,a.family,a.version,a.role,a.state,a.outcome,a.usage_units,a.started_at,a.finished_at,a.qualification_id,a.binding_digest,a.provider_lease_key,a.leader_epoch,a.runner_epoch,a.expected_ticket_version,a.repository_path,a.worktree_path,a.worktree_identity,a.base_sha,a.supervisor_key,a.auth_digest,a.auth_mode,COALESCE(q.binary_digest,''),COALESCE(q.policy_digest,''),COALESCE(q.fixture_digest,''),i.request_digest,i.canonical_input FROM provider_attempts a LEFT JOIN provider_qualifications q ON q.id=a.qualification_id JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id WHERE a.channel=? AND a.state IN ('active','quarantined') ORDER BY a.id`, channel)
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.project_id,a.ticket_id,a.phase,a.attempt,a.provider,a.model,a.family,a.version,a.role,a.state,a.outcome,a.usage_units,a.started_at,a.finished_at,a.qualification_id,a.binding_digest,a.provider_lease_key,a.leader_epoch,a.runner_epoch,a.expected_ticket_version,a.repository_path,a.worktree_path,a.worktree_identity,a.base_sha,a.supervisor_key,a.auth_digest,a.auth_mode,COALESCE(q.binary_digest,''),COALESCE(q.policy_digest,''),COALESCE(q.fixture_digest,''),COALESCE(i.request_digest,''),COALESCE(i.canonical_input,X'') FROM provider_attempts a LEFT JOIN provider_qualifications q ON q.id=a.qualification_id LEFT JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id WHERE a.channel=? AND a.state IN ('active','quarantined') ORDER BY a.id`, channel)
 	if err != nil {
 		return nil, normalizeBusy(ctx, err)
 	}
@@ -171,7 +171,10 @@ func (s *Store) ActiveProviderAttempts(ctx context.Context, channel domain.Chann
 		}
 		value.Ref = domain.TicketRef{Channel: channel, Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
 		if err := hydrateProviderAttemptInput(&value.ProviderAttemptClaim); err != nil {
-			return nil, ErrProviderAttempt
+			// Reconciliation leaves an ambiguous invalid claim visible as a
+			// quarantine rather than silently dropping it. Do not hand a malformed
+			// drain request to a supervisor; make startup surface the typed blocker.
+			return nil, ErrProviderRecoveryBlocked
 		}
 		if qualification.Valid {
 			value.QualificationID = qualification.Int64
@@ -191,6 +194,81 @@ func (s *Store) ActiveProviderAttempts(ctx context.Context, channel domain.Chann
 		out = append(out, value)
 	}
 	return out, rows.Err()
+}
+
+// reconcileProviderAttemptInputs is the Go-level half of migration v28. It is
+// intentionally idempotent and is run on every writable Store open, not just
+// while applying v28: immutable SQLite blobs can be crafted outside normal
+// Store admission, while SQL can only check their superficial JSON shape.
+func (s *Store) reconcileProviderAttemptInputs(ctx context.Context) error {
+	type row struct {
+		claim              ProviderAttemptClaim
+		state, launchState string
+		pid, pgid          int64
+		boot, start        string
+		phaseExact         int
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, `SELECT
+			a.id,a.channel,a.project_id,a.ticket_id,a.phase,a.attempt,a.provider,a.model,a.family,a.version,a.role,a.state,a.qualification_id,a.binding_digest,a.provider_lease_key,a.leader_epoch,a.runner_epoch,a.expected_ticket_version,a.repository_path,a.worktree_path,a.worktree_identity,a.base_sha,a.supervisor_key,a.auth_digest,a.auth_mode,COALESCE(q.binary_digest,''),COALESCE(q.policy_digest,''),COALESCE(q.fixture_digest,''),COALESCE(i.request_digest,''),COALESCE(i.canonical_input,X''),a.launch_state,a.process_pid,a.process_pgid,a.process_boot_identity,a.process_start_identity,
+			CASE WHEN EXISTS(SELECT 1 FROM phase_runs p WHERE p.channel=a.channel AND p.project_id=a.project_id AND p.ticket_id=a.ticket_id AND p.phase=a.phase AND p.attempt=a.attempt AND p.state='active' AND p.provider=a.provider AND p.model=a.model AND p.family=a.family AND p.provider_version=a.version AND p.leader_epoch=a.leader_epoch AND p.runner_epoch=a.runner_epoch AND p.expected_ticket_version=a.expected_ticket_version AND p.worktree_identity=a.worktree_identity AND p.base_sha=a.base_sha) THEN 1 ELSE 0 END
+			FROM provider_attempts a
+			LEFT JOIN provider_qualifications q ON q.id=a.qualification_id
+			LEFT JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id
+			WHERE a.state IN ('active','quarantined') ORDER BY a.id`)
+		if err != nil {
+			return err
+		}
+		var values []row
+		for rows.Next() {
+			var value row
+			var channel, project, ticket string
+			var qualification sql.NullInt64
+			if err := rows.Scan(&value.claim.ID, &channel, &project, &ticket, &value.claim.Phase, &value.claim.Attempt, &value.claim.Binding.Identity.Provider, &value.claim.Binding.Identity.Model, &value.claim.Binding.Identity.Family, &value.claim.Binding.Identity.Version, &value.claim.Role, &value.state, &qualification, &value.claim.BindingDigest, &value.claim.LeaseKey, &value.claim.LeaderEpoch, &value.claim.RunnerEpoch, &value.claim.ExpectedVersion, &value.claim.Repository, &value.claim.Worktree, &value.claim.WorktreeIdentity, &value.claim.BaseSHA, &value.claim.SupervisorKey, &value.claim.Binding.AuthDigest, &value.claim.Binding.AuthMode, &value.claim.Binding.BinaryDigest, &value.claim.Binding.PolicyDigest, &value.claim.Binding.FixtureDigest, &value.claim.RequestDigest, &value.claim.RequestPayload, &value.launchState, &value.pid, &value.pgid, &value.boot, &value.start, &value.phaseExact); err != nil {
+				rows.Close()
+				return err
+			}
+			value.claim.Ref = domain.TicketRef{Channel: domain.Channel(channel), Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
+			if qualification.Valid {
+				value.claim.QualificationID = qualification.Int64
+			}
+			values = append(values, value)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		for _, value := range values {
+			valid := value.phaseExact == 1 && hydrateProviderAttemptInput(&value.claim) == nil && validPersistedProviderAttemptClaim(value.claim)
+			if valid {
+				continue
+			}
+			definiteNoLaunch := value.launchState == "launching" && value.pid == 0 && value.pgid == 0 && value.boot == "" && value.start == ""
+			if definiteNoLaunch {
+				result, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='failed',outcome='legacy_unverifiable',finished_at=CASE WHEN finished_at='' THEN ? ELSE finished_at END,launch_state='legacy_unverifiable' WHERE id=? AND state IN ('active','quarantined') AND launch_state='launching' AND process_pid=0 AND process_pgid=0 AND process_boot_identity='' AND process_start_identity=''`, now, value.claim.ID)
+				if err != nil {
+					return err
+				}
+				if n, _ := result.RowsAffected(); n != 1 {
+					return ErrProviderAttempt
+				}
+				if _, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='failed',completed_at=COALESCE(completed_at,?),outcome='legacy_unverifiable' WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND state='active'`, now, value.claim.Ref.Channel, value.claim.Ref.Project, value.claim.Ref.Ticket, value.claim.Phase, value.claim.Attempt); err != nil {
+					return err
+				}
+				if _, err := conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND scope='provider' AND scope_key=? AND project_id=? AND ticket_id=? AND runner_epoch=?`, value.claim.Ref.Channel, value.claim.LeaseKey, value.claim.Ref.Project, value.claim.Ref.Ticket, value.claim.RunnerEpoch); err != nil {
+					return err
+				}
+				continue
+			}
+			// A released or otherwise ambiguous record might name a live writer.
+			// Retain its exact lease and active phase; only a verified operator
+			// recovery can clear this quarantine.
+			if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='quarantined',outcome='undrained_recovery',launch_state='quarantined' WHERE id=? AND state IN ('active','quarantined')`, value.claim.ID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptRequest) (ProviderAttemptClaim, error) {
@@ -743,8 +821,12 @@ func validProviderRole(v string) bool { return v == "planner" || v == "builder" 
 // because Store is the issuing authority. Direct callers must not be able to
 // mint a durable claim whose actual launch fields were never admissible.
 func validProviderAttemptInput(r ProviderAttemptRequest) bool {
+	return validPhaseInputForAttempt(r, 0)
+}
+
+func validPhaseInputForAttempt(r ProviderAttemptRequest, attempt int) bool {
 	in := r.Input
-	if in.Ticket != r.Ref || in.Phase != r.Phase || in.Attempt != 0 || in.LeaderEpoch != r.Fence.LeaderEpoch || in.RunnerEpoch != r.Fence.RunnerEpoch || in.ExpectedVersion != r.ExpectedVersion || in.Provider != r.Binding.Identity || in.AuthMode != r.Binding.AuthMode || in.Repository != r.Repository || in.Worktree != r.Worktree || in.WorktreeIdentity != r.WorktreeIdentity || in.BaseSHA != r.BaseSHA || in.Profile != contracts.ProfileGuarded || in.RequestDigest != "" || strings.TrimSpace(in.Prompt) == "" || len(in.Prompt) > 64<<10 || strings.ContainsRune(in.Prompt, '\x00') || in.Timeout <= 0 || in.Timeout > 45*time.Minute || len(in.Schema) == 0 || len(in.Schema) > 1<<20 || !json.Valid(in.Schema) {
+	if in.Ticket != r.Ref || in.Phase != r.Phase || in.Attempt != attempt || in.LeaderEpoch != r.Fence.LeaderEpoch || in.RunnerEpoch != r.Fence.RunnerEpoch || in.ExpectedVersion != r.ExpectedVersion || in.Provider != r.Binding.Identity || in.AuthMode != r.Binding.AuthMode || in.Repository != r.Repository || in.Worktree != r.Worktree || in.WorktreeIdentity != r.WorktreeIdentity || in.BaseSHA != r.BaseSHA || in.Profile != contracts.ProfileGuarded || (attempt == 0 && in.RequestDigest != "") || strings.TrimSpace(in.Prompt) == "" || len(in.Prompt) > 64<<10 || strings.ContainsRune(in.Prompt, '\x00') || in.Timeout <= 0 || in.Timeout > 45*time.Minute || len(in.Schema) == 0 || len(in.Schema) > 1<<20 || !json.Valid(in.Schema) {
 		return false
 	}
 	if len(in.AllowedPaths) == 0 || len(in.AllowedPaths) > 256 {
@@ -761,6 +843,11 @@ func validProviderAttemptInput(r ProviderAttemptRequest) bool {
 		seen[path] = struct{}{}
 	}
 	return true
+}
+
+func validPersistedProviderAttemptClaim(claim ProviderAttemptClaim) bool {
+	r := ProviderAttemptRequest{Ref: claim.Ref, ExpectedVersion: claim.ExpectedVersion, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch}, Phase: claim.Phase, Role: claim.Role, Binding: claim.Binding, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA, SupervisorKey: claim.SupervisorKey, Input: claim.Input}
+	return claim.ID > 0 && claim.Ref.Validate() == nil && claim.QualificationID > 0 && validProviderPhase(claim.Phase) && validProviderRole(claim.Role) && claim.Attempt > 0 && claim.ExpectedVersion > 0 && claim.LeaderEpoch > 0 && claim.RunnerEpoch > 0 && claim.RequestDigest != "" && claim.BindingDigest == bindingDigest(claim.Binding) && validRuntimeBinding(claim.Binding) && validProviderIdentityClaim(r) && validPhaseInputForAttempt(r, claim.Attempt)
 }
 func validAttemptState(v string) bool { return v == "completed" || v == "failed" || v == "cancelled" }
 func safeOutcome(v string) bool {
@@ -783,6 +870,10 @@ func drainRequestForClaim(c ProviderAttemptClaim) contracts.DrainRequest {
 // only when its canonical bytes still decode to the exact attempt identity.
 func hydrateProviderAttemptInput(claim *ProviderAttemptClaim) error {
 	if claim == nil || len(claim.RequestDigest) != 64 || len(claim.RequestPayload) == 0 || !hexDigest(claim.RequestDigest) {
+		return ErrProviderAttempt
+	}
+	sum := sha256.Sum256(claim.RequestPayload)
+	if hex.EncodeToString(sum[:]) != claim.RequestDigest {
 		return ErrProviderAttempt
 	}
 	input, err := contracts.DecodeCanonicalPhaseInput(claim.RequestPayload)

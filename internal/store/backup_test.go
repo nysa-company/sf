@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -184,7 +187,11 @@ func seedMigrationPhase(t *testing.T, path string, provider, mismatch bool) {
 	if mismatch {
 		model = "other-model"
 	}
-	result, err := raw.Exec(`INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,started_at,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha,supervisor_key,auth_digest,auth_mode,binding_digest,provider_lease_key,launch_state) VALUES('dev','migration','SF-v27','build',1,'provider','` + model + `','family','1','running','builder','active','now',1,1,1,'/migration','/migration','identity','` + base + `',X'0102030405060708091011121314151617181920212223242526272829303132','` + strings.Repeat("b", 64) + `','','` + strings.Repeat("c", 64) + `','provider/key','launching')`)
+	binding := contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "provider", Model: model, Family: "family", Version: "1"}, BinaryDigest: strings.Repeat("d", 64), PolicyDigest: strings.Repeat("e", 64), FixtureDigest: strings.Repeat("f", 64), AuthDigest: strings.Repeat("b", 64)}
+	if _, err := raw.Exec(`INSERT INTO provider_qualifications(channel,run_id,provider,model,family,provider_version,binary_digest,policy_digest,fixture_digest,profile,failed_probes_json,reason_code,created_at,auth_digest,probe_digest,auth_mode) VALUES('dev','11111111111111111111111111111111','provider',?,'family','1',?,?,?,'qualified_guarded','[]','','now',?,'','')`, model, binding.BinaryDigest, binding.PolicyDigest, binding.FixtureDigest, binding.AuthDigest); err != nil {
+		t.Fatal(err)
+	}
+	result, err := raw.Exec(`INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,started_at,qualification_id,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha,supervisor_key,auth_digest,auth_mode,binding_digest,provider_lease_key,launch_state) VALUES('dev','migration','SF-v27','build',1,'provider','` + model + `','family','1','running','builder','active','now',1,1,1,1,'/migration','/migration','identity','` + base + `',X'0102030405060708091011121314151617181920212223242526272829303132','` + binding.AuthDigest + `','','` + bindingDigest(binding) + `','provider/key','launching')`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +206,132 @@ func seedMigrationPhase(t *testing.T, path string, provider, mismatch bool) {
 	}
 	if _, err := raw.Exec(`INSERT INTO provider_attempt_inputs(provider_attempt_id,request_digest,canonical_input,created_at) VALUES(?,?,?,'now')`, id, digest, payload); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO leases(channel,project_id,scope,scope_key,ticket_id,runner_epoch,acquired_at) VALUES('dev','migration','provider','provider/key','SF-v27',1,'now')`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV28ReconcilesInvalidV25CanonicalInputsBeforeAnyRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *sql.DB)
+	}{
+		{"wrong digest", func(t *testing.T, raw *sql.DB) {
+			if _, err := raw.Exec(`DROP TRIGGER provider_attempt_inputs_immutable_update; UPDATE provider_attempt_inputs SET request_digest=?`, strings.Repeat("0", 64)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"noncanonical bytes", func(t *testing.T, raw *sql.DB) {
+			var payload []byte
+			if err := raw.QueryRow(`SELECT canonical_input FROM provider_attempt_inputs`).Scan(&payload); err != nil {
+				t.Fatal(err)
+			}
+			payload = append([]byte(" \n"), payload...)
+			sum := sha256.Sum256(payload)
+			if _, err := raw.Exec(`DROP TRIGGER provider_attempt_inputs_immutable_update; UPDATE provider_attempt_inputs SET canonical_input=?,request_digest=?`, payload, fmt.Sprintf("%x", sum)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"missing prompt", func(t *testing.T, raw *sql.DB) {
+			var payload []byte
+			if err := raw.QueryRow(`SELECT canonical_input FROM provider_attempt_inputs`).Scan(&payload); err != nil {
+				t.Fatal(err)
+			}
+			input, err := contracts.DecodeCanonicalPhaseInput(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input.Prompt = ""
+			payload, digest, err := contracts.CanonicalPhaseInput(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(`DROP TRIGGER provider_attempt_inputs_immutable_update; UPDATE provider_attempt_inputs SET canonical_input=?,request_digest=?`, payload, digest); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.sqlite")
+			createDatabaseAtVersion(t, path, 25)
+			seedMigrationPhase(t, path, true, false)
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, raw)
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			database, err := Open(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			var attemptState, providerOutcome, phaseState, phaseOutcome string
+			if err := database.db.QueryRow(`SELECT state,outcome FROM provider_attempts WHERE ticket_id='SF-v27'`).Scan(&attemptState, &providerOutcome); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.db.QueryRow(`SELECT state,outcome FROM phase_runs WHERE ticket_id='SF-v27'`).Scan(&phaseState, &phaseOutcome); err != nil {
+				t.Fatal(err)
+			}
+			if attemptState != "failed" || providerOutcome != "legacy_unverifiable" || phaseState != "failed" || phaseOutcome != "legacy_unverifiable" {
+				t.Fatalf("invalid input was not terminal: provider=%s/%s phase=%s/%s", attemptState, providerOutcome, phaseState, phaseOutcome)
+			}
+			var leases int
+			if err := database.db.QueryRow(`SELECT COUNT(*) FROM leases WHERE scope='provider' AND scope_key='provider/key'`).Scan(&leases); err != nil || leases != 0 {
+				t.Fatalf("unlaunched invalid claim retained lease=%d err=%v", leases, err)
+			}
+			// The released capacity is observable through actual Store admission,
+			// not merely by inspecting the lease table.
+			digest := setupProviderProject(t, database, context.Background())
+			leader, _ := database.AcquireLeader(context.Background(), domain.ChannelDev, "v28-test")
+			ticket := setupProviderTicket(t, database, context.Background(), "SF-v28-next", leader)
+			builder, _ := setupProviderPair(t, database, context.Background())
+			ticket = providerState(t, database, context.Background(), ticket, leader, domain.StateBuilding)
+			if _, err := database.BeginProviderAttempt(context.Background(), supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); err != nil {
+				t.Fatalf("subsequent Begin remained blocked: %v", err)
+			}
+		})
+	}
+}
+
+func TestV28QuarantinesReleasedInvalidInputAndSurfacesRecoveryBlocker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.sqlite")
+	createDatabaseAtVersion(t, path, 25)
+	seedMigrationPhase(t, path, true, false)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`DROP TRIGGER provider_attempt_inputs_immutable_update; UPDATE provider_attempt_inputs SET request_digest=?; UPDATE provider_attempts SET launch_state='released',process_pid=123,process_pgid=123,process_boot_identity='boot',process_start_identity='start'`, strings.Repeat("0", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var attemptState, phaseState string
+	if err := database.db.QueryRow(`SELECT state FROM provider_attempts WHERE ticket_id='SF-v27'`).Scan(&attemptState); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.QueryRow(`SELECT state FROM phase_runs WHERE ticket_id='SF-v27'`).Scan(&phaseState); err != nil {
+		t.Fatal(err)
+	}
+	if attemptState != "quarantined" || phaseState != "active" {
+		t.Fatalf("released invalid input was not fail-closed: attempt=%s phase=%s", attemptState, phaseState)
+	}
+	var leases int
+	if err := database.db.QueryRow(`SELECT COUNT(*) FROM leases WHERE scope='provider' AND scope_key='provider/key'`).Scan(&leases); err != nil || leases != 1 {
+		t.Fatalf("released invalid claim lost its lease=%d err=%v", leases, err)
+	}
+	if _, err := database.ActiveProviderAttempts(context.Background(), domain.ChannelDev); !errors.Is(err, ErrProviderRecoveryBlocked) {
+		t.Fatalf("invalid released claim did not surface typed recovery blocker: %v", err)
 	}
 }
 
@@ -382,6 +515,8 @@ func testMigration(version int) []string {
 		return migrationV26
 	case 27:
 		return migrationV27
+	case 28:
+		return migrationV28
 	default:
 		return nil
 	}
