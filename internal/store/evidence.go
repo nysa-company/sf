@@ -209,7 +209,7 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 	}
 	if artifact.ProviderResult != nil {
 		result, parsed, loadErr := s.LoadHistoricalProviderAttemptResult(ctx, *artifact.ProviderResult)
-		if loadErr != nil || result.Claim.Role != "verification" || result.Claim.Phase != domain.PhaseVerification || result.Claim.Ref != artifact.Ref || result.Claim.ExpectedVersion != artifact.ExpectedVersion || result.Claim.LeaderEpoch != artifact.Fence.LeaderEpoch || result.Claim.RunnerEpoch != artifact.Fence.RunnerEpoch || parsed.Verify == nil {
+		if loadErr != nil || result.Claim.Role != "reviewer" || result.Claim.Phase != domain.PhaseVerification || result.Claim.Ref != artifact.Ref || result.Claim.ExpectedVersion != artifact.ExpectedVersion || result.Claim.LeaderEpoch != artifact.Fence.LeaderEpoch || result.Claim.RunnerEpoch != artifact.Fence.RunnerEpoch || parsed.Verify == nil {
 			return VerificationRevision{}, ErrEvidenceConflict
 		}
 		intent, intentErr := workflowprompt.CanonicalVerificationIntentBytes(*parsed.Verify)
@@ -268,7 +268,13 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		if err != nil {
 			return err
 		}
-		return evidenceEvent(ctx, conn, artifact.Ref, artifact.ExpectedVersion, "verification_recorded", map[string]any{"revision": result.Revision, "intent_digest": intentDigest, "proof_digest": proofDigest})
+		if artifact.ProviderResult == nil {
+			return evidenceEvent(ctx, conn, artifact.Ref, artifact.ExpectedVersion, "verification_recorded", map[string]any{"revision": result.Revision, "intent_digest": intentDigest, "proof_digest": proofDigest})
+		}
+		if artifact.Checkpoint.CommitOID != artifact.CheckpointID || !validOID(artifact.Checkpoint.ParentOID) || !validOID(artifact.Checkpoint.TreeOID) {
+			return ErrEvidenceConflict
+		}
+		return evidenceEvent(ctx, conn, artifact.Ref, artifact.ExpectedVersion, "verification_recorded", map[string]any{"revision": result.Revision, "intent_digest": intentDigest, "proof_digest": proofDigest, "provider_attempt_id": artifact.ProviderResult.AttemptID, "provider_attempt": artifact.ProviderResult.Attempt, "provider_phase": artifact.ProviderResult.Phase, "checkpoint_commit": artifact.Checkpoint.CommitOID, "checkpoint_parent": artifact.Checkpoint.ParentOID, "checkpoint_tree": artifact.Checkpoint.TreeOID})
 	})
 	return result, err
 }

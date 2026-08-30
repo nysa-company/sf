@@ -37,6 +37,7 @@ type Evidence interface {
 	Worktree(context.Context, domain.TicketRef) (store.StoredWorktree, error)
 	AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error
 	LoadCurrentProviderAttemptResult(context.Context, store.ProviderAttemptResultKey, uint64, domain.Fence) (store.ProviderAttemptResult, phaseartifact.Parsed, error)
+	LoadHistoricalProviderAttemptResult(context.Context, store.ProviderAttemptResultKey) (store.ProviderAttemptResult, phaseartifact.Parsed, error)
 	LatestReusableProviderAttempt(context.Context, store.LatestReusableProviderAttemptRequest) (store.LatestReusableProviderAttemptResult, error)
 	RecordPlan(context.Context, store.PlanArtifact) (string, error)
 	RecordVerification(context.Context, store.VerificationArtifact) (store.VerificationRevision, error)
@@ -67,13 +68,7 @@ type PhaseRequest struct {
 // PhaseResult carries only an immutable Store key and independently observed
 // Git boundary witnesses.  Parsed provider output is deliberately absent.
 type PhaseResult struct {
-	// Parsed is retained only for compatibility with in-process test adapters.
-	// Worker code never reads it; transition authority is always reloaded from
-	// ProviderResult through Evidence.
-	Parsed         phaseartifact.Parsed
 	ProviderResult store.ProviderAttemptResultKey
-	Checkpoint     *VerificationCheckpoint
-	Candidate      *CandidateWitness
 }
 
 // VerificationCheckpoint is a typed commit witness. The worker does not
@@ -83,6 +78,13 @@ type PhaseResult struct {
 type VerificationCheckpoint struct {
 	ID     string
 	Commit store.CommitObservation
+}
+
+// VerificationCheckpointMaterializer reconstructs a checkpoint witness from
+// the provider result and the Git boundary. It is used both after a fresh
+// provider completion and after a crash; provider output never carries it.
+type VerificationCheckpointMaterializer interface {
+	MaterializeVerificationCheckpoint(context.Context, PhaseRequest, phaseartifact.Verification, store.ProviderAttemptResultKey) (VerificationCheckpoint, error)
 }
 
 type CheckpointAuthenticator interface {
@@ -105,6 +107,12 @@ type CandidateWitness struct {
 	Reason              string
 }
 
+// CandidateMaterializer reconstructs the candidate commit boundary for an
+// exact Builder result. It prevents a restart from invoking Builder again.
+type CandidateMaterializer interface {
+	MaterializeCandidate(context.Context, PhaseRequest, workflowprompt.PlanIdentity, workflowprompt.VerificationIdentity, phaseartifact.Builder, store.ProviderAttemptResultKey) (CandidateWitness, error)
+}
+
 // PhaseRunner is intentionally narrower than providercoord.Coordinator. A
 // later composition can adapt Coordinator.Run here while keeping this worker
 // independent of process supervision and provider registration.
@@ -116,11 +124,13 @@ type PhaseRunner interface {
 // re-reads the ticket. This makes it safe for a daemon scheduler to call it
 // repeatedly and keeps every provider call outside SQLite transactions.
 type Worker struct {
-	Evidence   Evidence
-	Engine     StateMachine
-	Runner     PhaseRunner
-	Checkpoint CheckpointAuthenticator
-	Candidate  CandidateAuthenticator
+	Evidence               Evidence
+	Engine                 StateMachine
+	Runner                 PhaseRunner
+	Checkpoint             CheckpointAuthenticator
+	Candidate              CandidateAuthenticator
+	CheckpointMaterializer VerificationCheckpointMaterializer
+	CandidateMaterializer  CandidateMaterializer
 }
 
 type RunResult struct {
@@ -169,6 +179,11 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		return result, nil
 	}
 	if err != nil {
+		if errors.Is(err, ErrAmendmentUnsupported) {
+			if current, readErr := w.Evidence.Ticket(ctx, ref); readErr == nil {
+				result.State, result.Version = current.State, current.Version
+			}
+		}
 		return result, err
 	}
 	// Signal mutates version/state.  Never return the pre-transition snapshot.
@@ -183,9 +198,6 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 func (w Worker) planning(ctx context.Context, ticket store.Ticket, fence domain.Fence) (bool, bool, error) {
 	plan, err := w.Evidence.Plan(ctx, ticket.Ref)
 	if err == nil {
-		if plan.TicketVersion != ticket.Version || plan.Fence != fence {
-			return false, false, ErrStaleEvidence
-		}
 		if _, err := w.storedPlanIdentity(ctx, ticket, plan, fence); err != nil {
 			return false, false, err
 		}
@@ -244,7 +256,10 @@ func (w Worker) planning(ctx context.Context, ticket store.Ticket, fence domain.
 		}
 		return false, false, err
 	}
-	_, parsed, err := w.Evidence.LoadCurrentProviderAttemptResult(ctx, out.ProviderResult, ticket.Version, fence)
+	result, parsed, err := w.Evidence.LoadCurrentProviderAttemptResult(ctx, out.ProviderResult, ticket.Version, fence)
+	if err != nil || out.ProviderResult.Ref != ticket.Ref || out.ProviderResult.Phase != domain.PhasePlanning || result.Claim.Ref != ticket.Ref || result.Claim.Phase != domain.PhasePlanning || result.Claim.Role != "planner" || result.Claim.ID != out.ProviderResult.AttemptID || result.Claim.Attempt != out.ProviderResult.Attempt {
+		return false, false, ErrStaleEvidence
+	}
 	planner, err := canonicalPlanner(parsed)
 	if err != nil {
 		return false, false, err
@@ -294,12 +309,18 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 	if !errors.Is(err, store.ErrNotFound) {
 		return false, false, err
 	}
-	// The Store can identify a reusable Verification result, but this skeleton
-	// has no durable full checkpoint observation to hand to the live Git
-	// authenticator.  Fail closed rather than rerunning the reviewer or
-	// accepting an old-fence checkpoint.
-	if _, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "verification", ExpectedVersion: ticket.Version, Fence: fence}); reuseErr == nil {
-		return false, true, ErrCheckpointRequired
+	if reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence}); reuseErr == nil {
+		artifact, parseErr := canonicalVerification(reusable.Parsed)
+		if parseErr != nil {
+			return false, true, parseErr
+		}
+		if err := w.persistVerification(ctx, ticket, fence, PhaseRequest{}, planIdentity, artifact, reusable.Key); err != nil {
+			return false, true, err
+		}
+		if err := w.signal(ctx, ticket, fence, "phase_pass", map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}); err != nil {
+			return false, true, err
+		}
+		return true, true, nil
 	} else if !errors.Is(reuseErr, store.ErrNotFound) {
 		return false, false, reuseErr
 	}
@@ -320,7 +341,10 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 		}
 		return false, false, err
 	}
-	_, parsed, err := w.Evidence.LoadCurrentProviderAttemptResult(ctx, out.ProviderResult, ticket.Version, fence)
+	result, parsed, err := w.Evidence.LoadCurrentProviderAttemptResult(ctx, out.ProviderResult, ticket.Version, fence)
+	if err != nil || out.ProviderResult.Ref != ticket.Ref || out.ProviderResult.Phase != domain.PhaseVerification || result.Claim.Ref != ticket.Ref || result.Claim.Phase != domain.PhaseVerification || result.Claim.Role != "reviewer" || result.Claim.ID != out.ProviderResult.AttemptID || result.Claim.Attempt != out.ProviderResult.Attempt {
+		return false, false, ErrStaleEvidence
+	}
 	artifact, err := canonicalVerification(parsed)
 	if err != nil {
 		return false, false, err
@@ -333,28 +357,9 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 	if err != nil {
 		return false, false, err
 	}
-	if out.Checkpoint == nil || w.Checkpoint == nil || out.Checkpoint.ID == "" || out.Checkpoint.ID != out.Checkpoint.Commit.CommitOID {
-		return false, false, ErrCheckpointRequired
-	}
-	intentDigest, err := workflowprompt.VerificationIntentDigest(artifact)
-	if err != nil {
-		return false, false, err
-	}
-	proofDigest, err := workflowprompt.VerificationProofDigest(artifact)
-	if err != nil {
-		return false, false, err
-	}
-	verificationIdentity, err := workflowprompt.NewVerificationIdentity(artifact, intentDigest, proofDigest, out.Checkpoint.ID)
-	if err != nil {
-		return false, false, err
-	}
-	if _, err := workflowprompt.ValidateVerificationIdentity(workflowTicket(ticket), planIdentity, verificationIdentity); err != nil {
-		return false, false, err
-	}
-	if err := w.Checkpoint.AuthenticateVerificationCheckpoint(ctx, request, artifact, *out.Checkpoint); err != nil {
-		return false, false, err
-	}
-	if _, err := w.Evidence.RecordVerification(ctx, store.VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: request.Fence, Intent: intent, Proof: proof, OwnedFiles: artifact.OwnedFiles, CheckpointID: out.Checkpoint.ID, ProviderResult: &out.ProviderResult, Checkpoint: out.Checkpoint.Commit}); err != nil {
+	_ = intent
+	_ = proof
+	if err := w.persistVerification(ctx, ticket, fence, request, planIdentity, artifact, out.ProviderResult); err != nil {
 		return false, false, err
 	}
 	if err := w.signal(ctx, ticket, fence, "phase_pass", map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}); err != nil {
@@ -393,6 +398,31 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 	if !errors.Is(err, store.ErrNotFound) {
 		return false, false, err
 	}
+	if reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: ticket.Version, Fence: fence}); reuseErr == nil {
+		builder, parseErr := canonicalBuilder(reusable.Parsed)
+		if parseErr != nil {
+			return false, true, parseErr
+		}
+		if builder.AmendmentRequest != nil {
+			if err := w.signalPayload(ctx, ticket, fence, "retry_or_correction_exhausted", nil, `{"reason":"amendment_unsupported"}`); err != nil {
+				return false, true, err
+			}
+			return false, true, ErrAmendmentUnsupported
+		}
+		if err := w.persistCandidate(ctx, ticket, fence, PhaseRequest{}, planIdentity, verificationIdentity, verification, builder, reusable.Key); err != nil {
+			return false, true, err
+		}
+		candidate, err := w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
+		if err != nil {
+			return false, true, err
+		}
+		if err = w.signalCandidate(ctx, ticket, fence, candidate.Snapshot); err != nil {
+			return false, true, err
+		}
+		return true, true, nil
+	} else if !errors.Is(reuseErr, store.ErrNotFound) {
+		return false, false, reuseErr
+	}
 	if w.Runner == nil {
 		return false, false, ErrNoPhaseRunner
 	}
@@ -410,36 +440,21 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 		}
 		return false, false, err
 	}
-	_, parsed, err := w.Evidence.LoadCurrentProviderAttemptResult(ctx, out.ProviderResult, ticket.Version, fence)
+	result, parsed, err := w.Evidence.LoadCurrentProviderAttemptResult(ctx, out.ProviderResult, ticket.Version, fence)
+	if err != nil || out.ProviderResult.Ref != ticket.Ref || out.ProviderResult.Phase != domain.PhaseBuild || result.Claim.Ref != ticket.Ref || result.Claim.Phase != domain.PhaseBuild || result.Claim.Role != "builder" || result.Claim.ID != out.ProviderResult.AttemptID || result.Claim.Attempt != out.ProviderResult.Attempt {
+		return false, false, ErrStaleEvidence
+	}
 	builder, err := canonicalBuilder(parsed)
 	if err != nil {
 		return false, false, err
 	}
 	if builder.AmendmentRequest != nil {
+		if err := w.signalPayload(ctx, ticket, fence, "retry_or_correction_exhausted", nil, `{"reason":"amendment_unsupported"}`); err != nil {
+			return false, false, err
+		}
 		return false, false, ErrAmendmentUnsupported
 	}
-	if out.Candidate == nil {
-		return false, false, ErrCandidateRequired
-	}
-	if w.Candidate == nil {
-		return false, false, ErrCandidateRequired
-	}
-	if err := w.Candidate.AuthenticateCandidate(ctx, request, planIdentity, verificationIdentity, builder, *out.Candidate); err != nil {
-		return false, false, err
-	}
-	if out.ProviderResult.AttemptID == 0 || out.ProviderResult.Ref != ticket.Ref || out.ProviderResult.Phase != domain.PhaseBuild || out.ProviderResult.Attempt <= 0 {
-		return false, false, ErrCandidateRequired
-	}
-	if out.Candidate.Reason == "" || out.Candidate.CommandPolicyDigest == "" {
-		return false, false, ErrCandidateRequired
-	}
-	evidence := store.CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: request.Fence, BuilderResult: out.ProviderResult, Commit: out.Candidate.Commit, Reason: out.Candidate.Reason, Snapshot: domain.CandidateSnapshot{BaseSHA: request.Worktree.BaseSHA, HeadSHA: out.Candidate.Commit.CommitOID, TreeSHA: out.Candidate.Commit.TreeOID, SourceDigest: ticket.SourceDigest, VerificationIntentDigest: verification.Revision.IntentDigest, ProofDigest: verification.Revision.ProofDigest, CommandPolicyDigest: out.Candidate.CommandPolicyDigest}}
-	builderEvidenceDigest, err := phaseartifact.BuilderEvidenceDigest(builder)
-	if err != nil {
-		return false, false, err
-	}
-	evidence.Snapshot.BuilderEvidenceDigest = builderEvidenceDigest
-	if _, err := w.Evidence.RecordCandidate(ctx, evidence); err != nil {
+	if err := w.persistCandidate(ctx, ticket, fence, request, planIdentity, verificationIdentity, verification, builder, out.ProviderResult); err != nil {
 		return false, false, err
 	}
 	candidate, err = w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
@@ -464,10 +479,13 @@ func (w Worker) request(ctx context.Context, ticket store.Ticket, fence domain.F
 }
 
 func (w Worker) signal(ctx context.Context, ticket store.Ticket, fence domain.Fence, trigger string, attributes map[string]string) error {
+	return w.signalPayload(ctx, ticket, fence, trigger, attributes, "{}")
+}
+func (w Worker) signalPayload(ctx context.Context, ticket store.Ticket, fence domain.Fence, trigger string, attributes map[string]string, payload string) error {
 	if fence.RunnerEpoch != ticket.RunnerEpoch {
 		return store.ErrStaleFence
 	}
-	_, err := w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: trigger, Fence: fence, Attributes: attributes, EventPayload: "{}"})
+	_, err := w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: trigger, Fence: fence, Attributes: attributes, EventPayload: payload})
 	return err
 }
 
@@ -496,15 +514,13 @@ func (w Worker) storedPlanIdentity(ctx context.Context, ticket store.Ticket, pla
 	if plan.Document.Planner == nil || plan.Document.ProviderResult == nil {
 		return workflowprompt.PlanIdentity{}, ErrStaleEvidence
 	}
-	_, parsed, err := w.Evidence.LoadCurrentProviderAttemptResult(ctx, *plan.Document.ProviderResult, ticket.Version, fence)
-	if err != nil || parsed.Planner == nil {
-		reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: ticket.Version, Fence: fence})
-		if reuseErr != nil || reusable.Key != *plan.Document.ProviderResult || reusable.Parsed.Planner == nil {
-			return workflowprompt.PlanIdentity{}, ErrStaleEvidence
-		}
-		parsed = reusable.Parsed
+	_, parsed, err := w.Evidence.LoadHistoricalProviderAttemptResult(ctx, *plan.Document.ProviderResult)
+	if err != nil || parsed.Planner == nil || parsed.Phase != domain.PhasePlanning {
+		return workflowprompt.PlanIdentity{}, ErrStaleEvidence
 	}
-	if parsed.Planner == nil {
+	stored, _, storedErr := phaseartifact.CanonicalTypedArtifact(phaseartifact.Parsed{Phase: domain.PhasePlanning, Provider: parsed.Provider, Planner: plan.Document.Planner})
+	loaded, _, loadedErr := phaseartifact.CanonicalTypedArtifact(phaseartifact.Parsed{Phase: domain.PhasePlanning, Provider: parsed.Provider, Planner: parsed.Planner})
+	if storedErr != nil || loadedErr != nil || string(stored) != string(loaded) {
 		return workflowprompt.PlanIdentity{}, ErrStaleEvidence
 	}
 	identity, err := w.planIdentity(ticket, *parsed.Planner)
@@ -518,11 +534,14 @@ func (w Worker) storedPlanIdentity(ctx context.Context, ticket store.Ticket, pla
 }
 
 func (w Worker) storedVerificationIdentity(ctx context.Context, ticket store.Ticket, plan workflowprompt.PlanIdentity, verification store.StoredVerification, fence domain.Fence) (workflowprompt.VerificationIdentity, error) {
-	reusable, err := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "verification", ExpectedVersion: ticket.Version, Fence: fence})
-	if err != nil || reusable.Parsed.Verify == nil {
+	if verification.ProviderResult.AttemptID == 0 || verification.ProviderResult.Phase != domain.PhaseVerification || verification.Checkpoint.CommitOID != verification.Revision.CheckpointID || verification.Checkpoint.ParentOID == "" || verification.Checkpoint.TreeOID == "" {
 		return workflowprompt.VerificationIdentity{}, ErrStaleEvidence
 	}
-	artifact := *reusable.Parsed.Verify
+	result, parsed, err := w.Evidence.LoadHistoricalProviderAttemptResult(ctx, verification.ProviderResult)
+	if err != nil || result.Claim.Role != "reviewer" || parsed.Verify == nil {
+		return workflowprompt.VerificationIdentity{}, ErrStaleEvidence
+	}
+	artifact := *parsed.Verify
 	identity, err := workflowprompt.NewVerificationIdentity(artifact, verification.Revision.IntentDigest, verification.Revision.ProofDigest, verification.Revision.CheckpointID)
 	if err != nil {
 		return workflowprompt.VerificationIdentity{}, err
@@ -537,18 +556,128 @@ func (w Worker) storedVerificationIdentity(ctx context.Context, ticket store.Tic
 	if err != nil {
 		return workflowprompt.VerificationIdentity{}, err
 	}
-	if err := w.Checkpoint.AuthenticateVerificationCheckpoint(ctx, request, artifact, VerificationCheckpoint{ID: verification.Revision.CheckpointID, Commit: store.CommitObservation{CommitOID: verification.Revision.CheckpointID}}); err != nil {
+	if err := w.Checkpoint.AuthenticateVerificationCheckpoint(ctx, request, artifact, VerificationCheckpoint{ID: verification.Revision.CheckpointID, Commit: verification.Checkpoint}); err != nil {
 		return workflowprompt.VerificationIdentity{}, err
 	}
 	return identity, nil
+}
+
+func (w Worker) persistVerification(ctx context.Context, ticket store.Ticket, fence domain.Fence, request PhaseRequest, plan workflowprompt.PlanIdentity, artifact phaseartifact.Verification, key store.ProviderAttemptResultKey) error {
+	result, parsed, err := w.Evidence.LoadHistoricalProviderAttemptResult(ctx, key)
+	if err != nil || key.Ref != ticket.Ref || key.Phase != domain.PhaseVerification || result.Claim.Ref != ticket.Ref || result.Claim.Phase != domain.PhaseVerification || result.Claim.Role != "reviewer" || result.Claim.Attempt != key.Attempt || result.Claim.ID != key.AttemptID || parsed.Verify == nil {
+		return ErrStaleEvidence
+	}
+	loaded, _, loadErr := phaseartifact.CanonicalTypedArtifact(phaseartifact.Parsed{Phase: domain.PhaseVerification, Provider: parsed.Provider, Verify: parsed.Verify})
+	want, _, wantErr := phaseartifact.CanonicalTypedArtifact(phaseartifact.Parsed{Phase: domain.PhaseVerification, Provider: parsed.Provider, Verify: &artifact})
+	if loadErr != nil || wantErr != nil || string(loaded) != string(want) {
+		return ErrStaleEvidence
+	}
+	if request.Phase == "" {
+		request, err = w.request(ctx, ticket, fence, domain.PhaseVerification, nil, nil, nil)
+		if err != nil {
+			return err
+		}
+	}
+	if w.CheckpointMaterializer == nil || w.Checkpoint == nil {
+		return ErrCheckpointRequired
+	}
+	checkpoint, err := w.CheckpointMaterializer.MaterializeVerificationCheckpoint(ctx, request, artifact, key)
+	if err != nil {
+		return err
+	}
+	if checkpoint.ID == "" || checkpoint.ID != checkpoint.Commit.CommitOID || checkpoint.Commit.ParentOID == "" || checkpoint.Commit.TreeOID == "" {
+		return ErrCheckpointRequired
+	}
+	intent, err := canonicalVerificationIntent(artifact)
+	if err != nil {
+		return err
+	}
+	proof, err := canonicalVerificationProof(artifact)
+	if err != nil {
+		return err
+	}
+	intentDigest, err := workflowprompt.VerificationIntentDigest(artifact)
+	if err != nil {
+		return err
+	}
+	proofDigest, err := workflowprompt.VerificationProofDigest(artifact)
+	if err != nil {
+		return err
+	}
+	identity, err := workflowprompt.NewVerificationIdentity(artifact, intentDigest, proofDigest, checkpoint.ID)
+	if err != nil {
+		return err
+	}
+	if _, err = workflowprompt.ValidateVerificationIdentity(workflowTicket(ticket), plan, identity); err != nil {
+		return err
+	}
+	if err = w.Checkpoint.AuthenticateVerificationCheckpoint(ctx, request, artifact, checkpoint); err != nil {
+		return err
+	}
+	_, err = w.Evidence.RecordVerification(ctx, store.VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: artifact.OwnedFiles, CheckpointID: checkpoint.ID, ProviderResult: &key, Checkpoint: checkpoint.Commit})
+	return err
+}
+
+func (w Worker) persistCandidate(ctx context.Context, ticket store.Ticket, fence domain.Fence, request PhaseRequest, plan workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, stored store.StoredVerification, builder phaseartifact.Builder, key store.ProviderAttemptResultKey) error {
+	result, parsed, err := w.Evidence.LoadHistoricalProviderAttemptResult(ctx, key)
+	if err != nil || key.Ref != ticket.Ref || key.Phase != domain.PhaseBuild || result.Claim.Ref != ticket.Ref || result.Claim.Phase != domain.PhaseBuild || result.Claim.Role != "builder" || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || parsed.Builder == nil {
+		return ErrStaleEvidence
+	}
+	if request.Phase == "" {
+		request, err = w.request(ctx, ticket, fence, domain.PhaseBuild, nil, &stored, nil)
+		if err != nil {
+			return err
+		}
+	}
+	if w.CandidateMaterializer == nil || w.Candidate == nil {
+		return ErrCandidateRequired
+	}
+	witness, err := w.CandidateMaterializer.MaterializeCandidate(ctx, request, plan, verification, builder, key)
+	if err != nil {
+		return err
+	}
+	if witness.Reason == "" || witness.CommandPolicyDigest == "" || witness.Commit.CommitOID == "" || witness.Commit.TreeOID == "" {
+		return ErrCandidateRequired
+	}
+	if err = w.Candidate.AuthenticateCandidate(ctx, request, plan, verification, builder, witness); err != nil {
+		return err
+	}
+	digest, err := phaseartifact.BuilderEvidenceDigest(builder)
+	if err != nil {
+		return err
+	}
+	_, err = w.Evidence.RecordCandidate(ctx, store.CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, BuilderResult: key, Commit: witness.Commit, Reason: witness.Reason, Snapshot: domain.CandidateSnapshot{BaseSHA: request.Worktree.BaseSHA, HeadSHA: witness.Commit.CommitOID, TreeSHA: witness.Commit.TreeOID, SourceDigest: ticket.SourceDigest, VerificationIntentDigest: stored.Revision.IntentDigest, ProofDigest: stored.Revision.ProofDigest, CommandPolicyDigest: witness.CommandPolicyDigest, BuilderEvidenceDigest: digest}})
+	return err
 }
 
 // Builder results are intentionally not reusable under the existing Store
 // authority.  Without a persisted exact Builder result key, a restart cannot
 // re-authenticate candidate evidence, so replay fails closed instead of
 // running the Builder again or accepting an ambiguous candidate.
-func (w Worker) authenticateStoredCandidate(context.Context, store.Ticket, domain.Fence, workflowprompt.PlanIdentity, workflowprompt.VerificationIdentity, store.StoredCandidate) error {
-	return ErrStaleEvidence
+func (w Worker) authenticateStoredCandidate(ctx context.Context, ticket store.Ticket, fence domain.Fence, plan workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, candidate store.StoredCandidate) error {
+	result, parsed, err := w.Evidence.LoadHistoricalProviderAttemptResult(ctx, candidate.BuilderResult)
+	if err != nil || result.Claim.Ref != ticket.Ref || result.Claim.Phase != domain.PhaseBuild || result.Claim.Role != "builder" || result.Claim.ID != candidate.BuilderResult.AttemptID || result.Claim.Attempt != candidate.BuilderResult.Attempt || parsed.Builder == nil {
+		return ErrStaleEvidence
+	}
+	digest, err := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
+	if err != nil || digest != candidate.Snapshot.BuilderEvidenceDigest {
+		return ErrStaleEvidence
+	}
+	request, err := w.request(ctx, ticket, fence, domain.PhaseBuild, nil, nil, &candidate)
+	if err != nil {
+		return err
+	}
+	if w.CandidateMaterializer == nil || w.Candidate == nil {
+		return ErrCandidateRequired
+	}
+	witness, err := w.CandidateMaterializer.MaterializeCandidate(ctx, request, plan, verification, *parsed.Builder, candidate.BuilderResult)
+	if err != nil {
+		return err
+	}
+	if witness.Commit.CommitOID != candidate.Commit.CommitOID || witness.Commit.TreeOID != candidate.Commit.TreeOID || witness.Commit.ParentOID != candidate.Commit.ParentOID || witness.CommandPolicyDigest != candidate.Snapshot.CommandPolicyDigest {
+		return ErrStaleEvidence
+	}
+	return w.Candidate.AuthenticateCandidate(ctx, request, plan, verification, *parsed.Builder, witness)
 }
 
 func canonicalPlanner(parsed phaseartifact.Parsed) (phaseartifact.Planner, error) {

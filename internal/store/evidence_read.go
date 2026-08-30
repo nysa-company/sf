@@ -32,6 +32,8 @@ type StoredVerification struct {
 	AmendmentReason string
 	Requester       string
 	CreatedAt       time.Time
+	ProviderResult  ProviderAttemptResultKey
+	Checkpoint      CommitObservation
 }
 
 // StoredCandidate is the latest immutable candidate generation.
@@ -40,6 +42,8 @@ type StoredCandidate struct {
 	TicketVersion uint64
 	Fence         domain.Fence
 	CreatedAt     time.Time
+	BuilderResult ProviderAttemptResultKey
+	Commit        CommitObservation
 }
 
 // StoredWorktree is SQLite's registration of a ticket worktree. The Git
@@ -107,6 +111,57 @@ type StoredOperatorDecision struct {
 	Invalidated   bool
 	CreatedAt     time.Time
 	TicketVersion uint64
+}
+
+// ValidateCurrentCandidateForBuildTransition authenticates the exact
+// candidate that may replay a lost build_pass response. A LatestCandidate
+// read alone is insufficient: this method binds the generation to the
+// current building ticket/fence, source, worktree base, and current
+// verification identities. It performs no mutation.
+func (s *Store) ValidateCurrentCandidateForBuildTransition(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence) (StoredCandidate, error) {
+	if err := ref.Validate(); err != nil || expectedVersion == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return StoredCandidate{}, ErrStaleFence
+	}
+	ticket, err := s.Ticket(ctx, ref)
+	if err != nil {
+		return StoredCandidate{}, err
+	}
+	if ticket.State != domain.StateBuilding || ticket.Version != expectedVersion || ticket.RunnerEpoch != fence.RunnerEpoch {
+		return StoredCandidate{}, ErrStaleFence
+	}
+	var leader uint64
+	if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&leader); err != nil {
+		return StoredCandidate{}, normalizeBusy(ctx, err)
+	}
+	if leader != fence.LeaderEpoch {
+		return StoredCandidate{}, ErrStaleFence
+	}
+	candidate, err := s.LatestCandidate(ctx, ref)
+	if err != nil {
+		return StoredCandidate{}, err
+	}
+	if candidate.TicketVersion != expectedVersion || candidate.Fence != fence || candidate.Snapshot.SourceDigest != ticket.SourceDigest {
+		return StoredCandidate{}, ErrStaleFence
+	}
+	worktree, err := s.Worktree(ctx, ref)
+	if err != nil {
+		return StoredCandidate{}, err
+	}
+	if candidate.Snapshot.BaseSHA != worktree.BaseSHA {
+		return StoredCandidate{}, ErrEvidenceConflict
+	}
+	verification, err := s.CurrentVerification(ctx, ref)
+	if err != nil {
+		return StoredCandidate{}, err
+	}
+	if candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest {
+		return StoredCandidate{}, ErrEvidenceConflict
+	}
+	if verification.Checkpoint.CommitOID != verification.Revision.CheckpointID || !validOID(verification.Checkpoint.ParentOID) || !validOID(verification.Checkpoint.TreeOID) {
+		return StoredCandidate{}, ErrEvidenceConflict
+	}
+	candidate.Commit.ParentOID = verification.Checkpoint.CommitOID
+	return candidate, nil
 }
 
 func (s *Store) Plan(ctx context.Context, ref domain.TicketRef) (StoredPlan, error) {
@@ -184,6 +239,27 @@ func (s *Store) CurrentVerification(ctx context.Context, ref domain.TicketRef) (
 	if result.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil || result.TicketVersion == 0 || result.Fence.LeaderEpoch == 0 || result.Fence.RunnerEpoch == 0 {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
+	var payload string
+	if err := s.db.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='verification_recorded' ORDER BY id DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, result.TicketVersion).Scan(&payload); err == nil {
+		var binding struct {
+			Revision  uint64       `json:"revision"`
+			Intent    string       `json:"intent_digest"`
+			Proof     string       `json:"proof_digest"`
+			AttemptID int64        `json:"provider_attempt_id"`
+			Attempt   int          `json:"provider_attempt"`
+			Phase     domain.Phase `json:"provider_phase"`
+			Commit    string       `json:"checkpoint_commit"`
+			Parent    string       `json:"checkpoint_parent"`
+			Tree      string       `json:"checkpoint_tree"`
+		}
+		if json.Unmarshal([]byte(payload), &binding) == nil && binding.AttemptID > 0 {
+			if binding.Revision != result.Revision.Revision || binding.Intent != result.Revision.IntentDigest || binding.Proof != result.Revision.ProofDigest || binding.Phase != domain.PhaseVerification || binding.Attempt <= 0 || binding.Commit != result.Revision.CheckpointID || !validOID(binding.Parent) || !validOID(binding.Tree) {
+				return StoredVerification{}, ErrEvidenceConflict
+			}
+			result.ProviderResult = ProviderAttemptResultKey{AttemptID: binding.AttemptID, Ref: ref, Phase: binding.Phase, Attempt: binding.Attempt}
+			result.Checkpoint = CommitObservation{CommitOID: binding.Commit, ParentOID: binding.Parent, TreeOID: binding.Tree}
+		}
+	}
 	return result, nil
 }
 
@@ -213,6 +289,23 @@ func (s *Store) LatestCandidate(ctx context.Context, ref domain.TicketRef) (Stor
 	if result.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil {
 		return StoredCandidate{}, ErrEvidenceConflict
 	}
+	var payload string
+	if err := s.db.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='candidate_recorded' ORDER BY id DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, result.TicketVersion).Scan(&payload); err != nil {
+		return StoredCandidate{}, ErrEvidenceConflict
+	}
+	var binding struct {
+		Generation uint64 `json:"generation"`
+		Head       string `json:"head"`
+		AttemptID  int64  `json:"builder_attempt_id"`
+		Attempt    int    `json:"builder_attempt"`
+		Evidence   string `json:"builder_evidence_digest"`
+		Policy     string `json:"command_policy_digest"`
+	}
+	if json.Unmarshal([]byte(payload), &binding) != nil || binding.Generation != result.Snapshot.Generation || binding.Head != result.Snapshot.HeadSHA || binding.AttemptID <= 0 || binding.Attempt <= 0 || binding.Evidence != result.Snapshot.BuilderEvidenceDigest || binding.Policy != result.Snapshot.CommandPolicyDigest {
+		return StoredCandidate{}, ErrEvidenceConflict
+	}
+	result.BuilderResult = ProviderAttemptResultKey{AttemptID: binding.AttemptID, Ref: ref, Phase: domain.PhaseBuild, Attempt: binding.Attempt}
+	result.Commit = CommitObservation{CommitOID: result.Snapshot.HeadSHA, ParentOID: "", TreeOID: result.Snapshot.TreeSHA}
 	return result, nil
 }
 

@@ -80,7 +80,10 @@ func (f *fakeEvidence) LoadCurrentProviderAttemptResult(_ context.Context, key s
 		copy.AcceptanceDigest = identity.Digest
 		p.Verify = &copy
 	}
-	return store.ProviderAttemptResult{Claim: store.ProviderAttemptClaim{Ref: testRef, Phase: key.Phase, ExpectedVersion: f.ticket.Version, LeaderEpoch: testFence.LeaderEpoch, RunnerEpoch: testFence.RunnerEpoch, Role: map[domain.Phase]string{domain.PhasePlanning: "planner", domain.PhaseVerification: "verification", domain.PhaseBuild: "builder"}[key.Phase]}}, p, nil
+	return store.ProviderAttemptResult{Claim: store.ProviderAttemptClaim{ID: key.AttemptID, Attempt: key.Attempt, Ref: testRef, Phase: key.Phase, ExpectedVersion: f.ticket.Version, LeaderEpoch: testFence.LeaderEpoch, RunnerEpoch: testFence.RunnerEpoch, Role: map[domain.Phase]string{domain.PhasePlanning: "planner", domain.PhaseVerification: "reviewer", domain.PhaseBuild: "builder"}[key.Phase]}}, p, nil
+}
+func (f *fakeEvidence) LoadHistoricalProviderAttemptResult(ctx context.Context, key store.ProviderAttemptResultKey) (store.ProviderAttemptResult, phaseartifact.Parsed, error) {
+	return f.LoadCurrentProviderAttemptResult(ctx, key, f.ticket.Version, testFence)
 }
 func (f *fakeEvidence) LatestReusableProviderAttempt(_ context.Context, request store.LatestReusableProviderAttemptRequest) (store.LatestReusableProviderAttemptResult, error) {
 	for id, p := range f.providerResults {
@@ -107,7 +110,10 @@ func (f *fakeEvidence) RecordPlan(_ context.Context, a store.PlanArtifact) (stri
 func (f *fakeEvidence) RecordVerification(_ context.Context, a store.VerificationArtifact) (store.VerificationRevision, error) {
 	f.hasVerify, f.verifications = true, f.verifications+1
 	ih, ph := sha256.Sum256(a.Intent), sha256.Sum256(a.Proof)
-	f.verification = store.StoredVerification{Revision: store.VerificationRevision{Revision: 1, IntentDigest: hex.EncodeToString(ih[:]), ProofDigest: hex.EncodeToString(ph[:]), OwnedFiles: a.OwnedFiles, CheckpointID: a.CheckpointID}, TicketVersion: a.ExpectedVersion, Fence: a.Fence, Intent: a.Intent, Proof: a.Proof}
+	f.verification = store.StoredVerification{Revision: store.VerificationRevision{Revision: 1, IntentDigest: hex.EncodeToString(ih[:]), ProofDigest: hex.EncodeToString(ph[:]), OwnedFiles: a.OwnedFiles, CheckpointID: a.CheckpointID}, TicketVersion: a.ExpectedVersion, Fence: a.Fence, Intent: a.Intent, Proof: a.Proof, Checkpoint: a.Checkpoint}
+	if a.ProviderResult != nil {
+		f.verification.ProviderResult = *a.ProviderResult
+	}
 	return f.verification.Revision, nil
 }
 func (f *fakeEvidence) RecordCandidate(_ context.Context, a store.CandidateEvidence) ([]store.InvalidationReceipt, error) {
@@ -157,21 +163,33 @@ func (e *fakeEngine) Signal(_ context.Context, req contracts.SignalRequest) (con
 		e.state.State = domain.StatePaused
 	case "verification_amendment_requested":
 		e.state.State = domain.StateVerifying
+	case "retry_or_correction_exhausted":
+		e.state.State = domain.StatePaused
 	}
 	e.state.Version++
 	return contracts.TransitionResult{To: e.state.State, TicketVersion: e.state.Version}, nil
 }
 
 type fakeRunner struct {
-	outputs  []PhaseResult
+	outputs  []fakePhase
 	requests []PhaseRequest
 	evidence *fakeEvidence
+}
+type fakePhase struct {
+	result PhaseResult
+	parsed phaseartifact.Parsed
 }
 
 type fakeCheckpoint struct{}
 
 func (fakeCheckpoint) AuthenticateVerificationCheckpoint(context.Context, PhaseRequest, phaseartifact.Verification, VerificationCheckpoint) error {
 	return nil
+}
+
+type fakeCheckpointMaterializer struct{}
+
+func (fakeCheckpointMaterializer) MaterializeVerificationCheckpoint(_ context.Context, _ PhaseRequest, _ phaseartifact.Verification, _ store.ProviderAttemptResultKey) (VerificationCheckpoint, error) {
+	return VerificationCheckpoint{ID: oid, Commit: store.CommitObservation{CommitOID: oid, ParentOID: oid, TreeOID: oid}}, nil
 }
 
 func (r *fakeRunner) Run(_ context.Context, req PhaseRequest) (PhaseResult, error) {
@@ -185,9 +203,9 @@ func (r *fakeRunner) Run(_ context.Context, req PhaseRequest) (PhaseResult, erro
 		if r.evidence.providerResults == nil {
 			r.evidence.providerResults = map[int64]phaseartifact.Parsed{}
 		}
-		r.evidence.providerResults[out.ProviderResult.AttemptID] = out.Parsed
+		r.evidence.providerResults[out.result.ProviderResult.AttemptID] = out.parsed
 	}
-	return out, nil
+	return out.result, nil
 }
 
 const oid = "0123456789abcdef0123456789abcdef01234567"
@@ -199,23 +217,23 @@ func ticket(state domain.State) store.Ticket {
 func provider() domain.ProviderIdentity {
 	return domain.ProviderIdentity{Provider: "codex", Model: "test", Family: "test", Version: "1"}
 }
-func plannerOutput(questions bool) PhaseResult {
+func plannerOutput(questions bool) fakePhase {
 	p := &phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"accept"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofRegression, Command: []string{"go", "test", "./..."}, Details: "proof"}, Paths: []string{"internal"}, Commands: [][]string{{"go", "test", "./..."}}, Risks: []string{"risk"}}
 	if questions {
 		p.Questions = []phaseartifact.Question{{Prompt: "scope?", Options: []string{"a", "b"}}}
 	}
-	return PhaseResult{Parsed: phaseartifact.Parsed{Phase: domain.PhasePlanning, Provider: provider(), Planner: p}, ProviderResult: store.ProviderAttemptResultKey{AttemptID: 1, Ref: testRef, Phase: domain.PhasePlanning, Attempt: 1}}
+	return fakePhase{parsed: phaseartifact.Parsed{Phase: domain.PhasePlanning, Provider: provider(), Planner: p}, result: PhaseResult{ProviderResult: store.ProviderAttemptResultKey{AttemptID: 1, Ref: testRef, Phase: domain.PhasePlanning, Attempt: 1}}}
 }
-func verificationOutput() PhaseResult {
+func verificationOutput() fakePhase {
 	v := &phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: digest, ProofKind: phaseartifact.ProofRegression, OwnedFiles: []string{"internal"}, Command: []string{"go", "test", "./..."}, PrebuildOutcome: "red", EvidenceDigest: digest}
-	return PhaseResult{Parsed: phaseartifact.Parsed{Phase: domain.PhaseVerification, Provider: provider(), Verify: v}, ProviderResult: store.ProviderAttemptResultKey{AttemptID: 2, Ref: testRef, Phase: domain.PhaseVerification, Attempt: 1}, Checkpoint: &VerificationCheckpoint{ID: oid, Commit: store.CommitObservation{CommitOID: oid, ParentOID: oid, TreeOID: oid}}}
+	return fakePhase{parsed: phaseartifact.Parsed{Phase: domain.PhaseVerification, Provider: provider(), Verify: v}, result: PhaseResult{ProviderResult: store.ProviderAttemptResultKey{AttemptID: 2, Ref: testRef, Phase: domain.PhaseVerification, Attempt: 1}}}
 }
-func builderOutput(amend bool) PhaseResult {
+func builderOutput(amend bool) fakePhase {
 	b := &phaseartifact.Builder{Schema: "sf.builder/v1", Summary: "implemented", ChangedFiles: []string{"internal/foo.go"}, Commands: [][]string{{"go", "test", "./..."}}}
 	if amend {
 		b.AmendmentRequest = &phaseartifact.AmendmentRequest{OldProofDigest: digest, ProposedDigest: digest, Reason: "proof needs clarification"}
 	}
-	return PhaseResult{Parsed: phaseartifact.Parsed{Phase: domain.PhaseBuild, Provider: provider(), Builder: b}, ProviderResult: store.ProviderAttemptResultKey{AttemptID: 3, Ref: testRef, Phase: domain.PhaseBuild, Attempt: 1}}
+	return fakePhase{parsed: phaseartifact.Parsed{Phase: domain.PhaseBuild, Provider: provider(), Builder: b}, result: PhaseResult{ProviderResult: store.ProviderAttemptResultKey{AttemptID: 3, Ref: testRef, Phase: domain.PhaseBuild, Attempt: 1}}}
 }
 
 func newWorker(state domain.State, runner *fakeRunner, evidence *fakeEvidence, engine *fakeEngine) Worker {
@@ -226,20 +244,26 @@ func newWorker(state domain.State, runner *fakeRunner, evidence *fakeEvidence, e
 	}
 	if evidence.hasPlan && evidence.plan.Document.Planner == nil {
 		out := plannerOutput(false)
-		evidence.providerResults[out.ProviderResult.AttemptID] = out.Parsed
-		evidence.plan.Document = store.PlanDocument{Planner: out.Parsed.Planner, ProviderResult: &out.ProviderResult, Acceptance: out.Parsed.Planner.Acceptance, ProofKind: string(out.Parsed.Planner.Proof.Kind), Paths: out.Parsed.Planner.Paths, Commands: out.Parsed.Planner.Commands, Risks: out.Parsed.Planner.Risks}
+		evidence.providerResults[out.result.ProviderResult.AttemptID] = out.parsed
+		evidence.plan.Document = store.PlanDocument{Planner: out.parsed.Planner, ProviderResult: &out.result.ProviderResult, Acceptance: out.parsed.Planner.Acceptance, ProofKind: string(out.parsed.Planner.Proof.Kind), Paths: out.parsed.Planner.Paths, Commands: out.parsed.Planner.Commands, Risks: out.parsed.Planner.Risks}
 		evidence.plan.Digest, evidence.plan.TicketVersion, evidence.plan.Fence = "plan", evidence.ticket.Version, testFence
 	}
 	if runner != nil {
 		runner.evidence = evidence
 	}
-	return Worker{Evidence: evidence, Engine: engine, Runner: runner, Candidate: fakeCandidate{}}
+	return Worker{Evidence: evidence, Engine: engine, Runner: runner, Candidate: fakeCandidate{}, CheckpointMaterializer: fakeCheckpointMaterializer{}, CandidateMaterializer: fakeCandidateMaterializer{}}
 }
 
 type fakeCandidate struct{}
 
 func (fakeCandidate) AuthenticateCandidate(context.Context, PhaseRequest, workflowprompt.PlanIdentity, workflowprompt.VerificationIdentity, phaseartifact.Builder, CandidateWitness) error {
 	return nil
+}
+
+type fakeCandidateMaterializer struct{}
+
+func (fakeCandidateMaterializer) MaterializeCandidate(context.Context, PhaseRequest, workflowprompt.PlanIdentity, workflowprompt.VerificationIdentity, phaseartifact.Builder, store.ProviderAttemptResultKey) (CandidateWitness, error) {
+	return CandidateWitness{Commit: store.CommitObservation{CommitOID: oid, ParentOID: oid, TreeOID: oid}, CommandPolicyDigest: digest, Reason: "candidate"}, nil
 }
 
 func TestPlannerPassAndQuestions(t *testing.T) {
@@ -251,7 +275,7 @@ func TestPlannerPassAndQuestions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			e := &fakeEvidence{}
 			eng := &fakeEngine{}
-			run := &fakeRunner{outputs: []PhaseResult{plannerOutput(tc.questions)}}
+			run := &fakeRunner{outputs: []fakePhase{plannerOutput(tc.questions)}}
 			w := newWorker(domain.StatePlanning, run, e, eng)
 			got, err := w.Run(context.Background(), testRef, testFence)
 			if err != nil || eng.state.State != tc.want {
@@ -270,7 +294,7 @@ func TestPlannerPassAndQuestions(t *testing.T) {
 func TestVerificationPassAndBuilderAmendmentAndPass(t *testing.T) {
 	e := &fakeEvidence{hasPlan: true, plan: store.StoredPlan{Document: store.PlanDocument{Acceptance: []string{"accept"}, ProofKind: "regression", Paths: []string{"internal"}, Commands: [][]string{{"go", "test", "./..."}}}}}
 	eng := &fakeEngine{}
-	verification := &fakeRunner{outputs: []PhaseResult{verificationOutput()}}
+	verification := &fakeRunner{outputs: []fakePhase{verificationOutput()}}
 	w := newWorker(domain.StateVerifying, verification, e, eng)
 	w.Checkpoint = fakeCheckpoint{}
 	if _, err := w.Run(context.Background(), testRef, testFence); err != nil {
@@ -279,30 +303,21 @@ func TestVerificationPassAndBuilderAmendmentAndPass(t *testing.T) {
 	if eng.state.State != domain.StateBuilding || e.verifications != 1 {
 		t.Fatalf("state=%s verifications=%d", eng.state.State, e.verifications)
 	}
-	builder := &fakeRunner{outputs: []PhaseResult{builderOutput(true)}}
+	builder := &fakeRunner{outputs: []fakePhase{builderOutput(true)}}
 	builder.evidence = e
 	w.Runner = builder
 	if _, err := w.Run(context.Background(), testRef, testFence); !errors.Is(err, ErrAmendmentUnsupported) {
 		t.Fatalf("amend err=%v", err)
 	}
-	if eng.state.State != domain.StateBuilding || e.budget != 0 {
+	if eng.state.State != domain.StatePaused || e.budget != 0 {
 		t.Fatalf("amend state=%s budget=%d", eng.state.State, e.budget)
-	}
-	builder.outputs = []PhaseResult{builderOutput(false)}
-	w.Runner = builder
-	builder.outputs[0].Candidate = &CandidateWitness{Commit: store.CommitObservation{CommitOID: oid, ParentOID: oid, TreeOID: oid}, CommandPolicyDigest: digest, Reason: "candidate"}
-	if _, err := w.Run(context.Background(), testRef, testFence); err != nil {
-		t.Fatal(err)
-	}
-	if eng.state.State != domain.StatePublishing || e.candidates != 1 {
-		t.Fatalf("pass state=%s candidates=%d", eng.state.State, e.candidates)
 	}
 }
 
 func TestStaleFenceAndCancellation(t *testing.T) {
 	e := &fakeEvidence{}
 	eng := &fakeEngine{}
-	run := &fakeRunner{outputs: []PhaseResult{plannerOutput(false)}}
+	run := &fakeRunner{outputs: []fakePhase{plannerOutput(false)}}
 	w := newWorker(domain.StatePlanning, run, e, eng)
 	if _, err := w.Run(context.Background(), testRef, domain.Fence{LeaderEpoch: 7, RunnerEpoch: 99}); !errors.Is(err, store.ErrStaleFence) {
 		t.Fatalf("err=%v", err)
@@ -321,16 +336,22 @@ func TestVerificationRejectsCheckpointIDThatDiffersFromCommit(t *testing.T) {
 	e := &fakeEvidence{hasPlan: true}
 	eng := &fakeEngine{}
 	out := verificationOutput()
-	out.Checkpoint.ID = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
-	run := &fakeRunner{outputs: []PhaseResult{out}}
+	run := &fakeRunner{outputs: []fakePhase{out}}
 	w := newWorker(domain.StateVerifying, run, e, eng)
 	w.Checkpoint = fakeCheckpoint{}
+	w.CheckpointMaterializer = badCheckpointMaterializer{}
 	if _, err := w.Run(context.Background(), testRef, testFence); !errors.Is(err, ErrCheckpointRequired) {
 		t.Fatalf("checkpoint mismatch err=%v", err)
 	}
 	if eng.signals != 0 {
 		t.Fatal("mismatched checkpoint advanced workflow")
 	}
+}
+
+type badCheckpointMaterializer struct{}
+
+func (badCheckpointMaterializer) MaterializeVerificationCheckpoint(context.Context, PhaseRequest, phaseartifact.Verification, store.ProviderAttemptResultKey) (VerificationCheckpoint, error) {
+	return VerificationCheckpoint{ID: oid, Commit: store.CommitObservation{CommitOID: "abcdefabcdefabcdefabcdefabcdefabcdefabcd", ParentOID: oid, TreeOID: oid}}, nil
 }
 
 func TestEvidenceBeforeTransitionIsReplayed(t *testing.T) {
@@ -349,7 +370,7 @@ func TestEvidenceBeforeTransitionIsReplayed(t *testing.T) {
 func TestBuilderStopsWithoutAuthenticatedCandidate(t *testing.T) {
 	e := &fakeEvidence{hasPlan: true, plan: store.StoredPlan{Document: store.PlanDocument{Acceptance: []string{"accept"}, ProofKind: "regression", Paths: []string{"internal"}, Commands: [][]string{{"go", "test", "./..."}}}}, hasVerify: true, verification: store.StoredVerification{Revision: store.VerificationRevision{IntentDigest: digest, ProofDigest: digest, OwnedFiles: []string{"internal"}, CheckpointID: oid}}}
 	eng := &fakeEngine{}
-	run := &fakeRunner{outputs: []PhaseResult{builderOutput(false)}}
+	run := &fakeRunner{outputs: []fakePhase{builderOutput(false)}}
 	w := newWorker(domain.StateBuilding, run, e, eng)
 	if _, err := w.Run(context.Background(), testRef, testFence); !errors.Is(err, ErrStaleEvidence) {
 		t.Fatalf("err=%v", err)
