@@ -701,10 +701,7 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: startIdentity}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{}), finished: make(chan struct{}), snapshot: trusted.snapshot}
 	s.runs[requestKey] = r
 	s.mu.Unlock()
-	defer func() {
-		s.removeRun(request, r)
-		close(r.finished)
-	}()
+	defer close(r.finished)
 	s.mu.Lock()
 	recorder := s.Recorder
 	s.mu.Unlock()
@@ -720,13 +717,11 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	if _, err := gateWrite.Write([]byte{1}); err != nil {
 		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
 		_ = cmd.Wait()
-		s.removeRun(request, r)
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	if err := gateWrite.Close(); err != nil {
 		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
 		_ = cmd.Wait()
-		s.removeRun(request, r)
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	wait := make(chan error, 1)

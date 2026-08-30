@@ -150,7 +150,7 @@ func TestSupervisorCloseReclaimsStagedRuntimeAndIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestSupervisorRunRemovesCompletedExactRun(t *testing.T) {
+func TestSupervisorRunRetainsCompletedRunUntilDrain(t *testing.T) {
 	supervisor, request, invocation, input := legacyRunFixture(t, "")
 	if _, err := supervisor.Run(context.Background(), request, invocation, input); err != nil {
 		t.Fatal(err)
@@ -158,8 +158,17 @@ func TestSupervisorRunRemovesCompletedExactRun(t *testing.T) {
 	supervisor.mu.Lock()
 	remaining := len(supervisor.runs)
 	supervisor.mu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("completed Run did not retain its proof-bearing entry: %d", remaining)
+	}
+	if _, err := supervisor.Drain(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	supervisor.mu.Lock()
+	remaining = len(supervisor.runs)
+	supervisor.mu.Unlock()
 	if remaining != 0 {
-		t.Fatalf("completed Run leaked %d active entries", remaining)
+		t.Fatalf("Drain leaked %d completed entries", remaining)
 	}
 }
 
