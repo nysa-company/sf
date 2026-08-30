@@ -78,6 +78,24 @@ func TestStatusWatchPollsUntilContextCancellation(t *testing.T) {
 	}
 }
 
+func TestStatusWatchStopsWhenTicketIsTerminal(t *testing.T) {
+	var requests int
+	client := fakeClient(func(_ context.Context, request api.Request) (api.Response, error) {
+		requests++
+		response := responseOK()
+		response.Data = json.RawMessage(`{"ticket":{"state":"done"}}`)
+		return response, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if code := Execute(ctx, []string{"status", "SF-1", "--watch"}, &bytes.Buffer{}, &bytes.Buffer{}, client); code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	if requests != 1 {
+		t.Fatalf("terminal watch requests=%d, want 1", requests)
+	}
+}
+
 func TestMutatingOperatorLabelIsForwardedToDaemon(t *testing.T) {
 	var got api.Request
 	client := fakeClient(func(_ context.Context, request api.Request) (api.Response, error) {

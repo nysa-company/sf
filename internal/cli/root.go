@@ -228,7 +228,10 @@ func (a *app) watchStatus(ctx context.Context, ticket string) error {
 		if err := a.emit(response); err != nil {
 			return err
 		}
-		if !response.OK {
+		if !response.OK || a.last != nil && !a.last.OK {
+			return nil
+		}
+		if ticket != "" && terminalStatusResponse(response.Data) {
 			return nil
 		}
 		timer := time.NewTimer(statusWatchInterval)
@@ -239,6 +242,23 @@ func (a *app) watchStatus(ctx context.Context, ticket string) error {
 		case <-timer.C:
 		}
 	}
+}
+
+func terminalStatusResponse(data json.RawMessage) bool {
+	var value struct {
+		State  domain.State `json:"state"`
+		Ticket *struct {
+			State domain.State `json:"state"`
+		} `json:"ticket"`
+	}
+	if len(data) == 0 || json.Unmarshal(data, &value) != nil {
+		return false
+	}
+	state := value.State
+	if value.Ticket != nil {
+		state = value.Ticket.State
+	}
+	return state.Terminal()
 }
 
 func (a *app) showCommand() *cobra.Command {
