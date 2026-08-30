@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/store"
@@ -253,6 +254,266 @@ func TestEnsureRefusesStaleFenceBeforeCreatingPath(t *testing.T) {
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stale ensure created %s: %v", path, err)
+	}
+}
+
+func TestEnsureFenceRotationAfterEarlyValidationHasNoCreationSideEffects(t *testing.T) {
+	f := setupCoordinator(t, "SF-stale-after-validation")
+	ctx := context.Background()
+	path, err := f.db.TicketWorktreePath(f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := coordinatorFor(f)
+	c.beforeCreationClaim = func() {
+		if _, err := f.db.AcquireLeader(ctx, domain.ChannelDev, "replacement-after-validation"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.Ensure(ctx, f.request); !errors.Is(err, store.ErrStaleFence) {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Dir(path)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale ensure created parent %s: %v", filepath.Dir(path), err)
+	}
+	branch, err := f.db.LoadBranch(ctx, string(f.ref.Channel)+"\x00"+string(f.ref.Project)+"\x00"+string(f.ref.Ticket))
+	if err != nil || branch != "" {
+		t.Fatalf("stale ensure allocated branch=%q err=%v", branch, err)
+	}
+	if refs := mustGit(t, f.project.Path, "for-each-ref", "--format=%(refname)", "refs/heads/sf"); refs != "" {
+		t.Fatalf("stale ensure created Git refs: %q", refs)
+	}
+}
+
+func TestEnsureCancellationAfterGitReturnReconcilesWithIndependentContext(t *testing.T) {
+	f := setupCoordinator(t, "SF-cancel-after-create")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := coordinatorFor(f)
+	c.afterCreate = cancel
+	registered, err := c.Ensure(ctx, f.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.Path == "" {
+		t.Fatal("cancelled post-create call did not register the worktree")
+	}
+	facts, err := f.db.WorktreeCreationIntent(context.Background(), f.ref)
+	if err != nil || facts.Effect.State != store.EffectConfirmed {
+		t.Fatalf("effect was not confirmed after independent recovery: %+v err=%v", facts.Effect, err)
+	}
+}
+
+func TestEnsureCancellationAfterConfirmRegistersWithIndependentContext(t *testing.T) {
+	f := setupCoordinator(t, "SF-cancel-after-confirm")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := coordinatorFor(f)
+	c.afterConfirm = cancel
+	registered, err := c.Ensure(ctx, f.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.Path == "" {
+		t.Fatal("cancelled post-confirm call did not register the worktree")
+	}
+	if _, err := coordinatorFor(f).Ensure(context.Background(), f.request); err != nil {
+		t.Fatalf("next Ensure did not adopt registered worktree: %v", err)
+	}
+}
+
+func TestEnsureCancellationDuringCreateErrorReconcilesVisibleEffect(t *testing.T) {
+	f := setupCoordinator(t, "SF-cancel-create-error")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The worktree add itself completes, then cancellation makes Runner's
+	// post-create snapshot fail.  This is the response-loss-shaped create-error
+	// path, after Runner has released its lease.
+	f.runner.Run = cancelAfterWorktreeAdd(t, cancel)
+	c := coordinatorFor(f)
+	registered, err := c.Ensure(ctx, f.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.Path == "" {
+		t.Fatal("cancelled create error did not reconcile the visible worktree")
+	}
+}
+
+func TestEnsureQuarantinePersistenceFailureIsFailClosed(t *testing.T) {
+	f := setupCoordinator(t, "SF-uncertain-write-failure")
+	ctx := context.Background()
+	c := coordinatorFor(f)
+	c.afterCreate = func() {
+		f.db.SetWriteFaultForTest(func() error { return errors.New("injected uncertainty persistence failure") })
+	}
+	_, err := c.Ensure(ctx, f.request)
+	if !errors.Is(err, ErrQuarantinePersistence) {
+		t.Fatalf("err=%v", err)
+	}
+	f.db.SetWriteFaultForTest(nil)
+	if _, err := coordinatorFor(f).Ensure(ctx, f.request); !errors.Is(err, ErrInProgress) {
+		t.Fatalf("uncertain persistence failure admitted a duplicate: %v", err)
+	}
+	path, _ := f.db.TicketWorktreePath(f.ref)
+	if got := mustGit(t, f.project.Path, "worktree", "list", "--porcelain"); strings.Count(got, "worktree "+path) != 1 {
+		t.Fatalf("duplicate worktree after persistence failure:\n%s", got)
+	}
+}
+
+func TestEnsureParentFailureAfterClaimPersistsUncertainty(t *testing.T) {
+	f := setupCoordinator(t, "SF-parent-failure")
+	ctx := context.Background()
+	path, err := f.db.TicketWorktreePath(f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := coordinatorFor(f)
+	c.afterCreationClaim = func(claim contracts.GitMutationClaim) {
+		parent := filepath.Dir(path)
+		if err := os.MkdirAll(filepath.Dir(parent), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(parent); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(parent, []byte("not a directory"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.Ensure(ctx, f.request); !errors.Is(err, ErrQuarantined) || errors.Is(err, ErrQuarantinePersistence) {
+		t.Fatalf("parent failure err=%v", err)
+	}
+	facts, err := f.db.WorktreeCreationIntent(ctx, f.ref)
+	if err != nil || facts.Effect.State != store.EffectUncertain {
+		t.Fatalf("parent failure did not persist uncertainty: %+v err=%v", facts.Effect, err)
+	}
+	if _, err := os.Lstat(path); err == nil {
+		t.Fatal("parent failure created worktree leaf")
+	}
+	started := time.Now()
+	if _, err := coordinatorFor(f).Ensure(ctx, f.request); !errors.Is(err, ErrQuarantined) {
+		t.Fatalf("known uncertain missing leaf err=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("known uncertain missing leaf waited instead of quarantining: %v", elapsed)
+	}
+}
+
+func TestEnsureLeaseReleaseFailureStaysAmbiguousAndExcludesDuplicate(t *testing.T) {
+	f := setupCoordinator(t, "SF-lease-release")
+	ctx := context.Background()
+	f.runner.Run = func(ctx context.Context, binary string, args, env []string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, binary, args...)
+		cmd.Env = env
+		output, err := cmd.CombinedOutput()
+		if strings.Contains(strings.Join(args, " "), "worktree add -b") {
+			f.db.SetWriteFaultForTest(func() error { return errors.New("injected lease release failure") })
+		}
+		return output, err
+	}
+	if _, err := coordinatorFor(f).Ensure(ctx, f.request); !errors.Is(err, git.ErrMutationLeaseRelease) {
+		t.Fatalf("lease release err=%v", err)
+	}
+	f.db.SetWriteFaultForTest(nil)
+	facts, err := f.db.WorktreeCreationIntent(ctx, f.ref)
+	if err != nil || facts.Effect.State == store.EffectConfirmed {
+		t.Fatalf("lease release was incorrectly confirmed: %+v err=%v", facts.Effect, err)
+	}
+	if _, err := f.db.Worktree(ctx, f.ref); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("lease release unexpectedly registered worktree: %v", err)
+	}
+	leases, err := f.db.ActiveGitMutationLeases(ctx, f.ref.Channel)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("lease release did not retain writer exclusion: leases=%+v err=%v", leases, err)
+	}
+	if _, err := coordinatorFor(f).Ensure(ctx, f.request); !errors.Is(err, ErrInProgress) {
+		t.Fatalf("lease ambiguity admitted duplicate Ensure: %v", err)
+	}
+}
+
+func TestEnsureSameDaemonReconcilesKnownUncertainCreation(t *testing.T) {
+	f := setupCoordinator(t, "SF-same-daemon-uncertain")
+	ctx := context.Background()
+	path, err := f.db.TicketWorktreePath(f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := (git.Allocator{Authority: f.db}).AllocateUnderFence(ctx, f.ref.Channel, f.ref.Project, f.ref.Ticket, f.request.Version, f.request.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, base, err := f.runner.ObserveRepositoryBase(ctx, f.project.Path, f.project.BaseRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: f.ref, TicketVersion: f.request.Version, Fence: f.request.Fence}, RequestDigest: ensureDigest(f.ref, repository, path, branch, f.project.BaseRef, base), Repository: repository, Worktree: path, Branch: branch, Operation: "create-worktree", BaseRef: f.project.BaseRef, ExpectedBaseOID: base, ExpectedHeadOID: base}
+	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)
+	if _, err := f.db.PlanEffect(ctx, store.EffectPlan{SemanticKey: intent.SemanticKey, Ref: f.ref, Kind: "git/create-worktree", TicketVersion: f.request.Version, Fence: f.request.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := f.db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureExactParent(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runner.CreateWorktree(ctx, repository, path, branch, f.project.BaseRef, claim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.MarkEffectUncertain(ctx, effectFence(claim)); err != nil {
+		t.Fatal(err)
+	}
+	if registered, err := coordinatorFor(f).Ensure(ctx, f.request); err != nil || registered.Path != path {
+		t.Fatalf("same-daemon uncertain recovery=%+v err=%v", registered, err)
+	}
+}
+
+func TestWaitForCreationCancellationWinsBeforeDeadlineOrQuery(t *testing.T) {
+	f := setupCoordinator(t, "SF-wait-cancel")
+	ctx := context.Background()
+	path, err := f.db.TicketWorktreePath(f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := (git.Allocator{Authority: f.db}).AllocateUnderFence(ctx, f.ref.Channel, f.ref.Project, f.ref.Ticket, f.request.Version, f.request.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, base, err := f.runner.ObserveRepositoryBase(ctx, f.project.Path, f.project.BaseRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: f.ref, TicketVersion: f.request.Version, Fence: f.request.Fence}, RequestDigest: ensureDigest(f.ref, repository, path, branch, f.project.BaseRef, base), Repository: repository, Worktree: path, Branch: branch, Operation: "create-worktree", BaseRef: f.project.BaseRef, ExpectedBaseOID: base, ExpectedHeadOID: base}
+	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)
+	if _, err := f.db.PlanEffect(ctx, store.EffectPlan{SemanticKey: intent.SemanticKey, Ref: f.ref, Kind: "git/create-worktree", TicketVersion: f.request.Version, Fence: f.request.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.IssueGitMutationClaim(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	facts, err := f.db.WorktreeCreationIntent(ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := coordinatorFor(f).waitForCreation(waitCtx, f.request, f.project, path, facts); !errors.Is(err, context.Canceled) || errors.Is(err, ErrQuarantined) {
+		t.Fatalf("cancelled wait err=%v", err)
+	}
+}
+
+func cancelAfterWorktreeAdd(t *testing.T, cancel context.CancelFunc) func(context.Context, string, []string, []string) ([]byte, error) {
+	t.Helper()
+	return func(ctx context.Context, binary string, args, env []string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, binary, args...)
+		cmd.Env = env
+		output, err := cmd.CombinedOutput()
+		if strings.Contains(strings.Join(args, " "), "worktree add -b") {
+			cancel()
+		}
+		return output, err
 	}
 }
 

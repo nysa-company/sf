@@ -45,6 +45,21 @@ func (s *Store) LoadBranch(ctx context.Context, key string) (string, error) {
 // The key grammar is channel NUL project NUL ticket; parsing it here binds the
 // opaque interface value back to a real durable ticket before insertion.
 func (s *Store) LoadOrStoreBranch(ctx context.Context, key, proposed string) (string, error) {
+	return s.loadOrStoreBranch(ctx, key, proposed, 0, domain.Fence{})
+}
+
+// LoadOrStoreBranchUnderFence is the creation-only branch authority.  It binds
+// allocation to the exact ticket identity in the same SQLite write
+// transaction, so an old coordinator cannot persist a branch after its leader
+// or runner has been replaced.
+func (s *Store) LoadOrStoreBranchUnderFence(ctx context.Context, key, proposed string, version uint64, fence domain.Fence) (string, error) {
+	if version == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return "", ErrStaleFence
+	}
+	return s.loadOrStoreBranch(ctx, key, proposed, version, fence)
+}
+
+func (s *Store) loadOrStoreBranch(ctx context.Context, key, proposed string, version uint64, fence domain.Fence) (string, error) {
 	ref, err := branchKey(key)
 	if err != nil {
 		return "", err
@@ -54,6 +69,11 @@ func (s *Store) LoadOrStoreBranch(ctx context.Context, key, proposed string) (st
 	}
 	var stored string
 	err = s.write(ctx, func(conn *sql.Conn) error {
+		if version != 0 {
+			if err := s.assertTicketFence(ctx, conn, ref, version, fence); err != nil {
+				return err
+			}
+		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO branch_allocations(authority_key, channel, project_id, ticket_id, branch_ref, created_at)
 			VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(authority_key) DO NOTHING`, key, ref.Channel, ref.Project, ref.Ticket, proposed, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err

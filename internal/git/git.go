@@ -58,6 +58,14 @@ type BranchAuthority interface {
 	LoadOrStoreBranch(context.Context, string, string) (string, error)
 }
 
+// FencedBranchAuthority provides the stronger creation-time allocation
+// boundary.  The Store validates the ticket fence and persists/replays the
+// branch in one transaction.
+type FencedBranchAuthority interface {
+	BranchAuthority
+	LoadOrStoreBranchUnderFence(context.Context, string, string, uint64, domain.Fence) (string, error)
+}
+
 // PersistedBranchAuthority is retained as a compatibility name for callers
 // that documented the stronger lookup contract separately.
 type PersistedBranchAuthority = BranchAuthority
@@ -68,16 +76,32 @@ type Allocator struct {
 }
 
 func (a Allocator) Allocate(ctx context.Context, channel domain.Channel, project domain.ProjectID, ticket domain.TicketID) (string, error) {
+	return a.allocate(ctx, channel, project, ticket, 0, domain.Fence{})
+}
+
+// AllocateUnderFence is required before worktree creation.  It deliberately
+// does not perform an unfenced read first: the Store's one write transaction
+// decides whether an existing branch is replayed or a new proposal is stored.
+func (a Allocator) AllocateUnderFence(ctx context.Context, channel domain.Channel, project domain.ProjectID, ticket domain.TicketID, version uint64, fence domain.Fence) (string, error) {
+	if version == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return "", fmt.Errorf("allocator requires a complete ticket fence")
+	}
+	return a.allocate(ctx, channel, project, ticket, version, fence)
+}
+
+func (a Allocator) allocate(ctx context.Context, channel domain.Channel, project domain.ProjectID, ticket domain.TicketID, version uint64, fence domain.Fence) (string, error) {
 	if !channel.Valid() || project == "" || ticket == "" || a.Authority == nil {
 		return "", fmt.Errorf("allocator requires channel, project, ticket, and SQLite branch authority")
 	}
 	key := string(channel) + "\x00" + string(project) + "\x00" + string(ticket)
-	stored, err := a.Authority.LoadBranch(ctx, key)
-	if err != nil {
-		return "", err
-	}
-	if stored != "" {
-		return validateAllocatedBranch(channel, stored)
+	if version == 0 {
+		stored, err := a.Authority.LoadBranch(ctx, key)
+		if err != nil {
+			return "", err
+		}
+		if stored != "" {
+			return validateAllocatedBranch(channel, stored)
+		}
 	}
 	random := a.Random
 	if random == nil {
@@ -88,7 +112,17 @@ func (a Allocator) Allocate(ctx context.Context, channel domain.Channel, project
 		return "", fmt.Errorf("random branch suffix: %w", err)
 	}
 	proposed := fmt.Sprintf("sf/%s/%s/%s-%s", channel, digestPart(string(project)), digestPart(string(ticket)), hex.EncodeToString(suffix[:]))
-	stored, err = a.Authority.LoadOrStoreBranch(ctx, key, proposed)
+	var stored string
+	var err error
+	if version != 0 {
+		authority, ok := a.Authority.(FencedBranchAuthority)
+		if !ok {
+			return "", fmt.Errorf("allocator requires fenced SQLite branch authority")
+		}
+		stored, err = authority.LoadOrStoreBranchUnderFence(ctx, key, proposed, version, fence)
+	} else {
+		stored, err = a.Authority.LoadOrStoreBranch(ctx, key, proposed)
+	}
 	if err != nil {
 		return "", err
 	}

@@ -32,6 +32,11 @@ var (
 	// ErrInProgress means another claimant owns an unresolved creation effect.
 	// Callers may retry Ensure; they must not create a second worktree.
 	ErrInProgress = errors.New("worktree creation is already in progress")
+	// ErrQuarantinePersistence means the coordinator could not prove that an
+	// effect which may have crossed Git's boundary is durably quarantined.  It
+	// is deliberately distinct from ErrQuarantined: callers must not treat it
+	// as a normal retryable recovery state.
+	ErrQuarantinePersistence = errors.New("worktree effect quarantine persistence failed")
 )
 
 // EnsureRequest is a daemon-acquired ticket identity. The coordinator never
@@ -47,6 +52,14 @@ type EnsureRequest struct {
 type Coordinator struct {
 	Store *store.Store
 	Git   git.Runner
+
+	// beforeCreationClaim is test-only synchronization for the stale-fence
+	// boundary.  It is intentionally unexported so production composition
+	// cannot install mutable behavior between validation and the durable claim.
+	beforeCreationClaim func()
+	afterCreationClaim  func(contracts.GitMutationClaim)
+	afterCreate         func()
+	afterConfirm        func()
 }
 
 func (c Coordinator) Ensure(ctx context.Context, request EnsureRequest) (store.StoredWorktree, error) {
@@ -84,10 +97,13 @@ func (c Coordinator) Ensure(ctx context.Context, request EnsureRequest) (store.S
 		return store.StoredWorktree{}, fmt.Errorf("%w: creation intent is ambiguous: %v", ErrQuarantined, factsErr)
 	}
 
-	if err := ensureExactParent(path); err != nil {
-		return store.StoredWorktree{}, fmt.Errorf("%w: unable to establish worktree parent: %v", ErrQuarantined, err)
+	if c.beforeCreationClaim != nil {
+		c.beforeCreationClaim()
 	}
-	branch, err := (git.Allocator{Authority: c.Store}).Allocate(ctx, request.Ref.Channel, request.Ref.Project, request.Ref.Ticket)
+	// Allocation is a fence-checked Store transaction.  Do not create the
+	// parent directory or allocate a branch on the strength of the earlier
+	// read-side validation: a replacement leader may have arrived since then.
+	branch, err := (git.Allocator{Authority: c.Store}).AllocateUnderFence(ctx, request.Ref.Channel, request.Ref.Project, request.Ref.Ticket, request.Version, request.Fence)
 	if err != nil {
 		return store.StoredWorktree{}, err
 	}
@@ -120,25 +136,82 @@ func (c Coordinator) Ensure(ctx context.Context, request EnsureRequest) (store.S
 		}
 		return store.StoredWorktree{}, fmt.Errorf("%w: durable Git claim was not available: %v", ErrInProgress, err)
 	}
+	// The durable executing claim is the final authority before any filesystem
+	// write.  A stale caller therefore cannot create a parent or leaf after the
+	// ticket fence has changed.
+	if c.afterCreationClaim != nil {
+		c.afterCreationClaim(claim)
+	}
+	if err := ensureExactParent(path); err != nil {
+		return c.preRunnerClaimFailure(request, claim, fmt.Errorf("unable to establish worktree parent: %w", err))
+	}
 	created, createErr := c.Git.CreateWorktree(ctx, repository, path, branch, project.BaseRef, claim)
 	if createErr != nil {
 		if errors.Is(createErr, git.ErrMutationLeaseRelease) {
-			return store.StoredWorktree{}, fmt.Errorf("%w: Git writer lease release was not durable: %v", ErrQuarantined, createErr)
+			// A failed lease release is itself ambiguous.  It can leave a live
+			// writer, so neither confirmation nor an assumed release is safe.
+			return store.StoredWorktree{}, fmt.Errorf("%w: Git writer lease release was not durable: %w", ErrQuarantined, createErr)
 		}
-		facts, factsErr := c.Store.WorktreeCreationIntent(ctx, request.Ref)
-		if factsErr == nil {
-			if _, statErr := os.Lstat(path); statErr == nil {
-				return c.reconcileCreation(ctx, request, project, path, facts)
+		return c.postClaimFailure(request, project, path, claim, createErr)
+	}
+	if c.afterCreate != nil {
+		c.afterCreate()
+	}
+	registered, err = c.confirmAndRegister(ctx, request, project, created, claim, "", nil)
+	if err != nil {
+		return c.postClaimFailure(request, project, path, claim, err)
+	}
+	return registered, nil
+}
+
+// preRunnerClaimFailure handles a failure after the durable claim but before
+// Runner starts.  No Git effect was launched, but the executing claim still
+// must become durably uncertain so a later Ensure cannot mint another claim.
+func (c Coordinator) preRunnerClaimFailure(request EnsureRequest, claim contracts.GitMutationClaim, cause error) (store.StoredWorktree, error) {
+	recoveryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return c.persistUncertain(recoveryCtx, request.Ref, claim, cause)
+}
+
+// postClaimFailure runs only after Runner has returned without
+// ErrMutationLeaseRelease, which proves its mutation lease release completed.
+// The caller context may be cancelled at exactly this point, so all
+// observation and quarantine writes use a bounded independent context.  A
+// clean visible result is confirmed/registered; otherwise the effect must be
+// durably uncertain before returning a recoverable quarantine.
+func (c Coordinator) postClaimFailure(request EnsureRequest, project store.Project, path string, claim contracts.GitMutationClaim, cause error) (store.StoredWorktree, error) {
+	// Git authentication can invoke several bounded helper commands on a cold
+	// filesystem; keep recovery finite but give it enough room to finish rather
+	// than converting cancellation into an artificial persistence failure.
+	recoveryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	facts, inspectErr := c.Store.WorktreeCreationIntent(recoveryCtx, request.Ref)
+	if inspectErr == nil && facts.Claim == claim {
+		if info, statErr := os.Lstat(path); statErr == nil && info.IsDir() {
+			if recovered, reconcileErr := c.reconcileCreation(recoveryCtx, request, project, path, facts); reconcileErr == nil {
+				return recovered, nil
 			}
 		}
-		// A failing Git invocation is not proof that it never crossed the launch
-		// gate: branch/control-plane state can exist even when no worktree leaf is
-		// visible. Preserve an uncertain effect for recovery rather than allowing
-		// a retry to run a second `worktree add -b` against ambiguous state.
-		_, _ = c.Store.MarkEffectUncertain(ctx, effectFence(claim))
-		return store.StoredWorktree{}, fmt.Errorf("%w: Git worktree creation did not produce an authenticated path: %v", ErrQuarantined, createErr)
 	}
-	return c.confirmAndRegister(ctx, request, project, created, claim, "", nil)
+	if inspectErr != nil {
+		cause = errors.Join(cause, fmt.Errorf("inspect creation effect: %w", inspectErr))
+	}
+	return c.persistUncertain(recoveryCtx, request.Ref, claim, cause)
+}
+
+func (c Coordinator) persistUncertain(ctx context.Context, ref domain.TicketRef, claim contracts.GitMutationClaim, cause error) (store.StoredWorktree, error) {
+	if _, persistErr := c.Store.MarkEffectUncertain(ctx, effectFence(claim)); persistErr == nil {
+		return store.StoredWorktree{}, fmt.Errorf("%w: creation result requires recovery: %w", ErrQuarantined, cause)
+	} else {
+		// A failed write is not proof that it failed before commit.  Re-read on
+		// the independent context and accept only a durable terminal quarantine
+		// (or a confirmed result) as proof that a duplicate cannot be launched.
+		facts, verifyErr := c.Store.WorktreeCreationIntent(ctx, ref)
+		if verifyErr == nil && facts.Claim == claim && (facts.Effect.State == store.EffectUncertain || facts.Effect.State == store.EffectConfirmed) {
+			return store.StoredWorktree{}, fmt.Errorf("%w: creation result requires recovery: %w", ErrQuarantined, cause)
+		}
+		return store.StoredWorktree{}, errors.Join(ErrQuarantinePersistence, cause, fmt.Errorf("persist uncertainty: %w", persistErr), fmt.Errorf("verify creation effect: %v", verifyErr))
+	}
 }
 
 func (c Coordinator) authenticateRegistered(ctx context.Context, request EnsureRequest, project store.Project, expectedPath string, stored store.StoredWorktree) (store.StoredWorktree, error) {
@@ -187,6 +260,9 @@ func (c Coordinator) confirmAndRegister(ctx context.Context, request EnsureReque
 		if _, err := c.Store.ConfirmEffect(ctx, effectFence(claim), string(identityJSON)); err != nil {
 			return store.StoredWorktree{}, err
 		}
+		if c.afterConfirm != nil {
+			c.afterConfirm()
+		}
 	} else if facts != nil && facts.Effect.State == store.EffectUncertain {
 		if _, err := c.Store.ConfirmRecoveredWorktreeCreation(ctx, claim, string(identityJSON)); err != nil {
 			return store.StoredWorktree{}, err
@@ -205,28 +281,59 @@ func (c Coordinator) confirmAndRegister(ctx context.Context, request EnsureReque
 }
 
 func (c Coordinator) waitForCreation(ctx context.Context, request EnsureRequest, project store.Project, path string, initial store.GitMutationIntentFacts) (store.StoredWorktree, error) {
-	deadline := time.Now().Add(5 * time.Second)
+	// Creation includes several authenticated Git observations.  Under SQLite
+	// and repository-writer contention it can legitimately outlast five
+	// seconds; callers still retain deterministic control through ctx.
+	deadline := time.Now().Add(30 * time.Second)
 	facts := initial
 	for {
+		// Caller cancellation always wins, even when the creation wait deadline
+		// or timer is also ready.  Never turn a cancelled caller into a durable
+		// ambiguity merely because a query raced its cancellation.
+		if err := ctx.Err(); err != nil {
+			return store.StoredWorktree{}, err
+		}
 		// A path appears before the creator has completed Runner's post-create
 		// snapshot and durable effect confirmation. Do not race that window: an
 		// executing effect remains owned by its claimant even if Git has already
 		// made the directory visible.
 		if facts.Effect.State != store.EffectExecuting {
-			if _, err := os.Lstat(path); err == nil {
+			if info, err := os.Lstat(path); err == nil && info.IsDir() {
 				return c.reconcileCreation(ctx, request, project, path, facts)
+			} else {
+				// An old result that is no longer executing must either prove the
+				// exact visible directory or remain quarantined.  Treating a
+				// missing/non-directory leaf as ordinary in-progress would hide a
+				// durable ambiguity and make every retry wait pointlessly.
+				return store.StoredWorktree{}, fmt.Errorf("%w: non-executing creation has no exact worktree directory", ErrQuarantined)
 			}
 		}
 		if time.Now().After(deadline) {
 			return store.StoredWorktree{}, ErrInProgress
 		}
+		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return store.StoredWorktree{}, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
+		case <-timer.C:
+		}
+		if err := ctx.Err(); err != nil {
+			return store.StoredWorktree{}, err
+		}
+		if time.Now().After(deadline) {
+			return store.StoredWorktree{}, ErrInProgress
 		}
 		var err error
 		facts, err = c.Store.WorktreeCreationIntent(ctx, request.Ref)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return store.StoredWorktree{}, ctxErr
+		}
 		if err != nil {
 			return store.StoredWorktree{}, fmt.Errorf("%w: creation effect changed while waiting: %v", ErrQuarantined, err)
 		}
