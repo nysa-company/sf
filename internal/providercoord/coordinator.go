@@ -54,6 +54,7 @@ type Request struct {
 	ConfigDigest    string
 }
 type Receipt struct {
+	AttemptID                        int64
 	Attempt                          int
 	Provider                         domain.ProviderIdentity
 	ArtifactDigest, TranscriptDigest string
@@ -301,17 +302,21 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		if cancelled {
 			state, outcome = "cancelled", "cancelled"
 		}
-		valid := !cancelled && runErr == nil && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0 && changedFilesAllowed(raw.ChangedFiles, input.AllowedPaths)
+		valid := !cancelled && runErr == nil && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0
 		var parsed phaseartifact.Parsed
 		if valid {
 			parsed, err = phaseartifact.Parse(input.Phase, raw, r.Validation)
 			if err == nil {
-				state, outcome = "completed", "completed"
+				if err = phaseartifact.ValidateMutationPaths(parsed, raw.ChangedFiles, input.AllowedPaths); err == nil {
+					state, outcome = "completed", "completed"
+				} else {
+					outcome = "invalid_artifact"
+				}
 			} else {
 				outcome = "invalid_artifact"
 			}
 		}
-		receipt := Receipt{Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), UsageUnits: max(raw.UsageUnits, 0)}
+		receipt := Receipt{AttemptID: claim.ID, Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), UsageUnits: max(raw.UsageUnits, 0)}
 		if raw.TokenUsageTrusted {
 			receipt.TokenUsage = max(raw.TokenUsage, 0)
 		}
@@ -324,7 +329,12 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		}
 		receipts = append(receipts, receipt)
 		finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		finishErr := c.store.FinishProviderAttempt(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, state, outcome, max(raw.UsageUnits, 0), c.clock.Now())
+		var finishErr error
+		if state == "completed" {
+			_, finishErr = c.store.CompleteProviderAttemptSuccess(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, raw, r.Validation, c.clock.Now())
+		} else {
+			finishErr = c.store.FinishProviderAttempt(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, state, outcome, max(raw.UsageUnits, 0), c.clock.Now())
+		}
 		finishCancel()
 		if finishErr != nil {
 			if errors.Is(finishErr, store.ErrBudgetExhausted) {

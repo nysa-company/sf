@@ -113,3 +113,73 @@ func TestFinalReviewerBindsExactHeadAndProof(t *testing.T) {
 		t.Fatal("stale reviewed head accepted")
 	}
 }
+
+func TestCanonicalTypedArtifactUsesExactlyOneParsedRoleValue(t *testing.T) {
+	cases := []struct {
+		phase      domain.Phase
+		result     contracts.PhaseResult
+		validation Validation
+	}{
+		{domain.PhasePlanning, result(t, planner()), Validation{TicketType: domain.TicketBug}},
+		{domain.PhaseVerification, result(t, Verification{Schema: "sf.verification/v1", AcceptanceDigest: "accepted", ProofKind: ProofRegression, OwnedFiles: []string{"proof_test.go"}, Command: []string{"go", "test"}, PrebuildOutcome: "red", EvidenceDigest: "evidence"}), Validation{TicketType: domain.TicketBug, AcceptanceDigest: "accepted"}},
+		{domain.PhaseBuild, result(t, Builder{Schema: "sf.builder/v1", Summary: "done", ChangedFiles: []string{"main.go"}, Commands: [][]string{{"go", "test"}}}), Validation{}},
+		{domain.PhaseReview, result(t, Reviewer{Schema: "sf.reviewer/v1", Decision: ReviewPass, ReviewedHead: "head", ProofDigest: "proof"}), Validation{ExpectedReviewedHead: "head", ExpectedProofDigest: "proof"}},
+	}
+	for _, tc := range cases {
+		parsed, err := Parse(tc.phase, tc.result, tc.validation)
+		if err != nil {
+			t.Fatalf("%s parse: %v", tc.phase, err)
+		}
+		data, _, err := CanonicalTypedArtifact(parsed)
+		if err != nil {
+			t.Fatalf("%s canonical: %v", tc.phase, err)
+		}
+		got, err := DecodeCanonicalTypedArtifact(data)
+		if err != nil {
+			t.Fatalf("%s decode: %v", tc.phase, err)
+		}
+		if got.Phase != tc.phase || got.Provider != provider {
+			t.Fatalf("%s decoded %+v", tc.phase, got)
+		}
+		if strings.Contains(string(data), `"artifact"`) {
+			t.Fatalf("%s wrapped raw artifact", tc.phase)
+		}
+	}
+}
+
+func TestValidateMutationPathsUsesTypedArtifactOverAdapterInventory(t *testing.T) {
+	builderResult := result(t, Builder{Schema: "sf.builder/v1", Summary: "done", ChangedFiles: []string{"src/main.go"}, Commands: [][]string{{"go", "test"}}})
+	builder, err := Parse(domain.PhaseBuild, builderResult, Validation{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateMutationPaths(builder, nil, []string{"src"}); err != nil {
+		t.Fatalf("nil Codex-style inventory rejected: %v", err)
+	}
+	if err := ValidateMutationPaths(builder, []string{}, []string{"src"}); err == nil {
+		t.Fatal("explicit empty inventory bypassed builder declaration")
+	}
+	if err := ValidateMutationPaths(builder, []string{"src/main.go"}, []string{"test"}); err == nil {
+		t.Fatal("out-of-scope builder declaration accepted")
+	}
+	if err := ValidateMutationPaths(builder, []string{"src/main.go"}, []string{"src"}); err != nil {
+		t.Fatal(err)
+	}
+	verifyResult := result(t, Verification{Schema: "sf.verification/v1", AcceptanceDigest: "accepted", ProofKind: ProofRegression, OwnedFiles: []string{"proof/check_test.go"}, Command: []string{"go", "test"}, PrebuildOutcome: "red", EvidenceDigest: "evidence"})
+	verify, err := Parse(domain.PhaseVerification, verifyResult, Validation{TicketType: domain.TicketBug, AcceptanceDigest: "accepted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateMutationPaths(verify, nil, []string{"proof"}); err != nil {
+		t.Fatalf("nil Codex-style verification inventory rejected: %v", err)
+	}
+	if err := ValidateMutationPaths(verify, []string{}, []string{"proof"}); err == nil {
+		t.Fatal("explicit empty verification inventory bypassed declaration")
+	}
+	if err := ValidateMutationPaths(verify, []string{"proof/check_test.go"}, []string{"src"}); err == nil {
+		t.Fatal("out-of-scope verification declaration accepted")
+	}
+	if err := ValidateMutationPaths(verify, []string{"proof/check_test.go"}, []string{"proof"}); err != nil {
+		t.Fatal(err)
+	}
+}

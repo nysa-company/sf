@@ -58,6 +58,12 @@ func (s *Store) validateSchema(ctx context.Context) error {
 			return err
 		}
 	}
+	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete"} {
+		var count int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigger).Scan(&count); err != nil || count != 1 {
+			return fmt.Errorf("required trigger %s is missing", trigger)
+		}
+	}
 	rows, err := s.db.QueryContext(ctx, "PRAGMA foreign_key_check")
 	if err != nil {
 		return fmt.Errorf("foreign key check: %w", err)
@@ -83,6 +89,8 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "approvals", target: "tickets"},
 	{table: "worktrees", target: "tickets"},
 	{table: "provider_attempts", target: "tickets"},
+	{table: "provider_attempt_results", target: "provider_attempts"},
+	{table: "provider_attempt_results", target: "tickets"},
 	{table: "leases", target: "tickets"},
 	{table: "plans", target: "tickets"},
 	{table: "verifications", target: "tickets"},
@@ -136,6 +144,7 @@ var requiredSchema = map[string][]string{
 	"worktrees":                    {"path", "branch_ref"},
 	"provider_attempts":            {"phase", "attempt", "provider", "role", "state", "usage_units", "started_at", "finished_at", "qualification_id", "binding_digest", "provider_lease_key", "leader_epoch", "runner_epoch", "expected_ticket_version", "auth_digest", "auth_mode", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "worktree_path"},
 	"provider_attempt_inputs":      {"provider_attempt_id", "request_digest", "canonical_input", "created_at"},
+	"provider_attempt_results":     {"provider_attempt_id", "raw_artifact", "raw_sha256", "typed_artifact", "typed_sha256", "validation", "validation_sha256", "transcript_sha256", "request_digest", "leader_epoch", "runner_epoch", "expected_ticket_version", "repository_path", "worktree_path", "worktree_identity", "base_sha"},
 	"leases":                       {"scope", "scope_key", "runner_epoch"},
 	"plans":                        {"ticket_id", "digest", "body"},
 	"verifications":                {"ticket_id", "intent_digest", "proof_digest", "current_revision"},
@@ -177,6 +186,7 @@ var requiredIndexes = []indexRequirement{
 	{table: "worktrees", columns: []string{"channel", "branch_ref"}},
 	{table: "provider_attempts", columns: []string{"channel", "project_id", "ticket_id", "phase", "attempt", "provider"}},
 	{table: "provider_attempts", name: "one_active_provider_attempt", columns: []string{"channel", "project_id", "ticket_id"}, partial: true},
+	{table: "provider_attempt_results", name: "provider_attempt_results_fence", columns: []string{"channel", "project_id", "ticket_id", "phase", "attempt", "leader_epoch", "runner_epoch", "expected_ticket_version"}, nonUnique: true},
 	{table: "verification_revisions", columns: []string{"channel", "project_id", "ticket_id", "intent_digest", "proof_digest", "checkpoint_id"}},
 	{table: "candidate_snapshots", columns: []string{"channel", "project_id", "ticket_id", "generation"}},
 	{table: "invalidation_receipts", columns: []string{"channel", "project_id", "ticket_id", "generation", "kind"}},

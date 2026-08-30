@@ -502,3 +502,34 @@ var migrationV27 = []string{
 // predicates cannot prove canonical encoding, SHA-256 authority, or all
 // PhaseInput admission semantics.
 var migrationV28 = []string{}
+
+// v29 is append-only durable evidence for a successful provider completion.
+// Digests are unprefixed, lowercase SHA-256 hex; phaseartifact.Parse exposes a
+// historical "sha256:" display digest, so Store deliberately converts it at
+// this boundary rather than storing two spellings of the same authority.
+var migrationV29 = []string{
+	`CREATE TABLE provider_attempt_results (
+		provider_attempt_id INTEGER PRIMARY KEY,
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		phase TEXT NOT NULL, role TEXT NOT NULL, attempt INTEGER NOT NULL,
+		provider TEXT NOT NULL, model TEXT NOT NULL, family TEXT NOT NULL, provider_version TEXT NOT NULL,
+		request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+		leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL, expected_ticket_version INTEGER NOT NULL,
+		repository_path TEXT NOT NULL, worktree_path TEXT NOT NULL, worktree_identity TEXT NOT NULL, base_sha TEXT NOT NULL,
+		raw_artifact BLOB NOT NULL CHECK(length(raw_artifact) BETWEEN 1 AND 1048576), raw_sha256 TEXT NOT NULL CHECK(length(raw_sha256)=64 AND raw_sha256 NOT GLOB '*[^0-9a-f]*'),
+		typed_artifact BLOB NOT NULL CHECK(length(typed_artifact) BETWEEN 2 AND 2097152), typed_sha256 TEXT NOT NULL CHECK(length(typed_sha256)=64 AND typed_sha256 NOT GLOB '*[^0-9a-f]*'),
+		validation BLOB NOT NULL CHECK(length(validation) BETWEEN 2 AND 65536), validation_sha256 TEXT NOT NULL CHECK(length(validation_sha256)=64 AND validation_sha256 NOT GLOB '*[^0-9a-f]*'),
+		transcript_sha256 TEXT NOT NULL CHECK(length(transcript_sha256) IN (0,64) AND transcript_sha256 NOT GLOB '*[^0-9a-f]*'), created_at TEXT NOT NULL,
+		FOREIGN KEY(provider_attempt_id) REFERENCES provider_attempts(id),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+	`CREATE INDEX provider_attempt_results_fence ON provider_attempt_results(channel,project_id,ticket_id,phase,attempt,leader_epoch,runner_epoch,expected_ticket_version)`,
+	`CREATE TRIGGER provider_attempt_results_immutable_update BEFORE UPDATE ON provider_attempt_results BEGIN SELECT RAISE(ABORT,'provider attempt result is immutable'); END`,
+	`CREATE TRIGGER provider_attempt_results_immutable_delete BEFORE DELETE ON provider_attempt_results BEGIN SELECT RAISE(ABORT,'provider attempt result is append-only'); END`,
+	// No pre-v29 completion has immutable result evidence.  Retire every such
+	// apparent success atomically rather than allowing a restart to consume a
+	// model answer it cannot authenticate.
+	`UPDATE provider_attempts SET state='failed',outcome='invalid_artifact',launch_state='drained',finished_at=CASE WHEN finished_at='' THEN started_at ELSE finished_at END WHERE state='completed' AND outcome='completed' AND NOT EXISTS(SELECT 1 FROM provider_attempt_results r WHERE r.provider_attempt_id=provider_attempts.id)`,
+	`UPDATE phase_runs SET state='failed',outcome='invalid_artifact',completed_at=COALESCE(completed_at,started_at) WHERE state='completed' AND outcome IN ('completed','passed') AND NOT EXISTS(SELECT 1 FROM provider_attempts a JOIN provider_attempt_results r ON r.provider_attempt_id=a.id WHERE a.channel=phase_runs.channel AND a.project_id=phase_runs.project_id AND a.ticket_id=phase_runs.ticket_id AND a.phase=phase_runs.phase AND a.attempt=phase_runs.attempt AND a.provider=phase_runs.provider AND a.model=phase_runs.model AND a.family=phase_runs.family AND a.version=phase_runs.provider_version AND a.leader_epoch=phase_runs.leader_epoch AND a.runner_epoch=phase_runs.runner_epoch AND a.expected_ticket_version=phase_runs.expected_ticket_version AND a.worktree_identity=phase_runs.worktree_identity AND a.base_sha=phase_runs.base_sha AND a.state='completed' AND a.outcome='completed')`,
+	`DELETE FROM leases WHERE scope='provider' AND EXISTS(SELECT 1 FROM provider_attempts a WHERE a.channel=leases.channel AND a.project_id=leases.project_id AND a.ticket_id=leases.ticket_id AND a.runner_epoch=leases.runner_epoch AND a.provider_lease_key=leases.scope_key AND a.state='failed' AND a.outcome='invalid_artifact')`,
+}

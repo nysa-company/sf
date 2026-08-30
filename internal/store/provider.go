@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -8,11 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/phaseartifact"
 )
 
 type ProviderAttemptRequest struct {
@@ -61,6 +64,43 @@ type ProviderAttempt struct {
 	State, Outcome        string
 	UsageUnits            int64
 	StartedAt, FinishedAt time.Time
+}
+
+// ProviderAttemptResult is immutable, transcript-free completion evidence.
+// Every digest is plain lowercase SHA-256 hex (not phaseartifact's display
+// prefix) so SQLite and Store have exactly one durable spelling.
+type ProviderAttemptResult struct {
+	AttemptID                                                  int64
+	RawArtifact, TypedArtifact, Validation                     []byte
+	RawSHA256, TypedSHA256, ValidationSHA256, TranscriptSHA256 string
+	Claim                                                      ProviderAttemptClaim
+}
+
+// ProviderAttemptResultKey identifies an immutable historical provider result.
+// Unlike ProviderAttemptClaim it deliberately carries no live fence: results
+// remain readable after the workflow transitions or a daemon restarts.
+type ProviderAttemptResultKey struct {
+	AttemptID int64
+	Ref       domain.TicketRef
+	Phase     domain.Phase
+	Attempt   int
+}
+
+func rawDigest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
+func validSHA256(value string) bool {
+	return len(value) == 64 && strings.ToLower(value) == value && strings.Trim(value, "0123456789abcdef") == ""
+}
+
+func makeProviderAttemptResult(claim ProviderAttemptClaim, raw contracts.PhaseResult, validation phaseartifact.Validation, parsed phaseartifact.Parsed) (ProviderAttemptResult, error) {
+	typed, typedDigest, err := phaseartifact.CanonicalTypedArtifact(parsed)
+	if err != nil {
+		return ProviderAttemptResult{}, err
+	}
+	validationBytes, validationDigest, err := phaseartifact.CanonicalValidation(validation)
+	if err != nil {
+		return ProviderAttemptResult{}, err
+	}
+	return ProviderAttemptResult{AttemptID: claim.ID, RawArtifact: append([]byte(nil), raw.Artifact...), TypedArtifact: typed, Validation: validationBytes, RawSHA256: rawDigest(raw.Artifact), TypedSHA256: typedDigest, ValidationSHA256: validationDigest, TranscriptSHA256: rawDigest([]byte(raw.Transcript)), Claim: claim}, nil
 }
 
 func (s *Store) ProviderLaunchIdentity(ctx context.Context, claim ProviderAttemptClaim) (contracts.ProviderLaunch, error) {
@@ -399,7 +439,96 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 }
 
 func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, state, outcome string, usage int64, finished time.Time) error {
+	if state == "completed" || outcome == "completed" {
+		return ErrProviderAttempt
+	}
+	return s.finishProviderAttempt(ctx, claim, proof, expected, fence, state, outcome, usage, finished, nil)
+}
+
+// CompleteProviderAttemptSuccess is the only success terminal path. It writes
+// immutable evidence, marks both lifecycle rows completed, and releases the
+// exact lease in one SQLite transaction.
+func (s *Store) CompleteProviderAttemptSuccess(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, raw contracts.PhaseResult, validation phaseartifact.Validation, finished time.Time) (ProviderAttemptResult, error) {
+	if !raw.UsageTrusted || raw.UsageUnits < 0 {
+		return ProviderAttemptResult{}, ErrProviderAttempt
+	}
+	immutable, err := loadAuthenticatedProviderAttemptClaim(ctx, s.db, claim.ID)
+	if err != nil || !sameImmutableProviderAttemptClaim(claim, immutable) || claim.Input.RequestDigest != immutable.Input.RequestDigest {
+		return ProviderAttemptResult{}, ErrProviderAttempt
+	}
+	parsed, err := phaseartifact.Parse(claim.Phase, raw, validation)
+	if err != nil {
+		return ProviderAttemptResult{}, ErrProviderAttempt
+	}
+	if err := phaseartifact.ValidateMutationPaths(parsed, raw.ChangedFiles, immutable.Input.AllowedPaths); err != nil {
+		return ProviderAttemptResult{}, ErrProviderAttempt
+	}
+	result, err := makeProviderAttemptResult(claim, raw, validation, parsed)
+	if err != nil {
+		return ProviderAttemptResult{}, ErrProviderAttempt
+	}
+	if prior, _, loadErr := s.LoadProviderAttemptResult(ctx, claim, expected, fence); loadErr == nil {
+		if sameProviderAttemptResult(prior, result) {
+			return prior, nil
+		}
+		return ProviderAttemptResult{}, ErrProviderAttempt
+	}
+	err = s.finishProviderAttempt(ctx, claim, proof, expected, fence, "completed", "completed", raw.UsageUnits, finished, &result)
+	if err != nil {
+		// A concurrent exact replay may have committed between the initial
+		// lookup and our transaction.  Re-read instead of weakening the update
+		// fence; a different durable value always fails closed.
+		if prior, _, loadErr := s.LoadProviderAttemptResult(ctx, claim, expected, fence); loadErr == nil && sameProviderAttemptResult(prior, result) {
+			return prior, nil
+		}
+	}
+	return result, err
+}
+
+// immutableProviderAttemptInput rehydrates the Store-issued launch input
+// before result admission. Callers hold a copy of ProviderAttemptClaim and
+// must not be able to widen its allowed paths after BeginProviderAttempt.
+func loadAuthenticatedProviderAttemptClaim(ctx context.Context, query rowQueryer, id int64) (ProviderAttemptClaim, error) {
+	var value ProviderAttemptClaim
+	var channel, project, ticket string
+	var qualification sql.NullInt64
+	err := query.QueryRowContext(ctx, `SELECT a.channel,a.project_id,a.ticket_id,a.phase,a.attempt,a.provider,a.model,a.family,a.version,a.role,a.qualification_id,a.binding_digest,a.provider_lease_key,a.leader_epoch,a.runner_epoch,a.expected_ticket_version,a.repository_path,a.worktree_path,a.worktree_identity,a.base_sha,a.supervisor_key,a.auth_digest,a.auth_mode,q.binary_digest,q.policy_digest,q.fixture_digest,i.request_digest,i.canonical_input FROM provider_attempts a JOIN provider_qualifications q ON q.id=a.qualification_id AND q.channel=a.channel AND q.provider=a.provider AND q.model=a.model AND q.family=a.family AND q.provider_version=a.version AND q.profile IN ('qualified_guarded','autonomous_eligible') AND (a.provider<>'codex' OR (q.auth_digest=a.auth_digest AND q.auth_mode=a.auth_mode AND length(q.probe_digest)=64 AND q.attested_leader_epoch>0 AND length(q.attestation_signature)=64)) JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id WHERE a.id=?`, id).Scan(&channel, &project, &ticket, &value.Phase, &value.Attempt, &value.Binding.Identity.Provider, &value.Binding.Identity.Model, &value.Binding.Identity.Family, &value.Binding.Identity.Version, &value.Role, &qualification, &value.BindingDigest, &value.LeaseKey, &value.LeaderEpoch, &value.RunnerEpoch, &value.ExpectedVersion, &value.Repository, &value.Worktree, &value.WorktreeIdentity, &value.BaseSHA, &value.SupervisorKey, &value.Binding.AuthDigest, &value.Binding.AuthMode, &value.Binding.BinaryDigest, &value.Binding.PolicyDigest, &value.Binding.FixtureDigest, &value.RequestDigest, &value.RequestPayload)
+	if err != nil {
+		return ProviderAttemptClaim{}, err
+	}
+	value.ID, value.Ref = id, domain.TicketRef{Channel: domain.Channel(channel), Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
+	if qualification.Valid {
+		value.QualificationID = qualification.Int64
+	}
+	if !qualification.Valid {
+		return ProviderAttemptClaim{}, ErrProviderAttempt
+	}
+	if err := hydrateProviderAttemptInput(&value); err != nil {
+		return ProviderAttemptClaim{}, ErrProviderAttempt
+	}
+	if !validPersistedProviderAttemptClaim(value) {
+		return ProviderAttemptClaim{}, ErrProviderAttempt
+	}
+	return value, nil
+}
+
+func sameImmutableProviderAttemptClaim(a, b ProviderAttemptClaim) bool {
+	return a.ID == b.ID && a.Ref == b.Ref && a.Phase == b.Phase && a.Role == b.Role && a.Attempt == b.Attempt && a.Binding == b.Binding && a.QualificationID == b.QualificationID && a.LeaseKey == b.LeaseKey && a.BindingDigest == b.BindingDigest && a.LeaderEpoch == b.LeaderEpoch && a.RunnerEpoch == b.RunnerEpoch && a.ExpectedVersion == b.ExpectedVersion && a.Repository == b.Repository && a.Worktree == b.Worktree && a.WorktreeIdentity == b.WorktreeIdentity && a.BaseSHA == b.BaseSHA && bytes.Equal(a.SupervisorKey, b.SupervisorKey) && a.RequestDigest == b.RequestDigest && bytes.Equal(a.RequestPayload, b.RequestPayload) && reflect.DeepEqual(a.Input, b.Input)
+}
+
+func resultClaimMatchesSource(result, source ProviderAttemptClaim) bool {
+	return result.ID == source.ID && result.Ref == source.Ref && result.Phase == source.Phase && result.Role == source.Role && result.Attempt == source.Attempt && result.Binding.Identity == source.Binding.Identity && result.RequestDigest == source.RequestDigest && result.LeaderEpoch == source.LeaderEpoch && result.RunnerEpoch == source.RunnerEpoch && result.ExpectedVersion == source.ExpectedVersion && result.Repository == source.Repository && result.Worktree == source.Worktree && result.WorktreeIdentity == source.WorktreeIdentity && result.BaseSHA == source.BaseSHA
+}
+
+func sameProviderAttemptResult(a, b ProviderAttemptResult) bool {
+	return a.AttemptID == b.AttemptID && a.RawSHA256 == b.RawSHA256 && a.TypedSHA256 == b.TypedSHA256 && a.ValidationSHA256 == b.ValidationSHA256 && a.TranscriptSHA256 == b.TranscriptSHA256 && bytes.Equal(a.RawArtifact, b.RawArtifact) && bytes.Equal(a.TypedArtifact, b.TypedArtifact) && bytes.Equal(a.Validation, b.Validation)
+}
+
+func (s *Store) finishProviderAttempt(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, state, outcome string, usage int64, finished time.Time, result *ProviderAttemptResult) error {
 	if claim.ID <= 0 || claim.ExpectedVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || !validAttemptState(state) || !safeOutcome(outcome) || usage < 0 || finished.IsZero() {
+		return ErrProviderAttempt
+	}
+	if result != nil && (state != "completed" || outcome != "completed") {
 		return ErrProviderAttempt
 	}
 	if claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch {
@@ -410,9 +539,7 @@ func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttempt
 	}
 	return s.write(ctx, func(conn *sql.Conn) error {
 		var version, runner uint64
-		var persisted ProviderAttemptClaim
-		var persistedRole, persistedState, persistedBinding string
-		var persistedQualification sql.NullInt64
+		var persistedState string
 		if err := conn.QueryRowContext(ctx, `SELECT version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&version, &runner); err != nil {
 			return err
 		}
@@ -425,12 +552,14 @@ func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttempt
 		if err := s.currentFence(ctx, conn, claim.Ref.Channel, version, runner, fence); err != nil {
 			return err
 		}
-		if err := conn.QueryRowContext(ctx, `SELECT a.provider,a.model,a.family,a.version,a.role,a.state,a.qualification_id,a.binding_digest,i.request_digest,i.canonical_input FROM provider_attempts a JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id WHERE a.id=?`, claim.ID).Scan(&persisted.Binding.Identity.Provider, &persisted.Binding.Identity.Model, &persisted.Binding.Identity.Family, &persisted.Binding.Identity.Version, &persistedRole, &persistedState, &persistedQualification, &persistedBinding, &persisted.RequestDigest, &persisted.RequestPayload); err != nil {
+		persisted, err := loadAuthenticatedProviderAttemptClaim(ctx, conn, claim.ID)
+		if err != nil {
 			return err
 		}
-		persisted.Ref, persisted.Phase, persisted.Attempt, persisted.Role, persisted.LeaderEpoch, persisted.RunnerEpoch, persisted.ExpectedVersion, persisted.Repository, persisted.Worktree, persisted.WorktreeIdentity, persisted.BaseSHA = claim.Ref, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.Repository, claim.Worktree, claim.WorktreeIdentity, claim.BaseSHA
-		persisted.Binding.BinaryDigest, persisted.Binding.PolicyDigest, persisted.Binding.AuthDigest, persisted.Binding.AuthMode = claim.Binding.BinaryDigest, claim.Binding.PolicyDigest, claim.Binding.AuthDigest, claim.Binding.AuthMode
-		if persistedRole != claim.Role || persistedState != "active" || !persistedQualification.Valid || persistedQualification.Int64 != claim.QualificationID || persistedBinding == "" || persistedBinding != bindingDigest(claim.Binding) || claim.BindingDigest != "" && claim.BindingDigest != persistedBinding || persisted.RequestDigest != claim.RequestDigest || hydrateProviderAttemptInput(&persisted) != nil {
+		if err := conn.QueryRowContext(ctx, `SELECT state FROM provider_attempts WHERE id=?`, claim.ID).Scan(&persistedState); err != nil {
+			return err
+		}
+		if persistedState != "active" || !sameImmutableProviderAttemptClaim(claim, persisted) || claim.Input.RequestDigest != persisted.Input.RequestDigest || persisted.BindingDigest == "" || persisted.BindingDigest != bindingDigest(persisted.Binding) {
 			return ErrStaleFence
 		}
 		var maxCost, spent, maxDuration int64
@@ -454,6 +583,27 @@ func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttempt
 		if maxDuration <= 0 || finished.After(createdAt.Add(time.Duration(maxDuration))) {
 			return ErrBudgetExhausted
 		}
+		if result != nil {
+			if result.AttemptID != claim.ID || result.Claim.ID != claim.ID || result.Claim.Ref != claim.Ref || result.Claim.Phase != claim.Phase || result.Claim.Role != claim.Role || result.Claim.Attempt != claim.Attempt || result.Claim.Binding.Identity != claim.Binding.Identity || result.Claim.RequestDigest != claim.RequestDigest || result.Claim.LeaderEpoch != claim.LeaderEpoch || result.Claim.RunnerEpoch != claim.RunnerEpoch || result.Claim.ExpectedVersion != claim.ExpectedVersion || result.Claim.Repository != claim.Repository || result.Claim.Worktree != claim.Worktree || result.Claim.WorktreeIdentity != claim.WorktreeIdentity || result.Claim.BaseSHA != claim.BaseSHA || !validSHA256(result.RawSHA256) || !validSHA256(result.TypedSHA256) || !validSHA256(result.ValidationSHA256) || !validSHA256(result.TranscriptSHA256) || rawDigest(result.RawArtifact) != result.RawSHA256 || rawDigest(result.TypedArtifact) != result.TypedSHA256 || rawDigest(result.Validation) != result.ValidationSHA256 {
+				return ErrProviderAttempt
+			}
+			if artifact, err := phaseartifact.DecodeCanonicalTypedArtifact(result.TypedArtifact); err != nil || artifact.Phase != claim.Phase || artifact.Provider != claim.Binding.Identity {
+				return ErrProviderAttempt
+			}
+			validation, err := phaseartifact.DecodeCanonicalValidation(result.Validation)
+			if err != nil {
+				return ErrProviderAttempt
+			}
+			parsed, err := phaseartifact.Parse(claim.Phase, contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: result.RawArtifact}, validation)
+			canonical, _, canonicalErr := phaseartifact.CanonicalTypedArtifact(parsed)
+			if err != nil || canonicalErr != nil || !bytes.Equal(canonical, result.TypedArtifact) {
+				return ErrProviderAttempt
+			}
+			_, err = conn.ExecContext(ctx, `INSERT INTO provider_attempt_results(provider_attempt_id,channel,project_id,ticket_id,phase,role,attempt,provider,model,family,provider_version,request_digest,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha,raw_artifact,raw_sha256,typed_artifact,typed_sha256,validation,validation_sha256,transcript_sha256,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Role, claim.Attempt, claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version, claim.RequestDigest, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.Repository, claim.Worktree, claim.WorktreeIdentity, claim.BaseSHA, result.RawArtifact, result.RawSHA256, result.TypedArtifact, result.TypedSHA256, result.Validation, result.ValidationSHA256, result.TranscriptSHA256, finished.UTC().Format(time.RFC3339Nano))
+			if err != nil {
+				return err
+			}
+		}
 		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state=?,outcome=?,usage_units=?,finished_at=?,launch_state='drained' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND state='active'`, state, outcome, usage, finished.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion)
 		if err != nil {
 			return err
@@ -470,9 +620,107 @@ func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttempt
 		if n != 1 {
 			return ErrStaleFence
 		}
-		_, err = conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND scope='provider' AND scope_key=? AND project_id=? AND ticket_id=? AND runner_epoch=?`, claim.Ref.Channel, claim.LeaseKey, claim.Ref.Project, claim.Ref.Ticket, claim.RunnerEpoch)
-		return err
+		row, err = conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND scope='provider' AND scope_key=? AND project_id=? AND ticket_id=? AND runner_epoch=? AND EXISTS(SELECT 1 FROM provider_attempts a WHERE a.id=? AND a.channel=? AND a.project_id=? AND a.ticket_id=? AND a.phase=? AND a.attempt=? AND a.role=? AND a.provider=? AND a.model=? AND a.family=? AND a.version=? AND a.binding_digest=? AND a.provider_lease_key=? AND a.leader_epoch=? AND a.runner_epoch=? AND a.expected_ticket_version=? AND a.repository_path=? AND a.worktree_path=? AND a.worktree_identity=? AND a.base_sha=? AND a.auth_digest=? AND a.auth_mode=?)`, claim.Ref.Channel, claim.LeaseKey, claim.Ref.Project, claim.Ref.Ticket, claim.RunnerEpoch, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version, claim.BindingDigest, claim.LeaseKey, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.Repository, claim.Worktree, claim.WorktreeIdentity, claim.BaseSHA, claim.Binding.AuthDigest, claim.Binding.AuthMode)
+		if err != nil {
+			return err
+		}
+		if n, _ := row.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		return nil
 	})
+}
+
+// LoadProviderAttemptResult verifies immutable bindings and every canonical
+// representation before re-running semantic Parse. It is safe for restart
+// consumers: a model is never invoked here.
+func (s *Store) LoadProviderAttemptResult(ctx context.Context, claim ProviderAttemptClaim, expected uint64, fence domain.Fence) (ProviderAttemptResult, phaseartifact.Parsed, error) {
+	if claim.ID <= 0 || claim.ExpectedVersion != expected || claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+	}
+	var out ProviderAttemptResult
+	var c ProviderAttemptClaim
+	var attemptState, attemptOutcome, phaseState, phaseOutcome string
+	var ticketVersion, ticketRunner, leader uint64
+	err := s.db.QueryRowContext(ctx, `SELECT r.provider_attempt_id,r.channel,r.project_id,r.ticket_id,r.phase,r.role,r.attempt,r.provider,r.model,r.family,r.provider_version,r.request_digest,r.leader_epoch,r.runner_epoch,r.expected_ticket_version,r.repository_path,r.worktree_path,r.worktree_identity,r.base_sha,r.raw_artifact,r.raw_sha256,r.typed_artifact,r.typed_sha256,r.validation,r.validation_sha256,r.transcript_sha256,a.auth_mode,i.canonical_input,a.state,a.outcome,p.state,p.outcome,t.version,t.runner_epoch,d.leader_epoch FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id AND a.channel=r.channel AND a.project_id=r.project_id AND a.ticket_id=r.ticket_id AND a.phase=r.phase AND a.role=r.role AND a.attempt=r.attempt AND a.provider=r.provider AND a.model=r.model AND a.family=r.family AND a.version=r.provider_version AND a.leader_epoch=r.leader_epoch AND a.runner_epoch=r.runner_epoch AND a.expected_ticket_version=r.expected_ticket_version AND a.repository_path=r.repository_path AND a.worktree_path=r.worktree_path AND a.worktree_identity=r.worktree_identity AND a.base_sha=r.base_sha JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id AND i.request_digest=r.request_digest JOIN phase_runs p ON p.channel=r.channel AND p.project_id=r.project_id AND p.ticket_id=r.ticket_id AND p.phase=r.phase AND p.attempt=r.attempt AND p.provider=r.provider AND p.model=r.model AND p.family=r.family AND p.provider_version=r.provider_version AND p.leader_epoch=r.leader_epoch AND p.runner_epoch=r.runner_epoch AND p.expected_ticket_version=r.expected_ticket_version AND p.worktree_identity=r.worktree_identity AND p.base_sha=r.base_sha JOIN tickets t ON t.channel=r.channel AND t.project_id=r.project_id AND t.id=r.ticket_id JOIN daemon_instances d ON d.channel=r.channel WHERE r.provider_attempt_id=?`, claim.ID).Scan(&out.AttemptID, &c.Ref.Channel, &c.Ref.Project, &c.Ref.Ticket, &c.Phase, &c.Role, &c.Attempt, &c.Binding.Identity.Provider, &c.Binding.Identity.Model, &c.Binding.Identity.Family, &c.Binding.Identity.Version, &c.RequestDigest, &c.LeaderEpoch, &c.RunnerEpoch, &c.ExpectedVersion, &c.Repository, &c.Worktree, &c.WorktreeIdentity, &c.BaseSHA, &out.RawArtifact, &out.RawSHA256, &out.TypedArtifact, &out.TypedSHA256, &out.Validation, &out.ValidationSHA256, &out.TranscriptSHA256, &c.Binding.AuthMode, &c.RequestPayload, &attemptState, &attemptOutcome, &phaseState, &phaseOutcome, &ticketVersion, &ticketRunner, &leader)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+		}
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, normalizeBusy(ctx, err)
+	}
+	c.ID = out.AttemptID
+	source, sourceErr := loadAuthenticatedProviderAttemptClaim(ctx, s.db, out.AttemptID)
+	if sourceErr != nil || !resultClaimMatchesSource(c, source) {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	c, out.Claim = source, source
+	if attemptState != "completed" || attemptOutcome != "completed" || phaseState != "completed" || phaseOutcome != "completed" || ticketVersion != expected || ticketRunner != fence.RunnerEpoch || leader != fence.LeaderEpoch || c.Ref != claim.Ref || c.Phase != claim.Phase || c.Role != claim.Role || c.Attempt != claim.Attempt || c.Binding.Identity != claim.Binding.Identity || c.RequestDigest != claim.RequestDigest || c.LeaderEpoch != claim.LeaderEpoch || c.RunnerEpoch != claim.RunnerEpoch || c.ExpectedVersion != claim.ExpectedVersion || c.Repository != claim.Repository || c.Worktree != claim.Worktree || c.WorktreeIdentity != claim.WorktreeIdentity || c.BaseSHA != claim.BaseSHA || hydrateProviderAttemptInput(&c) != nil || !validSHA256(out.RawSHA256) || !validSHA256(out.TypedSHA256) || !validSHA256(out.ValidationSHA256) || !validSHA256(out.TranscriptSHA256) || rawDigest(out.RawArtifact) != out.RawSHA256 || rawDigest(out.TypedArtifact) != out.TypedSHA256 || rawDigest(out.Validation) != out.ValidationSHA256 {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	artifact, err := phaseartifact.DecodeCanonicalTypedArtifact(out.TypedArtifact)
+	if err != nil || artifact.Phase != c.Phase || artifact.Provider != c.Binding.Identity {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	validation, err := phaseartifact.DecodeCanonicalValidation(out.Validation)
+	if err != nil {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	parsed, err := phaseartifact.Parse(c.Phase, contracts.PhaseResult{Provider: c.Binding.Identity, Artifact: out.RawArtifact}, validation)
+	if err != nil {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	canonical, _, canonicalErr := phaseartifact.CanonicalTypedArtifact(parsed)
+	if canonicalErr != nil || !bytes.Equal(canonical, out.TypedArtifact) {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	return out, parsed, nil
+}
+
+// LoadHistoricalProviderAttemptResult reads a completed immutable result by
+// its exact historical identity. It authenticates all duplicated bindings
+// against provider_attempts, provider_attempt_inputs, and phase_runs, but does
+// not require those original fences to still be current.
+func (s *Store) LoadHistoricalProviderAttemptResult(ctx context.Context, key ProviderAttemptResultKey) (ProviderAttemptResult, phaseartifact.Parsed, error) {
+	if key.AttemptID <= 0 || key.Ref.Validate() != nil || key.Phase == "" || key.Attempt <= 0 {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	var out ProviderAttemptResult
+	var c ProviderAttemptClaim
+	var attemptState, attemptOutcome, phaseState, phaseOutcome string
+	err := s.db.QueryRowContext(ctx, `SELECT r.provider_attempt_id,r.channel,r.project_id,r.ticket_id,r.phase,r.role,r.attempt,r.provider,r.model,r.family,r.provider_version,r.request_digest,r.leader_epoch,r.runner_epoch,r.expected_ticket_version,r.repository_path,r.worktree_path,r.worktree_identity,r.base_sha,r.raw_artifact,r.raw_sha256,r.typed_artifact,r.typed_sha256,r.validation,r.validation_sha256,r.transcript_sha256,a.auth_mode,i.canonical_input,a.state,a.outcome,p.state,p.outcome FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id AND a.channel=r.channel AND a.project_id=r.project_id AND a.ticket_id=r.ticket_id AND a.phase=r.phase AND a.role=r.role AND a.attempt=r.attempt AND a.provider=r.provider AND a.model=r.model AND a.family=r.family AND a.version=r.provider_version AND a.leader_epoch=r.leader_epoch AND a.runner_epoch=r.runner_epoch AND a.expected_ticket_version=r.expected_ticket_version AND a.repository_path=r.repository_path AND a.worktree_path=r.worktree_path AND a.worktree_identity=r.worktree_identity AND a.base_sha=r.base_sha JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id AND i.request_digest=r.request_digest JOIN phase_runs p ON p.channel=r.channel AND p.project_id=r.project_id AND p.ticket_id=r.ticket_id AND p.phase=r.phase AND p.attempt=r.attempt AND p.provider=r.provider AND p.model=r.model AND p.family=r.family AND p.provider_version=r.provider_version AND p.leader_epoch=r.leader_epoch AND p.runner_epoch=r.runner_epoch AND p.expected_ticket_version=r.expected_ticket_version AND p.worktree_identity=r.worktree_identity AND p.base_sha=r.base_sha WHERE r.provider_attempt_id=? AND r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase=? AND r.attempt=?`, key.AttemptID, key.Ref.Channel, key.Ref.Project, key.Ref.Ticket, key.Phase, key.Attempt).Scan(&out.AttemptID, &c.Ref.Channel, &c.Ref.Project, &c.Ref.Ticket, &c.Phase, &c.Role, &c.Attempt, &c.Binding.Identity.Provider, &c.Binding.Identity.Model, &c.Binding.Identity.Family, &c.Binding.Identity.Version, &c.RequestDigest, &c.LeaderEpoch, &c.RunnerEpoch, &c.ExpectedVersion, &c.Repository, &c.Worktree, &c.WorktreeIdentity, &c.BaseSHA, &out.RawArtifact, &out.RawSHA256, &out.TypedArtifact, &out.TypedSHA256, &out.Validation, &out.ValidationSHA256, &out.TranscriptSHA256, &c.Binding.AuthMode, &c.RequestPayload, &attemptState, &attemptOutcome, &phaseState, &phaseOutcome)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrNotFound
+		}
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, normalizeBusy(ctx, err)
+	}
+	c.ID = out.AttemptID
+	source, sourceErr := loadAuthenticatedProviderAttemptClaim(ctx, s.db, out.AttemptID)
+	if sourceErr != nil || !resultClaimMatchesSource(c, source) {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	c, out.Claim = source, source
+	if c.Ref != key.Ref || c.Phase != key.Phase || c.Attempt != key.Attempt || attemptState != "completed" || attemptOutcome != "completed" || phaseState != "completed" || phaseOutcome != "completed" || hydrateProviderAttemptInput(&out.Claim) != nil || !validSHA256(out.RawSHA256) || !validSHA256(out.TypedSHA256) || !validSHA256(out.ValidationSHA256) || !validSHA256(out.TranscriptSHA256) || rawDigest(out.RawArtifact) != out.RawSHA256 || rawDigest(out.TypedArtifact) != out.TypedSHA256 || rawDigest(out.Validation) != out.ValidationSHA256 {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	typed, err := phaseartifact.DecodeCanonicalTypedArtifact(out.TypedArtifact)
+	if err != nil || typed.Phase != c.Phase || typed.Provider != c.Binding.Identity {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	validation, err := phaseartifact.DecodeCanonicalValidation(out.Validation)
+	if err != nil {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	parsed, err := phaseartifact.Parse(c.Phase, contracts.PhaseResult{Provider: c.Binding.Identity, Artifact: out.RawArtifact}, validation)
+	if err != nil {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	canonical, _, err := phaseartifact.CanonicalTypedArtifact(parsed)
+	if err != nil || !bytes.Equal(canonical, out.TypedArtifact) {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	return out, parsed, nil
 }
 
 // FailProviderAttemptBeforeLaunch releases a claim only when adapter

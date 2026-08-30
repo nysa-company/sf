@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -114,6 +115,161 @@ type Validation struct {
 	ApprovedAmendmentDigest string
 	ExpectedReviewedHead    string
 	ExpectedProofDigest     string
+}
+
+// CanonicalArtifact is the durable, transcript-free representation of a
+// successful provider answer.  json.Marshal of this struct is deterministic:
+// it has no maps and its field order is part of the wire format.
+type CanonicalArtifact struct {
+	Phase    domain.Phase            `json:"phase"`
+	Provider domain.ProviderIdentity `json:"provider"`
+	Planner  *Planner                `json:"planner,omitempty"`
+	Verify   *Verification           `json:"verification,omitempty"`
+	Builder  *Builder                `json:"builder,omitempty"`
+	Reviewer *Reviewer               `json:"reviewer,omitempty"`
+}
+
+// CanonicalTypedArtifact stores the validated, role-specific structured value,
+// never a second encoding of the provider's raw JSON artifact.
+func CanonicalTypedArtifact(parsed Parsed) ([]byte, string, error) {
+	if err := validateProvider(parsed.Provider); err != nil {
+		return nil, "", errors.New("invalid provider artifact")
+	}
+	value := CanonicalArtifact{Phase: parsed.Phase, Provider: parsed.Provider, Planner: parsed.Planner, Verify: parsed.Verify, Builder: parsed.Builder, Reviewer: parsed.Reviewer}
+	if !validCanonicalArtifact(value) {
+		return nil, "", errors.New("invalid typed provider artifact")
+	}
+	b, err := json.Marshal(value)
+	if err != nil || len(b) > MaxBytes*2 {
+		return nil, "", errors.New("canonical artifact too large")
+	}
+	s := sha256.Sum256(b)
+	return b, hex.EncodeToString(s[:]), nil
+}
+
+func DecodeCanonicalTypedArtifact(data []byte) (CanonicalArtifact, error) {
+	var value CanonicalArtifact
+	if len(data) == 0 || len(data) > MaxBytes*2 || decodeStrict(data, &value) != nil {
+		return CanonicalArtifact{}, errors.New("invalid canonical artifact")
+	}
+	canonical, _, err := CanonicalTypedArtifact(Parsed{Phase: value.Phase, Provider: value.Provider, Planner: value.Planner, Verify: value.Verify, Builder: value.Builder, Reviewer: value.Reviewer})
+	if err != nil || !bytes.Equal(canonical, data) {
+		return CanonicalArtifact{}, errors.New("canonical artifact is not canonical")
+	}
+	return value, nil
+}
+
+func validCanonicalArtifact(value CanonicalArtifact) bool {
+	switch value.Phase {
+	case domain.PhasePlanning:
+		return value.Planner != nil && value.Verify == nil && value.Builder == nil && value.Reviewer == nil
+	case domain.PhaseVerification:
+		return value.Planner == nil && value.Verify != nil && value.Builder == nil && value.Reviewer == nil
+	case domain.PhaseBuild:
+		return value.Planner == nil && value.Verify == nil && value.Builder != nil && value.Reviewer == nil
+	case domain.PhaseReview:
+		return value.Planner == nil && value.Verify == nil && value.Builder == nil && value.Reviewer != nil
+	default:
+		return false
+	}
+}
+
+// ValidateMutationPaths makes the parsed artifact, not adapter metadata, the
+// authority for repository mutations. Builders and verification providers
+// must name their paths in the typed artifact. An adapter inventory, when
+// present, must exactly agree; an empty inventory cannot erase a declaration.
+func ValidateMutationPaths(parsed Parsed, reported, allowed []string) error {
+	var declared []string
+	switch parsed.Phase {
+	case domain.PhaseBuild:
+		if parsed.Builder == nil {
+			return errors.New("missing builder artifact")
+		}
+		var err error
+		declared, err = paths(parsed.Builder.ChangedFiles)
+		if err != nil {
+			return err
+		}
+	case domain.PhaseVerification:
+		if parsed.Verify == nil {
+			return errors.New("missing verification artifact")
+		}
+		var err error
+		declared, err = paths(parsed.Verify.OwnedFiles)
+		if err != nil {
+			return err
+		}
+	case domain.PhasePlanning, domain.PhaseReview:
+		if parsed.Planner == nil && parsed.Reviewer == nil {
+			return errors.New("missing phase artifact")
+		}
+		declared = []string{}
+	default:
+		return errors.New("unsupported artifact phase")
+	}
+	// A nil inventory means the adapter did not report filesystem metadata
+	// (Codex deliberately does this). An explicit empty list is an assertion
+	// that must agree with the typed artifact, and cannot erase its paths.
+	if reported != nil {
+		reportedCanonical, err := paths(reported)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(declared, reportedCanonical) {
+			return errors.New("adapter changed-file inventory disagrees with typed artifact")
+		}
+	}
+	if !allowedMutationPrefixes(allowed) {
+		return errors.New("invalid allowed paths")
+	}
+	for _, path := range declared {
+		ok := false
+		for _, prefix := range allowed {
+			if prefix == "." || path == prefix || strings.HasPrefix(path, prefix+"/") {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return fmt.Errorf("declared mutation path %q is outside allowed paths", path)
+		}
+	}
+	return nil
+}
+
+func allowedMutationPrefixes(values []string) bool {
+	if len(values) == 0 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, value := range values {
+		if value == "" || filepath.IsAbs(value) || filepath.ToSlash(filepath.Clean(value)) != value || (value != "." && (value == ".." || strings.HasPrefix(value, "../"))) || seen[value] {
+			return false
+		}
+		seen[value] = true
+	}
+	return true
+}
+
+// CanonicalValidation persists all semantic fences Parse needs after restart.
+func CanonicalValidation(validation Validation) ([]byte, string, error) {
+	b, err := json.Marshal(validation)
+	if err != nil || len(b) == 0 || len(b) > 64<<10 {
+		return nil, "", errors.New("invalid validation")
+	}
+	s := sha256.Sum256(b)
+	return b, hex.EncodeToString(s[:]), nil
+}
+func DecodeCanonicalValidation(data []byte) (Validation, error) {
+	var value Validation
+	if len(data) == 0 || len(data) > 64<<10 || decodeStrict(data, &value) != nil {
+		return Validation{}, errors.New("invalid canonical validation")
+	}
+	canonical, _, err := CanonicalValidation(value)
+	if err != nil || !bytes.Equal(canonical, data) {
+		return Validation{}, errors.New("canonical validation is not canonical")
+	}
+	return value, nil
 }
 
 func Parse(phase domain.Phase, result contracts.PhaseResult, validation Validation) (Parsed, error) {

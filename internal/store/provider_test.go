@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/phaseartifact"
 )
 
 var providerTestSigner, _ = contracts.NewDrainSigner()
@@ -54,14 +56,14 @@ func TestProviderAdmissionUsesPairCapacityAndFreshFences(t *testing.T) {
 	if !errors.Is(err, ErrProviderCapacity) {
 		t.Fatalf("second admission=%v", err)
 	}
-	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), first.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: first.RunnerEpoch}, "completed", "completed", 1, time.Now().UTC()); err != nil {
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), first.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: first.RunnerEpoch}, "failed", "failed", 1, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	var provider, model, family, version, outcome string
 	if err := db.db.QueryRowContext(ctx, `SELECT provider,model,family,provider_version,outcome FROM phase_runs WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=?`, first.Ref.Channel, first.Ref.Project, first.Ref.Ticket, domain.PhaseBuild, claim.Attempt).Scan(&provider, &model, &family, &version, &outcome); err != nil {
 		t.Fatal(err)
 	}
-	if provider != binding.Identity.Provider || model != binding.Identity.Model || family != binding.Identity.Family || version != binding.Identity.Version || outcome != "completed" {
+	if provider != binding.Identity.Provider || model != binding.Identity.Model || family != binding.Identity.Family || version != binding.Identity.Version || outcome != "failed" {
 		t.Fatalf("phase row lost provider binding: %s/%s/%s/%s outcome=%s", provider, model, family, version, outcome)
 	}
 	if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: second.Ref, ExpectedVersion: second.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: second.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); err != nil {
@@ -202,7 +204,7 @@ func TestReviewerMayBeFreshTwiceButNeverShareBuilderFamily(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", phase, err)
 		}
-		if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, "completed", "completed", 1, time.Now().UTC()); err != nil {
+		if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, "failed", "failed", 1, time.Now().UTC()); err != nil {
 			t.Fatal(err)
 		}
 		if phase == domain.PhaseVerification {
@@ -313,7 +315,7 @@ func TestProviderFinishRejectsStaleClaimAndPreservesLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), advanced.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: advanced.RunnerEpoch}, "completed", "completed", 1, time.Now().UTC()); !errors.Is(err, ErrStaleFence) {
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), advanced.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: advanced.RunnerEpoch}, "failed", "failed", 1, time.Now().UTC()); !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("stale finish=%v", err)
 	}
 	claims, err := db.ProviderAttempts(ctx, ticket.Ref)
@@ -323,6 +325,191 @@ func TestProviderFinishRejectsStaleClaimAndPreservesLease(t *testing.T) {
 	leases, err := db.Leases(ctx, domain.ChannelDev)
 	if err != nil || len(leases) != 1 {
 		t.Fatalf("stale finish leases=%+v err=%v", leases, err)
+	}
+}
+
+func TestCompleteProviderAttemptSuccessPersistsAndReparses(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "result-persist")
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-result-persist", leader), leader, domain.StateBuilding)
+	builder, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Codex supplies no ChangedFiles inventory; typed artifact paths remain the authority.
+	raw := contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: []byte(`{"schema":"sf.builder/v1","summary":"done","changed_files":["main.go"],"commands":[["go","test","./..."]]}`), UsageTrusted: true, UsageUnits: 1, Transcript: "never stored"}
+	mutatedClaim := claim
+	mutatedClaim.Input.AllowedPaths = []string{"other"}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, mutatedClaim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("mutated allowed paths=%v", err)
+	}
+	mutatedClaim = claim
+	mutatedClaim.Input.RequestDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, mutatedClaim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("mutated input request digest=%v", err)
+	}
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "completed", "completed", 1, time.Now().UTC()); !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("legacy success finish=%v", err)
+	}
+	badUsage := raw
+	badUsage.UsageTrusted = false
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, badUsage, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("untrusted usage=%v", err)
+	}
+	var count int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("premature result count=%d err=%v", count, err)
+	}
+	stored, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, parsed, err := db.LoadProviderAttemptResult(ctx, claim, ticket.Version, fence)
+	if err != nil || parsed.Builder == nil || loaded.RawSHA256 != stored.RawSHA256 || loaded.Claim.BindingDigest != claim.BindingDigest || loaded.Claim.LeaseKey != claim.LeaseKey || !bytes.Equal(loaded.Claim.SupervisorKey, claim.SupervisorKey) || loaded.Claim.Input.RequestDigest != claim.Input.RequestDigest {
+		t.Fatalf("load=%+v parsed=%+v err=%v", loaded, parsed, err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempt_results SET raw_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE provider_attempt_id=?`, claim.ID); err == nil {
+		t.Fatal("immutable result updated")
+	}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); err != nil {
+		t.Fatalf("exact replay=%v", err)
+	}
+	conflict := raw
+	conflict.Artifact = []byte(`{"schema":"sf.builder/v1","summary":"different","changed_files":["main.go"],"commands":[["go","test","./..."]]}`)
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, conflict, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("conflicting replay=%v", err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE daemon_instances SET leader_epoch=leader_epoch+1 WHERE channel=?`, ticket.Ref.Channel); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.LoadProviderAttemptResult(ctx, claim, ticket.Version, fence); !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("stale current fence load=%v", err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE daemon_instances SET leader_epoch=? WHERE channel=?`, leader, ticket.Ref.Channel); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_qualifications SET binary_digest='dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' WHERE id=?`, claim.QualificationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: claim.ID, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt}); !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("tampered qualification load=%v", err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempts SET worktree_path='tampered' WHERE id=?`, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.LoadProviderAttemptResult(ctx, claim, ticket.Version, fence); err == nil {
+		t.Fatalf("tampered source load=%v", err)
+	}
+}
+
+func TestProviderResultInsertFailureRollsBackTerminalCompletion(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "result-rollback")
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-result-rollback", leader), leader, domain.StateBuilding)
+	builder, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `CREATE TRIGGER provider_result_fault AFTER INSERT ON provider_attempt_results BEGIN SELECT RAISE(ABORT,'injected result insert failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	defer db.db.ExecContext(ctx, `DROP TRIGGER provider_result_fault`)
+	raw := contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: []byte(`{"schema":"sf.builder/v1","summary":"done","changed_files":["main.go"],"commands":[["go","test","./..."]]}`), UsageTrusted: true, UsageUnits: 1}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); err == nil {
+		t.Fatal("injected success completed")
+	}
+	var state string
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM provider_attempts WHERE id=?`, claim.ID).Scan(&state); err != nil || state != "active" {
+		t.Fatalf("attempt state=%q err=%v", state, err)
+	}
+	var results, leases int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&results); err != nil || results != 0 {
+		t.Fatalf("results=%d err=%v", results, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases WHERE channel=? AND scope='provider'`, ticket.Ref.Channel).Scan(&leases); err != nil || leases != 1 {
+		t.Fatalf("leases=%d err=%v", leases, err)
+	}
+}
+
+func TestProviderCompletionMissingLeaseRollsBack(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "result-missing-lease")
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-result-missing-lease", leader), leader, domain.StateBuilding)
+	builder, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND scope='provider' AND scope_key=?`, ticket.Ref.Channel, claim.LeaseKey); err != nil {
+		t.Fatal(err)
+	}
+	raw := contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: []byte(`{"schema":"sf.builder/v1","summary":"done","changed_files":["main.go"],"commands":[["go","test","./..."]]}`), UsageTrusted: true, UsageUnits: 1}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("missing lease completion=%v", err)
+	}
+	var state, phaseState string
+	var results int
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM provider_attempts WHERE id=?`, claim.ID).Scan(&state); err != nil || state != "active" {
+		t.Fatalf("attempt=%s err=%v", state, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM phase_runs WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, claim.Phase, claim.Attempt).Scan(&phaseState); err != nil || phaseState != "active" {
+		t.Fatalf("phase=%s err=%v", phaseState, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&results); err != nil || results != 0 {
+		t.Fatalf("results=%d err=%v", results, err)
+	}
+}
+
+func TestHistoricalProviderResultSurvivesTransitionAndLeaderRestart(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "historical-result")
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-historical-result", leader), leader, domain.StatePlanning)
+	planner, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"proof"},"paths":["main.go"],"commands":[["go","test"]],"risks":["risk"]}`), UsageTrusted: true, UsageUnits: 1}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	key := ProviderAttemptResultKey{AttemptID: claim.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: claim.Attempt}
+	if _, parsed, err := db.LoadHistoricalProviderAttemptResult(ctx, key); err != nil || parsed.Planner == nil {
+		t.Fatalf("initial historical=%+v err=%v", parsed, err)
+	}
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateVerifying)
+	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "historical-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, parsed, err := db.LoadHistoricalProviderAttemptResult(ctx, key); err != nil || parsed.Planner == nil {
+		t.Fatalf("post restart historical=%+v err=%v", parsed, err)
+	}
+	wrong := key
+	wrong.Attempt++
+	if _, _, err := db.LoadHistoricalProviderAttemptResult(ctx, wrong); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("wrong historical key=%v", err)
+	}
+	wrong = key
+	wrong.Ref.Ticket = "SF-other"
+	if _, _, err := db.LoadHistoricalProviderAttemptResult(ctx, wrong); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("wrong ref=%v", err)
+	}
+	if _, _, err := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: claim.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: claim.Attempt}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("wrong phase=%v", err)
+	}
+	if newLeader == leader {
+		t.Fatal("leader did not advance")
 	}
 }
 
@@ -365,10 +552,10 @@ func TestProviderFinishRejectsUsageBeyondTicketCeiling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "completed", "completed", ticket.MaxCostMicroUSD+1, time.Now().UTC()); !errors.Is(err, ErrBudgetExhausted) {
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "failed", ticket.MaxCostMicroUSD+1, time.Now().UTC()); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("overspend finish=%v", err)
 	}
-	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "completed", "completed", 1, ticket.CreatedAt.Add(ticket.MaxDuration).Add(time.Nanosecond)); !errors.Is(err, ErrBudgetExhausted) {
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "failed", 1, ticket.CreatedAt.Add(ticket.MaxDuration).Add(time.Nanosecond)); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("late finish=%v", err)
 	}
 	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)

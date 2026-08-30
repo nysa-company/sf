@@ -335,6 +335,55 @@ func TestV28QuarantinesReleasedInvalidInputAndSurfacesRecoveryBlocker(t *testing
 	}
 }
 
+func TestV29RetiresResultlessLegacySuccessAndProviderLease(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "v28.sqlite")
+	createDatabaseAtVersion(t, path, 28)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.ExecContext(ctx, `PRAGMA foreign_keys=ON;
+		INSERT INTO daemon_instances(channel,leader_epoch,identity,updated_at) VALUES('dev',1,'legacy','now');
+		INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('dev','p','/tmp/p','main');
+		INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES('dev','p','T','source','feature','guarded','building',1,1,'wf');
+		INSERT INTO phase_runs(channel,project_id,ticket_id,phase,attempt,state,leader_epoch,runner_epoch,expected_ticket_version,provider,model,family,provider_version,worktree_identity,base_sha,started_at,outcome) VALUES('dev','p','T','build',1,'completed',1,1,1,'legacy','m','f','v','wt','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','now','passed');
+		INSERT INTO phase_runs(channel,project_id,ticket_id,phase,attempt,state,leader_epoch,runner_epoch,expected_ticket_version,provider,model,family,provider_version,worktree_identity,base_sha,started_at,outcome) VALUES('dev','p','T','planning',2,'completed',1,1,1,'orphan','m','f','v','wt','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','now','completed');
+		INSERT INTO phase_runs(channel,project_id,ticket_id,phase,attempt,state,leader_epoch,runner_epoch,expected_ticket_version,provider,model,family,provider_version,worktree_identity,base_sha,started_at,outcome) VALUES('dev','p','T','verification',3,'completed',1,1,1,'mismatch','m','f','v','wt','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','now','passed');
+		INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,leader_epoch,runner_epoch,expected_ticket_version,worktree_identity,base_sha,provider_lease_key) VALUES('dev','p','T','build',1,'legacy','m','f','v','completed',1,1,1,'wt','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','');
+		INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,leader_epoch,runner_epoch,expected_ticket_version,worktree_identity,base_sha,provider_lease_key) VALUES('dev','p','T','verification',3,'other','m','f','v','completed',1,1,1,'wt','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','other-lease');
+		INSERT INTO leases(channel,project_id,scope,scope_key,ticket_id,runner_epoch,acquired_at) VALUES('dev','p','provider','','T',1,'now')`)
+	if err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	raw.Close()
+	db, err := OpenChannel(ctx, path, filepath.Join(root, "backups"), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var attemptState, attemptOutcome, phaseState, phaseOutcome string
+	if err := db.db.QueryRowContext(ctx, `SELECT state,outcome FROM provider_attempts WHERE channel='dev' AND project_id='p' AND ticket_id='T'`).Scan(&attemptState, &attemptOutcome); err != nil || attemptState != "failed" || attemptOutcome != "invalid_artifact" {
+		t.Fatalf("attempt=%s/%s err=%v", attemptState, attemptOutcome, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT state,outcome FROM phase_runs WHERE channel='dev' AND project_id='p' AND ticket_id='T' AND phase='build'`).Scan(&phaseState, &phaseOutcome); err != nil || phaseState != "failed" || phaseOutcome != "invalid_artifact" {
+		t.Fatalf("phase=%s/%s err=%v", phaseState, phaseOutcome, err)
+	}
+	var unsafeSuccess int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM phase_runs WHERE channel='dev' AND project_id='p' AND ticket_id='T' AND state='completed' AND outcome IN ('completed','passed')`).Scan(&unsafeSuccess); err != nil || unsafeSuccess != 0 {
+		t.Fatalf("remaining unsafe phases=%d err=%v", unsafeSuccess, err)
+	}
+	var results, leases int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results`).Scan(&results); err != nil || results != 0 {
+		t.Fatalf("results=%d err=%v", results, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases WHERE scope='provider'`).Scan(&leases); err != nil || leases != 0 {
+		t.Fatalf("leases=%d err=%v", leases, err)
+	}
+}
+
 func TestFutureAndForeignSchemasRefuseBeforePragmaOrBackupMutation(t *testing.T) {
 	ctx := context.Background()
 	for _, test := range []struct {
