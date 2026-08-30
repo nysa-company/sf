@@ -743,3 +743,80 @@ var migrationV35 = []string{
 		FROM tickets
 		WHERE state='blocked' AND blocked_code='legacy_workflow_evidence_unverifiable' AND resume_state IN ('planning','verifying','building')`,
 }
+
+// v36 makes a repository-command terminal observation durable authority. It
+// intentionally does not alter v33's claim/lease rows or v34's provider
+// bindings: both are historical compatibility evidence. Result rows copy the
+// complete Store-issued claim and are keyed by (semantic_key, claim_epoch), so
+// a safe retry cannot silently replace an observation from an earlier claim.
+var migrationV36 = []string{
+	`CREATE TABLE repository_command_results (
+		semantic_key TEXT NOT NULL, claim_epoch INTEGER NOT NULL CHECK(claim_epoch > 0),
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		request_digest TEXT NOT NULL, ticket_version INTEGER NOT NULL CHECK(ticket_version > 0), leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > 0),
+		repository_path TEXT NOT NULL, worktree_path TEXT NOT NULL, worktree_identity TEXT NOT NULL, branch_ref TEXT NOT NULL, base_ref TEXT NOT NULL, base_sha TEXT NOT NULL,
+		command_digest TEXT NOT NULL, spec_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, executable_path TEXT NOT NULL, executable_digest TEXT NOT NULL,
+		exit_code INTEGER NOT NULL, stdout BLOB NOT NULL CHECK(length(stdout) <= 65536), stderr BLOB NOT NULL CHECK(length(stderr) <= 65536), output_last_message BLOB NOT NULL CHECK(length(output_last_message) <= 1048576),
+		stdout_truncated INTEGER NOT NULL CHECK(stdout_truncated IN (0,1)), stderr_truncated INTEGER NOT NULL CHECK(stderr_truncated IN (0,1)), output_last_message_truncated INTEGER NOT NULL CHECK(output_last_message_truncated IN (0,1)),
+		duration_ns INTEGER NOT NULL CHECK(duration_ns >= 0), observed_at TEXT NOT NULL,
+		stdout_digest TEXT NOT NULL CHECK(length(stdout_digest)=71), stderr_digest TEXT NOT NULL CHECK(length(stderr_digest)=71), output_last_message_digest TEXT NOT NULL CHECK(length(output_last_message_digest)=71), result_digest TEXT NOT NULL CHECK(length(result_digest)=71),
+		created_at TEXT NOT NULL,
+		PRIMARY KEY(semantic_key,claim_epoch),
+		FOREIGN KEY(semantic_key) REFERENCES effects(semantic_key),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+	`CREATE INDEX repository_command_results_ticket ON repository_command_results(channel,project_id,ticket_id,worktree_path,base_sha,created_at)`,
+	`CREATE TRIGGER repository_command_results_immutable_update BEFORE UPDATE ON repository_command_results BEGIN SELECT RAISE(ABORT,'repository command result is immutable'); END`,
+	`CREATE TRIGGER repository_command_results_immutable_delete BEFORE DELETE ON repository_command_results BEGIN SELECT RAISE(ABORT,'repository command result is append-only'); END`,
+	`CREATE TABLE verification_command_result_bindings (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision > 0),
+		binding_ticket_version INTEGER NOT NULL CHECK(binding_ticket_version > 0), leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > 0),
+		semantic_key TEXT NOT NULL, claim_epoch INTEGER NOT NULL CHECK(claim_epoch > 0), command_digest TEXT NOT NULL, spec_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, executable_path TEXT NOT NULL, executable_digest TEXT NOT NULL, expected_outcome TEXT NOT NULL CHECK(expected_outcome IN ('red','missing','baseline','dry_run','check_failed','report_ready')),
+		PRIMARY KEY(channel,project_id,ticket_id,revision),
+		FOREIGN KEY(channel,project_id,ticket_id,revision) REFERENCES verification_revisions(channel,project_id,ticket_id,revision),
+		FOREIGN KEY(semantic_key,claim_epoch) REFERENCES repository_command_results(semantic_key,claim_epoch),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+	`CREATE TABLE candidate_command_result_bindings (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation > 0),
+		binding_ticket_version INTEGER NOT NULL CHECK(binding_ticket_version > 0), leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > 0),
+		semantic_key TEXT NOT NULL, claim_epoch INTEGER NOT NULL CHECK(claim_epoch > 0), command_digest TEXT NOT NULL, spec_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, executable_path TEXT NOT NULL, executable_digest TEXT NOT NULL,
+		PRIMARY KEY(channel,project_id,ticket_id,generation),
+		FOREIGN KEY(channel,project_id,ticket_id,generation) REFERENCES candidate_snapshots(channel,project_id,ticket_id,generation),
+		FOREIGN KEY(semantic_key,claim_epoch) REFERENCES repository_command_results(semantic_key,claim_epoch),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+	`CREATE TRIGGER verification_command_result_bindings_immutable_update BEFORE UPDATE ON verification_command_result_bindings BEGIN SELECT RAISE(ABORT,'verification command result binding is append-only'); END`,
+	`CREATE TRIGGER verification_command_result_bindings_immutable_delete BEFORE DELETE ON verification_command_result_bindings BEGIN SELECT RAISE(ABORT,'verification command result binding is append-only'); END`,
+	`CREATE TRIGGER candidate_command_result_bindings_immutable_update BEFORE UPDATE ON candidate_command_result_bindings BEGIN SELECT RAISE(ABORT,'candidate command result binding is append-only'); END`,
+	`CREATE TRIGGER candidate_command_result_bindings_immutable_delete BEFORE DELETE ON candidate_command_result_bindings BEGIN SELECT RAISE(ABORT,'candidate command result binding is append-only'); END`,
+	// A legacy verification artifact without the new command binding is not
+	// equivalent to no artifact. A just-entered verifying ticket with a valid
+	// plan and no reviewer artifact remains resumable so it can create fresh
+	// command evidence. Building always consumes verification evidence, and a
+	// legacy candidate is likewise not promotable.
+	`UPDATE tickets SET state='blocked',resume_state=state,blocked_code='legacy_repository_command_evidence_unverifiable',version=version+1
+		WHERE state='verifying' AND EXISTS(
+			SELECT 1 FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision
+			WHERE v.channel=tickets.channel AND v.project_id=tickets.project_id AND v.ticket_id=tickets.id
+			AND NOT EXISTS(SELECT 1 FROM verification_command_result_bindings b WHERE b.channel=r.channel AND b.project_id=r.project_id AND b.ticket_id=r.ticket_id AND b.revision=r.revision)
+		)`,
+	`UPDATE tickets SET state='blocked',resume_state=state,blocked_code='legacy_repository_command_evidence_unverifiable',version=version+1
+		WHERE state='building' AND (
+			NOT EXISTS(
+				SELECT 1 FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision
+				JOIN verification_command_result_bindings b ON b.channel=r.channel AND b.project_id=r.project_id AND b.ticket_id=r.ticket_id AND b.revision=r.revision
+				JOIN repository_command_results cr ON cr.semantic_key=b.semantic_key AND cr.claim_epoch=b.claim_epoch
+				WHERE v.channel=tickets.channel AND v.project_id=tickets.project_id AND v.ticket_id=tickets.id
+					AND ((b.expected_outcome IN ('red','missing','check_failed') AND cr.exit_code<>0) OR (b.expected_outcome IN ('baseline','dry_run','report_ready') AND cr.exit_code=0))
+			)
+			OR EXISTS(
+				SELECT 1 FROM candidate_snapshots c WHERE c.channel=tickets.channel AND c.project_id=tickets.project_id AND c.ticket_id=tickets.id
+				AND c.generation=(SELECT MAX(latest.generation) FROM candidate_snapshots latest WHERE latest.channel=c.channel AND latest.project_id=c.project_id AND latest.ticket_id=c.ticket_id)
+				AND NOT EXISTS(SELECT 1 FROM candidate_command_result_bindings b JOIN repository_command_results cr ON cr.semantic_key=b.semantic_key AND cr.claim_epoch=b.claim_epoch WHERE b.channel=c.channel AND b.project_id=c.project_id AND b.ticket_id=c.ticket_id AND b.generation=c.generation AND cr.exit_code=0 AND cr.policy_digest=c.command_policy_digest)
+			)
+		)`,
+	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at)
+		SELECT channel,project_id,id,version,'typed_blocker',resume_state,'blocked','{"code":"legacy_repository_command_evidence_unverifiable","reason":"legacy repository command evidence is unverifiable","next_action":"start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		FROM tickets WHERE state='blocked' AND blocked_code='legacy_repository_command_evidence_unverifiable' AND resume_state IN ('verifying','building')`,
+}

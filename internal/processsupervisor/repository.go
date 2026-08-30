@@ -417,7 +417,7 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if stdout.overflow || stderr.overflow {
 		return contracts.CommandResult{}, errors.New("repository command output exceeds limit")
 	}
-	result := contracts.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), Duration: time.Since(started), ExitCode: 0, Observed: true}
+	result := contracts.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), Duration: time.Since(started), ExitCode: 0, Observed: true, ObservedAt: time.Now().UTC()}
 	if waitErr != nil {
 		if ee, ok := waitErr.(*exec.ExitError); ok {
 			result.ExitCode = ee.ExitCode()

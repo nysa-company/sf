@@ -66,6 +66,17 @@ func (s *Store) IssueRepositoryCommandClaim(ctx context.Context, intent Reposito
 		if err := s.assertTicketFence(ctx, conn, intent.Ref, intent.TicketVersion, intent.Fence); err != nil {
 			return err
 		}
+		// An observed result is immutable terminal authority for this semantic
+		// request, including a non-zero exit used as red verification evidence.
+		// Retrying must use a new canonical semantic request, never claim a later
+		// epoch that could weaken the historical witness.
+		var completed int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_results WHERE semantic_key=?`, intent.SemanticKey).Scan(&completed); err != nil || completed != 0 {
+			if err != nil {
+				return err
+			}
+			return ErrRepositoryCommandIntent
+		}
 		// The issue response is allowed to be lost. Before the gate has opened,
 		// repeating the exact request must return the original durable claim,
 		// rather than minting a second claim epoch or stranding the first one.

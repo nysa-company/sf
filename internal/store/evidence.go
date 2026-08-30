@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
 	"github.com/nysa-company/sf/internal/workflowprompt"
@@ -61,6 +62,9 @@ type VerificationArtifact struct {
 	// its durable projections.
 	ProviderResult *ProviderAttemptResultKey
 	Checkpoint     CommitObservation
+	// CommandResult is the exact, drained repository-command observation that
+	// authenticated the provider-declared pre-build verification command.
+	CommandResult contracts.RepositoryCommandResultKey
 }
 
 type VerificationRevision struct {
@@ -80,6 +84,19 @@ type CandidateEvidence struct {
 	BuilderResult   ProviderAttemptResultKey
 	Commit          CommitObservation
 	Reason          string
+	// CommandResult is the exact post-build repository verification result.
+	CommandResult contracts.RepositoryCommandResultKey
+}
+
+// RepositoryCommandResultBinding is the append-only, consumer-specific
+// projection of immutable command evidence. Repeating the claim identities in
+// the binding keeps verification/candidate reads independent of a caller's
+// proposed command or policy.
+type RepositoryCommandResultBinding struct {
+	Key                                                                       contracts.RepositoryCommandResultKey
+	TicketVersion, LeaderEpoch, RunnerEpoch                                   uint64
+	CommandDigest, SpecDigest, PolicyDigest, ExecutablePath, ExecutableDigest string
+	ExpectedOutcome                                                           string
 }
 
 // CommitObservation is a Store-neutral, Git-bound commit witness. Store only
@@ -247,6 +264,7 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 	if err := validOwnedFiles(artifact.OwnedFiles); err != nil || !validOID(artifact.CheckpointID) || artifact.Checkpoint.CommitOID != "" && (artifact.Checkpoint.CommitOID != artifact.CheckpointID || artifact.Checkpoint.ParentOID == "" || artifact.Checkpoint.TreeOID == "") {
 		return VerificationRevision{}, fmt.Errorf("bounded verification checkpoint and owned files are required")
 	}
+	var providerVerify *phaseartifact.Verification
 	if artifact.ProviderResult != nil {
 		result, parsed, loadErr := s.LoadHistoricalProviderAttemptResult(ctx, *artifact.ProviderResult)
 		if loadErr != nil || result.Claim.Role != "reviewer" || result.Claim.Phase != domain.PhaseVerification || result.Claim.Ref != artifact.Ref || parsed.Verify == nil {
@@ -263,6 +281,11 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		if intentErr != nil || proofErr != nil || !bytes.Equal(intent, artifact.Intent) || !bytes.Equal(proof, artifact.Proof) || !equalStringSlices(parsed.Verify.OwnedFiles, artifact.OwnedFiles) {
 			return VerificationRevision{}, ErrEvidenceConflict
 		}
+		providerVerify = parsed.Verify
+	} else {
+		// A verification artifact without the typed provider declaration has no
+		// command to authenticate against frozen configuration.
+		return VerificationRevision{}, ErrEvidenceConflict
 	}
 	if (artifact.AmendsRevision == 0) != (artifact.Reason == "" && artifact.Requester == "") {
 		return VerificationRevision{}, fmt.Errorf("verification amendment must bind revision, reason, and requester")
@@ -277,10 +300,12 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		if err := s.assertTicketFence(ctx, conn, artifact.Ref, artifact.ExpectedVersion, artifact.Fence); err != nil {
 			return err
 		}
-		if artifact.ProviderResult != nil {
-			if err := assertNewestBoundResult(ctx, conn, artifact.Ref, domain.PhaseVerification, "reviewer", *artifact.ProviderResult); err != nil {
-				return err
-			}
+		if err := assertNewestBoundResult(ctx, conn, artifact.Ref, domain.PhaseVerification, "reviewer", *artifact.ProviderResult); err != nil {
+			return err
+		}
+		_, commandBinding, err := authenticateVerificationCommandEvidence(ctx, conn, artifact, providerVerify)
+		if err != nil {
+			return err
 		}
 		var current uint64
 		if err := conn.QueryRowContext(ctx, `SELECT current_revision FROM verifications WHERE channel=? AND project_id=? AND ticket_id=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket).Scan(&current); err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -298,10 +323,11 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 				}
 				if oldIntent == intentDigest && oldProof == proofDigest && oldCheckpoint == artifact.CheckpointID {
 					result.Revision = current
-					if artifact.ProviderResult != nil {
-						if err := ensureVerificationBinding(ctx, conn, artifact, current); err != nil {
-							return err
-						}
+					if err := ensureVerificationBinding(ctx, conn, artifact, current); err != nil {
+						return err
+					}
+					if err := ensureVerificationCommandBinding(ctx, conn, artifact.Ref, current, commandBinding); err != nil {
+						return err
 					}
 					return nil
 				}
@@ -314,28 +340,26 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 			return ErrEvidenceConflict
 		}
 		result.Revision = current + 1
-		_, err := conn.ExecContext(ctx, `INSERT INTO verification_revisions(channel, project_id, ticket_id, revision, ticket_version, leader_epoch, runner_epoch, intent_digest, intent_bytes, proof_digest, proof_bytes, owned_files_json, checkpoint_id, amends_revision, amendment_reason, requester, created_at)
+		_, err = conn.ExecContext(ctx, `INSERT INTO verification_revisions(channel, project_id, ticket_id, revision, ticket_version, leader_epoch, runner_epoch, intent_digest, intent_bytes, proof_digest, proof_bytes, owned_files_json, checkpoint_id, amends_revision, amendment_reason, requester, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, result.Revision, artifact.ExpectedVersion, artifact.Fence.LeaderEpoch, artifact.Fence.RunnerEpoch, intentDigest, artifact.Intent, proofDigest, artifact.Proof, string(owned), artifact.CheckpointID, nullableUint(artifact.AmendsRevision), artifact.Reason, artifact.Requester, now())
 		if err != nil {
 			return err
 		}
-		if artifact.ProviderResult != nil {
-			if err := ensureVerificationBinding(ctx, conn, artifact, result.Revision); err != nil {
-				return err
-			}
+		if err := ensureVerificationBinding(ctx, conn, artifact, result.Revision); err != nil {
+			return err
+		}
+		if err := ensureVerificationCommandBinding(ctx, conn, artifact.Ref, result.Revision, commandBinding); err != nil {
+			return err
 		}
 		_, err = conn.ExecContext(ctx, `INSERT INTO verifications(channel, project_id, ticket_id, intent_digest, proof_digest, current_revision) VALUES (?, ?, ?, ?, ?, ?)
 			ON CONFLICT(channel, project_id, ticket_id) DO UPDATE SET intent_digest=excluded.intent_digest, proof_digest=excluded.proof_digest, current_revision=excluded.current_revision`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, intentDigest, proofDigest, result.Revision)
 		if err != nil {
 			return err
 		}
-		if artifact.ProviderResult == nil {
-			return evidenceEvent(ctx, conn, artifact.Ref, artifact.ExpectedVersion, "verification_recorded", map[string]any{"revision": result.Revision, "intent_digest": intentDigest, "proof_digest": proofDigest})
-		}
 		if artifact.Checkpoint.CommitOID != artifact.CheckpointID || !validOID(artifact.Checkpoint.ParentOID) || !validOID(artifact.Checkpoint.TreeOID) {
 			return ErrEvidenceConflict
 		}
-		return evidenceEvent(ctx, conn, artifact.Ref, artifact.ExpectedVersion, "verification_recorded", map[string]any{"revision": result.Revision, "intent_digest": intentDigest, "proof_digest": proofDigest, "provider_attempt_id": artifact.ProviderResult.AttemptID, "provider_attempt": artifact.ProviderResult.Attempt, "provider_phase": artifact.ProviderResult.Phase, "checkpoint_commit": artifact.Checkpoint.CommitOID, "checkpoint_parent": artifact.Checkpoint.ParentOID, "checkpoint_tree": artifact.Checkpoint.TreeOID})
+		return evidenceEvent(ctx, conn, artifact.Ref, artifact.ExpectedVersion, "verification_recorded", map[string]any{"revision": result.Revision, "intent_digest": intentDigest, "proof_digest": proofDigest, "provider_attempt_id": artifact.ProviderResult.AttemptID, "provider_attempt": artifact.ProviderResult.Attempt, "provider_phase": artifact.ProviderResult.Phase, "checkpoint_commit": artifact.Checkpoint.CommitOID, "checkpoint_parent": artifact.Checkpoint.ParentOID, "checkpoint_tree": artifact.Checkpoint.TreeOID, "repository_command_semantic_key": commandBinding.Key.SemanticKey, "repository_command_claim_epoch": commandBinding.Key.ClaimEpoch, "repository_command_policy_digest": commandBinding.PolicyDigest, "prebuild_outcome": commandBinding.ExpectedOutcome})
 	})
 	return result, err
 }
@@ -428,14 +452,22 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if path != builder.Claim.Worktree || identity != builder.Claim.WorktreeIdentity || base != builder.Claim.BaseSHA || base != evidence.Snapshot.BaseSHA {
 			return ErrEvidenceConflict
 		}
+		var revision uint64
 		var intent, proof, owned, checkpoint string
 		var intentBytes, proofBytes []byte
-		if err := conn.QueryRowContext(ctx, `SELECT r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&intent, &intentBytes, &proof, &proofBytes, &owned, &checkpoint); err != nil || intent != evidence.Snapshot.VerificationIntentDigest || proof != evidence.Snapshot.ProofDigest || sha256Digest(intentBytes) != intent || sha256Digest(proofBytes) != proof || !validOID(checkpoint) || evidence.Commit.ParentOID != checkpoint {
+		if err := conn.QueryRowContext(ctx, `SELECT r.revision,r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&revision, &intent, &intentBytes, &proof, &proofBytes, &owned, &checkpoint); err != nil || revision == 0 || intent != evidence.Snapshot.VerificationIntentDigest || proof != evidence.Snapshot.ProofDigest || sha256Digest(intentBytes) != intent || sha256Digest(proofBytes) != proof || !validOID(checkpoint) || evidence.Commit.ParentOID != checkpoint {
 			return ErrEvidenceConflict
 		}
 		var ownedFiles []string
 		if json.Unmarshal([]byte(owned), &ownedFiles) != nil || validOwnedFiles(ownedFiles) != nil {
 			return ErrEvidenceConflict
+		}
+		if _, err := loadVerificationCommandBinding(ctx, conn, evidence.Ref, revision); err != nil {
+			return ErrEvidenceConflict
+		}
+		_, commandBinding, err := authenticateCandidateCommandEvidence(ctx, conn, evidence, builder, intent, proof, checkpoint)
+		if err != nil {
+			return err
 		}
 		var current uint64
 		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation), 0) FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&current); err != nil {
@@ -449,7 +481,10 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			candidate := evidence.Snapshot
 			candidate.Generation = current
 			if existing == candidate {
-				return ensureCandidateBinding(ctx, conn, evidence, current)
+				if err := ensureCandidateBinding(ctx, conn, evidence, current); err != nil {
+					return err
+				}
+				return ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding)
 			}
 		}
 		if evidence.Snapshot.Generation == 0 {
@@ -464,7 +499,10 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			if err != nil || existing != evidence.Snapshot {
 				return ErrEvidenceConflict
 			}
-			return ensureCandidateBinding(ctx, conn, evidence, current)
+			if err := ensureCandidateBinding(ctx, conn, evidence, current); err != nil {
+				return err
+			}
+			return ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding)
 		}
 		if evidence.Snapshot.Generation != current+1 {
 			return ErrEvidenceConflict
@@ -477,6 +515,9 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if err := ensureCandidateBinding(ctx, conn, evidence, evidence.Snapshot.Generation); err != nil {
 			return err
 		}
+		if err := ensureCandidateCommandBinding(ctx, conn, evidence.Ref, evidence.Snapshot.Generation, commandBinding); err != nil {
+			return err
+		}
 		for _, kind := range []string{"proof_result", "github_checks", "final_review", "approval"} {
 			at := time.Now().UTC()
 			if _, err := conn.ExecContext(ctx, `INSERT INTO invalidation_receipts(channel, project_id, ticket_id, generation, kind, ticket_version, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, evidence.Snapshot.Generation, kind, evidence.ExpectedVersion, evidence.Reason, at.Format(time.RFC3339Nano)); err != nil {
@@ -487,7 +528,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if _, err := conn.ExecContext(ctx, `UPDATE approvals SET invalidated=1 WHERE channel=? AND project_id=? AND ticket_id=? AND invalidated=0 AND reviewed_head<>?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, evidence.Snapshot.HeadSHA); err != nil {
 			return err
 		}
-		return evidenceEvent(ctx, conn, evidence.Ref, evidence.ExpectedVersion, "candidate_recorded", map[string]any{"generation": evidence.Snapshot.Generation, "head": evidence.Snapshot.HeadSHA, "builder_attempt_id": evidence.BuilderResult.AttemptID, "builder_attempt": evidence.BuilderResult.Attempt, "builder_evidence_digest": evidence.Snapshot.BuilderEvidenceDigest, "command_policy_digest": evidence.Snapshot.CommandPolicyDigest})
+		return evidenceEvent(ctx, conn, evidence.Ref, evidence.ExpectedVersion, "candidate_recorded", map[string]any{"generation": evidence.Snapshot.Generation, "head": evidence.Snapshot.HeadSHA, "builder_attempt_id": evidence.BuilderResult.AttemptID, "builder_attempt": evidence.BuilderResult.Attempt, "builder_evidence_digest": evidence.Snapshot.BuilderEvidenceDigest, "command_policy_digest": evidence.Snapshot.CommandPolicyDigest, "repository_command_semantic_key": commandBinding.Key.SemanticKey, "repository_command_claim_epoch": commandBinding.Key.ClaimEpoch})
 	})
 	return receipts, err
 }

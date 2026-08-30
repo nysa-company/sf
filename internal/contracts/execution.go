@@ -28,10 +28,23 @@ type CommandResult struct {
 	StderrTruncated            bool
 	OutputLastMessageTruncated bool
 	Duration                   time.Duration
+	// ObservedAt is the supervisor's UTC observation timestamp. It is recorded
+	// with the bounded result so a later reader never has to infer completion
+	// time from a lease or effect row.
+	ObservedAt time.Time
 	// Observed is true only after the repository-command supervisor has reaped
 	// the launched process and proved its recorded containment state. The zero
 	// value is deliberately not a successful exit.
 	Observed bool
+}
+
+// RepositoryCommandResultKey identifies one immutable terminal observation.
+// A semantic effect may be claimed more than once after a safe retry; the
+// claim epoch is therefore part of the authority and results are never
+// overwritten by a later retry.
+type RepositoryCommandResultKey struct {
+	SemanticKey string
+	ClaimEpoch  uint64
 }
 
 type CommandExecutor interface {

@@ -49,9 +49,10 @@ var (
 	ErrGitMutationLease        = errors.New("git mutation lease is unavailable or stale")
 	ErrRepositoryCommandIntent = errors.New("repository command intent is not a current executing effect")
 	ErrRepositoryCommandLease  = errors.New("repository command lease is unavailable or stale")
+	ErrRepositoryCommandResult = errors.New("repository command result is missing, malformed, or conflicts with durable evidence")
 )
 
-const schemaVersion = 35
+const schemaVersion = 36
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -89,6 +90,7 @@ var migrationChecksums = map[int]string{
 	33: migrationChecksum(migrationV33),
 	34: migrationChecksum(migrationV34),
 	35: migrationChecksum(migrationV35),
+	36: migrationChecksum(migrationV36),
 }
 
 func migrationChecksum(statements []string) string {
@@ -405,6 +407,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV34
 			} else if version == 35 {
 				statements = migrationV35
+			} else if version == 36 {
+				statements = migrationV36
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1233,7 +1237,14 @@ func (s *Store) TransitionVerification(ctx context.Context, transition Transitio
 		if err := conn.QueryRowContext(ctx, `SELECT attempt FROM provider_attempts WHERE id=?`, id).Scan(&actual); err != nil || actual != attempt {
 			return ErrEvidenceConflict
 		}
-		return assertNewestBoundResult(ctx, conn, transition.Ref, domain.PhaseVerification, "reviewer", ProviderAttemptResultKey{AttemptID: id, Ref: transition.Ref, Phase: domain.PhaseVerification, Attempt: attempt})
+		if err := assertNewestBoundResult(ctx, conn, transition.Ref, domain.PhaseVerification, "reviewer", ProviderAttemptResultKey{AttemptID: id, Ref: transition.Ref, Phase: domain.PhaseVerification, Attempt: attempt}); err != nil {
+			return err
+		}
+		stored, err := s.CurrentVerification(ctx, transition.Ref)
+		if err != nil || stored.Revision.Revision == 0 || stored.Revision.CheckpointID != revisionCheckpoint || stored.ProviderResult.AttemptID != id || stored.ProviderResult.Attempt != attempt || stored.TicketVersion != version || stored.Fence != transition.Fence || stored.CommandBinding.TicketVersion != version || stored.CommandBinding.LeaderEpoch != transition.Fence.LeaderEpoch || stored.CommandBinding.RunnerEpoch != transition.Fence.RunnerEpoch {
+			return ErrEvidenceConflict
+		}
+		return nil
 	})
 }
 
@@ -1320,6 +1331,10 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 			return ErrEvidenceConflict
 		}
 		if stored != candidate {
+			return ErrEvidenceConflict
+		}
+		authenticated, err := s.LatestCandidate(ctx, transition.Ref)
+		if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != version || authenticated.Fence != transition.Fence || authenticated.CommandBinding.TicketVersion != version || authenticated.CommandBinding.LeaderEpoch != transition.Fence.LeaderEpoch || authenticated.CommandBinding.RunnerEpoch != transition.Fence.RunnerEpoch || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {
 			return ErrEvidenceConflict
 		}
 		var attemptID int64

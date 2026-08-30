@@ -34,16 +34,18 @@ type StoredVerification struct {
 	CreatedAt       time.Time
 	ProviderResult  ProviderAttemptResultKey
 	Checkpoint      CommitObservation
+	CommandBinding  RepositoryCommandResultBinding
 }
 
 // StoredCandidate is the latest immutable candidate generation.
 type StoredCandidate struct {
-	Snapshot      domain.CandidateSnapshot
-	TicketVersion uint64
-	Fence         domain.Fence
-	CreatedAt     time.Time
-	BuilderResult ProviderAttemptResultKey
-	Commit        CommitObservation
+	Snapshot       domain.CandidateSnapshot
+	TicketVersion  uint64
+	Fence          domain.Fence
+	CreatedAt      time.Time
+	BuilderResult  ProviderAttemptResultKey
+	Commit         CommitObservation
+	CommandBinding RepositoryCommandResultBinding
 }
 
 // StoredWorktree is SQLite's registration of a ticket worktree. The Git
@@ -253,9 +255,19 @@ func (s *Store) CurrentVerification(ctx context.Context, ref domain.TicketRef) (
 			return StoredVerification{}, ErrEvidenceConflict
 		}
 	}
-	// Events are human/audit projections only. Provider and checkpoint authority
-	// comes exclusively from the constrained v34 binding above; legacy rows
-	// therefore expose no binding and worker transitions fail closed.
+	if result.ProviderResult.AttemptID == 0 || result.Checkpoint.CommitOID == "" {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	binding, err := loadVerificationCommandBinding(ctx, s.db, ref, result.Revision.Revision)
+	if err != nil || binding.TicketVersion != result.TicketVersion || binding.LeaderEpoch != result.Fence.LeaderEpoch || binding.RunnerEpoch != result.Fence.RunnerEpoch {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	result.CommandBinding = binding
+	if err := s.reauthenticateStoredVerificationCommand(ctx, ref, result); err != nil {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	// Events are human/audit projections only. Provider, checkpoint, and
+	// repository-command authority come from constrained immutable bindings.
 	return result, nil
 }
 
@@ -290,6 +302,14 @@ func (s *Store) LatestCandidate(ctx context.Context, ref domain.TicketRef) (Stor
 		result.Commit.CommitOID, result.Commit.TreeOID = result.Snapshot.HeadSHA, result.Snapshot.TreeSHA
 	}
 	if result.BuilderResult.AttemptID == 0 || result.Commit.ParentOID == "" {
+		return StoredCandidate{}, ErrEvidenceConflict
+	}
+	binding, err := loadCandidateCommandBinding(ctx, s.db, ref, result.Snapshot.Generation)
+	if err != nil || binding.TicketVersion != result.TicketVersion || binding.LeaderEpoch != result.Fence.LeaderEpoch || binding.RunnerEpoch != result.Fence.RunnerEpoch || !candidatePolicyMatches(result.Snapshot.CommandPolicyDigest, binding.PolicyDigest) {
+		return StoredCandidate{}, ErrEvidenceConflict
+	}
+	result.CommandBinding = binding
+	if err := s.reauthenticateStoredCandidateCommand(ctx, ref, result); err != nil {
 		return StoredCandidate{}, ErrEvidenceConflict
 	}
 	return result, nil
@@ -337,7 +357,7 @@ func (s *Store) PhaseAttempts(ctx context.Context, ref domain.TicketRef) ([]Stor
 			&item.Fence.LeaderEpoch, &item.Fence.RunnerEpoch, &started, &finished, &item.Outcome, &item.UsageJSON); err != nil {
 			return nil, err
 		}
-		if !validPhase(item.Phase) || item.Attempt < 1 || !validProvider(item.Provider) || !boundedText(item.WorktreeID, 500) || !validOID(item.BaseSHA) || item.ExpectedVersion == 0 || item.Fence.LeaderEpoch == 0 || item.Fence.RunnerEpoch == 0 || !validJSON(item.UsageJSON) {
+		if !validPhase(item.Phase) || item.Attempt < 1 || !validProvider(item.Provider) || !boundedText(item.WorktreeID, 16<<10) || !validOID(item.BaseSHA) || item.ExpectedVersion == 0 || item.Fence.LeaderEpoch == 0 || item.Fence.RunnerEpoch == 0 || !validJSON(item.UsageJSON) {
 			return nil, ErrEvidenceConflict
 		}
 		if item.State != "active" && item.State != "completed" && item.State != "failed" && item.State != "cancelled" {

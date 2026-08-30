@@ -58,7 +58,7 @@ func (s *Store) validateSchema(ctx context.Context) error {
 			return err
 		}
 	}
-	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete", "plan_result_bindings_immutable_update", "plan_result_bindings_immutable_delete", "verification_result_bindings_immutable_update", "verification_result_bindings_immutable_delete", "candidate_result_bindings_immutable_update", "candidate_result_bindings_immutable_delete"} {
+	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete", "plan_result_bindings_immutable_update", "plan_result_bindings_immutable_delete", "verification_result_bindings_immutable_update", "verification_result_bindings_immutable_delete", "candidate_result_bindings_immutable_update", "candidate_result_bindings_immutable_delete", "repository_command_results_immutable_update", "repository_command_results_immutable_delete", "verification_command_result_bindings_immutable_update", "verification_command_result_bindings_immutable_delete", "candidate_command_result_bindings_immutable_update", "candidate_command_result_bindings_immutable_delete"} {
 		var count int
 		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigger).Scan(&count); err != nil || count != 1 {
 			return fmt.Errorf("required trigger %s is missing", trigger)
@@ -116,6 +116,14 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "repository_command_intents", target: "effects"},
 	{table: "repository_command_leases", target: "repository_command_intents"},
 	{table: "repository_command_process_groups", target: "repository_command_leases"},
+	{table: "repository_command_results", target: "effects"},
+	{table: "repository_command_results", target: "tickets"},
+	{table: "verification_command_result_bindings", target: "verification_revisions"},
+	{table: "verification_command_result_bindings", target: "repository_command_results"},
+	{table: "verification_command_result_bindings", target: "tickets"},
+	{table: "candidate_command_result_bindings", target: "candidate_snapshots"},
+	{table: "candidate_command_result_bindings", target: "repository_command_results"},
+	{table: "candidate_command_result_bindings", target: "tickets"},
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {
@@ -141,41 +149,44 @@ func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error 
 }
 
 var requiredSchema = map[string][]string{
-	"schema_migrations":                 {"version", "applied_at", "checksum"},
-	"daemon_instances":                  {"channel", "leader_epoch", "identity"},
-	"projects":                          {"channel", "id", "canonical_path", "current_config_generation"},
-	"project_configurations":            {"channel", "project_id", "generation", "digest", "snapshot_bytes", "created_at"},
-	"tickets":                           {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd", "config_generation", "config_digest", "config_snapshot_bytes"},
-	"workflow_owners":                   {"channel", "project_id", "ticket_id", "workflow_id"},
-	"phase_runs":                        {"phase", "attempt", "expected_ticket_version", "provider", "model", "family", "provider_version", "started_at", "outcome"},
-	"events":                            {"ticket_version", "trigger", "from_state", "to_state"},
-	"effects":                           {"semantic_key", "claim_epoch", "observed_identity"},
-	"approvals":                         {"reviewed_head", "operator_uid", "invalidated"},
-	"worktrees":                         {"path", "branch_ref"},
-	"provider_attempts":                 {"phase", "attempt", "provider", "role", "state", "usage_units", "started_at", "finished_at", "qualification_id", "binding_digest", "provider_lease_key", "leader_epoch", "runner_epoch", "expected_ticket_version", "auth_digest", "auth_mode", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "worktree_path"},
-	"provider_attempt_inputs":           {"provider_attempt_id", "request_digest", "canonical_input", "created_at"},
-	"provider_attempt_results":          {"provider_attempt_id", "raw_artifact", "raw_sha256", "typed_artifact", "typed_sha256", "validation", "validation_sha256", "transcript_sha256", "request_digest", "leader_epoch", "runner_epoch", "expected_ticket_version", "repository_path", "worktree_path", "worktree_identity", "base_sha"},
-	"leases":                            {"scope", "scope_key", "runner_epoch"},
-	"plans":                             {"ticket_id", "digest", "body"},
-	"verifications":                     {"ticket_id", "intent_digest", "proof_digest", "current_revision"},
-	"verification_revisions":            {"revision", "intent_bytes", "proof_bytes", "owned_files_json", "checkpoint_id"},
-	"plan_result_bindings":              {"plan_digest", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt"},
-	"verification_result_bindings":      {"revision", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt", "checkpoint_commit_oid", "checkpoint_parent_oid", "checkpoint_tree_oid"},
-	"candidate_snapshots":               {"generation", "base_sha", "head_sha", "tree_sha", "command_policy_digest", "builder_evidence_digest"},
-	"candidate_result_bindings":         {"generation", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt", "commit_parent_oid"},
-	"invalidation_receipts":             {"generation", "kind", "reason"},
-	"ticket_counters":                   {"kind", "used", "limit_count"},
-	"ticket_budget_uses":                {"kind", "request_id", "ticket_version"},
-	"branch_allocations":                {"authority_key", "channel", "project_id", "ticket_id", "branch_ref", "created_at"},
-	"provider_qualifications":           {"id", "channel", "run_id", "provider", "model", "family", "provider_version", "binary_digest", "policy_digest", "fixture_digest", "profile", "failed_probes_json", "reason_code", "created_at", "auth_digest", "auth_mode", "probe_digest", "attested_leader_epoch", "attestation_signature"},
-	"provider_pair_selections":          {"channel", "builder_qualification_id", "reviewer_qualification_id", "selected_at"},
-	"merge_intents":                     {"semantic_key", "original_base_oid", "head_oid", "base_ref", "protection_rule_id", "protection_kind", "protection_checks_digest", "strict_status_checks", "admin_enforced", "active_ruleset_count"},
-	"external_mutation_quarantine":      {"singleton", "reason", "observed_at"},
-	"git_mutation_intents":              {"semantic_key", "request_digest", "ticket_version", "leader_epoch", "runner_epoch", "claim_epoch", "repository_path", "worktree_path", "branch_ref", "operation", "base_ref", "expected_base_oid", "expected_head_oid", "prepared_commit_oid", "prepared_tree_oid", "prior_remote_observed", "prior_remote_oid"},
-	"git_mutation_leases":               {"repository_path", "semantic_key", "nonce", "state", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "prepared_commit_oid", "prepared_tree_oid", "prior_remote_observed", "prior_remote_oid"},
-	"repository_command_intents":        {"semantic_key", "repository_path", "worktree_path", "worktree_identity", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest"},
-	"repository_command_leases":         {"repository_path", "semantic_key", "nonce", "state", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity"},
-	"repository_command_process_groups": {"repository_path", "semantic_key", "nonce", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity"},
+	"schema_migrations":                    {"version", "applied_at", "checksum"},
+	"daemon_instances":                     {"channel", "leader_epoch", "identity"},
+	"projects":                             {"channel", "id", "canonical_path", "current_config_generation"},
+	"project_configurations":               {"channel", "project_id", "generation", "digest", "snapshot_bytes", "created_at"},
+	"tickets":                              {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd", "config_generation", "config_digest", "config_snapshot_bytes"},
+	"workflow_owners":                      {"channel", "project_id", "ticket_id", "workflow_id"},
+	"phase_runs":                           {"phase", "attempt", "expected_ticket_version", "provider", "model", "family", "provider_version", "started_at", "outcome"},
+	"events":                               {"ticket_version", "trigger", "from_state", "to_state"},
+	"effects":                              {"semantic_key", "claim_epoch", "observed_identity"},
+	"approvals":                            {"reviewed_head", "operator_uid", "invalidated"},
+	"worktrees":                            {"path", "branch_ref"},
+	"provider_attempts":                    {"phase", "attempt", "provider", "role", "state", "usage_units", "started_at", "finished_at", "qualification_id", "binding_digest", "provider_lease_key", "leader_epoch", "runner_epoch", "expected_ticket_version", "auth_digest", "auth_mode", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "worktree_path"},
+	"provider_attempt_inputs":              {"provider_attempt_id", "request_digest", "canonical_input", "created_at"},
+	"provider_attempt_results":             {"provider_attempt_id", "raw_artifact", "raw_sha256", "typed_artifact", "typed_sha256", "validation", "validation_sha256", "transcript_sha256", "request_digest", "leader_epoch", "runner_epoch", "expected_ticket_version", "repository_path", "worktree_path", "worktree_identity", "base_sha"},
+	"leases":                               {"scope", "scope_key", "runner_epoch"},
+	"plans":                                {"ticket_id", "digest", "body"},
+	"verifications":                        {"ticket_id", "intent_digest", "proof_digest", "current_revision"},
+	"verification_revisions":               {"revision", "intent_bytes", "proof_bytes", "owned_files_json", "checkpoint_id"},
+	"plan_result_bindings":                 {"plan_digest", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt"},
+	"verification_result_bindings":         {"revision", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt", "checkpoint_commit_oid", "checkpoint_parent_oid", "checkpoint_tree_oid"},
+	"candidate_snapshots":                  {"generation", "base_sha", "head_sha", "tree_sha", "command_policy_digest", "builder_evidence_digest"},
+	"candidate_result_bindings":            {"generation", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt", "commit_parent_oid"},
+	"invalidation_receipts":                {"generation", "kind", "reason"},
+	"ticket_counters":                      {"kind", "used", "limit_count"},
+	"ticket_budget_uses":                   {"kind", "request_id", "ticket_version"},
+	"branch_allocations":                   {"authority_key", "channel", "project_id", "ticket_id", "branch_ref", "created_at"},
+	"provider_qualifications":              {"id", "channel", "run_id", "provider", "model", "family", "provider_version", "binary_digest", "policy_digest", "fixture_digest", "profile", "failed_probes_json", "reason_code", "created_at", "auth_digest", "auth_mode", "probe_digest", "attested_leader_epoch", "attestation_signature"},
+	"provider_pair_selections":             {"channel", "builder_qualification_id", "reviewer_qualification_id", "selected_at"},
+	"merge_intents":                        {"semantic_key", "original_base_oid", "head_oid", "base_ref", "protection_rule_id", "protection_kind", "protection_checks_digest", "strict_status_checks", "admin_enforced", "active_ruleset_count"},
+	"external_mutation_quarantine":         {"singleton", "reason", "observed_at"},
+	"git_mutation_intents":                 {"semantic_key", "request_digest", "ticket_version", "leader_epoch", "runner_epoch", "claim_epoch", "repository_path", "worktree_path", "branch_ref", "operation", "base_ref", "expected_base_oid", "expected_head_oid", "prepared_commit_oid", "prepared_tree_oid", "prior_remote_observed", "prior_remote_oid"},
+	"git_mutation_leases":                  {"repository_path", "semantic_key", "nonce", "state", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "prepared_commit_oid", "prepared_tree_oid", "prior_remote_observed", "prior_remote_oid"},
+	"repository_command_intents":           {"semantic_key", "repository_path", "worktree_path", "worktree_identity", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest"},
+	"repository_command_leases":            {"repository_path", "semantic_key", "nonce", "state", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity"},
+	"repository_command_process_groups":    {"repository_path", "semantic_key", "nonce", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity"},
+	"repository_command_results":           {"semantic_key", "claim_epoch", "channel", "project_id", "ticket_id", "request_digest", "ticket_version", "leader_epoch", "runner_epoch", "repository_path", "worktree_path", "worktree_identity", "branch_ref", "base_ref", "base_sha", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest", "exit_code", "stdout", "stderr", "output_last_message", "stdout_truncated", "stderr_truncated", "output_last_message_truncated", "duration_ns", "observed_at", "stdout_digest", "stderr_digest", "output_last_message_digest", "result_digest", "created_at"},
+	"verification_command_result_bindings": {"revision", "binding_ticket_version", "leader_epoch", "runner_epoch", "semantic_key", "claim_epoch", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest", "expected_outcome"},
+	"candidate_command_result_bindings":    {"generation", "binding_ticket_version", "leader_epoch", "runner_epoch", "semantic_key", "claim_epoch", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest"},
 }
 
 type indexRequirement struct {
@@ -211,6 +222,7 @@ var requiredIndexes = []indexRequirement{
 	{table: "git_mutation_leases", name: "git_mutation_lease_recovery", columns: []string{"channel", "state", "launch_state"}, nonUnique: true},
 	{table: "repository_command_leases", name: "repository_command_lease_recovery", columns: []string{"channel", "state", "launch_state"}, nonUnique: true},
 	{table: "repository_command_process_groups", name: "repository_command_process_group_recovery", columns: []string{"repository_path", "semantic_key", "nonce"}, nonUnique: true},
+	{table: "repository_command_results", name: "repository_command_results_ticket", columns: []string{"channel", "project_id", "ticket_id", "worktree_path", "base_sha", "created_at"}, nonUnique: true},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {
