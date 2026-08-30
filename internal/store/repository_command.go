@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	gitboundary "github.com/nysa-company/sf/internal/git"
 )
 
 // RepositoryCommandIntent is the durable, immutable binding for a read-only
@@ -35,7 +38,7 @@ type RepositoryCommandRecovery struct {
 }
 
 func validRepositoryCommandIntent(i RepositoryCommandIntent) bool {
-	return i.Ref.Validate() == nil && i.SemanticKey != "" && validClaimDigest(i.RequestDigest) && i.TicketVersion > 0 && i.Fence.LeaderEpoch > 0 && i.Fence.RunnerEpoch > 0 && validStorePath(i.Repository) && validStorePath(i.Worktree) && i.WorktreeIdentity != "" && i.Branch != "" && i.BaseRef != "" && validStoreOID(i.BaseSHA) && validClaimDigest(i.CommandDigest) && validClaimDigest(i.SpecDigest) && validClaimDigest(i.PolicyDigest) && validStorePath(i.ExecutablePath) && validClaimDigest(i.ExecutableDigest)
+	return i.Ref.Validate() == nil && i.SemanticKey != "" && validClaimDigest(i.RequestDigest) && i.TicketVersion > 0 && i.Fence.LeaderEpoch > 0 && i.Fence.RunnerEpoch > 0 && validStorePath(i.Repository) && validStorePath(i.Worktree) && validRepositoryWorktreeIdentity(i.WorktreeIdentity, i.Repository, i.Worktree, i.Branch, i.BaseRef, i.BaseSHA) && validClaimDigest(i.CommandDigest) && validClaimDigest(i.SpecDigest) && validClaimDigest(i.PolicyDigest) && validStorePath(i.ExecutablePath) && validClaimDigest(i.ExecutableDigest)
 }
 
 func (s *Store) IssueRepositoryCommandClaim(ctx context.Context, intent RepositoryCommandIntent) (contracts.RepositoryCommandClaim, error) {
@@ -256,7 +259,31 @@ func (s *Store) RecoverRepositoryCommandLeases(ctx context.Context, channel doma
 }
 
 func validRepositoryCommandClaim(c contracts.RepositoryCommandClaim) bool {
-	return c.TicketRef.Validate() == nil && c.SemanticKey != "" && validClaimDigest(c.RequestDigest) && c.TicketVersion > 0 && c.LeaderEpoch > 0 && c.RunnerEpoch > 0 && c.ClaimEpoch > 0 && validStorePath(c.Repository) && validStorePath(c.Worktree) && c.WorktreeIdentity != "" && c.Branch != "" && c.BaseRef != "" && validStoreOID(c.BaseSHA) && validClaimDigest(c.CommandDigest) && validClaimDigest(c.SpecDigest) && validClaimDigest(c.PolicyDigest) && validStorePath(c.ExecutablePath) && validClaimDigest(c.ExecutableDigest)
+	return c.TicketRef.Validate() == nil && c.SemanticKey != "" && validClaimDigest(c.RequestDigest) && c.TicketVersion > 0 && c.LeaderEpoch > 0 && c.RunnerEpoch > 0 && c.ClaimEpoch > 0 && validStorePath(c.Repository) && validStorePath(c.Worktree) && validRepositoryWorktreeIdentity(c.WorktreeIdentity, c.Repository, c.Worktree, c.Branch, c.BaseRef, c.BaseSHA) && validClaimDigest(c.CommandDigest) && validClaimDigest(c.SpecDigest) && validClaimDigest(c.PolicyDigest) && validStorePath(c.ExecutablePath) && validClaimDigest(c.ExecutableDigest)
+}
+
+// validRepositoryWorktreeIdentity rejects the historic opaque JSON blob.  The
+// command authority needs the exact Git snapshot shape so the supervisor can
+// compare an opened worktree FD to the durable device/inode witness before it
+// opens the launch gate.
+func validRepositoryWorktreeIdentity(raw, repository, worktree, branch, baseRef, baseSHA string) bool {
+	var identity gitboundary.Identity
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&identity) != nil || identity.Repository != repository || identity.Worktree != worktree || identity.HeadRef != branch || identity.BaseRef != baseRef || identity.BaseHead != baseSHA {
+		return false
+	}
+	for _, value := range []string{identity.Repository, identity.Worktree, identity.GitFile, identity.CommonDir, identity.Origin, identity.PushOrigin, identity.ConfigHash, identity.HooksHash} {
+		if strings.TrimSpace(value) == "" {
+			return false
+		}
+	}
+	for _, pair := range [][2]uint64{{identity.RepositoryDev, identity.RepositoryIno}, {identity.WorktreeDev, identity.WorktreeIno}, {identity.GitFileDev, identity.GitFileIno}, {identity.CommonDirDev, identity.CommonDirIno}, {identity.PushOriginDev, identity.PushOriginIno}} {
+		if pair[0] == 0 || pair[1] == 0 {
+			return false
+		}
+	}
+	return true
 }
 func (s *Store) assertRepositoryCommandCurrent(ctx context.Context, c *sql.Conn, v contracts.RepositoryCommandClaim) error {
 	if e := s.assertTicketFence(ctx, c, v.TicketRef, v.TicketVersion, domain.Fence{LeaderEpoch: v.LeaderEpoch, RunnerEpoch: v.RunnerEpoch}); e != nil {

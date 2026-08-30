@@ -115,13 +115,25 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 	result, runErr := e.Supervisor.Run(ctx, req.Claim, req.Spec, req.Policy, lease)
 	if runErr != nil && result.ExitCode < 0 {
 		if recorder, ok := e.Authority.(contracts.RepositoryCommandResultRecorder); ok {
-			_ = recorder.MarkRepositoryCommandUncertain(ctx, req.Claim, runErr.Error())
+			persistCtx, cancel := repositoryPersistenceContext()
+			err := recorder.MarkRepositoryCommandUncertain(persistCtx, req.Claim, runErr.Error())
+			cancel()
+			if err != nil {
+				_ = lease.Quarantine()
+				return result, fmt.Errorf("persist repository uncertainty: %w", err)
+			}
+		} else {
+			_ = lease.Quarantine()
+			return result, ErrInvalidBinding
 		}
 		_ = lease.Quarantine()
 		return result, runErr
 	}
 	if recorder, ok := e.Authority.(contracts.RepositoryCommandResultRecorder); ok && (runErr == nil || result.ExitCode >= 0) {
-		if err := recorder.CompleteRepositoryCommand(ctx, req.Claim, result); err != nil {
+		persistCtx, cancel := repositoryPersistenceContext()
+		err := recorder.CompleteRepositoryCommand(persistCtx, req.Claim, result)
+		cancel()
+		if err != nil {
 			_ = lease.Quarantine()
 			return result, err
 		}
@@ -137,4 +149,11 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 		return result, releaseErr
 	}
 	return result, runErr
+}
+
+// repositoryPersistenceContext intentionally does not inherit caller
+// cancellation: once a child crossed the launch gate, the durable effect must
+// become completed or uncertain, never silently remain executing.
+func repositoryPersistenceContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
 }

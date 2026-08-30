@@ -12,11 +12,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/executionpolicy"
+	gitboundary "github.com/nysa-company/sf/internal/git"
 )
 
 const repositoryOutputLimit = 64 << 10
@@ -28,6 +30,10 @@ const repositoryInputLimit = 1 << 20
 type RepositoryCommandSupervisor struct {
 	Executable           string
 	SoftDrain, HardDrain time.Duration
+	// beforeWorktreeOpen is test-only synchronization for the preflight/open
+	// replacement race.  It is intentionally unexported so production callers
+	// cannot turn it into a launch hook.
+	beforeWorktreeOpen func()
 }
 
 func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.RepositoryCommandClaim, spec contracts.CommandSpec, policy executionpolicy.CommandSnapshot, lease contracts.RepositoryCommandLease) (contracts.CommandResult, error) {
@@ -71,7 +77,8 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if claim.ExecutableDigest != "sha256:"+hex.EncodeToString(fileSum[:]) {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	if actual, err := filepath.EvalSymlinks(spec.Directory); err != nil || actual != claim.Worktree {
+	identity, err := parseRepositoryIdentity(claim)
+	if err != nil {
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	var input []byte
@@ -116,6 +123,11 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	}
 	defer os.RemoveAll(home)
 	defer os.RemoveAll(tmp)
+	staged, err := stageExecutable(resolved, claim.ExecutableDigest)
+	if err != nil {
+		return contracts.CommandResult{}, ErrUnclear
+	}
+	defer os.RemoveAll(filepath.Dir(staged))
 	env, err := executionpolicy.MinimalEnvironment(home, tmp)
 	if err != nil {
 		return contracts.CommandResult{}, err
@@ -125,17 +137,23 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		return contracts.CommandResult{}, err
 	}
 	defer gateWrite.Close()
-	worktreeFD, err := os.Open(spec.Directory)
+	worktreeFD, err := s.openAuthenticatedWorktree(claim, identity)
 	if err != nil {
-		return contracts.CommandResult{}, err
-	}
-	defer worktreeFD.Close()
-	worktreeInfo, err := worktreeFD.Stat()
-	if err != nil || !worktreeInfo.IsDir() {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	argv := append([]string{"__repository_command_gate", resolved}, spec.Argv[1:]...)
-	cmd := exec.Command(self, argv...)
+	defer worktreeFD.Close()
+	// Reauthenticate the rest of the persisted Git identity after the opened
+	// directory FD has proven exactly which worktree was selected.  The gate
+	// subsequently changes directory only through that FD.
+	if err := (gitboundary.Runner{}).Reauthenticate(runCtx, identity); err != nil {
+		return contracts.CommandResult{}, ErrUnclear
+	}
+	argv := append([]string{"__repository_command_gate", staged}, spec.Argv[1:]...)
+	cmd := exec.CommandContext(runCtx, self, argv...)
+	// Context cancellation arms WaitDelay, which closes supervisor-owned pipe
+	// endpoints even if an escaped child inherited stdout/stderr.
+	cmd.Cancel = func() error { return nil }
+	cmd.WaitDelay = s.drainHard()
 	// Start from a fixed directory. The gate changes directory through the
 	// inherited FD 4 only after the durable launch record is committed, so a
 	// rename/replace of the path cannot redirect the command.
@@ -192,7 +210,12 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 				return contracts.CommandResult{}, ErrUnclear
 			}
 			_ = signalGroup(launch.PGID, syscall.SIGKILL)
-			waitErr = <-wait
+			select {
+			case waitErr = <-wait:
+			case <-time.After(s.drainHard() + 250*time.Millisecond):
+				_ = lease.Quarantine()
+				return contracts.CommandResult{}, ErrUnclear
+			}
 		}
 	}
 	if err := s.ensureGone(launch); err != nil {
@@ -240,6 +263,96 @@ func (s RepositoryCommandSupervisor) drainSoft() time.Duration {
 	}
 	return 2 * time.Second
 }
+func (s RepositoryCommandSupervisor) drainHard() time.Duration {
+	if s.HardDrain > 0 {
+		return s.HardDrain
+	}
+	return 2 * time.Second
+}
+
+func stageExecutable(path, expectedDigest string) (string, error) {
+	source, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer source.Close()
+	dir, err := os.MkdirTemp("", "sf-command-exec-")
+	if err != nil {
+		return "", err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", err
+	}
+	destination := filepath.Join(dir, "command")
+	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o500)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", err
+	}
+	hash := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(out, hash), io.LimitReader(source, 64<<20+1))
+	closeErr := out.Close()
+	if copyErr != nil || closeErr != nil || n > 64<<20 || sourceSizeOver(path, 64<<20) || expectedDigest != "sha256:"+hex.EncodeToString(hash.Sum(nil)) {
+		_ = os.RemoveAll(dir)
+		return "", ErrUnclear
+	}
+	return destination, nil
+}
+
+func sourceSizeOver(path string, limit int64) bool {
+	info, err := os.Stat(path)
+	return err != nil || info.Size() > limit
+}
+
+func parseRepositoryIdentity(claim contracts.RepositoryCommandClaim) (gitboundary.Identity, error) {
+	var identity gitboundary.Identity
+	decoder := json.NewDecoder(strings.NewReader(claim.WorktreeIdentity))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&identity); err != nil {
+		return gitboundary.Identity{}, err
+	}
+	if identity.Repository != claim.Repository || identity.Worktree != claim.Worktree || identity.BaseRef != claim.BaseRef || identity.BaseHead != claim.BaseSHA || identity.HeadRef != claim.Branch {
+		return gitboundary.Identity{}, ErrUnclear
+	}
+	for _, value := range []string{identity.Repository, identity.Worktree, identity.GitFile, identity.CommonDir, identity.Origin, identity.PushOrigin, identity.BaseRef, identity.BaseHead, identity.HeadRef, identity.ConfigHash, identity.HooksHash} {
+		if strings.TrimSpace(value) == "" {
+			return gitboundary.Identity{}, ErrUnclear
+		}
+	}
+	for _, pair := range [][2]uint64{{identity.RepositoryDev, identity.RepositoryIno}, {identity.WorktreeDev, identity.WorktreeIno}, {identity.GitFileDev, identity.GitFileIno}, {identity.CommonDirDev, identity.CommonDirIno}, {identity.PushOriginDev, identity.PushOriginIno}} {
+		if pair[0] == 0 || pair[1] == 0 {
+			return gitboundary.Identity{}, ErrUnclear
+		}
+	}
+	for _, path := range []string{identity.Repository, identity.Worktree, identity.GitFile, identity.CommonDir} {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return gitboundary.Identity{}, ErrUnclear
+		}
+	}
+	return identity, nil
+}
+
+func matchesDirectoryIdentity(info os.FileInfo, dev, ino uint64) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && uint64(stat.Dev) == dev && uint64(stat.Ino) == ino
+}
+
+func (s RepositoryCommandSupervisor) openAuthenticatedWorktree(claim contracts.RepositoryCommandClaim, identity gitboundary.Identity) (*os.File, error) {
+	if s.beforeWorktreeOpen != nil {
+		s.beforeWorktreeOpen()
+	}
+	opened, err := os.Open(claim.Worktree)
+	if err != nil {
+		return nil, err
+	}
+	info, err := opened.Stat()
+	if err != nil || !info.IsDir() || !matchesDirectoryIdentity(info, identity.WorktreeDev, identity.WorktreeIno) {
+		_ = opened.Close()
+		return nil, ErrUnclear
+	}
+	return opened, nil
+}
 func (s RepositoryCommandSupervisor) ensureGone(l contracts.RepositoryCommandLaunch) error {
 	if l.PID <= 0 || l.PGID != l.PID || l.BootIdentity == "" || l.ProcessStartIdentity == "" {
 		return ErrUnclear
@@ -247,9 +360,9 @@ func (s RepositoryCommandSupervisor) ensureGone(l contracts.RepositoryCommandLau
 	deadline := time.Now().Add(250 * time.Millisecond)
 	for {
 		if got, e := processStartIdentity(l.PID); e == nil && got == l.ProcessStartIdentity { /* still live */
-		} else if e := syscall.Kill(-l.PGID, 0); e == syscall.ESRCH {
-			return nil
 		} else if e != nil {
+			// A vanished leader and absent old group cannot prove that a child did
+			// not call setsid/double-fork.  Retain the authority fail-closed.
 			return ErrUnclear
 		}
 		if time.Now().After(deadline) {
@@ -284,14 +397,14 @@ func (d RepositoryCommandDrainer) DrainRepositoryCommand(ctx context.Context, l 
 	if !validRepositoryLaunch(l) {
 		return ErrUnclear
 	}
+	if d.SoftDrain > 30*time.Second || d.HardDrain > 30*time.Second {
+		return ErrUnclear
+	}
 	if boot, err := hostBootIdentity(); err != nil || boot != l.BootIdentity {
 		return ErrUnclear
 	}
 	start, err := processStartIdentity(l.PID)
 	if err != nil {
-		if syscall.Kill(-l.PGID, 0) == syscall.ESRCH {
-			return nil
-		}
 		return ErrUnclear
 	}
 	if start != l.ProcessStartIdentity {
@@ -323,8 +436,13 @@ func (d RepositoryCommandDrainer) DrainRepositoryCommand(ctx context.Context, l 
 	deadline := time.NewTimer(hard)
 	defer deadline.Stop()
 	for {
+		if _, err := processStartIdentity(l.PID); err != nil {
+			// See ensureGone: leader disappearance is ambiguous on macOS without
+			// an OS job/process-tree witness.
+			return ErrUnclear
+		}
 		if syscall.Kill(-l.PGID, 0) == syscall.ESRCH {
-			return nil
+			return ErrUnclear
 		}
 		select {
 		case <-ctx.Done():

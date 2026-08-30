@@ -89,7 +89,10 @@ func TestRepositoryCommandPolicy(t *testing.T) {
 		allowed bool
 	}{
 		{[]string{"go", "test", "./..."}, true},
-		{[]string{"npm", "test"}, true},
+		{[]string{"npm", "test"}, false},
+		{[]string{"/bin/sh", "-c", "true"}, false},
+		{[]string{"nice", "go", "test", "./..."}, false},
+		{[]string{"xargs", "sh"}, false},
 		{[]string{"git", "status", "--porcelain=v1"}, true},
 		{[]string{"git", "diff", "--no-ext-diff", "--no-textconv", "--exit-code"}, true},
 		{[]string{"git", "diff", "--exit-code"}, false},

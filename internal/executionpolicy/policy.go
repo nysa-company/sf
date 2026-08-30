@@ -174,43 +174,30 @@ func EvaluateRepositoryCommand(argv []string) CommandDecision {
 		}
 	}
 	executable := strings.ToLower(filepath.Base(argv[0]))
+	// A snapshot makes an argv immutable for a ticket; it cannot make a shell
+	// or wrapper safe because wrappers reinterpret their remaining arguments.
+	// Keep this boundary positive-allowlisted.
 	switch executable {
-	case "sh", "bash", "zsh", "dash", "fish", "env", "command":
-		return deny("shell_evaluation_forbidden", "shell and command wrappers are forbidden; use an exact executable argv")
-	case "gh":
-		return deny("github_cli_forbidden", "repository commands cannot invoke gh")
-	case "curl", "wget", "ftp", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat":
-		return deny("network_command_forbidden", "direct network commands require operator takeover")
-	case "launchctl", "installer", "softwareupdate", "brew", "docker", "colima", "kubectl":
-		return deny("host_mutation_forbidden", "service, package, VM, and host mutations are forbidden")
 	case "git":
 		return evaluateReadOnlyGit(argv)
-	case "npx":
-		return deny("package_execution_forbidden", "on-demand package execution requires operator takeover")
-	case "npm", "pnpm", "yarn", "bun":
-		if containsWord(argv[1:], "install", "add", "remove", "update", "upgrade", "publish", "link", "dlx", "exec") {
-			return deny("package_mutation_forbidden", "dependency installation or publication requires operator takeover")
-		}
-	case "pip", "pip3", "gem", "cargo":
-		if containsWord(argv[1:], "install", "uninstall", "update", "publish", "yank", "add", "remove") {
-			return deny("package_mutation_forbidden", "dependency installation or publication requires operator takeover")
-		}
 	case "go":
-		if len(argv) > 1 && (argv[1] == "get" || argv[1] == "install") {
-			return deny("package_mutation_forbidden", "go get/install requires operator takeover")
+		if len(argv) < 2 {
+			return deny("go_subcommand_required", "a bounded Go verification subcommand is required")
 		}
-		if len(argv) > 2 && argv[1] == "env" && (argv[2] == "-w" || argv[2] == "-u") {
-			return deny("host_mutation_forbidden", "go env mutation requires operator takeover")
+		switch argv[1] {
+		case "test", "vet", "build", "list":
+			for _, argument := range argv[2:] {
+				if argument == "-exec" || strings.HasPrefix(argument, "-exec=") || argument == "-toolexec" || strings.HasPrefix(argument, "-toolexec=") {
+					return deny("go_wrapper_forbidden", "Go executable wrappers are forbidden")
+				}
+			}
+			return CommandDecision{Allowed: true, Code: "allowed_go_verification", Reason: "bounded Go verification command"}
+		default:
+			return deny("go_command_forbidden", "only go test, vet, build, and list are eligible")
 		}
-		if len(argv) > 2 && argv[1] == "clean" && containsWord(argv[2:], "-modcache", "-cache", "-testcache", "-fuzzcache") {
-			return deny("host_mutation_forbidden", "shared Go cache mutation requires operator takeover")
-		}
-	case "make":
-		if containsWord(argv[1:], "install", "deploy", "release", "publish") {
-			return deny("release_command_forbidden", "install, deploy, release, and publish targets are forbidden")
-		}
+	default:
+		return deny("repository_command_not_allowlisted", "only exact read-only Git and Go verification commands are eligible")
 	}
-	return CommandDecision{Allowed: true, Code: "allowed_registered_command", Reason: "argv is eligible for immutable registration"}
 }
 
 func evaluateReadOnlyGit(argv []string) CommandDecision {
