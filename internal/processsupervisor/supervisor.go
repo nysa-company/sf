@@ -86,12 +86,22 @@ type stagedExecutable struct {
 	cleaning        bool
 }
 type run struct {
-	identity Identity
-	worktree string
-	done     chan struct{}
-	streams  chan struct{}
-	finished chan struct{}
-	snapshot *stagedExecutable
+	identity    Identity
+	worktree    string
+	done        chan struct{}
+	streams     chan struct{}
+	finished    chan struct{}
+	snapshot    *stagedExecutable
+	doneOnce    sync.Once
+	streamsOnce sync.Once
+}
+
+func (r *run) completeWait() {
+	if r == nil {
+		return
+	}
+	r.doneOnce.Do(func() { close(r.done) })
+	r.streamsOnce.Do(func() { close(r.streams) })
 }
 
 func New(recorder LaunchRecorder) (*Supervisor, error) {
@@ -707,25 +717,23 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	s.mu.Unlock()
 	if recorder == nil || recorder.RecordLaunch(ctx, request, r.identity, r.worktree) != nil {
 		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
-		_ = cmd.Wait()
-		close(r.done)
-		close(r.streams)
+		_ = waitProcess(cmd, r)
 		s.removeRun(request, r)
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	// Durable identity exists; the only release is closing the inherited gate.
 	if _, err := gateWrite.Write([]byte{1}); err != nil {
 		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
-		_ = cmd.Wait()
+		_ = waitProcess(cmd, r)
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	if err := gateWrite.Close(); err != nil {
 		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
-		_ = cmd.Wait()
+		_ = waitProcess(cmd, r)
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	wait := make(chan error, 1)
-	go func() { wait <- cmd.Wait(); close(r.done); close(r.streams) }()
+	go func() { wait <- waitProcess(cmd, r) }()
 	var runErr error
 	select {
 	case runErr = <-wait:
@@ -758,6 +766,12 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 
 func (s *Supervisor) removeRun(request contracts.DrainRequest, target *run) {
 	s.removeRunKey(key(request), target)
+}
+
+func waitProcess(cmd *exec.Cmd, r *run) error {
+	err := cmd.Wait()
+	r.completeWait()
+	return err
 }
 
 func (s *Supervisor) removeRunKey(request requestKey, target *run) {
