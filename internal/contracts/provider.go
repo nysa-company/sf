@@ -45,6 +45,13 @@ type PhaseResult struct {
 	UsageUnits   int64
 }
 
+// Invocation is an argv-only adapter proposal. The supervisor is the sole
+// component allowed to start it; adapters never receive os/exec authority.
+type Invocation struct {
+	Argv []string
+	Env  []string
+}
+
 // RuntimeBinding is re-probed immediately before a paid invocation. Its
 // digests are opaque SHA-256 values; credentials themselves never cross this
 // interface or enter SQLite.
@@ -123,7 +130,8 @@ type Provider interface {
 	Name() string
 	Probe(context.Context) (domain.ProviderIdentity, error)
 	Binding(context.Context) (RuntimeBinding, error)
-	Run(context.Context, PhaseInput) (PhaseResult, error)
+	Invocation(context.Context, PhaseInput) (Invocation, error)
+	Parse(context.Context, PhaseInput, CommandResult) (PhaseResult, error)
 }
 
 // ProcessSupervisor owns every provider process group. It must TERM, drain,
@@ -131,6 +139,6 @@ type Provider interface {
 // store. A Provider adapter has no drain method or proof capability.
 type ProcessSupervisor interface {
 	PublicKey() []byte
-	Run(context.Context, DrainRequest, Provider, PhaseInput) (PhaseResult, error)
+	Run(context.Context, DrainRequest, Invocation, PhaseInput) (CommandResult, error)
 	Drain(context.Context, DrainRequest) (DrainProof, error)
 }

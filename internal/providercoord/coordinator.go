@@ -205,7 +205,19 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		input := r.Input
 		input.Provider = binding.Identity
 		input.Timeout = timeout
-		raw, runErr := c.supervisor.Run(attemptCtx, drainRequest(claim), p, input)
+		invocation, invokeErr := p.Invocation(attemptCtx, input)
+		var raw contracts.PhaseResult
+		var runErr error
+		if invokeErr != nil {
+			runErr = invokeErr
+		} else {
+			commandResult, commandErr := c.supervisor.Run(attemptCtx, drainRequest(claim), invocation, input)
+			if commandErr != nil {
+				runErr = commandErr
+			} else {
+				raw, runErr = p.Parse(attemptCtx, input, commandResult)
+			}
+		}
 		cancel()
 		cancelled := ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
 		// Returning from Run, including a provider error, is not proof that its

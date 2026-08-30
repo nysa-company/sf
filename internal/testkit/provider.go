@@ -71,8 +71,11 @@ type Supervisor struct{ Signer *contracts.DrainSigner }
 
 func NewSupervisor() *Supervisor        { s, _ := contracts.NewDrainSigner(); return &Supervisor{Signer: s} }
 func (s *Supervisor) PublicKey() []byte { return s.Signer.PublicKey() }
-func (s *Supervisor) Run(ctx context.Context, _ contracts.DrainRequest, p contracts.Provider, input contracts.PhaseInput) (contracts.PhaseResult, error) {
-	return p.Run(ctx, input)
+func (s *Supervisor) Run(_ context.Context, _ contracts.DrainRequest, invocation contracts.Invocation, _ contracts.PhaseInput) (contracts.CommandResult, error) {
+	if len(invocation.Argv) == 0 {
+		return contracts.CommandResult{}, errors.New("missing fixture argv")
+	}
+	return contracts.CommandResult{}, nil
 }
 func (s *Supervisor) Drain(_ context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
 	return s.Signer.ProveDrained(request)
@@ -124,7 +127,11 @@ func (p *ScriptedProvider) next(phase domain.Phase) ProviderStep {
 	return step
 }
 
-func (p *ScriptedProvider) Run(ctx context.Context, input contracts.PhaseInput) (contracts.PhaseResult, error) {
+func (p *ScriptedProvider) Invocation(context.Context, contracts.PhaseInput) (contracts.Invocation, error) {
+	return contracts.Invocation{Argv: []string{"fixture-provider"}}, nil
+}
+
+func (p *ScriptedProvider) Parse(ctx context.Context, input contracts.PhaseInput, _ contracts.CommandResult) (contracts.PhaseResult, error) {
 	if err := input.Ticket.Validate(); err != nil {
 		return contracts.PhaseResult{}, err
 	}
