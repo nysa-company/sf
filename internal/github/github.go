@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
@@ -60,6 +61,7 @@ type PRMatch struct {
 	State                string
 	MergeState           string
 	AutoMerge            bool
+	MergeQueued          bool
 }
 type EffectPlan struct {
 	SemanticKey string
@@ -78,6 +80,16 @@ const (
 )
 
 var _ contracts.GitHub = (*Client)(nil)
+
+// NewClient is the production wiring point. The orchestrator supplies the
+// Store mutation handoff and the Git-boundary protected-branch verifier; a
+// guarded merge client is never constructed without both authorities.
+func NewClient(binary, home, configDir string, validate func(context.Context, domain.ExternalEffectClaim) error, guard contracts.ExternalMutationGuard, verifier contracts.ProtectedBranchVerifier) (*Client, error) {
+	if binary == "" || !filepath.IsAbs(binary) || home == "" || !filepath.IsAbs(home) || configDir == "" || !filepath.IsAbs(configDir) || validate == nil || guard == nil || verifier == nil {
+		return nil, ErrPolicyRefusal
+	}
+	return &Client{Binary: binary, Home: home, ConfigDir: configDir, ValidateClaim: validate, MutationGuard: guard, VerifyProtectedBranch: verifier}, nil
+}
 
 type authHost struct {
 	Login       string `json:"login"`
@@ -180,13 +192,16 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 	if err := c.validateClaim(ctx, durable, identity, "pr_ready", requestDigest("pr_ready", identity)); err != nil {
 		return err
 	}
-	_, err = c.mutate(ctx, durable, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository))
-	if err == nil {
+	_, err = c.mutateExact(ctx, durable, identity, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository))
+	observed, observeErr := c.Observe(ctx, identity)
+	if observeErr == nil && sameExact(observed.Identity, identity) && observed.Ready && !observed.Draft {
 		return nil
 	}
-	observed, observeErr := c.Observe(ctx, identity)
-	if observeErr == nil && observed.Ready && !observed.Draft {
-		return nil
+	if observeErr != nil {
+		return ErrPolicyRefusal
+	}
+	if err == nil {
+		return ErrPolicyRefusal
 	}
 	return err
 }
@@ -196,7 +211,7 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	if err != nil {
 		return err
 	}
-	if observed.Draft || observed.Merged || observed.AutoMerge || queueState(observed.MergeState) || observed.State != "OPEN" {
+	if c.VerifyProtectedBranch == nil || observed.Draft || observed.Merged || observed.AutoMerge || observed.MergeQueued || queueState(observed.MergeState) || observed.State != "OPEN" {
 		return ErrPolicyRefusal
 	}
 	identity = observed.Identity
@@ -222,6 +237,21 @@ func (c Client) mutate(ctx context.Context, claim domain.ExternalEffectClaim, ar
 		return nil, ErrPolicyRefusal
 	}
 	return c.MutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+		return c.run(runCtx, args...)
+	})
+}
+
+// mutateExact re-observes the exact factory identity inside the durable launch
+// handoff. A PR number alone is never sufficient authorization to mutate.
+func (c Client) mutateExact(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, args ...string) ([]byte, error) {
+	if c.MutationGuard == nil {
+		return nil, ErrPolicyRefusal
+	}
+	return c.MutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+		observed, err := c.view(runCtx, identity)
+		if err != nil || !sameExact(observed.Identity, identity) {
+			return nil, ErrPolicyRefusal
+		}
 		return c.run(runCtx, args...)
 	})
 }
@@ -366,14 +396,17 @@ func (c Client) updateWithClaim(ctx context.Context, durable domain.ExternalEffe
 	if !claim.Claimed || !sameExact(current.Identity, claim.Plan.Identity) || !validTitle(title) || !validBody(body) {
 		return ErrPolicyRefusal
 	}
-	_, err := c.mutate(ctx, durable, "pr", "edit", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--title", title, "--body", body+"\n\n"+ownershipMarker(current.Identity))
-	if err == nil {
-		return nil
-	}
+	_, err := c.mutateExact(ctx, durable, current.Identity, "pr", "edit", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--title", title, "--body", body+"\n\n"+ownershipMarker(current.Identity))
 	markedBody := body + "\n\n" + ownershipMarker(current.Identity)
 	observed, observeErr := c.Observe(ctx, current.Identity)
-	if observeErr == nil && observed.Identity.Number == current.Identity.Number && observed.Title == title && observed.Body == markedBody {
+	if observeErr == nil && sameExact(observed.Identity, current.Identity) && observed.Title == title && observed.Body == markedBody {
 		return nil
+	}
+	if observeErr != nil {
+		return ErrPolicyRefusal
+	}
+	if err == nil {
+		return ErrPolicyRefusal
 	}
 	return err
 }
@@ -426,12 +459,18 @@ func (c Client) WaitChecks(ctx context.Context, identity contracts.PullRequestId
 }
 
 func (c Client) checks(ctx context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
+	if !validIdentity(identity) {
+		return nil, ErrPolicyRefusal
+	}
 	var wire []checkWire
 	if err := c.json(ctx, &wire, "pr", "checks", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--json", "name,state,workflow,link,bucket"); err != nil {
 		return nil, err
 	}
 	checks := make([]contracts.RequiredCheck, 0, len(wire))
 	for _, check := range wire {
+		if !validCheck(check.Name, check.Link, check.Workflow, check.Bucket) {
+			return nil, ErrMalformedResponse
+		}
 		identity := check.Link
 		if check.Workflow != "" || check.Bucket != "" {
 			identity = check.Workflow + "\x00" + check.Link + "\x00" + check.Bucket
@@ -491,7 +530,7 @@ func (c Client) mergeRun(ctx context.Context, claim EffectClaim, pr PRMatch, rev
 	if mode == domain.MergeAutonomous {
 		return "", fmt.Errorf("%w: autonomous merge is unavailable without a passing native profile", ErrPolicyRefusal)
 	}
-	if mode != domain.MergeGuarded || !claim.Claimed || pr.Draft || pr.Merged || pr.AutoMerge || queueState(pr.MergeState) || pr.State != "" && pr.State != "OPEN" || reviewedHead == "" || reviewedHead != pr.Identity.HeadOID || method != "merge" && method != "squash" && method != "rebase" {
+	if mode != domain.MergeGuarded || !claim.Claimed || pr.Draft || pr.Merged || pr.AutoMerge || pr.MergeQueued || queueState(pr.MergeState) || pr.State != "" && pr.State != "OPEN" || reviewedHead == "" || reviewedHead != pr.Identity.HeadOID || method != "merge" && method != "squash" && method != "rebase" {
 		return "", ErrPolicyRefusal
 	}
 	args := []string{"pr", "merge", fmt.Sprint(pr.Identity.Number), "--repo", repoArg(pr.Identity.Repository), "--match-head-commit", reviewedHead, "--" + method}
@@ -558,7 +597,7 @@ func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryI
 	return value.match(parsed), nil
 }
 
-const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest"
+const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest,mergeQueueEntry"
 
 type prWire struct {
 	Number         int `json:"number"`
@@ -582,6 +621,7 @@ type prWire struct {
 	State            string          `json:"state"`
 	MergeState       string          `json:"mergeStateStatus"`
 	AutoMergeRequest json.RawMessage `json:"autoMergeRequest"`
+	MergeQueueEntry  json.RawMessage `json:"mergeQueueEntry"`
 }
 
 func (p prWire) match(identity contracts.PullRequestIdentity) PRMatch {
@@ -589,7 +629,7 @@ func (p prWire) match(identity contracts.PullRequestIdentity) PRMatch {
 	if p.MergeCommit != nil && validOID(p.MergeCommit.OID) {
 		mergeCommit = p.MergeCommit.OID
 	}
-	return PRMatch{Identity: identity, Draft: p.Draft, Merged: p.MergedAt != nil, Ready: !p.Draft, Title: p.Title, Body: p.Body, MergeCommit: mergeCommit, BaseHeadOID: p.BaseOID, State: p.State, MergeState: p.MergeState, AutoMerge: presentJSON(p.AutoMergeRequest)}
+	return PRMatch{Identity: identity, Draft: p.Draft, Merged: p.MergedAt != nil, Ready: !p.Draft, Title: p.Title, Body: p.Body, MergeCommit: mergeCommit, BaseHeadOID: p.BaseOID, State: p.State, MergeState: p.MergeState, AutoMerge: presentJSON(p.AutoMergeRequest), MergeQueued: presentJSON(p.MergeQueueEntry)}
 }
 
 func presentJSON(value json.RawMessage) bool { return len(value) > 0 && string(value) != "null" }
@@ -597,7 +637,7 @@ func queueState(value string) bool           { return value == "QUEUED" || value
 
 func (p prWire) identity(repository contracts.RepositoryIdentity) (contracts.PullRequestIdentity, error) {
 	owner, name, ok := strings.Cut(p.HeadRepository.NameWithOwner, "/")
-	if !ok || owner == "" || name == "" || p.HeadRepositoryOwner.Login != owner || p.Number <= 0 || p.HeadRef == "" || !validOID(p.HeadOID) || !validRef(p.HeadRef) || !validRef(p.BaseRef) {
+	if !ok || !validRepositoryPart(owner) || !validRepositoryPart(name) || p.HeadRepositoryOwner.Login != owner || p.Number <= 0 || p.HeadRef == "" || !validOID(p.HeadOID) || !validRef(p.HeadRef) || !validRef(p.BaseRef) {
 		return contracts.PullRequestIdentity{}, ErrMalformedResponse
 	}
 	identity := contracts.PullRequestIdentity{Repository: repository, Number: p.Number, HeadOwner: owner, HeadRepository: name, HeadRef: p.HeadRef, HeadOID: p.HeadOID, BaseRef: p.BaseRef, FactoryOwned: true}
@@ -611,13 +651,16 @@ func sameExact(left, right contracts.PullRequestIdentity) bool {
 }
 func adoptableDraft(match PRMatch) bool { return match.Draft && !match.Merged && match.State == "OPEN" }
 func validRepository(value contracts.RepositoryIdentity) error {
-	if value.Host != "github.com" || !validRepositoryPart(value.Owner) || !validRepositoryPart(value.Name) {
+	if value.Host != "github.com" || strings.Count(value.Owner, "/") != 0 || strings.Count(value.Name, "/") != 0 || !validRepositoryPart(value.Owner) || !validRepositoryPart(value.Name) {
 		return ErrPolicyRefusal
 	}
 	return nil
 }
+func validCheck(name, link, workflow, bucket string) bool {
+	return bounded(name, 256) && bounded(link, 2048) && (workflow == "" || bounded(workflow, 512)) && (bucket == "" || bounded(bucket, 256))
+}
 func validIdentity(value contracts.PullRequestIdentity) bool {
-	return validRepository(value.Repository) == nil && bounded(value.HeadOwner, 100) && bounded(value.HeadRepository, 100) && validRef(value.HeadRef) && validOID(value.HeadOID) && validRef(value.BaseRef) && value.FactoryOwned
+	return validRepository(value.Repository) == nil && validRepositoryPart(value.HeadOwner) && validRepositoryPart(value.HeadRepository) && validRef(value.HeadRef) && validOID(value.HeadOID) && validRef(value.BaseRef) && value.FactoryOwned
 }
 func repoArg(value contracts.RepositoryIdentity) string { return value.Owner + "/" + value.Name }
 func ownershipMarker(value contracts.PullRequestIdentity) string {
@@ -740,11 +783,30 @@ func boundedGHContext(parent context.Context) (context.Context, context.CancelFu
 }
 
 func runBounded(ctx context.Context, binary string, args, env []string) ([]byte, error) {
-	command := exec.CommandContext(ctx, binary, args...)
+	command := exec.Command(binary, args...)
 	command.Env = env
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	buffer := &boundedBuffer{limit: maxResponse}
 	command.Stdout, command.Stderr = buffer, buffer
-	err := command.Run()
+	if err := command.Start(); err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		// Kill the complete process group so a hung gh helper cannot outlive the
+		// bounded handoff or keep lifecycle draining blocked.
+		if command.Process != nil {
+			_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		}
+		err = <-done
+		if err == nil {
+			err = ctx.Err()
+		}
+	}
 	if buffer.exceeded {
 		return buffer.data, ErrResponseTooLarge
 	}

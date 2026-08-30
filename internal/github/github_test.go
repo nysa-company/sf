@@ -185,6 +185,18 @@ func TestDraftAndNonOpenPRsCannotMergeOrBeAdopted(t *testing.T) {
 	}
 }
 
+func TestMergeQueueEntryRefusesBeforeCommand(t *testing.T) {
+	client, _, identity := fixture(t)
+	identity.Number = 1
+	called := false
+	client.Run = func(context.Context, string, []string, []string) ([]byte, error) { called = true; return nil, nil }
+	plan, _ := client.Plan(identity, "queue")
+	claim, _ := client.Claim(plan)
+	if _, err := client.merge(context.Background(), claim, PRMatch{Identity: identity, State: "OPEN", MergeQueued: true}, identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) || called {
+		t.Fatalf("queue merge err=%v command=%v", err, called)
+	}
+}
+
 func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 	t.Run("unavailable verifier is never success", func(t *testing.T) {
 		client, fake, identity := fixture(t)
@@ -421,5 +433,15 @@ func TestStrictJSONBoundedSanitizedCommandBoundary(t *testing.T) {
 	}
 	if _, err := client.run(context.Background(), "repo", "view"); err == nil || err.Error() != "gh command failed" {
 		t.Fatalf("sanitized error=%v", err)
+	}
+}
+
+func TestRunBoundedKillsProcessGroupOnDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := runBounded(ctx, "/bin/sh", []string{"-c", "sleep 5 & wait"}, []string{"PATH=/usr/bin:/bin"})
+	if err == nil || time.Since(started) > time.Second {
+		t.Fatalf("stuck process group err=%v elapsed=%s", err, time.Since(started))
 	}
 }

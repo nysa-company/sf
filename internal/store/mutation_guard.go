@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"sync"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -16,7 +15,7 @@ import (
 // the drain and allows only a newer ticket/leader/runner identity through.
 type ExternalMutationGate struct {
 	store   *Store
-	mu      sync.Mutex
+	gate    chan struct{}
 	revoked map[domain.TicketRef]mutationRevocation
 }
 
@@ -30,12 +29,24 @@ var _ contracts.ExternalMutationGuard = (*ExternalMutationGate)(nil)
 
 func (s *Store) ExternalMutationGuard() contracts.ExternalMutationGuard { return s.mutations }
 
+func (g *ExternalMutationGate) lock(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-g.gate:
+		return nil
+	}
+}
+func (g *ExternalMutationGate) unlock() { g.gate <- struct{}{} }
+
 func (g *ExternalMutationGate) RunExternalMutation(ctx context.Context, claim domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 	if start == nil {
 		return nil, ErrStaleFence
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	if err := g.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer g.unlock()
 	if revoked, ok := g.revoked[claim.Ref]; ok && claim.TicketVersion <= revoked.version && claim.LeaderEpoch <= revoked.leader && claim.RunnerEpoch <= revoked.runner {
 		return nil, ErrStaleFence
 	}
@@ -56,8 +67,10 @@ func (s *Store) DrainExternalMutations(ctx context.Context, ref domain.TicketRef
 		return err
 	}
 	g := s.mutations
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	if err := g.lock(ctx); err != nil {
+		return err
+	}
+	defer g.unlock()
 	var version, runner, leader uint64
 	err := s.db.QueryRowContext(ctx, `SELECT t.version, t.runner_epoch, d.leader_epoch
 		FROM tickets t JOIN daemon_instances d ON d.channel=t.channel
@@ -80,8 +93,10 @@ func (s *Store) DrainChannelExternalMutations(ctx context.Context, channel domai
 		return ErrStaleFence
 	}
 	g := s.mutations
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	if err := g.lock(ctx); err != nil {
+		return err
+	}
+	defer g.unlock()
 	rows, err := s.db.QueryContext(ctx, `SELECT t.project_id, t.id, t.version, t.runner_epoch, d.leader_epoch
 		FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=?`, channel)
 	if err != nil {

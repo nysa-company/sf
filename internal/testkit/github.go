@@ -63,7 +63,7 @@ type FakeGHState struct {
 const (
 	fakeGHLockRetry    = 5 * time.Millisecond
 	fakeGHLockDeadline = 5 * time.Second
-	prJSONFields       = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest"
+	prJSONFields       = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest,mergeQueueEntry"
 )
 
 func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, error) {
@@ -995,6 +995,7 @@ func prJSON(pr PullRequest) map[string]any {
 	}
 	value["autoMergeRequest"] = nil
 	value["mergeStateStatus"] = "CLEAN"
+	value["mergeQueueEntry"] = nil
 	return value
 }
 

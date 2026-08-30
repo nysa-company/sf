@@ -123,7 +123,8 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
 	s := &Store{db: db, commit: commitTransaction}
-	s.mutations = &ExternalMutationGate{store: s, revoked: make(map[domain.TicketRef]mutationRevocation)}
+	s.mutations = &ExternalMutationGate{store: s, gate: make(chan struct{}, 1), revoked: make(map[domain.TicketRef]mutationRevocation)}
+	s.mutations.gate <- struct{}{}
 	if err := s.configure(ctx); err != nil {
 		db.Close()
 		return nil, err
