@@ -11,10 +11,18 @@ build:
 	@./scripts/semver-check "$(VERSION)"
 	mkdir -p "$(BIN_DIR)"
 	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=stable" -o "$(BIN_DIR)/sf" ./cmd/sf
+	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=stable" -o "$(BIN_DIR)/sf-ssh" ./cmd/sf-ssh
+	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=stable" -o "$(BIN_DIR)/sf-git-exec" ./cmd/sf-git-exec
+	cp internal/gitssh/github_known_hosts "$(BIN_DIR)/github_known_hosts"
+	chmod 0644 "$(BIN_DIR)/github_known_hosts"
 
 build-dev:
 	mkdir -p "$(BIN_DIR)"
 	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(DEV_VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=dev" -o "$(BIN_DIR)/sf-dev" ./cmd/sf
+	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(DEV_VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=dev" -o "$(BIN_DIR)/sf-ssh-dev" ./cmd/sf-ssh
+	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(DEV_VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=dev" -o "$(BIN_DIR)/sf-git-exec-dev" ./cmd/sf-git-exec
+	cp internal/gitssh/github_known_hosts "$(BIN_DIR)/github_known_hosts"
+	chmod 0644 "$(BIN_DIR)/github_known_hosts"
 
 test:
 	go test ./...

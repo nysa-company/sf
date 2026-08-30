@@ -18,6 +18,30 @@ The approved normative design is in
 - Each ticket's unguessable channel-prefixed branch is allocated once through
   SQLite and protected by ticket and channel uniqueness. Git does not own a
   second branch-name ledger.
+- GitHub publication preserves the exact local candidate SHA through an
+  ordinary fast-forward Git push. HTTPS and GraphQL publication remain
+  disabled; the optional port-443 SSH path uses the packaged `sf-ssh` helper,
+  a pinned GitHub host-key asset, and an explicitly supplied SSH agent socket.
+  `make build` packages these together as `bin/sf-ssh` and
+  `bin/github_known_hosts`, alongside `bin/sf-git-exec`; production
+  configuration supplies their absolute paths plus the agent socket to
+  `git.Runner`. `sf-git-exec` performs an fd-pinned `fchdir` and confirms the
+  live worktree `.git` pointer, linked-worktree gitdir, and common directory
+  against inherited descriptors immediately before Git exec. Every Git
+  mutation additionally requires a caller-supplied, fenced durable mutation
+  claim and non-self-attested supervisor lease which holds the repository's
+  no-live-writer exclusion from that final authentication through the effect.
+  macOS does not accept `/dev/fd/N` as
+  `GIT_DIR` (and this host also rejects it as an executable path), so this is a
+  trusted-repository boundary rather than a claim to isolate a malicious
+  concurrent same-UID process. Production rejects local origins; they exist
+  only under the explicit hermetic test transport. The SQLite supervisor is
+  the pending production implementation of this claim/lease contract; until
+  it is wired, Git mutations fail closed.
+  An ordinary candidate-ref push has no server-side CAS for a separate base
+  ref: sf observes BaseRef before and after that bounded publication effect
+  and treats any movement as stale rather than final. The build performs no
+  service installation, channel-state mutation, or network operation.
 
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
 one custom Go state engine over the application schema; DBOS is retained only

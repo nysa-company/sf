@@ -62,6 +62,23 @@ func TestDevelopmentMigrationDoesNotTouchStableBackupDirectory(t *testing.T) {
 	}
 }
 
+func TestPrivateSchemaV10UpgradesThroughProviderMigrations(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "dev.sqlite")
+	createDatabaseAtVersion(t, path, 10)
+	database, err := OpenChannel(ctx, path, filepath.Join(root, "unused-backups"), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := rawSchemaVersion(t, path); got != schemaVersion {
+		t.Fatalf("migrated schema=%d want=%d", got, schemaVersion)
+	}
+}
+
 func TestFutureAndForeignSchemasRefuseBeforePragmaOrBackupMutation(t *testing.T) {
 	ctx := context.Background()
 	for _, test := range []struct {
