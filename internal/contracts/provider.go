@@ -144,6 +144,57 @@ type DrainSigner struct {
 	privateKey ed25519.PrivateKey
 }
 
+// QualificationAttestation is the non-secret evidence that a currently
+// running supervisor observed a local, guarded qualification.  It is kept
+// deliberately small: probe output and credentials never enter SQLite; their
+// canonical SHA-256 digests are what the signature binds.
+type QualificationAttestation struct {
+	Channel          domain.Channel
+	RunID            string
+	Identity         domain.ProviderIdentity
+	BinaryDigest     string
+	PolicyDigest     string
+	FixtureDigest    string
+	AuthDigest       string
+	ProbeDigest      string
+	Profile          ExecutionProfile
+	CreatedUnixNanos int64
+	Nonce            string
+	Signature        []byte
+}
+
+// SignQualification attests to an exact, already bounded qualification
+// observation.  The same supervisor key is durably published by the daemon
+// for process-recovery proof, so Store can reject a signature from a stale or
+// unrelated local process.
+func (s *DrainSigner) SignQualification(value QualificationAttestation) (QualificationAttestation, error) {
+	if s == nil || len(s.privateKey) != ed25519.PrivateKeySize || !validQualificationAttestation(value) {
+		return QualificationAttestation{}, errors.New("qualification signer unavailable or attestation invalid")
+	}
+	value.Signature = ed25519.Sign(s.privateKey, qualificationPayload(value))
+	return value, nil
+}
+
+func VerifyQualificationAttestation(publicKey []byte, value QualificationAttestation) bool {
+	return len(publicKey) == ed25519.PublicKeySize && validQualificationAttestation(value) && len(value.Signature) == ed25519.SignatureSize && ed25519.Verify(ed25519.PublicKey(publicKey), qualificationPayload(value), value.Signature)
+}
+
+func validQualificationAttestation(value QualificationAttestation) bool {
+	if !value.Channel.Valid() || value.RunID == "" || value.Identity.Provider == "" || value.Identity.Model == "" || value.Identity.Family == "" || value.Identity.Version == "" || value.CreatedUnixNanos <= 0 || value.Nonce == "" || value.Profile != ProfileGuarded {
+		return false
+	}
+	for _, digest := range []string{value.BinaryDigest, value.PolicyDigest, value.FixtureDigest, value.AuthDigest, value.ProbeDigest} {
+		if len(digest) != 64 {
+			return false
+		}
+	}
+	return true
+}
+
+func qualificationPayload(value QualificationAttestation) []byte {
+	return []byte("sf-qualification/v1\x00" + string(value.Channel) + "\x00" + value.RunID + "\x00" + value.Identity.Provider + "\x00" + value.Identity.Model + "\x00" + value.Identity.Family + "\x00" + value.Identity.Version + "\x00" + value.BinaryDigest + "\x00" + value.PolicyDigest + "\x00" + value.FixtureDigest + "\x00" + value.AuthDigest + "\x00" + value.ProbeDigest + "\x00" + string(value.Profile) + "\x00" + fmt.Sprintf("%d", value.CreatedUnixNanos) + "\x00" + value.Nonce)
+}
+
 func NewDrainSigner() (*DrainSigner, error) {
 	pub, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

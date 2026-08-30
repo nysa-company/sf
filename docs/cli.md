@@ -57,8 +57,10 @@ semantics. A next action always contains a non-empty argv.
 
 ## Direct setup and diagnostics
 
-`doctor`, `auth status`, `auth login`, `init`, and `providers qualify` are direct
-local setup/diagnostic commands. `init` is implemented: it validates an
+`doctor`, `auth status`, `auth login`, and `init` are direct local
+setup/diagnostic commands. `providers qualify` is an authenticated local-daemon
+operation because a passing result must carry the current supervisor's
+signature. `init` is implemented: it validates an
 absolute Git worktree root and its configured base branch, reads optional
 strict `.sf/config.toml`, creates only the selected channel's owner-only local
 state, and idempotently registers the canonical repository in SQLite. It never

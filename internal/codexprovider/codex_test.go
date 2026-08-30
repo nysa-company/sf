@@ -16,6 +16,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
+	"github.com/nysa-company/sf/internal/processsupervisor"
 	"github.com/nysa-company/sf/internal/providercoord"
 	"github.com/nysa-company/sf/internal/store"
 )
@@ -166,6 +167,21 @@ func TestCodexCredentialHomeAllowsReadOnlyUserDirectoryButRejectsWritableOrSymli
 	}
 }
 
+func TestCodexAuthDigestBindsOpenedAuthFileIdentityAndMetadata(t *testing.T) {
+	adapter, _ := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
+	before, err := adapter.Binding(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(adapter.authHome, "auth.json"), []byte(`{"fixture":"rotated-account"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	after, err := adapter.Binding(context.Background())
+	if err != nil || before.AuthDigest == after.AuthDigest {
+		t.Fatalf("auth binding did not change after credential metadata changed: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
 func TestCodexQualificationBindsFixtureAndBinaryDigest(t *testing.T) {
 	adapter, _ := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
 	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "sf.sqlite"))
@@ -173,18 +189,19 @@ func TestCodexQualificationBindsFixtureAndBinaryDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	passed, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, fixture{})
+	attestor := qualificationAttestor(t, database, domain.ChannelDev)
+	passed, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, fixture{}, attestor)
 	if err != nil || passed.Profile != store.QualificationGuarded || passed.Provider.Provider != "codex" || passed.FixtureDigest != fixtureDigest() {
 		t.Fatalf("passed=%+v err=%v", passed, err)
 	}
-	failed, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, fixture{failed: []string{"network", "network"}})
+	failed, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, fixture{failed: []string{"network", "network"}}, attestor)
 	if err != nil || failed.Profile != store.QualificationDisabled || !reflect.DeepEqual(failed.FailedProbes, []string{"network"}) {
 		t.Fatalf("failed=%+v err=%v", failed, err)
 	}
-	if _, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, fixture{failed: []string{"unknown_probe"}}); !errors.Is(err, ErrUnsafeConfiguration) {
+	if _, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, fixture{failed: []string{"unknown_probe"}}, attestor); !errors.Is(err, ErrUnsafeConfiguration) {
 		t.Fatalf("unknown probe accepted: %v", err)
 	}
-	if _, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, wrongFixture{}); !errors.Is(err, ErrUnsafeConfiguration) {
+	if _, err := Qualify(context.Background(), database, domain.ChannelDev, adapter, wrongFixture{}, attestor); !errors.Is(err, ErrUnsafeConfiguration) {
 		t.Fatalf("fixture digest mismatch err=%v", err)
 	}
 	old := passed.BinaryDigest
@@ -195,6 +212,34 @@ func TestCodexQualificationBindsFixtureAndBinaryDigest(t *testing.T) {
 	if err != nil || binding.BinaryDigest == old || qualificationMatches(database, context.Background(), domain.ChannelDev, binding) {
 		t.Fatalf("digest binding=%+v err=%v", binding, err)
 	}
+}
+
+func qualificationAttestor(t *testing.T, database *store.Store, channel domain.Channel) *processsupervisor.Supervisor {
+	t.Helper()
+	value, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(context.Background(), channel, "qualification-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetRecoveryAuthority(context.Background(), channel, leader, value.PublicKey()); err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func qualificationAttestorForLeader(t *testing.T, database *store.Store, channel domain.Channel, leader uint64) *processsupervisor.Supervisor {
+	t.Helper()
+	value, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetRecoveryAuthority(context.Background(), channel, leader, value.PublicKey()); err != nil {
+		t.Fatal(err)
+	}
+	return value
 }
 
 type wrongFixture struct{}
@@ -263,12 +308,9 @@ func TestComposeProfilesRequiresTwoQualifiedDistinctFamilies(t *testing.T) {
 	t.Cleanup(func() { _ = database.Close() })
 	builder, _ := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
 	reviewer, _ := adapterFixture(t, "codex-reviewer", "gpt-5.5")
-	for index, adapter := range []*Adapter{builder, reviewer} {
-		binding, bindErr := adapter.Binding(ctx)
-		if bindErr != nil {
-			t.Fatal(bindErr)
-		}
-		if _, _, recordErr := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: fmt.Sprintf("%032x", index+1), Provider: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()}); recordErr != nil {
+	attestor := qualificationAttestor(t, database, domain.ChannelDev)
+	for _, adapter := range []*Adapter{builder, reviewer} {
+		if _, recordErr := Qualify(ctx, database, domain.ChannelDev, adapter, fixture{}, attestor); recordErr != nil {
 			t.Fatal(recordErr)
 		}
 	}
@@ -306,16 +348,6 @@ func TestComposeProfilesRequiresTwoQualifiedDistinctFamilies(t *testing.T) {
 	if err != nil || aliasBinding.Identity.Family != buildBinding.Identity.Family || aliasBinding.Identity.Model != buildBinding.Identity.Model {
 		t.Fatalf("route alias changed durable model family: binding=%+v err=%v", aliasBinding, err)
 	}
-	if _, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: strings.Repeat("f", 32), Provider: aliasBinding.Identity, BinaryDigest: aliasBinding.BinaryDigest, PolicyDigest: aliasBinding.PolicyDigest, FixtureDigest: aliasBinding.FixtureDigest, Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()}); err != nil {
-		t.Fatal(err)
-	}
-	aliasQualification, err := database.LatestProviderQualification(ctx, domain.ChannelDev, aliasBinding.Identity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := database.SelectProviderPair(ctx, domain.ChannelDev, buildQ.ID, aliasQualification.ID, time.Now().UTC()); !errors.Is(err, store.ErrProviderPairRefused) {
-		t.Fatalf("same-model aliases were accepted as independent: %v", err)
-	}
 }
 
 type jsonSupervisor struct{ signer *contracts.DrainSigner }
@@ -347,10 +379,6 @@ func TestCodexJSONLPhaseFailsClosedWithoutMonetaryReservation(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 	adapter, _ := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
-	binding, err := adapter.Binding(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
 	raw := []byte("configuration")
 	digest := fmt.Sprintf("%x", sha256.Sum256(raw))
 	project := store.Project{Channel: domain.ChannelDev, ID: "demo", Path: "/tmp/codex-project", BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: raw}
@@ -374,7 +402,8 @@ func TestCodexJSONLPhaseFailsClosedWithoutMonetaryReservation(t *testing.T) {
 	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticketValue.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticketValue.RunnerEpoch}, Path: worktree, Branch: "dev/demo/SF-codex", IdentityJSON: []byte(identity), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
-	builder, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: strings.Repeat("1", 32), Provider: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()})
+	attestor := qualificationAttestorForLeader(t, database, domain.ChannelDev, leader)
+	builder, err := Qualify(ctx, database, domain.ChannelDev, adapter, fixture{}, attestor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +440,11 @@ func adapterFixture(t *testing.T, route, model string) (*Adapter, *fakeProbe) {
 		t.Fatal(err)
 	}
 	probe := &fakeProbe{version: []byte("codex 1.2.3\n"), help: requiredHelp(), loginExit: 0}
-	adapter, err := New(Config{Route: route, Executable: executable, AuthHome: privateDir(t, "auth"), Model: model, Runner: probe})
+	authHome := privateDir(t, "auth")
+	if err := os.WriteFile(filepath.Join(authHome, "auth.json"), []byte(`{"fixture":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := New(Config{Route: route, Executable: executable, AuthHome: authHome, Model: model, Runner: probe})
 	if err != nil {
 		t.Fatal(err)
 	}

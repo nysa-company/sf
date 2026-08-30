@@ -10,7 +10,7 @@ the foreground daemon is the only process that owns ticket mutations.
 - `gh` authenticated interactively to the disposable or trusted GitHub
   account you intend to use.
 - One qualified Builder provider and one independently qualified Reviewer
-  provider. The beta pair is Cursor as Builder and Claude as Reviewer.
+  provider. The local beta pair uses separately qualified Codex model families.
 - A trusted local product checkout with a GitHub origin.
 
 Docker, Colima, root access, deployment credentials, and copied GitHub tokens
@@ -59,14 +59,16 @@ read-only diagnostic:
 
 ```text
 cd /absolute/path/to/sf-source
-./bin/sf-dev providers qualify --builder cursor --reviewer claude
+./bin/sf-dev providers qualify --builder codex --reviewer codex
 ./bin/sf-dev doctor --repo /absolute/path/to/nysa-app
 ```
 
-Qualification runs before paid work and records provider/version/family and a
-guarded qualification result. Doctor never prints provider output or
-credential bytes. A missing or expired provider login stops here with one
-concrete login command.
+Qualification is served by the running foreground daemon: its current local
+supervisor signs the exact provider/version/family, executable, non-secret
+authentication identity, and bounded probe digests before SQLite admits the
+guarded result. It invokes no model. On macOS it fails closed unless the outer
+Seatbelt probe denies loopback/external sockets and CODEX_HOME metadata access.
+Doctor never prints provider output or credential bytes.
 
 ## Submit and watch one ticket
 

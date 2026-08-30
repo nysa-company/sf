@@ -63,6 +63,9 @@ func main() {
 			ProviderCoordinatorFactory: func(database *store.Store, process contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
 				return codexprovider.Compose(context.Background(), channel, database, process)
 			},
+			ProviderQualifier: func(qualifyCtx context.Context, database *store.Store, value domain.Channel, builder, reviewer string) (any, error) {
+				return codexprovider.QualifyLocalPair(qualifyCtx, database, value, builder, reviewer, supervisor)
+			},
 		})
 	}
 	os.Exit(cli.ExecuteWithDaemon(ctx, os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}, runDaemon))

@@ -122,6 +122,9 @@ type Config struct {
 	// the daemon opens the authoritative Store. A nil factory leaves provider
 	// execution unavailable rather than inventing an adapter.
 	ProviderCoordinatorFactory func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error)
+	// ProviderQualifier is invoked only through this authenticated foreground
+	// daemon, after its supervisor key is current in SQLite.
+	ProviderQualifier func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
 }
 
 type Daemon struct {
@@ -144,6 +147,7 @@ type Daemon struct {
 	}
 	gitMutationDrainer  contracts.GitMutationDrainer
 	providerCoordinator *providercoord.Coordinator
+	providerQualifier   func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
 	mu                  sync.Mutex
 	closed              bool
 
@@ -246,7 +250,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		}
 	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, providerCoordinator: coordinator}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, providerCoordinator: coordinator, providerQualifier: configuration.ProviderQualifier}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -404,6 +408,8 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		response = daemon.controlTicket(ctx, request, identity, "cancel")
 	case "daemon.status":
 		response = daemon.status(request, identity)
+	case "provider.qualify":
+		response = daemon.qualifyProvider(ctx, request)
 	default:
 		response = daemon.failure(request, "not_ready", "this lifecycle operation is not enabled by the local daemon yet", false)
 	}
@@ -413,6 +419,40 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		}
 	}
 	return response
+}
+
+func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) api.Response {
+	if daemon.providerQualifier == nil {
+		return daemon.failure(request, "provider_unavailable", "provider qualification is not configured for this daemon", false)
+	}
+	var parameters struct {
+		Builder  string `json:"builder"`
+		Reviewer string `json:"reviewer"`
+	}
+	if err := json.Unmarshal(request.Parameters, &parameters); err != nil || parameters.Builder != "codex" || parameters.Reviewer != "codex" {
+		return daemon.failure(request, "invalid_argument", "builder and reviewer must name the local Codex provider", false)
+	}
+	value, err := daemon.providerQualifier(ctx, daemon.store, daemon.channel, parameters.Builder, parameters.Reviewer)
+	if err != nil {
+		response := daemon.failure(request, "unqualified_provider", "local Codex qualification failed without invoking a model: "+safeQualificationError(err), false)
+		if encoded, encodeErr := json.Marshal(value); encodeErr == nil {
+			response.Data = encoded
+		}
+		return response
+	}
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "provider.qualify", Identity: string(daemon.channel), Observed: true}, value)
+}
+
+func safeQualificationError(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "bounded probe did not complete"
+	}
+	for _, value := range []string{"unsafe", "unavailable", "capability", "authentication", "attestation", "qualified"} {
+		if strings.Contains(strings.ToLower(err.Error()), value) {
+			return err.Error()
+		}
+	}
+	return "guarded probe refused"
 }
 
 func (daemon *Daemon) projectEvents(ctx context.Context) error {

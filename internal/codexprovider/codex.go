@@ -15,9 +15,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -98,6 +101,13 @@ type sealedQualificationFixture interface {
 	qualificationFixtureSeal()
 }
 
+// QualificationAttestor is implemented only by the daemon's live process
+// supervisor.  It makes a passing result unforgeable by an adapter or CLI
+// helper: Store verifies its signature against the current daemon key.
+type QualificationAttestor interface {
+	AttestQualification(contracts.QualificationAttestation) (contracts.QualificationAttestation, error)
+}
+
 // LocalQualificationFixture runs the bounded, credential-free qualification
 // probes owned by this adapter.  It never invokes `codex exec`, and therefore
 // never spends model tokens.  The caller still chooses the channel and stores
@@ -113,9 +123,9 @@ func (localQualificationFixture) Run(ctx context.Context, adapter *Adapter) ([]s
 	if adapter == nil || adapter.runner == nil {
 		return []string{"configuration"}, ErrUnsafeConfiguration
 	}
-	// ProbeRunner is deliberately the same bounded runner used for version and
-	// auth probes. These checks inspect the installed CLI and Seatbelt profile;
-	// they do not call a model or touch the network outside the denied command.
+	// The adapter supplied to this fixture has an independently-enforced outer
+	// Seatbelt runner. The inner `codex sandbox` command proves the exact Codex
+	// profile too; neither command receives CODEX_HOME or prompt stdin.
 	probe := func(name string, args []string, env []string, expect func(auth.ProbeResult) bool) error {
 		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -140,6 +150,30 @@ func (localQualificationFixture) Run(ctx context.Context, adapter *Adapter) ([]s
 	if err := probe("sandbox_workspace_write", workspace, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode == 0 }); err != nil {
 		return []string{"sandbox_workspace_write"}, nil
 	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return []string{"network_loopback"}, nil
+	}
+	defer listener.Close()
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			_, _ = connection.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"))
+			_ = connection.Close()
+		}
+	}()
+	loopback := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":read-only"`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/usr/bin/curl", "-fsS", "--connect-timeout", "1", "http://" + listener.Addr().String()}
+	if err := probe("network_loopback", loopback, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode != 0 }); err != nil {
+		return []string{"network_loopback"}, nil
+	}
+	external := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":read-only"`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/usr/bin/curl", "-fsS", "--connect-timeout", "1", "http://198.51.100.1:9"}
+	if err := probe("network_external", external, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode != 0 }); err != nil {
+		return []string{"network_external"}, nil
+	}
+	credential := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":read-only"`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/bin/sh", "-c", `test -r "$CODEX_HOME/auth.json"`}
+	if err := probe("credential_isolation", credential, append(probeEnvironment(), "CODEX_HOME="+adapter.authHome), func(result auth.ProbeResult) bool { return result.ExitCode != 0 }); err != nil {
+		return []string{"credential_isolation"}, nil
+	}
 	return nil, nil
 }
 
@@ -148,14 +182,14 @@ func (localQualificationFixture) Run(ctx context.Context, adapter *Adapter) ([]s
 // hostile-fixture digest have all been observed. Autonomous eligibility is
 // intentionally unavailable until the separately approved native-profile
 // proof exists.
-func Qualify(ctx context.Context, database *store.Store, channel domain.Channel, adapter *Adapter, fixture QualificationFixture) (store.ProviderQualification, error) {
-	if database == nil || !channel.Valid() || adapter == nil || fixture == nil || fixture.Digest() != fixtureDigest() {
+func Qualify(ctx context.Context, database *store.Store, channel domain.Channel, adapter *Adapter, fixture QualificationFixture, attestor QualificationAttestor) (store.ProviderQualification, error) {
+	if database == nil || !channel.Valid() || adapter == nil || fixture == nil || attestor == nil || fixture.Digest() != fixtureDigest() {
 		return store.ProviderQualification{}, ErrUnsafeConfiguration
 	}
 	if _, sealed := fixture.(sealedQualificationFixture); !sealed {
 		return store.ProviderQualification{}, ErrUnsafeConfiguration
 	}
-	binding, err := adapter.Binding(ctx)
+	binding, err := adapter.qualificationBinding(ctx)
 	if err != nil {
 		return store.ProviderQualification{}, err
 	}
@@ -175,7 +209,19 @@ func Qualify(ctx context.Context, database *store.Store, channel domain.Channel,
 	if err != nil {
 		return store.ProviderQualification{}, err
 	}
-	qualification, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: channel, RunID: runID, Provider: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, Profile: profile, FailedProbes: failed, ReasonCode: reason, CreatedAt: time.Now().UTC()})
+	created := time.Now().UTC()
+	value := store.ProviderQualification{Channel: channel, RunID: runID, Provider: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, Profile: profile, FailedProbes: failed, ReasonCode: reason, CreatedAt: created}
+	if profile == store.QualificationDisabled {
+		qualification, _, recordErr := database.RecordProviderQualification(ctx, value)
+		return qualification, recordErr
+	}
+	probeDigest := qualificationProbeDigest(binding, failed)
+	attestation, attestErr := attestor.AttestQualification(contracts.QualificationAttestation{Channel: channel, RunID: runID, Identity: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, AuthDigest: binding.AuthDigest, ProbeDigest: probeDigest, Profile: contracts.ProfileGuarded, CreatedUnixNanos: created.UnixNano(), Nonce: runID})
+	if attestErr != nil {
+		return store.ProviderQualification{}, attestErr
+	}
+	value.ProbeDigest = probeDigest
+	qualification, _, err := database.RecordAttestedProviderQualification(ctx, value, attestation)
 	return qualification, err
 }
 
@@ -251,13 +297,42 @@ func (a *Adapter) Binding(ctx context.Context) (contracts.RuntimeBinding, error)
 	if err != nil {
 		return contracts.RuntimeBinding{}, err
 	}
+	auth, err := authDigest(a.authHome)
+	if err != nil {
+		return contracts.RuntimeBinding{}, err
+	}
 	return contracts.RuntimeBinding{
 		Identity:      identity,
 		BinaryDigest:  binary,
 		PolicyDigest:  policyDigest(),
 		FixtureDigest: fixtureDigest(),
-		AuthDigest:    authDigest(identity, a.authHome),
+		AuthDigest:    auth,
 	}, nil
+}
+
+// qualificationBinding deliberately omits `login status`: qualification must
+// never read a credential or make a provider/model request. Runtime admission
+// re-probes authentication separately immediately before paid work.
+func (a *Adapter) qualificationBinding(ctx context.Context) (contracts.RuntimeBinding, error) {
+	if a == nil || a.runner == nil {
+		return contracts.RuntimeBinding{}, ErrUnavailable
+	}
+	version, err := a.version(ctx)
+	if err != nil {
+		return contracts.RuntimeBinding{}, err
+	}
+	if err := a.capabilities(ctx); err != nil {
+		return contracts.RuntimeBinding{}, err
+	}
+	binary, err := digestFile(a.executable)
+	if err != nil {
+		return contracts.RuntimeBinding{}, err
+	}
+	auth, err := authDigest(a.authHome)
+	if err != nil {
+		return contracts.RuntimeBinding{}, err
+	}
+	return contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: a.model, Family: a.family, Version: version}, BinaryDigest: binary, PolicyDigest: policyDigest(), FixtureDigest: fixtureDigest(), AuthDigest: auth}, nil
 }
 
 func (a *Adapter) Invocation(_ context.Context, input contracts.PhaseInput) (contracts.Invocation, error) {
@@ -425,11 +500,94 @@ func fixtureDigest() string {
 	sum := sha256.Sum256([]byte("codex-qualification-fixture/v1\x00hostile-fixture-required\x00no-live-network-in-tests"))
 	return hex.EncodeToString(sum[:])
 }
-func authDigest(identity domain.ProviderIdentity, authHome string) string {
-	// This is only a non-secret freshness binding. It intentionally hashes no
-	// credential bytes and never exposes the auth-home path.
-	sum := sha256.Sum256([]byte("codex-auth/v1\x00" + identity.Provider + "\x00" + identity.Version + "\x00" + authHome))
+func authDigest(authHome string) (string, error) {
+	// Bind non-secret filesystem identity and metadata, never credential
+	// content. A replacement, rotation, or symlink race therefore invalidates
+	// the binding while no token byte reaches memory outside Codex itself.
+	file, err := openPrivateAuthFile(authHome)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || !trustedAuthHomeOwner(info) {
+		return "", ErrUnsafeConfiguration
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("codex-auth/v2\x00%d\x00%d\x00%d\x00%d", stat.Dev, stat.Ino, info.Size(), info.ModTime().UnixNano())))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func openPrivateAuthFile(home string) (*os.File, error) {
+	if _, err := resolveAuthHome(home); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(home, "auth.json")
+	before, err := os.Lstat(path)
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || before.Mode().Perm()&0o077 != 0 || !trustedAuthHomeOwner(before) {
+		return nil, ErrUnauthenticated
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, ErrUnauthenticated
+	}
+	after, statErr := file.Stat()
+	if statErr != nil || !sameFileIdentity(before, after) {
+		_ = file.Close()
+		return nil, ErrUnsafeConfiguration
+	}
+	return file, nil
+}
+
+func sameFileIdentity(left, right os.FileInfo) bool {
+	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
+	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
+	return leftOK && rightOK && leftStat.Dev == rightStat.Dev && leftStat.Ino == rightStat.Ino && left.Mode() == right.Mode() && left.Size() == right.Size()
+}
+
+func qualificationProbeDigest(binding contracts.RuntimeBinding, failed []string) string {
+	values := append([]string(nil), failed...)
+	sort.Strings(values)
+	sum := sha256.Sum256([]byte("codex-qualification-probes/v2\x00" + binding.BinaryDigest + "\x00" + binding.PolicyDigest + "\x00" + binding.FixtureDigest + "\x00" + binding.AuthDigest + "\x00" + strings.Join(values, "\x00")))
 	return hex.EncodeToString(sum[:])
+}
+
+type outerQualificationRunner struct {
+	base    ProbeRunner
+	profile string
+}
+
+func newOuterQualificationRunner(base ProbeRunner, authHome string) (ProbeRunner, error) {
+	if runtime.GOOS != "darwin" {
+		return nil, ErrUnsafeConfiguration
+	}
+	sandbox, err := exec.LookPath("sandbox-exec")
+	if err != nil || sandbox != "/usr/bin/sandbox-exec" {
+		return nil, ErrUnsafeConfiguration
+	}
+	if _, err := resolveAuthHome(authHome); err != nil {
+		return nil, err
+	}
+	return outerQualificationRunner{base: base, profile: qualificationSandboxProfile(authHome)}, nil
+}
+
+func (r outerQualificationRunner) Probe(ctx context.Context, executable string, arguments, environment []string, limit int) (auth.ProbeResult, error) {
+	if r.base == nil || r.profile == "" {
+		return auth.ProbeResult{}, ErrUnsafeConfiguration
+	}
+	args := append([]string{"-p", r.profile, executable}, arguments...)
+	return r.base.Probe(ctx, "/usr/bin/sandbox-exec", args, environment, limit)
+}
+
+func qualificationSandboxProfile(authHome string) string {
+	escaped := strings.ReplaceAll(authHome, `"`, `\\"`)
+	// Specific Seatbelt denials win over the broad host-read compatibility
+	// allowance. The outer profile constrains Codex itself as well as the
+	// command passed to `codex sandbox`.
+	return `(version 1) (allow default) (deny network*) (deny file-write*) (deny file-read* (subpath "` + escaped + `"))`
 }
 func safeName(value string) bool {
 	return value != "" && len(value) <= 100 && !strings.ContainsAny(value, "\x00\r\n\t /\\")
@@ -445,7 +603,7 @@ func qualificationRunID() (string, error) {
 
 func normalizeProbes(values []string) ([]string, error) {
 	known := map[string]struct{}{
-		"configuration": {}, "sandbox_read": {}, "sandbox_write_denied": {}, "sandbox_workspace_write": {},
+		"configuration": {}, "sandbox_read": {}, "sandbox_write_denied": {}, "sandbox_workspace_write": {}, "network_loopback": {}, "network_external": {}, "credential_isolation": {},
 		"version": {}, "capabilities": {}, "authentication": {}, "fixture_execution": {},
 		"binary": {}, "network": {}, "root_denied": {}, "auth_denied": {}, "argv": {}, "jsonl": {},
 	}

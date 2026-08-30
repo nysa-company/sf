@@ -420,3 +420,13 @@ var migrationV22 = []string{
 	`ALTER TABLE provider_attempts ADD COLUMN auth_digest TEXT NOT NULL DEFAULT '' CHECK(length(auth_digest) IN (0,64))`,
 	`UPDATE provider_attempts SET state='failed',outcome='legacy_unverifiable',finished_at=CASE WHEN finished_at='' THEN started_at ELSE finished_at END WHERE state IN ('active','quarantined') AND auth_digest=''`,
 }
+
+// v23 makes a passing Codex qualification an auditable, supervisor-signed
+// observation. Existing rows remain readable but cannot admit a Codex route
+// until re-qualified through the current daemon.
+var migrationV23 = []string{
+	`ALTER TABLE provider_qualifications ADD COLUMN auth_digest TEXT NOT NULL DEFAULT '' CHECK(length(auth_digest) IN (0,64))`,
+	`ALTER TABLE provider_qualifications ADD COLUMN probe_digest TEXT NOT NULL DEFAULT '' CHECK(length(probe_digest) IN (0,64))`,
+	`ALTER TABLE provider_qualifications ADD COLUMN attested_leader_epoch INTEGER NOT NULL DEFAULT 0 CHECK(attested_leader_epoch >= 0)`,
+	`ALTER TABLE provider_qualifications ADD COLUMN attestation_signature BLOB NOT NULL DEFAULT X'' CHECK(length(attestation_signature) IN (0,64))`,
+}

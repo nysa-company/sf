@@ -75,6 +75,16 @@ func New(recorder LaunchRecorder) (*Supervisor, error) {
 	return &Supervisor{Signer: signer, Recorder: recorder, trusted: map[domain.ProviderIdentity]trustedExecutable{}, SoftDrain: 2 * time.Second, HardDrain: 2 * time.Second, runs: map[requestKey]*run{}}, nil
 }
 func (s *Supervisor) PublicKey() []byte { return s.Signer.PublicKey() }
+
+// AttestQualification is intentionally the only qualification-signing
+// capability exposed by the process supervisor.  Adapters receive neither
+// this method nor the private key.
+func (s *Supervisor) AttestQualification(value contracts.QualificationAttestation) (contracts.QualificationAttestation, error) {
+	if s == nil {
+		return contracts.QualificationAttestation{}, errors.New("qualification supervisor is unavailable")
+	}
+	return s.Signer.SignQualification(value)
+}
 func (s *Supervisor) SetLaunchRecorder(recorder func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -517,6 +527,10 @@ func copyCodexAuth(sourceHome, destination string) error {
 		return err
 	}
 	defer in.Close()
+	opened, err := in.Stat()
+	if err != nil || !sameFileIdentity(info, opened) {
+		return errors.New("Codex auth file changed while opening")
+	}
 	out, err := os.OpenFile(filepath.Join(destination, "auth.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
@@ -527,6 +541,12 @@ func copyCodexAuth(sourceHome, destination string) error {
 		return errors.New("could not copy Codex auth")
 	}
 	return os.Chmod(filepath.Join(destination, "auth.json"), 0o600)
+}
+
+func sameFileIdentity(left, right os.FileInfo) bool {
+	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
+	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
+	return leftOK && rightOK && leftStat.Dev == rightStat.Dev && leftStat.Ino == rightStat.Ino && left.Mode() == right.Mode() && left.Size() == right.Size()
 }
 
 func materializeInvocationFiles(invocation contracts.Invocation, temporary string) ([]string, string, error) {

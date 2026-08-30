@@ -119,6 +119,10 @@ func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
 	paths, err := config.PathsFor(home, domain.ChannelDev)
 	if err != nil {
@@ -584,6 +588,96 @@ func TestProductionForegroundDaemonServesAnotherCLIClient(t *testing.T) {
 	}
 	if err := foreground.Wait(); err != nil {
 		t.Fatalf("foreground daemon exit: %v", err)
+	}
+}
+
+func TestCompiledDevQualificationUsesDaemonAttestationAndNeverExecutesModel(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("qualification fails closed without macOS sandbox-exec")
+	}
+	home, err := os.MkdirTemp("/tmp", "sfh-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	authHome := filepath.Join(home, ".codex")
+	if err := os.Mkdir(authHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authHome, "auth.json"), []byte(`{"account":"fixture"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fakeCodex := filepath.Join(bin, "codex")
+	// The fake accepts only capability/help and locally sandboxed probe shapes.
+	// Any real `codex exec` model invocation exits nonzero, so a green
+	// qualification proves this path did not make a model call.
+	fake := `#!/bin/sh
+case "$1" in
+  --version) echo 'codex 1.2.3'; exit 0 ;;
+  exec) [ "$2" = '--help' ] && { echo '--json --output-schema --output-last-message --ephemeral --ignore-user-config --ignore-rules --profile --config --model -C'; exit 0; }; exit 97 ;;
+  sandbox) case "$*" in
+    *curl*) for arg in "$@"; do url="$arg"; done; /usr/bin/curl -fsS --connect-timeout 1 "$url"; exit $? ;;
+    *CODEX_HOME*) test -r "$CODEX_HOME/auth.json"; exit $? ;;
+    *'test -r /etc/hosts'*) exit 0 ;;
+    *'test -w /etc/hosts'*) exit 1 ;;
+    *) exit 0 ;;
+  esac ;;
+esac
+exit 98
+`
+	if err := os.WriteFile(fakeCodex, []byte(fake), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), "sf-dev")
+	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sf-dev: %v\n%s", err, output)
+	}
+	paths, err := config.PathsFor(home, domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := append(os.Environ(), "HOME="+home, "CODEX_HOME="+authHome, "PATH="+bin+":/usr/bin:/bin")
+	foreground := exec.Command(binary, "daemon", "run")
+	foreground.Env = environment
+	var daemonOutput bytes.Buffer
+	foreground.Stdout, foreground.Stderr = &daemonOutput, &daemonOutput
+	if err := foreground.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if foreground.ProcessState == nil || !foreground.ProcessState.Exited() {
+			_ = foreground.Process.Signal(os.Interrupt)
+			_, _ = foreground.Process.Wait()
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Lstat(paths.Socket); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dev daemon did not create socket: %s", daemonOutput.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	qualify := exec.Command(binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex", "--json")
+	qualify.Env = environment
+	output, err := qualify.CombinedOutput()
+	if err != nil {
+		t.Fatalf("qualified local Codex pair: %v\n%s\ndaemon=%s", err, output, daemonOutput.String())
+	}
+	if !strings.Contains(string(output), `"independent":true`) || !strings.Contains(string(output), `"model_call_made":false`) || strings.Contains(string(output), `"auth.json"`) {
+		t.Fatalf("unsafe qualification response: %s", output)
 	}
 }
 

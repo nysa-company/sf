@@ -23,7 +23,7 @@ for required in \
 	'./bin/sf-dev auth login claude' \
 	'./bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app' \
 	'./bin/sf-dev daemon run' \
-	'./bin/sf-dev providers qualify --builder cursor --reviewer claude' \
+	'./bin/sf-dev providers qualify --builder codex --reviewer codex' \
 	'./bin/sf-dev doctor --repo /absolute/path/to/nysa-app' \
 	'./bin/sf-dev submit ./tickets/fix-duplicate-reminders.md --project nysa' \
 	'./bin/sf-dev start SF-00000001' \
@@ -36,7 +36,7 @@ build_line=$(line 'make build-dev')
 auth_line=$(line './bin/sf-dev auth status')
 init_line=$(line './bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app')
 daemon_line=$(line './bin/sf-dev daemon run')
-qualify_line=$(line './bin/sf-dev providers qualify --builder cursor --reviewer claude')
+qualify_line=$(line './bin/sf-dev providers qualify --builder codex --reviewer codex')
 doctor_line=$(line './bin/sf-dev doctor --repo /absolute/path/to/nysa-app')
 submit_line=$(line './bin/sf-dev submit ./tickets/fix-duplicate-reminders.md --project nysa')
 start_line=$(line './bin/sf-dev start SF-00000001')

@@ -144,7 +144,7 @@ var requiredSchema = map[string][]string{
 	"ticket_counters":              {"kind", "used", "limit_count"},
 	"ticket_budget_uses":           {"kind", "request_id", "ticket_version"},
 	"branch_allocations":           {"authority_key", "channel", "project_id", "ticket_id", "branch_ref", "created_at"},
-	"provider_qualifications":      {"id", "channel", "run_id", "provider", "model", "family", "provider_version", "binary_digest", "policy_digest", "fixture_digest", "profile", "failed_probes_json", "reason_code", "created_at"},
+	"provider_qualifications":      {"id", "channel", "run_id", "provider", "model", "family", "provider_version", "binary_digest", "policy_digest", "fixture_digest", "profile", "failed_probes_json", "reason_code", "created_at", "auth_digest", "probe_digest", "attested_leader_epoch", "attestation_signature"},
 	"provider_pair_selections":     {"channel", "builder_qualification_id", "reviewer_qualification_id", "selected_at"},
 	"merge_intents":                {"semantic_key", "original_base_oid", "head_oid", "base_ref", "protection_rule_id", "strict_status_checks", "admin_enforced", "active_ruleset_count"},
 	"external_mutation_quarantine": {"singleton", "reason", "observed_at"},

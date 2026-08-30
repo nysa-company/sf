@@ -604,9 +604,14 @@ func currentRuntimeQualification(ctx context.Context, conn *sql.Conn, channel do
 	var id int64
 	q := ProviderQualification{}
 	q.ID = 0
-	query := `SELECT q.id,q.channel,q.run_id,q.provider,q.model,q.family,q.provider_version,q.binary_digest,q.policy_digest,q.fixture_digest,q.profile,q.failed_probes_json,q.reason_code,q.created_at FROM provider_qualifications q`
-	where := ` WHERE q.channel=? AND q.provider=? AND q.model=? AND q.family=? AND q.provider_version=? AND q.binary_digest=? AND q.policy_digest=? AND q.fixture_digest=? AND q.profile IN ('qualified_guarded','autonomous_eligible')`
+	query := `SELECT q.id,q.channel,q.run_id,q.provider,q.model,q.family,q.provider_version,q.binary_digest,q.policy_digest,q.fixture_digest,q.profile,q.failed_probes_json,q.reason_code,q.created_at,q.auth_digest,q.probe_digest,q.attested_leader_epoch,q.attestation_signature FROM provider_qualifications q`
+	where := ` WHERE q.channel=? AND q.provider=? AND q.model=? AND q.family=? AND q.provider_version=? AND q.binary_digest=? AND q.policy_digest=? AND q.fixture_digest=? AND q.profile IN ('qualified_guarded','autonomous_eligible') AND (q.provider <> 'codex' OR (q.auth_digest=? AND length(q.probe_digest)=64 AND q.attested_leader_epoch>0 AND length(q.attestation_signature)=64))`
 	args := []any{channel, b.Identity.Provider, b.Identity.Model, b.Identity.Family, b.Identity.Version, b.BinaryDigest, b.PolicyDigest, b.FixtureDigest}
+	if b.Identity.Provider == "codex" {
+		args = append(args, b.AuthDigest)
+	} else {
+		args = append(args, "")
+	}
 	if role == "planner" || role == "builder" || role == "reviewer" {
 		col := "planner_qualification_id"
 		if role == "builder" {

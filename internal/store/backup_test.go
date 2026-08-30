@@ -249,6 +249,8 @@ func testMigration(version int) []string {
 		return migrationV21
 	case 22:
 		return migrationV22
+	case 23:
+		return migrationV23
 	default:
 		return nil
 	}
