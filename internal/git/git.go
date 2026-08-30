@@ -35,6 +35,11 @@ var (
 	// shell command interface, including its absolute-path form, so it cannot
 	// implement the repository command policy by itself.
 	ErrHTTPSCredentialBoundary = errors.New("HTTPS git publication requires an argv-only credential boundary")
+	// ErrGitHubRefCASUnavailable is returned before any gh command starts. The
+	// GitHub Git Data ref APIs expose create and force/fast-forward update, but
+	// no expected-old-SHA precondition. A read followed by either mutation would
+	// therefore violate the exact remote-base fence required for v1.
+	ErrGitHubRefCASUnavailable = errors.New("github git-data ref API lacks exact expected-old-sha CAS")
 )
 
 const maxGitOutput = 1 << 20
@@ -1016,6 +1021,36 @@ type Worktree struct {
 	Identity     Identity
 }
 
+// GitHubPublicationClaim is the adapter-facing subset of a durable external
+// effect claim. The SQLite owner validates it immediately before a future
+// publisher starts any external command; Git deliberately never owns that
+// persistence or substitutes an in-memory authorization check.
+type GitHubPublicationClaim struct {
+	SemanticKey   string
+	RequestDigest string
+	Fence         domain.Fence
+}
+
+// GitHubPublicationAuthority is supplied by the SQLite effect owner. It is
+// intentionally narrow so this package only coordinates through the durable
+// candidate/ref identity, not a second workflow authority.
+type GitHubPublicationAuthority interface {
+	ValidateGitHubPublication(context.Context, GitHubPublicationClaim) error
+}
+
+// GitHubPublicationRequest binds the local candidate to the remote base that
+// was observed by the effect owner. A future implementation may publish only
+// this exact identity and must durably record a different published SHA before
+// any PR, review, or approval gate can use it.
+type GitHubPublicationRequest struct {
+	Worktree           Worktree
+	ExpectedRemoteBase string
+	ExpectedHead       string
+	ExpectedTree       string
+	Policy             DiffPolicy
+	Claim              GitHubPublicationClaim
+}
+
 // PreflightRepository proves that repository is the primary checkout. Snapshot
 // intentionally requires a linked-worktree .git file; callers creating a
 // worktree must use this separate primary-checkout preflight first.
@@ -1757,6 +1792,57 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 		return "", fmt.Errorf("%w: push did not converge", ErrUnexpectedRemote)
 	}
 	return expectedHead, nil
+}
+
+// PublishGitHub validates the exact local candidate and the durable mutation
+// claim, then fails before launching gh. GitHub's documented Git Data API has
+// no compare-and-swap field for an expected prior ref SHA: POST creates only an
+// absent ref and PATCH offers force or ordinary fast-forward behavior. Neither
+// can atomically prove the remote base observed for this candidate. Publishing
+// through a gh api read-then-write sequence would create the very reconcile
+// gap this boundary is intended to close.
+//
+// A future implementation needs a forge endpoint with expected-old-SHA CAS, or
+// a separately qualified transport whose server-side atomic ref transaction
+// returns and durably binds the published candidate SHA. Until then this method
+// makes no network call and is safe to retry after a lost response because no
+// response can have represented a started mutation.
+func (r Runner) PublishGitHub(ctx context.Context, request GitHubPublicationRequest, authority GitHubPublicationAuthority) (string, error) {
+	if authority == nil || request.Claim.SemanticKey == "" || !validEvidenceDigest(request.Claim.RequestDigest) ||
+		request.Claim.Fence.LeaderEpoch == 0 || request.Claim.Fence.RunnerEpoch == 0 || request.Claim.Fence.ClaimEpoch == 0 ||
+		!validOID(request.ExpectedRemoteBase) || !validOID(request.ExpectedHead) || !validOID(request.ExpectedTree) || len(request.Policy.AllowedPaths) == 0 {
+		return "", fmt.Errorf("%w: invalid durable github publication request", ErrUnexpectedRemote)
+	}
+	if _, err := validateBranch(request.Worktree.Branch); err != nil {
+		return "", err
+	}
+	if request.ExpectedRemoteBase != request.Worktree.Identity.BaseHead {
+		return "", fmt.Errorf("%w: remote base does not match authenticated base", ErrUnexpectedRemote)
+	}
+	if err := r.InspectWorktree(ctx, request.Worktree); err != nil {
+		return "", err
+	}
+	head, err := r.oneExpected(ctx, request.Worktree.Path, request.Worktree.Identity.WorktreeDev, request.Worktree.Identity.WorktreeIno, "rev-parse", "HEAD^{commit}")
+	if err != nil || head != request.ExpectedHead {
+		return "", fmt.Errorf("%w: local candidate head changed", ErrUnexpectedRemote)
+	}
+	parent, err := r.oneExpected(ctx, request.Worktree.Path, request.Worktree.Identity.WorktreeDev, request.Worktree.Identity.WorktreeIno, "rev-parse", "HEAD^1")
+	if err != nil || parent != request.ExpectedRemoteBase {
+		return "", fmt.Errorf("%w: local candidate parent is not expected remote base", ErrUnexpectedRemote)
+	}
+	tree, err := r.oneExpected(ctx, request.Worktree.Path, request.Worktree.Identity.WorktreeDev, request.Worktree.Identity.WorktreeIno, "rev-parse", "HEAD^{tree}")
+	if err != nil || tree != request.ExpectedTree {
+		return "", fmt.Errorf("%w: local candidate tree changed", ErrUnexpectedRemote)
+	}
+	policy := request.Policy
+	policy.ExpectedHead = request.ExpectedHead
+	if err := r.validateImmutableTree(ctx, request.Worktree.Path, request.Worktree.Identity.BaseRef, tree, policy); err != nil {
+		return "", err
+	}
+	if err := authority.ValidateGitHubPublication(ctx, request.Claim); err != nil {
+		return "", err
+	}
+	return "", ErrGitHubRefCASUnavailable
 }
 
 func (r Runner) provePushHead(ctx context.Context, worktree Worktree, expectedHead string) (string, error) {

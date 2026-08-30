@@ -71,6 +71,19 @@ type errorReader struct{}
 
 func (errorReader) Read([]byte) (int, error) { return 0, errors.New("random generation must not run") }
 
+type publicationAuthority struct {
+	called bool
+	err    error
+}
+
+func (a *publicationAuthority) ValidateGitHubPublication(_ context.Context, claim GitHubPublicationClaim) error {
+	a.called = true
+	if claim.SemanticKey == "" || claim.RequestDigest == "" {
+		return errors.New("invalid publication claim")
+	}
+	return a.err
+}
+
 func rawGit(t *testing.T, directory string, args ...string) string {
 	t.Helper()
 	command := exec.Command("git", append([]string{"-C", directory}, args...)...)
@@ -638,6 +651,57 @@ func TestHTTPSCredentialHelperConfigurationFailsClosed(t *testing.T) {
 	branch := "sf/dev/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef"
 	if _, err := (Runner{}).Push(context.Background(), Worktree{Branch: branch, Identity: Identity{PushOrigin: "https://example.test/owner/repository.git"}}, strings.Repeat("a", 40)); !errors.Is(err, ErrHTTPSCredentialBoundary) {
 		t.Fatalf("HTTPS publication did not fail closed: %v", err)
+	}
+}
+
+func TestGitHubPublicationFailsClosedAfterExactLocalCandidateProof(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-github-publish")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(7, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := rawGit(t, worktree.Path, "rev-parse", "HEAD^{tree}")
+	authority := &publicationAuthority{}
+	request := GitHubPublicationRequest{Worktree: worktree, ExpectedRemoteBase: worktree.Identity.BaseHead, ExpectedHead: head, ExpectedTree: tree, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, Claim: GitHubPublicationClaim{SemanticKey: "publish/SF-github-publish", RequestDigest: digest([]byte("publish")), Fence: domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1, ClaimEpoch: 1}}}
+	if _, err := runner.PublishGitHub(ctx, request, authority); !errors.Is(err, ErrGitHubRefCASUnavailable) {
+		t.Fatalf("publish=%v", err)
+	}
+	if !authority.called {
+		t.Fatal("durable publication authority was not validated")
+	}
+	if remote := rawGit(t, repository, "ls-remote", "--heads", "origin", "refs/heads/"+branch); remote != "" {
+		t.Fatalf("fail-closed publication contacted or changed remote: %q", remote)
+	}
+}
+
+func TestGitHubPublicationRefusesMismatchedBaseBeforeClaimValidation(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-github-mismatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := &publicationAuthority{}
+	request := GitHubPublicationRequest{Worktree: worktree, ExpectedRemoteBase: strings.Repeat("a", 40), ExpectedHead: worktree.Identity.BaseHead, ExpectedTree: strings.Repeat("b", 40), Policy: DiffPolicy{AllowedPaths: []string{"src"}}, Claim: GitHubPublicationClaim{SemanticKey: "publish/SF-github-mismatch", RequestDigest: digest([]byte("publish")), Fence: domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1, ClaimEpoch: 1}}}
+	if _, err := runner.PublishGitHub(ctx, request, authority); !errors.Is(err, ErrUnexpectedRemote) {
+		t.Fatalf("mismatched remote base=%v", err)
+	}
+	if authority.called {
+		t.Fatal("durable claim was touched before local identity rejection")
 	}
 }
 
