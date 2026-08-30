@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -33,7 +34,7 @@ func evidenceOID(value string) string    { return strings.Repeat(value, 40) }
 
 func TestEvidencePlanVerificationCandidateAndApprovalFences(t *testing.T) {
 	database, ctx, ref, version, fence := evidenceFixture(t)
-	plan := PlanArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Document: PlanDocument{Acceptance: []string{"works"}, ProofKind: "regression", Paths: []string{"src"}, Commands: []string{"go test ./..."}, Risks: []string{"migration"}}}
+	plan := PlanArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Document: PlanDocument{Acceptance: []string{"works"}, ProofKind: "regression", Paths: []string{"src"}, Commands: [][]string{{"go", "test", "./..."}}, Risks: []string{"migration"}}}
 	digest, err := database.RecordPlan(ctx, plan)
 	if err != nil || digest == "" {
 		t.Fatalf("plan digest=%q err=%v", digest, err)
@@ -78,6 +79,29 @@ func TestEvidencePlanVerificationCandidateAndApprovalFences(t *testing.T) {
 	}
 	if _, err := database.RecordPlan(ctx, PlanArtifact{Ref: ref, ExpectedVersion: version + 1, Fence: fence, Document: plan.Document}); !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("stale fence=%v", err)
+	}
+}
+
+func TestPlanEvidencePreservesArgvAndRejectsFlattenedCommands(t *testing.T) {
+	database, ctx, ref, version, fence := evidenceFixture(t)
+	document := PlanDocument{
+		Acceptance: []string{"argv remains exact"},
+		ProofKind:  "regression",
+		Paths:      []string{"internal"},
+		Commands:   [][]string{{"go", "test", "./internal/example", "-run", "Test one; still one argument"}},
+		Risks:      []string{"command policy"},
+	}
+	if _, err := database.RecordPlan(ctx, PlanArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Document: document}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.Plan(ctx, ref)
+	if err != nil || len(stored.Document.Commands) != 1 || len(stored.Document.Commands[0]) != 5 || stored.Document.Commands[0][4] != "Test one; still one argument" {
+		t.Fatalf("commands=%v err=%v", stored.Document.Commands, err)
+	}
+
+	var legacy PlanDocument
+	if err := json.Unmarshal([]byte(`{"acceptance":["one"],"proof_kind":"regression","paths":["internal"],"commands":["go test ./..."],"risks":["one"]}`), &legacy); err == nil {
+		t.Fatal("flattened legacy command unexpectedly decoded as argv")
 	}
 }
 

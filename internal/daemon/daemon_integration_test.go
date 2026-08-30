@@ -362,7 +362,7 @@ func TestDaemonShowAndStatusExposeBoundedAuthenticatedEvidence(t *testing.T) {
 		Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch},
 		Document: store.PlanDocument{
 			Acceptance: []string{"a durable result exists"}, ProofKind: "regression",
-			Paths: []string{"internal/example.go"}, Commands: []string{"go test ./..."}, Risks: []string{"stale state"},
+			Paths: []string{"internal/example.go"}, Commands: [][]string{{"go", "test", "./..."}}, Risks: []string{"stale state"},
 		},
 	})
 	if err != nil {
@@ -390,7 +390,7 @@ func TestDaemonRefusesToHideCorruptDurableEvidence(t *testing.T) {
 	if _, err := d.store.RecordPlan(context.Background(), store.PlanArtifact{
 		Ref: started.Ref, ExpectedVersion: started.Version,
 		Fence:    domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch},
-		Document: store.PlanDocument{Acceptance: []string{"one"}, ProofKind: "focused", Paths: []string{"x.go"}, Commands: []string{"go test ./..."}, Risks: []string{"one"}},
+		Document: store.PlanDocument{Acceptance: []string{"one"}, ProofKind: "focused", Paths: []string{"x.go"}, Commands: [][]string{{"go", "test", "./..."}}, Risks: []string{"one"}},
 	}); err != nil {
 		t.Fatal(err)
 	}

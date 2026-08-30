@@ -23,11 +23,11 @@ const (
 // PlanDocument is the bounded, typed Planner output retained for recovery and
 // review. It is intentionally not a provider transcript.
 type PlanDocument struct {
-	Acceptance []string `json:"acceptance"`
-	ProofKind  string   `json:"proof_kind"`
-	Paths      []string `json:"paths"`
-	Commands   []string `json:"commands"`
-	Risks      []string `json:"risks"`
+	Acceptance []string   `json:"acceptance"`
+	ProofKind  string     `json:"proof_kind"`
+	Paths      []string   `json:"paths"`
+	Commands   [][]string `json:"commands"`
+	Risks      []string   `json:"risks"`
 }
 
 type PlanArtifact struct {
@@ -462,13 +462,26 @@ func validatePlanDocument(document PlanDocument) ([]byte, error) {
 	if !boundedText(document.ProofKind, 100) || len(document.Acceptance) == 0 || len(document.Paths) == 0 || len(document.Commands) == 0 {
 		return nil, fmt.Errorf("plan requires bounded acceptance, proof kind, paths, and commands")
 	}
-	for _, values := range [][]string{document.Acceptance, document.Paths, document.Commands, document.Risks} {
+	for _, values := range [][]string{document.Acceptance, document.Paths, document.Risks} {
 		if len(values) > 256 {
 			return nil, fmt.Errorf("plan field exceeds item bound")
 		}
 		for _, value := range values {
 			if !boundedText(value, 2_000) {
 				return nil, fmt.Errorf("plan field contains unbounded text")
+			}
+		}
+	}
+	if len(document.Commands) > 20 {
+		return nil, fmt.Errorf("plan commands exceed item bound")
+	}
+	for _, argv := range document.Commands {
+		if len(argv) == 0 || len(argv) > 64 {
+			return nil, fmt.Errorf("plan command requires 1 to 64 argv values")
+		}
+		for _, value := range argv {
+			if !boundedText(value, 2_000) {
+				return nil, fmt.Errorf("plan command contains unbounded argv")
 			}
 		}
 	}

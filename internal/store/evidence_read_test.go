@@ -11,7 +11,7 @@ import (
 
 func TestEvidenceReadsRebuildCurrentWorkflowAuthority(t *testing.T) {
 	database, ctx, ref, version, fence := evidenceFixture(t)
-	planDocument := PlanDocument{Acceptance: []string{"works"}, ProofKind: "regression", Paths: []string{"internal"}, Commands: []string{"go test ./..."}, Risks: []string{"migration"}}
+	planDocument := PlanDocument{Acceptance: []string{"works"}, ProofKind: "regression", Paths: []string{"internal"}, Commands: [][]string{{"go", "test", "./..."}}, Risks: []string{"migration"}}
 	planDigest, err := database.RecordPlan(ctx, PlanArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Document: planDocument})
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +99,7 @@ func TestEvidenceReadsFailClosedOnAbsenceAndTampering(t *testing.T) {
 	if _, err := database.Worktree(ctx, ref); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing worktree error=%v", err)
 	}
-	document := PlanDocument{Acceptance: []string{"works"}, ProofKind: "regression", Paths: []string{"internal"}, Commands: []string{"go test ./..."}, Risks: []string{"risk"}}
+	document := PlanDocument{Acceptance: []string{"works"}, ProofKind: "regression", Paths: []string{"internal"}, Commands: [][]string{{"go", "test", "./..."}}, Risks: []string{"risk"}}
 	if _, err := database.RecordPlan(ctx, PlanArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Document: document}); err != nil {
 		t.Fatal(err)
 	}
