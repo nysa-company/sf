@@ -100,6 +100,48 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 	}
 }
 
+func TestLeaseCapacitiesUseAuthenticatedProjectSnapshot(t *testing.T) {
+	machine := config.DefaultMachineLimits()
+	machine.MaxConcurrentTickets = 4
+	projectConfig := config.DefaultProject("demo", "/tmp/demo")
+	projectConfig.MaxConcurrentTickets = 3
+	effective, err := config.Resolve(machine, projectConfig, config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := store.Project{Channel: domain.ChannelDev, ID: "demo", Path: "/tmp/demo", BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: snapshot}
+	global, perProject, err := leaseCapacities(project)
+	if err != nil || global != 4 || perProject != 3 {
+		t.Fatalf("global=%d project=%d err=%v", global, perProject, err)
+	}
+	project.Path = "/tmp/other"
+	if _, _, err := leaseCapacities(project); err == nil {
+		t.Fatal("configuration snapshot was accepted for another repository")
+	}
+}
+
+func TestDaemonAdmissionUsesConfiguredTwoTicketDefault(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	for index := 1; index <= 3; index++ {
+		ref := domain.TicketRef{Channel: domain.ChannelStable, Project: "demo", Ticket: domain.TicketID(fmt.Sprintf("SF-capacity-%d", index))}
+		if err := d.store.CreateTicket(context.Background(), store.Ticket{Ref: ref, SourceDigest: fmt.Sprintf("capacity-%d", index), Type: domain.TicketBug, MergeMode: domain.MergeGuarded}); err != nil {
+			t.Fatal(err)
+		}
+		request := api.Request{Version: api.Version, RequestID: fmt.Sprintf("capacity-%d", index), Method: "ticket.start", Ticket: string(ref.Ticket), Parameters: []byte(`{"channel":"stable","project":"demo"}`)}
+		response := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, request)
+		if index <= 2 && !response.OK {
+			t.Fatalf("ticket %d was not admitted: %+v", index, response)
+		}
+		if index == 3 && (response.OK || response.Error == nil || response.Error.Code != "capacity_unavailable") {
+			t.Fatalf("third ticket did not hit capacity: %+v", response)
+		}
+	}
+}
+
 func TestSubmitRejectsUnregisteredProjectBeforeTicketPersistence(t *testing.T) {
 	for _, channel := range []domain.Channel{domain.ChannelStable, domain.ChannelDev} {
 		t.Run(string(channel), func(t *testing.T) {

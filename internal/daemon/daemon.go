@@ -344,21 +344,28 @@ func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ do
 		if err != nil {
 			return daemon.failure(request, "unknown_project", "ticket project is not registered", false)
 		}
+		globalCapacity, projectCapacity, err := leaseCapacities(project)
+		if err != nil {
+			return daemon.failure(request, "invalid_configuration", "the durable project configuration is invalid", false)
+		}
 		doctorGreen := true
 		if daemon.doctor != nil {
 			doctorGreen = daemon.doctor(ctx, project) == nil
 		}
-		capacityAvailable := true
+		globalUsed, projectUsed := 0, 0
 		leases, err := daemon.store.Leases(ctx, daemon.channel)
 		if err != nil {
 			return daemon.failure(request, "capacity_unavailable", "capacity could not be checked", errors.Is(err, store.ErrBusy))
 		}
 		for _, lease := range leases {
-			if lease.Scope == "global" || (lease.Scope == "project" && lease.Ref.Project == ref.Project) {
-				capacityAvailable = false
-				break
+			if lease.Scope == "global" {
+				globalUsed++
+			}
+			if lease.Scope == "project" && lease.Ref.Project == ref.Project {
+				projectUsed++
 			}
 		}
+		capacityAvailable := globalUsed < globalCapacity && projectUsed < projectCapacity
 		if _, err := daemon.spec.Select(string(stored.State), "operator_start", map[string]bool{"doctor_preflight_green": doctorGreen, "capacity_available": capacityAvailable}); err != nil {
 			if !doctorGreen {
 				return daemon.failure(request, "doctor_required", "local doctor preflight is not green", false)
@@ -366,8 +373,16 @@ func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ do
 			return daemon.failure(request, "capacity_unavailable", "local capacity is already reserved", true)
 		}
 	}
+	project, err := daemon.store.Project(ctx, daemon.channel, ref.Project)
+	if err != nil {
+		return daemon.failure(request, "unknown_project", "ticket project is not registered", false)
+	}
+	globalCapacity, projectCapacity, err := leaseCapacities(project)
+	if err != nil {
+		return daemon.failure(request, "invalid_configuration", "the durable project configuration is invalid", false)
+	}
 	workflowID := fmt.Sprintf("%s/%s/%s/planning", daemon.channel, ref.Project, ref.Ticket)
-	started, observed, err := daemon.store.StartWithOwnership(ctx, ref, stored.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, workflowID, []store.LeaseRequest{{Scope: "global", Resource: "machine", Capacity: 1}, {Scope: "project", Resource: string(ref.Project), Capacity: 1}}, daemon.clock.Now().UTC())
+	started, observed, err := daemon.store.StartWithOwnership(ctx, ref, stored.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, workflowID, []store.LeaseRequest{{Scope: "global", Resource: "machine", Capacity: globalCapacity}, {Scope: "project", Resource: string(ref.Project), Capacity: projectCapacity}}, daemon.clock.Now().UTC())
 	if err != nil {
 		code := "start_refused"
 		if errors.Is(err, store.ErrLeaseCapacity) {
@@ -376,6 +391,21 @@ func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ do
 		return daemon.failure(request, code, "ticket could not enter local planning state", errors.Is(err, store.ErrBusy))
 	}
 	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_start", Identity: workflowID, Observed: observed}, ticketView(started))
+}
+
+func leaseCapacities(project store.Project) (int, int, error) {
+	if project.ConfigGeneration == 0 && len(project.ConfigSnapshot) == 0 && project.ConfigDigest == "" {
+		defaults := config.DefaultMachineLimits()
+		return defaults.MaxConcurrentTickets, defaults.MaxConcurrentTickets, nil
+	}
+	effective, err := config.DecodeSnapshot(project.ConfigSnapshot, project.ConfigDigest)
+	if err != nil {
+		return 0, 0, err
+	}
+	if domain.ProjectID(effective.Name) != project.ID || effective.Repository != project.Path || effective.BaseBranch != project.BaseRef {
+		return 0, 0, errors.New("configuration snapshot does not match durable project identity")
+	}
+	return effective.Machine.MaxConcurrentTickets, effective.MaxConcurrentTickets, nil
 }
 
 func (daemon *Daemon) ticketRef(ctx context.Context, request api.Request) (domain.TicketRef, *api.Response) {

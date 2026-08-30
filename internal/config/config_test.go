@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -92,6 +94,31 @@ func TestSnapshotIsStable(t *testing.T) {
 	}
 	if string(first) != string(second) || firstDigest != secondDigest {
 		t.Fatal("configuration snapshot is not deterministic")
+	}
+}
+
+func TestDecodeSnapshotAuthenticatesCanonicalFrozenAuthority(t *testing.T) {
+	value, err := Resolve(DefaultMachineLimits(), DefaultProject("nysa", "/tmp/nysa"), TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, digest, err := Snapshot(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeSnapshot(data, digest)
+	if err != nil || decoded.Name != "nysa" || decoded.MaxConcurrentTickets != 2 || decoded.Machine.MaxConcurrentTickets != 2 {
+		t.Fatalf("decoded=%+v err=%v", decoded, err)
+	}
+	changed := append([]byte(nil), data...)
+	changed[len(changed)-1] ^= 1
+	if _, err := DecodeSnapshot(changed, digest); err == nil {
+		t.Fatal("changed snapshot was accepted")
+	}
+	withUnknown := append(data[:len(data)-1], []byte(`,"unknown":true}`)...)
+	unknownDigest := sha256.Sum256(withUnknown)
+	if _, err := DecodeSnapshot(withUnknown, hex.EncodeToString(unknownDigest[:])); err == nil {
+		t.Fatal("unknown snapshot field was accepted")
 	}
 }
 

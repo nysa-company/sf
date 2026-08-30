@@ -1,10 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -165,6 +168,42 @@ func Snapshot(value Effective) ([]byte, string, error) {
 	}
 	digest := sha256.Sum256(data)
 	return data, hex.EncodeToString(digest[:]), nil
+}
+
+// DecodeSnapshot authenticates and strictly decodes the canonical project
+// authority frozen onto a ticket. Runtime code must use this function rather
+// than a later repository file or mutable machine policy.
+func DecodeSnapshot(data []byte, wantDigest string) (Effective, error) {
+	if len(data) == 0 || len(data) > MaxFileBytes || len(wantDigest) != sha256.Size*2 || strings.ToLower(wantDigest) != wantDigest {
+		return Effective{}, fmt.Errorf("complete canonical configuration snapshot is required")
+	}
+	want, err := hex.DecodeString(wantDigest)
+	if err != nil || len(want) != sha256.Size {
+		return Effective{}, fmt.Errorf("configuration snapshot digest is invalid")
+	}
+	actual := sha256.Sum256(data)
+	if !bytes.Equal(actual[:], want) {
+		return Effective{}, fmt.Errorf("configuration snapshot digest does not match")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var value Effective
+	if err := decoder.Decode(&value); err != nil {
+		return Effective{}, fmt.Errorf("decode configuration snapshot: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return Effective{}, fmt.Errorf("configuration snapshot contains trailing data")
+	}
+	resolved, err := Resolve(value.Machine, value.Project, TicketOverride{})
+	if err != nil {
+		return Effective{}, fmt.Errorf("validate configuration snapshot: %w", err)
+	}
+	canonical, _, err := Snapshot(resolved)
+	if err != nil || !bytes.Equal(canonical, data) {
+		return Effective{}, fmt.Errorf("configuration snapshot is not canonical")
+	}
+	return resolved, nil
 }
 
 func validateMachine(machine MachineLimits) error {
