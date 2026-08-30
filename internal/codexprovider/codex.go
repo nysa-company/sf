@@ -209,7 +209,7 @@ func (a *Adapter) Invocation(_ context.Context, input contracts.PhaseInput) (con
 	if len(input.Prompt) == 0 || len(input.Prompt) > 64<<10 || strings.ContainsRune(input.Prompt, '\x00') || len(input.Schema) == 0 || len(input.Schema) > 1<<20 || !json.Valid(input.Schema) {
 		return contracts.Invocation{}, errors.New("Codex phase input is invalid")
 	}
-	sandbox, ok := sandboxForPhase(input.Phase)
+	parent, workspaceAccess, ok := permissionProfileForPhase(input.Phase)
 	if !ok {
 		return contracts.Invocation{}, errors.New("Codex phase has no supported sandbox")
 	}
@@ -218,7 +218,7 @@ func (a *Adapter) Invocation(_ context.Context, input contracts.PhaseInput) (con
 	// untrusted ticket text never becomes an argv element. The permissions
 	// profile is deliberately code-owned, not project/user configuration.
 	return contracts.Invocation{
-		Argv:               codexArgv(a.executable, a.model, input.Worktree, sandbox),
+		Argv:               codexArgv(a.executable, a.model, input.Worktree, parent, workspaceAccess),
 		Stdin:              []byte(input.Prompt),
 		OutputSchema:       append([]byte(nil), input.Schema...),
 		CaptureLastMessage: true,
@@ -226,18 +226,18 @@ func (a *Adapter) Invocation(_ context.Context, input contracts.PhaseInput) (con
 	}, nil
 }
 
-func codexArgv(executable, model, worktree, access string) []string {
-	return []string{executable, "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules", "--profile", "sf-guarded", "--config", `permissions.sf-guarded.extends=":` + access + `"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="` + access + `"}`, "--config", `permissions.sf-guarded.network.enabled=false`, "--model", model, "-C", worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-"}
+func codexArgv(executable, model, worktree, parent, workspaceAccess string) []string {
+	return []string{executable, "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules", "--profile", "sf-guarded", "--config", `permissions.sf-guarded.extends=":` + parent + `"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="` + workspaceAccess + `"}`, "--config", `permissions.sf-guarded.network.enabled=false`, "--model", model, "-C", worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-"}
 }
 
-func sandboxForPhase(phase domain.Phase) (string, bool) {
+func permissionProfileForPhase(phase domain.Phase) (string, string, bool) {
 	switch phase {
 	case domain.PhasePlanning, domain.PhaseReview:
-		return "read-only", true
+		return "read-only", "read", true
 	case domain.PhaseVerification, domain.PhaseBuild:
-		return "workspace", true
+		return "workspace", "write", true
 	default:
-		return "", false
+		return "", "", false
 	}
 }
 
@@ -357,7 +357,7 @@ func policyDigest() string {
 	// command shape is independently pinned by fixtureDigest and capability
 	// probing; this digest only names the launch environment that the
 	// supervisor itself enforces.
-	sum := sha256.Sum256([]byte("PATH=/usr/bin:/bin\x00LANG=C\x00HOME=<private>\x00TMPDIR=<private>"))
+	sum := sha256.Sum256([]byte("PATH=/usr/bin:/bin\x00LANG=C\x00LC_ALL=C\x00HOME=<private>\x00TMPDIR=<private>\x00CODEX_HOME=<private>"))
 	return hex.EncodeToString(sum[:])
 }
 func fixtureDigest() string {

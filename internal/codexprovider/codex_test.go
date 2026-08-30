@@ -69,7 +69,7 @@ func TestCodexInvocationUsesBoundedStdinAndPinnedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := codexArgv(adapter.executable, "gpt-5.6-luna", worktree, "read-only")
+	want := codexArgv(adapter.executable, "gpt-5.6-luna", worktree, "read-only", "read")
 	if !reflect.DeepEqual(invocation.Argv, want) || string(invocation.Stdin) != input.Prompt || string(invocation.OutputSchema) != string(input.Schema) || invocation.AuthHome != adapter.authHome {
 		t.Fatalf("invocation=%+v", invocation)
 	}
@@ -78,7 +78,7 @@ func TestCodexInvocationUsesBoundedStdinAndPinnedSchema(t *testing.T) {
 	}
 	input.Phase = domain.PhaseBuild
 	build, err := adapter.Invocation(context.Background(), input)
-	if err != nil || !strings.Contains(strings.Join(build.Argv, " "), `extends=":workspace"`) {
+	if err != nil || !strings.Contains(strings.Join(build.Argv, " "), `extends=":workspace"`) || !strings.Contains(strings.Join(build.Argv, " "), `:workspace_roots"="write`) {
 		t.Fatalf("build invocation=%+v err=%v", build, err)
 	}
 	input.Phase = domain.PhasePublish

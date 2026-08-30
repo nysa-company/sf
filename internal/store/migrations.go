@@ -415,3 +415,8 @@ var migrationV21 = []string{
 	)`,
 	`CREATE INDEX git_mutation_lease_recovery ON git_mutation_leases(channel, state, launch_state)`,
 }
+
+var migrationV22 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN auth_digest TEXT NOT NULL DEFAULT '' CHECK(length(auth_digest) IN (0,64))`,
+	`UPDATE provider_attempts SET state='failed',outcome='legacy_unverifiable',finished_at=CASE WHEN finished_at='' THEN started_at ELSE finished_at END WHERE state IN ('active','quarantined') AND auth_digest=''`,
+}

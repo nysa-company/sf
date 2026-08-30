@@ -139,7 +139,7 @@ func (s *Supervisor) RegisterRuntime(binding contracts.RuntimeBinding, executabl
 func (s *Supervisor) PolicyDigest() string { return environmentPolicyDigest() }
 
 func environmentPolicyDigest() string {
-	sum := sha256.Sum256([]byte("PATH=/usr/bin:/bin\x00LANG=C\x00HOME=<private>\x00TMPDIR=<private>"))
+	sum := sha256.Sum256([]byte("PATH=/usr/bin:/bin\x00LANG=C\x00LC_ALL=C\x00HOME=<private>\x00TMPDIR=<private>\x00CODEX_HOME=<private>"))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -270,16 +270,16 @@ func key(r contracts.DrainRequest) requestKey {
 // are executable. In particular it excludes legacy sandbox, add-dir, config
 // injection, hooks, plugin/MCP setup, and every free-form argv tail.
 func validCodexInvocation(invocation contracts.Invocation, identity domain.ProviderIdentity, input contracts.PhaseInput) bool {
-	access := ""
+	parent, workspaceAccess := "", ""
 	switch input.Phase {
 	case domain.PhasePlanning, domain.PhaseReview:
-		access = "read-only"
+		parent, workspaceAccess = "read-only", "read"
 	case domain.PhaseVerification, domain.PhaseBuild:
-		access = "workspace"
+		parent, workspaceAccess = "workspace", "write"
 	default:
 		return false
 	}
-	want := []string{invocation.Argv[0], "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules", "--profile", "sf-guarded", "--config", `permissions.sf-guarded.extends=":` + access + `"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="` + access + `"}`, "--config", `permissions.sf-guarded.network.enabled=false`, "--model", identity.Model, "-C", input.Worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-"}
+	want := []string{invocation.Argv[0], "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules", "--profile", "sf-guarded", "--config", `permissions.sf-guarded.extends=":` + parent + `"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="` + workspaceAccess + `"}`, "--config", `permissions.sf-guarded.network.enabled=false`, "--model", identity.Model, "-C", input.Worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-"}
 	if len(invocation.Argv) != len(want) || !invocation.CaptureLastMessage || len(invocation.Stdin) == 0 || len(invocation.OutputSchema) == 0 {
 		return false
 	}
@@ -471,19 +471,51 @@ func vettedEnvironment(authHome string) ([]string, string, func(), error) {
 		_ = os.RemoveAll(tmp)
 		return nil, "", func() {}, err
 	}
-	environment := []string{"PATH=/usr/bin:/bin", "LANG=C", "HOME=" + home, "TMPDIR=" + tmp}
+	environment := []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "HOME=" + home, "TMPDIR=" + tmp}
 	if authHome != "" {
 		if err := privateExistingDirectory(authHome); err != nil {
 			_ = os.RemoveAll(home)
 			_ = os.RemoveAll(tmp)
 			return nil, "", func() {}, errors.New("provider authentication home is unsafe")
 		}
-		environment = append(environment, "CODEX_HOME="+authHome)
+		runtimeHome := filepath.Join(home, "codex")
+		if err := copyCodexAuth(authHome, runtimeHome); err != nil {
+			_ = os.RemoveAll(home)
+			_ = os.RemoveAll(tmp)
+			return nil, "", func() {}, errors.New("provider authentication runtime could not be prepared")
+		}
+		environment = append(environment, "CODEX_HOME="+runtimeHome)
 	}
 	return environment, tmp, func() {
 		_ = os.RemoveAll(home)
 		_ = os.RemoveAll(tmp)
 	}, nil
+}
+
+func copyCodexAuth(sourceHome, destination string) error {
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		return err
+	}
+	source := filepath.Join(sourceHome, "auth.json")
+	info, err := os.Lstat(source)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !trustedOwner(info) || info.Mode().Perm()&0o077 != 0 || info.Size() > 1<<20 {
+		return errors.New("unsafe Codex auth file")
+	}
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(filepath.Join(destination, "auth.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, io.LimitReader(in, 1<<20+1))
+	syncErr, closeErr := out.Sync(), out.Close()
+	if copyErr != nil || syncErr != nil || closeErr != nil {
+		return errors.New("could not copy Codex auth")
+	}
+	return os.Chmod(filepath.Join(destination, "auth.json"), 0o600)
 }
 
 func materializeInvocationFiles(invocation contracts.Invocation, temporary string) ([]string, string, error) {

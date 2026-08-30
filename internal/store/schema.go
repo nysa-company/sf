@@ -134,7 +134,7 @@ var requiredSchema = map[string][]string{
 	"effects":                      {"semantic_key", "claim_epoch", "observed_identity"},
 	"approvals":                    {"reviewed_head", "operator_uid", "invalidated"},
 	"worktrees":                    {"path", "branch_ref"},
-	"provider_attempts":            {"phase", "attempt", "provider", "role", "state", "usage_units", "started_at", "finished_at", "qualification_id", "binding_digest", "provider_lease_key", "leader_epoch", "runner_epoch", "expected_ticket_version", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "worktree_path"},
+	"provider_attempts":            {"phase", "attempt", "provider", "role", "state", "usage_units", "started_at", "finished_at", "qualification_id", "binding_digest", "provider_lease_key", "leader_epoch", "runner_epoch", "expected_ticket_version", "auth_digest", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "worktree_path"},
 	"leases":                       {"scope", "scope_key", "runner_epoch"},
 	"plans":                        {"ticket_id", "digest", "body"},
 	"verifications":                {"ticket_id", "intent_digest", "proof_digest", "current_revision"},
