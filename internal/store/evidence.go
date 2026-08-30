@@ -209,8 +209,14 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 	}
 	if artifact.ProviderResult != nil {
 		result, parsed, loadErr := s.LoadHistoricalProviderAttemptResult(ctx, *artifact.ProviderResult)
-		if loadErr != nil || result.Claim.Role != "reviewer" || result.Claim.Phase != domain.PhaseVerification || result.Claim.Ref != artifact.Ref || result.Claim.ExpectedVersion != artifact.ExpectedVersion || result.Claim.LeaderEpoch != artifact.Fence.LeaderEpoch || result.Claim.RunnerEpoch != artifact.Fence.RunnerEpoch || parsed.Verify == nil {
+		if loadErr != nil || result.Claim.Role != "reviewer" || result.Claim.Phase != domain.PhaseVerification || result.Claim.Ref != artifact.Ref || parsed.Verify == nil {
 			return VerificationRevision{}, ErrEvidenceConflict
+		}
+		if result.Claim.ExpectedVersion != artifact.ExpectedVersion || result.Claim.LeaderEpoch != artifact.Fence.LeaderEpoch || result.Claim.RunnerEpoch != artifact.Fence.RunnerEpoch {
+			reusable, reuseErr := s.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: artifact.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: artifact.ExpectedVersion, Fence: artifact.Fence})
+			if reuseErr != nil || !reusable.Recovered || reusable.Key != *artifact.ProviderResult {
+				return VerificationRevision{}, ErrEvidenceConflict
+			}
 		}
 		intent, intentErr := workflowprompt.CanonicalVerificationIntentBytes(*parsed.Verify)
 		proof, proofErr := workflowprompt.CanonicalVerificationProofBytes(*parsed.Verify)
@@ -247,6 +253,12 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 				}
 				if oldIntent == intentDigest && oldProof == proofDigest && oldCheckpoint == artifact.CheckpointID {
 					result.Revision = current
+					if artifact.ProviderResult != nil {
+						_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO verification_result_bindings(channel,project_id,ticket_id,revision,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current, artifact.ExpectedVersion, artifact.Fence.LeaderEpoch, artifact.Fence.RunnerEpoch, artifact.ProviderResult.AttemptID, artifact.ProviderResult.Attempt, artifact.Checkpoint.CommitOID, artifact.Checkpoint.ParentOID, artifact.Checkpoint.TreeOID)
+						if err != nil {
+							return err
+						}
+					}
 					return nil
 				}
 				return ErrEvidenceConflict
@@ -262,6 +274,11 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, result.Revision, artifact.ExpectedVersion, artifact.Fence.LeaderEpoch, artifact.Fence.RunnerEpoch, intentDigest, artifact.Intent, proofDigest, artifact.Proof, string(owned), artifact.CheckpointID, nullableUint(artifact.AmendsRevision), artifact.Reason, artifact.Requester, now())
 		if err != nil {
 			return err
+		}
+		if artifact.ProviderResult != nil {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO verification_result_bindings(channel,project_id,ticket_id,revision,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, result.Revision, artifact.ExpectedVersion, artifact.Fence.LeaderEpoch, artifact.Fence.RunnerEpoch, artifact.ProviderResult.AttemptID, artifact.ProviderResult.Attempt, artifact.Checkpoint.CommitOID, artifact.Checkpoint.ParentOID, artifact.Checkpoint.TreeOID); err != nil {
+				return err
+			}
 		}
 		_, err = conn.ExecContext(ctx, `INSERT INTO verifications(channel, project_id, ticket_id, intent_digest, proof_digest, current_revision) VALUES (?, ?, ?, ?, ?, ?)
 			ON CONFLICT(channel, project_id, ticket_id) DO UPDATE SET intent_digest=excluded.intent_digest, proof_digest=excluded.proof_digest, current_revision=excluded.current_revision`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, intentDigest, proofDigest, result.Revision)
@@ -294,8 +311,14 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 	// attempt, so a later malformed or failed completion cannot be skipped while
 	// waiting for the writer.
 	builder, parsed, err := s.LoadHistoricalProviderAttemptResult(ctx, evidence.BuilderResult)
-	if err != nil || builder.Claim.Role != "builder" || builder.Claim.Phase != domain.PhaseBuild || builder.Claim.ExpectedVersion != evidence.ExpectedVersion || builder.Claim.LeaderEpoch != evidence.Fence.LeaderEpoch || builder.Claim.RunnerEpoch != evidence.Fence.RunnerEpoch || parsed.Builder == nil {
+	if err != nil || builder.Claim.Role != "builder" || builder.Claim.Phase != domain.PhaseBuild || parsed.Builder == nil {
 		return nil, ErrEvidenceConflict
+	}
+	if builder.Claim.ExpectedVersion != evidence.ExpectedVersion || builder.Claim.LeaderEpoch != evidence.Fence.LeaderEpoch || builder.Claim.RunnerEpoch != evidence.Fence.RunnerEpoch {
+		reusable, reuseErr := s.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: evidence.Ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: evidence.ExpectedVersion, Fence: evidence.Fence})
+		if reuseErr != nil || !reusable.Recovered || reusable.Key != evidence.BuilderResult {
+			return nil, ErrEvidenceConflict
+		}
 	}
 	builderDigest, err := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
 	if err != nil || builderDigest != evidence.Snapshot.BuilderEvidenceDigest {
@@ -360,6 +383,10 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			candidate := evidence.Snapshot
 			candidate.Generation = current
 			if existing == candidate {
+				_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES(?,?,?,?,?,?,?,?,?,?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, current, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.BuilderResult.AttemptID, evidence.BuilderResult.Attempt, evidence.Commit.ParentOID)
+				if err != nil {
+					return err
+				}
 				return nil
 			}
 		}
@@ -375,6 +402,10 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			if err != nil || existing != evidence.Snapshot {
 				return ErrEvidenceConflict
 			}
+			_, err = conn.ExecContext(ctx, `INSERT OR IGNORE INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES(?,?,?,?,?,?,?,?,?,?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, current, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.BuilderResult.AttemptID, evidence.BuilderResult.Attempt, evidence.Commit.ParentOID)
+			if err != nil {
+				return err
+			}
 			return nil
 		}
 		if evidence.Snapshot.Generation != current+1 {
@@ -383,6 +414,9 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		_, err = conn.ExecContext(ctx, `INSERT INTO candidate_snapshots(channel, project_id, ticket_id, generation, ticket_version, leader_epoch, runner_epoch, base_sha, head_sha, tree_sha, source_digest, verification_intent_digest, proof_digest, command_policy_digest, builder_evidence_digest, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, evidence.Snapshot.Generation, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.Snapshot.BaseSHA, evidence.Snapshot.HeadSHA, evidence.Snapshot.TreeSHA, evidence.Snapshot.SourceDigest, evidence.Snapshot.VerificationIntentDigest, evidence.Snapshot.ProofDigest, evidence.Snapshot.CommandPolicyDigest, evidence.Snapshot.BuilderEvidenceDigest, now())
 		if err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES(?,?,?,?,?,?,?,?,?,?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, evidence.Snapshot.Generation, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.BuilderResult.AttemptID, evidence.BuilderResult.Attempt, evidence.Commit.ParentOID); err != nil {
 			return err
 		}
 		for _, kind := range []string{"proof_result", "github_checks", "final_review", "approval"} {

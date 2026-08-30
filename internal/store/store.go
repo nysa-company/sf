@@ -51,7 +51,7 @@ var (
 	ErrRepositoryCommandLease  = errors.New("repository command lease is unavailable or stale")
 )
 
-const schemaVersion = 33
+const schemaVersion = 34
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -87,6 +87,7 @@ var migrationChecksums = map[int]string{
 	31: migrationChecksum(migrationV31),
 	32: migrationChecksum(migrationV32),
 	33: migrationChecksum(migrationV33),
+	34: migrationChecksum(migrationV34),
 }
 
 func migrationChecksum(statements []string) string {
@@ -399,6 +400,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV32
 			} else if version == 33 {
 				statements = migrationV33
+			} else if version == 34 {
+				statements = migrationV34
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1200,35 +1203,28 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 			return err
 		}
 		var stored domain.CandidateSnapshot
-		var cv, cl, cr uint64
-		err := conn.QueryRowContext(ctx, `SELECT generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY generation DESC LIMIT 1`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&stored.Generation, &cv, &cl, &cr, &stored.BaseSHA, &stored.HeadSHA, &stored.TreeSHA, &stored.SourceDigest, &stored.VerificationIntentDigest, &stored.ProofDigest, &stored.CommandPolicyDigest, &stored.BuilderEvidenceDigest)
+		err := conn.QueryRowContext(ctx, `SELECT generation,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY generation DESC LIMIT 1`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&stored.Generation, &stored.BaseSHA, &stored.HeadSHA, &stored.TreeSHA, &stored.SourceDigest, &stored.VerificationIntentDigest, &stored.ProofDigest, &stored.CommandPolicyDigest, &stored.BuilderEvidenceDigest)
 		if err != nil {
 			return ErrEvidenceConflict
 		}
-		if stored != candidate || cv != version || cl != transition.Fence.LeaderEpoch || cr != transition.Fence.RunnerEpoch {
+		if stored != candidate {
 			return ErrEvidenceConflict
 		}
-		// candidate_snapshots deliberately avoids a mutable provider-result
-		// column. RecordCandidate therefore emits this bounded, Store-authored
-		// append-only binding event. Requiring it here makes a valid-looking
-		// direct snapshot insertion insufficient for a transition.
-		var payload string
-		if err := conn.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='candidate_recorded' ORDER BY id DESC LIMIT 1`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version).Scan(&payload); err != nil {
-			return ErrEvidenceConflict
-		}
-		var binding struct {
-			Generation            uint64 `json:"generation"`
-			Head                  string `json:"head"`
-			BuilderAttemptID      int64  `json:"builder_attempt_id"`
-			BuilderAttempt        int    `json:"builder_attempt"`
-			BuilderEvidenceDigest string `json:"builder_evidence_digest"`
-			CommandPolicyDigest   string `json:"command_policy_digest"`
-		}
-		if json.Unmarshal([]byte(payload), &binding) != nil || binding.Generation != candidate.Generation || binding.Head != candidate.HeadSHA || binding.BuilderAttemptID <= 0 || binding.BuilderAttempt <= 0 || binding.BuilderEvidenceDigest != candidate.BuilderEvidenceDigest || binding.CommandPolicyDigest != candidate.CommandPolicyDigest {
+		var attemptID int64
+		var attempt int
+		var parent string
+		var phase, role, state, outcome string
+		if err := conn.QueryRowContext(ctx, `SELECT b.provider_attempt_id,b.provider_attempt,b.commit_parent_oid,r.phase,a.role,a.state,a.outcome
+			FROM candidate_result_bindings b JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id JOIN provider_attempts a ON a.id=r.provider_attempt_id
+			WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.generation=? AND b.binding_ticket_version=? AND b.leader_epoch=? AND b.runner_epoch=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, version, transition.Fence.LeaderEpoch, transition.Fence.RunnerEpoch).Scan(&attemptID, &attempt, &parent, &phase, &role, &state, &outcome); err != nil || attemptID <= 0 || attempt <= 0 || phase != "build" || role != "builder" || state != "completed" || outcome != "completed" || !validOID(parent) {
 			return ErrEvidenceConflict
 		}
 		var source, base, intent, proof string
 		if err := conn.QueryRowContext(ctx, `SELECT t.source_digest,w.base_sha,v.intent_digest,v.proof_digest FROM tickets t JOIN worktrees w ON w.channel=t.channel AND w.project_id=t.project_id AND w.ticket_id=t.id JOIN verifications v ON v.channel=t.channel AND v.project_id=t.project_id AND v.ticket_id=t.id WHERE t.channel=? AND t.project_id=? AND t.id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&source, &base, &intent, &proof); err != nil {
+			return ErrEvidenceConflict
+		}
+		var checkpoint string
+		if err := conn.QueryRowContext(ctx, `SELECT r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&checkpoint); err != nil || checkpoint != parent {
 			return ErrEvidenceConflict
 		}
 		if source != candidate.SourceDigest || base != candidate.BaseSHA || intent != candidate.VerificationIntentDigest || proof != candidate.ProofDigest {

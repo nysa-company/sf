@@ -95,8 +95,8 @@ func TestRepositoryCommandV33UpgradeAndRequiredSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	if got := rawSchemaVersion(t, path); got != 33 {
-		t.Fatalf("migrated schema=%d want=33", got)
+	if got := rawSchemaVersion(t, path); got != 34 {
+		t.Fatalf("migrated schema=%d want=34", got)
 	}
 	if err := database.validateSchema(ctx); err != nil {
 		t.Fatalf("v33 required schema: %v", err)
@@ -594,6 +594,8 @@ func testMigration(version int) []string {
 		return migrationV32
 	case 33:
 		return migrationV33
+	case 34:
+		return migrationV34
 	default:
 		return nil
 	}

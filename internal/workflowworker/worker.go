@@ -33,6 +33,7 @@ type Evidence interface {
 	Ticket(context.Context, domain.TicketRef) (store.Ticket, error)
 	Plan(context.Context, domain.TicketRef) (store.StoredPlan, error)
 	CurrentVerification(context.Context, domain.TicketRef) (store.StoredVerification, error)
+	LatestCandidate(context.Context, domain.TicketRef) (store.StoredCandidate, error)
 	ValidateCurrentCandidateForBuildTransition(context.Context, domain.TicketRef, uint64, domain.Fence) (store.StoredCandidate, error)
 	Worktree(context.Context, domain.TicketRef) (store.StoredWorktree, error)
 	AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error
@@ -296,7 +297,25 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 	verification, err := w.Evidence.CurrentVerification(ctx, ticket.Ref)
 	if err == nil {
 		if verification.TicketVersion != ticket.Version || verification.Fence != fence {
-			return false, false, ErrStaleEvidence
+			// A completed reviewer result survives runner-fence recovery, but its
+			// old binding is not itself transition authority. Re-select the exact
+			// newest reusable result under the live fence, re-materialize its Git
+			// checkpoint, and let RecordVerification append a live binding.
+			reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence})
+			if reuseErr != nil || !reusable.Recovered || reusable.Key != verification.ProviderResult {
+				return false, false, ErrStaleEvidence
+			}
+			artifact, parseErr := canonicalVerification(reusable.Parsed)
+			if parseErr != nil {
+				return false, true, parseErr
+			}
+			if err := w.persistVerification(ctx, ticket, fence, PhaseRequest{}, planIdentity, artifact, reusable.Key); err != nil {
+				return false, true, err
+			}
+			verification, err = w.Evidence.CurrentVerification(ctx, ticket.Ref)
+			if err != nil || verification.TicketVersion != ticket.Version || verification.Fence != fence {
+				return false, true, ErrStaleEvidence
+			}
 		}
 		if _, err := w.storedVerificationIdentity(ctx, ticket, planIdentity, verification, fence); err != nil {
 			return false, false, err
@@ -387,6 +406,37 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 	}
 	candidate, err := w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
 	if err == nil {
+		if err := w.authenticateStoredCandidate(ctx, ticket, fence, planIdentity, verificationIdentity, candidate); err != nil {
+			return false, true, err
+		}
+		if err := w.signalCandidate(ctx, ticket, fence, candidate.Snapshot); err != nil {
+			return false, true, err
+		}
+		return true, true, nil
+	}
+	if errors.Is(err, store.ErrStaleFence) {
+		// A candidate snapshot is immutable provenance.  Rebind an old snapshot
+		// only from the exact newest recovered Builder result, after the injected
+		// materializer and authenticator have re-proved the live Git boundary.
+		old, oldErr := w.Evidence.LatestCandidate(ctx, ticket.Ref)
+		if oldErr != nil {
+			return false, false, err
+		}
+		reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: ticket.Version, Fence: fence})
+		if reuseErr != nil || !reusable.Recovered || reusable.Key != old.BuilderResult {
+			return false, false, ErrStaleEvidence
+		}
+		builder, parseErr := canonicalBuilder(reusable.Parsed)
+		if parseErr != nil {
+			return false, true, parseErr
+		}
+		if err := w.persistCandidate(ctx, ticket, fence, PhaseRequest{}, planIdentity, verificationIdentity, verification, builder, reusable.Key); err != nil {
+			return false, true, err
+		}
+		candidate, err = w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
+		if err != nil {
+			return false, true, err
+		}
 		if err := w.authenticateStoredCandidate(ctx, ticket, fence, planIdentity, verificationIdentity, candidate); err != nil {
 			return false, true, err
 		}

@@ -101,6 +101,15 @@ func TestTransitionCandidateRefusesReplacementGenerationAtomically(t *testing.T)
 	if err != nil || current.State != domain.StateBuilding || current.Version != version {
 		t.Fatalf("ticket=%+v err=%v", current, err)
 	}
+	// Removing the competing generation leaves an otherwise valid immutable
+	// snapshot, but no v34 current-fence result binding.  Transition authority
+	// must fail closed rather than infer recovery from the snapshot's old claim.
+	if _, err := database.db.ExecContext(ctx, `DELETE FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? AND generation=2`, ref.Channel, ref.Project, ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.TransitionCandidate(ctx, Transition{Ref: ref, ExpectedVersion: version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}, base); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("legacy unbound candidate transition=%v", err)
+	}
 }
 
 func TestPlanEvidencePreservesArgvAndRejectsFlattenedCommands(t *testing.T) {

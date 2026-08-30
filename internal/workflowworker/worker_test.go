@@ -48,6 +48,12 @@ func (f *fakeEvidence) CurrentVerification(context.Context, domain.TicketRef) (s
 	}
 	return f.verification, nil
 }
+func (f *fakeEvidence) LatestCandidate(context.Context, domain.TicketRef) (store.StoredCandidate, error) {
+	if !f.hasCandidate {
+		return store.StoredCandidate{}, store.ErrNotFound
+	}
+	return f.candidate, nil
+}
 func (f *fakeEvidence) ValidateCurrentCandidateForBuildTransition(_ context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (store.StoredCandidate, error) {
 	if !f.hasCandidate {
 		return store.StoredCandidate{}, store.ErrNotFound

@@ -597,3 +597,27 @@ var migrationV33 = []string{
 	)`,
 	`CREATE INDEX repository_command_process_group_recovery ON repository_command_process_groups(repository_path, semantic_key, nonce)`,
 }
+
+// v34 binds reusable reviewer and builder results to durable workflow
+// artifacts.  Event payloads are projections only and are never authority.
+var migrationV34 = []string{
+	`CREATE TABLE verification_result_bindings (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, revision INTEGER NOT NULL,
+		binding_ticket_version INTEGER NOT NULL, leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL,
+		provider_attempt_id INTEGER NOT NULL, provider_attempt INTEGER NOT NULL,
+		checkpoint_commit_oid TEXT NOT NULL, checkpoint_parent_oid TEXT NOT NULL, checkpoint_tree_oid TEXT NOT NULL,
+		PRIMARY KEY(channel,project_id,ticket_id,revision,binding_ticket_version,leader_epoch,runner_epoch),
+		FOREIGN KEY(channel,project_id,ticket_id,revision) REFERENCES verification_revisions(channel,project_id,ticket_id,revision),
+		FOREIGN KEY(provider_attempt_id) REFERENCES provider_attempt_results(provider_attempt_id),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+	`CREATE TABLE candidate_result_bindings (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, generation INTEGER NOT NULL,
+		binding_ticket_version INTEGER NOT NULL, leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL,
+		provider_attempt_id INTEGER NOT NULL, provider_attempt INTEGER NOT NULL, commit_parent_oid TEXT NOT NULL,
+		PRIMARY KEY(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch),
+		FOREIGN KEY(channel,project_id,ticket_id,generation) REFERENCES candidate_snapshots(channel,project_id,ticket_id,generation),
+		FOREIGN KEY(provider_attempt_id) REFERENCES provider_attempt_results(provider_attempt_id),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+}
