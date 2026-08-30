@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -10,6 +11,15 @@ import (
 	"github.com/nysa-company/sf/internal/domain"
 	gitboundary "github.com/nysa-company/sf/internal/git"
 )
+
+type repositoryRecoveryDrainer struct{ err error }
+
+func (d repositoryRecoveryDrainer) DrainRepositoryCommand(context.Context, contracts.RepositoryCommandLaunch) error {
+	return d.err
+}
+func (d repositoryRecoveryDrainer) DrainRepositoryCommandTree(context.Context, contracts.RepositoryCommandLaunch, []contracts.RepositoryCommandLaunch) error {
+	return d.err
+}
 
 func repositoryCommandDigest(ch string) string { return "sha256:" + strings.Repeat(ch, 64) }
 
@@ -107,6 +117,163 @@ func TestRepositoryCommandCompleteReleaseThenNextAcquire(t *testing.T) {
 	}
 }
 
+func TestRepositoryCommandIssueResponseLossReturnsExactClaim(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "issue-replay")
+	first, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil || second != first {
+		t.Fatalf("replayed claim=%+v first=%+v err=%v", second, first, err)
+	}
+	if _, err := db.AcquireRepositoryCommand(ctx, second); err != nil {
+		t.Fatalf("lost issue response could not acquire exact claim: %v", err)
+	}
+}
+
+func TestRecoverUnleasedRepositoryCommandRetiresGateClosedClaimForRetry(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "unleased-restart")
+	if _, err := db.IssueRepositoryCommandClaim(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecoverUnleasedRepositoryCommands(ctx, intent.Ref.Channel, intent.Fence.LeaderEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecoverUnleasedRepositoryCommands(ctx, intent.Ref.Channel, intent.Fence.LeaderEpoch); err != nil {
+		t.Fatalf("repeat recovery was not idempotent: %v", err)
+	}
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "repository_command", TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatalf("fresh issue after gate-closed recovery: %v", err)
+	}
+	if _, err := db.AcquireRepositoryCommand(ctx, claim); err != nil {
+		t.Fatalf("fresh acquire after gate-closed recovery: %v", err)
+	}
+}
+
+func TestRecoverRepositoryCommandQuarantineDoesNotAbortAndLaterProofClears(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "quarantine-retry")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch := contracts.RepositoryCommandLaunch{PID: 101, PGID: 101, BootIdentity: "boot", ProcessStartIdentity: "start"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecoverRepositoryCommandLeases(ctx, claim.TicketRef.Channel, claim.LeaderEpoch, repositoryRecoveryDrainer{err: errors.New("ambiguous")}); err != nil {
+		t.Fatalf("ambiguous recovery must retain quarantine without aborting startup: %v", err)
+	}
+	active, err := db.ActiveRepositoryCommandLeases(ctx, claim.TicketRef.Channel)
+	if err != nil || len(active) != 1 || active[0].State != "quarantined" {
+		t.Fatalf("quarantine=%+v err=%v", active, err)
+	}
+	if _, err := db.AcquireRepositoryCommand(ctx, claim); err == nil {
+		t.Fatal("quarantined repository lease admitted another writer")
+	}
+	newLeader, err := db.AcquireLeader(ctx, claim.TicketRef.Channel, "repository-command-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ReconcileEffects(ctx, claim.TicketRef.Channel, newLeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecoverRepositoryCommandLeases(ctx, claim.TicketRef.Channel, newLeader, repositoryRecoveryDrainer{}); err != nil {
+		t.Fatalf("later exact proof did not clear quarantine: %v", err)
+	}
+	active, err = db.ActiveRepositoryCommandLeases(ctx, claim.TicketRef.Channel)
+	if err != nil || len(active) != 0 {
+		t.Fatalf("stale lease after proof=%+v err=%v", active, err)
+	}
+	effect, err := db.Effect(ctx, claim.SemanticKey)
+	if err != nil || effect.State != EffectFailed {
+		t.Fatalf("recovered effect=%+v err=%v", effect, err)
+	}
+}
+
+func TestRecoverRepositoryCommandPreservesTerminalResultBeforeRelease(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "terminal-restart")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch := contracts.RepositoryCommandLaunch{PID: 111, PGID: 111, BootIdentity: "boot", ProcessStartIdentity: "start"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Observed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecoverRepositoryCommandLeases(ctx, claim.TicketRef.Channel, claim.LeaderEpoch, repositoryRecoveryDrainer{}); err != nil {
+		t.Fatal(err)
+	}
+	effect, err := db.Effect(ctx, claim.SemanticKey)
+	if err != nil || effect.State != EffectConfirmed {
+		t.Fatalf("terminal result overwritten effect=%+v err=%v", effect, err)
+	}
+	if active, err := db.ActiveRepositoryCommandLeases(ctx, claim.TicketRef.Channel); err != nil || len(active) != 0 {
+		t.Fatalf("terminal lease not retired=%+v err=%v", active, err)
+	}
+}
+
+func TestRecoverRepositoryCommandKeepsUnrecordedAndDrainedQuarantineProofs(t *testing.T) {
+	for _, state := range []string{"unrecorded", "drained"} {
+		t.Run(state, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			intent := repositoryCommandIntentFixture(t, db, ctx, "quarantine-"+state)
+			claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := db.AcquireRepositoryCommand(ctx, claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state == "drained" {
+				launch := contracts.RepositoryCommandLaunch{PID: 777, PGID: 777, BootIdentity: "boot", ProcessStartIdentity: "start"}
+				if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
+					t.Fatal(err)
+				}
+				if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := lease.Quarantine(); err != nil {
+				t.Fatal(err)
+			}
+			active, err := db.ActiveRepositoryCommandLeases(ctx, claim.TicketRef.Channel)
+			if err != nil || len(active) != 1 || active[0].State != "quarantined" || active[0].LaunchState != state {
+				t.Fatalf("quarantine state=%+v err=%v", active, err)
+			}
+			if err := db.RecoverRepositoryCommandLeases(ctx, claim.TicketRef.Channel, claim.LeaderEpoch, nil); err != nil {
+				t.Fatal(err)
+			}
+			if active, err := db.ActiveRepositoryCommandLeases(ctx, claim.TicketRef.Channel); err != nil || len(active) != 0 {
+				t.Fatalf("proof row not cleared=%+v err=%v", active, err)
+			}
+		})
+	}
+}
+
 func TestRepositoryCommandRejectsOpaqueWorktreeIdentity(t *testing.T) {
 	db, ctx := openTestStore(t)
 	intent := repositoryCommandIntentFixture(t, db, ctx, "opaque")
@@ -157,7 +324,9 @@ func TestRepositoryCommandStaleObservedResultRetiresExactExecutingEffect(t *test
 	if err := db.db.QueryRowContext(ctx, `SELECT state FROM effects WHERE semantic_key=?`, claim.SemanticKey).Scan(&state); err != nil || state != string(EffectFailed) {
 		t.Fatalf("effect state=%q err=%v", state, err)
 	}
-	if err := lease.Quarantine(); err != nil {
+	// No child was launched in this Store race fixture, so the exact stale
+	// claim can release its unopened lease before control completion.
+	if err := lease.Release(); err != nil {
 		t.Fatal(err)
 	}
 	stopping, err := db.Ticket(ctx, claim.TicketRef)
@@ -166,6 +335,40 @@ func TestRepositoryCommandStaleObservedResultRetiresExactExecutingEffect(t *test
 	}
 	if _, err := db.CompleteControlTransition(ctx, Transition{Ref: claim.TicketRef, ExpectedVersion: control.Version, From: domain.StateStopping, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}"}); err != nil {
 		t.Fatalf("control stayed blocked after stale result reconciliation: %v", err)
+	}
+}
+
+func TestRepositoryCommandLeaseBlocksControlCompletionAfterTerminalResult(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "control-lease")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Observed: true}); err != nil {
+		t.Fatal(err)
+	}
+	control, err := db.TransitionAndInvalidateRunner(ctx, Transition{Ref: claim.TicketRef, ExpectedVersion: claim.TicketVersion, From: domain.StatePlanning, To: domain.StateStopping, ResumeState: domain.StatePlanning, Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch}, EventPayload: "{}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopping, err := db.Ticket(ctx, claim.TicketRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition := Transition{Ref: claim.TicketRef, ExpectedVersion: control.Version, From: domain.StateStopping, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}"}
+	if _, err := db.CompleteControlTransition(ctx, transition); !errors.Is(err, ErrControlNotDrained) {
+		t.Fatalf("terminal result bypassed live repository lease: %v", err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CompleteControlTransition(ctx, transition); err != nil {
+		t.Fatalf("control did not finish after exact lease release: %v", err)
 	}
 }
 
@@ -208,5 +411,34 @@ func TestRepositoryCommandPersistsTrackedGoTestGroups(t *testing.T) {
 	var residue int
 	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_process_groups WHERE repository_path=?`, claim.Repository).Scan(&residue); err != nil || residue != 0 {
 		t.Fatalf("tracked group residue=%d err=%v", residue, err)
+	}
+}
+
+func TestRepositoryCommandRejectsMoreThanBoundedTrackedGroups(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "group-limit")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, contracts.RepositoryCommandLaunch{PID: 1, PGID: 1, BootIdentity: "boot", ProcessStartIdentity: "primary"}); err != nil {
+		t.Fatal(err)
+	}
+	recorder := lease.(contracts.RepositoryCommandGroupRecorder)
+	for i := 0; i < repositoryCommandProcessGroupLimit; i++ {
+		v := contracts.RepositoryCommandLaunch{PID: 1000 + i, PGID: 1000 + i, BootIdentity: "boot", ProcessStartIdentity: "group-" + string(rune('a'+i))}
+		if err := recorder.RecordRepositoryCommandProcessGroup(ctx, v); err != nil {
+			t.Fatalf("record group %d: %v", i, err)
+		}
+	}
+	if err := recorder.RecordRepositoryCommandProcessGroup(ctx, contracts.RepositoryCommandLaunch{PID: 2000, PGID: 2000, BootIdentity: "boot", ProcessStartIdentity: "group-over"}); !errors.Is(err, ErrRepositoryCommandLease) {
+		t.Fatalf("unbounded group accepted: %v", err)
+	}
+	if active, err := db.ActiveRepositoryCommandLeases(ctx, claim.TicketRef.Channel); err != nil || len(active) != 1 || len(active[0].Groups) != repositoryCommandProcessGroupLimit {
+		t.Fatalf("bounded recovery groups=%+v err=%v", active, err)
 	}
 }

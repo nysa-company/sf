@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -33,13 +34,22 @@ func TestRepositoryCommandRejectsCustomExecutableNamedGit(t *testing.T) {
 }
 
 func TestRepositoryCommandDrainerReapsRecordedGroup(t *testing.T) {
-	cmd := exec.Command("/bin/sh", "-c", "sleep 30")
+	// A distinct boot is the OS-lifetime proof that the persisted PID/PGID
+	// cannot still name the old guarded test group; it must not be signalled.
+	d := RepositoryCommandDrainer{bootIdentity: func() (string, error) { return "new-boot", nil }}
+	if err := d.DrainRepositoryCommand(context.Background(), contracts.RepositoryCommandLaunch{PID: 999999, PGID: 999999, BootIdentity: "old-boot", ProcessStartIdentity: "old-start"}); err != nil {
+		t.Fatalf("different boot did not prove old group gone: %v", err)
+	}
+}
+
+func TestRepositoryCommandDrainerRefusesLeaderGoneWithLiveOldGroup(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "sleep 30 & exit")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
-	start, err := processStartIdentity(cmd.Process.Pid)
+	pid := cmd.Process.Pid
+	start, err := processStartIdentity(pid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,16 +57,46 @@ func TestRepositoryCommandDrainerReapsRecordedGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waited := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(waited)
-	}()
-	d := RepositoryCommandDrainer{SoftDrain: 10 * time.Millisecond, HardDrain: 500 * time.Millisecond}
-	if err := d.DrainRepositoryCommand(context.Background(), contracts.RepositoryCommandLaunch{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: boot, ProcessStartIdentity: start}); err == nil {
-		t.Fatal("restart drainer accepted a vanished leader/old PGID as proof")
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
 	}
-	<-waited
+	defer signalGroup(pid, syscall.SIGKILL)
+	d := RepositoryCommandDrainer{SoftDrain: 5 * time.Millisecond, HardDrain: 5 * time.Millisecond}
+	if err := d.DrainRepositoryCommand(context.Background(), contracts.RepositoryCommandLaunch{PID: pid, PGID: pid, BootIdentity: boot, ProcessStartIdentity: start}); err == nil {
+		t.Fatal("leader-gone live group was treated as drained")
+	}
+}
+
+func TestRepositoryCommandDrainerBootMismatchProvesOldLaunchGone(t *testing.T) {
+	d := RepositoryCommandDrainer{bootIdentity: func() (string, error) { return "new-boot", nil }}
+	launch := contracts.RepositoryCommandLaunch{PID: 999999, PGID: 999999, BootIdentity: "old-boot", ProcessStartIdentity: "old-start"}
+	if err := d.DrainRepositoryCommand(context.Background(), launch); err != nil {
+		t.Fatalf("different boot did not retire old identity: %v", err)
+	}
+}
+
+func TestRepositoryCommandDrainerRefusesMixedBootGroups(t *testing.T) {
+	d := RepositoryCommandDrainer{bootIdentity: func() (string, error) { return "new-boot", nil }}
+	primary := contracts.RepositoryCommandLaunch{PID: 999998, PGID: 999998, BootIdentity: "old-boot", ProcessStartIdentity: "old-start"}
+	group := contracts.RepositoryCommandLaunch{PID: 999997, PGID: 999997, BootIdentity: "other-boot", ProcessStartIdentity: "other-start"}
+	if err := d.DrainRepositoryCommandTree(context.Background(), primary, []contracts.RepositoryCommandLaunch{group}); err == nil {
+		t.Fatal("mixed persisted boots were accepted")
+	}
+}
+
+func TestRepositoryCommandDrainerUsesOneSharedGroupDeadline(t *testing.T) {
+	primary := contracts.RepositoryCommandLaunch{PID: 999999, PGID: 999999, BootIdentity: "old-boot", ProcessStartIdentity: "old-start"}
+	groups := make([]contracts.RepositoryCommandLaunch, repositoryTestGroupLimit)
+	for i := range groups {
+		groups[i] = contracts.RepositoryCommandLaunch{PID: 999000 + i, PGID: 999000 + i, BootIdentity: "old-boot", ProcessStartIdentity: "old-start"}
+	}
+	started := time.Now()
+	if err := (RepositoryCommandDrainer{SoftDrain: 10 * time.Millisecond, HardDrain: 500 * time.Millisecond, bootIdentity: func() (string, error) { return "new-boot", nil }}).DrainRepositoryCommandTree(context.Background(), primary, groups); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("group recovery was serially bounded: %s", elapsed)
+	}
 }
 
 func TestRepositoryCommandDrainerFailsClosedOnUnclearIdentity(t *testing.T) {
@@ -69,6 +109,25 @@ func TestRepositoryCommandDrainerFailsClosedOnUnclearIdentity(t *testing.T) {
 func TestRepositoryCommandPreflightRefusesUnsupportedPlatformBeforeLaunch(t *testing.T) {
 	if repositoryCommandPlatformAvailable("linux") || !repositoryCommandPlatformAvailable("darwin") {
 		t.Fatal("platform guard accepted unsupported host or rejected darwin")
+	}
+}
+
+func TestRepositoryGoDependencyClosureRequiresVendorForExternalModules(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.test/proof\n\ngo 1.25\n\nrequire example.test/dep v1.0.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repositoryGoDependencyClosure(root); !errors.Is(err, ErrSubprocessRecipeUnsupported) {
+		t.Fatalf("unvendored module error=%v", err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "vendor"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "vendor", "modules.txt"), []byte("# example.test/dep v1.0.0\n## explicit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if useVendor, err := repositoryGoDependencyClosure(root); err != nil || !useVendor {
+		t.Fatalf("vendored closure useVendor=%v err=%v", useVendor, err)
 	}
 }
 

@@ -2,14 +2,12 @@ package config
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -213,29 +211,7 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 		return Commands{Verify: command, Review: command}, nil
 	}
 	if packageJSON {
-		data, err := readBoundedRepositoryFile(filepath.Join(repository, "package.json"), MaxFileBytes)
-		if err != nil {
-			return Commands{}, detectionError("package.json could not be parsed; add explicit commands to .sf/config.toml")
-		}
-		var document struct {
-			Scripts map[string]json.RawMessage `json:"scripts"`
-		}
-		decoder := json.NewDecoder(bytes.NewReader(data))
-		if err := decoder.Decode(&document); err != nil {
-			return Commands{}, detectionError("package.json is malformed; add explicit commands to .sf/config.toml")
-		}
-		var trailing any
-		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-			return Commands{}, detectionError("package.json contains trailing data; add explicit commands to .sf/config.toml")
-		}
-		for _, name := range []string{"test", "build"} {
-			raw, ok := document.Scripts[name]
-			var script string
-			if !ok || json.Unmarshal(raw, &script) != nil || strings.TrimSpace(script) == "" {
-				return Commands{}, detectionError("package.json scripts." + name + " must be a nonempty string; add explicit commands to .sf/config.toml")
-			}
-		}
-		return Commands{Verify: Command{Argv: []string{"npm", "test"}}, Review: Command{Argv: []string{"npm", "run", "build"}}}, nil
+		return Commands{}, detectionError("package.json/npm is not a locally executable v1 repository-command recipe; use operator or credential-free CI takeover instead of local commands")
 	}
 	return Commands{}, detectionError("repository type is unsupported; add explicit commands to .sf/config.toml")
 }

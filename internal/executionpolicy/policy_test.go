@@ -100,8 +100,8 @@ func TestRepositoryCommandPolicy(t *testing.T) {
 		{[]string{"/bin/sh", "-c", "true"}, false},
 		{[]string{"nice", "go", "test", "./..."}, false},
 		{[]string{"xargs", "sh"}, false},
-		{[]string{"git", "status", "--porcelain=v1"}, true},
-		{[]string{"git", "diff", "--no-ext-diff", "--no-textconv", "--exit-code"}, true},
+		{[]string{"git", "status", "--porcelain=v1"}, false},
+		{[]string{"git", "diff", "--no-ext-diff", "--no-textconv", "--exit-code"}, false},
 		{[]string{"git", "diff", "--exit-code"}, false},
 		{[]string{"git", "push", "origin", "main"}, false},
 		{[]string{"git", "-C", "../other", "status"}, false},
@@ -135,7 +135,7 @@ func TestRepositoryCommandPolicy(t *testing.T) {
 }
 
 func TestImmutableCommandSnapshot(t *testing.T) {
-	snapshot, err := NewCommandSnapshot([]string{"go", "test", "./..."}, []string{"git", "status", "--porcelain=v1"})
+	snapshot, err := NewCommandSnapshot([]string{"go", "test", "./..."})
 	if err != nil {
 		t.Fatal(err)
 	}

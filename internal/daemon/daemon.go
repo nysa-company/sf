@@ -309,6 +309,13 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 	if err := daemon.store.RecoverGitMutationLeases(ctx, daemon.channel, daemon.epoch, daemon.gitMutationDrainer); err != nil {
 		return fmt.Errorf("recover stranded git mutations: %w", err)
 	}
+	// This runs before generic effect reconciliation. An issued repository
+	// command with no lease could not have crossed the closed launch gate, so
+	// it can be retired for a future retry rather than becoming permanently
+	// uncertain after a lost issue response.
+	if err := daemon.store.RecoverUnleasedRepositoryCommands(ctx, daemon.channel, daemon.epoch); err != nil {
+		return fmt.Errorf("recover unleased repository commands: %w", err)
+	}
 	if err := daemon.store.RecoverRepositoryCommandLeases(ctx, daemon.channel, daemon.epoch, daemon.repositoryCommandDrainer); err != nil {
 		return fmt.Errorf("recover stranded repository commands: %w", err)
 	}
@@ -367,6 +374,14 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 			next++
 		}
 		if _, err := daemon.store.AdoptInvalidatedLeases(ctx, group.Ref, group.RunnerEpoch, daemon.epoch); err != nil {
+			// A quarantined repository-command lease retains its own writer
+			// exclusion. Do not turn that operator-visible uncertainty into a
+			// daemon/socket availability outage; a later exact recovery proof can
+			// retire it and normal capacity adoption can then replay.
+			if errors.Is(err, store.ErrRepositoryCommandLease) {
+				index = next
+				continue
+			}
 			return fmt.Errorf("adopt invalidated leases for %s/%s runner %d: %w", group.Ref.Project, group.Ref.Ticket, group.RunnerEpoch, err)
 		}
 		index = next

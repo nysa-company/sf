@@ -348,6 +348,19 @@ func (s *Store) AdoptInvalidatedLeases(ctx context.Context, ref domain.TicketRef
 			return ErrStaleFence
 		}
 
+		// Repository-command rows are an independent writer/process witness.
+		// Check them before the no-capacity replay branch: a ticket may have no
+		// transferable capacity rows yet still be blocked by a quarantined or
+		// live guarded command.
+		var repositoryWriters int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases
+			WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`, ref.Channel, ref.Project, ref.Ticket).Scan(&repositoryWriters); err != nil {
+			return err
+		}
+		if repositoryWriters != 0 {
+			return ErrRepositoryCommandLease
+		}
+
 		var found, unsupported int
 		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(CASE WHEN scope NOT IN ('global','project') THEN 1 ELSE 0 END), 0)
 			FROM leases WHERE channel=? AND project_id=? AND ticket_id=? AND runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, staleRunner).Scan(&found, &unsupported); err != nil {

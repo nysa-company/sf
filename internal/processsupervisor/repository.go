@@ -15,7 +15,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +30,11 @@ const repositoryOutputLimit = 64 << 10
 const repositoryInputLimit = 1 << 20
 const repositoryToolchainFileLimit = 32768
 const repositoryToolchainByteLimit = 512 << 20
+
+// repositoryTestGroupLimit matches the durable Store limit.  A wrapper is
+// never acknowledged beyond this bound: an unrecorded test group could not be
+// recovered safely after a crash.
+const repositoryTestGroupLimit = 64
 
 // RepositoryCommandSupervisor is the sole os/exec boundary for exact,
 // credential-free repository commands. The child is held behind the sf gate
@@ -60,6 +64,9 @@ func (s RepositoryCommandSupervisor) Preflight(spec contracts.CommandSpec) error
 	if len(spec.Argv) > 0 && filepath.Base(spec.Argv[0]) == "npm" {
 		return ErrSubprocessRecipeUnsupported
 	}
+	if len(spec.Argv) == 0 || filepath.Base(spec.Argv[0]) != "go" {
+		return ErrUnclear
+	}
 	return nil
 }
 
@@ -82,6 +89,10 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	}
 	if !filepath.IsAbs(spec.Directory) || filepath.Clean(spec.Directory) != spec.Directory {
 		return contracts.CommandResult{}, ErrUnclear
+	}
+	useVendor, err := repositoryGoDependencyClosure(spec.Directory)
+	if err != nil {
+		return contracts.CommandResult{}, err
 	}
 	resolved, err := resolveFixedExecutable(spec.Argv[0])
 	if err != nil {
@@ -157,31 +168,21 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	}
 	defer os.RemoveAll(home)
 	defer os.RemoveAll(tmp)
-	isGo := filepath.Base(resolved) == "go"
-	var staged, stagedToolchain string
-	if isGo {
-		goRoot := filepath.Dir(filepath.Dir(resolved))
-		rootBinary, rootErr := filepath.EvalSymlinks(filepath.Join(goRoot, "bin", "go"))
-		if rootErr != nil || rootBinary != resolved {
-			return contracts.CommandResult{}, ErrUnclear
-		}
-		stagedToolchain, err = stageGoToolchain(goRoot)
-		if err != nil {
-			return contracts.CommandResult{}, fmt.Errorf("stage Go toolchain: %w", err)
-		}
-		defer os.RemoveAll(filepath.Dir(stagedToolchain))
-		staged = filepath.Join(stagedToolchain, "bin", "go")
-		stagedDigest, digestErr := executableDigest(staged)
-		sourceDigest, sourceDigestErr := executableFileDigest(resolved)
-		if digestErr != nil || sourceDigestErr != nil || stagedDigest != sourceDigest {
-			return contracts.CommandResult{}, ErrUnclear
-		}
-	} else {
-		staged, err = stageExecutable(resolved, claim.ExecutableDigest)
-		if err != nil {
-			return contracts.CommandResult{}, fmt.Errorf("stage repository executable: %w", err)
-		}
-		defer os.RemoveAll(filepath.Dir(staged))
+	goRoot := filepath.Dir(filepath.Dir(resolved))
+	rootBinary, rootErr := filepath.EvalSymlinks(filepath.Join(goRoot, "bin", "go"))
+	if rootErr != nil || rootBinary != resolved {
+		return contracts.CommandResult{}, ErrUnclear
+	}
+	stagedToolchain, err := stageGoToolchain(goRoot)
+	if err != nil {
+		return contracts.CommandResult{}, fmt.Errorf("stage Go toolchain: %w", err)
+	}
+	defer os.RemoveAll(filepath.Dir(stagedToolchain))
+	staged := filepath.Join(stagedToolchain, "bin", "go")
+	stagedDigest, digestErr := executableDigest(staged)
+	sourceDigest, sourceDigestErr := executableFileDigest(resolved)
+	if digestErr != nil || sourceDigestErr != nil || stagedDigest != sourceDigest {
+		return contracts.CommandResult{}, ErrUnclear
 	}
 	env, err := executionpolicy.MinimalEnvironment(home, tmp)
 	if err != nil {
@@ -211,55 +212,37 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if err := s.GitRunner.Reauthenticate(runCtx, identity); err != nil {
 		return contracts.CommandResult{}, fmt.Errorf("reauthenticate repository command worktree: %w", err)
 	}
-	isGoTest := isGo && len(spec.Argv) >= 2 && spec.Argv[1] == "test"
-	if isGo {
-		// The whole Go root, including compiler/linker tools, is copied into a
-		// private owner-only stage before the driver sees repository input. CGO
-		// and every module/tool-selection escape are disabled by the exact policy
-		// recipe plus this environment.
-		env = append(env, "GOROOT="+stagedToolchain, "CGO_ENABLED=0", "GOPROXY=off", "GOSUMDB=off", "GONOSUMDB=*", "GOTOOLCHAIN=local", "GOENV=off", "GOWORK=off", "GOTELEMETRY=off")
+	// The whole Go root, including compiler/linker tools, is copied into a
+	// private owner-only stage before the driver sees repository input. CGO
+	// and every module/tool-selection escape are disabled by the exact policy
+	// recipe plus this environment.
+	env = append(env, "GOROOT="+stagedToolchain, "CGO_ENABLED=0", "GOPROXY=off", "GOSUMDB=off", "GONOSUMDB=*", "GOTOOLCHAIN=local", "GOENV=off", "GOWORK=off", "GOTELEMETRY=off")
+	if useVendor {
+		env = append(env, "GOFLAGS=-mod=vendor")
 	}
 	self, err = stageRepositoryGate(self)
 	if err != nil {
 		return contracts.CommandResult{}, fmt.Errorf("stage repository gate: %w", err)
 	}
 	defer os.RemoveAll(filepath.Dir(self))
-	var sandboxProfile string
-	launchArgs := append([]string(nil), spec.Argv[1:]...)
-	if isGoTest {
-		// Package execution is serial so the shared durable group-report/
-		// acknowledgement pipe cannot acknowledge a different test binary.
-		// -count=1 makes a verification actually execute rather than trust a
-		// prior Go cache result.
-		launchArgs = append([]string{"test", "-p=1", "-count=1", "-exec=" + self + " __repository_command_test_gate"}, spec.Argv[2:]...)
-		gitFile, err := repositoryGitFilePath(identity)
-		if err != nil {
-			return contracts.CommandResult{}, ErrUnclear
-		}
-		env = append(env,
-			"SF_REPOSITORY_SANDBOX_REPOSITORY="+claim.Repository,
-			"SF_REPOSITORY_SANDBOX_WORKTREE="+claim.Worktree,
-			"SF_REPOSITORY_SANDBOX_GIT_FILE="+gitFile,
-			"SF_REPOSITORY_SANDBOX_COMMON_DIR="+identity.CommonDir,
-			"SF_REPOSITORY_SANDBOX_HOME="+home,
-			"SF_REPOSITORY_SANDBOX_TMP="+tmp,
-		)
-	} else if !isGo {
-		gitFile, pathErr := repositoryGitFilePath(identity)
-		if pathErr != nil {
-			return contracts.CommandResult{}, ErrUnclear
-		}
-		sandboxProfile, err = repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: claim.Repository, Worktree: claim.Worktree, GitFile: gitFile, CommonDir: identity.CommonDir, Home: home, Temporary: tmp, Executable: staged})
-	}
+	// Package execution is serial so the shared durable group-report/
+	// acknowledgement pipe cannot acknowledge a different test binary.
+	// -count=1 makes a verification actually execute rather than trust a prior
+	// Go cache result. Policy has already required the sole v1 recipe.
+	launchArgs := append([]string{"test", "-p=1", "-count=1", "-exec=" + self + " __repository_command_test_gate"}, spec.Argv[2:]...)
+	gitFile, err := repositoryGitFilePath(identity)
 	if err != nil {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	argv := append([]string{"__repository_command_gate"}, launchArgs...)
-	if isGo {
-		argv = append([]string{"__repository_command_gate", staged}, launchArgs...)
-	} else {
-		argv = append([]string{"__repository_command_gate", repositorySandboxExec, "-p", sandboxProfile, staged}, launchArgs...)
-	}
+	env = append(env,
+		"SF_REPOSITORY_SANDBOX_REPOSITORY="+claim.Repository,
+		"SF_REPOSITORY_SANDBOX_WORKTREE="+claim.Worktree,
+		"SF_REPOSITORY_SANDBOX_GIT_FILE="+gitFile,
+		"SF_REPOSITORY_SANDBOX_COMMON_DIR="+identity.CommonDir,
+		"SF_REPOSITORY_SANDBOX_HOME="+home,
+		"SF_REPOSITORY_SANDBOX_TMP="+tmp,
+	)
+	argv := append([]string{"__repository_command_gate", staged}, launchArgs...)
 	cmd := exec.CommandContext(runCtx, self, argv...)
 	// Context cancellation arms WaitDelay, which closes supervisor-owned pipe
 	// endpoints even if an escaped child inherited stdout/stderr.
@@ -273,22 +256,20 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	cmd.Stdin = bytes.NewReader(input)
 	cmd.ExtraFiles = []*os.File{gateRead, worktreeFD}
 	var groupReportRead, groupReportWrite, groupAckRead, groupAckWrite *os.File
-	if isGoTest {
-		groupReportRead, groupReportWrite, err = os.Pipe()
-		if err != nil {
-			return contracts.CommandResult{}, err
-		}
-		groupAckRead, groupAckWrite, err = os.Pipe()
-		if err != nil {
-			_ = groupReportRead.Close()
-			_ = groupReportWrite.Close()
-			return contracts.CommandResult{}, err
-		}
-		defer groupReportRead.Close()
-		defer groupAckRead.Close()
-		defer groupAckWrite.Close()
-		cmd.ExtraFiles = append(cmd.ExtraFiles, groupReportWrite, groupAckRead)
+	groupReportRead, groupReportWrite, err = os.Pipe()
+	if err != nil {
+		return contracts.CommandResult{}, err
 	}
+	groupAckRead, groupAckWrite, err = os.Pipe()
+	if err != nil {
+		_ = groupReportRead.Close()
+		_ = groupReportWrite.Close()
+		return contracts.CommandResult{}, err
+	}
+	defer groupReportRead.Close()
+	defer groupAckRead.Close()
+	defer groupAckWrite.Close()
+	cmd.ExtraFiles = append(cmd.ExtraFiles, groupReportWrite, groupAckRead)
 	// The opened directory remains inherited as FD 4 for the gate; the
 	// process starts in the canonical path after the preflight identity check.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -319,21 +300,19 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	}
 	groups := &repositoryTestGroups{}
 	var reportsDone <-chan struct{}
-	if isGoTest {
-		recorder, ok := lease.(contracts.RepositoryCommandGroupRecorder)
-		if !ok {
-			_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
-			_ = cmd.Wait()
-			_ = lease.Quarantine()
-			return contracts.CommandResult{}, ErrUnclear
-		}
-		done := make(chan struct{})
-		reportsDone = done
-		go func() {
-			defer close(done)
-			readRepositoryTestGroups(groupReportRead, groupAckWrite, recorder, groups)
-		}()
+	recorder, ok := lease.(contracts.RepositoryCommandGroupRecorder)
+	if !ok {
+		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		_ = lease.Quarantine()
+		return contracts.CommandResult{}, ErrUnclear
 	}
+	done := make(chan struct{})
+	reportsDone = done
+	go func() {
+		defer close(done)
+		readRepositoryTestGroups(groupReportRead, groupAckWrite, recorder, groups)
+	}()
 	// The launch record and gate are deliberately separate system calls. Check
 	// the exact Store fence once more immediately before unblocking the child so
 	// a pause/cancel/take that raced the record cannot start stale work.
@@ -512,297 +491,6 @@ func RepositoryExecutableDigest(path string) (string, error) {
 	return executableFileDigest(resolved)
 }
 
-type nodeToolchainClosure struct {
-	Root            string
-	Digest          string
-	DependencyPaths []string
-}
-
-func resolveNodeToolchainClosure(entry string) (nodeToolchainClosure, error) {
-	root, err := nodeToolchainRoot(entry)
-	if err != nil {
-		return nodeToolchainClosure{}, err
-	}
-	return resolveNodeToolchainClosureForRoot(root)
-}
-
-// resolveNodeToolchainClosure is bounded to a qualified Node 22 root and the
-// transitive Mach-O dependencies of its node binary. It never treats an otool
-// result as a broad filesystem grant: only checked absolute dependency files
-// are later passed to Seatbelt as literals.
-func resolveNodeToolchainClosureForRoot(root string) (nodeToolchainClosure, error) {
-	rootDigest, err := nodeToolchainDigest(root)
-	if err != nil {
-		return nodeToolchainClosure{}, err
-	}
-	node := filepath.Join(root, "bin", "node")
-	probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	probe := exec.CommandContext(probeCtx, node, "--version")
-	probe.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + root, "TMPDIR=" + root}
-	version, err := probe.Output()
-	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(version)), "v22.") {
-		return nodeToolchainClosure{}, ErrUnclear
-	}
-	paths, err := nodeMachOClosure(root, node)
-	if err != nil {
-		return nodeToolchainClosure{}, err
-	}
-	hash := sha256.New()
-	_, _ = hash.Write([]byte("node-root\x00" + root + "\x00" + rootDigest + "\x00"))
-	for _, path := range paths {
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil || !trustedNodeDependency(path, resolved) || authenticateRepositorySourceDependency(resolved) != nil {
-			return nodeToolchainClosure{}, ErrUnclear
-		}
-		info, err := os.Stat(resolved)
-		if err != nil {
-			return nodeToolchainClosure{}, err
-		}
-		_, _ = hash.Write([]byte("dependency\x00" + path + "\x00" + resolved + "\x00" + info.Mode().String() + "\x00" + strconv.FormatInt(info.Size(), 10) + "\x00"))
-		if err := hashFile(hash, resolved); err != nil {
-			return nodeToolchainClosure{}, err
-		}
-	}
-	// Seatbelt must grant each versioned dylib directory so dyld can resolve
-	// internal symlinks. Bind the whole enumerated directory as well: an added
-	// sibling cannot become a pre-launch loader input without changing this
-	// closure digest.
-	directories := map[string]bool{}
-	for _, path := range paths {
-		resolved, err := filepath.EvalSymlinks(filepath.Dir(path))
-		if err != nil || !cleanAbsolute(resolved) {
-			return nodeToolchainClosure{}, ErrUnclear
-		}
-		directories[resolved] = true
-	}
-	dirs := make([]string, 0, len(directories))
-	for directory := range directories {
-		dirs = append(dirs, directory)
-	}
-	sort.Strings(dirs)
-	for _, directory := range dirs {
-		digest, err := dependencyDirectoryDigest(directory)
-		if err != nil {
-			return nodeToolchainClosure{}, fmt.Errorf("authenticate Node dependency directory %s: %w", directory, err)
-		}
-		_, _ = hash.Write([]byte("dependency-directory\x00" + directory + "\x00" + digest + "\x00"))
-	}
-	return nodeToolchainClosure{Root: root, Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil)), DependencyPaths: paths}, nil
-}
-
-func dependencyDirectoryDigest(root string) (string, error) {
-	info, err := os.Lstat(root)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
-		return "", ErrUnclear
-	}
-	hash := sha256.New()
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return ErrUnclear
-		}
-		info, err := entry.Info()
-		if err != nil || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
-			return ErrUnclear
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			target, err := filepath.EvalSymlinks(path)
-			if err != nil || !pathWithin(root, target) {
-				return ErrUnclear
-			}
-			targetInfo, err := os.Stat(target)
-			if err != nil || targetInfo.Mode().Perm()&0o022 != 0 || !trustedOwner(targetInfo) {
-				return ErrUnclear
-			}
-			_, _ = hash.Write([]byte("L\x00" + rel + "\x00" + target + "\x00"))
-			if targetInfo.IsDir() {
-				// WalkDir reaches the real sibling directory separately; record the
-				// link identity without traversing it twice.
-				return nil
-			}
-			if !targetInfo.Mode().IsRegular() {
-				return ErrUnclear
-			}
-			return hashFile(hash, target)
-		}
-		if entry.IsDir() {
-			_, _ = hash.Write([]byte("D\x00" + rel + "\x00" + info.Mode().String() + "\x00"))
-			return nil
-		}
-		if !info.Mode().IsRegular() {
-			return ErrUnclear
-		}
-		_, _ = hash.Write([]byte("F\x00" + rel + "\x00" + info.Mode().String() + "\x00" + strconv.FormatInt(info.Size(), 10) + "\x00"))
-		return hashFile(hash, path)
-	})
-	if err != nil {
-		return "", err
-	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-func nodeMachOClosure(root, node string) ([]string, error) {
-	queue := []string{node}
-	seen := map[string]bool{}
-	allowed := map[string]bool{}
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		resolved, err := filepath.EvalSymlinks(current)
-		if err != nil || seen[resolved] {
-			continue
-		}
-		seen[resolved] = true
-		dependencies, err := machODependencies(resolved)
-		if err != nil {
-			return nil, fmt.Errorf("inspect Node dependency %s: %w", resolved, err)
-		}
-		rpaths, err := machORpaths(resolved)
-		if err != nil {
-			return nil, fmt.Errorf("inspect Node rpaths %s: %w", resolved, err)
-		}
-		for _, dependency := range dependencies {
-			candidate, err := resolveMachODependency(resolved, rpaths, dependency)
-			if err != nil {
-				return nil, fmt.Errorf("resolve Node dependency %s from %s: %w", dependency, resolved, err)
-			}
-			// System libraries live inside the code-owned macOS paths already
-			// explicit in the profile. They are neither Homebrew grants nor
-			// mutable Node closure members.
-			if strings.HasPrefix(candidate, "/System/") || strings.HasPrefix(candidate, "/usr/lib/") {
-				continue
-			}
-			resolvedCandidate, err := filepath.EvalSymlinks(candidate)
-			if err != nil || !trustedNodeDependency(candidate, resolvedCandidate) {
-				return nil, fmt.Errorf("untrusted Node dependency %s resolved %s: %w", candidate, resolvedCandidate, ErrUnclear)
-			}
-			allowed[candidate] = true
-			allowed[resolvedCandidate] = true
-			queue = append(queue, resolvedCandidate)
-		}
-	}
-	paths := make([]string, 0, len(allowed))
-	for path := range allowed {
-		paths = append(paths, path)
-	}
-	sort.Strings(paths)
-	return paths, nil
-}
-
-func machORpaths(path string) ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	output, err := exec.CommandContext(ctx, "/usr/bin/otool", "-l", path).Output()
-	if err != nil || len(output) > 256<<10 {
-		return nil, ErrUnclear
-	}
-	var result []string
-	wantPath := false
-	for _, line := range strings.Split(string(output), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "cmd LC_RPATH" {
-			wantPath = true
-			continue
-		}
-		if wantPath && strings.HasPrefix(line, "path ") {
-			path, _, ok := strings.Cut(strings.TrimPrefix(line, "path "), " (offset ")
-			if !ok || path == "" {
-				return nil, ErrUnclear
-			}
-			result = append(result, path)
-			wantPath = false
-		}
-	}
-	return result, nil
-}
-
-func machODependencies(path string) ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	output, err := exec.CommandContext(ctx, "/usr/bin/otool", "-L", path).Output()
-	if err != nil || len(output) > 128<<10 {
-		return nil, ErrUnclear
-	}
-	var result []string
-	for _, line := range strings.Split(string(output), "\n")[1:] {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		dependency, _, ok := strings.Cut(line, " (")
-		if !ok || dependency == "" {
-			return nil, ErrUnclear
-		}
-		result = append(result, dependency)
-	}
-	return result, nil
-}
-
-func resolveMachODependency(current string, rpaths []string, dependency string) (string, error) {
-	switch {
-	case strings.HasPrefix(dependency, "/"):
-		return dependency, nil
-	case strings.HasPrefix(dependency, "@loader_path/"):
-		return filepath.Join(filepath.Dir(current), strings.TrimPrefix(dependency, "@loader_path/")), nil
-	case strings.HasPrefix(dependency, "@rpath/"):
-		name := strings.TrimPrefix(dependency, "@rpath/")
-		for _, rpath := range append([]string{"@loader_path/../lib"}, rpaths...) {
-			var directory string
-			switch {
-			case strings.HasPrefix(rpath, "@loader_path/"):
-				directory = filepath.Join(filepath.Dir(current), strings.TrimPrefix(rpath, "@loader_path/"))
-			case strings.HasPrefix(rpath, "/"):
-				directory = rpath
-			default:
-				return "", ErrUnclear
-			}
-			candidate := filepath.Join(directory, name)
-			if _, err := os.Stat(candidate); err == nil {
-				return candidate, nil
-			}
-		}
-		return "", ErrUnclear
-	default:
-		return "", ErrUnclear
-	}
-}
-
-func trustedNodeDependency(path, resolved string) bool {
-	if pathWithin("/opt/homebrew/Cellar", resolved) || pathWithin("/usr/local/Cellar", resolved) || pathWithin("/usr/local/lib/nodejs", resolved) {
-		return strings.HasPrefix(path, "/opt/homebrew/opt/") || strings.HasPrefix(path, "/usr/local/opt/") || pathWithin("/opt/homebrew/Cellar", path) || pathWithin("/usr/local/Cellar", path) || pathWithin("/usr/local/lib/nodejs", path)
-	}
-	return false
-}
-
-func authenticateRepositorySourceDependency(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
-		return ErrUnclear
-	}
-	return nil
-}
-
-func equalStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func nodeClosureMatches(entry string, expected nodeToolchainClosure, expectedDigest string) bool {
-	fresh, err := resolveNodeToolchainClosure(entry)
-	return err == nil && fresh.Digest == expectedDigest && fresh.Digest == expected.Digest && equalStringSlices(fresh.DependencyPaths, expected.DependencyPaths)
-}
-
 func executableFileDigest(path string) (string, error) {
 	digest, err := executableDigest(path)
 	if err != nil {
@@ -811,31 +499,6 @@ func executableFileDigest(path string) (string, error) {
 	return digest, nil
 }
 
-func nodeToolchainRoot(entry string) (string, error) {
-	const npmSuffix = "/lib/node_modules/npm/bin/npm-cli.js"
-	if !strings.HasSuffix(entry, npmSuffix) || !cleanAbsolute(entry) {
-		return "", ErrUnclear
-	}
-	root := strings.TrimSuffix(entry, npmSuffix)
-	if !trustedNodeToolchainRoot(root) {
-		return "", ErrUnclear
-	}
-	for _, required := range []string{filepath.Join(root, "bin", "node"), entry} {
-		if err := authenticateRepositorySourceExecutable(required); err != nil {
-			return "", err
-		}
-	}
-	return root, nil
-}
-
-func trustedNodeToolchainRoot(root string) bool {
-	for _, prefix := range []string{"/opt/homebrew/Cellar/node@22/", "/usr/local/Cellar/node@22/", "/usr/local/lib/nodejs/"} {
-		if strings.HasPrefix(root, prefix) && cleanAbsolute(root) {
-			return true
-		}
-	}
-	return false
-}
 func (s RepositoryCommandSupervisor) drainSoft() time.Duration {
 	if s.SoftDrain > 0 {
 		return s.SoftDrain
@@ -999,75 +662,6 @@ func stageGoToolchain(root string) (string, error) {
 	return destinationRoot, nil
 }
 
-// nodeToolchainDigest authenticates the whole Node/npm closure in a stable
-// lexical order. npm-cli.js is only a launcher: binding just that file would
-// leave Node and npm's JavaScript dependency graph mutable after planning.
-func nodeToolchainDigest(root string) (string, error) {
-	if !trustedNodeToolchainRoot(root) {
-		return "", ErrUnclear
-	}
-	hash := sha256.New()
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return ErrUnclear
-		}
-		info, err := entry.Info()
-		if err != nil || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
-			return ErrUnclear
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			target, err := filepath.EvalSymlinks(path)
-			if err != nil || !pathWithin(root, target) {
-				return ErrUnclear
-			}
-			targetInfo, err := os.Stat(target)
-			if err != nil || !targetInfo.Mode().IsRegular() || targetInfo.Mode().Perm()&0o022 != 0 || !trustedOwner(targetInfo) {
-				return ErrUnclear
-			}
-			_, _ = hash.Write([]byte("L\x00" + rel + "\x00" + strings.TrimPrefix(target, root+string(filepath.Separator)) + "\x00"))
-			return hashFile(hash, target)
-		}
-		if entry.IsDir() {
-			_, _ = hash.Write([]byte("D\x00" + rel + "\x00"))
-			return nil
-		}
-		if !info.Mode().IsRegular() {
-			return ErrUnclear
-		}
-		_, _ = hash.Write([]byte("F\x00" + rel + "\x00"))
-		return hashFile(hash, path)
-	})
-	if err != nil {
-		return "", err
-	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-func hashFile(hash io.Writer, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := io.Copy(hash, f); err != nil {
-		return err
-	}
-	_, err = hash.Write([]byte{0})
-	return err
-}
-
-func pathWithin(root, path string) bool {
-	if !cleanAbsolute(root) || !cleanAbsolute(path) {
-		return false
-	}
-	rel, err := filepath.Rel(root, path)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
 func repositoryGitFilePath(identity gitboundary.Identity) (string, error) {
 	if !cleanAbsolute(identity.Worktree) {
 		return "", ErrUnclear
@@ -1120,6 +714,41 @@ func parseRepositoryIdentity(claim contracts.RepositoryCommandClaim) (gitboundar
 		}
 	}
 	return identity, nil
+}
+
+// repositoryGoDependencyClosure deliberately supports only a dependency-free
+// module or a checked-in Go vendor closure. GOPROXY is disabled regardless;
+// an external requirement without vendor is an operator/CI takeover, never a
+// reason to read an ambient module cache or reach the network.
+func repositoryGoDependencyClosure(worktree string) (bool, error) {
+	goMod := filepath.Join(worktree, "go.mod")
+	info, err := os.Lstat(goMod)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > 1<<20 {
+		return false, ErrUnclear
+	}
+	contents, err := os.ReadFile(goMod)
+	if err != nil {
+		return false, ErrUnclear
+	}
+	requires := false
+	for _, raw := range strings.Split(string(contents), "\n") {
+		line := strings.TrimSpace(strings.SplitN(raw, "//", 2)[0])
+		if line == "require (" || strings.HasPrefix(line, "require ") {
+			requires = true
+		}
+		if strings.HasPrefix(line, "replace ") || strings.HasPrefix(line, "exclude ") {
+			return false, ErrUnclear
+		}
+	}
+	if !requires {
+		return false, nil
+	}
+	modules := filepath.Join(worktree, "vendor", "modules.txt")
+	entry, err := os.Lstat(modules)
+	if err != nil || entry.Mode()&os.ModeSymlink != 0 || !entry.Mode().IsRegular() || entry.Size() == 0 || entry.Size() > 8<<20 {
+		return false, ErrSubprocessRecipeUnsupported
+	}
+	return true, nil
 }
 
 func matchesDirectoryIdentity(info os.FileInfo, dev, ino uint64) bool {
@@ -1212,10 +841,14 @@ func (g *repositoryTestGroups) stoppingNow() bool {
 	defer g.mu.Unlock()
 	return g.stopping
 }
-func (g *repositoryTestGroups) add(v contracts.RepositoryCommandLaunch) {
+func (g *repositoryTestGroups) add(v contracts.RepositoryCommandLaunch) bool {
 	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.groups) >= repositoryTestGroupLimit {
+		return false
+	}
 	g.groups = append(g.groups, v)
-	g.mu.Unlock()
+	return true
 }
 func (g *repositoryTestGroups) fail(err error) {
 	g.mu.Lock()
@@ -1254,13 +887,20 @@ func readRepositoryTestGroups(report *os.File, ack *os.File, recorder contracts.
 		v := contracts.RepositoryCommandLaunch{PID: pid, PGID: pgid, BootIdentity: boot, ProcessStartIdentity: start}
 		if e1 != nil || e2 != nil || e3 != nil || !validRepositoryLaunch(v) || groups.stoppingNow() {
 			if validRepositoryLaunch(v) {
-				groups.add(v)
+				_ = groups.add(v)
 				_ = signalGroup(v.PGID, syscall.SIGKILL)
 			}
 			groups.fail(ErrUnclear)
 			return
 		}
-		groups.add(v)
+		if !groups.add(v) {
+			// The wrapper is still behind the acknowledgement gate.  Kill its
+			// just-created group rather than permit a 65th group whose identity
+			// cannot be durably retained for recovery.
+			_ = signalGroup(v.PGID, syscall.SIGKILL)
+			groups.fail(ErrUnclear)
+			return
+		}
 		persistCtx, cancel := repositoryLeasePersistenceContext()
 		err = recorder.RecordRepositoryCommandProcessGroup(persistCtx, v)
 		cancel()
@@ -1329,85 +969,138 @@ func (b *repositoryBuffer) Write(p []byte) (int, error) {
 }
 
 // RepositoryCommandDrainer verifies the complete persisted launch identity
-// before signalling. An absent or mismatched identity is never guessed.
-type RepositoryCommandDrainer struct{ SoftDrain, HardDrain time.Duration }
+// before signalling. It is intentionally not a general process-tree
+// containment primitive: v1 only admits Go test wrappers whose group leaders
+// were durably recorded before untrusted test code was acknowledged.
+type RepositoryCommandDrainer struct {
+	SoftDrain, HardDrain time.Duration
+	// bootIdentity is test-only injection. Production always obtains the
+	// current host boot witness.
+	bootIdentity func() (string, error)
+}
 
 func (d RepositoryCommandDrainer) DrainRepositoryCommand(ctx context.Context, l contracts.RepositoryCommandLaunch) error {
 	return d.DrainRepositoryCommandTree(ctx, l, nil)
 }
 
 func (d RepositoryCommandDrainer) DrainRepositoryCommandTree(ctx context.Context, primary contracts.RepositoryCommandLaunch, groups []contracts.RepositoryCommandLaunch) error {
-	if err := d.drainRepositoryGroup(ctx, primary); err != nil {
-		return err
+	if !validRepositoryLaunch(primary) || len(groups) > repositoryTestGroupLimit || d.SoftDrain > 30*time.Second || d.HardDrain > 30*time.Second {
+		return ErrUnclear
 	}
-	for _, group := range groups {
-		if err := d.drainRepositoryGroup(ctx, group); err != nil {
-			return err
+	launches := append([]contracts.RepositoryCommandLaunch{primary}, groups...)
+	for _, launch := range launches {
+		if !validRepositoryLaunch(launch) || launch.BootIdentity != primary.BootIdentity {
+			return ErrUnclear
 		}
 	}
-	return nil
-}
-
-func (d RepositoryCommandDrainer) drainRepositoryGroup(ctx context.Context, l contracts.RepositoryCommandLaunch) error {
-	if !validRepositoryLaunch(l) {
-		return ErrUnclear
-	}
-	if d.SoftDrain > 30*time.Second || d.HardDrain > 30*time.Second {
-		return ErrUnclear
-	}
-	if boot, err := hostBootIdentity(); err != nil || boot != l.BootIdentity {
-		return ErrUnclear
-	}
-	start, err := processStartIdentity(l.PID)
+	boot, err := d.currentBootIdentity()
 	if err != nil {
 		return ErrUnclear
 	}
-	if start != l.ProcessStartIdentity {
-		return ErrUnclear
+	// A boot identifier is an OS-lifetime witness. A process from the prior
+	// boot cannot still exist, so no old PID or PGID is ever signalled.
+	if boot != primary.BootIdentity {
+		return nil
 	}
-	pgid, err := syscall.Getpgid(l.PID)
-	if err != nil || pgid != l.PGID {
-		return ErrUnclear
-	}
-	if err := signalGroup(l.PGID, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+	live, err := inspectRepositoryGroups(launches)
+	if err != nil {
 		return err
+	}
+	for _, launch := range live {
+		if err := signalGroup(launch.PGID, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+			return ErrUnclear
+		}
 	}
 	soft := d.SoftDrain
 	if soft <= 0 {
 		soft = 2 * time.Second
 	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(soft):
+	if err := waitRepositoryGroups(ctx, launches, time.Now().Add(soft)); err == nil {
+		return nil
+	} else if !errors.Is(err, errRepositoryGroupsStillLive) {
+		return err
 	}
-	if current, err := syscall.Getpgid(l.PID); err == nil && current == l.PGID && syscall.Kill(-l.PGID, 0) == nil {
-		_ = signalGroup(l.PGID, syscall.SIGKILL)
+
+	// Re-authenticate every leader immediately before KILL. If a leader has
+	// vanished while its old group remains, the PGID could now name an
+	// unrelated group; that is ambiguity, not permission to signal it.
+	live, err = inspectRepositoryGroups(launches)
+	if err != nil {
+		return err
+	}
+	for _, launch := range live {
+		if err := signalGroup(launch.PGID, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return ErrUnclear
+		}
 	}
 	hard := d.HardDrain
 	if hard <= 0 {
 		hard = 2 * time.Second
 	}
-	deadline := time.NewTimer(hard)
-	defer deadline.Stop()
-	for {
-		start, startErr := processStartIdentity(l.PID)
-		groupErr := syscall.Kill(-l.PGID, 0)
-		if startErr != nil && groupErr == syscall.ESRCH {
-			// A restarted daemon cannot infer a full process tree from an old
-			// PGID's disappearance. Keep the lease quarantined; successful live
-			// runs finish only after their own monitored group handshake.
-			return ErrUnclear
+	return waitRepositoryGroups(ctx, launches, time.Now().Add(hard))
+}
+
+func (d RepositoryCommandDrainer) currentBootIdentity() (string, error) {
+	if d.bootIdentity != nil {
+		return d.bootIdentity()
+	}
+	return hostBootIdentity()
+}
+
+var errRepositoryGroupsStillLive = errors.New("repository command groups still live")
+
+// inspectRepositoryGroups is deliberately stricter than Kill(-pgid, 0): a
+// missing leader plus a live group is not authenticated and therefore cannot
+// be signalled. A missing leader and ESRCH for its exact group is the narrow
+// proof that this recorded wrapper group is gone.
+func inspectRepositoryGroups(launches []contracts.RepositoryCommandLaunch) ([]contracts.RepositoryCommandLaunch, error) {
+	live := make([]contracts.RepositoryCommandLaunch, 0, len(launches))
+	for _, launch := range launches {
+		start, startErr := processStartIdentity(launch.PID)
+		groupErr := syscall.Kill(-launch.PGID, 0)
+		if startErr != nil {
+			if groupErr == syscall.ESRCH {
+				continue
+			}
+			return nil, ErrUnclear
 		}
-		if startErr == nil && (start != l.ProcessStartIdentity || func() bool { pgid, err := syscall.Getpgid(l.PID); return err != nil || pgid != l.PGID }()) {
-			return ErrUnclear
+		if start != launch.ProcessStartIdentity {
+			return nil, ErrUnclear
+		}
+		pgid, err := syscall.Getpgid(launch.PID)
+		// Darwin can retain the exact exited leader briefly as a zombie until
+		// its parent reaps it. Its start witness still matches, while ESRCH for
+		// the exact group proves no runnable member remains; this is safe gone,
+		// not a permission to signal a possibly reused PGID.
+		if groupErr == syscall.ESRCH {
+			continue
+		}
+		if err != nil || pgid != launch.PGID || groupErr != nil {
+			return nil, ErrUnclear
+		}
+		live = append(live, launch)
+	}
+	return live, nil
+}
+
+func waitRepositoryGroups(ctx context.Context, launches []contracts.RepositoryCommandLaunch, deadline time.Time) error {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		live, err := inspectRepositoryGroups(launches)
+		if err != nil {
+			return err
+		}
+		if len(live) == 0 {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return errRepositoryGroupsStillLive
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-deadline.C:
-			return ErrUnclear
-		case <-time.After(20 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 }

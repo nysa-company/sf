@@ -27,9 +27,10 @@ allow_autonomous = false
 The optional project file is `<repository>/.sf/config.toml`. When it is
 omitted, `sf init` selects a conservative command pair from the repository:
 
-- A regular `go.mod` selects `go test ./...` for verification and review.
-- A regular `package.json` with both `scripts.test` and `scripts.build`
-  selects `npm test` and `npm run build`.
+- A dependency-free `go.mod`, or a checked-in compatible Go `vendor/`
+  closure, selects the exact guarded `go test ./...` recipe.
+- A regular `package.json` remains an operator or credential-free CI takeover
+  shape in v1; npm commands are not locally executable repository commands.
 
 Repositories that match neither shape, match both, contain malformed metadata,
 or use symlinked marker files are refused with an actionable `sf config --help`

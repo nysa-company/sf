@@ -180,12 +180,10 @@ func EvaluateRepositoryCommand(argv []string) CommandDecision {
 	// or wrapper safe because wrappers reinterpret their remaining arguments.
 	// Keep this boundary positive-allowlisted.
 	switch executable {
-	case "git":
-		return evaluateReadOnlyGit(argv)
 	case "go":
 		return evaluateGoVerification(argv)
 	default:
-		return deny("repository_command_not_allowlisted", "only exact read-only Git and Go verification commands are eligible")
+		return deny("repository_command_not_allowlisted", "only the exact guarded Go test verification recipe is eligible")
 	}
 }
 
@@ -200,27 +198,6 @@ func evaluateGoVerification(argv []string) CommandDecision {
 		return deny("go_recipe_forbidden", "only the hermetic recipe `go test ./...` is eligible; flags, tool selection, outputs, module changes, cgo, and subprocess-dependent tests require operator takeover")
 	}
 	return CommandDecision{Allowed: true, Code: "allowed_go_test_recipe", Reason: "exact hermetic Go test recipe"}
-}
-
-func evaluateReadOnlyGit(argv []string) CommandDecision {
-	if len(argv) < 2 || strings.HasPrefix(argv[1], "-") {
-		return deny("git_control_plane_forbidden", "Git global options and implicit operations are forbidden")
-	}
-	switch argv[1] {
-	case "status", "rev-parse", "ls-files":
-	case "diff":
-		if !containsWord(argv[2:], "--no-ext-diff") || !containsWord(argv[2:], "--no-textconv") {
-			return deny("git_external_execution_forbidden", "Git diff requires --no-ext-diff and --no-textconv")
-		}
-	default:
-		return deny("git_mutation_forbidden", "only bounded read-only Git subcommands are allowed")
-	}
-	for _, argument := range argv[2:] {
-		if argument == "--ext-diff" || argument == "--textconv" || strings.HasPrefix(argument, "--output") || strings.HasPrefix(argument, "--exec") {
-			return deny("git_external_execution_forbidden", "Git may not execute helpers or write output")
-		}
-	}
-	return CommandDecision{Allowed: true, Code: "allowed_read_only_git", Reason: "read-only Git command"}
 }
 
 func secureDirectory(name, path string) error {
@@ -238,19 +215,6 @@ func secureDirectory(name, path string) error {
 		return fmt.Errorf("%s must be owner-only", name)
 	}
 	return nil
-}
-
-func containsWord(values []string, targets ...string) bool {
-	set := make(map[string]struct{}, len(targets))
-	for _, target := range targets {
-		set[target] = struct{}{}
-	}
-	for _, value := range values {
-		if _, exists := set[strings.ToLower(value)]; exists {
-			return true
-		}
-	}
-	return false
 }
 
 func deny(code, reason string) CommandDecision {

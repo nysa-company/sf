@@ -19,11 +19,11 @@ func (neverAuthority) AcquireRepositoryCommand(context.Context, contracts.Reposi
 }
 
 func TestCommandDigestAndSpecDigestChangeOnEveryLaunchInput(t *testing.T) {
-	p, err := executionpolicy.NewCommandSnapshot([]string{"git", "status", "--short"})
+	p, err := executionpolicy.NewCommandSnapshot([]string{"go", "test", "./..."})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := contracts.CommandSpec{Argv: []string{"git", "status", "--short"}, Directory: "/tmp/worktree", Timeout: 5}
+	s := contracts.CommandSpec{Argv: []string{"go", "test", "./..."}, Directory: "/tmp/worktree", Timeout: 5}
 	a, err := CommandDigest(s.Argv)
 	if err != nil {
 		t.Fatal(err)
@@ -44,7 +44,7 @@ func TestCommandDigestAndSpecDigestChangeOnEveryLaunchInput(t *testing.T) {
 }
 
 func TestRunRejectsShellAndNeverCallsAuthority(t *testing.T) {
-	p, err := executionpolicy.NewCommandSnapshot([]string{"git", "status", "--short"})
+	p, err := executionpolicy.NewCommandSnapshot([]string{"go", "test", "./..."})
 	if err != nil {
 		t.Fatal(err)
 	}

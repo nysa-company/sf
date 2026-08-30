@@ -76,10 +76,14 @@ not hidden fallbacks.
 
 The local guarded repository-command executor is intentionally narrow: its only
 Go recipe is `go test ./...`, with no caller flags, CGO, downloads, module
-updates, overlays, compiler/linker selection, or output paths. npm/Node commands
-are not locally executable in v1: ADR 0002 cannot prove their complete process
-tree has drained after setsid or double-fork behavior. They require operator or
-credential-free CI takeover; autonomous execution remains unavailable.
+updates, overlays, compiler/linker selection, or output paths. It accepts only
+a dependency-free module or a checked-in compatible vendor closure; it never
+uses an ambient module cache or network. npm/Node commands are not locally
+executable in v1: ADR 0002 cannot prove their complete process tree has drained
+after setsid or double-fork behavior. SF itself and Nysa remain CI/operator
+takeover work until they meet this vendored Go-only contract; this boundary is
+uncomposed infrastructure, not a production workflow. Autonomous execution
+remains unavailable.
 This is a local guarded baseline, not evidence that ADR 0002's autonomous
 capability has changed.
 

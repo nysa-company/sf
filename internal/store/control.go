@@ -131,6 +131,18 @@ func (s *Store) CompleteControlTransition(ctx context.Context, transition Transi
 		if providerClaims != 0 {
 			return ErrControlNotDrained
 		}
+		// A durable repository-command lease is an independent process witness.
+		// Its effect may already hold a terminal result while the command group
+		// or a quarantined recovery row still blocks repository writers.
+		var repositoryCommands int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases
+			WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`,
+			transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&repositoryCommands); err != nil {
+			return err
+		}
+		if repositoryCommands != 0 {
+			return ErrControlNotDrained
+		}
 		at := time.Now().UTC().Format(time.RFC3339Nano)
 		if _, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='cancelled',completed_at=COALESCE(completed_at,?),outcome='cancelled'
 			WHERE channel=? AND project_id=? AND ticket_id=? AND state='active'`, at, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket); err != nil {

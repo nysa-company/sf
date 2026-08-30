@@ -28,24 +28,14 @@ func TestLoadProjectDefaultsWithoutRepositoryFile(t *testing.T) {
 	}
 }
 
-func TestLoadProjectAutoDetectsNysaPackageScripts(t *testing.T) {
+func TestLoadProjectRefusesNysaPackageScriptsForLocalV1(t *testing.T) {
 	repository := t.TempDir()
 	packageJSON := `{"name":"nysa-app","private":true,"workspaces":["packages/*"],"scripts":{"test":"npm run test:all","build":"npm run build:all","lint":"eslint ."},"engines":{"node":">=22"}}`
 	if err := os.WriteFile(filepath.Join(repository, "package.json"), []byte(packageJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	effective, _, _, err := LoadProject(repository, "nysa", DefaultMachineLimits())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := effective.Commands.Verify.Argv; len(got) != 2 || got[0] != "npm" || got[1] != "test" {
-		t.Fatalf("verify argv=%q", got)
-	}
-	if got := effective.Commands.Review.Argv; len(got) != 3 || got[0] != "npm" || got[1] != "run" || got[2] != "build" {
-		t.Fatalf("review argv=%q", got)
-	}
-	if strings.Join(effective.Providers.Planner, ",") != "codex" || strings.Join(effective.Providers.Builder, ",") != "codex" || strings.Join(effective.Providers.Reviewer, ",") != "codex" {
-		t.Fatalf("provider defaults=%+v", effective.Providers)
+	if _, _, _, err := LoadProject(repository, "nysa", DefaultMachineLimits()); !errors.Is(err, ErrCommandDetection) || !strings.Contains(err.Error(), "credential-free CI") {
+		t.Fatalf("npm local detection error=%v", err)
 	}
 }
 
@@ -100,7 +90,7 @@ func TestLoadProjectDetectionRefusesAmbiguousUnsupportedMissingScriptsAndSymlink
 			if err := prepare(repository); err != nil {
 				t.Fatal(err)
 			}
-			if _, _, _, err := LoadProject(repository, "project", DefaultMachineLimits()); err == nil || !errors.Is(err, ErrCommandDetection) || !strings.Contains(err.Error(), "add explicit commands") {
+			if _, _, _, err := LoadProject(repository, "project", DefaultMachineLimits()); err == nil || !errors.Is(err, ErrCommandDetection) {
 				t.Fatalf("detection error=%v", err)
 			}
 		})
