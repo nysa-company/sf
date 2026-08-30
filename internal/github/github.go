@@ -40,6 +40,9 @@ var (
 	ErrGuardedMergeUnavailable = errors.New("sf-managed guarded merge is unavailable without server-enforced strict protected-base checks; observe a manual merge instead")
 	ErrProcessCleanup          = contracts.ErrExternalCleanupUncertain
 	ErrCleanupQuarantineFatal  = contracts.ErrExternalCleanupQuarantineFatal
+	// ErrRunnerBusy means this invocation did not acquire the runner's launch
+	// ownership. Client must not call Cleanup for another invocation's run.
+	ErrRunnerBusy = errors.New("gh runner is already in use")
 )
 
 const maxResponse = 1 << 20
@@ -61,6 +64,7 @@ type Client struct {
 	mergeIntents          contracts.MergeIntentRecorder
 	quarantiner           contracts.ExternalMutationQuarantineAuthority
 	cleanupLatched        *atomic.Bool
+	runMu                 *sync.Mutex // serializes one Run+Cleanup ownership pair
 }
 
 type Principal struct{ Login string }
@@ -121,7 +125,7 @@ func NewClient(binary, home, configDir string, runner SupervisedCommandRunner, v
 	if binary == "" || !filepath.IsAbs(binary) || home == "" || !filepath.IsAbs(home) || configDir == "" || !filepath.IsAbs(configDir) || runner == nil || validate == nil || guard == nil || verifier == nil || intents == nil || quarantiner == nil {
 		return nil, ErrPolicyRefusal
 	}
-	return &Client{binaryPath: binary, home: home, configDir: configDir, runner: runner, validateClaimFn: validate, mutationGuard: guard, verifyProtectedBranch: verifier, mergeIntents: intents, quarantiner: quarantiner, cleanupLatched: &atomic.Bool{}}, nil
+	return &Client{binaryPath: binary, home: home, configDir: configDir, runner: runner, validateClaimFn: validate, mutationGuard: guard, verifyProtectedBranch: verifier, mergeIntents: intents, quarantiner: quarantiner, cleanupLatched: &atomic.Bool{}, runMu: &sync.Mutex{}}, nil
 }
 
 // NewStoreClient supplies SQLite's durable-effect, guard, and quarantine
@@ -966,6 +970,10 @@ func (c Client) json(ctx context.Context, destination any, args ...string) error
 	return nil
 }
 func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
+	if c.runMu != nil {
+		c.runMu.Lock()
+		defer c.runMu.Unlock()
+	}
 	if c.cleanupLatched != nil && c.cleanupLatched.Load() {
 		return nil, ErrCleanupQuarantineFatal
 	}
@@ -984,6 +992,9 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	}
 	if c.runner != nil {
 		output, runErr := c.runner.Run(ctx, c.binary(), args, env)
+		if errors.Is(runErr, ErrRunnerBusy) {
+			return nil, runErr
+		}
 		proof, cleanupErr := c.runner.Cleanup(ctx)
 		if cleanupErr != nil || !proof.valid() || errors.Is(runErr, ErrProcessCleanup) {
 			return nil, c.quarantineCleanup()

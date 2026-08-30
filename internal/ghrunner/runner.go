@@ -61,10 +61,12 @@ var (
 	ErrInvalidEnvironment       = errors.New("gh environment is outside the minimal contract")
 	ErrInvalidCommand           = errors.New("gh command is invalid")
 	ErrOutputTooLarge           = errors.New("gh output exceeded the bound")
-	ErrConcurrentRun            = errors.New("gh runner is already in use")
+	ErrConcurrentRun            = github.ErrRunnerBusy
 	ErrCleanupBeforeRun         = errors.New("gh cleanup has no preceding run")
 	ErrCleanupAlreadyUsed       = errors.New("gh cleanup proof was already consumed")
 	ErrExternalCleanupUncertain = contracts.ErrExternalCleanupUncertain
+	ErrRunnerClosed             = errors.New("gh runner is closed")
+	ErrCleanupInProgress        = errors.New("gh cleanup is already in progress")
 	hostBootIdentityFn          = hostBootIdentity
 	processStartIdentityFn      = processStartIdentity
 )
@@ -83,6 +85,8 @@ type Runner struct {
 	snapshotPath     string
 	snapshotDir      string
 	removeSnapshot   func(string) error
+	closing          bool
+	closed           bool
 }
 
 var _ github.SupervisedCommandRunner = (*Runner)(nil)
@@ -133,7 +137,11 @@ func (r *Runner) Close() error {
 		return nil
 	}
 	r.mu.Lock()
-	if r.active != nil || r.needsCleanup {
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	if r.active != nil || r.needsCleanup || r.closing {
 		r.mu.Unlock()
 		return ErrConcurrentRun
 	}
@@ -142,20 +150,30 @@ func (r *Runner) Close() error {
 	if removeSnapshot == nil {
 		removeSnapshot = os.RemoveAll
 	}
+	r.closing = true
 	r.mu.Unlock()
 	if directory == "" {
+		r.mu.Lock()
+		r.closing = false
+		r.closed = true
+		r.mu.Unlock()
 		return nil
 	}
 	if err := removeSnapshot(directory); err != nil {
 		// Retain both paths so a caller can retry after a transient removal
 		// failure. Clearing them before RemoveAll would make the snapshot
 		// permanently unreachable and would lose cleanup state.
+		r.mu.Lock()
+		r.closing = false
+		r.mu.Unlock()
 		return err
 	}
 	r.mu.Lock()
 	if r.snapshotDir == directory {
 		r.snapshotDir, r.snapshotPath = "", ""
 	}
+	r.closing = false
+	r.closed = true
 	r.mu.Unlock()
 	return nil
 }
@@ -169,7 +187,14 @@ func (r *Runner) markPrelaunch() {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.markPrelaunchLocked()
+}
+
+func (r *Runner) markPrelaunchLocked() {
 	if r.active == nil && !r.needsCleanup {
+		if r.closing || r.closed {
+			return
+		}
 		r.needsCleanup = true
 		r.prelaunchPending = true
 		r.cleanupUsed = false
@@ -191,7 +216,8 @@ type run struct {
 	streamsUncertain       bool
 	identityUncertain      atomic.Bool
 	finished               chan struct{}
-	cleaned                bool // protected by Runner.mu
+	cleaned                bool // protected by Runner.mu; final proof consumed
+	cleanupInProgress      bool // protected by Runner.mu; retryable claim
 }
 
 // Run starts exactly binary with args and env. The binary must equal the
@@ -200,29 +226,37 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 	if r == nil {
 		return nil, ErrInvalidCommand
 	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, ErrRunnerClosed
+	}
+	if r.active != nil || r.needsCleanup || r.closing {
+		r.mu.Unlock()
+		return nil, ErrConcurrentRun
+	}
 	if ctx == nil {
-		r.markPrelaunch()
+		r.markPrelaunchLocked()
+		r.mu.Unlock()
 		return nil, ErrInvalidCommand
 	}
 	if err := validateCommand(binary, args); err != nil {
-		r.markPrelaunch()
+		r.markPrelaunchLocked()
+		r.mu.Unlock()
 		return nil, err
 	}
 	safeEnv, err := validatedEnvironment(env)
 	if err != nil {
-		r.markPrelaunch()
+		r.markPrelaunchLocked()
+		r.mu.Unlock()
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		r.markPrelaunch()
+		r.markPrelaunchLocked()
+		r.mu.Unlock()
 		return nil, err
 	}
 
-	r.mu.Lock()
-	if r.active != nil || r.needsCleanup {
-		r.mu.Unlock()
-		return nil, ErrConcurrentRun
-	}
 	binaryCanonical, binaryErr := filepath.EvalSymlinks(binary)
 	if binaryErr != nil || binaryCanonical != r.canonical {
 		r.mu.Unlock()
@@ -497,6 +531,10 @@ func (r *Runner) Cleanup(ctx context.Context) (github.CleanupProof, error) {
 		r.mu.Unlock()
 		return github.CleanupProof{}, ErrCleanupAlreadyUsed
 	}
+	if current != nil && current.cleanupInProgress {
+		r.mu.Unlock()
+		return github.CleanupProof{}, ErrCleanupInProgress
+	}
 	if !r.needsCleanup || current == nil {
 		used := r.cleanupUsed
 		r.mu.Unlock()
@@ -505,8 +543,7 @@ func (r *Runner) Cleanup(ctx context.Context) (github.CleanupProof, error) {
 		}
 		return github.CleanupProof{}, ErrCleanupBeforeRun
 	}
-	current.cleaned = true
-	r.cleanupUsed = true
+	current.cleanupInProgress = true
 	r.mu.Unlock()
 	bounded, cancel := boundedCleanupContext(ctx)
 	defer cancel()
@@ -516,7 +553,8 @@ func (r *Runner) Cleanup(ctx context.Context) (github.CleanupProof, error) {
 	select {
 	case <-current.finished:
 	case <-bounded.Done():
-		return quarantine()
+		r.releaseCleanupClaim(current)
+		return github.CleanupProof{}, cleanupContextError(bounded)
 	}
 	if !current.ownerDone {
 		select {
@@ -526,28 +564,57 @@ func (r *Runner) Cleanup(ctx context.Context) (github.CleanupProof, error) {
 			// final state write; no other goroutine reads this field now.
 			current.ownerDone = true
 		case <-bounded.Done():
-			return quarantine()
+			return r.consumeCleanupUncertain(current)
 		}
 	}
 	if current.streamsUncertain || current.identityUncertain.Load() {
-		return quarantine()
+		return r.consumeCleanupUncertain(current)
 	}
-	if err := observeLeader(current); err != nil {
-		return quarantine()
+	if err := observeLeader(bounded, current); err != nil {
+		return r.consumeCleanupUncertain(current)
 	}
 	if err := waitGroupGone(bounded, current.pgid); err != nil {
-		return quarantine()
+		return r.consumeCleanupUncertain(current)
 	}
 	select {
 	case <-current.streamsDone:
 	default:
-		return quarantine()
+		return r.consumeCleanupUncertain(current)
 	}
 	r.mu.Lock()
 	r.active = nil
 	r.needsCleanup = false
+	current.cleaned = true
+	current.cleanupInProgress = false
+	r.cleanupUsed = true
 	r.mu.Unlock()
 	return github.CleanupProof{Drained: true}, nil
+}
+
+func (r *Runner) releaseCleanupClaim(current *run) {
+	r.mu.Lock()
+	if r.active == current && !current.cleaned {
+		current.cleanupInProgress = false
+	}
+	r.mu.Unlock()
+}
+
+func (r *Runner) consumeCleanupUncertain(current *run) (github.CleanupProof, error) {
+	r.mu.Lock()
+	if r.active == current {
+		current.cleaned = true
+		current.cleanupInProgress = false
+		r.cleanupUsed = true
+	}
+	r.mu.Unlock()
+	return quarantine()
+}
+
+func cleanupContextError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return context.DeadlineExceeded
 }
 
 func quarantine() (github.CleanupProof, error) {
@@ -559,13 +626,15 @@ func (r *Runner) terminate(current *run, deadline time.Time) bool {
 		return false
 	}
 	// Once the single wall-clock budget is exhausted there is no wait budget
-	// left. The launch identity was already captured, so issue the group kill
-	// immediately and let Cleanup await the owner asynchronously.
+	// left, so issue the group kill immediately and let Cleanup await the owner
+	// asynchronously.
 	if time.Until(deadline) <= 0 && !current.identityUncertain.Load() {
 		err := signalGroup(current.pgid, syscall.SIGKILL)
 		return err == nil || errors.Is(err, syscall.ESRCH)
 	}
-	if err := observeLeader(current); err != nil {
+	observation, cancelObservation := observationContext(deadline)
+	defer cancelObservation()
+	if err := observeLeader(observation, current); err != nil {
 		return false
 	}
 	if err := signalGroup(current.pgid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
@@ -582,7 +651,7 @@ func (r *Runner) terminate(current *run, deadline time.Time) bool {
 		case <-time.After(wait):
 		}
 	}
-	if err := observeLeader(current); err != nil {
+	if err := observeLeader(observation, current); err != nil {
 		_ = signalGroup(current.pgid, syscall.SIGKILL)
 		return false
 	}
@@ -627,11 +696,7 @@ func monitorLeader(current *run) {
 				// failure to read its identity there is not a group change.
 				continue
 			}
-			start, startErr := processStartIdentity(current.pid)
-			current.identityMu.RLock()
-			knownStart := current.start
-			current.identityMu.RUnlock()
-			if pgid != current.pgid || (knownStart != "" && startErr == nil && start != knownStart) {
+			if pgid != current.pgid {
 				current.identityUncertain.Store(true)
 				return
 			}
@@ -639,7 +704,10 @@ func monitorLeader(current *run) {
 	}
 }
 
-func observeLeader(current *run) error {
+func observeLeader(ctx context.Context, current *run) error {
+	// Re-sampling protects against PID reuse, but the reader is an extension
+	// point that may stall. Keep it behind a bounded, buffered observation so
+	// Cleanup and cancellation never synchronously wait on it.
 	if current == nil || current.pid <= 0 {
 		return ErrExternalCleanupUncertain
 	}
@@ -654,14 +722,39 @@ func observeLeader(current *run) error {
 	if err != nil || pgid != current.pgid {
 		return ErrExternalCleanupUncertain
 	}
-	start, err := processStartIdentity(current.pid)
 	current.identityMu.RLock()
 	knownStart := current.start
 	current.identityMu.RUnlock()
-	if err != nil || start != knownStart {
+	if knownStart == "" {
+		return ErrExternalCleanupUncertain
+	}
+	start, sampleErr := boundedProcessStartIdentity(ctx, current.pid)
+	if sampleErr != nil || start != knownStart {
 		return ErrExternalCleanupUncertain
 	}
 	return nil
+}
+
+func boundedProcessStartIdentity(ctx context.Context, pid int) (string, error) {
+	type result struct {
+		value string
+		err   error
+	}
+	results := make(chan result, 1)
+	go func() {
+		value, err := processStartIdentityFn(pid)
+		results <- result{value: value, err: err}
+	}()
+	select {
+	case result := <-results:
+		return result.value, result.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func observationContext(deadline time.Time) (context.Context, context.CancelFunc) {
+	return context.WithDeadline(context.Background(), deadline)
 }
 
 func waitGroupGone(ctx context.Context, pgid int) error {

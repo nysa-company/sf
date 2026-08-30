@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -210,7 +211,7 @@ func TestCleanupWaitsForRunLifecycleAndNextRunWorks(t *testing.T) {
 	cleanupClaimedBy := time.Now().Add(time.Second)
 	for {
 		runner.mu.Lock()
-		claimed := runner.active != nil && runner.active.cleaned
+		claimed := runner.active != nil && runner.active.cleanupInProgress
 		runner.mu.Unlock()
 		if claimed {
 			break
@@ -247,6 +248,88 @@ func TestCleanupWaitsForRunLifecycleAndNextRunWorks(t *testing.T) {
 	}
 	if proof, err := runner.Cleanup(context.Background()); err != nil || !proof.Drained {
 		t.Fatalf("next cleanup=%+v err=%v", proof, err)
+	}
+}
+
+func TestCleanupTimeoutReleasesClaimForRetry(t *testing.T) {
+	runner, err := New(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancelRun()
+	runDone := make(chan error, 1)
+	go func() {
+		_, runErr := runner.Run(runCtx, mustExecutable(t), helperArgs("hang"), runnerEnvironment(t))
+		runDone <- runErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		runner.mu.Lock()
+		active := runner.active != nil
+		runner.mu.Unlock()
+		if active {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	runner.mu.Lock()
+	active := runner.active != nil
+	runner.mu.Unlock()
+	if !active {
+		t.Fatal("Run did not publish active lifecycle record")
+	}
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	proof, cleanupErr := runner.Cleanup(cleanupCtx)
+	cancelCleanup()
+	if cleanupErr == nil || proof.Drained || proof.Quarantined {
+		t.Fatalf("timed-out cleanup=%+v err=%v", proof, cleanupErr)
+	}
+	if runErr := <-runDone; !errors.Is(runErr, context.DeadlineExceeded) {
+		t.Fatalf("Run timeout: %v", runErr)
+	}
+	proof, cleanupErr = runner.Cleanup(context.Background())
+	if cleanupErr != nil || !proof.Drained || proof.Quarantined {
+		t.Fatalf("retry cleanup=%+v err=%v", proof, cleanupErr)
+	}
+	if _, err := runner.Run(context.Background(), mustExecutable(t), helperArgs("fast"), runnerEnvironment(t)); err != nil {
+		t.Fatalf("next Run after retry: %v", err)
+	}
+	if proof, err := runner.Cleanup(context.Background()); err != nil || !proof.Drained {
+		t.Fatalf("next cleanup=%+v err=%v", proof, err)
+	}
+}
+
+func TestCloseSerializesSnapshotRemovalAndRun(t *testing.T) {
+	runner, err := New(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	runner.removeSnapshot = func(path string) error {
+		close(entered)
+		<-release
+		return os.RemoveAll(path)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- runner.Close() }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not enter removal seam")
+	}
+	if _, err := runner.Run(context.Background(), mustExecutable(t), helperArgs("fast"), runnerEnvironment(t)); !errors.Is(err, ErrConcurrentRun) {
+		t.Fatalf("Run during Close: %v", err)
+	}
+	close(release)
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Run(context.Background(), "\x00", nil, nil); !errors.Is(err, ErrRunnerClosed) {
+		t.Fatalf("invalid Run after Close: %v", err)
+	}
+	if _, err := runner.Run(context.Background(), mustExecutable(t), helperArgs("fast"), runnerEnvironment(t)); !errors.Is(err, ErrRunnerClosed) {
+		t.Fatalf("Run after Close: %v", err)
 	}
 }
 
@@ -369,6 +452,51 @@ func TestBlockingPostStartIdentityIsDeadlineBounded(t *testing.T) {
 	}
 	proof, cleanupErr := runner.Cleanup(context.Background())
 	if !errors.Is(cleanupErr, ErrExternalCleanupUncertain) || !proof.Quarantined {
+		t.Fatalf("cleanup=%+v err=%v", proof, cleanupErr)
+	}
+}
+
+func TestCancellationAndSubsequentIdentitySamplingAreBounded(t *testing.T) {
+	old := processStartIdentityFn
+	defer func() { processStartIdentityFn = old }()
+	var calls atomic.Int32
+	secondStarted := make(chan struct{})
+	release := make(chan struct{})
+	processStartIdentityFn = func(pid int) (string, error) {
+		if calls.Add(1) == 1 {
+			return old(pid)
+		}
+		close(secondStarted)
+		<-release
+		return old(pid)
+	}
+	runner, err := New(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, runErr := runner.Run(ctx, mustExecutable(t), helperArgs("hang"), runnerEnvironment(t))
+	if !errors.Is(runErr, context.DeadlineExceeded) || time.Since(started) > 2*time.Second {
+		t.Fatalf("cached identity cancellation err=%v duration=%s", runErr, time.Since(started))
+	}
+	sampleCtx, cancelSample := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelSample()
+	sampleStarted := time.Now()
+	if _, sampleErr := boundedProcessStartIdentity(sampleCtx, os.Getpid()); !errors.Is(sampleErr, context.DeadlineExceeded) || time.Since(sampleStarted) > time.Second {
+		t.Fatalf("blocking subsequent identity sample err=%v duration=%s", sampleErr, time.Since(sampleStarted))
+	}
+	select {
+	case <-secondStarted:
+		close(release)
+	default:
+		t.Fatal("blocking subsequent identity sample was not started")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("identity reader calls=%d, want initial plus bounded subsequent sample", calls.Load())
+	}
+	if proof, cleanupErr := runner.Cleanup(context.Background()); cleanupErr != nil || !proof.Drained {
 		t.Fatalf("cleanup=%+v err=%v", proof, cleanupErr)
 	}
 }
