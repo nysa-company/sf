@@ -18,7 +18,7 @@ func repositoryCommandIdentity(t *testing.T, repository, worktree, branch, base 
 	identity := gitboundary.Identity{
 		Repository: repository, RepositoryDev: 1, RepositoryIno: 2,
 		Worktree: worktree, WorktreeDev: 3, WorktreeIno: 4,
-		GitFile: worktree + "/.git", GitFileDev: 5, GitFileIno: 6,
+		GitFile: "gitdir: " + worktree + "/.git", GitFileDev: 5, GitFileIno: 6,
 		CommonDir: repository + "/.git", CommonDirDev: 7, CommonDirIno: 8,
 		Origin: "git@example.test:nysa.git", PushOrigin: "/tmp/nysa-origin", PushOriginDev: 9, PushOriginIno: 10,
 		BaseRef: base, BaseHead: strings.Repeat("a", 40), HeadRef: branch,
@@ -128,5 +128,47 @@ func TestRepositoryCommandRefusesUnobservedCompletion(t *testing.T) {
 	}
 	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0}); err == nil {
 		t.Fatal("zero-value command result was accepted as success")
+	}
+}
+
+func TestRepositoryCommandPersistsTrackedGoTestGroups(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "tracked-groups")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := contracts.RepositoryCommandLaunch{PID: 101, PGID: 101, BootIdentity: "boot", ProcessStartIdentity: "start-primary"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	recorder, ok := lease.(contracts.RepositoryCommandGroupRecorder)
+	if !ok {
+		t.Fatal("production repository lease does not record test groups")
+	}
+	group := contracts.RepositoryCommandLaunch{PID: 202, PGID: 202, BootIdentity: "boot", ProcessStartIdentity: "start-test"}
+	if err := recorder.RecordRepositoryCommandProcessGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	active, err := db.ActiveRepositoryCommandLeases(ctx, claim.TicketRef.Channel)
+	if err != nil || len(active) != 1 || len(active[0].Groups) != 1 || active[0].Groups[0] != group {
+		t.Fatalf("active=%+v err=%v", active, err)
+	}
+	if err := lease.FinishRepositoryCommandLaunch(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Observed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	var residue int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_process_groups WHERE repository_path=?`, claim.Repository).Scan(&residue); err != nil || residue != 0 {
+		t.Fatalf("tracked group residue=%d err=%v", residue, err)
 	}
 }

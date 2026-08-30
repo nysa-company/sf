@@ -187,7 +187,7 @@ func EvaluateRepositoryCommand(argv []string) CommandDecision {
 		switch argv[1] {
 		case "test", "vet", "build", "list":
 			for _, argument := range argv[2:] {
-				if argument == "-exec" || strings.HasPrefix(argument, "-exec=") || argument == "-toolexec" || strings.HasPrefix(argument, "-toolexec=") {
+				if argument == "-exec" || strings.HasPrefix(argument, "-exec=") || argument == "-toolexec" || strings.HasPrefix(argument, "-toolexec=") || argument == "-p" || strings.HasPrefix(argument, "-p=") || argument == "-count" || strings.HasPrefix(argument, "-count=") {
 					return deny("go_wrapper_forbidden", "Go executable wrappers are forbidden")
 				}
 			}

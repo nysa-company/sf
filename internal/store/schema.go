@@ -106,6 +106,10 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "git_mutation_intents", target: "tickets"},
 	{table: "git_mutation_intents", target: "effects"},
 	{table: "git_mutation_leases", target: "git_mutation_intents"},
+	{table: "repository_command_intents", target: "tickets"},
+	{table: "repository_command_intents", target: "effects"},
+	{table: "repository_command_leases", target: "repository_command_intents"},
+	{table: "repository_command_process_groups", target: "repository_command_leases"},
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {

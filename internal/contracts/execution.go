@@ -134,6 +134,14 @@ type RepositoryCommandLease interface {
 	FinishRepositoryCommandLaunch(context.Context, RepositoryCommandLaunch) error
 	Quarantine() error
 }
+
+// RepositoryCommandGroupRecorder durably records a constrained Go test
+// process group before its launch gate is opened. It is deliberately an
+// optional extension so non-Go repository commands retain the small lease
+// interface, while production Go verification fails closed if unavailable.
+type RepositoryCommandGroupRecorder interface {
+	RecordRepositoryCommandProcessGroup(context.Context, RepositoryCommandLaunch) error
+}
 type RepositoryCommandAuthority interface {
 	AcquireRepositoryCommand(context.Context, RepositoryCommandClaim) (RepositoryCommandLease, error)
 }
@@ -144,6 +152,15 @@ type RepositoryCommandResultRecorder interface {
 }
 type RepositoryCommandDrainer interface {
 	DrainRepositoryCommand(context.Context, RepositoryCommandLaunch) error
+}
+
+// RepositoryCommandTreeDrainer is used when Go verification has spawned
+// sandboxed, separately tracked test process groups. Recovery must drain the
+// primary driver and every recorded group before releasing repository
+// exclusion; treating the driver's old process group as a tree witness is
+// unsafe on macOS.
+type RepositoryCommandTreeDrainer interface {
+	DrainRepositoryCommandTree(context.Context, RepositoryCommandLaunch, []RepositoryCommandLaunch) error
 }
 
 // ProtectedBranchWitness is the durable recovery witness for a completed

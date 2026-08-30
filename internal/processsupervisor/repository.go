@@ -1,6 +1,7 @@
 package processsupervisor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -12,7 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,7 +31,12 @@ const repositoryInputLimit = 1 << 20
 // credential-free repository commands. The child is held behind the sf gate
 // until its Store lease has durably recorded the process identity.
 type RepositoryCommandSupervisor struct {
-	Executable           string
+	Executable string
+	// GitRunner is the prequalified, credential-free Git observer used to
+	// reauthenticate the persisted worktree identity immediately before
+	// launch. It is injected by composition; a zero-value Runner is not a
+	// safe fallback because it has no packaged execution helper/HOME.
+	GitRunner            gitboundary.Runner
 	SoftDrain, HardDrain time.Duration
 	// beforeWorktreeOpen is test-only synchronization for the preflight/open
 	// replacement race.  It is intentionally unexported so production callers
@@ -63,7 +71,7 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if err != nil {
 		return contracts.CommandResult{}, err
 	}
-	if _, err = authenticateExecutable(resolved); err != nil {
+	if err = authenticateRepositorySourceExecutable(resolved); err != nil {
 		return contracts.CommandResult{}, err
 	}
 	if claim.ExecutablePath != resolved {
@@ -125,7 +133,7 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	defer os.RemoveAll(tmp)
 	staged, err := stageExecutable(resolved, claim.ExecutableDigest)
 	if err != nil {
-		return contracts.CommandResult{}, ErrUnclear
+		return contracts.CommandResult{}, fmt.Errorf("stage repository executable: %w", err)
 	}
 	defer os.RemoveAll(filepath.Dir(staged))
 	env, err := executionpolicy.MinimalEnvironment(home, tmp)
@@ -145,10 +153,51 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	// Reauthenticate the rest of the persisted Git identity after the opened
 	// directory FD has proven exactly which worktree was selected.  The gate
 	// subsequently changes directory only through that FD.
-	if err := (gitboundary.Runner{}).Reauthenticate(runCtx, identity); err != nil {
+	if s.GitRunner.ExecHelper == "" || s.GitRunner.Home == "" {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	argv := append([]string{"__repository_command_gate", staged}, spec.Argv[1:]...)
+	if err := s.GitRunner.Reauthenticate(runCtx, identity); err != nil {
+		return contracts.CommandResult{}, fmt.Errorf("reauthenticate repository command worktree: %w", err)
+	}
+	isGo := filepath.Base(resolved) == "go"
+	isGoTest := isGo && len(spec.Argv) >= 2 && spec.Argv[1] == "test"
+	if isGo {
+		goRoot := filepath.Dir(filepath.Dir(resolved))
+		rootBinary, rootErr := filepath.EvalSymlinks(filepath.Join(goRoot, "bin", "go"))
+		if rootErr != nil || rootBinary != resolved {
+			return contracts.CommandResult{}, ErrUnclear
+		}
+		// The authenticated Go binary is staged to close the final pathname
+		// race. A moved Go binary cannot infer its installation root, so bind
+		// its verified original GOROOT explicitly; this value is derived from
+		// (and rechecked against) the exact executable claim, never caller env.
+		// The Go driver is a fixed staged binary. It must compile/package test
+		// code, so it cannot itself carry the strict no-exec profile used by
+		// test binaries. Disable every Go-controlled download/toolchain path;
+		// arbitrary test code crosses the strict sandbox below before running.
+		env = append(env, "GOROOT="+goRoot, "GOPROXY=off", "GOSUMDB=off", "GOTOOLCHAIN=local")
+	}
+	var sandboxProfile string
+	launchArgs := append([]string(nil), spec.Argv[1:]...)
+	if isGoTest {
+		// Package execution is serial so the shared durable group-report/
+		// acknowledgement pipe cannot acknowledge a different test binary.
+		// -count=1 makes a verification actually execute rather than trust a
+		// prior Go cache result.
+		launchArgs = append([]string{"test", "-p=1", "-count=1", "-exec=" + self + " __repository_command_test_gate"}, spec.Argv[2:]...)
+		env = append(env, "SF_REPOSITORY_SANDBOX_REPOSITORY="+claim.Repository)
+	} else if !isGo {
+		sandboxProfile, err = repositoryStrictSandboxProfile(claim.Repository, staged)
+	}
+	if err != nil {
+		return contracts.CommandResult{}, ErrUnclear
+	}
+	argv := append([]string{"__repository_command_gate"}, launchArgs...)
+	if isGo {
+		argv = append([]string{"__repository_command_gate", staged}, launchArgs...)
+	} else {
+		argv = append([]string{"__repository_command_gate", repositorySandboxExec, "-p", sandboxProfile, staged}, launchArgs...)
+	}
 	cmd := exec.CommandContext(runCtx, self, argv...)
 	// Context cancellation arms WaitDelay, which closes supervisor-owned pipe
 	// endpoints even if an escaped child inherited stdout/stderr.
@@ -160,8 +209,24 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	cmd.Dir = string(filepath.Separator)
 	cmd.Env = env
 	cmd.Stdin = bytes.NewReader(input)
-	cmd.ExtraFiles = []*os.File{gateRead}
-	cmd.ExtraFiles = append(cmd.ExtraFiles, worktreeFD)
+	cmd.ExtraFiles = []*os.File{gateRead, worktreeFD}
+	var groupReportRead, groupReportWrite, groupAckRead, groupAckWrite *os.File
+	if isGoTest {
+		groupReportRead, groupReportWrite, err = os.Pipe()
+		if err != nil {
+			return contracts.CommandResult{}, err
+		}
+		groupAckRead, groupAckWrite, err = os.Pipe()
+		if err != nil {
+			_ = groupReportRead.Close()
+			_ = groupReportWrite.Close()
+			return contracts.CommandResult{}, err
+		}
+		defer groupReportRead.Close()
+		defer groupAckRead.Close()
+		defer groupAckWrite.Close()
+		cmd.ExtraFiles = append(cmd.ExtraFiles, groupReportWrite, groupAckRead)
+	}
 	// The opened directory remains inherited as FD 4 for the gate; the
 	// process starts in the canonical path after the preflight identity check.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -170,9 +235,16 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	started := time.Now()
 	if err := cmd.Start(); err != nil {
 		gateRead.Close()
+		if groupReportWrite != nil {
+			_ = groupReportWrite.Close()
+		}
 		return contracts.CommandResult{}, err
 	}
 	gateRead.Close()
+	if groupReportWrite != nil {
+		_ = groupReportWrite.Close()
+		_ = groupAckRead.Close()
+	}
 	startID, e1 := processStartIdentity(cmd.Process.Pid)
 	bootID, e2 := hostBootIdentity()
 	launch := contracts.RepositoryCommandLaunch{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootID, ProcessStartIdentity: startID}
@@ -182,6 +254,23 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		_ = s.ensureGone(launch, false)
 		_ = lease.Quarantine()
 		return contracts.CommandResult{}, ErrUnclear
+	}
+	groups := &repositoryTestGroups{}
+	var reportsDone <-chan struct{}
+	if isGoTest {
+		recorder, ok := lease.(contracts.RepositoryCommandGroupRecorder)
+		if !ok {
+			_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+			_ = lease.Quarantine()
+			return contracts.CommandResult{}, ErrUnclear
+		}
+		done := make(chan struct{})
+		reportsDone = done
+		go func() {
+			defer close(done)
+			readRepositoryTestGroups(groupReportRead, groupAckWrite, recorder, groups)
+		}()
 	}
 	// The launch record and gate are deliberately separate system calls. Check
 	// the exact Store fence once more immediately before unblocking the child so
@@ -215,19 +304,24 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	select {
 	case waitErr = <-wait:
 	case <-runCtx.Done():
+		groups.stop()
 		if pgid, err := syscall.Getpgid(launch.PID); err != nil || pgid != launch.PGID {
+			terminateRepositoryGroups(groups.snapshot(), syscall.SIGKILL)
 			_ = lease.Quarantine()
 			return contracts.CommandResult{}, ErrUnclear
 		}
 		_ = signalGroup(launch.PGID, syscall.SIGTERM)
+		terminateRepositoryGroups(groups.snapshot(), syscall.SIGTERM)
 		select {
 		case waitErr = <-wait:
 		case <-time.After(s.drainSoft()):
 			if pgid, err := syscall.Getpgid(launch.PID); err != nil || pgid != launch.PGID {
+				terminateRepositoryGroups(groups.snapshot(), syscall.SIGKILL)
 				_ = lease.Quarantine()
 				return contracts.CommandResult{}, ErrUnclear
 			}
 			_ = signalGroup(launch.PGID, syscall.SIGKILL)
+			terminateRepositoryGroups(groups.snapshot(), syscall.SIGKILL)
 			select {
 			case waitErr = <-wait:
 			case <-time.After(s.drainHard() + 250*time.Millisecond):
@@ -236,11 +330,23 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 			}
 		}
 	}
+	if reportsDone != nil {
+		<-reportsDone
+		if groups.err() != nil {
+			terminateRepositoryGroups(groups.snapshot(), syscall.SIGKILL)
+			_ = lease.Quarantine()
+			return contracts.CommandResult{}, fmt.Errorf("repository test-group handshake: %w", groups.err())
+		}
+	}
 	close(monitorStop)
 	monitorStopped = true
 	groupEscaped := <-escaped
 	if err := s.ensureGone(launch, groupEscaped); err != nil {
 		return contracts.CommandResult{}, fmt.Errorf("repository ensure gone: %w", err)
+	}
+	if err := ensureRepositoryGroupsGone(groups.snapshot()); err != nil {
+		_ = lease.Quarantine()
+		return contracts.CommandResult{}, fmt.Errorf("repository test groups remain: %w", err)
 	}
 	finishCtx, finishCancel := repositoryLeasePersistenceContext()
 	err = lease.FinishRepositoryCommandLaunch(finishCtx, launch)
@@ -264,6 +370,21 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		return result, waitErr
 	}
 	return result, nil
+}
+
+// authenticateRepositorySourceExecutable intentionally does not require every
+// ancestor directory to be private. Homebrew's code-owned Go installation is
+// commonly group-writable at an ancestor even though its executable file is
+// not. The source is never executed by path: stageExecutable opens it once,
+// hashes that exact FD against the Store claim, and executes only the private
+// staged copy. A directory-swap race therefore becomes a digest mismatch,
+// not a broadened executable authority.
+func authenticateRepositorySourceExecutable(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 || info.Mode()&0o022 != 0 || !trustedOwner(info) {
+		return ErrUnclear
+	}
+	return nil
 }
 
 func resolveFixedExecutable(name string) (string, error) {
@@ -299,7 +420,10 @@ func resolveFixedExecutable(name string) (string, error) {
 func approvedRepositoryExecutables(tool string) []string {
 	switch tool {
 	case "git":
-		return []string{"/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"}
+		// /usr/bin/git is a macOS developer-tools trampoline. The actual
+		// binary must be bound and staged; otherwise the trampoline performs a
+		// second path-based exec after the digest check.
+		return []string{"/Library/Developer/CommandLineTools/usr/bin/git", "/Applications/Xcode.app/Contents/Developer/usr/bin/git", "/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"}
 	case "go":
 		return []string{"/usr/local/go/bin/go", "/usr/local/bin/go", "/opt/homebrew/bin/go"}
 	default:
@@ -369,12 +493,22 @@ func parseRepositoryIdentity(claim contracts.RepositoryCommandClaim) (gitboundar
 			return gitboundary.Identity{}, ErrUnclear
 		}
 	}
-	for _, pair := range [][2]uint64{{identity.RepositoryDev, identity.RepositoryIno}, {identity.WorktreeDev, identity.WorktreeIno}, {identity.GitFileDev, identity.GitFileIno}, {identity.CommonDirDev, identity.CommonDirIno}, {identity.PushOriginDev, identity.PushOriginIno}} {
+	for _, pair := range [][2]uint64{{identity.RepositoryDev, identity.RepositoryIno}, {identity.WorktreeDev, identity.WorktreeIno}, {identity.GitFileDev, identity.GitFileIno}, {identity.CommonDirDev, identity.CommonDirIno}} {
 		if pair[0] == 0 || pair[1] == 0 {
 			return gitboundary.Identity{}, ErrUnclear
 		}
 	}
-	for _, path := range []string{identity.Repository, identity.Worktree, identity.GitFile, identity.CommonDir} {
+	// A hermetic local push remote is a filesystem witness. SSH remotes have
+	// no local inode by definition and Snapshot records their zero pair.
+	if filepath.IsAbs(identity.PushOrigin) && (identity.PushOriginDev == 0 || identity.PushOriginIno == 0) {
+		return gitboundary.Identity{}, ErrUnclear
+	}
+	gitFileTarget, ok := strings.CutPrefix(identity.GitFile, "gitdir: ")
+	gitFileTarget = strings.TrimSpace(gitFileTarget)
+	if !ok || !filepath.IsAbs(gitFileTarget) || filepath.Clean(gitFileTarget) != gitFileTarget {
+		return gitboundary.Identity{}, ErrUnclear
+	}
+	for _, path := range []string{identity.Repository, identity.Worktree, identity.CommonDir} {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 			return gitboundary.Identity{}, ErrUnclear
 		}
@@ -450,6 +584,127 @@ func (s RepositoryCommandSupervisor) ensureGone(l contracts.RepositoryCommandLau
 	}
 }
 
+type repositoryTestGroups struct {
+	mu       sync.Mutex
+	groups   []contracts.RepositoryCommandLaunch
+	stopping bool
+	failure  error
+}
+
+func (g *repositoryTestGroups) stop() {
+	g.mu.Lock()
+	g.stopping = true
+	g.mu.Unlock()
+}
+func (g *repositoryTestGroups) snapshot() []contracts.RepositoryCommandLaunch {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]contracts.RepositoryCommandLaunch(nil), g.groups...)
+}
+func (g *repositoryTestGroups) stoppingNow() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.stopping
+}
+func (g *repositoryTestGroups) add(v contracts.RepositoryCommandLaunch) {
+	g.mu.Lock()
+	g.groups = append(g.groups, v)
+	g.mu.Unlock()
+}
+func (g *repositoryTestGroups) fail(err error) {
+	g.mu.Lock()
+	if g.failure == nil {
+		g.failure = err
+	}
+	g.mu.Unlock()
+}
+func (g *repositoryTestGroups) err() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.failure
+}
+
+// readRepositoryTestGroups is the parent half of the test-wrapper handshake.
+// The wrapper reports only after Setpgid(0,0), then waits for this function to
+// durably record the exact PID/start witness before sandboxing and execing the
+// test binary. Go is invoked with -p=1, making the shared acknowledgement
+// byte unambiguous.
+func readRepositoryTestGroups(report *os.File, ack *os.File, recorder contracts.RepositoryCommandGroupRecorder, groups *repositoryTestGroups) {
+	if report == nil || ack == nil || recorder == nil {
+		groups.fail(ErrUnclear)
+		return
+	}
+	scanner := bufio.NewScanner(report)
+	scanner.Buffer(make([]byte, 32), 128)
+	for scanner.Scan() {
+		pid, err := strconv.Atoi(strings.TrimSpace(scanner.Text()))
+		if err != nil || pid <= 0 {
+			groups.fail(ErrUnclear)
+			return
+		}
+		start, e1 := processStartIdentity(pid)
+		boot, e2 := hostBootIdentity()
+		pgid, e3 := syscall.Getpgid(pid)
+		v := contracts.RepositoryCommandLaunch{PID: pid, PGID: pgid, BootIdentity: boot, ProcessStartIdentity: start}
+		if e1 != nil || e2 != nil || e3 != nil || !validRepositoryLaunch(v) || groups.stoppingNow() {
+			if validRepositoryLaunch(v) {
+				groups.add(v)
+				_ = signalGroup(v.PGID, syscall.SIGKILL)
+			}
+			groups.fail(ErrUnclear)
+			return
+		}
+		groups.add(v)
+		persistCtx, cancel := repositoryLeasePersistenceContext()
+		err = recorder.RecordRepositoryCommandProcessGroup(persistCtx, v)
+		cancel()
+		if err != nil {
+			_ = signalGroup(v.PGID, syscall.SIGKILL)
+			groups.fail(err)
+			return
+		}
+		if _, err := ack.Write([]byte{1}); err != nil {
+			groups.fail(err)
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		groups.fail(err)
+	}
+}
+
+func terminateRepositoryGroups(groups []contracts.RepositoryCommandLaunch, signal syscall.Signal) {
+	for _, group := range groups {
+		if validRepositoryLaunch(group) {
+			_ = signalGroup(group.PGID, signal)
+		}
+	}
+}
+
+func ensureRepositoryGroupsGone(groups []contracts.RepositoryCommandLaunch) error {
+	for _, group := range groups {
+		if !validRepositoryLaunch(group) {
+			return ErrUnclear
+		}
+		deadline := time.Now().Add(250 * time.Millisecond)
+		for {
+			start, startErr := processStartIdentity(group.PID)
+			groupErr := syscall.Kill(-group.PGID, 0)
+			if startErr != nil && groupErr == syscall.ESRCH {
+				break
+			}
+			if startErr == nil && (start != group.ProcessStartIdentity || func() bool { pgid, err := syscall.Getpgid(group.PID); return err != nil || pgid != group.PGID }()) {
+				return ErrUnclear
+			}
+			if time.Now().After(deadline) {
+				return ErrUnclear
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
 type repositoryBuffer struct {
 	bytes.Buffer
 	overflow bool
@@ -472,6 +727,22 @@ func (b *repositoryBuffer) Write(p []byte) (int, error) {
 type RepositoryCommandDrainer struct{ SoftDrain, HardDrain time.Duration }
 
 func (d RepositoryCommandDrainer) DrainRepositoryCommand(ctx context.Context, l contracts.RepositoryCommandLaunch) error {
+	return d.DrainRepositoryCommandTree(ctx, l, nil)
+}
+
+func (d RepositoryCommandDrainer) DrainRepositoryCommandTree(ctx context.Context, primary contracts.RepositoryCommandLaunch, groups []contracts.RepositoryCommandLaunch) error {
+	if err := d.drainRepositoryGroup(ctx, primary); err != nil {
+		return err
+	}
+	for _, group := range groups {
+		if err := d.drainRepositoryGroup(ctx, group); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d RepositoryCommandDrainer) drainRepositoryGroup(ctx context.Context, l contracts.RepositoryCommandLaunch) error {
 	if !validRepositoryLaunch(l) {
 		return ErrUnclear
 	}

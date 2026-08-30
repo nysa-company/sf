@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/nysa-company/sf/internal/cli"
@@ -46,12 +47,49 @@ func main() {
 		if _, err := gate.Read(one[:]); err != nil {
 			os.Exit(125)
 		}
-		if err := os.Chdir("/dev/fd/4"); err != nil {
-			if err := os.Chdir("/proc/self/fd/4"); err != nil {
-				os.Exit(125)
-			}
+		if err := syscall.Fchdir(4); err != nil {
+			os.Exit(125)
 		}
 		if err := syscall.Exec(os.Args[2], os.Args[2:], os.Environ()); err != nil {
+			os.Exit(126)
+		}
+		return
+	}
+	if len(os.Args) >= 3 && os.Args[1] == "__repository_command_test_gate" {
+		// Go's trusted driver invokes this wrapper for every test binary. Make
+		// the binary its own process-group leader before the strict Seatbelt
+		// profile starts it: a group leader cannot call setsid, and the profile
+		// denies fork/exec. FDs 5/6 form a durable parent acknowledgement; the
+		// target never inherits them.
+		if err := syscall.Setpgid(0, 0); err != nil {
+			os.Exit(125)
+		}
+		report, ack := os.NewFile(uintptr(5), "repository-test-group-report"), os.NewFile(uintptr(6), "repository-test-group-ack")
+		if report == nil || ack == nil {
+			os.Exit(125)
+		}
+		if _, err := fmt.Fprintf(report, "%d\n", os.Getpid()); err != nil {
+			os.Exit(125)
+		}
+		var one [1]byte
+		if _, err := ack.Read(one[:]); err != nil {
+			os.Exit(125)
+		}
+		syscall.CloseOnExec(5)
+		syscall.CloseOnExec(6)
+		target, err := filepath.EvalSymlinks(os.Args[2])
+		if err != nil {
+			os.Exit(125)
+		}
+		profile, err := processsupervisor.RepositoryTestSandboxProfile(os.Getenv("SF_REPOSITORY_SANDBOX_REPOSITORY"), target)
+		if err != nil {
+			os.Exit(125)
+		}
+		if err := processsupervisor.ApplyRepositoryTestSandbox(profile); err != nil {
+			os.Exit(125)
+		}
+		if err := syscall.Exec(target, append([]string{target}, os.Args[3:]...), os.Environ()); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "repository test sandbox exec:", err)
 			os.Exit(126)
 		}
 		return

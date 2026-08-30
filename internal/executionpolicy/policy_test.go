@@ -104,6 +104,9 @@ func TestRepositoryCommandPolicy(t *testing.T) {
 		{[]string{"npm", "install"}, false},
 		{[]string{"npx", "unknown-package"}, false},
 		{[]string{"go", "env", "-w", "GOPROXY=evil"}, false},
+		{[]string{"go", "test", "-exec=/tmp/wrapper", "./..."}, false},
+		{[]string{"go", "test", "-p=64", "./..."}, false},
+		{[]string{"go", "test", "-count=0", "./..."}, false},
 		{[]string{"launchctl", "load", "job.plist"}, false},
 		{[]string{"make", "deploy"}, false},
 	}

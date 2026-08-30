@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,6 +36,7 @@ type RepositoryCommandRecovery struct {
 	Nonce  []byte
 	State  string
 	Launch contracts.RepositoryCommandLaunch
+	Groups []contracts.RepositoryCommandLaunch
 }
 
 func validRepositoryCommandIntent(i RepositoryCommandIntent) bool {
@@ -200,6 +202,28 @@ func (l *repositoryCommandLease) FinishRepositoryCommandLaunch(ctx context.Conte
 	})
 }
 
+// RecordRepositoryCommandProcessGroup is the Go-test child handshake. The
+// wrapper has made itself a process-group leader but is still blocked before
+// executing untrusted test code; this row must commit before the supervisor
+// acknowledges the wrapper. Recovery consequently knows every group that can
+// outlive the trusted Go driver.
+func (l *repositoryCommandLease) RecordRepositoryCommandProcessGroup(ctx context.Context, v contracts.RepositoryCommandLaunch) error {
+	if l == nil || l.store == nil || !validRepositoryCommandLaunch(v) {
+		return ErrRepositoryCommandLease
+	}
+	return l.store.write(ctx, func(c *sql.Conn) error {
+		if err := l.store.assertRepositoryCommandCurrent(ctx, c, l.claim); err != nil {
+			return ErrRepositoryCommandLease
+		}
+		var n int
+		if err := c.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND launch_state='released'`, l.claim.Repository, l.claim.SemanticKey, l.nonce).Scan(&n); err != nil || n != 1 {
+			return ErrRepositoryCommandLease
+		}
+		_, err := c.ExecContext(ctx, `INSERT INTO repository_command_process_groups(repository_path,semantic_key,nonce,process_pid,process_pgid,process_boot_identity,process_start_identity) VALUES(?,?,?,?,?,?,?) ON CONFLICT(repository_path,process_pid,process_start_identity) DO NOTHING`, l.claim.Repository, l.claim.SemanticKey, l.nonce, v.PID, v.PGID, v.BootIdentity, v.ProcessStartIdentity)
+		return err
+	})
+}
+
 func (s *Store) ActiveRepositoryCommandLeases(ctx context.Context, channel domain.Channel) ([]RepositoryCommandRecovery, error) {
 	if !channel.Valid() {
 		return nil, ErrRepositoryCommandLease
@@ -217,9 +241,34 @@ func (s *Store) ActiveRepositoryCommandLeases(ctx context.Context, channel domai
 			return nil, e
 		}
 		r.Claim.TicketRef = domain.TicketRef{Channel: channel, Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
+		groups, x := s.repositoryCommandGroups(ctx, r.Claim.Repository, r.Claim.SemanticKey, r.Nonce)
+		if x != nil {
+			return nil, x
+		}
+		r.Groups = groups
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) repositoryCommandGroups(ctx context.Context, repository, semanticKey string, nonce []byte) ([]contracts.RepositoryCommandLaunch, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT process_pid,process_pgid,process_boot_identity,process_start_identity FROM repository_command_process_groups WHERE repository_path=? AND semantic_key=? AND nonce=? ORDER BY process_pid`, repository, semanticKey, nonce)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var groups []contracts.RepositoryCommandLaunch
+	for rows.Next() {
+		var group contracts.RepositoryCommandLaunch
+		if err := rows.Scan(&group.PID, &group.PGID, &group.BootIdentity, &group.ProcessStartIdentity); err != nil {
+			return nil, err
+		}
+		if !validRepositoryCommandLaunch(group) {
+			return nil, ErrRepositoryCommandLease
+		}
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
 }
 func (s *Store) RecoverRepositoryCommandLeases(ctx context.Context, channel domain.Channel, leader uint64, d contracts.RepositoryCommandDrainer) error {
 	leases, e := s.ActiveRepositoryCommandLeases(ctx, channel)
@@ -227,7 +276,16 @@ func (s *Store) RecoverRepositoryCommandLeases(ctx context.Context, channel doma
 		return e
 	}
 	for _, l := range leases {
-		if !validRepositoryCommandLaunch(l.Launch) || d == nil || d.DrainRepositoryCommand(ctx, l.Launch) != nil {
+		treeDrainer, treeCapable := d.(contracts.RepositoryCommandTreeDrainer)
+		drainErr := error(nil)
+		if treeCapable {
+			drainErr = treeDrainer.DrainRepositoryCommandTree(ctx, l.Launch, l.Groups)
+		} else if len(l.Groups) != 0 || d == nil {
+			drainErr = ErrRepositoryCommandLease
+		} else if d != nil {
+			drainErr = d.DrainRepositoryCommand(ctx, l.Launch)
+		}
+		if !validRepositoryCommandLaunch(l.Launch) || drainErr != nil {
 			_ = s.write(ctx, func(c *sql.Conn) error {
 				_, x := c.ExecContext(ctx, `UPDATE repository_command_leases SET state='quarantined',launch_state='quarantined' WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active'`, l.Claim.Repository, l.Claim.SemanticKey, l.Nonce)
 				return x
@@ -278,10 +336,18 @@ func validRepositoryWorktreeIdentity(raw, repository, worktree, branch, baseRef,
 			return false
 		}
 	}
-	for _, pair := range [][2]uint64{{identity.RepositoryDev, identity.RepositoryIno}, {identity.WorktreeDev, identity.WorktreeIno}, {identity.GitFileDev, identity.GitFileIno}, {identity.CommonDirDev, identity.CommonDirIno}, {identity.PushOriginDev, identity.PushOriginIno}} {
+	gitFileTarget, ok := strings.CutPrefix(identity.GitFile, "gitdir: ")
+	gitFileTarget = strings.TrimSpace(gitFileTarget)
+	if !ok || !filepath.IsAbs(gitFileTarget) || filepath.Clean(gitFileTarget) != gitFileTarget {
+		return false
+	}
+	for _, pair := range [][2]uint64{{identity.RepositoryDev, identity.RepositoryIno}, {identity.WorktreeDev, identity.WorktreeIno}, {identity.GitFileDev, identity.GitFileIno}, {identity.CommonDirDev, identity.CommonDirIno}} {
 		if pair[0] == 0 || pair[1] == 0 {
 			return false
 		}
+	}
+	if filepath.IsAbs(identity.PushOrigin) && (identity.PushOriginDev == 0 || identity.PushOriginIno == 0) {
+		return false
 	}
 	return true
 }
