@@ -6,9 +6,9 @@ import (
 	"github.com/nysa-company/sf/internal/domain"
 )
 
-// RecoverMergeIntent is the production restart path: it loads the structured
-// witness, lets the GitHub/Git boundaries prove the result, then confirms the
-// original durable effect using its recorded fence.
+// RecoverMergeIntent is the restart-reconciliation hook: it loads the
+// structured witness, lets an injected observer prove the result, then
+// confirms the original durable effect using its recorded fence.
 func (s *Store) RecoverMergeIntent(ctx context.Context, semanticKey string, observer contracts.MergeIntentObserver) (Effect, error) {
 	intent, found, err := s.MergeIntent(ctx, semanticKey)
 	if err != nil || !found || observer == nil {

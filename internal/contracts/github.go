@@ -92,6 +92,14 @@ type ExternalMutationQuarantineStatus interface {
 	ExternalMutationsQuarantined(context.Context) (bool, error)
 }
 
+// ExternalMutationQuarantineAuthority is the complete durable quarantine
+// capability. A write-only quarantine cannot make a restarted client fail
+// closed, so production GitHub clients must require both operations together.
+type ExternalMutationQuarantineAuthority interface {
+	ExternalMutationQuarantiner
+	ExternalMutationQuarantineStatus
+}
+
 type GitHub interface {
 	AuthStatus(context.Context) error
 	Repository(context.Context, RepositoryIdentity) (RepositoryIdentity, error)

@@ -58,6 +58,9 @@ func (f intentRecorderFunc) RecordMergeIntent(ctx context.Context, intent domain
 type cleanupQuarantinerFunc func(context.Context) error
 
 func (f cleanupQuarantinerFunc) QuarantineExternalMutations(ctx context.Context) error { return f(ctx) }
+func (f cleanupQuarantinerFunc) ExternalMutationsQuarantined(context.Context) (bool, error) {
+	return false, nil
+}
 
 func (f mutationGuardFunc) RunExternalMutation(ctx context.Context, claim domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 	return f(ctx, claim, start)
@@ -258,7 +261,7 @@ func TestAuthStatusAcceptsOfficialHostsStateShape(t *testing.T) {
 			return nil, errors.New("unexpected auth argv")
 		}
 		return []byte(`{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"sf-test","tokenSource":"keyring","scopes":"repo","gitProtocol":"https"}]}}`), nil
-	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+	}), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		return start(ctx)
 	}), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }}
 	if err := client.AuthStatus(context.Background()); err != nil {
@@ -520,7 +523,7 @@ func TestChecksRejectsHeadDriftBetweenCheckObservations(t *testing.T) {
 			return []byte(checks), nil
 		}
 		return nil, errors.New("unexpected command")
-	})}
+	}), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil })}
 	if _, err := client.RequiredChecks(context.Background(), identity); !errors.Is(err, ErrChecksFailed) {
 		t.Fatalf("head drift checks=%v", err)
 	}
@@ -818,6 +821,64 @@ func TestMergeRequiresStrictServerProtectionWithoutBypass(t *testing.T) {
 			}
 		})
 	}
+	t.Run("force-push bypass allowance", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		pr := createDraft(t, client, identity, "title", "body")
+		if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
+			t.Fatal(err)
+		}
+		if err := fake.SetBypassForcePushAllowancesForTest(1); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.MergeExactHead(context.Background(), testClaim("merge", pr.Identity, pr.Identity.HeadOID, "squash"), pr.Identity, pr.Identity.HeadOID, "squash", testAuthorization(pr.Identity)); !errors.Is(err, ErrGuardedMergeUnavailable) {
+			t.Fatalf("force-push bypass=%v", err)
+		}
+		if got := fake.MutationCount("pr_merge"); got != 0 {
+			t.Fatalf("force-push bypass launched merge %d times", got)
+		}
+	})
+}
+
+func TestMergeFinalHandoffRefusesChangedSafetyWitness(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*testkit.FakeGH, contracts.PullRequestIdentity) error
+	}{
+		{"rule-removed", func(fake *testkit.FakeGH, _ contracts.PullRequestIdentity) error {
+			return fake.SetProtectionWitnessForTest(false, true, 0, 0)
+		}},
+		{"ruleset-added", func(fake *testkit.FakeGH, _ contracts.PullRequestIdentity) error {
+			return fake.SetProtectionWitnessForTest(true, true, 0, 1)
+		}},
+		{"head-moved", func(fake *testkit.FakeGH, identity contracts.PullRequestIdentity) error {
+			return fake.SetPullRequestHeadOIDForTest(identity.Number, strings.Repeat("b", 40))
+		}},
+		{"queue-entered", func(fake *testkit.FakeGH, _ contracts.PullRequestIdentity) error {
+			return fake.SetMergeQueuedForTest(true)
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			client, fake, identity := fixture(t)
+			pr := createDraft(t, client, identity, "title", "body")
+			if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
+				t.Fatal(err)
+			}
+			client.mutationGuard = mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+				if err := test.mutate(fake, pr.Identity); err != nil {
+					return nil, err
+				}
+				return start(ctx)
+			})
+			err := client.MergeExactHead(context.Background(), testClaim("merge", pr.Identity, pr.Identity.HeadOID, "squash"), pr.Identity, pr.Identity.HeadOID, "squash", testAuthorization(pr.Identity))
+			if !errors.Is(err, ErrPolicyRefusal) && !errors.Is(err, ErrGuardedMergeUnavailable) {
+				t.Fatalf("handoff %s err=%v", test.name, err)
+			}
+			if got := fake.MutationCount("pr_merge"); got != 0 {
+				t.Fatalf("handoff %s launched merge %d times", test.name, got)
+			}
+		})
+	}
 }
 
 func TestCleanupQuarantineWriteFailureLatchesProcess(t *testing.T) {
@@ -883,7 +944,7 @@ func TestOfficialGHArgvGolden(t *testing.T) {
 		default:
 			return nil, errors.New("unexpected command")
 		}
-	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+	}), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		return start(ctx)
 	}), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }}
 	claim := testClaim("draft_pr", identity, "title", "body")
@@ -920,7 +981,10 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		}
 		if args[0] == "api" {
 			if strings.Contains(strings.Join(args, "\x00"), "branchProtectionRules") {
-				return []byte(`{"data":{"repository":{"ref":{"rules":{"totalCount":0}},"branchProtectionRules":{"nodes":[{"id":"rule-main","pattern":"main","requiresStrictStatusChecks":true,"isAdminEnforced":true,"bypassPullRequestAllowances":{"totalCount":0}}]}}}}`), nil
+				return []byte(`{"data":{"repository":{"branchProtectionRules":{"nodes":[{"id":"rule-main","pattern":"main","requiresStrictStatusChecks":true,"isAdminEnforced":true,"bypassPullRequestAllowances":{"totalCount":0},"bypassForcePushAllowances":{"totalCount":0}}]}}}}`), nil
+			}
+			if len(args) == 4 && args[1] == "--method" && args[2] == "GET" {
+				return []byte(`[]`), nil
 			}
 			if len(args) == 2 && args[1] == "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random" {
 				return []byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`), nil
@@ -943,7 +1007,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 			return payload, nil
 		}
 		return nil, errors.New("unexpected command")
-	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+	}), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		return start(ctx)
 	}), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, mergeIntents: intentRecorderFunc(func(context.Context, domain.MergeIntent) error { return nil }), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
 		verified = repository == identity.Repository && baseRef == "main" && mergeCommit == strings.Repeat("b", 40)
@@ -955,9 +1019,10 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		t.Fatalf("guarded merge verified=%v err=%v", verified, err)
 	}
 	queue := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}
-	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$ref:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$ref){rules(first:100){totalCount}} branchProtectionRules(first:100){nodes{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app", "-F", "ref=refs/heads/main"}
+	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app"}
+	rules := []string{"api", "--method", "GET", "repos/example/app/rules/branches/main?per_page=1&page=1"}
 	view := []string{"pr", "view", "7", "--repo", "example/app", "--json", prFields}
-	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, queue, protection, view, queue, protection, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, view}
+	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, queue, protection, rules, view, queue, protection, rules, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, view}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("official merge argv\n got: %#v\nwant: %#v", got, want)
 	}
@@ -1030,7 +1095,7 @@ func TestWaitChecksPreservesCancellationAsPending(t *testing.T) {
 func TestStrictJSONBoundedSanitizedCommandBoundary(t *testing.T) {
 	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: filepath.Join(t.TempDir(), "gh-config"), runner: commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
 		return []byte(`{"unknown":true}`), nil
-	})}
+	}), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil })}
 	var value struct{}
 	if err := client.json(context.Background(), &value, "repo", "view"); !errors.Is(err, ErrMalformedResponse) {
 		t.Fatalf("unknown json=%v", err)

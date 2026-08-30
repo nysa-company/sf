@@ -150,6 +150,116 @@ func TestMigrationAndActiveTicketConstraint(t *testing.T) {
 	}
 }
 
+func createLegacySchema(t *testing.T, path string, target int) *sql.DB {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	for version := 1; version <= target; version++ {
+		statements := migrationV1
+		switch version {
+		case 2:
+			statements = migrationV2
+		case 3:
+			statements = migrationV3
+		case 4:
+			statements = migrationV4
+		case 5:
+			statements = migrationV5
+		case 6:
+			statements = migrationV6
+		case 7:
+			statements = migrationV7
+		}
+		for _, statement := range statements {
+			if _, err := raw.Exec(statement); err != nil {
+				_ = raw.Close()
+				t.Fatalf("legacy migration %d: %v", version, err)
+			}
+		}
+		if version == 1 {
+			if _, err := raw.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'legacy')`); err != nil {
+				_ = raw.Close()
+				t.Fatal(err)
+			}
+			continue
+		}
+		if _, err := raw.Exec(`UPDATE schema_migrations SET checksum=? WHERE version=1`, migrationChecksums[1]); err != nil {
+			_ = raw.Close()
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`INSERT INTO schema_migrations(version, applied_at, checksum) VALUES (?, 'legacy', ?)`, version, migrationChecksums[version]); err != nil {
+			_ = raw.Close()
+			t.Fatal(err)
+		}
+	}
+	return raw
+}
+
+func TestV5ToV7MigrationPreservesExistingRows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v5.sqlite")
+	raw := createLegacySchema(t, path, 5)
+	if _, err := raw.Exec(`INSERT INTO projects(channel, id, canonical_path, base_ref) VALUES ('dev', 'nysa', '/tmp/nysa', 'main');
+		INSERT INTO tickets(channel, project_id, id, source_digest, ticket_type, merge_mode, state, version, runner_epoch, workflow_id) VALUES ('dev', 'nysa', 'SF-v5', 'legacy', 'bug', 'guarded', 'queued', 1, 1, '')`); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	loaded, err := database.Ticket(ctx, domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-v5"})
+	if err != nil || loaded.SourceDigest != "legacy" || loaded.Version != 1 {
+		t.Fatalf("v5 ticket=%+v err=%v", loaded, err)
+	}
+	if err := hasColumns(ctx, database.db, "merge_intents", "admin_enforced", "active_ruleset_count"); err != nil {
+		t.Fatalf("v7 merge intent columns: %v", err)
+	}
+}
+
+func TestV6ToV7MigrationPreservesButRefusesUnsafeLegacyMergeIntent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v6.sqlite")
+	raw := createLegacySchema(t, path, 6)
+	statements := []string{
+		`INSERT INTO projects(channel, id, canonical_path, base_ref) VALUES ('dev', 'nysa', '/tmp/nysa', 'main')`,
+		`INSERT INTO tickets(channel, project_id, id, source_digest, ticket_type, merge_mode, state, version, runner_epoch, workflow_id) VALUES ('dev', 'nysa', 'SF-v6', 'legacy', 'bug', 'guarded', 'publishing', 3, 2, 'workflow')`,
+		`INSERT INTO effects(semantic_key, channel, project_id, ticket_id, effect_kind, state, ticket_version, leader_epoch, runner_epoch, claim_epoch, request_digest) VALUES ('merge/v6', 'dev', 'nysa', 'SF-v6', 'merge', 'executing', 3, 4, 2, 5, 'digest')`,
+		`INSERT INTO merge_intents(semantic_key, channel, project_id, ticket_id, request_digest, ticket_version, leader_epoch, runner_epoch, claim_epoch, repository_host, repository_owner, repository_name, pull_request_number, head_oid, base_ref, original_base_oid, protection_rule_id, strict_status_checks, method, created_at) VALUES ('merge/v6', 'dev', 'nysa', 'SF-v6', 'digest', 3, 4, 2, 5, 'github.com', 'example', 'app', 7, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'main', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'rule-main', 1, 'squash', 'legacy')`,
+	}
+	for _, statement := range statements {
+		if _, err := raw.Exec(statement); err != nil {
+			_ = raw.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	intent, found, err := database.MergeIntent(ctx, "merge/v6")
+	if err != nil || !found || intent.HeadOID != strings.Repeat("a", 40) || intent.OriginalBaseOID != strings.Repeat("b", 40) || intent.AdminEnforced || intent.ActiveRulesetCount != 0 {
+		t.Fatalf("v6 intent=%+v found=%v err=%v", intent, found, err)
+	}
+	if err := validMergeIntent(intent); err == nil {
+		t.Fatal("legacy merge witness without administrator enforcement was accepted")
+	}
+}
+
 func TestConcurrentActiveTicketConstraint(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "concurrent.sqlite")

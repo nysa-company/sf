@@ -62,6 +62,8 @@ type FakeGHState struct {
 	AdminEnforced               bool                              `json:"admin_enforced"`
 	ActiveRulesetCount          int                               `json:"active_ruleset_count"`
 	BypassPullRequestAllowances int                               `json:"bypass_pull_request_allowances"`
+	BypassForcePushAllowances   int                               `json:"bypass_force_push_allowances"`
+	MergeQueued                 bool                              `json:"merge_queued"`
 	NextPR                      int                               `json:"next_pr"`
 	PRs                         []PullRequest                     `json:"prs"`
 	Checks                      map[int][]contracts.RequiredCheck `json:"checks"`
@@ -128,6 +130,38 @@ func (f *FakeGH) SetProtectionWitnessForTest(strict, admin bool, bypassAllowance
 	return f.withState(func() (bool, error) {
 		f.state.StrictStatusChecks, f.state.AdminEnforced, f.state.BypassPullRequestAllowances, f.state.ActiveRulesetCount = strict, admin, bypassAllowances, rulesets
 		return true, nil
+	})
+}
+
+func (f *FakeGH) SetBypassForcePushAllowancesForTest(count int) error {
+	if count < 0 {
+		return errors.New("testkit: bypass allowance count cannot be negative")
+	}
+	return f.withState(func() (bool, error) {
+		f.state.BypassForcePushAllowances = count
+		return true, nil
+	})
+}
+
+func (f *FakeGH) SetMergeQueuedForTest(queued bool) error {
+	return f.withState(func() (bool, error) {
+		f.state.MergeQueued = queued
+		return true, nil
+	})
+}
+
+func (f *FakeGH) SetPullRequestHeadOIDForTest(number int, oid string) error {
+	if number <= 0 || !fakeOID(oid) {
+		return errors.New("testkit: pull request number and head OID are required")
+	}
+	return f.withState(func() (bool, error) {
+		for index := range f.state.PRs {
+			if f.state.PRs[index].Identity.Number == number {
+				f.state.PRs[index].Identity.HeadOID = oid
+				return true, nil
+			}
+		}
+		return false, errors.New("testkit: pull request not found")
 	})
 }
 
@@ -743,10 +777,19 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 	if len(argv) >= 2 && argv[0] == "repo" && argv[1] == "view" {
 		return f.runRepoView(argv)
 	}
+	if len(argv) >= 3 && argv[0] == "api" && argv[1] == "--method" && strings.Contains(argv[3], "/rules/branches/") {
+		if f.Snapshot().ActiveRulesetCount != 0 {
+			return []byte(`[{"type":"pull_request"}]`), nil
+		}
+		return []byte(`[]`), nil
+	}
 	if len(argv) >= 2 && argv[0] == "api" && argv[1] == "--hostname" {
 		if strings.Contains(graphqlQuery(argv), "branchProtectionRules") {
 			snapshot := f.Snapshot()
-			return json.Marshal(map[string]any{"data": map[string]any{"repository": map[string]any{"ref": map[string]any{"rules": map[string]int{"totalCount": snapshot.ActiveRulesetCount}}, "branchProtectionRules": map[string]any{"nodes": []map[string]any{{"id": "fake-rule-main", "pattern": "main", "requiresStrictStatusChecks": snapshot.StrictStatusChecks, "isAdminEnforced": snapshot.AdminEnforced, "bypassPullRequestAllowances": map[string]int{"totalCount": snapshot.BypassPullRequestAllowances}}}}}}})
+			return json.Marshal(map[string]any{"data": map[string]any{"repository": map[string]any{"branchProtectionRules": map[string]any{"nodes": []map[string]any{{"id": "fake-rule-main", "pattern": "main", "requiresStrictStatusChecks": snapshot.StrictStatusChecks, "isAdminEnforced": snapshot.AdminEnforced, "bypassPullRequestAllowances": map[string]int{"totalCount": snapshot.BypassPullRequestAllowances}, "bypassForcePushAllowances": map[string]int{"totalCount": snapshot.BypassForcePushAllowances}}}}}}})
+		}
+		if f.Snapshot().MergeQueued {
+			return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":{"position":1}}}}}`), nil
 		}
 		return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}`), nil
 	}
@@ -828,6 +871,11 @@ func validateOfficialArgv(argv []string) error {
 	case "api --hostname":
 		// Exact GraphQL queue lookup; fake supports only the production shape.
 		if len(argv) < 6 || argv[2] != "github.com" || argv[3] != "graphql" {
+			return fmt.Errorf("fake-gh: incomplete %s", key)
+		}
+	case "api --method":
+		allowed["--method"] = true
+		if len(argv) != 4 || argv[2] != "GET" || !strings.HasPrefix(argv[3], "repos/") || !strings.Contains(argv[3], "/rules/branches/") || !strings.HasSuffix(argv[3], "?per_page=1&page=1") {
 			return fmt.Errorf("fake-gh: incomplete %s", key)
 		}
 	case "auth status":

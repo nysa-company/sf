@@ -117,7 +117,7 @@ var requiredSchema = map[string][]string{
 	"leases":                       {"scope", "scope_key", "runner_epoch"},
 	"plans":                        {"ticket_id", "digest", "body"},
 	"verifications":                {"ticket_id", "intent_digest", "proof_digest"},
-	"merge_intents":                {"semantic_key", "original_base_oid", "head_oid", "base_ref", "protection_rule_id", "strict_status_checks"},
+	"merge_intents":                {"semantic_key", "original_base_oid", "head_oid", "base_ref", "protection_rule_id", "strict_status_checks", "admin_enforced", "active_ruleset_count"},
 	"external_mutation_quarantine": {"singleton", "reason", "observed_at"},
 }
 
