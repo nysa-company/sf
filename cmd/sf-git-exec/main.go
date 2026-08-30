@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 4 || os.Args[1] != "--fd=3" || os.Args[2] != "--" || os.Args[3] == "" {
+	if len(os.Args) < 4 || os.Args[1] != "--fd=3" || os.Args[2] != "--" || os.Args[3] != "/usr/bin/git" {
 		fmt.Fprintln(os.Stderr, "sf-git-exec: invalid invocation")
 		os.Exit(2)
 	}

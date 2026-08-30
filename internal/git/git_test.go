@@ -1187,6 +1187,7 @@ func TestFDExecutionGateKeepsOriginalDirectoryAfterRename(t *testing.T) {
 	if err := os.Mkdir(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	rawGit(t, directory, "init")
 	pinned, err := openPinnedDirectory(directory)
 	if err != nil {
 		t.Fatal(err)
@@ -1203,7 +1204,7 @@ func TestFDExecutionGateKeepsOriginalDirectoryAfterRename(t *testing.T) {
 	if err := os.WriteFile(foreign, []byte("do not touch"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	output, err := runBounded(context.Background(), testExecHelper, "/bin/pwd", nil, []string{"PATH=/usr/bin:/bin"}, []*os.File{pinned.file})
+	output, err := runBounded(context.Background(), testExecHelper, "/usr/bin/git", []string{"-C", ".", "rev-parse", "--show-toplevel"}, []string{"PATH=/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}, []*os.File{pinned.file})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -379,6 +379,12 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	if !validAbsolutePath(r.binary()) {
 		return nil, fmt.Errorf("runner requires an explicit absolute git binary")
 	}
+	if r.Run == nil && r.binary() != "/usr/bin/git" {
+		return nil, fmt.Errorf("runner requires pinned /usr/bin/git")
+	}
+	if r.GHBinary != "" || r.GHConfigDir != "" {
+		return nil, ErrHTTPSCredentialBoundary
+	}
 	if r.Run == nil && !validAbsolutePath(r.execHelper()) {
 		return nil, fmt.Errorf("runner requires packaged absolute git execution helper")
 	}
@@ -390,9 +396,6 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	}
 	if r.Home == "" || !validAbsolutePath(r.Home) {
 		return nil, fmt.Errorf("runner requires an explicit absolute isolated HOME")
-	}
-	if r.GHBinary != "" || r.GHConfigDir != "" {
-		return nil, ErrHTTPSCredentialBoundary
 	}
 	info, err := os.Lstat(r.Home)
 	if err == nil {
@@ -2009,6 +2012,13 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 		}
 		observed, observeErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, sshEnv)
 		if observeErr == nil && observed == request.ExpectedHead {
+			baseAfter, baseErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
+			if baseErr != nil {
+				return "", baseErr
+			}
+			if baseAfter != worktree.Identity.BaseHead {
+				return "", fmt.Errorf("%w: remote base moved during candidate publication", ErrUnexpectedRemote)
+			}
 			return request.ExpectedHead, nil
 		}
 		return "", err
