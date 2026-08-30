@@ -13,6 +13,12 @@
   access after its supervisor returns. Guarded/manual remain the trusted
   provider/repository baseline.
 - No remote, Nysa mutation, or legacy retirement is currently authorized.
+- The trusted-local v1 does not attempt arbitrary npm/process-tree containment;
+  full project verification is authoritative in required GitHub CI. The local
+  Reviewer still authors verification before the Builder changes product code.
+- Canonical GitHub HTTPS transport uses a packaged credential-protocol bridge
+  to `gh auth git-credential`; sf neither requests a displayed token nor stores
+  one. Runtime composition remains part of the production workflow milestone.
 - `sf init` now performs native-only canonical repository registration. Stable
   and dev configuration generations are stored in separate SQLite databases,
   and tickets snapshot exact canonical configuration bytes at start.

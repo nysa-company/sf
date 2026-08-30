@@ -28,13 +28,17 @@ The approved normative design is in
   SQLite and protected by ticket and channel uniqueness. Git does not own a
   second branch-name ledger.
 - GitHub publication preserves the exact local candidate SHA through an
-  ordinary fast-forward Git push. HTTPS and GraphQL publication remain
-  disabled; the optional port-443 SSH path uses the packaged `sf-ssh` helper,
-  a pinned GitHub host-key asset, and an explicitly supplied SSH agent socket.
-  `make build` packages these together as `bin/sf-ssh` and
-  `bin/github_known_hosts`, alongside `bin/sf-git-exec`; production
-  configuration supplies their absolute paths plus the agent socket to
-  `git.Runner`. `sf-git-exec` performs an fd-pinned `fchdir` and confirms the
+  ordinary fast-forward Git push. Canonical
+  `https://github.com/<owner>/<repository>.git` remotes use the packaged
+  `sf-git-credential` bridge, which delegates only Git credential `get` to
+  `gh auth git-credential`; it never displays or stores a token. The optional
+  port-443 SSH path uses the packaged `sf-ssh` helper, a pinned GitHub host-key
+  asset, and an explicitly supplied SSH agent socket. `make build` packages
+  these helpers with `bin/github_known_hosts` and `bin/sf-git-exec`.
+  The transport boundary is implemented and hermetically tested; the real
+  workflow worker must still supply the absolute helper and gh configuration
+  paths before HTTPS publication becomes reachable in production.
+  `sf-git-exec` performs an fd-pinned `fchdir` and confirms the
   live worktree `.git` pointer, linked-worktree gitdir, and common directory
   against inherited descriptors immediately before Git exec. Every Git
   mutation additionally requires a caller-supplied, fenced durable mutation
