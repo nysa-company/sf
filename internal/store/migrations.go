@@ -542,3 +542,10 @@ var migrationV30 = []string{
 	`ALTER TABLE merge_intents ADD COLUMN protection_kind TEXT NOT NULL DEFAULT '' CHECK(protection_kind IN ('','classic','ruleset'))`,
 	`ALTER TABLE merge_intents ADD COLUMN protection_checks_digest TEXT NOT NULL DEFAULT ''`,
 }
+
+// v31 binds every candidate to the canonical Builder artifact that produced
+// it.  Existing candidates intentionally receive the blank default and are
+// rejected by readers rather than being retroactively asserted as evidence.
+var migrationV31 = []string{
+	`ALTER TABLE candidate_snapshots ADD COLUMN builder_evidence_digest TEXT NOT NULL DEFAULT ''`,
+}

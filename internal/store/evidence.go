@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/phaseartifact"
 )
 
 const (
@@ -64,7 +65,17 @@ type CandidateEvidence struct {
 	ExpectedVersion uint64
 	Fence           domain.Fence
 	Snapshot        domain.CandidateSnapshot
+	BuilderResult   ProviderAttemptResultKey
+	Commit          CommitObservation
 	Reason          string
+}
+
+// CommitObservation is a Store-neutral, Git-bound commit witness. Store only
+// binds the three object identities and deliberately does not import Git.
+type CommitObservation struct {
+	CommitOID string
+	ParentOID string
+	TreeOID   string
 }
 
 type InvalidationReceipt struct {
@@ -159,7 +170,7 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 	if err := validBlob(artifact.Proof, "verification proof"); err != nil {
 		return VerificationRevision{}, err
 	}
-	if err := validOwnedFiles(artifact.OwnedFiles); err != nil || !boundedText(artifact.CheckpointID, 300) {
+	if err := validOwnedFiles(artifact.OwnedFiles); err != nil || !validOID(artifact.CheckpointID) {
 		return VerificationRevision{}, fmt.Errorf("bounded verification checkpoint and owned files are required")
 	}
 	if (artifact.AmendsRevision == 0) != (artifact.Reason == "" && artifact.Requester == "") {
@@ -224,13 +235,67 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 	if err := evidence.Ref.Validate(); err != nil {
 		return nil, err
 	}
-	if err := validateCandidate(evidence.Snapshot); err != nil || !boundedText(evidence.Reason, 2_000) {
+	if err := validateCandidate(evidence.Snapshot); err != nil || !boundedText(evidence.Reason, 2_000) || evidence.BuilderResult.AttemptID <= 0 || evidence.BuilderResult.Ref != evidence.Ref || evidence.BuilderResult.Phase != domain.PhaseBuild || evidence.BuilderResult.Attempt <= 0 || !validOID(evidence.Commit.CommitOID) || !validOID(evidence.Commit.ParentOID) || !validOID(evidence.Commit.TreeOID) || evidence.Commit.CommitOID != evidence.Snapshot.HeadSHA || evidence.Commit.ParentOID != evidence.Snapshot.BaseSHA || evidence.Commit.TreeOID != evidence.Snapshot.TreeSHA {
 		return nil, fmt.Errorf("valid bounded candidate evidence and reason are required")
 	}
+	// Immutable provider evidence is authenticated before opening the write
+	// transaction. The transaction below re-selects the newest terminal Builder
+	// attempt, so a later malformed or failed completion cannot be skipped while
+	// waiting for the writer.
+	builder, parsed, err := s.LoadHistoricalProviderAttemptResult(ctx, evidence.BuilderResult)
+	if err != nil || builder.Claim.Role != "builder" || builder.Claim.Phase != domain.PhaseBuild || parsed.Builder == nil {
+		return nil, ErrEvidenceConflict
+	}
+	builderDigest, err := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
+	if err != nil || builderDigest != evidence.Snapshot.BuilderEvidenceDigest {
+		return nil, ErrEvidenceConflict
+	}
 	receipts := make([]InvalidationReceipt, 0, 4)
-	err := s.write(ctx, func(conn *sql.Conn) error {
+	err = s.write(ctx, func(conn *sql.Conn) error {
 		if err := s.assertTicketFence(ctx, conn, evidence.Ref, evidence.ExpectedVersion, evidence.Fence); err != nil {
 			return err
+		}
+		var state, source string
+		if err := conn.QueryRowContext(ctx, `SELECT state,source_digest FROM tickets WHERE channel=? AND project_id=? AND id=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&state, &source); err != nil {
+			return err
+		}
+		if domain.State(state) != domain.StateBuilding || source != evidence.Snapshot.SourceDigest {
+			return ErrEvidenceConflict
+		}
+		var newest ProviderAttemptResultKey
+		var resultID sql.NullInt64
+		err := conn.QueryRowContext(ctx, `SELECT r.provider_attempt_id,a.attempt
+			FROM provider_attempts a LEFT JOIN provider_attempt_results r ON r.provider_attempt_id=a.id
+			WHERE a.channel=? AND a.project_id=? AND a.ticket_id=? AND a.phase='build' AND a.role='builder' AND a.finished_at IS NOT NULL
+			ORDER BY a.attempt DESC,a.id DESC LIMIT 1`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&resultID, &newest.Attempt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if !resultID.Valid {
+			return ErrEvidenceConflict
+		}
+		newest.AttemptID, newest.Ref, newest.Phase = resultID.Int64, evidence.Ref, domain.PhaseBuild
+		if newest != evidence.BuilderResult {
+			return ErrEvidenceConflict
+		}
+		var path, identity, base string
+		if err := conn.QueryRowContext(ctx, `SELECT path,identity_json,base_sha FROM worktrees WHERE channel=? AND project_id=? AND ticket_id=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&path, &identity, &base); err != nil {
+			return ErrEvidenceConflict
+		}
+		if path != builder.Claim.Worktree || identity != builder.Claim.WorktreeIdentity || base != builder.Claim.BaseSHA || base != evidence.Snapshot.BaseSHA {
+			return ErrEvidenceConflict
+		}
+		var intent, proof, owned, checkpoint string
+		var intentBytes, proofBytes []byte
+		if err := conn.QueryRowContext(ctx, `SELECT r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&intent, &intentBytes, &proof, &proofBytes, &owned, &checkpoint); err != nil || intent != evidence.Snapshot.VerificationIntentDigest || proof != evidence.Snapshot.ProofDigest || sha256Digest(intentBytes) != intent || sha256Digest(proofBytes) != proof || !validOID(checkpoint) {
+			return ErrEvidenceConflict
+		}
+		var ownedFiles []string
+		if json.Unmarshal([]byte(owned), &ownedFiles) != nil || validOwnedFiles(ownedFiles) != nil {
+			return ErrEvidenceConflict
 		}
 		var current uint64
 		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation), 0) FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&current); err != nil {
@@ -239,11 +304,22 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if evidence.Snapshot.Generation == 0 {
 			evidence.Snapshot.Generation = current + 1
 		}
+		if evidence.Snapshot.Generation < current {
+			return ErrEvidenceConflict
+		}
+		if evidence.Snapshot.Generation == current {
+			var existing domain.CandidateSnapshot
+			err := conn.QueryRowContext(ctx, `SELECT generation,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? AND generation=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, evidence.Snapshot.Generation).Scan(&existing.Generation, &existing.BaseSHA, &existing.HeadSHA, &existing.TreeSHA, &existing.SourceDigest, &existing.VerificationIntentDigest, &existing.ProofDigest, &existing.CommandPolicyDigest, &existing.BuilderEvidenceDigest)
+			if err != nil || existing != evidence.Snapshot {
+				return ErrEvidenceConflict
+			}
+			return nil
+		}
 		if evidence.Snapshot.Generation != current+1 {
 			return ErrEvidenceConflict
 		}
-		_, err := conn.ExecContext(ctx, `INSERT INTO candidate_snapshots(channel, project_id, ticket_id, generation, ticket_version, leader_epoch, runner_epoch, base_sha, head_sha, tree_sha, source_digest, verification_intent_digest, proof_digest, command_policy_digest, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, evidence.Snapshot.Generation, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.Snapshot.BaseSHA, evidence.Snapshot.HeadSHA, evidence.Snapshot.TreeSHA, evidence.Snapshot.SourceDigest, evidence.Snapshot.VerificationIntentDigest, evidence.Snapshot.ProofDigest, evidence.Snapshot.CommandPolicyDigest, now())
+		_, err = conn.ExecContext(ctx, `INSERT INTO candidate_snapshots(channel, project_id, ticket_id, generation, ticket_version, leader_epoch, runner_epoch, base_sha, head_sha, tree_sha, source_digest, verification_intent_digest, proof_digest, command_policy_digest, builder_evidence_digest, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, evidence.Snapshot.Generation, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.Snapshot.BaseSHA, evidence.Snapshot.HeadSHA, evidence.Snapshot.TreeSHA, evidence.Snapshot.SourceDigest, evidence.Snapshot.VerificationIntentDigest, evidence.Snapshot.ProofDigest, evidence.Snapshot.CommandPolicyDigest, evidence.Snapshot.BuilderEvidenceDigest, now())
 		if err != nil {
 			return err
 		}
@@ -538,7 +614,7 @@ func validateCandidate(snapshot domain.CandidateSnapshot) error {
 	if !validOID(snapshot.BaseSHA) || !validOID(snapshot.HeadSHA) || !validOID(snapshot.TreeSHA) {
 		return errors.New("candidate git identities must be canonical object ids")
 	}
-	for _, digest := range []string{snapshot.SourceDigest, snapshot.VerificationIntentDigest, snapshot.ProofDigest, snapshot.CommandPolicyDigest} {
+	for _, digest := range []string{snapshot.SourceDigest, snapshot.VerificationIntentDigest, snapshot.ProofDigest, snapshot.CommandPolicyDigest, snapshot.BuilderEvidenceDigest} {
 		if !validDigest(digest) {
 			return errors.New("candidate digest must be canonical SHA-256")
 		}
@@ -580,8 +656,8 @@ func (s *Store) VerificationRevisions(ctx context.Context, ref domain.TicketRef)
 		if err := rows.Scan(&item.Revision, &item.IntentDigest, &item.ProofDigest, &owned, &item.CheckpointID, &item.Amends); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(owned), &item.OwnedFiles); err != nil {
-			return nil, err
+		if err := json.Unmarshal([]byte(owned), &item.OwnedFiles); err != nil || validOwnedFiles(item.OwnedFiles) != nil || !validDigest(item.IntentDigest) || !validDigest(item.ProofDigest) || !validOID(item.CheckpointID) {
+			return nil, ErrEvidenceConflict
 		}
 		result = append(result, item)
 	}

@@ -183,23 +183,8 @@ func TestReviewerMayBeFreshTwiceButNeverShareBuilderFamily(t *testing.T) {
 	ticket := setupProviderTicket(t, db, ctx, "SF-review", leader)
 	builder, reviewer := setupProviderPair(t, db, ctx)
 	ticket = providerState(t, db, ctx, ticket, leader, domain.StateVerifying)
-	for _, phase := range []domain.Phase{domain.PhaseVerification, domain.PhaseReview} {
+	for _, phase := range []domain.Phase{domain.PhaseVerification} {
 		request := supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: phase, Role: "reviewer", Binding: runtime(reviewer), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
-		if phase == domain.PhaseReview {
-			if _, err := db.db.ExecContext(ctx, `UPDATE tickets SET source_digest=? WHERE channel=? AND project_id=? AND id=?`, sha256Digest([]byte("review-source")), ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
-				t.Fatal(err)
-			}
-			intent, proof := []byte("review intent"), []byte("review proof")
-			revision, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: request.Fence, Intent: intent, Proof: proof, OwnedFiles: []string{"verify.txt"}, CheckpointID: "review-checkpoint"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			snapshot := domain.CandidateSnapshot{BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: sha256Digest([]byte("review-source")), VerificationIntentDigest: revision.IntentDigest, ProofDigest: revision.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy"))}
-			if _, err := db.RecordCandidate(ctx, CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: request.Fence, Snapshot: snapshot, Reason: "review candidate"}); err != nil {
-				t.Fatal(err)
-			}
-			request.ExpectedHead, request.ExpectedProof = snapshot.HeadSHA, snapshot.ProofDigest
-		}
 		claim, err := db.BeginProviderAttempt(ctx, request)
 		if err != nil {
 			t.Fatalf("%s: %v", phase, err)
@@ -371,6 +356,35 @@ func TestCompleteProviderAttemptSuccessPersistsAndReparses(t *testing.T) {
 	if err != nil || parsed.Builder == nil || loaded.RawSHA256 != stored.RawSHA256 || loaded.Claim.BindingDigest != claim.BindingDigest || loaded.Claim.LeaseKey != claim.LeaseKey || !bytes.Equal(loaded.Claim.SupervisorKey, claim.SupervisorKey) || loaded.Claim.Input.RequestDigest != claim.Input.RequestDigest {
 		t.Fatalf("load=%+v parsed=%+v err=%v", loaded, parsed, err)
 	}
+	// Adoption binds the exact immutable Builder result, current source and
+	// verification, registered worktree/base, and a Store-neutral commit
+	// observation. An exact generation replay creates no new receipts.
+	source := sha256Digest([]byte("candidate source"))
+	if _, err := db.db.ExecContext(ctx, `UPDATE tickets SET source_digest=? WHERE channel=? AND project_id=? AND id=?`, source, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	revision, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: []byte("candidate intent"), Proof: []byte("candidate proof"), OwnedFiles: []string{"verify.txt"}, CheckpointID: strings.Repeat("d", 40)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builderDigest, err := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := domain.CandidateSnapshot{Generation: 1, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: source, VerificationIntentDigest: revision.IntentDigest, ProofDigest: revision.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: builderDigest}
+	evidence := CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snapshot, BuilderResult: ProviderAttemptResultKey{AttemptID: claim.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: claim.Attempt}, Commit: CommitObservation{CommitOID: snapshot.HeadSHA, ParentOID: snapshot.BaseSHA, TreeOID: snapshot.TreeSHA}, Reason: "candidate created"}
+	if receipts, err := db.RecordCandidate(ctx, evidence); err != nil || len(receipts) != 4 {
+		t.Fatalf("candidate receipts=%+v err=%v", receipts, err)
+	}
+	if receipts, err := db.RecordCandidate(ctx, evidence); err != nil || len(receipts) != 0 {
+		t.Fatalf("candidate replay receipts=%+v err=%v", receipts, err)
+	}
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO candidate_snapshots(channel,project_id,ticket_id,generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, 2, ticket.Version, fence.LeaderEpoch, fence.RunnerEpoch, snapshot.BaseSHA, strings.Repeat("e", 40), strings.Repeat("f", 40), snapshot.SourceDigest, snapshot.VerificationIntentDigest, snapshot.ProofDigest, snapshot.CommandPolicyDigest, snapshot.BuilderEvidenceDigest, now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordCandidate(ctx, evidence); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("older candidate replay=%v", err)
+	}
 	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempt_results SET raw_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE provider_attempt_id=?`, claim.ID); err == nil {
 		t.Fatal("immutable result updated")
 	}
@@ -487,10 +501,28 @@ func TestHistoricalProviderResultSurvivesTransitionAndLeaderRestart(t *testing.T
 	if _, parsed, err := db.LoadHistoricalProviderAttemptResult(ctx, key); err != nil || parsed.Planner == nil {
 		t.Fatalf("initial historical=%+v err=%v", parsed, err)
 	}
-	ticket = providerState(t, db, ctx, ticket, leader, domain.StateVerifying)
+	if reused, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: ticket.Version, Fence: fence}); err != nil || reused.Recovered || reused.Parsed.Planner == nil {
+		t.Fatalf("exact reusable=%+v err=%v", reused, err)
+	}
+	advanced, err := db.InvalidateRunner(ctx, ticket.Ref, ticket.Version, fence)
+	if err != nil {
+		t.Fatal(err)
+	}
 	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "historical-restart")
 	if err != nil {
 		t.Fatal(err)
+	}
+	currentFence := domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: advanced.RunnerEpoch}
+	if reused, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: advanced.Version, Fence: currentFence}); err != nil || !reused.Recovered || reused.Parsed.Planner == nil {
+		t.Fatalf("recovered reusable=%+v err=%v", reused, err)
+	}
+	if _, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: ticket.Version, Fence: fence}); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("stale reuse request=%v", err)
+	}
+	ticket = Ticket{Ref: ticket.Ref, State: domain.StatePlanning, Version: advanced.Version, RunnerEpoch: advanced.RunnerEpoch}
+	ticket = providerState(t, db, ctx, ticket, newLeader, domain.StateVerifying)
+	if _, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: ticket.RunnerEpoch}}); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("ordinary transition reuse=%v", err)
 	}
 	if _, parsed, err := db.LoadHistoricalProviderAttemptResult(ctx, key); err != nil || parsed.Planner == nil {
 		t.Fatalf("post restart historical=%+v err=%v", parsed, err)
@@ -610,12 +642,12 @@ func TestFinalReviewValidationUsesDurableCandidateAndVerification(t *testing.T) 
 	}
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
 	intent, proof := []byte("durable intent"), []byte("durable proof")
-	revision, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: []string{"verify.txt"}, CheckpointID: "checkpoint"})
+	revision, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: []string{"verify.txt"}, CheckpointID: strings.Repeat("d", 40)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot := domain.CandidateSnapshot{BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: sha256Digest([]byte("source")), VerificationIntentDigest: revision.IntentDigest, ProofDigest: revision.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy"))}
-	if _, err := db.RecordCandidate(ctx, CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snapshot, Reason: "fresh candidate"}); err != nil {
+	snapshot := domain.CandidateSnapshot{Generation: 1, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: sha256Digest([]byte("source")), VerificationIntentDigest: revision.IntentDigest, ProofDigest: revision.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: sha256Digest([]byte("builder"))}
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO candidate_snapshots(channel,project_id,ticket_id,generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, snapshot.Generation, ticket.Version, fence.LeaderEpoch, fence.RunnerEpoch, snapshot.BaseSHA, snapshot.HeadSHA, snapshot.TreeSHA, snapshot.SourceDigest, snapshot.VerificationIntentDigest, snapshot.ProofDigest, snapshot.CommandPolicyDigest, snapshot.BuilderEvidenceDigest, now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.ValidateFinalReviewEvidence(ctx, ticket.Ref, ticket.Version, fence, snapshot.HeadSHA, snapshot.ProofDigest); err != nil {

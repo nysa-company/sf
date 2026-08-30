@@ -537,7 +537,7 @@ func CanonicalVerificationProofBytes(artifact phaseartifact.Verification) ([]byt
 
 // NewCandidateIdentity canonicalizes typed Builder evidence for final review.
 func NewCandidateIdentity(base, head, tree, source, verificationIntent, proof, policy string, evidence phaseartifact.Builder, evidenceDigest string) (CandidateIdentity, error) {
-	digest, _, err := canonicalDigest(evidence)
+	digest, err := phaseartifact.BuilderEvidenceDigest(evidence)
 	if err != nil {
 		return CandidateIdentity{}, err
 	}

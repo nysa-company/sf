@@ -34,6 +34,9 @@ func evidenceOID(value string) string    { return strings.Repeat(value, 40) }
 
 func TestEvidencePlanVerificationCandidateAndApprovalFences(t *testing.T) {
 	database, ctx, ref, version, fence := evidenceFixture(t)
+	if _, err := database.RecordVerification(ctx, VerificationArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Intent: []byte("intent"), Proof: []byte("proof"), OwnedFiles: []string{"verify_test.go"}, CheckpointID: "legacy-checkpoint"}); err == nil {
+		t.Fatal("legacy non-OID checkpoint was accepted")
+	}
 	plan := PlanArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Document: PlanDocument{Acceptance: []string{"works"}, ProofKind: "regression", Paths: []string{"src"}, Commands: [][]string{{"go", "test", "./..."}}, Risks: []string{"migration"}}}
 	digest, err := database.RecordPlan(ctx, plan)
 	if err != nil || digest == "" {
@@ -60,23 +63,8 @@ func TestEvidencePlanVerificationCandidateAndApprovalFences(t *testing.T) {
 		t.Fatalf("history=%+v err=%v", history, err)
 	}
 
-	candidate := CandidateEvidence{Ref: ref, ExpectedVersion: version, Fence: fence, Reason: "candidate head changed", Snapshot: domain.CandidateSnapshot{BaseSHA: evidenceOID("c"), HeadSHA: evidenceOID("d"), TreeSHA: evidenceOID("e"), SourceDigest: evidenceDigest("source"), VerificationIntentDigest: second.IntentDigest, ProofDigest: second.ProofDigest, CommandPolicyDigest: evidenceDigest("policy")}}
-	receipts, err := database.RecordCandidate(ctx, candidate)
-	if err != nil || strings.Join(sortedReceiptKinds(receipts), ",") != "approval,final_review,github_checks,proof_result" {
-		t.Fatalf("receipts=%+v err=%v", receipts, err)
-	}
-	if err := database.RecordOperatorDecision(ctx, OperatorDecision{Ref: ref, ExpectedVersion: version, Fence: fence, ReviewedHead: candidate.Snapshot.HeadSHA, OperatorUID: 501, Decision: "approved"}); err != nil {
-		t.Fatal(err)
-	}
-	candidate.Snapshot.HeadSHA = evidenceOID("f")
-	candidate.Snapshot.TreeSHA = evidenceOID("f")
-	if _, err := database.RecordCandidate(ctx, candidate); err != nil {
-		t.Fatal(err)
-	}
-	var invalidated int
-	if err := database.db.QueryRow(`SELECT invalidated FROM approvals WHERE channel='dev' AND ticket_id='SF-evidence'`).Scan(&invalidated); err != nil || invalidated != 1 {
-		t.Fatalf("approval invalidated=%d err=%v", invalidated, err)
-	}
+	// Direct snapshots cannot be adopted after v31: CandidateEvidence must
+	// carry authenticated Builder completion evidence.
 	if _, err := database.RecordPlan(ctx, PlanArtifact{Ref: ref, ExpectedVersion: version + 1, Fence: fence, Document: plan.Document}); !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("stale fence=%v", err)
 	}

@@ -146,7 +146,13 @@ type CandidateSnapshot struct {
 	SourceDigest             string
 	VerificationIntentDigest string
 	ProofDigest              string
-	CommandPolicyDigest      string
+	// CommandPolicyDigest remains an asserted candidate identity. v31 does not
+	// invent a second authority for it: the later proof-result admission path
+	// is responsible for binding command execution to this digest.
+	CommandPolicyDigest string
+	// BuilderEvidenceDigest is the canonical digest of the authenticated
+	// Builder artifact which produced this exact candidate.
+	BuilderEvidenceDigest string
 }
 
 type Fence struct {

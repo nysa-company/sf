@@ -149,7 +149,7 @@ var requiredSchema = map[string][]string{
 	"plans":                        {"ticket_id", "digest", "body"},
 	"verifications":                {"ticket_id", "intent_digest", "proof_digest", "current_revision"},
 	"verification_revisions":       {"revision", "intent_bytes", "proof_bytes", "owned_files_json", "checkpoint_id"},
-	"candidate_snapshots":          {"generation", "base_sha", "head_sha", "tree_sha", "command_policy_digest"},
+	"candidate_snapshots":          {"generation", "base_sha", "head_sha", "tree_sha", "command_policy_digest", "builder_evidence_digest"},
 	"invalidation_receipts":        {"generation", "kind", "reason"},
 	"ticket_counters":              {"kind", "used", "limit_count"},
 	"ticket_budget_uses":           {"kind", "request_id", "ticket_version"},

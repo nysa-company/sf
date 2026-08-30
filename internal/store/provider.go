@@ -86,6 +86,27 @@ type ProviderAttemptResultKey struct {
 	Attempt   int
 }
 
+// LatestReusableProviderAttemptRequest asks for the single newest completed
+// immutable provider result eligible to be reused after a restart.  Reuse is
+// deliberately limited to the non-mutating Planner and Reviewer roles.
+type LatestReusableProviderAttemptRequest struct {
+	Ref             domain.TicketRef
+	Phase           domain.Phase
+	Role            string
+	ExpectedVersion uint64
+	Fence           domain.Fence
+}
+
+// LatestReusableProviderAttemptResult is authenticated evidence, never a
+// provider transcript. Recovered reports the bounded runner/version recovery
+// path rather than an exact-current fence read.
+type LatestReusableProviderAttemptResult struct {
+	Key       ProviderAttemptResultKey
+	Result    ProviderAttemptResult
+	Parsed    phaseartifact.Parsed
+	Recovered bool
+}
+
 func rawDigest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 func validSHA256(value string) bool {
 	return len(value) == 64 && strings.ToLower(value) == value && strings.Trim(value, "0123456789abcdef") == ""
@@ -721,6 +742,94 @@ func (s *Store) LoadHistoricalProviderAttemptResult(ctx context.Context, key Pro
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
 	}
 	return out, parsed, nil
+}
+
+// LatestReusableProviderAttemptResult returns exactly the newest completed
+// Planner or Reviewer result. It intentionally never falls back to an older
+// row when that newest row is malformed or stale: doing so would let a restart
+// adopt evidence after a later provider attempt superseded it.
+func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request LatestReusableProviderAttemptRequest) (LatestReusableProviderAttemptResult, error) {
+	if request.Ref.Validate() != nil || request.ExpectedVersion == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 || !((request.Phase == domain.PhasePlanning && request.Role == "planner") || (request.Phase == domain.PhaseReview && request.Role == "reviewer")) {
+		return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
+	}
+	var key ProviderAttemptResultKey
+	var resultID sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT r.provider_attempt_id,a.attempt
+		FROM provider_attempts a LEFT JOIN provider_attempt_results r ON r.provider_attempt_id=a.id
+		WHERE a.channel=? AND a.project_id=? AND a.ticket_id=? AND a.phase=? AND a.role=? AND a.finished_at IS NOT NULL
+		ORDER BY a.attempt DESC,a.id DESC LIMIT 1`, request.Ref.Channel, request.Ref.Project, request.Ref.Ticket, request.Phase, request.Role).Scan(&resultID, &key.Attempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return LatestReusableProviderAttemptResult{}, ErrNotFound
+	}
+	if err != nil {
+		return LatestReusableProviderAttemptResult{}, normalizeBusy(ctx, err)
+	}
+	if !resultID.Valid {
+		return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
+	}
+	key.AttemptID, key.Ref, key.Phase = resultID.Int64, request.Ref, request.Phase
+	historical, parsed, err := s.LoadHistoricalProviderAttemptResult(ctx, key)
+	if err != nil {
+		return LatestReusableProviderAttemptResult{}, err
+	}
+	if historical.Claim.Role != request.Role || historical.Claim.Phase != request.Phase {
+		return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
+	}
+	live, err := s.Ticket(ctx, request.Ref)
+	if err != nil {
+		return LatestReusableProviderAttemptResult{}, err
+	}
+	var liveLeader uint64
+	if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, request.Ref.Channel).Scan(&liveLeader); err != nil {
+		return LatestReusableProviderAttemptResult{}, normalizeBusy(ctx, err)
+	}
+	if liveLeader == 0 {
+		return LatestReusableProviderAttemptResult{}, ErrStaleFence
+	}
+	// The request is a live caller fence, never a historical hint. Without
+	// this check an arbitrary old request could satisfy the relative recovery
+	// arithmetic below.
+	if live.Version != request.ExpectedVersion || live.RunnerEpoch != request.Fence.RunnerEpoch || liveLeader != request.Fence.LeaderEpoch {
+		return LatestReusableProviderAttemptResult{}, ErrStaleFence
+	}
+	current := historical.Claim.ExpectedVersion == request.ExpectedVersion && historical.Claim.RunnerEpoch == request.Fence.RunnerEpoch && historical.Claim.LeaderEpoch == request.Fence.LeaderEpoch
+	result := LatestReusableProviderAttemptResult{Key: key, Result: historical, Parsed: parsed}
+	if current {
+		currentResult, currentParsed, loadErr := s.LoadProviderAttemptResult(ctx, historical.Claim, request.ExpectedVersion, request.Fence)
+		if loadErr != nil {
+			return LatestReusableProviderAttemptResult{}, loadErr
+		}
+		result.Result, result.Parsed = currentResult, currentParsed
+	} else {
+		allowedState := (request.Phase == domain.PhasePlanning && live.State == domain.StatePlanning) || (request.Phase == domain.PhaseReview && live.State == domain.StateReviewing)
+		if !allowedState || live.Version <= historical.Claim.ExpectedVersion || live.RunnerEpoch <= historical.Claim.RunnerEpoch || live.Version-historical.Claim.ExpectedVersion != live.RunnerEpoch-historical.Claim.RunnerEpoch {
+			return LatestReusableProviderAttemptResult{}, ErrStaleFence
+		}
+		result.Recovered = true
+	}
+	worktree, err := s.Worktree(ctx, request.Ref)
+	if err != nil || worktree.Path != result.Result.Claim.Worktree || string(worktree.IdentityJSON) != result.Result.Claim.WorktreeIdentity || worktree.BaseSHA != result.Result.Claim.BaseSHA {
+		return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+	}
+	if request.Phase == domain.PhasePlanning {
+		if result.Parsed.Planner == nil {
+			return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
+		}
+		return result, nil
+	}
+	validation, err := phaseartifact.DecodeCanonicalValidation(result.Result.Validation)
+	if err != nil || result.Parsed.Reviewer == nil || validation.ExpectedReviewedHead == "" || validation.ExpectedProofDigest == "" {
+		return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
+	}
+	candidate, err := s.LatestCandidate(ctx, request.Ref)
+	if err != nil || candidate.Snapshot.HeadSHA != validation.ExpectedReviewedHead || candidate.Snapshot.ProofDigest != validation.ExpectedProofDigest || result.Parsed.Reviewer.ReviewedHead != validation.ExpectedReviewedHead || result.Parsed.Reviewer.ProofDigest != validation.ExpectedProofDigest {
+		return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+	}
+	verification, err := s.CurrentVerification(ctx, request.Ref)
+	if err != nil || verification.Revision.IntentDigest != candidate.Snapshot.VerificationIntentDigest || verification.Revision.ProofDigest != candidate.Snapshot.ProofDigest {
+		return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+	}
+	return result, nil
 }
 
 // FailProviderAttemptBeforeLaunch releases a claim only when adapter

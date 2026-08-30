@@ -12,7 +12,7 @@ func snapshot() domain.CandidateSnapshot {
 	return domain.CandidateSnapshot{
 		Generation: 1, BaseSHA: "base", HeadSHA: "head", TreeSHA: "tree",
 		SourceDigest: "source", VerificationIntentDigest: "intent", ProofDigest: "proof",
-		CommandPolicyDigest: "policy",
+		CommandPolicyDigest: "policy", BuilderEvidenceDigest: "builder",
 	}
 }
 
@@ -26,6 +26,7 @@ func TestEveryCandidateIdentityChangeInvalidatesDownstreamGates(t *testing.T) {
 		"source":     func(value *domain.CandidateSnapshot) { value.SourceDigest = "new-source" },
 		"proof":      func(value *domain.CandidateSnapshot) { value.ProofDigest = "new-proof" },
 		"policy":     func(value *domain.CandidateSnapshot) { value.CommandPolicyDigest = "new-policy" },
+		"builder":    func(value *domain.CandidateSnapshot) { value.BuilderEvidenceDigest = "new-builder" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

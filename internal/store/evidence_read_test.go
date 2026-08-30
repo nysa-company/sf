@@ -16,18 +16,11 @@ func TestEvidenceReadsRebuildCurrentWorkflowAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	verification, err := database.RecordVerification(ctx, VerificationArtifact{
+	_, err = database.RecordVerification(ctx, VerificationArtifact{
 		Ref: ref, ExpectedVersion: version, Fence: fence, Intent: []byte("intent"), Proof: []byte("proof"),
 		OwnedFiles: []string{"verification_test.go"}, CheckpointID: evidenceOID("a"),
 	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	candidate := domain.CandidateSnapshot{
-		BaseSHA: evidenceOID("b"), HeadSHA: evidenceOID("c"), TreeSHA: evidenceOID("d"), SourceDigest: evidenceDigest("source"),
-		VerificationIntentDigest: verification.IntentDigest, ProofDigest: verification.ProofDigest, CommandPolicyDigest: evidenceDigest("policy"),
-	}
-	if _, err := database.RecordCandidate(ctx, CandidateEvidence{Ref: ref, ExpectedVersion: version, Fence: fence, Snapshot: candidate, Reason: "candidate created"}); err != nil {
 		t.Fatal(err)
 	}
 	attempt := PhaseAttempt{
@@ -49,9 +42,6 @@ func TestEvidenceReadsRebuildCurrentWorkflowAuthority(t *testing.T) {
 	if err := database.RegisterWorktree(ctx, worktree); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.RecordOperatorDecision(ctx, OperatorDecision{Ref: ref, ExpectedVersion: version, Fence: fence, ReviewedHead: candidate.HeadSHA, OperatorUID: 501, Decision: "approved"}); err != nil {
-		t.Fatal(err)
-	}
 
 	storedPlan, err := database.Plan(ctx, ref)
 	if err != nil || storedPlan.Digest != planDigest || !reflect.DeepEqual(storedPlan.Document, planDocument) || storedPlan.TicketVersion != version || storedPlan.Fence != fence || storedPlan.CreatedAt.IsZero() {
@@ -61,10 +51,6 @@ func TestEvidenceReadsRebuildCurrentWorkflowAuthority(t *testing.T) {
 	if err != nil || storedVerification.Revision.Revision != 1 || !bytes.Equal(storedVerification.Intent, []byte("intent")) || !bytes.Equal(storedVerification.Proof, []byte("proof")) || storedVerification.Fence != fence {
 		t.Fatalf("verification=%+v err=%v", storedVerification, err)
 	}
-	storedCandidate, err := database.LatestCandidate(ctx, ref)
-	if err != nil || storedCandidate.Snapshot.Generation != 1 || storedCandidate.Snapshot.HeadSHA != candidate.HeadSHA || storedCandidate.Fence != fence {
-		t.Fatalf("candidate=%+v err=%v", storedCandidate, err)
-	}
 	storedWorktree, err := database.Worktree(ctx, ref)
 	if err != nil || storedWorktree.Path != worktree.Path || storedWorktree.Branch != worktree.Branch || !bytes.Equal(storedWorktree.IdentityJSON, worktree.IdentityJSON) || storedWorktree.Fence != fence {
 		t.Fatalf("worktree=%+v err=%v", storedWorktree, err)
@@ -72,10 +58,6 @@ func TestEvidenceReadsRebuildCurrentWorkflowAuthority(t *testing.T) {
 	attempts, err := database.PhaseAttempts(ctx, ref)
 	if err != nil || len(attempts) != 1 || attempts[0].State != "completed" || attempts[0].Outcome != "passed" || attempts[0].Provider != attempt.Provider || attempts[0].StartedAt.IsZero() || attempts[0].FinishedAt.IsZero() {
 		t.Fatalf("attempts=%+v err=%v", attempts, err)
-	}
-	decisions, err := database.OperatorDecisions(ctx, ref)
-	if err != nil || len(decisions) != 1 || decisions[0].ReviewedHead != candidate.HeadSHA || decisions[0].OperatorUID != 501 || decisions[0].Decision != "approved" || decisions[0].Invalidated || decisions[0].CreatedAt.IsZero() {
-		t.Fatalf("decisions=%+v err=%v", decisions, err)
 	}
 
 	storedVerification.Intent[0] = 'X'

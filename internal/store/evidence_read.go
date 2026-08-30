@@ -143,7 +143,7 @@ func (s *Store) CurrentVerification(ctx context.Context, ref domain.TicketRef) (
 	if err := json.Unmarshal([]byte(owned), &result.Revision.OwnedFiles); err != nil || validOwnedFiles(result.Revision.OwnedFiles) != nil {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
-	if sha256Digest(result.Intent) != result.Revision.IntentDigest || sha256Digest(result.Proof) != result.Revision.ProofDigest || !boundedText(result.Revision.CheckpointID, 300) {
+	if sha256Digest(result.Intent) != result.Revision.IntentDigest || sha256Digest(result.Proof) != result.Revision.ProofDigest || !validOID(result.Revision.CheckpointID) {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
 	if amends.Valid {
@@ -167,12 +167,12 @@ func (s *Store) LatestCandidate(ctx context.Context, ref domain.TicketRef) (Stor
 	var result StoredCandidate
 	var created string
 	err := s.db.QueryRowContext(ctx, `SELECT generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,
-		source_digest,verification_intent_digest,proof_digest,command_policy_digest,created_at
+		source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest,created_at
 		FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY generation DESC LIMIT 1`,
 		ref.Channel, ref.Project, ref.Ticket).Scan(
 		&result.Snapshot.Generation, &result.TicketVersion, &result.Fence.LeaderEpoch, &result.Fence.RunnerEpoch,
 		&result.Snapshot.BaseSHA, &result.Snapshot.HeadSHA, &result.Snapshot.TreeSHA, &result.Snapshot.SourceDigest,
-		&result.Snapshot.VerificationIntentDigest, &result.Snapshot.ProofDigest, &result.Snapshot.CommandPolicyDigest, &created,
+		&result.Snapshot.VerificationIntentDigest, &result.Snapshot.ProofDigest, &result.Snapshot.CommandPolicyDigest, &result.Snapshot.BuilderEvidenceDigest, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return StoredCandidate{}, ErrNotFound

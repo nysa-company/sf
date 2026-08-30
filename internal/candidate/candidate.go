@@ -51,6 +51,7 @@ func Validate(snapshot domain.CandidateSnapshot) error {
 		{"verification intent digest", snapshot.VerificationIntentDigest},
 		{"proof digest", snapshot.ProofDigest},
 		{"command policy digest", snapshot.CommandPolicyDigest},
+		{"builder evidence digest", snapshot.BuilderEvidenceDigest},
 	} {
 		if field[1] == "" {
 			return fmt.Errorf("candidate %s is required", field[0])

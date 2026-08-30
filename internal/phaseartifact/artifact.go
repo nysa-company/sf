@@ -81,6 +81,18 @@ type Builder struct {
 	AmendmentRequest *AmendmentRequest `json:"amendment_request,omitempty"`
 }
 
+// BuilderEvidenceDigest is the sole canonical identity for bounded Builder
+// evidence when it is bound to a candidate.  It intentionally hashes the
+// role value itself, rather than a provider transcript or adapter metadata.
+func BuilderEvidenceDigest(value Builder) (string, error) {
+	b, err := json.Marshal(value)
+	if err != nil || len(b) == 0 || len(b) > MaxBytes {
+		return "", errors.New("invalid builder evidence")
+	}
+	s := sha256.Sum256(b)
+	return hex.EncodeToString(s[:]), nil
+}
+
 type ReviewDecision string
 
 const (
