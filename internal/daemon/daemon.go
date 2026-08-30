@@ -247,7 +247,7 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 			if identityErr != nil {
 				return identityErr
 			}
-			req := contracts.DrainRequest{Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest}
+			req := contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest}
 			proof, drainErr := daemon.recoveryDrainer.DrainPersisted(ctx, req, pid, pgid)
 			if drainErr != nil {
 				return drainErr
