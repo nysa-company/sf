@@ -36,9 +36,13 @@ import (
 const (
 	// MaxOutput is the combined stdout+stderr bound.
 	MaxOutput = 1 << 20
-	// MaxDeadline is the maximum wall-clock duration of one Run.
+	// MaxDeadline is the maximum owned-child budget. Trusted local filesystem
+	// preflight happens synchronously before this budget starts and may be
+	// delayed by the OS; it creates no child and is not a mutating operation.
 	MaxDeadline = 2 * time.Minute
-	// MaxRunWallClock includes the bounded termination and pipe-drain handoff.
+	// MaxRunWallClock includes the owned-child budget and bounded termination,
+	// fast-exit identity handoff, and pipe-drain overhead. It excludes trusted
+	// local preflight before Start.
 	MaxRunWallClock     = MaxDeadline + identitySampleGrace + termWait + killWait + pipeWait*2
 	maxArg              = 64 << 10
 	maxArgs             = 128
@@ -78,6 +82,7 @@ type Runner struct {
 	prelaunchPending bool
 	snapshotPath     string
 	snapshotDir      string
+	removeSnapshot   func(string) error
 }
 
 var _ github.SupervisedCommandRunner = (*Runner)(nil)
@@ -94,7 +99,7 @@ func New(executable string) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{requested: requested, canonical: canonical, digest: digest, snapshotPath: snapshot, snapshotDir: directory}, nil
+	return &Runner{requested: requested, canonical: canonical, digest: digest, snapshotPath: snapshot, snapshotDir: directory, removeSnapshot: os.RemoveAll}, nil
 }
 
 // NewRunner is an explicit spelling of New for composition code.
@@ -133,12 +138,26 @@ func (r *Runner) Close() error {
 		return ErrConcurrentRun
 	}
 	directory := r.snapshotDir
-	r.snapshotDir, r.snapshotPath = "", ""
+	removeSnapshot := r.removeSnapshot
+	if removeSnapshot == nil {
+		removeSnapshot = os.RemoveAll
+	}
 	r.mu.Unlock()
 	if directory == "" {
 		return nil
 	}
-	return os.RemoveAll(directory)
+	if err := removeSnapshot(directory); err != nil {
+		// Retain both paths so a caller can retry after a transient removal
+		// failure. Clearing them before RemoveAll would make the snapshot
+		// permanently unreachable and would lose cleanup state.
+		return err
+	}
+	r.mu.Lock()
+	if r.snapshotDir == directory {
+		r.snapshotDir, r.snapshotPath = "", ""
+	}
+	r.mu.Unlock()
+	return nil
 }
 
 // markPrelaunch records a failed launch attempt that never created an owned
@@ -160,6 +179,7 @@ func (r *Runner) markPrelaunch() {
 type run struct {
 	cmd                    *exec.Cmd
 	pid, pgid              int
+	identityMu             sync.RWMutex
 	boot, start            string
 	stdout, stderr         *limitedBuffer
 	stdoutRead, stderrRead *os.File
@@ -170,20 +190,20 @@ type run struct {
 	waitErr                error
 	streamsUncertain       bool
 	identityUncertain      atomic.Bool
-	cleaned                bool
+	finished               chan struct{}
+	cleaned                bool // protected by Runner.mu
 }
 
 // Run starts exactly binary with args and env. The binary must equal the
 // canonical path bound by New; args exclude argv[0].
 func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]byte, error) {
-	if r == nil || ctx == nil {
+	if r == nil {
 		return nil, ErrInvalidCommand
 	}
-	// Start the single wall-clock budget before validation, authentication, and
-	// process setup. No pre-start work can extend the RunMax.
-	bounded, cancel := boundedContext(ctx)
-	defer cancel()
-	runDeadline, _ := bounded.Deadline()
+	if ctx == nil {
+		r.markPrelaunch()
+		return nil, ErrInvalidCommand
+	}
 	if err := validateCommand(binary, args); err != nil {
 		r.markPrelaunch()
 		return nil, err
@@ -193,7 +213,7 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 		r.markPrelaunch()
 		return nil, err
 	}
-	if err := bounded.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		r.markPrelaunch()
 		return nil, err
 	}
@@ -252,6 +272,13 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 	// One shared sink bounds the combined stdout+stderr envelope to 1 MiB.
 	// Separate pipes are retained so a noisy stream cannot deadlock the other.
 	stderr := stdout
+	// The owned-child budget starts immediately before Start. All preceding
+	// work is trusted local preflight: it performs no child mutation, but may
+	// be delayed synchronously by the OS and is therefore not described as a
+	// hard context bound.
+	bounded, cancel := boundedContext(ctx)
+	defer cancel()
+	runDeadline, _ := bounded.Deadline()
 	if err := bounded.Err(); err != nil {
 		_ = stdoutRead.Close()
 		_ = stdoutWrite.Close()
@@ -277,7 +304,7 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 	// would make a retained descendant indistinguishable from a live owner.
 	_ = stdoutWrite.Close()
 	_ = stderrWrite.Close()
-	currentRun := &run{cmd: command, pid: command.Process.Pid, pgid: command.Process.Pid, stdout: stdout, stderr: stderr, stdoutRead: stdoutRead, stderrRead: stderrRead, waitDone: make(chan error, 1), ownerGone: make(chan struct{}), streamsDone: make(chan struct{})}
+	currentRun := &run{cmd: command, pid: command.Process.Pid, pgid: command.Process.Pid, stdout: stdout, stderr: stderr, stdoutRead: stdoutRead, stderrRead: stderrRead, waitDone: make(chan error, 1), ownerGone: make(chan struct{}), streamsDone: make(chan struct{}), finished: make(chan struct{})}
 	r.active = currentRun
 	r.cleanupUsed = false
 	r.needsCleanup = true
@@ -291,15 +318,6 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 		currentRun.waitDone <- err
 		close(currentRun.ownerGone)
 	}()
-	boot, bootErr := hostBootIdentityFn()
-	start, startErr := processStartIdentityFn(command.Process.Pid)
-	currentRun.boot, currentRun.start = boot, start
-	ownerExited := false
-	select {
-	case <-currentRun.ownerGone:
-		ownerExited = true
-	default:
-	}
 
 	var streams sync.WaitGroup
 	streams.Add(2)
@@ -307,15 +325,51 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 	go func() { defer streams.Done(); _, _ = io.Copy(stderr, stderrRead) }()
 	go monitorLeader(currentRun)
 	go func() { streams.Wait(); close(currentRun.streamsDone) }()
-	identityFailed := bootErr != nil || startErr != nil
-	if identityFailed && !ownerExited {
+
+	// Identity samplers are extension points for platform-specific process
+	// identity. Run them asynchronously: an injected or OS-stalled sampler
+	// must not defeat the owned-child deadline or strand Run in a synchronous
+	// call. The buffered result permits the sampler to finish without needing
+	// Run to remain alive.
+	type identityResult struct {
+		boot, start       string
+		bootErr, startErr error
+	}
+	identityCh := make(chan identityResult, 1)
+	go func() {
+		boot, bootErr := hostBootIdentityFn()
+		start, startErr := processStartIdentityFn(command.Process.Pid)
+		identityCh <- identityResult{boot: boot, start: start, bootErr: bootErr, startErr: startErr}
+	}()
+	var identities identityResult
+	identityTimedOut := false
+	select {
+	case identities = <-identityCh:
+		currentRun.identityMu.Lock()
+		currentRun.boot, currentRun.start = identities.boot, identities.start
+		currentRun.identityMu.Unlock()
+	case <-bounded.Done():
+		identityTimedOut = true
+	}
+	identityFailed := identityTimedOut || identities.bootErr != nil || identities.startErr != nil
+	ownerExited := false
+	select {
+	case <-currentRun.ownerGone:
+		ownerExited = true
+	default:
+	}
+	// An ordinary identity read can race a legitimate fast exit. Give the
+	// already-installed Wait a bounded handoff before treating a sampler error
+	// as an external identity ambiguity. A sampler timeout itself remains an
+	// uncertainty even if the owner happened to exit while it was blocked.
+	if identityFailed && !identityTimedOut && !ownerExited {
 		select {
 		case <-currentRun.ownerGone:
 			ownerExited = true
 		case <-time.After(identitySampleGrace):
 		}
 	}
-	if identityFailed && ownerExited {
+	if identityFailed && !identityTimedOut && ownerExited {
 		identityFailed = false
 	}
 	if identityFailed {
@@ -335,7 +389,8 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 		}
 	}
 
-	// The bounded context above includes all pre-start and post-start work.
+	// The owned-child context covers post-start execution and its bounded
+	// termination handoff; trusted preflight occurred before this boundary.
 	var waitErr error
 	cancelled := false
 	if identityFailed {
@@ -410,10 +465,13 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 	// Keep this run as the immediately preceding run until Cleanup consumes it.
 	r.needsCleanup = true
 	r.mu.Unlock()
-	if identityFailed {
-		return stdout.Bytes(), ErrExternalCleanupUncertain
-	}
+	// Every non-atomic lifecycle field is now final. Cleanup waits for this
+	// marker before it can inspect or publish a proof.
+	close(currentRun.finished)
 	output := stdout.Bytes()
+	if identityFailed {
+		return output, ErrExternalCleanupUncertain
+	}
 	if stdout.Truncated() && waitErr == nil {
 		return output, ErrOutputTooLarge
 	}
@@ -452,9 +510,20 @@ func (r *Runner) Cleanup(ctx context.Context) (github.CleanupProof, error) {
 	r.mu.Unlock()
 	bounded, cancel := boundedCleanupContext(ctx)
 	defer cancel()
+	// Run owns all lifecycle and stream state until this marker. Claiming the
+	// proof above prevents a second Cleanup, while this wait prevents a first
+	// Cleanup from observing partially-written owner/stream/wait state.
+	select {
+	case <-current.finished:
+	case <-bounded.Done():
+		return quarantine()
+	}
 	if !current.ownerDone {
 		select {
 		case <-current.ownerGone:
+			// Run normally records this before closing finished. This fallback is
+			// only for a completed owner whose channel notification raced the
+			// final state write; no other goroutine reads this field now.
 			current.ownerDone = true
 		case <-bounded.Done():
 			return quarantine()
@@ -559,7 +628,10 @@ func monitorLeader(current *run) {
 				continue
 			}
 			start, startErr := processStartIdentity(current.pid)
-			if pgid != current.pgid || (current.start != "" && startErr == nil && start != current.start) {
+			current.identityMu.RLock()
+			knownStart := current.start
+			current.identityMu.RUnlock()
+			if pgid != current.pgid || (knownStart != "" && startErr == nil && start != knownStart) {
 				current.identityUncertain.Store(true)
 				return
 			}
@@ -583,7 +655,10 @@ func observeLeader(current *run) error {
 		return ErrExternalCleanupUncertain
 	}
 	start, err := processStartIdentity(current.pid)
-	if err != nil || start != current.start {
+	current.identityMu.RLock()
+	knownStart := current.start
+	current.identityMu.RUnlock()
+	if err != nil || start != knownStart {
 		return ErrExternalCleanupUncertain
 	}
 	return nil

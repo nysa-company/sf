@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/nysa-company/sf/internal/github"
 )
 
 // TestGHRunnerHelper is an executable helper process. It intentionally uses
@@ -166,6 +168,88 @@ func TestRefusalsAndConcurrent(t *testing.T) {
 	}
 }
 
+func TestCleanupWaitsForRunLifecycleAndNextRunWorks(t *testing.T) {
+	runner, err := New(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() {
+		_, runErr := runner.Run(ctx, mustExecutable(t), helperArgs("hang"), runnerEnvironment(t))
+		runDone <- runErr
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		runner.mu.Lock()
+		active := runner.active != nil
+		runner.mu.Unlock()
+		if active {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	runner.mu.Lock()
+	active := runner.active != nil
+	runner.mu.Unlock()
+	if !active {
+		t.Fatal("Run did not publish active lifecycle record")
+	}
+	cleanupDone := make(chan struct {
+		proof github.CleanupProof
+		err   error
+	}, 1)
+	go func() {
+		proof, cleanupErr := runner.Cleanup(context.Background())
+		cleanupDone <- struct {
+			proof github.CleanupProof
+			err   error
+		}{proof: proof, err: cleanupErr}
+	}()
+	cleanupClaimedBy := time.Now().Add(time.Second)
+	for {
+		runner.mu.Lock()
+		claimed := runner.active != nil && runner.active.cleaned
+		runner.mu.Unlock()
+		if claimed {
+			break
+		}
+		if time.Now().After(cleanupClaimedBy) {
+			t.Fatal("Cleanup did not claim the active proof")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	runner.mu.Lock()
+	finished := runner.active.finished
+	runner.mu.Unlock()
+	select {
+	case <-finished:
+		t.Fatal("Cleanup claim raced past Run lifecycle completion")
+	default:
+	}
+	cancel()
+	if runErr := <-runDone; !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run cancellation: %v", runErr)
+	}
+	result := <-cleanupDone
+	if result.err != nil || !result.proof.Drained || result.proof.Quarantined {
+		t.Fatalf("cleanup=%+v err=%v", result.proof, result.err)
+	}
+	runner.mu.Lock()
+	active, needsCleanup := runner.active != nil, runner.needsCleanup
+	runner.mu.Unlock()
+	if active || needsCleanup {
+		t.Fatalf("cleanup left runner active=%v needsCleanup=%v", active, needsCleanup)
+	}
+	if _, err := runner.Run(context.Background(), mustExecutable(t), helperArgs("fast"), runnerEnvironment(t)); err != nil {
+		t.Fatalf("next Run after cleanup: %v", err)
+	}
+	if proof, err := runner.Cleanup(context.Background()); err != nil || !proof.Drained {
+		t.Fatalf("next cleanup=%+v err=%v", proof, err)
+	}
+}
+
 func TestExecutableReplacementRefused(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "gh")
@@ -244,6 +328,71 @@ func TestPostStartProcessIdentityFaultIsBounded(t *testing.T) {
 	proof, cleanErr := runner.Cleanup(context.Background())
 	if !errors.Is(cleanErr, ErrExternalCleanupUncertain) || !proof.Quarantined {
 		t.Fatalf("cleanup=%+v err=%v", proof, cleanErr)
+	}
+}
+
+func TestBlockingPostStartIdentityIsDeadlineBounded(t *testing.T) {
+	oldBoot, oldStart := hostBootIdentityFn, processStartIdentityFn
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	identityDone := make(chan struct{})
+	defer func() {
+		close(release)
+		<-identityDone
+		hostBootIdentityFn = oldBoot
+		processStartIdentityFn = oldStart
+	}()
+	hostBootIdentityFn = func() (string, error) {
+		close(entered)
+		<-release
+		return "", errors.New("released identity fault")
+	}
+	processStartIdentityFn = func(pid int) (string, error) {
+		defer close(identityDone)
+		return oldStart(pid)
+	}
+	runner, err := New(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, runErr := runner.Run(ctx, mustExecutable(t), helperArgs("hang"), runnerEnvironment(t))
+	if runErr == nil || !errors.Is(runErr, ErrExternalCleanupUncertain) || time.Since(started) > 2*time.Second {
+		t.Fatalf("blocking identity err=%v duration=%s", runErr, time.Since(started))
+	}
+	select {
+	case <-entered:
+	default:
+		t.Fatal("identity sampler was not started")
+	}
+	proof, cleanupErr := runner.Cleanup(context.Background())
+	if !errors.Is(cleanupErr, ErrExternalCleanupUncertain) || !proof.Quarantined {
+		t.Fatalf("cleanup=%+v err=%v", proof, cleanupErr)
+	}
+}
+
+func TestCloseRetainsSnapshotAfterRemovalFailure(t *testing.T) {
+	runner, err := New(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, directory := runner.snapshotPath, runner.snapshotDir
+	injected := errors.New("injected remove failure")
+	runner.removeSnapshot = func(string) error { return injected }
+	if err := runner.Close(); !errors.Is(err, injected) {
+		t.Fatalf("Close error=%v", err)
+	}
+	if runner.snapshotPath != path || runner.snapshotDir != directory {
+		t.Fatalf("snapshot paths were discarded after failed removal")
+	}
+	runner.removeSnapshot = os.RemoveAll
+	if err := runner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if runner.snapshotPath != "" || runner.snapshotDir != "" {
+		t.Fatal("snapshot paths retained after successful removal")
 	}
 }
 
