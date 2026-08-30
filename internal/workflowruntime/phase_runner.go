@@ -199,11 +199,20 @@ func (r PhaseRunner) planIdentity(ctx context.Context, request workflowworker.Ph
 		return store.StoredPlan{}, workflowprompt.PlanIdentity{}, ErrProviderResultInvalid
 	}
 	_, parsed, err := r.loadHistorical(ctx, *plan.Document.ProviderResult, request.Ticket.Ref, project, worktree, domain.PhasePlanning, providercoord.RolePlanner)
-	if err != nil || parsed.Planner == nil || !reflect.DeepEqual(*plan.Document.Planner, *parsed.Planner) {
+	if err != nil || parsed.Planner == nil {
+		return store.StoredPlan{}, workflowprompt.PlanIdentity{}, ErrProviderResultInvalid
+	}
+	stored, _, storedErr := phaseartifact.CanonicalTypedArtifact(phaseartifact.Parsed{Phase: domain.PhasePlanning, Provider: parsed.Provider, Planner: plan.Document.Planner})
+	loaded, _, loadedErr := phaseartifact.CanonicalTypedArtifact(phaseartifact.Parsed{Phase: domain.PhasePlanning, Provider: parsed.Provider, Planner: parsed.Planner})
+	if storedErr != nil || loadedErr != nil || !bytes.Equal(stored, loaded) {
 		return store.StoredPlan{}, workflowprompt.PlanIdentity{}, ErrProviderResultInvalid
 	}
 	identity, err := workflowprompt.NewPlanIdentity(*parsed.Planner)
-	if err != nil || plan.Digest != identity.Digest {
+	// Store.Plan.Digest authenticates the complete durable PlanDocument (and
+	// therefore includes its provider-result binding); PlanIdentity.Digest
+	// authenticates only the canonical Planner artifact. They intentionally
+	// have different preimages.
+	if err != nil || plan.Digest == "" {
 		return store.StoredPlan{}, workflowprompt.PlanIdentity{}, ErrProviderResultInvalid
 	}
 	if _, err := workflowprompt.ValidatePlanIdentity(phaseTicket(request.Ticket), identity); err != nil {
