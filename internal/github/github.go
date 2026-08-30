@@ -181,6 +181,58 @@ func (c Client) FindPullRequest(ctx context.Context, identity contracts.PullRequ
 	}
 	return match.Identity, true, nil
 }
+
+// RefreshFactoryPullRequestIdentity re-observes one already-persisted factory
+// pull request after a correction advances its source head. It is deliberately
+// a continuity check, not a branch-name lookup: both the prior identity and
+// the expected replacement identity name the same numbered PR and source.
+//
+// A correction can leave the old ownership marker in the PR body, or a lost
+// response from a preceding idempotent update can already have installed the
+// new marker. Either is sufficient, but a missing or substituted marker never
+// authorizes adoption.
+func (c Client) RefreshFactoryPullRequestIdentity(ctx context.Context, prior, expected contracts.PullRequestIdentity) (contracts.PullRequestIdentity, error) {
+	if !validPersistedPRIdentity(prior) || !validPersistedPRIdentity(expected) || !sameRefreshContinuity(prior, expected) || prior.HeadOID == expected.HeadOID {
+		return contracts.PullRequestIdentity{}, ErrPolicyRefusal
+	}
+	var values []prWire
+	if err := c.json(ctx, &values, "pr", "list", "--repo", repoArg(prior.Repository), "--state", "all", "--limit", "100", "--json", prFields); err != nil {
+		return contracts.PullRequestIdentity{}, err
+	}
+	if len(values) == 100 {
+		return contracts.PullRequestIdentity{}, ErrAmbiguousPR
+	}
+	var match *PRMatch
+	for _, value := range values {
+		candidate, err := value.identityUnmarked(prior.Repository)
+		if err != nil {
+			return contracts.PullRequestIdentity{}, err
+		}
+		// The persisted number is an exact factory identity. A row for that
+		// number that no longer proves the old source/base is a substitution,
+		// not an opportunity to adopt a PR with a familiar branch name.
+		if candidate.Number == prior.Number {
+			if !sameRefreshContinuity(prior, candidate) || candidate.HeadOID != expected.HeadOID || !refreshMarkerPresent(value.Body, prior, expected) || value.State != "OPEN" || value.MergedAt != nil {
+				return contracts.PullRequestIdentity{}, ErrNoMatchingPR
+			}
+			if match != nil {
+				return contracts.PullRequestIdentity{}, ErrAmbiguousPR
+			}
+			observed := value.match(candidate)
+			match = &observed
+			continue
+		}
+		// A second PR for this exact source/base is a foreign candidate. The
+		// list must not be used to select between it and the durable number.
+		if sameRefreshSourceAndBase(candidate, prior) {
+			return contracts.PullRequestIdentity{}, ErrAmbiguousPR
+		}
+	}
+	if match == nil {
+		return contracts.PullRequestIdentity{}, ErrNoMatchingPR
+	}
+	return match.Identity, nil
+}
 func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
 	if !validIdentity(identity) || !validTitle(title) || !validBody(body) {
 		return contracts.PullRequestIdentity{}, ErrPolicyRefusal
@@ -1272,15 +1324,25 @@ func presentJSON(value json.RawMessage) bool { return len(value) > 0 && string(v
 func queueState(value string) bool           { return value == "QUEUED" || value == "ENQUEUED" }
 
 func (p prWire) identity(repository contracts.RepositoryIdentity) (contracts.PullRequestIdentity, error) {
-	owner, name, ok := strings.Cut(p.HeadRepository.NameWithOwner, "/")
-	if !ok || !validRepositoryPart(owner) || !validRepositoryPart(name) || p.HeadRepositoryOwner.Login != owner || p.Number <= 0 || p.HeadRef == "" || !validOID(p.HeadOID) || !validRef(p.HeadRef) || !validRef(p.BaseRef) {
-		return contracts.PullRequestIdentity{}, ErrMalformedResponse
+	identity, err := p.identityUnmarked(repository)
+	if err != nil {
+		return contracts.PullRequestIdentity{}, err
 	}
-	identity := contracts.PullRequestIdentity{Repository: repository, Number: p.Number, HeadOwner: owner, HeadRepository: name, HeadRef: p.HeadRef, HeadOID: p.HeadOID, BaseRef: p.BaseRef, BaseOID: p.BaseOID, FactoryOwned: true}
 	if !strings.Contains(p.Body, ownershipMarker(identity)) {
 		return contracts.PullRequestIdentity{}, ErrNoMatchingPR
 	}
 	return identity, nil
+}
+
+// identityUnmarked retains the strict wire validation used by Observe while
+// letting RefreshFactoryPullRequestIdentity accept either adjacent durable
+// marker during a head-only correction.
+func (p prWire) identityUnmarked(repository contracts.RepositoryIdentity) (contracts.PullRequestIdentity, error) {
+	owner, name, ok := strings.Cut(p.HeadRepository.NameWithOwner, "/")
+	if !ok || !validRepositoryPart(owner) || !validRepositoryPart(name) || p.HeadRepositoryOwner.Login != owner || p.Number <= 0 || p.HeadRef == "" || !validOID(p.HeadOID) || !validRef(p.HeadRef) || !validRef(p.BaseRef) {
+		return contracts.PullRequestIdentity{}, ErrMalformedResponse
+	}
+	return contracts.PullRequestIdentity{Repository: repository, Number: p.Number, HeadOwner: owner, HeadRepository: name, HeadRef: p.HeadRef, HeadOID: p.HeadOID, BaseRef: p.BaseRef, BaseOID: p.BaseOID, FactoryOwned: true}, nil
 }
 func sameExact(left, right contracts.PullRequestIdentity) bool {
 	return left.Repository == right.Repository && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.HeadOID == right.HeadOID && left.BaseRef == right.BaseRef && (left.BaseOID == "" || right.BaseOID == "" || left.BaseOID == right.BaseOID) && left.FactoryOwned && right.FactoryOwned && (right.Number == 0 || left.Number == right.Number)
@@ -1297,6 +1359,18 @@ func validCheck(name, link, workflow, bucket string) bool {
 }
 func validIdentity(value contracts.PullRequestIdentity) bool {
 	return validRepository(value.Repository) == nil && validRepositoryPart(value.HeadOwner) && validRepositoryPart(value.HeadRepository) && validRef(value.HeadRef) && validOID(value.HeadOID) && validRef(value.BaseRef) && value.FactoryOwned
+}
+func validPersistedPRIdentity(value contracts.PullRequestIdentity) bool {
+	return validIdentity(value) && value.Number > 0
+}
+func sameRefreshSourceAndBase(left, right contracts.PullRequestIdentity) bool {
+	return left.Repository == right.Repository && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.BaseRef == right.BaseRef && left.FactoryOwned && right.FactoryOwned
+}
+func sameRefreshContinuity(left, right contracts.PullRequestIdentity) bool {
+	return left.Number == right.Number && sameRefreshSourceAndBase(left, right)
+}
+func refreshMarkerPresent(body string, prior, expected contracts.PullRequestIdentity) bool {
+	return strings.Contains(body, ownershipMarker(prior)) || strings.Contains(body, ownershipMarker(expected))
 }
 func repoArg(value contracts.RepositoryIdentity) string { return value.Owner + "/" + value.Name }
 func ownershipMarker(value contracts.PullRequestIdentity) string {

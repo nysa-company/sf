@@ -138,6 +138,133 @@ func createDraft(t *testing.T, client *Client, identity contracts.PullRequestIde
 	return match
 }
 
+func TestRefreshFactoryPullRequestIdentityAcceptsOldMarkerAfterHeadCorrection(t *testing.T) {
+	client, fake, identity := fixture(t)
+	prior := createDraft(t, client, identity, "title", "body").Identity
+	expected := prior
+	expected.HeadOID = strings.Repeat("b", 40)
+	if err := fake.SetPullRequestHeadOIDForTest(prior.Number, expected.HeadOID); err != nil {
+		t.Fatal(err)
+	}
+	before := fake.Snapshot().Mutations
+	got, err := client.RefreshFactoryPullRequestIdentity(context.Background(), prior, expected)
+	if err != nil {
+		t.Fatalf("refresh old marker: %v", err)
+	}
+	if !sameExact(got, expected) || got.Number != prior.Number {
+		t.Fatalf("refresh identity=%+v expected=%+v", got, expected)
+	}
+	after := fake.Snapshot().Mutations
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("read-only refresh mutated fake github: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestRefreshFactoryPullRequestIdentityRefusals(t *testing.T) {
+	prior := contracts.PullRequestIdentity{Number: 7, Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
+	expected := prior
+	expected.HeadOID = strings.Repeat("b", 40)
+	wire := func(identity contracts.PullRequestIdentity, body, state string, merged bool) map[string]any {
+		return map[string]any{
+			"number": identity.Number, "title": "title", "body": body,
+			"headRepositoryOwner": map[string]string{"login": identity.HeadOwner},
+			"headRepository":      map[string]string{"nameWithOwner": identity.HeadOwner + "/" + identity.HeadRepository},
+			"headRefName":         identity.HeadRef, "headRefOid": identity.HeadOID, "baseRefName": identity.BaseRef, "baseRefOid": strings.Repeat("c", 40),
+			"isDraft": false, "mergedAt": map[bool]any{true: "2026-01-01T00:00:00Z", false: nil}[merged], "mergeCommit": nil,
+			"state": state, "mergeStateStatus": "CLEAN", "autoMergeRequest": nil,
+		}
+	}
+	payload := func(values ...map[string]any) []byte {
+		encoded, err := json.Marshal(values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encoded
+	}
+	newMarker := ownershipMarker(expected)
+	oldMarker := ownershipMarker(prior)
+	cases := []struct {
+		name            string
+		prior, expected contracts.PullRequestIdentity
+		response        []byte
+		want            error
+	}{
+		{"new-marker-replay", prior, expected, payload(wire(expected, newMarker, "OPEN", false)), nil},
+		{"zero", prior, expected, payload(), ErrNoMatchingPR},
+		{"marker-substituted", prior, expected, payload(wire(expected, ownershipMarker(func() contracts.PullRequestIdentity { x := expected; x.HeadRef = "foreign"; return x }()), "OPEN", false)), ErrNoMatchingPR},
+		{"closed", prior, expected, payload(wire(expected, oldMarker, "CLOSED", false)), ErrNoMatchingPR},
+		{"merged", prior, expected, payload(wire(expected, oldMarker, "MERGED", true)), ErrNoMatchingPR},
+		{"multiple", prior, expected, payload(wire(expected, oldMarker, "OPEN", false), wire(expected, newMarker, "OPEN", false)), ErrAmbiguousPR},
+		{"foreign-same-source", prior, expected, payload(wire(func() contracts.PullRequestIdentity { x := expected; x.Number = 8; return x }(), newMarker, "OPEN", false), wire(expected, oldMarker, "OPEN", false)), ErrAmbiguousPR},
+		{"response-source-changed", prior, expected, payload(wire(func() contracts.PullRequestIdentity { x := expected; x.HeadRef = "other"; return x }(), oldMarker, "OPEN", false)), ErrNoMatchingPR},
+		{"response-base-changed", prior, expected, payload(wire(func() contracts.PullRequestIdentity { x := expected; x.BaseRef = "release"; return x }(), oldMarker, "OPEN", false)), ErrNoMatchingPR},
+		{"changed-source", prior, func() contracts.PullRequestIdentity { x := expected; x.HeadRef = "other"; return x }(), nil, ErrPolicyRefusal},
+		{"changed-base", prior, func() contracts.PullRequestIdentity { x := expected; x.BaseRef = "release"; return x }(), nil, ErrPolicyRefusal},
+		{"changed-number", prior, func() contracts.PullRequestIdentity { x := expected; x.Number = 8; return x }(), nil, ErrPolicyRefusal},
+		{"changed-repository", prior, func() contracts.PullRequestIdentity { x := expected; x.Repository.Name = "other"; return x }(), nil, ErrPolicyRefusal},
+		{"missing-oid", prior, func() contracts.PullRequestIdentity { x := expected; x.HeadOID = ""; return x }(), nil, ErrPolicyRefusal},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			var calls [][]string
+			client := refreshTestClient(t, test.response, &calls)
+			got, err := client.RefreshFactoryPullRequestIdentity(context.Background(), test.prior, test.expected)
+			if test.want == nil {
+				if err != nil || !sameExact(got, expected) {
+					t.Fatalf("refresh got=%+v err=%v", got, err)
+				}
+			} else if !errors.Is(err, test.want) {
+				t.Fatalf("refresh err=%v want %v", err, test.want)
+			}
+			if test.response == nil {
+				if len(calls) != 0 {
+					t.Fatalf("invalid caller identity launched command: %#v", calls)
+				}
+				return
+			}
+			wantArgs := []string{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}
+			if !reflect.DeepEqual(calls, [][]string{wantArgs}) {
+				t.Fatalf("refresh calls=%#v want only read list %#v", calls, wantArgs)
+			}
+		})
+	}
+
+	t.Run("full-page", func(t *testing.T) {
+		values := make([]map[string]any, 100)
+		for index := range values {
+			identity := expected
+			identity.Number = index + 1
+			values[index] = wire(identity, newMarker, "OPEN", false)
+		}
+		var calls [][]string
+		_, err := refreshTestClient(t, payload(values...), &calls).RefreshFactoryPullRequestIdentity(context.Background(), prior, expected)
+		if !errors.Is(err, ErrAmbiguousPR) || len(calls) != 1 {
+			t.Fatalf("full-page err=%v calls=%#v", err, calls)
+		}
+	})
+
+	t.Run("malformed-and-unknown", func(t *testing.T) {
+		for _, response := range [][]byte{[]byte(`[{"number":7}]`), []byte(`[{"number":7,"unexpected":true}]`)} {
+			var calls [][]string
+			_, err := refreshTestClient(t, response, &calls).RefreshFactoryPullRequestIdentity(context.Background(), prior, expected)
+			if !errors.Is(err, ErrMalformedResponse) || len(calls) != 1 {
+				t.Fatalf("response=%s err=%v calls=%#v", response, err, calls)
+			}
+		}
+	})
+}
+
+func refreshTestClient(t *testing.T, response []byte, calls *[][]string) *Client {
+	t.Helper()
+	return &Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		*calls = append(*calls, append([]string(nil), args...))
+		if !reflect.DeepEqual(args, []string{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}) {
+			return nil, errors.New("unexpected command")
+		}
+		return response, nil
+	})}
+}
+
 func TestStoreClaimGuardAndClientComposeExactHeadFlow(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
