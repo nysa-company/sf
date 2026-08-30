@@ -68,6 +68,19 @@ type ExternalMutationGuard interface {
 	RunExternalMutation(context.Context, domain.ExternalEffectClaim, func(context.Context) ([]byte, error)) ([]byte, error)
 }
 
+// MergeIntentRecorder persists structured merge evidence before any merge
+// intent can be reconciled after a crash or a lost response.
+type MergeIntentRecorder interface {
+	RecordMergeIntent(context.Context, domain.MergeIntent) error
+}
+
+// ExternalMutationQuarantiner durably blocks later launches after any
+// supervised command reports uncertain cleanup, including read observations
+// that occur before a durable mutation handoff.
+type ExternalMutationQuarantiner interface {
+	QuarantineExternalMutations(context.Context) error
+}
+
 type GitHub interface {
 	AuthStatus(context.Context) error
 	Repository(context.Context, RepositoryIdentity) (RepositoryIdentity, error)

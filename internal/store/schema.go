@@ -103,20 +103,22 @@ func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error 
 }
 
 var requiredSchema = map[string][]string{
-	"schema_migrations": {"version", "applied_at", "checksum"},
-	"daemon_instances":  {"channel", "leader_epoch", "identity"},
-	"projects":          {"channel", "id", "canonical_path"},
-	"tickets":           {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd"},
-	"workflow_owners":   {"channel", "project_id", "ticket_id", "workflow_id"},
-	"phase_runs":        {"phase", "attempt", "expected_ticket_version"},
-	"events":            {"ticket_version", "trigger", "from_state", "to_state"},
-	"effects":           {"semantic_key", "claim_epoch", "observed_identity"},
-	"approvals":         {"reviewed_head", "operator_uid", "invalidated"},
-	"worktrees":         {"path", "branch_ref"},
-	"provider_attempts": {"phase", "attempt", "provider"},
-	"leases":            {"scope", "scope_key", "runner_epoch"},
-	"plans":             {"ticket_id", "digest", "body"},
-	"verifications":     {"ticket_id", "intent_digest", "proof_digest"},
+	"schema_migrations":            {"version", "applied_at", "checksum"},
+	"daemon_instances":             {"channel", "leader_epoch", "identity"},
+	"projects":                     {"channel", "id", "canonical_path"},
+	"tickets":                      {"channel", "project_id", "id", "version", "runner_epoch", "workflow_id", "title", "problem", "acceptance_json", "source_bytes", "priority", "created_at", "max_duration_ns", "max_cost_micro_usd"},
+	"workflow_owners":              {"channel", "project_id", "ticket_id", "workflow_id"},
+	"phase_runs":                   {"phase", "attempt", "expected_ticket_version"},
+	"events":                       {"ticket_version", "trigger", "from_state", "to_state"},
+	"effects":                      {"semantic_key", "claim_epoch", "observed_identity"},
+	"approvals":                    {"reviewed_head", "operator_uid", "invalidated"},
+	"worktrees":                    {"path", "branch_ref"},
+	"provider_attempts":            {"phase", "attempt", "provider"},
+	"leases":                       {"scope", "scope_key", "runner_epoch"},
+	"plans":                        {"ticket_id", "digest", "body"},
+	"verifications":                {"ticket_id", "intent_digest", "proof_digest"},
+	"merge_intents":                {"semantic_key", "original_base_oid", "head_oid", "base_ref", "protection_rule_id", "strict_status_checks"},
+	"external_mutation_quarantine": {"singleton", "reason", "observed_at"},
 }
 
 type indexRequirement struct {

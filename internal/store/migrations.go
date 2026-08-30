@@ -139,3 +139,20 @@ var migrationV5 = []string{
 	`ALTER TABLE tickets ADD COLUMN max_duration_ns INTEGER NOT NULL DEFAULT 0 CHECK(max_duration_ns >= 0)`,
 	`ALTER TABLE tickets ADD COLUMN max_cost_micro_usd INTEGER NOT NULL DEFAULT 0 CHECK(max_cost_micro_usd >= 0)`,
 }
+
+// v6 keeps structured merge reconciliation evidence and makes cleanup
+// uncertainty survive restart rather than trusting an in-memory gate latch.
+var migrationV6 = []string{
+	`CREATE TABLE merge_intents (
+		semantic_key TEXT PRIMARY KEY, channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		request_digest TEXT NOT NULL, ticket_version INTEGER NOT NULL, leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL, claim_epoch INTEGER NOT NULL,
+		repository_host TEXT NOT NULL, repository_owner TEXT NOT NULL, repository_name TEXT NOT NULL, pull_request_number INTEGER NOT NULL,
+		head_oid TEXT NOT NULL, base_ref TEXT NOT NULL, original_base_oid TEXT NOT NULL, protection_rule_id TEXT NOT NULL, strict_status_checks INTEGER NOT NULL CHECK(strict_status_checks IN (0,1)), method TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id),
+		FOREIGN KEY(semantic_key) REFERENCES effects(semantic_key)
+	)`,
+	`CREATE TABLE external_mutation_quarantine (
+		singleton INTEGER PRIMARY KEY CHECK(singleton=1), reason TEXT NOT NULL, observed_at TEXT NOT NULL
+	)`,
+}

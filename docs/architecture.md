@@ -11,9 +11,14 @@ The approved normative design is in
 - NDJSON events and logs are readable projections, never recovery inputs.
 - Git and GitHub mutations cross narrow fenced interfaces and reconcile remote
   truth before any retry. Guarded merge binds the reviewed local base SHA and
-  GitHub base-ref OID to one exact witness, re-fetches source and protected
-  base refs inside the durable mutation handoff, and reconciles a lost response
-  by proving the merge from that original base witness.
+  GitHub base-ref OID to one exact witness. Because `gh pr merge` exposes only
+  an expected-head CAS, sf permits its managed guarded merge only when a
+  freshly observed exact protected-branch rule requires strict status checks
+  and has no pull-request bypass allowances; GitHub then enforces an
+  up-to-date base at the server-side merge. Otherwise sf refuses to mutate and
+  leaves manual merge observation available. The durable merge intent records
+  the base and protection witnesses; reconciliation proves ancestry from the
+  original base rather than expecting the protected branch tip to remain old.
 
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
 one custom Go state engine over the application schema; DBOS is retained only

@@ -48,6 +48,16 @@ func (contradictoryCleanupRunner) Cleanup(context.Context) (CleanupProof, error)
 	return CleanupProof{Drained: true, Quarantined: true}, nil
 }
 
+type intentRecorderFunc func(context.Context, domain.MergeIntent) error
+
+func (f intentRecorderFunc) RecordMergeIntent(ctx context.Context, intent domain.MergeIntent) error {
+	return f(ctx, intent)
+}
+
+type cleanupQuarantinerFunc func(context.Context) error
+
+func (f cleanupQuarantinerFunc) QuarantineExternalMutations(ctx context.Context) error { return f(ctx) }
+
 func (f mutationGuardFunc) RunExternalMutation(ctx context.Context, claim domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 	return f(ctx, claim, start)
 }
@@ -74,7 +84,7 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build fake-gh: %v\n%s", err, output)
 	}
-	client := &Client{binaryPath: binary, home: filepath.Join(root, "home"), configDir: filepath.Join(root, "gh-config"), env: []string{"SF_FAKE_GH_STATE=" + state}, runner: commandRunnerFunc(runBounded), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, mutationGuard: fixtureGuard(), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
+	client := &Client{binaryPath: binary, home: filepath.Join(root, "home"), configDir: filepath.Join(root, "gh-config"), env: []string{"SF_FAKE_GH_STATE=" + state}, runner: commandRunnerFunc(runBounded), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, mutationGuard: fixtureGuard(), mergeIntents: intentRecorderFunc(func(context.Context, domain.MergeIntent) error { return nil }), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
 	})}
 	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
@@ -161,7 +171,7 @@ func TestStoreClaimGuardAndClientComposeExactHeadFlow(t *testing.T) {
 		t.Fatalf("build fake-gh: %v\n%s", err, output)
 	}
 	verified := false
-	client, err := NewClient(binary, filepath.Join(root, "home"), filepath.Join(root, "gh-config"), supervisedFakeRunner{}, database.ValidateExternalEffectClaim, database.ExternalMutationGuard(), verifierFunc(func(_ context.Context, gotRepository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
+	client, err := NewStoreClient(binary, filepath.Join(root, "home"), filepath.Join(root, "gh-config"), supervisedFakeRunner{}, database, verifierFunc(func(_ context.Context, gotRepository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
 		verified = gotRepository == repository && baseRef == "main" && originalBaseOID == strings.Repeat("c", 40)
 		return contracts.ProtectedBranchObservation{Repository: gotRepository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
 	}))
@@ -190,11 +200,25 @@ func TestStoreClaimGuardAndClientComposeExactHeadFlow(t *testing.T) {
 	}
 	authorization := testAuthorization(created)
 	mergeDigest := requestDigest("merge", created, created.HeadOID, "squash", authorization.ReviewedBaseSHA, authorization.CurrentBaseSHA, authorization.ReviewedBaseHeadOID, authorization.CurrentBaseHeadOID)
-	if err := client.MergeExactHead(ctx, claim("merge", mergeDigest), created, created.HeadOID, "squash", authorization); err != nil {
+	mergeClaim := claim("merge", mergeDigest)
+	if err := client.MergeExactHead(ctx, mergeClaim, created, created.HeadOID, "squash", authorization); err != nil {
+		t.Fatalf("guarded merge=%v", err)
+	}
+	intent, found, err := database.MergeIntent(ctx, mergeClaim.SemanticKey)
+	if err != nil || !found || intent.OriginalBaseOID != created.BaseOID || !intent.StrictStatusChecks || intent.ProtectionRuleID == "" || fake.MutationCount("pr_merge") != 1 || !verified {
+		t.Fatalf("strict guarded intent=%+v found=%v err=%v verified=%v merge mutations=%d", intent, found, err, verified, fake.MutationCount("pr_merge"))
+	}
+	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if !verified || fake.MutationCount("pr_merge") != 1 {
-		t.Fatalf("guarded exact-head flow verified=%v merge mutations=%d", verified, fake.MutationCount("pr_merge"))
+	restarted, err := store.Open(ctx, filepath.Join(root, "sf.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	persisted, found, err := restarted.MergeIntent(ctx, mergeClaim.SemanticKey)
+	if err != nil || !found || persisted.OriginalBaseOID != created.BaseOID || persisted.ProtectionRuleID != intent.ProtectionRuleID || !persisted.StrictStatusChecks {
+		t.Fatalf("restart merge intent=%+v found=%v err=%v", persisted, found, err)
 	}
 }
 
@@ -217,7 +241,7 @@ func TestNewClientRejectsMissingAuthoritiesAndLiteralCannotRun(t *testing.T) {
 		return nil, nil
 	}), verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
-	})); err != nil {
+	}), intentRecorderFunc(func(context.Context, domain.MergeIntent) error { return nil }), cleanupQuarantinerFunc(func(context.Context) error { return nil })); err != nil {
 		t.Fatalf("valid client rejected: %v", err)
 	}
 	client := Client{}
@@ -372,7 +396,7 @@ func TestCleanupUncertaintyNeverBecomesMutationSuccess(t *testing.T) {
 	authorization := testAuthorization(created.Identity)
 	client.mutationGuard = uncertainGuard
 	if err := client.MergeExactHead(context.Background(), mergeClaim, created.Identity, created.Identity.HeadOID, "merge", authorization); !errors.Is(err, ErrProcessCleanup) {
-		t.Fatalf("merge cleanup uncertainty=%v", err)
+		t.Fatalf("guarded merge cleanup uncertainty=%v", err)
 	}
 }
 
@@ -387,11 +411,11 @@ func TestCleanupQuarantineIsNotACompletedProof(t *testing.T) {
 
 func TestContradictoryCleanupProofLatchesStoreMutationGate(t *testing.T) {
 	ctx := context.Background()
-	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "sf.sqlite"))
+	databasePath := filepath.Join(t.TempDir(), "sf.sqlite")
+	database, err := store.Open(ctx, databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "cleanup", Ticket: "SF-44"}
 	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "cleanup", Path: t.TempDir(), BaseRef: "main"}); err != nil {
 		t.Fatal(err)
@@ -415,19 +439,25 @@ func TestContradictoryCleanupProofLatchesStoreMutationGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: contradictoryCleanupRunner{}}
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: contradictoryCleanupRunner{}, quarantiner: database}
 	if _, err := database.ExternalMutationGuard().RunExternalMutation(ctx, claimed.ExternalClaim(), func(runCtx context.Context) ([]byte, error) {
 		return client.run(runCtx, "auth", "status", "--json", "hosts")
 	}); !errors.Is(err, ErrProcessCleanup) {
 		t.Fatalf("contradictory cleanup=%v", err)
 	}
-	short, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
-	defer cancel()
-	if _, err := database.ExternalMutationGuard().RunExternalMutation(short, claimed.ExternalClaim(), func(context.Context) ([]byte, error) {
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if _, err := restarted.ExternalMutationGuard().RunExternalMutation(ctx, claimed.ExternalClaim(), func(context.Context) ([]byte, error) {
 		t.Fatal("contradictory cleanup released the mutation gate")
 		return nil, nil
-	}); err == nil {
-		t.Fatal("contradictory cleanup gate was not latched")
+	}); !errors.Is(err, ErrProcessCleanup) {
+		t.Fatalf("contradictory cleanup was not durably latched: %v", err)
 	}
 }
 
@@ -512,12 +542,6 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "1"}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksFailed) {
 		t.Fatalf("strict checks=%v", err)
 	}
-	if _, err := client.mergeRun(context.Background(), pr, pr.Identity.HeadOID, pr.Identity.BaseOID, domain.MergeManual, "merge", nil); !errors.Is(err, ErrPolicyRefusal) {
-		t.Fatalf("manual merge=%v", err)
-	}
-	if _, err := client.mergeRun(context.Background(), pr, pr.Identity.HeadOID, pr.Identity.BaseOID, domain.MergeAutonomous, "merge", nil); !errors.Is(err, ErrPolicyRefusal) {
-		t.Fatalf("autonomous merge=%v", err)
-	}
 	if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +552,7 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	authorization := testAuthorization(pr.Identity)
 	err = client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "squash", authorization)
 	if err != nil {
-		t.Fatalf("guarded merge err=%v", err)
+		t.Fatalf("guarded merge=%v", err)
 	}
 	if err := (ApprovalBinding{ReviewedHead: pr.Identity.HeadOID, CurrentHead: pr.Identity.HeadOID}).Validate(); err != nil {
 		t.Fatal(err)
@@ -762,6 +786,35 @@ func TestMergeCrossBindsBaseAndRefusesMovedBaseDuringGuardedHandoff(t *testing.T
 	})
 }
 
+func TestMergeRequiresStrictServerProtectionWithoutBypass(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		strict bool
+		bypass int
+	}{
+		{name: "non-strict", strict: false},
+		{name: "bypass allowance", strict: true, bypass: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, fake, identity := fixture(t)
+			pr := createDraft(t, client, identity, "title", "body")
+			if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
+				t.Fatal(err)
+			}
+			if err := fake.SetBranchProtectionForTest(test.strict, test.bypass); err != nil {
+				t.Fatal(err)
+			}
+			claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "squash")
+			if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "squash", testAuthorization(pr.Identity)); !errors.Is(err, ErrGuardedMergeUnavailable) {
+				t.Fatalf("protection=%v", err)
+			}
+			if got := fake.MutationCount("pr_merge"); got != 0 {
+				t.Fatalf("unsafe protection launched merge %d times", got)
+			}
+		})
+	}
+}
+
 func TestMergeLostResponseReconcilesFromOriginalBaseWitness(t *testing.T) {
 	client, fake, identity := fixture(t)
 	pr := createDraft(t, client, identity, "title", "body")
@@ -781,117 +834,7 @@ func TestMergeLostResponseReconcilesFromOriginalBaseWitness(t *testing.T) {
 		t.Fatalf("lost-response merge=%v", err)
 	}
 	if original != pr.Identity.BaseOID || fake.MutationCount("pr_merge") != 1 {
-		t.Fatalf("reconciliation original=%q mutations=%d", original, fake.MutationCount("pr_merge"))
-	}
-}
-
-func TestMergeFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
-	cases := []struct {
-		name       string
-		wire       func(contracts.PullRequestIdentity) map[string]any
-		queueAfter bool
-	}{
-		{"closed", func(id contracts.PullRequestIdentity) map[string]any {
-			return mergeWire(id, "CLOSED", "CLEAN", nil, nil)
-		}, false},
-		{"merged", func(id contracts.PullRequestIdentity) map[string]any {
-			return mergeWire(id, "MERGED", "CLEAN", "2026-01-01T00:00:00Z", nil)
-		}, false},
-		{"head-changed", func(id contracts.PullRequestIdentity) map[string]any {
-			id.HeadOID = strings.Repeat("b", 40)
-			return mergeWire(id, "OPEN", "CLEAN", nil, nil)
-		}, false},
-		{"base-changed", func(id contracts.PullRequestIdentity) map[string]any {
-			id.BaseRef = "release"
-			return mergeWire(id, "OPEN", "CLEAN", nil, nil)
-		}, false},
-		{"base-head-changed", func(id contracts.PullRequestIdentity) map[string]any {
-			wire := mergeWire(id, "OPEN", "CLEAN", nil, nil)
-			wire["baseRefOid"] = strings.Repeat("d", 40)
-			return wire
-		}, false},
-		{"auto-merge", func(id contracts.PullRequestIdentity) map[string]any {
-			return mergeWire(id, "OPEN", "CLEAN", nil, map[string]any{"enabledAt": "now"})
-		}, false},
-		{"queue-enrolled", func(id contracts.PullRequestIdentity) map[string]any { return mergeWire(id, "OPEN", "CLEAN", nil, nil) }, true},
-	}
-	for _, test := range cases {
-		t.Run(test.name, func(t *testing.T) {
-			client, _, identity := fixture(t)
-			identity.Number = 1
-			initial, err := json.Marshal(mergeWire(identity, "OPEN", "CLEAN", nil, nil))
-			if err != nil {
-				t.Fatal(err)
-			}
-			changed, err := json.Marshal(test.wire(identity))
-			if err != nil {
-				t.Fatal(err)
-			}
-			queueCalls, mergeCalls := 0, 0
-			client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
-				if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
-					return []byte("[" + string(initial) + "]"), nil
-				}
-				if len(args) >= 2 && args[0] == "pr" && args[1] == "view" {
-					return changed, nil
-				}
-				if len(args) >= 2 && args[0] == "api" {
-					queueCalls++
-					if test.queueAfter && queueCalls >= 2 {
-						return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":{"position":1}}}}}`), nil
-					}
-					return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}`), nil
-				}
-				if len(args) >= 2 && args[0] == "pr" && args[1] == "merge" {
-					mergeCalls++
-				}
-				return []byte("{}"), nil
-			})
-			authorization := testAuthorization(identity)
-			claim := testClaim("merge", identity, identity.HeadOID, "squash")
-			if err := client.MergeExactHead(context.Background(), claim, identity, identity.HeadOID, "squash", authorization); !errors.Is(err, ErrPolicyRefusal) {
-				t.Fatalf("changed %s accepted: %v", test.name, err)
-			}
-			if mergeCalls != 0 {
-				t.Fatalf("changed %s launched merge %d times", test.name, mergeCalls)
-			}
-		})
-	}
-}
-
-func TestMergeNeverTrustsCLIExitWithoutFreshMergedObservation(t *testing.T) {
-	client, _, identity := fixture(t)
-	identity.Number = 1
-	identity.BaseOID = strings.Repeat("c", 40)
-	pr := PRMatch{Identity: identity, State: "OPEN"}
-	for _, test := range []struct {
-		name string
-		wire map[string]any
-	}{
-		{name: "zero-exit-unmerged", wire: mergeWire(identity, "OPEN", "CLEAN", nil, nil)},
-		{name: "auto-or-queued", wire: mergeWire(identity, "OPEN", "QUEUED", nil, map[string]any{"enabledAt": "now"})},
-		{name: "missing-merge-commit", wire: mergeWire(identity, "MERGED", "CLEAN", "2026-01-01T00:00:00Z", nil)},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			payload, err := json.Marshal(test.wire)
-			if err != nil {
-				t.Fatal(err)
-			}
-			client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
-				if len(args) >= 2 && args[0] == "pr" && args[1] == "merge" {
-					return nil, nil // gh may report success for a non-merge operation.
-				}
-				if len(args) >= 2 && args[0] == "pr" && args[1] == "view" {
-					return payload, nil
-				}
-				return nil, errors.New("unexpected gh argv")
-			})
-			if _, err := client.mergeRun(context.Background(), pr, identity.HeadOID, identity.BaseOID, domain.MergeGuarded, "merge", func(args ...string) ([]byte, error) {
-				return client.mutateMergeExact(context.Background(), testClaim("merge", identity, identity.HeadOID, "merge"), identity, identity.HeadOID, testAuthorization(identity), args...)
-			}); !errors.Is(err, ErrPolicyRefusal) {
-				t.Fatalf("merge must reject %s: %v", test.name, err)
-			}
-		})
+		t.Fatalf("lost-response original=%q mutations=%d", original, fake.MutationCount("pr_merge"))
 	}
 }
 
@@ -959,6 +902,9 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 			return nil, nil
 		}
 		if args[0] == "api" {
+			if strings.Contains(strings.Join(args, "\x00"), "branchProtectionRules") {
+				return []byte(`{"data":{"repository":{"branchProtectionRules":{"nodes":[{"id":"rule-main","pattern":"main","requiresStrictStatusChecks":true,"bypassPullRequestAllowances":{"totalCount":0}}]}}}}`), nil
+			}
 			if len(args) == 2 && args[1] == "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random" {
 				return []byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`), nil
 			}
@@ -973,7 +919,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		}
 		if args[0] == "pr" && args[1] == "view" {
 			viewCalls++
-			if viewCalls < 3 {
+			if viewCalls < 2 {
 				open := mergeWire(identity, "OPEN", "CLEAN", nil, nil)
 				return json.Marshal(open)
 			}
@@ -982,16 +928,19 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		return nil, errors.New("unexpected command")
 	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		return start(ctx)
-	}), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
+	}), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, mergeIntents: intentRecorderFunc(func(context.Context, domain.MergeIntent) error { return nil }), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
 		verified = repository == identity.Repository && baseRef == "main" && mergeCommit == strings.Repeat("b", 40)
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
 	})}
 	claim := testClaim("merge", identity, identity.HeadOID, "squash")
 	authorization := testAuthorization(identity)
 	if err := client.MergeExactHead(context.Background(), claim, identity, identity.HeadOID, "squash", authorization); err != nil || !verified {
-		t.Fatalf("proven merge verified=%v err=%v", verified, err)
+		t.Fatalf("guarded merge verified=%v err=%v", verified, err)
 	}
-	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random"}, {"api", "repos/example/app/git/ref/heads/main"}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random"}, {"api", "repos/example/app/git/ref/heads/main"}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}}
+	queue := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}
+	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern requiresStrictStatusChecks bypassPullRequestAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app"}
+	view := []string{"pr", "view", "7", "--repo", "example/app", "--json", prFields}
+	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, queue, protection, view, queue, protection, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, view}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("official merge argv\n got: %#v\nwant: %#v", got, want)
 	}

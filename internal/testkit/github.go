@@ -57,13 +57,15 @@ type FakeGHState struct {
 	// BaseHeadOID is the independently observable protected ref tip. Keeping
 	// it durable lets boundary tests move main between observations without
 	// pretending a PR's historical baseRefOid is the live protected ref.
-	BaseHeadOID     string                            `json:"base_head_oid"`
-	NextPR          int                               `json:"next_pr"`
-	PRs             []PullRequest                     `json:"prs"`
-	Checks          map[int][]contracts.RequiredCheck `json:"checks"`
-	ResponseScripts map[string][]ResponseMode         `json:"response_scripts,omitempty"`
-	Mutations       []Mutation                        `json:"mutations"`
-	Deliveries      []string                          `json:"deliveries"`
+	BaseHeadOID                 string                            `json:"base_head_oid"`
+	StrictStatusChecks          bool                              `json:"strict_status_checks"`
+	BypassPullRequestAllowances int                               `json:"bypass_pull_request_allowances"`
+	NextPR                      int                               `json:"next_pr"`
+	PRs                         []PullRequest                     `json:"prs"`
+	Checks                      map[int][]contracts.RequiredCheck `json:"checks"`
+	ResponseScripts             map[string][]ResponseMode         `json:"response_scripts,omitempty"`
+	Mutations                   []Mutation                        `json:"mutations"`
+	Deliveries                  []string                          `json:"deliveries"`
 }
 
 const (
@@ -77,12 +79,13 @@ func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, e
 		return nil, errors.New("testkit: fake-gh state path is required")
 	}
 	state := FakeGHState{
-		Schema:          "sf.testkit.fake-gh/v1",
-		Repository:      repository,
-		BaseHeadOID:     strings.Repeat("c", 40),
-		NextPR:          1,
-		Checks:          make(map[int][]contracts.RequiredCheck),
-		ResponseScripts: make(map[string][]ResponseMode),
+		Schema:             "sf.testkit.fake-gh/v1",
+		Repository:         repository,
+		BaseHeadOID:        strings.Repeat("c", 40),
+		StrictStatusChecks: true,
+		NextPR:             1,
+		Checks:             make(map[int][]contracts.RequiredCheck),
+		ResponseScripts:    make(map[string][]ResponseMode),
 	}
 	f := &FakeGH{path: path}
 	if err := f.initialize(state); err != nil {
@@ -100,6 +103,17 @@ func (f *FakeGH) SetBaseHeadOIDForTest(oid string) error {
 	}
 	return f.withState(func() (bool, error) {
 		f.state.BaseHeadOID = oid
+		return true, nil
+	})
+}
+
+func (f *FakeGH) SetBranchProtectionForTest(strict bool, bypassAllowances int) error {
+	if bypassAllowances < 0 {
+		return errors.New("testkit: bypass allowance count cannot be negative")
+	}
+	return f.withState(func() (bool, error) {
+		f.state.StrictStatusChecks = strict
+		f.state.BypassPullRequestAllowances = bypassAllowances
 		return true, nil
 	})
 }
@@ -385,6 +399,9 @@ func (f *FakeGH) mergeUnchecked(identity contracts.PullRequestIdentity, headOID,
 		if f.state.PRs[index].Draft {
 			return false, errors.New("fake-gh: draft pull request cannot merge")
 		}
+		if !f.state.StrictStatusChecks || f.state.BypassPullRequestAllowances != 0 {
+			return false, errors.New("fake-gh: strict protected-base enforcement is required")
+		}
 		if method != "merge" && method != "squash" && method != "rebase" {
 			return false, errors.New("fake-gh: unsupported merge method")
 		}
@@ -399,6 +416,10 @@ func (f *FakeGH) mergeUnchecked(identity contracts.PullRequestIdentity, headOID,
 		// it distinct from the reviewed head so the boundary cannot mistake a
 		// head OID for protected-branch evidence.
 		f.state.PRs[index].MergeCommit = strings.Repeat("b", 40)
+		// The protected ref advances to the merge result. PR baseRefOid remains
+		// the original PR witness, so reconciliation must not compare it to this
+		// live post-merge tip.
+		f.state.BaseHeadOID = f.state.PRs[index].MergeCommit
 		f.recordMutationLocked("pr_merge", identity)
 		return true, f.finishErrorLocked("pr_merge")
 	})
@@ -710,6 +731,10 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 		return f.runRepoView(argv)
 	}
 	if len(argv) >= 2 && argv[0] == "api" && argv[1] == "--hostname" {
+		if strings.Contains(graphqlQuery(argv), "branchProtectionRules") {
+			snapshot := f.Snapshot()
+			return json.Marshal(map[string]any{"data": map[string]any{"repository": map[string]any{"branchProtectionRules": map[string]any{"nodes": []map[string]any{{"id": "fake-rule-main", "pattern": "main", "requiresStrictStatusChecks": snapshot.StrictStatusChecks, "bypassPullRequestAllowances": map[string]int{"totalCount": snapshot.BypassPullRequestAllowances}}}}}}})
+		}
 		return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}`), nil
 	}
 	if len(argv) >= 2 && argv[0] == "api" && strings.HasPrefix(argv[1], "repos/") {
@@ -898,7 +923,7 @@ func (f *FakeGH) runList(argv []string) ([]byte, error) {
 			if repo := option(argv, "--repo"); repo != "" && repo != pr.Identity.Repository.Owner+"/"+pr.Identity.Repository.Name {
 				continue
 			}
-			results = append(results, prJSON(pr))
+			results = append(results, prJSON(pr, f.state.BaseHeadOID))
 		}
 		return false, nil
 	})
@@ -915,6 +940,15 @@ func option(argv []string, name string) string {
 		}
 		if strings.HasPrefix(arg, name+"=") {
 			return strings.TrimPrefix(arg, name+"=")
+		}
+	}
+	return ""
+}
+
+func graphqlQuery(argv []string) string {
+	for _, value := range argv {
+		if strings.HasPrefix(value, "query=") {
+			return strings.TrimPrefix(value, "query=")
 		}
 	}
 	return ""
@@ -1012,6 +1046,7 @@ func (f *FakeGH) runView(argv []string) ([]byte, error) {
 	number := prNumber(argv)
 	identity := identityFromArgs(argv, number)
 	var pr PullRequest
+	var baseHeadOID string
 	err := f.withState(func() (bool, error) {
 		if number > 0 && identity.HeadRef == "" {
 			if err := f.requireAuthLocked(); err != nil {
@@ -1020,6 +1055,7 @@ func (f *FakeGH) runView(argv []string) ([]byte, error) {
 			for _, candidate := range f.state.PRs {
 				if candidate.Identity.Number == number && sameRepository(candidate.Identity.Repository, identity.Repository) {
 					pr = candidate
+					baseHeadOID = f.state.BaseHeadOID
 					return false, nil
 				}
 			}
@@ -1030,12 +1066,13 @@ func (f *FakeGH) runView(argv []string) ([]byte, error) {
 			return false, err
 		}
 		pr = f.state.PRs[index]
+		baseHeadOID = f.state.BaseHeadOID
 		return false, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(prJSON(pr))
+	return json.Marshal(prJSON(pr, baseHeadOID))
 }
 
 func (f *FakeGH) runEdit(argv []string) ([]byte, error) {
@@ -1115,7 +1152,7 @@ func mergeMethod(argv []string) string {
 	return ""
 }
 
-func prJSON(pr PullRequest) map[string]any {
+func prJSON(pr PullRequest, baseHeadOID string) map[string]any {
 	identity, draft, merged := pr.Identity, pr.Draft, pr.Merged
 	body := pr.Body
 	if body == "" {
@@ -1128,7 +1165,7 @@ func prJSON(pr PullRequest) map[string]any {
 		"headRefName":         identity.HeadRef,
 		"headRefOid":          identity.HeadOID,
 		"baseRefName":         identity.BaseRef,
-		"baseRefOid":          pr.Identity.BaseOID,
+		"baseRefOid":          baseHeadOID,
 		"isDraft":             draft,
 		"title":               pr.Title,
 		"body":                body,

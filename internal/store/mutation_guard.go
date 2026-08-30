@@ -53,6 +53,9 @@ func (g *ExternalMutationGate) RunExternalMutation(ctx context.Context, claim do
 			g.unlock()
 		}
 	}()
+	if quarantined, err := g.store.externalMutationsQuarantined(ctx); err != nil || quarantined {
+		return nil, contracts.ErrExternalCleanupUncertain
+	}
 	if revoked, ok := g.revoked[claim.Ref]; ok && claim.TicketVersion <= revoked.version && claim.LeaderEpoch <= revoked.leader && claim.RunnerEpoch <= revoked.runner {
 		return nil, ErrStaleFence
 	}
