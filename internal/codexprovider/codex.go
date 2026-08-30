@@ -42,6 +42,7 @@ const (
 var (
 	ErrUnavailable         = errors.New("codex executable is unavailable")
 	ErrUnauthenticated     = errors.New("codex authentication is unavailable")
+	ErrUnsupportedAuthMode = errors.New("codex authentication mode is not the supported ChatGPT subscription")
 	ErrCapability          = errors.New("codex executable lacks required exec capabilities")
 	ErrMalformedJSONL      = errors.New("codex JSONL output is malformed")
 	ErrNoFinalArtifact     = errors.New("codex did not return a final structured artifact")
@@ -108,10 +109,9 @@ type QualificationAttestor interface {
 	AttestQualification(contracts.QualificationAttestation) (contracts.QualificationAttestation, error)
 }
 
-// LocalQualificationFixture runs the bounded, credential-free qualification
-// probes owned by this adapter.  It never invokes `codex exec`, and therefore
-// never spends model tokens.  The caller still chooses the channel and stores
-// the resulting verdict durably through Qualify.
+// LocalQualificationFixture runs bounded, credential-free local probes. It
+// includes Codex's own configuration parser but never supplies an exec prompt,
+// so qualification cannot spend model tokens.
 func LocalQualificationFixture() QualificationFixture { return localQualificationFixture{} }
 
 type localQualificationFixture struct{}
@@ -135,18 +135,24 @@ func (localQualificationFixture) Run(ctx context.Context, adapter *Adapter) ([]s
 		}
 		return nil
 	}
+	// Verify the current CLI accepts the guarded `exec` configuration without
+	// running a model. This closes the historical false-green where `--profile`
+	// selected a config file instead of the custom permission profile.
+	if err := probe("exec_config_parse", append([]string{"exec", "--help"}, guardedConfig("read-only", "read")...), probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode == 0 }); err != nil {
+		return []string{"exec_config_parse"}, nil
+	}
 	// `codex sandbox` is a local command runner, not `codex exec`; no model is
 	// selected and stdin is not supplied. Read-only and workspace-write are
 	// measured independently so a profile accidentally widening access fails.
-	readOnly := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":read-only"`, "-c", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="read"}`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/bin/sh", "-c", "test -r /etc/hosts && ! test -w /etc/hosts"}
+	readOnly := append(append([]string{"sandbox", "--permission-profile", "sf-guarded"}, guardedConfig("read-only", "read")...), "--", "/bin/sh", "-c", "test -r /etc/hosts && ! test -w /etc/hosts")
 	if err := probe("sandbox_read", readOnly, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode == 0 }); err != nil {
 		return []string{"sandbox_read"}, nil
 	}
-	writeDenied := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":read-only"`, "-c", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="read"}`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/bin/sh", "-c", "test -w /etc/hosts"}
+	writeDenied := append(append([]string{"sandbox", "--permission-profile", "sf-guarded"}, guardedConfig("read-only", "read")...), "--", "/bin/sh", "-c", "test -w /etc/hosts")
 	if err := probe("sandbox_write_denied", writeDenied, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode != 0 }); err != nil {
 		return []string{"sandbox_write_denied"}, nil
 	}
-	workspace := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":workspace"`, "-c", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="write"}`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/bin/sh", "-c", "test -w ."}
+	workspace := append(append([]string{"sandbox", "--permission-profile", "sf-guarded"}, guardedConfig("workspace", "write")...), "--", "/bin/sh", "-c", "test -w .")
 	if err := probe("sandbox_workspace_write", workspace, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode == 0 }); err != nil {
 		return []string{"sandbox_workspace_write"}, nil
 	}
@@ -162,15 +168,15 @@ func (localQualificationFixture) Run(ctx context.Context, adapter *Adapter) ([]s
 			_ = connection.Close()
 		}
 	}()
-	loopback := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":read-only"`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/usr/bin/curl", "-fsS", "--connect-timeout", "1", "http://" + listener.Addr().String()}
+	loopback := append(append([]string{"sandbox", "--permission-profile", "sf-guarded"}, guardedConfig("read-only", "read")...), "--", "/usr/bin/curl", "-fsS", "--connect-timeout", "1", "http://"+listener.Addr().String())
 	if err := probe("network_loopback", loopback, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode != 0 }); err != nil {
 		return []string{"network_loopback"}, nil
 	}
-	external := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":read-only"`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/usr/bin/curl", "-fsS", "--connect-timeout", "1", "http://198.51.100.1:9"}
+	external := append(append([]string{"sandbox", "--permission-profile", "sf-guarded"}, guardedConfig("read-only", "read")...), "--", "/usr/bin/curl", "-fsS", "--connect-timeout", "1", "http://198.51.100.1:9")
 	if err := probe("network_external", external, probeEnvironment(), func(result auth.ProbeResult) bool { return result.ExitCode != 0 }); err != nil {
 		return []string{"network_external"}, nil
 	}
-	credential := []string{"sandbox", "--permission-profile", "sf-guarded", "-c", `permissions.sf-guarded.extends=":read-only"`, "-c", `permissions.sf-guarded.network.enabled=false`, "--", "/bin/sh", "-c", `test -r "$CODEX_HOME/auth.json"`}
+	credential := append(append([]string{"sandbox", "--permission-profile", "sf-guarded"}, guardedConfig("read-only", "read")...), "--", "/bin/sh", "-c", `test -r "$CODEX_HOME/auth.json"`)
 	if err := probe("credential_isolation", credential, append(probeEnvironment(), "CODEX_HOME="+adapter.authHome), func(result auth.ProbeResult) bool { return result.ExitCode != 0 }); err != nil {
 		return []string{"credential_isolation"}, nil
 	}
@@ -203,20 +209,27 @@ func Qualify(ctx context.Context, database *store.Store, channel domain.Channel,
 	}
 	profile, reason := store.QualificationGuarded, ""
 	if len(failed) != 0 {
-		profile, reason = store.QualificationDisabled, "hostile_fixture_failed"
+		profile, reason = store.QualificationDisabled, "hostile_fixture_"+failed[0]
 	}
 	runID, err := qualificationRunID()
 	if err != nil {
 		return store.ProviderQualification{}, err
 	}
 	created := time.Now().UTC()
-	value := store.ProviderQualification{Channel: channel, RunID: runID, Provider: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, Profile: profile, FailedProbes: failed, ReasonCode: reason, CreatedAt: created}
+	value := store.ProviderQualification{Channel: channel, RunID: runID, Provider: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, AuthDigest: binding.AuthDigest, AuthMode: binding.AuthMode, Profile: profile, FailedProbes: failed, ReasonCode: reason, CreatedAt: created}
 	if profile == store.QualificationDisabled {
+		// A failed fixture is useful audit evidence but must not carry an
+		// admission attestation or auth-mode claim into a disabled record.
+		value.AuthDigest, value.AuthMode = "", ""
 		qualification, _, recordErr := database.RecordProviderQualification(ctx, value)
 		return qualification, recordErr
 	}
+	leader, leaderErr := database.LeaderEpoch(ctx, channel)
+	if leaderErr != nil {
+		return store.ProviderQualification{}, leaderErr
+	}
 	probeDigest := qualificationProbeDigest(binding, failed)
-	attestation, attestErr := attestor.AttestQualification(contracts.QualificationAttestation{Channel: channel, RunID: runID, Identity: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, AuthDigest: binding.AuthDigest, ProbeDigest: probeDigest, Profile: contracts.ProfileGuarded, CreatedUnixNanos: created.UnixNano(), Nonce: runID})
+	attestation, attestErr := attestor.AttestQualification(contracts.QualificationAttestation{Channel: channel, RunID: runID, Identity: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, AuthDigest: binding.AuthDigest, AuthMode: binding.AuthMode, ProbeDigest: probeDigest, Profile: contracts.ProfileGuarded, CreatedUnixNanos: created.UnixNano(), LeaderEpoch: leader, Nonce: runID})
 	if attestErr != nil {
 		return store.ProviderQualification{}, attestErr
 	}
@@ -281,9 +294,8 @@ func (a *Adapter) Probe(ctx context.Context) (domain.ProviderIdentity, error) {
 	if err := a.capabilities(ctx); err != nil {
 		return domain.ProviderIdentity{}, err
 	}
-	result, err := a.runner.Probe(ctx, a.executable, []string{"login", "status"}, a.authEnvironment(), 0)
-	if err != nil || result.ExitCode != 0 {
-		return domain.ProviderIdentity{}, ErrUnauthenticated
+	if _, err := a.authMode(ctx); err != nil {
+		return domain.ProviderIdentity{}, err
 	}
 	return domain.ProviderIdentity{Provider: "codex", Model: a.model, Family: a.family, Version: version}, nil
 }
@@ -307,36 +319,16 @@ func (a *Adapter) Binding(ctx context.Context) (contracts.RuntimeBinding, error)
 		PolicyDigest:  policyDigest(),
 		FixtureDigest: fixtureDigest(),
 		AuthDigest:    auth,
+		AuthMode:      authModeChatGPTSubscription,
 	}, nil
 }
 
-// qualificationBinding deliberately omits `login status`: qualification must
-// never read a credential or make a provider/model request. Runtime admission
-// re-probes authentication separately immediately before paid work.
 func (a *Adapter) qualificationBinding(ctx context.Context) (contracts.RuntimeBinding, error) {
-	if a == nil || a.runner == nil {
-		return contracts.RuntimeBinding{}, ErrUnavailable
-	}
-	version, err := a.version(ctx)
-	if err != nil {
-		return contracts.RuntimeBinding{}, err
-	}
-	if err := a.capabilities(ctx); err != nil {
-		return contracts.RuntimeBinding{}, err
-	}
-	binary, err := digestFile(a.executable)
-	if err != nil {
-		return contracts.RuntimeBinding{}, err
-	}
-	auth, err := authDigest(a.authHome)
-	if err != nil {
-		return contracts.RuntimeBinding{}, err
-	}
-	return contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: a.model, Family: a.family, Version: version}, BinaryDigest: binary, PolicyDigest: policyDigest(), FixtureDigest: fixtureDigest(), AuthDigest: auth}, nil
+	return a.Binding(ctx)
 }
 
 func (a *Adapter) Invocation(_ context.Context, input contracts.PhaseInput) (contracts.Invocation, error) {
-	if a == nil || input.Provider.Provider != "codex" || input.Provider.Model != a.model || input.Provider.Family != a.family || input.Provider.Version == "" {
+	if a == nil || input.Provider.Provider != "codex" || input.Provider.Model != a.model || input.Provider.Family != a.family || input.Provider.Version == "" || input.AuthMode != authModeChatGPTSubscription {
 		return contracts.Invocation{}, errors.New("Codex provider identity does not match the runtime binding")
 	}
 	if input.Worktree == "" || !filepath.IsAbs(input.Worktree) || filepath.Clean(input.Worktree) != input.Worktree || input.Worktree == "/" {
@@ -363,7 +355,13 @@ func (a *Adapter) Invocation(_ context.Context, input contracts.PhaseInput) (con
 }
 
 func codexArgv(executable, model, worktree, parent, workspaceAccess string) []string {
-	return []string{executable, "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules", "--profile", "sf-guarded", "--config", `permissions.sf-guarded.extends=":` + parent + `"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="` + workspaceAccess + `"}`, "--config", `permissions.sf-guarded.network.enabled=false`, "--model", model, "-C", worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-"}
+	argv := []string{executable, "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules"}
+	argv = append(argv, guardedConfig(parent, workspaceAccess)...)
+	return append(argv, "--model", model, "-C", worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-")
+}
+
+func guardedConfig(parent, workspaceAccess string) []string {
+	return []string{"--config", `default_permissions="sf-guarded"`, "--config", `permissions.sf-guarded.extends=":` + parent + `"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="` + workspaceAccess + `"}`, "--config", `permissions.sf-guarded.network.enabled=false`}
 }
 
 func permissionProfileForPhase(phase domain.Phase) (string, string, bool) {
@@ -395,10 +393,28 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	if len(artifact) == 0 || !json.Valid(artifact) || len(artifact) > 1<<20 {
 		return contracts.PhaseResult{}, ErrNoFinalArtifact
 	}
-	// Codex reports token counts, not an authoritative monetary charge. Keep
-	// them observable but leave the micro-USD charge untrusted until a
-	// snapshotted pricing/reservation policy exists.
-	return contracts.PhaseResult{Outcome: "completed", Artifact: artifact, Transcript: transcript, Provider: input.Provider, TokenUsageTrusted: usageTrusted, TokenUsage: usage, TokenInputTokens: usageDetail.input, TokenCachedTokens: usageDetail.cached, TokenOutputTokens: usageDetail.output, TokenReasoningTokens: usageDetail.reasoning}, nil
+	if input.AuthMode != authModeChatGPTSubscription {
+		return contracts.PhaseResult{}, ErrUnsupportedAuthMode
+	}
+	// This route has been admitted only for the exact ChatGPT subscription
+	// status. Its incremental API charge is therefore known to be zero; token
+	// counters remain observability only and never become monetary usage.
+	return contracts.PhaseResult{Outcome: "completed", Artifact: artifact, Transcript: transcript, Provider: input.Provider, UsageTrusted: true, UsageUnits: 0, TokenUsageTrusted: usageTrusted, TokenUsage: usage, TokenInputTokens: usageDetail.input, TokenCachedTokens: usageDetail.cached, TokenOutputTokens: usageDetail.output, TokenReasoningTokens: usageDetail.reasoning}, nil
+}
+
+const authModeChatGPTSubscription = "chatgpt_subscription"
+
+func (a *Adapter) authMode(ctx context.Context) (string, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	result, err := a.runner.Probe(probeCtx, a.executable, []string{"login", "status"}, a.authEnvironment(), maxProbeOutput)
+	if err != nil || result.ExitCode != 0 || len(result.Output) == 0 || len(result.Output) > maxProbeOutput {
+		return "", ErrUnauthenticated
+	}
+	if strings.TrimSpace(string(result.Output)) != "Logged in using ChatGPT" {
+		return "", ErrUnsupportedAuthMode
+	}
+	return authModeChatGPTSubscription, nil
 }
 
 func (a *Adapter) version(ctx context.Context) (string, error) {
@@ -423,7 +439,7 @@ func (a *Adapter) capabilities(ctx context.Context) error {
 		return ErrCapability
 	}
 	output := string(result.Output)
-	for _, required := range []string{"--json", "--output-schema", "--output-last-message", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--profile", "--config", "--model", "-C"} {
+	for _, required := range []string{"--json", "--output-schema", "--output-last-message", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--config", "--model", "-C"} {
 		if !strings.Contains(output, required) {
 			return ErrCapability
 		}
@@ -551,7 +567,7 @@ func sameFileIdentity(left, right os.FileInfo) bool {
 func qualificationProbeDigest(binding contracts.RuntimeBinding, failed []string) string {
 	values := append([]string(nil), failed...)
 	sort.Strings(values)
-	sum := sha256.Sum256([]byte("codex-qualification-probes/v2\x00" + binding.BinaryDigest + "\x00" + binding.PolicyDigest + "\x00" + binding.FixtureDigest + "\x00" + binding.AuthDigest + "\x00" + strings.Join(values, "\x00")))
+	sum := sha256.Sum256([]byte("codex-qualification-probes/v3\x00" + binding.BinaryDigest + "\x00" + binding.PolicyDigest + "\x00" + binding.FixtureDigest + "\x00" + binding.AuthDigest + "\x00" + binding.AuthMode + "\x00" + strings.Join(values, "\x00")))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -578,6 +594,13 @@ func (r outerQualificationRunner) Probe(ctx context.Context, executable string, 
 	if r.base == nil || r.profile == "" {
 		return auth.ProbeResult{}, ErrUnsafeConfiguration
 	}
+	// Codex itself must read its private auth metadata to answer its documented
+	// local status command. Keep that one bounded, exact probe outside the
+	// hostile-fixture Seatbelt; every fixture command remains wrapped and never
+	// receives CODEX_HOME.
+	if len(arguments) == 2 && arguments[0] == "login" && arguments[1] == "status" {
+		return r.base.Probe(ctx, executable, arguments, environment, limit)
+	}
 	args := append([]string{"-p", r.profile, executable}, arguments...)
 	return r.base.Probe(ctx, "/usr/bin/sandbox-exec", args, environment, limit)
 }
@@ -603,7 +626,7 @@ func qualificationRunID() (string, error) {
 
 func normalizeProbes(values []string) ([]string, error) {
 	known := map[string]struct{}{
-		"configuration": {}, "sandbox_read": {}, "sandbox_write_denied": {}, "sandbox_workspace_write": {}, "network_loopback": {}, "network_external": {}, "credential_isolation": {},
+		"configuration": {}, "exec_config_parse": {}, "sandbox_read": {}, "sandbox_write_denied": {}, "sandbox_workspace_write": {}, "network_loopback": {}, "network_external": {}, "credential_isolation": {},
 		"version": {}, "capabilities": {}, "authentication": {}, "fixture_execution": {},
 		"binary": {}, "network": {}, "root_denied": {}, "auth_denied": {}, "argv": {}, "jsonl": {},
 	}

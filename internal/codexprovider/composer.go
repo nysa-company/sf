@@ -3,6 +3,7 @@ package codexprovider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,7 +60,7 @@ func QualifyLocalPair(ctx context.Context, database *store.Store, channel domain
 	}
 	result := QualificationResult{Channel: channel, Builder: builder, Reviewer: reviewer, ModelCallMade: false}
 	if builder.Profile != store.QualificationGuarded || reviewer.Profile != store.QualificationGuarded || builder.Provider.Family == reviewer.Provider.Family {
-		return result, ErrUnsafeConfiguration
+		return result, fmt.Errorf("unsafe qualification failed: builder=%s reviewer=%s", builder.ReasonCode, reviewer.ReasonCode)
 	}
 	if _, _, err := database.SelectProviderPair(ctx, channel, builder.ID, reviewer.ID, time.Now().UTC()); err != nil {
 		return result, err
@@ -129,7 +130,7 @@ func ComposeProfiles(ctx context.Context, channel domain.Channel, database *stor
 
 func qualificationMatches(database *store.Store, ctx context.Context, channel domain.Channel, binding contracts.RuntimeBinding) bool {
 	qualification, err := database.LatestProviderQualification(ctx, channel, binding.Identity)
-	return err == nil && qualification.Profile == store.QualificationGuarded && qualification.BinaryDigest == binding.BinaryDigest && qualification.PolicyDigest == binding.PolicyDigest && qualification.FixtureDigest == binding.FixtureDigest && qualification.AuthDigest == binding.AuthDigest && qualification.ProbeDigest != "" && qualification.AttestedLeaderEpoch > 0 && len(qualification.AttestationSignature) == 64
+	return err == nil && qualification.Profile == store.QualificationGuarded && qualification.BinaryDigest == binding.BinaryDigest && qualification.PolicyDigest == binding.PolicyDigest && qualification.FixtureDigest == binding.FixtureDigest && qualification.AuthDigest == binding.AuthDigest && qualification.AuthMode == binding.AuthMode && qualification.ProbeDigest != "" && qualification.AttestedLeaderEpoch > 0 && len(qualification.AttestationSignature) == 64 && database.QualificationCurrent(ctx, channel, qualification)
 }
 
 func defaultProfiles() []Config {

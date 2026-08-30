@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +25,7 @@ import (
 
 type fakeProbe struct {
 	version, help []byte
+	login         []byte
 	loginExit     int
 	err           error
 	calls         [][]string
@@ -42,7 +45,7 @@ func (f *fakeProbe) Probe(ctx context.Context, _ string, arguments, _ []string, 
 	case "exec --help":
 		return auth.ProbeResult{Output: append([]byte(nil), f.help...)}, nil
 	case "login status":
-		return auth.ProbeResult{ExitCode: f.loginExit}, nil
+		return auth.ProbeResult{ExitCode: f.loginExit, Output: append([]byte(nil), f.login...)}, nil
 	default:
 		return auth.ProbeResult{}, errors.New("unexpected probe")
 	}
@@ -66,7 +69,7 @@ func TestCodexInvocationUsesBoundedStdinAndPinnedSchema(t *testing.T) {
 		t.Fatalf("identity=%+v err=%v", identity, err)
 	}
 	worktree := privateDir(t, "worktree")
-	input := contracts.PhaseInput{Provider: identity, Phase: domain.PhasePlanning, Worktree: worktree, Prompt: "untrusted ticket; $(not-shell)", Schema: []byte(`{"type":"object"}`)}
+	input := contracts.PhaseInput{Provider: identity, AuthMode: authModeChatGPTSubscription, Phase: domain.PhasePlanning, Worktree: worktree, Prompt: "untrusted ticket; $(not-shell)", Schema: []byte(`{"type":"object"}`)}
 	invocation, err := adapter.Invocation(context.Background(), input)
 	if err != nil {
 		t.Fatal(err)
@@ -89,13 +92,39 @@ func TestCodexInvocationUsesBoundedStdinAndPinnedSchema(t *testing.T) {
 	}
 }
 
+// TestInstalledCodexExecGuardedConfigParsesWithoutModel exercises the real
+// local CLI parser only. `exec --help` accepts no prompt/stdin and cannot make
+// a model request; this catches config-key drift such as using --profile for a
+// permission profile before a paid invocation is ever admitted.
+func TestInstalledCodexExecGuardedConfigParsesWithoutModel(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("the trusted local v1 qualification target is macOS")
+	}
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("Codex CLI is not installed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	args := append([]string{"exec", "--help"}, guardedConfig("read-only", "read")...)
+	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "HOME=/tmp"}
+	output, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		if len(output) > 1024 {
+			output = output[:1024]
+		}
+		t.Fatalf("guarded Codex exec configuration did not parse (no model call): %v: %s", runErr, output)
+	}
+}
+
 func TestCodexParseRejectsMalformedOversizedAndNonzeroOutput(t *testing.T) {
 	adapter, _ := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
 	identity, _ := adapter.Probe(context.Background())
-	input := contracts.PhaseInput{Provider: identity}
+	input := contracts.PhaseInput{Provider: identity, AuthMode: authModeChatGPTSubscription}
 	valid := []byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"intermediate\"},\"future\":true}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"final is in output-last-message\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"cached_input_tokens\":3,\"output_tokens\":8,\"reasoning_tokens\":5,\"total_tokens\":23}}\n")
 	result, err := adapter.Parse(context.Background(), input, contracts.CommandResult{ExitCode: 0, Stdout: valid, OutputLastMessage: []byte(`{"schema":"sf.builder/v1"}`), Stderr: []byte("progress password=keep-out")})
-	if err != nil || string(result.Artifact) != `{"schema":"sf.builder/v1"}` || result.UsageTrusted || result.UsageUnits != 0 || !result.TokenUsageTrusted || result.TokenUsage != 23 || result.TokenInputTokens != 12 || result.TokenCachedTokens != 3 || result.TokenOutputTokens != 8 || result.TokenReasoningTokens != 5 || strings.Contains(result.Transcript, "keep-out") {
+	if err != nil || string(result.Artifact) != `{"schema":"sf.builder/v1"}` || !result.UsageTrusted || result.UsageUnits != 0 || !result.TokenUsageTrusted || result.TokenUsage != 23 || result.TokenInputTokens != 12 || result.TokenCachedTokens != 3 || result.TokenOutputTokens != 8 || result.TokenReasoningTokens != 5 || strings.Contains(result.Transcript, "keep-out") {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	for _, command := range []contracts.CommandResult{
@@ -128,12 +157,46 @@ func TestCodexProbeFailsClosedForCapabilityAuthAndVersion(t *testing.T) {
 		t.Fatalf("auth err=%v", err)
 	}
 	probe.loginExit = 0
+	probe.login = []byte("Logged in using an API key\n")
+	if _, err := adapter.Probe(context.Background()); !errors.Is(err, ErrUnsupportedAuthMode) {
+		t.Fatalf("metered auth mode err=%v", err)
+	}
+	probe.login = []byte("Logged in using ChatGPT\n")
 	probe.version = []byte("Codex development build\n")
 	if _, err := adapter.Probe(context.Background()); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("version err=%v", err)
 	}
 	if _, err := New(Config{Executable: filepath.Join(t.TempDir(), "missing"), AuthHome: privateDir(t, "auth")}); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("missing executable err=%v", err)
+	}
+}
+
+func TestCodexQualificationExpiresWhenDaemonLeaderRestarts(t *testing.T) {
+	ctx := context.Background()
+	adapter, _ := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "sf.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	attestor := qualificationAttestor(t, database, domain.ChannelDev)
+	if _, err := Qualify(ctx, database, domain.ChannelDev, adapter, fixture{}, attestor); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := adapter.Binding(ctx)
+	if err != nil || !qualificationMatches(database, ctx, domain.ChannelDev, binding) {
+		t.Fatalf("fresh qualification did not match: binding=%+v err=%v", binding, err)
+	}
+	restarted, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "qualification-restart")
+	if err != nil || database.SetRecoveryAuthority(ctx, domain.ChannelDev, leader, restarted.PublicKey()) != nil {
+		t.Fatalf("restart recovery authority: leader=%d err=%v", leader, err)
+	}
+	if qualificationMatches(database, ctx, domain.ChannelDev, binding) {
+		t.Fatal("a qualification signed by the previous daemon leader was admitted after restart")
 	}
 }
 
@@ -371,7 +434,7 @@ func (s *jsonSupervisor) Drain(_ context.Context, request contracts.DrainRequest
 func (s *jsonSupervisor) SetLaunchRecorder(func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error) {
 }
 
-func TestCodexJSONLPhaseFailsClosedWithoutMonetaryReservation(t *testing.T) {
+func TestCodexJSONLSubscriptionPhaseReportsTrustedZeroIncrementalUsage(t *testing.T) {
 	ctx := context.Background()
 	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "sf.sqlite"))
 	if err != nil {
@@ -425,7 +488,7 @@ func TestCodexJSONLPhaseFailsClosedWithoutMonetaryReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := coordinator.Run(ctx, providercoord.Request{Role: providercoord.RolePlanner, ExpectedVersion: ticketValue.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticketValue.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "plan", Repository: project.Path, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}})
-	if result.Code != providercoord.NeedsOperator || result.CostUsed != 0 || len(result.Attempts) != 1 || result.Attempts[0].UsageUnits != 0 || result.Attempts[0].TokenUsage != 7 {
+	if result.Code != providercoord.Completed || result.CostUsed != 0 || len(result.Attempts) != 1 || result.Attempts[0].UsageUnits != 0 || result.Attempts[0].TokenUsage != 7 {
 		current, _ := database.Ticket(ctx, ref)
 		attempts, _ := database.ProviderAttempts(ctx, ref)
 		t.Fatalf("result=%+v ticket=%+v attempts=%+v", result, current, attempts)
@@ -439,7 +502,7 @@ func adapterFixture(t *testing.T, route, model string) (*Adapter, *fakeProbe) {
 	if err := os.WriteFile(executable, []byte("fixture-codex"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	probe := &fakeProbe{version: []byte("codex 1.2.3\n"), help: requiredHelp(), loginExit: 0}
+	probe := &fakeProbe{version: []byte("codex 1.2.3\n"), help: requiredHelp(), login: []byte("Logged in using ChatGPT\n"), loginExit: 0}
 	authHome := privateDir(t, "auth")
 	if err := os.WriteFile(filepath.Join(authHome, "auth.json"), []byte(`{"fixture":true}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -452,7 +515,7 @@ func adapterFixture(t *testing.T, route, model string) (*Adapter, *fakeProbe) {
 }
 
 func requiredHelp() []byte {
-	return []byte("exec --json --output-schema FILE --output-last-message FILE --ephemeral --ignore-user-config --ignore-rules --profile NAME --config KEY=VALUE --model NAME -C DIR\n")
+	return []byte("exec --json --output-schema FILE --output-last-message FILE --ephemeral --ignore-user-config --ignore-rules --config KEY=VALUE --model NAME -C DIR\n")
 }
 
 func privateDir(t *testing.T, name string) string {

@@ -430,3 +430,11 @@ var migrationV23 = []string{
 	`ALTER TABLE provider_qualifications ADD COLUMN attested_leader_epoch INTEGER NOT NULL DEFAULT 0 CHECK(attested_leader_epoch >= 0)`,
 	`ALTER TABLE provider_qualifications ADD COLUMN attestation_signature BLOB NOT NULL DEFAULT X'' CHECK(length(attestation_signature) IN (0,64))`,
 }
+
+// v24 binds the non-secret Codex credential class to both qualification and
+// a launched attempt. Existing records deliberately have no mode and therefore
+// cannot admit Codex until a current daemon re-qualifies them.
+var migrationV24 = []string{
+	`ALTER TABLE provider_qualifications ADD COLUMN auth_mode TEXT NOT NULL DEFAULT '' CHECK(length(auth_mode) <= 64)`,
+	`ALTER TABLE provider_attempts ADD COLUMN auth_mode TEXT NOT NULL DEFAULT '' CHECK(length(auth_mode) <= 64)`,
+}

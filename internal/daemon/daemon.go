@@ -219,7 +219,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 			return failStore(errors.New("provider supervisor does not support durable launch recording"))
 		}
 		setter.SetLaunchRecorder(func(recordCtx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) error {
-			claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest, PolicyDigest: request.PolicyDigest, AuthDigest: request.AuthDigest}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}
+			claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest, PolicyDigest: request.PolicyDigest, AuthDigest: request.AuthDigest, AuthMode: request.AuthMode}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}
 			return database.RecordProviderLaunch(recordCtx, claim, launch)
 		})
 	}
@@ -447,7 +447,7 @@ func safeQualificationError(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return "bounded probe did not complete"
 	}
-	for _, value := range []string{"unsafe", "unavailable", "capability", "authentication", "attestation", "qualified"} {
+	for _, value := range []string{"unsafe", "unavailable", "capability", "authentication", "attestation", "qualified", "leader", "supervisor", "qualification"} {
 		if strings.Contains(strings.ToLower(err.Error()), value) {
 			return err.Error()
 		}
@@ -878,6 +878,9 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	verb := strings.TrimPrefix(request.Method, "ticket.")
 	if code == "autonomous_unavailable" {
 		argv = []string{binary, "providers", "qualify", "--help"}
+	}
+	if code == "unqualified_provider" {
+		argv = []string{binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"}
 	}
 	if code == "terminal_replay_requires_new" {
 		argv = []string{binary, "submit", "--help"}

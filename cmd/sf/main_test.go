@@ -619,10 +619,11 @@ func TestCompiledDevQualificationUsesDaemonAttestationAndNeverExecutesModel(t *t
 	// The fake accepts only capability/help and locally sandboxed probe shapes.
 	// Any real `codex exec` model invocation exits nonzero, so a green
 	// qualification proves this path did not make a model call.
-	fake := `#!/bin/sh
+fake := `#!/bin/sh
 case "$1" in
   --version) echo 'codex 1.2.3'; exit 0 ;;
-  exec) [ "$2" = '--help' ] && { echo '--json --output-schema --output-last-message --ephemeral --ignore-user-config --ignore-rules --profile --config --model -C'; exit 0; }; exit 97 ;;
+  login) [ "$2" = status ] && { echo 'Logged in using ChatGPT'; exit 0; }; exit 98 ;;
+  exec) [ "$2" = '--help' ] && { echo '--json --output-schema --output-last-message --ephemeral --ignore-user-config --ignore-rules --config --model -C'; exit 0; }; exit 97 ;;
   sandbox) case "$*" in
     *curl*) for arg in "$@"; do url="$arg"; done; /usr/bin/curl -fsS --connect-timeout 1 "$url"; exit $? ;;
     *CODEX_HOME*) test -r "$CODEX_HOME/auth.json"; exit $? ;;

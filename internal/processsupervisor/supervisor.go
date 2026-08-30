@@ -58,6 +58,7 @@ type trustedExecutable struct {
 	digest       string
 	policyDigest string
 	authDigest   string
+	authMode     string
 	authHome     string
 }
 type run struct {
@@ -122,7 +123,7 @@ func (s *Supervisor) RegisterExecutable(identity domain.ProviderIdentity, path s
 // same-UID attacker can still race the source before the copy, but cannot
 // alter the staged bytes after their digest is checked against qualification.
 func (s *Supervisor) RegisterRuntime(binding contracts.RuntimeBinding, executable, authHome string) (string, error) {
-	if s == nil || binding.Identity.Provider != "codex" || binding.BinaryDigest == "" || binding.PolicyDigest != environmentPolicyDigest() || binding.AuthDigest == "" || authHome == "" {
+	if s == nil || binding.Identity.Provider != "codex" || binding.BinaryDigest == "" || binding.PolicyDigest != environmentPolicyDigest() || binding.AuthDigest == "" || binding.AuthMode != "chatgpt_subscription" || authHome == "" {
 		return "", errors.New("complete Codex runtime binding is required")
 	}
 	if err := privateExistingDirectory(authHome); err != nil {
@@ -138,7 +139,7 @@ func (s *Supervisor) RegisterRuntime(binding contracts.RuntimeBinding, executabl
 	if err := trusted.stage(); err != nil {
 		return "", err
 	}
-	trusted.authDigest, trusted.authHome, trusted.policyDigest = binding.AuthDigest, authHome, binding.PolicyDigest
+	trusted.authDigest, trusted.authMode, trusted.authHome, trusted.policyDigest = binding.AuthDigest, binding.AuthMode, authHome, binding.PolicyDigest
 	s.mu.Lock()
 	s.trusted[binding.Identity] = trusted
 	s.mu.Unlock()
@@ -267,6 +268,7 @@ type requestKey struct {
 	BinaryDigest     string
 	PolicyDigest     string
 	AuthDigest       string
+	AuthMode         string
 	Repository       string
 	Worktree         string
 	WorktreeIdentity string
@@ -274,7 +276,7 @@ type requestKey struct {
 }
 
 func key(r contracts.DrainRequest) requestKey {
-	return requestKey{ClaimID: r.ClaimID, Identity: r.Identity, Ref: r.Ref, Phase: r.Phase, Role: r.Role, Attempt: r.Attempt, LeaderEpoch: r.LeaderEpoch, RunnerEpoch: r.RunnerEpoch, ExpectedVersion: r.ExpectedVersion, LeaseKey: r.LeaseKey, BindingDigest: r.BindingDigest, BinaryDigest: r.BinaryDigest, PolicyDigest: r.PolicyDigest, AuthDigest: r.AuthDigest, Repository: r.Repository, Worktree: r.Worktree, WorktreeIdentity: r.WorktreeIdentity, BaseSHA: r.BaseSHA}
+	return requestKey{ClaimID: r.ClaimID, Identity: r.Identity, Ref: r.Ref, Phase: r.Phase, Role: r.Role, Attempt: r.Attempt, LeaderEpoch: r.LeaderEpoch, RunnerEpoch: r.RunnerEpoch, ExpectedVersion: r.ExpectedVersion, LeaseKey: r.LeaseKey, BindingDigest: r.BindingDigest, BinaryDigest: r.BinaryDigest, PolicyDigest: r.PolicyDigest, AuthDigest: r.AuthDigest, AuthMode: r.AuthMode, Repository: r.Repository, Worktree: r.Worktree, WorktreeIdentity: r.WorktreeIdentity, BaseSHA: r.BaseSHA}
 }
 
 // validCodexInvocation is deliberately duplicated from the adapter's small
@@ -291,7 +293,7 @@ func validCodexInvocation(invocation contracts.Invocation, identity domain.Provi
 	default:
 		return false
 	}
-	want := []string{invocation.Argv[0], "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules", "--profile", "sf-guarded", "--config", `permissions.sf-guarded.extends=":` + parent + `"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="` + workspaceAccess + `"}`, "--config", `permissions.sf-guarded.network.enabled=false`, "--model", identity.Model, "-C", input.Worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-"}
+	want := []string{invocation.Argv[0], "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules", "--config", `default_permissions="sf-guarded"`, "--config", `permissions.sf-guarded.extends=":` + parent + `"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="` + workspaceAccess + `"}`, "--config", `permissions.sf-guarded.network.enabled=false`, "--model", identity.Model, "-C", input.Worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-"}
 	if len(invocation.Argv) != len(want) || !invocation.CaptureLastMessage || len(invocation.Stdin) == 0 || len(invocation.OutputSchema) == 0 {
 		return false
 	}
@@ -329,7 +331,7 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 		return contracts.CommandResult{}, errors.New("provider environment policy does not match claim")
 	}
 	if request.Identity.Provider == "codex" {
-		if input.Profile != contracts.ProfileGuarded || request.AuthDigest == "" || request.AuthDigest != trusted.authDigest || invocation.AuthHome != trusted.authHome || !validCodexInvocation(invocation, request.Identity, input) {
+		if input.Profile != contracts.ProfileGuarded || input.AuthMode != "chatgpt_subscription" || request.AuthDigest == "" || request.AuthDigest != trusted.authDigest || request.AuthMode != trusted.authMode || invocation.AuthHome != trusted.authHome || !validCodexInvocation(invocation, request.Identity, input) {
 			return contracts.CommandResult{}, errors.New("Codex invocation does not match guarded registered runtime policy")
 		}
 	}

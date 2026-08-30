@@ -55,7 +55,8 @@ func TestCodexQualificationRequiresCurrentSupervisorAttestation(t *testing.T) {
 	if err != nil || database.SetRecoveryAuthority(ctx, domain.ChannelDev, leader, supervisor.PublicKey()) != nil {
 		t.Fatalf("set current supervisor: leader=%d err=%v", leader, err)
 	}
-	attestation, err := supervisor.AttestQualification(contracts.QualificationAttestation{Channel: input.Channel, RunID: input.RunID, Identity: input.Provider, BinaryDigest: input.BinaryDigest, PolicyDigest: input.PolicyDigest, FixtureDigest: input.FixtureDigest, AuthDigest: strings.Repeat("e", 64), ProbeDigest: input.ProbeDigest, Profile: contracts.ProfileGuarded, CreatedUnixNanos: input.CreatedAt.UnixNano(), Nonce: input.RunID})
+	input.AuthMode = "chatgpt_subscription"
+	attestation, err := supervisor.AttestQualification(contracts.QualificationAttestation{Channel: input.Channel, RunID: input.RunID, Identity: input.Provider, BinaryDigest: input.BinaryDigest, PolicyDigest: input.PolicyDigest, FixtureDigest: input.FixtureDigest, AuthDigest: strings.Repeat("e", 64), AuthMode: input.AuthMode, ProbeDigest: input.ProbeDigest, Profile: contracts.ProfileGuarded, CreatedUnixNanos: input.CreatedAt.UnixNano(), LeaderEpoch: leader, Nonce: input.RunID})
 	if err != nil {
 		t.Fatal(err)
 	}

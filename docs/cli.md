@@ -75,7 +75,11 @@ error. `auth status` probes only the four allowlisted official CLIs (`gh`,
 `cursor-agent`, `claude`, and `codex`) with bounded, discarded output. `auth
 login <provider>` delegates to that CLI's official interactive flow and then
 re-probes status; sf never accepts, captures, or stores a credential byte. The
-qualification command remains local adapter work in progress.
+Codex qualification is a foreground-daemon operation: it admits only the
+exact local `Logged in using ChatGPT` subscription status, binds that bounded
+mode into the supervisor attestation, and performs no model call. API-key,
+metered, and unknown login statuses fail before an invocation; tokens remain
+observability while the trusted incremental subscription charge is zero.
 
 `daemon run` is the foreground entry point for development and tests (for
 example, `sf-dev daemon run`). Its socket-backed lifecycle commands use the

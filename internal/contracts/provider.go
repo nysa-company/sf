@@ -30,9 +30,12 @@ type PhaseInput struct {
 	BaseSHA          string
 	AllowedPaths     []string
 	Provider         domain.ProviderIdentity
-	Timeout          time.Duration
-	Profile          ExecutionProfile
-	Schema           []byte
+	// AuthMode is copied from the just-observed RuntimeBinding. It is an
+	// admission value, never a credential or provider-controlled transcript.
+	AuthMode string
+	Timeout  time.Duration
+	Profile  ExecutionProfile
+	Schema   []byte
 }
 
 type PhaseResult struct {
@@ -99,6 +102,10 @@ type RuntimeBinding struct {
 	PolicyDigest  string
 	FixtureDigest string
 	AuthDigest    string
+	// AuthMode is a bounded, non-secret credential class. Codex is admitted
+	// only for the explicitly supported subscription mode; an API/metered
+	// login must never be mistaken for a zero-cost attempt.
+	AuthMode string
 }
 
 // DrainRequest identifies exactly one provider process group. Supervisors must
@@ -118,6 +125,7 @@ type DrainRequest struct {
 	BinaryDigest     string
 	PolicyDigest     string
 	AuthDigest       string
+	AuthMode         string
 	Repository       string
 	Worktree         string
 	WorktreeIdentity string
@@ -156,9 +164,11 @@ type QualificationAttestation struct {
 	PolicyDigest     string
 	FixtureDigest    string
 	AuthDigest       string
+	AuthMode         string
 	ProbeDigest      string
 	Profile          ExecutionProfile
 	CreatedUnixNanos int64
+	LeaderEpoch      uint64
 	Nonce            string
 	Signature        []byte
 }
@@ -180,7 +190,7 @@ func VerifyQualificationAttestation(publicKey []byte, value QualificationAttesta
 }
 
 func validQualificationAttestation(value QualificationAttestation) bool {
-	if !value.Channel.Valid() || value.RunID == "" || value.Identity.Provider == "" || value.Identity.Model == "" || value.Identity.Family == "" || value.Identity.Version == "" || value.CreatedUnixNanos <= 0 || value.Nonce == "" || value.Profile != ProfileGuarded {
+	if !value.Channel.Valid() || value.RunID == "" || value.Identity.Provider == "" || value.Identity.Model == "" || value.Identity.Family == "" || value.Identity.Version == "" || value.AuthMode == "" || len(value.AuthMode) > 64 || value.CreatedUnixNanos <= 0 || value.LeaderEpoch == 0 || value.Nonce == "" || value.Profile != ProfileGuarded {
 		return false
 	}
 	for _, digest := range []string{value.BinaryDigest, value.PolicyDigest, value.FixtureDigest, value.AuthDigest, value.ProbeDigest} {
@@ -192,7 +202,7 @@ func validQualificationAttestation(value QualificationAttestation) bool {
 }
 
 func qualificationPayload(value QualificationAttestation) []byte {
-	return []byte("sf-qualification/v1\x00" + string(value.Channel) + "\x00" + value.RunID + "\x00" + value.Identity.Provider + "\x00" + value.Identity.Model + "\x00" + value.Identity.Family + "\x00" + value.Identity.Version + "\x00" + value.BinaryDigest + "\x00" + value.PolicyDigest + "\x00" + value.FixtureDigest + "\x00" + value.AuthDigest + "\x00" + value.ProbeDigest + "\x00" + string(value.Profile) + "\x00" + fmt.Sprintf("%d", value.CreatedUnixNanos) + "\x00" + value.Nonce)
+	return []byte("sf-qualification/v2\x00" + string(value.Channel) + "\x00" + value.RunID + "\x00" + value.Identity.Provider + "\x00" + value.Identity.Model + "\x00" + value.Identity.Family + "\x00" + value.Identity.Version + "\x00" + value.BinaryDigest + "\x00" + value.PolicyDigest + "\x00" + value.FixtureDigest + "\x00" + value.AuthDigest + "\x00" + value.AuthMode + "\x00" + value.ProbeDigest + "\x00" + string(value.Profile) + "\x00" + fmt.Sprintf("%d", value.CreatedUnixNanos) + "\x00" + fmt.Sprintf("%d", value.LeaderEpoch) + "\x00" + value.Nonce)
 }
 
 func NewDrainSigner() (*DrainSigner, error) {
@@ -219,7 +229,7 @@ func VerifyDrainProof(publicKey []byte, request DrainRequest, proof DrainProof) 
 	return len(publicKey) == ed25519.PublicKeySize && string(publicKey) == string(proof.publicKey) && proof.request == request && ed25519.Verify(ed25519.PublicKey(publicKey), drainPayload(request), proof.signature)
 }
 func drainPayload(r DrainRequest) []byte {
-	return []byte(fmt.Sprintf("%d", r.ClaimID) + "\x00" + string(r.Ref.Channel) + "\x00" + string(r.Ref.Project) + "\x00" + string(r.Ref.Ticket) + "\x00" + string(r.Phase) + "\x00" + r.Role + "\x00" + r.Identity.Provider + "\x00" + r.Identity.Model + "\x00" + r.Identity.Family + "\x00" + r.Identity.Version + "\x00" + r.LeaseKey + "\x00" + r.BindingDigest + "\x00" + r.BinaryDigest + "\x00" + r.PolicyDigest + "\x00" + r.AuthDigest + "\x00" + r.Repository + "\x00" + r.Worktree + "\x00" + r.WorktreeIdentity + "\x00" + r.BaseSHA + "\x00" + fmtUint(r.LeaderEpoch) + "\x00" + fmtUint(r.RunnerEpoch) + "\x00" + fmtUint(r.ExpectedVersion) + "\x00" + fmtInt(r.Attempt))
+	return []byte(fmt.Sprintf("%d", r.ClaimID) + "\x00" + string(r.Ref.Channel) + "\x00" + string(r.Ref.Project) + "\x00" + string(r.Ref.Ticket) + "\x00" + string(r.Phase) + "\x00" + r.Role + "\x00" + r.Identity.Provider + "\x00" + r.Identity.Model + "\x00" + r.Identity.Family + "\x00" + r.Identity.Version + "\x00" + r.LeaseKey + "\x00" + r.BindingDigest + "\x00" + r.BinaryDigest + "\x00" + r.PolicyDigest + "\x00" + r.AuthDigest + "\x00" + r.AuthMode + "\x00" + r.Repository + "\x00" + r.Worktree + "\x00" + r.WorktreeIdentity + "\x00" + r.BaseSHA + "\x00" + fmtUint(r.LeaderEpoch) + "\x00" + fmtUint(r.RunnerEpoch) + "\x00" + fmtUint(r.ExpectedVersion) + "\x00" + fmtInt(r.Attempt))
 }
 func fmtUint(v uint64) string { return fmt.Sprintf("%d", v) }
 func fmtInt(v int) string     { return fmt.Sprintf("%d", v) }
