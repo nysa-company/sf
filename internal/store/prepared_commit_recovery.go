@@ -12,6 +12,64 @@ import (
 
 var ErrPreparedCommitRecovery = errors.New("prepared git commit recovery is uncertain")
 
+// ConfirmPreparedCommit is the normal-path counterpart to recovery.  Git has
+// already recorded the immutable commit/tree tuple before making the ref
+// reachable; this final Store write accepts only an authenticated observation
+// of that exact tuple under the still-live original fence.
+func (s *Store) ConfirmPreparedCommit(ctx context.Context, claim contracts.GitMutationClaim, observation contracts.PreparedCommitObservation) (Effect, error) {
+	if s == nil || !validContractClaim(claim) || claim.Operation != "commit" ||
+		!validStoreOID(observation.CommitOID) || !validStoreOID(observation.ParentOID) || !validStoreOID(observation.TreeOID) ||
+		len(observation.CommitOID) != len(claim.ExpectedBaseOID) || len(observation.TreeOID) != len(claim.ExpectedBaseOID) || len(observation.ParentOID) != len(claim.ExpectedHeadOID) {
+		return Effect{}, ErrGitMutationIntent
+	}
+	var result Effect
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		facts, err := gitMutationIntentFactsFrom(ctx, conn, claim.SemanticKey)
+		if err != nil || facts.Claim != claim || facts.Effect.Kind != "git/commit" || facts.Effect.Ref != claim.TicketRef || facts.Effect.RequestDigest != claim.RequestDigest {
+			return ErrGitMutationIntent
+		}
+		if facts.PreparedCommitOID == "" || facts.PreparedTreeOID == "" || observation.CommitOID != facts.PreparedCommitOID || observation.TreeOID != facts.PreparedTreeOID || observation.ParentOID != claim.ExpectedHeadOID {
+			return ErrGitMutationIntent
+		}
+		if facts.Effect.State == EffectConfirmed {
+			if facts.Effect.ObservedIdentity != observation.CommitOID {
+				return ErrGitMutationIntent
+			}
+			result = facts.Effect
+			return nil
+		}
+		if facts.Effect.State != EffectExecuting {
+			return ErrStaleFence
+		}
+		if err := s.assertTicketFence(ctx, conn, claim.TicketRef, claim.TicketVersion, domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}); err != nil {
+			return err
+		}
+		// Commit releases its own lease before the final read-only observation.
+		// Do not let that small interval admit a different provider, repository
+		// command, or Git writer and then bless an observation from a changing
+		// repository.
+		if err := repositoryHasProviderWriter(ctx, conn, claim.Repository); err != nil {
+			return err
+		}
+		if err := repositoryHasCommandWriter(ctx, conn, claim.Repository); err != nil {
+			return err
+		}
+		if err := repositoryHasGitWriter(ctx, conn, claim.Repository); err != nil {
+			return err
+		}
+		updated, err := conn.ExecContext(ctx, `UPDATE effects SET state='confirmed',observed_identity=? WHERE semantic_key=? AND state='executing' AND channel=? AND project_id=? AND ticket_id=? AND request_digest=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?`, observation.CommitOID, claim.SemanticKey, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch)
+		if err != nil {
+			return err
+		}
+		if changed, _ := updated.RowsAffected(); changed != 1 {
+			return ErrStaleFence
+		}
+		result, err = effectFrom(ctx, conn, claim.SemanticKey)
+		return err
+	})
+	return result, err
+}
+
 func preparedCommitRecoveryFailure(err error) error {
 	if err == nil {
 		return ErrPreparedCommitRecovery

@@ -39,6 +39,65 @@ func preparedCommitRecoveryFixture(t *testing.T, ticketID string) (*Store, conte
 	return db, ctx, intent, claim, commit, tree, leader
 }
 
+func TestConfirmPreparedCommitAuthenticatesCurrentPreparedTupleAndIsIdempotent(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := gitIntentFixture(t, db, ctx, "SF-prepared-normal")
+	claim, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireGitMutation(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, tree := strings.Repeat("b", 40), strings.Repeat("c", 40)
+	if err := lease.(contracts.GitMutationRecoveryFactsLease).RecordPreparedCommit(ctx, commit, tree); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	observation := contracts.PreparedCommitObservation{CommitOID: commit, ParentOID: intent.ExpectedHeadOID, TreeOID: tree}
+	confirmed, err := db.ConfirmPreparedCommit(ctx, claim, observation)
+	if err != nil || confirmed.State != EffectConfirmed || confirmed.ObservedIdentity != commit {
+		t.Fatalf("confirmed=%+v err=%v", confirmed, err)
+	}
+	again, err := db.ConfirmPreparedCommit(ctx, claim, observation)
+	if err != nil || again != confirmed {
+		t.Fatalf("replay=%+v err=%v", again, err)
+	}
+}
+
+func TestConfirmPreparedCommitRefusesActiveLeaseAndMismatch(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := gitIntentFixture(t, db, ctx, "SF-prepared-normal-reject")
+	claim, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireGitMutation(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, tree := strings.Repeat("b", 40), strings.Repeat("c", 40)
+	if err := lease.(contracts.GitMutationRecoveryFactsLease).RecordPreparedCommit(ctx, commit, tree); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ConfirmPreparedCommit(ctx, claim, contracts.PreparedCommitObservation{CommitOID: commit, ParentOID: intent.ExpectedHeadOID, TreeOID: tree}); !errors.Is(err, ErrGitMutationLease) {
+		t.Fatalf("active lease err=%v", err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ConfirmPreparedCommit(ctx, claim, contracts.PreparedCommitObservation{CommitOID: commit, ParentOID: intent.ExpectedHeadOID, TreeOID: strings.Repeat("d", 40)}); !errors.Is(err, ErrGitMutationIntent) {
+		t.Fatalf("mismatch err=%v", err)
+	}
+	got, err := db.Effect(ctx, claim.SemanticKey)
+	if err != nil || got.State != EffectExecuting {
+		t.Fatalf("effect=%+v err=%v", got, err)
+	}
+}
+
 func TestConfirmRecoveredPreparedCommitIsExactAndIdempotentAcrossRunnerFence(t *testing.T) {
 	db, ctx, intent, claim, commit, tree, leader := preparedCommitRecoveryFixture(t, "SF-prepared-confirm")
 	observation := contracts.PreparedCommitObservation{CommitOID: commit, ParentOID: intent.ExpectedHeadOID, TreeOID: tree}

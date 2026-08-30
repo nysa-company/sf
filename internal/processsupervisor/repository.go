@@ -103,26 +103,14 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		}
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	resolved, err := resolveFixedExecutable(spec.Argv[0])
+	resolved, selectedDigest, err := RepositoryExecutableIdentity(spec.Argv[0])
 	if err != nil {
-		return contracts.CommandResult{}, err
-	}
-	resolved, err = filepath.Abs(resolved)
-	if err != nil {
-		return contracts.CommandResult{}, err
-	}
-	resolved, err = filepath.EvalSymlinks(resolved)
-	if err != nil {
-		return contracts.CommandResult{}, err
-	}
-	if err = authenticateRepositorySourceExecutable(resolved); err != nil {
 		return contracts.CommandResult{}, err
 	}
 	if claim.ExecutablePath != resolved {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	selectedDigest, err := executableFileDigest(resolved)
-	if err != nil || claim.ExecutableDigest != selectedDigest {
+	if claim.ExecutableDigest != selectedDigest {
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	identity, err := parseRepositoryIdentity(claim)
@@ -445,6 +433,33 @@ func authenticateRepositorySourceExecutable(path string) error {
 		return ErrUnclear
 	}
 	return nil
+}
+
+// RepositoryExecutableIdentity returns the one code-approved executable that
+// a guarded repository command may name, together with its immutable digest.
+// It intentionally shares Supervisor.Run's resolver and source checks so a
+// caller cannot prepare a claim using a broader PATH-based interpretation.
+func RepositoryExecutableIdentity(name string) (string, string, error) {
+	resolved, err := resolveFixedExecutable(name)
+	if err != nil {
+		return "", "", err
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return "", "", err
+	}
+	resolved, err = filepath.EvalSymlinks(resolved)
+	if err != nil {
+		return "", "", err
+	}
+	if err := authenticateRepositorySourceExecutable(resolved); err != nil {
+		return "", "", err
+	}
+	digest, err := executableFileDigest(resolved)
+	if err != nil {
+		return "", "", err
+	}
+	return resolved, digest, nil
 }
 
 func resolveFixedExecutable(name string) (string, error) {

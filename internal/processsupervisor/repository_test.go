@@ -32,6 +32,27 @@ func TestRepositoryCommandRejectsCustomExecutableNamedGo(t *testing.T) {
 	if _, err := resolveFixedExecutable(path); err == nil {
 		t.Fatal("custom executable named go was accepted")
 	}
+	if _, _, err := RepositoryExecutableIdentity(path); err == nil {
+		t.Fatal("exported identity accepted custom executable")
+	}
+}
+
+func TestRepositoryExecutableIdentityMatchesSupervisorResolver(t *testing.T) {
+	resolved, err := resolveFixedExecutable("go")
+	if err != nil {
+		t.Skipf("approved Go is unavailable: %v", err)
+	}
+	path, digest, err := RepositoryExecutableIdentity("go")
+	if err != nil {
+		t.Skipf("approved Go source is unavailable: %v", err)
+	}
+	if path != resolved {
+		t.Fatalf("path=%q want %q", path, resolved)
+	}
+	want, err := executableFileDigest(path)
+	if err != nil || digest != want {
+		t.Fatalf("digest=%q want=%q err=%v", digest, want, err)
+	}
 }
 
 func TestRepositoryCommandDrainerReapsRecordedGroup(t *testing.T) {
