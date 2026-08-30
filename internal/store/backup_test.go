@@ -95,8 +95,8 @@ func TestRepositoryCommandV36UpgradeAndRequiredSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	if got := rawSchemaVersion(t, path); got != 36 {
-		t.Fatalf("migrated schema=%d want=36", got)
+	if got := rawSchemaVersion(t, path); got != schemaVersion {
+		t.Fatalf("migrated schema=%d want=%d", got, schemaVersion)
 	}
 	if err := database.validateSchema(ctx); err != nil {
 		t.Fatalf("v36 required schema: %v", err)
@@ -151,8 +151,8 @@ func TestV35BlocksOnlyUnboundLegacyWorkflowArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	if got := rawSchemaVersion(t, path); got != 36 {
-		t.Fatalf("migrated schema=%d want=36", got)
+	if got := rawSchemaVersion(t, path); got != schemaVersion {
+		t.Fatalf("migrated schema=%d want=%d", got, schemaVersion)
 	}
 	for _, legacy := range []struct{ id, state string }{
 		{id: "SF-v35-plan-legacy", state: "planning"},

@@ -54,9 +54,10 @@ var (
 	ErrRepositoryCommandIntent = errors.New("repository command intent is not a current executing effect")
 	ErrRepositoryCommandLease  = errors.New("repository command lease is unavailable or stale")
 	ErrRepositoryCommandResult = errors.New("repository command result is missing, malformed, or conflicts with durable evidence")
+	ErrPublicationEvidence     = errors.New("publication evidence is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 36
+const schemaVersion = 37
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -95,6 +96,7 @@ var migrationChecksums = map[int]string{
 	34: migrationChecksum(migrationV34),
 	35: migrationChecksum(migrationV35),
 	36: migrationChecksum(migrationV36),
+	37: migrationChecksum(migrationV37),
 }
 
 func migrationChecksum(statements []string) string {
@@ -413,6 +415,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV35
 			} else if version == 36 {
 				statements = migrationV36
+			} else if version == 37 {
+				statements = migrationV37
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {

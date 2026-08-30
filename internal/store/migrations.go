@@ -820,3 +820,44 @@ var migrationV36 = []string{
 		SELECT channel,project_id,id,version,'typed_blocker',resume_state,'blocked','{"code":"legacy_repository_command_evidence_unverifiable","reason":"legacy repository command evidence is unverifiable","next_action":"start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		FROM tickets WHERE state='blocked' AND blocked_code='legacy_repository_command_evidence_unverifiable' AND resume_state IN ('verifying','building')`,
 }
+
+// v37 records the complete, authenticated handoff from a local candidate to
+// the remote draft PR.  It is intentionally a single append-only witness per
+// candidate generation/head; corrected candidates retain their own history.
+// No lifecycle state is changed by this migration or by its Store API.
+var migrationV37 = []string{
+	`CREATE TABLE publication_evidence (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		ticket_version INTEGER NOT NULL CHECK(ticket_version > 0), leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > 0),
+		candidate_generation INTEGER NOT NULL CHECK(candidate_generation > 0), candidate_ticket_version INTEGER NOT NULL CHECK(candidate_ticket_version > 0), candidate_leader_epoch INTEGER NOT NULL CHECK(candidate_leader_epoch > 0), candidate_runner_epoch INTEGER NOT NULL CHECK(candidate_runner_epoch > 0), candidate_base_sha TEXT NOT NULL, candidate_head_sha TEXT NOT NULL, candidate_tree_sha TEXT NOT NULL,
+		candidate_source_digest TEXT NOT NULL CHECK(length(candidate_source_digest)=64), candidate_verification_intent_digest TEXT NOT NULL CHECK(length(candidate_verification_intent_digest)=64), candidate_proof_digest TEXT NOT NULL CHECK(length(candidate_proof_digest)=64), candidate_command_policy_digest TEXT NOT NULL CHECK(length(candidate_command_policy_digest)=64), candidate_builder_evidence_digest TEXT NOT NULL CHECK(length(candidate_builder_evidence_digest)=64),
+		candidate_builder_attempt_id INTEGER NOT NULL CHECK(candidate_builder_attempt_id > 0), candidate_builder_attempt INTEGER NOT NULL CHECK(candidate_builder_attempt > 0), candidate_commit_parent_oid TEXT NOT NULL,
+		candidate_command_semantic_key TEXT NOT NULL, candidate_command_claim_epoch INTEGER NOT NULL CHECK(candidate_command_claim_epoch > 0), candidate_command_ticket_version INTEGER NOT NULL CHECK(candidate_command_ticket_version > 0), candidate_command_leader_epoch INTEGER NOT NULL CHECK(candidate_command_leader_epoch > 0), candidate_command_runner_epoch INTEGER NOT NULL CHECK(candidate_command_runner_epoch > 0), candidate_command_digest TEXT NOT NULL, candidate_command_spec_digest TEXT NOT NULL, candidate_command_policy_claim_digest TEXT NOT NULL, candidate_command_executable_path TEXT NOT NULL, candidate_command_executable_digest TEXT NOT NULL,
+		config_generation INTEGER NOT NULL CHECK(config_generation > 0), config_digest TEXT NOT NULL CHECK(length(config_digest)=64), config_snapshot_digest TEXT NOT NULL CHECK(length(config_snapshot_digest)=64),
+		worktree_path TEXT NOT NULL, worktree_branch_ref TEXT NOT NULL, worktree_state TEXT NOT NULL, worktree_ticket_version INTEGER NOT NULL CHECK(worktree_ticket_version > 0), worktree_leader_epoch INTEGER NOT NULL CHECK(worktree_leader_epoch > 0), worktree_runner_epoch INTEGER NOT NULL CHECK(worktree_runner_epoch > 0), worktree_identity_json BLOB NOT NULL, worktree_identity_digest TEXT NOT NULL CHECK(length(worktree_identity_digest)=64), worktree_base_sha TEXT NOT NULL,
+		remote_branch_ref TEXT NOT NULL, remote_branch_oid TEXT NOT NULL, remote_base_oid TEXT NOT NULL,
+		push_effect_semantic_key TEXT NOT NULL, push_effect_kind TEXT NOT NULL, push_effect_request_digest TEXT NOT NULL, push_effect_claim_epoch INTEGER NOT NULL CHECK(push_effect_claim_epoch > 0), push_effect_observed_identity TEXT NOT NULL,
+		github_host TEXT NOT NULL CHECK(github_host='github.com'), github_owner TEXT NOT NULL, github_name TEXT NOT NULL, github_pr_number INTEGER NOT NULL CHECK(github_pr_number > 0), github_head_owner TEXT NOT NULL, github_head_repository TEXT NOT NULL, github_head_ref TEXT NOT NULL, github_head_oid TEXT NOT NULL, github_base_ref TEXT NOT NULL, github_base_oid TEXT NOT NULL, github_state TEXT NOT NULL CHECK(github_state='OPEN'), github_draft INTEGER NOT NULL CHECK(github_draft=1), github_factory_owned INTEGER NOT NULL CHECK(github_factory_owned=1), github_observed_at TEXT NOT NULL,
+		pr_effect_semantic_key TEXT NOT NULL, pr_effect_kind TEXT NOT NULL, pr_effect_request_digest TEXT NOT NULL, pr_effect_claim_epoch INTEGER NOT NULL CHECK(pr_effect_claim_epoch > 0), pr_effect_observed_identity TEXT NOT NULL,
+		witness_digest TEXT NOT NULL CHECK(length(witness_digest)=71), created_at TEXT NOT NULL,
+		PRIMARY KEY(channel, project_id, ticket_id, candidate_generation, candidate_head_sha),
+		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id),
+		CHECK(remote_branch_ref=worktree_branch_ref), CHECK(remote_branch_oid=candidate_head_sha), CHECK(github_head_oid=candidate_head_sha), CHECK(github_base_oid=remote_base_oid), CHECK(worktree_base_sha=candidate_base_sha), CHECK(remote_base_oid=worktree_base_sha)
+	)`,
+	`CREATE INDEX publication_evidence_current ON publication_evidence(channel,project_id,ticket_id,candidate_generation DESC,candidate_head_sha)`,
+	`CREATE UNIQUE INDEX publication_evidence_witness ON publication_evidence(witness_digest)`,
+	`CREATE TRIGGER publication_evidence_immutable_update BEFORE UPDATE ON publication_evidence BEGIN SELECT RAISE(ABORT,'publication evidence is immutable'); END`,
+	`CREATE TRIGGER publication_evidence_immutable_delete BEFORE DELETE ON publication_evidence BEGIN SELECT RAISE(ABORT,'publication evidence is append-only'); END`,
+	`CREATE TABLE publication_evidence_rebinds (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		candidate_generation INTEGER NOT NULL CHECK(candidate_generation > 0), candidate_head_sha TEXT NOT NULL,
+		prior_witness_digest TEXT NOT NULL CHECK(length(prior_witness_digest)=71), prior_ticket_version INTEGER NOT NULL CHECK(prior_ticket_version > 0), prior_leader_epoch INTEGER NOT NULL CHECK(prior_leader_epoch > 0), prior_runner_epoch INTEGER NOT NULL CHECK(prior_runner_epoch > 0),
+		ticket_version INTEGER NOT NULL CHECK(ticket_version > prior_ticket_version), leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > prior_runner_epoch),
+		rebind_digest TEXT NOT NULL CHECK(length(rebind_digest)=71), created_at TEXT NOT NULL,
+		PRIMARY KEY(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,ticket_version),
+		FOREIGN KEY(channel,project_id,ticket_id,candidate_generation,candidate_head_sha) REFERENCES publication_evidence(channel,project_id,ticket_id,candidate_generation,candidate_head_sha)
+	)`,
+	`CREATE UNIQUE INDEX publication_evidence_rebind_digest ON publication_evidence_rebinds(rebind_digest)`,
+	`CREATE TRIGGER publication_evidence_rebinds_immutable_update BEFORE UPDATE ON publication_evidence_rebinds BEGIN SELECT RAISE(ABORT,'publication evidence rebind is immutable'); END`,
+	`CREATE TRIGGER publication_evidence_rebinds_immutable_delete BEFORE DELETE ON publication_evidence_rebinds BEGIN SELECT RAISE(ABORT,'publication evidence rebind is append-only'); END`,
+}

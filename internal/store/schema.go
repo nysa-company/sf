@@ -58,7 +58,7 @@ func (s *Store) validateSchema(ctx context.Context) error {
 			return err
 		}
 	}
-	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete", "plan_result_bindings_immutable_update", "plan_result_bindings_immutable_delete", "verification_result_bindings_immutable_update", "verification_result_bindings_immutable_delete", "candidate_result_bindings_immutable_update", "candidate_result_bindings_immutable_delete", "repository_command_results_immutable_update", "repository_command_results_immutable_delete", "verification_command_result_bindings_immutable_update", "verification_command_result_bindings_immutable_delete", "candidate_command_result_bindings_immutable_update", "candidate_command_result_bindings_immutable_delete"} {
+	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete", "plan_result_bindings_immutable_update", "plan_result_bindings_immutable_delete", "verification_result_bindings_immutable_update", "verification_result_bindings_immutable_delete", "candidate_result_bindings_immutable_update", "candidate_result_bindings_immutable_delete", "repository_command_results_immutable_update", "repository_command_results_immutable_delete", "verification_command_result_bindings_immutable_update", "verification_command_result_bindings_immutable_delete", "candidate_command_result_bindings_immutable_update", "candidate_command_result_bindings_immutable_delete", "publication_evidence_immutable_update", "publication_evidence_immutable_delete", "publication_evidence_rebinds_immutable_update", "publication_evidence_rebinds_immutable_delete"} {
 		var count int
 		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigger).Scan(&count); err != nil || count != 1 {
 			return fmt.Errorf("required trigger %s is missing", trigger)
@@ -124,6 +124,8 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "candidate_command_result_bindings", target: "candidate_snapshots"},
 	{table: "candidate_command_result_bindings", target: "repository_command_results"},
 	{table: "candidate_command_result_bindings", target: "tickets"},
+	{table: "publication_evidence", target: "tickets"},
+	{table: "publication_evidence_rebinds", target: "publication_evidence"},
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {
@@ -187,6 +189,8 @@ var requiredSchema = map[string][]string{
 	"repository_command_results":           {"semantic_key", "claim_epoch", "channel", "project_id", "ticket_id", "request_digest", "ticket_version", "leader_epoch", "runner_epoch", "repository_path", "worktree_path", "worktree_identity", "branch_ref", "base_ref", "base_sha", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest", "exit_code", "stdout", "stderr", "output_last_message", "stdout_truncated", "stderr_truncated", "output_last_message_truncated", "duration_ns", "observed_at", "stdout_digest", "stderr_digest", "output_last_message_digest", "result_digest", "created_at"},
 	"verification_command_result_bindings": {"revision", "binding_ticket_version", "leader_epoch", "runner_epoch", "semantic_key", "claim_epoch", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest", "expected_outcome"},
 	"candidate_command_result_bindings":    {"generation", "binding_ticket_version", "leader_epoch", "runner_epoch", "semantic_key", "claim_epoch", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest"},
+	"publication_evidence":                 {"channel", "project_id", "ticket_id", "ticket_version", "leader_epoch", "runner_epoch", "candidate_generation", "candidate_ticket_version", "candidate_leader_epoch", "candidate_runner_epoch", "candidate_base_sha", "candidate_head_sha", "candidate_tree_sha", "candidate_source_digest", "candidate_verification_intent_digest", "candidate_proof_digest", "candidate_command_policy_digest", "candidate_builder_evidence_digest", "candidate_builder_attempt_id", "candidate_builder_attempt", "candidate_commit_parent_oid", "candidate_command_semantic_key", "candidate_command_claim_epoch", "candidate_command_ticket_version", "candidate_command_leader_epoch", "candidate_command_runner_epoch", "candidate_command_digest", "candidate_command_spec_digest", "candidate_command_policy_claim_digest", "candidate_command_executable_path", "candidate_command_executable_digest", "config_generation", "config_digest", "config_snapshot_digest", "worktree_path", "worktree_branch_ref", "worktree_state", "worktree_ticket_version", "worktree_leader_epoch", "worktree_runner_epoch", "worktree_identity_json", "worktree_identity_digest", "worktree_base_sha", "remote_branch_ref", "remote_branch_oid", "remote_base_oid", "push_effect_semantic_key", "push_effect_kind", "push_effect_request_digest", "push_effect_claim_epoch", "push_effect_observed_identity", "github_host", "github_owner", "github_name", "github_pr_number", "github_head_owner", "github_head_repository", "github_head_ref", "github_head_oid", "github_base_ref", "github_base_oid", "github_state", "github_draft", "github_factory_owned", "github_observed_at", "pr_effect_semantic_key", "pr_effect_kind", "pr_effect_request_digest", "pr_effect_claim_epoch", "pr_effect_observed_identity", "witness_digest", "created_at"},
+	"publication_evidence_rebinds":         {"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "prior_witness_digest", "prior_ticket_version", "prior_leader_epoch", "prior_runner_epoch", "ticket_version", "leader_epoch", "runner_epoch", "rebind_digest", "created_at"},
 }
 
 type indexRequirement struct {
@@ -223,6 +227,9 @@ var requiredIndexes = []indexRequirement{
 	{table: "repository_command_leases", name: "repository_command_lease_recovery", columns: []string{"channel", "state", "launch_state"}, nonUnique: true},
 	{table: "repository_command_process_groups", name: "repository_command_process_group_recovery", columns: []string{"repository_path", "semantic_key", "nonce"}, nonUnique: true},
 	{table: "repository_command_results", name: "repository_command_results_ticket", columns: []string{"channel", "project_id", "ticket_id", "worktree_path", "base_sha", "created_at"}, nonUnique: true},
+	{table: "publication_evidence", name: "publication_evidence_witness", columns: []string{"witness_digest"}},
+	{table: "publication_evidence", name: "publication_evidence_current", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha"}, nonUnique: true},
+	{table: "publication_evidence_rebinds", name: "publication_evidence_rebind_digest", columns: []string{"rebind_digest"}},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {
