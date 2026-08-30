@@ -760,7 +760,7 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 	if err := c.json(ctx, &activeRules, "api", "--hostname", "github.com", "--method", "GET", endpoint); err != nil || len(activeRules) >= 100 {
 		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 	}
-	listedDetails, err := c.auditEvaluateRulesets(ctx, repository, baseRef)
+	inventory, err := c.auditEvaluateRulesets(ctx, repository, baseRef)
 	if err != nil {
 		return strictProtectionWitness{}, err
 	}
@@ -802,7 +802,15 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 	if len(requestedMethod) == 1 {
 		method = requestedMethod[0]
 	}
-	detail, hasListed := listedDetails[selected.ID]
+	summary, found := inventory.Summaries[selected.ID]
+	if !found || summary.SourceType != selected.SourceType || summary.Source != selected.Source || (summary.Enforcement != "active" && summary.Enforcement != "enabled") {
+		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+	}
+	detail, hasListed := inventory.Details[selected.ID]
+	if summary.Enforcement == "enabled" && !hasListed {
+		// An enabled list item is ambiguous until its detail proves active.
+		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+	}
 	return c.rulesetProtection(ctx, repository, baseRef, method, selected, detail, hasListed)
 }
 
@@ -882,19 +890,25 @@ type rulesetSummaryWire struct {
 	UpdatedAt   string        `json:"updated_at"`
 }
 
-func (c Client) auditEvaluateRulesets(ctx context.Context, repository contracts.RepositoryIdentity, baseRef string) (map[int64]rulesetWire, error) {
+type rulesetInventory struct {
+	Summaries map[int64]rulesetSummaryWire
+	Details   map[int64]rulesetWire
+}
+
+func (c Client) auditEvaluateRulesets(ctx context.Context, repository contracts.RepositoryIdentity, baseRef string) (rulesetInventory, error) {
 	var listed []rulesetSummaryWire
 	endpoint := "repos/" + repoArg(repository) + "/rulesets?includes_parents=true&targets=branch&per_page=100&page=1"
 	if err := c.json(ctx, &listed, "api", "--hostname", "github.com", "--method", "GET", endpoint); err != nil || len(listed) >= 100 {
-		return nil, ErrGuardedMergeUnavailable
+		return rulesetInventory{}, ErrGuardedMergeUnavailable
 	}
 	seen := make(map[int64]bool, len(listed))
-	details := make(map[int64]rulesetWire)
+	inventory := rulesetInventory{Summaries: make(map[int64]rulesetSummaryWire, len(listed)), Details: make(map[int64]rulesetWire)}
 	for _, summary := range listed {
 		if !validRulesetSummary(summary) || seen[summary.ID] {
-			return nil, ErrGuardedMergeUnavailable
+			return rulesetInventory{}, ErrGuardedMergeUnavailable
 		}
 		seen[summary.ID] = true
+		inventory.Summaries[summary.ID] = summary
 		switch summary.Enforcement {
 		case "disabled":
 			continue
@@ -905,7 +919,7 @@ func (c Client) auditEvaluateRulesets(ctx context.Context, repository contracts.
 		case "enabled", "evaluate":
 			var detail rulesetWire
 			if err := c.json(ctx, &detail, "api", "--hostname", "github.com", "--method", "GET", "repos/"+repoArg(repository)+"/rulesets/"+fmt.Sprint(summary.ID)+"?includes_parents=true"); err != nil || !validRulesetMetadata(detail) || !sameRulesetSummary(summary, detail) {
-				return nil, ErrGuardedMergeUnavailable
+				return rulesetInventory{}, ErrGuardedMergeUnavailable
 			}
 			// The list API spells active rules "enabled" in its documented
 			// response. Detail is the authority for whether this summary is an
@@ -914,21 +928,21 @@ func (c Client) auditEvaluateRulesets(ctx context.Context, repository contracts.
 			switch detail.Enforcement {
 			case "active":
 				if summary.Enforcement == "evaluate" {
-					return nil, ErrGuardedMergeUnavailable
+					return rulesetInventory{}, ErrGuardedMergeUnavailable
 				}
-				details[summary.ID] = detail
+				inventory.Details[summary.ID] = detail
 			case "evaluate":
 				if evaluateRulesetMayApply(detail, baseRef) {
-					return nil, ErrGuardedMergeUnavailable
+					return rulesetInventory{}, ErrGuardedMergeUnavailable
 				}
 			default:
-				return nil, ErrGuardedMergeUnavailable
+				return rulesetInventory{}, ErrGuardedMergeUnavailable
 			}
 		default:
-			return nil, ErrGuardedMergeUnavailable
+			return rulesetInventory{}, ErrGuardedMergeUnavailable
 		}
 	}
-	return details, nil
+	return inventory, nil
 }
 
 func validRulesetSummary(value rulesetSummaryWire) bool {

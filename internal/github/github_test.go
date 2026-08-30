@@ -1101,6 +1101,104 @@ func TestEvaluateRulesetSummaryAuditFailsClosed(t *testing.T) {
 	})
 }
 
+func TestStrictProtectionRequiresSelectedRulesetInventory(t *testing.T) {
+	type testCase struct {
+		name    string
+		list    func(testkit.FakeRuleset) []map[string]any
+		detail  func(testkit.FakeRuleset) testkit.FakeRuleset
+		accepts bool
+	}
+	for _, test := range []testCase{
+		{
+			name: "selected-active-summary",
+			list: func(rule testkit.FakeRuleset) []map[string]any {
+				return []map[string]any{rulesetSummaryForTest(rule, "active")}
+			},
+			accepts: true,
+		},
+		{
+			name: "selected-documented-enabled-summary",
+			list: func(rule testkit.FakeRuleset) []map[string]any {
+				return []map[string]any{rulesetSummaryForTest(rule, "enabled")}
+			},
+			accepts: true,
+		},
+		{
+			name: "selected-summary-omitted",
+			list: func(testkit.FakeRuleset) []map[string]any { return []map[string]any{} },
+		},
+		{
+			name: "selected-summary-source-mismatch",
+			list: func(rule testkit.FakeRuleset) []map[string]any {
+				summary := rulesetSummaryForTest(rule, "active")
+				summary["source"] = "other/app"
+				return []map[string]any{summary}
+			},
+		},
+		{
+			name: "selected-summary-source-type-mismatch",
+			list: func(rule testkit.FakeRuleset) []map[string]any {
+				summary := rulesetSummaryForTest(rule, "active")
+				summary["source_type"], summary["source"] = "Organization", "example"
+				return []map[string]any{summary}
+			},
+		},
+		{
+			name: "selected-summary-disabled",
+			list: func(rule testkit.FakeRuleset) []map[string]any {
+				return []map[string]any{rulesetSummaryForTest(rule, "disabled")}
+			},
+		},
+		{
+			name: "selected-summary-evaluate",
+			list: func(rule testkit.FakeRuleset) []map[string]any {
+				return []map[string]any{rulesetSummaryForTest(rule, "evaluate")}
+			},
+		},
+		{
+			name: "enabled-list-detail-race",
+			list: func(rule testkit.FakeRuleset) []map[string]any {
+				return []map[string]any{rulesetSummaryForTest(rule, "enabled")}
+			},
+			detail: func(rule testkit.FakeRuleset) testkit.FakeRuleset {
+				rule.Enforcement = "evaluate"
+				rule.Conditions.RefName.Include = []string{"refs/heads/release"}
+				return rule
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, fake, identity := fixture(t)
+			if err := fake.SetRulesetsForTest(exactRepositoryRuleset()); err != nil {
+				t.Fatal(err)
+			}
+			rule := fake.Snapshot().Rulesets[0]
+			original := client.runner
+			client.runner = commandRunnerFunc(func(ctx context.Context, binary string, args, env []string) ([]byte, error) {
+				path := args[len(args)-1]
+				if strings.HasSuffix(path, "/rulesets?includes_parents=true&targets=branch&per_page=100&page=1") {
+					return json.Marshal(test.list(rule))
+				}
+				if test.detail != nil && strings.Contains(path, "/rulesets/42?includes_parents=true") {
+					return json.Marshal(test.detail(rule))
+				}
+				return original.Run(ctx, binary, args, env)
+			})
+			_, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash")
+			if test.accepts && err != nil {
+				t.Fatalf("selected inventory witness refused: %v", err)
+			}
+			if !test.accepts && !errors.Is(err, ErrGuardedMergeUnavailable) {
+				t.Fatalf("incomplete or mismatched inventory accepted: %v", err)
+			}
+		})
+	}
+}
+
+func rulesetSummaryForTest(rule testkit.FakeRuleset, enforcement string) map[string]any {
+	return map[string]any{"id": rule.ID, "name": rule.Name, "target": rule.Target, "source": rule.Source, "source_type": rule.SourceType, "enforcement": enforcement, "node_id": rule.NodeID, "_links": rule.Links, "created_at": rule.CreatedAt, "updated_at": rule.UpdatedAt}
+}
+
 func TestStrictProtectionRejectsMixedClassicAndRulesetWitness(t *testing.T) {
 	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 		if strings.Contains(strings.Join(args, "\x00"), "graphql") {
