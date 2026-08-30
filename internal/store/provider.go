@@ -89,11 +89,11 @@ func (s *Store) SetRecoveryAuthority(ctx context.Context, channel domain.Channel
 // RecordProviderLaunch is the pre-exec gate's durable publication point. The
 // wrapper remains blocked until this exact PID/PGID record commits.
 func (s *Store) RecordProviderLaunch(ctx context.Context, claim ProviderAttemptClaim, launch contracts.ProviderLaunch) error {
-	if claim.ID <= 0 || claim.Ref.Validate() != nil || claim.Phase == "" || claim.Attempt <= 0 || claim.LeaseKey == "" || claim.BindingDigest == "" || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ExpectedVersion == 0 || launch.PID <= 0 || launch.PGID <= 0 || launch.PID != launch.PGID || launch.BootIdentity == "" || launch.ProcessStartIdentity == "" || launch.Worktree == "" || claim.Worktree != launch.Worktree {
+	if claim.ID <= 0 || claim.Ref.Validate() != nil || claim.Phase == "" || !validProviderRole(claim.Role) || claim.Attempt <= 0 || claim.LeaseKey == "" || claim.BindingDigest == "" || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ExpectedVersion == 0 || launch.PID <= 0 || launch.PGID <= 0 || launch.PID != launch.PGID || launch.BootIdentity == "" || launch.ProcessStartIdentity == "" || launch.Worktree == "" || claim.Worktree != launch.Worktree {
 		return ErrProviderAttempt
 	}
 	return s.write(ctx, func(conn *sql.Conn) error {
-		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET process_pid=?,process_pgid=?,process_boot_identity=?,process_start_identity=?,launch_state='released' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND state='active' AND launch_state='launching' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=? AND provider_lease_key=? AND worktree_path=?`, launch.PID, launch.PGID, launch.BootIdentity, launch.ProcessStartIdentity, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest, claim.LeaseKey, launch.Worktree)
+		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET process_pid=?,process_pgid=?,process_boot_identity=?,process_start_identity=?,launch_state='released' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND state='active' AND launch_state='launching' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=? AND provider_lease_key=? AND worktree_path=?`, launch.PID, launch.PGID, launch.BootIdentity, launch.ProcessStartIdentity, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest, claim.LeaseKey, launch.Worktree)
 		if err != nil {
 			return err
 		}
@@ -150,7 +150,7 @@ func (s *Store) ActiveProviderAttempts(ctx context.Context, channel domain.Chann
 	if !channel.Valid() {
 		return nil, errors.New("valid channel is required")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,project_id,ticket_id,phase,attempt,provider,model,family,version,role,state,outcome,usage_units,started_at,finished_at,qualification_id,binding_digest,provider_lease_key,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha,supervisor_key FROM provider_attempts WHERE channel=? AND state IN ('active','quarantined') ORDER BY id`, channel)
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.project_id,a.ticket_id,a.phase,a.attempt,a.provider,a.model,a.family,a.version,a.role,a.state,a.outcome,a.usage_units,a.started_at,a.finished_at,a.qualification_id,a.binding_digest,a.provider_lease_key,a.leader_epoch,a.runner_epoch,a.expected_ticket_version,a.repository_path,a.worktree_path,a.worktree_identity,a.base_sha,a.supervisor_key,COALESCE(q.binary_digest,''),COALESCE(q.policy_digest,''),COALESCE(q.fixture_digest,'') FROM provider_attempts a LEFT JOIN provider_qualifications q ON q.id=a.qualification_id WHERE a.channel=? AND a.state IN ('active','quarantined') ORDER BY a.id`, channel)
 	if err != nil {
 		return nil, normalizeBusy(ctx, err)
 	}
@@ -160,7 +160,7 @@ func (s *Store) ActiveProviderAttempts(ctx context.Context, channel domain.Chann
 		var value ProviderAttempt
 		var project, ticket, started, finished string
 		var qualification sql.NullInt64
-		if err := rows.Scan(&value.ID, &project, &ticket, &value.Phase, &value.Attempt, &value.Binding.Identity.Provider, &value.Binding.Identity.Model, &value.Binding.Identity.Family, &value.Binding.Identity.Version, &value.Role, &value.State, &value.Outcome, &value.UsageUnits, &started, &finished, &qualification, &value.BindingDigest, &value.LeaseKey, &value.LeaderEpoch, &value.RunnerEpoch, &value.ExpectedVersion, &value.Repository, &value.Worktree, &value.WorktreeIdentity, &value.BaseSHA, &value.SupervisorKey); err != nil {
+		if err := rows.Scan(&value.ID, &project, &ticket, &value.Phase, &value.Attempt, &value.Binding.Identity.Provider, &value.Binding.Identity.Model, &value.Binding.Identity.Family, &value.Binding.Identity.Version, &value.Role, &value.State, &value.Outcome, &value.UsageUnits, &started, &finished, &qualification, &value.BindingDigest, &value.LeaseKey, &value.LeaderEpoch, &value.RunnerEpoch, &value.ExpectedVersion, &value.Repository, &value.Worktree, &value.WorktreeIdentity, &value.BaseSHA, &value.SupervisorKey, &value.Binding.BinaryDigest, &value.Binding.PolicyDigest, &value.Binding.FixtureDigest); err != nil {
 			return nil, err
 		}
 		value.Ref = domain.TicketRef{Channel: channel, Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
@@ -554,7 +554,7 @@ func (s *Store) quarantineProviderAttempts(ctx context.Context, ref domain.Ticke
 }
 
 func (s *Store) ProviderAttempts(ctx context.Context, ref domain.TicketRef) ([]ProviderAttempt, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,phase,attempt,provider,model,family,version,role,state,outcome,usage_units,started_at,finished_at,qualification_id,binding_digest,provider_lease_key,leader_epoch,runner_epoch,expected_ticket_version,repository_path,worktree_path,worktree_identity,base_sha,supervisor_key FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY id`, ref.Channel, ref.Project, ref.Ticket)
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.phase,a.attempt,a.provider,a.model,a.family,a.version,a.role,a.state,a.outcome,a.usage_units,a.started_at,a.finished_at,a.qualification_id,a.binding_digest,a.provider_lease_key,a.leader_epoch,a.runner_epoch,a.expected_ticket_version,a.repository_path,a.worktree_path,a.worktree_identity,a.base_sha,a.supervisor_key,COALESCE(q.binary_digest,''),COALESCE(q.policy_digest,''),COALESCE(q.fixture_digest,'') FROM provider_attempts a LEFT JOIN provider_qualifications q ON q.id=a.qualification_id WHERE a.channel=? AND a.project_id=? AND a.ticket_id=? ORDER BY a.id`, ref.Channel, ref.Project, ref.Ticket)
 	if err != nil {
 		return nil, normalizeBusy(ctx, err)
 	}
@@ -564,7 +564,7 @@ func (s *Store) ProviderAttempts(ctx context.Context, ref domain.TicketRef) ([]P
 		var v ProviderAttempt
 		var started, finished string
 		var qualification sql.NullInt64
-		if err := rows.Scan(&v.ID, &v.Phase, &v.Attempt, &v.Binding.Identity.Provider, &v.Binding.Identity.Model, &v.Binding.Identity.Family, &v.Binding.Identity.Version, &v.Role, &v.State, &v.Outcome, &v.UsageUnits, &started, &finished, &qualification, &v.BindingDigest, &v.LeaseKey, &v.LeaderEpoch, &v.RunnerEpoch, &v.ExpectedVersion, &v.Repository, &v.Worktree, &v.WorktreeIdentity, &v.BaseSHA, &v.SupervisorKey); err != nil {
+		if err := rows.Scan(&v.ID, &v.Phase, &v.Attempt, &v.Binding.Identity.Provider, &v.Binding.Identity.Model, &v.Binding.Identity.Family, &v.Binding.Identity.Version, &v.Role, &v.State, &v.Outcome, &v.UsageUnits, &started, &finished, &qualification, &v.BindingDigest, &v.LeaseKey, &v.LeaderEpoch, &v.RunnerEpoch, &v.ExpectedVersion, &v.Repository, &v.Worktree, &v.WorktreeIdentity, &v.BaseSHA, &v.SupervisorKey, &v.Binding.BinaryDigest, &v.Binding.PolicyDigest, &v.Binding.FixtureDigest); err != nil {
 			return nil, err
 		}
 		if qualification.Valid {
@@ -669,7 +669,7 @@ func validProviderIdentityClaim(r ProviderAttemptRequest) bool {
 	return r.Repository != "" && r.Worktree != "" && r.WorktreeIdentity != "" && validOID(r.BaseSHA) && len(r.SupervisorKey) == 32
 }
 func drainRequestForClaim(c ProviderAttemptClaim) contracts.DrainRequest {
-	return contracts.DrainRequest{ClaimID: c.ID, Identity: c.Binding.Identity, Ref: c.Ref, Phase: c.Phase, Attempt: c.Attempt, LeaderEpoch: c.LeaderEpoch, RunnerEpoch: c.RunnerEpoch, ExpectedVersion: c.ExpectedVersion, LeaseKey: c.LeaseKey, BindingDigest: c.BindingDigest}
+	return contracts.DrainRequest{ClaimID: c.ID, Identity: c.Binding.Identity, Ref: c.Ref, Phase: c.Phase, Role: c.Role, Attempt: c.Attempt, LeaderEpoch: c.LeaderEpoch, RunnerEpoch: c.RunnerEpoch, ExpectedVersion: c.ExpectedVersion, LeaseKey: c.LeaseKey, BindingDigest: c.BindingDigest, BinaryDigest: c.Binding.BinaryDigest, Repository: c.Repository, Worktree: c.Worktree, WorktreeIdentity: c.WorktreeIdentity, BaseSHA: c.BaseSHA}
 }
 func hexDigest(v string) bool {
 	return len(v) == 64 && strings.ToLower(v) == v && strings.Trim(v, "0123456789abcdef") == ""

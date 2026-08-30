@@ -149,7 +149,7 @@ func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Cloc
 		return nil, errors.New("process supervisor must support durable launch recording")
 	}
 	setter.SetLaunchRecorder(func(ctx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) error {
-		claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Worktree: launch.Worktree}
+		claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}
 		return database.RecordProviderLaunch(ctx, claim, launch)
 	})
 	return &Coordinator{registry: reg, routes: copy, store: database, clock: clock, supervisor: supervisor}, nil
@@ -331,7 +331,7 @@ func (c *Coordinator) RecoverClaim(ctx context.Context, claim store.ProviderAtte
 }
 
 func drainRequest(claim store.ProviderAttemptClaim) contracts.DrainRequest {
-	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest}
+	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA}
 }
 func validate(r Request) error {
 	if !r.Role.valid() || r.Input.Ticket.Validate() != nil || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.ConfigDigest == "" || len(r.ConfigDigest) != 64 || r.Input.Profile != contracts.ProfileGuarded || r.Input.Timeout <= 0 || r.Input.Timeout > 10*time.Minute || strings.TrimSpace(r.Input.Prompt) == "" || len(r.Input.Prompt) > 64<<10 || !cleanAbs(r.Input.Repository) || !cleanAbs(r.Input.Worktree) || r.Input.WorktreeIdentity == "" || len(r.Input.BaseSHA) != 40 || len(r.Input.Schema) == 0 || len(r.Input.Schema) > 1<<20 {

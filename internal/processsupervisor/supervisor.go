@@ -5,17 +5,21 @@ package processsupervisor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
+	"github.com/nysa-company/sf/internal/domain"
 )
 
 var ErrUnclear = errors.New("provider process drain is unclear")
@@ -37,12 +41,17 @@ type Supervisor struct {
 	Signer   *contracts.DrainSigner
 	Recorder LaunchRecorder
 	Env      []string
+	trusted  map[domain.ProviderIdentity]trustedExecutable
 	// Executable is the sf binary that implements __provider_gate. It is only
 	// overridden by compiled-boundary tests; production uses os.Executable.
 	Executable           string
 	SoftDrain, HardDrain time.Duration
 	mu                   sync.Mutex
-	runs                 map[string]*run
+	runs                 map[requestKey]*run
+}
+type trustedExecutable struct {
+	path   string
+	digest string
 }
 type run struct {
 	identity Identity
@@ -56,7 +65,7 @@ func New(recorder LaunchRecorder) (*Supervisor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Supervisor{Signer: signer, Recorder: recorder, Env: []string{"PATH=/usr/bin:/bin"}, SoftDrain: 2 * time.Second, HardDrain: 2 * time.Second, runs: map[string]*run{}}, nil
+	return &Supervisor{Signer: signer, Recorder: recorder, Env: []string{"PATH=/usr/bin:/bin"}, trusted: map[domain.ProviderIdentity]trustedExecutable{}, SoftDrain: 2 * time.Second, HardDrain: 2 * time.Second, runs: map[requestKey]*run{}}, nil
 }
 func (s *Supervisor) PublicKey() []byte { return s.Signer.PublicKey() }
 func (s *Supervisor) SetLaunchRecorder(recorder func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error) {
@@ -69,18 +78,134 @@ func (s *Supervisor) SetLaunchRecorder(recorder func(context.Context, contracts.
 	s.Recorder = launchRecorderFunc(recorder)
 }
 
+// RegisterExecutable authenticates the exact provider executable selected by
+// qualification. Production composition must register a path before a
+// provider can run; invocation argv cannot select or replace it.
+func (s *Supervisor) RegisterExecutable(identity domain.ProviderIdentity, path string) (string, error) {
+	if s == nil || identity.Provider == "" || identity.Model == "" || identity.Family == "" || identity.Version == "" {
+		return "", errors.New("complete provider identity is required")
+	}
+	trusted, err := authenticateExecutable(path)
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	s.trusted[identity] = trusted
+	s.mu.Unlock()
+	return trusted.digest, nil
+}
+
+func authenticateExecutable(path string) (trustedExecutable, error) {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return trustedExecutable{}, errors.New("trusted executable must be an absolute clean path")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || !filepath.IsAbs(resolved) || filepath.Clean(resolved) != resolved {
+		return trustedExecutable{}, errors.New("trusted executable could not be resolved")
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 || info.Mode()&0o022 != 0 {
+		return trustedExecutable{}, errors.New("trusted executable must be an executable private regular file")
+	}
+	if !trustedOwner(info) {
+		return trustedExecutable{}, errors.New("trusted executable owner is not trusted")
+	}
+	for current := filepath.Dir(resolved); ; current = filepath.Dir(current) {
+		entry, err := os.Lstat(current)
+		if err != nil || entry.Mode()&os.ModeSymlink != 0 || !entry.IsDir() {
+			return trustedExecutable{}, errors.New("trusted executable parent is not a real directory")
+		}
+		if !trustedOwner(entry) || entry.Mode()&0o022 != 0 {
+			return trustedExecutable{}, errors.New("trusted executable parent is not private")
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	file, err := os.Open(resolved)
+	if err != nil {
+		return trustedExecutable{}, errors.New("trusted executable could not be opened")
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return trustedExecutable{}, errors.New("trusted executable digest could not be read")
+	}
+	return trustedExecutable{path: resolved, digest: hex.EncodeToString(hash.Sum(nil))}, nil
+}
+
+func trustedOwner(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	uid := uint32(os.Getuid())
+	return stat.Uid == uid || stat.Uid == 0
+}
+
 type launchRecorderFunc func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error
 
 func (f launchRecorderFunc) RecordLaunch(ctx context.Context, req contracts.DrainRequest, identity Identity, worktree string) error {
 	return f(ctx, req, contracts.ProviderLaunch{PID: identity.PID, PGID: identity.PGID, BootIdentity: identity.BootIdentity, ProcessStartIdentity: identity.ProcessStartIdentity, Worktree: worktree})
 }
-func key(r contracts.DrainRequest) string {
-	return fmt.Sprintf("%s/%s/%s/%s/%d", r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, r.Attempt)
+
+type requestKey struct {
+	ClaimID          int64
+	Identity         domain.ProviderIdentity
+	Ref              domain.TicketRef
+	Phase            domain.Phase
+	Role             string
+	Attempt          int
+	LeaderEpoch      uint64
+	RunnerEpoch      uint64
+	ExpectedVersion  uint64
+	LeaseKey         string
+	BindingDigest    string
+	BinaryDigest     string
+	Repository       string
+	Worktree         string
+	WorktreeIdentity string
+	BaseSHA          string
+}
+
+func key(r contracts.DrainRequest) requestKey {
+	return requestKey{ClaimID: r.ClaimID, Identity: r.Identity, Ref: r.Ref, Phase: r.Phase, Role: r.Role, Attempt: r.Attempt, LeaderEpoch: r.LeaderEpoch, RunnerEpoch: r.RunnerEpoch, ExpectedVersion: r.ExpectedVersion, LeaseKey: r.LeaseKey, BindingDigest: r.BindingDigest, BinaryDigest: r.BinaryDigest, Repository: r.Repository, Worktree: r.Worktree, WorktreeIdentity: r.WorktreeIdentity, BaseSHA: r.BaseSHA}
 }
 
 func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, invocation contracts.Invocation, input contracts.PhaseInput) (contracts.CommandResult, error) {
 	if len(invocation.Argv) == 0 || !filepath.IsAbs(invocation.Argv[0]) || input.Worktree == "" || filepath.Clean(input.Worktree) != input.Worktree {
 		return contracts.CommandResult{}, errors.New("guarded argv and worktree required")
+	}
+	if request.ClaimID <= 0 || request.Ref.Validate() != nil || request.Phase == "" || (request.Role != "planner" && request.Role != "builder" && request.Role != "reviewer") || request.Attempt <= 0 || request.LeaderEpoch == 0 || request.RunnerEpoch == 0 || request.ExpectedVersion == 0 || request.LeaseKey == "" || request.BindingDigest == "" || request.Worktree == "" {
+		return contracts.CommandResult{}, errors.New("complete provider claim identity is required")
+	}
+	s.mu.Lock()
+	trusted, registered := s.trusted[request.Identity]
+	s.mu.Unlock()
+	if !registered {
+		return contracts.CommandResult{}, errors.New("provider executable is not registered")
+	}
+	resolved, err := filepath.EvalSymlinks(invocation.Argv[0])
+	if err != nil || resolved != trusted.path {
+		return contracts.CommandResult{}, errors.New("provider invocation executable does not match qualification")
+	}
+	current, err := authenticateExecutable(trusted.path)
+	if err != nil || current.digest != trusted.digest {
+		return contracts.CommandResult{}, errors.New("provider executable changed after qualification")
+	}
+	if request.BinaryDigest != "" && request.BinaryDigest != trusted.digest {
+		return contracts.CommandResult{}, errors.New("provider executable digest does not match claim")
+	}
+	providerPath := trusted.path
+	var executable *os.File
+	if runtime.GOOS == "linux" {
+		executable, err = os.Open(trusted.path)
+		if err != nil {
+			return contracts.CommandResult{}, errors.New("provider executable could not be pinned")
+		}
+		defer executable.Close()
+		providerPath = fmt.Sprintf("/proc/self/fd/%d", 4) // FD 3 is the gate.
 	}
 	self := s.Executable
 	if self == "" {
@@ -95,11 +220,14 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 		return contracts.CommandResult{}, err
 	}
 	defer gateWrite.Close()
-	argv := append([]string{"__provider_gate", invocation.Argv[0]}, invocation.Argv[1:]...)
+	argv := append([]string{"__provider_gate", providerPath}, invocation.Argv[1:]...)
 	cmd := exec.Command(self, argv...)
 	cmd.Dir = input.Worktree
 	cmd.Env = append(append([]string(nil), s.Env...), invocation.Env...)
 	cmd.ExtraFiles = []*os.File{gateRead} // FD 3: wrapper exits on EOF before release.
+	if executable != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, executable) // FD 4: pinned provider.
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr limitedBuffer
 	stdout.limit, stderr.limit = 64<<10, 64<<10

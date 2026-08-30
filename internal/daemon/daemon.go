@@ -27,6 +27,8 @@ import (
 	"github.com/nysa-company/sf/internal/events"
 	"github.com/nysa-company/sf/internal/leader"
 	"github.com/nysa-company/sf/internal/operator"
+	"github.com/nysa-company/sf/internal/phaseartifact"
+	"github.com/nysa-company/sf/internal/providercoord"
 	"github.com/nysa-company/sf/internal/redact"
 	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
@@ -90,6 +92,10 @@ type Config struct {
 	RecoveryDrainer    interface {
 		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
+	// ProviderCoordinatorFactory composes configured, qualified adapters after
+	// the daemon opens the authoritative Store. A nil factory leaves provider
+	// execution unavailable rather than inventing an adapter.
+	ProviderCoordinatorFactory func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error)
 }
 
 type Daemon struct {
@@ -109,8 +115,9 @@ type Daemon struct {
 	recoveryDrainer interface {
 		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
-	mu     sync.Mutex
-	closed bool
+	providerCoordinator *providercoord.Coordinator
+	mu                  sync.Mutex
+	closed              bool
 
 	projectionMu      sync.Mutex
 	projector         events.Projector
@@ -180,7 +187,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 			return failStore(errors.New("provider supervisor does not support durable launch recording"))
 		}
 		setter.SetLaunchRecorder(func(recordCtx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) error {
-			claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Worktree: launch.Worktree}
+			claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}
 			return database.RecordProviderLaunch(recordCtx, claim, launch)
 		})
 	}
@@ -203,8 +210,15 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		}
 	}
 
+	var coordinator *providercoord.Coordinator
+	if configuration.ProviderCoordinatorFactory != nil {
+		coordinator, err = configuration.ProviderCoordinatorFactory(database, configuration.ProviderSupervisor)
+		if err != nil {
+			return failStore(fmt.Errorf("compose provider coordinator: %w", err))
+		}
+	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, providerCoordinator: coordinator}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -269,7 +283,7 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 				}
 				return fmt.Errorf("quarantined provider attempt %d without a provable launch identity: %w", claim.ID, store.ErrProviderDrain)
 			}
-			req := contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest}
+			req := contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA}
 			proof, drainErr := daemon.recoveryDrainer.DrainPersisted(ctx, req, launch)
 			if drainErr != nil {
 				if err := daemon.store.QuarantineRecoveredProviderAttemptClaim(ctx, claim, daemon.epoch, daemon.clock.Now()); err != nil {
@@ -347,6 +361,8 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		response = daemon.show(ctx, request)
 	case "ticket.start":
 		response = daemon.startTicket(ctx, request, identity)
+	case "provider.run":
+		response = daemon.runProvider(ctx, request)
 	case "daemon.status":
 		response = daemon.status(request)
 	default:
@@ -358,6 +374,72 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		}
 	}
 	return response
+}
+
+type providerRunParameters struct {
+	Project          string                     `json:"project"`
+	Ticket           string                     `json:"ticket"`
+	Role             providercoord.Role         `json:"role"`
+	Phase            domain.Phase               `json:"phase"`
+	Prompt           string                     `json:"prompt"`
+	Worktree         string                     `json:"worktree"`
+	WorktreeIdentity string                     `json:"worktree_identity"`
+	BaseSHA          string                     `json:"base_sha"`
+	AllowedPaths     []string                   `json:"allowed_paths"`
+	Schema           []byte                     `json:"schema"`
+	Timeout          time.Duration              `json:"timeout"`
+	Profile          contracts.ExecutionProfile `json:"profile"`
+	ExpectedVersion  uint64                     `json:"expected_version"`
+	LeaderEpoch      uint64                     `json:"leader_epoch"`
+	RunnerEpoch      uint64                     `json:"runner_epoch"`
+	ConfigDigest     string                     `json:"config_digest"`
+}
+
+// runProvider is the daemon's narrow provider execution API. Production
+// composition supplies only qualified adapters through ProviderCoordinator;
+// absent configuration fails closed before any provider attempt is admitted.
+func (daemon *Daemon) runProvider(ctx context.Context, request api.Request) api.Response {
+	if daemon.providerCoordinator == nil {
+		return daemon.failure(request, "provider_unavailable", "no qualified provider coordinator is configured", false)
+	}
+	var parameters providerRunParameters
+	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Project == "" || parameters.Ticket == "" {
+		return daemon.failure(request, "invalid_provider_request", "provider.run requires project and ticket", false)
+	}
+	ref := domain.TicketRef{Channel: daemon.channel, Project: domain.ProjectID(parameters.Project), Ticket: domain.TicketID(parameters.Ticket)}
+	if err := ref.Validate(); err != nil {
+		return daemon.failure(request, "invalid_provider_request", "provider ticket reference is invalid", false)
+	}
+	ticket, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	project, err := daemon.store.Project(ctx, daemon.channel, ref.Project)
+	if err != nil {
+		return daemon.failure(request, "unknown_project", "ticket project is not registered", false)
+	}
+	if parameters.ExpectedVersion == 0 {
+		parameters.ExpectedVersion = ticket.Version
+	}
+	if parameters.LeaderEpoch == 0 {
+		parameters.LeaderEpoch = daemon.epoch
+	}
+	if parameters.RunnerEpoch == 0 {
+		parameters.RunnerEpoch = ticket.RunnerEpoch
+	}
+	if parameters.ConfigDigest == "" {
+		parameters.ConfigDigest = project.ConfigDigest
+	}
+	result := daemon.providerCoordinator.Run(ctx, providercoord.Request{
+		Role: parameters.Role, ExpectedVersion: parameters.ExpectedVersion,
+		Fence: domain.Fence{LeaderEpoch: parameters.LeaderEpoch, RunnerEpoch: parameters.RunnerEpoch}, ConfigDigest: parameters.ConfigDigest,
+		Validation: phaseartifact.Validation{TicketType: ticket.Type},
+		Input:      contracts.PhaseInput{Ticket: ref, Phase: parameters.Phase, Prompt: parameters.Prompt, Repository: project.Path, Worktree: parameters.Worktree, WorktreeIdentity: parameters.WorktreeIdentity, BaseSHA: parameters.BaseSHA, AllowedPaths: parameters.AllowedPaths, Timeout: parameters.Timeout, Profile: parameters.Profile, Schema: parameters.Schema},
+	})
+	if result.NeedsOperator {
+		return daemon.failure(request, "provider_needs_operator", "provider execution did not complete under the configured coordinator", true)
+	}
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "provider_run", Identity: string(ref.Ticket)}, result)
 }
 
 func (daemon *Daemon) projectEvents(ctx context.Context) error {

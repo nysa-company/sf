@@ -9,9 +9,12 @@ import (
 
 	"github.com/nysa-company/sf/internal/cli"
 	"github.com/nysa-company/sf/internal/config"
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/processsupervisor"
+	"github.com/nysa-company/sf/internal/providercoord"
+	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/version"
 )
 
@@ -54,6 +57,12 @@ func main() {
 			RecoveryAuthorityKey: supervisor.PublicKey(),
 			ProviderSupervisor:   supervisor,
 			RecoveryDrainer:      supervisor,
+			ProviderCoordinatorFactory: func(database *store.Store, process contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
+				// Real provider adapters are intentionally not bundled. An empty
+				// qualified registry keeps production fail-closed until explicit
+				// provider qualification/configuration is implemented.
+				return providercoord.New(providercoord.NewRegistry(), nil, database, nil, process)
+			},
 		})
 	}
 	os.Exit(cli.ExecuteWithDaemon(ctx, os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}, runDaemon))
