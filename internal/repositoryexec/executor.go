@@ -141,6 +141,16 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 		err := recorder.CompleteRepositoryCommand(persistCtx, req.Claim, result)
 		cancel()
 		if err != nil {
+			staleCtx, staleCancel := repositoryPersistenceContext()
+			staleErr := recorder.ReconcileStaleRepositoryCommandObservation(staleCtx, req.Claim, result)
+			staleCancel()
+			if staleErr == nil {
+				if releaseErr := lease.Release(); releaseErr != nil {
+					_ = lease.Quarantine()
+					return result, releaseErr
+				}
+				return result, err
+			}
 			_ = lease.Quarantine()
 			return result, err
 		}

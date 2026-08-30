@@ -19,13 +19,6 @@ type repositorySandboxPaths struct {
 	Home       string
 	Temporary  string
 	Executable string
-	// Toolchain is a private, authenticated closure (for example staged Node
-	// and npm).  It is intentionally distinct from Executable: scripts may
-	// exec descendants, but their runtime files must still be a fixed staged
-	// tree rather than an ambient package-manager installation.
-	Toolchain        string
-	DependencyPaths  []string
-	AllowProcessTree bool
 }
 
 // repositoryStrictSandboxProfile applies to Git and each Go test binary. The
@@ -47,7 +40,7 @@ func repositoryStrictSandboxProfileFor(paths repositorySandboxPaths) (string, er
 	if !repositorySandboxAvailable(paths.Repository) || !cleanAbsolute(paths.Repository) || !cleanAbsolute(paths.Worktree) || !cleanAbsolute(paths.Executable) {
 		return "", ErrUnclear
 	}
-	for _, path := range []string{paths.GitFile, paths.CommonDir, paths.Home, paths.Temporary, paths.Toolchain} {
+	for _, path := range []string{paths.GitFile, paths.CommonDir, paths.Home, paths.Temporary} {
 		if path != "" && !cleanAbsolute(path) {
 			return "", ErrUnclear
 		}
@@ -74,31 +67,10 @@ func repositoryStrictSandboxProfileFor(paths repositorySandboxPaths) (string, er
 		"(allow file-read* (subpath " + seatbeltString(paths.Worktree) + "))\n" +
 		"(allow file-read* (literal " + seatbeltString(paths.Executable) + "))\n" +
 		"(allow file-write* (literal \"/dev/null\"))\n"
-	if paths.Toolchain != "" {
-		profile += "(allow file-read* (subpath " + seatbeltString(paths.Toolchain) + "))\n" +
-			"(allow file-map-executable (subpath " + seatbeltString(paths.Toolchain) + "))\n"
-	}
-	for _, path := range paths.DependencyPaths {
-		if !cleanAbsolute(path) {
-			return "", ErrUnclear
-		}
-		profile += "(allow file-read* (literal " + seatbeltString(path) + "))\n" +
-			"(allow file-map-executable (literal " + seatbeltString(path) + "))\n"
-		// dyld resolves versioned dylib symlinks through their exact library
-		// directory. The closure builder supplies only parent directories of
-		// authenticated dependency files; no Homebrew prefix is allowed.
-		profile += "(allow file-read* (subpath " + seatbeltString(filepath.Dir(path)) + "))\n" +
-			"(allow file-map-executable (subpath " + seatbeltString(filepath.Dir(path)) + "))\n"
-	}
 	// A default-deny profile needs metadata permission for each ancestor while
 	// resolving an otherwise exact path.  Do not replace this with a broad home
 	// allowlist: only the named command paths receive ancestor traversal.
-	for _, path := range []string{paths.Repository, paths.Worktree, paths.GitFile, paths.CommonDir, paths.Home, paths.Temporary, paths.Executable, paths.Toolchain} {
-		for _, ancestor := range seatbeltAncestors(path) {
-			profile += "(allow file-read* (literal " + seatbeltString(ancestor) + "))\n"
-		}
-	}
-	for _, path := range paths.DependencyPaths {
+	for _, path := range []string{paths.Repository, paths.Worktree, paths.GitFile, paths.CommonDir, paths.Home, paths.Temporary, paths.Executable} {
 		for _, ancestor := range seatbeltAncestors(path) {
 			profile += "(allow file-read* (literal " + seatbeltString(ancestor) + "))\n"
 		}
@@ -126,20 +98,10 @@ func repositoryStrictSandboxProfileFor(paths repositorySandboxPaths) (string, er
 	if paths.CommonDir != "" {
 		profile += "(deny file-write* (subpath " + seatbeltString(paths.CommonDir) + "))\n"
 	}
-	profile += "(deny network*)\n"
-	if paths.AllowProcessTree {
-		// npm scripts necessarily use Node, a shell, and (for many normal test
-		// runners) further descendants.  Seatbelt restrictions are inherited by
-		// each child, so this admits a process tree without admitting repository,
-		// Git-control, credential, host-write, or network authority.  Lifecycle
-		// ambiguity is still quarantined by the supervisor; this is guarded-only,
-		// not an ADR 0002 autonomous-containment assertion.
-		profile += "(allow process-fork)\n(allow process-exec)\n"
-	} else {
-		profile += "(deny process-fork)\n" +
-			"(deny process-exec)\n" +
-			"(allow process-exec (literal " + seatbeltString(paths.Executable) + "))\n"
-	}
+	profile += "(deny network*)\n" +
+		"(deny process-fork)\n" +
+		"(deny process-exec)\n" +
+		"(allow process-exec (literal " + seatbeltString(paths.Executable) + "))\n"
 	return profile, nil
 }
 

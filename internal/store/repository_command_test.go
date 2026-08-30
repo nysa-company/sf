@@ -131,6 +131,36 @@ func TestRepositoryCommandRefusesUnobservedCompletion(t *testing.T) {
 	}
 }
 
+func TestRepositoryCommandStaleObservedResultRetiresExactExecutingEffect(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "stale-observation")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.InvalidateRunner(ctx, claim.TicketRef, claim.TicketVersion, domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch}); err != nil {
+		t.Fatal(err)
+	}
+	result := contracts.CommandResult{ExitCode: 0, Observed: true, Stdout: []byte("observed after cancellation")}
+	if err := db.CompleteRepositoryCommand(ctx, claim, result); err == nil {
+		t.Fatal("stale claim was accepted as completion")
+	}
+	if err := db.ReconcileStaleRepositoryCommandObservation(ctx, claim, result); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM effects WHERE semantic_key=?`, claim.SemanticKey).Scan(&state); err != nil || state != string(EffectFailed) {
+		t.Fatalf("effect state=%q err=%v", state, err)
+	}
+	if err := lease.Quarantine(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRepositoryCommandPersistsTrackedGoTestGroups(t *testing.T) {
 	db, ctx := openTestStore(t)
 	intent := repositoryCommandIntentFixture(t, db, ctx, "tracked-groups")

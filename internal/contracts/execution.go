@@ -149,6 +149,7 @@ type RepositoryCommandAuthority interface {
 type RepositoryCommandResultRecorder interface {
 	CompleteRepositoryCommand(context.Context, RepositoryCommandClaim, CommandResult) error
 	MarkRepositoryCommandUncertain(context.Context, RepositoryCommandClaim, string) error
+	ReconcileStaleRepositoryCommandObservation(context.Context, RepositoryCommandClaim, CommandResult) error
 }
 type RepositoryCommandDrainer interface {
 	DrainRepositoryCommand(context.Context, RepositoryCommandLaunch) error

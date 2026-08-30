@@ -138,8 +138,10 @@ func (l *repositoryCommandLease) Release() error {
 	if l == nil || l.store == nil {
 		return ErrRepositoryCommandLease
 	}
-	return l.store.write(context.Background(), func(c *sql.Conn) error {
-		r, e := c.ExecContext(context.Background(), `DELETE FROM repository_command_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND launch_state IN ('unrecorded','drained')`, l.claim.Repository, l.claim.SemanticKey, l.nonce)
+	ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second)
+	defer cancel()
+	return l.store.write(ctx, func(c *sql.Conn) error {
+		r, e := c.ExecContext(ctx, `DELETE FROM repository_command_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND launch_state IN ('unrecorded','drained')`, l.claim.Repository, l.claim.SemanticKey, l.nonce)
 		if e != nil {
 			return e
 		}
@@ -154,8 +156,10 @@ func (l *repositoryCommandLease) Quarantine() error {
 	if l == nil || l.store == nil {
 		return ErrRepositoryCommandLease
 	}
-	return l.store.write(context.Background(), func(c *sql.Conn) error {
-		result, err := c.ExecContext(context.Background(), `UPDATE repository_command_leases SET state='quarantined',launch_state='quarantined' WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active'`, l.claim.Repository, l.claim.SemanticKey, l.nonce)
+	ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second)
+	defer cancel()
+	return l.store.write(ctx, func(c *sql.Conn) error {
+		result, err := c.ExecContext(ctx, `UPDATE repository_command_leases SET state='quarantined',launch_state='quarantined' WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active'`, l.claim.Repository, l.claim.SemanticKey, l.nonce)
 		if err != nil {
 			return err
 		}
@@ -259,6 +263,9 @@ func (s *Store) repositoryCommandGroups(ctx context.Context, repository, semanti
 	defer rows.Close()
 	var groups []contracts.RepositoryCommandLaunch
 	for rows.Next() {
+		if len(groups) >= 64 {
+			return nil, ErrRepositoryCommandLease
+		}
 		var group contracts.RepositoryCommandLaunch
 		if err := rows.Scan(&group.PID, &group.PGID, &group.BootIdentity, &group.ProcessStartIdentity); err != nil {
 			return nil, err
@@ -271,6 +278,8 @@ func (s *Store) repositoryCommandGroups(ctx context.Context, repository, semanti
 	return groups, rows.Err()
 }
 func (s *Store) RecoverRepositoryCommandLeases(ctx context.Context, channel domain.Channel, leader uint64, d contracts.RepositoryCommandDrainer) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	leases, e := s.ActiveRepositoryCommandLeases(ctx, channel)
 	if e != nil {
 		return e

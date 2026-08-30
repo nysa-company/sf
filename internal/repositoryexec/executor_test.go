@@ -55,13 +55,11 @@ func TestRunRejectsShellAndNeverCallsAuthority(t *testing.T) {
 	}
 }
 
-func TestNPMRecipeReachesGuardedSupervisorPreflight(t *testing.T) {
-	policy, err := executionpolicy.NewCommandSnapshot([]string{"npm", "test"})
-	if err != nil {
-		t.Fatal(err)
+func TestNPMRecipeNeverAcquiresRepositoryLease(t *testing.T) {
+	if _, err := executionpolicy.NewCommandSnapshot([]string{"npm", "test"}); err == nil {
+		t.Fatal("npm recipe was admitted for local repository execution")
 	}
-	if err := (processsupervisor.RepositoryCommandSupervisor{}).Preflight(contracts.CommandSpec{Argv: []string{"npm", "test"}, Profile: contracts.ProfileGuarded}); err != nil {
-		t.Fatalf("guarded npm preflight error=%v", err)
+	if err := (processsupervisor.RepositoryCommandSupervisor{}).Preflight(contracts.CommandSpec{Argv: []string{"npm", "test"}, Profile: contracts.ProfileGuarded}); err == nil {
+		t.Fatal("npm preflight was executable")
 	}
-	_ = policy
 }

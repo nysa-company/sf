@@ -1,7 +1,6 @@
 package processsupervisor
 
 import (
-	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -138,100 +137,5 @@ func TestRepositoryStrictSandboxDeniesSeparateWorktreeAndHostWrites(t *testing.T
 		if !strings.Contains(text, want) {
 			t.Fatalf("strict profile allowed prohibited operation %q: %s", want, text)
 		}
-	}
-}
-
-// npm is intentionally exercised through its normal shell/Node descendant
-// chain. This is the guarded proof for the Nysa-shaped exact recipe: children
-// may fork/exec, but Seatbelt inherits and leaves them unable to alter either
-// repository identity, read host credentials, write outside private state, or
-// use the network.
-func TestRepositoryStrictSandboxRunsExactNPMRecipeWithInheritedBoundary(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("repository command product boundary is macOS")
-	}
-	npm, err := resolveFixedExecutable("npm")
-	if err != nil {
-		t.Skipf("qualified Node 22/npm unavailable: %v", err)
-	}
-	closure, err := resolveNodeToolchainClosure(npm)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	repository, worktree, private, host := filepath.Join(root, "repository"), filepath.Join(root, "worktree"), filepath.Join(root, "private"), filepath.Join(root, "host")
-	for _, path := range []string{repository, worktree, filepath.Join(repository, ".git"), filepath.Join(worktree, ".git"), private, host} {
-		if err := os.MkdirAll(path, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	sentinel := filepath.Join(host, "credential-sentinel")
-	if err := os.WriteFile(sentinel, []byte("non-secret sentinel"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	if err := os.WriteFile(filepath.Join(worktree, "package.json"), []byte(`{"name":"sf-npm-fixture","private":true,"scripts":{"test":"node proof.js"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	fixture := fmt.Sprintf(`const fs=require("fs"), net=require("net");
-function denied(n,f){try{f();console.log(n+"-ok");process.exitCode=97}catch(_){console.log(n+"-denied")}}
-denied("source-write",()=>fs.writeFileSync(%q,"x"));
-denied("worktree-write",()=>fs.writeFileSync(%q,"x"));
-denied("git-write",()=>fs.writeFileSync(%q,"x"));
-denied("outside-write",()=>fs.writeFileSync(%q,"x"));
-denied("credential-read",()=>fs.readFileSync(%q));
-const s=net.connect(%d,"127.0.0.1"); s.on("connect",()=>{console.log("network-ok");process.exitCode=98;s.destroy()}); s.on("error",()=>console.log("network-denied"));
-setTimeout(()=>{console.log("safe-ok");process.exit(process.exitCode||0)},100);`, filepath.Join(repository, "source"), filepath.Join(worktree, "source"), filepath.Join(repository, ".git", "config"), filepath.Join(host, "outside"), sentinel, listener.Addr().(*net.TCPAddr).Port)
-	if err := os.WriteFile(filepath.Join(worktree, "proof.js"), []byte(fixture), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	profile, err := repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: repository, Worktree: worktree, GitFile: filepath.Join(worktree, ".git"), CommonDir: filepath.Join(repository, ".git"), Home: private, Temporary: private, Executable: npm, Toolchain: closure.Root, DependencyPaths: closure.DependencyPaths, AllowProcessTree: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(repositorySandboxExec, "-p", profile, npm, "test")
-	cmd.Dir = worktree
-	cmd.Env = []string{"HOME=" + private, "TMPDIR=" + private, "PATH=" + filepath.Join(closure.Root, "bin") + ":/usr/bin:/bin", "NPM_CONFIG_AUDIT=false", "NPM_CONFIG_FUND=false", "NPM_CONFIG_UPDATE_NOTIFIER=false", "NPM_CONFIG_OFFLINE=true", "NPM_CONFIG_CACHE=" + filepath.Join(private, "cache"), "NPM_CONFIG_USERCONFIG=" + filepath.Join(private, "npmrc"), "NPM_CONFIG_GLOBALCONFIG=/dev/null", "OPENSSL_CONF=/dev/null"}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("exact npm test did not complete in inherited sandbox: %v: %s", err, out)
-	}
-	text := string(out)
-	for _, want := range []string{"source-write-denied", "worktree-write-denied", "git-write-denied", "outside-write-denied", "credential-read-denied", "network-denied", "safe-ok"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("npm fixture missing %q: %s", want, text)
-		}
-	}
-	for _, rejected := range []string{"source-write-ok", "worktree-write-ok", "git-write-ok", "outside-write-ok", "credential-read-ok", "network-ok"} {
-		if strings.Contains(text, rejected) {
-			t.Fatalf("npm fixture escaped inherited boundary %q: %s", rejected, text)
-		}
-	}
-}
-
-func TestNodeClosureRecheckRejectsChangedClaimDigest(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("repository command product boundary is macOS")
-	}
-	npm, err := resolveFixedExecutable("npm")
-	if err != nil {
-		t.Skipf("qualified Node 22/npm unavailable: %v", err)
-	}
-	closure, err := resolveNodeToolchainClosure(npm)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !nodeClosureMatches(npm, closure, closure.Digest) {
-		t.Fatal("unchanged Node/npm closure did not reauthenticate")
-	}
-	if nodeClosureMatches(npm, closure, "sha256:"+strings.Repeat("0", 64)) {
-		t.Fatal("changed Node/npm closure digest was accepted before launch")
 	}
 }

@@ -184,8 +184,6 @@ func EvaluateRepositoryCommand(argv []string) CommandDecision {
 		return evaluateReadOnlyGit(argv)
 	case "go":
 		return evaluateGoVerification(argv)
-	case "npm":
-		return evaluateNPMVerification(argv)
 	default:
 		return deny("repository_command_not_allowlisted", "only exact read-only Git and Go verification commands are eligible")
 	}
@@ -202,20 +200,6 @@ func evaluateGoVerification(argv []string) CommandDecision {
 		return deny("go_recipe_forbidden", "only the hermetic recipe `go test ./...` is eligible; flags, tool selection, outputs, module changes, cgo, and subprocess-dependent tests require operator takeover")
 	}
 	return CommandDecision{Allowed: true, Code: "allowed_go_test_recipe", Reason: "exact hermetic Go test recipe"}
-}
-
-// evaluateNPMVerification admits only durable, declarative project recipes.
-// It never accepts npm flags, install/audit/download commands, workspace
-// selectors, or a caller-defined script name.  The supervisor currently fails
-// these recipes closed before lease acquisition because Seatbelt cannot prove a
-// complete process tree for npm's Node/shell subprocess chain; retaining the
-// typed recipe lets the planner bind Nysa's configured intent without silently
-// broadening it into arbitrary npm argv.
-func evaluateNPMVerification(argv []string) CommandDecision {
-	if (len(argv) == 2 && argv[1] == "test") || (len(argv) == 3 && argv[1] == "run" && argv[2] == "build") {
-		return CommandDecision{Allowed: true, Code: "allowed_npm_recipe", Reason: "exact local NPM verification recipe"}
-	}
-	return deny("npm_recipe_forbidden", "only exact `npm test` and `npm run build` recipes are eligible; installs, CI-only scripts, flags, workspace selectors, downloads, and arbitrary subprocesses require operator takeover")
 }
 
 func evaluateReadOnlyGit(argv []string) CommandDecision {

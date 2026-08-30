@@ -53,8 +53,8 @@ func TestRepositoryCommandDrainerReapsRecordedGroup(t *testing.T) {
 		close(waited)
 	}()
 	d := RepositoryCommandDrainer{SoftDrain: 10 * time.Millisecond, HardDrain: 500 * time.Millisecond}
-	if err := d.DrainRepositoryCommand(context.Background(), contracts.RepositoryCommandLaunch{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: boot, ProcessStartIdentity: start}); err != nil {
-		t.Fatalf("drain recorded group: %v", err)
+	if err := d.DrainRepositoryCommand(context.Background(), contracts.RepositoryCommandLaunch{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: boot, ProcessStartIdentity: start}); err == nil {
+		t.Fatal("restart drainer accepted a vanished leader/old PGID as proof")
 	}
 	<-waited
 }
@@ -63,6 +63,15 @@ func TestRepositoryCommandDrainerFailsClosedOnUnclearIdentity(t *testing.T) {
 	d := RepositoryCommandDrainer{}
 	if err := d.DrainRepositoryCommand(context.Background(), contracts.RepositoryCommandLaunch{PID: 42, PGID: 42}); err == nil {
 		t.Fatal("drainer accepted an identity without boot/start proofs")
+	}
+}
+
+func TestRepositoryCommandPreflightRefusesUnsupportedPlatformBeforeLaunch(t *testing.T) {
+	old := repositoryCommandGOOS
+	repositoryCommandGOOS = "linux"
+	defer func() { repositoryCommandGOOS = old }()
+	if err := (RepositoryCommandSupervisor{}).Preflight(contracts.CommandSpec{Argv: []string{"go", "test", "./..."}, Profile: contracts.ProfileGuarded}); err != ErrUnclear {
+		t.Fatalf("unsupported platform error=%v", err)
 	}
 }
 

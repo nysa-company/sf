@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +29,8 @@ import (
 
 const repositoryOutputLimit = 64 << 10
 const repositoryInputLimit = 1 << 20
+const repositoryToolchainFileLimit = 32768
+const repositoryToolchainByteLimit = 512 << 20
 
 // RepositoryCommandSupervisor is the sole os/exec boundary for exact,
 // credential-free repository commands. The child is held behind the sf gate
@@ -46,12 +49,28 @@ type RepositoryCommandSupervisor struct {
 	beforeWorktreeOpen func()
 }
 
-// Preflight is a deliberately side-effect-free compatibility hook. Typed
-// recipes are admitted only after Run stages the complete selected toolchain
-// and applies the inherited default-deny profile.
-func (s RepositoryCommandSupervisor) Preflight(contracts.CommandSpec) error { return nil }
+// Preflight is side-effect-free. v1 repository commands are macOS-only: other
+// hosts cannot reach any filesystem, toolchain, or process operation.
+var repositoryCommandGOOS = runtime.GOOS
+
+func repositoryCommandPlatformAvailable() bool { return repositoryCommandGOOS == "darwin" }
+
+func (s RepositoryCommandSupervisor) Preflight(spec contracts.CommandSpec) error {
+	if !repositoryCommandPlatformAvailable() {
+		return ErrUnclear
+	}
+	if len(spec.Argv) > 0 && filepath.Base(spec.Argv[0]) == "npm" {
+		return ErrSubprocessRecipeUnsupported
+	}
+	return nil
+}
+
+var ErrSubprocessRecipeUnsupported = errors.New("repository npm recipe requires operator or CI takeover")
 
 func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.RepositoryCommandClaim, spec contracts.CommandSpec, policy executionpolicy.CommandSnapshot, lease contracts.RepositoryCommandLease) (contracts.CommandResult, error) {
+	if err := s.Preflight(spec); err != nil {
+		return contracts.CommandResult{}, err
+	}
 	if lease == nil || spec.Profile != contracts.ProfileGuarded || len(spec.Argv) == 0 || spec.Directory != claim.Worktree || spec.Timeout <= 0 || spec.Timeout > 45*time.Minute || s.SoftDrain > 30*time.Second || s.HardDrain > 30*time.Second || policy.Authorize(spec.Argv) != nil || policy.Digest() != claim.PolicyDigest {
 		return contracts.CommandResult{}, ErrUnclear
 	}
@@ -84,7 +103,7 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if claim.ExecutablePath != resolved {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	selectedDigest, err := repositoryExecutableDigest(resolved)
+	selectedDigest, err := executableFileDigest(resolved)
 	if err != nil || claim.ExecutableDigest != selectedDigest {
 		return contracts.CommandResult{}, ErrUnclear
 	}
@@ -94,8 +113,8 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	}
 	var input []byte
 	if spec.Stdin != nil {
-		input, err = io.ReadAll(io.LimitReader(spec.Stdin, repositoryInputLimit+1))
-		if err != nil || len(input) > repositoryInputLimit {
+		input, err = readRepositoryInput(ctx, spec.Stdin)
+		if err != nil {
 			return contracts.CommandResult{}, errors.New("repository command stdin exceeds limit")
 		}
 	}
@@ -144,10 +163,7 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	defer os.RemoveAll(home)
 	defer os.RemoveAll(tmp)
 	isGo := filepath.Base(resolved) == "go"
-	_, npmRootErr := nodeToolchainRoot(resolved)
-	isNPM := npmRootErr == nil
 	var staged, stagedToolchain string
-	var npmClosure nodeToolchainClosure
 	if isGo {
 		goRoot := filepath.Dir(filepath.Dir(resolved))
 		rootBinary, rootErr := filepath.EvalSymlinks(filepath.Join(goRoot, "bin", "go"))
@@ -165,12 +181,6 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		if digestErr != nil || sourceDigestErr != nil || stagedDigest != sourceDigest {
 			return contracts.CommandResult{}, ErrUnclear
 		}
-	} else if isNPM {
-		npmClosure, err = resolveNodeToolchainClosure(resolved)
-		if err != nil || npmClosure.Digest != claim.ExecutableDigest {
-			return contracts.CommandResult{}, ErrUnclear
-		}
-		staged, stagedToolchain = resolved, npmClosure.Root
 	} else {
 		staged, err = stageExecutable(resolved, claim.ExecutableDigest)
 		if err != nil {
@@ -213,19 +223,6 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		// and every module/tool-selection escape are disabled by the exact policy
 		// recipe plus this environment.
 		env = append(env, "GOROOT="+stagedToolchain, "CGO_ENABLED=0", "GOPROXY=off", "GOSUMDB=off", "GONOSUMDB=*", "GOTOOLCHAIN=local", "GOENV=off", "GOWORK=off", "GOTELEMETRY=off")
-	} else if isNPM {
-		// Do not let npm discover a host-global prefix/config/cache or fetch a
-		// package. The default-deny Seatbelt profile independently denies
-		// network and every non-private write path; these knobs make normal npm
-		// behavior deterministic before it reaches that kernel boundary.
-		env = append(env,
-			"PATH="+filepath.Join(stagedToolchain, "bin")+":/usr/bin:/bin:/usr/sbin:/sbin",
-			"NPM_CONFIG_AUDIT=false", "NPM_CONFIG_FUND=false", "NPM_CONFIG_UPDATE_NOTIFIER=false",
-			"NPM_CONFIG_OFFLINE=true", "NPM_CONFIG_PREFER_OFFLINE=true",
-			"NPM_CONFIG_CACHE="+filepath.Join(tmp, "npm-cache"),
-			"NPM_CONFIG_USERCONFIG="+filepath.Join(home, "npmrc"), "NPM_CONFIG_GLOBALCONFIG=/dev/null",
-			"OPENSSL_CONF=/dev/null",
-		)
 	}
 	self, err = stageRepositoryGate(self)
 	if err != nil {
@@ -257,7 +254,7 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		if pathErr != nil {
 			return contracts.CommandResult{}, ErrUnclear
 		}
-		sandboxProfile, err = repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: claim.Repository, Worktree: claim.Worktree, GitFile: gitFile, CommonDir: identity.CommonDir, Home: home, Temporary: tmp, Executable: staged, Toolchain: stagedToolchain, DependencyPaths: npmClosure.DependencyPaths, AllowProcessTree: isNPM})
+		sandboxProfile, err = repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: claim.Repository, Worktree: claim.Worktree, GitFile: gitFile, CommonDir: identity.CommonDir, Home: home, Temporary: tmp, Executable: staged})
 	}
 	if err != nil {
 		return contracts.CommandResult{}, ErrUnclear
@@ -302,13 +299,6 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr repositoryBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if isNPM {
-		// Recompute every Node/npm closure member after profile construction and
-		// immediately before the gate starts. A mismatch is a pre-launch refusal.
-		if !nodeClosureMatches(resolved, npmClosure, claim.ExecutableDigest) {
-			return contracts.CommandResult{}, ErrUnclear
-		}
-	}
 	started := time.Now()
 	if err := cmd.Start(); err != nil {
 		gateRead.Close()
@@ -459,6 +449,36 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	return result, nil
 }
 
+// readRepositoryInput is synchronous (so it cannot strand a reader goroutine)
+// and checks cancellation between bounded reads. Callers that provide a reader
+// which itself blocks forever receive no child launch; trusted composition uses
+// deadline-aware readers for external input.
+func readRepositoryInput(ctx context.Context, r io.Reader) ([]byte, error) {
+	var out bytes.Buffer
+	buffer := make([]byte, 32<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		n, err := r.Read(buffer)
+		if n > 0 {
+			if out.Len()+n > repositoryInputLimit {
+				return nil, ErrUnclear
+			}
+			_, _ = out.Write(buffer[:n])
+		}
+		if err == io.EOF {
+			return out.Bytes(), nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			return nil, ErrUnclear
+		}
+	}
+}
+
 // authenticateRepositorySourceExecutable intentionally does not require every
 // ancestor directory to be private. Homebrew's code-owned Go installation is
 // commonly group-writable at an ancestor even though its executable file is
@@ -478,28 +498,14 @@ func resolveFixedExecutable(name string) (string, error) {
 	if name == "" {
 		return "", exec.ErrNotFound
 	}
-	if filepath.IsAbs(name) {
-		resolved, err := filepath.EvalSymlinks(name)
-		if err != nil {
-			return "", exec.ErrNotFound
-		}
-		if _, nodeErr := nodeToolchainRoot(resolved); nodeErr == nil {
-			return resolved, nil
-		}
-	}
 	tool := filepath.Base(name)
-	if tool != "git" && tool != "go" && tool != "npm" {
+	if tool != "git" && tool != "go" {
 		return "", exec.ErrNotFound
 	}
 	for _, candidate := range approvedRepositoryExecutables(tool) {
 		resolved, err := filepath.EvalSymlinks(candidate)
 		if err != nil {
 			continue
-		}
-		if tool == "npm" {
-			if _, err := nodeToolchainRoot(resolved); err != nil {
-				continue
-			}
 		}
 		if filepath.IsAbs(name) {
 			provided, err := filepath.EvalSymlinks(name)
@@ -527,31 +533,16 @@ func approvedRepositoryExecutables(tool string) []string {
 		return []string{"/Library/Developer/CommandLineTools/usr/bin/git", "/Applications/Xcode.app/Contents/Developer/usr/bin/git", "/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"}
 	case "go":
 		return []string{"/usr/local/go/bin/go", "/usr/local/bin/go", "/opt/homebrew/bin/go"}
-	case "npm":
-		return []string{"/opt/homebrew/bin/npm", "/usr/local/bin/npm"}
 	default:
 		return nil
 	}
 }
 
-// RepositoryExecutableDigest binds an npm claim to the complete immutable
-// Node/npm closure rather than only npm-cli.js. Other approved commands are
-// single staged files and retain their ordinary file digest.
+// RepositoryExecutableDigest binds the approved executable file to the claim.
 func RepositoryExecutableDigest(path string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", err
-	}
-	return repositoryExecutableDigest(resolved)
-}
-
-func repositoryExecutableDigest(resolved string) (string, error) {
-	if root, err := nodeToolchainRoot(resolved); err == nil {
-		closure, err := resolveNodeToolchainClosureForRoot(root)
-		if err != nil {
-			return "", err
-		}
-		return closure.Digest, nil
 	}
 	return executableFileDigest(resolved)
 }
@@ -980,7 +971,13 @@ func stageGoToolchain(root string) (string, error) {
 		return "", err
 	}
 	destinationRoot := filepath.Join(base, "goroot")
+	deadline := time.Now().Add(30 * time.Second)
+	var files int
+	var copied int64
 	err = filepath.WalkDir(root, func(source string, entry fs.DirEntry, walkErr error) error {
+		if time.Now().After(deadline) {
+			return ErrUnclear
+		}
 		if walkErr != nil {
 			return walkErr
 		}
@@ -1002,6 +999,11 @@ func stageGoToolchain(root string) (string, error) {
 			return os.MkdirAll(destination, 0o700)
 		}
 		if !info.Mode().IsRegular() {
+			return ErrUnclear
+		}
+		files++
+		copied += info.Size()
+		if files > repositoryToolchainFileLimit || copied > repositoryToolchainByteLimit {
 			return ErrUnclear
 		}
 		sourceFile, err := os.Open(source)
@@ -1427,10 +1429,10 @@ func (d RepositoryCommandDrainer) drainRepositoryGroup(ctx context.Context, l co
 		start, startErr := processStartIdentity(l.PID)
 		groupErr := syscall.Kill(-l.PGID, 0)
 		if startErr != nil && groupErr == syscall.ESRCH {
-			// The recorded leader was reaped and its original group is empty.
-			// This is sufficient only for the documented non-hostile local
-			// containment boundary; it is not an OS process-tree witness.
-			return nil
+			// A restarted daemon cannot infer a full process tree from an old
+			// PGID's disappearance. Keep the lease quarantined; successful live
+			// runs finish only after their own monitored group handshake.
+			return ErrUnclear
 		}
 		if startErr == nil && (start != l.ProcessStartIdentity || func() bool { pgid, err := syscall.Getpgid(l.PID); return err != nil || pgid != l.PGID }()) {
 			return ErrUnclear
