@@ -454,3 +454,13 @@ var migrationV25 = []string{
 	`CREATE TRIGGER provider_attempt_inputs_immutable_delete BEFORE DELETE ON provider_attempt_inputs BEGIN SELECT RAISE(ABORT,'provider attempt input is append-only'); END`,
 	`UPDATE provider_attempts SET state='failed',outcome='legacy_unverifiable',finished_at=CASE WHEN finished_at='' THEN started_at ELSE finished_at END,launch_state='legacy_unverifiable' WHERE state IN ('active','quarantined')`,
 }
+
+// v26 completes the v25 fail-closed upgrade. A provider attempt and its
+// phase run are one lifecycle: retaining an active phase after its legacy
+// provider claim became unverifiable would permanently block future work.
+var migrationV26 = []string{
+	`UPDATE phase_runs SET state='failed',completed_at=COALESCE(completed_at,started_at),outcome='legacy_unverifiable'
+	 WHERE state='active' AND EXISTS(
+		SELECT 1 FROM provider_attempts a WHERE a.channel=phase_runs.channel AND a.project_id=phase_runs.project_id AND a.ticket_id=phase_runs.ticket_id AND a.phase=phase_runs.phase AND a.attempt=phase_runs.attempt AND a.state='failed' AND a.outcome='legacy_unverifiable'
+	 )`,
+}

@@ -79,6 +79,39 @@ func TestPrivateSchemaV10UpgradesThroughProviderMigrations(t *testing.T) {
 	}
 }
 
+func TestV26ClosesPhaseRunForV25LegacyProviderClaim(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v24.sqlite")
+	createDatabaseAtVersion(t, path, 24)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.ExecContext(ctx, `INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('dev','legacy','/legacy','main'); INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES('dev','legacy','SF-v26','source','feature','guarded','building',1,1,'legacy-v26'); INSERT INTO phase_runs(channel,project_id,ticket_id,phase,attempt,state,leader_epoch,runner_epoch,expected_ticket_version,outcome,started_at) VALUES('dev','legacy','SF-v26','build',1,'active',1,1,1,'running','now'); INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,started_at) VALUES('dev','legacy','SF-v26','build',1,'legacy','model','family','1','running','builder','active','now')`)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := OpenChannel(ctx, path, filepath.Join(t.TempDir(), "backups"), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var providerState, phaseState, phaseOutcome string
+	if err := database.db.QueryRowContext(ctx, `SELECT state FROM provider_attempts WHERE project_id='legacy' AND ticket_id='SF-v26'`).Scan(&providerState); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.QueryRowContext(ctx, `SELECT state,outcome FROM phase_runs WHERE project_id='legacy' AND ticket_id='SF-v26'`).Scan(&phaseState, &phaseOutcome); err != nil {
+		t.Fatal(err)
+	}
+	if providerState != "failed" || phaseState != "failed" || phaseOutcome != "legacy_unverifiable" {
+		t.Fatalf("legacy lifecycle was left active: provider=%s phase=%s/%s", providerState, phaseState, phaseOutcome)
+	}
+}
+
 func TestFutureAndForeignSchemasRefuseBeforePragmaOrBackupMutation(t *testing.T) {
 	ctx := context.Background()
 	for _, test := range []struct {
@@ -255,6 +288,8 @@ func testMigration(version int) []string {
 		return migrationV24
 	case 25:
 		return migrationV25
+	case 26:
+		return migrationV26
 	default:
 		return nil
 	}

@@ -179,8 +179,9 @@ type DrainRequest struct {
 	RequestDigest    string
 }
 
-// DrainResult is supplied by the process supervisor after cancellation or
-// recovery. A false value keeps the durable claim quarantined.
+// DrainProof attests only that the recorded supervised process group drained.
+// Guarded v1 trusts the qualified local provider and does not represent this
+// as hostile same-UID process-tree containment.
 type DrainProof struct {
 	publicKey ed25519.PublicKey
 	signature []byte

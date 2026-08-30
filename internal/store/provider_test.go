@@ -23,7 +23,7 @@ func supervised(t *testing.T, request ProviderAttemptRequest) ProviderAttemptReq
 	request.BaseSHA = strings.Repeat("a", 40)
 	request.SupervisorKey = providerTestSigner.PublicKey()
 	if request.Input.Ticket == (domain.TicketRef{}) {
-		request.Input = contracts.PhaseInput{Ticket: request.Ref, Phase: request.Phase, Prompt: "provider test", Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA, AllowedPaths: []string{"."}, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}
+		request.Input = contracts.PhaseInput{Ticket: request.Ref, Phase: request.Phase, LeaderEpoch: request.Fence.LeaderEpoch, RunnerEpoch: request.Fence.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Prompt: "provider test", Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA, AllowedPaths: []string{"."}, Provider: request.Binding.Identity, AuthMode: request.Binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}
 	}
 	return request
 }
@@ -115,6 +115,35 @@ func TestProviderAttemptLaunchInputIsAppendOnly(t *testing.T) {
 	}
 	if _, err := db.db.ExecContext(ctx, `DELETE FROM provider_attempt_inputs WHERE provider_attempt_id=?`, claim.ID); err == nil {
 		t.Fatal("launch input record was deletable")
+	}
+}
+
+func TestBeginProviderAttemptRejectsInvalidDirectLaunchInput(t *testing.T) {
+	for name, mutate := range map[string]func(*ProviderAttemptRequest){
+		"prompt":   func(r *ProviderAttemptRequest) { r.Input.Prompt = " " },
+		"schema":   func(r *ProviderAttemptRequest) { r.Input.Schema = []byte("not-json") },
+		"paths":    func(r *ProviderAttemptRequest) { r.Input.AllowedPaths = []string{"../escape"} },
+		"profile":  func(r *ProviderAttemptRequest) { r.Input.Profile = contracts.ProfileAutonomous },
+		"timeout":  func(r *ProviderAttemptRequest) { r.Input.Timeout = 46 * time.Minute },
+		"ticket":   func(r *ProviderAttemptRequest) { r.Input.Ticket.Ticket = "SF-other" },
+		"phase":    func(r *ProviderAttemptRequest) { r.Input.Phase = domain.PhasePlanning },
+		"fence":    func(r *ProviderAttemptRequest) { r.Input.RunnerEpoch++ },
+		"worktree": func(r *ProviderAttemptRequest) { r.Input.Worktree = "/tmp/other" },
+		"provider": func(r *ProviderAttemptRequest) { r.Input.Provider.Model = "other" },
+		"auth":     func(r *ProviderAttemptRequest) { r.Input.AuthMode = "other" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			digest := setupProviderProject(t, db, ctx)
+			leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "invalid-input")
+			ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-direct-input", leader), leader, domain.StateBuilding)
+			builder, _ := setupProviderPair(t, db, ctx)
+			request := supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+			mutate(&request)
+			if _, err := db.BeginProviderAttempt(ctx, request); !errors.Is(err, ErrProviderAttempt) {
+				t.Fatalf("invalid %s direct input admitted: %v", name, err)
+			}
+		})
 	}
 }
 

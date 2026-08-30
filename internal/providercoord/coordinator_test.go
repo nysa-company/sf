@@ -67,7 +67,7 @@ func TestMalformedOutputFallsBackAndNeverPersistsSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: time.Second, Profile: contracts.ProfileGuarded, Schema: []byte("schema")}}
+	r := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: time.Second, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}}
 	result := c.Run(ctx, r)
 	if result.Code != Failed || len(result.Attempts) != 1 {
 		t.Fatalf("result=%+v", result)
@@ -175,7 +175,7 @@ func newCoordinatorFixture(t *testing.T, supervisor contracts.ProcessSupervisor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: `{"repository":"/tmp/p"}`, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: 200 * time.Millisecond, Profile: contracts.ProfileGuarded, Schema: []byte("schema")}}
+	request := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: `{"repository":"/tmp/p"}`, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: 200 * time.Millisecond, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}}
 	return database, request, coordinator, ref
 }
 
@@ -242,7 +242,7 @@ func TestCancellationQuarantinesWhenProviderDoesNotDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: time.Second, Profile: contracts.ProfileGuarded, Schema: []byte("schema")}}
+	request := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: time.Second, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}}
 	// Leave enough startup budget for the race-instrumented SQLite admission
 	// path to persist the claim before cancellation exercises quarantine.
 	callCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)

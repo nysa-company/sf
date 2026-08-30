@@ -230,6 +230,8 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		claimInput := r.Input
 		claimInput.Timeout = timeout
+		claimInput.Provider, claimInput.AuthMode = binding.Identity, binding.AuthMode
+		claimInput.LeaderEpoch, claimInput.RunnerEpoch, claimInput.ExpectedVersion = r.Fence.LeaderEpoch, r.Fence.RunnerEpoch, r.ExpectedVersion
 		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest, Repository: r.Input.Repository, Worktree: r.Input.Worktree, WorktreeIdentity: r.Input.WorktreeIdentity, BaseSHA: r.Input.BaseSHA, SupervisorKey: c.supervisor.PublicKey(), Input: claimInput})
 		if err != nil {
 			cancel()

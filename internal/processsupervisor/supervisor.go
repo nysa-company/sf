@@ -274,10 +274,11 @@ type requestKey struct {
 	Worktree         string
 	WorktreeIdentity string
 	BaseSHA          string
+	RequestDigest    string
 }
 
 func key(r contracts.DrainRequest) requestKey {
-	return requestKey{ClaimID: r.ClaimID, Identity: r.Identity, Ref: r.Ref, Phase: r.Phase, Role: r.Role, Attempt: r.Attempt, LeaderEpoch: r.LeaderEpoch, RunnerEpoch: r.RunnerEpoch, ExpectedVersion: r.ExpectedVersion, LeaseKey: r.LeaseKey, BindingDigest: r.BindingDigest, BinaryDigest: r.BinaryDigest, PolicyDigest: r.PolicyDigest, AuthDigest: r.AuthDigest, AuthMode: r.AuthMode, Repository: r.Repository, Worktree: r.Worktree, WorktreeIdentity: r.WorktreeIdentity, BaseSHA: r.BaseSHA}
+	return requestKey{ClaimID: r.ClaimID, Identity: r.Identity, Ref: r.Ref, Phase: r.Phase, Role: r.Role, Attempt: r.Attempt, LeaderEpoch: r.LeaderEpoch, RunnerEpoch: r.RunnerEpoch, ExpectedVersion: r.ExpectedVersion, LeaseKey: r.LeaseKey, BindingDigest: r.BindingDigest, BinaryDigest: r.BinaryDigest, PolicyDigest: r.PolicyDigest, AuthDigest: r.AuthDigest, AuthMode: r.AuthMode, Repository: r.Repository, Worktree: r.Worktree, WorktreeIdentity: r.WorktreeIdentity, BaseSHA: r.BaseSHA, RequestDigest: r.RequestDigest}
 }
 
 // validCodexInvocation is deliberately duplicated from the adapter's small
@@ -313,10 +314,10 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	if len(invocation.Argv) == 0 || !filepath.IsAbs(invocation.Argv[0]) || input.Worktree == "" || filepath.Clean(input.Worktree) != input.Worktree {
 		return contracts.CommandResult{}, errors.New("guarded argv and worktree required")
 	}
-	if request.ClaimID <= 0 || request.Ref.Validate() != nil || request.Phase == "" || (request.Role != "planner" && request.Role != "builder" && request.Role != "reviewer") || request.Attempt <= 0 || request.LeaderEpoch == 0 || request.RunnerEpoch == 0 || request.ExpectedVersion == 0 || request.LeaseKey == "" || request.BindingDigest == "" || request.BinaryDigest == "" || request.PolicyDigest == "" || request.Repository == "" || request.Worktree == "" || request.WorktreeIdentity == "" || request.BaseSHA == "" {
+	if request.ClaimID <= 0 || request.Ref.Validate() != nil || request.Phase == "" || (request.Role != "planner" && request.Role != "builder" && request.Role != "reviewer") || request.Attempt <= 0 || request.LeaderEpoch == 0 || request.RunnerEpoch == 0 || request.ExpectedVersion == 0 || request.LeaseKey == "" || request.BindingDigest == "" || request.BinaryDigest == "" || request.PolicyDigest == "" || request.Repository == "" || request.Worktree == "" || request.WorktreeIdentity == "" || request.BaseSHA == "" || !validRequestDigest(request.RequestDigest) {
 		return contracts.CommandResult{}, errors.New("complete provider claim identity is required")
 	}
-	if !requestMatchesInput(request, input) || (request.RequestDigest != "" && !contracts.PhaseInputDigestMatches(input, request.RequestDigest)) {
+	if !requestMatchesInput(request, input) || !contracts.PhaseInputDigestMatches(input, request.RequestDigest) {
 		return contracts.CommandResult{}, errors.New("provider claim does not match phase input")
 	}
 	s.mu.Lock()
@@ -647,7 +648,7 @@ func readBoundedFile(path string, limit int64) ([]byte, bool, error) {
 }
 
 func requestMatchesInput(request contracts.DrainRequest, input contracts.PhaseInput) bool {
-	if request.Repository == "" || request.WorktreeIdentity == "" || request.BaseSHA == "" || request.Ref != input.Ticket || request.Phase != input.Phase || request.Identity != input.Provider || request.AuthMode != input.AuthMode || request.Repository != input.Repository || request.Worktree != input.Worktree || request.WorktreeIdentity != input.WorktreeIdentity || request.BaseSHA != input.BaseSHA || request.Attempt != input.Attempt || request.LeaderEpoch != input.LeaderEpoch || request.RunnerEpoch != input.RunnerEpoch || request.ExpectedVersion != input.ExpectedVersion || (request.RequestDigest != "" && input.RequestDigest != request.RequestDigest) {
+	if request.Repository == "" || request.WorktreeIdentity == "" || request.BaseSHA == "" || request.Ref != input.Ticket || request.Phase != input.Phase || request.Identity != input.Provider || request.AuthMode != input.AuthMode || request.Repository != input.Repository || request.Worktree != input.Worktree || request.WorktreeIdentity != input.WorktreeIdentity || request.BaseSHA != input.BaseSHA || request.Attempt != input.Attempt || request.LeaderEpoch != input.LeaderEpoch || request.RunnerEpoch != input.RunnerEpoch || request.ExpectedVersion != input.ExpectedVersion || input.RequestDigest != request.RequestDigest {
 		return false
 	}
 	switch request.Role {
@@ -691,31 +692,42 @@ func privateExistingDirectory(path string) error {
 	return nil
 }
 func (s *Supervisor) Drain(ctx context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
-	if s == nil || s.SoftDrain <= 0 || s.HardDrain <= 0 || s.SoftDrain > maxDrainDuration || s.HardDrain > maxDrainDuration {
+	if s == nil || !validRequestDigest(request.RequestDigest) {
 		return contracts.DrainProof{}, ErrUnclear
 	}
+	drainCtx, cancel, err := s.drainContext(ctx)
+	if err != nil {
+		return contracts.DrainProof{}, err
+	}
+	defer cancel()
 	s.mu.Lock()
 	r := s.runs[key(request)]
 	s.mu.Unlock()
 	if r == nil {
 		return contracts.DrainProof{}, ErrUnclear
 	}
-	if err := s.terminate(r); err != nil {
+	if err := s.terminateContext(drainCtx, r); err != nil {
 		return contracts.DrainProof{}, err
 	}
-	if err := s.proveGone(r); err != nil {
+	if err := s.proveGoneContext(drainCtx, r); err != nil {
 		return contracts.DrainProof{}, err
 	}
 	s.removeRun(request, r)
 	return s.Signer.ProveDrained(request)
 }
 
-// DrainPersisted is restart recovery: it accepts only the exact durable
-// PID/PGID identity published through the launch gate.
+// DrainPersisted is restart recovery for a qualified local provider. It
+// proves only the recorded process group; v1 does not claim containment of
+// hostile same-UID trees that escaped that group.
 func (s *Supervisor) DrainPersisted(ctx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) (contracts.DrainProof, error) {
-	if s == nil || s.SoftDrain <= 0 || s.HardDrain <= 0 || s.SoftDrain > maxDrainDuration || s.HardDrain > maxDrainDuration {
+	if s == nil || !validRequestDigest(request.RequestDigest) {
 		return contracts.DrainProof{}, ErrUnclear
 	}
+	drainCtx, cancel, err := s.drainContext(ctx)
+	if err != nil {
+		return contracts.DrainProof{}, err
+	}
+	defer cancel()
 	if launch.PID <= 0 || launch.PGID <= 0 || launch.PID != launch.PGID || launch.BootIdentity == "" || launch.ProcessStartIdentity == "" {
 		return contracts.DrainProof{}, ErrUnclear
 	}
@@ -751,16 +763,16 @@ func (s *Supervisor) DrainPersisted(ctx context.Context, request contracts.Drain
 				return
 			}
 			select {
-			case <-ctx.Done():
+			case <-drainCtx.Done():
 				return
 			case <-time.After(20 * time.Millisecond):
 			}
 		}
 	}()
-	if err := s.terminate(r); err != nil {
+	if err := s.terminateContext(drainCtx, r); err != nil {
 		return contracts.DrainProof{}, err
 	}
-	if err := s.proveGone(r); err != nil {
+	if err := s.proveGoneContext(drainCtx, r); err != nil {
 		return contracts.DrainProof{}, err
 	}
 	return s.Signer.ProveDrained(request)
@@ -769,9 +781,6 @@ func (s *Supervisor) DrainPersisted(ctx context.Context, request contracts.Drain
 func bootIdentityChanged(recorded, observed string) bool {
 	return recorded != "" && observed != "" && recorded != observed
 }
-func missingLeaderGroupGone(leaderErr, groupErr error) bool {
-	return leaderErr == syscall.ESRCH && groupErr == syscall.ESRCH
-}
 
 // persistedIdentityMatches is separated from signalling so a failed identity
 // check has a mechanically obvious no-signal path. In particular, a rapid
@@ -779,7 +788,33 @@ func missingLeaderGroupGone(leaderErr, groupErr error) bool {
 func persistedIdentityMatches(launch contracts.ProviderLaunch, observed string, observedPGID int) bool {
 	return launch.PID > 0 && launch.PID == launch.PGID && launch.BootIdentity != "" && launch.ProcessStartIdentity != "" && observed == launch.ProcessStartIdentity && observedPGID == launch.PGID
 }
+
+func validRequestDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// drainContext is the single wall-clock budget for TERM, KILL, stream drain,
+// and final group observation. Caller cancellation always wins.
+func (s *Supervisor) drainContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	if s.SoftDrain <= 0 || s.HardDrain <= 0 || s.SoftDrain > maxDrainDuration || s.HardDrain > maxDrainDuration || ctx == nil || ctx.Err() != nil {
+		return nil, nil, ErrUnclear
+	}
+	bounded, cancel := context.WithTimeout(ctx, s.SoftDrain+s.HardDrain)
+	return bounded, cancel, nil
+}
+
 func (s *Supervisor) terminate(r *run) error {
+	return s.terminateContext(context.Background(), r)
+}
+func (s *Supervisor) terminateContext(ctx context.Context, r *run) error {
 	if r == nil || r.identity.PID <= 0 || r.identity.PGID != r.identity.PID {
 		return ErrUnclear
 	}
@@ -796,14 +831,18 @@ func (s *Supervisor) terminate(r *run) error {
 	case <-r.done:
 		return nil
 	case <-time.After(s.SoftDrain):
+	case <-ctx.Done():
+		return ErrUnclear
 	}
 	_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
 	select {
 	case <-r.done:
 		return nil
 	case <-time.After(s.HardDrain):
+	case <-ctx.Done():
 		return ErrUnclear
 	}
+	return ErrUnclear
 }
 
 func validateLiveIdentity(identity Identity) error {
@@ -824,14 +863,17 @@ func validateLiveIdentity(identity Identity) error {
 	return nil
 }
 func (s *Supervisor) proveGone(r *run) error {
+	return s.proveGoneContext(context.Background(), r)
+}
+func (s *Supervisor) proveGoneContext(ctx context.Context, r *run) error {
 	select {
 	case <-r.done:
-	case <-time.After(s.HardDrain):
+	case <-ctx.Done():
 		return ErrUnclear
 	}
 	select {
 	case <-r.streams:
-	case <-time.After(s.HardDrain):
+	case <-ctx.Done():
 		return ErrUnclear
 	}
 	if err := syscall.Kill(-r.identity.PGID, 0); err == nil || err != syscall.ESRCH {

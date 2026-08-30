@@ -5,8 +5,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -47,7 +49,7 @@ func TestRunKeyRequiresExactClaimIdentity(t *testing.T) {
 		ClaimID: 7, Identity: domain.ProviderIdentity{Provider: "p", Model: "m", Family: "f", Version: "v"},
 		Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "project", Ticket: "SF-key"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 2,
 		LeaderEpoch: 3, RunnerEpoch: 4, ExpectedVersion: 5, LeaseKey: "lease", BindingDigest: "binding", BinaryDigest: "binary",
-		Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: "base",
+		Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: "base", RequestDigest: strings.Repeat("e", 64),
 	}
 	for name, mutate := range map[string]func(*contracts.DrainRequest){
 		"role":              func(request *contracts.DrainRequest) { request.Role = "reviewer" },
@@ -57,6 +59,7 @@ func TestRunKeyRequiresExactClaimIdentity(t *testing.T) {
 		"policy":            func(request *contracts.DrainRequest) { request.PolicyDigest = "other" },
 		"worktree":          func(request *contracts.DrainRequest) { request.Worktree = "/other" },
 		"worktree identity": func(request *contracts.DrainRequest) { request.WorktreeIdentity = "other" },
+		"request digest":    func(request *contracts.DrainRequest) { request.RequestDigest = strings.Repeat("f", 64) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			changed := base
@@ -65,6 +68,54 @@ func TestRunKeyRequiresExactClaimIdentity(t *testing.T) {
 				t.Fatal("mismatched claim identity reused the same supervisor run key")
 			}
 		})
+	}
+}
+
+func TestDrainContextHonorsCallerDeadlineAndTotalBudget(t *testing.T) {
+	supervisor, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor.SoftDrain, supervisor.HardDrain = 80*time.Millisecond, 80*time.Millisecond
+	caller, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	bounded, boundedCancel, err := supervisor.drainContext(caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer boundedCancel()
+	<-bounded.Done()
+	if elapsed := time.Since(started); elapsed > 75*time.Millisecond {
+		t.Fatalf("caller deadline was not honored: %s", elapsed)
+	}
+	started = time.Now()
+	bounded, boundedCancel, err = supervisor.drainContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer boundedCancel()
+	<-bounded.Done()
+	if elapsed := time.Since(started); elapsed > 230*time.Millisecond {
+		t.Fatalf("soft+hard drain budget was exceeded: %s", elapsed)
+	}
+}
+
+func TestDrainPersistedLeaderGoneAfterSetsidRemainsUnclear(t *testing.T) {
+	supervisor, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := hostBootIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := contracts.DrainRequest{ClaimID: 99, RequestDigest: strings.Repeat("a", 64)}
+	// A setsid child can outlive a vanished leader. With no durable descendant
+	// witness, v1 rejects recovery instead of claiming whole-tree containment.
+	launch := contracts.ProviderLaunch{PID: 999999, PGID: 999999, BootIdentity: boot, ProcessStartIdentity: "old-leader", Worktree: "/worktree"}
+	if _, err := supervisor.DrainPersisted(context.Background(), request, launch); !errors.Is(err, ErrUnclear) {
+		t.Fatalf("leader-gone recovery was accepted: %v", err)
 	}
 }
 

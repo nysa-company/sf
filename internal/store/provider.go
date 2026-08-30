@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -192,7 +194,7 @@ func (s *Store) ActiveProviderAttempts(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptRequest) (ProviderAttemptClaim, error) {
-	if r.Ref.Validate() != nil || !validProviderPhase(r.Phase) || !validProviderRole(r.Role) || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.Capacity < 1 || r.Capacity > 16 || r.At.IsZero() || !validRuntimeBinding(r.Binding) {
+	if r.Ref.Validate() != nil || !validProviderPhase(r.Phase) || !validProviderRole(r.Role) || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.Capacity < 1 || r.Capacity > 16 || r.At.IsZero() || !validRuntimeBinding(r.Binding) || !validProviderAttemptInput(r) {
 		return ProviderAttemptClaim{}, ErrProviderAttempt
 	}
 	var claim ProviderAttemptClaim
@@ -216,12 +218,6 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		var projectPath, durablePath, durableIdentity, durableBase string
 		if err := conn.QueryRowContext(ctx, `SELECT p.canonical_path,w.path,w.identity_json,w.base_sha FROM projects p JOIN worktrees w ON w.channel=p.channel AND w.project_id=p.id AND w.ticket_id=? WHERE p.channel=? AND p.id=?`, r.Ref.Ticket, r.Ref.Channel, r.Ref.Project).Scan(&projectPath, &durablePath, &durableIdentity, &durableBase); err != nil {
 			return ErrEvidenceConflict
-		}
-		// Old in-process Store callers had no identity fields. They can only use
-		// the already-registered durable record; runnable coordinator requests
-		// always supply and are checked against every exact field.
-		if r.Repository == "" && r.Worktree == "" && r.WorktreeIdentity == "" && r.BaseSHA == "" {
-			r.Repository, r.Worktree, r.WorktreeIdentity, r.BaseSHA = projectPath, durablePath, durableIdentity, durableBase
 		}
 		if len(r.SupervisorKey) == 0 {
 			return ErrProviderAttempt
@@ -703,6 +699,30 @@ func providerAdmissionState(state domain.State, phase domain.Phase, role string)
 	}
 }
 func validProviderRole(v string) bool { return v == "planner" || v == "builder" || v == "reviewer" }
+
+// validProviderAttemptInput duplicates the coordinator's admission boundary
+// because Store is the issuing authority. Direct callers must not be able to
+// mint a durable claim whose actual launch fields were never admissible.
+func validProviderAttemptInput(r ProviderAttemptRequest) bool {
+	in := r.Input
+	if in.Ticket != r.Ref || in.Phase != r.Phase || in.Attempt != 0 || in.LeaderEpoch != r.Fence.LeaderEpoch || in.RunnerEpoch != r.Fence.RunnerEpoch || in.ExpectedVersion != r.ExpectedVersion || in.Provider != r.Binding.Identity || in.AuthMode != r.Binding.AuthMode || in.Repository != r.Repository || in.Worktree != r.Worktree || in.WorktreeIdentity != r.WorktreeIdentity || in.BaseSHA != r.BaseSHA || in.Profile != contracts.ProfileGuarded || in.RequestDigest != "" || strings.TrimSpace(in.Prompt) == "" || len(in.Prompt) > 64<<10 || strings.ContainsRune(in.Prompt, '\x00') || in.Timeout <= 0 || in.Timeout > 45*time.Minute || len(in.Schema) == 0 || len(in.Schema) > 1<<20 || !json.Valid(in.Schema) {
+		return false
+	}
+	if len(in.AllowedPaths) == 0 || len(in.AllowedPaths) > 256 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(in.AllowedPaths))
+	for _, path := range in.AllowedPaths {
+		if path == "" || len(path) > 4096 || filepath.IsAbs(path) || filepath.Clean(path) != path || (path != "." && (path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)))) {
+			return false
+		}
+		if _, ok := seen[path]; ok {
+			return false
+		}
+		seen[path] = struct{}{}
+	}
+	return true
+}
 func validAttemptState(v string) bool { return v == "completed" || v == "failed" || v == "cancelled" }
 func safeOutcome(v string) bool {
 	if v == "completed" || v == "failed" || v == "cancelled" || v == "invalid_artifact" || v == "drained_recovery" {
