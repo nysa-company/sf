@@ -143,3 +143,21 @@ type ProcessSupervisor interface {
 	Run(context.Context, DrainRequest, Invocation, PhaseInput) (CommandResult, error)
 	Drain(context.Context, DrainRequest) (DrainProof, error)
 }
+
+// ProviderLaunch is the immutable local identity that was observed while the
+// provider was still behind the supervisor's pre-exec gate.  The start
+// identity is deliberately not a wall-clock value supplied by the caller: it
+// is re-read from the operating system before recovery can signal a group.
+type ProviderLaunch struct {
+	PID, PGID            int
+	BootIdentity         string
+	ProcessStartIdentity string
+	Worktree             string
+}
+
+// LaunchRecorderSetter lets the durable coordinator install the one recorder
+// used by the production supervisor.  Keeping this narrow avoids giving
+// provider adapters access to either SQLite or the process supervisor.
+type LaunchRecorderSetter interface {
+	SetLaunchRecorder(func(context.Context, DrainRequest, ProviderLaunch) error)
+}

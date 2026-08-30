@@ -24,10 +24,14 @@ var ErrUnclear = errors.New("provider process drain is unclear")
 // Implementations must fail closed; a supervisor never releases a child after
 // recorder failure.
 type LaunchRecorder interface {
-	RecordLaunch(context.Context, contracts.DrainRequest, Identity) error
+	RecordLaunch(context.Context, contracts.DrainRequest, Identity, string) error
 }
 
-type Identity struct{ PID, PGID int }
+type Identity struct {
+	PID, PGID            int
+	BootIdentity         string
+	ProcessStartIdentity string
+}
 
 type Supervisor struct {
 	Signer               *contracts.DrainSigner
@@ -52,6 +56,21 @@ func New(recorder LaunchRecorder) (*Supervisor, error) {
 	return &Supervisor{Signer: signer, Recorder: recorder, Env: []string{"PATH=/usr/bin:/bin"}, SoftDrain: 2 * time.Second, HardDrain: 2 * time.Second, runs: map[string]*run{}}, nil
 }
 func (s *Supervisor) PublicKey() []byte { return s.Signer.PublicKey() }
+func (s *Supervisor) SetLaunchRecorder(recorder func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if recorder == nil {
+		s.Recorder = nil
+		return
+	}
+	s.Recorder = launchRecorderFunc(recorder)
+}
+
+type launchRecorderFunc func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error
+
+func (f launchRecorderFunc) RecordLaunch(ctx context.Context, req contracts.DrainRequest, identity Identity, worktree string) error {
+	return f(ctx, req, contracts.ProviderLaunch{PID: identity.PID, PGID: identity.PGID, BootIdentity: identity.BootIdentity, ProcessStartIdentity: identity.ProcessStartIdentity, Worktree: worktree})
+}
 func key(r contracts.DrainRequest) string {
 	return fmt.Sprintf("%s/%s/%s/%s/%d", r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, r.Attempt)
 }
@@ -83,11 +102,26 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 		return contracts.CommandResult{}, err
 	}
 	gateRead.Close()
-	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{})}
+	startIdentity, identityErr := processStartIdentity(cmd.Process.Pid)
+	if identityErr != nil {
+		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		return contracts.CommandResult{}, ErrUnclear
+	}
+	bootIdentity, bootErr := hostBootIdentity()
+	if bootErr != nil {
+		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		return contracts.CommandResult{}, ErrUnclear
+	}
+	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: startIdentity}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{})}
 	s.mu.Lock()
 	s.runs[key(request)] = r
 	s.mu.Unlock()
-	if s.Recorder != nil && s.Recorder.RecordLaunch(ctx, request, r.identity) != nil {
+	s.mu.Lock()
+	recorder := s.Recorder
+	s.mu.Unlock()
+	if recorder == nil || recorder.RecordLaunch(ctx, request, r.identity, r.worktree) != nil {
 		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
 		_ = cmd.Wait()
 		close(r.done)
@@ -137,18 +171,39 @@ func (s *Supervisor) Drain(ctx context.Context, request contracts.DrainRequest) 
 
 // DrainPersisted is restart recovery: it accepts only the exact durable
 // PID/PGID identity published through the launch gate.
-func (s *Supervisor) DrainPersisted(ctx context.Context, request contracts.DrainRequest, pid, pgid int) (contracts.DrainProof, error) {
-	if pid <= 0 || pgid <= 0 {
+func (s *Supervisor) DrainPersisted(ctx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) (contracts.DrainProof, error) {
+	if launch.PID <= 0 || launch.PGID <= 0 || launch.PID != launch.PGID || launch.BootIdentity == "" || launch.ProcessStartIdentity == "" {
 		return contracts.DrainProof{}, ErrUnclear
 	}
-	if err := syscall.Kill(pid, 0); err != nil {
+	boot, err := hostBootIdentity()
+	if err != nil {
 		return contracts.DrainProof{}, ErrUnclear
 	}
-	r := &run{identity: Identity{PID: pid, PGID: pgid}, done: make(chan struct{}), streams: make(chan struct{})}
+	if bootIdentityChanged(launch.BootIdentity, boot) {
+		return s.Signer.ProveDrained(request) // reboot proves every old group gone.
+	}
+	if leaderErr := syscall.Kill(launch.PID, 0); leaderErr == syscall.ESRCH {
+		groupErr := syscall.Kill(-launch.PGID, 0)
+		if missingLeaderGroupGone(leaderErr, groupErr) {
+			return s.Signer.ProveDrained(request) // leader and every group member are gone.
+		}
+		return contracts.DrainProof{}, ErrUnclear
+	} else if leaderErr != nil {
+		return contracts.DrainProof{}, ErrUnclear
+	}
+	pgid, err := syscall.Getpgid(launch.PID)
+	if err != nil {
+		return contracts.DrainProof{}, ErrUnclear
+	}
+	actualStart, err := processStartIdentity(launch.PID)
+	if err != nil || !persistedIdentityMatches(launch, actualStart, pgid) {
+		return contracts.DrainProof{}, ErrUnclear
+	}
+	r := &run{identity: Identity{PID: launch.PID, PGID: launch.PGID, BootIdentity: boot, ProcessStartIdentity: actualStart}, done: make(chan struct{}), streams: make(chan struct{})}
 	close(r.streams)
 	go func() {
 		for {
-			if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+			if err := syscall.Kill(launch.PID, 0); err == syscall.ESRCH {
 				close(r.done)
 				return
 			}
@@ -166,6 +221,20 @@ func (s *Supervisor) DrainPersisted(ctx context.Context, request contracts.Drain
 		return contracts.DrainProof{}, err
 	}
 	return s.Signer.ProveDrained(request)
+}
+
+func bootIdentityChanged(recorded, observed string) bool {
+	return recorded != "" && observed != "" && recorded != observed
+}
+func missingLeaderGroupGone(leaderErr, groupErr error) bool {
+	return leaderErr == syscall.ESRCH && groupErr == syscall.ESRCH
+}
+
+// persistedIdentityMatches is separated from signalling so a failed identity
+// check has a mechanically obvious no-signal path. In particular, a rapid
+// PID reuse with a matching human-readable lstart cannot reach terminate.
+func persistedIdentityMatches(launch contracts.ProviderLaunch, observed string, observedPGID int) bool {
+	return launch.PID > 0 && launch.PID == launch.PGID && launch.BootIdentity != "" && launch.ProcessStartIdentity != "" && observed == launch.ProcessStartIdentity && observedPGID == launch.PGID
 }
 func (s *Supervisor) terminate(r *run) error {
 	_ = signalGroup(r.identity.PGID, syscall.SIGTERM)

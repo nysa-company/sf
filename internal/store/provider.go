@@ -57,16 +57,16 @@ type ProviderAttempt struct {
 	StartedAt, FinishedAt time.Time
 }
 
-func (s *Store) ProviderLaunchIdentity(ctx context.Context, claim ProviderAttemptClaim) (int, int, error) {
-	var pid, pgid int
-	err := s.db.QueryRowContext(ctx, `SELECT process_pid,process_pgid FROM provider_attempts WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND binding_digest=?`, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.BindingDigest).Scan(&pid, &pgid)
+func (s *Store) ProviderLaunchIdentity(ctx context.Context, claim ProviderAttemptClaim) (contracts.ProviderLaunch, error) {
+	var launch contracts.ProviderLaunch
+	err := s.db.QueryRowContext(ctx, `SELECT process_pid,process_pgid,process_boot_identity,process_start_identity,worktree_path FROM provider_attempts WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=? AND provider_lease_key=? AND state IN ('active','quarantined') AND launch_state='released'`, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest, claim.LeaseKey).Scan(&launch.PID, &launch.PGID, &launch.BootIdentity, &launch.ProcessStartIdentity, &launch.Worktree)
 	if err != nil {
-		return 0, 0, err
+		return contracts.ProviderLaunch{}, err
 	}
-	if pid <= 0 || pgid <= 0 {
-		return 0, 0, ErrProviderDrain
+	if launch.PID <= 0 || launch.PGID <= 0 || launch.BootIdentity == "" || launch.ProcessStartIdentity == "" || launch.Worktree == "" {
+		return contracts.ProviderLaunch{}, ErrProviderDrain
 	}
-	return pid, pgid, nil
+	return launch, nil
 }
 
 func (s *Store) SetRecoveryAuthority(ctx context.Context, channel domain.Channel, leader uint64, key []byte) error {
@@ -88,12 +88,12 @@ func (s *Store) SetRecoveryAuthority(ctx context.Context, channel domain.Channel
 
 // RecordProviderLaunch is the pre-exec gate's durable publication point. The
 // wrapper remains blocked until this exact PID/PGID record commits.
-func (s *Store) RecordProviderLaunch(ctx context.Context, claim ProviderAttemptClaim, pid, pgid int, started time.Time) error {
-	if claim.ID <= 0 || pid <= 0 || pgid <= 0 || started.IsZero() {
+func (s *Store) RecordProviderLaunch(ctx context.Context, claim ProviderAttemptClaim, launch contracts.ProviderLaunch) error {
+	if claim.ID <= 0 || claim.Ref.Validate() != nil || claim.Phase == "" || claim.Role == "" || claim.Attempt <= 0 || claim.LeaseKey == "" || claim.BindingDigest == "" || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ExpectedVersion == 0 || launch.PID <= 0 || launch.PGID <= 0 || launch.PID != launch.PGID || launch.BootIdentity == "" || launch.ProcessStartIdentity == "" || launch.Worktree == "" || claim.Worktree != launch.Worktree {
 		return ErrProviderAttempt
 	}
 	return s.write(ctx, func(conn *sql.Conn) error {
-		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET process_pid=?,process_pgid=?,process_started_at=?,launch_state='released' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND state='active' AND launch_state='launching' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=?`, pid, pgid, started.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest)
+		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET process_pid=?,process_pgid=?,process_boot_identity=?,process_start_identity=?,launch_state='released' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND state='active' AND launch_state='launching' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=? AND provider_lease_key=? AND worktree_path=?`, launch.PID, launch.PGID, launch.BootIdentity, launch.ProcessStartIdentity, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest, claim.LeaseKey, launch.Worktree)
 		if err != nil {
 			return err
 		}
@@ -347,7 +347,7 @@ func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttempt
 		if maxDuration <= 0 || finished.After(createdAt.Add(time.Duration(maxDuration))) {
 			return ErrBudgetExhausted
 		}
-		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state=?,outcome=?,usage_units=?,finished_at=? WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND state='active'`, state, outcome, usage, finished.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion)
+		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state=?,outcome=?,usage_units=?,finished_at=?,launch_state='drained' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND state='active'`, state, outcome, usage, finished.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion)
 		if err != nil {
 			return err
 		}
@@ -477,7 +477,7 @@ func (s *Store) recoverProviderAttemptClaim(ctx context.Context, claim ProviderA
 			}
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='cancelled',outcome='drained_recovery',finished_at=? WHERE id=? AND state IN ('active','quarantined')`, at.UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='cancelled',outcome='drained_recovery',finished_at=?,launch_state='drained' WHERE id=? AND state IN ('active','quarantined')`, at.UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
 			return err
 		}
 		result, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='cancelled',completed_at=?,outcome='drained_recovery' WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND state='active' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND provider=? AND model=? AND family=? AND provider_version=?`, at.UTC().Format(time.RFC3339Nano), claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version)
@@ -504,6 +504,33 @@ func (s *Store) RecoverProviderAttemptClaimWithProof(ctx context.Context, claim 
 		return ErrProviderDrain
 	}
 	return s.recoverProviderAttemptClaim(ctx, claim, leader, at)
+}
+
+// QuarantineRecoveredProviderAttemptClaim is used when a launch record is
+// absent or no longer proves the live Unix process is ours. It intentionally
+// retains the provider lease and active phase: no replacement run may start
+// while an unverified process could still exist.
+func (s *Store) QuarantineRecoveredProviderAttemptClaim(ctx context.Context, claim ProviderAttempt, leader uint64, at time.Time) error {
+	if claim.Ref.Validate() != nil || claim.ID <= 0 || leader == 0 || at.IsZero() {
+		return ErrProviderAttempt
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		var currentLeader uint64
+		if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, claim.Ref.Channel).Scan(&currentLeader); err != nil {
+			return err
+		}
+		if currentLeader != leader {
+			return ErrStaleFence
+		}
+		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='quarantined',outcome='undrained_recovery',launch_state='quarantined' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=? AND provider_lease_key=? AND state IN ('active','quarantined')`, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest, claim.LeaseKey)
+		if err != nil {
+			return err
+		}
+		if n, _ := row.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		return nil
+	})
 }
 
 func (s *Store) quarantineProviderAttempts(ctx context.Context, ref domain.TicketRef, staleRunner, leader uint64, at time.Time) error {

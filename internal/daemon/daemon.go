@@ -82,8 +82,13 @@ type Config struct {
 	// a durable attempt. A nil callback fails closed when claims exist.
 	RecoverProvider      func(context.Context, store.ProviderAttempt, uint64) error
 	RecoveryAuthorityKey []byte
-	RecoveryDrainer      interface {
-		DrainPersisted(context.Context, contracts.DrainRequest, int, int) (contracts.DrainProof, error)
+	// ProviderSupervisor is the production process-group supervisor. Start
+	// installs its durable launch recorder before recovery or socket exposure;
+	// the coordinator may install the same recorder when it is composed on its
+	// own in tests or future worker entrypoints.
+	ProviderSupervisor contracts.ProcessSupervisor
+	RecoveryDrainer    interface {
+		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
 }
 
@@ -102,7 +107,7 @@ type Daemon struct {
 	auth            operator.Authenticator
 	recoverProvider func(context.Context, store.ProviderAttempt, uint64) error
 	recoveryDrainer interface {
-		DrainPersisted(context.Context, contracts.DrainRequest, int, int) (contracts.DrainProof, error)
+		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
 	mu     sync.Mutex
 	closed bool
@@ -168,6 +173,16 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		if err := database.SetRecoveryAuthority(startupCtx, configuration.Channel, epoch, configuration.RecoveryAuthorityKey); err != nil {
 			return failStore(fmt.Errorf("set recovery authority: %w", err))
 		}
+	}
+	if configuration.ProviderSupervisor != nil {
+		setter, ok := configuration.ProviderSupervisor.(contracts.LaunchRecorderSetter)
+		if !ok {
+			return failStore(errors.New("provider supervisor does not support durable launch recording"))
+		}
+		setter.SetLaunchRecorder(func(recordCtx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) error {
+			claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Worktree: launch.Worktree}
+			return database.RecordProviderLaunch(recordCtx, claim, launch)
+		})
 	}
 	for _, project := range configuration.Projects {
 		if project.Channel != configuration.Channel {
@@ -243,14 +258,20 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 	}
 	for _, claim := range claims {
 		if daemon.recoveryDrainer != nil {
-			pid, pgid, identityErr := daemon.store.ProviderLaunchIdentity(ctx, claim.ProviderAttemptClaim)
+			launch, identityErr := daemon.store.ProviderLaunchIdentity(ctx, claim.ProviderAttemptClaim)
 			if identityErr != nil {
-				return identityErr
+				if err := daemon.store.QuarantineRecoveredProviderAttemptClaim(ctx, claim, daemon.epoch, daemon.clock.Now()); err != nil {
+					return err
+				}
+				return fmt.Errorf("quarantined provider attempt %d without a provable launch identity: %w", claim.ID, store.ErrProviderDrain)
 			}
 			req := contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest}
-			proof, drainErr := daemon.recoveryDrainer.DrainPersisted(ctx, req, pid, pgid)
+			proof, drainErr := daemon.recoveryDrainer.DrainPersisted(ctx, req, launch)
 			if drainErr != nil {
-				return drainErr
+				if err := daemon.store.QuarantineRecoveredProviderAttemptClaim(ctx, claim, daemon.epoch, daemon.clock.Now()); err != nil {
+					return err
+				}
+				return fmt.Errorf("quarantined provider attempt %d after identity verification failed: %w", claim.ID, store.ErrProviderDrain)
 			}
 			if err := daemon.store.RecoverProviderAttemptClaimWithProof(ctx, claim, daemon.epoch, proof, daemon.clock.Now()); err != nil {
 				return err

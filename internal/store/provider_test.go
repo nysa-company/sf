@@ -67,6 +67,32 @@ func TestProviderAdmissionUsesPairCapacityAndFreshFences(t *testing.T) {
 	_ = reviewer
 }
 
+func TestRecordProviderLaunchBindsTheEntireClaimAndStartIdentity(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "launch-record")
+	ticket := setupProviderTicket(t, db, ctx, "SF-launch", leader)
+	builder, _ := setupProviderPair(t, db, ctx)
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateBuilding)
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch := contracts.ProviderLaunch{PID: 123, PGID: 123, BootIdentity: "test-boot", ProcessStartIdentity: "Thu Aug 29 12:34:56 2026", Worktree: claim.Worktree}
+	if err := db.RecordProviderLaunch(ctx, claim, launch); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.ProviderLaunchIdentity(ctx, claim)
+	if err != nil || got != launch {
+		t.Fatalf("launch=%+v err=%v want=%+v", got, err, launch)
+	}
+	wrong := claim
+	wrong.Attempt++
+	if err := db.RecordProviderLaunch(ctx, wrong, launch); !errors.Is(err, ErrStaleFence) && !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("wrong attempt recorded: %v", err)
+	}
+}
+
 func TestReviewerMayBeFreshTwiceButNeverShareBuilderFamily(t *testing.T) {
 	db, ctx := openTestStore(t)
 	digest := setupProviderProject(t, db, ctx)

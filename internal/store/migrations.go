@@ -330,3 +330,16 @@ var migrationV14 = []string{
 var migrationV15 = []string{
 	`ALTER TABLE daemon_instances ADD COLUMN recovery_public_key BLOB NOT NULL DEFAULT X''`,
 }
+
+// v16 adds the OS-observed start identity used to reject a reused PID during
+// recovery. Existing active rows deliberately remain active: startup can
+// quarantine them without ever signalling an identity it cannot prove.
+var migrationV16 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN process_start_identity TEXT NOT NULL DEFAULT ''`,
+}
+
+// v17 makes the host boot epoch part of the launch identity. A changed boot
+// proves an old process group is dead; a missing value remains fail-closed.
+var migrationV17 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN process_boot_identity TEXT NOT NULL DEFAULT ''`,
+}

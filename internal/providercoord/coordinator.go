@@ -144,6 +144,14 @@ func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Cloc
 	if clock == nil {
 		clock = wallClock{}
 	}
+	setter, ok := supervisor.(contracts.LaunchRecorderSetter)
+	if !ok {
+		return nil, errors.New("process supervisor must support durable launch recording")
+	}
+	setter.SetLaunchRecorder(func(ctx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) error {
+		claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Worktree: launch.Worktree}
+		return database.RecordProviderLaunch(ctx, claim, launch)
+	})
 	return &Coordinator{registry: reg, routes: copy, store: database, clock: clock, supervisor: supervisor}, nil
 }
 func (role Role) valid() bool {

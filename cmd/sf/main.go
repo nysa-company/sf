@@ -52,6 +52,7 @@ func main() {
 			Channel: channel, Paths: paths,
 			DaemonIdentity:       fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
 			RecoveryAuthorityKey: supervisor.PublicKey(),
+			ProviderSupervisor:   supervisor,
 			RecoveryDrainer:      supervisor,
 		})
 	}

@@ -67,10 +67,16 @@ type ScriptedProvider struct {
 
 // Supervisor is a deterministic test process supervisor. Production runners
 // must supply an OS process-group supervisor; adapters never receive Signer.
-type Supervisor struct{ Signer *contracts.DrainSigner }
+type Supervisor struct {
+	Signer   *contracts.DrainSigner
+	recorder func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error
+}
 
 func NewSupervisor() *Supervisor        { s, _ := contracts.NewDrainSigner(); return &Supervisor{Signer: s} }
 func (s *Supervisor) PublicKey() []byte { return s.Signer.PublicKey() }
+func (s *Supervisor) SetLaunchRecorder(recorder func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error) {
+	s.recorder = recorder
+}
 func (s *Supervisor) Run(_ context.Context, _ contracts.DrainRequest, invocation contracts.Invocation, _ contracts.PhaseInput) (contracts.CommandResult, error) {
 	if len(invocation.Argv) == 0 {
 		return contracts.CommandResult{}, errors.New("missing fixture argv")
