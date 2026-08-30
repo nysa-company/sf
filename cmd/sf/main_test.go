@@ -37,7 +37,7 @@ func TestCompiledDevGateRestartDrainsRecordedGroupBeforeCallerContinues(t *testi
 	}
 	owner.Executable = binary
 	launches := make(chan contracts.ProviderLaunch, 1)
-	request := contracts.DrainRequest{ClaimID: 9, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-gate-restart"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64), Worktree: t.TempDir()}
+	request := contracts.DrainRequest{ClaimID: 9, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-gate-restart"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64), Repository: "/repo", Worktree: t.TempDir(), WorktreeIdentity: "identity", BaseSHA: "base"}
 	binaryDigest, err := owner.RegisterExecutable(request.Identity, "/bin/sh")
 	if err != nil {
 		t.Fatalf("register fixture executable: %v", err)
@@ -53,7 +53,7 @@ func TestCompiledDevGateRestartDrainsRecordedGroupBeforeCallerContinues(t *testi
 	})
 	finished := make(chan error, 1)
 	go func() {
-		_, err := owner.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 10"}}, contracts.PhaseInput{Worktree: t.TempDir()})
+		_, err := owner.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 10"}}, contracts.PhaseInput{Ticket: request.Ref, Phase: request.Phase, Attempt: request.Attempt, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Provider: request.Identity, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA})
 		finished <- err
 	}()
 	var launch contracts.ProviderLaunch
@@ -101,9 +101,9 @@ func TestCompiledDevRunRetainsClaimUntilNormalDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := contracts.DrainRequest{ClaimID: 10, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-normal-drain"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: identity, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64), BinaryDigest: binaryDigest, PolicyDigest: supervisor.PolicyDigest(), Worktree: t.TempDir()}
+	request := contracts.DrainRequest{ClaimID: 10, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-normal-drain"}, Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: identity, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64), BinaryDigest: binaryDigest, PolicyDigest: supervisor.PolicyDigest(), Repository: "/repo", Worktree: t.TempDir(), WorktreeIdentity: "identity", BaseSHA: "base"}
 	supervisor.SetLaunchRecorder(func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error { return nil })
-	if _, err := supervisor.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "exit 0"}}, contracts.PhaseInput{Worktree: request.Worktree}); err != nil {
+	if _, err := supervisor.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "exit 0"}}, contracts.PhaseInput{Ticket: request.Ref, Phase: request.Phase, Attempt: request.Attempt, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Provider: request.Identity, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := supervisor.Drain(context.Background(), request); err != nil {
@@ -358,11 +358,13 @@ func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *te
 		bootIdentity = launch.BootIdentity
 		return nil
 	})
-	if _, err := owner.Run(context.Background(), contracts.DrainRequest{
+	request := contracts.DrainRequest{
 		ClaimID: 1, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-identity-probe"},
 		Phase: domain.PhaseBuild, Role: "builder", Attempt: 1, Identity: domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"},
-		LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/identity-probe", BindingDigest: strings.Repeat("a", 64), BinaryDigest: binaryDigest, PolicyDigest: owner.PolicyDigest(), Worktree: t.TempDir(),
-	}, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 0.1"}}, contracts.PhaseInput{Worktree: t.TempDir()}); err != nil {
+		LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/identity-probe", BindingDigest: strings.Repeat("a", 64), BinaryDigest: binaryDigest, PolicyDigest: owner.PolicyDigest(), Repository: "/repo", Worktree: t.TempDir(), WorktreeIdentity: "identity", BaseSHA: "base",
+	}
+	if _, err := owner.Run(context.Background(), request,
+		contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 0.1"}}, contracts.PhaseInput{Ticket: request.Ref, Phase: request.Phase, Attempt: request.Attempt, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Provider: request.Identity, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}); err != nil {
 		t.Fatalf("capture boot identity: %v", err)
 	}
 	if bootIdentity == "" {
@@ -619,7 +621,7 @@ func TestCompiledDevQualificationUsesDaemonAttestationAndNeverExecutesModel(t *t
 	// The fake accepts only capability/help and locally sandboxed probe shapes.
 	// Any real `codex exec` model invocation exits nonzero, so a green
 	// qualification proves this path did not make a model call.
-fake := `#!/bin/sh
+	fake := `#!/bin/sh
 case "$1" in
   --version) echo 'codex 1.2.3'; exit 0 ;;
   login) [ "$2" = status ] && { echo 'Logged in using ChatGPT'; exit 0; }; exit 98 ;;

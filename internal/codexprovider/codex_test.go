@@ -122,9 +122,9 @@ func TestCodexParseRejectsMalformedOversizedAndNonzeroOutput(t *testing.T) {
 	adapter, _ := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
 	identity, _ := adapter.Probe(context.Background())
 	input := contracts.PhaseInput{Provider: identity, AuthMode: authModeChatGPTSubscription}
-	valid := []byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"intermediate\"},\"future\":true}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"final is in output-last-message\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"cached_input_tokens\":3,\"output_tokens\":8,\"reasoning_tokens\":5,\"total_tokens\":23}}\n")
+	valid := []byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"intermediate\"},\"future\":true}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"final is in output-last-message\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"cached_input_tokens\":3,\"cache_write_input_tokens\":2,\"output_tokens\":8,\"reasoning_output_tokens\":5}}\n")
 	result, err := adapter.Parse(context.Background(), input, contracts.CommandResult{ExitCode: 0, Stdout: valid, OutputLastMessage: []byte(`{"schema":"sf.builder/v1"}`), Stderr: []byte("progress password=keep-out")})
-	if err != nil || string(result.Artifact) != `{"schema":"sf.builder/v1"}` || !result.UsageTrusted || result.UsageUnits != 0 || !result.TokenUsageTrusted || result.TokenUsage != 23 || result.TokenInputTokens != 12 || result.TokenCachedTokens != 3 || result.TokenOutputTokens != 8 || result.TokenReasoningTokens != 5 || strings.Contains(result.Transcript, "keep-out") {
+	if err != nil || string(result.Artifact) != `{"schema":"sf.builder/v1"}` || !result.UsageTrusted || result.UsageUnits != 0 || !result.TokenUsageTrusted || result.TokenUsage != 20 || result.TokenInputTokens != 12 || result.TokenCachedTokens != 3 || result.TokenCacheWriteTokens != 2 || result.TokenOutputTokens != 8 || result.TokenReasoningTokens != 5 || strings.Contains(result.Transcript, "keep-out") {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	for _, command := range []contracts.CommandResult{
@@ -136,6 +136,18 @@ func TestCodexParseRejectsMalformedOversizedAndNonzeroOutput(t *testing.T) {
 	} {
 		if _, err := adapter.Parse(context.Background(), input, command); err == nil {
 			t.Fatalf("accepted bad result=%+v", command)
+		}
+	}
+	for name, malformed := range map[string][]byte{
+		"missing usage":            []byte(`{"type":"turn.completed"}` + "\n"),
+		"missing official counter": []byte(`{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}` + "\n"),
+		"legacy counter names":     []byte(`{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_tokens":0}}` + "\n"),
+		"duplicate completion":     append(valid, []byte(`{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}`+"\n")...),
+		"failed turn":              []byte(`{"type":"turn.failed","error":{"message":"no"}}` + "\n"),
+		"unknown terminal failure": []byte(`{"type":"future.failed","error":{}}` + "\n"),
+	} {
+		if _, err := adapter.Parse(context.Background(), input, contracts.CommandResult{ExitCode: 0, Stdout: malformed, OutputLastMessage: []byte(`{}`)}); err == nil {
+			t.Fatalf("accepted malformed JSONL %s", name)
 		}
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
@@ -338,6 +350,7 @@ func TestProbeContextCancellationDoesNotBecomeAuthentication(t *testing.T) {
 type compositionSupervisor struct {
 	signer     *contracts.DrainSigner
 	registered []domain.ProviderIdentity
+	runs       int
 }
 
 func newCompositionSupervisor(t *testing.T) *compositionSupervisor {
@@ -350,7 +363,9 @@ func newCompositionSupervisor(t *testing.T) *compositionSupervisor {
 }
 func (s *compositionSupervisor) PublicKey() []byte { return s.signer.PublicKey() }
 func (s *compositionSupervisor) Run(context.Context, contracts.DrainRequest, contracts.Invocation, contracts.PhaseInput) (contracts.CommandResult, error) {
-	return contracts.CommandResult{}, errors.New("must not launch in composition test")
+	s.runs++
+	artifact := []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"x"},"paths":["x"],"commands":[["go","test"]],"risks":["x"]}`)
+	return contracts.CommandResult{ExitCode: 0, OutputLastMessage: artifact, Stdout: []byte(`{"type":"turn.completed","usage":{"input_tokens":4,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":0}}` + "\n")}, nil
 }
 func (s *compositionSupervisor) Drain(_ context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
 	return s.signer.ProveDrained(request)
@@ -384,12 +399,42 @@ func TestComposeProfilesRequiresTwoQualifiedDistinctFamilies(t *testing.T) {
 	if _, _, err := database.SelectProviderPair(ctx, domain.ChannelDev, buildQ.ID, reviewQ.ID, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
+	// Give the composed coordinator a real ticket and invoke its planner route.
+	// Registration alone is insufficient: this proves route aliases resolve to
+	// the provider whose durable identity was qualified.
+	raw := []byte("composition-config")
+	digest := fmt.Sprintf("%x", sha256.Sum256(raw))
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "compose", Path: "/tmp/compose-project", BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: raw}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.LeaderEpoch(ctx, domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "compose", Ticket: "SF-compose"}
+	if err := database.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "source", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := database.StartOrAdopt(ctx, ref, 1, "dev/compose/SF-compose", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree := privateDir(t, "compose-worktree")
+	identity := `{"repository":"/tmp/compose-project"}`
+	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Path: worktree, Branch: "dev/compose/SF-compose", IdentityJSON: []byte(identity), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
+		t.Fatal(err)
+	}
 	supervisor := newCompositionSupervisor(t)
-	if _, err := ComposeProfiles(ctx, domain.ChannelDev, database, supervisor, []Config{{Route: builder.route, Executable: builder.executable, AuthHome: builder.authHome, Model: builder.model, Runner: builder.runner}, {Route: reviewer.route, Executable: reviewer.executable, AuthHome: reviewer.authHome, Model: reviewer.model, Runner: reviewer.runner}}); err != nil {
+	coordinator, err := ComposeProfiles(ctx, domain.ChannelDev, database, supervisor, []Config{{Route: builder.route, Executable: builder.executable, AuthHome: builder.authHome, Model: builder.model, Runner: builder.runner}, {Route: reviewer.route, Executable: reviewer.executable, AuthHome: reviewer.authHome, Model: reviewer.model, Runner: reviewer.runner}})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if len(supervisor.registered) != 2 || supervisor.registered[0].Family == supervisor.registered[1].Family {
 		t.Fatalf("registered=%+v", supervisor.registered)
+	}
+	result := coordinator.Run(ctx, providercoord.Request{Role: providercoord.RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "plan", Repository: "/tmp/compose-project", Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}})
+	if result.Code != providercoord.Completed || supervisor.runs != 1 {
+		t.Fatalf("composed planner route did not execute: result=%+v runs=%d", result, supervisor.runs)
 	}
 	if _, _, err := database.SelectProviderPair(ctx, domain.ChannelDev, buildQ.ID, buildQ.ID, time.Now().UTC()); !errors.Is(err, store.ErrProviderPairRefused) {
 		t.Fatalf("same-family pair was accepted: %v", err)
@@ -426,7 +471,7 @@ func newJSONSupervisor(t *testing.T) *jsonSupervisor {
 func (s *jsonSupervisor) PublicKey() []byte { return s.signer.PublicKey() }
 func (s *jsonSupervisor) Run(context.Context, contracts.DrainRequest, contracts.Invocation, contracts.PhaseInput) (contracts.CommandResult, error) {
 	artifact := []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"proof"},"paths":["internal/x.go"],"commands":[["go","test"]],"risks":["risk"],"questions":[]}`)
-	return contracts.CommandResult{ExitCode: 0, OutputLastMessage: artifact, Stdout: []byte("{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3,\"total_tokens\":7}}\n")}, nil
+	return contracts.CommandResult{ExitCode: 0, OutputLastMessage: artifact, Stdout: []byte("{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":4,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":3,\"reasoning_output_tokens\":0}}\n")}, nil
 }
 func (s *jsonSupervisor) Drain(_ context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
 	return s.signer.ProveDrained(request)

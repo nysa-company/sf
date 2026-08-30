@@ -21,6 +21,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"golang.org/x/sys/unix"
 )
 
 var ErrUnclear = errors.New("provider process drain is unclear")
@@ -312,8 +313,11 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	if len(invocation.Argv) == 0 || !filepath.IsAbs(invocation.Argv[0]) || input.Worktree == "" || filepath.Clean(input.Worktree) != input.Worktree {
 		return contracts.CommandResult{}, errors.New("guarded argv and worktree required")
 	}
-	if request.ClaimID <= 0 || request.Ref.Validate() != nil || request.Phase == "" || (request.Role != "planner" && request.Role != "builder" && request.Role != "reviewer") || request.Attempt <= 0 || request.LeaderEpoch == 0 || request.RunnerEpoch == 0 || request.ExpectedVersion == 0 || request.LeaseKey == "" || request.BindingDigest == "" || request.BinaryDigest == "" || request.PolicyDigest == "" || request.Worktree == "" {
+	if request.ClaimID <= 0 || request.Ref.Validate() != nil || request.Phase == "" || (request.Role != "planner" && request.Role != "builder" && request.Role != "reviewer") || request.Attempt <= 0 || request.LeaderEpoch == 0 || request.RunnerEpoch == 0 || request.ExpectedVersion == 0 || request.LeaseKey == "" || request.BindingDigest == "" || request.BinaryDigest == "" || request.PolicyDigest == "" || request.Repository == "" || request.Worktree == "" || request.WorktreeIdentity == "" || request.BaseSHA == "" {
 		return contracts.CommandResult{}, errors.New("complete provider claim identity is required")
+	}
+	if !requestMatchesInput(request, input) {
+		return contracts.CommandResult{}, errors.New("provider claim does not match phase input")
 	}
 	s.mu.Lock()
 	trusted, registered := s.trusted[request.Identity]
@@ -595,19 +599,67 @@ func readBoundedFile(path string, limit int64) ([]byte, bool, error) {
 	if path == "" {
 		return nil, false, nil
 	}
-	file, err := os.Open(path)
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || limit < 0 {
+		return nil, false, errors.New("provider final artifact path is invalid")
+	}
+	// Open the parent and leaf by descriptor with no-follow flags. The final
+	// artifact path is provider-controlled output; opening it by path would let
+	// a symlink replacement turn a credential file into the returned artifact.
+	parentFD, err := unix.Open(filepath.Dir(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, false, err
 	}
+	defer unix.Close(parentFD)
+	name := filepath.Base(path)
+	var before unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return nil, false, err
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, false, errors.New("provider final artifact is not a regular file")
+	}
+	fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, false, errors.New("provider final artifact could not be opened")
+	}
 	defer file.Close()
+	var opened unix.Stat_t
+	if err := unix.Fstat(fd, &opened); err != nil || opened.Dev != before.Dev || opened.Ino != before.Ino || opened.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, false, errors.New("provider final artifact changed while opening")
+	}
 	contents, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, false, err
+	}
+	var after unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &after, unix.AT_SYMLINK_NOFOLLOW); err != nil || after.Dev != opened.Dev || after.Ino != opened.Ino || after.Mode&unix.S_IFMT != unix.S_IFREG || after.Size != opened.Size {
+		return nil, false, errors.New("provider final artifact changed while reading")
 	}
 	if int64(len(contents)) > limit {
 		return contents[:limit], true, nil
 	}
 	return contents, false, nil
+}
+
+func requestMatchesInput(request contracts.DrainRequest, input contracts.PhaseInput) bool {
+	if request.Repository == "" || request.WorktreeIdentity == "" || request.BaseSHA == "" || request.Ref != input.Ticket || request.Phase != input.Phase || request.Identity != input.Provider || request.AuthMode != input.AuthMode || request.Repository != input.Repository || request.Worktree != input.Worktree || request.WorktreeIdentity != input.WorktreeIdentity || request.BaseSHA != input.BaseSHA || request.Attempt != input.Attempt || request.LeaderEpoch != input.LeaderEpoch || request.RunnerEpoch != input.RunnerEpoch || request.ExpectedVersion != input.ExpectedVersion {
+		return false
+	}
+	switch request.Role {
+	case "planner":
+		return request.Phase == domain.PhasePlanning
+	case "builder":
+		return request.Phase == domain.PhaseBuild
+	case "reviewer":
+		return request.Phase == domain.PhaseVerification || request.Phase == domain.PhaseReview
+	default:
+		return false
+	}
 }
 
 func privateDirectory(path string) error {

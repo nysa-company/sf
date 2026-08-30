@@ -399,7 +399,7 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	// This route has been admitted only for the exact ChatGPT subscription
 	// status. Its incremental API charge is therefore known to be zero; token
 	// counters remain observability only and never become monetary usage.
-	return contracts.PhaseResult{Outcome: "completed", Artifact: artifact, Transcript: transcript, Provider: input.Provider, UsageTrusted: true, UsageUnits: 0, TokenUsageTrusted: usageTrusted, TokenUsage: usage, TokenInputTokens: usageDetail.input, TokenCachedTokens: usageDetail.cached, TokenOutputTokens: usageDetail.output, TokenReasoningTokens: usageDetail.reasoning}, nil
+	return contracts.PhaseResult{Outcome: "completed", Artifact: artifact, Transcript: transcript, Provider: input.Provider, UsageTrusted: true, UsageUnits: 0, TokenUsageTrusted: usageTrusted, TokenUsage: usage, TokenInputTokens: usageDetail.input, TokenCachedTokens: usageDetail.cached, TokenCacheWriteTokens: usageDetail.cacheWrite, TokenOutputTokens: usageDetail.output, TokenReasoningTokens: usageDetail.reasoning}, nil
 }
 
 const authModeChatGPTSubscription = "chatgpt_subscription"
@@ -651,7 +651,7 @@ func normalizeProbes(values []string) ([]string, error) {
 var qualificationProbeName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 type tokenUsage struct {
-	input, cached, output, reasoning int64
+	input, cached, cacheWrite, output, reasoning int64
 }
 
 func parseJSONL(stdout, stderr []byte) (string, int64, bool, tokenUsage, error) {
@@ -664,14 +664,15 @@ func parseJSONL(stdout, stderr []byte) (string, int64, bool, tokenUsage, error) 
 	}
 	var usage int64
 	var detail tokenUsage
-	usageTrusted := false
+	completed := 0
 	for _, line := range lines {
 		if len(line) == 0 || len(line) > maxJSONL {
 			return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 		}
 		var event struct {
-			Type string `json:"type"`
-			Item struct {
+			Type   string `json:"type"`
+			Status string `json:"status"`
+			Item   struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"item"`
@@ -686,67 +687,68 @@ func parseJSONL(stdout, stderr []byte) (string, int64, bool, tokenUsage, error) 
 		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 			return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 		}
-		if event.Type == "error" {
-			return "", 0, false, tokenUsage{}, errors.New("codex returned a structured error")
+		if event.Type == "error" || strings.HasSuffix(event.Type, ".failed") || strings.HasSuffix(event.Type, ".error") || strings.HasSuffix(event.Type, ".cancelled") || strings.HasSuffix(event.Type, ".canceled") || strings.HasSuffix(event.Type, ".aborted") || event.Status == "failed" || event.Status == "error" || event.Status == "cancelled" || event.Status == "canceled" || event.Status == "aborted" || (len(event.Error) != 0 && string(event.Error) != "null") {
+			return "", 0, false, tokenUsage{}, errors.New("codex returned a structured terminal failure")
 		}
-		if event.Type == "turn.completed" && len(event.Usage) != 0 {
-			units, input, cached, output, reasoning, valid := parseUsage(event.Usage)
-			if !valid || usageTrusted {
+		if event.Type == "turn.completed" {
+			completed++
+			if completed != 1 || len(event.Usage) == 0 {
 				return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 			}
-			usage, detail, usageTrusted = units, tokenUsage{input: input, cached: cached, output: output, reasoning: reasoning}, true
+			units, input, cached, cacheWrite, output, reasoning, valid := parseUsage(event.Usage)
+			if !valid {
+				return "", 0, false, tokenUsage{}, ErrMalformedJSONL
+			}
+			usage, detail = units, tokenUsage{input: input, cached: cached, cacheWrite: cacheWrite, output: output, reasoning: reasoning}
 		}
+	}
+	if completed != 1 {
+		return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 	}
 	transcript := redact.String(string(stdout) + "\n" + string(stderr))
 	if len(transcript) > maxJSONL {
 		transcript = transcript[:maxJSONL]
 	}
-	return transcript, usage, usageTrusted, detail, nil
+	return transcript, usage, true, detail, nil
 }
 
-func parseUsage(raw json.RawMessage) (int64, int64, int64, int64, int64, bool) {
+func parseUsage(raw json.RawMessage) (int64, int64, int64, int64, int64, int64, bool) {
 	if len(raw) == 0 || len(raw) > 4096 {
-		return 0, 0, 0, 0, 0, false
+		return 0, 0, 0, 0, 0, 0, false
 	}
 	var value struct {
 		InputTokens     json.Number `json:"input_tokens"`
 		CachedTokens    json.Number `json:"cached_input_tokens"`
+		CacheWrite      json.Number `json:"cache_write_input_tokens"`
 		OutputTokens    json.Number `json:"output_tokens"`
-		ReasoningTokens json.Number `json:"reasoning_tokens"`
-		TotalTokens     json.Number `json:"total_tokens"`
+		ReasoningTokens json.Number `json:"reasoning_output_tokens"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
-		return 0, 0, 0, 0, 0, false
+		return 0, 0, 0, 0, 0, 0, false
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return 0, 0, 0, 0, 0, false
+		return 0, 0, 0, 0, 0, 0, false
 	}
 	parse := func(number json.Number) (int64, bool) {
 		if number == "" {
-			return 0, true
+			return 0, false
 		}
 		result, err := number.Int64()
 		return result, err == nil && result >= 0
 	}
 	input, okInput := parse(value.InputTokens)
 	cached, okCached := parse(value.CachedTokens)
+	cacheWrite, okCacheWrite := parse(value.CacheWrite)
 	output, okOutput := parse(value.OutputTokens)
 	reasoning, okReasoning := parse(value.ReasoningTokens)
-	total, okTotal := parse(value.TotalTokens)
-	if !okInput || !okCached || !okOutput || !okReasoning || !okTotal || input > 1<<50 || cached > 1<<50 || output > 1<<50 || reasoning > 1<<50 || total > 1<<50 {
-		return 0, 0, 0, 0, 0, false
+	if !okInput || !okCached || !okCacheWrite || !okOutput || !okReasoning || input > 1<<50 || cached > 1<<50 || cacheWrite > 1<<50 || output > 1<<50 || reasoning > 1<<50 || input > (1<<62)-output {
+		return 0, 0, 0, 0, 0, 0, false
 	}
-	if value.TotalTokens != "" {
-		if value.InputTokens != "" && value.OutputTokens != "" && total != input+cached+output {
-			return 0, 0, 0, 0, 0, false
-		}
-		return total, input, cached, output, reasoning, total > 0
-	}
-	if value.InputTokens == "" || value.OutputTokens == "" || input+cached+output <= 0 {
-		return 0, 0, 0, 0, 0, false
-	}
-	return input + cached + output, input, cached, output, reasoning, true
+	// input_tokens already includes cached input in Codex's event contract.
+	// Do not add cached_input_tokens (or cache_write_input_tokens) a second
+	// time. TokenUsage is the total billable-observation shape, not currency.
+	return input + output, input, cached, cacheWrite, output, reasoning, true
 }

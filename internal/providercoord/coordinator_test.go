@@ -277,3 +277,34 @@ func recordQual(t *testing.T, db *store.Store, p *testkit.ScriptedProvider) {
 		t.Fatal(e)
 	}
 }
+
+func TestBindClaimToInputRejectsDurableIdentityDrift(t *testing.T) {
+	identity := domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "project", Ticket: "SF-claim-binding"}
+	request := Request{Role: RoleBuilder, ExpectedVersion: 5, Fence: domain.Fence{LeaderEpoch: 3, RunnerEpoch: 4}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: "base"}}
+	claim := store.ProviderAttemptClaim{ID: 7, Ref: ref, Phase: domain.PhaseBuild, Role: "builder", Attempt: 2, Binding: contracts.RuntimeBinding{Identity: identity}, LeaderEpoch: 3, RunnerEpoch: 4, ExpectedVersion: 5, Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: "base"}
+	input := request.Input
+	if !bindClaimToInput(&input, claim, request, identity) || input.Attempt != claim.Attempt || input.LeaderEpoch != claim.LeaderEpoch || input.RunnerEpoch != claim.RunnerEpoch || input.ExpectedVersion != claim.ExpectedVersion {
+		t.Fatalf("matching claim was not bound: input=%+v", input)
+	}
+	for name, mutate := range map[string]func(*contracts.PhaseInput){
+		"ticket":     func(value *contracts.PhaseInput) { value.Ticket.Ticket = "SF-other" },
+		"phase":      func(value *contracts.PhaseInput) { value.Phase = domain.PhasePlanning },
+		"repository": func(value *contracts.PhaseInput) { value.Repository = "/other" },
+		"worktree":   func(value *contracts.PhaseInput) { value.Worktree = "/other" },
+		"identity":   func(value *contracts.PhaseInput) { value.WorktreeIdentity = "other" },
+		"base":       func(value *contracts.PhaseInput) { value.BaseSHA = "other" },
+		"attempt":    func(value *contracts.PhaseInput) { value.Attempt = claim.Attempt + 1 },
+		"leader":     func(value *contracts.PhaseInput) { value.LeaderEpoch++ },
+		"runner":     func(value *contracts.PhaseInput) { value.RunnerEpoch++ },
+		"version":    func(value *contracts.PhaseInput) { value.ExpectedVersion++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := request.Input
+			mutate(&changed)
+			if bindClaimToInput(&changed, claim, request, identity) {
+				t.Fatal("durable claim accepted mismatched phase input")
+			}
+		})
+	}
+}

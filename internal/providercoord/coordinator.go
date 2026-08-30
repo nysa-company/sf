@@ -237,6 +237,18 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			continue
 		}
 		input := r.Input
+		if !bindClaimToInput(&input, claim, r, binding.Identity) {
+			// The Store claim is the sole authority for launch identity. A
+			// caller-provided PhaseInput must never be allowed to drift from it.
+			cancel()
+			finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			quarantineErr := c.store.QuarantineProviderAttempt(finishCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
+			finishCancel()
+			if quarantineErr != nil {
+				c.markPersistenceFailure(quarantineErr)
+			}
+			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: quarantineErr != nil}
+		}
 		input.Provider = binding.Identity
 		input.AuthMode = binding.AuthMode
 		input.Timeout = timeout
@@ -390,6 +402,26 @@ func (c *Coordinator) RecoverClaim(ctx context.Context, claim store.ProviderAtte
 
 func drainRequest(claim store.ProviderAttemptClaim) contracts.DrainRequest {
 	return contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, AuthDigest: claim.Binding.AuthDigest, AuthMode: claim.Binding.AuthMode, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA}
+}
+
+// bindClaimToInput is the last coordinator-side authentication point before
+// an adapter invocation. BeginProviderAttempt returns the durable claim, so
+// all execution identity fields are copied from that claim rather than being
+// trusted from a caller's PhaseInput. Non-zero claim fields supplied by a
+// caller are checked first to catch a split-brain request instead of silently
+// overwriting it.
+func bindClaimToInput(input *contracts.PhaseInput, claim store.ProviderAttemptClaim, request Request, identity domain.ProviderIdentity) bool {
+	if input == nil || (input.Provider != (domain.ProviderIdentity{}) && input.Provider != identity) || (input.AuthMode != "" && input.AuthMode != claim.Binding.AuthMode) || claim.Ref != input.Ticket || claim.Phase != input.Phase || claim.Role != string(request.Role) || claim.Ref != request.Input.Ticket || claim.Phase != request.Input.Phase || claim.LeaderEpoch != request.Fence.LeaderEpoch || claim.RunnerEpoch != request.Fence.RunnerEpoch || claim.ExpectedVersion != request.ExpectedVersion || claim.Worktree != input.Worktree || claim.Worktree != request.Input.Worktree || claim.Repository != input.Repository || claim.Repository != request.Input.Repository || claim.WorktreeIdentity != input.WorktreeIdentity || claim.WorktreeIdentity != request.Input.WorktreeIdentity || claim.BaseSHA != input.BaseSHA || claim.BaseSHA != request.Input.BaseSHA || claim.Binding.Identity != identity {
+		return false
+	}
+	if (input.Attempt != 0 && input.Attempt != claim.Attempt) || (input.LeaderEpoch != 0 && input.LeaderEpoch != claim.LeaderEpoch) || (input.RunnerEpoch != 0 && input.RunnerEpoch != claim.RunnerEpoch) || (input.ExpectedVersion != 0 && input.ExpectedVersion != claim.ExpectedVersion) {
+		return false
+	}
+	input.Attempt = claim.Attempt
+	input.LeaderEpoch = claim.LeaderEpoch
+	input.RunnerEpoch = claim.RunnerEpoch
+	input.ExpectedVersion = claim.ExpectedVersion
+	return true
 }
 func validate(r Request) error {
 	if !r.Role.valid() || r.Input.Ticket.Validate() != nil || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.ConfigDigest == "" || len(r.ConfigDigest) != 64 || r.Input.Profile != contracts.ProfileGuarded || r.Input.Timeout <= 0 || r.Input.Timeout > 10*time.Minute || strings.TrimSpace(r.Input.Prompt) == "" || len(r.Input.Prompt) > 64<<10 || !cleanAbs(r.Input.Repository) || !cleanAbs(r.Input.Worktree) || r.Input.WorktreeIdentity == "" || len(r.Input.BaseSHA) != 40 || len(r.Input.Schema) == 0 || len(r.Input.Schema) > 1<<20 {

@@ -141,3 +141,61 @@ func TestRecoveryLivenessRules(t *testing.T) {
 		t.Fatal("surviving or foreign group was released")
 	}
 }
+
+func TestReadBoundedFileDoesNotFollowCredentialSymlink(t *testing.T) {
+	directory := t.TempDir()
+	credential := filepath.Join(directory, "auth.json")
+	artifact := filepath.Join(directory, "output-last-message.json")
+	if err := os.WriteFile(credential, []byte(`{"access_token":"must-not-leak"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(credential, artifact); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readBoundedFile(artifact, 1<<20); err == nil {
+		t.Fatal("final artifact reader followed a credential symlink")
+	}
+}
+
+func TestReadBoundedFileAuthenticatesOpenedRegularFile(t *testing.T) {
+	directory := t.TempDir()
+	artifact := filepath.Join(directory, "output-last-message.json")
+	if err := os.WriteFile(artifact, []byte(`{"ok":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	contents, truncated, err := readBoundedFile(artifact, 1<<20)
+	if err != nil || truncated || string(contents) != `{"ok":true}` {
+		t.Fatalf("contents=%q truncated=%v err=%v", contents, truncated, err)
+	}
+}
+
+func TestRequestMatchesInputRequiresEveryDurableBinding(t *testing.T) {
+	identity := domain.ProviderIdentity{Provider: "fixture", Model: "model", Family: "family", Version: "v1"}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "project", Ticket: "SF-binding"}
+	request := contracts.DrainRequest{ClaimID: 1, Identity: identity, Ref: ref, Phase: domain.PhaseBuild, Role: "builder", Attempt: 2, LeaderEpoch: 3, RunnerEpoch: 4, ExpectedVersion: 5, LeaseKey: "lease", BindingDigest: "binding", BinaryDigest: "binary", PolicyDigest: "policy", Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: "base"}
+	input := contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, Attempt: 2, LeaderEpoch: 3, RunnerEpoch: 4, ExpectedVersion: 5, Provider: identity, Repository: "/repo", Worktree: "/worktree", WorktreeIdentity: "identity", BaseSHA: "base"}
+	if !requestMatchesInput(request, input) {
+		t.Fatal("matching durable request was rejected")
+	}
+	for name, mutate := range map[string]func(*contracts.PhaseInput){
+		"ticket":            func(value *contracts.PhaseInput) { value.Ticket.Ticket = "SF-other" },
+		"phase":             func(value *contracts.PhaseInput) { value.Phase = domain.PhasePlanning },
+		"attempt":           func(value *contracts.PhaseInput) { value.Attempt++ },
+		"leader":            func(value *contracts.PhaseInput) { value.LeaderEpoch++ },
+		"runner":            func(value *contracts.PhaseInput) { value.RunnerEpoch++ },
+		"ticket version":    func(value *contracts.PhaseInput) { value.ExpectedVersion++ },
+		"provider":          func(value *contracts.PhaseInput) { value.Provider.Model = "other" },
+		"repository":        func(value *contracts.PhaseInput) { value.Repository = "/other" },
+		"worktree":          func(value *contracts.PhaseInput) { value.Worktree = "/other" },
+		"worktree identity": func(value *contracts.PhaseInput) { value.WorktreeIdentity = "other" },
+		"base":              func(value *contracts.PhaseInput) { value.BaseSHA = "other" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := input
+			mutate(&changed)
+			if requestMatchesInput(request, changed) {
+				t.Fatal("mismatched phase input was accepted")
+			}
+		})
+	}
+}

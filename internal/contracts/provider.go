@@ -19,11 +19,19 @@ const (
 )
 
 type PhaseInput struct {
-	Ticket     domain.TicketRef
-	Phase      domain.Phase
-	Prompt     string
-	Repository string
-	Worktree   string
+	Ticket domain.TicketRef
+	Phase  domain.Phase
+	// The following fields are copied from the Store-issued provider claim by
+	// the coordinator immediately before launch. They make the input handed to
+	// the provider and supervisor an authenticated view of that claim rather
+	// than a second caller-controlled set of fence values.
+	Attempt         int
+	LeaderEpoch     uint64
+	RunnerEpoch     uint64
+	ExpectedVersion uint64
+	Prompt          string
+	Repository      string
+	Worktree        string
 	// WorktreeIdentity and BaseSHA are the exact durable Git/worktree
 	// identity authenticated by the store, never merely a caller path.
 	WorktreeIdentity string
@@ -57,10 +65,11 @@ type PhaseResult struct {
 	// Individual provider-reported counters are retained for observability.
 	// They are never interpreted as currency and are not used for budget
 	// enforcement without a separately snapshotted pricing policy.
-	TokenInputTokens     int64
-	TokenCachedTokens    int64
-	TokenOutputTokens    int64
-	TokenReasoningTokens int64
+	TokenInputTokens      int64
+	TokenCachedTokens     int64
+	TokenCacheWriteTokens int64
+	TokenOutputTokens     int64
+	TokenReasoningTokens  int64
 }
 
 // Invocation is an argv-only adapter proposal. The supervisor is the sole
