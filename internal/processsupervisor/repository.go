@@ -51,12 +51,10 @@ type RepositoryCommandSupervisor struct {
 
 // Preflight is side-effect-free. v1 repository commands are macOS-only: other
 // hosts cannot reach any filesystem, toolchain, or process operation.
-var repositoryCommandGOOS = runtime.GOOS
-
-func repositoryCommandPlatformAvailable() bool { return repositoryCommandGOOS == "darwin" }
+func repositoryCommandPlatformAvailable(goos string) bool { return goos == "darwin" }
 
 func (s RepositoryCommandSupervisor) Preflight(spec contracts.CommandSpec) error {
-	if !repositoryCommandPlatformAvailable() {
+	if !repositoryCommandPlatformAvailable(runtime.GOOS) {
 		return ErrUnclear
 	}
 	if len(spec.Argv) > 0 && filepath.Base(spec.Argv[0]) == "npm" {
@@ -111,13 +109,10 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if err != nil {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	var input []byte
 	if spec.Stdin != nil {
-		input, err = readRepositoryInput(ctx, spec.Stdin)
-		if err != nil {
-			return contracts.CommandResult{}, errors.New("repository command stdin exceeds limit")
-		}
+		return contracts.CommandResult{}, ErrUnclear
 	}
+	var input []byte
 	stdinSum := sha256.Sum256(input)
 	specBytes, err := json.Marshal(struct {
 		Argv        []string
@@ -447,36 +442,6 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 		return result, waitErr
 	}
 	return result, nil
-}
-
-// readRepositoryInput is synchronous (so it cannot strand a reader goroutine)
-// and checks cancellation between bounded reads. Callers that provide a reader
-// which itself blocks forever receive no child launch; trusted composition uses
-// deadline-aware readers for external input.
-func readRepositoryInput(ctx context.Context, r io.Reader) ([]byte, error) {
-	var out bytes.Buffer
-	buffer := make([]byte, 32<<10)
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		n, err := r.Read(buffer)
-		if n > 0 {
-			if out.Len()+n > repositoryInputLimit {
-				return nil, ErrUnclear
-			}
-			_, _ = out.Write(buffer[:n])
-		}
-		if err == io.EOF {
-			return out.Bytes(), nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		if n == 0 {
-			return nil, ErrUnclear
-		}
-	}
 }
 
 // authenticateRepositorySourceExecutable intentionally does not require every

@@ -142,7 +142,8 @@ func TestRepositoryCommandStaleObservedResultRetiresExactExecutingEffect(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.InvalidateRunner(ctx, claim.TicketRef, claim.TicketVersion, domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch}); err != nil {
+	control, err := db.TransitionAndInvalidateRunner(ctx, Transition{Ref: claim.TicketRef, ExpectedVersion: claim.TicketVersion, From: domain.StatePlanning, To: domain.StateStopping, ResumeState: domain.StatePlanning, Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch}, EventPayload: "{}"})
+	if err != nil {
 		t.Fatal(err)
 	}
 	result := contracts.CommandResult{ExitCode: 0, Observed: true, Stdout: []byte("observed after cancellation")}
@@ -158,6 +159,13 @@ func TestRepositoryCommandStaleObservedResultRetiresExactExecutingEffect(t *test
 	}
 	if err := lease.Quarantine(); err != nil {
 		t.Fatal(err)
+	}
+	stopping, err := db.Ticket(ctx, claim.TicketRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CompleteControlTransition(ctx, Transition{Ref: claim.TicketRef, ExpectedVersion: control.Version, From: domain.StateStopping, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+		t.Fatalf("control stayed blocked after stale result reconciliation: %v", err)
 	}
 }
 

@@ -6,14 +6,12 @@
 package repositoryexec
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -78,14 +76,12 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 	if err != nil || digest != req.Claim.CommandDigest {
 		return contracts.CommandResult{}, ErrInvalidBinding
 	}
-	var input []byte
+	// Proof commands have no stdin contract. Rejecting it avoids an arbitrary
+	// blocking reader before the durable launch gate.
 	if req.Spec.Stdin != nil {
-		input, err = io.ReadAll(io.LimitReader(req.Spec.Stdin, 1<<20+1))
-		if err != nil || len(input) > 1<<20 {
-			return contracts.CommandResult{}, ErrInvalidBinding
-		}
-		req.Spec.Stdin = bytes.NewReader(input)
+		return contracts.CommandResult{}, ErrInvalidBinding
 	}
+	var input []byte
 	stdinSum := sha256.Sum256(input)
 	specDigest, err := SpecDigest(req.Spec, "sha256:"+hex.EncodeToString(stdinSum[:]))
 	if err != nil || specDigest != req.Claim.SpecDigest {

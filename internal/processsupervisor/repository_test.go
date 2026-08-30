@@ -67,11 +67,8 @@ func TestRepositoryCommandDrainerFailsClosedOnUnclearIdentity(t *testing.T) {
 }
 
 func TestRepositoryCommandPreflightRefusesUnsupportedPlatformBeforeLaunch(t *testing.T) {
-	old := repositoryCommandGOOS
-	repositoryCommandGOOS = "linux"
-	defer func() { repositoryCommandGOOS = old }()
-	if err := (RepositoryCommandSupervisor{}).Preflight(contracts.CommandSpec{Argv: []string{"go", "test", "./..."}, Profile: contracts.ProfileGuarded}); err != ErrUnclear {
-		t.Fatalf("unsupported platform error=%v", err)
+	if repositoryCommandPlatformAvailable("linux") || !repositoryCommandPlatformAvailable("darwin") {
+		t.Fatal("platform guard accepted unsupported host or rejected darwin")
 	}
 }
 
