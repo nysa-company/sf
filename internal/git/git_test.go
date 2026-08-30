@@ -105,6 +105,11 @@ func pushClaim(worktree Worktree, head string) contracts.GitMutationClaim {
 	return claim
 }
 
+func protectedFetchClaim(worktree Worktree, base, merge string) contracts.GitMutationClaim {
+	claim, _ := testClaim(context.Background(), contracts.GitMutationClaim{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Identity.HeadRef, Operation: "protected-ref-fetch", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: base, ExpectedHeadOID: merge})
+	return claim
+}
+
 func (a *memoryBranchAuthority) LoadBranch(_ context.Context, key string) (string, error) {
 	return a.branches[key], nil
 }
@@ -1444,15 +1449,17 @@ func TestVerifyProtectedBranchFreshWitness(t *testing.T) {
 	}
 	rawGit(t, repository, "merge", "--ff-only", branch)
 	rawGit(t, repository, "push", "origin", "main")
-	witness := contracts.ProtectedBranchWitness{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Origin: remote, ProtectedRef: "main", OriginalBaseOID: worktree.Identity.BaseHead, MergeOID: head}
+	witness := contracts.ProtectedBranchWitness{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Origin: remote, ProtectedRef: "main", OriginalBaseOID: worktree.Identity.BaseHead, MergeOID: head, MutationClaim: protectedFetchClaim(worktree, worktree.Identity.BaseHead, head)}
 	if err := runner.VerifyProtectedBranch(ctx, witness); err != nil {
 		t.Fatalf("fresh witness=%v", err)
 	}
 	witness.MergeOID = strings.Repeat("b", 40)
+	witness.MutationClaim = protectedFetchClaim(worktree, witness.OriginalBaseOID, witness.MergeOID)
 	if err := runner.VerifyProtectedBranch(ctx, witness); !errors.Is(err, ErrUnexpectedRemote) {
 		t.Fatalf("mismatched merge witness=%v", err)
 	}
 	witness.MergeOID, witness.OriginalBaseOID = head, strings.Repeat("a", 40)
+	witness.MutationClaim = protectedFetchClaim(worktree, witness.OriginalBaseOID, witness.MergeOID)
 	if err := runner.VerifyProtectedBranch(ctx, witness); !errors.Is(err, ErrUnexpectedRemote) {
 		t.Fatalf("mismatched base witness=%v", err)
 	}
