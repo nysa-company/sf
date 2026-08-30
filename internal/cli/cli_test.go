@@ -365,6 +365,33 @@ func TestHumanRendererProjectsKnownTicketAndLogShapes(t *testing.T) {
 	}
 }
 
+func TestHumanRendererProjectsStatusEvidenceAndOperatorWithoutPaths(t *testing.T) {
+	response := api.Response{Version: api.Version, RequestID: "status-detail", OK: true, Data: json.RawMessage(`{
+		"channel":"dev","operator":{"uid":501,"username":"sofia","label":"sofia"},
+		"ticket":{"ticket":"SF-9","state":"blocked","blocked_code":"blocked_process","merge_mode":"manual"},
+		"evidence":{
+			"plan":{"digest":"plan-digest","proof_kind":"focused","acceptance_count":2},
+			"verification":{"revision":3,"checkpoint_id":"checkpoint-3","intent_digest":"intent","amends_revision":2},
+			"candidate":{"generation":4,"head_sha":"head-4"},
+			"worktree":{"path":"/private/tmp/secret-worktree","branch":"sf/SF-9","state":"ready"},
+			"phase_attempts":[{"phase":"build","attempt":2,"state":"failed","outcome":"blocked_process"}],
+			"operator_decisions":[{"id":7,"decision":"reject","reviewed_head":"head-3","invalidated":true}]
+		}
+	}`)}
+	var output bytes.Buffer
+	if err := Render(&output, response, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Operator: label=sofia, uid=501", "Blocker: blocked_process", "Plan: digest=plan-digest", "Verification: revision=3, checkpoint=checkpoint-3, intent=intent, amends=2", "Candidate: generation=4, head=head-4", "Worktree: branch=sf/SF-9", "Phase attempts:", "outcome=blocked_process", "Operator decisions:", "invalidated=true"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("status output=%q missing %q", output.String(), want)
+		}
+	}
+	if strings.Contains(output.String(), "/private/tmp/secret-worktree") {
+		t.Fatalf("human status leaked absolute worktree path: %q", output.String())
+	}
+}
+
 func TestJSONRenderingIsUnchangedForAdditiveData(t *testing.T) {
 	response := api.Response{Version: api.Version, RequestID: "json", OK: true, Data: json.RawMessage(`{"channel":"dev","ticket":"SF-1","new_field":{"opaque":true}}`)}
 	var output bytes.Buffer

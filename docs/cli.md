@@ -69,9 +69,16 @@ writes into the repository or contacts a remote. See
 
 Doctor performs read-only checks for the
 channel root, socket, disk space, Git/gh executables, and an optional
-repository worktree. It reports typed check records, keeps
-`autonomous_eligible` false, and never treats missing Docker or Colima as an
-error. `auth status` probes only the four allowlisted official CLIs (`gh`,
+repository worktree. When an owner-only socket exists it also performs a
+read-only `daemon.status` handshake. A missing socket points to `daemon run`;
+a present but unhealthy socket points to `daemon status`, so Doctor does not
+loop back into the same failed probe. Human Doctor output includes every
+check and its executable action, bounded authentication status/reason, the
+selected builder/reviewer identity and qualification, guarded/autonomous
+eligibility, and `credentials_stored_by_sf=false`; it never prints paths,
+digests, raw outputs, transcripts, or credential bytes. It reports typed check
+records, keeps `autonomous_eligible` false, and never treats missing Docker or
+Colima as an error. `auth status` probes only the four allowlisted official CLIs (`gh`,
 `cursor-agent`, `claude`, and `codex`) with bounded, discarded output. `auth
 login <provider>` delegates to that CLI's official interactive flow and then
 re-probes status; sf never accepts, captures, or stores a credential byte. The
@@ -105,7 +112,11 @@ returned by the logs API.
 Single-ticket `status` and `show` authenticate durable plan, verification,
 candidate, worktree, phase-attempt, and operator-decision checkpoints before
 displaying their bounded metadata. They include the socket-authenticated
-operator and current runner epoch. Raw provider transcripts, proof bodies,
+operator and current runner epoch, including the plan/checkpoint revisions,
+candidate generation/head, worktree branch, phase outcomes, and invalidated
+operator decisions. Absolute worktree paths are omitted from human output.
+Blocker codes are shown when present; a `next_action` is shown only when the
+API emits one. Raw provider transcripts, proof bodies,
 credential material, and worktree identity bytes are never returned; corrupt
 evidence fails closed as `evidence_conflict` instead of disappearing from the
 view.

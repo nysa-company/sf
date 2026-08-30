@@ -117,7 +117,15 @@ func Render(writer io.Writer, response api.Response, jsonOutput bool) error {
 	if len(response.Data) > 0 && string(response.Data) != "null" {
 		var value any
 		if err := json.Unmarshal(response.Data, &value); err == nil {
-			if _, err := fmt.Fprintf(writer, "Data: %s\n", stableJSON(value)); err != nil {
+			if object, ok := value.(map[string]any); ok {
+				if _, hasChecks := object["checks"]; hasChecks {
+					if err := renderDoctor(writer, object); err != nil {
+						return err
+					}
+				} else if _, err := fmt.Fprintf(writer, "Data: %s\n", stableJSON(value)); err != nil {
+					return err
+				}
+			} else if _, err := fmt.Fprintf(writer, "Data: %s\n", stableJSON(value)); err != nil {
 				return err
 			}
 		}

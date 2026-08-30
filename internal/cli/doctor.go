@@ -47,6 +47,7 @@ type DoctorReport struct {
 	Checks             []DoctorCheck       `json:"checks"`
 	Authentication     []authStatusView    `json:"authentication"`
 	ProviderPair       *DoctorProviderPair `json:"provider_pair,omitempty"`
+	GuardedEligible    bool                `json:"guarded_eligible"`
 	AutonomousEligible bool                `json:"autonomous_eligible"`
 	CredentialsStored  bool                `json:"credentials_stored_by_sf"`
 }
@@ -63,6 +64,7 @@ type DoctorProviderQualification struct {
 	Model         string                     `json:"model"`
 	Family        string                     `json:"family"`
 	Version       string                     `json:"version"`
+	AuthMode      string                     `json:"auth_mode,omitempty"`
 	Qualification store.QualificationProfile `json:"qualification"`
 }
 
@@ -174,13 +176,15 @@ func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
 	return deps
 }
 
-// RunDoctor performs only read-only probes. It never contacts the daemon,
-// mutates channel state, invokes provider inference, or starts a container.
+// RunDoctor performs only read-only probes. It never mutates channel state,
+// invokes provider inference, or starts a container. When an owner-only
+// socket is present it performs the injected read-only daemon status
+// handshake; it does not start or repair the daemon.
 func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	deps = deps.defaults()
 	report := DoctorReport{
 		Schema: doctorSchema, Channel: deps.Channel, Checks: []DoctorCheck{},
-		Authentication: []authStatusView{}, AutonomousEligible: false, CredentialsStored: false,
+		Authentication: []authStatusView{}, GuardedEligible: false, AutonomousEligible: false, CredentialsStored: false,
 	}
 	if !deps.Channel.Valid() {
 		report.Checks = append(report.Checks, failedCheck("channel", "channel is invalid", deps.Binary, "doctor"))
@@ -192,7 +196,10 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	report.Checks = append(report.Checks, socketCheck)
 	if socketCheck.Status == CheckPass && deps.DaemonStatus != nil {
 		if err := deps.DaemonStatus(ctx, deps.Paths); err != nil {
-			report.Checks = append(report.Checks, failedCheck("daemon_status", "daemon socket did not complete a compatible status handshake", deps.Binary, "doctor"))
+			// The socket is present but unhealthy. `doctor` would repeat this
+			// exact probe; daemon status is the bounded executable diagnostic
+			// action, while daemon run is reserved for an absent socket.
+			report.Checks = append(report.Checks, failedCheck("daemon_status", "daemon socket did not complete a compatible status handshake", deps.Binary, "daemon", "status"))
 		} else {
 			report.Checks = append(report.Checks, DoctorCheck{ID: "daemon_status", Status: CheckPass, Summary: "running daemon completed a compatible status handshake"})
 		}
@@ -212,6 +219,7 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	pair, pairAvailable := checkProviderPair(ctx, deps, &report)
 	checkQuarantinedProviders(ctx, deps, &report)
 	checkAuthentication(ctx, deps, pair, pairAvailable, &report)
+	report.GuardedEligible = pairAvailable && guardedEligibilityChecksPass(report)
 	report.Checks = append(report.Checks, DoctorCheck{ID: "container_runtime", Status: CheckNotRun, Summary: "Docker and Colima are not required"})
 	report.Checks = append(report.Checks, DoctorCheck{ID: "autonomous_mode", Status: CheckPass, Summary: "autonomous mode is disabled by policy"})
 	return report
@@ -286,7 +294,12 @@ func validDoctorPair(pair store.ProviderPair, channel domain.Channel) bool {
 		return false
 	}
 	return safeDoctorProvider(pair.Builder.Provider) && safeDoctorProvider(pair.Reviewer.Provider) &&
+		safeDoctorAuthMode(pair.Builder.AuthMode) && safeDoctorAuthMode(pair.Reviewer.AuthMode) &&
 		passingQualification(pair.Builder.Profile) && passingQualification(pair.Reviewer.Profile)
+}
+
+func safeDoctorAuthMode(value string) bool {
+	return value == "" || safeDoctorField(value, 100)
 }
 
 func safeDoctorProvider(identity domain.ProviderIdentity) bool {
@@ -304,8 +317,40 @@ func passingQualification(profile store.QualificationProfile) bool {
 func doctorQualification(role string, value store.ProviderQualification) DoctorProviderQualification {
 	return DoctorProviderQualification{
 		Role: role, Provider: value.Provider.Provider, Model: value.Provider.Model,
-		Family: value.Provider.Family, Version: value.Provider.Version, Qualification: value.Profile,
+		Family: value.Provider.Family, Version: value.Provider.Version, AuthMode: value.AuthMode, Qualification: value.Profile,
 	}
+}
+
+func guardedEligibilityChecksPass(report DoctorReport) bool {
+	mandatory := []string{"channel_root", "disk_space", "git_executable", "gh_executable", "provider_pair", "github_auth", "builder_auth", "reviewer_auth"}
+	for _, check := range report.Checks {
+		if check.ID == "repository_worktree" && check.Status != CheckNotRun {
+			mandatory = append(mandatory, check.ID)
+		}
+		if check.ID == "daemon_socket" && check.Status == CheckFail {
+			mandatory = append(mandatory, check.ID)
+		}
+		if check.ID == "daemon_status" {
+			mandatory = append(mandatory, check.ID)
+		}
+	}
+	return doctorChecksPass(report, mandatory...)
+}
+
+func doctorChecksPass(report DoctorReport, ids ...string) bool {
+	for _, id := range ids {
+		found := false
+		for _, check := range report.Checks {
+			if check.ID == id {
+				found = check.Status == CheckPass
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func checkAuthentication(ctx context.Context, deps DoctorDeps, pair store.ProviderPair, pairAvailable bool, report *DoctorReport) {

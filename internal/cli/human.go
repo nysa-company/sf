@@ -3,20 +3,21 @@ package cli
 import (
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 )
 
-// renderHumanData is deliberately a tolerant projection of the wire data. It
-// only reads fields currently emitted by the daemon and ignores additive
-// fields, leaving unknown response shapes on the stable JSON fallback.
+// renderHumanData is a tolerant projection of the current wire shapes. It
+// only reads fields owned by the CLI contract and ignores additive fields.
+// Unknown response shapes retain the stable JSON fallback.
 func renderHumanData(writer io.Writer, value any) error {
 	object, ok := value.(map[string]any)
 	if !ok {
 		_, err := fmt.Fprintf(writer, "OK\n%s\n", stableJSON(value))
 		return err
 	}
-	if checks, ok := object["checks"].([]any); ok {
-		return renderChecks(writer, checks)
+	if _, hasChecks := object["checks"]; hasChecks {
+		return renderDoctor(writer, object)
 	}
 	if events, ok := object["events"].([]any); ok {
 		return renderEvents(writer, object, events)
@@ -25,10 +26,10 @@ func renderHumanData(writer io.Writer, value any) error {
 		return renderTickets(writer, object, tickets)
 	}
 	if nested, ok := object["ticket"].(map[string]any); ok {
-		return renderTicket(writer, nested, object["evidence"])
+		return renderTicket(writer, nested, object["evidence"], object)
 	}
 	if _, hasState := object["state"]; hasState {
-		return renderTicket(writer, object, object["evidence"])
+		return renderTicket(writer, object, object["evidence"], object)
 	}
 	_, err := fmt.Fprintf(writer, "OK\n%s\n", stableJSON(value))
 	return err
@@ -54,7 +55,7 @@ func renderTickets(writer io.Writer, parent map[string]any, values []any) error 
 	return nil
 }
 
-func renderTicket(writer io.Writer, ticket map[string]any, evidence any) error {
+func renderTicket(writer io.Writer, ticket map[string]any, evidence any, context map[string]any) error {
 	id := stringField(ticket, "ticket")
 	title := stringField(ticket, "title")
 	if title != "" {
@@ -71,12 +72,17 @@ func renderTicket(writer io.Writer, ticket map[string]any, evidence any) error {
 	for _, field := range []struct{ label, key string }{
 		{"Channel", "channel"}, {"Project", "project"}, {"State", "state"},
 		{"Merge mode", "merge_mode"}, {"Resume state", "resume_state"},
-		{"Version", "version"}, {"Runner epoch", "runner_epoch"},
+		{"Version", "version"}, {"Runner epoch", "runner_epoch"}, {"Blocker", "blocked_code"},
 	} {
 		if text := displayField(ticket, field.key); text != "" {
 			if _, err := fmt.Fprintf(writer, "%s: %s\n", field.label, text); err != nil {
 				return err
 			}
+		}
+	}
+	if operator, ok := context["operator"].(map[string]any); ok {
+		if err := renderOperator(writer, operator); err != nil {
+			return err
 		}
 	}
 	if title != "" {
@@ -91,6 +97,11 @@ func renderTicket(writer io.Writer, ticket map[string]any, evidence any) error {
 			}
 		}
 	}
+	if action, ok := context["next_action"].(map[string]any); ok {
+		if err := renderAction(writer, "Next", action); err != nil {
+			return err
+		}
+	}
 	if evidenceMap, ok := evidence.(map[string]any); ok {
 		if err := renderEvidence(writer, evidenceMap); err != nil {
 			return err
@@ -99,25 +110,127 @@ func renderTicket(writer io.Writer, ticket map[string]any, evidence any) error {
 	return nil
 }
 
+func renderOperator(writer io.Writer, operator map[string]any) error {
+	label, uid, username := stringField(operator, "label"), displayField(operator, "uid"), stringField(operator, "username")
+	parts := make([]string, 0, 2)
+	if label != "" {
+		parts = append(parts, "label="+label)
+	}
+	if uid != "" {
+		parts = append(parts, "uid="+uid)
+	}
+	if username != "" && username != label {
+		parts = append(parts, "username="+username)
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	_, err := fmt.Fprintf(writer, "Operator: %s\n", strings.Join(parts, ", "))
+	return err
+}
+
 func renderEvidence(writer io.Writer, evidence map[string]any) error {
 	if plan, ok := evidence["plan"].(map[string]any); ok {
-		if proof := stringField(plan, "proof_kind"); proof != "" {
-			if _, err := fmt.Fprintf(writer, "Proof: %s\n", proof); err != nil {
+		parts := []string{}
+		for _, field := range []struct{ label, key string }{{"digest", "digest"}, {"proof", "proof_kind"}, {"acceptance", "acceptance_count"}, {"paths", "path_count"}, {"commands", "command_count"}, {"risks", "risk_count"}} {
+			if value := displayField(plan, field.key); value != "" {
+				parts = append(parts, field.label+"="+value)
+			}
+		}
+		if len(parts) > 0 {
+			if _, err := fmt.Fprintf(writer, "Plan: %s\n", strings.Join(parts, ", ")); err != nil {
+				return err
+			}
+		}
+	}
+	if verification, ok := evidence["verification"].(map[string]any); ok {
+		parts := []string{}
+		for _, field := range []struct{ label, key string }{{"revision", "revision"}, {"checkpoint", "checkpoint_id"}, {"intent", "intent_digest"}, {"proof", "proof_digest"}} {
+			if value := displayField(verification, field.key); value != "" {
+				parts = append(parts, field.label+"="+value)
+			}
+		}
+		if amended := displayField(verification, "amends_revision"); amended != "" {
+			parts = append(parts, "amends="+amended)
+		}
+		if len(parts) > 0 {
+			if _, err := fmt.Fprintf(writer, "Verification: %s\n", strings.Join(parts, ", ")); err != nil {
 				return err
 			}
 		}
 	}
 	if candidate, ok := evidence["candidate"].(map[string]any); ok {
-		if head := stringField(candidate, "head_sha"); head != "" {
-			if _, err := fmt.Fprintf(writer, "Head: %s\n", head); err != nil {
+		parts := []string{}
+		for _, field := range []struct{ label, key string }{{"generation", "generation"}, {"head", "head_sha"}, {"base", "base_sha"}, {"tree", "tree_sha"}} {
+			if value := displayField(candidate, field.key); value != "" {
+				parts = append(parts, field.label+"="+value)
+			}
+		}
+		if len(parts) > 0 {
+			if _, err := fmt.Fprintf(writer, "Candidate: %s\n", strings.Join(parts, ", ")); err != nil {
 				return err
 			}
 		}
 	}
 	if worktree, ok := evidence["worktree"].(map[string]any); ok {
-		if branch := stringField(worktree, "branch"); branch != "" {
-			if _, err := fmt.Fprintf(writer, "Branch: %s\n", branch); err != nil {
+		parts := []string{}
+		for _, field := range []struct{ label, key string }{{"branch", "branch"}, {"state", "state"}, {"head", "head_sha"}} {
+			if value := displayField(worktree, field.key); value != "" {
+				parts = append(parts, field.label+"="+value)
+			}
+		}
+		// Deliberately omit worktree.path: human status must not expose an
+		// absolute local path by default.
+		if len(parts) > 0 {
+			if _, err := fmt.Fprintf(writer, "Worktree: %s\n", strings.Join(parts, ", ")); err != nil {
 				return err
+			}
+		}
+	}
+	if attempts, ok := evidence["phase_attempts"].([]any); ok && len(attempts) > 0 {
+		if _, err := io.WriteString(writer, "Phase attempts:\n"); err != nil {
+			return err
+		}
+		for _, value := range attempts {
+			attempt, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			parts := []string{}
+			for _, field := range []struct{ label, key string }{{"phase", "phase"}, {"attempt", "attempt"}, {"state", "state"}, {"outcome", "outcome"}} {
+				if text := displayField(attempt, field.key); text != "" {
+					parts = append(parts, field.label+"="+text)
+				}
+			}
+			if len(parts) > 0 {
+				if _, err := fmt.Fprintf(writer, "- %s\n", strings.Join(parts, ", ")); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if decisions, ok := evidence["operator_decisions"].([]any); ok && len(decisions) > 0 {
+		if _, err := io.WriteString(writer, "Operator decisions:\n"); err != nil {
+			return err
+		}
+		for _, value := range decisions {
+			decision, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			parts := []string{}
+			for _, field := range []struct{ label, key string }{{"id", "id"}, {"decision", "decision"}, {"reviewed_head", "reviewed_head"}} {
+				if text := displayField(decision, field.key); text != "" {
+					parts = append(parts, field.label+"="+text)
+				}
+			}
+			if invalidated, ok := decision["invalidated"].(bool); ok {
+				parts = append(parts, "invalidated="+strconv.FormatBool(invalidated))
+			}
+			if len(parts) > 0 {
+				if _, err := fmt.Fprintf(writer, "- %s\n", strings.Join(parts, ", ")); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -149,20 +262,135 @@ func renderEvents(writer io.Writer, parent map[string]any, events []any) error {
 	return nil
 }
 
-func renderChecks(writer io.Writer, checks []any) error {
-	if _, err := io.WriteString(writer, "Doctor\n"); err != nil {
+func renderDoctor(writer io.Writer, report map[string]any) error {
+	if _, err := fmt.Fprintf(writer, "Doctor (channel: %s)\n", stringField(report, "channel")); err != nil {
 		return err
 	}
-	for _, value := range checks {
-		check, ok := value.(map[string]any)
-		if !ok {
-			continue
-		}
-		if _, err := fmt.Fprintf(writer, "%s: %s (%s)\n", stringField(check, "id"), stringField(check, "status"), stringField(check, "summary")); err != nil {
+	if value, ok := report["guarded_eligible"].(bool); ok {
+		if _, err := fmt.Fprintf(writer, "Guarded eligible: %t\n", value); err != nil {
 			return err
 		}
 	}
+	if value, ok := report["autonomous_eligible"].(bool); ok {
+		if _, err := fmt.Fprintf(writer, "Autonomous eligible: %t\n", value); err != nil {
+			return err
+		}
+	}
+	if value, ok := report["credentials_stored_by_sf"].(bool); ok {
+		if _, err := fmt.Fprintf(writer, "Credentials stored by sf: %t\n", value); err != nil {
+			return err
+		}
+	}
+	if checks, ok := report["checks"].([]any); ok {
+		if _, err := io.WriteString(writer, "Checks:\n"); err != nil {
+			return err
+		}
+		for _, value := range checks {
+			check, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			if _, err := fmt.Fprintf(writer, "- %s: %s — %s\n", stringField(check, "id"), stringField(check, "status"), stringField(check, "summary")); err != nil {
+				return err
+			}
+			if action, ok := check["next_action"].(map[string]any); ok {
+				if err := renderAction(writer, "Action", action); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if auth, ok := report["authentication"].([]any); ok {
+		if _, err := io.WriteString(writer, "Authentication:\n"); err != nil {
+			return err
+		}
+		for _, value := range auth {
+			status, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			parts := []string{stringField(status, "state")}
+			if installed, ok := status["installed"].(bool); ok {
+				parts = append(parts, "installed="+strconv.FormatBool(installed))
+			}
+			if authenticated, ok := status["authenticated"].(bool); ok {
+				parts = append(parts, "authenticated="+strconv.FormatBool(authenticated))
+			}
+			if version := stringField(status, "version"); version != "" {
+				parts = append(parts, "version="+version)
+			}
+			if authMode := stringField(status, "auth_mode"); authMode != "" {
+				parts = append(parts, "auth_mode="+authMode)
+			}
+			if _, err := fmt.Fprintf(writer, "- %s: %s\n", stringField(status, "provider"), strings.Join(parts, ", ")); err != nil {
+				return err
+			}
+			if reason := stringField(status, "reason"); reason != "" {
+				if _, err := fmt.Fprintf(writer, "  Reason: %s\n", reason); err != nil {
+					return err
+				}
+			}
+			if action, ok := status["next_action"].(map[string]any); ok {
+				if err := renderAction(writer, "Action", action); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if pair, ok := report["provider_pair"].(map[string]any); ok {
+		if _, err := fmt.Fprintf(writer, "Provider pair (independent: %t)\n", boolField(pair, "independent")); err != nil {
+			return err
+		}
+		for _, role := range []string{"builder", "reviewer"} {
+			provider, ok := pair[role].(map[string]any)
+			if !ok {
+				continue
+			}
+			parts := []string{}
+			for _, field := range []struct{ label, key string }{{"provider", "provider"}, {"model", "model"}, {"family", "family"}, {"version", "version"}, {"qualification", "qualification"}, {"auth_mode", "auth_mode"}} {
+				if text := stringField(provider, field.key); text != "" {
+					parts = append(parts, field.label+"="+text)
+				}
+			}
+			if _, err := fmt.Fprintf(writer, "- %s: %s\n", roleLabel(role), strings.Join(parts, ", ")); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+func roleLabel(role string) string {
+	switch role {
+	case "builder":
+		return "Builder"
+	case "reviewer":
+		return "Reviewer"
+	default:
+		return role
+	}
+}
+
+func renderAction(writer io.Writer, label string, action map[string]any) error {
+	argv, ok := action["argv"].([]any)
+	if !ok || len(argv) == 0 {
+		return nil
+	}
+	values := make([]string, 0, len(argv))
+	for _, item := range argv {
+		text, ok := item.(string)
+		if !ok || text == "" {
+			return nil
+		}
+		values = append(values, text)
+	}
+	_, err := fmt.Fprintf(writer, "  %s: %s\n", label, shellWords(values))
+	return err
+}
+
+func boolField(value map[string]any, key string) bool {
+	result, _ := value[key].(bool)
+	return result
 }
 
 func stringField(value map[string]any, key string) string {

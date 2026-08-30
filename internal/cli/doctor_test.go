@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/api"
 	localauth "github.com/nysa-company/sf/internal/auth"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/domain"
@@ -30,8 +31,97 @@ func TestDoctorHumanOutputIncludesTypedFailureDetails(t *testing.T) {
 	if err := Render(&output, response, false); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(output.Bytes(), []byte(`"gh_executable"`)) || bytes.Count(output.Bytes(), []byte("Next:")) != 1 {
+	if !bytes.Contains(output.Bytes(), []byte("gh_executable: fail")) || bytes.Count(output.Bytes(), []byte("Next:")) != 1 {
 		t.Fatalf("output=%q", output.String())
+	}
+}
+
+func TestDoctorHealthyHumanGolden(t *testing.T) {
+	report := DoctorReport{
+		Schema: doctorSchema, Channel: domain.ChannelStable,
+		Checks: []DoctorCheck{
+			{ID: "channel_root", Status: CheckPass, Summary: "channel root is secure"},
+			{ID: "builder_auth", Status: CheckPass, Summary: "Builder authentication is active"},
+		},
+		Authentication: []authStatusView{{Provider: localauth.Cursor, Installed: true, Authenticated: true, State: localauth.StateAuthenticated, Version: "cursor-agent 1.2.3"}},
+		ProviderPair: &DoctorProviderPair{
+			Builder:     DoctorProviderQualification{Role: "builder", Provider: "cursor", Model: "cursor-model", Family: "cursor-family", Version: "1.2.3", AuthMode: "local_session", Qualification: store.QualificationGuarded},
+			Reviewer:    DoctorProviderQualification{Role: "reviewer", Provider: "claude", Model: "claude-model", Family: "claude-family", Version: "2.1.0", Qualification: store.QualificationGuarded},
+			Independent: true,
+		},
+		GuardedEligible: true, AutonomousEligible: false, CredentialsStored: false,
+	}
+	var output bytes.Buffer
+	if err := Render(&output, reportResponse(report), false); err != nil {
+		t.Fatal(err)
+	}
+	want := "Doctor (channel: stable)\n" +
+		"Guarded eligible: true\nAutonomous eligible: false\nCredentials stored by sf: false\n" +
+		"Checks:\n- channel_root: pass — channel root is secure\n- builder_auth: pass — Builder authentication is active\n" +
+		"Authentication:\n- cursor: authenticated, installed=true, authenticated=true, version=cursor-agent 1.2.3\n" +
+		"Provider pair (independent: true)\n" +
+		"- Builder: provider=cursor, model=cursor-model, family=cursor-family, version=1.2.3, qualification=qualified_guarded, auth_mode=local_session\n" +
+		"- Reviewer: provider=claude, model=claude-model, family=claude-family, version=2.1.0, qualification=qualified_guarded\n"
+	if output.String() != want {
+		t.Fatalf("healthy doctor output=%q, want %q", output.String(), want)
+	}
+}
+
+func TestDoctorGuardedEligibilityRequiresMandatoryHostChecks(t *testing.T) {
+	deps := healthyDoctorDeps(t)
+	deps.Pair = func(context.Context, domain.Channel) (store.ProviderPair, error) { return qualifiedDoctorPair(), nil }
+	deps.AuthStatus = func(context.Context) []localauth.Status {
+		return []localauth.Status{
+			authenticatedDoctorStatus(localauth.GitHub, "gh", "gh 1.0"),
+			authenticatedDoctorStatus(localauth.Cursor, "cursor-agent", "cursor 1.0"),
+			authenticatedDoctorStatus(localauth.Claude, "claude", "claude 1.0"),
+			{Provider: localauth.Codex, Executable: "codex", State: localauth.StateUnavailable},
+		}
+	}
+	deps.Lookup = func(name string) (string, error) {
+		if name == "git" {
+			return "", errors.New("git missing")
+		}
+		return "/bin/" + name, nil
+	}
+	report := RunDoctor(context.Background(), deps)
+	if report.GuardedEligible {
+		t.Fatalf("guarded eligibility ignored mandatory host failure: %+v", report)
+	}
+	if check := doctorCheckByID(t, report, "git_executable"); check.Status != CheckFail {
+		t.Fatalf("git check=%+v", check)
+	}
+}
+
+func TestDoctorFailedHumanGoldenIncludesEveryAction(t *testing.T) {
+	report := DoctorReport{
+		Schema: doctorSchema, Channel: domain.ChannelDev,
+		Checks: []DoctorCheck{
+			{ID: "channel_root", Status: CheckFail, Summary: "channel root is not owner-only", NextAction: &domain.NextAction{Code: "channel_root", Argv: []string{"sf-dev", "doctor"}}},
+			{ID: "github_auth", Status: CheckFail, Summary: "GitHub authentication is unavailable", NextAction: &domain.NextAction{Code: "provider_auth_missing", Argv: []string{"sf-dev", "auth", "login", "github"}}},
+		},
+		Authentication:    []authStatusView{{Provider: localauth.GitHub, Installed: true, Authenticated: false, State: localauth.StateUnauthenticated, Reason: "official CLI reports no active authentication", NextAction: &domain.NextAction{Code: "provider_auth_missing", Argv: []string{"sf-dev", "auth", "login", "github"}}}},
+		CredentialsStored: false,
+	}
+	var output bytes.Buffer
+	if err := Render(&output, reportResponse(report), false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Error: doctor_failed:", "channel_root: fail", "Action: sf-dev doctor", "github_auth: fail", "Action: sf-dev auth login github", "Reason: official CLI reports no active authentication", "Next: sf-dev doctor"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("failed doctor output=%q missing %q", output.String(), want)
+		}
+	}
+}
+
+func TestDoctorHumanRendererIgnoresAdditiveFields(t *testing.T) {
+	response := api.Response{Version: api.Version, RequestID: "doctor-additive", OK: true, Mutation: api.Mutation{}, Data: json.RawMessage(`{"channel":"dev","checks":[{"id":"channel_root","status":"pass","summary":"secure","future_check_detail":"ignore"}],"authentication":[],"credentials_stored_by_sf":false,"future_top_level":"ignore"}`)}
+	var output bytes.Buffer
+	if err := Render(&output, response, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Doctor (channel: dev)") || !strings.Contains(output.String(), "channel_root: pass") || strings.Contains(output.String(), "future_") {
+		t.Fatalf("additive field leaked or known field missing: %q", output.String())
 	}
 }
 
@@ -203,6 +293,47 @@ func TestDoctorUsesReadOnlyDaemonHandshakeWhenSocketIsPresent(t *testing.T) {
 	}
 }
 
+func TestDoctorHandshakeFailureUsesChannelDaemonStatusAction(t *testing.T) {
+	for _, test := range []struct {
+		channel domain.Channel
+		binary  string
+	}{
+		{channel: domain.ChannelStable, binary: "sf"},
+		{channel: domain.ChannelDev, binary: "sf-dev"},
+	} {
+		t.Run(string(test.channel), func(t *testing.T) {
+			deps := healthyDoctorDeps(t)
+			deps.Channel, deps.Binary = test.channel, test.binary
+			root, err := os.MkdirTemp("/tmp", "sf-dx-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(root)
+			_ = os.Chmod(root, 0o700)
+			socket := filepath.Join(root, "sf.sock")
+			listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			if err := os.Chmod(socket, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			deps.Paths.Socket = socket
+			deps.Paths.Root = root
+			deps.DaemonStatus = func(context.Context, config.ChannelPaths) error { return errors.New("protocol mismatch") }
+			report := RunDoctor(context.Background(), deps)
+			check := doctorCheckByID(t, report, "daemon_status")
+			if check.Status != CheckFail || check.NextAction == nil || strings.Join(check.NextAction.Argv, " ") != test.binary+" daemon status" {
+				t.Fatalf("daemon handshake action=%+v", check)
+			}
+			if strings.Join(check.NextAction.Argv, " ") == test.binary+" doctor" {
+				t.Fatal("daemon handshake failure loops back to doctor")
+			}
+		})
+	}
+}
+
 func TestDoctorReportsSelectedPairAndRequiredAuthentication(t *testing.T) {
 	deps := healthyDoctorDeps(t)
 	deps.Pair = func(context.Context, domain.Channel) (store.ProviderPair, error) {
@@ -232,7 +363,7 @@ func TestDoctorReportsSelectedPairAndRequiredAuthentication(t *testing.T) {
 			t.Fatalf("check %s=%+v", id, check)
 		}
 	}
-	if report.AutonomousEligible || report.CredentialsStored {
+	if !report.GuardedEligible || report.AutonomousEligible || report.CredentialsStored {
 		t.Fatalf("unsafe policy flags=%+v", report)
 	}
 }
