@@ -207,6 +207,16 @@ func validateWorktree(request workflowworker.PhaseRequest, project store.Project
 	if worktree.State != "registered" || worktree.Path == "" || filepath.IsAbs(worktree.Path) == false || filepath.Clean(worktree.Path) != worktree.Path || worktree.Path == "/" || worktree.Branch == "" || worktree.TicketVersion != request.Ticket.Version || worktree.Fence != request.Fence || worktree.BaseSHA == "" || len(worktree.IdentityJSON) == 0 {
 		return ErrIdentityMismatch
 	}
+	return validateHistoricalWorktree(worktree, project)
+}
+
+// validateHistoricalWorktree verifies stable registration facts. Worktree
+// registration happens during planning, so later phase runners must not turn
+// its historical ticket version or fence into a current-attempt requirement.
+func validateHistoricalWorktree(worktree store.StoredWorktree, project store.Project) error {
+	if worktree.State != "registered" || worktree.Path == "" || filepath.IsAbs(worktree.Path) == false || filepath.Clean(worktree.Path) != worktree.Path || worktree.Path == "/" || worktree.Branch == "" || worktree.BaseSHA == "" || len(worktree.IdentityJSON) == 0 || worktree.TicketVersion == 0 || worktree.Fence.LeaderEpoch == 0 || worktree.Fence.RunnerEpoch == 0 {
+		return ErrIdentityMismatch
+	}
 	identity, err := workflowprompt.ValidateCanonicalWorktreeIdentity(worktree.IdentityJSON)
 	if err != nil || identity.Repository != project.Path || identity.Worktree != worktree.Path || identity.BaseRef != project.BaseRef || identity.BaseHead != worktree.BaseSHA || identity.HeadRef != worktree.Branch {
 		return ErrIdentityMismatch

@@ -22,8 +22,12 @@ import (
 // evidence-writing authority.
 type PhaseEvidence interface {
 	PlannerEvidence
+	Ticket(context.Context, domain.TicketRef) (store.Ticket, error)
+	Worktree(context.Context, domain.TicketRef) (store.StoredWorktree, error)
 	Plan(context.Context, domain.TicketRef) (store.StoredPlan, error)
 	CurrentVerification(context.Context, domain.TicketRef) (store.StoredVerification, error)
+	AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error
+	LoadCurrentProviderAttemptResult(context.Context, store.ProviderAttemptResultKey, uint64, domain.Fence) (store.ProviderAttemptResult, phaseartifact.Parsed, error)
 }
 
 // PhaseRunner adapts the qualified coordinator to workflowworker for the
@@ -65,42 +69,55 @@ func (r PhaseRunner) Run(ctx context.Context, request workflowworker.PhaseReques
 }
 
 func (r PhaseRunner) verification(ctx context.Context, request workflowworker.PhaseRequest) (workflowworker.PhaseResult, error) {
-	project, effective, err := r.admit(ctx, request, domain.StateVerifying, "reviewer")
+	if request.Plan == nil {
+		return workflowworker.PhaseResult{}, ErrIdentityMismatch
+	}
+	project, effective, worktree, err := r.admit(ctx, request, domain.StateVerifying, "reviewer")
 	if err != nil {
 		return workflowworker.PhaseResult{}, err
 	}
-	_, identity, err := r.planIdentity(ctx, request, project)
+	if verification, readErr := r.Store.CurrentVerification(ctx, request.Ticket.Ref); readErr == nil || !errors.Is(readErr, store.ErrNotFound) {
+		// A verifier is only launched before a verification is recorded. If a
+		// concurrent worker has already recorded one, this request is no longer
+		// an admission to launch a new predecessor result.
+		_ = verification
+		return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+	}
+	_, identity, err := r.planIdentity(ctx, request, project, worktree)
 	if err != nil {
 		return workflowworker.PhaseResult{}, err
 	}
 	input, err := workflowprompt.Verification(workflowprompt.VerificationInput{
 		Ticket:    phaseTicket(request.Ticket),
-		Workspace: phaseWorkspace(project, request, identity.Plan.Paths),
+		Workspace: phaseWorkspace(project, worktree, identity.Plan.Paths),
 		Plan:      identity,
 		Runtime:   phaseRuntime(effective.PhaseTimeout),
 	})
 	if err != nil {
 		return workflowworker.PhaseResult{}, ErrConfigSnapshotInvalid
 	}
-	return r.run(ctx, request, project, providercoord.RoleReviewer, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: identity.Digest})
+	return r.run(ctx, request, project, worktree, providercoord.RoleReviewer, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: identity.Digest})
 }
 
 func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequest) (workflowworker.PhaseResult, error) {
-	project, effective, err := r.admit(ctx, request, domain.StateBuilding, "builder")
+	if request.Plan == nil || request.Verification == nil {
+		return workflowworker.PhaseResult{}, ErrIdentityMismatch
+	}
+	project, effective, worktree, err := r.admit(ctx, request, domain.StateBuilding, "builder")
 	if err != nil {
 		return workflowworker.PhaseResult{}, err
 	}
-	_, plan, err := r.planIdentity(ctx, request, project)
+	_, plan, err := r.planIdentity(ctx, request, project, worktree)
 	if err != nil {
 		return workflowworker.PhaseResult{}, err
 	}
-	verification, err := r.verificationIdentity(ctx, request, project, plan)
+	verification, err := r.verificationIdentity(ctx, request, project, worktree, plan)
 	if err != nil {
 		return workflowworker.PhaseResult{}, err
 	}
 	input, err := workflowprompt.Builder(workflowprompt.BuilderInput{
 		Ticket:       phaseTicket(request.Ticket),
-		Workspace:    phaseWorkspace(project, request, plan.Plan.Paths),
+		Workspace:    phaseWorkspace(project, worktree, plan.Plan.Paths),
 		Plan:         plan,
 		Verification: verification,
 		Runtime:      phaseRuntime(effective.PhaseTimeout),
@@ -110,29 +127,34 @@ func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequ
 	}
 	// ApprovedAmendmentDigest remains empty by design. Any attempt to modify a
 	// protected verification path therefore fails in phaseartifact validation.
-	return r.run(ctx, request, project, providercoord.RoleBuilder, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ProtectedVerification: append([]string(nil), verification.OwnedFiles...)})
+	return r.run(ctx, request, project, worktree, providercoord.RoleBuilder, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ProtectedVerification: append([]string(nil), verification.OwnedFiles...)})
 }
 
-func (r PhaseRunner) admit(ctx context.Context, request workflowworker.PhaseRequest, state domain.State, route string) (store.Project, config.Effective, error) {
+func (r PhaseRunner) admit(ctx context.Context, request workflowworker.PhaseRequest, state domain.State, route string) (store.Project, config.Effective, store.StoredWorktree, error) {
 	if request.Ticket.Ref.Validate() != nil || request.Ticket.State != state || request.Ticket.Version == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 {
-		return store.Project{}, config.Effective{}, ErrIdentityMismatch
+		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrIdentityMismatch
 	}
 	project, err := r.Store.Project(ctx, request.Ticket.Ref.Channel, request.Ticket.Ref.Project)
 	if err != nil {
-		return store.Project{}, config.Effective{}, ErrIdentityMismatch
+		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrIdentityMismatch
+	}
+	current, err := r.Store.Ticket(ctx, request.Ticket.Ref)
+	if err != nil || !reflect.DeepEqual(current, request.Ticket) {
+		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrIdentityMismatch
 	}
 	effective, err := decodeTicketConfig(request.Ticket)
 	if err != nil {
-		return store.Project{}, config.Effective{}, err
+		return store.Project{}, config.Effective{}, store.StoredWorktree{}, err
 	}
 	if project.Channel != request.Ticket.Ref.Channel || project.ID != request.Ticket.Ref.Project || project.Path != effective.Repository || project.BaseRef != effective.BaseBranch {
-		return store.Project{}, config.Effective{}, ErrIdentityMismatch
+		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrIdentityMismatch
 	}
-	if err := validateWorktree(request, project); err != nil {
-		return store.Project{}, config.Effective{}, err
+	worktree, err := r.Store.Worktree(ctx, request.Ticket.Ref)
+	if err != nil || !reflect.DeepEqual(request.Worktree, worktree) || validateHistoricalWorktree(worktree, project) != nil {
+		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrIdentityMismatch
 	}
 	if !permittedMode(request.Ticket.MergeMode) || !permittedMode(effective.MergeMode) {
-		return store.Project{}, config.Effective{}, ErrUnsupportedMode
+		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrUnsupportedMode
 	}
 	var providers []string
 	switch route {
@@ -141,12 +163,12 @@ func (r PhaseRunner) admit(ctx context.Context, request workflowworker.PhaseRequ
 	case "builder":
 		providers = effective.Providers.Builder
 	default:
-		return store.Project{}, config.Effective{}, ErrPhaseBoundaryUnavailable
+		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrPhaseBoundaryUnavailable
 	}
 	if len(providers) != 1 || providers[0] != "codex" {
-		return store.Project{}, config.Effective{}, ErrProviderOrder
+		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrProviderOrder
 	}
-	return project, effective, nil
+	return project, effective, worktree, nil
 }
 
 func permittedMode(mode domain.MergeMode) bool {
@@ -157,8 +179,8 @@ func phaseTicket(ticket store.Ticket) workflowprompt.Ticket {
 	return workflowprompt.Ticket{Channel: ticket.Ref.Channel, Project: ticket.Ref.Project, ID: ticket.Ref.Ticket, Type: ticket.Type, SourceDigest: ticket.SourceDigest, Body: plannerBody(ticket)}
 }
 
-func phaseWorkspace(project store.Project, request workflowworker.PhaseRequest, paths []string) workflowprompt.Workspace {
-	return workflowprompt.Workspace{Repository: project.Path, Worktree: request.Worktree.Path, WorktreeIdentity: string(request.Worktree.IdentityJSON), BaseSHA: request.Worktree.BaseSHA, AllowedPaths: append([]string(nil), paths...)}
+func phaseWorkspace(project store.Project, worktree store.StoredWorktree, paths []string) workflowprompt.Workspace {
+	return workflowprompt.Workspace{Repository: project.Path, Worktree: worktree.Path, WorktreeIdentity: string(worktree.IdentityJSON), BaseSHA: worktree.BaseSHA, AllowedPaths: append([]string(nil), paths...)}
 }
 
 func phaseRuntime(timeout time.Duration) workflowprompt.Runtime {
@@ -168,12 +190,15 @@ func phaseRuntime(timeout time.Duration) workflowprompt.Runtime {
 	return workflowprompt.Runtime{Timeout: timeout, Profile: contracts.ProfileGuarded}
 }
 
-func (r PhaseRunner) planIdentity(ctx context.Context, request workflowworker.PhaseRequest, project store.Project) (store.StoredPlan, workflowprompt.PlanIdentity, error) {
+func (r PhaseRunner) planIdentity(ctx context.Context, request workflowworker.PhaseRequest, project store.Project, worktree store.StoredWorktree) (store.StoredPlan, workflowprompt.PlanIdentity, error) {
+	// Plan returns the Store-selected append-only binding for this immutable
+	// document. The request pointer is only a scheduler snapshot; it must
+	// exactly match that Store value and must never select a different plan.
 	plan, err := r.Store.Plan(ctx, request.Ticket.Ref)
-	if err != nil || plan.TicketVersion != request.Ticket.Version || plan.Fence != request.Fence || plan.Document.Planner == nil || plan.Document.ProviderResult == nil {
+	if err != nil || request.Plan != nil && !reflect.DeepEqual(*request.Plan, plan) || plan.Document.Planner == nil || plan.Document.ProviderResult == nil {
 		return store.StoredPlan{}, workflowprompt.PlanIdentity{}, ErrProviderResultInvalid
 	}
-	_, parsed, err := r.load(ctx, *plan.Document.ProviderResult, request, project, domain.PhasePlanning, providercoord.RolePlanner, nil, nil)
+	_, parsed, err := r.loadHistorical(ctx, *plan.Document.ProviderResult, request.Ticket.Ref, project, worktree, domain.PhasePlanning, providercoord.RolePlanner)
 	if err != nil || parsed.Planner == nil || !reflect.DeepEqual(*plan.Document.Planner, *parsed.Planner) {
 		return store.StoredPlan{}, workflowprompt.PlanIdentity{}, ErrProviderResultInvalid
 	}
@@ -187,12 +212,15 @@ func (r PhaseRunner) planIdentity(ctx context.Context, request workflowworker.Ph
 	return plan, identity, nil
 }
 
-func (r PhaseRunner) verificationIdentity(ctx context.Context, request workflowworker.PhaseRequest, project store.Project, plan workflowprompt.PlanIdentity) (workflowprompt.VerificationIdentity, error) {
+func (r PhaseRunner) verificationIdentity(ctx context.Context, request workflowworker.PhaseRequest, project store.Project, worktree store.StoredWorktree, plan workflowprompt.PlanIdentity) (workflowprompt.VerificationIdentity, error) {
+	// CurrentVerification likewise resolves the Store's append-only binding
+	// (including an authorized recovery rebind), rather than accepting a
+	// caller-selected revision or provider key.
 	verification, err := r.Store.CurrentVerification(ctx, request.Ticket.Ref)
-	if err != nil || verification.TicketVersion != request.Ticket.Version || verification.Fence != request.Fence || verification.ProviderResult.AttemptID <= 0 || verification.ProviderResult.Ref != request.Ticket.Ref || verification.ProviderResult.Phase != domain.PhaseVerification || verification.Checkpoint.CommitOID != verification.Revision.CheckpointID || verification.Checkpoint.ParentOID == "" || verification.Checkpoint.TreeOID == "" {
+	if err != nil || request.Verification != nil && !reflect.DeepEqual(*request.Verification, verification) || verification.ProviderResult.AttemptID <= 0 || verification.ProviderResult.Ref != request.Ticket.Ref || verification.ProviderResult.Phase != domain.PhaseVerification || verification.Checkpoint.CommitOID != verification.Revision.CheckpointID || verification.Checkpoint.ParentOID == "" || verification.Checkpoint.TreeOID == "" {
 		return workflowprompt.VerificationIdentity{}, ErrProviderResultInvalid
 	}
-	_, parsed, err := r.load(ctx, verification.ProviderResult, request, project, domain.PhaseVerification, providercoord.RoleReviewer, nil, nil)
+	_, parsed, err := r.loadHistorical(ctx, verification.ProviderResult, request.Ticket.Ref, project, worktree, domain.PhaseVerification, providercoord.RoleReviewer)
 	if err != nil || parsed.Verify == nil {
 		return workflowprompt.VerificationIdentity{}, ErrProviderResultInvalid
 	}
@@ -206,7 +234,13 @@ func (r PhaseRunner) verificationIdentity(ctx context.Context, request workfloww
 	return identity, nil
 }
 
-func (r PhaseRunner) run(ctx context.Context, request workflowworker.PhaseRequest, project store.Project, role providercoord.Role, input contracts.PhaseInput, validation phaseartifact.Validation) (workflowworker.PhaseResult, error) {
+func (r PhaseRunner) run(ctx context.Context, request workflowworker.PhaseRequest, project store.Project, worktree store.StoredWorktree, role providercoord.Role, input contracts.PhaseInput, validation phaseartifact.Validation) (workflowworker.PhaseResult, error) {
+	// This is intentionally the last operation before entering the coordinator.
+	// Historical predecessor evidence may have old fences; the newly launched
+	// attempt never may.
+	if err := r.Store.AssertTicketFence(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence); err != nil {
+		return workflowworker.PhaseResult{}, ErrIdentityMismatch
+	}
 	result := r.Coordinator.Run(ctx, providercoord.Request{Role: role, Input: input, Validation: validation, ExpectedVersion: request.Ticket.Version, Fence: request.Fence, ConfigDigest: request.Ticket.ConfigDigest})
 	if result.Code != providercoord.Completed || result.ProviderResult.AttemptID <= 0 {
 		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) || result.Code == providercoord.Canceled {
@@ -215,25 +249,25 @@ func (r PhaseRunner) run(ctx context.Context, request workflowworker.PhaseReques
 		return workflowworker.PhaseResult{}, ErrPlannerNotReady
 	}
 	key := result.ProviderResult
-	_, parsed, err := r.load(ctx, key, request, project, request.Phase, role, &input, &validation)
+	_, parsed, err := r.loadCurrent(ctx, key, request, project, worktree, role, input, validation)
 	if err != nil || !parsedForPhase(parsed, request.Phase) {
 		return workflowworker.PhaseResult{}, ErrProviderResultInvalid
 	}
 	return workflowworker.PhaseResult{ProviderResult: key}, nil
 }
 
-func (r PhaseRunner) load(ctx context.Context, key store.ProviderAttemptResultKey, request workflowworker.PhaseRequest, project store.Project, phase domain.Phase, role providercoord.Role, expectedInput *contracts.PhaseInput, expectedValidation *phaseartifact.Validation) (store.ProviderAttemptResult, phaseartifact.Parsed, error) {
+func (r PhaseRunner) loadHistorical(ctx context.Context, key store.ProviderAttemptResultKey, ref domain.TicketRef, project store.Project, worktree store.StoredWorktree, phase domain.Phase, role providercoord.Role) (store.ProviderAttemptResult, phaseartifact.Parsed, error) {
 	result, parsed, err := r.Store.LoadHistoricalProviderAttemptResult(ctx, key)
-	if err != nil || key.AttemptID <= 0 || key.Ref != request.Ticket.Ref || key.Phase != phase || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || result.Claim.Ref != request.Ticket.Ref || result.Claim.Phase != phase || result.Claim.Role != string(role) || result.Claim.ExpectedVersion != request.Ticket.Version || result.Claim.LeaderEpoch != request.Fence.LeaderEpoch || result.Claim.RunnerEpoch != request.Fence.RunnerEpoch || result.Claim.Repository != project.Path || result.Claim.Worktree != request.Worktree.Path || result.Claim.WorktreeIdentity != string(request.Worktree.IdentityJSON) || result.Claim.BaseSHA != request.Worktree.BaseSHA || result.Claim.Binding.Identity.Provider != "codex" || parsed.Phase != phase || parsed.Provider != result.Claim.Binding.Identity || parsed.Provider.Provider != "codex" || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes {
+	if err != nil || key.AttemptID <= 0 || key.Ref != ref || key.Phase != phase || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || result.Claim.Ref != ref || result.Claim.Phase != phase || result.Claim.Role != string(role) || result.Claim.ExpectedVersion == 0 || result.Claim.LeaderEpoch == 0 || result.Claim.RunnerEpoch == 0 || result.Claim.Repository != project.Path || result.Claim.Worktree != worktree.Path || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || result.Claim.BaseSHA != worktree.BaseSHA || result.Claim.Binding.Identity.Provider != "codex" || parsed.Phase != phase || parsed.Provider != result.Claim.Binding.Identity || parsed.Provider.Provider != "codex" || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes {
 		return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
 	}
-	if expectedInput != nil || expectedValidation != nil {
-		if expectedInput == nil || expectedValidation == nil || !matchesLaunchInput(result.Claim, key, *expectedInput) {
-			return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
-		}
-		if !matchesValidation(result.Validation, *expectedValidation) {
-			return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
-		}
+	return result, parsed, nil
+}
+
+func (r PhaseRunner) loadCurrent(ctx context.Context, key store.ProviderAttemptResultKey, request workflowworker.PhaseRequest, project store.Project, worktree store.StoredWorktree, role providercoord.Role, input contracts.PhaseInput, validation phaseartifact.Validation) (store.ProviderAttemptResult, phaseartifact.Parsed, error) {
+	result, parsed, err := r.Store.LoadCurrentProviderAttemptResult(ctx, key, request.Ticket.Version, request.Fence)
+	if err != nil || key.AttemptID <= 0 || key.Ref != request.Ticket.Ref || key.Phase != request.Phase || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || result.Claim.Ref != request.Ticket.Ref || result.Claim.Phase != request.Phase || result.Claim.Role != string(role) || result.Claim.ExpectedVersion != request.Ticket.Version || result.Claim.LeaderEpoch != request.Fence.LeaderEpoch || result.Claim.RunnerEpoch != request.Fence.RunnerEpoch || result.Claim.Repository != project.Path || result.Claim.Worktree != worktree.Path || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || result.Claim.BaseSHA != worktree.BaseSHA || result.Claim.Binding.Identity.Provider != "codex" || parsed.Phase != request.Phase || parsed.Provider != result.Claim.Binding.Identity || parsed.Provider.Provider != "codex" || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes || !matchesLaunchInput(result.Claim, key, input) || !matchesValidation(result.Validation, validation) {
+		return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
 	}
 	return result, parsed, nil
 }
