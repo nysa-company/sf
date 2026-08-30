@@ -20,8 +20,8 @@ func TestEvidenceReadsRebuildCurrentWorkflowAuthority(t *testing.T) {
 		Ref: ref, ExpectedVersion: version, Fence: fence, Intent: []byte("intent"), Proof: []byte("proof"),
 		OwnedFiles: []string{"verification_test.go"}, CheckpointID: evidenceOID("a"),
 	})
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("unbound legacy verification=%v", err)
 	}
 	attempt := PhaseAttempt{
 		Ref: ref, Phase: domain.PhasePlanning, Attempt: 1, ExpectedVersion: version, Fence: fence,
@@ -47,9 +47,8 @@ func TestEvidenceReadsRebuildCurrentWorkflowAuthority(t *testing.T) {
 	if err != nil || storedPlan.Digest != planDigest || !reflect.DeepEqual(storedPlan.Document, planDocument) || storedPlan.TicketVersion != version || storedPlan.Fence != fence || storedPlan.CreatedAt.IsZero() {
 		t.Fatalf("plan=%+v err=%v", storedPlan, err)
 	}
-	storedVerification, err := database.CurrentVerification(ctx, ref)
-	if err != nil || storedVerification.Revision.Revision != 1 || !bytes.Equal(storedVerification.Intent, []byte("intent")) || !bytes.Equal(storedVerification.Proof, []byte("proof")) || storedVerification.Fence != fence {
-		t.Fatalf("verification=%+v err=%v", storedVerification, err)
+	if _, err := database.CurrentVerification(ctx, ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unbound verification read=%v", err)
 	}
 	storedWorktree, err := database.Worktree(ctx, ref)
 	if err != nil || storedWorktree.Path != worktree.Path || storedWorktree.Branch != worktree.Branch || !bytes.Equal(storedWorktree.IdentityJSON, worktree.IdentityJSON) || storedWorktree.Fence != fence {
@@ -60,11 +59,6 @@ func TestEvidenceReadsRebuildCurrentWorkflowAuthority(t *testing.T) {
 		t.Fatalf("attempts=%+v err=%v", attempts, err)
 	}
 
-	storedVerification.Intent[0] = 'X'
-	again, err := database.CurrentVerification(ctx, ref)
-	if err != nil || !bytes.Equal(again.Intent, []byte("intent")) {
-		t.Fatalf("verification read aliased database bytes: %+v err=%v", again, err)
-	}
 }
 
 func TestEvidenceReadsFailClosedOnAbsenceAndTampering(t *testing.T) {

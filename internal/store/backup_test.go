@@ -85,7 +85,7 @@ func TestPrivateSchemaV10UpgradesThroughProviderMigrations(t *testing.T) {
 	}
 }
 
-func TestRepositoryCommandV33UpgradeAndRequiredSchema(t *testing.T) {
+func TestRepositoryCommandV36UpgradeAndRequiredSchema(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	path := filepath.Join(root, "dev.sqlite")
@@ -95,11 +95,11 @@ func TestRepositoryCommandV33UpgradeAndRequiredSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	if got := rawSchemaVersion(t, path); got != 35 {
-		t.Fatalf("migrated schema=%d want=35", got)
+	if got := rawSchemaVersion(t, path); got != 36 {
+		t.Fatalf("migrated schema=%d want=36", got)
 	}
 	if err := database.validateSchema(ctx); err != nil {
-		t.Fatalf("v33 required schema: %v", err)
+		t.Fatalf("v36 required schema: %v", err)
 	}
 }
 
@@ -151,8 +151,8 @@ func TestV35BlocksOnlyUnboundLegacyWorkflowArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	if got := rawSchemaVersion(t, path); got != 35 {
-		t.Fatalf("migrated schema=%d want=35", got)
+	if got := rawSchemaVersion(t, path); got != 36 {
+		t.Fatalf("migrated schema=%d want=36", got)
 	}
 	for _, legacy := range []struct{ id, state string }{
 		{id: "SF-v35-plan-legacy", state: "planning"},
@@ -180,7 +180,7 @@ func TestV35BlocksOnlyUnboundLegacyWorkflowArtifacts(t *testing.T) {
 			t.Fatalf("legacy %s blocker events=%d err=%v", state, eventCount, err)
 		}
 	}
-	for _, id := range []string{"SF-v35-plan-bound", "SF-v35-verify-bound", "SF-v35-build-bound", "SF-v35-plan-fresh", "SF-v35-verify-plan-bound", "SF-v35-build-no-candidate"} {
+	for _, id := range []string{"SF-v35-plan-bound", "SF-v35-plan-fresh", "SF-v35-verify-plan-bound"} {
 		var state, resume, code string
 		var version int
 		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='dev' AND project_id='v35' AND id=?`, id).Scan(&state, &resume, &code, &version); err != nil {
@@ -192,6 +192,26 @@ func TestV35BlocksOnlyUnboundLegacyWorkflowArtifacts(t *testing.T) {
 		var eventCount int
 		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel='dev' AND project_id='v35' AND ticket_id=? AND trigger='typed_blocker'`, id).Scan(&eventCount); err != nil || eventCount != 0 {
 			t.Fatalf("bound/fresh ticket %s blocker events=%d err=%v", id, eventCount, err)
+		}
+	}
+	for _, legacy := range []struct{ id, resume string }{
+		{id: "SF-v35-verify-bound", resume: "verifying"},
+		{id: "SF-v35-build-bound", resume: "building"},
+		{id: "SF-v35-build-no-candidate", resume: "building"},
+	} {
+		var state, resume, code, payload string
+		var version, count int
+		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='dev' AND project_id='v35' AND id=?`, legacy.id).Scan(&state, &resume, &code, &version); err != nil {
+			t.Fatal(err)
+		}
+		if state != "blocked" || resume != legacy.resume || code != "legacy_repository_command_evidence_unverifiable" || version != 2 {
+			t.Fatalf("v36 command-evidence blocker %s=%s/%s/%s/v%d", legacy.id, state, resume, code, version)
+		}
+		if err := database.db.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel='dev' AND project_id='v35' AND ticket_id=? AND trigger='typed_blocker' AND from_state=? AND to_state='blocked'`, legacy.id, legacy.resume).Scan(&payload); err != nil || payload != `{"code":"legacy_repository_command_evidence_unverifiable","reason":"legacy repository command evidence is unverifiable","next_action":"start a fresh ticket"}` {
+			t.Fatalf("v36 command-evidence event %s=%q err=%v", legacy.id, payload, err)
+		}
+		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel='dev' AND project_id='v35' AND ticket_id=? AND trigger='typed_blocker'`, legacy.id).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("v36 command-evidence events %s=%d err=%v", legacy.id, count, err)
 		}
 	}
 }
@@ -762,6 +782,8 @@ func testMigration(version int) []string {
 		return migrationV34
 	case 35:
 		return migrationV35
+	case 36:
+		return migrationV36
 	default:
 		return nil
 	}

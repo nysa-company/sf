@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	_ "modernc.org/sqlite"
@@ -34,7 +35,15 @@ func openTestStore(t *testing.T) (*Store, context.Context) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	project := Project{Channel: domain.ChannelDev, ID: "nysa", Path: "/tmp/nysa", BaseRef: "main"}
+	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("nysa", "/tmp/nysa"), config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := Project{Channel: domain.ChannelDev, ID: "nysa", Path: "/tmp/nysa", BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: snapshot}
 	if err := database.CreateProject(ctx, project); err != nil {
 		t.Fatal(err)
 	}

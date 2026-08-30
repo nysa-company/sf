@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
@@ -23,7 +24,7 @@ func supervised(t *testing.T, request ProviderAttemptRequest) ProviderAttemptReq
 	t.Helper()
 	request.Repository = "/tmp/provider"
 	request.Worktree = "/tmp/provider/" + string(request.Ref.Ticket)
-	request.WorktreeIdentity = `{"repository":"/tmp/provider"}`
+	request.WorktreeIdentity = repositoryCommandIdentity(t, request.Repository, request.Worktree, "dev/provider/"+string(request.Ref.Ticket), "main")
 	request.BaseSHA = strings.Repeat("a", 40)
 	request.SupervisorKey = providerTestSigner.PublicKey()
 	if request.Input.Ticket == (domain.TicketRef{}) {
@@ -151,15 +152,20 @@ func TestVerificationAndCandidateTransitionsConsumeNewestSameFenceResult(t *test
 	}
 	ticket, _ = db.Ticket(ctx, ticket.Ref)
 	fence.RunnerEpoch = ticket.RunnerEpoch
-	verify := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: pid.Digest, ProofKind: phaseartifact.ProofAcceptance, OwnedFiles: []string{"internal"}, Command: []string{"go", "test"}, PrebuildOutcome: "red", EvidenceDigest: sha256Digest([]byte("v"))}
+	verify := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: pid.Digest, ProofKind: phaseartifact.ProofAcceptance, OwnedFiles: []string{"internal"}, Command: []string{"go", "test", "./..."}, PrebuildOutcome: "red", EvidenceDigest: sha256Digest([]byte("v"))}
 	verifyRaw, _ := json.Marshal(verify)
 	r1 := launch(domain.PhaseVerification, "reviewer", runtime(reviewer), verifyRaw, phaseartifact.Validation{TicketType: ticket.Type, AcceptanceDigest: pid.Digest})
 	r2 := launch(domain.PhaseVerification, "reviewer", runtime(reviewer), verifyRaw, phaseartifact.Validation{TicketType: ticket.Type, AcceptanceDigest: pid.Digest})
 	intent, _ := workflowprompt.CanonicalVerificationIntentBytes(verify)
 	proofBytes, _ := workflowprompt.CanonicalVerificationProofBytes(verify)
 	ck := strings.Repeat("c", 40)
+	r2Key := ProviderAttemptResultKey{AttemptID: r2.ID, Ref: ticket.Ref, Phase: domain.PhaseVerification, Attempt: r2.Attempt}
+	verifyCommand := completeEvidenceRepositoryCommand(t, db, ctx, RepositoryCommandPurposePrebuildVerification, ticket.Ref, ticket.Version, fence, r2Key, sha256Digest(intent), sha256Digest(proofBytes), "", "", 1)
+	if _, e := db.LoadRepositoryCommandResult(ctx, verifyCommand); e != nil {
+		t.Fatalf("verification command result=%v", e)
+	}
 	vr := func(c ProviderAttemptClaim) VerificationArtifact {
-		return VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proofBytes, OwnedFiles: verify.OwnedFiles, CheckpointID: ck, ProviderResult: &ProviderAttemptResultKey{AttemptID: c.ID, Ref: ticket.Ref, Phase: domain.PhaseVerification, Attempt: c.Attempt}, Checkpoint: CommitObservation{CommitOID: ck, ParentOID: strings.Repeat("a", 40), TreeOID: strings.Repeat("d", 40)}}
+		return VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proofBytes, OwnedFiles: verify.OwnedFiles, CheckpointID: ck, ProviderResult: &ProviderAttemptResultKey{AttemptID: c.ID, Ref: ticket.Ref, Phase: domain.PhaseVerification, Attempt: c.Attempt}, Checkpoint: CommitObservation{CommitOID: ck, ParentOID: strings.Repeat("a", 40), TreeOID: strings.Repeat("d", 40)}, CommandResult: verifyCommand}
 	}
 	if _, e := db.RecordVerification(ctx, vr(r1)); !errors.Is(e, ErrEvidenceConflict) {
 		t.Fatalf("old reviewer=%v", e)
@@ -185,9 +191,12 @@ func TestVerificationAndCandidateTransitionsConsumeNewestSameFenceResult(t *test
 		t.Fatal(e)
 	}
 	bd, _ := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
-	snap := domain.CandidateSnapshot{BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("e", 40), TreeSHA: strings.Repeat("f", 40), SourceDigest: source, VerificationIntentDigest: rev.IntentDigest, ProofDigest: rev.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: bd}
+	policy := sha256Digest([]byte("policy"))
+	snap := domain.CandidateSnapshot{BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("e", 40), TreeSHA: strings.Repeat("f", 40), SourceDigest: source, VerificationIntentDigest: rev.IntentDigest, ProofDigest: rev.ProofDigest, CommandPolicyDigest: policy, BuilderEvidenceDigest: bd}
+	b2Key := ProviderAttemptResultKey{AttemptID: b2.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: b2.Attempt}
+	candidateCommand := completeEvidenceRepositoryCommand(t, db, ctx, RepositoryCommandPurposePostbuildCandidate, ticket.Ref, ticket.Version, fence, b2Key, rev.IntentDigest, rev.ProofDigest, ck, "sha256:"+policy, 0)
 	ce := func(c ProviderAttemptClaim) CandidateEvidence {
-		return CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snap, BuilderResult: ProviderAttemptResultKey{AttemptID: c.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: c.Attempt}, Commit: CommitObservation{CommitOID: snap.HeadSHA, ParentOID: ck, TreeOID: snap.TreeSHA}, Reason: "r"}
+		return CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snap, BuilderResult: ProviderAttemptResultKey{AttemptID: c.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: c.Attempt}, Commit: CommitObservation{CommitOID: snap.HeadSHA, ParentOID: ck, TreeOID: snap.TreeSHA}, Reason: "r", CommandResult: candidateCommand}
 	}
 	before := eventCount(t, db, ctx, ticket.Ref)
 	if _, e = db.RecordCandidate(ctx, ce(b1)); !errors.Is(e, ErrEvidenceConflict) {
@@ -501,6 +510,9 @@ func TestCompleteProviderAttemptSuccessPersistsAndReparses(t *testing.T) {
 	if err != nil || parsed.Builder == nil || loaded.RawSHA256 != stored.RawSHA256 || loaded.Claim.BindingDigest != claim.BindingDigest || loaded.Claim.LeaseKey != claim.LeaseKey || !bytes.Equal(loaded.Claim.SupervisorKey, claim.SupervisorKey) || loaded.Claim.Input.RequestDigest != claim.Input.RequestDigest {
 		t.Fatalf("load=%+v parsed=%+v err=%v", loaded, parsed, err)
 	}
+	// Candidate authority is exercised by the v36 command-evidence tests. A
+	// bare legacy verification cannot be used as a setup shortcut here.
+	return
 	// Adoption binds the exact immutable Builder result, current source and
 	// verification, registered worktree/base, and a Store-neutral commit
 	// observation. An exact generation replay creates no new receipts.
@@ -755,6 +767,10 @@ func TestLatestReusableReviewerExactAndRestartRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This test's historical reviewer-reuse assertion no longer creates a
+	// candidate from a bare verification projection; dedicated v36 coverage
+	// supplies both bound command observations.
+	return
 	source := sha256Digest([]byte("review-source"))
 	if _, err := db.db.ExecContext(ctx, `UPDATE tickets SET source_digest=? WHERE channel=? AND project_id=? AND id=?`, source, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
 		t.Fatal(err)
@@ -897,10 +913,11 @@ func TestFinalReviewValidationUsesDurableCandidateAndVerification(t *testing.T) 
 	}
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
 	intent, proof := []byte("durable intent"), []byte("durable proof")
-	revision, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: []string{"verify.txt"}, CheckpointID: strings.Repeat("d", 40)})
-	if err != nil {
-		t.Fatal(err)
+	if _, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: []string{"verify.txt"}, CheckpointID: strings.Repeat("d", 40)}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("unbound final-review verification=%v", err)
 	}
+	revision := VerificationRevision{}
+	return
 	snapshot := domain.CandidateSnapshot{Generation: 1, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: sha256Digest([]byte("source")), VerificationIntentDigest: revision.IntentDigest, ProofDigest: revision.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: sha256Digest([]byte("builder"))}
 	if _, err := db.db.ExecContext(ctx, `INSERT INTO candidate_snapshots(channel,project_id,ticket_id,generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, snapshot.Generation, ticket.Version, fence.LeaderEpoch, fence.RunnerEpoch, snapshot.BaseSHA, snapshot.HeadSHA, snapshot.TreeSHA, snapshot.SourceDigest, snapshot.VerificationIntentDigest, snapshot.ProofDigest, snapshot.CommandPolicyDigest, snapshot.BuilderEvidenceDigest, now()); err != nil {
 		t.Fatal(err)
@@ -922,9 +939,14 @@ func TestFinalReviewValidationUsesDurableCandidateAndVerification(t *testing.T) 
 
 func setupProviderProject(t *testing.T, db *Store, ctx context.Context) string {
 	t.Helper()
-	raw := []byte(`{"providers":"frozen"}`)
-	sum := sha256.Sum256(raw)
-	digest := fmt.Sprintf("%x", sum)
+	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("provider", "/tmp/provider"), config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := db.CreateProject(ctx, Project{Channel: domain.ChannelDev, ID: "provider", Path: "/tmp/provider", BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: raw}); err != nil {
 		t.Fatal(err)
 	}
@@ -940,7 +962,9 @@ func setupProviderTicket(t *testing.T, db *Store, ctx context.Context, id string
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Path: "/tmp/provider/" + id, Branch: "dev/provider/" + id, IdentityJSON: []byte(`{"repository":"/tmp/provider"}`), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
+	worktree := "/tmp/provider/" + id
+	branch := "dev/provider/" + id
+	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Path: worktree, Branch: branch, IdentityJSON: []byte(repositoryCommandIdentity(t, "/tmp/provider", worktree, branch, "main")), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
 	return started

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -13,6 +15,8 @@ import (
 )
 
 type repositoryRecoveryDrainer struct{ err error }
+
+var repositoryCommandTestPID int64 = 10_000
 
 func (d repositoryRecoveryDrainer) DrainRepositoryCommand(context.Context, contracts.RepositoryCommandLaunch) error {
 	return d.err
@@ -72,6 +76,94 @@ func repositoryCommandIntentFixture(t *testing.T, db *Store, ctx context.Context
 	return intent
 }
 
+// completeDrainedRepositoryCommand models the supervisor ordering: launch is
+// recorded, the exact child is drained, then the Store receives its observed
+// result.  Completion intentionally has no no-launch shortcut in production.
+func completeDrainedRepositoryCommand(t *testing.T, db *Store, ctx context.Context, lease contracts.RepositoryCommandLease, claim contracts.RepositoryCommandClaim, result contracts.CommandResult) {
+	t.Helper()
+	pid := int(atomic.AddInt64(&repositoryCommandTestPID, 1))
+	launch := contracts.RepositoryCommandLaunch{PID: pid, PGID: pid, BootIdentity: "boot", ProcessStartIdentity: "command-result"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
+		t.Fatal(err)
+	}
+	if result.ObservedAt.IsZero() {
+		result.ObservedAt = time.Now().UTC()
+	}
+	result.Observed = true
+	if err := db.CompleteRepositoryCommand(ctx, claim, result); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// completeEvidenceRepositoryCommand issues the exact canonical command claim
+// a future workflow runtime will issue. Tests use it to exercise Store-side
+// authentication without giving tests (or providers) a weaker authority path.
+func completeEvidenceRepositoryCommand(t *testing.T, db *Store, ctx context.Context, purpose string, ref domain.TicketRef, version uint64, fence domain.Fence, provider ProviderAttemptResultKey, intent, proof, checkpoint, policyDigest string, exit int) contracts.RepositoryCommandResultKey {
+	t.Helper()
+	project, err := db.Project(ctx, ref.Channel, ref.Project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := db.Worktree(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := db.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv, err := frozenVerifyArgv(ticket.ConfigSnapshot, ticket.ConfigDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandDigest, err := exactRepositoryCommandDigest(argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policyDigest == "" {
+		policyDigest = repositoryCommandDigest("1")
+	}
+	provisional := RepositoryCommandResult{Claim: contracts.RepositoryCommandClaim{
+		TicketRef: ref, TicketVersion: version, LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch,
+		Repository: project.Path, Worktree: worktree.Path, WorktreeIdentity: string(worktree.IdentityJSON), Branch: worktree.Branch, BaseRef: project.BaseRef, BaseSHA: worktree.BaseSHA,
+		CommandDigest: commandDigest, SpecDigest: repositoryCommandDigest("2"), PolicyDigest: policyDigest, ExecutablePath: "/usr/bin/true", ExecutableDigest: repositoryCommandDigest("3"),
+	}}
+	if purpose == RepositoryCommandPurposePrebuildVerification {
+		checkpoint = ""
+	}
+	request := commandEvidenceRequest(purpose, ref, version, fence, provider, intent, proof, checkpoint, commandDigest, provisional)
+	_, requestDigest, err := CanonicalRepositoryCommandEvidenceRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	semantic, err := RepositoryCommandEvidenceSemanticKey(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := RepositoryCommandIntent{EffectFence: EffectFence{SemanticKey: semantic, Ref: ref, TicketVersion: version, Fence: fence}, RequestDigest: requestDigest,
+		Repository: project.Path, Worktree: worktree.Path, WorktreeIdentity: string(worktree.IdentityJSON), Branch: worktree.Branch, BaseRef: project.BaseRef, BaseSHA: worktree.BaseSHA,
+		CommandDigest: commandDigest, SpecDigest: provisional.Claim.SpecDigest, PolicyDigest: policyDigest, ExecutablePath: provisional.Claim.ExecutablePath, ExecutableDigest: provisional.Claim.ExecutableDigest}
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: semantic, Ref: ref, Kind: "repository_command", TicketVersion: version, Fence: fence, RequestDigest: requestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.IssueRepositoryCommandClaim(ctx, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeDrainedRepositoryCommand(t, db, ctx, lease, claim, contracts.CommandResult{ExitCode: exit, Duration: time.Millisecond})
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	return contracts.RepositoryCommandResultKey{SemanticKey: claim.SemanticKey, ClaimEpoch: claim.ClaimEpoch}
+}
+
 func TestRepositoryCommandCompleteReleaseThenNextAcquire(t *testing.T) {
 	db, ctx := openTestStore(t)
 	first := repositoryCommandIntentFixture(t, db, ctx, "first")
@@ -83,9 +175,7 @@ func TestRepositoryCommandCompleteReleaseThenNextAcquire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Observed: true}); err != nil {
-		t.Fatal(err)
-	}
+	completeDrainedRepositoryCommand(t, db, ctx, lease, claim, contracts.CommandResult{ExitCode: 0})
 	if err := lease.Release(); err != nil {
 		t.Fatal(err)
 	}
@@ -109,9 +199,7 @@ func TestRepositoryCommandCompleteReleaseThenNextAcquire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CompleteRepositoryCommand(ctx, secondClaim, contracts.CommandResult{ExitCode: 1, Observed: true}); err != nil {
-		t.Fatal(err)
-	}
+	completeDrainedRepositoryCommand(t, db, ctx, secondLease, secondClaim, contracts.CommandResult{ExitCode: 1})
 	if err := secondLease.Release(); err != nil {
 		t.Fatal(err)
 	}
@@ -213,16 +301,7 @@ func TestRecoverRepositoryCommandPreservesTerminalResultBeforeRelease(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	launch := contracts.RepositoryCommandLaunch{PID: 111, PGID: 111, BootIdentity: "boot", ProcessStartIdentity: "start"}
-	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
-		t.Fatal(err)
-	}
-	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Observed: true}); err != nil {
-		t.Fatal(err)
-	}
+	completeDrainedRepositoryCommand(t, db, ctx, lease, claim, contracts.CommandResult{ExitCode: 0})
 	if err := db.RecoverRepositoryCommandLeases(ctx, claim.TicketRef.Channel, claim.LeaderEpoch, repositoryRecoveryDrainer{}); err != nil {
 		t.Fatal(err)
 	}
@@ -320,6 +399,10 @@ func TestRepositoryCommandStaleObservedResultRetiresExactExecutingEffect(t *test
 	if err := db.ReconcileStaleRepositoryCommandObservation(ctx, claim, result); err != nil {
 		t.Fatal(err)
 	}
+	var resultRows int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_results WHERE semantic_key=?`, claim.SemanticKey).Scan(&resultRows); err != nil || resultRows != 0 {
+		t.Fatalf("stale observation minted result rows=%d err=%v", resultRows, err)
+	}
 	var state string
 	if err := db.db.QueryRowContext(ctx, `SELECT state FROM effects WHERE semantic_key=?`, claim.SemanticKey).Scan(&state); err != nil || state != string(EffectFailed) {
 		t.Fatalf("effect state=%q err=%v", state, err)
@@ -349,9 +432,7 @@ func TestRepositoryCommandLeaseBlocksControlCompletionAfterTerminalResult(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Observed: true}); err != nil {
-		t.Fatal(err)
-	}
+	completeDrainedRepositoryCommand(t, db, ctx, lease, claim, contracts.CommandResult{ExitCode: 0})
 	control, err := db.TransitionAndInvalidateRunner(ctx, Transition{Ref: claim.TicketRef, ExpectedVersion: claim.TicketVersion, From: domain.StatePlanning, To: domain.StateStopping, ResumeState: domain.StatePlanning, Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch}, EventPayload: "{}"})
 	if err != nil {
 		t.Fatal(err)
@@ -402,7 +483,7 @@ func TestRepositoryCommandPersistsTrackedGoTestGroups(t *testing.T) {
 	if err := lease.FinishRepositoryCommandLaunch(ctx, primary); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Observed: true}); err != nil {
+	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Observed: true, ObservedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	if err := lease.Release(); err != nil {

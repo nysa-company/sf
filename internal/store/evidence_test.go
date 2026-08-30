@@ -50,17 +50,8 @@ func TestEvidencePlanVerificationCandidateAndApprovalFences(t *testing.T) {
 		t.Fatalf("plan mutation=%v", err)
 	}
 
-	first, err := database.RecordVerification(ctx, VerificationArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Intent: []byte("intent one"), Proof: []byte("proof one"), OwnedFiles: []string{"verify_test.go"}, CheckpointID: evidenceOID("a")})
-	if err != nil || first.Revision != 1 {
-		t.Fatalf("first=%+v err=%v", first, err)
-	}
-	second, err := database.RecordVerification(ctx, VerificationArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Intent: []byte("intent two"), Proof: []byte("proof two"), OwnedFiles: []string{"verify_test.go"}, CheckpointID: evidenceOID("b"), AmendsRevision: first.Revision, Reason: "fix assertion", Requester: "reviewer"})
-	if err != nil || second.Revision != 2 {
-		t.Fatalf("second=%+v err=%v", second, err)
-	}
-	history, err := database.VerificationRevisions(ctx, ref)
-	if err != nil || len(history) != 2 || history[1].Amends != 1 {
-		t.Fatalf("history=%+v err=%v", history, err)
+	if _, err := database.RecordVerification(ctx, VerificationArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Intent: []byte("intent one"), Proof: []byte("proof one"), OwnedFiles: []string{"verify_test.go"}, CheckpointID: evidenceOID("a")}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("verification without immutable provider/result authority=%v", err)
 	}
 
 	// Direct snapshots cannot be adopted after v31: CandidateEvidence must
@@ -78,11 +69,9 @@ func TestTransitionCandidateRefusesReplacementGenerationAtomically(t *testing.T)
 	if err := database.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: version, Fence: fence, Path: "/tmp/candidate-race", Branch: "dev/candidate-race", IdentityJSON: []byte(`{"repository":"/tmp/candidate-race"}`), BaseSHA: evidenceOID("a"), HeadSHA: evidenceOID("b")}); err != nil {
 		t.Fatal(err)
 	}
-	verification, err := database.RecordVerification(ctx, VerificationArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Intent: []byte("intent"), Proof: []byte("proof"), OwnedFiles: []string{"internal"}, CheckpointID: evidenceOID("c")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := domain.CandidateSnapshot{Generation: 1, BaseSHA: evidenceOID("a"), HeadSHA: evidenceOID("d"), TreeSHA: evidenceOID("e"), SourceDigest: "evidence-digest", VerificationIntentDigest: verification.IntentDigest, ProofDigest: verification.ProofDigest, CommandPolicyDigest: evidenceDigest("policy"), BuilderEvidenceDigest: evidenceDigest("builder")}
+	// The old snapshot is deliberately injected without a v36 result binding;
+	// it must never authorize a transition, even if its projections look valid.
+	base := domain.CandidateSnapshot{Generation: 1, BaseSHA: evidenceOID("a"), HeadSHA: evidenceOID("d"), TreeSHA: evidenceOID("e"), SourceDigest: "evidence-digest", VerificationIntentDigest: evidenceDigest("intent"), ProofDigest: evidenceDigest("proof"), CommandPolicyDigest: evidenceDigest("policy"), BuilderEvidenceDigest: evidenceDigest("builder")}
 	for _, candidate := range []domain.CandidateSnapshot{base, func() domain.CandidateSnapshot {
 		v := base
 		v.Generation = 2

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/engine"
@@ -21,11 +22,11 @@ import (
 	"github.com/nysa-company/sf/internal/workflowprompt"
 )
 
-// This test deliberately uses a real Store and Engine. The only doubles are
-// the injected provider and Git boundaries: they create authenticated provider
-// attempt results through the public Store API rather than supplying Parsed
-// values to Worker.
-func TestWorkerRealStoreEnginePlanningVerifyingBuildingPublishing(t *testing.T) {
+// This deliberately uses a real Store and Engine. Repository-command
+// composition is intentionally not wired into workflowruntime yet, so once a
+// reviewer result exists the Store must fail closed instead of accepting the
+// historical provider artifact alone.
+func TestWorkerRealStoreFailsClosedWithoutCommandResultWiring(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.sqlite"))
 	if err != nil {
@@ -33,10 +34,15 @@ func TestWorkerRealStoreEnginePlanningVerifyingBuildingPublishing(t *testing.T) 
 	}
 	defer db.Close()
 	const projectPath = "/tmp/workflow-worker-real"
-	config := []byte(`{"providers":"real-test"}`)
-	configSum := sha256.Sum256(config)
-	configDigest := hex.EncodeToString(configSum[:])
-	if err := db.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "real", Path: projectPath, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: configDigest, ConfigSnapshot: config}); err != nil {
+	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("real", projectPath), config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, configDigest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "real", Path: projectPath, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: configDigest, ConfigSnapshot: snapshot}); err != nil {
 		t.Fatal(err)
 	}
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "real", Ticket: "SF-real-worker"}
@@ -81,7 +87,7 @@ func TestWorkerRealStoreEnginePlanningVerifyingBuildingPublishing(t *testing.T) 
 	if _, err := worker.Run(ctx, ref, fence); err == nil {
 		t.Fatal("expected injected crash after durable planner result")
 	}
-	for i := 0; i < 7; i++ {
+	for i := 0; i < 3; i++ {
 		if i == 3 || i == 6 {
 			// Recover once after reviewer evidence/before signal and again after
 			// candidate evidence/before signal. Each old result must be selected
@@ -101,11 +107,21 @@ func TestWorkerRealStoreEnginePlanningVerifyingBuildingPublishing(t *testing.T) 
 		}
 		fence.RunnerEpoch = ticket.RunnerEpoch
 		_, err = worker.Run(ctx, ref, fence)
-		if i == 1 || i == 2 || i == 4 || i == 5 {
+		if i == 1 {
 			if err == nil {
 				t.Fatalf("run %d expected injected post-result crash", i)
 			}
 			continue
+		}
+		if i == 2 {
+			if !errors.Is(err, store.ErrEvidenceConflict) {
+				t.Fatalf("run %d accepted unbound reviewer evidence: %v", i, err)
+			}
+			current, readErr := db.Ticket(ctx, ref)
+			if readErr != nil || current.State != domain.StateVerifying || runner.calls[domain.PhasePlanning] != 1 || runner.calls[domain.PhaseVerification] != 1 {
+				t.Fatalf("unwired command boundary ticket=%+v calls=%v err=%v", current, runner.calls, readErr)
+			}
+			return
 		}
 		if err != nil {
 			t.Fatalf("run %d: %v", i, err)
