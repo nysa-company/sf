@@ -77,6 +77,15 @@ func TestLoadProjectDetectionRefusesAmbiguousUnsupportedMissingScriptsAndSymlink
 		"missing scripts": func(repository string) error {
 			return os.WriteFile(filepath.Join(repository, "package.json"), []byte(`{"name":"missing"}`), 0o600)
 		},
+		"malformed test script": func(repository string) error {
+			return os.WriteFile(filepath.Join(repository, "package.json"), []byte(`{"scripts":{"test":null,"build":"ok"}}`), 0o600)
+		},
+		"malformed build script": func(repository string) error {
+			return os.WriteFile(filepath.Join(repository, "package.json"), []byte(`{"scripts":{"test":"ok","build":{}}}`), 0o600)
+		},
+		"empty script": func(repository string) error {
+			return os.WriteFile(filepath.Join(repository, "package.json"), []byte(`{"scripts":{"test":"   ","build":"ok"}}`), 0o600)
+		},
 		"symlink": func(repository string) error {
 			target := filepath.Join(t.TempDir(), "package.json")
 			if err := os.WriteFile(target, []byte(`{"scripts":{"test":"ok","build":"ok"}}`), 0o600); err != nil {

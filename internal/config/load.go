@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -227,11 +228,12 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 			return Commands{}, detectionError("package.json contains trailing data; add explicit commands to .sf/config.toml")
 		}
-		if _, ok := document.Scripts["test"]; !ok {
-			return Commands{}, detectionError("package.json has no scripts.test; add explicit commands to .sf/config.toml")
-		}
-		if _, ok := document.Scripts["build"]; !ok {
-			return Commands{}, detectionError("package.json has no scripts.build; add explicit commands to .sf/config.toml")
+		for _, name := range []string{"test", "build"} {
+			raw, ok := document.Scripts[name]
+			var script string
+			if !ok || json.Unmarshal(raw, &script) != nil || strings.TrimSpace(script) == "" {
+				return Commands{}, detectionError("package.json scripts." + name + " must be a nonempty string; add explicit commands to .sf/config.toml")
+			}
 		}
 		return Commands{Verify: Command{Argv: []string{"npm", "test"}}, Review: Command{Argv: []string{"npm", "run", "build"}}}, nil
 	}
