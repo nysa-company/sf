@@ -92,10 +92,23 @@ func (s *Store) IssueGitMutationClaim(ctx context.Context, intent GitMutationInt
 			return err
 		}
 		var repository, worktree, branch, baseRef string
-		err := conn.QueryRowContext(ctx, `SELECT p.canonical_path,w.path,w.branch_ref,p.base_ref
-			FROM projects p JOIN worktrees w ON w.channel=p.channel AND w.project_id=p.id
-			WHERE p.channel=? AND p.id=? AND w.ticket_id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).
-			Scan(&repository, &worktree, &branch, &baseRef)
+		var err error
+		if intent.Operation == "create-worktree" {
+			// Worktree creation is the one Git mutation that necessarily happens
+			// before a worktree identity can be registered. Bind it to the durable
+			// project and ticket branch allocation instead of requiring the row
+			// that this very operation is responsible for creating.
+			err = conn.QueryRowContext(ctx, `SELECT p.canonical_path,b.branch_ref,p.base_ref
+				FROM projects p JOIN branch_allocations b ON b.channel=p.channel AND b.project_id=p.id
+				WHERE p.channel=? AND p.id=? AND b.ticket_id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).
+				Scan(&repository, &branch, &baseRef)
+			worktree = intent.Worktree
+		} else {
+			err = conn.QueryRowContext(ctx, `SELECT p.canonical_path,w.path,w.branch_ref,p.base_ref
+				FROM projects p JOIN worktrees w ON w.channel=p.channel AND w.project_id=p.id
+				WHERE p.channel=? AND p.id=? AND w.ticket_id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).
+				Scan(&repository, &worktree, &branch, &baseRef)
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrGitMutationIntent
 		}

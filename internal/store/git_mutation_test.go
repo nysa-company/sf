@@ -55,6 +55,71 @@ func gitIntentFixture(t *testing.T, db *Store, ctx context.Context, ticketID str
 	return intent
 }
 
+func createWorktreeGitIntentFixture(t *testing.T, db *Store, ctx context.Context, ticketID string) GitMutationIntent {
+	t.Helper()
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: domain.TicketID(ticketID)}
+	if err := db.CreateTicket(ctx, ticket(ref, "source-"+ticketID)); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "git-create-authority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := db.StartOrAdopt(ctx, ref, current.Version, "dev/nysa/"+ticketID+"/git", domain.Fence{LeaderEpoch: leader, RunnerEpoch: current.RunnerEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "sf/dev/" + branchDigestPart("nysa") + "/" + branchDigestPart(ticketID) + "-" + strings.Repeat("b", 32)
+	key := "dev\x00nysa\x00" + ticketID
+	if stored, err := db.LoadOrStoreBranch(ctx, key, branch); err != nil || stored != branch {
+		t.Fatalf("allocate branch=%q err=%v", stored, err)
+	}
+	intent := GitMutationIntent{EffectFence: EffectFence{SemanticKey: "git/" + ticketID + "/create-worktree", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}, RequestDigest: gitDigest("c"), Repository: "/tmp/nysa", Worktree: "/tmp/sf-worktrees/" + ticketID, Branch: branch, Operation: "create-worktree", BaseRef: "main", ExpectedBaseOID: strings.Repeat("a", 40), ExpectedHeadOID: strings.Repeat("a", 40)}
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: ref, Kind: "git/create-worktree", TicketVersion: started.Version, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	return intent
+}
+
+func TestGitMutationClaimBootstrapsWorktreeFromDurableBranchAllocation(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := createWorktreeGitIntentFixture(t, db, ctx, "SF-git-create")
+	claim, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Operation != "create-worktree" || claim.Repository != intent.Repository || claim.Worktree != intent.Worktree || claim.Branch != intent.Branch {
+		t.Fatalf("claim=%+v", claim)
+	}
+	var registered int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM worktrees WHERE channel=? AND project_id=? AND ticket_id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&registered); err != nil || registered != 0 {
+		t.Fatalf("bootstrap unexpectedly required worktree row: count=%d err=%v", registered, err)
+	}
+}
+
+func TestGitMutationClaimRefusesCreateWithUnallocatedIdentity(t *testing.T) {
+	db, ctx := openTestStore(t)
+	for name, mutate := range map[string]func(*GitMutationIntent){
+		"repository": func(intent *GitMutationIntent) { intent.Repository = "/tmp/other" },
+		"branch": func(intent *GitMutationIntent) {
+			intent.Branch = "sf/dev/aaaaaaaa/aaaaaaaa-cccccccccccccccccccccccccccccccc"
+		},
+		"base ref": func(intent *GitMutationIntent) { intent.BaseRef = "trunk" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			intent := createWorktreeGitIntentFixture(t, db, ctx, "SF-git-create-"+strings.ReplaceAll(name, " ", "-"))
+			mutate(&intent)
+			if _, err := db.IssueGitMutationClaim(ctx, intent); !errors.Is(err, ErrGitMutationIntent) {
+				t.Fatalf("unallocated create identity accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestGitMutationClaimRefusesUnplannedEffect(t *testing.T) {
 	db, ctx := openTestStore(t)
 	intent := unplannedGitIntentFixture(t, db, ctx, "SF-git-unplanned")
