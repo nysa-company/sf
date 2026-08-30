@@ -275,3 +275,19 @@ var migrationV10 = []string{
 		CHECK(builder_qualification_id <> reviewer_qualification_id)
 	)`,
 }
+
+// v11 adds fenced, qualification-backed provider attempts. It deliberately
+// references the existing qualification authority rather than introducing a
+// mutable provider-binding ledger.
+var migrationV11 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN role TEXT NOT NULL DEFAULT 'planner' CHECK(role IN ('planner','builder','reviewer'))`,
+	`ALTER TABLE provider_attempts ADD COLUMN state TEXT NOT NULL DEFAULT 'completed' CHECK(state IN ('active','completed','failed','cancelled','quarantined'))`,
+	`ALTER TABLE provider_attempts ADD COLUMN usage_units INTEGER NOT NULL DEFAULT 0 CHECK(usage_units >= 0)`,
+	`ALTER TABLE provider_attempts ADD COLUMN started_at TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN finished_at TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN qualification_id INTEGER`,
+	`ALTER TABLE provider_attempts ADD COLUMN binding_digest TEXT NOT NULL DEFAULT '' CHECK(length(binding_digest) IN (0,64))`,
+	`ALTER TABLE provider_attempts ADD COLUMN provider_lease_key TEXT NOT NULL DEFAULT ''`,
+	`CREATE UNIQUE INDEX one_active_provider_attempt ON provider_attempts(channel, project_id, ticket_id) WHERE state='active'`,
+	`CREATE INDEX provider_attempt_recovery ON provider_attempts(channel, state, started_at)`,
+}

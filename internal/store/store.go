@@ -36,9 +36,12 @@ var (
 	ErrQualificationConflict = errors.New("provider qualification conflicts with durable record")
 	ErrProviderPairRefused   = errors.New("provider pair is not current, qualified, and independent")
 	ErrReadOnly              = errors.New("store is read-only")
+	ErrProviderCapacity      = errors.New("provider route capacity is exhausted")
+	ErrProviderAttempt       = errors.New("provider attempt cannot be admitted")
+	ErrProviderDrain         = errors.New("provider process has not drained")
 )
 
-const schemaVersion = 10
+const schemaVersion = 11
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -51,6 +54,7 @@ var migrationChecksums = map[int]string{
 	8:  migrationChecksum(migrationV8),
 	9:  migrationChecksum(migrationV9),
 	10: migrationChecksum(migrationV10),
+	11: migrationChecksum(migrationV11),
 }
 
 func migrationChecksum(statements []string) string {
@@ -239,6 +243,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV9
 			} else if version == 10 {
 				statements = migrationV10
+			} else if version == 11 {
+				statements = migrationV11
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {

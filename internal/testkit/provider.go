@@ -2,6 +2,8 @@ package testkit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +16,11 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 )
+
+func digest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
 
 type ProviderBehavior string
 
@@ -69,6 +76,18 @@ func (p *ScriptedProvider) Probe(context.Context) (domain.ProviderIdentity, erro
 		return domain.ProviderIdentity{}, errors.New("testkit: incomplete provider identity")
 	}
 	return p.Identity, nil
+}
+
+func (p *ScriptedProvider) Binding(context.Context) (contracts.RuntimeBinding, error) {
+	identity, err := p.Probe(context.Background())
+	if err != nil {
+		return contracts.RuntimeBinding{}, err
+	}
+	return contracts.RuntimeBinding{Identity: identity, BinaryDigest: digest("binary:" + identity.Version), PolicyDigest: digest("policy:" + identity.Provider), FixtureDigest: digest("fixture:" + identity.Provider), AuthDigest: digest("auth:" + identity.Provider)}, nil
+}
+
+func (p *ScriptedProvider) Drain(context.Context) (contracts.DrainResult, error) {
+	return contracts.DrainResult{Drained: true}, nil
 }
 
 func (p *ScriptedProvider) Add(phase domain.Phase, step ProviderStep) {
@@ -148,10 +167,10 @@ func (p *ScriptedProvider) Run(ctx context.Context, input contracts.PhaseInput) 
 		return contracts.PhaseResult{}, errors.New("testkit: provider exited before submission")
 	}
 	if step.Behavior == ProviderMalformed {
-		return contracts.PhaseResult{Outcome: "malformed", Artifact: []byte("not-json"), Provider: p.Identity}, errors.New("testkit: malformed structured output")
+		return contracts.PhaseResult{Outcome: "malformed", Artifact: []byte("not-json"), Transcript: step.Transcript, Provider: p.Identity, UsageTrusted: true}, errors.New("testkit: malformed structured output")
 	}
 	if step.Behavior == ProviderOversized {
-		return contracts.PhaseResult{Outcome: "oversized", Artifact: []byte(strings.Repeat("x", 2<<20)), Provider: p.Identity}, errors.New("testkit: oversized structured output")
+		return contracts.PhaseResult{Outcome: "oversized", Artifact: []byte(strings.Repeat("x", 2<<20)), Provider: p.Identity, UsageTrusted: true}, errors.New("testkit: oversized structured output")
 	}
 	if step.Behavior == ProviderSecret {
 		return contracts.PhaseResult{Outcome: "secret", Transcript: "token=fixture-secret-must-redact", Provider: p.Identity}, errors.New("testkit: secret output fixture")

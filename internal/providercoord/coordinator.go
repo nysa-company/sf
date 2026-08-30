@@ -1,0 +1,290 @@
+// Package providercoord is a durable, exec-free provider admission layer.
+package providercoord
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/nysa-company/sf/internal/contracts"
+	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/phaseartifact"
+	"github.com/nysa-company/sf/internal/redact"
+	"github.com/nysa-company/sf/internal/store"
+)
+
+type Role string
+
+const (
+	RolePlanner  Role = "planner"
+	RoleBuilder  Role = "builder"
+	RoleReviewer Role = "reviewer"
+)
+
+type Route struct {
+	Primary, Fallback string
+	Capacity          int
+}
+type Outcome string
+
+const (
+	Completed       Outcome = "completed"
+	Failed          Outcome = "failed"
+	Canceled        Outcome = "canceled"
+	NeedsOperator   Outcome = "needs_operator"
+	BudgetExhausted Outcome = "budget_exhausted"
+)
+
+type Request struct {
+	Role            Role
+	Input           contracts.PhaseInput
+	Validation      phaseartifact.Validation
+	ExpectedVersion uint64
+	Fence           domain.Fence
+	ConfigDigest    string
+}
+type Receipt struct {
+	Attempt                          int
+	Provider                         domain.ProviderIdentity
+	ArtifactDigest, TranscriptDigest string
+	UsageUnits                       int64
+	ErrorCode                        string
+}
+type Result struct {
+	Code          Outcome
+	Parsed        *phaseartifact.Parsed
+	Attempts      []Receipt
+	NeedsOperator bool
+	CostUsed      int64
+}
+type Clock interface{ Now() time.Time }
+type wallClock struct{}
+
+func (wallClock) Now() time.Time { return time.Now().UTC() }
+
+type Registry struct {
+	mu        sync.RWMutex
+	providers map[string]contracts.Provider
+}
+
+func NewRegistry() *Registry { return &Registry{providers: map[string]contracts.Provider{}} }
+func (r *Registry) Register(ctx context.Context, p contracts.Provider) error {
+	if r == nil || p == nil || p.Name() == "" {
+		return errors.New("provider required")
+	}
+	id, e := p.Probe(ctx)
+	if e != nil || id.Provider != p.Name() {
+		return errors.New("provider identity probe failed")
+	}
+	if _, e = p.Binding(ctx); e != nil {
+		return e
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.providers[p.Name()]; ok {
+		return errors.New("duplicate provider")
+	}
+	r.providers[p.Name()] = p
+	return nil
+}
+func (r *Registry) get(name string) (contracts.Provider, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.providers[name]
+	return p, ok
+}
+
+type Coordinator struct {
+	registry *Registry
+	routes   map[Role]Route
+	store    *store.Store
+	clock    Clock
+}
+
+func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Clock) (*Coordinator, error) {
+	if reg == nil || database == nil {
+		return nil, errors.New("registry and store required")
+	}
+	copy := map[Role]Route{}
+	for role, route := range routes {
+		if !role.valid() || route.Primary == "" || route.Primary == route.Fallback || route.Capacity < 0 || route.Capacity > 16 {
+			return nil, errors.New("invalid provider route")
+		}
+		if route.Capacity == 0 {
+			route.Capacity = 1
+		}
+		if _, ok := reg.get(route.Primary); !ok {
+			return nil, errors.New("unregistered primary")
+		}
+		if route.Fallback != "" {
+			if _, ok := reg.get(route.Fallback); !ok {
+				return nil, errors.New("unregistered fallback")
+			}
+		}
+		copy[role] = route
+	}
+	if clock == nil {
+		clock = wallClock{}
+	}
+	return &Coordinator{reg, copy, database, clock}, nil
+}
+func (role Role) valid() bool {
+	return role == RolePlanner || role == RoleBuilder || role == RoleReviewer
+}
+
+func (c *Coordinator) Run(ctx context.Context, r Request) Result {
+	if err := validate(r); err != nil {
+		return Result{Code: NeedsOperator, NeedsOperator: true}
+	}
+	ticket, err := c.store.Ticket(ctx, r.Input.Ticket)
+	if err != nil || ticket.Version != r.ExpectedVersion || ticket.RunnerEpoch != r.Fence.RunnerEpoch || ticket.ConfigDigest == "" || ticket.ConfigDigest != r.ConfigDigest {
+		return Result{Code: NeedsOperator, NeedsOperator: true}
+	}
+	route, ok := c.routes[r.Role]
+	if !ok {
+		return Result{Code: NeedsOperator, NeedsOperator: true}
+	}
+	names := []string{route.Primary}
+	if route.Fallback != "" {
+		names = append(names, route.Fallback)
+	}
+	var receipts []Receipt
+	var spent int64
+	for _, name := range names {
+		if ctx.Err() != nil {
+			return Result{Code: Canceled, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+		}
+		p, ok := c.registry.get(name)
+		if !ok {
+			continue
+		}
+		binding, err := p.Binding(ctx)
+		if err != nil || binding.Identity.Provider != name {
+			continue
+		}
+		remaining := time.Until(ticket.CreatedAt.Add(ticket.MaxDuration))
+		if remaining <= 0 {
+			return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+		}
+		timeout := r.Input.Timeout
+		if timeout > remaining {
+			timeout = remaining
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now()})
+		if err != nil {
+			cancel()
+			if errors.Is(err, store.ErrProviderCapacity) {
+				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			}
+			continue
+		}
+		input := r.Input
+		input.Provider = binding.Identity
+		input.Timeout = timeout
+		raw, runErr := p.Run(attemptCtx, input)
+		cancel()
+		state, outcome := "failed", "failed"
+		valid := runErr == nil && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0
+		var parsed phaseartifact.Parsed
+		if valid {
+			parsed, err = phaseartifact.Parse(input.Phase, raw, r.Validation)
+			if err == nil {
+				state, outcome = "completed", "completed"
+			} else {
+				outcome = "invalid_artifact"
+			}
+		}
+		receipt := Receipt{Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), UsageUnits: max(raw.UsageUnits, 0)}
+		if runErr != nil {
+			receipt.ErrorCode = "provider_error"
+		} else if !valid {
+			receipt.ErrorCode = "invalid_result"
+		} else if outcome == "invalid_artifact" {
+			receipt.ErrorCode = "invalid_artifact"
+		}
+		receipts = append(receipts, receipt)
+		finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		finishErr := c.store.FinishProviderAttempt(finishCtx, claim, r.ExpectedVersion, r.Fence, state, outcome, max(raw.UsageUnits, 0), c.clock.Now())
+		finishCancel()
+		if finishErr != nil {
+			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+		}
+		spent += max(raw.UsageUnits, 0)
+		if !raw.UsageTrusted {
+			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+		}
+		if spent >= ticket.MaxCostMicroUSD {
+			return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+		}
+		if state == "completed" {
+			return Result{Code: Completed, Parsed: &parsed, Attempts: receipts, CostUsed: spent}
+		}
+	}
+	return Result{Code: Failed, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+}
+
+// Recover drains a provider before releasing an old fenced claim. It does not
+// guess from PID or time alone.
+func (c *Coordinator) Recover(ctx context.Context, ref domain.TicketRef, staleRunner, leader uint64, name string) error {
+	p, ok := c.registry.get(name)
+	if !ok {
+		return errors.New("provider unavailable")
+	}
+	drain, err := p.Drain(ctx)
+	if err != nil {
+		return err
+	}
+	return c.store.RecoverProviderAttempts(ctx, ref, staleRunner, leader, drain.Drained, c.clock.Now())
+}
+func validate(r Request) error {
+	if !r.Role.valid() || r.Input.Ticket.Validate() != nil || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.ConfigDigest == "" || len(r.ConfigDigest) != 64 || r.Input.Profile != contracts.ProfileGuarded || r.Input.Timeout <= 0 || r.Input.Timeout > 10*time.Minute || strings.TrimSpace(r.Input.Prompt) == "" || len(r.Input.Prompt) > 64<<10 || !cleanAbs(r.Input.Repository) || !cleanAbs(r.Input.Worktree) || len(r.Input.Schema) == 0 || len(r.Input.Schema) > 1<<20 {
+		return errors.New("invalid request")
+	}
+	if r.Input.Provider != (domain.ProviderIdentity{}) {
+		return errors.New("provider registry owns identity")
+	}
+	if r.Input.Phase != phase(r.Role) && !(r.Role == RoleReviewer && (r.Input.Phase == domain.PhaseVerification || r.Input.Phase == domain.PhaseReview)) {
+		return errors.New("role phase mismatch")
+	}
+	return nil
+}
+func phase(r Role) domain.Phase {
+	if r == RolePlanner {
+		return domain.PhasePlanning
+	}
+	if r == RoleBuilder {
+		return domain.PhaseBuild
+	}
+	return domain.PhaseReview
+}
+func cleanAbs(v string) bool { return filepath.IsAbs(v) && filepath.Clean(v) == v && v != "/" }
+func max(v int64, x int64) int64 {
+	if v < x {
+		return x
+	}
+	return v
+}
+func safeDigest(v []byte) string {
+	if len(v) == 0 {
+		return ""
+	}
+	if len(v) > 64<<10 {
+		v = v[:64<<10]
+	}
+	sum := sha256.Sum256([]byte(redact.String(string(v))))
+	return "sha256:" + fmtHex(sum[:])
+}
+func fmtHex(v []byte) string {
+	const h = "0123456789abcdef"
+	b := make([]byte, len(v)*2)
+	for i, x := range v {
+		b[2*i] = h[x>>4]
+		b[2*i+1] = h[x&15]
+	}
+	return string(b)
+}
