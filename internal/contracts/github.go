@@ -2,9 +2,15 @@ package contracts
 
 import (
 	"context"
+	"errors"
 
 	"github.com/nysa-company/sf/internal/domain"
 )
+
+// ErrExternalCleanupUncertain means a supervised external process may still
+// have descendants or output writers. Mutation guards must quarantine their
+// gate until a supervisor supplies a drain or quarantine proof.
+var ErrExternalCleanupUncertain = errors.New("external process cleanup is uncertain")
 
 type RepositoryIdentity struct {
 	Host  string

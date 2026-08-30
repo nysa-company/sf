@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -46,7 +47,12 @@ func (g *ExternalMutationGate) RunExternalMutation(ctx context.Context, claim do
 	if err := g.lock(ctx); err != nil {
 		return nil, err
 	}
-	defer g.unlock()
+	release := true
+	defer func() {
+		if release {
+			g.unlock()
+		}
+	}()
 	if revoked, ok := g.revoked[claim.Ref]; ok && claim.TicketVersion <= revoked.version && claim.LeaderEpoch <= revoked.leader && claim.RunnerEpoch <= revoked.runner {
 		return nil, ErrStaleFence
 	}
@@ -59,7 +65,14 @@ func (g *ExternalMutationGate) RunExternalMutation(ctx context.Context, claim do
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return start(ctx)
+	result, err := start(ctx)
+	if errors.Is(err, contracts.ErrExternalCleanupUncertain) {
+		// Do not release the serialization gate while an external writer may
+		// still exist. This quarantines every later mutation until the process
+		// supervisor has repaired the host and the store is restarted.
+		release = false
+	}
+	return result, err
 }
 
 // DrainExternalMutations must be called before any pause/take/cancel/leader

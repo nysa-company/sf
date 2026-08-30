@@ -92,6 +92,8 @@ func TestAuthStatusAcceptsOfficialHostsStateShape(t *testing.T) {
 			return nil, errors.New("unexpected auth argv")
 		}
 		return []byte(`{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"sf-test","tokenSource":"keyring","scopes":"repo","gitProtocol":"https"}]}}`), nil
+	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+		return start(ctx)
 	})}
 	if err := client.AuthStatus(context.Background()); err != nil {
 		t.Fatalf("official auth status shape=%v", err)
@@ -331,6 +333,70 @@ func TestMarkReadySynchronizeGapCompensatesChangedSource(t *testing.T) {
 	}
 }
 
+func TestMarkReadyFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
+	cases := []struct {
+		name string
+		wire func(contracts.PullRequestIdentity) map[string]any
+	}{
+		{"closed", func(id contracts.PullRequestIdentity) map[string]any {
+			return mergeWire(id, "CLOSED", "CLEAN", nil, nil)
+		}},
+		{"merged", func(id contracts.PullRequestIdentity) map[string]any {
+			return mergeWire(id, "MERGED", "CLEAN", "2026-01-01T00:00:00Z", nil)
+		}},
+		{"head-changed", func(id contracts.PullRequestIdentity) map[string]any {
+			id.HeadOID = strings.Repeat("b", 40)
+			return mergeWire(id, "OPEN", "CLEAN", nil, nil)
+		}},
+		{"base-changed", func(id contracts.PullRequestIdentity) map[string]any {
+			id.BaseRef = "release"
+			return mergeWire(id, "OPEN", "CLEAN", nil, nil)
+		}},
+		{"auto-merge", func(id contracts.PullRequestIdentity) map[string]any {
+			return mergeWire(id, "OPEN", "CLEAN", nil, map[string]any{"enabledAt": "now"})
+		}},
+		{"queued", func(id contracts.PullRequestIdentity) map[string]any {
+			return mergeWire(id, "OPEN", "QUEUED", nil, nil)
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			client, _, identity := fixture(t)
+			identity.Number = 1
+			initialWire := mergeWire(identity, "OPEN", "CLEAN", nil, nil)
+			initialWire["isDraft"] = true
+			initial, err := json.Marshal(initialWire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed, err := json.Marshal(test.wire(identity))
+			if err != nil {
+				t.Fatal(err)
+			}
+			readyCalls := 0
+			client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+				if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+					return []byte("[" + string(initial) + "]"), nil
+				}
+				if len(args) >= 2 && args[0] == "pr" && args[1] == "view" {
+					return changed, nil
+				}
+				if len(args) >= 2 && args[0] == "pr" && args[1] == "ready" {
+					readyCalls++
+				}
+				return []byte("{}"), nil
+			})
+			claim := domain.ExternalEffectClaim{SemanticKey: "ready-final-" + test.name, Kind: "pr_ready", RequestDigest: requestDigest("pr_ready", identity)}
+			if err := client.MarkReady(context.Background(), claim, identity); !errors.Is(err, ErrPolicyRefusal) {
+				t.Fatalf("changed %s accepted: %v", test.name, err)
+			}
+			if readyCalls != 0 {
+				t.Fatalf("changed %s launched ready %d times", test.name, readyCalls)
+			}
+		})
+	}
+}
+
 func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 	t.Run("unavailable verifier is never success", func(t *testing.T) {
 		client, fake, identity := fixture(t)
@@ -366,6 +432,75 @@ func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 			t.Fatalf("mismatched proof=%v", err)
 		}
 	})
+}
+
+func TestMergeFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
+	cases := []struct {
+		name       string
+		wire       func(contracts.PullRequestIdentity) map[string]any
+		queueAfter bool
+	}{
+		{"closed", func(id contracts.PullRequestIdentity) map[string]any {
+			return mergeWire(id, "CLOSED", "CLEAN", nil, nil)
+		}, false},
+		{"merged", func(id contracts.PullRequestIdentity) map[string]any {
+			return mergeWire(id, "MERGED", "CLEAN", "2026-01-01T00:00:00Z", nil)
+		}, false},
+		{"head-changed", func(id contracts.PullRequestIdentity) map[string]any {
+			id.HeadOID = strings.Repeat("b", 40)
+			return mergeWire(id, "OPEN", "CLEAN", nil, nil)
+		}, false},
+		{"base-changed", func(id contracts.PullRequestIdentity) map[string]any {
+			id.BaseRef = "release"
+			return mergeWire(id, "OPEN", "CLEAN", nil, nil)
+		}, false},
+		{"auto-merge", func(id contracts.PullRequestIdentity) map[string]any {
+			return mergeWire(id, "OPEN", "CLEAN", nil, map[string]any{"enabledAt": "now"})
+		}, false},
+		{"queue-enrolled", func(id contracts.PullRequestIdentity) map[string]any { return mergeWire(id, "OPEN", "CLEAN", nil, nil) }, true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			client, _, identity := fixture(t)
+			identity.Number = 1
+			initial, err := json.Marshal(mergeWire(identity, "OPEN", "CLEAN", nil, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed, err := json.Marshal(test.wire(identity))
+			if err != nil {
+				t.Fatal(err)
+			}
+			queueCalls, mergeCalls := 0, 0
+			client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+				if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+					return []byte("[" + string(initial) + "]"), nil
+				}
+				if len(args) >= 2 && args[0] == "pr" && args[1] == "view" {
+					return changed, nil
+				}
+				if len(args) >= 2 && args[0] == "api" {
+					queueCalls++
+					if test.queueAfter && queueCalls >= 2 {
+						return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":{"position":1}}}}}`), nil
+					}
+					return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}`), nil
+				}
+				if len(args) >= 2 && args[0] == "pr" && args[1] == "merge" {
+					mergeCalls++
+				}
+				return []byte("{}"), nil
+			})
+			authorization := domain.MergeAuthorization{ReviewedHead: identity.HeadOID, CurrentHead: identity.HeadOID, Approved: true, GatesGreen: true}
+			claim := domain.ExternalEffectClaim{SemanticKey: "merge-final-" + test.name, Kind: "merge", RequestDigest: requestDigest("merge", identity, identity.HeadOID, "squash")}
+			if err := client.MergeExactHead(context.Background(), claim, identity, identity.HeadOID, "squash", authorization); !errors.Is(err, ErrPolicyRefusal) {
+				t.Fatalf("changed %s accepted: %v", test.name, err)
+			}
+			if mergeCalls != 0 {
+				t.Fatalf("changed %s launched merge %d times", test.name, mergeCalls)
+			}
+		})
+	}
 }
 
 func TestMergeNeverTrustsCLIExitWithoutFreshMergedObservation(t *testing.T) {
@@ -427,6 +562,8 @@ func TestOfficialGHArgvGolden(t *testing.T) {
 		default:
 			return nil, errors.New("unexpected command")
 		}
+	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+		return start(ctx)
 	})}
 	claim := EffectClaim{Plan: EffectPlan{SemanticKey: "key", Identity: identity}, Claimed: true}
 	if _, err := client.createOrAdopt(context.Background(), claim, "title", "body"); err != nil {
@@ -452,15 +589,26 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 	}
 	var got [][]string
 	verified := false
+	viewCalls := 0
 	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 		got = append(got, append([]string(nil), args...))
 		if args[0] == "pr" && args[1] == "merge" {
 			return nil, nil
 		}
+		if args[0] == "api" {
+			return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}`), nil
+		}
 		if args[0] == "pr" && args[1] == "view" {
+			viewCalls++
+			if viewCalls < 3 {
+				open := mergeWire(identity, "OPEN", "CLEAN", nil, nil)
+				return json.Marshal(open)
+			}
 			return payload, nil
 		}
 		return nil, errors.New("unexpected command")
+	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+		return start(ctx)
 	}), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 		verified = repository == identity.Repository && baseRef == "main" && mergeCommit == strings.Repeat("b", 40)
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
@@ -469,7 +617,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 	if outcome, err := client.merge(context.Background(), claim, PRMatch{Identity: identity, State: "OPEN"}, identity.HeadOID, domain.MergeGuarded, "squash"); err != nil || outcome != MergeApplied || !verified {
 		t.Fatalf("proven merge outcome=%q verified=%v err=%v", outcome, verified, err)
 	}
-	want := [][]string{{"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}}
+	want := [][]string{{"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("official merge argv\n got: %#v\nwant: %#v", got, want)
 	}
@@ -584,7 +732,7 @@ func TestRunBoundedClosesRetainedPipeFromEscapedDescendant(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	script := "import os,time\nif os.fork()==0:\n if os.fork()==0:\n  os.setsid(); print(os.getpid(), flush=True); time.sleep(5)\n os._exit(0)\ntime.sleep(5)"
+	script := "import os,time\nif os.fork()==0:\n if os.fork()==0:\n  os.setsid(); print('escaped-child-pid='+str(os.getpid()), flush=True); time.sleep(5)\n os._exit(0)\ntime.sleep(5)"
 	output, err := runBounded(ctx, "/usr/bin/python3", []string{"-c", script}, []string{"PATH=/usr/bin:/bin"})
 	if !errors.Is(err, ErrProcessCleanup) || time.Since(started) > 2*time.Second {
 		t.Fatalf("escaped retained pipe err=%v elapsed=%s output=%q", err, time.Since(started), output)

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	_ "modernc.org/sqlite"
 )
@@ -576,6 +577,41 @@ func TestExternalMutationGateWaitHonorsCancellation(t *testing.T) {
 		t.Fatal("cancelled gate wait succeeded")
 	}
 	close(release)
+}
+
+func TestExternalMutationGateQuarantinesUncertainCleanup(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-gate-quarantine"}
+	if err := database.CreateTicket(ctx, ticket(ref, "gate-quarantine")); err != nil {
+		t.Fatal(err)
+	}
+	leader, _ := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-gate-quarantine")
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-gate-quarantine/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := EffectFence{SemanticKey: "gate-quarantine", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
+	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: base.SemanticKey, Ref: ref, Kind: "pr_update", TicketVersion: base.TicketVersion, Fence: base.Fence, RequestDigest: "digest"}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := database.ClaimEffect(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.ExternalMutationGuard().RunExternalMutation(ctx, claimed.ExternalClaim(), func(context.Context) ([]byte, error) {
+		return nil, contracts.ErrExternalCleanupUncertain
+	})
+	if !errors.Is(err, contracts.ErrExternalCleanupUncertain) {
+		t.Fatalf("uncertain cleanup=%v", err)
+	}
+	short, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := database.ExternalMutationGuard().RunExternalMutation(short, claimed.ExternalClaim(), func(context.Context) ([]byte, error) {
+		t.Fatal("quarantined mutation gate released")
+		return nil, nil
+	}); err == nil {
+		t.Fatal("quarantined mutation unexpectedly started")
+	}
 }
 
 func TestEffectSemanticKeyCannotBeReplannedDifferently(t *testing.T) {
