@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -230,20 +231,25 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 			return contracts.CommandResult{}, err
 		}
 	}
-	environment, cleanupEnvironment, err := vettedEnvironment()
+	environment, temporary, cleanupEnvironment, err := vettedEnvironment(invocation.AuthHome)
 	if err != nil {
 		return contracts.CommandResult{}, err
 	}
 	defer cleanupEnvironment()
+	arguments, err := materializeOutputSchema(invocation, temporary)
+	if err != nil {
+		return contracts.CommandResult{}, err
+	}
 	gateRead, gateWrite, err := os.Pipe()
 	if err != nil {
 		return contracts.CommandResult{}, err
 	}
 	defer gateWrite.Close()
-	argv := append([]string{"__provider_gate", providerPath}, invocation.Argv[1:]...)
+	argv := append([]string{"__provider_gate", providerPath}, arguments[1:]...)
 	cmd := exec.Command(self, argv...)
 	cmd.Dir = input.Worktree
 	cmd.Env = environment
+	cmd.Stdin = bytes.NewReader(invocation.Stdin)
 	cmd.ExtraFiles = []*os.File{gateRead} // FD 3: wrapper exits on EOF before release.
 	if executable != nil {
 		cmd.ExtraFiles = append(cmd.ExtraFiles, executable) // FD 4: pinned provider.
@@ -317,9 +323,9 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 		return contracts.CommandResult{}, err
 	}
 	if runErr != nil {
-		return contracts.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), ExitCode: -1}, runErr
+		return contracts.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), StdoutTruncated: stdout.exceeded(), StderrTruncated: stderr.exceeded(), ExitCode: -1}, runErr
 	}
-	return contracts.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), ExitCode: 0}, nil
+	return contracts.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), StdoutTruncated: stdout.exceeded(), StderrTruncated: stderr.exceeded(), ExitCode: 0}, nil
 }
 
 func (s *Supervisor) removeRun(request contracts.DrainRequest, target *run) {
@@ -330,30 +336,67 @@ func (s *Supervisor) removeRun(request contracts.DrainRequest, target *run) {
 	}
 }
 
-func vettedEnvironment() ([]string, func(), error) {
+func vettedEnvironment(authHome string) ([]string, string, func(), error) {
 	home, err := os.MkdirTemp("", "sf-provider-home-")
 	if err != nil {
-		return nil, func() {}, err
+		return nil, "", func() {}, err
 	}
 	tmp, err := os.MkdirTemp("", "sf-provider-tmp-")
 	if err != nil {
 		_ = os.RemoveAll(home)
-		return nil, func() {}, err
+		return nil, "", func() {}, err
 	}
 	if err := privateDirectory(home); err != nil {
 		_ = os.RemoveAll(home)
 		_ = os.RemoveAll(tmp)
-		return nil, func() {}, err
+		return nil, "", func() {}, err
 	}
 	if err := privateDirectory(tmp); err != nil {
 		_ = os.RemoveAll(home)
 		_ = os.RemoveAll(tmp)
-		return nil, func() {}, err
+		return nil, "", func() {}, err
 	}
-	return []string{"PATH=/usr/bin:/bin", "LANG=C", "HOME=" + home, "TMPDIR=" + tmp}, func() {
+	environment := []string{"PATH=/usr/bin:/bin", "LANG=C", "HOME=" + home, "TMPDIR=" + tmp}
+	if authHome != "" {
+		if err := privateExistingDirectory(authHome); err != nil {
+			_ = os.RemoveAll(home)
+			_ = os.RemoveAll(tmp)
+			return nil, "", func() {}, errors.New("provider authentication home is unsafe")
+		}
+		environment = append(environment, "CODEX_HOME="+authHome)
+	}
+	return environment, tmp, func() {
 		_ = os.RemoveAll(home)
 		_ = os.RemoveAll(tmp)
 	}, nil
+}
+
+func materializeOutputSchema(invocation contracts.Invocation, temporary string) ([]string, error) {
+	if len(invocation.Argv) == 0 {
+		return nil, errors.New("provider invocation argv is required")
+	}
+	arguments := append([]string(nil), invocation.Argv...)
+	count := 0
+	for index, argument := range arguments {
+		if argument == contracts.OutputSchemaPlaceholder {
+			count++
+			if len(invocation.OutputSchema) == 0 || len(invocation.OutputSchema) > 1<<20 || !json.Valid(invocation.OutputSchema) {
+				return nil, errors.New("provider output schema is invalid")
+			}
+			path := filepath.Join(temporary, "output-schema.json")
+			if err := os.WriteFile(path, invocation.OutputSchema, 0o600); err != nil {
+				return nil, err
+			}
+			arguments[index] = path
+		}
+	}
+	if len(invocation.OutputSchema) == 0 && count != 0 || len(invocation.OutputSchema) != 0 && count != 1 {
+		return nil, errors.New("provider output schema placeholder is invalid")
+	}
+	if len(invocation.Stdin) > 64<<10 {
+		return nil, errors.New("provider stdin exceeds limit")
+	}
+	return arguments, nil
 }
 
 func privateDirectory(path string) error {
@@ -363,6 +406,24 @@ func privateDirectory(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || !trustedOwner(info) {
 		return errors.New("provider environment directory is not private")
+	}
+	return nil
+}
+
+// privateExistingDirectory is intentionally read-only: provider credential
+// homes are operator-owned and the daemon must never repair their modes or
+// otherwise mutate authentication state.
+func privateExistingDirectory(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errors.New("provider authentication home must be an absolute clean directory")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || resolved != path {
+		return errors.New("provider authentication home contains a symlink")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || !trustedOwner(info) {
+		return errors.New("provider authentication home is not private")
 	}
 	return nil
 }
@@ -494,10 +555,12 @@ func signalGroup(pgid int, sig syscall.Signal) error {
 
 type limitedBuffer struct {
 	bytes.Buffer
-	limit int
+	limit     int
+	truncated bool
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
+	before := b.Len()
 	if b.Len() < b.limit {
 		n := b.limit - b.Len()
 		if n > len(p) {
@@ -505,7 +568,12 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 		}
 		_, _ = b.Buffer.Write(p[:n])
 	}
+	if len(p) > b.limit-before {
+		b.truncated = true
+	}
 	return len(p), nil
 }
+
+func (b *limitedBuffer) exceeded() bool { return b.truncated }
 
 var _ io.Writer = (*limitedBuffer)(nil)

@@ -18,10 +18,12 @@ type CommandSpec struct {
 }
 
 type CommandResult struct {
-	ExitCode int
-	Stdout   []byte
-	Stderr   []byte
-	Duration time.Duration
+	ExitCode        int
+	Stdout          []byte
+	Stderr          []byte
+	StdoutTruncated bool
+	StderrTruncated bool
+	Duration        time.Duration
 }
 
 type CommandExecutor interface {

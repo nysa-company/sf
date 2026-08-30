@@ -41,15 +41,40 @@ type PhaseResult struct {
 	Transcript   string
 	Provider     domain.ProviderIdentity
 	ChangedFiles []string
+	// UsageTrusted and UsageUnits describe a trusted monetary charge in
+	// micro-USD. They alone may be charged against Ticket.MaxCostMicroUSD.
+	// A provider-reported token count must never be placed here.
 	UsageTrusted bool
 	UsageUnits   int64
+	// TokenUsage is optional provider observability. It is separate because
+	// tokens cannot be compared to a monetary ceiling without an immutable
+	// pricing or reservation policy.
+	TokenUsageTrusted bool
+	TokenUsage        int64
 }
 
 // Invocation is an argv-only adapter proposal. The supervisor is the sole
 // component allowed to start it; adapters never receive os/exec authority.
 type Invocation struct {
 	Argv []string
+	// Stdin is a bounded adapter-supplied payload. The supervisor owns the
+	// pipe and never inherits the daemon terminal.
+	Stdin []byte
+	// OutputSchema is materialized by the supervisor in its private temporary
+	// directory. Argv must contain OutputSchemaPlaceholder exactly once when
+	// this field is non-empty.
+	OutputSchema []byte
+	// AuthHome is an adapter-approved credential directory that is not
+	// group/world writable. It is deliberately not persisted and is exposed
+	// only under the provider's documented environment variable by the
+	// supervisor.
+	AuthHome string
 }
+
+// OutputSchemaPlaceholder is replaced by the supervisor with a private,
+// absolute schema file immediately before exec. It prevents an adapter from
+// writing schema material into a ticket worktree.
+const OutputSchemaPlaceholder = "__SF_OUTPUT_SCHEMA__"
 
 // RuntimeBinding is re-probed immediately before a paid invocation. Its
 // digests are opaque SHA-256 values; credentials themselves never cross this

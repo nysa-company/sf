@@ -58,6 +58,7 @@ type Receipt struct {
 	Provider                         domain.ProviderIdentity
 	ArtifactDigest, TranscriptDigest string
 	UsageUnits                       int64
+	TokenUsage                       int64
 	ErrorCode                        string
 }
 type Result struct {
@@ -86,7 +87,10 @@ func (r *Registry) Register(ctx context.Context, p contracts.Provider) error {
 		return errors.New("provider required")
 	}
 	id, e := p.Probe(ctx)
-	if e != nil || id.Provider != p.Name() {
+	// Name is a local route key; identity.Provider remains the durable,
+	// operator-visible executable/provider name. This permits two configured
+	// model-family profiles of one executable without claiming two binaries.
+	if e != nil || id.Provider == "" || id.Model == "" || id.Family == "" || id.Version == "" {
 		return errors.New("provider identity probe failed")
 	}
 	binding, e := p.Binding(ctx)
@@ -205,7 +209,11 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			continue
 		}
 		binding, err := p.Binding(ctx)
-		if err != nil || binding.Identity.Provider != name {
+		// Route names may distinguish separately pinned model/family profiles
+		// of one underlying provider executable. The durable identity remains
+		// in binding.Identity and is validated by Store; do not compare it to
+		// the local registry route alias.
+		if err != nil || p.Name() != name {
 			continue
 		}
 		remaining := ticket.CreatedAt.Add(ticket.MaxDuration).Sub(c.clock.Now())
@@ -273,6 +281,9 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			}
 		}
 		receipt := Receipt{Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), UsageUnits: max(raw.UsageUnits, 0)}
+		if raw.TokenUsageTrusted {
+			receipt.TokenUsage = max(raw.TokenUsage, 0)
+		}
 		if runErr != nil {
 			receipt.ErrorCode = "provider_error"
 		} else if !valid {

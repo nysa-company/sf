@@ -3,12 +3,44 @@ package processsupervisor
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 )
+
+func TestMaterializeOutputSchemaUsesPrivateSupervisorFileAndBoundsStdin(t *testing.T) {
+	temporary := t.TempDir()
+	invocation := contracts.Invocation{
+		Argv:         []string{"/fixture/codex", "exec", "--output-schema", contracts.OutputSchemaPlaceholder, "-"},
+		Stdin:        []byte("untrusted ticket prompt"),
+		OutputSchema: []byte(`{"type":"object"}`),
+	}
+	arguments, err := materializeOutputSchema(invocation, temporary)
+	if err != nil || arguments[3] == contracts.OutputSchemaPlaceholder || filepath.Dir(arguments[3]) != temporary {
+		t.Fatalf("arguments=%q err=%v", arguments, err)
+	}
+	info, err := os.Stat(arguments[3])
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("schema permissions=%v err=%v", info.Mode(), err)
+	}
+	contents, err := os.ReadFile(arguments[3])
+	if err != nil || string(contents) != string(invocation.OutputSchema) {
+		t.Fatalf("schema contents=%q err=%v", contents, err)
+	}
+	invocation.Stdin = make([]byte, 64<<10+1)
+	if _, err := materializeOutputSchema(invocation, temporary); err == nil {
+		t.Fatal("oversized provider stdin was accepted")
+	}
+	invocation.Stdin = nil
+	invocation.Argv = []string{"/fixture/codex", "exec", "-"}
+	if _, err := materializeOutputSchema(invocation, temporary); err == nil {
+		t.Fatal("schema without a placeholder was accepted")
+	}
+}
 
 func TestRunKeyRequiresExactClaimIdentity(t *testing.T) {
 	base := contracts.DrainRequest{
