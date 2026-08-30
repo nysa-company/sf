@@ -108,6 +108,54 @@ func TestGitMutationClaimBootstrapsWorktreeFromDurableBranchAllocation(t *testin
 	}
 }
 
+func TestWorktreeCreationIntentRecoversExecutingAndConfirmedIdentity(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := createWorktreeGitIntentFixture(t, db, ctx, "SF-git-create-recovery")
+	claim, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := db.WorktreeCreationIntent(ctx, intent.Ref)
+	if err != nil || facts.Claim != claim || facts.ObservedIdentity != "" {
+		t.Fatalf("executing facts=%+v err=%v", facts, err)
+	}
+	identity := `{"worktree":"created"}`
+	if _, err := db.ConfirmEffect(ctx, EffectFence{SemanticKey: claim.SemanticKey, Ref: claim.TicketRef, TicketVersion: claim.TicketVersion, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}, identity); err != nil {
+		t.Fatal(err)
+	}
+	facts, err = db.WorktreeCreationIntent(ctx, intent.Ref)
+	if err != nil || facts.Claim != claim || facts.ObservedIdentity != identity {
+		t.Fatalf("confirmed facts=%+v err=%v", facts, err)
+	}
+}
+
+func TestGitMutationLeaseReleaseIsBoundedWhenSQLiteIsBusy(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := gitIntentFixture(t, db, ctx, "SF-git-release-busy")
+	claim, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireGitMutation(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := db.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.ExecContext(context.Background(), "ROLLBACK")
+	started := time.Now()
+	err = lease.Release()
+	if err == nil || time.Since(started) > 3*time.Second {
+		t.Fatalf("release err=%v elapsed=%s", err, time.Since(started))
+	}
+}
+
 func TestGitMutationClaimRefusesCreateWithUnallocatedIdentity(t *testing.T) {
 	db, ctx := openTestStore(t)
 	for name, mutate := range map[string]func(*GitMutationIntent){

@@ -84,6 +84,19 @@ func (s *Store) ValidateExternalEffectClaim(ctx context.Context, claim domain.Ex
 	})
 }
 
+// ValidateTicketFence is the narrow read-side authorization used by bounded
+// coordinators before they inspect an external resource. It creates no effect
+// and makes no lifecycle decision; its transaction only proves that the
+// supplied ticket, leader, and runner identity is current at this instant.
+func (s *Store) ValidateTicketFence(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) error {
+	if err := ref.Validate(); err != nil || version == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return ErrStaleFence
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		return s.assertTicketFence(ctx, conn, ref, version, fence)
+	})
+}
+
 type EffectObservation struct {
 	EffectFence
 	Present  bool

@@ -62,6 +62,8 @@ type GitMutationRecovery struct {
 // effect, never to start a new mutation.
 type GitMutationIntentFacts struct {
 	Claim               contracts.GitMutationClaim
+	Effect              Effect
+	ObservedIdentity    string
 	PreparedCommitOID   string
 	PreparedTreeOID     string
 	PriorRemoteObserved bool
@@ -402,11 +404,13 @@ func (l *gitMutationLease) Release() error {
 	if l == nil || l.store == nil {
 		return ErrGitMutationLease
 	}
-	return l.store.write(context.Background(), func(conn *sql.Conn) error {
-		if err := l.store.assertGitIntentCurrent(context.Background(), conn, l.claim); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return l.store.write(ctx, func(conn *sql.Conn) error {
+		if err := l.store.assertGitIntentCurrent(ctx, conn, l.claim); err != nil {
 			return ErrGitMutationLease
 		}
-		result, err := conn.ExecContext(context.Background(), `DELETE FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND launch_state IN ('unrecorded','drained')`, l.claim.Repository, l.claim.SemanticKey, l.nonce)
+		result, err := conn.ExecContext(ctx, `DELETE FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND launch_state IN ('unrecorded','drained')`, l.claim.Repository, l.claim.SemanticKey, l.nonce)
 		if err != nil {
 			return err
 		}
@@ -518,12 +522,11 @@ func (s *Store) GitMutationIntentFacts(ctx context.Context, semanticKey string) 
 		return GitMutationIntentFacts{}, ErrGitMutationIntent
 	}
 	var out GitMutationIntentFacts
-	var project, ticket, effectChannel, effectProject, effectTicket, effectKind, effectState, effectRequest string
-	var effectVersion, effectLeader, effectRunner, effectClaim uint64
+	var project, ticket string
 	var prior int
-	err := s.db.QueryRowContext(ctx, `SELECT i.channel,i.project_id,i.ticket_id,i.request_digest,i.ticket_version,i.leader_epoch,i.runner_epoch,i.claim_epoch,i.repository_path,i.worktree_path,i.branch_ref,i.operation,i.base_ref,i.expected_base_oid,i.expected_head_oid,i.prepared_commit_oid,i.prepared_tree_oid,i.prior_remote_observed,i.prior_remote_oid,e.channel,e.project_id,e.ticket_id,e.effect_kind,e.state,e.request_digest,e.ticket_version,e.leader_epoch,e.runner_epoch,e.claim_epoch
+	err := s.db.QueryRowContext(ctx, `SELECT i.channel,i.project_id,i.ticket_id,i.request_digest,i.ticket_version,i.leader_epoch,i.runner_epoch,i.claim_epoch,i.repository_path,i.worktree_path,i.branch_ref,i.operation,i.base_ref,i.expected_base_oid,i.expected_head_oid,i.prepared_commit_oid,i.prepared_tree_oid,i.prior_remote_observed,i.prior_remote_oid,e.channel,e.project_id,e.ticket_id,e.effect_kind,e.state,e.request_digest,e.ticket_version,e.leader_epoch,e.runner_epoch,e.claim_epoch,e.observed_identity
 		FROM git_mutation_intents i JOIN effects e ON e.semantic_key=i.semantic_key WHERE i.semantic_key=?`, semanticKey).
-		Scan(&out.Claim.TicketRef.Channel, &project, &ticket, &out.Claim.RequestDigest, &out.Claim.TicketVersion, &out.Claim.LeaderEpoch, &out.Claim.RunnerEpoch, &out.Claim.ClaimEpoch, &out.Claim.Repository, &out.Claim.Worktree, &out.Claim.Branch, &out.Claim.Operation, &out.Claim.BaseRef, &out.Claim.ExpectedBaseOID, &out.Claim.ExpectedHeadOID, &out.PreparedCommitOID, &out.PreparedTreeOID, &prior, &out.PriorRemoteOID, &effectChannel, &effectProject, &effectTicket, &effectKind, &effectState, &effectRequest, &effectVersion, &effectLeader, &effectRunner, &effectClaim)
+		Scan(&out.Claim.TicketRef.Channel, &project, &ticket, &out.Claim.RequestDigest, &out.Claim.TicketVersion, &out.Claim.LeaderEpoch, &out.Claim.RunnerEpoch, &out.Claim.ClaimEpoch, &out.Claim.Repository, &out.Claim.Worktree, &out.Claim.Branch, &out.Claim.Operation, &out.Claim.BaseRef, &out.Claim.ExpectedBaseOID, &out.Claim.ExpectedHeadOID, &out.PreparedCommitOID, &out.PreparedTreeOID, &prior, &out.PriorRemoteOID, &out.Effect.Ref.Channel, &out.Effect.Ref.Project, &out.Effect.Ref.Ticket, &out.Effect.Kind, &out.Effect.State, &out.Effect.RequestDigest, &out.Effect.TicketVersion, &out.Effect.LeaderEpoch, &out.Effect.RunnerEpoch, &out.Effect.ClaimEpoch, &out.ObservedIdentity)
 	if errors.Is(err, sql.ErrNoRows) {
 		return GitMutationIntentFacts{}, ErrGitMutationIntent
 	}
@@ -531,8 +534,9 @@ func (s *Store) GitMutationIntentFacts(ctx context.Context, semanticKey string) 
 		return GitMutationIntentFacts{}, err
 	}
 	out.Claim.TicketRef.Project, out.Claim.TicketRef.Ticket, out.Claim.SemanticKey = domain.ProjectID(project), domain.TicketID(ticket), semanticKey
+	out.Effect.SemanticKey, out.Effect.ObservedIdentity = semanticKey, out.ObservedIdentity
 	intent := GitMutationIntent{EffectFence: EffectFence{SemanticKey: semanticKey, Ref: out.Claim.TicketRef, TicketVersion: out.Claim.TicketVersion, Fence: domain.Fence{LeaderEpoch: out.Claim.LeaderEpoch, RunnerEpoch: out.Claim.RunnerEpoch}}, RequestDigest: out.Claim.RequestDigest, Repository: out.Claim.Repository, Worktree: out.Claim.Worktree, Branch: out.Claim.Branch, Operation: out.Claim.Operation, BaseRef: out.Claim.BaseRef, ExpectedBaseOID: out.Claim.ExpectedBaseOID, ExpectedHeadOID: out.Claim.ExpectedHeadOID}
-	if !validGitIntent(intent) || !validContractClaim(out.Claim) || effectChannel != string(out.Claim.TicketRef.Channel) || effectProject != string(out.Claim.TicketRef.Project) || effectTicket != string(out.Claim.TicketRef.Ticket) || effectKind != "git/"+out.Claim.Operation || (effectState != string(EffectExecuting) && effectState != string(EffectUncertain)) || effectRequest != out.Claim.RequestDigest || effectVersion != out.Claim.TicketVersion || effectLeader != out.Claim.LeaderEpoch || effectRunner != out.Claim.RunnerEpoch || effectClaim != out.Claim.ClaimEpoch {
+	if !validGitIntent(intent) || !validContractClaim(out.Claim) || out.Effect.Ref != out.Claim.TicketRef || out.Effect.Kind != "git/"+out.Claim.Operation || out.Effect.RequestDigest != out.Claim.RequestDigest || (out.Effect.State != EffectExecuting && out.Effect.State != EffectUncertain && out.Effect.State != EffectConfirmed) || !linkedGitRecoveryEffect(out.Claim, out.Effect) {
 		return GitMutationIntentFacts{}, ErrGitMutationIntent
 	}
 	if !validGitMutationFacts(out.Claim.Operation, out.Claim.ExpectedBaseOID, out.Claim.ExpectedHeadOID, out.PreparedCommitOID, out.PreparedTreeOID, prior, out.PriorRemoteOID) {
@@ -540,6 +544,116 @@ func (s *Store) GitMutationIntentFacts(ctx context.Context, semanticKey string) 
 	}
 	out.PriorRemoteObserved = prior == 1
 	return out, nil
+}
+
+func linkedGitRecoveryEffect(claim contracts.GitMutationClaim, effect Effect) bool {
+	if effect.State == EffectExecuting {
+		return effect.TicketVersion == claim.TicketVersion && effect.LeaderEpoch == claim.LeaderEpoch && effect.RunnerEpoch == claim.RunnerEpoch && effect.ClaimEpoch == claim.ClaimEpoch
+	}
+	if effect.LeaderEpoch < claim.LeaderEpoch || effect.ClaimEpoch < claim.ClaimEpoch {
+		return false
+	}
+	if effect.TicketVersion == claim.TicketVersion && effect.RunnerEpoch == claim.RunnerEpoch {
+		if effect.State == EffectUncertain {
+			return effect.LeaderEpoch >= claim.LeaderEpoch && effect.ClaimEpoch >= claim.ClaimEpoch
+		}
+		return effect.LeaderEpoch == claim.LeaderEpoch && effect.ClaimEpoch == claim.ClaimEpoch
+	}
+	return effect.LeaderEpoch > claim.LeaderEpoch && effect.ClaimEpoch > claim.ClaimEpoch && equalRecoveryAdvance(claim.TicketVersion, claim.RunnerEpoch, effect.TicketVersion, effect.RunnerEpoch)
+}
+
+// ConfirmRecoveredWorktreeCreation settles an old create claim only after the
+// daemon has installed an equal version/runner recovery fence in planning.
+// The immutable Git intent remains the original launch witness.
+func (s *Store) ConfirmRecoveredWorktreeCreation(ctx context.Context, claim contracts.GitMutationClaim, identity string) (Effect, error) {
+	if !validContractClaim(claim) || claim.Operation != "create-worktree" || identity == "" {
+		return Effect{}, ErrGitMutationIntent
+	}
+	facts, err := s.GitMutationIntentFacts(ctx, claim.SemanticKey)
+	if err != nil || facts.Claim != claim {
+		return Effect{}, ErrGitMutationIntent
+	}
+	var result Effect
+	err = s.write(ctx, func(conn *sql.Conn) error {
+		current, err := effectFrom(ctx, conn, claim.SemanticKey)
+		if err != nil {
+			return err
+		}
+		if current.Ref != claim.TicketRef || current.Kind != "git/create-worktree" || current.RequestDigest != claim.RequestDigest || !linkedGitRecoveryEffect(claim, current) {
+			return ErrStaleFence
+		}
+		if current.State == EffectConfirmed && current.ObservedIdentity == identity {
+			result = current
+			return nil
+		}
+		if current.State != EffectUncertain {
+			return ErrStaleFence
+		}
+		var state domain.State
+		var version, runner, leader uint64
+		if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket).Scan(&state, &version, &runner, &leader); err != nil {
+			return err
+		}
+		if state != domain.StatePlanning || leader != current.LeaderEpoch || !equalRecoveryAdvance(current.TicketVersion, current.RunnerEpoch, version, runner) {
+			return ErrStaleFence
+		}
+		if err := s.currentFence(ctx, conn, claim.TicketRef.Channel, version, runner, domain.Fence{LeaderEpoch: leader, RunnerEpoch: runner, ClaimEpoch: current.ClaimEpoch}); err != nil {
+			return err
+		}
+		changed, err := conn.ExecContext(ctx, `UPDATE effects SET state='confirmed',observed_identity=?,ticket_version=?,runner_epoch=? WHERE semantic_key=? AND state='uncertain' AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=? AND request_digest=?`, identity, version, runner, current.SemanticKey, current.TicketVersion, current.LeaderEpoch, current.RunnerEpoch, current.ClaimEpoch, current.RequestDigest)
+		if err != nil {
+			return err
+		}
+		if n, _ := changed.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		result, err = effectFrom(ctx, conn, claim.SemanticKey)
+		return err
+	})
+	return result, err
+}
+
+// WorktreeCreationIntent returns the sole unresolved or confirmed creation
+// binding for a ticket. It is recovery-only authority: a caller can inspect
+// the exact path it already owns, but it cannot mint a new Git mutation from
+// these facts. More than one live fact is durable ambiguity and is refused.
+func (s *Store) WorktreeCreationIntent(ctx context.Context, ref domain.TicketRef) (GitMutationIntentFacts, error) {
+	if err := ref.Validate(); err != nil {
+		return GitMutationIntentFacts{}, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT i.semantic_key
+		FROM git_mutation_intents i JOIN effects e ON e.semantic_key=i.semantic_key
+		WHERE i.channel=? AND i.project_id=? AND i.ticket_id=? AND i.operation='create-worktree'
+		AND e.state IN ('executing','uncertain','confirmed') ORDER BY i.semantic_key`, ref.Channel, ref.Project, ref.Ticket)
+	if err != nil {
+		return GitMutationIntentFacts{}, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return GitMutationIntentFacts{}, err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return GitMutationIntentFacts{}, err
+	}
+	if len(keys) == 0 {
+		return GitMutationIntentFacts{}, ErrNotFound
+	}
+	if len(keys) != 1 {
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
+	facts, err := s.GitMutationIntentFacts(ctx, keys[0])
+	if err != nil || facts.Claim.TicketRef != ref || facts.Claim.Operation != "create-worktree" {
+		if err != nil {
+			return GitMutationIntentFacts{}, err
+		}
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
+	return facts, nil
 }
 
 // RecoverGitMutationLeases is deliberately proof-before-release.  Nothing in
@@ -684,8 +798,12 @@ func repositoryHasProviderWriter(ctx context.Context, conn *sql.Conn, repository
 
 func repositoryHasCommandWriter(ctx context.Context, conn *sql.Conn, repository string) error {
 	var n int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE repository_path=? AND state IN ('active','quarantined')`, repository).Scan(&n); err != nil { return err }
-	if n != 0 { return ErrRepositoryCommandLease }
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE repository_path=? AND state IN ('active','quarantined')`, repository).Scan(&n); err != nil {
+		return err
+	}
+	if n != 0 {
+		return ErrRepositoryCommandLease
+	}
 	return nil
 }
 

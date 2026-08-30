@@ -212,7 +212,12 @@ func open(ctx context.Context, path string, policy openPolicy) (*Store, error) {
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
-	s := &Store{db: db, commit: commitTransaction, worktreeRoot: filepath.Join(filepath.Dir(path), "worktrees")}
+	worktreeRoot, err := canonicalWorktreeRoot(path)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	s := &Store{db: db, commit: commitTransaction, worktreeRoot: worktreeRoot}
 	s.mutations = &ExternalMutationGate{store: s, gate: make(chan struct{}, 1), revoked: make(map[domain.TicketRef]mutationRevocation)}
 	s.mutations.gate <- struct{}{}
 	storedVersion, recognized, err := inspectStoredSchema(ctx, db)
@@ -274,7 +279,12 @@ func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 	// startup. query_only and mode=ro still make every connection non-mutating.
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
-	value := &Store{db: db, commit: commitTransaction, readOnly: true, worktreeRoot: filepath.Join(filepath.Dir(path), "worktrees")}
+	worktreeRoot, err := canonicalWorktreeRoot(path)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	value := &Store{db: db, commit: commitTransaction, readOnly: true, worktreeRoot: worktreeRoot}
 	if err := value.validateSchema(ctx); err != nil {
 		_ = db.Close()
 		return nil, normalizeBusy(ctx, err)
@@ -283,6 +293,17 @@ func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// canonicalWorktreeRoot fixes the one filesystem namespace that Store derives
+// from its own database location. A /var -> /private/var alias must not leak
+// into a durable worktree path, because Runner pins canonical path identities.
+func canonicalWorktreeRoot(databasePath string) (string, error) {
+	parent, err := filepath.EvalSymlinks(filepath.Dir(databasePath))
+	if err != nil || !filepath.IsAbs(parent) || filepath.Clean(parent) != parent {
+		return "", fmt.Errorf("sqlite parent cannot anchor canonical worktrees")
+	}
+	return filepath.Join(parent, "worktrees"), nil
+}
 
 func (s *Store) configure(ctx context.Context) error {
 	for _, statement := range []string{

@@ -54,6 +54,8 @@ type memoryBranchAuthority struct{ branches map[string]string }
 
 type testMutationAuthority struct{ err error }
 type testMutationLease struct{ err error }
+type releaseFailMutationAuthority struct{}
+type releaseFailMutationLease struct{}
 
 type factMutationAuthority struct{ lease *factMutationLease }
 type factMutationLease struct {
@@ -74,6 +76,11 @@ func (l testMutationLease) RecordPreparedCommit(_ context.Context, _, _ string) 
 func (l testMutationLease) RecordPushPriorRemote(_ context.Context, _ string) error {
 	return l.err
 }
+func (releaseFailMutationAuthority) AcquireGitMutation(context.Context, contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
+	return releaseFailMutationLease{}, nil
+}
+func (releaseFailMutationLease) Check(context.Context) error { return nil }
+func (releaseFailMutationLease) Release() error              { return errors.New("durable lease delete blocked") }
 func (a factMutationAuthority) AcquireGitMutation(_ context.Context, _ contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
 	return a.lease, nil
 }
@@ -1401,6 +1408,23 @@ func TestMutationsRequireExternalLeaseAndDoNotCreateWorktree(t *testing.T) {
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("proofless create changed filesystem: %v", err)
+	}
+}
+
+func TestCreateWorktreeSurfacesDurableLeaseReleaseFailure(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	runner.MutationAuthority = releaseFailMutationAuthority{}
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-release-failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	_, err = runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if !errors.Is(err, ErrMutationLeaseRelease) {
+		t.Fatalf("creation hid lease release failure: %v", err)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("authenticated path unexpectedly disappeared: %v", statErr)
 	}
 }
 

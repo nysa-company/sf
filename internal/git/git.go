@@ -32,6 +32,10 @@ var (
 	ErrUnexpectedRemote    = errors.New("remote branch head is unexpected")
 	ErrOutputBound         = errors.New("git output exceeded bound")
 	ErrWorktreeQuarantined = errors.New("created worktree could not be safely cleaned up")
+	// ErrMutationLeaseRelease means Git completed (or attempted) an effect but
+	// its durable repository-writer exclusion could not be released. Callers
+	// must retain/quarantine rather than treating the visible worktree as ready.
+	ErrMutationLeaseRelease = errors.New("git mutation lease could not be released")
 	// ErrHTTPSCredentialBoundary marks a refused GitHub HTTPS credential path.
 	// The accepted path is one packaged helper configured from code-owned argv;
 	// no ticket, provider, repository config, or caller text may choose it.
@@ -1556,6 +1560,26 @@ func (r Runner) PreflightRepository(ctx context.Context, repository, baseRef str
 	return err
 }
 
+// ObserveRepositoryBase proves the primary-checkout identity and returns the
+// exact protected-base object that a caller may bind into a durable mutation
+// claim. It intentionally remains read-only: creation re-observes the same
+// object immediately before it acquires the claim, so a moving base fails
+// closed instead of being silently retried.
+func (r Runner) ObserveRepositoryBase(ctx context.Context, repository, baseRef string) (string, string, error) {
+	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
+		return "", "", err
+	}
+	canonical, err := canonicalExistingRepository(repository)
+	if err != nil {
+		return "", "", err
+	}
+	base, err := r.one(ctx, canonical, "rev-parse", "--verify", baseRef+"^{commit}")
+	if err != nil || !validOID(base) {
+		return "", "", fmt.Errorf("%w: invalid repository base", ErrIdentityMismatch)
+	}
+	return canonical, base, nil
+}
+
 func canonicalExistingRepository(path string) (string, error) {
 	if !validAbsolutePath(path) {
 		return "", fmt.Errorf("%w: absolute clean repository path required", ErrIdentityMismatch)
@@ -1574,7 +1598,7 @@ func canonicalExistingRepository(path string) (string, error) {
 	return canonical, nil
 }
 
-func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, baseRef string, claim contracts.GitMutationClaim) (Worktree, error) {
+func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, baseRef string, claim contracts.GitMutationClaim) (result Worktree, returnedErr error) {
 	if !validAbsolutePath(repository) || !validAbsolutePath(path) || !validRef(baseRef) {
 		return Worktree{}, fmt.Errorf("canonical repository/worktree paths and base ref are required")
 	}
@@ -1627,7 +1651,16 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	if err != nil {
 		return Worktree{}, err
 	}
-	defer lease.Release()
+	defer func() {
+		if releaseErr := lease.Release(); releaseErr != nil {
+			releaseErr = fmt.Errorf("%w: %v", ErrMutationLeaseRelease, releaseErr)
+			if returnedErr == nil {
+				result, returnedErr = Worktree{}, releaseErr
+			} else {
+				returnedErr = errors.Join(returnedErr, releaseErr)
+			}
+		}
+	}()
 	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return Worktree{}, err
@@ -1813,6 +1846,40 @@ func (r Runner) InspectWorktree(ctx context.Context, worktree Worktree) error {
 		return fmt.Errorf("%w: worktree branch changed", ErrIdentityMismatch)
 	}
 	return nil
+}
+
+// InspectCleanWorktree extends identity reauthentication with a pinned clean
+// status check. Worktree creation/adoption is deliberately refused once any
+// unowned change is present; later workflow phases have their own, narrower
+// change-validation boundaries.
+func (r Runner) InspectCleanWorktree(ctx context.Context, worktree Worktree) error {
+	_, err := r.CleanWorktreeHead(ctx, worktree)
+	return err
+}
+
+// CleanWorktreeHead returns the current branch tip only after a full identity
+// reauthentication and a pinned clean-status check. A coordinator uses this
+// to distinguish its pristine creation witness from a clean but foreign
+// commit before registering or adopting a worktree.
+func (r Runner) CleanWorktreeHead(ctx context.Context, worktree Worktree) (string, error) {
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	status, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "status", "--porcelain=v1")
+	if err != nil || strings.TrimSpace(string(status)) != "" {
+		return "", fmt.Errorf("%w: worktree status is not clean", ErrUnsafeWorktree)
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	head, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil || !validOID(head) {
+		return "", fmt.Errorf("%w: worktree head is invalid", ErrIdentityMismatch)
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	return head, nil
 }
 
 // Retain validates and returns the durable identity without removing anything.
