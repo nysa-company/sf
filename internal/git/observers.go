@@ -1,0 +1,198 @@
+package git
+
+import (
+	"context"
+	"fmt"
+	"strings"
+)
+
+// CommitObservation is the immutable identity of the currently checked-out
+// commit and its single parent and tree. It is an observation only; it does
+// not authorize any Git mutation.
+type CommitObservation struct {
+	CommitOID string
+	ParentOID string
+	TreeOID   string
+}
+
+// RemoteBranchObservation records the exact head of one authenticated remote
+// branch. OID is empty only when ls-remote returned no rows for that ref.
+type RemoteBranchObservation struct {
+	Branch string
+	OID    string
+}
+
+// ObserveCommit authenticates the supplied worktree and then reads the
+// checked-out commit, its one parent, and its tree. In particular, roots and
+// merge commits are rejected because this observation is used where a single
+// parent is part of the identity being proved.
+func (r Runner) ObserveCommit(ctx context.Context, worktree Worktree) (CommitObservation, error) {
+	if err := ctx.Err(); err != nil {
+		return CommitObservation{}, err
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return CommitObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return CommitObservation{}, err
+	}
+
+	commitOutput, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno,
+		"rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return CommitObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return CommitObservation{}, err
+	}
+	commitOID, err := parseSingleOID(commitOutput, "commit")
+	if err != nil {
+		return CommitObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return CommitObservation{}, err
+	}
+
+	parentsOutput, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno,
+		"rev-list", "--parents", "-n", "1", "HEAD")
+	if err != nil {
+		return CommitObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return CommitObservation{}, err
+	}
+	parentCommitOID, parentOID, err := parseCommitParents(parentsOutput)
+	if err != nil {
+		return CommitObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return CommitObservation{}, err
+	}
+	if parentCommitOID != commitOID || len(parentCommitOID) != len(parentOID) {
+		return CommitObservation{}, fmt.Errorf("%w: commit parent output is inconsistent", ErrUnexpectedRemote)
+	}
+
+	treeOutput, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno,
+		"rev-parse", "--verify", commitOID+"^{tree}")
+	if err != nil {
+		return CommitObservation{}, err
+	}
+	treeOID, err := parseSingleOID(treeOutput, "tree")
+	if err != nil {
+		return CommitObservation{}, err
+	}
+	if len(treeOID) != len(commitOID) {
+		return CommitObservation{}, fmt.Errorf("%w: tree object format differs from commit", ErrUnexpectedRemote)
+	}
+	// Deriving the tree from the captured commit makes the tuple intrinsically
+	// consistent even if HEAD is moved and moved back while this read runs.
+	// The final identity check below closes the authenticated path and
+	// repository/config boundary after the complete read set.
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return CommitObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return CommitObservation{}, err
+	}
+
+	return CommitObservation{CommitOID: commitOID, ParentOID: parentOID, TreeOID: treeOID}, nil
+}
+
+// ObserveRemoteBranch authenticates the supplied worktree, verifies that
+// origin is one of its already-authenticated configured origins, and performs
+// one read-only ls-remote query for the allocated branch.
+func (r Runner) ObserveRemoteBranch(ctx context.Context, worktree Worktree, origin, branch string) (RemoteBranchObservation, error) {
+	if err := ctx.Err(); err != nil {
+		return RemoteBranchObservation{}, err
+	}
+	if _, err := validateBranch(branch); err != nil {
+		return RemoteBranchObservation{}, err
+	}
+	if worktree.Branch != branch {
+		return RemoteBranchObservation{}, fmt.Errorf("%w: remote branch is not bound to authenticated worktree", ErrIdentityMismatch)
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return RemoteBranchObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return RemoteBranchObservation{}, err
+	}
+
+	canonicalOrigin, err := safeOrigin(origin)
+	if err != nil {
+		return RemoteBranchObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return RemoteBranchObservation{}, err
+	}
+	if canonicalOrigin == "" || (canonicalOrigin != worktree.Identity.Origin && canonicalOrigin != worktree.Identity.PushOrigin) {
+		return RemoteBranchObservation{}, fmt.Errorf("%w: remote origin is not an authenticated configured origin", ErrIdentityMismatch)
+	}
+	transportEnv, _, err := r.githubTransportEnvironment(canonicalOrigin)
+	if err != nil {
+		return RemoteBranchObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return RemoteBranchObservation{}, err
+	}
+
+	output, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, transportEnv,
+		"ls-remote", "--heads", canonicalOrigin, "refs/heads/"+branch)
+	if err != nil {
+		return RemoteBranchObservation{}, err
+	}
+	// Reauthenticate after the remote read as well. This ensures a repository,
+	// worktree, pointer, hook, config, or configured origin replacement during
+	// the command cannot be accepted as an observation of the original identity.
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return RemoteBranchObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return RemoteBranchObservation{}, err
+	}
+	oid, err := parseRemoteBranchOutput(output, branch)
+	if err != nil {
+		return RemoteBranchObservation{}, err
+	}
+	return RemoteBranchObservation{Branch: branch, OID: oid}, nil
+}
+
+func parseSingleOID(output []byte, kind string) (string, error) {
+	text := strings.TrimSuffix(string(output), "\n")
+	if text == "" || strings.ContainsAny(text, "\r\n") || strings.TrimSpace(text) != text || !validOID(text) {
+		return "", fmt.Errorf("%w: malformed %s object id", ErrUnexpectedRemote, kind)
+	}
+	return text, nil
+}
+
+func parseCommitParents(output []byte) (string, string, error) {
+	text := strings.TrimSuffix(string(output), "\n")
+	fields := strings.Split(text, " ")
+	// rev-list --parents for a non-root, non-merge commit is exactly HEAD and
+	// one parent. This also rejects extra lines/tokens and malformed output.
+	if len(fields) != 2 || strings.ContainsAny(text, "\r\n\t") || strings.TrimSpace(text) != text || !validOID(fields[0]) || !validOID(fields[1]) {
+		return "", "", fmt.Errorf("%w: commit must have exactly one canonical parent", ErrUnexpectedRemote)
+	}
+	return fields[0], fields[1], nil
+}
+
+func parseRemoteBranchOutput(output []byte, branch string) (string, error) {
+	target := "refs/heads/" + branch
+	text := string(output)
+	// Git's exact absence response is empty output. Whitespace is not a
+	// remote row and must not be silently converted into absence.
+	if text == "" {
+		return "", nil
+	}
+
+	text = strings.TrimSuffix(text, "\n")
+	if strings.ContainsAny(text, "\r\n") {
+		return "", fmt.Errorf("%w: duplicate or extra remote branch rows", ErrUnexpectedRemote)
+	}
+	fields := strings.Fields(text)
+	if len(fields) != 2 || !validOID(fields[0]) || fields[1] != target ||
+		(text != fields[0]+"\t"+fields[1] && text != fields[0]+" "+fields[1]) {
+		return "", fmt.Errorf("%w: malformed remote branch observation", ErrUnexpectedRemote)
+	}
+	return fields[0], nil
+}
