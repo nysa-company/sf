@@ -47,7 +47,7 @@ func TestPublicationRebindDigestIsCanonicalAndChainsVersions(t *testing.T) {
 		t.Fatal(err)
 	}
 	first.RebindDigest = publicationIdentityDigest(firstPayload)
-	second := PublicationRebind{Ref: ref, CandidateGeneration: 1, CandidateHeadOID: head, PriorWitnessDigest: first.PriorWitnessDigest, PriorTicketVersion: first.TicketVersion, PriorFence: first.Fence, TicketVersion: 7, Fence: domain.Fence{LeaderEpoch: 5, RunnerEpoch: 5}}
+	second := PublicationRebind{Ref: ref, CandidateGeneration: 1, CandidateHeadOID: head, PriorWitnessDigest: first.RebindDigest, PriorTicketVersion: first.TicketVersion, PriorFence: first.Fence, TicketVersion: 7, Fence: domain.Fence{LeaderEpoch: 5, RunnerEpoch: 5}}
 	secondPayload, err := publicationRebindPayload(second)
 	if err != nil {
 		t.Fatal(err)
@@ -263,10 +263,39 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	if err := db.RebindPublishedCandidate(ctx, ticket.Ref, current.Version, domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}); err != nil {
 		t.Fatal(err)
 	}
+	for recovery := 3; recovery <= 64; recovery++ {
+		newLeader, err = db.AcquireLeader(ctx, domain.ChannelDev, fmt.Sprintf("publication-recovery-%d", recovery))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil {
+			t.Fatal(err)
+		}
+		current, _ = db.Ticket(ctx, ticket.Ref)
+		if err := db.RebindPublishedCandidate(ctx, ticket.Ref, current.Version, domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}); err != nil {
+			t.Fatalf("rebind %d: %v", recovery, err)
+		}
+	}
+	current, _ = db.Ticket(ctx, ticket.Ref)
+	if err := db.RebindPublishedCandidate(ctx, ticket.Ref, current.Version, domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}); err != nil {
+		t.Fatalf("64th rebind replay: %v", err)
+	}
+	futureFence := domain.Fence{LeaderEpoch: newLeader + 1, RunnerEpoch: current.RunnerEpoch + 1}
+	if err := db.RebindPublishedCandidate(ctx, ticket.Ref, current.Version+1, futureFence); err == nil {
+		t.Fatal("65th rebind was accepted")
+	}
+	var rebindRows int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&rebindRows); err != nil || rebindRows != 64 {
+		t.Fatalf("rebind cap residue rows=%d err=%v", rebindRows, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='publication_rebind'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&rebindRows); err != nil || rebindRows != 64 {
+		t.Fatalf("rebind cap residue events=%d err=%v", rebindRows, err)
+	}
 	loaded, err = db.LoadPublishedCandidate(ctx, ticket.Ref)
 	if err != nil || loaded.CurrentTicketVersion != current.Version || loaded.CurrentFence.LeaderEpoch != newLeader {
 		t.Fatalf("rebound publication load=%+v err=%v", loaded, err)
 	}
+	publicationLatestVersion := current.Version
 	backupDir := t.TempDir()
 	if err := os.Chmod(backupDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -284,12 +313,74 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		t.Fatalf("backup publication load=%v", err)
 	}
 	copyDB.Close()
-	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "publication_complete", Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}, EventPayload: "{}"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
 		t.Fatalf("waiting_ci replay=%v", err)
 	}
+	for recovery := 1; recovery <= 2; recovery++ {
+		newLeader, err = db.AcquireLeader(ctx, domain.ChannelDev, fmt.Sprintf("waiting-recovery-%d", recovery))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
+			t.Fatalf("waiting_ci recovery %d=%v", recovery, err)
+		}
+	}
+	waitingVersion := publicationLatestVersion + 1
+	for name, statement := range map[string]string{
+		"waiting-wrong-transition":   fmt.Sprintf(`UPDATE events SET trigger='wrong_transition' WHERE channel='%s' AND project_id='%s' AND ticket_id='%s' AND ticket_version=%d AND trigger='effects_confirmed'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, waitingVersion),
+		"waiting-missing-transition": fmt.Sprintf(`DELETE FROM events WHERE channel='%s' AND project_id='%s' AND ticket_id='%s' AND ticket_version=%d AND trigger='effects_confirmed'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, waitingVersion),
+	} {
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := dir + "/" + name + ".sqlite"
+		if err := db.Backup(ctx, path); err != nil {
+			t.Fatal(err)
+		}
+		mutant, err := Open(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mutant.db.ExecContext(ctx, statement); err != nil {
+			mutant.Close()
+			t.Fatal(err)
+		}
+		if _, err := mutant.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
+			mutant.Close()
+			t.Fatalf("tampered %s waiting transition was accepted", name)
+		}
+		mutant.Close()
+	}
+	// A prior generation's state transition is historical context, not the
+	// transition that consumed this witness. It must not poison current replay.
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	historicalPath := dir + "/waiting-historical.sqlite"
+	if err := db.Backup(ctx, historicalPath); err != nil {
+		t.Fatal(err)
+	}
+	historical, err := Open(ctx, historicalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := historical.db.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, publicationLatestVersion, "effects_confirmed", "publishing", "waiting_ci", "{}", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		historical.Close()
+		t.Fatal(err)
+	}
+	if _, err := historical.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
+		historical.Close()
+		t.Fatalf("historical extra transition poisoned current replay: %v", err)
+	}
+	historical.Close()
 	// Tamper tests use independent backups so the good lifecycle fixture remains
 	// available for the waiting_ci assertion above.
 	for name, statement := range map[string]string{"witness": `UPDATE publication_evidence SET witness_digest='sha256:` + strings.Repeat("f", 64) + `'`, "effect": `UPDATE effects SET observed_identity='tampered' WHERE semantic_key='publication-push'`} {
@@ -324,7 +415,7 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	// each is performed on an independent backup after dropping only the
 	// relevant immutability triggers.
 	middleVersion := ticket.Version + 1
-	latestVersion := current.Version
+	latestVersion := publicationLatestVersion
 	rebindTamper := map[string]func(*Store) error{
 		"rebind-middle-digest": func(mutant *Store) error {
 			_, err := mutant.db.ExecContext(ctx, `UPDATE publication_evidence_rebinds SET rebind_digest=? WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND ticket_version=?`, "sha256:"+strings.Repeat("e", 64), ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, candidate.Snapshot.Generation, candidate.Snapshot.HeadSHA, middleVersion)

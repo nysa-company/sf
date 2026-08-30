@@ -822,9 +822,11 @@ var migrationV36 = []string{
 }
 
 // v37 records the complete, authenticated handoff from a local candidate to
-// the remote draft PR.  It is intentionally a single append-only witness per
+// the remote draft PR. It is intentionally a single append-only witness per
 // candidate generation/head; corrected candidates retain their own history.
-// No lifecycle state is changed by this migration or by its Store API.
+// A pre-v37 publishing/waiting ticket has no possible witness in this schema,
+// so migration makes that uncertainty explicit and recoverable instead of
+// leaving an apparent publish success.
 var migrationV37 = []string{
 	`CREATE TABLE publication_evidence (
 		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
@@ -860,4 +862,6 @@ var migrationV37 = []string{
 	`CREATE UNIQUE INDEX publication_evidence_rebind_digest ON publication_evidence_rebinds(rebind_digest)`,
 	`CREATE TRIGGER publication_evidence_rebinds_immutable_update BEFORE UPDATE ON publication_evidence_rebinds BEGIN SELECT RAISE(ABORT,'publication evidence rebind is immutable'); END`,
 	`CREATE TRIGGER publication_evidence_rebinds_immutable_delete BEFORE DELETE ON publication_evidence_rebinds BEGIN SELECT RAISE(ABORT,'publication evidence rebind is append-only'); END`,
+	`UPDATE tickets SET state='blocked',resume_state=state,blocked_code='legacy_publication_evidence_unverifiable',version=version+1 WHERE state IN ('publishing','waiting_ci')`,
+	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,id,version,'typed_blocker',resume_state,'blocked','{"code":"legacy_publication_evidence_unverifiable","reason":"publication evidence predates the authenticated witness schema","next_action":"reconcile the external publication or start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tickets WHERE state='blocked' AND blocked_code='legacy_publication_evidence_unverifiable' AND resume_state IN ('publishing','waiting_ci')`,
 }

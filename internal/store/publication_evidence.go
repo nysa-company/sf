@@ -380,9 +380,41 @@ func (s *Store) RebindPublishedCandidate(ctx context.Context, ref domain.TicketR
 		if err := loadLatestPublicationRebind(ctx, conn, &row); err != nil {
 			return err
 		}
+		// A lost response can replay an already persisted rebind, including the
+		// 64th row. Authenticate that exact row before applying the insertion cap.
+		if existing, found, err := loadPublicationRebindAt(ctx, conn, ref, row.Candidate.Snapshot.Generation, row.Candidate.Snapshot.HeadSHA, currentVersion); err != nil {
+			return err
+		} else if found {
+			priorVersion, priorFence, priorDigest := row.TicketVersion, row.Fence, row.WitnessDigest
+			if currentVersion != row.TicketVersion {
+				prior, priorFound, err := loadPublicationRebindBefore(ctx, conn, ref, row.Candidate.Snapshot.Generation, row.Candidate.Snapshot.HeadSHA, currentVersion)
+				if err != nil {
+					return err
+				}
+				if priorFound {
+					priorVersion, priorFence, priorDigest = prior.TicketVersion, prior.Fence, prior.RebindDigest
+				} else if currentVersion != row.TicketVersion+1 {
+					return ErrPublicationEvidence
+				}
+			}
+			expected := PublicationRebind{Ref: ref, CandidateGeneration: row.Candidate.Snapshot.Generation, CandidateHeadOID: row.Candidate.Snapshot.HeadSHA, PriorWitnessDigest: priorDigest, PriorTicketVersion: priorVersion, PriorFence: priorFence, TicketVersion: existing.TicketVersion, Fence: existing.Fence}
+			payload, err := publicationRebindPayload(expected)
+			if err != nil || existing.PriorWitnessDigest != expected.PriorWitnessDigest || existing.PriorTicketVersion != expected.PriorTicketVersion || existing.PriorFence != expected.PriorFence || existing.RebindDigest != publicationIdentityDigest(payload) || existing.Fence != currentFence {
+				return ErrPublicationEvidence
+			}
+			var events int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='publication_rebind' AND from_state='publishing' AND to_state='publishing' AND payload=?`, ref.Channel, ref.Project, ref.Ticket, currentVersion, string(payload)).Scan(&events); err != nil || events != 1 {
+				return ErrPublicationEvidence
+			}
+			return nil
+		}
 		priorVersion, priorFence := row.TicketVersion, row.Fence
-		if row.CurrentTicketVersion != 0 {
+		priorDigest := row.WitnessDigest
+		if row.CurrentTicketVersion != 0 && row.CurrentTicketVersion != row.TicketVersion {
 			priorVersion, priorFence = row.CurrentTicketVersion, row.CurrentFence
+			if err := conn.QueryRowContext(ctx, `SELECT rebind_digest FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, row.Candidate.Snapshot.Generation, row.Candidate.Snapshot.HeadSHA, priorVersion).Scan(&priorDigest); err != nil {
+				return ErrPublicationEvidence
+			}
 		}
 		var state string
 		var version, runner, leader uint64
@@ -393,7 +425,7 @@ func (s *Store) RebindPublishedCandidate(ctx context.Context, ref domain.TicketR
 			return ErrStaleFence
 		}
 		candidateHead := row.Candidate.Snapshot.HeadSHA
-		value := PublicationRebind{Ref: ref, CandidateGeneration: row.Candidate.Snapshot.Generation, CandidateHeadOID: candidateHead, PriorWitnessDigest: row.WitnessDigest, PriorTicketVersion: priorVersion, PriorFence: priorFence, TicketVersion: currentVersion, Fence: currentFence}
+		value := PublicationRebind{Ref: ref, CandidateGeneration: row.Candidate.Snapshot.Generation, CandidateHeadOID: candidateHead, PriorWitnessDigest: priorDigest, PriorTicketVersion: priorVersion, PriorFence: priorFence, TicketVersion: currentVersion, Fence: currentFence}
 		payload, err := publicationRebindPayload(value)
 		if err != nil {
 			return ErrPublicationEvidence
@@ -409,6 +441,13 @@ func (s *Store) RebindPublishedCandidate(ctx context.Context, ref domain.TicketR
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
+		}
+		var rebindCount int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=?`, ref.Channel, ref.Project, ref.Ticket, value.CandidateGeneration, value.CandidateHeadOID).Scan(&rebindCount); err != nil {
+			return err
+		}
+		if rebindCount >= 64 {
+			return ErrPublicationEvidence
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO publication_evidence_rebinds(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, value.CandidateGeneration, value.CandidateHeadOID, value.PriorWitnessDigest, value.PriorTicketVersion, value.PriorFence.LeaderEpoch, value.PriorFence.RunnerEpoch, value.TicketVersion, value.Fence.LeaderEpoch, value.Fence.RunnerEpoch, value.RebindDigest, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
@@ -488,6 +527,7 @@ func loadLatestPublicationRebind(ctx context.Context, q interface {
 	}
 	defer rows.Close()
 	priorVersion, priorFence := value.TicketVersion, value.Fence
+	priorDigest := value.WitnessDigest
 	var found bool
 	var count int
 	for rows.Next() {
@@ -501,14 +541,14 @@ func loadLatestPublicationRebind(ctx context.Context, q interface {
 		}
 		rebind.Ref, rebind.CandidateGeneration, rebind.CandidateHeadOID = value.Ref, value.Candidate.Snapshot.Generation, value.Candidate.Snapshot.HeadSHA
 		payload, err := publicationRebindPayload(rebind)
-		if err != nil || publicationIdentityDigest(payload) != rebind.RebindDigest || rebind.PriorWitnessDigest != value.WitnessDigest || rebind.PriorTicketVersion != priorVersion || rebind.PriorFence != priorFence || rebind.TicketVersion != priorVersion+1 || rebind.Fence.RunnerEpoch != priorFence.RunnerEpoch+1 || rebind.Fence.LeaderEpoch == 0 || rebind.Fence.ClaimEpoch != 0 || priorFence.ClaimEpoch != 0 {
+		if err != nil || publicationIdentityDigest(payload) != rebind.RebindDigest || rebind.PriorWitnessDigest != priorDigest || rebind.PriorTicketVersion != priorVersion || rebind.PriorFence != priorFence || rebind.TicketVersion != priorVersion+1 || rebind.Fence.RunnerEpoch != priorFence.RunnerEpoch+1 || rebind.Fence.LeaderEpoch == 0 || rebind.Fence.ClaimEpoch != 0 || priorFence.ClaimEpoch != 0 {
 			return ErrPublicationEvidence
 		}
 		var eventCount int
 		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='publication_rebind' AND from_state='publishing' AND to_state='publishing' AND payload=?`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, rebind.TicketVersion, string(payload)).Scan(&eventCount); err != nil || eventCount != 1 {
 			return ErrPublicationEvidence
 		}
-		priorVersion, priorFence, found = rebind.TicketVersion, rebind.Fence, true
+		priorVersion, priorFence, priorDigest, found = rebind.TicketVersion, rebind.Fence, rebind.RebindDigest, true
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -521,10 +561,42 @@ func loadLatestPublicationRebind(ctx context.Context, q interface {
 	return nil
 }
 
+func loadPublicationRebindAt(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, generation uint64, head string, version uint64) (PublicationRebind, bool, error) {
+	var row PublicationRebind
+	err := q.QueryRowContext(ctx, `SELECT prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, generation, head, version).Scan(&row.PriorWitnessDigest, &row.PriorTicketVersion, &row.PriorFence.LeaderEpoch, &row.PriorFence.RunnerEpoch, &row.TicketVersion, &row.Fence.LeaderEpoch, &row.Fence.RunnerEpoch, &row.RebindDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PublicationRebind{}, false, nil
+	}
+	if err != nil {
+		return PublicationRebind{}, false, err
+	}
+	row.Ref, row.CandidateGeneration, row.CandidateHeadOID = ref, generation, head
+	return row, true, nil
+}
+
+func loadPublicationRebindBefore(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, generation uint64, head string, version uint64) (PublicationRebind, bool, error) {
+	var row PublicationRebind
+	err := q.QueryRowContext(ctx, `SELECT prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND ticket_version<? ORDER BY ticket_version DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, generation, head, version).Scan(&row.PriorWitnessDigest, &row.PriorTicketVersion, &row.PriorFence.LeaderEpoch, &row.PriorFence.RunnerEpoch, &row.TicketVersion, &row.Fence.LeaderEpoch, &row.Fence.RunnerEpoch, &row.RebindDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PublicationRebind{}, false, nil
+	}
+	if err != nil {
+		return PublicationRebind{}, false, err
+	}
+	row.Ref, row.CandidateGeneration, row.CandidateHeadOID = ref, generation, head
+	return row, true, nil
+}
+
 // LoadPublishedCandidate authenticates the durable row and all of the
 // immutable authorities it names. It accepts a row while the ticket remains
 // in publishing; waiting_ci replay can use the narrow existence query without
-// mistaking this evidence for a merge claim.
+// mistaking this evidence for a merge claim. It does not authenticate CI,
+// review, approval, merge readiness, or the eventual merge result; those are
+// separate later workflow authorities.
 func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef) (PublishedCandidateEvidence, error) {
 	if err := ref.Validate(); err != nil {
 		return PublishedCandidateEvidence{}, err
@@ -543,7 +615,8 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 	if err != nil {
 		return PublishedCandidateEvidence{}, err
 	}
-	waitingReplay := ticket.State == domain.StateWaitingCI && ticket.Version == value.CurrentTicketVersion+1
+	waitingReplay := ticket.State == domain.StateWaitingCI
+	waitingVersion := value.CurrentTicketVersion + 1
 	if (ticket.State != domain.StatePublishing && !waitingReplay) || (!waitingReplay && ticket.Version != value.CurrentTicketVersion) || (!waitingReplay && ticket.RunnerEpoch != value.CurrentFence.RunnerEpoch) || ticket.SourceDigest != value.Candidate.Snapshot.SourceDigest || ticket.ConfigGeneration != value.ConfigGeneration || ticket.ConfigDigest != value.ConfigDigest || sha256Digest(ticket.ConfigSnapshot) != value.ConfigSnapshotDigest {
 		return PublishedCandidateEvidence{}, ErrPublicationEvidence
 	}
@@ -553,7 +626,17 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 	}
 	if waitingReplay {
 		var transitions int
-		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state='publishing' AND to_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, ticket.Version).Scan(&transitions); err != nil || transitions != 1 {
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='effects_confirmed' AND from_state='publishing' AND to_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, waitingVersion).Scan(&transitions); err != nil || transitions != 1 {
+			return PublishedCandidateEvidence{}, ErrPublicationEvidence
+		}
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND NOT (trigger='effects_confirmed' AND from_state='publishing' AND to_state='waiting_ci')`, ref.Channel, ref.Project, ref.Ticket, waitingVersion).Scan(&transitions); err != nil || transitions != 0 {
+			return PublishedCandidateEvidence{}, ErrPublicationEvidence
+		}
+		if ticket.Version < waitingVersion || ticket.RunnerEpoch < value.CurrentFence.RunnerEpoch || ticket.Version-waitingVersion != ticket.RunnerEpoch-value.CurrentFence.RunnerEpoch {
+			return PublishedCandidateEvidence{}, ErrPublicationEvidence
+		}
+		var leader uint64
+		if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&leader); err != nil || (ticket.RunnerEpoch == value.CurrentFence.RunnerEpoch && leader != value.CurrentFence.LeaderEpoch) || (ticket.RunnerEpoch > value.CurrentFence.RunnerEpoch && leader <= value.CurrentFence.LeaderEpoch) {
 			return PublishedCandidateEvidence{}, ErrPublicationEvidence
 		}
 	}
