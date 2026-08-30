@@ -158,8 +158,8 @@ var requiredSchema = map[string][]string{
 	"provider_pair_selections":     {"channel", "builder_qualification_id", "reviewer_qualification_id", "selected_at"},
 	"merge_intents":                {"semantic_key", "original_base_oid", "head_oid", "base_ref", "protection_rule_id", "protection_kind", "protection_checks_digest", "strict_status_checks", "admin_enforced", "active_ruleset_count"},
 	"external_mutation_quarantine": {"singleton", "reason", "observed_at"},
-	"git_mutation_intents":         {"semantic_key", "request_digest", "ticket_version", "leader_epoch", "runner_epoch", "claim_epoch", "repository_path", "worktree_path", "branch_ref", "operation", "base_ref", "expected_base_oid", "expected_head_oid"},
-	"git_mutation_leases":          {"repository_path", "semantic_key", "nonce", "state", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity"},
+	"git_mutation_intents":         {"semantic_key", "request_digest", "ticket_version", "leader_epoch", "runner_epoch", "claim_epoch", "repository_path", "worktree_path", "branch_ref", "operation", "base_ref", "expected_base_oid", "expected_head_oid", "prepared_commit_oid", "prepared_tree_oid", "prior_remote_observed", "prior_remote_oid"},
+	"git_mutation_leases":          {"repository_path", "semantic_key", "nonce", "state", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "prepared_commit_oid", "prepared_tree_oid", "prior_remote_observed", "prior_remote_oid"},
 }
 
 type indexRequirement struct {

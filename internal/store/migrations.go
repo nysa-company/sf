@@ -549,3 +549,18 @@ var migrationV30 = []string{
 var migrationV31 = []string{
 	`ALTER TABLE candidate_snapshots ADD COLUMN builder_evidence_digest TEXT NOT NULL DEFAULT ''`,
 }
+
+// v32 preserves the exact observations made immediately before the two Git
+// mutations whose outcomes must be reconciled after a restart.  Blank/0 are
+// deliberately ambiguous defaults for pre-v32 rows: old activity is never
+// retroactively asserted as a recovered fact.
+var migrationV32 = []string{
+	`ALTER TABLE git_mutation_intents ADD COLUMN prepared_commit_oid TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE git_mutation_intents ADD COLUMN prepared_tree_oid TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE git_mutation_intents ADD COLUMN prior_remote_observed INTEGER NOT NULL DEFAULT 0 CHECK(prior_remote_observed IN (0,1))`,
+	`ALTER TABLE git_mutation_intents ADD COLUMN prior_remote_oid TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE git_mutation_leases ADD COLUMN prepared_commit_oid TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE git_mutation_leases ADD COLUMN prepared_tree_oid TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE git_mutation_leases ADD COLUMN prior_remote_observed INTEGER NOT NULL DEFAULT 0 CHECK(prior_remote_observed IN (0,1))`,
+	`ALTER TABLE git_mutation_leases ADD COLUMN prior_remote_oid TEXT NOT NULL DEFAULT ''`,
+}

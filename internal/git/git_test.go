@@ -55,14 +55,44 @@ type memoryBranchAuthority struct{ branches map[string]string }
 type testMutationAuthority struct{ err error }
 type testMutationLease struct{ err error }
 
+type factMutationAuthority struct{ lease *factMutationLease }
+type factMutationLease struct {
+	recordErr            error
+	preparedCommit, tree string
+	priorRemoteOID       string
+}
+
 func (a testMutationAuthority) AcquireGitMutation(_ context.Context, _ contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
 	if a.err != nil {
 		return nil, a.err
 	}
 	return testMutationLease{}, nil
 }
-func (l testMutationLease) Check(context.Context) error { return l.err }
-func (testMutationLease) Release() error                { return nil }
+func (l testMutationLease) Check(context.Context) error                               { return l.err }
+func (testMutationLease) Release() error                                              { return nil }
+func (l testMutationLease) RecordPreparedCommit(_ context.Context, _, _ string) error { return l.err }
+func (l testMutationLease) RecordPushPriorRemote(_ context.Context, _ string) error {
+	return l.err
+}
+func (a factMutationAuthority) AcquireGitMutation(_ context.Context, _ contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
+	return a.lease, nil
+}
+func (*factMutationLease) Check(context.Context) error { return nil }
+func (*factMutationLease) Release() error              { return nil }
+func (l *factMutationLease) RecordPreparedCommit(_ context.Context, commit, tree string) error {
+	if l.recordErr != nil {
+		return l.recordErr
+	}
+	l.preparedCommit, l.tree = commit, tree
+	return nil
+}
+func (l *factMutationLease) RecordPushPriorRemote(_ context.Context, oid string) error {
+	if l.recordErr != nil {
+		return l.recordErr
+	}
+	l.priorRemoteOID = oid
+	return nil
+}
 
 func testClaim(_ context.Context, binding contracts.GitMutationClaim) (contracts.GitMutationClaim, error) {
 	binding.TicketRef, binding.SemanticKey, binding.RequestDigest = domain.TicketRef{Channel: domain.ChannelDev, Project: "project", Ticket: "SF-test"}, "git/SF-test", digest([]byte("test-claim"))
@@ -1422,6 +1452,58 @@ func TestMutationLeaseRefusalPrecedesCommitEffect(t *testing.T) {
 	}
 	if status := rawGit(t, worktree.Path, "status", "--porcelain"); status == "" {
 		t.Fatal("refused lease staged or erased candidate")
+	}
+}
+
+func TestPreparedCommitFactPrecedesUpdateRef(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-prepared-fact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lease := &factMutationLease{recordErr: errors.New("disk full")}
+	runner.MutationAuthority = factMutationAuthority{lease: lease}
+	_, err = runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(12, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
+	if !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("commit with failed fact persistence=%v", err)
+	}
+	if head := rawGit(t, worktree.Path, "rev-parse", "HEAD"); head != worktree.Identity.BaseHead {
+		t.Fatalf("failed fact persistence moved ref to %q", head)
+	}
+}
+
+func TestPriorRemoteFactPrecedesPush(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-push-fact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(13, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.MutationAuthority = factMutationAuthority{lease: &factMutationLease{recordErr: errors.New("disk full")}}
+	if _, err := runner.Push(ctx, worktree, head, pushClaim(worktree, head)); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("push with failed fact persistence=%v", err)
+	}
+	if remote := rawGit(t, repository, "ls-remote", "--heads", "origin", "refs/heads/"+branch); remote != "" {
+		t.Fatalf("failed fact persistence pushed remote=%q", remote)
 	}
 }
 

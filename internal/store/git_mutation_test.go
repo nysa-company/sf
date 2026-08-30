@@ -37,7 +37,8 @@ func unplannedGitIntentFixture(t *testing.T, db *Store, ctx context.Context, tic
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := GitMutationIntent{EffectFence: EffectFence{SemanticKey: "git/" + ticketID + "/commit", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}, RequestDigest: gitDigest("a"), Repository: "/tmp/nysa", Worktree: "/tmp/nysa/" + ticketID, Branch: "sf/dev/aaaaaaaa/aaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Operation: "commit", BaseRef: "main", ExpectedBaseOID: strings.Repeat("a", 40), ExpectedHeadOID: strings.Repeat("a", 40)}
+	intent := GitMutationIntent{EffectFence: EffectFence{Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}, RequestDigest: gitDigest("a"), Repository: "/tmp/nysa", Worktree: "/tmp/nysa/" + ticketID, Branch: "sf/dev/aaaaaaaa/aaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Operation: "commit", BaseRef: "main", ExpectedBaseOID: strings.Repeat("a", 40), ExpectedHeadOID: strings.Repeat("a", 40)}
+	intent.SemanticKey = CanonicalGitMutationSemanticKey(intent)
 	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: intent.Fence, Path: intent.Worktree, Branch: intent.Branch, IdentityJSON: []byte(`{"repository":"/tmp/nysa"}`), BaseSHA: intent.ExpectedBaseOID, HeadSHA: intent.ExpectedHeadOID}); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +84,8 @@ func createWorktreeGitIntentFixture(t *testing.T, db *Store, ctx context.Context
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := GitMutationIntent{EffectFence: EffectFence{SemanticKey: "git/" + ticketID + "/create-worktree", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}, RequestDigest: gitDigest("c"), Repository: "/tmp/nysa", Worktree: worktree, Branch: branch, Operation: "create-worktree", BaseRef: "main", ExpectedBaseOID: strings.Repeat("a", 40), ExpectedHeadOID: strings.Repeat("a", 40)}
+	intent := GitMutationIntent{EffectFence: EffectFence{Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}, RequestDigest: gitDigest("c"), Repository: "/tmp/nysa", Worktree: worktree, Branch: branch, Operation: "create-worktree", BaseRef: "main", ExpectedBaseOID: strings.Repeat("a", 40), ExpectedHeadOID: strings.Repeat("a", 40)}
+	intent.SemanticKey = CanonicalGitMutationSemanticKey(intent)
 	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: ref, Kind: "git/create-worktree", TicketVersion: started.Version, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
 		t.Fatal(err)
 	}
@@ -186,6 +188,140 @@ func TestGitMutationClaimIsIssuedOnlyFromExactDurableIntent(t *testing.T) {
 	}
 	if _, err := db.IssueGitMutationClaim(ctx, intent); !errors.Is(err, ErrGitMutationIntent) {
 		t.Fatalf("reissued executing effect=%v", err)
+	}
+}
+
+func TestCanonicalGitMutationSemanticKeyBindsEveryStableInput(t *testing.T) {
+	db, ctx := openTestStore(t)
+	base := unplannedGitIntentFixture(t, db, ctx, "SF-git-semantic-key")
+	if base.SemanticKey != CanonicalGitMutationSemanticKey(base) {
+		t.Fatalf("fixture key is not canonical: %q", base.SemanticKey)
+	}
+	for name, mutate := range map[string]func(*GitMutationIntent){
+		"channel":        func(i *GitMutationIntent) { i.Ref.Channel = domain.ChannelStable },
+		"project":        func(i *GitMutationIntent) { i.Ref.Project = "other" },
+		"ticket":         func(i *GitMutationIntent) { i.Ref.Ticket = "SF-other" },
+		"request digest": func(i *GitMutationIntent) { i.RequestDigest = gitDigest("b") },
+		"repository":     func(i *GitMutationIntent) { i.Repository = "/tmp/other" },
+		"worktree":       func(i *GitMutationIntent) { i.Worktree = "/tmp/other-worktree" },
+		"branch":         func(i *GitMutationIntent) { i.Branch = "sf/dev/aaaaaaaa/aaaaaaaa-cccccccccccccccccccccccccccccccc" },
+		"operation":      func(i *GitMutationIntent) { i.Operation = "push" },
+		"base ref":       func(i *GitMutationIntent) { i.BaseRef = "trunk" },
+		"expected base":  func(i *GitMutationIntent) { i.ExpectedBaseOID = strings.Repeat("b", 40) },
+		"expected head":  func(i *GitMutationIntent) { i.ExpectedHeadOID = strings.Repeat("b", 40) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			if got := CanonicalGitMutationSemanticKey(changed); got == base.SemanticKey {
+				t.Fatalf("%s did not change canonical key", name)
+			}
+		})
+	}
+}
+
+func TestGitMutationClaimRefusesArbitrarySemanticKeyBeforeEffectMutation(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := unplannedGitIntentFixture(t, db, ctx, "SF-git-arbitrary-key")
+	intent.SemanticKey = "arbitrary-key"
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "git/" + intent.Operation, TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.IssueGitMutationClaim(ctx, intent); !errors.Is(err, ErrGitMutationIntent) {
+		t.Fatalf("arbitrary key issued: %v", err)
+	}
+	var state string
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM effects WHERE semantic_key=?`, intent.SemanticKey).Scan(&state); err != nil || state != string(EffectPlanned) {
+		t.Fatalf("effect changed before key refusal: state=%q err=%v", state, err)
+	}
+	var rows int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM git_mutation_intents WHERE semantic_key=?`, intent.SemanticKey).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("intent persisted for arbitrary key: rows=%d err=%v", rows, err)
+	}
+}
+
+func TestGitMutationRecoveryFactsAreOneWayAndVisibleToRecovery(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := gitIntentFixture(t, db, ctx, "SF-git-facts-commit")
+	claim, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireGitMutation(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts := lease.(contracts.GitMutationRecoveryFactsLease)
+	commit, tree := strings.Repeat("b", 40), strings.Repeat("c", 40)
+	if err := facts.RecordPreparedCommit(ctx, commit, tree); err != nil {
+		t.Fatal(err)
+	}
+	if err := facts.RecordPreparedCommit(ctx, commit, tree); err != nil {
+		t.Fatalf("exact replay: %v", err)
+	}
+	if err := facts.RecordPreparedCommit(ctx, strings.Repeat("d", 40), tree); !errors.Is(err, ErrGitMutationLease) {
+		t.Fatalf("conflicting replay=%v", err)
+	}
+	recovery, err := db.ActiveGitMutationLeases(ctx, domain.ChannelDev)
+	if err != nil || len(recovery) != 1 || recovery[0].PreparedCommitOID != commit || recovery[0].PreparedTreeOID != tree {
+		t.Fatalf("recovery facts=%+v err=%v", recovery, err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := db.GitMutationIntentFacts(ctx, intent.SemanticKey)
+	if err != nil || loaded.PreparedCommitOID != commit || loaded.PreparedTreeOID != tree {
+		t.Fatalf("released intent facts=%+v err=%v", loaded, err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_intents SET prepared_tree_oid='not-an-oid' WHERE semantic_key=?`, intent.SemanticKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GitMutationIntentFacts(ctx, intent.SemanticKey); !errors.Is(err, ErrGitMutationIntent) {
+		t.Fatalf("tampered recovery fact accepted: %v", err)
+	}
+}
+
+func TestGitMutationPushFactsDistinguishUnrecordedAbsentAndPresent(t *testing.T) {
+	newPush := func(ticket string) (*Store, context.Context, contracts.GitMutationRecoveryFactsLease) {
+		db, ctx := openTestStore(t)
+		intent := unplannedGitIntentFixture(t, db, ctx, ticket)
+		intent.Operation = "push"
+		intent.SemanticKey = CanonicalGitMutationSemanticKey(intent)
+		if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "git/push", TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := db.IssueGitMutationClaim(ctx, intent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := db.AcquireGitMutation(ctx, claim)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db, ctx, lease.(contracts.GitMutationRecoveryFactsLease)
+	}
+	db, ctx, absent := newPush("SF-git-facts-absent")
+	var observed int
+	var oid string
+	if err := db.db.QueryRowContext(ctx, `SELECT prior_remote_observed,prior_remote_oid FROM git_mutation_leases`).Scan(&observed, &oid); err != nil || observed != 0 || oid != "" {
+		t.Fatalf("unrecorded fact observed=%d oid=%q err=%v", observed, oid, err)
+	}
+	if err := absent.RecordPushPriorRemote(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT prior_remote_observed,prior_remote_oid FROM git_mutation_leases`).Scan(&observed, &oid); err != nil || observed != 1 || oid != "" {
+		t.Fatalf("recorded absence observed=%d oid=%q err=%v", observed, oid, err)
+	}
+	if err := absent.RecordPushPriorRemote(ctx, strings.Repeat("a", 40)); !errors.Is(err, ErrGitMutationLease) {
+		t.Fatalf("absence overwrite=%v", err)
+	}
+	db, ctx, present := newPush("SF-git-facts-present")
+	want := strings.Repeat("a", 40)
+	if err := present.RecordPushPriorRemote(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT prior_remote_observed,prior_remote_oid FROM git_mutation_leases`).Scan(&observed, &oid); err != nil || observed != 1 || oid != want {
+		t.Fatalf("recorded presence observed=%d oid=%q err=%v", observed, oid, err)
 	}
 }
 

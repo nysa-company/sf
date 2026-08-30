@@ -466,6 +466,28 @@ func requireMutationLease(ctx context.Context, lease contracts.GitMutationLease)
 	return nil
 }
 
+func recordPreparedCommit(ctx context.Context, lease contracts.GitMutationLease, commit, tree string) error {
+	facts, ok := lease.(contracts.GitMutationRecoveryFactsLease)
+	if !ok {
+		return fmt.Errorf("%w: mutation lease cannot record commit recovery facts", ErrIdentityMismatch)
+	}
+	if err := facts.RecordPreparedCommit(ctx, commit, tree); err != nil {
+		return fmt.Errorf("%w: record prepared commit: %v", ErrIdentityMismatch, err)
+	}
+	return nil
+}
+
+func recordPushPriorRemote(ctx context.Context, lease contracts.GitMutationLease, oid string) error {
+	facts, ok := lease.(contracts.GitMutationRecoveryFactsLease)
+	if !ok {
+		return fmt.Errorf("%w: mutation lease cannot record push recovery facts", ErrIdentityMismatch)
+	}
+	if err := facts.RecordPushPriorRemote(ctx, oid); err != nil {
+		return fmt.Errorf("%w: record prior remote: %v", ErrIdentityMismatch, err)
+	}
+	return nil
+}
+
 func (r Runner) environment(extra []string) ([]string, error) {
 	if !validAbsolutePath(r.binary()) {
 		return nil, fmt.Errorf("runner requires an explicit absolute git binary")
@@ -2202,6 +2224,12 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err != nil || !validOID(newHead) {
 		return "", fmt.Errorf("%w: candidate commit could not be created", ErrUnsafeWorktree)
 	}
+	// commit-tree creates an unreachable object.  Persist its exact immutable
+	// identity before update-ref can make it visible, so a crash or lost reply
+	// leaves recovery authority rather than an inference from mutable refs.
+	if err := recordPreparedCommit(ctx, lease, newHead, tree); err != nil {
+		return "", err
+	}
 	// update-ref's old-value argument is the concurrency boundary: even if a
 	// second writer advances the branch after the final observation, this CAS
 	// refuses to rewrite or append to the unexpected parent.
@@ -2315,13 +2343,21 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 	if err != nil {
 		return "", err
 	}
-	_, err = r.provePushHead(ctx, worktree, request.ExpectedHead)
+	lease, err := r.acquireSuppliedMutation(ctx, request.MutationClaim, contracts.GitMutationClaim{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "push", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: request.ExpectedHead})
 	if err != nil {
 		return "", err
 	}
-	// Every publication starts from a fresh remote observation. The local
-	// snapshot alone is insufficient: another actor may have moved BaseRef
-	// after the worktree was made but before this irreversible effect.
+	defer lease.Release()
+	ctx = withMutationLease(ctx, lease)
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return "", err
+	}
+	// Every publication starts from fresh observations while the repository
+	// writer is held.  The candidate observation is the exact fact persisted
+	// before the push, closing the old observe-to-writer-start race.
+	if _, err := r.provePushHead(ctx, worktree, request.ExpectedHead); err != nil {
+		return "", err
+	}
 	baseEnv, _, err := r.githubTransportEnvironment(worktree.Identity.Origin)
 	if err != nil {
 		return "", err
@@ -2343,13 +2379,7 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 	if remote != request.ExpectedPriorHead {
 		return "", fmt.Errorf("%w: candidate branch does not match durable observation", ErrUnexpectedRemote)
 	}
-	lease, err := r.acquireSuppliedMutation(ctx, request.MutationClaim, contracts.GitMutationClaim{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "push", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: request.ExpectedHead})
-	if err != nil {
-		return "", err
-	}
-	defer lease.Release()
-	ctx = withMutationLease(ctx, lease)
-	if err := requireMutationLease(ctx, lease); err != nil {
+	if err := recordPushPriorRemote(ctx, lease, remote); err != nil {
 		return "", err
 	}
 	// Reauthenticate and prove the exact candidate immediately before push.

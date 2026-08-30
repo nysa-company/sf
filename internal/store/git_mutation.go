@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -43,14 +45,48 @@ type gitMutationLease struct {
 // GitMutationRecovery is the exact persisted repository child that must be
 // drained before startup can admit any writer for its repository.
 type GitMutationRecovery struct {
-	Claim  contracts.GitMutationClaim
-	Nonce  []byte
-	State  string
-	Launch contracts.GitMutationLaunch
+	Claim               contracts.GitMutationClaim
+	Nonce               []byte
+	State               string
+	Launch              contracts.GitMutationLaunch
+	PreparedCommitOID   string
+	PreparedTreeOID     string
+	PriorRemoteObserved int // 0 means unrecorded/legacy; 1 means recorded.
+	PriorRemoteOID      string
+}
+
+// GitMutationIntentFacts is the immutable recovery authority that remains
+// after a normally drained lease is deleted.  It deliberately contains no
+// process identity: callers use it only to reconcile the already-fenced
+// effect, never to start a new mutation.
+type GitMutationIntentFacts struct {
+	Claim               contracts.GitMutationClaim
+	PreparedCommitOID   string
+	PreparedTreeOID     string
+	PriorRemoteObserved bool
+	PriorRemoteOID      string
+}
+
+// CanonicalGitMutationSemanticKey binds precisely the stable Git effect input.
+// Epochs and claim counters are intentionally excluded: they are fences, not
+// effect identity. Length-prefixing makes the hashed representation unambiguous
+// even if a future validated field grammar is relaxed.
+func CanonicalGitMutationSemanticKey(i GitMutationIntent) string {
+	h := sha256.New()
+	for _, value := range []string{
+		"sf.git-mutation.semantic-key.v1", string(i.Ref.Channel), string(i.Ref.Project), string(i.Ref.Ticket),
+		i.RequestDigest, i.Repository, i.Worktree, i.Branch, i.Operation, i.BaseRef, i.ExpectedBaseOID, i.ExpectedHeadOID,
+	} {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+		_, _ = h.Write(size[:])
+		_, _ = h.Write([]byte(value))
+	}
+	return "git/v1/" + fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func validGitIntent(i GitMutationIntent) bool {
-	return i.Ref.Validate() == nil && i.SemanticKey != "" && validClaimDigest(i.RequestDigest) && i.TicketVersion != 0 &&
+	return i.Ref.Validate() == nil && i.SemanticKey == CanonicalGitMutationSemanticKey(i) && validClaimDigest(i.RequestDigest) && i.TicketVersion != 0 &&
 		i.Fence.LeaderEpoch != 0 && i.Fence.RunnerEpoch != 0 && validStorePath(i.Repository) && validStorePath(i.Worktree) &&
 		i.Branch != "" && validGitOperation(i.Operation) && i.BaseRef != "" && validStoreOID(i.ExpectedBaseOID) &&
 		(i.ExpectedHeadOID == "" || validStoreOID(i.ExpectedHeadOID))
@@ -233,6 +269,116 @@ func (l *gitMutationLease) Check(ctx context.Context) error {
 	err = l.store.write(ctx, func(conn *sql.Conn) error { return l.store.assertGitIntentCurrent(ctx, conn, l.claim) })
 	return err
 }
+
+// RecordPreparedCommit durably records the immutable commit-tree result before
+// update-ref can make it reachable.  The same exact replay is harmless, while
+// any changed or partially tampered value is refused.
+func (l *gitMutationLease) RecordPreparedCommit(ctx context.Context, commit, tree string) error {
+	if l == nil || l.store == nil || l.claim.Operation != "commit" || !validStoreOID(commit) || !validStoreOID(tree) {
+		return ErrGitMutationLease
+	}
+	return l.store.write(ctx, func(conn *sql.Conn) error {
+		if err := l.store.assertGitIntentCurrent(ctx, conn, l.claim); err != nil {
+			return ErrGitMutationLease
+		}
+		var intentCommit, intentTree, leaseCommit, leaseTree string
+		if err := conn.QueryRowContext(ctx, `SELECT prepared_commit_oid,prepared_tree_oid FROM git_mutation_intents WHERE semantic_key=? AND operation='commit'`, l.claim.SemanticKey).Scan(&intentCommit, &intentTree); err != nil {
+			return ErrGitMutationLease
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT prepared_commit_oid,prepared_tree_oid FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND operation='commit'`, l.claim.Repository, l.claim.SemanticKey, l.nonce).Scan(&leaseCommit, &leaseTree); err != nil {
+			return ErrGitMutationLease
+		}
+		if intentCommit == commit && intentTree == tree && leaseCommit == commit && leaseTree == tree {
+			return nil
+		}
+		// A fresh lease may be acquired after a lost response. The immutable
+		// intent remains the authority, so an exact replay copies that fact to
+		// the new nonce lease; any other divergence is tamper/conflict.
+		if intentCommit == commit && intentTree == tree && leaseCommit == "" && leaseTree == "" {
+			result, err := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET prepared_commit_oid=?,prepared_tree_oid=? WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND operation='commit' AND prepared_commit_oid='' AND prepared_tree_oid=''`, commit, tree, l.claim.Repository, l.claim.SemanticKey, l.nonce)
+			if err != nil {
+				return err
+			}
+			if n, _ := result.RowsAffected(); n != 1 {
+				return ErrGitMutationLease
+			}
+			return nil
+		}
+		if intentCommit != "" || intentTree != "" || leaseCommit != "" || leaseTree != "" {
+			return ErrGitMutationLease
+		}
+		result, err := conn.ExecContext(ctx, `UPDATE git_mutation_intents SET prepared_commit_oid=?,prepared_tree_oid=? WHERE semantic_key=? AND operation='commit' AND prepared_commit_oid='' AND prepared_tree_oid=''`, commit, tree, l.claim.SemanticKey)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return ErrGitMutationLease
+		}
+		result, err = conn.ExecContext(ctx, `UPDATE git_mutation_leases SET prepared_commit_oid=?,prepared_tree_oid=? WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND operation='commit' AND prepared_commit_oid='' AND prepared_tree_oid=''`, commit, tree, l.claim.Repository, l.claim.SemanticKey, l.nonce)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return ErrGitMutationLease
+		}
+		return nil
+	})
+}
+
+// RecordPushPriorRemote records the candidate ref observation immediately
+// before the ordinary push. An empty OID is a recorded observation that the
+// branch was absent; a non-empty OID must be canonical. The separate flag
+// keeps that fact distinct from an old, unrecorded default row.
+func (l *gitMutationLease) RecordPushPriorRemote(ctx context.Context, oid string) error {
+	if l == nil || l.store == nil || l.claim.Operation != "push" || (oid != "" && !validStoreOID(oid)) {
+		return ErrGitMutationLease
+	}
+	return l.store.write(ctx, func(conn *sql.Conn) error {
+		if err := l.store.assertGitIntentCurrent(ctx, conn, l.claim); err != nil {
+			return ErrGitMutationLease
+		}
+		var intentObserved, leaseObserved int
+		var intentOID, leaseOID string
+		if err := conn.QueryRowContext(ctx, `SELECT prior_remote_observed,prior_remote_oid FROM git_mutation_intents WHERE semantic_key=? AND operation='push'`, l.claim.SemanticKey).Scan(&intentObserved, &intentOID); err != nil {
+			return ErrGitMutationLease
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT prior_remote_observed,prior_remote_oid FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND operation='push'`, l.claim.Repository, l.claim.SemanticKey, l.nonce).Scan(&leaseObserved, &leaseOID); err != nil {
+			return ErrGitMutationLease
+		}
+		if intentObserved == 1 && intentOID == oid && leaseObserved == 1 && leaseOID == oid {
+			return nil
+		}
+		if intentObserved == 1 && intentOID == oid && leaseObserved == 0 && leaseOID == "" {
+			result, err := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET prior_remote_observed=1,prior_remote_oid=? WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND operation='push' AND prior_remote_observed=0 AND prior_remote_oid=''`, oid, l.claim.Repository, l.claim.SemanticKey, l.nonce)
+			if err != nil {
+				return err
+			}
+			if n, _ := result.RowsAffected(); n != 1 {
+				return ErrGitMutationLease
+			}
+			return nil
+		}
+		if intentObserved != 0 || intentOID != "" || leaseObserved != 0 || leaseOID != "" {
+			return ErrGitMutationLease
+		}
+		result, err := conn.ExecContext(ctx, `UPDATE git_mutation_intents SET prior_remote_observed=1,prior_remote_oid=? WHERE semantic_key=? AND operation='push' AND prior_remote_observed=0 AND prior_remote_oid=''`, oid, l.claim.SemanticKey)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return ErrGitMutationLease
+		}
+		result, err = conn.ExecContext(ctx, `UPDATE git_mutation_leases SET prior_remote_observed=1,prior_remote_oid=? WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND operation='push' AND prior_remote_observed=0 AND prior_remote_oid=''`, oid, l.claim.Repository, l.claim.SemanticKey, l.nonce)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return ErrGitMutationLease
+		}
+		return nil
+	})
+}
+
 func (l *gitMutationLease) Release() error {
 	if l == nil || l.store == nil {
 		return ErrGitMutationLease
@@ -300,7 +446,7 @@ func (s *Store) ActiveGitMutationLeases(ctx context.Context, channel domain.Chan
 	if !channel.Valid() {
 		return nil, ErrGitMutationLease
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT semantic_key,nonce,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,state,process_pid,process_pgid,process_boot_identity,process_start_identity FROM git_mutation_leases WHERE channel=? ORDER BY repository_path`, channel)
+	rows, err := s.db.QueryContext(ctx, `SELECT semantic_key,nonce,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,state,process_pid,process_pgid,process_boot_identity,process_start_identity,prepared_commit_oid,prepared_tree_oid,prior_remote_observed,prior_remote_oid FROM git_mutation_leases WHERE channel=? ORDER BY repository_path`, channel)
 	if err != nil {
 		return nil, normalizeBusy(ctx, err)
 	}
@@ -309,13 +455,57 @@ func (s *Store) ActiveGitMutationLeases(ctx context.Context, channel domain.Chan
 	for rows.Next() {
 		var r GitMutationRecovery
 		var project, ticket string
-		if err := rows.Scan(&r.Claim.SemanticKey, &r.Nonce, &project, &ticket, &r.Claim.RequestDigest, &r.Claim.TicketVersion, &r.Claim.LeaderEpoch, &r.Claim.RunnerEpoch, &r.Claim.ClaimEpoch, &r.Claim.Repository, &r.Claim.Worktree, &r.Claim.Branch, &r.Claim.Operation, &r.Claim.BaseRef, &r.Claim.ExpectedBaseOID, &r.Claim.ExpectedHeadOID, &r.State, &r.Launch.PID, &r.Launch.PGID, &r.Launch.BootIdentity, &r.Launch.ProcessStartIdentity); err != nil {
+		if err := rows.Scan(&r.Claim.SemanticKey, &r.Nonce, &project, &ticket, &r.Claim.RequestDigest, &r.Claim.TicketVersion, &r.Claim.LeaderEpoch, &r.Claim.RunnerEpoch, &r.Claim.ClaimEpoch, &r.Claim.Repository, &r.Claim.Worktree, &r.Claim.Branch, &r.Claim.Operation, &r.Claim.BaseRef, &r.Claim.ExpectedBaseOID, &r.Claim.ExpectedHeadOID, &r.State, &r.Launch.PID, &r.Launch.PGID, &r.Launch.BootIdentity, &r.Launch.ProcessStartIdentity, &r.PreparedCommitOID, &r.PreparedTreeOID, &r.PriorRemoteObserved, &r.PriorRemoteOID); err != nil {
 			return nil, err
 		}
 		r.Claim.TicketRef = domain.TicketRef{Channel: channel, Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// GitMutationIntentFacts loads the exact immutable recovery facts by semantic
+// key. It re-validates both copies of the effect binding and rejects malformed
+// or operation-inapplicable facts rather than treating a tampered row as
+// authority after a lease has been released.
+func (s *Store) GitMutationIntentFacts(ctx context.Context, semanticKey string) (GitMutationIntentFacts, error) {
+	if s == nil || semanticKey == "" {
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
+	var out GitMutationIntentFacts
+	var project, ticket, effectChannel, effectProject, effectTicket, effectKind, effectState, effectRequest string
+	var effectVersion, effectLeader, effectRunner, effectClaim uint64
+	var prior int
+	err := s.db.QueryRowContext(ctx, `SELECT i.channel,i.project_id,i.ticket_id,i.request_digest,i.ticket_version,i.leader_epoch,i.runner_epoch,i.claim_epoch,i.repository_path,i.worktree_path,i.branch_ref,i.operation,i.base_ref,i.expected_base_oid,i.expected_head_oid,i.prepared_commit_oid,i.prepared_tree_oid,i.prior_remote_observed,i.prior_remote_oid,e.channel,e.project_id,e.ticket_id,e.effect_kind,e.state,e.request_digest,e.ticket_version,e.leader_epoch,e.runner_epoch,e.claim_epoch
+		FROM git_mutation_intents i JOIN effects e ON e.semantic_key=i.semantic_key WHERE i.semantic_key=?`, semanticKey).
+		Scan(&out.Claim.TicketRef.Channel, &project, &ticket, &out.Claim.RequestDigest, &out.Claim.TicketVersion, &out.Claim.LeaderEpoch, &out.Claim.RunnerEpoch, &out.Claim.ClaimEpoch, &out.Claim.Repository, &out.Claim.Worktree, &out.Claim.Branch, &out.Claim.Operation, &out.Claim.BaseRef, &out.Claim.ExpectedBaseOID, &out.Claim.ExpectedHeadOID, &out.PreparedCommitOID, &out.PreparedTreeOID, &prior, &out.PriorRemoteOID, &effectChannel, &effectProject, &effectTicket, &effectKind, &effectState, &effectRequest, &effectVersion, &effectLeader, &effectRunner, &effectClaim)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
+	if err != nil {
+		return GitMutationIntentFacts{}, err
+	}
+	out.Claim.TicketRef.Project, out.Claim.TicketRef.Ticket, out.Claim.SemanticKey = domain.ProjectID(project), domain.TicketID(ticket), semanticKey
+	intent := GitMutationIntent{EffectFence: EffectFence{SemanticKey: semanticKey, Ref: out.Claim.TicketRef, TicketVersion: out.Claim.TicketVersion, Fence: domain.Fence{LeaderEpoch: out.Claim.LeaderEpoch, RunnerEpoch: out.Claim.RunnerEpoch}}, RequestDigest: out.Claim.RequestDigest, Repository: out.Claim.Repository, Worktree: out.Claim.Worktree, Branch: out.Claim.Branch, Operation: out.Claim.Operation, BaseRef: out.Claim.BaseRef, ExpectedBaseOID: out.Claim.ExpectedBaseOID, ExpectedHeadOID: out.Claim.ExpectedHeadOID}
+	if !validGitIntent(intent) || !validContractClaim(out.Claim) || effectChannel != string(out.Claim.TicketRef.Channel) || effectProject != string(out.Claim.TicketRef.Project) || effectTicket != string(out.Claim.TicketRef.Ticket) || effectKind != "git/"+out.Claim.Operation || (effectState != string(EffectExecuting) && effectState != string(EffectUncertain)) || effectRequest != out.Claim.RequestDigest || effectVersion != out.Claim.TicketVersion || effectLeader != out.Claim.LeaderEpoch || effectRunner != out.Claim.RunnerEpoch || effectClaim != out.Claim.ClaimEpoch {
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
+	switch out.Claim.Operation {
+	case "commit":
+		if (out.PreparedCommitOID == "") != (out.PreparedTreeOID == "") || (out.PreparedCommitOID != "" && (!validStoreOID(out.PreparedCommitOID) || !validStoreOID(out.PreparedTreeOID))) || prior != 0 || out.PriorRemoteOID != "" {
+			return GitMutationIntentFacts{}, ErrGitMutationIntent
+		}
+	case "push":
+		if out.PreparedCommitOID != "" || out.PreparedTreeOID != "" || (prior != 0 && prior != 1) || (out.PriorRemoteOID != "" && !validStoreOID(out.PriorRemoteOID)) || (prior == 0 && out.PriorRemoteOID != "") {
+			return GitMutationIntentFacts{}, ErrGitMutationIntent
+		}
+		out.PriorRemoteObserved = prior == 1
+	default:
+		if out.PreparedCommitOID != "" || out.PreparedTreeOID != "" || prior != 0 || out.PriorRemoteOID != "" {
+			return GitMutationIntentFacts{}, ErrGitMutationIntent
+		}
+	}
+	return out, nil
 }
 
 // RecoverGitMutationLeases is deliberately proof-before-release.  Nothing in

@@ -65,6 +65,17 @@ type GitMutationLease interface {
 	Release() error
 }
 
+// GitMutationRecoveryFactsLease records the one-way facts needed to recover
+// an irreversible Git mutation after a lost response.  The production store
+// implementation binds each write to the immutable intent and exact active
+// lease nonce; runners must record the fact before performing the mutation.
+// Test leases which drive mutation paths should implement this interface too.
+type GitMutationRecoveryFactsLease interface {
+	GitMutationLease
+	RecordPreparedCommit(context.Context, string, string) error
+	RecordPushPriorRemote(context.Context, string) error
+}
+
 // GitMutationLaunchLease is implemented by the production SQLite lease.  A
 // Git child remains behind its supervisor gate until RecordGitMutationLaunch
 // commits; FinishGitMutationLaunch is permitted only after the parent has

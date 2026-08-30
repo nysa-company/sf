@@ -49,7 +49,7 @@ var (
 	ErrGitMutationLease        = errors.New("git mutation lease is unavailable or stale")
 )
 
-const schemaVersion = 31
+const schemaVersion = 32
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -83,6 +83,7 @@ var migrationChecksums = map[int]string{
 	29: migrationChecksum(migrationV29),
 	30: migrationChecksum(migrationV30),
 	31: migrationChecksum(migrationV31),
+	32: migrationChecksum(migrationV32),
 }
 
 func migrationChecksum(statements []string) string {
@@ -370,6 +371,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV30
 			} else if version == 31 {
 				statements = migrationV31
+			} else if version == 32 {
+				statements = migrationV32
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
