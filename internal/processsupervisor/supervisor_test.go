@@ -2,7 +2,10 @@ package processsupervisor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +15,377 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 )
+
+type recordingLaunches func(context.Context, contracts.DrainRequest, Identity, string) error
+
+func (f recordingLaunches) RecordLaunch(ctx context.Context, request contracts.DrainRequest, identity Identity, worktree string) error {
+	return f(ctx, request, identity, worktree)
+}
+
+func runtimeRegistration(t *testing.T) (*Supervisor, contracts.RuntimeBinding, string, string) {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	authHome := filepath.Join(root, "codex-home")
+	if err := os.Mkdir(authHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authHome, "auth.json"), []byte(`{"tokens":{"access_token":"fixture"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(root, "codex")
+	contents := []byte("#!/bin/sh\nexit 0\n")
+	if err := os.WriteFile(executable, contents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	supervisor, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor.Executable = testProviderGate(t)
+	binding := contracts.RuntimeBinding{
+		Identity:     domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"},
+		BinaryDigest: hex.EncodeToString(digest[:]), PolicyDigest: supervisor.PolicyDigest(),
+		FixtureDigest: strings.Repeat("a", 64), AuthDigest: strings.Repeat("b", 64), AuthMode: "chatgpt_subscription",
+	}
+	return supervisor, binding, executable, authHome
+}
+
+func TestRegisterRuntimeRefreshReusesAndReclaimsStagedSnapshots(t *testing.T) {
+	supervisor, binding, executable, authHome := runtimeRegistration(t)
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	first := supervisor.trusted[binding.Identity].stagedDir
+	for range 3 {
+		if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+			t.Fatal(err)
+		}
+		if got := supervisor.trusted[binding.Identity].stagedDir; got != first {
+			t.Fatalf("unchanged binding restaged %q, want %q", got, first)
+		}
+	}
+	for index := 0; index < 3; index++ {
+		previous := supervisor.trusted[binding.Identity].stagedDir
+		binding.AuthDigest = fmt.Sprintf("%064x", index+1)
+		if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+			t.Fatal(err)
+		}
+		if got := supervisor.trusted[binding.Identity].stagedDir; got == previous {
+			t.Fatal("changed binding reused the old staged executable")
+		}
+		if _, err := os.Stat(previous); !os.IsNotExist(err) {
+			t.Fatalf("retired snapshot remained at %q: %v", previous, err)
+		}
+		if len(supervisor.retired) != 0 {
+			t.Fatalf("retired snapshots leaked: %d", len(supervisor.retired))
+		}
+	}
+}
+
+func TestRegisterRuntimeFailureAndMissingCachePreserveOrReplaceExactly(t *testing.T) {
+	supervisor, binding, executable, authHome := runtimeRegistration(t)
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	first := supervisor.trusted[binding.Identity]
+	failed := binding
+	failed.AuthDigest = strings.Repeat("c", 64)
+	supervisor.stageRuntime = func(*trustedExecutable) error { return errors.New("stage failure") }
+	if _, err := supervisor.RegisterRuntime(failed, executable, authHome); err == nil {
+		t.Fatal("failed stage was accepted")
+	}
+	supervisor.stageRuntime = nil
+	if got := supervisor.trusted[binding.Identity]; got.stagedDir != first.stagedDir || got.snapshot != first.snapshot {
+		t.Fatal("failed staging replaced the usable runtime")
+	}
+	if err := os.Remove(first.stagedPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	if got := supervisor.trusted[binding.Identity]; got.stagedDir == first.stagedDir || !stagedRuntimeMatches(got.snapshot, binding.BinaryDigest) {
+		t.Fatal("missing cached snapshot was reused instead of atomically replaced")
+	}
+}
+
+func TestSupervisorCloseNeverDeletesLegacyExecutable(t *testing.T) {
+	supervisor, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := domain.ProviderIdentity{Provider: "fixture", Model: "model", Family: "family", Version: "v1"}
+	if _, err := supervisor.RegisterExecutable(identity, "/bin/sh"); err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat("/bin/sh"); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("Close modified legacy executable: info=%v err=%v", info, err)
+	}
+}
+
+func TestSupervisorCloseReclaimsStagedRuntimeAndIsIdempotent(t *testing.T) {
+	supervisor, binding, executable, authHome := runtimeRegistration(t)
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	staged := supervisor.trusted[binding.Identity].stagedDir
+	if err := supervisor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Fatalf("Close retained unused stage %q: %v", staged, err)
+	}
+	if err := supervisor.Close(); err != nil {
+		t.Fatalf("second Close=%v", err)
+	}
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err == nil {
+		t.Fatal("closed supervisor accepted a new runtime")
+	}
+}
+
+func TestSupervisorRunRemovesCompletedExactRun(t *testing.T) {
+	supervisor, request, invocation, input := legacyRunFixture(t, "")
+	if _, err := supervisor.Run(context.Background(), request, invocation, input); err != nil {
+		t.Fatal(err)
+	}
+	supervisor.mu.Lock()
+	remaining := len(supervisor.runs)
+	supervisor.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("completed Run leaked %d active entries", remaining)
+	}
+}
+
+func TestSupervisorCloseDrainsActiveRunAndRejectsFutureRun(t *testing.T) {
+	supervisor, request, invocation, input := legacyRunFixture(t, "sleep 30")
+	entered := make(chan struct{})
+	supervisor.Recorder = recordingLaunches(func(context.Context, contracts.DrainRequest, Identity, string) error {
+		close(entered)
+		return nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := supervisor.Run(context.Background(), request, invocation, input)
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider run did not cross the durable launch gate")
+	}
+	if err := supervisor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("closed supervisor let its active Run report success")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not join the active Run")
+	}
+	if _, err := supervisor.Run(context.Background(), request, invocation, input); err == nil {
+		t.Fatal("closed supervisor accepted a new Run")
+	}
+}
+
+func TestReplacementRetainsSnapshotUntilBlockedRunReturns(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	authHome := filepath.Join(root, "codex-home")
+	if err := os.Mkdir(authHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authHome, "auth.json"), []byte(`{"tokens":{"access_token":"fixture"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(root, "codex")
+	program := "#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = '--output-last-message' ]; then out=\"$2\"; shift 2; continue; fi\n  shift\ndone\nsleep 1\nprintf '{}' > \"$out\"\n"
+	if err := os.WriteFile(executable, []byte(program), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(program))
+	supervisor, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor.Executable = testProviderGate(t)
+	binding := contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"}, BinaryDigest: hex.EncodeToString(sum[:]), PolicyDigest: supervisor.PolicyDigest(), FixtureDigest: strings.Repeat("a", 64), AuthDigest: strings.Repeat("b", 64), AuthMode: "chatgpt_subscription"}
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	oldStage := supervisor.trusted[binding.Identity].stagedDir
+	entered := make(chan struct{})
+	supervisor.Recorder = recordingLaunches(func(context.Context, contracts.DrainRequest, Identity, string) error {
+		close(entered)
+		return nil
+	})
+	request, invocation, input := codexRunFixture(t, executable, binding, authHome)
+	done := make(chan error, 1)
+	go func() {
+		_, err := supervisor.Run(context.Background(), request, invocation, input)
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked Run did not register its launch")
+	}
+	binding.AuthDigest = strings.Repeat("c", 64)
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldStage); err != nil {
+		t.Fatalf("replacement deleted a snapshot still held by Run: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocked Run did not complete")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(oldStage); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retired snapshot was not reclaimed after final Run reference")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestCloseWinsPrelaunchSnapshotRaceWithoutDeletingInUseStage(t *testing.T) {
+	supervisor, binding, executable, authHome := runtimeRegistration(t)
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	staged := supervisor.trusted[binding.Identity].stagedDir
+	supervisor.Executable = testProviderGate(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	supervisor.beforeStart = func() {
+		close(entered)
+		<-release
+	}
+	request, invocation, input := codexRunFixture(t, executable, binding, authHome)
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := supervisor.Run(context.Background(), request, invocation, input)
+		runDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not retain its selected snapshot before launch")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- supervisor.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		supervisor.mu.Lock()
+		closing := supervisor.closing
+		supervisor.mu.Unlock()
+		if closing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not claim the prelaunch handoff")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Close has marked the supervisor closed and is now waiting on the selected
+	// snapshot. Releasing Run must make it refuse cmd.Start rather than insert a
+	// process that Close did not snapshot.
+	close(release)
+	select {
+	case err := <-runDone:
+		if err == nil {
+			t.Fatal("prelaunch Run started after Close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("prelaunch Run did not return after Close")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not finish after prelaunch reference left")
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Fatalf("Close retained an unused prelaunch stage: %v", err)
+	}
+}
+
+func legacyRunFixture(t *testing.T, command string) (*Supervisor, contracts.DrainRequest, contracts.Invocation, contracts.PhaseInput) {
+	t.Helper()
+	supervisor, err := New(recordingLaunches(func(context.Context, contracts.DrainRequest, Identity, string) error { return nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor.Executable = testProviderGate(t)
+	identity := domain.ProviderIdentity{Provider: "fixture", Model: "model", Family: "family", Version: "v1"}
+	digest, err := supervisor.RegisterExecutable(identity, "/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree := t.TempDir()
+	input := contracts.PhaseInput{Ticket: domain.TicketRef{Channel: domain.ChannelDev, Project: "project", Ticket: "SF-run"}, Phase: domain.PhaseBuild, Attempt: 1, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, Prompt: "fixture", Repository: worktree, Worktree: worktree, WorktreeIdentity: "identity", BaseSHA: "base", Provider: identity, Timeout: time.Minute}
+	_, input.RequestDigest, err = contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := contracts.DrainRequest{ClaimID: 1, Identity: identity, Ref: input.Ticket, Phase: input.Phase, Role: "builder", Attempt: input.Attempt, LeaderEpoch: input.LeaderEpoch, RunnerEpoch: input.RunnerEpoch, ExpectedVersion: input.ExpectedVersion, LeaseKey: "lease", BindingDigest: "binding", BinaryDigest: digest, PolicyDigest: supervisor.PolicyDigest(), Repository: input.Repository, Worktree: input.Worktree, WorktreeIdentity: input.WorktreeIdentity, BaseSHA: input.BaseSHA, RequestDigest: input.RequestDigest}
+	argv := []string{"/bin/sh"}
+	if command != "" {
+		argv = append(argv, "-c", command)
+	}
+	return supervisor, request, contracts.Invocation{Argv: argv}, input
+}
+
+func testProviderGate(t *testing.T) string {
+	t.Helper()
+	gate := filepath.Join(t.TempDir(), "provider-gate")
+	// The helper mirrors the production wrapper's argv shape. The supervisor's
+	// own durable recorder remains the boundary under test here; the helper
+	// intentionally does not consume the inherited release byte.
+	if err := os.WriteFile(gate, []byte("#!/bin/sh\n[ \"$1\" = __provider_gate ] || exit 125\nshift\nprovider=$1\nshift\nexec \"$provider\" \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return gate
+}
+
+func codexRunFixture(t *testing.T, executable string, binding contracts.RuntimeBinding, authHome string) (contracts.DrainRequest, contracts.Invocation, contracts.PhaseInput) {
+	t.Helper()
+	worktree := t.TempDir()
+	input := contracts.PhaseInput{Ticket: domain.TicketRef{Channel: domain.ChannelDev, Project: "project", Ticket: "SF-codex"}, Phase: domain.PhaseBuild, Attempt: 1, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, Prompt: "fixture", Repository: worktree, Worktree: worktree, WorktreeIdentity: "identity", BaseSHA: "base", Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}
+	_, input.RequestDigest = mustCanonicalPhaseInput(t, input)
+	request := contracts.DrainRequest{ClaimID: 1, Identity: binding.Identity, Ref: input.Ticket, Phase: input.Phase, Role: "builder", Attempt: input.Attempt, LeaderEpoch: input.LeaderEpoch, RunnerEpoch: input.RunnerEpoch, ExpectedVersion: input.ExpectedVersion, LeaseKey: "lease", BindingDigest: "binding", BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, AuthDigest: binding.AuthDigest, AuthMode: binding.AuthMode, Repository: input.Repository, Worktree: input.Worktree, WorktreeIdentity: input.WorktreeIdentity, BaseSHA: input.BaseSHA, RequestDigest: input.RequestDigest}
+	argv := []string{executable, "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules", "--config", `default_permissions="sf-guarded"`, "--config", `permissions.sf-guarded.extends=":workspace"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="write"}`, "--config", `permissions.sf-guarded.network.enabled=false`, "--model", binding.Identity.Model, "-C", input.Worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-"}
+	return request, contracts.Invocation{Argv: argv, Stdin: []byte("fixture"), OutputSchema: input.Schema, CaptureLastMessage: true, AuthHome: authHome}, input
+}
+
+func mustCanonicalPhaseInput(t *testing.T, input contracts.PhaseInput) ([]byte, string) {
+	t.Helper()
+	payload, digest, err := contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload, digest
+}
 
 func TestMaterializeOutputSchemaUsesPrivateSupervisorFileAndBoundsStdin(t *testing.T) {
 	temporary := t.TempDir()

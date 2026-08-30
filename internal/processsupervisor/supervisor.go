@@ -51,22 +51,47 @@ type Supervisor struct {
 	SoftDrain, HardDrain time.Duration
 	mu                   sync.Mutex
 	runs                 map[requestKey]*run
+	retired              map[*stagedExecutable]struct{}
+	changed              chan struct{}
+	closing              bool
+	closed               bool
+	closeDone            chan struct{}
+	closeErr             error
+	// beforeStart is test-only synchronization for the selected-snapshot to
+	// process-launch handoff. Production callers cannot install a hook.
+	beforeStart func()
+	// stageRuntime is test-only fault injection for the all-or-nothing staging
+	// boundary. Nil uses trustedExecutable.stage in production.
+	stageRuntime func(*trustedExecutable) error
 }
 type trustedExecutable struct {
 	path         string // immutable source spelling selected during qualification
 	stagedPath   string // supervisor-owned executable snapshot
 	stagedDir    string
+	snapshot     *stagedExecutable
 	digest       string
 	policyDigest string
 	authDigest   string
 	authMode     string
 	authHome     string
 }
+
+// stagedExecutable is owned by the supervisor, unlike legacy registered
+// executable paths. refs protects the interval from Run selecting a snapshot
+// until that exact Run has completely returned, including the pre-launch
+// preparation interval before a process is visible in runs.
+type stagedExecutable struct {
+	path, directory string
+	refs            int
+	cleaning        bool
+}
 type run struct {
 	identity Identity
 	worktree string
 	done     chan struct{}
 	streams  chan struct{}
+	finished chan struct{}
+	snapshot *stagedExecutable
 }
 
 func New(recorder LaunchRecorder) (*Supervisor, error) {
@@ -74,7 +99,7 @@ func New(recorder LaunchRecorder) (*Supervisor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Supervisor{Signer: signer, Recorder: recorder, trusted: map[domain.ProviderIdentity]trustedExecutable{}, SoftDrain: 2 * time.Second, HardDrain: 2 * time.Second, runs: map[requestKey]*run{}}, nil
+	return &Supervisor{Signer: signer, Recorder: recorder, trusted: map[domain.ProviderIdentity]trustedExecutable{}, SoftDrain: 2 * time.Second, HardDrain: 2 * time.Second, runs: map[requestKey]*run{}, retired: map[*stagedExecutable]struct{}{}, changed: make(chan struct{})}, nil
 }
 func (s *Supervisor) PublicKey() []byte { return s.Signer.PublicKey() }
 
@@ -112,9 +137,16 @@ func (s *Supervisor) RegisterExecutable(identity domain.ProviderIdentity, path s
 	// Codex runtimes must use RegisterRuntime, which stages a pinned snapshot.
 	trusted.stagedPath = trusted.path
 	s.mu.Lock()
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		return "", errors.New("provider supervisor is closed")
+	}
+	previous := s.trusted[identity]
 	trusted.policyDigest = environmentPolicyDigest()
 	s.trusted[identity] = trusted
+	s.retireLocked(previous)
 	s.mu.Unlock()
+	_ = s.reclaimRetired()
 	return trusted.digest, nil
 }
 
@@ -137,20 +169,260 @@ func (s *Supervisor) RegisterRuntime(binding contracts.RuntimeBinding, executabl
 	if trusted.digest != binding.BinaryDigest {
 		return "", errors.New("Codex executable digest does not match qualification")
 	}
-	if err := trusted.stage(); err != nil {
+	s.mu.Lock()
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		return "", errors.New("provider supervisor is closed")
+	}
+	if runtimeBindingMatches(s.trusted[binding.Identity], trusted, binding, authHome) {
+		s.mu.Unlock()
+		return trusted.digest, nil
+	}
+	s.mu.Unlock()
+	// Stage before replacement. A failed stage therefore leaves the current
+	// trusted binding untouched.
+	s.mu.Lock()
+	stage := s.stageRuntime
+	s.mu.Unlock()
+	if stage == nil {
+		stage = func(value *trustedExecutable) error { return value.stage() }
+	}
+	if err := stage(&trusted); err != nil {
 		return "", err
 	}
 	trusted.authDigest, trusted.authMode, trusted.authHome, trusted.policyDigest = binding.AuthDigest, binding.AuthMode, authHome, binding.PolicyDigest
 	s.mu.Lock()
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		_ = os.RemoveAll(trusted.stagedDir)
+		return "", errors.New("provider supervisor is closed")
+	}
+	if runtimeBindingMatches(s.trusted[binding.Identity], trusted, binding, authHome) {
+		s.mu.Unlock()
+		_ = os.RemoveAll(trusted.stagedDir)
+		return trusted.digest, nil
+	}
+	previous := s.trusted[binding.Identity]
 	s.trusted[binding.Identity] = trusted
+	s.retireLocked(previous)
 	s.mu.Unlock()
+	_ = s.reclaimRetired()
 	return trusted.digest, nil
+}
+
+func runtimeBindingMatches(current, candidate trustedExecutable, binding contracts.RuntimeBinding, authHome string) bool {
+	return current.snapshot != nil && stagedRuntimeMatches(current.snapshot, current.digest) && current.path == candidate.path && current.digest == candidate.digest &&
+		current.policyDigest == binding.PolicyDigest && current.authDigest == binding.AuthDigest &&
+		current.authMode == binding.AuthMode && current.authHome == authHome
+}
+
+// stagedRuntimeMatches rechecks a cached snapshot before a refresh reuses it.
+// Supervisor-owned snapshots can still disappear after an operator cleanup or
+// filesystem fault; treating that as a successful registration would defer a
+// deterministic configuration failure until a later provider launch.
+func stagedRuntimeMatches(snapshot *stagedExecutable, digest string) bool {
+	if snapshot == nil || snapshot.path == "" || snapshot.directory == "" || filepath.Dir(snapshot.path) != snapshot.directory || digest == "" {
+		return false
+	}
+	info, err := os.Lstat(snapshot.path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || info.Size() > 128<<20 || !trustedOwner(info) {
+		return false
+	}
+	file, err := os.Open(snapshot.path)
+	if err != nil {
+		return false
+	}
+	hash := sha256.New()
+	_, copyErr := io.Copy(hash, io.LimitReader(file, 128<<20+1))
+	closeErr := file.Close()
+	return copyErr == nil && closeErr == nil && hex.EncodeToString(hash.Sum(nil)) == digest
 }
 
 // PolicyDigest is the digest of the supervisor-owned environment policy. It
 // lets the durable provider binding pin the policy without persisting any
 // per-run secret or temporary directory name.
 func (s *Supervisor) PolicyDigest() string { return environmentPolicyDigest() }
+
+// Close permanently closes the supervisor. It first stops new registration
+// and launch, then drains every run that crossed the launch boundary. Staged
+// snapshots are removed only after no Run can still reference them. An
+// ambiguous drain leaves its snapshot on disk for operator recovery and the
+// same error is returned by later Close calls.
+func (s *Supervisor) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	if s.closed {
+		err := s.closeErr
+		s.mu.Unlock()
+		return err
+	}
+	if s.closing {
+		done := s.closeDone
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+		err := s.closeErr
+		s.mu.Unlock()
+		return err
+	}
+	s.closing, s.closeDone = true, make(chan struct{})
+	runs := make(map[requestKey]*run, len(s.runs))
+	for request, active := range s.runs {
+		runs[request] = active
+	}
+	for identity, trusted := range s.trusted {
+		delete(s.trusted, identity)
+		s.retireLocked(trusted)
+	}
+	s.mu.Unlock()
+
+	var result error
+	for request, active := range runs {
+		drainCtx, cancel, err := s.drainContext(context.Background())
+		if err == nil {
+			err = s.terminateContext(drainCtx, active)
+			if err == nil {
+				err = s.proveGoneContext(drainCtx, active)
+			}
+			cancel()
+		}
+		if err != nil {
+			result = errors.Join(result, fmt.Errorf("drain provider run %d: %w", request.ClaimID, err))
+			continue
+		}
+		s.removeRunKey(request, active)
+		if err := s.waitForRunReturn(active); err != nil {
+			result = errors.Join(result, fmt.Errorf("join provider run %d: %w", request.ClaimID, err))
+		}
+	}
+
+	if err := s.waitForSnapshotReferences(); err != nil {
+		result = errors.Join(result, err)
+	}
+	if err := s.reclaimRetired(); err != nil {
+		result = errors.Join(result, err)
+	}
+	s.mu.Lock()
+	s.closeErr, s.closed = result, true
+	close(s.closeDone)
+	s.mu.Unlock()
+	return result
+}
+
+func (s *Supervisor) retireLocked(trusted trustedExecutable) {
+	if trusted.snapshot != nil {
+		s.retired[trusted.snapshot] = struct{}{}
+	}
+}
+
+func (s *Supervisor) acquireTrusted(identity domain.ProviderIdentity) (trustedExecutable, func(), error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing || s.closed {
+		return trustedExecutable{}, nil, errors.New("provider supervisor is closed")
+	}
+	trusted, found := s.trusted[identity]
+	if !found {
+		return trustedExecutable{}, nil, errors.New("provider executable is not registered")
+	}
+	if trusted.snapshot != nil {
+		trusted.snapshot.refs++
+	}
+	return trusted, func() { s.releaseSnapshot(trusted.snapshot) }, nil
+}
+
+func (s *Supervisor) releaseSnapshot(snapshot *stagedExecutable) {
+	if snapshot == nil {
+		return
+	}
+	s.mu.Lock()
+	if snapshot.refs > 0 {
+		snapshot.refs--
+	}
+	s.signalChangedLocked()
+	s.mu.Unlock()
+	_ = s.reclaimRetired()
+}
+
+func (s *Supervisor) signalChangedLocked() {
+	close(s.changed)
+	s.changed = make(chan struct{})
+}
+
+func (s *Supervisor) waitForSnapshotReferences() error {
+	deadline := s.SoftDrain + s.HardDrain
+	if !validDrainDurations(s.SoftDrain, s.HardDrain) {
+		return ErrUnclear
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+	for {
+		s.mu.Lock()
+		busy := false
+		for snapshot := range s.retired {
+			if snapshot.refs != 0 {
+				busy = true
+				break
+			}
+		}
+		changed := s.changed
+		s.mu.Unlock()
+		if !busy {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ErrUnclear
+		}
+	}
+}
+
+func (s *Supervisor) waitForRunReturn(active *run) error {
+	if active == nil || active.finished == nil || !validDrainDurations(s.SoftDrain, s.HardDrain) {
+		return ErrUnclear
+	}
+	timer := time.NewTimer(s.SoftDrain + s.HardDrain)
+	defer timer.Stop()
+	select {
+	case <-active.finished:
+		return nil
+	case <-timer.C:
+		return ErrUnclear
+	}
+}
+
+func (s *Supervisor) reclaimRetired() error {
+	for {
+		s.mu.Lock()
+		var target *stagedExecutable
+		for snapshot := range s.retired {
+			if snapshot.refs == 0 && !snapshot.cleaning {
+				snapshot.cleaning = true
+				target = snapshot
+				break
+			}
+		}
+		s.mu.Unlock()
+		if target == nil {
+			return nil
+		}
+		err := os.RemoveAll(target.directory)
+		s.mu.Lock()
+		if err == nil {
+			delete(s.retired, target)
+		} else {
+			target.cleaning = false
+		}
+		s.signalChangedLocked()
+		s.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("remove retired provider executable: %w", err)
+		}
+	}
+}
 
 func environmentPolicyDigest() string {
 	sum := sha256.Sum256([]byte("PATH=/usr/bin:/bin\x00LANG=C\x00LC_ALL=C\x00HOME=<private>\x00TMPDIR=<private>\x00CODEX_HOME=<private>"))
@@ -236,6 +508,7 @@ func (trusted *trustedExecutable) stage() error {
 		return errors.New("trusted executable changed while staging")
 	}
 	trusted.stagedPath, trusted.stagedDir = targetPath, directory
+	trusted.snapshot = &stagedExecutable{path: targetPath, directory: directory}
 	return nil
 }
 
@@ -320,12 +593,11 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	if !requestMatchesInput(request, input) || !contracts.PhaseInputDigestMatches(input, request.RequestDigest) {
 		return contracts.CommandResult{}, errors.New("provider claim does not match phase input")
 	}
-	s.mu.Lock()
-	trusted, registered := s.trusted[request.Identity]
-	s.mu.Unlock()
-	if !registered {
-		return contracts.CommandResult{}, errors.New("provider executable is not registered")
+	trusted, releaseSnapshot, trustedErr := s.acquireTrusted(request.Identity)
+	if trustedErr != nil {
+		return contracts.CommandResult{}, trustedErr
 	}
+	defer releaseSnapshot()
 	if invocation.Argv[0] != trusted.path {
 		return contracts.CommandResult{}, errors.New("provider invocation executable does not match qualification")
 	}
@@ -388,7 +660,26 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	var stdout, stderr limitedBuffer
 	stdout.limit, stderr.limit = 64<<10, 64<<10
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	requestKey := key(request)
+	if s.beforeStart != nil {
+		s.beforeStart()
+	}
+	s.mu.Lock()
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		gateRead.Close()
+		return contracts.CommandResult{}, errors.New("provider supervisor is closed")
+	}
+	if _, exists := s.runs[requestKey]; exists {
+		s.mu.Unlock()
+		gateRead.Close()
+		return contracts.CommandResult{}, errors.New("provider claim is already running")
+	}
+	// Hold the lifecycle lock from the final closed check through cmd.Start and
+	// run registration. Close therefore cannot miss a process that was selected
+	// before launch but had not yet reached the runs map.
 	if err := cmd.Start(); err != nil {
+		s.mu.Unlock()
 		gateRead.Close()
 		return contracts.CommandResult{}, err
 	}
@@ -397,24 +688,23 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	if identityErr != nil {
 		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
+		s.mu.Unlock()
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	bootIdentity, bootErr := hostBootIdentity()
 	if bootErr != nil {
 		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
+		s.mu.Unlock()
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: startIdentity}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{})}
-	s.mu.Lock()
-	if _, exists := s.runs[key(request)]; exists {
-		s.mu.Unlock()
-		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
-		_ = cmd.Wait()
-		return contracts.CommandResult{}, errors.New("provider claim is already running")
-	}
-	s.runs[key(request)] = r
+	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: startIdentity}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{}), finished: make(chan struct{}), snapshot: trusted.snapshot}
+	s.runs[requestKey] = r
 	s.mu.Unlock()
+	defer func() {
+		s.removeRun(request, r)
+		close(r.finished)
+	}()
 	s.mu.Lock()
 	recorder := s.Recorder
 	s.mu.Unlock()
@@ -472,10 +762,14 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 }
 
 func (s *Supervisor) removeRun(request contracts.DrainRequest, target *run) {
+	s.removeRunKey(key(request), target)
+}
+
+func (s *Supervisor) removeRunKey(request requestKey, target *run) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if current := s.runs[key(request)]; current == target {
-		delete(s.runs, key(request))
+	if current := s.runs[request]; current == target {
+		delete(s.runs, request)
 	}
 }
 
