@@ -93,21 +93,6 @@ func (f commandRunnerFunc) Cleanup(context.Context) (CleanupProof, error) {
 	return CleanupProof{Drained: true}, nil
 }
 
-type EffectPlan struct {
-	SemanticKey string
-	Identity    contracts.PullRequestIdentity
-}
-type EffectClaim struct {
-	Plan    EffectPlan
-	Claimed bool
-}
-
-func externalClaimFromEffect(claim EffectClaim, kind, digest string) domain.ExternalEffectClaim {
-	// The legacy private helpers do not carry a durable ticket fence. They still
-	// route through the guard, which rejects this incomplete claim in production.
-	return domain.ExternalEffectClaim{SemanticKey: claim.Plan.SemanticKey, Kind: kind, RequestDigest: digest}
-}
-
 type CheckIdentity struct{ Name, ExternalID string }
 type MergeOutcome string
 
@@ -194,12 +179,24 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 		return contracts.PullRequestIdentity{}, err
 	}
 	markedBody := body + "\n\n" + ownershipMarker(identity)
-	_, runErr := c.mutate(ctx, durable, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
+	// Creation has no GitHub-side CAS.  The durable launch handoff therefore
+	// performs one final exact absence/source observation while the mutation
+	// gate is held; a pre-handoff list result is never sufficient.
+	_, runErr := c.mutateCreateExact(ctx, durable, identity, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
+	if errors.Is(runErr, ErrProcessCleanup) {
+		return contracts.PullRequestIdentity{}, runErr
+	}
 	// Both a delivered response and a lost response are reconciled by the same
 	// exact ownership observation; command output is never object evidence.
 	match, observeErr := c.Observe(ctx, identity)
-	if observeErr == nil {
+	if errors.Is(observeErr, ErrProcessCleanup) {
+		return contracts.PullRequestIdentity{}, observeErr
+	}
+	if observeErr == nil && adoptableDraft(match) {
 		return match.Identity, nil
+	}
+	if observeErr == nil {
+		return contracts.PullRequestIdentity{}, ErrPolicyRefusal
 	}
 	if runErr != nil {
 		return contracts.PullRequestIdentity{}, fmt.Errorf("%w: command result unavailable", ErrCreateUncertain)
@@ -210,13 +207,43 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 	return contracts.PullRequestIdentity{}, fmt.Errorf("%w: %v", ErrCreateUncertain, observeErr)
 }
 func (c Client) UpdatePullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) error {
+	if !validIdentity(identity) || !validTitle(title) || !validBody(body) {
+		return ErrPolicyRefusal
+	}
+	if err := c.validateClaim(ctx, durable, identity, "pr_edit", requestDigest("pr_edit", identity, title, body)); err != nil {
+		return err
+	}
 	observed, err := c.Observe(ctx, identity)
 	if err != nil {
 		return err
 	}
+	if observed.State != "OPEN" || observed.Merged {
+		return ErrPolicyRefusal
+	}
 	marked := body + "\n\n" + ownershipMarker(observed.Identity)
 	if sameExact(observed.Identity, identity) && observed.Title == title && observed.Body == marked {
-		return nil // idempotent read only; v1 PR metadata is immutable after creation.
+		return nil
+	}
+	identity = observed.Identity
+	if err := c.validateClaim(ctx, durable, identity, "pr_edit", requestDigest("pr_edit", identity, title, body)); err != nil {
+		return err
+	}
+	_, runErr := c.mutateExact(ctx, durable, identity, "pr", "edit", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--title", title, "--body", marked)
+	if errors.Is(runErr, ErrProcessCleanup) {
+		return runErr
+	}
+	post, observeErr := c.Observe(ctx, identity)
+	if errors.Is(observeErr, ErrProcessCleanup) {
+		return observeErr
+	}
+	if observeErr == nil && sameExact(post.Identity, identity) && post.State == "OPEN" && !post.Merged && post.Title == title && post.Body == marked {
+		return nil
+	}
+	if observeErr != nil {
+		return ErrPolicyRefusal
+	}
+	if runErr != nil {
+		return runErr
 	}
 	return ErrPolicyRefusal
 }
@@ -236,7 +263,13 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 		return err
 	}
 	_, err = c.mutateReadyExact(ctx, durable, identity, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository))
+	if errors.Is(err, ErrProcessCleanup) {
+		return err
+	}
 	observed, observeErr := c.Observe(ctx, identity)
+	if errors.Is(observeErr, ErrProcessCleanup) {
+		return observeErr
+	}
 	if observeErr == nil && sameExact(observed.Identity, identity) && observed.State == "OPEN" && !observed.Merged && observed.Ready && !observed.Draft {
 		return nil
 	}
@@ -245,7 +278,13 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 	// verify it, and leave the durable effect unconfirmed for reconciliation.
 	if observeErr == nil && observed.State == "OPEN" && !observed.Merged {
 		_, undoErr := c.mutateUndoReadyExact(ctx, durable, observed.Identity, "pr", "ready", fmt.Sprint(observed.Identity.Number), "--repo", repoArg(observed.Identity.Repository), "--undo")
+		if errors.Is(undoErr, ErrProcessCleanup) {
+			return undoErr
+		}
 		restored, restoreErr := c.Observe(ctx, observed.Identity)
+		if errors.Is(restoreErr, ErrProcessCleanup) {
+			return restoreErr
+		}
 		if undoErr != nil || restoreErr != nil || !sameExact(restored.Identity, observed.Identity) || !restored.Draft {
 			return ErrPolicyRefusal
 		}
@@ -253,12 +292,21 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 	}
 	if observeErr != nil {
 		current, sourceErr := c.viewSameSourceNumber(ctx, identity.Repository, identity.Number, identity)
+		if errors.Is(sourceErr, ErrProcessCleanup) {
+			return sourceErr
+		}
 		if sourceErr == nil {
 			// Re-prove the exact currently observed identity inside the launch
 			// handoff; the number-scoped undo is never authorized by a stale
 			// pre-handoff read alone.
 			_, undoErr := c.mutateSameSourceExact(ctx, durable, identity, current.Identity, "pr", "ready", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--undo")
+			if errors.Is(undoErr, ErrProcessCleanup) {
+				return undoErr
+			}
 			restored, restoreErr := c.viewSameSourceNumber(ctx, identity.Repository, identity.Number, identity)
+			if errors.Is(restoreErr, ErrProcessCleanup) {
+				return restoreErr
+			}
 			if undoErr == nil && restoreErr == nil && sameExact(restored.Identity, current.Identity) && restored.Draft {
 				return ErrPolicyRefusal
 			}
@@ -284,7 +332,9 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	if !authorization.Approved || !authorization.GatesGreen || authorization.ReviewedHead != headOID || authorization.CurrentHead != headOID {
 		return ErrApprovalInvalid
 	}
-	_, err = c.mergeWithClaim(ctx, durable, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, observed, headOID, domain.MergeGuarded, method)
+	_, err = c.mergeRun(ctx, observed, headOID, domain.MergeGuarded, method, func(args ...string) ([]byte, error) {
+		return c.mutateMergeExact(ctx, durable, identity, headOID, args...)
+	})
 	return err
 }
 
@@ -295,13 +345,48 @@ func (c Client) validateClaim(ctx context.Context, claim domain.ExternalEffectCl
 	return c.validateClaimFn(ctx, claim)
 }
 
-func (c Client) mutate(ctx context.Context, claim domain.ExternalEffectClaim, args ...string) ([]byte, error) {
+func (c Client) mutateCreateExact(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, args ...string) ([]byte, error) {
 	if c.mutationGuard == nil {
 		return nil, ErrPolicyRefusal
 	}
 	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+		if err := c.observeSourceExact(runCtx, identity); err != nil {
+			if errors.Is(err, ErrProcessCleanup) {
+				return nil, ErrProcessCleanup
+			}
+			return nil, ErrPolicyRefusal
+		}
+		if _, err := c.Observe(runCtx, identity); !errors.Is(err, ErrNoMatchingPR) {
+			if errors.Is(err, ErrProcessCleanup) {
+				return nil, ErrProcessCleanup
+			}
+			return nil, ErrPolicyRefusal
+		}
 		return c.run(runCtx, args...)
 	})
+}
+
+// observeSourceExact binds a create to the exact branch tip selected by the
+// durable effect.  PR absence alone cannot prove that the branch did not move
+// between the preflight observation and launch.
+func (c Client) observeSourceExact(ctx context.Context, identity contracts.PullRequestIdentity) error {
+	path := "repos/" + repoArg(identity.Repository) + "/git/ref/heads/" + identity.HeadRef
+	output, err := c.run(ctx, "api", path)
+	if err != nil {
+		if errors.Is(err, ErrProcessCleanup) {
+			return ErrProcessCleanup
+		}
+		return ErrPolicyRefusal
+	}
+	var ref struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	if json.Unmarshal(output, &ref) != nil || ref.Object.SHA != identity.HeadOID {
+		return ErrPolicyRefusal
+	}
+	return nil
 }
 
 // mutateExact re-observes the exact factory identity inside the durable launch
@@ -312,6 +397,9 @@ func (c Client) mutateExact(ctx context.Context, claim domain.ExternalEffectClai
 	}
 	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
 		observed, err := c.view(runCtx, identity)
+		if errors.Is(err, ErrProcessCleanup) {
+			return nil, ErrProcessCleanup
+		}
 		if err != nil || !sameExact(observed.Identity, identity) || observed.State != "OPEN" || observed.Merged {
 			return nil, ErrPolicyRefusal
 		}
@@ -333,6 +421,9 @@ func (c Client) mutateReadyExact(ctx context.Context, claim domain.ExternalEffec
 	}
 	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
 		observed, err := c.view(runCtx, identity)
+		if errors.Is(err, ErrProcessCleanup) {
+			return nil, ErrProcessCleanup
+		}
 		if err != nil || !readyLaunchSafe(observed, identity) {
 			return nil, ErrPolicyRefusal
 		}
@@ -346,6 +437,9 @@ func (c Client) mutateUndoReadyExact(ctx context.Context, claim domain.ExternalE
 	}
 	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
 		observed, err := c.view(runCtx, identity)
+		if errors.Is(err, ErrProcessCleanup) {
+			return nil, ErrProcessCleanup
+		}
 		if err != nil || !undoReadyLaunchSafe(observed, identity) {
 			return nil, ErrPolicyRefusal
 		}
@@ -364,6 +458,9 @@ func (c Client) mutateSameSourceExact(ctx context.Context, claim domain.External
 	}
 	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
 		observed, err := c.viewSameSourceNumber(runCtx, original.Repository, original.Number, original)
+		if errors.Is(err, ErrProcessCleanup) {
+			return nil, ErrProcessCleanup
+		}
 		if err != nil || !sameExact(observed.Identity, current) || observed.State != "OPEN" || observed.Merged || observed.Draft {
 			return nil, ErrPolicyRefusal
 		}
@@ -422,19 +519,6 @@ func activeLogin(hosts map[string][]authHost) (string, error) {
 	return active, nil
 }
 
-func (c Client) Plan(identity contracts.PullRequestIdentity, semanticKey string) (EffectPlan, error) {
-	if semanticKey == "" || !validIdentity(identity) {
-		return EffectPlan{}, fmt.Errorf("semantic key and complete factory PR identity are required")
-	}
-	return EffectPlan{SemanticKey: semanticKey, Identity: identity}, nil
-}
-func (c Client) Claim(plan EffectPlan) (EffectClaim, error) {
-	if plan.SemanticKey == "" || !validIdentity(plan.Identity) {
-		return EffectClaim{}, ErrPolicyRefusal
-	}
-	return EffectClaim{Plan: plan, Claimed: true}, nil
-}
-
 // Observe returns exactly one marker-bearing factory PR, or a typed zero/many
 // result. Head owner/repository/ref/OID/base are all compared; a branch name
 // alone can never be adopted.
@@ -470,63 +554,6 @@ func (c Client) Observe(ctx context.Context, want contracts.PullRequestIdentity)
 	default:
 		return PRMatch{}, ErrAmbiguousPR
 	}
-}
-
-func (c Client) createOrAdopt(ctx context.Context, claim EffectClaim, title, body string) (PRMatch, error) {
-	if !claim.Claimed || !validTitle(title) || !validBody(body) {
-		return PRMatch{}, ErrPolicyRefusal
-	}
-	if match, err := c.Observe(ctx, claim.Plan.Identity); err == nil {
-		if !adoptableDraft(match) {
-			return PRMatch{}, ErrPolicyRefusal
-		}
-		return match, nil
-	} else if !errors.Is(err, ErrNoMatchingPR) {
-		return PRMatch{}, err
-	}
-	markedBody := body + "\n\n" + ownershipMarker(claim.Plan.Identity)
-	_, err := c.mutate(ctx, externalClaimFromEffect(claim, "draft_pr", requestDigest("draft_pr", claim.Plan.Identity, title, body)), "pr", "create", "--repo", repoArg(claim.Plan.Identity.Repository), "--head", claim.Plan.Identity.HeadOwner+":"+claim.Plan.Identity.HeadRef, "--base", claim.Plan.Identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
-	if err != nil {
-		// A dropped response is indistinguishable from a network error. Read
-		// first and adopt only the one exact, factory-marked remote object.
-		return c.Observe(ctx, claim.Plan.Identity)
-	}
-	return c.Observe(ctx, claim.Plan.Identity)
-}
-
-func (c Client) updateOrObserve(ctx context.Context, claim EffectClaim, current PRMatch, title, body string) error {
-	if !claim.Claimed || !sameExact(current.Identity, claim.Plan.Identity) || !validTitle(title) || !validBody(body) {
-		return ErrPolicyRefusal
-	}
-	_, err := c.mutate(ctx, externalClaimFromEffect(claim, "pr_edit", requestDigest("pr_edit", current.Identity, title, body)), "pr", "edit", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--title", title, "--body", body+"\n\n"+ownershipMarker(current.Identity))
-	if err == nil {
-		return nil
-	}
-	markedBody := body + "\n\n" + ownershipMarker(current.Identity)
-	observed, observeErr := c.Observe(ctx, current.Identity)
-	if observeErr == nil && observed.Identity.Number == current.Identity.Number && observed.Title == title && observed.Body == markedBody {
-		return nil
-	}
-	return err
-}
-
-func (c Client) updateWithClaim(ctx context.Context, durable domain.ExternalEffectClaim, claim EffectClaim, current PRMatch, title, body string) error {
-	if !claim.Claimed || !sameExact(current.Identity, claim.Plan.Identity) || !validTitle(title) || !validBody(body) {
-		return ErrPolicyRefusal
-	}
-	_, err := c.mutateExact(ctx, durable, current.Identity, "pr", "edit", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--title", title, "--body", body+"\n\n"+ownershipMarker(current.Identity))
-	markedBody := body + "\n\n" + ownershipMarker(current.Identity)
-	observed, observeErr := c.Observe(ctx, current.Identity)
-	if observeErr == nil && sameExact(observed.Identity, current.Identity) && observed.Title == title && observed.Body == markedBody {
-		return nil
-	}
-	if observeErr != nil {
-		return ErrPolicyRefusal
-	}
-	if err == nil {
-		return ErrPolicyRefusal
-	}
-	return err
 }
 
 func (c Client) WaitChecks(ctx context.Context, identity contracts.PullRequestIdentity, required []CheckIdentity, initial, maximum time.Duration) ([]contracts.RequiredCheck, error) {
@@ -580,9 +607,23 @@ func (c Client) checks(ctx context.Context, identity contracts.PullRequestIdenti
 	if !validIdentity(identity) {
 		return nil, ErrPolicyRefusal
 	}
+	before, err := c.Observe(ctx, identity)
+	if err != nil {
+		return nil, ErrChecksFailed
+	}
+	if !sameExact(before.Identity, identity) || before.State != "OPEN" || before.Merged {
+		return nil, ErrChecksFailed
+	}
+	// Use the observed server-side number for the checks request.  A caller
+	// may intentionally omit Number while binding the exact source identity.
+	identity = before.Identity
 	var wire []checkWire
 	if err := c.json(ctx, &wire, "pr", "checks", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--json", "name,state,workflow,link,bucket"); err != nil {
 		return nil, err
+	}
+	after, err := c.Observe(ctx, identity)
+	if err != nil || !sameExact(after.Identity, identity) || after.State != "OPEN" || after.Merged {
+		return nil, ErrChecksFailed
 	}
 	checks := make([]contracts.RequiredCheck, 0, len(wire))
 	for _, check := range wire {
@@ -633,18 +674,6 @@ func evaluateChecks(actual []contracts.RequiredCheck, required []CheckIdentity) 
 	return nil
 }
 
-func (c Client) merge(ctx context.Context, claim EffectClaim, pr PRMatch, reviewedHead string, mode domain.MergeMode, method string) (MergeOutcome, error) {
-	return c.mergeRun(ctx, claim, pr, reviewedHead, mode, method, func(args ...string) ([]byte, error) {
-		return c.mutateMergeExact(ctx, externalClaimFromEffect(claim, "merge", requestDigest("merge", pr.Identity, reviewedHead, method)), pr.Identity, reviewedHead, args...)
-	})
-}
-
-func (c Client) mergeWithClaim(ctx context.Context, durable domain.ExternalEffectClaim, claim EffectClaim, pr PRMatch, reviewedHead string, mode domain.MergeMode, method string) (MergeOutcome, error) {
-	return c.mergeRun(ctx, claim, pr, reviewedHead, mode, method, func(args ...string) ([]byte, error) {
-		return c.mutateMergeExact(ctx, durable, pr.Identity, reviewedHead, args...)
-	})
-}
-
 func mergeLaunchSafe(observed PRMatch, identity contracts.PullRequestIdentity, reviewedHead string) bool {
 	return sameExact(observed.Identity, identity) && observed.State == "OPEN" && !observed.Draft && !observed.Merged && !observed.AutoMerge && !queueState(observed.MergeState) && observed.Identity.BaseRef == identity.BaseRef && observed.Identity.HeadOID == reviewedHead
 }
@@ -655,10 +684,16 @@ func (c Client) mutateMergeExact(ctx context.Context, claim domain.ExternalEffec
 	}
 	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
 		observed, err := c.view(runCtx, identity)
+		if errors.Is(err, ErrProcessCleanup) {
+			return nil, ErrProcessCleanup
+		}
 		if err != nil || !mergeLaunchSafe(observed, identity, reviewedHead) {
 			return nil, ErrPolicyRefusal
 		}
 		queued, err := c.mergeQueued(runCtx, observed.Identity)
+		if errors.Is(err, ErrProcessCleanup) {
+			return nil, ErrProcessCleanup
+		}
 		if err != nil || queued {
 			return nil, ErrPolicyRefusal
 		}
@@ -666,10 +701,16 @@ func (c Client) mutateMergeExact(ctx context.Context, claim domain.ExternalEffec
 		// merge command has no base/state/queue CAS, so stale observations must
 		// never be the final authorization.
 		latest, err := c.view(runCtx, identity)
+		if errors.Is(err, ErrProcessCleanup) {
+			return nil, ErrProcessCleanup
+		}
 		if err != nil || !mergeLaunchSafe(latest, identity, reviewedHead) {
 			return nil, ErrPolicyRefusal
 		}
 		queued, err = c.mergeQueued(runCtx, latest.Identity)
+		if errors.Is(err, ErrProcessCleanup) {
+			return nil, ErrProcessCleanup
+		}
 		if err != nil || queued {
 			return nil, ErrPolicyRefusal
 		}
@@ -677,21 +718,24 @@ func (c Client) mutateMergeExact(ctx context.Context, claim domain.ExternalEffec
 	})
 }
 
-func (c Client) mergeRun(ctx context.Context, claim EffectClaim, pr PRMatch, reviewedHead string, mode domain.MergeMode, method string, mutate func(...string) ([]byte, error)) (MergeOutcome, error) {
+func (c Client) mergeRun(ctx context.Context, pr PRMatch, reviewedHead string, mode domain.MergeMode, method string, mutate func(...string) ([]byte, error)) (MergeOutcome, error) {
 	if mode == domain.MergeManual {
 		return "", fmt.Errorf("%w: manual mode never mutates readiness or merge", ErrPolicyRefusal)
 	}
 	if mode == domain.MergeAutonomous {
 		return "", fmt.Errorf("%w: autonomous merge is unavailable without a passing native profile", ErrPolicyRefusal)
 	}
-	if mode != domain.MergeGuarded || !claim.Claimed || pr.Draft || pr.Merged || pr.AutoMerge || queueState(pr.MergeState) || pr.State != "" && pr.State != "OPEN" || reviewedHead == "" || reviewedHead != pr.Identity.HeadOID || method != "merge" && method != "squash" && method != "rebase" {
+	if mode != domain.MergeGuarded || pr.Draft || pr.Merged || pr.AutoMerge || queueState(pr.MergeState) || pr.State != "" && pr.State != "OPEN" || reviewedHead == "" || reviewedHead != pr.Identity.HeadOID || method != "merge" && method != "squash" && method != "rebase" {
 		return "", ErrPolicyRefusal
 	}
 	args := []string{"pr", "merge", fmt.Sprint(pr.Identity.Number), "--repo", repoArg(pr.Identity.Repository), "--match-head-commit", reviewedHead, "--" + method}
 	// A CLI exit status is never merge evidence.  In particular a dropped
 	// response, a successful queue enrollment, and a successful auto-merge
 	// request must all be distinguished by a fresh exact PR observation.
-	_, _ = mutate(args...)
+	_, mutateErr := mutate(args...)
+	if errors.Is(mutateErr, ErrProcessCleanup) {
+		return "", mutateErr
+	}
 	observed, err := c.viewNumber(ctx, pr.Identity.Repository, pr.Identity.Number)
 	if err != nil {
 		return "", err

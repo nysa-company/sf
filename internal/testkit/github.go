@@ -609,6 +609,9 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 	if len(argv) >= 2 && argv[0] == "api" && argv[1] == "--hostname" {
 		return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}`), nil
 	}
+	if len(argv) >= 2 && argv[0] == "api" && strings.HasPrefix(argv[1], "repos/") {
+		return f.runSourceRef(argv)
+	}
 	if len(argv) >= 2 && argv[0] == "pr" {
 		switch argv[1] {
 		case "create":
@@ -628,6 +631,25 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 		}
 	}
 	return nil, errors.New("fake-gh: unsupported invocation")
+}
+
+func (f *FakeGH) runSourceRef(argv []string) ([]byte, error) {
+	const marker = "/git/ref/heads/"
+	path := argv[1]
+	index := strings.Index(path, marker)
+	if index < 0 {
+		return nil, errors.New("fake-gh: unsupported source ref")
+	}
+	ref := path[index+len(marker):]
+	sha := strings.Repeat("a", 40)
+	snapshot := f.Snapshot()
+	for _, pr := range snapshot.PRs {
+		if pr.Identity.HeadRef == ref {
+			sha = pr.Identity.HeadOID
+			break
+		}
+	}
+	return json.Marshal(map[string]any{"object": map[string]string{"sha": sha}})
 }
 
 // validateOfficialArgv deliberately accepts only the public gh CLI grammar
@@ -717,6 +739,9 @@ func validateOfficialArgv(argv []string) error {
 			return fmt.Errorf("fake-gh: incomplete %s", key)
 		}
 	default:
+		if argv[0] == "api" && strings.HasPrefix(argv[1], "repos/") && strings.Contains(argv[1], "/git/ref/heads/") {
+			break
+		}
 		return errors.New("fake-gh: unsupported invocation")
 	}
 	for index := 2; index < len(argv); index++ {

@@ -48,18 +48,43 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build fake-gh: %v\n%s", err, output)
 	}
-	client := &Client{binaryPath: binary, home: filepath.Join(root, "home"), configDir: filepath.Join(root, "gh-config"), env: []string{"SF_FAKE_GH_STATE=" + state}, runner: commandRunnerFunc(runBounded), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
-		return start(ctx)
-	}), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+	client := &Client{binaryPath: binary, home: filepath.Join(root, "home"), configDir: filepath.Join(root, "gh-config"), env: []string{"SF_FAKE_GH_STATE=" + state}, runner: commandRunnerFunc(runBounded), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, mutationGuard: fixtureGuard(), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
 	})}
 	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
 	return client, fake, identity
 }
 
+func testClaim(kind string, identity contracts.PullRequestIdentity, values ...string) domain.ExternalEffectClaim {
+	return domain.ExternalEffectClaim{
+		SemanticKey:   "test-" + kind,
+		Ref:           domain.TicketRef{Channel: "dev", Project: "example", Ticket: "SF-44"},
+		Kind:          kind,
+		RequestDigest: requestDigest(kind, identity, values...),
+		TicketVersion: 1,
+		LeaderEpoch:   1,
+		RunnerEpoch:   1,
+		ClaimEpoch:    1,
+	}
+}
+
+func createDraft(t *testing.T, client *Client, identity contracts.PullRequestIdentity, title, body string) PRMatch {
+	t.Helper()
+	claim := testClaim("draft_pr", identity, title, body)
+	created, err := client.CreateDraftPullRequest(context.Background(), claim, identity, title, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	match, err := client.Observe(context.Background(), created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return match
+}
+
 func TestContractMutationRequiresClaimValidator(t *testing.T) {
 	client, _, identity := fixture(t)
-	claim := domain.ExternalEffectClaim{SemanticKey: "k", Kind: "draft_pr", RequestDigest: requestDigest("draft_pr", identity, "title", "body")}
+	claim := testClaim("draft_pr", identity, "title", "body")
 	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); err != nil {
 		t.Fatalf("validated claim=%v", err)
 	}
@@ -94,7 +119,7 @@ func TestAuthStatusAcceptsOfficialHostsStateShape(t *testing.T) {
 		return []byte(`{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"sf-test","tokenSource":"keyring","scopes":"repo","gitProtocol":"https"}]}}`), nil
 	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		return start(ctx)
-	})}
+	}), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }}
 	if err := client.AuthStatus(context.Background()); err != nil {
 		t.Fatalf("official auth status shape=%v", err)
 	}
@@ -123,25 +148,19 @@ func TestPreflightCreateLostResponseAndExactAdoption(t *testing.T) {
 	if err != nil || principal.Login != "sf-test" {
 		t.Fatalf("preflight=%+v err=%v", principal, err)
 	}
-	plan, err := client.Plan(identity, "dev/example/SF-44/publish/1/draft-pr")
-	if err != nil {
-		t.Fatal(err)
-	}
-	claim, err := client.Claim(plan)
-	if err != nil {
-		t.Fatal(err)
-	}
+	claim := testClaim("draft_pr", identity, "title", "<!-- sf:owned -->")
 	if err := fake.SetResponse("pr_create", testkit.ResponseDropAfterCall); err != nil {
 		t.Fatal(err)
 	}
-	pr, err := client.createOrAdopt(context.Background(), claim, "title", "<!-- sf:owned -->")
-	if err != nil || pr.Identity.Number != 1 || !pr.Draft {
+	created, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "<!-- sf:owned -->")
+	pr, observeErr := client.Observe(context.Background(), created)
+	if err != nil || observeErr != nil || pr.Identity.Number != 1 || !pr.Draft {
 		t.Fatalf("create/adopt=%+v err=%v", pr, err)
 	}
 	if fake.MutationCount("pr_create") != 1 {
 		t.Fatalf("create mutations=%d", fake.MutationCount("pr_create"))
 	}
-	if _, err := client.createOrAdopt(context.Background(), claim, "title", "<!-- sf:owned -->"); err != nil {
+	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "<!-- sf:owned -->"); err != nil {
 		t.Fatalf("idempotent adopt=%v", err)
 	}
 	if err := fake.InjectPullRequestForTest(testkit.PullRequest{Identity: pr.Identity, Draft: true}); err != nil {
@@ -168,7 +187,7 @@ func TestCreateUncertainNeverAttemptsNumberOnlyOrphanClose(t *testing.T) {
 			return nil, errors.New("unexpected command")
 		}
 	})
-	claim := domain.ExternalEffectClaim{SemanticKey: "uncertain-create", Kind: "draft_pr", RequestDigest: requestDigest("draft_pr", identity, "title", "body")}
+	claim := testClaim("draft_pr", identity, "title", "body")
 	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrCreateUncertain) {
 		t.Fatalf("uncertain create err=%v", err)
 	}
@@ -177,14 +196,112 @@ func TestCreateUncertainNeverAttemptsNumberOnlyOrphanClose(t *testing.T) {
 	}
 }
 
-func TestChecksMergeAndApprovalPolicies(t *testing.T) {
+func TestCreateFinalHandoffRefusesIfPRAppearsBeforeLaunch(t *testing.T) {
+	client, _, identity := fixture(t)
+	created := false
+	client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+			return []byte("[]"), nil
+		}
+		if len(args) >= 2 && args[0] == "api" {
+			return []byte(`{"object":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`), nil
+		}
+		if len(args) >= 2 && args[0] == "pr" && args[1] == "create" {
+			created = true
+		}
+		return []byte("{}"), nil
+	})
+	claim := testClaim("draft_pr", identity, "title", "body")
+	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrCreateUncertain) {
+		t.Fatalf("handoff race err=%v", err)
+	}
+	if created {
+		t.Fatal("create launched after exact in-handoff identity appeared")
+	}
+}
+
+func TestCleanupUncertaintyNeverBecomesMutationSuccess(t *testing.T) {
 	client, fake, identity := fixture(t)
-	plan, _ := client.Plan(identity, "key")
-	claim, _ := client.Claim(plan)
-	pr, err := client.createOrAdopt(context.Background(), claim, "title", "body")
-	if err != nil {
+	uncertainGuard := mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+		_, _ = start(ctx)
+		return nil, ErrProcessCleanup
+	})
+
+	client.mutationGuard = uncertainGuard
+	createClaim := testClaim("draft_pr", identity, "title", "body")
+	if _, err := client.CreateDraftPullRequest(context.Background(), createClaim, identity, "title", "body"); !errors.Is(err, ErrProcessCleanup) {
+		t.Fatalf("create cleanup uncertainty=%v", err)
+	}
+
+	client.mutationGuard = fixtureGuard()
+	created := createDraft(t, client, identity, "before", "before body")
+	client.mutationGuard = uncertainGuard
+	editClaim := testClaim("pr_edit", created.Identity, "after", "after body")
+	if err := client.UpdatePullRequest(context.Background(), editClaim, created.Identity, "after", "after body"); !errors.Is(err, ErrProcessCleanup) {
+		t.Fatalf("update cleanup uncertainty=%v", err)
+	}
+
+	client.mutationGuard = fixtureGuard()
+	if err := fake.MarkReady(context.Background(), domain.ExternalEffectClaim{}, created.Identity); err != nil {
 		t.Fatal(err)
 	}
+	readyClaim := testClaim("pr_ready", created.Identity)
+	client.mutationGuard = uncertainGuard
+	if err := client.MarkReady(context.Background(), readyClaim, created.Identity); !errors.Is(err, ErrProcessCleanup) {
+		t.Fatalf("ready cleanup uncertainty=%v", err)
+	}
+
+	client.mutationGuard = fixtureGuard()
+	mergeClaim := testClaim("merge", created.Identity, created.Identity.HeadOID, "merge")
+	authorization := domain.MergeAuthorization{ReviewedHead: created.Identity.HeadOID, CurrentHead: created.Identity.HeadOID, Approved: true, GatesGreen: true}
+	client.mutationGuard = uncertainGuard
+	if err := client.MergeExactHead(context.Background(), mergeClaim, created.Identity, created.Identity.HeadOID, "merge", authorization); !errors.Is(err, ErrProcessCleanup) {
+		t.Fatalf("merge cleanup uncertainty=%v", err)
+	}
+}
+
+func fixtureGuard() contracts.ExternalMutationGuard {
+	return mutationGuardFunc(func(ctx context.Context, claim domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+		if claim.Ref.Validate() != nil || claim.SemanticKey == "" || claim.Kind == "" || claim.RequestDigest == "" || claim.TicketVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ClaimEpoch == 0 {
+			return nil, ErrPolicyRefusal
+		}
+		return start(ctx)
+	})
+}
+
+func TestChecksRejectsHeadDriftBetweenCheckObservations(t *testing.T) {
+	_, _, identity := fixture(t)
+	identity.Number = 7
+	changed := identity
+	changed.HeadOID = strings.Repeat("b", 40)
+	open := mergeWire(identity, "OPEN", "CLEAN", nil, nil)
+	mutated := mergeWire(changed, "OPEN", "CLEAN", nil, nil)
+	pre, _ := json.Marshal([]map[string]any{open})
+	post, _ := json.Marshal([]map[string]any{mutated})
+	checks := `[{"name":"unit","state":"SUCCESS","workflow":"ci","link":"https://example.test/1","bucket":"test"}]`
+	listCalls := 0
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if args[0] == "pr" && args[1] == "list" {
+			listCalls++
+			if listCalls == 1 {
+				return pre, nil
+			}
+			return post, nil
+		}
+		if args[0] == "pr" && args[1] == "checks" {
+			return []byte(checks), nil
+		}
+		return nil, errors.New("unexpected command")
+	})}
+	if _, err := client.RequiredChecks(context.Background(), identity); !errors.Is(err, ErrChecksFailed) {
+		t.Fatalf("head drift checks=%v", err)
+	}
+}
+
+func TestChecksMergeAndApprovalPolicies(t *testing.T) {
+	client, fake, identity := fixture(t)
+	pr := createDraft(t, client, identity, "title", "body")
+	claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "squash")
 	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "1", State: "SUCCESS"}); err != nil {
 		t.Fatal(err)
 	}
@@ -198,10 +315,10 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "1"}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksFailed) {
 		t.Fatalf("strict checks=%v", err)
 	}
-	if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeManual, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+	if _, err := client.mergeRun(context.Background(), pr, pr.Identity.HeadOID, domain.MergeManual, "merge", nil); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("manual merge=%v", err)
 	}
-	if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeAutonomous, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+	if _, err := client.mergeRun(context.Background(), pr, pr.Identity.HeadOID, domain.MergeAutonomous, "merge", nil); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("autonomous merge=%v", err)
 	}
 	if err := fake.MarkReady(context.Background(), domain.ExternalEffectClaim{}, pr.Identity); err != nil {
@@ -211,9 +328,10 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
 		t.Fatal(err)
 	}
-	outcome, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeGuarded, "squash")
-	if err != nil || outcome != MergeApplied {
-		t.Fatalf("guarded merge=%q err=%v", outcome, err)
+	authorization := domain.MergeAuthorization{ReviewedHead: pr.Identity.HeadOID, CurrentHead: pr.Identity.HeadOID, Approved: true, GatesGreen: true}
+	err = client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "squash", authorization)
+	if err != nil {
+		t.Fatalf("guarded merge err=%v", err)
 	}
 	if err := (ApprovalBinding{ReviewedHead: pr.Identity.HeadOID, CurrentHead: pr.Identity.HeadOID}).Validate(); err != nil {
 		t.Fatal(err)
@@ -225,13 +343,9 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 
 func TestDraftAndNonOpenPRsCannotMergeOrBeAdopted(t *testing.T) {
 	client, _, identity := fixture(t)
-	plan, _ := client.Plan(identity, "draft-policy")
-	claim, _ := client.Claim(plan)
-	pr, err := client.createOrAdopt(context.Background(), claim, "title", "body")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+	pr := createDraft(t, client, identity, "title", "body")
+	claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "merge")
+	if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "merge", domain.MergeAuthorization{ReviewedHead: pr.Identity.HeadOID, CurrentHead: pr.Identity.HeadOID, Approved: true, GatesGreen: true}); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("draft merge=%v", err)
 	}
 	closedClient, closedFake, closedIdentity := fixture(t)
@@ -240,9 +354,8 @@ func TestDraftAndNonOpenPRsCannotMergeOrBeAdopted(t *testing.T) {
 	if err := closedFake.InjectPullRequestForTest(testkit.PullRequest{Identity: closed, Draft: true, Merged: true}); err != nil {
 		t.Fatal(err)
 	}
-	closedPlan, _ := closedClient.Plan(closedIdentity, "closed-policy")
-	closedClaim, _ := closedClient.Claim(closedPlan)
-	if _, err := closedClient.createOrAdopt(context.Background(), closedClaim, "title", "body"); !errors.Is(err, ErrPolicyRefusal) {
+	closedClaim := testClaim("draft_pr", closedIdentity, "title", "body")
+	if _, err := closedClient.CreateDraftPullRequest(context.Background(), closedClaim, closedIdentity, "title", "body"); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("merged draft adoption=%v", err)
 	}
 }
@@ -253,7 +366,7 @@ func TestMarkReadyRejectsMergedPRBeforeMutation(t *testing.T) {
 	if err := fake.InjectPullRequestForTest(testkit.PullRequest{Identity: identity, Merged: true}); err != nil {
 		t.Fatal(err)
 	}
-	durable := domain.ExternalEffectClaim{SemanticKey: "ready-merged", Kind: "pr_ready", RequestDigest: requestDigest("pr_ready", identity)}
+	durable := testClaim("pr_ready", identity)
 	if err := client.MarkReady(context.Background(), durable, identity); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("merged ready=%v", err)
 	}
@@ -324,7 +437,7 @@ func TestMarkReadySynchronizeGapCompensatesChangedSource(t *testing.T) {
 			return nil, errors.New("unexpected command")
 		}
 	})
-	claim := domain.ExternalEffectClaim{SemanticKey: "ready-gap", Kind: "pr_ready", RequestDigest: requestDigest("pr_ready", identity)}
+	claim := testClaim("pr_ready", identity)
 	if err := client.MarkReady(context.Background(), claim, identity); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("changed-head ready=%v", err)
 	}
@@ -386,7 +499,7 @@ func TestMarkReadyFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
 				}
 				return []byte("{}"), nil
 			})
-			claim := domain.ExternalEffectClaim{SemanticKey: "ready-final-" + test.name, Kind: "pr_ready", RequestDigest: requestDigest("pr_ready", identity)}
+			claim := testClaim("pr_ready", identity)
 			if err := client.MarkReady(context.Background(), claim, identity); !errors.Is(err, ErrPolicyRefusal) {
 				t.Fatalf("changed %s accepted: %v", test.name, err)
 			}
@@ -400,35 +513,27 @@ func TestMarkReadyFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
 func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 	t.Run("unavailable verifier is never success", func(t *testing.T) {
 		client, fake, identity := fixture(t)
-		plan, _ := client.Plan(identity, "key")
-		claim, _ := client.Claim(plan)
-		pr, err := client.createOrAdopt(context.Background(), claim, "title", "body")
-		if err != nil {
-			t.Fatal(err)
-		}
+		pr := createDraft(t, client, identity, "title", "body")
+		claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "merge")
 		client.verifyProtectedBranch = nil
 		if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+		if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "merge", domain.MergeAuthorization{ReviewedHead: pr.Identity.HeadOID, CurrentHead: pr.Identity.HeadOID, Approved: true, GatesGreen: true}); !errors.Is(err, ErrPolicyRefusal) {
 			t.Fatalf("missing proof verifier=%v", err)
 		}
 	})
 	t.Run("mismatched proof is never success", func(t *testing.T) {
 		client, fake, identity := fixture(t)
-		plan, _ := client.Plan(identity, "key")
-		claim, _ := client.Claim(plan)
-		pr, err := client.createOrAdopt(context.Background(), claim, "title", "body")
-		if err != nil {
-			t.Fatal(err)
-		}
+		pr := createDraft(t, client, identity, "title", "body")
+		claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "merge")
 		client.verifyProtectedBranch = verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 			return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
 		})
 		if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+		if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "merge", domain.MergeAuthorization{ReviewedHead: pr.Identity.HeadOID, CurrentHead: pr.Identity.HeadOID, Approved: true, GatesGreen: true}); !errors.Is(err, ErrPolicyRefusal) {
 			t.Fatalf("mismatched proof=%v", err)
 		}
 	})
@@ -492,7 +597,7 @@ func TestMergeFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
 				return []byte("{}"), nil
 			})
 			authorization := domain.MergeAuthorization{ReviewedHead: identity.HeadOID, CurrentHead: identity.HeadOID, Approved: true, GatesGreen: true}
-			claim := domain.ExternalEffectClaim{SemanticKey: "merge-final-" + test.name, Kind: "merge", RequestDigest: requestDigest("merge", identity, identity.HeadOID, "squash")}
+			claim := testClaim("merge", identity, identity.HeadOID, "squash")
 			if err := client.MergeExactHead(context.Background(), claim, identity, identity.HeadOID, "squash", authorization); !errors.Is(err, ErrPolicyRefusal) {
 				t.Fatalf("changed %s accepted: %v", test.name, err)
 			}
@@ -506,8 +611,6 @@ func TestMergeFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
 func TestMergeNeverTrustsCLIExitWithoutFreshMergedObservation(t *testing.T) {
 	client, _, identity := fixture(t)
 	identity.Number = 1
-	plan, _ := client.Plan(identity, "key")
-	claim, _ := client.Claim(plan)
 	pr := PRMatch{Identity: identity, State: "OPEN"}
 	for _, test := range []struct {
 		name string
@@ -531,7 +634,9 @@ func TestMergeNeverTrustsCLIExitWithoutFreshMergedObservation(t *testing.T) {
 				}
 				return nil, errors.New("unexpected gh argv")
 			})
-			if _, err := client.merge(context.Background(), claim, pr, identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+			if _, err := client.mergeRun(context.Background(), pr, identity.HeadOID, domain.MergeGuarded, "merge", func(args ...string) ([]byte, error) {
+				return client.mutateMergeExact(context.Background(), testClaim("merge", identity, identity.HeadOID, "merge"), identity, identity.HeadOID, args...)
+			}); !errors.Is(err, ErrPolicyRefusal) {
 				t.Fatalf("merge must reject %s: %v", test.name, err)
 			}
 		})
@@ -542,7 +647,9 @@ func TestOfficialGHArgvGolden(t *testing.T) {
 	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
 	created := identity
 	created.Number = 7
-	createdWire, err := json.Marshal(mergeWire(created, "OPEN", "CLEAN", nil, nil))
+	createdMap := mergeWire(created, "OPEN", "CLEAN", nil, nil)
+	createdMap["isDraft"] = true
+	createdWire, err := json.Marshal(createdMap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,23 +660,27 @@ func TestOfficialGHArgvGolden(t *testing.T) {
 		switch args[0] + " " + args[1] {
 		case "pr list":
 			listCalls++
-			if listCalls == 1 {
+			if listCalls <= 2 {
 				return []byte("[]"), nil
 			}
 			return []byte("[" + string(createdWire) + "]"), nil
 		case "pr create":
 			return []byte("https://github.com/example/app/pull/7\n"), nil
+		case "api repos/example/app/git/ref/heads/sf/dev/example/SF-44-random":
+			return []byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`), nil
 		default:
 			return nil, errors.New("unexpected command")
 		}
 	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		return start(ctx)
-	})}
-	claim := EffectClaim{Plan: EffectPlan{SemanticKey: "key", Identity: identity}, Claimed: true}
-	if _, err := client.createOrAdopt(context.Background(), claim, "title", "body"); err != nil {
+	}), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }}
+	claim := testClaim("draft_pr", identity, "title", "body")
+	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); err != nil {
 		t.Fatal(err)
 	}
 	want := [][]string{
+		{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields},
+		{"api", "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random"},
 		{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields},
 		{"pr", "create", "--repo", "example/app", "--head", "example:sf/dev/example/SF-44-random", "--base", "main", "--draft", "--title", "title", "--body", "body\n\n" + ownershipMarker(identity)},
 		{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields},
@@ -598,6 +709,10 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		if args[0] == "api" {
 			return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}`), nil
 		}
+		if args[0] == "pr" && args[1] == "list" {
+			open := mergeWire(identity, "OPEN", "CLEAN", nil, nil)
+			return json.Marshal([]map[string]any{open})
+		}
 		if args[0] == "pr" && args[1] == "view" {
 			viewCalls++
 			if viewCalls < 3 {
@@ -609,15 +724,16 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		return nil, errors.New("unexpected command")
 	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		return start(ctx)
-	}), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+	}), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 		verified = repository == identity.Repository && baseRef == "main" && mergeCommit == strings.Repeat("b", 40)
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
 	})}
-	claim := EffectClaim{Plan: EffectPlan{SemanticKey: "key", Identity: identity}, Claimed: true}
-	if outcome, err := client.merge(context.Background(), claim, PRMatch{Identity: identity, State: "OPEN"}, identity.HeadOID, domain.MergeGuarded, "squash"); err != nil || outcome != MergeApplied || !verified {
-		t.Fatalf("proven merge outcome=%q verified=%v err=%v", outcome, verified, err)
+	claim := testClaim("merge", identity, identity.HeadOID, "squash")
+	authorization := domain.MergeAuthorization{ReviewedHead: identity.HeadOID, CurrentHead: identity.HeadOID, Approved: true, GatesGreen: true}
+	if err := client.MergeExactHead(context.Background(), claim, identity, identity.HeadOID, "squash", authorization); err != nil || !verified {
+		t.Fatalf("proven merge verified=%v err=%v", verified, err)
 	}
-	want := [][]string{{"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}}
+	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("official merge argv\n got: %#v\nwant: %#v", got, want)
 	}
@@ -635,22 +751,18 @@ func mergeWire(identity contracts.PullRequestIdentity, state, mergeState string,
 
 func TestUpdateAndReadyReconcileOnlyExactObservedState(t *testing.T) {
 	client, fake, identity := fixture(t)
-	plan, _ := client.Plan(identity, "update")
-	claim, _ := client.Claim(plan)
-	pr, err := client.createOrAdopt(context.Background(), claim, "before", "before body")
-	if err != nil {
-		t.Fatal(err)
-	}
+	pr := createDraft(t, client, identity, "before", "before body")
 	if err := fake.SetResponse("pr_edit", testkit.ResponseDropAfterCall); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.updateOrObserve(context.Background(), claim, pr, "after", "after body"); err != nil {
+	updateClaim := testClaim("pr_edit", pr.Identity, "after", "after body")
+	if err := client.UpdatePullRequest(context.Background(), updateClaim, pr.Identity, "after", "after body"); err != nil {
 		t.Fatalf("update reconciliation=%v", err)
 	}
 	if err := fake.SetResponse("pr_ready", testkit.ResponseDropAfterCall); err != nil {
 		t.Fatal(err)
 	}
-	durable := domain.ExternalEffectClaim{SemanticKey: "ready", Kind: "pr_ready", RequestDigest: requestDigest("pr_ready", pr.Identity)}
+	durable := testClaim("pr_ready", pr.Identity)
 	if err := client.MarkReady(context.Background(), durable, pr.Identity); err != nil {
 		t.Fatalf("ready reconciliation=%v", err)
 	}
@@ -669,12 +781,7 @@ func TestChecksAllowExtrasButFailureDominatesPending(t *testing.T) {
 
 func TestWaitChecksBoundsBackgroundContext(t *testing.T) {
 	client, fake, identity := fixture(t)
-	plan, _ := client.Plan(identity, "checks-deadline")
-	claim, _ := client.Claim(plan)
-	pr, err := client.createOrAdopt(context.Background(), claim, "title", "body")
-	if err != nil {
-		t.Fatal(err)
-	}
+	pr := createDraft(t, client, identity, "title", "body")
 	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "one", State: "PENDING"}); err != nil {
 		t.Fatal(err)
 	}
