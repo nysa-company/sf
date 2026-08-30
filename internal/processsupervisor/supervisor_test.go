@@ -205,6 +205,60 @@ func TestSupervisorCloseDrainsActiveRunAndRejectsFutureRun(t *testing.T) {
 	}
 }
 
+func TestSupervisorCloseJoinsRunWhenGateWriteRacesDrain(t *testing.T) {
+	supervisor, request, invocation, input := legacyRunFixture(t, "sleep 30")
+	supervisor.SoftDrain, supervisor.HardDrain = 250*time.Millisecond, 250*time.Millisecond
+	recorded, release := make(chan struct{}), make(chan struct{})
+	supervisor.Recorder = recordingLaunches(func(context.Context, contracts.DrainRequest, Identity, string) error {
+		close(recorded)
+		<-release
+		return nil
+	})
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := supervisor.Run(context.Background(), request, invocation, input)
+		runDone <- err
+	}()
+	select {
+	case <-recorded:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not reach the launch recorder")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- supervisor.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		supervisor.mu.Lock()
+		closing := supervisor.closing
+		supervisor.mu.Unlock()
+		if closing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not claim the run")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Give Close's TERM a chance to make the gate write fail with EPIPE, then
+	// let RecordLaunch return. The synchronous wait path must still complete
+	// both channels that Close observes.
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("racing Run did not return")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close=%v after gate-write race", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not join the gate-write race")
+	}
+}
+
 func TestReplacementRetainsSnapshotUntilBlockedRunReturns(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -273,6 +327,9 @@ func TestReplacementRetainsSnapshotUntilBlockedRunReturns(t *testing.T) {
 			t.Fatal("retired snapshot was not reclaimed after final Run reference")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := supervisor.Drain(context.Background(), request); err != nil {
+		t.Fatalf("completed replacement run was not drainable: %v", err)
 	}
 }
 
