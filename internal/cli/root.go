@@ -271,11 +271,49 @@ func (a *app) logsCommand() *cobra.Command {
 	var follow bool
 	var phase string
 	command := &cobra.Command{Use: "logs <ticket>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return a.emit(a.request("ticket.logs", args[0], params(map[string]any{"follow": follow, "phase": phase}, a.channel)))
+		if !follow {
+			return a.emit(a.request("ticket.logs", args[0], params(map[string]any{"follow": false, "phase": phase, "after": uint64(0)}, a.channel)))
+		}
+		return a.followLogs(cmd.Context(), args[0], phase)
 	}}
 	command.Flags().BoolVar(&follow, "follow", false, "follow logs")
 	command.Flags().StringVar(&phase, "phase", "", "filter by phase")
 	return command
+}
+
+func (a *app) followLogs(ctx context.Context, ticket, phase string) error {
+	var after uint64
+	first := true
+	for {
+		response := a.request("ticket.logs", ticket, params(map[string]any{"follow": true, "phase": phase, "after": after}, a.channel))
+		if !response.OK {
+			return a.emit(response)
+		}
+		var page struct {
+			NextAfter uint64            `json:"next_after"`
+			Events    []json.RawMessage `json:"events"`
+		}
+		if json.Unmarshal(response.Data, &page) != nil || page.NextAfter < after {
+			return a.emit(failure("invalid_response", "the daemon returned an invalid log cursor", []string{binaryName(), "logs", ticket}))
+		}
+		if first || len(page.Events) > 0 {
+			if err := a.emit(response); err != nil {
+				return err
+			}
+		}
+		first = false
+		if a.last != nil && !a.last.OK {
+			return nil
+		}
+		after = page.NextAfter
+		timer := time.NewTimer(statusWatchInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
 }
 
 func (a *app) controlCommand(name string) *cobra.Command {

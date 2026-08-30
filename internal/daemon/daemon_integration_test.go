@@ -104,6 +104,7 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				"terminal_replay_requires_new": {binary, "submit", "--help"},
 				"unknown_project":              {binary, "init", "--help"},
 				"invalid_submit":               {binary, "submit", "--help"},
+				"invalid_logs":                 {binary, "logs", "--help"},
 				"not_ready":                    {binary, "--help"},
 				"other":                        {binary, "doctor"},
 			} {
@@ -176,6 +177,54 @@ func TestDaemonAdmissionUsesConfiguredTwoTicketDefault(t *testing.T) {
 		if index == 3 && (response.OK || response.Error == nil || response.Error.Code != "capacity_unavailable") {
 			t.Fatalf("third ticket did not hit capacity: %+v", response)
 		}
+	}
+}
+
+func TestDaemonLogsReturnBoundedRedactedDurableEvents(t *testing.T) {
+	d, paths, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-logs")
+	_ = createAndStartControlTicket(t, d, "SF-other-logs")
+	request := api.Request{Version: api.Version, RequestID: "logs", Method: "ticket.logs", Ticket: string(started.Ref.Ticket), Parameters: json.RawMessage(`{"channel":"stable","phase":"planning","follow":false,"after":0}`)}
+	response := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, request)
+	if !response.OK {
+		t.Fatalf("logs response=%+v", response)
+	}
+	var page struct {
+		Ticket    domain.TicketID `json:"ticket"`
+		NextAfter uint64          `json:"next_after"`
+		Events    []events.Record `json:"events"`
+	}
+	if err := json.Unmarshal(response.Data, &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Ticket != started.Ref.Ticket || page.NextAfter == 0 || len(page.Events) == 0 || len(page.Events) > maxLogItems {
+		t.Fatalf("page=%+v", page)
+	}
+	for _, event := range page.Events {
+		if event.Ticket != started.Ref.Ticket || !eventMatchesPhase(store.Event{From: event.From, To: event.To, Payload: string(event.Payload)}, "planning") {
+			t.Fatalf("cross-ticket or cross-phase event=%+v", event)
+		}
+		if strings.Contains(string(event.Payload), paths.Root) {
+			t.Fatalf("unredacted channel path in payload=%s", event.Payload)
+		}
+	}
+	request.RequestID = "logs-replay"
+	request.Parameters = json.RawMessage(fmt.Sprintf(`{"channel":"stable","phase":"planning","follow":false,"after":%d}`, page.NextAfter))
+	replay := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, request)
+	if !replay.OK {
+		t.Fatalf("replay=%+v", replay)
+	}
+	var replayPage struct {
+		Events []events.Record `json:"events"`
+	}
+	if err := json.Unmarshal(replay.Data, &replayPage); err != nil || replayPage.Events == nil || len(replayPage.Events) != 0 {
+		t.Fatalf("replay events=%+v err=%v", replayPage.Events, err)
+	}
+	request.RequestID = "logs-invalid"
+	request.Parameters = json.RawMessage(`{"channel":"stable","phase":"unknown"}`)
+	invalid := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, request)
+	if invalid.OK || invalid.Error == nil || invalid.Error.Code != "invalid_logs" {
+		t.Fatalf("invalid phase response=%+v", invalid)
 	}
 }
 

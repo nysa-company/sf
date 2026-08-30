@@ -96,6 +96,31 @@ func TestStatusWatchStopsWhenTicketIsTerminal(t *testing.T) {
 	}
 }
 
+func TestLogsFollowUsesDurableCursorAndStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	var got api.Request
+	client := fakeClient(func(_ context.Context, request api.Request) (api.Response, error) {
+		got = request
+		return api.Response{Version: api.Version, RequestID: request.RequestID, OK: true, Mutation: api.Mutation{}, Data: json.RawMessage(`{"next_after":7,"events":[]}`)}, nil
+	})
+	var output bytes.Buffer
+	if code := Execute(ctx, []string{"logs", "SF-1", "--follow", "--phase", "build"}, &output, &bytes.Buffer{}, client); code != 0 {
+		t.Fatalf("exit=%d output=%s", code, output.String())
+	}
+	if got.Method != "ticket.logs" || got.Ticket != "SF-1" {
+		t.Fatalf("request=%+v", got)
+	}
+	var parameters struct {
+		Follow bool   `json:"follow"`
+		Phase  string `json:"phase"`
+		After  uint64 `json:"after"`
+	}
+	if err := json.Unmarshal(got.Parameters, &parameters); err != nil || !parameters.Follow || parameters.Phase != "build" || parameters.After != 0 {
+		t.Fatalf("parameters=%s decoded=%+v err=%v", got.Parameters, parameters, err)
+	}
+}
+
 func TestMutatingOperatorLabelIsForwardedToDaemon(t *testing.T) {
 	var got api.Request
 	client := fakeClient(func(_ context.Context, request api.Request) (api.Response, error) {

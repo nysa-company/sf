@@ -424,6 +424,8 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		response = daemon.statusTickets(ctx, request, identity)
 	case "ticket.show":
 		response = daemon.show(ctx, request, identity)
+	case "ticket.logs":
+		response = daemon.logs(ctx, request, identity)
 	case "ticket.start":
 		response = daemon.startTicket(ctx, request, identity)
 	case "ticket.pause":
@@ -575,6 +577,107 @@ func (daemon *Daemon) show(ctx context.Context, request api.Request, identity do
 	view["evidence"] = evidence
 	view["operator"] = operatorView(identity)
 	return daemon.success(request, api.Mutation{}, view)
+}
+
+const (
+	logPageSize = 4096
+	maxLogItems = 1000
+	maxLogPages = 25
+)
+
+type logParameters struct {
+	Channel domain.Channel `json:"channel"`
+	Phase   string         `json:"phase"`
+	Follow  bool           `json:"follow"`
+	After   uint64         `json:"after"`
+}
+
+// logs reads the SQLite event authority and returns a bounded, redacted view.
+// Provider transcripts and command output are deliberately not event-log
+// material and can never cross this API boundary.
+func (daemon *Daemon) logs(ctx context.Context, request api.Request, identity domain.OperatorIdentity) api.Response {
+	var parameters logParameters
+	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || !validLogPhase(parameters.Phase) {
+		return daemon.failure(request, "invalid_logs", "logs requires the daemon channel and an optional valid phase", false)
+	}
+	ref, response := daemon.ticketRefByID(ctx, request)
+	if response != nil {
+		return *response
+	}
+	records := make([]events.Record, 0)
+	after := parameters.After
+	for page := 0; page < maxLogPages; page++ {
+		batch, err := daemon.store.Events(ctx, daemon.channel, after, logPageSize)
+		if err != nil {
+			return daemon.failure(request, "logs_unavailable", "durable ticket events could not be read", errors.Is(err, store.ErrBusy))
+		}
+		for _, item := range batch {
+			after = item.ID
+			if item.Ref != ref || !eventMatchesPhase(item, parameters.Phase) {
+				continue
+			}
+			payload := daemon.projector.Policy.JSON(json.RawMessage(item.Payload))
+			records = append(records, events.Record{
+				Schema: events.Schema, ID: item.ID, Channel: item.Ref.Channel, Project: item.Ref.Project,
+				Ticket: item.Ref.Ticket, TicketVersion: item.TicketVersion, Trigger: item.Trigger,
+				From: item.From, To: item.To, Payload: payload, CreatedAt: item.CreatedAt,
+			})
+			if len(records) == maxLogItems {
+				break
+			}
+		}
+		if len(records) == maxLogItems || len(batch) < logPageSize || page == maxLogPages-1 {
+			break
+		}
+	}
+	return daemon.success(request, api.Mutation{}, map[string]any{
+		"channel": daemon.channel, "ticket": ref.Ticket, "phase": parameters.Phase,
+		"follow": parameters.Follow, "after": parameters.After, "next_after": after,
+		"operator": operatorView(identity), "events": records,
+	})
+}
+
+func validLogPhase(value string) bool {
+	switch domain.Phase(value) {
+	case "", domain.PhasePlanning, domain.PhaseVerification, domain.PhaseBuild, domain.PhasePublish, domain.PhaseReview, domain.PhaseMerge, domain.PhaseReconcile:
+		return true
+	default:
+		return false
+	}
+}
+
+func eventMatchesPhase(event store.Event, phase string) bool {
+	if phase == "" {
+		return true
+	}
+	var payload struct {
+		Phase string `json:"phase"`
+	}
+	if json.Unmarshal([]byte(event.Payload), &payload) == nil && payload.Phase == phase {
+		return true
+	}
+	statePhase := func(state domain.State) domain.Phase {
+		switch state {
+		case domain.StatePlanning:
+			return domain.PhasePlanning
+		case domain.StateVerifying:
+			return domain.PhaseVerification
+		case domain.StateBuilding:
+			return domain.PhaseBuild
+		case domain.StatePublishing, domain.StateWaitingCI:
+			return domain.PhasePublish
+		case domain.StateReviewing, domain.StateWaitingApproval, domain.StateWaitingManualMerge:
+			return domain.PhaseReview
+		case domain.StateMerging:
+			return domain.PhaseMerge
+		case domain.StateReconciling, domain.StateDone, domain.StateExternalMerged:
+			return domain.PhaseReconcile
+		default:
+			return ""
+		}
+	}
+	want := domain.Phase(phase)
+	return statePhase(event.From) == want || statePhase(event.To) == want
 }
 
 func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ domain.OperatorIdentity) api.Response {
@@ -917,6 +1020,9 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	}
 	if code == "invalid_submit" {
 		argv = []string{binary, "submit", "--help"}
+	}
+	if code == "invalid_logs" {
+		argv = []string{binary, "logs", "--help"}
 	}
 	if code == "invalid_control" || code == "invalid_ticket_reference" {
 		if verb != "" && verb != request.Method {
