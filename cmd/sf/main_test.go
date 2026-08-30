@@ -210,8 +210,15 @@ func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T)
 	if err := syscall.Kill(-launch.PGID, 0); err != syscall.ESRCH {
 		t.Fatalf("provider group survived daemon recovery: %v", err)
 	}
-	if _, err := os.Lstat(paths.Socket); err != nil {
-		t.Fatalf("socket was not exposed after recovery: %v", err)
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Lstat(paths.Socket); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("socket was not exposed after recovery")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	status := exec.Command(binary, "status", "--json")
 	status.Env = append(os.Environ(), "HOME="+home)
@@ -222,6 +229,177 @@ func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T)
 	case <-ownerDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("owner waiter did not finish")
+	}
+}
+
+func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "sfh-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	paths, err := config.PathsFor(home, domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	worktree := t.TempDir()
+	raw := []byte(`{"providers":"integration"}`)
+	digestBytes := sha256.Sum256(raw)
+	digest := fmt.Sprintf("%x", digestBytes)
+	database, err := store.Open(context.Background(), paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := store.Project{Channel: domain.ChannelDev, ID: "demo", Path: worktree, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: raw}
+	if err := database.CreateProject(context.Background(), project); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	binary := filepath.Join(t.TempDir(), "sf-dev")
+	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sf-dev: %v\n%s", err, output)
+	}
+
+	// Capture the current boot identity through the public supervisor boundary;
+	// the foreign process below gets a deliberately mismatched start identity.
+	owner, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.Executable = binary
+	var bootIdentity string
+	owner.SetLaunchRecorder(func(_ context.Context, _ contracts.DrainRequest, launch contracts.ProviderLaunch) error {
+		bootIdentity = launch.BootIdentity
+		return nil
+	})
+	if _, err := owner.Run(context.Background(), contracts.DrainRequest{
+		ClaimID: 1, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-identity-probe"},
+		Phase: domain.PhaseBuild, Attempt: 1, Identity: domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"},
+		LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/identity-probe", BindingDigest: strings.Repeat("a", 64),
+	}, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 0.1"}}, contracts.PhaseInput{Worktree: t.TempDir()}); err != nil {
+		t.Fatalf("capture boot identity: %v", err)
+	}
+	if bootIdentity == "" {
+		t.Fatal("supervisor did not publish boot identity")
+	}
+
+	foreign := exec.Command("/bin/sleep", "30")
+	foreign.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := foreign.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if foreign.ProcessState != nil && foreign.ProcessState.Exited() {
+			return
+		}
+		_ = syscall.Kill(-foreign.Process.Pid, syscall.SIGTERM)
+		wait := make(chan struct{})
+		go func() {
+			_, _ = foreign.Process.Wait()
+			close(wait)
+		}()
+		select {
+		case <-wait:
+		case <-time.After(time.Second):
+			_ = syscall.Kill(-foreign.Process.Pid, syscall.SIGKILL)
+			<-wait
+		}
+	})
+
+	_, thisFile, _, _ := runtime.Caller(0)
+	stateMachine := filepath.Join(filepath.Dir(thisFile), "..", "..", "docs", "plans", "2026-08-29-software-factory-v1-state-machine.json")
+	d, err := daemon.Start(context.Background(), daemon.Config{Channel: domain.ChannelDev, Paths: paths, StateMachinePath: stateMachine, DaemonIdentity: "provider-owner", Projects: []store.Project{project}, RecoveryAuthorityKey: owner.PublicKey(), ProviderSupervisor: owner, RecoveryDrainer: owner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := store.Open(context.Background(), paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-mismatched-foreign"}
+	if err := writer.CreateTicket(context.Background(), store.Ticket{Ref: ref, SourceDigest: "integration", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := writer.StartOrAdopt(context.Background(), ref, 1, "dev/demo/SF-mismatched-foreign", domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := `{"repository":"integration"}`
+	if err := writer.RegisterWorktree(context.Background(), store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, Path: worktree, Branch: "dev/demo/SF-mismatched-foreign", IdentityJSON: []byte(identity), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
+		t.Fatal(err)
+	}
+	transition, err := writer.Transition(context.Background(), store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateBuilding, Trigger: "integration", Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, EventPayload: "{}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket.Version = transition.Version
+	ticket.State = domain.StateBuilding
+	qual := func(run, name, family string) store.ProviderQualification {
+		return store.ProviderQualification{Channel: domain.ChannelDev, RunID: run, Provider: domain.ProviderIdentity{Provider: name, Model: name + "-model", Family: family, Version: "1"}, BinaryDigest: strings.Repeat("a", 64), PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()}
+	}
+	builder, _, err := writer.RecordProviderQualification(context.Background(), qual("33333333333333333333333333333333", "builder", "builder-family"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer, _, err := writer.RecordProviderQualification(context.Background(), qual("44444444444444444444444444444444", "reviewer", "reviewer-family"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := writer.SelectProviderSet(context.Background(), domain.ChannelDev, builder.ID, builder.ID, reviewer.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	auth := sha256.Sum256([]byte("auth"))
+	binding := contracts.RuntimeBinding{Identity: builder.Provider, BinaryDigest: builder.BinaryDigest, PolicyDigest: builder.PolicyDigest, FixtureDigest: builder.FixtureDigest, AuthDigest: fmt.Sprintf("%x", auth)}
+	claim, err := writer.BeginProviderAttempt(context.Background(), store.ProviderAttemptRequest{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(), Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), SupervisorKey: owner.PublicKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.RecordProviderLaunch(context.Background(), claim, contracts.ProviderLaunch{PID: foreign.Process.Pid, PGID: foreign.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: "mismatched-foreign-process-start", Worktree: worktree}); err != nil {
+		t.Fatalf("record foreign launch: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(paths.Socket); !os.IsNotExist(err) {
+		t.Fatalf("seed daemon left socket behind: %v", err)
+	}
+
+	foreground := exec.Command(binary, "daemon", "run")
+	foreground.Env = append(os.Environ(), "HOME="+home)
+	var foregroundOutput bytes.Buffer
+	foreground.Stdout = &foregroundOutput
+	foreground.Stderr = &foregroundOutput
+	if err := foreground.Start(); err != nil {
+		t.Fatal(err)
+	}
+	err = foreground.Wait()
+	if err == nil {
+		t.Fatal("daemon unexpectedly accepted mismatched foreign provider claim")
+	}
+	if exitError, ok := err.(*exec.ExitError); !ok || exitError.ExitCode() == 0 {
+		t.Fatalf("daemon had unexpected exit error: %v\n%s", err, foregroundOutput.String())
+	}
+	if _, err := os.Lstat(paths.Socket); !os.IsNotExist(err) {
+		t.Fatalf("daemon exposed socket despite failed recovery: %v\n%s", err, foregroundOutput.String())
+	}
+	attempts, err := writer.ProviderAttempts(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || attempts[0].State != "quarantined" || attempts[0].Outcome != "undrained_recovery" {
+		t.Fatalf("mismatched claim was not durably quarantined: %+v", attempts)
+	}
+	if err := syscall.Kill(-foreign.Process.Pid, 0); err != nil {
+		t.Fatalf("foreign provider group was signaled or exited: %v", err)
 	}
 }
 

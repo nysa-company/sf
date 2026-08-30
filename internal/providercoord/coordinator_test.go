@@ -143,7 +143,9 @@ func TestCancellationQuarantinesWhenProviderDoesNotDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: time.Second, Profile: contracts.ProfileGuarded, Schema: []byte("schema")}}
-	callCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	// Leave enough startup budget for the race-instrumented SQLite admission
+	// path to persist the claim before cancellation exercises quarantine.
+	callCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	defer cancel()
 	result := c.Run(callCtx, request)
 	if !result.NeedsOperator {
