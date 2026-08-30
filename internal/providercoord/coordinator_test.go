@@ -130,6 +130,63 @@ func TestCoordinatorReusesOnlyExactCompletedResult(t *testing.T) {
 	}
 }
 
+type blockingBindingProvider struct {
+	*testkit.ScriptedProvider
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingBindingProvider) Binding(ctx context.Context) (contracts.RuntimeBinding, error) {
+	select {
+	case p.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+		return contracts.RuntimeBinding{}, ctx.Err()
+	}
+	return p.ScriptedProvider.Binding(ctx)
+}
+
+func TestCoordinatorBeginRaceReusesCompletionWithoutSecondLaunch(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	plain := testkit.NewScriptedProvider(id("cursor", "cursor-family"))
+	plain.Add(domain.PhasePlanning, testkit.ProviderStep{Artifact: plannerArtifact()})
+	registry := NewRegistry()
+	if err := registry.Register(context.Background(), plain); err != nil {
+		t.Fatal(err)
+	}
+	// Use a separate production coordinator for A so B can be held after its
+	// early Store reuse check but before BeginProviderAttempt.
+	a, err := New(registry, map[Role]Route{RolePlanner: {Primary: "cursor"}}, database, nil, testkit.NewSupervisor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := &blockingBindingProvider{ScriptedProvider: primary, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	coordinator.registry.providers["cursor"] = blocked
+	resultB := make(chan Result, 1)
+	go func() { resultB <- coordinator.Run(context.Background(), request) }()
+	select {
+	case <-blocked.entered:
+	case <-time.After(time.Second):
+		t.Fatal("B did not reach binding barrier")
+	}
+	resultA := a.Run(context.Background(), request)
+	if resultA.Code != Completed {
+		t.Fatalf("A=%+v", resultA)
+	}
+	close(blocked.release)
+	result := <-resultB
+	if result.Code != Completed || result.ProviderResult != resultA.ProviderResult {
+		t.Fatalf("B=%+v A=%+v", result, resultA)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+}
+
 func TestFallbackCompletionExposesFallbackAttemptKey(t *testing.T) {
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
 	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Behavior: testkit.ProviderMalformed}}
