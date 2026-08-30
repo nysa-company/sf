@@ -813,7 +813,7 @@ var migrationV36 = []string{
 			OR EXISTS(
 				SELECT 1 FROM candidate_snapshots c WHERE c.channel=tickets.channel AND c.project_id=tickets.project_id AND c.ticket_id=tickets.id
 				AND c.generation=(SELECT MAX(latest.generation) FROM candidate_snapshots latest WHERE latest.channel=c.channel AND latest.project_id=c.project_id AND latest.ticket_id=c.ticket_id)
-				AND NOT EXISTS(SELECT 1 FROM candidate_command_result_bindings b JOIN repository_command_results cr ON cr.semantic_key=b.semantic_key AND cr.claim_epoch=b.claim_epoch WHERE b.channel=c.channel AND b.project_id=c.project_id AND b.ticket_id=c.ticket_id AND b.generation=c.generation AND cr.exit_code=0 AND cr.policy_digest=c.command_policy_digest)
+				AND NOT EXISTS(SELECT 1 FROM candidate_command_result_bindings b JOIN repository_command_results cr ON cr.semantic_key=b.semantic_key AND cr.claim_epoch=b.claim_epoch WHERE b.channel=c.channel AND b.project_id=c.project_id AND b.ticket_id=c.ticket_id AND b.generation=c.generation AND cr.exit_code=0 AND cr.policy_digest=('sha256:' || c.command_policy_digest))
 			)
 		)`,
 	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at)
