@@ -11,6 +11,7 @@ import (
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/processsupervisor"
 	"github.com/nysa-company/sf/internal/version"
 )
 
@@ -43,9 +44,14 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	runDaemon := func(runCtx context.Context) error {
+		supervisor, err := processsupervisor.New(nil)
+		if err != nil {
+			return err
+		}
 		return daemon.Run(runCtx, daemon.Config{
 			Channel: channel, Paths: paths,
-			DaemonIdentity: fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
+			DaemonIdentity:       fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
+			RecoveryAuthorityKey: supervisor.PublicKey(),
 		})
 	}
 	os.Exit(cli.ExecuteWithDaemon(ctx, os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}, runDaemon))

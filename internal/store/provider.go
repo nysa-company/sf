@@ -57,6 +57,23 @@ type ProviderAttempt struct {
 	StartedAt, FinishedAt time.Time
 }
 
+func (s *Store) SetRecoveryAuthority(ctx context.Context, channel domain.Channel, leader uint64, key []byte) error {
+	if !channel.Valid() || leader == 0 || len(key) != 32 {
+		return ErrProviderAttempt
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		row, err := conn.ExecContext(ctx, `UPDATE daemon_instances SET recovery_public_key=? WHERE channel=? AND leader_epoch=?`, key, channel, leader)
+		if err != nil {
+			return err
+		}
+		n, _ := row.RowsAffected()
+		if n != 1 {
+			return ErrStaleFence
+		}
+		return nil
+	})
+}
+
 // RecordProviderLaunch is the pre-exec gate's durable publication point. The
 // wrapper remains blocked until this exact PID/PGID record commits.
 func (s *Store) RecordProviderLaunch(ctx context.Context, claim ProviderAttemptClaim, pid, pgid int, started time.Time) error {
@@ -467,7 +484,11 @@ func (s *Store) recoverProviderAttemptClaim(ctx context.Context, claim ProviderA
 // replacement leader must present a proof signed by the supervisor key stored
 // with the old claim; an arbitrary new supervisor key cannot release it.
 func (s *Store) RecoverProviderAttemptClaimWithProof(ctx context.Context, claim ProviderAttempt, leader uint64, proof contracts.DrainProof, at time.Time) error {
-	if !contracts.VerifyDrainProof(claim.SupervisorKey, drainRequestForClaim(claim.ProviderAttemptClaim), proof) {
+	var key []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT recovery_public_key FROM daemon_instances WHERE channel=? AND leader_epoch=?`, claim.Ref.Channel, leader).Scan(&key); err != nil {
+		return err
+	}
+	if !contracts.VerifyDrainProof(key, drainRequestForClaim(claim.ProviderAttemptClaim), proof) {
 		return ErrProviderDrain
 	}
 	return s.recoverProviderAttemptClaim(ctx, claim, leader, at)

@@ -79,7 +79,8 @@ type Config struct {
 	StartupTimeout time.Duration
 	// RecoverProvider must drain the exact provider process group represented by
 	// a durable attempt. A nil callback fails closed when claims exist.
-	RecoverProvider func(context.Context, store.ProviderAttempt, uint64) error
+	RecoverProvider      func(context.Context, store.ProviderAttempt, uint64) error
+	RecoveryAuthorityKey []byte
 }
 
 type Daemon struct {
@@ -155,6 +156,11 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	epoch, err := database.AcquireLeader(startupCtx, configuration.Channel, configuration.DaemonIdentity)
 	if err != nil {
 		return failStore(fmt.Errorf("acquire durable leader epoch: %w", err))
+	}
+	if len(configuration.RecoveryAuthorityKey) > 0 {
+		if err := database.SetRecoveryAuthority(startupCtx, configuration.Channel, epoch, configuration.RecoveryAuthorityKey); err != nil {
+			return failStore(fmt.Errorf("set recovery authority: %w", err))
+		}
 	}
 	for _, project := range configuration.Projects {
 		if project.Channel != configuration.Channel {

@@ -126,6 +126,9 @@ func TestProviderRecoveryRequiresDrainAndReleasesOnlyOldClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := db.SetRecoveryAuthority(ctx, domain.ChannelDev, leader, providerTestSigner.PublicKey()); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.recoverProviderAttempts(ctx, ticket.Ref, ticket.RunnerEpoch, leader, time.Now().UTC()); err != nil {
 		t.Fatalf("undrained=%v", err)
 	}
@@ -161,6 +164,9 @@ func TestProviderRecoveryAcrossLeaderRestartUsesOriginalClaimEpoch(t *testing.T)
 		t.Fatal(err)
 	}
 	newLeader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "new-leader")
+	if err := db.SetRecoveryAuthority(ctx, domain.ChannelDev, newLeader, providerTestSigner.PublicKey()); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil {
 		t.Fatal(err)
 	}

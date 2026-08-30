@@ -327,3 +327,6 @@ var migrationV14 = []string{
 	`ALTER TABLE provider_attempts ADD COLUMN process_started_at TEXT NOT NULL DEFAULT ''`,
 	`UPDATE provider_attempts SET launch_state=CASE WHEN state IN ('active','quarantined') THEN 'quarantined' ELSE 'legacy_unverifiable' END`,
 }
+var migrationV15 = []string{
+	`ALTER TABLE daemon_instances ADD COLUMN recovery_public_key BLOB NOT NULL DEFAULT X''`,
+}
