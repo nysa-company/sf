@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,17 +15,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/codexprovider"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/engine"
 	"github.com/nysa-company/sf/internal/git"
-	"github.com/nysa-company/sf/internal/phaseartifact"
 	"github.com/nysa-company/sf/internal/processsupervisor"
+	"github.com/nysa-company/sf/internal/providercoord"
 	"github.com/nysa-company/sf/internal/repositoryexec"
 	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
-	"github.com/nysa-company/sf/internal/workflowprompt"
 	"github.com/nysa-company/sf/internal/workflowruntime"
 	"github.com/nysa-company/sf/internal/workflowworker"
 )
@@ -102,21 +101,61 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	planner := materializerQualification(t, db, "11111111111111111111111111111111", "planner")
-	builder := materializerQualification(t, db, "22222222222222222222222222222222", "builder")
-	reviewer := materializerQualification(t, db, "33333333333333333333333333333333", "reviewer")
-	if _, _, err := db.SelectProviderSet(ctx, domain.ChannelDev, planner.ID, builder.ID, reviewer.ID, time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
-	signer, err := contracts.NewDrainSigner()
+	providerScript := writeMaterializerProvider(t)
+	builderAuth := writeMaterializerAuthHome(t)
+	reviewerAuth := writeMaterializerAuthHome(t)
+	providerSupervisor, err := processsupervisor.New(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	providers := &materializerProviderRunner{db: db, configDigest: configDigest, repository: repository, bindings: map[domain.Phase]contracts.RuntimeBinding{
-		domain.PhasePlanning:     materializerBinding(planner),
-		domain.PhaseVerification: materializerBinding(reviewer),
-		domain.PhaseBuild:        materializerBinding(builder),
-	}, signer: signer, worktree: worktree}
+	providerSupervisor.Executable = sfBinary
+	if err := db.SetRecoveryAuthority(ctx, domain.ChannelDev, leader, providerSupervisor.PublicKey()); err != nil {
+		t.Fatal(err)
+	}
+	builderAdapter, err := codexprovider.New(codexprovider.Config{Route: "codex-builder", Executable: providerScript, AuthHome: builderAuth, Model: "gpt-5.6-luna"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewerAdapter, err := codexprovider.New(codexprovider.Config{Route: "codex-reviewer", Executable: providerScript, AuthHome: reviewerAuth, Model: "gpt-5.5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builderBinding, err := builderAdapter.Binding(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewerBinding, err := reviewerAdapter.Binding(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := materializerAttestedQualification(t, db, providerSupervisor, builderBinding, "11111111111111111111111111111111")
+	reviewer := materializerAttestedQualification(t, db, providerSupervisor, reviewerBinding, "22222222222222222222222222222222")
+	planner := builder
+	if _, _, err := db.SelectProviderSet(ctx, domain.ChannelDev, planner.ID, builder.ID, reviewer.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := providerSupervisor.RegisterRuntime(builderBinding, providerScript, builderAuth); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := providerSupervisor.RegisterRuntime(reviewerBinding, providerScript, reviewerAuth); err != nil {
+		t.Fatal(err)
+	}
+	registry := providercoord.NewRegistry()
+	if err := registry.Register(ctx, builderAdapter); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(ctx, reviewerAdapter); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := providercoord.New(registry, map[providercoord.Role]providercoord.Route{
+		providercoord.RolePlanner:  {Primary: builderAdapter.Name()},
+		providercoord.RoleBuilder:  {Primary: builderAdapter.Name()},
+		providercoord.RoleReviewer: {Primary: reviewerAdapter.Name()},
+	}, db, nil, providerSupervisor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providers := workflowruntime.NewPhaseRunner(db, coordinator)
 	baseEngine, err := statemachine.LoadEmbeddedApproved()
 	if err != nil {
 		t.Fatal(err)
@@ -135,12 +174,13 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	failingMaterializer.Git.MutationAuthority = failingAuthority
 	worker.Checkpoint = failingMaterializer
 	worker.CheckpointMaterializer = failingMaterializer
-	if _, err := worker.Run(cancel, ref, fence); err == nil {
+	_, canceledRunErr := worker.Run(cancel, ref, fence)
+	if canceledRunErr == nil {
 		t.Fatal("expected canceled pre-prepare checkpoint commit")
 	}
 	cancellation()
 	if failingAuthority.Claim.SemanticKey == "" {
-		t.Fatal("canceled Git boundary did not receive a Store-issued claim")
+		t.Fatalf("canceled Git boundary did not receive a Store-issued claim: %v", canceledRunErr)
 	}
 	if effect, effectErr := db.Effect(ctx, failingAuthority.Claim.SemanticKey); effectErr != nil || effect.State != store.EffectFailed {
 		t.Fatalf("canceled commit effect=%+v err=%v", effect, effectErr)
@@ -162,9 +202,7 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	if _, err := worker.Run(ctx, ref, fence); err != nil {
 		t.Fatalf("verification replay: %v", err)
 	}
-	if providers.calls[domain.PhaseVerification] != 1 {
-		t.Fatalf("reviewer reran on checkpoint replay: %d", providers.calls[domain.PhaseVerification])
-	}
+	assertMaterializerProviderAttempts(t, db, ref, 3)
 
 	if _, err := worker.Run(ctx, ref, fence); err == nil {
 		t.Fatal("expected injected response loss after candidate evidence")
@@ -180,9 +218,7 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	if err != nil || candidateAfter.Commit != candidateBefore.Commit || candidateAfter.CommandBinding.Key != candidateBefore.CommandBinding.Key {
 		t.Fatalf("candidate replay changed evidence before=%+v after=%+v err=%v", candidateBefore, candidateAfter, err)
 	}
-	if providers.calls[domain.PhasePlanning] != 1 || providers.calls[domain.PhaseVerification] != 1 || providers.calls[domain.PhaseBuild] != 1 {
-		t.Fatalf("provider rerun counts=%v", providers.calls)
-	}
+	assertMaterializerProviderAttempts(t, db, ref, 3)
 	ticket, err := db.Ticket(ctx, ref)
 	if err != nil || ticket.State != domain.StatePublishing {
 		t.Fatalf("ticket=%+v err=%v", ticket, err)
@@ -206,83 +242,6 @@ func (a *cancelFirstGitMutationAuthority) AcquireGitMutation(ctx context.Context
 	a.Claim = claim
 	a.once.Do(a.Cancel)
 	return a.Store.AcquireGitMutation(ctx, claim)
-}
-
-type materializerProviderRunner struct {
-	db           *store.Store
-	configDigest string
-	repository   string
-	worktree     string
-	bindings     map[domain.Phase]contracts.RuntimeBinding
-	signer       *contracts.DrainSigner
-	calls        map[domain.Phase]int
-}
-
-func (r *materializerProviderRunner) Run(ctx context.Context, req workflowworker.PhaseRequest) (workflowworker.PhaseResult, error) {
-	if r.calls == nil {
-		r.calls = map[domain.Phase]int{}
-	}
-	r.calls[req.Phase]++
-	role := map[domain.Phase]string{domain.PhasePlanning: "planner", domain.PhaseVerification: "reviewer", domain.PhaseBuild: "builder"}[req.Phase]
-	binding := r.bindings[req.Phase]
-	input := contracts.PhaseInput{Ticket: req.Ticket.Ref, Phase: req.Phase, LeaderEpoch: req.Fence.LeaderEpoch, RunnerEpoch: req.Fence.RunnerEpoch, ExpectedVersion: req.Ticket.Version, Prompt: "real materializer integration", Repository: r.repository, Worktree: r.worktree, WorktreeIdentity: string(req.Worktree.IdentityJSON), BaseSHA: req.Worktree.BaseSHA, AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}
-	claim, err := r.db.BeginProviderAttempt(ctx, store.ProviderAttemptRequest{Ref: req.Ticket.Ref, ExpectedVersion: req.Ticket.Version, Fence: req.Fence, Phase: req.Phase, Role: role, Binding: binding, ConfigDigest: r.configDigest, Capacity: 1, At: time.Now().UTC(), Repository: r.repository, Worktree: r.worktree, WorktreeIdentity: string(req.Worktree.IdentityJSON), BaseSHA: req.Worktree.BaseSHA, SupervisorKey: r.signer.PublicKey(), Input: input})
-	if err != nil {
-		return workflowworker.PhaseResult{}, fmt.Errorf("begin %s: %w", req.Phase, err)
-	}
-	if err := r.db.RecordProviderLaunch(ctx, claim, contracts.ProviderLaunch{PID: 99, PGID: 99, BootIdentity: "real-materializer", ProcessStartIdentity: "real-materializer", Worktree: claim.Worktree}); err != nil {
-		return workflowworker.PhaseResult{}, err
-	}
-	artifact, changed, validation, err := r.artifact(req)
-	if err != nil {
-		return workflowworker.PhaseResult{}, err
-	}
-	result := contracts.PhaseResult{Outcome: "completed", Provider: binding.Identity, Artifact: artifact, ChangedFiles: changed, UsageTrusted: true, UsageUnits: 1}
-	if _, err := phaseartifact.Parse(req.Phase, result, validation); err != nil {
-		return workflowworker.PhaseResult{}, fmt.Errorf("parse %s: %w", req.Phase, err)
-	}
-	proof, err := r.signer.ProveDrained(materializerDrainRequest(claim))
-	if err != nil {
-		return workflowworker.PhaseResult{}, err
-	}
-	if _, err := r.db.CompleteProviderAttemptSuccess(ctx, claim, proof, req.Ticket.Version, req.Fence, result, validation, time.Now().UTC()); err != nil {
-		return workflowworker.PhaseResult{}, err
-	}
-	key := store.ProviderAttemptResultKey{AttemptID: claim.ID, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt}
-	return workflowworker.PhaseResult{ProviderResult: key}, nil
-}
-
-func (r *materializerProviderRunner) artifact(req workflowworker.PhaseRequest) ([]byte, []string, phaseartifact.Validation, error) {
-	validation := phaseartifact.Validation{TicketType: req.Ticket.Type}
-	switch req.Phase {
-	case domain.PhasePlanning:
-		value := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"real materializer"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofAcceptance, Command: []string{"go", "test", "./..."}, Details: "real"}, Paths: []string{"tracked_test.go"}, Commands: [][]string{{"go", "test", "./..."}}, Risks: []string{"none"}}
-		artifact, err := json.Marshal(value)
-		return artifact, nil, validation, err
-	case domain.PhaseVerification:
-		identity, err := workflowprompt.NewPlanIdentity(*req.Plan.Document.Planner)
-		if err != nil {
-			return nil, nil, validation, err
-		}
-		value := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: identity.Digest, ProofKind: phaseartifact.ProofAcceptance, OwnedFiles: []string{"proof.txt"}, Command: []string{"go", "test", "./..."}, PrebuildOutcome: "red", EvidenceDigest: materializerDigest("verification")}
-		validation.AcceptanceDigest = identity.Digest
-		artifact, err := json.Marshal(value)
-		return artifact, nil, validation, err
-	case domain.PhaseBuild:
-		if err := os.WriteFile(filepath.Join(r.worktree, "tracked_test.go"), []byte("package example\n\nimport \"testing\"\n\nfunc TestFeature(t *testing.T) {}\n"), 0o600); err != nil {
-			return nil, nil, validation, err
-		}
-		check := exec.Command("go", "test", "./...")
-		check.Dir = r.worktree
-		if output, checkErr := check.CombinedOutput(); checkErr != nil {
-			return nil, nil, validation, fmt.Errorf("builder fixture test: %v: %s", checkErr, output)
-		}
-		value := phaseartifact.Builder{Schema: "sf.builder/v1", Summary: "real mutation", ChangedFiles: []string{"tracked_test.go"}, Commands: [][]string{{"go", "test", "./..."}}}
-		artifact, err := json.Marshal(value)
-		return artifact, []string{"tracked_test.go"}, validation, err
-	default:
-		return nil, nil, validation, errors.New("unexpected phase")
-	}
 }
 
 type materializerFaultEngine struct {
@@ -376,19 +335,111 @@ func repoRoot(t *testing.T) string {
 		dir = parent
 	}
 }
-func materializerQualification(t *testing.T, db *store.Store, run, name string) store.ProviderQualification {
+func materializerAttestedQualification(t *testing.T, db *store.Store, supervisor *processsupervisor.Supervisor, binding contracts.RuntimeBinding, run string) store.ProviderQualification {
 	t.Helper()
-	q, _, err := db.RecordProviderQualification(context.Background(), store.ProviderQualification{Channel: domain.ChannelDev, RunID: run, Provider: domain.ProviderIdentity{Provider: name, Model: name + "-model", Family: name + "-family", Version: "1.0.0"}, BinaryDigest: strings.Repeat("a", 64), PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Date(2026, 8, 29, 18, 0, 0, 0, time.UTC)})
+	created := time.Now().UTC()
+	leader, err := db.LeaderEpoch(context.Background(), domain.ChannelDev)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return q
+	probeDigest := materializerDigest("probe:" + run)
+	attestation, err := supervisor.AttestQualification(contracts.QualificationAttestation{Channel: domain.ChannelDev, RunID: run, Identity: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, AuthDigest: binding.AuthDigest, AuthMode: binding.AuthMode, ProbeDigest: probeDigest, Profile: contracts.ProfileGuarded, CreatedUnixNanos: created.UnixNano(), LeaderEpoch: leader, Nonce: run})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qualification, _, err := db.RecordAttestedProviderQualification(context.Background(), store.ProviderQualification{Channel: domain.ChannelDev, RunID: run, Provider: binding.Identity, BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, FixtureDigest: binding.FixtureDigest, AuthDigest: binding.AuthDigest, AuthMode: binding.AuthMode, Profile: store.QualificationGuarded, ProbeDigest: probeDigest, CreatedAt: created}, attestation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return qualification
 }
-func materializerBinding(q store.ProviderQualification) contracts.RuntimeBinding {
-	return contracts.RuntimeBinding{Identity: q.Provider, BinaryDigest: q.BinaryDigest, PolicyDigest: q.PolicyDigest, FixtureDigest: q.FixtureDigest, AuthDigest: materializerDigest("auth:" + q.Provider.Model)}
+
+func writeMaterializerAuthHome(t *testing.T) string {
+	t.Helper()
+	home := filepath.Join(t.TempDir(), "codex-home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"fixture":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
 }
-func materializerDrainRequest(c store.ProviderAttemptClaim) contracts.DrainRequest {
-	return contracts.DrainRequest{ClaimID: c.ID, Identity: c.Binding.Identity, Ref: c.Ref, Phase: c.Phase, Role: c.Role, Attempt: c.Attempt, LeaderEpoch: c.LeaderEpoch, RunnerEpoch: c.RunnerEpoch, ExpectedVersion: c.ExpectedVersion, LeaseKey: c.LeaseKey, BindingDigest: c.BindingDigest, BinaryDigest: c.Binding.BinaryDigest, PolicyDigest: c.Binding.PolicyDigest, AuthDigest: c.Binding.AuthDigest, AuthMode: c.Binding.AuthMode, Repository: c.Repository, Worktree: c.Worktree, WorktreeIdentity: c.WorktreeIdentity, BaseSHA: c.BaseSHA, RequestDigest: c.RequestDigest}
+
+func writeMaterializerProvider(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "codex-fixture")
+	script := `#!/bin/sh
+set -eu
+case "${1:-} ${2:-}" in
+  "--version ") printf '%s\n' 'Codex 1.2.3'; exit 0 ;;
+  "exec --help") printf '%s\n' '--json --output-schema --output-last-message --ephemeral --ignore-user-config --ignore-rules --config --model -C'; exit 0 ;;
+  "login status") printf '%s\n' 'Logged in using ChatGPT'; exit 0 ;;
+esac
+last=''
+previous=''
+for arg in "$@"; do
+  if [ "$previous" = '--output-last-message' ]; then last="$arg"; fi
+  previous="$arg"
+done
+[ -n "$last" ]
+prompt=$(cat)
+model=''
+previous=''
+for arg in "$@"; do
+  if [ "$previous" = '--model' ]; then model="$arg"; fi
+  previous="$arg"
+done
+if [ "$model" = 'gpt-5.5' ] || printf '%s' "$prompt" | grep -qi 'independent pre-build reviewer'; then
+	plan=${prompt#*PLAN=}
+	plan=${plan%%WORKSPACE=*}
+	digest=$(printf '%s' "$plan" | grep -Eo '"digest":"[0-9a-f]+"' | grep -Eo '[0-9a-f]{64}' | head -1 || true)
+  printf '%s\n' '{"schema":"sf.verification/v1","acceptance_digest":"'"$digest"'","proof_kind":"acceptance","owned_files":["proof.txt"],"command":["go","test","./..."],"prebuild_outcome":"red","evidence_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' > "$last"
+elif printf '%s' "$prompt" | grep -qi 'builder'; then
+  printf '%s\n' 'package example
+
+import "testing"
+
+func TestFeature(t *testing.T) {}
+' > tracked_test.go
+  printf '%s\n' '{"schema":"sf.builder/v1","summary":"real mutation","changed_files":["tracked_test.go"],"commands":[["go","test","./..."]]}' > "$last"
+else
+  printf '%s\n' '{"schema":"sf.planner/v1","acceptance":["real materializer"],"proof":{"kind":"acceptance","command":["go","test","./..."],"details":"real"},"paths":["tracked_test.go"],"commands":[["go","test","./..."]],"risks":["none"]}' > "$last"
+fi
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}'
+`
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func assertMaterializerProviderAttempts(t *testing.T, db *store.Store, ref domain.TicketRef, want int) {
+	t.Helper()
+	attempts, err := db.ProviderAttempts(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != want {
+		t.Fatalf("provider attempt count=%d, want %d", len(attempts), want)
+	}
+	for _, attempt := range attempts {
+		launch, err := db.ProviderLaunchIdentity(context.Background(), attempt.ProviderAttemptClaim)
+		if err != nil || launch.PID <= 0 || launch.PGID <= 0 {
+			t.Fatalf("provider launch evidence=%+v err=%v", launch, err)
+		}
+	}
+	active, err := db.ActiveProviderAttempts(context.Background(), ref.Channel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("active provider attempts=%+v", active)
+	}
 }
 func materializerDigest(value string) string {
 	sum := sha256.Sum256([]byte(value))

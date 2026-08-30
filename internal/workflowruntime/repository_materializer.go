@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"time"
 
@@ -78,15 +79,13 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 	if err != nil || result.Result.ExitCode != 0 {
 		return workflowworker.CandidateWitness{}, materializeErr(err)
 	}
-	allowed := append([]string(nil), plan.Plan.Paths...)
-	if len(allowed) == 0 {
-		allowed = append([]string(nil), builder.ChangedFiles...)
+	allowed, err := m.currentCandidatePlanScope(ctx, request, plan)
+	if err != nil {
+		return workflowworker.CandidateWitness{}, err
 	}
 	// The builder may not overwrite proof ownership outside the accepted plan.
-	for _, p := range builder.ChangedFiles {
-		if !containsPath(allowed, p) {
-			return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
-		}
+	if err := candidateChangedFilesWithinScope(builder.ChangedFiles, allowed); err != nil {
+		return workflowworker.CandidateWitness{}, err
 	}
 	observation, err := m.commit(ctx, request, verification.CheckpointID, allowed, verification.OwnedFiles, commitDigest("candidate", request, key, command, result.ResultDigest, struct {
 		Plan         workflowprompt.PlanIdentity
@@ -97,6 +96,75 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 		return workflowworker.CandidateWitness{}, err
 	}
 	return workflowworker.CandidateWitness{Commit: observation, CommandPolicyDigest: strings.TrimPrefix(result.Claim.PolicyDigest, "sha256:"), Reason: "authenticated post-build verification", CommandResult: command}, nil
+}
+
+// currentCandidatePlanScope re-authenticates every mutable input immediately
+// before the Git commit. The builder can only narrow the persisted Planner
+// scope; it can never supply an empty scope or broaden it with ChangedFiles.
+func (m RepositoryMaterializer) currentCandidatePlanScope(ctx context.Context, request workflowworker.PhaseRequest, supplied workflowprompt.PlanIdentity) ([]string, error) {
+	if m.Store == nil {
+		return nil, ErrRepositoryMaterialization
+	}
+	ticket, err := m.Store.Ticket(ctx, request.Ticket.Ref)
+	if err != nil || !reflect.DeepEqual(ticket, request.Ticket) || ticket.Ref != request.Ticket.Ref || ticket.State != domain.StateBuilding || ticket.RunnerEpoch != request.Fence.RunnerEpoch {
+		return nil, ErrRepositoryMaterialization
+	}
+	if err := m.Store.AssertTicketFence(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence); err != nil {
+		return nil, ErrRepositoryMaterialization
+	}
+	project, err := m.Store.Project(ctx, request.Ticket.Ref.Channel, request.Ticket.Ref.Project)
+	if err != nil || project.Path == "" {
+		return nil, ErrRepositoryMaterialization
+	}
+	plan, err := m.Store.Plan(ctx, request.Ticket.Ref)
+	if err != nil || request.Plan == nil || !sameJSON(*request.Plan, plan) || plan.TicketVersion == 0 || plan.Fence.LeaderEpoch == 0 || plan.Fence.RunnerEpoch == 0 || plan.Document.Planner == nil || plan.Document.ProviderResult == nil || plan.Digest == "" {
+		return nil, ErrRepositoryMaterialization
+	}
+	encoded, err := json.Marshal(plan.Document)
+	if err != nil {
+		return nil, ErrRepositoryMaterialization
+	}
+	digest := sha256.Sum256(encoded)
+	if hex.EncodeToString(digest[:]) != plan.Digest {
+		return nil, ErrRepositoryMaterialization
+	}
+	provider, parsed, err := m.Store.LoadHistoricalProviderAttemptResult(ctx, *plan.Document.ProviderResult)
+	if err != nil || provider.Claim.Ref != request.Ticket.Ref || provider.Claim.Phase != domain.PhasePlanning || provider.Claim.Role != "planner" || provider.Claim.ExpectedVersion != plan.TicketVersion || provider.Claim.LeaderEpoch != plan.Fence.LeaderEpoch || provider.Claim.RunnerEpoch != plan.Fence.RunnerEpoch || provider.Claim.Repository != project.Path || provider.Claim.Worktree != request.Worktree.Path || provider.Claim.WorktreeIdentity != string(request.Worktree.IdentityJSON) || provider.Claim.BaseSHA != request.Worktree.BaseSHA || parsed.Planner == nil || !sameJSON(*plan.Document.Planner, *parsed.Planner) {
+		return nil, ErrRepositoryMaterialization
+	}
+	worktree, err := m.Store.Worktree(ctx, request.Ticket.Ref)
+	if err != nil || worktree.Path != request.Worktree.Path || worktree.Branch != request.Worktree.Branch || worktree.BaseSHA != request.Worktree.BaseSHA || worktree.TicketVersion != request.Worktree.TicketVersion || worktree.Fence != request.Worktree.Fence || !bytes.Equal(worktree.IdentityJSON, request.Worktree.IdentityJSON) {
+		return nil, ErrRepositoryMaterialization
+	}
+	return candidatePlanScope(*plan.Document.Planner, supplied)
+}
+
+func candidatePlanScope(stored phaseartifact.Planner, supplied workflowprompt.PlanIdentity) ([]string, error) {
+	persisted, err := workflowprompt.NewPlanIdentity(stored)
+	if err != nil || persisted.Digest != supplied.Digest || !sameJSON(persisted.Plan, supplied.Plan) {
+		return nil, ErrRepositoryMaterialization
+	}
+	if len(stored.Paths) == 0 {
+		return nil, ErrRepositoryMaterialization
+	}
+	for _, path := range stored.Paths {
+		if path == "." {
+			return nil, ErrRepositoryMaterialization
+		}
+	}
+	if err := phaseartifact.ValidateMutationPaths(phaseartifact.Parsed{Phase: domain.PhasePlanning, Planner: &stored}, nil, stored.Paths); err != nil {
+		return nil, ErrRepositoryMaterialization
+	}
+	return append([]string(nil), stored.Paths...), nil
+}
+
+func candidateChangedFilesWithinScope(changed, scope []string) error {
+	for _, path := range changed {
+		if !containsPath(scope, path) {
+			return ErrRepositoryMaterialization
+		}
+	}
+	return nil
 }
 
 func (m RepositoryMaterializer) AuthenticateCandidate(ctx context.Context, request workflowworker.PhaseRequest, _ workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, _ phaseartifact.Builder, witness workflowworker.CandidateWitness) error {

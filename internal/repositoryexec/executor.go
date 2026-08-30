@@ -113,10 +113,9 @@ func (e Executor) Run(ctx context.Context, req Request) (result contracts.Comman
 		return contracts.CommandResult{}, err
 	}
 	lease, err := e.Authority.AcquireRepositoryCommand(ctx, req.Claim)
-	// A malformed authority response is still an acquisition ambiguity: a
-	// durable lease may have committed before the response was lost. Never
-	// retire the intent or invoke the supervisor unless a non-nil lease was
-	// returned cleanly; Store recovery remains the fail-closed arbiter.
+	// Any error from the authority is an acquisition ambiguity, including a nil
+	// lease. The transaction may have committed and the response may have been
+	// lost or malformed; only Store recovery can safely decide its disposition.
 	if lease != nil {
 		acquired = true
 	}
@@ -126,6 +125,7 @@ func (e Executor) Run(ctx context.Context, req Request) (result contracts.Comman
 				return contracts.CommandResult{}, errors.Join(err, quarantineErr)
 			}
 		}
+		acquireAmbiguous = true
 		return contracts.CommandResult{}, err
 	}
 	if lease == nil {

@@ -55,21 +55,30 @@ type lifecycleAuthority struct {
 	acquireErr   error
 	returnNil    bool
 	lease        *cancellationLease
+	active       bool
+	activeClaims map[string]bool
 }
 
-func (a *lifecycleAuthority) AcquireRepositoryCommand(context.Context, contracts.RepositoryCommandClaim) (contracts.RepositoryCommandLease, error) {
+func (a *lifecycleAuthority) AcquireRepositoryCommand(_ context.Context, claim contracts.RepositoryCommandClaim) (contracts.RepositoryCommandLease, error) {
 	a.acquireCalls++
+	if a.activeClaims == nil {
+		a.activeClaims = map[string]bool{}
+	}
+	a.activeClaims[claim.SemanticKey] = true
 	if a.acquireErr != nil {
 		if a.returnNil {
+			a.active = true
 			return nil, a.acquireErr
 		}
 		a.lease = &cancellationLease{}
+		a.active = true
 		return a.lease, a.acquireErr
 	}
 	if a.returnNil {
 		return nil, nil
 	}
 	a.lease = &cancellationLease{}
+	a.active = true
 	return a.lease, nil
 }
 func (a *lifecycleAuthority) RetireUnleasedRepositoryCommand(ctx context.Context, _ contracts.RepositoryCommandClaim) error {
@@ -241,7 +250,7 @@ func TestRunDoesNotRetireAfterAcquireError(t *testing.T) {
 	}
 }
 
-func TestRunRetiresWhenAcquireReturnsBeforeLease(t *testing.T) {
+func TestRunPreservesAmbiguousNilLeaseAcquire(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("repository supervisor is Darwin-only")
 	}
@@ -260,10 +269,10 @@ func TestRunRetiresWhenAcquireReturnsBeforeLease(t *testing.T) {
 	spec := contracts.CommandSpec{Argv: []string{"go", "test", "./..."}, Directory: directory, Timeout: time.Second, Profile: contracts.ProfileGuarded}
 	commandDigest, _ := CommandDigest(spec.Argv)
 	specDigest, _ := SpecDigest(spec, "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-	authority := &lifecycleAuthority{acquireErr: errors.New("acquire rejected"), returnNil: true}
-	claim := contracts.RepositoryCommandClaim{TicketRef: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "t"}, Repository: directory, Worktree: directory, CommandDigest: commandDigest, SpecDigest: specDigest, PolicyDigest: policy.Digest()}
+	authority := &lifecycleAuthority{acquireErr: errors.New("acquire response lost"), returnNil: true}
+	claim := contracts.RepositoryCommandClaim{SemanticKey: "persisted-ambiguous-claim", TicketRef: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "t"}, Repository: directory, Worktree: directory, CommandDigest: commandDigest, SpecDigest: specDigest, PolicyDigest: policy.Digest()}
 	_, runErr := (Executor{Authority: authority}).Run(context.Background(), Request{Claim: claim, Spec: spec, Policy: policy})
-	if runErr == nil || authority.acquireCalls != 1 || authority.retireCalls != 1 {
+	if runErr == nil || authority.acquireCalls != 1 || authority.retireCalls != 0 || !authority.active || !authority.activeClaims[claim.SemanticKey] {
 		t.Fatalf("err=%v acquire=%d retire=%d", runErr, authority.acquireCalls, authority.retireCalls)
 	}
 }
