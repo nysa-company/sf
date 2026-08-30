@@ -113,10 +113,16 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 		return contracts.CommandResult{}, err
 	}
 	result, runErr := e.Supervisor.Run(ctx, req.Claim, req.Spec, req.Policy, lease)
-	if runErr != nil && result.ExitCode < 0 {
+	// Once a lease is acquired, an unobserved result is always uncertain. Do
+	// not infer success from CommandResult's zero-valued exit code.
+	if !result.Observed {
+		reason := "repository command result was not observed"
+		if runErr != nil {
+			reason = runErr.Error()
+		}
 		if recorder, ok := e.Authority.(contracts.RepositoryCommandResultRecorder); ok {
 			persistCtx, cancel := repositoryPersistenceContext()
-			err := recorder.MarkRepositoryCommandUncertain(persistCtx, req.Claim, runErr.Error())
+			err := recorder.MarkRepositoryCommandUncertain(persistCtx, req.Claim, reason)
 			cancel()
 			if err != nil {
 				_ = lease.Quarantine()
@@ -127,9 +133,12 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 			return result, ErrInvalidBinding
 		}
 		_ = lease.Quarantine()
+		if runErr == nil {
+			runErr = ErrInvalidBinding
+		}
 		return result, runErr
 	}
-	if recorder, ok := e.Authority.(contracts.RepositoryCommandResultRecorder); ok && (runErr == nil || result.ExitCode >= 0) {
+	if recorder, ok := e.Authority.(contracts.RepositoryCommandResultRecorder); ok {
 		persistCtx, cancel := repositoryPersistenceContext()
 		err := recorder.CompleteRepositoryCommand(persistCtx, req.Claim, result)
 		cancel()

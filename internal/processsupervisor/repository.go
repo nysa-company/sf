@@ -179,20 +179,38 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if e1 != nil || e2 != nil || lease.RecordRepositoryCommandLaunch(ctx, launch) != nil {
 		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
-		_ = s.ensureGone(launch)
+		_ = s.ensureGone(launch, false)
+		_ = lease.Quarantine()
+		return contracts.CommandResult{}, ErrUnclear
+	}
+	// The launch record and gate are deliberately separate system calls. Check
+	// the exact Store fence once more immediately before unblocking the child so
+	// a pause/cancel/take that raced the record cannot start stale work.
+	if err := lease.Check(ctx); err != nil {
+		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
 		_ = lease.Quarantine()
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	if _, err := gateWrite.Write([]byte{1}); err != nil {
 		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
-		_ = s.ensureGone(launch)
+		_ = s.ensureGone(launch, false)
 		_ = lease.Quarantine()
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	_ = gateWrite.Close()
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
+	monitorStop := make(chan struct{})
+	escaped := make(chan bool, 1)
+	go monitorRepositoryGroup(launch, monitorStop, escaped)
+	monitorStopped := false
+	defer func() {
+		if !monitorStopped {
+			close(monitorStop)
+		}
+	}()
 	var waitErr error
 	select {
 	case waitErr = <-wait:
@@ -218,16 +236,22 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 			}
 		}
 	}
-	if err := s.ensureGone(launch); err != nil {
+	close(monitorStop)
+	monitorStopped = true
+	groupEscaped := <-escaped
+	if err := s.ensureGone(launch, groupEscaped); err != nil {
 		return contracts.CommandResult{}, fmt.Errorf("repository ensure gone: %w", err)
 	}
-	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
+	finishCtx, finishCancel := repositoryLeasePersistenceContext()
+	err = lease.FinishRepositoryCommandLaunch(finishCtx, launch)
+	finishCancel()
+	if err != nil {
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	if stdout.overflow || stderr.overflow {
 		return contracts.CommandResult{}, errors.New("repository command output exceeds limit")
 	}
-	result := contracts.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), Duration: time.Since(started), ExitCode: 0}
+	result := contracts.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), Duration: time.Since(started), ExitCode: 0, Observed: true}
 	if waitErr != nil {
 		if ee, ok := waitErr.(*exec.ExitError); ok {
 			result.ExitCode = ee.ExitCode()
@@ -243,19 +267,44 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 }
 
 func resolveFixedExecutable(name string) (string, error) {
-	if filepath.IsAbs(name) {
-		return name, nil
-	}
-	if name == "" || filepath.Base(name) != name {
+	if name == "" {
 		return "", exec.ErrNotFound
 	}
-	for _, dir := range []string{"/usr/bin", "/bin", "/usr/sbin", "/sbin"} {
-		candidate := filepath.Join(dir, name)
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate, nil
+	tool := filepath.Base(name)
+	if tool != "git" && tool != "go" {
+		return "", exec.ErrNotFound
+	}
+	for _, candidate := range approvedRepositoryExecutables(tool) {
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			continue
+		}
+		if filepath.IsAbs(name) {
+			provided, err := filepath.EvalSymlinks(name)
+			if err != nil || provided != resolved {
+				continue
+			}
+			return resolved, nil
+		}
+		if name == tool {
+			return resolved, nil
 		}
 	}
 	return "", exec.ErrNotFound
+}
+
+// approvedRepositoryExecutables is intentionally code-owned. A digest binds
+// the selected binary to an intent; this list prevents a private executable
+// merely named "git" or "go" from becoming eligible for that binding.
+func approvedRepositoryExecutables(tool string) []string {
+	switch tool {
+	case "git":
+		return []string{"/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"}
+	case "go":
+		return []string{"/usr/local/go/bin/go", "/usr/local/bin/go", "/opt/homebrew/bin/go"}
+	default:
+		return nil
+	}
 }
 func (s RepositoryCommandSupervisor) drainSoft() time.Duration {
 	if s.SoftDrain > 0 {
@@ -353,17 +402,46 @@ func (s RepositoryCommandSupervisor) openAuthenticatedWorktree(claim contracts.R
 	}
 	return opened, nil
 }
-func (s RepositoryCommandSupervisor) ensureGone(l contracts.RepositoryCommandLaunch) error {
+func repositoryLeasePersistenceContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
+}
+
+// monitorRepositoryGroup catches the recorded leader changing process group
+// while it is still observable. It cannot, by itself, prove that a fast
+// double-forked descendant did not escape after the leader exits; callers must
+// not mistake this local check for hostile same-UID containment.
+func monitorRepositoryGroup(l contracts.RepositoryCommandLaunch, stop <-chan struct{}, escaped chan<- bool) {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if pgid, err := syscall.Getpgid(l.PID); err == nil && pgid != l.PGID {
+			escaped <- true
+			return
+		}
+		select {
+		case <-stop:
+			escaped <- false
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s RepositoryCommandSupervisor) ensureGone(l contracts.RepositoryCommandLaunch, groupEscaped bool) error {
 	if l.PID <= 0 || l.PGID != l.PID || l.BootIdentity == "" || l.ProcessStartIdentity == "" {
+		return ErrUnclear
+	}
+	if groupEscaped {
 		return ErrUnclear
 	}
 	deadline := time.Now().Add(250 * time.Millisecond)
 	for {
-		if got, e := processStartIdentity(l.PID); e == nil && got == l.ProcessStartIdentity { /* still live */
-		} else if e != nil {
-			// A vanished leader and absent old group cannot prove that a child did
-			// not call setsid/double-fork.  Retain the authority fail-closed.
-			return ErrUnclear
+		if got, e := processStartIdentity(l.PID); e == nil {
+			if got != l.ProcessStartIdentity {
+				return ErrUnclear
+			}
+		} else if syscall.Kill(-l.PGID, 0) == syscall.ESRCH {
+			return nil
 		}
 		if time.Now().After(deadline) {
 			return ErrUnclear
@@ -436,12 +514,15 @@ func (d RepositoryCommandDrainer) DrainRepositoryCommand(ctx context.Context, l 
 	deadline := time.NewTimer(hard)
 	defer deadline.Stop()
 	for {
-		if _, err := processStartIdentity(l.PID); err != nil {
-			// See ensureGone: leader disappearance is ambiguous on macOS without
-			// an OS job/process-tree witness.
-			return ErrUnclear
+		start, startErr := processStartIdentity(l.PID)
+		groupErr := syscall.Kill(-l.PGID, 0)
+		if startErr != nil && groupErr == syscall.ESRCH {
+			// The recorded leader was reaped and its original group is empty.
+			// This is sufficient only for the documented non-hostile local
+			// containment boundary; it is not an OS process-tree witness.
+			return nil
 		}
-		if syscall.Kill(-l.PGID, 0) == syscall.ESRCH {
+		if startErr == nil && (start != l.ProcessStartIdentity || func() bool { pgid, err := syscall.Getpgid(l.PID); return err != nil || pgid != l.PGID }()) {
 			return ErrUnclear
 		}
 		select {

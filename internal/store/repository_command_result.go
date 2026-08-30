@@ -14,7 +14,7 @@ import (
 // the lease is released. A zero exit is never inferred from process absence;
 // the exact command claim and observed output identity are persisted together.
 func (s *Store) CompleteRepositoryCommand(ctx context.Context, claim contracts.RepositoryCommandClaim, result contracts.CommandResult) error {
-	if !validRepositoryCommandClaim(claim) {
+	if !validRepositoryCommandClaim(claim) || !result.Observed {
 		return ErrRepositoryCommandIntent
 	}
 	sum := sha256.New()

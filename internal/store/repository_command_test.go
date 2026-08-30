@@ -73,7 +73,7 @@ func TestRepositoryCommandCompleteReleaseThenNextAcquire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0}); err != nil {
+	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Observed: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := lease.Release(); err != nil {
@@ -99,7 +99,7 @@ func TestRepositoryCommandCompleteReleaseThenNextAcquire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CompleteRepositoryCommand(ctx, secondClaim, contracts.CommandResult{ExitCode: 1}); err != nil {
+	if err := db.CompleteRepositoryCommand(ctx, secondClaim, contracts.CommandResult{ExitCode: 1, Observed: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := secondLease.Release(); err != nil {
@@ -113,5 +113,20 @@ func TestRepositoryCommandRejectsOpaqueWorktreeIdentity(t *testing.T) {
 	intent.WorktreeIdentity = `{"repository":"/tmp/nysa"}`
 	if _, err := db.IssueRepositoryCommandClaim(ctx, intent); err == nil {
 		t.Fatal("opaque worktree identity was accepted")
+	}
+}
+
+func TestRepositoryCommandRefusesUnobservedCompletion(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "unobserved")
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcquireRepositoryCommand(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0}); err == nil {
+		t.Fatal("zero-value command result was accepted as success")
 	}
 }

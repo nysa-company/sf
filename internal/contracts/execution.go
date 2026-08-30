@@ -28,6 +28,10 @@ type CommandResult struct {
 	StderrTruncated            bool
 	OutputLastMessageTruncated bool
 	Duration                   time.Duration
+	// Observed is true only after the repository-command supervisor has reaped
+	// the launched process and proved its recorded containment state. The zero
+	// value is deliberately not a successful exit.
+	Observed bool
 }
 
 type CommandExecutor interface {

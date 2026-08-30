@@ -6,14 +6,53 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	gitboundary "github.com/nysa-company/sf/internal/git"
 )
+
+func TestRepositoryCommandRejectsCustomExecutableNamedGit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "git")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveFixedExecutable(path); err == nil {
+		t.Fatal("custom executable named git was accepted")
+	}
+}
+
+func TestRepositoryCommandDrainerReapsRecordedGroup(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "sleep 30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	start, err := processStartIdentity(cmd.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := hostBootIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(waited)
+	}()
+	d := RepositoryCommandDrainer{SoftDrain: 10 * time.Millisecond, HardDrain: 500 * time.Millisecond}
+	if err := d.DrainRepositoryCommand(context.Background(), contracts.RepositoryCommandLaunch{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: boot, ProcessStartIdentity: start}); err != nil {
+		t.Fatalf("drain recorded group: %v", err)
+	}
+	<-waited
+}
 
 func TestRepositoryCommandDrainerFailsClosedOnUnclearIdentity(t *testing.T) {
 	d := RepositoryCommandDrainer{}
