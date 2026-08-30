@@ -252,6 +252,48 @@ func TestValidationRejectsOversizedUntrustedAndMismatchedIdentities(t *testing.T
 	}
 }
 
+func TestRepositoryRootAllowedPathForPlannerAndFinalReviewer(t *testing.T) {
+	workspace := testWorkspace()
+	workspace.AllowedPaths = []string{"."}
+	if _, err := Planner(PlannerInput{Ticket: testTicket(), Workspace: workspace, Runtime: testRuntime()}); err != nil {
+		t.Fatalf("planner rejected repository-root scope: %v", err)
+	}
+	if _, err := FinalReviewer(FinalReviewerInput{
+		Ticket: testTicket(), Workspace: workspace, Plan: testPlan(), Verification: testVerification(),
+		Candidate: testCandidate(), Checks: testChecks(), Runtime: testRuntime(),
+	}); err != nil {
+		t.Fatalf("final reviewer rejected repository-root scope: %v", err)
+	}
+
+	for _, malformed := range []string{"", "./", ".//", "..", "../", "../escape", "/tmp/repo", `\.`, `foo\\bar`} {
+		workspace.AllowedPaths = []string{malformed}
+		if _, err := Planner(PlannerInput{Ticket: testTicket(), Workspace: workspace, Runtime: testRuntime()}); err == nil {
+			t.Errorf("planner accepted malformed allowed path %q", malformed)
+		}
+		if _, err := FinalReviewer(FinalReviewerInput{
+			Ticket: testTicket(), Workspace: workspace, Plan: testPlan(), Verification: testVerification(),
+			Candidate: testCandidate(), Checks: testChecks(), Runtime: testRuntime(),
+		}); err == nil {
+			t.Errorf("final reviewer accepted malformed allowed path %q", malformed)
+		}
+	}
+}
+
+func TestRepositoryRootAllowedPathRejectedForWriteRoles(t *testing.T) {
+	workspace := testWorkspace()
+	workspace.AllowedPaths = []string{"."}
+	if _, err := Verification(VerificationInput{
+		Ticket: testTicket(), Workspace: workspace, Plan: testPlan(), Runtime: testRuntime(),
+	}); err == nil {
+		t.Fatal("verification accepted repository-root scope")
+	}
+	if _, err := Builder(BuilderInput{
+		Ticket: testTicket(), Workspace: workspace, Plan: testPlan(), Verification: testVerification(), Runtime: testRuntime(),
+	}); err == nil {
+		t.Fatal("builder accepted repository-root scope")
+	}
+}
+
 func TestCanonicalIdentityRequiresShapeAndNonzeroFilesystemIdentity(t *testing.T) {
 	workspace := testWorkspace()
 	if _, err := ValidateCanonicalWorktreeIdentity([]byte(workspace.WorktreeIdentity)); err != nil {

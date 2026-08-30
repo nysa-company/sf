@@ -282,7 +282,7 @@ type FinalReviewerInput struct {
 
 // Planner returns a contracts.PhaseInput for the read-only Planner role.
 func Planner(input PlannerInput) (contracts.PhaseInput, error) {
-	if err := validateBase(input.Ticket, input.Workspace, input.Runtime); err != nil {
+	if err := validateBase(input.Ticket, input.Workspace, input.Runtime, true); err != nil {
 		return contracts.PhaseInput{}, err
 	}
 	prompt, err := renderPlanner(input)
@@ -296,7 +296,7 @@ func Planner(input PlannerInput) (contracts.PhaseInput, error) {
 // Verification returns a contracts.PhaseInput for the independent pre-build
 // Reviewer invocation that authors and executes proof before implementation.
 func Verification(input VerificationInput) (contracts.PhaseInput, error) {
-	if err := validateBase(input.Ticket, input.Workspace, input.Runtime); err != nil {
+	if err := validateBase(input.Ticket, input.Workspace, input.Runtime, false); err != nil {
 		return contracts.PhaseInput{}, err
 	}
 	if _, err := input.Plan.validate(input.Ticket); err != nil {
@@ -311,7 +311,7 @@ func Verification(input VerificationInput) (contracts.PhaseInput, error) {
 
 // Builder returns a contracts.PhaseInput for the implementation Builder.
 func Builder(input BuilderInput) (contracts.PhaseInput, error) {
-	if err := validateBase(input.Ticket, input.Workspace, input.Runtime); err != nil {
+	if err := validateBase(input.Ticket, input.Workspace, input.Runtime, false); err != nil {
 		return contracts.PhaseInput{}, err
 	}
 	if _, err := input.Plan.validate(input.Ticket); err != nil {
@@ -330,7 +330,7 @@ func Builder(input BuilderInput) (contracts.PhaseInput, error) {
 // FinalReviewer returns a contracts.PhaseInput for the fresh read-only final
 // Reviewer invocation.
 func FinalReviewer(input FinalReviewerInput) (contracts.PhaseInput, error) {
-	if err := validateBase(input.Ticket, input.Workspace, input.Runtime); err != nil {
+	if err := validateBase(input.Ticket, input.Workspace, input.Runtime, true); err != nil {
 		return contracts.PhaseInput{}, err
 	}
 	if _, err := input.Plan.validate(input.Ticket); err != nil {
@@ -399,12 +399,19 @@ func ticketRef(ticket Ticket) domain.TicketRef {
 	return domain.TicketRef{Channel: ticket.Channel, Project: ticket.Project, Ticket: ticket.ID}
 }
 
-func validateBase(ticket Ticket, workspace Workspace, runtime Runtime) error {
+func validateBase(ticket Ticket, workspace Workspace, runtime Runtime, allowRepositoryRoot bool) error {
 	if err := ticket.Validate(); err != nil {
 		return err
 	}
 	if err := workspace.Validate(); err != nil {
 		return err
+	}
+	if !allowRepositoryRoot {
+		for _, path := range workspace.AllowedPaths {
+			if path == "." {
+				return errors.New("write-capable roles require non-root allowed paths")
+			}
+		}
 	}
 	if runtime.Timeout <= 0 || runtime.Timeout > 10*time.Minute {
 		return errors.New("timeout must be greater than zero and at most ten minutes")
@@ -596,7 +603,7 @@ func (v VerificationIdentity) validate(ticket Ticket, plan PlanIdentity) (phasea
 	if err := bounded("verification checkpoint", v.CheckpointID, MaxIdentityText, false); err != nil {
 		return phaseartifact.Verification{}, err
 	}
-	if err := validatePaths("verification owned files", v.OwnedFiles, 1); err != nil {
+	if err := validatePaths("verification owned files", v.OwnedFiles, 1, false); err != nil {
 		return phaseartifact.Verification{}, err
 	}
 	canonicalIntent, _, err := canonicalVerificationIntent(v.Artifact)
@@ -675,7 +682,7 @@ func (w Workspace) Validate() error {
 	if err := validateOID("base SHA", w.BaseSHA); err != nil {
 		return err
 	}
-	return validatePaths("allowed paths", w.AllowedPaths, 1)
+	return validatePaths("allowed paths", w.AllowedPaths, 1, true)
 }
 
 func validateCandidate(v CandidateIdentity) error {
@@ -822,7 +829,7 @@ func validateIdentityDigest(name, value string) error {
 	return nil
 }
 
-func validatePaths(name string, paths []string, minimum int) error {
+func validatePaths(name string, paths []string, minimum int, allowRoot bool) error {
 	if len(paths) < minimum || len(paths) > MaxPathItems {
 		return fmt.Errorf("%s must contain %d to %d paths", name, minimum, MaxPathItems)
 	}
@@ -832,7 +839,7 @@ func validatePaths(name string, paths []string, minimum int) error {
 			return fmt.Errorf("%s contains an unsafe path", name)
 		}
 		clean := filepath.ToSlash(filepath.Clean(value))
-		if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || clean != value {
+		if clean == "." && (!allowRoot || value != ".") || clean == ".." || strings.HasPrefix(clean, "../") || clean != value {
 			return fmt.Errorf("%s contains a non-normalized path %q", name, value)
 		}
 		if _, ok := seen[value]; ok {
