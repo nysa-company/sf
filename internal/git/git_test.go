@@ -567,6 +567,47 @@ func TestCommitRevalidatesResultingTreeAfterStagingRace(t *testing.T) {
 	}
 }
 
+func TestCommitRejectsIndexRaceBeforeWriteTreeWithoutAdvancingBranch(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-write-tree-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	injected := false
+	runner.Run = func(runCtx context.Context, binary string, argv, env []string) ([]byte, error) {
+		if !injected && slicesContain(argv, "write-tree") {
+			injected = true
+			if err := os.WriteFile(filepath.Join(worktree.Path, "outside.txt"), []byte("raced\n"), 0o600); err != nil {
+				return nil, err
+			}
+			stage := exec.CommandContext(runCtx, binary, "-C", worktree.Path, "add", "--", "outside.txt")
+			stage.Env = env
+			if output, err := stage.CombinedOutput(); err != nil {
+				return output, err
+			}
+		}
+		command := exec.CommandContext(runCtx, binary, argv...)
+		command.Env = env
+		return command.CombinedOutput()
+	}
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(6, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); !errors.Is(err, ErrUnsafeWorktree) {
+		t.Fatalf("write-tree index race=%v", err)
+	}
+	if !injected {
+		t.Fatal("write-tree race fixture did not run")
+	}
+	if head := rawGit(t, worktree.Path, "rev-parse", "HEAD"); head != worktree.Identity.BaseHead {
+		t.Fatalf("unsafe tree advanced candidate branch: got=%q want=%q", head, worktree.Identity.BaseHead)
+	}
+}
+
 func slicesContain(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
@@ -585,30 +626,22 @@ func slicesContainPrefix(values []string, prefix string) bool {
 	return false
 }
 
-func TestHTTPSCredentialHelperUsesExplicitGHConfigOnly(t *testing.T) {
-	var argv, env []string
+func TestHTTPSCredentialHelperConfigurationFailsClosed(t *testing.T) {
 	root := t.TempDir()
-	ghBinary := filepath.Join(root, "gh")
-	ghConfig := filepath.Join(root, "gh-config")
-	if err := os.WriteFile(ghBinary, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
-		t.Fatal(err)
+	runner := Runner{Home: filepath.Join(root, "git-home"), GHBinary: filepath.Join(root, "gh"), GHConfigDir: filepath.Join(root, "gh-config")}
+	if _, err := runner.one(context.Background(), root, "status"); !errors.Is(err, ErrHTTPSCredentialBoundary) {
+		t.Fatalf("credential helper configuration=%v", err)
 	}
-	if err := os.Mkdir(ghConfig, 0o700); err != nil {
-		t.Fatal(err)
+	if strings.Contains(strings.Join((Runner{}).commandArgs("."), "\x00"), "credential.helper=!") {
+		t.Fatal("shell-form credential helper remains in git argv")
 	}
-	runner := Runner{Home: filepath.Join(root, "git-home"), GHBinary: ghBinary, GHConfigDir: ghConfig, Run: func(_ context.Context, _ string, gotArgv, gotEnv []string) ([]byte, error) {
-		argv, env = gotArgv, gotEnv
-		return []byte("ok\n"), nil
-	}}
-	if _, err := runner.one(context.Background(), root, "status"); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(strings.Join(argv, "\x00"), "credential.helper=!"+ghBinary+" auth git-credential") || !strings.Contains(strings.Join(env, "\n"), "GH_CONFIG_DIR="+runner.GHConfigDir) {
-		t.Fatalf("missing explicit HTTPS helper argv=%q env=%q", argv, env)
+	branch := "sf/dev/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef"
+	if _, err := (Runner{}).Push(context.Background(), Worktree{Branch: branch, Identity: Identity{PushOrigin: "https://example.test/owner/repository.git"}}, strings.Repeat("a", 40)); !errors.Is(err, ErrHTTPSCredentialBoundary) {
+		t.Fatalf("HTTPS publication did not fail closed: %v", err)
 	}
 }
 
-func TestGitDeadlineIsCappedAndCredentialHelperRejectsShellSyntax(t *testing.T) {
+func TestGitDeadlineIsCapped(t *testing.T) {
 	root := t.TempDir()
 	directory := filepath.Join(root, "directory")
 	if err := os.Mkdir(directory, 0o700); err != nil {
@@ -625,18 +658,6 @@ func TestGitDeadlineIsCappedAndCredentialHelperRejectsShellSyntax(t *testing.T) 
 	}}
 	if _, err := runner.one(parent, directory, "status"); err != nil {
 		t.Fatal(err)
-	}
-	unsafeBinary := filepath.Join(root, "gh;touch-pwned")
-	if err := os.WriteFile(unsafeBinary, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	config := filepath.Join(root, "gh-config")
-	if err := os.Mkdir(config, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	unsafe := Runner{Home: filepath.Join(root, "other-home"), GHBinary: unsafeBinary, GHConfigDir: config, Run: runner.Run}
-	if _, err := unsafe.one(context.Background(), directory, "status"); err == nil {
-		t.Fatal("shell-bearing credential helper path was accepted")
 	}
 }
 

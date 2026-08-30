@@ -30,6 +30,11 @@ var (
 	ErrUnexpectedRemote    = errors.New("remote branch head is unexpected")
 	ErrOutputBound         = errors.New("git output exceeded bound")
 	ErrWorktreeQuarantined = errors.New("created worktree could not be safely cleaned up")
+	// ErrHTTPSCredentialBoundary deliberately keeps HTTPS publication disabled
+	// until it has an argv-only credential bridge. Git credential.helper is a
+	// shell command interface, including its absolute-path form, so it cannot
+	// implement the repository command policy by itself.
+	ErrHTTPSCredentialBoundary = errors.New("HTTPS git publication requires an argv-only credential boundary")
 )
 
 const maxGitOutput = 1 << 20
@@ -147,23 +152,6 @@ func validAbsolutePath(path string) bool {
 	return filepath.IsAbs(path) && filepath.Clean(path) == path && path != string(filepath.Separator)
 }
 
-// credential.helper values beginning with ! are executed by Git through a
-// shell. Keep the configured executable path deliberately boring so an
-// otherwise absolute path cannot add shell syntax to that fixed helper.
-func validHelperPath(path string) bool {
-	if !validAbsolutePath(path) {
-		return false
-	}
-	for _, value := range path {
-		if (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
-			(value >= '0' && value <= '9') || strings.ContainsRune("/._+-", value) {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
 func validRepoPath(path string) bool {
 	if path == "" || strings.Contains(path, "\\") || strings.HasPrefix(path, "/") || strings.Contains(path, "\x00") {
 		return false
@@ -176,10 +164,13 @@ func validRepoPath(path string) bool {
 // removed, system/global configuration disabled, and hooks disabled per call.
 // Run is replaceable only for exact-argv tests; production always uses git.
 type Runner struct {
-	Binary      string
-	Home        string
-	GHBinary    string // absolute gh used only as Git's HTTPS credential helper
-	GHConfigDir string // explicit existing gh auth/config authority; never copied into HOME
+	Binary string
+	Home   string
+	// GHBinary and GHConfigDir are retained only to reject old configuration.
+	// Git credential.helper executes an effective shell command, so this
+	// boundary intentionally has no HTTPS credential-helper integration.
+	GHBinary    string
+	GHConfigDir string
 	Run         func(context.Context, string, []string, []string) ([]byte, error)
 }
 
@@ -355,9 +346,6 @@ func (r Runner) commandArgs(gitDirectory string, args ...string) []string {
 			"-c", "interactive.diffFilter=",
 		)
 	}
-	if r.GHBinary != "" {
-		argv = append(argv, "-c", "credential.helper=!"+r.GHBinary+" auth git-credential")
-	}
 	return argv
 }
 
@@ -378,8 +366,8 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	if r.Home == "" || !validAbsolutePath(r.Home) {
 		return nil, fmt.Errorf("runner requires an explicit absolute isolated HOME")
 	}
-	if (r.GHBinary == "") != (r.GHConfigDir == "") || (r.GHBinary != "" && (!validHelperPath(r.GHBinary) || !validAbsolutePath(r.GHConfigDir))) {
-		return nil, fmt.Errorf("HTTPS auth requires absolute gh binary and explicit gh config directory")
+	if r.GHBinary != "" || r.GHConfigDir != "" {
+		return nil, ErrHTTPSCredentialBoundary
 	}
 	info, err := os.Lstat(r.Home)
 	if err == nil {
@@ -396,22 +384,7 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	if err := os.MkdirAll(r.Home, 0o700); err != nil {
 		return nil, err
 	}
-	if r.GHBinary != "" {
-		binaryInfo, binaryErr := os.Stat(r.GHBinary)
-		configInfo, configErr := os.Stat(r.GHConfigDir)
-		if binaryErr != nil || !binaryInfo.Mode().IsRegular() || binaryInfo.Mode().Perm()&0o111 == 0 {
-			return nil, fmt.Errorf("HTTPS auth gh binary is unavailable or not executable")
-		}
-		if configErr != nil || !configInfo.IsDir() {
-			return nil, fmt.Errorf("HTTPS auth config directory is unavailable")
-		}
-	}
 	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
-	if r.GHConfigDir != "" {
-		// HTTPS auth is delegated to the explicitly selected gh auth store. The
-		// private Git HOME remains credential-free; no token is copied into env.
-		env = append(env, "GH_CONFIG_DIR="+r.GHConfigDir, "GIT_ASKPASS_REQUIRE=force")
-	}
 	for _, entry := range extra {
 		key, _, _ := strings.Cut(entry, "=")
 		if (strings.HasPrefix(key, "GIT_") && !strings.HasPrefix(key, "GIT_AUTHOR_") && !strings.HasPrefix(key, "GIT_COMMITTER_")) || key == "HOME" {
@@ -1423,13 +1396,8 @@ func (r Runner) ValidateDiff(ctx context.Context, worktree, baseRef string, poli
 	paths := append(splitNUL(changed), splitNUL(unstaged)...)
 	paths = append(paths, splitNUL(staged)...)
 	paths = append(paths, splitNUL(untracked)...)
-	for _, path := range paths {
-		if !validRepoPath(path) {
-			return fmt.Errorf("%w: invalid changed path", ErrUnsafeWorktree)
-		}
-		if !allowed(path, policy.AllowedPaths) {
-			return fmt.Errorf("%w: changed path %s is not allowed", ErrUnsafeWorktree, path)
-		}
+	if err := validateChangedPaths(policy, paths); err != nil {
+		return err
 	}
 	if err := validateFiles(worktree, policy, paths); err != nil {
 		return err
@@ -1437,17 +1405,26 @@ func (r Runner) ValidateDiff(ctx context.Context, worktree, baseRef string, poli
 	return validateSpecialFiles(worktree)
 }
 
-func validateFiles(worktree string, policy DiffPolicy, changed []string) error {
+func validateChangedPaths(policy DiffPolicy, paths []string) error {
 	seenCase := map[string]string{}
-	for _, path := range changed {
+	for _, path := range paths {
 		if !validRepoPath(path) {
 			return fmt.Errorf("%w: invalid changed path", ErrUnsafeWorktree)
+		}
+		if !allowed(path, policy.AllowedPaths) {
+			return fmt.Errorf("%w: changed path %s is not allowed", ErrUnsafeWorktree, path)
 		}
 		lower := strings.ToLower(path)
 		if previous, ok := seenCase[lower]; ok && previous != path {
 			return fmt.Errorf("%w: case collision %s and %s", ErrUnsafeWorktree, previous, path)
 		}
 		seenCase[lower] = path
+	}
+	return nil
+}
+
+func validateFiles(worktree string, policy DiffPolicy, changed []string) error {
+	for _, path := range changed {
 		full := filepath.Join(worktree, filepath.FromSlash(path))
 		info, err := os.Lstat(full)
 		if errors.Is(err, os.ErrNotExist) {
@@ -1464,6 +1441,57 @@ func validateFiles(worktree string, policy DiffPolicy, changed []string) error {
 		}
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
 			return fmt.Errorf("%w: hardlink %s", ErrUnsafeWorktree, path)
+		}
+	}
+	return nil
+}
+
+// validateImmutableTree applies the candidate policy to the exact tree that
+// commit-tree will consume. The mutable worktree and index are intentionally
+// not consulted after write-tree: a concurrent writer may change them, but it
+// cannot change this object. This prevents an index race from advancing the
+// sf branch before a later, merely diagnostic validation can notice it.
+func (r Runner) validateImmutableTree(ctx context.Context, worktree, baseRef, tree string, policy DiffPolicy) error {
+	if !validOID(tree) || !validRef(baseRef) {
+		return fmt.Errorf("%w: invalid candidate tree or base", ErrUnsafeWorktree)
+	}
+	if _, err := r.command(ctx, worktree, "cat-file", "-e", tree+"^{tree}"); err != nil {
+		return fmt.Errorf("%w: candidate tree is unavailable", ErrUnsafeWorktree)
+	}
+	if _, err := r.command(ctx, worktree, "merge-base", "--is-ancestor", baseRef, "HEAD"); err != nil {
+		return fmt.Errorf("%w: history does not descend from base", ErrUnsafeWorktree)
+	}
+	changed, err := r.command(ctx, worktree, "diff", "--no-renames", "--name-only", "-z", baseRef, tree)
+	if err != nil {
+		return err
+	}
+	paths := splitNUL(changed)
+	if err := validateChangedPaths(policy, paths); err != nil {
+		return err
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	args := append([]string{"ls-tree", "-r", "-z", tree, "--"}, paths...)
+	entries, err := r.command(ctx, worktree, args...)
+	if err != nil {
+		return err
+	}
+	return validateImmutableTreeEntries(entries, policy)
+}
+
+func validateImmutableTreeEntries(data []byte, policy DiffPolicy) error {
+	for _, entry := range splitNUL(data) {
+		metadata, path, found := strings.Cut(entry, "\t")
+		fields := strings.Fields(metadata)
+		if !found || len(fields) != 3 || !validRepoPath(path) || !validOID(fields[2]) {
+			return fmt.Errorf("%w: malformed candidate tree entry", ErrUnsafeWorktree)
+		}
+		if !allowed(path, policy.AllowedPaths) {
+			return fmt.Errorf("%w: candidate tree path %s is not allowed", ErrUnsafeWorktree, path)
+		}
+		if fields[1] != "blob" || (fields[0] != "100644" && (fields[0] != "100755" || !policy.AllowExecutable)) {
+			return fmt.Errorf("%w: unsafe candidate tree entry %s", ErrUnsafeWorktree, path)
 		}
 	}
 	return nil
@@ -1580,6 +1608,18 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err != nil || !validOID(tree) {
 		return "", fmt.Errorf("%w: staged tree could not be persisted", ErrUnsafeWorktree)
 	}
+	if err := r.validateImmutableTree(ctx, worktree.Path, request.BaseRef, tree, request.Policy); err != nil {
+		return "", err
+	}
+	// The tree is immutable, but the control plane and parent are not. Prove
+	// both again immediately before commit-tree; later index changes cannot
+	// affect the already-validated tree object.
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	if head, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD"); err != nil || head != request.ExpectedParent {
+		return "", fmt.Errorf("%w: candidate parent changed before commit-tree", ErrUnsafeWorktree)
+	}
 	newHead, err := r.oneEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, []string{"GIT_AUTHOR_NAME=sf", "GIT_AUTHOR_EMAIL=sf@localhost", "GIT_COMMITTER_NAME=sf", "GIT_COMMITTER_EMAIL=sf@localhost", "GIT_AUTHOR_DATE=" + timestamp, "GIT_COMMITTER_DATE=" + timestamp}, "commit-tree", tree, "-p", request.ExpectedParent, "-m", message)
 	if err != nil || !validOID(newHead) {
 		return "", fmt.Errorf("%w: candidate commit could not be created", ErrUnsafeWorktree)
@@ -1659,6 +1699,9 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 	}
 	if !validOID(expectedHead) {
 		return "", fmt.Errorf("%w: invalid expected candidate head", ErrUnexpectedRemote)
+	}
+	if strings.HasPrefix(worktree.Identity.PushOrigin, "https://") {
+		return "", ErrHTTPSCredentialBoundary
 	}
 	_, err := r.provePushHead(ctx, worktree, expectedHead)
 	if err != nil {
