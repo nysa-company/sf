@@ -655,15 +655,22 @@ func (w Worker) storedVerificationIdentity(ctx context.Context, ticket store.Tic
 	if _, err := workflowprompt.ValidateVerificationIdentity(workflowTicket(ticket), plan, identity); err != nil {
 		return workflowprompt.VerificationIdentity{}, err
 	}
-	if w.Checkpoint == nil {
-		return workflowprompt.VerificationIdentity{}, ErrCheckpointRequired
-	}
-	request, err := w.request(ctx, ticket, fence, domain.PhaseVerification, nil, nil, nil)
-	if err != nil {
-		return workflowprompt.VerificationIdentity{}, err
-	}
-	if err := w.Checkpoint.AuthenticateVerificationCheckpoint(ctx, request, artifact, VerificationCheckpoint{ID: verification.Revision.CheckpointID, Commit: verification.Checkpoint, CommandResult: verification.CommandBinding.Key}); err != nil {
-		return workflowprompt.VerificationIdentity{}, err
+	// Once the ticket is Building, HEAD is expected to be the candidate rather
+	// than the earlier checkpoint. Store has already bound the candidate's
+	// parent to this checkpoint, and candidate authentication re-observes the
+	// live head; requiring checkpoint HEAD equality here would reject a valid
+	// post-build replay.
+	if ticket.State != domain.StateBuilding {
+		if w.Checkpoint == nil {
+			return workflowprompt.VerificationIdentity{}, ErrCheckpointRequired
+		}
+		request, err := w.request(ctx, ticket, fence, domain.PhaseVerification, nil, nil, nil)
+		if err != nil {
+			return workflowprompt.VerificationIdentity{}, err
+		}
+		if err := w.Checkpoint.AuthenticateVerificationCheckpoint(ctx, request, artifact, VerificationCheckpoint{ID: verification.Revision.CheckpointID, Commit: verification.Checkpoint, CommandResult: verification.CommandBinding.Key}); err != nil {
+			return workflowprompt.VerificationIdentity{}, err
+		}
 	}
 	return identity, nil
 }
@@ -772,7 +779,11 @@ func (w Worker) authenticateStoredCandidate(ctx context.Context, ticket store.Ti
 	if err != nil || digest != candidate.Snapshot.BuilderEvidenceDigest {
 		return ErrStaleEvidence
 	}
-	request, err := w.request(ctx, ticket, fence, domain.PhaseBuild, nil, nil, &candidate)
+	storedVerification, err := w.Evidence.CurrentVerification(ctx, ticket.Ref)
+	if err != nil {
+		return ErrStaleEvidence
+	}
+	request, err := w.request(ctx, ticket, fence, domain.PhaseBuild, nil, &storedVerification, &candidate)
 	if err != nil {
 		return err
 	}

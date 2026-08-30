@@ -68,7 +68,17 @@ func SpecDigest(spec contracts.CommandSpec, stdinDigest string) (string, error) 
 	return "sha256:" + hex.EncodeToString(s[:]), nil
 }
 
-func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult, error) {
+func (e Executor) Run(ctx context.Context, req Request) (result contracts.CommandResult, returnedErr error) {
+	acquired := false
+	acquireAmbiguous := false
+	defer func() {
+		if returnedErr == nil || acquired || acquireAmbiguous {
+			return
+		}
+		if retireErr := RetireUnleased(e.Authority, req.Claim); retireErr != nil {
+			returnedErr = errors.Join(returnedErr, retireErr)
+		}
+	}()
 	if e.Authority == nil || req.Spec.Profile != contracts.ProfileGuarded || len(req.Spec.Argv) == 0 || req.Spec.Directory != req.Claim.Worktree || req.Spec.Timeout <= 0 || req.Spec.Timeout > 45*time.Minute || req.Policy.Digest() != req.Claim.PolicyDigest {
 		return contracts.CommandResult{}, ErrInvalidBinding
 	}
@@ -103,8 +113,24 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 		return contracts.CommandResult{}, err
 	}
 	lease, err := e.Authority.AcquireRepositoryCommand(ctx, req.Claim)
+	// A malformed authority response is still an acquisition ambiguity: a
+	// durable lease may have committed before the response was lost. Never
+	// retire the intent or invoke the supervisor unless a non-nil lease was
+	// returned cleanly; Store recovery remains the fail-closed arbiter.
+	if lease != nil {
+		acquired = true
+	}
 	if err != nil {
+		if lease != nil {
+			if quarantineErr := lease.Quarantine(); quarantineErr != nil {
+				return contracts.CommandResult{}, errors.Join(err, quarantineErr)
+			}
+		}
 		return contracts.CommandResult{}, err
+	}
+	if lease == nil {
+		acquireAmbiguous = true
+		return contracts.CommandResult{}, ErrInvalidBinding
 	}
 	result, runErr := e.Supervisor.Run(ctx, req.Claim, req.Spec, req.Policy, lease)
 	// A cancellation/deadline is control-plane authority, not command evidence.

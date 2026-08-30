@@ -205,9 +205,6 @@ func (m RepositoryMaterializer) runCommand(ctx context.Context, request workflow
 	result, loadErr := m.Store.LoadRepositoryCommandResult(ctx, key)
 	if loadErr != nil {
 		if runErr != nil {
-			if retireErr := repositoryexec.RetireUnleased(executor.Authority, claim); retireErr != nil {
-				return key, store.RepositoryCommandResult{}, errors.Join(runErr, retireErr)
-			}
 			return key, store.RepositoryCommandResult{}, runErr
 		}
 		return key, store.RepositoryCommandResult{}, loadErr
@@ -224,7 +221,9 @@ func (m RepositoryMaterializer) commit(ctx context.Context, request workflowwork
 		return store.CommitObservation{}, err
 	}
 	runner := m.Git
-	runner.MutationAuthority = m.Store
+	if runner.MutationAuthority == nil {
+		runner.MutationAuthority = m.Store
+	}
 	intent := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: request.Ticket.Ref, TicketVersion: request.Ticket.Version, Fence: request.Fence}, RequestDigest: evidence, Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "commit", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: parent}
 	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)
 	// A response can be lost after update-ref.  Re-observe the exact prepared
