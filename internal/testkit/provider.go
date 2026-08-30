@@ -65,6 +65,19 @@ type ScriptedProvider struct {
 	Crash    *CrashController
 }
 
+// Supervisor is a deterministic test process supervisor. Production runners
+// must supply an OS process-group supervisor; adapters never receive Signer.
+type Supervisor struct{ Signer *contracts.DrainSigner }
+
+func NewSupervisor() *Supervisor        { s, _ := contracts.NewDrainSigner(); return &Supervisor{Signer: s} }
+func (s *Supervisor) PublicKey() []byte { return s.Signer.PublicKey() }
+func (s *Supervisor) Run(ctx context.Context, _ contracts.DrainRequest, p contracts.Provider, input contracts.PhaseInput) (contracts.PhaseResult, error) {
+	return p.Run(ctx, input)
+}
+func (s *Supervisor) Drain(_ context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
+	return s.Signer.ProveDrained(request)
+}
+
 func NewScriptedProvider(identity domain.ProviderIdentity) *ScriptedProvider {
 	return &ScriptedProvider{Identity: identity, Steps: make(map[domain.Phase][]ProviderStep)}
 }
@@ -84,10 +97,6 @@ func (p *ScriptedProvider) Binding(context.Context) (contracts.RuntimeBinding, e
 		return contracts.RuntimeBinding{}, err
 	}
 	return contracts.RuntimeBinding{Identity: identity, BinaryDigest: digest("binary:" + identity.Version), PolicyDigest: digest("policy:" + identity.Provider), FixtureDigest: digest("fixture:" + identity.Provider), AuthDigest: digest("auth:" + identity.Provider)}, nil
-}
-
-func (p *ScriptedProvider) Drain(context.Context, contracts.DrainRequest) (contracts.DrainResult, error) {
-	return contracts.DrainResult{Drained: true}, nil
 }
 
 func (p *ScriptedProvider) Add(phase domain.Phase, step ProviderStep) {

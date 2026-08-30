@@ -300,3 +300,20 @@ var migrationV12 = []string{
 	`ALTER TABLE provider_attempts ADD COLUMN runner_epoch INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE provider_attempts ADD COLUMN expected_ticket_version INTEGER NOT NULL DEFAULT 0`,
 }
+
+// v13 binds every runnable provider claim to its durable Git identity and to
+// a supervisor verification key. Pre-v13 claims cannot establish either fact,
+// so they are explicitly failed/quarantined rather than being resumed.
+var migrationV13 = []string{
+	`ALTER TABLE provider_pair_selections ADD COLUMN planner_qualification_id INTEGER REFERENCES provider_qualifications(id)`,
+	`UPDATE provider_pair_selections SET planner_qualification_id=builder_qualification_id WHERE planner_qualification_id IS NULL`,
+	`ALTER TABLE provider_attempts ADD COLUMN repository_path TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN worktree_path TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN worktree_identity TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN base_sha TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN supervisor_key BLOB NOT NULL DEFAULT X''`,
+	`UPDATE provider_attempts SET state='failed', outcome='legacy_unverifiable', finished_at=CASE WHEN finished_at='' THEN started_at ELSE finished_at END WHERE expected_ticket_version=0 OR qualification_id IS NULL OR binding_digest='' OR leader_epoch=0 OR runner_epoch=0 OR repository_path='' OR worktree_path='' OR worktree_identity='' OR base_sha='' OR length(supervisor_key)<>32`,
+	`CREATE TRIGGER provider_attempt_state_outcome_insert BEFORE INSERT ON provider_attempts WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome='completed') OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='quarantined' AND NEW.outcome IN ('undrained','undrained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid provider state/outcome'); END`,
+	`CREATE TRIGGER provider_attempt_state_outcome_update BEFORE UPDATE OF state,outcome ON provider_attempts WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome='completed') OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='quarantined' AND NEW.outcome IN ('undrained','undrained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid provider state/outcome'); END`,
+	`CREATE TRIGGER phase_run_state_outcome_update BEFORE UPDATE OF state,outcome ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome='completed') OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
+}

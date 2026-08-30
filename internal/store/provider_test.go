@@ -13,6 +13,26 @@ import (
 	"github.com/nysa-company/sf/internal/domain"
 )
 
+var providerTestSigner, _ = contracts.NewDrainSigner()
+
+func supervised(t *testing.T, request ProviderAttemptRequest) ProviderAttemptRequest {
+	t.Helper()
+	request.Repository = "/tmp/provider"
+	request.Worktree = "/tmp/provider/" + string(request.Ref.Ticket)
+	request.WorktreeIdentity = `{"repository":"/tmp/provider"}`
+	request.BaseSHA = strings.Repeat("a", 40)
+	request.SupervisorKey = providerTestSigner.PublicKey()
+	return request
+}
+func proof(t *testing.T, claim ProviderAttemptClaim) contracts.DrainProof {
+	t.Helper()
+	value, err := providerTestSigner.ProveDrained(drainRequestForClaim(claim))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
 func TestProviderAdmissionUsesPairCapacityAndFreshFences(t *testing.T) {
 	db, ctx := openTestStore(t)
 	digest := setupProviderProject(t, db, ctx)
@@ -23,15 +43,15 @@ func TestProviderAdmissionUsesPairCapacityAndFreshFences(t *testing.T) {
 	binding := runtime(builder)
 	first = providerState(t, db, ctx, first, leader, domain.StateBuilding)
 	second = providerState(t, db, ctx, second, leader, domain.StateBuilding)
-	claim, err := db.BeginProviderAttempt(ctx, ProviderAttemptRequest{Ref: first.Ref, ExpectedVersion: first.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: first.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: first.Ref, ExpectedVersion: first.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: first.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.BeginProviderAttempt(ctx, ProviderAttemptRequest{Ref: second.Ref, ExpectedVersion: second.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: second.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+	_, err = db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: second.Ref, ExpectedVersion: second.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: second.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
 	if !errors.Is(err, ErrProviderCapacity) {
 		t.Fatalf("second admission=%v", err)
 	}
-	if err := db.FinishProviderAttempt(ctx, claim, first.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: first.RunnerEpoch}, "completed", "completed", 1, time.Now().UTC()); err != nil {
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), first.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: first.RunnerEpoch}, "completed", "completed", 1, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	var provider, model, family, version, outcome string
@@ -41,7 +61,7 @@ func TestProviderAdmissionUsesPairCapacityAndFreshFences(t *testing.T) {
 	if provider != binding.Identity.Provider || model != binding.Identity.Model || family != binding.Identity.Family || version != binding.Identity.Version || outcome != "completed" {
 		t.Fatalf("phase row lost provider binding: %s/%s/%s/%s outcome=%s", provider, model, family, version, outcome)
 	}
-	if _, err := db.BeginProviderAttempt(ctx, ProviderAttemptRequest{Ref: second.Ref, ExpectedVersion: second.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: second.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}); err != nil {
+	if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: second.Ref, ExpectedVersion: second.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: second.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); err != nil {
 		t.Fatal(err)
 	}
 	_ = reviewer
@@ -55,7 +75,7 @@ func TestReviewerMayBeFreshTwiceButNeverShareBuilderFamily(t *testing.T) {
 	builder, reviewer := setupProviderPair(t, db, ctx)
 	ticket = providerState(t, db, ctx, ticket, leader, domain.StateVerifying)
 	for _, phase := range []domain.Phase{domain.PhaseVerification, domain.PhaseReview} {
-		request := ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: phase, Role: "reviewer", Binding: runtime(reviewer), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}
+		request := supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: phase, Role: "reviewer", Binding: runtime(reviewer), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
 		if phase == domain.PhaseReview {
 			if _, err := db.db.ExecContext(ctx, `UPDATE tickets SET source_digest=? WHERE channel=? AND project_id=? AND id=?`, sha256Digest([]byte("review-source")), ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
 				t.Fatal(err)
@@ -75,7 +95,7 @@ func TestReviewerMayBeFreshTwiceButNeverShareBuilderFamily(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", phase, err)
 		}
-		if err := db.FinishProviderAttempt(ctx, claim, ticket.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, "completed", "completed", 1, time.Now().UTC()); err != nil {
+		if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, "completed", "completed", 1, time.Now().UTC()); err != nil {
 			t.Fatal(err)
 		}
 		if phase == domain.PhaseVerification {
@@ -86,7 +106,7 @@ func TestReviewerMayBeFreshTwiceButNeverShareBuilderFamily(t *testing.T) {
 	same := builder
 	same.Provider.Family = reviewer.Provider.Family
 	ticket = providerState(t, db, ctx, ticket, leader, domain.StateBuilding)
-	if _, err := db.BeginProviderAttempt(ctx, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(same), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}); !errors.Is(err, ErrProviderPairRefused) {
+	if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(same), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); !errors.Is(err, ErrProviderPairRefused) {
 		t.Fatalf("same family builder=%v", err)
 	}
 }
@@ -98,7 +118,7 @@ func TestProviderRecoveryRequiresDrainAndReleasesOnlyOldClaim(t *testing.T) {
 	ticket := setupProviderTicket(t, db, ctx, "SF-recover", leader)
 	builder, _ := setupProviderPair(t, db, ctx)
 	ticket = providerState(t, db, ctx, ticket, leader, domain.StateBuilding)
-	_, err := db.BeginProviderAttempt(ctx, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+	_, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +156,7 @@ func TestProviderRecoveryAcrossLeaderRestartUsesOriginalClaimEpoch(t *testing.T)
 	ticket := setupProviderTicket(t, db, ctx, "SF-restart-recover", oldLeader)
 	builder, _ := setupProviderPair(t, db, ctx)
 	ticket = providerState(t, db, ctx, ticket, oldLeader, domain.StateBuilding)
-	if _, err := db.BeginProviderAttempt(ctx, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: oldLeader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}); err != nil {
+	if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: oldLeader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); err != nil {
 		t.Fatal(err)
 	}
 	newLeader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "new-leader")
@@ -171,7 +191,7 @@ func TestProviderFinishRejectsStaleClaimAndPreservesLease(t *testing.T) {
 	ticket = providerState(t, db, ctx, ticket, leader, domain.StateBuilding)
 	builder, _ := setupProviderPair(t, db, ctx)
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
-	claim, err := db.BeginProviderAttempt(ctx, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +199,7 @@ func TestProviderFinishRejectsStaleClaimAndPreservesLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FinishProviderAttempt(ctx, claim, advanced.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: advanced.RunnerEpoch}, "completed", "completed", 1, time.Now().UTC()); !errors.Is(err, ErrStaleFence) {
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), advanced.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: advanced.RunnerEpoch}, "completed", "completed", 1, time.Now().UTC()); !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("stale finish=%v", err)
 	}
 	claims, err := db.ProviderAttempts(ctx, ticket.Ref)
@@ -198,7 +218,7 @@ func TestProviderAdmissionRequiresMatchingTicketStateAndPhase(t *testing.T) {
 	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "state-admission")
 	ticket := setupProviderTicket(t, db, ctx, "SF-state-admission", leader)
 	builder, _ := setupProviderPair(t, db, ctx)
-	_, err := db.BeginProviderAttempt(ctx, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+	_, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
 	if !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("queued builder admission=%v", err)
 	}
@@ -227,14 +247,14 @@ func TestProviderFinishRejectsUsageBeyondTicketCeiling(t *testing.T) {
 	ticket = providerState(t, db, ctx, ticket, leader, domain.StateBuilding)
 	builder, _ := setupProviderPair(t, db, ctx)
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
-	claim, err := db.BeginProviderAttempt(ctx, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FinishProviderAttempt(ctx, claim, ticket.Version, fence, "completed", "completed", ticket.MaxCostMicroUSD+1, time.Now().UTC()); !errors.Is(err, ErrBudgetExhausted) {
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "completed", "completed", ticket.MaxCostMicroUSD+1, time.Now().UTC()); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("overspend finish=%v", err)
 	}
-	if err := db.FinishProviderAttempt(ctx, claim, ticket.Version, fence, "completed", "completed", 1, ticket.CreatedAt.Add(ticket.MaxDuration).Add(time.Nanosecond)); !errors.Is(err, ErrBudgetExhausted) {
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "completed", "completed", 1, ticket.CreatedAt.Add(ticket.MaxDuration).Add(time.Nanosecond)); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("late finish=%v", err)
 	}
 	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
@@ -298,6 +318,9 @@ func setupProviderTicket(t *testing.T, db *Store, ctx context.Context, id string
 	}
 	started, err := db.StartOrAdopt(ctx, ref, 1, "dev/provider/"+id, domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Path: "/tmp/provider/" + id, Branch: "dev/provider/" + id, IdentityJSON: []byte(`{"repository":"/tmp/provider"}`), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
 	return started

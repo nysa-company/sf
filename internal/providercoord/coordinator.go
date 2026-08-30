@@ -112,15 +112,16 @@ func (r *Registry) get(name string) (contracts.Provider, bool) {
 }
 
 type Coordinator struct {
-	registry *Registry
-	routes   map[Role]Route
-	store    *store.Store
-	clock    Clock
+	registry   *Registry
+	routes     map[Role]Route
+	store      *store.Store
+	clock      Clock
+	supervisor contracts.ProcessSupervisor
 }
 
-func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Clock) (*Coordinator, error) {
-	if reg == nil || database == nil {
-		return nil, errors.New("registry and store required")
+func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Clock, supervisor contracts.ProcessSupervisor) (*Coordinator, error) {
+	if reg == nil || database == nil || supervisor == nil || len(supervisor.PublicKey()) != 32 {
+		return nil, errors.New("registry, store, and process supervisor required")
 	}
 	copy := map[Role]Route{}
 	for role, route := range routes {
@@ -143,7 +144,7 @@ func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Cloc
 	if clock == nil {
 		clock = wallClock{}
 	}
-	return &Coordinator{reg, copy, database, clock}, nil
+	return &Coordinator{registry: reg, routes: copy, store: database, clock: clock, supervisor: supervisor}, nil
 }
 func (role Role) valid() bool {
 	return role == RolePlanner || role == RoleBuilder || role == RoleReviewer
@@ -193,7 +194,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			timeout = remaining
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest})
+		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest, Repository: r.Input.Repository, Worktree: r.Input.Worktree, WorktreeIdentity: r.Input.WorktreeIdentity, BaseSHA: r.Input.BaseSHA, SupervisorKey: c.supervisor.PublicKey()})
 		if err != nil {
 			cancel()
 			if errors.Is(err, store.ErrProviderCapacity) {
@@ -204,16 +205,16 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		input := r.Input
 		input.Provider = binding.Identity
 		input.Timeout = timeout
-		raw, runErr := p.Run(attemptCtx, input)
+		raw, runErr := c.supervisor.Run(attemptCtx, drainRequest(claim), p, input)
 		cancel()
 		cancelled := ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
 		// Returning from Run, including a provider error, is not proof that its
 		// process group drained. Every terminal path must obtain an explicit
 		// supervisor proof before releasing the durable claim and lease.
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		drain, drainErr := p.Drain(drainCtx, drainRequest(claim))
+		drain, drainErr := c.supervisor.Drain(drainCtx, drainRequest(claim))
 		drainCancel()
-		if drainErr != nil || !drain.Drained {
+		if drainErr != nil {
 			quarantineCtx, quarantineCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = c.store.QuarantineProviderAttempt(quarantineCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
 			quarantineCancel()
@@ -243,12 +244,12 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		}
 		receipts = append(receipts, receipt)
 		finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		finishErr := c.store.FinishProviderAttempt(finishCtx, claim, r.ExpectedVersion, r.Fence, state, outcome, max(raw.UsageUnits, 0), c.clock.Now())
+		finishErr := c.store.FinishProviderAttempt(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, state, outcome, max(raw.UsageUnits, 0), c.clock.Now())
 		finishCancel()
 		if finishErr != nil {
 			if errors.Is(finishErr, store.ErrBudgetExhausted) {
 				quarantineCtx, quarantineCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = c.store.FailProviderAttemptBudget(quarantineCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
+				_ = c.store.FailProviderAttemptBudget(quarantineCtx, claim, drain, r.ExpectedVersion, r.Fence, c.clock.Now())
 				quarantineCancel()
 				return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
@@ -295,15 +296,11 @@ func (c *Coordinator) Recover(ctx context.Context, ref domain.TicketRef, staleRu
 }
 
 func (c *Coordinator) recoverClaim(ctx context.Context, claim store.ProviderAttempt, leader uint64) error {
-	p, ok := c.registry.get(claim.Binding.Identity.Provider)
-	if !ok {
-		return errors.New("provider unavailable")
-	}
-	drain, err := p.Drain(ctx, drainRequest(claim.ProviderAttemptClaim))
+	drain, err := c.supervisor.Drain(ctx, drainRequest(claim.ProviderAttemptClaim))
 	if err != nil {
 		return err
 	}
-	return c.store.RecoverProviderAttemptClaim(ctx, claim, leader, drain.Drained, c.clock.Now())
+	return c.store.RecoverProviderAttemptClaimWithProof(ctx, claim, leader, drain, c.clock.Now())
 }
 
 // RecoverClaim is the daemon integration boundary. It uses the provider and
@@ -317,7 +314,7 @@ func drainRequest(claim store.ProviderAttemptClaim) contracts.DrainRequest {
 	return contracts.DrainRequest{Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest}
 }
 func validate(r Request) error {
-	if !r.Role.valid() || r.Input.Ticket.Validate() != nil || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.ConfigDigest == "" || len(r.ConfigDigest) != 64 || r.Input.Profile != contracts.ProfileGuarded || r.Input.Timeout <= 0 || r.Input.Timeout > 10*time.Minute || strings.TrimSpace(r.Input.Prompt) == "" || len(r.Input.Prompt) > 64<<10 || !cleanAbs(r.Input.Repository) || !cleanAbs(r.Input.Worktree) || len(r.Input.Schema) == 0 || len(r.Input.Schema) > 1<<20 {
+	if !r.Role.valid() || r.Input.Ticket.Validate() != nil || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.ConfigDigest == "" || len(r.ConfigDigest) != 64 || r.Input.Profile != contracts.ProfileGuarded || r.Input.Timeout <= 0 || r.Input.Timeout > 10*time.Minute || strings.TrimSpace(r.Input.Prompt) == "" || len(r.Input.Prompt) > 64<<10 || !cleanAbs(r.Input.Repository) || !cleanAbs(r.Input.Worktree) || r.Input.WorktreeIdentity == "" || len(r.Input.BaseSHA) != 40 || len(r.Input.Schema) == 0 || len(r.Input.Schema) > 1<<20 {
 		return errors.New("invalid request")
 	}
 	if r.Input.Provider != (domain.ProviderIdentity{}) {

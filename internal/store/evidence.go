@@ -292,7 +292,7 @@ func (s *Store) recordPhaseAttempt(ctx context.Context, attempt PhaseAttempt, di
 			if disposition != "active" {
 				return ErrStaleFence
 			}
-			_, err = conn.ExecContext(ctx, `INSERT INTO phase_runs(channel, project_id, ticket_id, phase, attempt, state, leader_epoch, runner_epoch, expected_ticket_version, provider, model, family, provider_version, worktree_identity, base_sha, started_at, outcome, usage_json) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '{}')`, attempt.Ref.Channel, attempt.Ref.Project, attempt.Ref.Ticket, attempt.Phase, attempt.Attempt, attempt.Fence.LeaderEpoch, attempt.Fence.RunnerEpoch, attempt.ExpectedVersion, attempt.Provider.Provider, attempt.Provider.Model, attempt.Provider.Family, attempt.Provider.Version, attempt.WorktreeID, attempt.BaseSHA, now())
+			_, err = conn.ExecContext(ctx, `INSERT INTO phase_runs(channel, project_id, ticket_id, phase, attempt, state, leader_epoch, runner_epoch, expected_ticket_version, provider, model, family, provider_version, worktree_identity, base_sha, started_at, outcome, usage_json) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', '{}')`, attempt.Ref.Channel, attempt.Ref.Project, attempt.Ref.Ticket, attempt.Phase, attempt.Attempt, attempt.Fence.LeaderEpoch, attempt.Fence.RunnerEpoch, attempt.ExpectedVersion, attempt.Provider.Provider, attempt.Provider.Model, attempt.Provider.Family, attempt.Provider.Version, attempt.WorktreeID, attempt.BaseSHA, now())
 			if err != nil {
 				return err
 			}
