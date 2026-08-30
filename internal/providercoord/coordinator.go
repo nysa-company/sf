@@ -36,7 +36,10 @@ type Outcome string
 // ErrPersistenceFatal means durable provider state could not be finalized.
 // Once observed, this coordinator refuses all later launches because the
 // active claim and process ownership are no longer safely knowable.
-var ErrPersistenceFatal = errors.New("provider coordinator persistence failure is fatal")
+var (
+	ErrPersistenceFatal      = errors.New("provider coordinator persistence failure is fatal")
+	ErrPrePublishingNotReady = errors.New("pre-publishing provider routes are not ready")
+)
 
 const (
 	Completed       Outcome = "completed"
@@ -150,6 +153,35 @@ type Coordinator struct {
 // Keeping this hook explicit makes that ownership auditable for later runtime
 // compositions without making daemon shutdown depend on a concrete type.
 func (c *Coordinator) Close() error { return nil }
+
+// ReadyForPrePublishing proves that the local Planner/Builder/Reviewer
+// walking skeleton has a complete, currently usable route set.  Composition
+// calls this before it gives a workflow runtime any execution authority.  An
+// empty coordinator remains useful for doctor/qualification flows, but it is
+// never equivalent to an executable runtime.
+func (c *Coordinator) ReadyForPrePublishing() error {
+	if c == nil || c.registry == nil || c.store == nil || c.supervisor == nil {
+		return ErrPrePublishingNotReady
+	}
+	if err := c.persistenceFailure(); err != nil {
+		return err
+	}
+	for _, role := range []Role{RolePlanner, RoleBuilder, RoleReviewer} {
+		route, ok := c.routes[role]
+		if !ok || route.Primary == "" {
+			return ErrPrePublishingNotReady
+		}
+		if _, ok := c.registry.get(route.Primary); !ok {
+			return ErrPrePublishingNotReady
+		}
+		if route.Fallback != "" {
+			if _, ok := c.registry.get(route.Fallback); !ok {
+				return ErrPrePublishingNotReady
+			}
+		}
+	}
+	return nil
+}
 
 func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Clock, supervisor contracts.ProcessSupervisor) (*Coordinator, error) {
 	if reg == nil || database == nil || supervisor == nil || len(supervisor.PublicKey()) != 32 {

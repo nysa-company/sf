@@ -131,6 +131,22 @@ func TestCoordinatorReusesOnlyExactCompletedResult(t *testing.T) {
 	}
 }
 
+func TestPrePublishingReadinessRequiresAllRoutesAndNoFatalLatch(t *testing.T) {
+	_, _, coordinator, _, _ := newCoordinatorFixture(t, testkit.NewSupervisor())
+	if err := coordinator.ReadyForPrePublishing(); !errors.Is(err, ErrPrePublishingNotReady) {
+		t.Fatalf("incomplete route set readiness=%v", err)
+	}
+	coordinator.routes[RoleBuilder] = Route{Primary: "cursor", Fallback: "claude"}
+	coordinator.routes[RoleReviewer] = Route{Primary: "claude", Fallback: "cursor"}
+	if err := coordinator.ReadyForPrePublishing(); err != nil {
+		t.Fatalf("complete route set readiness=%v", err)
+	}
+	coordinator.markPersistenceFailure(errors.New("durable result uncertain"))
+	if err := coordinator.ReadyForPrePublishing(); !errors.Is(err, ErrPersistenceFatal) {
+		t.Fatalf("fatal coordinator readiness=%v", err)
+	}
+}
+
 type blockingBindingProvider struct {
 	*testkit.ScriptedProvider
 	entered     chan struct{}
