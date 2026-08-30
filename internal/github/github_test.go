@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -46,9 +48,9 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build fake-gh: %v\n%s", err, output)
 	}
-	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), ConfigDir: filepath.Join(root, "gh-config"), Env: []string{"SF_FAKE_GH_STATE=" + state}, Runner: commandRunnerFunc(runBounded), ValidateClaim: func(context.Context, domain.ExternalEffectClaim) error { return nil }, MutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+	client := &Client{binaryPath: binary, home: filepath.Join(root, "home"), configDir: filepath.Join(root, "gh-config"), env: []string{"SF_FAKE_GH_STATE=" + state}, runner: commandRunnerFunc(runBounded), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		return start(ctx)
-	}), VerifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+	}), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
 	})}
 	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
@@ -61,14 +63,30 @@ func TestContractMutationRequiresClaimValidator(t *testing.T) {
 	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); err != nil {
 		t.Fatalf("validated claim=%v", err)
 	}
-	client.ValidateClaim = nil
+	client.validateClaimFn = nil
 	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("missing validator=%v", err)
 	}
 }
 
+func TestNewClientRejectsMissingAuthoritiesAndLiteralCannotRun(t *testing.T) {
+	if _, err := NewClient("/bin/echo", t.TempDir(), t.TempDir(), commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
+		return nil, nil
+	}), func(context.Context, domain.ExternalEffectClaim) error { return nil }, mutationGuardFunc(func(context.Context, domain.ExternalEffectClaim, func(context.Context) ([]byte, error)) ([]byte, error) {
+		return nil, nil
+	}), verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, Contains: true}, nil
+	})); err != nil {
+		t.Fatalf("valid client rejected: %v", err)
+	}
+	client := Client{}
+	if err := client.AuthStatus(context.Background()); !errors.Is(err, ErrPolicyRefusal) {
+		t.Fatalf("literal err=%v", err)
+	}
+}
+
 func TestAuthStatusAcceptsOfficialHostsStateShape(t *testing.T) {
-	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 		want := []string{"auth", "status", "--json", "hosts"}
 		if !reflect.DeepEqual(args, want) {
 			return nil, errors.New("unexpected auth argv")
@@ -84,7 +102,7 @@ func TestMergeQueueGraphQLFailsClosedBeforeMerge(t *testing.T) {
 	client, _, identity := fixture(t)
 	identity.Number = 7
 	called := false
-	client.Runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+	client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 		called = true
 		if len(args) < 4 || args[0] != "api" || args[1] != "--hostname" || args[2] != "github.com" || args[3] != "graphql" {
 			return nil, errors.New("wrong queue argv")
@@ -129,6 +147,31 @@ func TestPreflightCreateLostResponseAndExactAdoption(t *testing.T) {
 	}
 	if _, err := client.Observe(context.Background(), identity); !errors.Is(err, ErrAmbiguousPR) {
 		t.Fatalf("ambiguous=%v", err)
+	}
+}
+
+func TestCreateUncertainNeverAttemptsNumberOnlyOrphanClose(t *testing.T) {
+	client, _, identity := fixture(t)
+	var closed bool
+	client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		switch {
+		case len(args) >= 2 && args[0] == "pr" && args[1] == "list":
+			return []byte("[]"), nil
+		case len(args) >= 2 && args[0] == "pr" && args[1] == "create":
+			return []byte("https://github.com/example/app/pull/999\n"), nil
+		case len(args) >= 2 && args[0] == "pr" && args[1] == "close":
+			closed = true
+			return nil, nil
+		default:
+			return nil, errors.New("unexpected command")
+		}
+	})
+	claim := domain.ExternalEffectClaim{SemanticKey: "uncertain-create", Kind: "draft_pr", RequestDigest: requestDigest("draft_pr", identity, "title", "body")}
+	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrCreateUncertain) {
+		t.Fatalf("uncertain create err=%v", err)
+	}
+	if closed {
+		t.Fatal("uncertain create attempted number-only orphan close")
 	}
 }
 
@@ -202,6 +245,92 @@ func TestDraftAndNonOpenPRsCannotMergeOrBeAdopted(t *testing.T) {
 	}
 }
 
+func TestMarkReadyRejectsMergedPRBeforeMutation(t *testing.T) {
+	client, fake, identity := fixture(t)
+	identity.Number = 1
+	if err := fake.InjectPullRequestForTest(testkit.PullRequest{Identity: identity, Merged: true}); err != nil {
+		t.Fatal(err)
+	}
+	durable := domain.ExternalEffectClaim{SemanticKey: "ready-merged", Kind: "pr_ready", RequestDigest: requestDigest("pr_ready", identity)}
+	if err := client.MarkReady(context.Background(), durable, identity); !errors.Is(err, ErrPolicyRefusal) {
+		t.Fatalf("merged ready=%v", err)
+	}
+	if fake.MutationCount("pr_ready") != 0 {
+		t.Fatalf("merged PR was mutated")
+	}
+}
+
+func TestMarkReadySynchronizeGapCompensatesChangedSource(t *testing.T) {
+	client, _, identity := fixture(t)
+	identity.Number = 1
+	changed := identity
+	changed.HeadOID = strings.Repeat("b", 40)
+	oldWire, err := json.Marshal(mergeWire(identity, "OPEN", "CLEAN", nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newWireValue := mergeWire(changed, "OPEN", "CLEAN", nil, nil)
+	newWireValue["body"] = ownershipMarker(identity)
+	newWire, err := json.Marshal(newWireValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredWireValue := mergeWire(changed, "OPEN", "CLEAN", nil, nil)
+	restoredWireValue["body"] = ownershipMarker(identity)
+	restoredWireValue["isDraft"] = true
+	restoredWire, err := json.Marshal(restoredWireValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phase := 0
+	undoCalled := false
+	client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if len(args) < 2 || args[0] != "pr" {
+			return nil, errors.New("unexpected command")
+		}
+		switch args[1] {
+		case "list":
+			if phase == 0 {
+				return []byte("[" + string(oldWire) + "]"), nil
+			}
+			if phase == 3 {
+				return []byte("[" + string(restoredWire) + "]"), nil
+			}
+			return []byte("[" + string(newWire) + "]"), nil
+		case "view":
+			if phase == 0 {
+				phase = 1
+				return oldWire, nil
+			}
+			if phase == 3 {
+				return restoredWire, nil
+			}
+			return newWire, nil
+		case "ready":
+			undo := false
+			for _, arg := range args {
+				undo = undo || arg == "--undo"
+			}
+			if undo {
+				undoCalled = true
+				phase = 3
+				return []byte("{}"), nil
+			}
+			phase = 2
+			return []byte("{}"), nil
+		default:
+			return nil, errors.New("unexpected command")
+		}
+	})
+	claim := domain.ExternalEffectClaim{SemanticKey: "ready-gap", Kind: "pr_ready", RequestDigest: requestDigest("pr_ready", identity)}
+	if err := client.MarkReady(context.Background(), claim, identity); !errors.Is(err, ErrPolicyRefusal) {
+		t.Fatalf("changed-head ready=%v", err)
+	}
+	if !undoCalled {
+		t.Fatal("changed-head ready did not attempt exact number-scoped undo")
+	}
+}
+
 func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 	t.Run("unavailable verifier is never success", func(t *testing.T) {
 		client, fake, identity := fixture(t)
@@ -211,7 +340,7 @@ func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		client.VerifyProtectedBranch = nil
+		client.verifyProtectedBranch = nil
 		if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
 			t.Fatal(err)
 		}
@@ -227,7 +356,7 @@ func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		client.VerifyProtectedBranch = verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+		client.verifyProtectedBranch = verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 			return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
 		})
 		if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
@@ -258,7 +387,7 @@ func TestMergeNeverTrustsCLIExitWithoutFreshMergedObservation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			client.Runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+			client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 				if len(args) >= 2 && args[0] == "pr" && args[1] == "merge" {
 					return nil, nil // gh may report success for a non-merge operation.
 				}
@@ -284,7 +413,7 @@ func TestOfficialGHArgvGolden(t *testing.T) {
 	}
 	var got [][]string
 	listCalls := 0
-	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 		got = append(got, append([]string(nil), args...))
 		switch args[0] + " " + args[1] {
 		case "pr list":
@@ -323,7 +452,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 	}
 	var got [][]string
 	verified := false
-	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 		got = append(got, append([]string(nil), args...))
 		if args[0] == "pr" && args[1] == "merge" {
 			return nil, nil
@@ -332,7 +461,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 			return payload, nil
 		}
 		return nil, errors.New("unexpected command")
-	}), VerifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+	}), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 		verified = repository == identity.Repository && baseRef == "main" && mergeCommit == strings.Repeat("b", 40)
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
 	})}
@@ -401,7 +530,7 @@ func TestWaitChecksBoundsBackgroundContext(t *testing.T) {
 	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "one", State: "PENDING"}); err != nil {
 		t.Fatal(err)
 	}
-	client.Runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) { return fake.Run(args) })
+	client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) { return fake.Run(args) })
 	old := maxGHDeadline
 	maxGHDeadline = 300 * time.Millisecond
 	t.Cleanup(func() { maxGHDeadline = old })
@@ -420,20 +549,20 @@ func TestWaitChecksPreservesCancellationAsPending(t *testing.T) {
 }
 
 func TestStrictJSONBoundedSanitizedCommandBoundary(t *testing.T) {
-	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: filepath.Join(t.TempDir(), "gh-config"), Runner: commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: filepath.Join(t.TempDir(), "gh-config"), runner: commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
 		return []byte(`{"unknown":true}`), nil
 	})}
 	var value struct{}
 	if err := client.json(context.Background(), &value, "repo", "view"); !errors.Is(err, ErrMalformedResponse) {
 		t.Fatalf("unknown json=%v", err)
 	}
-	client.Runner = commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
+	client.runner = commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
 		return make([]byte, maxResponse+1), nil
 	})
 	if _, err := client.run(context.Background(), "repo", "view"); !errors.Is(err, ErrResponseTooLarge) {
 		t.Fatalf("oversized=%v", err)
 	}
-	client.Runner = commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
+	client.runner = commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
 		return []byte("secret-token-in-output"), errors.New("failure")
 	})
 	if _, err := client.run(context.Background(), "repo", "view"); err == nil || err.Error() != "gh command failed" {
@@ -448,5 +577,23 @@ func TestRunBoundedKillsProcessGroupOnDeadline(t *testing.T) {
 	_, err := runBounded(ctx, "/bin/sh", []string{"-c", "sleep 5 & wait"}, []string{"PATH=/usr/bin:/bin"})
 	if err == nil || time.Since(started) > time.Second {
 		t.Fatalf("stuck process group err=%v elapsed=%s", err, time.Since(started))
+	}
+}
+
+func TestRunBoundedClosesRetainedPipeFromEscapedDescendant(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	script := "import os,time\nif os.fork()==0:\n if os.fork()==0:\n  os.setsid(); print(os.getpid(), flush=True); time.sleep(5)\n os._exit(0)\ntime.sleep(5)"
+	output, err := runBounded(ctx, "/usr/bin/python3", []string{"-c", script}, []string{"PATH=/usr/bin:/bin"})
+	if !errors.Is(err, ErrProcessCleanup) || time.Since(started) > 2*time.Second {
+		t.Fatalf("escaped retained pipe err=%v elapsed=%s output=%q", err, time.Since(started), output)
+	}
+	for _, field := range strings.Fields(string(output)) {
+		if strings.HasPrefix(field, "escaped-child-pid=") {
+			if pid, parseErr := strconv.Atoi(strings.TrimPrefix(field, "escaped-child-pid=")); parseErr == nil && pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
 	}
 }

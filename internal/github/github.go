@@ -11,10 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +33,8 @@ var (
 	ErrApprovalInvalid   = errors.New("approval is not bound to current reviewed head")
 	ErrResponseTooLarge  = errors.New("github response exceeded bound")
 	ErrMalformedResponse = errors.New("github response is malformed")
+	ErrCreateUncertain   = errors.New("github pull request creation is uncertain; reconcile before retrying")
+	ErrProcessCleanup    = errors.New("github command descendant cleanup is uncertain")
 )
 
 const maxResponse = 1 << 20
@@ -39,17 +42,17 @@ const maxResponse = 1 << 20
 var maxGHDeadline = 2 * time.Minute
 
 type Client struct {
-	Binary        string
-	Home          string
-	ConfigDir     string        // explicit existing gh auth/config authority, never a temp substitute
-	Env           []string      // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
-	Runner        CommandRunner // required by NewClient; supervisor-owned in production
-	ValidateClaim func(context.Context, domain.ExternalEffectClaim) error
-	MutationGuard contracts.ExternalMutationGuard
+	binaryPath      string
+	home            string
+	configDir       string                  // explicit existing gh auth/config authority, never a temp substitute
+	env             []string                // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
+	runner          SupervisedCommandRunner // required by NewClient; supervisor-owned in production
+	validateClaimFn func(context.Context, domain.ExternalEffectClaim) error
+	mutationGuard   contracts.ExternalMutationGuard
 	// VerifyProtectedBranch is supplied by the Git boundary.  It is the
 	// authority that freshly fetches the protected base ref and proves that the
 	// reported merge commit is contained by that exact ref.
-	VerifyProtectedBranch contracts.ProtectedBranchVerifier
+	verifyProtectedBranch contracts.ProtectedBranchVerifier
 }
 
 type Principal struct{ Login string }
@@ -63,14 +66,23 @@ type PRMatch struct {
 	MergeState           string
 	AutoMerge            bool
 }
-type CommandRunner interface {
+
+// SupervisedCommandRunner is the only process capability accepted by the
+// GitHub boundary. Its Cleanup method is part of the authority contract: the
+// caller must not regain the mutation gate until descendants and output
+// writers are gone or cleanup has returned an uncertainty error.
+type SupervisedCommandRunner interface {
 	Run(context.Context, string, []string, []string) ([]byte, error)
+	// Cleanup must return only after all descendants and output writers from the
+	// run are gone, or return an uncertainty error that blocks the effect.
+	Cleanup(context.Context) error
 }
 type commandRunnerFunc func(context.Context, string, []string, []string) ([]byte, error)
 
 func (f commandRunnerFunc) Run(ctx context.Context, binary string, args, env []string) ([]byte, error) {
 	return f(ctx, binary, args, env)
 }
+func (f commandRunnerFunc) Cleanup(context.Context) error { return nil }
 
 type EffectPlan struct {
 	SemanticKey string
@@ -93,11 +105,11 @@ var _ contracts.GitHub = (*Client)(nil)
 // NewClient is the production wiring point. The orchestrator supplies the
 // Store mutation handoff and the Git-boundary protected-branch verifier; a
 // guarded merge client is never constructed without both authorities.
-func NewClient(binary, home, configDir string, runner CommandRunner, validate func(context.Context, domain.ExternalEffectClaim) error, guard contracts.ExternalMutationGuard, verifier contracts.ProtectedBranchVerifier) (*Client, error) {
+func NewClient(binary, home, configDir string, runner SupervisedCommandRunner, validate func(context.Context, domain.ExternalEffectClaim) error, guard contracts.ExternalMutationGuard, verifier contracts.ProtectedBranchVerifier) (*Client, error) {
 	if binary == "" || !filepath.IsAbs(binary) || home == "" || !filepath.IsAbs(home) || configDir == "" || !filepath.IsAbs(configDir) || runner == nil || validate == nil || guard == nil || verifier == nil {
 		return nil, ErrPolicyRefusal
 	}
-	return &Client{Binary: binary, Home: home, ConfigDir: configDir, Runner: runner, ValidateClaim: validate, MutationGuard: guard, VerifyProtectedBranch: verifier}, nil
+	return &Client{binaryPath: binary, home: home, configDir: configDir, runner: runner, validateClaimFn: validate, mutationGuard: guard, verifyProtectedBranch: verifier}, nil
 }
 
 type authHost struct {
@@ -166,7 +178,7 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 		return contracts.PullRequestIdentity{}, err
 	}
 	markedBody := body + "\n\n" + ownershipMarker(identity)
-	output, runErr := c.mutate(ctx, durable, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
+	_, runErr := c.mutate(ctx, durable, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
 	// Both a delivered response and a lost response are reconciled by the same
 	// exact ownership observation; command output is never object evidence.
 	match, observeErr := c.Observe(ctx, identity)
@@ -174,40 +186,12 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 		return match.Identity, nil
 	}
 	if runErr != nil {
-		return contracts.PullRequestIdentity{}, runErr
+		return contracts.PullRequestIdentity{}, fmt.Errorf("%w: command result unavailable", ErrCreateUncertain)
 	}
-	if number, ok := createdPRNumber(string(output)); ok {
-		if err := c.closeOrphan(ctx, durable, identity, number); err != nil {
-			return contracts.PullRequestIdentity{}, err
-		}
-	}
-	return contracts.PullRequestIdentity{}, observeErr
-}
-
-func createdPRNumber(output string) (int, bool) {
-	last := strings.LastIndex(strings.TrimSpace(output), "/")
-	if last < 0 {
-		return 0, false
-	}
-	value, err := strconv.Atoi(strings.TrimSpace(output[last+1:]))
-	return value, err == nil && value > 0
-}
-func (c Client) closeOrphan(ctx context.Context, claim domain.ExternalEffectClaim, want contracts.PullRequestIdentity, number int) error {
-	if number <= 0 || !validIdentity(want) {
-		return ErrPolicyRefusal
-	}
-	actual, err := c.viewOwnedNumber(ctx, want.Repository, number, want)
-	if err != nil || !sameExact(actual.Identity, want) || actual.State != "OPEN" {
-		return ErrPolicyRefusal
-	}
-	if _, err := c.mutate(ctx, claim, "pr", "close", fmt.Sprint(number), "--repo", repoArg(want.Repository)); err != nil {
-		return ErrPolicyRefusal
-	}
-	closed, err := c.viewOwnedNumber(ctx, want.Repository, number, want)
-	if err != nil || !sameExact(closed.Identity, want) || closed.State != "CLOSED" {
-		return ErrPolicyRefusal
-	}
-	return ErrPolicyRefusal // the original claim remains uncertain; never confirm an orphan.
+	// A create response that cannot be reconciled is not safe to compensate:
+	// gh exposes no API-side expected-identity precondition for closing a PR by
+	// number. Leave the remote object untouched and require reconciliation.
+	return contracts.PullRequestIdentity{}, fmt.Errorf("%w: %v", ErrCreateUncertain, observeErr)
 }
 func (c Client) UpdatePullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) error {
 	observed, err := c.Observe(ctx, identity)
@@ -228,19 +212,22 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 	if err != nil {
 		return err
 	}
+	if observed.State != "OPEN" || observed.Merged {
+		return ErrPolicyRefusal
+	}
 	identity = observed.Identity
 	if err := c.validateClaim(ctx, durable, identity, "pr_ready", requestDigest("pr_ready", identity)); err != nil {
 		return err
 	}
 	_, err = c.mutateExact(ctx, durable, identity, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository))
 	observed, observeErr := c.Observe(ctx, identity)
-	if observeErr == nil && sameExact(observed.Identity, identity) && observed.Ready && !observed.Draft {
+	if observeErr == nil && sameExact(observed.Identity, identity) && observed.State == "OPEN" && !observed.Merged && observed.Ready && !observed.Draft {
 		return nil
 	}
 	// GitHub exposes no expected-head CAS for ready. Compensate immediately on
 	// a changed/uncertain post-state: restore draft on the freshly observed PR,
 	// verify it, and leave the durable effect unconfirmed for reconciliation.
-	if observeErr == nil {
+	if observeErr == nil && observed.State == "OPEN" && !observed.Merged {
 		_, undoErr := c.mutateExact(ctx, durable, observed.Identity, "pr", "ready", fmt.Sprint(observed.Identity.Number), "--repo", repoArg(observed.Identity.Repository), "--undo")
 		restored, restoreErr := c.Observe(ctx, observed.Identity)
 		if undoErr != nil || restoreErr != nil || !sameExact(restored.Identity, observed.Identity) || !restored.Draft {
@@ -251,18 +238,18 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 	if observeErr != nil {
 		current, sourceErr := c.viewSameSourceNumber(ctx, identity.Repository, identity.Number, identity)
 		if sourceErr == nil {
-			_, undoErr := c.mutate(ctx, durable, "pr", "ready", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--undo")
+			// Re-prove the exact currently observed identity inside the launch
+			// handoff; the number-scoped undo is never authorized by a stale
+			// pre-handoff read alone.
+			_, undoErr := c.mutateSameSourceExact(ctx, durable, identity, current.Identity, "pr", "ready", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--undo")
 			restored, restoreErr := c.viewSameSourceNumber(ctx, identity.Repository, identity.Number, identity)
-			if undoErr == nil && restoreErr == nil && restored.Draft {
+			if undoErr == nil && restoreErr == nil && sameExact(restored.Identity, current.Identity) && restored.Draft {
 				return ErrPolicyRefusal
 			}
 		}
 		return ErrPolicyRefusal
 	}
-	if err == nil {
-		return ErrPolicyRefusal
-	}
-	return err
+	return ErrPolicyRefusal
 }
 
 func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, headOID, method string, authorization domain.MergeAuthorization) error {
@@ -271,7 +258,7 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 		return err
 	}
 	queued, queueErr := c.mergeQueued(ctx, observed.Identity)
-	if queueErr != nil || c.VerifyProtectedBranch == nil || observed.Draft || observed.Merged || observed.AutoMerge || queued || queueState(observed.MergeState) || observed.State != "OPEN" {
+	if queueErr != nil || c.verifyProtectedBranch == nil || observed.Draft || observed.Merged || observed.AutoMerge || queued || queueState(observed.MergeState) || observed.State != "OPEN" {
 		return ErrPolicyRefusal
 	}
 	identity = observed.Identity
@@ -286,17 +273,17 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 }
 
 func (c Client) validateClaim(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, requiredKind, digest string) error {
-	if c.ValidateClaim == nil || c.MutationGuard == nil || claim.SemanticKey == "" || claim.Kind != requiredKind || claim.RequestDigest != digest || !validIdentity(identity) {
+	if c.validateClaimFn == nil || c.mutationGuard == nil || claim.SemanticKey == "" || claim.Kind != requiredKind || claim.RequestDigest != digest || !validIdentity(identity) {
 		return ErrPolicyRefusal
 	}
-	return c.ValidateClaim(ctx, claim)
+	return c.validateClaimFn(ctx, claim)
 }
 
 func (c Client) mutate(ctx context.Context, claim domain.ExternalEffectClaim, args ...string) ([]byte, error) {
-	if c.MutationGuard == nil {
+	if c.mutationGuard == nil {
 		return nil, ErrPolicyRefusal
 	}
-	return c.MutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
 		return c.run(runCtx, args...)
 	})
 }
@@ -304,12 +291,30 @@ func (c Client) mutate(ctx context.Context, claim domain.ExternalEffectClaim, ar
 // mutateExact re-observes the exact factory identity inside the durable launch
 // handoff. A PR number alone is never sufficient authorization to mutate.
 func (c Client) mutateExact(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, args ...string) ([]byte, error) {
-	if c.MutationGuard == nil {
+	if c.mutationGuard == nil {
 		return nil, ErrPolicyRefusal
 	}
-	return c.MutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
 		observed, err := c.view(runCtx, identity)
 		if err != nil || !sameExact(observed.Identity, identity) {
+			return nil, ErrPolicyRefusal
+		}
+		return c.run(runCtx, args...)
+	})
+}
+
+// mutateSameSourceExact is the compensation variant used after a ready
+// synchronize gap. GitHub has no head CAS for the undo operation, so the
+// source identity (repository, branch, base, marker, and PR number) is
+// re-observed inside the durable launch handoff and the observed head OID must
+// still equal the one selected for compensation.
+func (c Client) mutateSameSourceExact(ctx context.Context, claim domain.ExternalEffectClaim, original, current contracts.PullRequestIdentity, args ...string) ([]byte, error) {
+	if c.mutationGuard == nil {
+		return nil, ErrPolicyRefusal
+	}
+	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+		observed, err := c.viewSameSourceNumber(runCtx, original.Repository, original.Number, original)
+		if err != nil || !sameExact(observed.Identity, current) {
 			return nil, ErrPolicyRefusal
 		}
 		return c.run(runCtx, args...)
@@ -609,10 +614,10 @@ func (c Client) mergeRun(ctx context.Context, claim EffectClaim, pr PRMatch, rev
 		if !sameExact(observed.Identity, pr.Identity) || observed.Identity.HeadOID != reviewedHead {
 			return MergeExternal, ErrExternalMerged
 		}
-		if observed.State != "MERGED" || observed.MergeCommit == "" || observed.Identity.BaseRef != pr.Identity.BaseRef || c.VerifyProtectedBranch == nil {
+		if observed.State != "MERGED" || observed.MergeCommit == "" || observed.Identity.BaseRef != pr.Identity.BaseRef || c.verifyProtectedBranch == nil {
 			return "", ErrPolicyRefusal
 		}
-		proof, verifyErr := c.VerifyProtectedBranch.VerifyProtectedBranch(ctx, pr.Identity.Repository, pr.Identity.BaseRef, observed.MergeCommit)
+		proof, verifyErr := c.verifyProtectedBranch.VerifyProtectedBranch(ctx, pr.Identity.Repository, pr.Identity.BaseRef, observed.MergeCommit)
 		if verifyErr != nil {
 			return "", verifyErr
 		}
@@ -689,23 +694,6 @@ func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryI
 	return value.match(parsed), nil
 }
 
-// viewOwnedNumber is the narrow orphan-cleanup proof: create output is only a
-// hint; closure is authorized only after this fresh full identity read.
-func (c Client) viewOwnedNumber(ctx context.Context, repository contracts.RepositoryIdentity, number int, want contracts.PullRequestIdentity) (PRMatch, error) {
-	if number <= 0 || !validIdentity(want) {
-		return PRMatch{}, ErrPolicyRefusal
-	}
-	var value prWire
-	if err := c.json(ctx, &value, "pr", "view", fmt.Sprint(number), "--repo", repoArg(repository), "--json", prFields); err != nil {
-		return PRMatch{}, err
-	}
-	parsed, err := value.identity(repository)
-	if err != nil || !sameExact(parsed, want) || parsed.Number != number {
-		return PRMatch{}, ErrPolicyRefusal
-	}
-	return value.match(parsed), nil
-}
-
 // viewSameSourceNumber deliberately permits a changed head OID only for ready
 // compensation; ownership marker, repository, source branch and base remain exact.
 func (c Client) viewSameSourceNumber(ctx context.Context, repository contracts.RepositoryIdentity, number int, want contracts.PullRequestIdentity) (PRMatch, error) {
@@ -714,7 +702,7 @@ func (c Client) viewSameSourceNumber(ctx context.Context, repository contracts.R
 		return PRMatch{}, err
 	}
 	owner, name, ok := strings.Cut(value.HeadRepository.NameWithOwner, "/")
-	if !ok || owner != want.HeadOwner || name != want.HeadRepository || value.HeadRepositoryOwner.Login != want.HeadOwner || value.HeadRef != want.HeadRef || value.BaseRef != want.BaseRef || !validOID(value.HeadOID) || !strings.Contains(value.Body, ownershipMarker(want)) {
+	if !ok || value.Number != number || owner != want.HeadOwner || name != want.HeadRepository || value.HeadRepositoryOwner.Login != want.HeadOwner || value.HeadRef != want.HeadRef || value.BaseRef != want.BaseRef || !validOID(value.HeadOID) || !strings.Contains(value.Body, ownershipMarker(want)) {
 		return PRMatch{}, ErrPolicyRefusal
 	}
 	current := want
@@ -846,8 +834,11 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if c.Runner != nil {
-		output, runErr := c.Runner.Run(ctx, c.binary(), args, env)
+	if c.runner != nil {
+		output, runErr := c.runner.Run(ctx, c.binary(), args, env)
+		if cleanupErr := c.runner.Cleanup(ctx); cleanupErr != nil {
+			return nil, ErrProcessCleanup
+		}
 		if len(output) > maxResponse {
 			return nil, ErrResponseTooLarge
 		}
@@ -870,17 +861,17 @@ func isChecksPending(args []string, err error) bool {
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == 8
 }
 func (c Client) binary() string {
-	if c.Binary != "" {
-		return c.Binary
+	if c.binaryPath != "" {
+		return c.binaryPath
 	}
 	return ""
 }
 func (c Client) environment() ([]string, error) {
-	if c.Home == "" || !filepath.IsAbs(c.Home) || c.ConfigDir == "" || !filepath.IsAbs(c.ConfigDir) || c.Binary == "" || !filepath.IsAbs(c.Binary) {
+	if c.home == "" || !filepath.IsAbs(c.home) || c.configDir == "" || !filepath.IsAbs(c.configDir) || c.binaryPath == "" || !filepath.IsAbs(c.binaryPath) {
 		return nil, ErrPolicyRefusal
 	}
-	env := []string{"HOME=" + c.Home, "GH_CONFIG_DIR=" + c.ConfigDir, "GH_PROMPT_DISABLED=1", "GIT_TERMINAL_PROMPT=0", "NO_COLOR=1", "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
-	for _, entry := range c.Env {
+	env := []string{"HOME=" + c.home, "GH_CONFIG_DIR=" + c.configDir, "GH_PROMPT_DISABLED=1", "GIT_TERMINAL_PROMPT=0", "NO_COLOR=1", "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
+	for _, entry := range c.env {
 		if !strings.HasPrefix(entry, "SF_FAKE_GH_STATE=") {
 			return nil, ErrPolicyRefusal
 		}
@@ -900,14 +891,39 @@ func runBounded(ctx context.Context, binary string, args, env []string) ([]byte,
 	command := exec.Command(binary, args...)
 	command.Env = env
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdoutRead, stdoutWrite, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		return nil, pipeErr
+	}
+	stderrRead, stderrWrite, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		_ = stdoutRead.Close()
+		_ = stdoutWrite.Close()
+		return nil, pipeErr
+	}
+	command.Stdout = stdoutWrite
+	command.Stderr = stderrWrite
 	buffer := &boundedBuffer{limit: maxResponse}
-	command.Stdout, command.Stderr = buffer, buffer
 	if err := command.Start(); err != nil {
+		_ = stdoutRead.Close()
+		_ = stdoutWrite.Close()
+		_ = stderrRead.Close()
+		_ = stderrWrite.Close()
 		return nil, err
 	}
+	// The child owns the write ends. Keeping a parent write descriptor open
+	// would mask escaped descendants and make the retained-pipe case harder to
+	// distinguish during cleanup.
+	_ = stdoutWrite.Close()
+	_ = stderrWrite.Close()
+	var streams sync.WaitGroup
+	streams.Add(2)
+	go func() { defer streams.Done(); _, _ = io.Copy(buffer, stdoutRead) }()
+	go func() { defer streams.Done(); _, _ = io.Copy(buffer, stderrRead) }()
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
 	var err error
+	streamsUncertain := false
 	select {
 	case err = <-done:
 	case <-ctx.Done():
@@ -916,24 +932,56 @@ func runBounded(ctx context.Context, binary string, args, env []string) ([]byte,
 		if command.Process != nil {
 			_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		}
-		err = <-done
+		select {
+		case err = <-done:
+		case <-time.After(250 * time.Millisecond):
+			// A detached descendant may retain the pipes after the owner dies.
+			// Close our read ends so Wait cannot hold the lifecycle gate forever.
+			_ = stdoutRead.Close()
+			_ = stderrRead.Close()
+			select {
+			case err = <-done:
+			case <-time.After(250 * time.Millisecond):
+				return buffer.snapshot(), ErrProcessCleanup
+			}
+		}
 		if err == nil {
 			err = ctx.Err()
 		}
 	}
-	if buffer.exceeded {
-		return buffer.data, ErrResponseTooLarge
+	streamsDone := make(chan struct{})
+	go func() { streams.Wait(); close(streamsDone) }()
+	select {
+	case <-streamsDone:
+	case <-time.After(250 * time.Millisecond):
+		streamsUncertain = true
+		_ = stdoutRead.Close()
+		_ = stderrRead.Close()
+		select {
+		case <-streamsDone:
+		case <-time.After(250 * time.Millisecond):
+			return buffer.snapshot(), ErrProcessCleanup
+		}
 	}
-	return buffer.data, err
+	if streamsUncertain {
+		return buffer.snapshot(), ErrProcessCleanup
+	}
+	if buffer.exceeded {
+		return buffer.snapshot(), ErrResponseTooLarge
+	}
+	return buffer.snapshot(), err
 }
 
 type boundedBuffer struct {
+	mu       sync.Mutex
 	data     []byte
 	limit    int
 	exceeded bool
 }
 
 func (b *boundedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if len(b.data)+len(value) > b.limit {
 		remaining := b.limit - len(b.data)
 		if remaining > 0 {
@@ -944,4 +992,10 @@ func (b *boundedBuffer) Write(value []byte) (int, error) {
 	}
 	b.data = append(b.data, value...)
 	return len(value), nil
+}
+
+func (b *boundedBuffer) snapshot() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.data...)
 }
