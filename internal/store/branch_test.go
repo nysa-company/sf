@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -17,12 +18,18 @@ func TestLoadOrStoreBranchIsDurableAndTicketBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := "dev\x00nysa\x00SF-branch"
-	first := "sf/dev/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef"
+	first := testAllocatedBranch(ref, strings.Repeat("01", 16))
+	if loaded, err := database.LoadBranch(ctx, key); err != nil || loaded != "" {
+		t.Fatalf("empty load=%q err=%v", loaded, err)
+	}
 	stored, err := database.LoadOrStoreBranch(ctx, key, first)
 	if err != nil || stored != first {
 		t.Fatalf("stored=%q err=%v", stored, err)
 	}
-	otherProposal := "sf/dev/0123456789abcdef/0123456789abcdef-ffffffffffffffffffffffffffffffff"
+	if loaded, err := database.LoadBranch(ctx, key); err != nil || loaded != first {
+		t.Fatalf("durable load=%q err=%v", loaded, err)
+	}
+	otherProposal := testAllocatedBranch(ref, "ffffffffffffffffffffffffffffffff")
 	stored, err = database.LoadOrStoreBranch(ctx, key, otherProposal)
 	if err != nil || stored != first {
 		t.Fatalf("replay stored=%q err=%v", stored, err)
@@ -32,6 +39,8 @@ func TestLoadOrStoreBranchIsDurableAndTicketBound(t *testing.T) {
 		{"dev\x00nysa", first},
 		{key, "sf/stable/wrong/channel"},
 		{key, "sf/dev/../escape"},
+		{key, "sf/dev/" + branchDigestPart("wrong-project") + "/" + branchDigestPart(string(ref.Ticket)) + "-" + strings.Repeat("01", 16)},
+		{key, "sf/dev/" + branchDigestPart(string(ref.Project)) + "/" + branchDigestPart(string(ref.Ticket)) + "-not-random"},
 	} {
 		if _, err := database.LoadOrStoreBranch(ctx, invalid.key, invalid.branch); err == nil {
 			t.Fatalf("invalid allocation accepted: %+v", invalid)
@@ -59,10 +68,7 @@ func TestConcurrentBranchReplayChoosesExactlyOneDurableValue(t *testing.T) {
 	if err := first.CreateTicket(ctx, ticket(ref, "race-branch")); err != nil {
 		t.Fatal(err)
 	}
-	proposals := []string{
-		"sf/dev/0123456789abcdef/0123456789abcdef-11111111111111111111111111111111",
-		"sf/dev/0123456789abcdef/0123456789abcdef-22222222222222222222222222222222",
-	}
+	proposals := []string{testAllocatedBranch(ref, strings.Repeat("1", 32)), testAllocatedBranch(ref, strings.Repeat("2", 32))}
 	stores := []*Store{first, second}
 	results := make(chan string, 2)
 	errorsOut := make(chan error, 2)
@@ -101,4 +107,24 @@ func TestConcurrentBranchReplayChoosesExactlyOneDurableValue(t *testing.T) {
 	if chosen == "" {
 		t.Fatal("no durable branch was chosen")
 	}
+}
+
+func TestLoadBranchFailsClosedOnMismatchedDurableAuthority(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-corrupt-branch"}
+	if err := database.CreateTicket(ctx, ticket(ref, "corrupt-branch")); err != nil {
+		t.Fatal(err)
+	}
+	key := "dev\x00nysa\x00SF-corrupt-branch"
+	wrong := "sf/dev/" + branchDigestPart("another-project") + "/" + branchDigestPart(string(ref.Ticket)) + "-" + strings.Repeat("a", 32)
+	if _, err := database.db.ExecContext(ctx, `INSERT INTO branch_allocations(authority_key, channel, project_id, ticket_id, branch_ref, created_at) VALUES (?, ?, ?, ?, ?, ?)`, key, ref.Channel, ref.Project, ref.Ticket, wrong, "2026-08-29T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.LoadBranch(ctx, key); !errors.Is(err, ErrBranchConflict) {
+		t.Fatalf("corrupt branch load err=%v", err)
+	}
+}
+
+func testAllocatedBranch(ref domain.TicketRef, suffix string) string {
+	return "sf/" + string(ref.Channel) + "/" + branchDigestPart(string(ref.Project)) + "/" + branchDigestPart(string(ref.Ticket)) + "-" + suffix
 }
