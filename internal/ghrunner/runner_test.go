@@ -578,7 +578,19 @@ func TestCloseRetainsSnapshotAfterRemovalFailure(t *testing.T) {
 func TestFastExitBeforeIdentitySampleIsNotQuarantined(t *testing.T) {
 	old := processStartIdentityFn
 	defer func() { processStartIdentityFn = old }()
-	processStartIdentityFn = func(int) (string, error) { return "", errors.New("sample raced with exit") }
+	processStartIdentityFn = func(pid int) (string, error) {
+		// Do not infer an exit from a scheduler window. Wait until the saved
+		// identity reader reports that /proc no longer describes this pid, with
+		// a bounded test-only deadline for a genuinely stuck helper.
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := old(pid); err != nil {
+				return "", errors.New("sample raced with exit")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return "", errors.New("sample raced with exit")
+	}
 	runner, err := New(mustExecutable(t))
 	if err != nil {
 		t.Fatal(err)
