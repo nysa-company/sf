@@ -95,6 +95,41 @@ func TestCompletedResultExposesOnlyTheDurableAttemptKey(t *testing.T) {
 	}
 }
 
+func TestCoordinatorReusesOnlyExactCompletedResult(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
+	first := coordinator.Run(context.Background(), request)
+	if first.Code != Completed {
+		t.Fatalf("first=%+v", first)
+	}
+	second := coordinator.Run(context.Background(), request)
+	if second.Code != Completed || second.ProviderResult != first.ProviderResult {
+		t.Fatalf("reused=%+v first=%+v", second, first)
+	}
+	if attempts, err := database.ProviderAttempts(context.Background(), ref); err != nil || len(attempts) != 1 {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+
+	for name, mutate := range map[string]func(*Request){
+		"prompt":     func(r *Request) { r.Input.Prompt = "different" },
+		"paths":      func(r *Request) { r.Input.AllowedPaths = []string{"different"} },
+		"validation": func(r *Request) { r.Validation.ProtectedVerification = []string{"internal/protected.go"} },
+		"fence":      func(r *Request) { r.Fence.LeaderEpoch++ },
+		"version":    func(r *Request) { r.ExpectedVersion++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := request
+			mutate(&changed)
+			if result := coordinator.Run(context.Background(), changed); result.Code == Completed {
+				t.Fatalf("false completion=%+v", result)
+			}
+			if attempts, err := database.ProviderAttempts(context.Background(), ref); err != nil || len(attempts) != 1 {
+				t.Fatalf("attempts=%+v err=%v", attempts, err)
+			}
+		})
+	}
+}
+
 func TestFallbackCompletionExposesFallbackAttemptKey(t *testing.T) {
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
 	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Behavior: testkit.ProviderMalformed}}
