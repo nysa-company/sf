@@ -303,6 +303,33 @@ func TestPlannerPassAndQuestions(t *testing.T) {
 	}
 }
 
+func TestCurrentPlanForCandidateReplayReloadsExactDurablePlan(t *testing.T) {
+	evidence := &fakeEvidence{hasPlan: true}
+	engine := &fakeEngine{}
+	worker := newWorker(domain.StateBuilding, nil, evidence, engine)
+	plan, err := worker.storedPlanIdentity(context.Background(), evidence.ticket, evidence.plan, testFence)
+	if err != nil {
+		t.Fatalf("stored plan identity: %v", err)
+	}
+	got, err := worker.currentPlanForCandidateReplay(context.Background(), evidence.ticket, testFence, plan)
+	if err != nil || got.Document.ProviderResult == nil || *got.Document.ProviderResult != *evidence.plan.Document.ProviderResult {
+		t.Fatalf("reloaded plan=%+v err=%v", got, err)
+	}
+
+	// The passed identity is only a comparison witness. A replay must reject a
+	// Store plan whose bound Planner artifact no longer matches it.
+	tampered := *evidence.plan.Document.Planner
+	tampered.Paths = []string{"other"}
+	evidence.plan.Document.Planner = &tampered
+	if _, err := worker.currentPlanForCandidateReplay(context.Background(), evidence.ticket, testFence, plan); !errors.Is(err, ErrStaleEvidence) {
+		t.Fatalf("tampered durable plan err=%v, want stale evidence", err)
+	}
+	evidence.hasPlan = false
+	if _, err := worker.currentPlanForCandidateReplay(context.Background(), evidence.ticket, testFence, plan); !errors.Is(err, ErrStaleEvidence) {
+		t.Fatalf("missing durable plan err=%v, want stale evidence", err)
+	}
+}
+
 func TestVerificationPassAndBuilderAmendmentAndPass(t *testing.T) {
 	e := &fakeEvidence{hasPlan: true, plan: store.StoredPlan{Document: store.PlanDocument{Acceptance: []string{"accept"}, ProofKind: "regression", Paths: []string{"internal"}, Commands: [][]string{{"go", "test", "./..."}}}}}
 	eng := &fakeEngine{}

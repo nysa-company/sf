@@ -75,10 +75,9 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 	if err != nil || !providerMatches(request, provider, key, domain.PhaseBuild, "builder") || parsed.Builder == nil || !sameJSON(*parsed.Builder, builder) {
 		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
 	}
-	command, result, err := m.runCommand(ctx, request, store.RepositoryCommandPurposePostbuildCandidate, key, phaseartifact.Verification{}, verification.CheckpointID)
-	if err != nil || result.Result.ExitCode != 0 {
-		return workflowworker.CandidateWitness{}, materializeErr(err)
-	}
+	// Re-establish the durable Planner scope before starting the post-build
+	// command. A lost-response replay must fail closed on a missing or modified
+	// plan rather than launching a command from caller memory.
 	allowed, err := m.currentCandidatePlanScope(ctx, request, plan)
 	if err != nil {
 		return workflowworker.CandidateWitness{}, err
@@ -86,6 +85,19 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 	// The builder may not overwrite proof ownership outside the accepted plan.
 	if err := candidateChangedFilesWithinScope(builder.ChangedFiles, allowed); err != nil {
 		return workflowworker.CandidateWitness{}, err
+	}
+	if request.Candidate != nil {
+		if request.Candidate.BuilderResult != key {
+			return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
+		}
+		// Candidate replay is observation-only. In particular, a stale-fence
+		// replay may prove the old immutable witness but must not launch another
+		// repository command while Store has no historical-command rebind.
+		return m.replayCandidate(ctx, request, verification, builder, *request.Candidate)
+	}
+	command, result, err := m.runCommand(ctx, request, store.RepositoryCommandPurposePostbuildCandidate, key, phaseartifact.Verification{}, verification.CheckpointID)
+	if err != nil || result.Result.ExitCode != 0 {
+		return workflowworker.CandidateWitness{}, materializeErr(err)
 	}
 	observation, err := m.commit(ctx, request, verification.CheckpointID, allowed, verification.OwnedFiles, commitDigest("candidate", request, key, command, result.ResultDigest, struct {
 		Plan         workflowprompt.PlanIdentity
@@ -96,6 +108,33 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 		return workflowworker.CandidateWitness{}, err
 	}
 	return workflowworker.CandidateWitness{Commit: observation, CommandPolicyDigest: strings.TrimPrefix(result.Claim.PolicyDigest, "sha256:"), Reason: "authenticated post-build verification", CommandResult: command}, nil
+}
+
+func (m RepositoryMaterializer) replayCandidate(ctx context.Context, request workflowworker.PhaseRequest, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, candidate store.StoredCandidate) (workflowworker.CandidateWitness, error) {
+	if err := candidateMatches(request, verification, builder, candidate); err != nil {
+		return workflowworker.CandidateWitness{}, err
+	}
+	durable, err := m.Store.LatestCandidate(ctx, request.Ticket.Ref)
+	if err != nil || !reflect.DeepEqual(durable, candidate) {
+		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
+	}
+	result, err := m.Store.LoadRepositoryCommandResult(ctx, candidate.CommandBinding.Key)
+	if err != nil || result.Result.ExitCode != 0 {
+		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
+	}
+	observed, err := m.observe(ctx, request)
+	if err != nil || observed != candidate.Commit {
+		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
+	}
+	return workflowworker.CandidateWitness{Commit: candidate.Commit, CommandPolicyDigest: strings.TrimPrefix(result.Claim.PolicyDigest, "sha256:"), Reason: "authenticated post-build verification", CommandResult: candidate.CommandBinding.Key}, nil
+}
+
+func candidateMatches(request workflowworker.PhaseRequest, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, candidate store.StoredCandidate) error {
+	digest, err := phaseartifact.BuilderEvidenceDigest(builder)
+	if err != nil || candidate.BuilderResult.AttemptID == 0 || candidate.TicketVersion != request.Ticket.Version || candidate.Fence != request.Fence || candidate.Commit.CommitOID != candidate.Snapshot.HeadSHA || candidate.Commit.TreeOID != candidate.Snapshot.TreeSHA || candidate.Commit.ParentOID != verification.CheckpointID || candidate.Snapshot.BaseSHA != request.Worktree.BaseSHA || candidate.Snapshot.SourceDigest != request.Ticket.SourceDigest || candidate.Snapshot.VerificationIntentDigest != verification.IntentDigest || candidate.Snapshot.ProofDigest != verification.ProofDigest || candidate.Snapshot.BuilderEvidenceDigest != digest || candidate.CommandBinding.Key.SemanticKey == "" || candidate.CommandBinding.Key.ClaimEpoch == 0 {
+		return ErrRepositoryMaterialization
+	}
+	return nil
 }
 
 // currentCandidatePlanScope re-authenticates every mutable input immediately

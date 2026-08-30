@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -472,7 +473,7 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 		if parseErr != nil {
 			return false, true, parseErr
 		}
-		if err := w.persistCandidate(ctx, ticket, fence, PhaseRequest{}, planIdentity, verificationIdentity, verification, builder, reusable.Key); err != nil {
+		if err := w.persistCandidate(ctx, ticket, fence, PhaseRequest{}, planIdentity, verificationIdentity, verification, &old, builder, reusable.Key); err != nil {
 			return false, true, err
 		}
 		candidate, err = w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
@@ -501,7 +502,7 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 			}
 			return false, true, ErrAmendmentUnsupported
 		}
-		if err := w.persistCandidate(ctx, ticket, fence, PhaseRequest{}, planIdentity, verificationIdentity, verification, builder, reusable.Key); err != nil {
+		if err := w.persistCandidate(ctx, ticket, fence, PhaseRequest{}, planIdentity, verificationIdentity, verification, nil, builder, reusable.Key); err != nil {
 			return false, true, err
 		}
 		candidate, err := w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
@@ -546,7 +547,7 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 		}
 		return false, false, ErrAmendmentUnsupported
 	}
-	if err := w.persistCandidate(ctx, ticket, fence, request, planIdentity, verificationIdentity, verification, builder, out.ProviderResult); err != nil {
+	if err := w.persistCandidate(ctx, ticket, fence, request, planIdentity, verificationIdentity, verification, nil, builder, out.ProviderResult); err != nil {
 		return false, false, err
 	}
 	candidate, err = w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
@@ -731,13 +732,17 @@ func (w Worker) persistVerification(ctx context.Context, ticket store.Ticket, fe
 	return err
 }
 
-func (w Worker) persistCandidate(ctx context.Context, ticket store.Ticket, fence domain.Fence, request PhaseRequest, plan workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, stored store.StoredVerification, builder phaseartifact.Builder, key store.ProviderAttemptResultKey) error {
+func (w Worker) persistCandidate(ctx context.Context, ticket store.Ticket, fence domain.Fence, request PhaseRequest, plan workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, stored store.StoredVerification, prior *store.StoredCandidate, builder phaseartifact.Builder, key store.ProviderAttemptResultKey) error {
 	result, parsed, err := w.Evidence.LoadHistoricalProviderAttemptResult(ctx, key)
 	if err != nil || key.Ref != ticket.Ref || key.Phase != domain.PhaseBuild || result.Claim.Ref != ticket.Ref || result.Claim.Phase != domain.PhaseBuild || result.Claim.Role != "builder" || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || parsed.Builder == nil {
 		return ErrStaleEvidence
 	}
 	if request.Phase == "" {
-		request, err = w.request(ctx, ticket, fence, domain.PhaseBuild, nil, &stored, nil)
+		currentPlan, planErr := w.currentPlanForCandidateReplay(ctx, ticket, fence, plan)
+		if planErr != nil {
+			return planErr
+		}
+		request, err = w.request(ctx, ticket, fence, domain.PhaseBuild, &currentPlan, &stored, prior)
 		if err != nil {
 			return err
 		}
@@ -783,7 +788,11 @@ func (w Worker) authenticateStoredCandidate(ctx context.Context, ticket store.Ti
 	if err != nil {
 		return ErrStaleEvidence
 	}
-	request, err := w.request(ctx, ticket, fence, domain.PhaseBuild, nil, &storedVerification, &candidate)
+	storedPlan, err := w.currentPlanForCandidateReplay(ctx, ticket, fence, plan)
+	if err != nil {
+		return err
+	}
+	request, err := w.request(ctx, ticket, fence, domain.PhaseBuild, &storedPlan, &storedVerification, &candidate)
 	if err != nil {
 		return err
 	}
@@ -798,6 +807,22 @@ func (w Worker) authenticateStoredCandidate(ctx context.Context, ticket store.Ti
 		return ErrStaleEvidence
 	}
 	return w.Candidate.AuthenticateCandidate(ctx, request, plan, verification, *parsed.Builder, witness)
+}
+
+// currentPlanForCandidateReplay reloads the accepted Planner authority from
+// Store. Candidate replay must never trust the plan identity handed down by a
+// previous worker invocation: the materializer needs the durable document to
+// re-authenticate its provider binding, worktree, and mutation scope.
+func (w Worker) currentPlanForCandidateReplay(ctx context.Context, ticket store.Ticket, fence domain.Fence, expected workflowprompt.PlanIdentity) (store.StoredPlan, error) {
+	stored, err := w.Evidence.Plan(ctx, ticket.Ref)
+	if err != nil {
+		return store.StoredPlan{}, ErrStaleEvidence
+	}
+	identity, err := w.storedPlanIdentity(ctx, ticket, stored, fence)
+	if err != nil || !reflect.DeepEqual(identity, expected) {
+		return store.StoredPlan{}, ErrStaleEvidence
+	}
+	return stored, nil
 }
 
 func canonicalPlanner(parsed phaseartifact.Parsed) (phaseartifact.Planner, error) {

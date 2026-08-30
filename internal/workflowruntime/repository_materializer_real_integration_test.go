@@ -26,6 +26,7 @@ import (
 	"github.com/nysa-company/sf/internal/repositoryexec"
 	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
+	"github.com/nysa-company/sf/internal/workflowprompt"
 	"github.com/nysa-company/sf/internal/workflowruntime"
 	"github.com/nysa-company/sf/internal/workflowworker"
 )
@@ -211,6 +212,59 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	if err != nil || candidateBefore.Commit.CommitOID == "" || candidateBefore.CommandBinding.Key.SemanticKey == "" {
 		t.Fatalf("candidate evidence=%+v err=%v", candidateBefore, err)
 	}
+	// A direct materializer caller cannot substitute an older candidate fence
+	// while a runner-recovery chain is unavailable. The rejection happens before
+	// command execution or Git observation is used as fresh authority.
+	storedPlan, err := db.Plan(ctx, ref)
+	if err != nil || storedPlan.Document.Planner == nil {
+		t.Fatalf("stored plan=%+v err=%v", storedPlan, err)
+	}
+	planIdentity, err := workflowprompt.NewPlanIdentity(*storedPlan.Document.Planner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedVerification, err := db.CurrentVerification(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, verificationParsed, err := db.LoadHistoricalProviderAttemptResult(ctx, storedVerification.ProviderResult)
+	if err != nil || verificationParsed.Verify == nil {
+		t.Fatalf("verification provider result=%+v err=%v", verificationParsed, err)
+	}
+	verificationIdentity, err := workflowprompt.NewVerificationIdentity(*verificationParsed.Verify, storedVerification.Revision.IntentDigest, storedVerification.Revision.ProofDigest, storedVerification.Revision.CheckpointID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, builderParsed, err := db.LoadHistoricalProviderAttemptResult(ctx, candidateBefore.BuilderResult)
+	if err != nil || builderParsed.Builder == nil {
+		t.Fatalf("builder provider result=%+v err=%v", builderParsed, err)
+	}
+	buildingTicket, err := db.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedWorktree, err := db.Worktree(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleCandidate := candidateBefore
+	staleCandidate.Fence.RunnerEpoch++
+	if _, err := materializer.MaterializeCandidate(ctx, workflowworker.PhaseRequest{Ticket: buildingTicket, Worktree: storedWorktree, Phase: domain.PhaseBuild, Fence: fence, Plan: &storedPlan, Verification: &storedVerification, Candidate: &staleCandidate}, planIdentity, verificationIdentity, *builderParsed.Builder, candidateBefore.BuilderResult); !errors.Is(err, workflowruntime.ErrRepositoryMaterialization) {
+		t.Fatalf("stale candidate fence accepted: %v", err)
+	}
+	verificationBefore, err := db.CurrentVerification(ctx, ref)
+	if err != nil {
+		t.Fatalf("checkpoint evidence: %v", err)
+	}
+	candidateCommandBefore, err := db.LoadRepositoryCommandResult(ctx, candidateBefore.CommandBinding.Key)
+	if err != nil {
+		t.Fatalf("candidate command evidence: %v", err)
+	}
+	checkpointCommandBefore, err := db.LoadRepositoryCommandResult(ctx, verificationBefore.CommandBinding.Key)
+	if err != nil {
+		t.Fatalf("checkpoint command evidence: %v", err)
+	}
+	commitCountBefore := rawMaterializerGit(t, worktree, "rev-list", "--count", "HEAD")
 	if _, err := worker.Run(ctx, ref, fence); err != nil {
 		t.Fatalf("candidate replay: %+v", err)
 	}
@@ -218,13 +272,25 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	if err != nil || candidateAfter.Commit != candidateBefore.Commit || candidateAfter.CommandBinding.Key != candidateBefore.CommandBinding.Key {
 		t.Fatalf("candidate replay changed evidence before=%+v after=%+v err=%v", candidateBefore, candidateAfter, err)
 	}
+	verificationAfter, err := db.CurrentVerification(ctx, ref)
+	if err != nil || verificationAfter.Checkpoint != verificationBefore.Checkpoint || verificationAfter.CommandBinding.Key != verificationBefore.CommandBinding.Key {
+		t.Fatalf("candidate replay changed checkpoint evidence before=%+v after=%+v err=%v", verificationBefore, verificationAfter, err)
+	}
+	candidateCommandAfter, err := db.LoadRepositoryCommandResult(ctx, candidateAfter.CommandBinding.Key)
+	if err != nil || candidateCommandAfter.Key != candidateCommandBefore.Key || candidateCommandAfter.ResultDigest != candidateCommandBefore.ResultDigest {
+		t.Fatalf("candidate replay changed command evidence before=%+v after=%+v err=%v", candidateCommandBefore, candidateCommandAfter, err)
+	}
+	checkpointCommandAfter, err := db.LoadRepositoryCommandResult(ctx, verificationAfter.CommandBinding.Key)
+	if err != nil || checkpointCommandAfter.Key != checkpointCommandBefore.Key || checkpointCommandAfter.ResultDigest != checkpointCommandBefore.ResultDigest {
+		t.Fatalf("candidate replay changed checkpoint command before=%+v after=%+v err=%v", checkpointCommandBefore, checkpointCommandAfter, err)
+	}
 	assertMaterializerProviderAttempts(t, db, ref, 3)
 	ticket, err := db.Ticket(ctx, ref)
 	if err != nil || ticket.State != domain.StatePublishing {
 		t.Fatalf("ticket=%+v err=%v", ticket, err)
 	}
-	if got := rawMaterializerGit(t, worktree, "rev-list", "--count", "HEAD"); got != "3" {
-		t.Fatalf("expected base, checkpoint, candidate commits; count=%q", got)
+	if got := rawMaterializerGit(t, worktree, "rev-list", "--count", "HEAD"); got != commitCountBefore || got != "3" {
+		t.Fatalf("candidate replay changed commit count before=%q after=%q", commitCountBefore, got)
 	}
 	if got := rawMaterializerGit(t, worktree, "show", "--format=%s", "--no-patch", "HEAD"); got == "" {
 		t.Fatal("candidate commit was not observed")
