@@ -30,6 +30,7 @@ var (
 // StoreTicketSource is provided for the production Store composition.
 type TicketSource interface {
 	ListTickets(context.Context, domain.Channel) ([]store.Ticket, error)
+	Ticket(context.Context, domain.TicketRef) (store.Ticket, error)
 }
 
 // StoreTicketSource adapts Store.Tickets without exposing SQL to the runtime.
@@ -47,6 +48,13 @@ func (s StoreTicketSource) ListTickets(ctx context.Context, channel domain.Chann
 		limit = 10_000
 	}
 	return s.Store.Tickets(ctx, channel, "", limit)
+}
+
+func (s StoreTicketSource) Ticket(ctx context.Context, ref domain.TicketRef) (store.Ticket, error) {
+	if s.Store == nil {
+		return store.Ticket{}, ErrInvalidScheduler
+	}
+	return s.Store.Ticket(ctx, ref)
 }
 
 // WorktreeEnsurer is compatible with worktreecoord.Coordinator. Keeping the
@@ -94,14 +102,19 @@ type Scheduler struct {
 	Tickets   TicketSource
 	Worktrees WorktreeEnsurer
 	Worker    Worker
+	admission *admission
 }
 
 func NewScheduler(channel domain.Channel, tickets TicketSource, worktrees WorktreeEnsurer, worker Worker) *Scheduler {
-	return &Scheduler{Channel: channel, Tickets: tickets, Worktrees: worktrees, Worker: worker}
+	return newScheduler(channel, tickets, worktrees, worker, newAdmission())
+}
+
+func newScheduler(channel domain.Channel, tickets TicketSource, worktrees WorktreeEnsurer, worker Worker, admission *admission) *Scheduler {
+	return &Scheduler{Channel: channel, Tickets: tickets, Worktrees: worktrees, Worker: worker, admission: admission}
 }
 
 func (s Scheduler) validate() error {
-	if !s.Channel.Valid() || s.Tickets == nil || s.Worktrees == nil || s.Worker == nil {
+	if !s.Channel.Valid() || s.Tickets == nil || s.Worktrees == nil || s.Worker == nil || s.admission == nil {
 		return ErrInvalidScheduler
 	}
 	return nil
@@ -129,6 +142,9 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 	if err != nil {
 		return classify(err, fence, domain.TicketRef{})
 	}
+	// A source may reuse a backing slice across calls. Runtime pool loops tick
+	// concurrently, so sort an owned snapshot rather than mutating the source.
+	tickets = append([]store.Ticket(nil), tickets...)
 	// Store's historical query order is intentionally not scheduler order.
 	// Sorting all rows before filtering makes ordering stable across restarts
 	// and independent of SQLite rowid allocation.
@@ -155,8 +171,26 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 		candidateFence := fence
 		candidateFence.RunnerEpoch = ticket.RunnerEpoch
 		result := TickResult{Ref: ticket.Ref, Ticket: ticket, Fence: candidateFence}
-		worktree, ensureErr := s.Worktrees.Ensure(ctx, worktreecoord.EnsureRequest{Ref: ticket.Ref, Version: ticket.Version, Fence: candidateFence})
+		runCtx, end, admitted := s.admission.Begin(ctx, ticket.Ref, ticket.Version, candidateFence.LeaderEpoch, ticket.RunnerEpoch)
+		if !admitted {
+			lastBenign = &TickResult{Outcome: OutcomeCanceled, Ref: ticket.Ref, Ticket: ticket, Fence: candidateFence, Err: ErrCanceled}
+			continue
+		}
+		// Register before the durable current-row check and every external
+		// boundary, so control can cancel this exact activity first.
+		current, currentErr := s.Tickets.Ticket(runCtx, ticket.Ref)
+		if currentErr != nil {
+			end()
+			return classify(currentErr, candidateFence, ticket.Ref)
+		}
+		if current.State != ticket.State || current.Version != ticket.Version || current.RunnerEpoch != ticket.RunnerEpoch || !activeState(current.State) {
+			end()
+			lastBenign = &TickResult{Outcome: OutcomeStale, Ref: ticket.Ref, Ticket: current, Fence: candidateFence, Err: ErrStale}
+			continue
+		}
+		worktree, ensureErr := s.Worktrees.Ensure(runCtx, worktreecoord.EnsureRequest{Ref: ticket.Ref, Version: ticket.Version, Fence: candidateFence})
 		if ensureErr != nil {
+			end()
 			result.Outcome, result.Err = classifyEnsure(ensureErr)
 			if result.Outcome == OutcomeStale || result.Outcome == OutcomeBusy || result.Outcome == OutcomeInProgress {
 				// Keep the most recent benign outcome so a one-candidate tick
@@ -168,7 +202,8 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 			return result
 		}
 		result.Worktree = worktree
-		workerResult, workerErr := s.Worker.Run(ctx, ticket.Ref, candidateFence)
+		workerResult, workerErr := s.Worker.Run(runCtx, ticket.Ref, candidateFence)
+		end()
 		result.Worker = workerResult
 		if workerErr != nil {
 			result.Outcome, result.Err = classifyWorker(workerErr)

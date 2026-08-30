@@ -203,7 +203,7 @@ func (s *Store) StartWithOwnership(ctx context.Context, ref domain.TicketRef, ex
 			}
 			return err
 		}
-		if err := s.currentFence(ctx, conn, ref.Channel, version, runner, fence); err != nil {
+		if err := s.assertTicketFence(ctx, conn, ref, version, fence); err != nil {
 			return err
 		}
 		if state == domain.StatePlanning {
@@ -271,6 +271,9 @@ func (s *Store) AcquireLeases(ctx context.Context, ref domain.TicketRef, expecte
 	}
 	var acquired []Lease
 	err = s.write(ctx, func(conn *sql.Conn) error {
+		if err := s.assertTicketFence(ctx, conn, ref, expectedVersion, fence); err != nil {
+			return err
+		}
 		var version, runner uint64
 		var state domain.State
 		if err := conn.QueryRowContext(ctx, `SELECT state, version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner); err != nil {
@@ -281,9 +284,6 @@ func (s *Store) AcquireLeases(ctx context.Context, ref domain.TicketRef, expecte
 		}
 		if state.Terminal() || version != expectedVersion {
 			return ErrStaleFence
-		}
-		if err := s.currentFence(ctx, conn, ref.Channel, version, runner, fence); err != nil {
-			return err
 		}
 		acquired = make([]Lease, 0, len(requests))
 		for _, request := range requests {

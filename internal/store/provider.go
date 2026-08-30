@@ -432,6 +432,9 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 	}
 	var claim ProviderAttemptClaim
 	err := s.write(ctx, func(conn *sql.Conn) error {
+		if err := s.assertTicketFence(ctx, conn, r.Ref, r.ExpectedVersion, r.Fence); err != nil {
+			return err
+		}
 		var version, runner uint64
 		var state string
 		var maxDuration, maxCost int64
@@ -444,9 +447,6 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		}
 		if domain.State(state).Terminal() || state == string(domain.StateBlocked) || version != r.ExpectedVersion || config == "" || config != r.ConfigDigest || !providerAdmissionState(domain.State(state), r.Phase, r.Role) {
 			return ErrStaleFence
-		}
-		if err := s.currentFence(ctx, conn, r.Ref.Channel, version, runner, r.Fence); err != nil {
-			return err
 		}
 		var projectPath, durablePath, durableIdentity, durableBase string
 		if err := conn.QueryRowContext(ctx, `SELECT p.canonical_path,w.path,w.identity_json,w.base_sha FROM projects p JOIN worktrees w ON w.channel=p.channel AND w.project_id=p.id AND w.ticket_id=? WHERE p.channel=? AND p.id=?`, r.Ref.Ticket, r.Ref.Channel, r.Ref.Project).Scan(&projectPath, &durablePath, &durableIdentity, &durableBase); err != nil {

@@ -907,3 +907,27 @@ var migrationV39 = []string{
 	`UPDATE tickets SET state='blocked',resume_state=state,blocked_code='legacy_publication_timestamp_unverifiable',version=version+1 WHERE state IN ('publishing','waiting_ci')`,
 	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,id,version,'typed_blocker',resume_state,'blocked','{"code":"legacy_publication_timestamp_unverifiable","reason":"publication timestamps predate authenticated digest coverage","next_action":"reconcile the external publication or start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tickets WHERE state='blocked' AND blocked_code='legacy_publication_timestamp_unverifiable' AND resume_state IN ('publishing','waiting_ci')`,
 }
+
+// v40 adds the runtime-control authority without changing the published
+// v37-v39 migration history. Legacy stopped states are sealed on upgrade.
+var migrationV40 = []string{
+	`CREATE TABLE runtime_ticket_controls (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		state TEXT NOT NULL CHECK(state IN ('sealed','armed','open')),
+		generation INTEGER NOT NULL CHECK(generation > 0),
+		stop_version INTEGER NOT NULL CHECK(stop_version > 0),
+		stop_leader_epoch INTEGER NOT NULL CHECK(stop_leader_epoch > 0),
+		stop_runner_epoch INTEGER NOT NULL CHECK(stop_runner_epoch > 0),
+		authority_version INTEGER NOT NULL CHECK(authority_version > 0),
+		authority_leader_epoch INTEGER NOT NULL CHECK(authority_leader_epoch > 0),
+		authority_runner_epoch INTEGER NOT NULL CHECK(authority_runner_epoch > 0),
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY(channel,project_id,ticket_id),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+	`CREATE INDEX runtime_ticket_controls_state ON runtime_ticket_controls(channel,state)`,
+	`INSERT INTO runtime_ticket_controls(channel,project_id,ticket_id,state,generation,stop_version,stop_leader_epoch,stop_runner_epoch,authority_version,authority_leader_epoch,authority_runner_epoch,updated_at)
+		SELECT t.channel,t.project_id,t.id,'sealed',1,t.version,d.leader_epoch,t.runner_epoch,t.version,d.leader_epoch,t.runner_epoch,strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		FROM tickets t JOIN daemon_instances d ON d.channel=t.channel
+		WHERE t.state IN ('stopping','cancelling','paused','blocked')`,
+}

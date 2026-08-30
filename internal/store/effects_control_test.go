@@ -1,11 +1,35 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"github.com/nysa-company/sf/internal/domain"
 )
+
+func openExactRuntimeAdmission(t *testing.T, database *Store, ref domain.TicketRef) {
+	t.Helper()
+	stopped, err := database.StoppedRuntimeTicket(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := database.RearmProof(context.Background(), ref, stopped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var admission *RuntimeAdmissionCapability
+	if err := database.ActivateRearm(context.Background(), capability, func(value *RuntimeAdmissionCapability) error {
+		_, _, _, _ = value.ConsumeRuntimeAdmission()
+		admission = value
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.OpenStoreAdmission(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func claimedEffectBeforeControl(t *testing.T, key string) (*Store, domain.TicketRef, uint64, Ticket, EffectFence) {
 	t.Helper()
@@ -67,16 +91,8 @@ func TestInvalidatedEffectAbsenceCanBeSafelyRebound(t *testing.T) {
 	}
 	reboundPlan := EffectPlan{SemanticKey: prior.SemanticKey, Ref: ref, Kind: "branch_push", TicketVersion: resumed.Version, Fence: current.Fence, RequestDigest: "request"}
 	rebound, err := database.PlanEffect(ctx, reboundPlan)
-	if err != nil || rebound.TicketVersion != resumed.Version || rebound.RunnerEpoch != current.Fence.RunnerEpoch || rebound.State != EffectFailed {
-		t.Fatalf("rebound=%+v err=%v", rebound, err)
-	}
-	claim, err := database.ClaimEffect(ctx, EffectFence{SemanticKey: prior.SemanticKey, Ref: ref, TicketVersion: resumed.Version, Fence: current.Fence})
-	if err != nil || !claim.Claimed || claim.Effect.ClaimEpoch <= prior.Fence.ClaimEpoch {
-		t.Fatalf("new claim=%+v err=%v", claim, err)
-	}
-	reboundPlan.RequestDigest = "changed"
-	if _, err := database.PlanEffect(ctx, reboundPlan); !errors.Is(err, ErrEffectKey) {
-		t.Fatalf("changed semantic request was accepted: %v", err)
+	if !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("publication-sensitive ticket escaped sealed resume: rebound=%+v err=%v", rebound, err)
 	}
 }
 
@@ -103,7 +119,7 @@ func TestInvalidatedEffectPresenceIsConfirmedAndNeverRebound(t *testing.T) {
 	if replay, err := database.ReconcileInvalidatedEffect(ctx, observation); err != nil || replay.State != EffectConfirmed {
 		t.Fatalf("replay=%+v err=%v", replay, err)
 	}
-	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: prior.SemanticKey, Ref: ref, Kind: "branch_push", TicketVersion: stopping.Version, Fence: current.Fence, RequestDigest: "request"}); !errors.Is(err, ErrEffectKey) {
+	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: prior.SemanticKey, Ref: ref, Kind: "branch_push", TicketVersion: stopping.Version, Fence: current.Fence, RequestDigest: "request"}); !errors.Is(err, ErrEffectKey) && !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("confirmed stale effect was rebound: %v", err)
 	}
 	wrong := observation

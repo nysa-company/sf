@@ -7,22 +7,29 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/store"
 )
 
 var (
 	ErrRuntimeStarted    = errors.New("workflow runtime is already started")
 	ErrRuntimeNotStarted = errors.New("workflow runtime is not started")
 	ErrRuntimeInterval   = errors.New("workflow runtime interval is invalid")
+	ErrRuntimeWorkers    = errors.New("workflow runtime worker count is invalid")
+	ErrRuntimeRearm      = errors.New("workflow runtime ticket cannot be rearmed")
 )
 
-const maxRuntimeInterval = time.Hour
+const (
+	maxRuntimeInterval = time.Hour
+	maxRuntimeWorkers  = 2
+)
 
 // Runtime is a daemon-neutral lifecycle wrapper around the one-tick
-// Scheduler. It has exactly one in-flight Tick and never launches a second
-// tick until the bounded interval has elapsed.
+// Scheduler. Every loop shares one Scheduler and its admission lineage; the
+// bounded worker count controls only distinct ticket concurrency.
 type Runtime struct {
 	Scheduler *Scheduler
 	Interval  time.Duration
+	workers   int
 
 	mu      sync.Mutex
 	started bool
@@ -30,14 +37,77 @@ type Runtime struct {
 	done    chan struct{}
 }
 
+type RuntimeConfig struct {
+	Interval time.Duration
+	Workers  int
+}
+
+// ControlBundle is the sealed daemon handoff for this exact Runtime.
+type ControlBundle struct{ runtime *Runtime }
+
+func (r *Runtime) ControlBundle() *ControlBundle {
+	if r == nil {
+		return nil
+	}
+	return &ControlBundle{runtime: r}
+}
+
+func (b *ControlBundle) Valid() bool {
+	return b != nil && b.runtime != nil && b.runtime.Scheduler != nil && b.runtime.Scheduler.validate() == nil
+}
+
+func (b *ControlBundle) Drain(ctx context.Context, ref domain.TicketRef) error {
+	if !b.Valid() {
+		return ErrInvalidScheduler
+	}
+	if err := ref.Validate(); err != nil {
+		return err
+	}
+	return b.runtime.Scheduler.admission.Stop(ctx, ref)
+}
+
+func (b *ControlBundle) ApplyRearm(capability *store.RuntimeAdmissionCapability) error {
+	if !b.Valid() || capability == nil {
+		return ErrRuntimeRearm
+	}
+	ref, version, fence, issued := capability.ConsumeRuntimeAdmission()
+	if !issued || ref.Validate() != nil || version == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return ErrRuntimeRearm
+	}
+	return b.runtime.Scheduler.admission.Rearm(ref, version, fence.LeaderEpoch, fence.RunnerEpoch, capability.OpenStoreAdmission, capability.SuspendStoreAdmission, capability.SealStoreAdmission)
+}
+
+func (b *ControlBundle) ApplyRetirement(ctx context.Context, capability *store.RuntimeRetirementCapability) error {
+	if !b.Valid() || capability == nil {
+		return ErrRuntimeRearm
+	}
+	err := capability.RetireRuntime(ctx, func(ref domain.TicketRef) error {
+		if ref.Validate() != nil {
+			return ErrRuntimeRearm
+		}
+		return b.runtime.Scheduler.admission.Retire(ref)
+	})
+	if errors.Is(err, store.ErrStaleFence) {
+		return ErrRuntimeRearm
+	}
+	return err
+}
+
 func NewRuntime(scheduler *Scheduler, interval time.Duration) (*Runtime, error) {
+	return NewRuntimeWithConfig(scheduler, RuntimeConfig{Interval: interval, Workers: 1})
+}
+
+func NewRuntimeWithConfig(scheduler *Scheduler, configuration RuntimeConfig) (*Runtime, error) {
 	if scheduler == nil || scheduler.validate() != nil {
 		return nil, ErrInvalidScheduler
 	}
-	if interval <= 0 || interval > maxRuntimeInterval {
+	if configuration.Interval <= 0 || configuration.Interval > maxRuntimeInterval {
 		return nil, ErrRuntimeInterval
 	}
-	return &Runtime{Scheduler: scheduler, Interval: interval}, nil
+	if configuration.Workers < 1 || configuration.Workers > maxRuntimeWorkers {
+		return nil, ErrRuntimeWorkers
+	}
+	return &Runtime{Scheduler: scheduler, Interval: configuration.Interval, workers: configuration.Workers}, nil
 }
 
 // Start starts the loop immediately with the supplied leader fence. The
@@ -57,10 +127,24 @@ func (r *Runtime) Start(ctx context.Context, fence domain.Fence) error {
 	if r.Interval <= 0 || r.Interval > maxRuntimeInterval {
 		return ErrRuntimeInterval
 	}
+	if r.workers < 1 || r.workers > maxRuntimeWorkers {
+		return ErrRuntimeWorkers
+	}
 	loopCtx, cancel := context.WithCancel(ctx)
 	r.started, r.cancel, r.done = true, cancel, make(chan struct{})
 	done := r.done
-	go r.loop(loopCtx, fence, done)
+	var loops sync.WaitGroup
+	loops.Add(r.workers)
+	for worker := 0; worker < r.workers; worker++ {
+		go func() {
+			defer loops.Done()
+			r.loop(loopCtx, fence)
+		}()
+	}
+	go func() {
+		loops.Wait()
+		close(done)
+	}()
 	return nil
 }
 
@@ -73,8 +157,7 @@ func (r *Runtime) Serve(ctx context.Context, fence domain.Fence) error {
 	return r.Wait(context.Background())
 }
 
-func (r *Runtime) loop(ctx context.Context, fence domain.Fence, done chan struct{}) {
-	defer close(done)
+func (r *Runtime) loop(ctx context.Context, fence domain.Fence) {
 	for {
 		if ctx.Err() != nil {
 			return

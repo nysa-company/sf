@@ -36,7 +36,15 @@ func (s *Store) TransitionAndInvalidateRunner(ctx context.Context, transition Tr
 		return TransitionResult{}, fmt.Errorf("control event payload must be bounded JSON")
 	}
 
+	if s.mutations == nil {
+		return TransitionResult{}, ErrStaleFence
+	}
+	if err := s.mutations.lock(ctx); err != nil {
+		return TransitionResult{}, err
+	}
+	defer s.mutations.unlock()
 	var result TransitionResult
+	var seal mutationRevocation
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var version, runner uint64
 		var actual domain.State
@@ -63,6 +71,11 @@ func (s *Store) TransitionAndInvalidateRunner(ctx context.Context, transition Tr
 		if count, _ := updated.RowsAffected(); count != 1 {
 			return ErrStaleFence
 		}
+		value := mutationRevocation{version: version + 1, leader: transition.Fence.LeaderEpoch, runner: runner + 1}
+		if err := sealRuntimeControl(ctx, conn, transition.Ref, value); err != nil {
+			return err
+		}
+		seal = value
 		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, transition.Ref.Channel, transition.Ref.Project,
 			transition.Ref.Ticket, version+1, transition.Trigger, transition.From, transition.To,
@@ -74,6 +87,9 @@ func (s *Store) TransitionAndInvalidateRunner(ctx context.Context, transition Tr
 		result.EventID, _ = created.LastInsertId()
 		return nil
 	})
+	if err == nil {
+		s.mutations.latch(transition.Ref, seal)
+	}
 	return result, err
 }
 

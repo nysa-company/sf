@@ -57,7 +57,7 @@ var (
 	ErrPublicationEvidence     = errors.New("publication evidence is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 39
+const schemaVersion = 40
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -99,6 +99,7 @@ var migrationChecksums = map[int]string{
 	37: migrationChecksum(migrationV37),
 	38: migrationChecksum(migrationV38),
 	39: migrationChecksum(migrationV39),
+	40: migrationChecksum(migrationV40),
 }
 
 func migrationChecksum(statements []string) string {
@@ -118,6 +119,9 @@ type Store struct {
 	faultMu      sync.RWMutex
 	writeFault   func() error
 	mutations    *ExternalMutationGate
+	// controlProofHook is package-test-only synchronization for proving the
+	// Store control/admission linearization.
+	controlProofHook func()
 }
 
 // SetWriteFaultForTest injects a deterministic write failure. It is reserved
@@ -230,7 +234,7 @@ func open(ctx context.Context, path string, policy openPolicy) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{db: db, commit: commitTransaction, worktreeRoot: worktreeRoot}
-	s.mutations = &ExternalMutationGate{store: s, gate: make(chan struct{}, 1), revoked: make(map[domain.TicketRef]mutationRevocation)}
+	s.mutations = &ExternalMutationGate{store: s, gate: make(chan struct{}, 1), revoked: make(map[domain.TicketRef]mutationRevocation), controls: make(map[domain.TicketRef]mutationRevocation)}
 	s.mutations.gate <- struct{}{}
 	storedVersion, recognized, err := inspectStoredSchema(ctx, db)
 	if err != nil {
@@ -256,6 +260,10 @@ func open(ctx context.Context, path string, policy openPolicy) (*Store, error) {
 		return nil, normalizeBusy(ctx, err)
 	}
 	if err := s.migrate(ctx); err != nil {
+		db.Close()
+		return nil, normalizeBusy(ctx, err)
+	}
+	if err := s.restoreRuntimeControls(ctx); err != nil {
 		db.Close()
 		return nil, normalizeBusy(ctx, err)
 	}
@@ -423,6 +431,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV38
 			} else if version == 39 {
 				statements = migrationV39
+			} else if version == 40 {
+				statements = migrationV40
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -972,9 +982,13 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expected
 	if workflowID == "" {
 		return Ticket{}, fmt.Errorf("stable workflow id is required")
 	}
-	if err := s.DrainExternalMutations(ctx, ref); err != nil {
+	if s.mutations == nil {
+		return Ticket{}, ErrStaleFence
+	}
+	if err := s.mutations.lock(ctx); err != nil {
 		return Ticket{}, err
 	}
+	defer s.mutations.unlock()
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var state domain.State
 		var persistedWorkflowID string
@@ -985,7 +999,7 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expected
 			}
 			return err
 		}
-		if err := s.currentFence(ctx, conn, ref.Channel, version, runner, fence); err != nil {
+		if err := s.assertTicketFence(ctx, conn, ref, version, fence); err != nil {
 			return err
 		}
 		stateChanged := false

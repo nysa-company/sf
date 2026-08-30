@@ -288,7 +288,7 @@ func (s *Store) ReconcileInvalidatedEffect(ctx context.Context, observation Inva
 	}
 	var effect Effect
 	err := s.write(ctx, func(conn *sql.Conn) error {
-		if err := s.assertTicketFence(ctx, conn, prior.Ref, observation.Current.TicketVersion, observation.Current.Fence); err != nil {
+		if err := s.assertCurrentTicketFence(ctx, conn, prior.Ref, observation.Current.TicketVersion, observation.Current.Fence); err != nil {
 			return err
 		}
 		current, err := effectFrom(ctx, conn, prior.SemanticKey)
@@ -408,8 +408,36 @@ func (s *Store) MarkEffectUncertain(ctx context.Context, fence EffectFence) (Eff
 }
 
 func (s *Store) assertTicketFence(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence) error {
+	if s.mutations == nil || s.mutations.revokedBy(ref, expectedVersion, fence) {
+		return ErrStaleFence
+	}
+	var controlState string
+	err := conn.QueryRowContext(ctx, `SELECT state FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&controlState)
+	if err == nil && (controlState == "sealed" || controlState == "armed") {
+		return ErrStaleFence
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	var version, runner uint64
 	if err := conn.QueryRowContext(ctx, `SELECT version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&version, &runner); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if version != expectedVersion {
+		return ErrStaleFence
+	}
+	return s.currentFence(ctx, conn, ref.Channel, version, runner, fence)
+}
+
+// assertCurrentTicketFence is reserved for reconciling an already-started
+// external effect. It never admits a new authority, so recording that
+// observation remains legal after the runtime-control seal.
+func (s *Store) assertCurrentTicketFence(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence) error {
+	var version, runner uint64
+	if err := conn.QueryRowContext(ctx, `SELECT version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&version, &runner); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}

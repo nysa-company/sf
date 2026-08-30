@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -15,9 +16,61 @@ import (
 // or replacing a leader; a draining mark rejects old claims that arrive after
 // the drain and allows only a newer ticket/leader/runner identity through.
 type ExternalMutationGate struct {
-	store   *Store
-	gate    chan struct{}
-	revoked map[domain.TicketRef]mutationRevocation
+	store        *Store
+	gate         chan struct{}
+	revocationMu sync.RWMutex
+	revoked      map[domain.TicketRef]mutationRevocation
+	controls     map[domain.TicketRef]mutationRevocation
+}
+
+func (g *ExternalMutationGate) revoke(ref domain.TicketRef, value mutationRevocation) {
+	g.revocationMu.Lock()
+	g.revoked[ref] = value
+	g.revocationMu.Unlock()
+}
+func (g *ExternalMutationGate) latch(ref domain.TicketRef, value mutationRevocation) {
+	g.revocationMu.Lock()
+	g.controls[ref] = value
+	g.revocationMu.Unlock()
+}
+func (g *ExternalMutationGate) seal(ref domain.TicketRef, value mutationRevocation) {
+	g.revocationMu.Lock()
+	if _, ok := g.controls[ref]; !ok {
+		g.controls[ref] = value
+	}
+	g.revocationMu.Unlock()
+}
+func (g *ExternalMutationGate) control(ref domain.TicketRef) (mutationRevocation, bool) {
+	g.revocationMu.RLock()
+	value, ok := g.controls[ref]
+	g.revocationMu.RUnlock()
+	return value, ok
+}
+func (g *ExternalMutationGate) openControl(ref domain.TicketRef, value mutationRevocation) bool {
+	g.revocationMu.Lock()
+	defer g.revocationMu.Unlock()
+	if current, ok := g.controls[ref]; !ok || current != value {
+		return false
+	}
+	delete(g.controls, ref)
+	return true
+}
+func (g *ExternalMutationGate) retireControl(ref domain.TicketRef, value mutationRevocation) bool {
+	g.revocationMu.Lock()
+	defer g.revocationMu.Unlock()
+	if current, ok := g.controls[ref]; !ok || current != value {
+		return false
+	}
+	delete(g.controls, ref)
+	delete(g.revoked, ref)
+	return true
+}
+func (g *ExternalMutationGate) revokedBy(ref domain.TicketRef, version uint64, fence domain.Fence) bool {
+	g.revocationMu.RLock()
+	_, controlled := g.controls[ref]
+	value, ok := g.revoked[ref]
+	g.revocationMu.RUnlock()
+	return controlled || (ok && version <= value.version && fence.LeaderEpoch <= value.leader && fence.RunnerEpoch <= value.runner)
 }
 
 type mutationRevocation struct {
@@ -56,7 +109,7 @@ func (g *ExternalMutationGate) RunExternalMutation(ctx context.Context, claim do
 	if quarantined, err := g.store.externalMutationsQuarantined(ctx); err != nil || quarantined {
 		return nil, contracts.ErrExternalCleanupUncertain
 	}
-	if revoked, ok := g.revoked[claim.Ref]; ok && claim.TicketVersion <= revoked.version && claim.LeaderEpoch <= revoked.leader && claim.RunnerEpoch <= revoked.runner {
+	if g.revokedBy(claim.Ref, claim.TicketVersion, domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch}) {
 		return nil, ErrStaleFence
 	}
 	// This validation and the process start are protected by the same gate.
@@ -100,7 +153,7 @@ func (s *Store) DrainExternalMutations(ctx context.Context, ref domain.TicketRef
 	if err != nil {
 		return normalizeBusy(ctx, err)
 	}
-	g.revoked[ref] = mutationRevocation{version: version, leader: leader, runner: runner}
+	g.revoke(ref, mutationRevocation{version: version, leader: leader, runner: runner})
 	return nil
 }
 
@@ -129,7 +182,7 @@ func (s *Store) DrainChannelExternalMutations(ctx context.Context, channel domai
 		if err := rows.Scan(&project, &ticket, &version, &runner, &leader); err != nil {
 			return err
 		}
-		g.revoked[domain.TicketRef{Channel: channel, Project: project, Ticket: ticket}] = mutationRevocation{version: version, leader: leader, runner: runner}
+		g.revoke(domain.TicketRef{Channel: channel, Project: project, Ticket: ticket}, mutationRevocation{version: version, leader: leader, runner: runner})
 	}
 	return rows.Err()
 }

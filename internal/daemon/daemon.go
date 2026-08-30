@@ -74,6 +74,10 @@ type RuntimeController interface {
 	MergeObserved(context.Context, domain.TicketRef) (bool, error)
 }
 
+type RuntimeRearmController interface {
+	Rearm(context.Context, domain.TicketRef) error
+}
+
 // WorkflowRuntime is the daemon lifecycle boundary for a composed workflow
 // runtime. Implementations own their goroutines and must not return from
 // Close until those goroutines have stopped. The fence is supplied by the
@@ -629,6 +633,8 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		response = daemon.startTicket(ctx, request, identity)
 	case "ticket.pause":
 		response = daemon.controlTicket(ctx, request, identity, "pause")
+	case "ticket.resume":
+		response = daemon.resumeTicket(ctx, request, identity)
 	case "ticket.cancel":
 		response = daemon.controlTicket(ctx, request, identity, "cancel")
 	case "daemon.status":
@@ -1061,6 +1067,48 @@ func (daemon *Daemon) finishControl(ctx context.Context, request api.Request, st
 		return daemon.controlFailure(request, stored, intent, "control_state_unavailable", "completed control state could not be confirmed", true, true)
 	}
 	return daemon.controlSuccess(request, finished, intent, false)
+}
+
+func (daemon *Daemon) resumeTicket(ctx context.Context, request api.Request, identity domain.OperatorIdentity) api.Response {
+	var parameters controlParameters
+	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) {
+		return daemon.failure(request, "invalid_resume", "resume requires the authenticated operator and daemon channel", false)
+	}
+	ref, response := daemon.ticketRefByID(ctx, request)
+	if response != nil {
+		return *response
+	}
+	controller, ok := daemon.control.(RuntimeRearmController)
+	if !ok {
+		return daemon.failure(request, "runtime_rearm_unavailable", "ticket resume is unavailable until the runtime control boundary is configured", true)
+	}
+	if err := daemon.lease.Validate(); err != nil {
+		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	}
+	stored, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	if stored.State == domain.StatePaused {
+		payload, err := json.Marshal(map[string]string{"intent": "resume", "operator": identity.Label})
+		if err != nil {
+			return daemon.failure(request, "internal_encoding", "resume control metadata could not be encoded", false)
+		}
+		result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, Attributes: map[string]string{
+			"operator_identity_authenticated": "true", "takeover_diff_none": "true", "branch_remote_identity_exact": "true", "prerequisites_green": "true",
+		}, EventPayload: string(payload)})
+		if err != nil {
+			return daemon.failure(request, "resume_transition_refused", "ticket cannot resume from its current durable state", false)
+		}
+		stored, err = daemon.store.Ticket(ctx, ref)
+		if err != nil || stored.Version != result.TicketVersion {
+			return daemon.failure(request, "resume_state_unavailable", "resume transition could not be confirmed", true)
+		}
+	}
+	if err := controller.Rearm(ctx, ref); err != nil {
+		return daemon.failure(request, "runtime_rearm_failed", "resume is durably sealed until runtime admission is installed; retry resume after the local runtime is available", true)
+	}
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_resume", Identity: string(ref.Ticket)}, ticketView(stored))
 }
 
 func (daemon *Daemon) ticketRefByID(ctx context.Context, request api.Request) (domain.TicketRef, *api.Response) {
