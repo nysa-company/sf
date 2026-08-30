@@ -278,7 +278,11 @@ func TestRepositoryCommandRunsGoTestThroughTrackedStrictGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	goSum := sha256.Sum256(goBytes)
-	spec := contracts.CommandSpec{Argv: []string{"go", "test", "./..."}, Directory: worktree, Timeout: 20 * time.Second, Profile: contracts.ProfileGuarded}
+	// This is a full compiled helper + staged-toolchain integration fixture.
+	// Keep it bounded, but leave enough budget for contention from a complete
+	// repository suite; the product accepts up to 45 minutes and this test
+	// remains deliberately far below that cap.
+	spec := contracts.CommandSpec{Argv: []string{"go", "test", "./..."}, Directory: worktree, Timeout: 60 * time.Second, Profile: contracts.ProfileGuarded}
 	policy, err := executionpolicy.NewCommandSnapshot(spec.Argv)
 	if err != nil {
 		t.Fatal(err)
