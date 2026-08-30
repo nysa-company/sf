@@ -248,3 +248,30 @@ var migrationV9 = []string{
 		FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id)
 	)`,
 }
+
+// v10 records exact, sanitized provider qualification verdicts and one
+// channel-local independent pair. This is not a per-product release ledger:
+// it contains no product, prompt, transcript, filesystem path, or credential.
+var migrationV10 = []string{
+	`CREATE TABLE provider_qualifications (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL CHECK(channel IN ('stable','dev')),
+		run_id TEXT NOT NULL CHECK(length(run_id)=32), provider TEXT NOT NULL CHECK(length(provider) BETWEEN 1 AND 48),
+		model TEXT NOT NULL CHECK(length(model) BETWEEN 1 AND 200), family TEXT NOT NULL CHECK(length(family) BETWEEN 1 AND 100),
+		provider_version TEXT NOT NULL CHECK(length(provider_version) BETWEEN 1 AND 200),
+		binary_digest TEXT NOT NULL CHECK(length(binary_digest)=64), policy_digest TEXT NOT NULL CHECK(length(policy_digest)=64),
+		fixture_digest TEXT NOT NULL CHECK(length(fixture_digest)=64),
+		profile TEXT NOT NULL CHECK(profile IN ('disabled','qualified_guarded','autonomous_eligible')),
+		failed_probes_json TEXT NOT NULL CHECK(length(failed_probes_json) BETWEEN 2 AND 16384),
+		reason_code TEXT NOT NULL CHECK(length(reason_code) <= 100), created_at TEXT NOT NULL,
+		UNIQUE(channel, run_id),
+		CHECK((profile='disabled' AND failed_probes_json<>'[]' AND reason_code<>'') OR (profile<>'disabled' AND failed_probes_json='[]' AND reason_code=''))
+	)`,
+	`CREATE INDEX provider_qualification_latest ON provider_qualifications(channel, provider, model, family, provider_version, id DESC)`,
+	`CREATE TABLE provider_pair_selections (
+		channel TEXT PRIMARY KEY CHECK(channel IN ('stable','dev')),
+		builder_qualification_id INTEGER NOT NULL, reviewer_qualification_id INTEGER NOT NULL, selected_at TEXT NOT NULL,
+		FOREIGN KEY(builder_qualification_id) REFERENCES provider_qualifications(id),
+		FOREIGN KEY(reviewer_qualification_id) REFERENCES provider_qualifications(id),
+		CHECK(builder_qualification_id <> reviewer_qualification_id)
+	)`,
+}

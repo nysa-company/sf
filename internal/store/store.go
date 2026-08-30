@@ -19,32 +19,35 @@ import (
 )
 
 var (
-	ErrBusy             = errors.New("sqlite write deadline exceeded")
-	ErrStaleFence       = errors.New("ticket fence is stale")
-	ErrNotFound         = errors.New("store row not found")
-	ErrBlocked          = errors.New("ticket is blocked")
-	ErrTerminalReplay   = errors.New("terminal ticket replay requires an explicit new ticket")
-	ErrStaleObservation = errors.New("effect observation belongs to a stale ticket identity")
-	ErrEffectBusy       = errors.New("effect already has a live claim")
-	ErrEffectKey        = errors.New("effect semantic key conflicts with durable record")
-	ErrEvidenceConflict = errors.New("evidence conflicts with durable record")
-	ErrBudgetExhausted  = errors.New("bounded ticket budget is exhausted")
-	ErrProjectConflict  = errors.New("project registration conflicts with durable record")
-	ErrBranchConflict   = errors.New("branch allocation conflicts with durable record")
+	ErrBusy                  = errors.New("sqlite write deadline exceeded")
+	ErrStaleFence            = errors.New("ticket fence is stale")
+	ErrNotFound              = errors.New("store row not found")
+	ErrBlocked               = errors.New("ticket is blocked")
+	ErrTerminalReplay        = errors.New("terminal ticket replay requires an explicit new ticket")
+	ErrStaleObservation      = errors.New("effect observation belongs to a stale ticket identity")
+	ErrEffectBusy            = errors.New("effect already has a live claim")
+	ErrEffectKey             = errors.New("effect semantic key conflicts with durable record")
+	ErrEvidenceConflict      = errors.New("evidence conflicts with durable record")
+	ErrBudgetExhausted       = errors.New("bounded ticket budget is exhausted")
+	ErrProjectConflict       = errors.New("project registration conflicts with durable record")
+	ErrBranchConflict        = errors.New("branch allocation conflicts with durable record")
+	ErrQualificationConflict = errors.New("provider qualification conflicts with durable record")
+	ErrProviderPairRefused   = errors.New("provider pair is not current, qualified, and independent")
 )
 
-const schemaVersion = 9
+const schemaVersion = 10
 
 var migrationChecksums = map[int]string{
-	1: migrationChecksum(migrationV1),
-	2: migrationChecksum(migrationV2),
-	3: migrationChecksum(migrationV3),
-	4: migrationChecksum(migrationV4),
-	5: migrationChecksum(migrationV5),
-	6: migrationChecksum(migrationV6),
-	7: migrationChecksum(migrationV7),
-	8: migrationChecksum(migrationV8),
-	9: migrationChecksum(migrationV9),
+	1:  migrationChecksum(migrationV1),
+	2:  migrationChecksum(migrationV2),
+	3:  migrationChecksum(migrationV3),
+	4:  migrationChecksum(migrationV4),
+	5:  migrationChecksum(migrationV5),
+	6:  migrationChecksum(migrationV6),
+	7:  migrationChecksum(migrationV7),
+	8:  migrationChecksum(migrationV8),
+	9:  migrationChecksum(migrationV9),
+	10: migrationChecksum(migrationV10),
 }
 
 func migrationChecksum(statements []string) string {
@@ -204,6 +207,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV8
 			} else if version == 9 {
 				statements = migrationV9
+			} else if version == 10 {
+				statements = migrationV10
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
