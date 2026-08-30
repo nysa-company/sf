@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -488,12 +489,16 @@ func TestCancellationAndSubsequentIdentitySamplingAreBounded(t *testing.T) {
 	old := processStartIdentityFn
 	defer func() { processStartIdentityFn = old }()
 	var calls atomic.Int32
+	var firstOnce sync.Once
+	firstSampleDone := make(chan struct{})
 	secondStarted := make(chan struct{})
 	secondDone := make(chan struct{})
 	release := make(chan struct{})
 	processStartIdentityFn = func(pid int) (string, error) {
 		if calls.Add(1) == 1 {
-			return old(pid)
+			value, err := old(pid)
+			firstOnce.Do(func() { close(firstSampleDone) })
+			return value, err
 		}
 		close(secondStarted)
 		<-release
@@ -512,11 +517,9 @@ func TestCancellationAndSubsequentIdentitySamplingAreBounded(t *testing.T) {
 		_, runErr := runner.Run(ctx, mustExecutable(t), helperArgs("hang"), env)
 		runDone <- runErr
 	}()
-	deadline := time.Now().Add(time.Second)
-	for calls.Load() < 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if calls.Load() != 1 {
+	select {
+	case <-firstSampleDone:
+	case <-time.After(time.Second):
 		t.Fatal("initial process identity sample did not complete")
 	}
 	cancel()
@@ -526,7 +529,7 @@ func TestCancellationAndSubsequentIdentitySamplingAreBounded(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run waited on a blocked subsequent identity sample")
 	}
-	if !(errors.Is(runErr, context.Canceled) || errors.Is(runErr, ErrExternalCleanupUncertain)) || time.Since(started) > 2*time.Second {
+	if !errors.Is(runErr, context.Canceled) || time.Since(started) > 2*time.Second {
 		t.Fatalf("blocked subsequent identity cancellation err=%v duration=%s", runErr, time.Since(started))
 	}
 	select {
@@ -544,16 +547,8 @@ func TestCancellationAndSubsequentIdentitySamplingAreBounded(t *testing.T) {
 		t.Fatalf("identity reader calls=%d, want initial plus bounded subsequent sample", calls.Load())
 	}
 	proof, cleanupErr := runner.Cleanup(context.Background())
-	if errors.Is(runErr, ErrExternalCleanupUncertain) {
-		if !errors.Is(cleanupErr, ErrExternalCleanupUncertain) || !proof.Quarantined {
-			t.Fatalf("uncertain cleanup=%+v err=%v", proof, cleanupErr)
-		}
-	} else if cleanupErr != nil {
-		if !errors.Is(cleanupErr, ErrExternalCleanupUncertain) || !proof.Quarantined {
-			t.Fatalf("cleanup=%+v err=%v", proof, cleanupErr)
-		}
-	} else if !proof.Drained || proof.Quarantined {
-		t.Fatalf("cleanup=%+v err=%v", proof, cleanupErr)
+	if !errors.Is(cleanupErr, ErrExternalCleanupUncertain) || !proof.Quarantined || proof.Drained {
+		t.Fatalf("blocked identity cleanup=%+v err=%v", proof, cleanupErr)
 	}
 }
 
