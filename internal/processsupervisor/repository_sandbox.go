@@ -19,6 +19,9 @@ type repositorySandboxPaths struct {
 	Home       string
 	Temporary  string
 	Executable string
+	// Toolchain is an optional read-only code-owned Go root for the narrow
+	// no-fork toolchain probe fixture. Test binaries do not receive it.
+	Toolchain string
 }
 
 // repositoryStrictSandboxProfile applies to Git and each Go test binary. The
@@ -40,7 +43,7 @@ func repositoryStrictSandboxProfileFor(paths repositorySandboxPaths) (string, er
 	if !repositorySandboxAvailable(paths.Repository) || !cleanAbsolute(paths.Repository) || !cleanAbsolute(paths.Worktree) || !cleanAbsolute(paths.Executable) {
 		return "", ErrUnclear
 	}
-	for _, path := range []string{paths.GitFile, paths.CommonDir, paths.Home, paths.Temporary} {
+	for _, path := range []string{paths.GitFile, paths.CommonDir, paths.Home, paths.Temporary, paths.Toolchain} {
 		if path != "" && !cleanAbsolute(path) {
 			return "", ErrUnclear
 		}
@@ -67,10 +70,13 @@ func repositoryStrictSandboxProfileFor(paths repositorySandboxPaths) (string, er
 		"(allow file-read* (subpath " + seatbeltString(paths.Worktree) + "))\n" +
 		"(allow file-read* (literal " + seatbeltString(paths.Executable) + "))\n" +
 		"(allow file-write* (literal \"/dev/null\"))\n"
+	if paths.Toolchain != "" {
+		profile += "(allow file-read* (subpath " + seatbeltString(paths.Toolchain) + "))\n"
+	}
 	// A default-deny profile needs metadata permission for each ancestor while
 	// resolving an otherwise exact path.  Do not replace this with a broad home
 	// allowlist: only the named command paths receive ancestor traversal.
-	for _, path := range []string{paths.Repository, paths.Worktree, paths.GitFile, paths.CommonDir, paths.Home, paths.Temporary, paths.Executable} {
+	for _, path := range []string{paths.Repository, paths.Worktree, paths.GitFile, paths.CommonDir, paths.Home, paths.Temporary, paths.Executable, paths.Toolchain} {
 		for _, ancestor := range seatbeltAncestors(path) {
 			profile += "(allow file-read* (literal " + seatbeltString(ancestor) + "))\n"
 		}

@@ -63,37 +63,37 @@ func TestRepositoryStrictSandboxBlocksDoubleForkAndSetsid(t *testing.T) {
 	}
 }
 
-func TestRepositoryStrictSandboxAllowsReadOnlyGit(t *testing.T) {
+func TestRepositoryStrictSandboxAllowsReadOnlyGoToolchainRepository(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("repository command product boundary is macOS")
 	}
-	gitPath, err := resolveFixedExecutable("git")
+	goPath, err := resolveFixedExecutable("go")
 	if err != nil {
-		t.Skipf("approved Git unavailable: %v", err)
+		t.Skipf("approved Go unavailable: %v", err)
 	}
 	repository, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	gitFile := filepath.Join(repository, ".git")
-	gitFileRaw, err := os.ReadFile(gitFile)
+	goRoot := filepath.Dir(filepath.Dir(goPath))
+	profile, err := repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: repository, Worktree: repository, GitFile: filepath.Join(repository, ".git"), CommonDir: filepath.Join(repository, ".git"), Executable: goPath, Toolchain: goRoot})
 	if err != nil {
 		t.Fatal(err)
 	}
-	commonDir := filepath.Join(repository, ".git")
-	if target, ok := strings.CutPrefix(strings.TrimSpace(string(gitFileRaw)), "gitdir: "); ok {
-		commonDir = filepath.Dir(filepath.Dir(strings.TrimSpace(target)))
-	}
-	profile, err := repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: repository, Worktree: repository, GitFile: gitFile, CommonDir: commonDir, Executable: gitPath})
+	// `go env GOMOD` is a no-fork, read-only toolchain operation which must
+	// resolve the checked-in module marker from the confined repository. It is
+	// the narrow strict-profile capability used by the Go-only v1 boundary; the
+	// actual `go test` driver remains outside Seatbelt only while compiling,
+	// before each generated test binary crosses the durable sandbox gate.
+	cmd := exec.Command(repositorySandboxExec, "-p", profile, goPath, "env", "GOMOD")
+	cmd.Dir = repository
+	cmd.Env = []string{"HOME=" + t.TempDir(), "PATH=/usr/bin:/bin", "GOROOT=" + goRoot, "GOTOOLCHAIN=local", "GOENV=off", "GOWORK=off", "GOPROXY=off", "GOSUMDB=off"}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read-only Go toolchain did not run inside strict sandbox: %v: %s", err, out)
 	}
-	cmd := exec.Command(repositorySandboxExec, "-p", profile, gitPath, "-C", repository, "status", "--porcelain=v1")
-	cmd.Dir = "/"
-	gitHome := t.TempDir()
-	cmd.Env = append(os.Environ(), "HOME="+gitHome, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_ATTR_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("read-only Git did not run inside strict sandbox: %v: %s", err, out)
+	if got := strings.TrimSpace(string(out)); got != filepath.Join(repository, "go.mod") {
+		t.Fatalf("strict sandbox Go repository read=%q want %q", got, filepath.Join(repository, "go.mod"))
 	}
 }
 

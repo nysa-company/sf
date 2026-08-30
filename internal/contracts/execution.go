@@ -135,10 +135,10 @@ type RepositoryCommandLease interface {
 	Quarantine() error
 }
 
-// RepositoryCommandGroupRecorder durably records a constrained Go test
-// process group before its launch gate is opened. It is deliberately an
-// optional extension so non-Go repository commands retain the small lease
-// interface, while production Go verification fails closed if unavailable.
+// RepositoryCommandGroupRecorder durably records an exact Go-test process
+// group before its launch gate is opened. v1 admits only the guarded,
+// dependency-closed `go test ./...` recipe; production fails closed when this
+// Go-only containment handshake is unavailable.
 type RepositoryCommandGroupRecorder interface {
 	RecordRepositoryCommandProcessGroup(context.Context, RepositoryCommandLaunch) error
 }
