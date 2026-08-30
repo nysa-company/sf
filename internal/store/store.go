@@ -35,6 +35,7 @@ var (
 	ErrBranchConflict        = errors.New("branch allocation conflicts with durable record")
 	ErrQualificationConflict = errors.New("provider qualification conflicts with durable record")
 	ErrProviderPairRefused   = errors.New("provider pair is not current, qualified, and independent")
+	ErrControlNotDrained     = errors.New("ticket control cannot complete before effects are reconciled")
 	ErrReadOnly              = errors.New("store is read-only")
 )
 

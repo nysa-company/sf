@@ -84,8 +84,31 @@ func (s *Store) PlanEffect(ctx context.Context, plan EffectPlan) (Effect, error)
 		if err != nil {
 			return err
 		}
-		if effect.Ref != plan.Ref || effect.Kind != plan.Kind || effect.RequestDigest != plan.RequestDigest || effect.TicketVersion != plan.TicketVersion {
+		if effect.Ref != plan.Ref || effect.Kind != plan.Kind || effect.RequestDigest != plan.RequestDigest {
 			return fmt.Errorf("%w: %s", ErrEffectKey, plan.SemanticKey)
+		}
+		if effect.TicketVersion != plan.TicketVersion || effect.LeaderEpoch != plan.Fence.LeaderEpoch || effect.RunnerEpoch != plan.Fence.RunnerEpoch {
+			// A planned effect never crossed the external boundary. A failed effect
+			// has a durable semantic absence observation. Either may be rebound to
+			// the current ticket identity after pause/recovery; uncertain or
+			// confirmed effects may never be reinterpreted this way.
+			if effect.State != EffectPlanned && effect.State != EffectFailed {
+				return fmt.Errorf("%w: %s", ErrEffectKey, plan.SemanticKey)
+			}
+			updated, err := conn.ExecContext(ctx, `UPDATE effects SET ticket_version=?,leader_epoch=?,runner_epoch=?
+				WHERE semantic_key=? AND state IN ('planned','failed') AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?`,
+				plan.TicketVersion, plan.Fence.LeaderEpoch, plan.Fence.RunnerEpoch, plan.SemanticKey,
+				effect.TicketVersion, effect.LeaderEpoch, effect.RunnerEpoch, effect.ClaimEpoch)
+			if err != nil {
+				return err
+			}
+			if changed, _ := updated.RowsAffected(); changed != 1 {
+				return ErrEffectBusy
+			}
+			effect, err = effectFrom(ctx, conn, plan.SemanticKey)
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -192,6 +215,75 @@ func (s *Store) RecordStaleObservation(ctx context.Context, observation EffectOb
 		return effect, err
 	}
 	return effect, ErrStaleObservation
+}
+
+// InvalidatedEffectObservation settles an effect whose runner was revoked by
+// pause, take, cancel, or leader recovery. Prior identifies the claim that
+// crossed the external boundary; Current proves the only live ticket/leader
+// authority allowed to persist the read-only semantic observation.
+type InvalidatedEffectObservation struct {
+	Prior   EffectObservation
+	Current EffectFence
+}
+
+// ReconcileInvalidatedEffect records a conclusive semantic observation after
+// the original runner can no longer write. Proven presence confirms the old
+// effect; proven absence marks it failed so a later PlanEffect may rebind the
+// same semantic key to the current ticket identity. It never performs or
+// retries the external mutation itself.
+func (s *Store) ReconcileInvalidatedEffect(ctx context.Context, observation InvalidatedEffectObservation) (Effect, error) {
+	prior := observation.Prior
+	if err := prior.Ref.Validate(); err != nil {
+		return Effect{}, err
+	}
+	if prior.SemanticKey == "" || prior.TicketVersion == 0 || prior.Fence.LeaderEpoch == 0 || prior.Fence.RunnerEpoch == 0 || prior.Fence.ClaimEpoch == 0 || observation.Current.Ref != prior.Ref || observation.Current.SemanticKey != prior.SemanticKey || observation.Current.TicketVersion == 0 || observation.Current.Fence.LeaderEpoch == 0 || observation.Current.Fence.RunnerEpoch == 0 {
+		return Effect{}, errors.New("prior effect claim and current ticket fence are required")
+	}
+	if prior.Present && strings.TrimSpace(prior.Identity) == "" {
+		return Effect{}, errors.New("observed identity is required for a present effect")
+	}
+	target := EffectFailed
+	if prior.Present {
+		target = EffectConfirmed
+	}
+	var effect Effect
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		if err := s.assertTicketFence(ctx, conn, prior.Ref, observation.Current.TicketVersion, observation.Current.Fence); err != nil {
+			return err
+		}
+		current, err := effectFrom(ctx, conn, prior.SemanticKey)
+		if err != nil {
+			return err
+		}
+		if current.Ref != prior.Ref || current.TicketVersion != prior.TicketVersion || current.LeaderEpoch != prior.Fence.LeaderEpoch || current.RunnerEpoch != prior.Fence.RunnerEpoch || current.ClaimEpoch != prior.Fence.ClaimEpoch {
+			return ErrStaleFence
+		}
+		if current.TicketVersion == observation.Current.TicketVersion && current.LeaderEpoch == observation.Current.Fence.LeaderEpoch && current.RunnerEpoch == observation.Current.Fence.RunnerEpoch {
+			return errors.New("invalidated effect reconciliation requires a revoked claim")
+		}
+		if current.State == target && current.ObservedIdentity == prior.Identity {
+			effect = current
+			return nil
+		}
+		if current.State != EffectExecuting && current.State != EffectUncertain {
+			return fmt.Errorf("cannot reconcile invalidated effect in state %q", current.State)
+		}
+		updated, err := conn.ExecContext(ctx, `UPDATE effects SET state=?,observed_identity=?
+			WHERE semantic_key=? AND state IN ('executing','uncertain') AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?`,
+			target, prior.Identity, prior.SemanticKey, prior.TicketVersion, prior.Fence.LeaderEpoch, prior.Fence.RunnerEpoch, prior.Fence.ClaimEpoch)
+		if err != nil {
+			return err
+		}
+		if changed, _ := updated.RowsAffected(); changed != 1 {
+			return ErrStaleFence
+		}
+		if err := evidenceEvent(ctx, conn, prior.Ref, observation.Current.TicketVersion, "invalidated_effect_reconciled", map[string]any{"semantic_key": prior.SemanticKey, "present": prior.Present}); err != nil {
+			return err
+		}
+		effect, err = effectFrom(ctx, conn, prior.SemanticKey)
+		return err
+	})
+	return effect, err
 }
 
 func (s *Store) finishEffect(ctx context.Context, fence EffectFence, state EffectState, identity string) (Effect, error) {

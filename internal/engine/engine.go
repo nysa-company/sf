@@ -87,7 +87,9 @@ func (e *Engine) Transition(ctx context.Context, request contracts.TransitionReq
 		EventPayload: "{}",
 	}
 	var result store.TransitionResult
-	if strings.HasPrefix(transition.PhaseDisposition, "invalidate_runner_epoch") {
+	if transition.ID == "stopped" || transition.ID == "cancelled" {
+		result, err = e.store.CompleteControlTransition(ctx, persisted)
+	} else if strings.HasPrefix(transition.PhaseDisposition, "invalidate_runner_epoch") {
 		result, err = e.store.TransitionAndInvalidateRunner(ctx, persisted)
 	} else {
 		result, err = e.store.Transition(ctx, persisted)
