@@ -19,6 +19,11 @@ make build-dev
 go test ./...
 ```
 
+`make build-dev` embeds the development channel and exact source commit.
+Stable artifacts are intentionally explicit: `make build VERSION=<semver>`
+embeds the stable channel and refuses to create an unversioned stable binary.
+Neither command copies state between the isolated channels.
+
 The approved product, architecture, verification, state-machine, and task
 contracts live in [`docs/plans/`](docs/plans/). Implementation has no authority
 to create a remote, mutate Nysa, enable autonomous Nysa merge, retire the

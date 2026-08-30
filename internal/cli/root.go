@@ -408,6 +408,6 @@ func (a *app) simpleSetupCommand(name string) *cobra.Command {
 
 func (a *app) versionCommand() *cobra.Command {
 	return &cobra.Command{Use: "version", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		return a.emit(api.Response{Version: api.Version, RequestID: requestID(), OK: true, Mutation: api.Mutation{}, Data: json.RawMessage(fmt.Sprintf(`{"version":%q,"channel":%q}`, version.Version, a.channel))})
+		return a.emit(api.Response{Version: api.Version, RequestID: requestID(), OK: true, Mutation: api.Mutation{}, Data: json.RawMessage(fmt.Sprintf(`{"version":%q,"commit":%q,"channel":%q,"protocol":%q}`, version.Version, version.Commit, a.channel, api.Version))})
 	}}
 }

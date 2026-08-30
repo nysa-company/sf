@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/sf-release-smoke.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT HUP INT TERM
+
+fail() {
+	echo "release-build-smoke: $*" >&2
+	exit 1
+}
+
+if make -s -C "$root" BIN_DIR="$scratch/unversioned" build >/dev/null 2>&1; then
+	fail "stable build accepted an omitted VERSION"
+fi
+if make -s -C "$root" BIN_DIR="$scratch/non-semver" VERSION=latest build >/dev/null 2>&1; then
+	fail "stable build accepted a non-SemVer VERSION"
+fi
+
+commit=0123456789abcdef0123456789abcdef01234567
+make -s -C "$root" BIN_DIR="$scratch/dev" DEV_VERSION=0.2.0-dev.7 COMMIT="$commit" build-dev
+dev=$($scratch/dev/sf-dev version --json)
+printf '%s' "$dev" | grep -F '"version":"0.2.0-dev.7"' >/dev/null || fail "dev version was not embedded"
+printf '%s' "$dev" | grep -F '"commit":"'"$commit"'"' >/dev/null || fail "dev commit was not embedded"
+printf '%s' "$dev" | grep -F '"channel":"dev"' >/dev/null || fail "dev channel was not embedded"
+printf '%s' "$dev" | grep -F '"protocol":"sf.local/v1"' >/dev/null || fail "protocol was not reported"
+
+make -s -C "$root" BIN_DIR="$scratch/stable" VERSION=1.2.3 COMMIT="$commit" build
+stable=$($scratch/stable/sf version --json)
+printf '%s' "$stable" | grep -F '"version":"1.2.3"' >/dev/null || fail "stable version was not embedded"
+printf '%s' "$stable" | grep -F '"commit":"'"$commit"'"' >/dev/null || fail "stable commit was not embedded"
+printf '%s' "$stable" | grep -F '"channel":"stable"' >/dev/null || fail "stable channel was not embedded"
+
+echo "release-build-smoke: PASS"
