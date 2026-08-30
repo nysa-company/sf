@@ -27,6 +27,7 @@ import (
 	"github.com/nysa-company/sf/internal/events"
 	"github.com/nysa-company/sf/internal/leader"
 	"github.com/nysa-company/sf/internal/operator"
+	"github.com/nysa-company/sf/internal/providercoord"
 	"github.com/nysa-company/sf/internal/redact"
 	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
@@ -101,24 +102,45 @@ type Config struct {
 	// StartupTimeout bounds migrations, recovery, and all startup-only SQLite
 	// operations even when the process context is long-lived.
 	StartupTimeout time.Duration
+	// RecoverProvider must drain the exact provider process group represented by
+	// a durable attempt. A nil callback fails closed when claims exist.
+	RecoverProvider      func(context.Context, store.ProviderAttempt, uint64) error
+	RecoveryAuthorityKey []byte
+	// ProviderSupervisor is the production process-group supervisor. Start
+	// installs its durable launch recorder before recovery or socket exposure;
+	// the coordinator may install the same recorder when it is composed on its
+	// own in tests or future worker entrypoints.
+	ProviderSupervisor contracts.ProcessSupervisor
+	RecoveryDrainer    interface {
+		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
+	}
+	// ProviderCoordinatorFactory composes configured, qualified adapters after
+	// the daemon opens the authoritative Store. A nil factory leaves provider
+	// execution unavailable rather than inventing an adapter.
+	ProviderCoordinatorFactory func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error)
 }
 
 type Daemon struct {
-	channel domain.Channel
-	paths   config.ChannelPaths
-	lease   *leader.Lease
-	store   *store.Store
-	engine  *engine.Engine
-	spec    statemachine.Spec
-	doctor  func(context.Context, store.Project) error
-	server  *transport.Server
-	epoch   uint64
-	clock   Clock
-	ids     TicketIDGenerator
-	auth    operator.Authenticator
-	control RuntimeController
-	mu      sync.Mutex
-	closed  bool
+	channel         domain.Channel
+	paths           config.ChannelPaths
+	lease           *leader.Lease
+	store           *store.Store
+	engine          *engine.Engine
+	spec            statemachine.Spec
+	doctor          func(context.Context, store.Project) error
+	server          *transport.Server
+	epoch           uint64
+	clock           Clock
+	ids             TicketIDGenerator
+	auth            operator.Authenticator
+	control         RuntimeController
+	recoverProvider func(context.Context, store.ProviderAttempt, uint64) error
+	recoveryDrainer interface {
+		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
+	}
+	providerCoordinator *providercoord.Coordinator
+	mu                  sync.Mutex
+	closed              bool
 
 	projectionMu      sync.Mutex
 	projector         events.Projector
@@ -177,6 +199,21 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if err != nil {
 		return failStore(fmt.Errorf("acquire durable leader epoch: %w", err))
 	}
+	if len(configuration.RecoveryAuthorityKey) > 0 {
+		if err := database.SetRecoveryAuthority(startupCtx, configuration.Channel, epoch, configuration.RecoveryAuthorityKey); err != nil {
+			return failStore(fmt.Errorf("set recovery authority: %w", err))
+		}
+	}
+	if configuration.ProviderSupervisor != nil {
+		setter, ok := configuration.ProviderSupervisor.(contracts.LaunchRecorderSetter)
+		if !ok {
+			return failStore(errors.New("provider supervisor does not support durable launch recording"))
+		}
+		setter.SetLaunchRecorder(func(recordCtx context.Context, request contracts.DrainRequest, launch contracts.ProviderLaunch) error {
+			claim := store.ProviderAttemptClaim{ID: request.ClaimID, Ref: request.Ref, Phase: request.Phase, Role: request.Role, Attempt: request.Attempt, Binding: contracts.RuntimeBinding{Identity: request.Identity, BinaryDigest: request.BinaryDigest, PolicyDigest: request.PolicyDigest}, LeaseKey: request.LeaseKey, BindingDigest: request.BindingDigest, LeaderEpoch: request.LeaderEpoch, RunnerEpoch: request.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA}
+			return database.RecordProviderLaunch(recordCtx, claim, launch)
+		})
+	}
 	for _, project := range configuration.Projects {
 		if project.Channel != configuration.Channel {
 			return failStore(fmt.Errorf("configured project %q belongs to another channel", project.ID))
@@ -196,8 +233,15 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		}
 	}
 
+	var coordinator *providercoord.Coordinator
+	if configuration.ProviderCoordinatorFactory != nil {
+		coordinator, err = configuration.ProviderCoordinatorFactory(database, configuration.ProviderSupervisor)
+		if err != nil {
+			return failStore(fmt.Errorf("compose provider coordinator: %w", err))
+		}
+	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, providerCoordinator: coordinator}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -238,6 +282,10 @@ func (daemon *Daemon) Serve(ctx context.Context) error {
 	return err
 }
 
+// Epoch exposes the durable leader fence to the production composition and
+// integration harnesses without exposing the Store itself.
+func (daemon *Daemon) Epoch() uint64 { return daemon.epoch }
+
 func (daemon *Daemon) Recover(ctx context.Context) error {
 	if err := daemon.lease.Validate(); err != nil {
 		return err
@@ -247,6 +295,39 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 	}
 	if _, err := daemon.store.FenceRecoveredRunners(ctx, daemon.channel, daemon.epoch); err != nil {
 		return fmt.Errorf("invalidate recovered runners: %w", err)
+	}
+	claims, err := daemon.store.ActiveProviderAttempts(ctx, daemon.channel)
+	if err != nil {
+		return fmt.Errorf("read provider recovery claims: %w", err)
+	}
+	for _, claim := range claims {
+		if daemon.recoveryDrainer != nil {
+			launch, identityErr := daemon.store.ProviderLaunchIdentity(ctx, claim.ProviderAttemptClaim)
+			if identityErr != nil {
+				if err := daemon.store.QuarantineRecoveredProviderAttemptClaim(ctx, claim, daemon.epoch, daemon.clock.Now()); err != nil {
+					return err
+				}
+				return fmt.Errorf("quarantined provider attempt %d without a provable launch identity: %w", claim.ID, store.ErrProviderDrain)
+			}
+			req := contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA}
+			proof, drainErr := daemon.recoveryDrainer.DrainPersisted(ctx, req, launch)
+			if drainErr != nil {
+				if err := daemon.store.QuarantineRecoveredProviderAttemptClaim(ctx, claim, daemon.epoch, daemon.clock.Now()); err != nil {
+					return err
+				}
+				return fmt.Errorf("quarantined provider attempt %d after identity verification failed: %w", claim.ID, store.ErrProviderDrain)
+			}
+			if err := daemon.store.RecoverProviderAttemptClaimWithProof(ctx, claim, daemon.epoch, proof, daemon.clock.Now()); err != nil {
+				return err
+			}
+			continue
+		}
+		if daemon.recoverProvider == nil {
+			return store.ErrProviderDrain
+		}
+		if err := daemon.recoverProvider(ctx, claim, daemon.epoch); err != nil {
+			return fmt.Errorf("recover provider attempt %d: %w", claim.ID, err)
+		}
 	}
 	return daemon.engine.RecoverChannel(ctx, daemon.channel, daemon.epoch)
 }

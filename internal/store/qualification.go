@@ -39,9 +39,31 @@ type ProviderQualification struct {
 
 type ProviderPair struct {
 	Channel    domain.Channel
+	Planner    ProviderQualification
 	Builder    ProviderQualification
 	Reviewer   ProviderQualification
 	SelectedAt time.Time
+}
+
+// SelectProviderSet records the exact qualified planner/builder/reviewer set.
+// Planner may intentionally equal Builder; Reviewer must remain independent.
+func (s *Store) SelectProviderSet(ctx context.Context, channel domain.Channel, plannerID, builderID, reviewerID int64, selectedAt time.Time) (ProviderPair, bool, error) {
+	pair, created, err := s.SelectProviderPair(ctx, channel, builderID, reviewerID, selectedAt)
+	if err != nil {
+		return ProviderPair{}, false, err
+	}
+	err = s.write(ctx, func(conn *sql.Conn) error {
+		planner, err := currentQualificationByID(ctx, conn, channel, plannerID)
+		if err != nil || planner.Profile == QualificationDisabled {
+			return ErrProviderPairRefused
+		}
+		if _, err = conn.ExecContext(ctx, `UPDATE provider_pair_selections SET planner_qualification_id=? WHERE channel=?`, plannerID, channel); err != nil {
+			return err
+		}
+		pair.Planner = planner
+		return nil
+	})
+	return pair, created, err
 }
 
 var (
@@ -164,12 +186,12 @@ func (s *Store) SelectProviderPair(ctx context.Context, channel domain.Channel, 
 			return err
 		}
 		stamp := selectedAt.UTC().Format(time.RFC3339Nano)
-		if _, err := conn.ExecContext(ctx, `INSERT INTO provider_pair_selections(channel, builder_qualification_id, reviewer_qualification_id, selected_at)
-			VALUES (?, ?, ?, ?) ON CONFLICT(channel) DO UPDATE SET builder_qualification_id=excluded.builder_qualification_id,
-			reviewer_qualification_id=excluded.reviewer_qualification_id, selected_at=excluded.selected_at`, channel, builderID, reviewerID, stamp); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO provider_pair_selections(channel, planner_qualification_id, builder_qualification_id, reviewer_qualification_id, selected_at)
+			VALUES (?, ?, ?, ?, ?) ON CONFLICT(channel) DO UPDATE SET planner_qualification_id=excluded.planner_qualification_id, builder_qualification_id=excluded.builder_qualification_id,
+			reviewer_qualification_id=excluded.reviewer_qualification_id, selected_at=excluded.selected_at`, channel, builderID, builderID, reviewerID, stamp); err != nil {
 			return err
 		}
-		pair = ProviderPair{Channel: channel, Builder: builder, Reviewer: reviewer, SelectedAt: selectedAt.UTC()}
+		pair = ProviderPair{Channel: channel, Planner: builder, Builder: builder, Reviewer: reviewer, SelectedAt: selectedAt.UTC()}
 		created = true
 		return nil
 	})

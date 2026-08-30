@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
@@ -37,9 +38,12 @@ var (
 	ErrProviderPairRefused   = errors.New("provider pair is not current, qualified, and independent")
 	ErrControlNotDrained     = errors.New("ticket control cannot complete before effects are reconciled")
 	ErrReadOnly              = errors.New("store is read-only")
+	ErrProviderCapacity      = errors.New("provider route capacity is exhausted")
+	ErrProviderAttempt       = errors.New("provider attempt cannot be admitted")
+	ErrProviderDrain         = errors.New("provider process has not drained")
 )
 
-const schemaVersion = 10
+const schemaVersion = 18
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -52,6 +56,14 @@ var migrationChecksums = map[int]string{
 	8:  migrationChecksum(migrationV8),
 	9:  migrationChecksum(migrationV9),
 	10: migrationChecksum(migrationV10),
+	11: migrationChecksum(migrationV11),
+	12: migrationChecksum(migrationV12),
+	13: migrationChecksum(migrationV13),
+	14: migrationChecksum(migrationV14),
+	15: migrationChecksum(migrationV15),
+	16: migrationChecksum(migrationV16),
+	17: migrationChecksum(migrationV17),
+	18: migrationChecksum(migrationV18),
 }
 
 func migrationChecksum(statements []string) string {
@@ -64,9 +76,29 @@ func migrationChecksum(statements []string) string {
 }
 
 type Store struct {
-	db       *sql.DB
-	commit   func(context.Context, *sql.Conn) error
-	readOnly bool
+	db         *sql.DB
+	commit     func(context.Context, *sql.Conn) error
+	readOnly   bool
+	faultMu    sync.RWMutex
+	writeFault func() error
+}
+
+// SetWriteFaultForTest injects a deterministic write failure. It is reserved
+// for package/integration tests that verify fail-closed persistence handling.
+func (s *Store) SetWriteFaultForTest(fault func() error) {
+	s.faultMu.Lock()
+	s.writeFault = fault
+	s.faultMu.Unlock()
+}
+
+func (s *Store) injectedWriteFault() error {
+	s.faultMu.RLock()
+	fault := s.writeFault
+	s.faultMu.RUnlock()
+	if fault != nil {
+		return fault()
+	}
+	return nil
 }
 
 type Project struct {
@@ -266,6 +298,22 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV9
 			} else if version == 10 {
 				statements = migrationV10
+			} else if version == 11 {
+				statements = migrationV11
+			} else if version == 12 {
+				statements = migrationV12
+			} else if version == 13 {
+				statements = migrationV13
+			} else if version == 14 {
+				statements = migrationV14
+			} else if version == 15 {
+				statements = migrationV15
+			} else if version == 16 {
+				statements = migrationV16
+			} else if version == 17 {
+				statements = migrationV17
+			} else if version == 18 {
+				statements = migrationV18
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -296,6 +344,9 @@ func (s *Store) write(ctx context.Context, fn func(*sql.Conn) error) error {
 	}
 	backoff := time.Millisecond
 	for {
+		if err := s.injectedWriteFault(); err != nil {
+			return err
+		}
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("%w: %v", ErrBusy, err)
 		}
@@ -1066,7 +1117,7 @@ func (s *Store) RecordPhaseCompletion(ctx context.Context, ref domain.TicketRef,
 		if err := s.currentFence(ctx, conn, ref.Channel, version, runner, fence); err != nil {
 			return err
 		}
-		result, err := conn.ExecContext(ctx, `INSERT INTO phase_runs(channel, project_id, ticket_id, phase, attempt, state, leader_epoch, runner_epoch, expected_ticket_version, completed_at) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?) ON CONFLICT(channel, project_id, ticket_id, phase, attempt) DO NOTHING`, ref.Channel, ref.Project, ref.Ticket, phase, attempt, fence.LeaderEpoch, fence.RunnerEpoch, expectedVersion, time.Now().UTC().Format(time.RFC3339Nano))
+		result, err := conn.ExecContext(ctx, `INSERT INTO phase_runs(channel, project_id, ticket_id, phase, attempt, state, leader_epoch, runner_epoch, expected_ticket_version, completed_at, outcome) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, 'completed') ON CONFLICT(channel, project_id, ticket_id, phase, attempt) DO NOTHING`, ref.Channel, ref.Project, ref.Ticket, phase, attempt, fence.LeaderEpoch, fence.RunnerEpoch, expectedVersion, time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}

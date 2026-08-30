@@ -275,3 +275,86 @@ var migrationV10 = []string{
 		CHECK(builder_qualification_id <> reviewer_qualification_id)
 	)`,
 }
+
+// v11 adds fenced, qualification-backed provider attempts. It deliberately
+// references the existing qualification authority rather than introducing a
+// mutable provider-binding ledger.
+var migrationV11 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN role TEXT NOT NULL DEFAULT 'planner' CHECK(role IN ('planner','builder','reviewer'))`,
+	`ALTER TABLE provider_attempts ADD COLUMN state TEXT NOT NULL DEFAULT 'completed' CHECK(state IN ('active','completed','failed','cancelled','quarantined'))`,
+	`ALTER TABLE provider_attempts ADD COLUMN usage_units INTEGER NOT NULL DEFAULT 0 CHECK(usage_units >= 0)`,
+	`ALTER TABLE provider_attempts ADD COLUMN started_at TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN finished_at TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN qualification_id INTEGER`,
+	`ALTER TABLE provider_attempts ADD COLUMN binding_digest TEXT NOT NULL DEFAULT '' CHECK(length(binding_digest) IN (0,64))`,
+	`ALTER TABLE provider_attempts ADD COLUMN provider_lease_key TEXT NOT NULL DEFAULT ''`,
+	`CREATE UNIQUE INDEX one_active_provider_attempt ON provider_attempts(channel, project_id, ticket_id) WHERE state='active'`,
+	`CREATE INDEX provider_attempt_recovery ON provider_attempts(channel, state, started_at)`,
+}
+
+// v12 binds each provider attempt to the exact fenced launch that created it.
+// The defaults preserve readability of pre-v11 rows; new admission always
+// writes non-zero values and validates them before completion.
+var migrationV12 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN leader_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE provider_attempts ADD COLUMN runner_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE provider_attempts ADD COLUMN expected_ticket_version INTEGER NOT NULL DEFAULT 0`,
+}
+
+// v13 binds every runnable provider claim to its durable Git identity and to
+// a supervisor verification key. Pre-v13 claims cannot establish either fact,
+// so they are explicitly failed/quarantined rather than being resumed.
+var migrationV13 = []string{
+	`ALTER TABLE provider_pair_selections ADD COLUMN planner_qualification_id INTEGER REFERENCES provider_qualifications(id)`,
+	`UPDATE provider_pair_selections SET planner_qualification_id=builder_qualification_id WHERE planner_qualification_id IS NULL`,
+	`ALTER TABLE provider_attempts ADD COLUMN repository_path TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN worktree_path TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN worktree_identity TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN base_sha TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE provider_attempts ADD COLUMN supervisor_key BLOB NOT NULL DEFAULT X''`,
+	`UPDATE provider_attempts SET state='failed', outcome='legacy_unverifiable', finished_at=CASE WHEN finished_at='' THEN started_at ELSE finished_at END WHERE expected_ticket_version=0 OR qualification_id IS NULL OR binding_digest='' OR leader_epoch=0 OR runner_epoch=0 OR repository_path='' OR worktree_path='' OR worktree_identity='' OR base_sha='' OR length(supervisor_key)<>32`,
+	`CREATE TRIGGER provider_attempt_state_outcome_insert BEFORE INSERT ON provider_attempts WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome='completed') OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='quarantined' AND NEW.outcome IN ('undrained','undrained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid provider state/outcome'); END`,
+	`CREATE TRIGGER provider_attempt_state_outcome_update BEFORE UPDATE OF state,outcome ON provider_attempts WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome='completed') OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='quarantined' AND NEW.outcome IN ('undrained','undrained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid provider state/outcome'); END`,
+	`CREATE TRIGGER phase_run_state_outcome_update BEFORE UPDATE OF state,outcome ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome='completed') OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
+}
+
+// v14 reserves durable launch lifecycle fields. A launch that dies before its
+// PID/PGID is recorded remains unrecoverable and is quarantined, never freed.
+var migrationV14 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN launch_state TEXT NOT NULL DEFAULT 'legacy_unverifiable' CHECK(launch_state IN ('launching','released','drained','quarantined','legacy_unverifiable'))`,
+	`ALTER TABLE provider_attempts ADD COLUMN process_pid INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE provider_attempts ADD COLUMN process_pgid INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE provider_attempts ADD COLUMN process_started_at TEXT NOT NULL DEFAULT ''`,
+	`UPDATE provider_attempts SET launch_state=CASE WHEN state IN ('active','quarantined') THEN 'quarantined' ELSE 'legacy_unverifiable' END`,
+}
+var migrationV15 = []string{
+	`ALTER TABLE daemon_instances ADD COLUMN recovery_public_key BLOB NOT NULL DEFAULT X''`,
+}
+
+// v16 adds the OS-observed start identity used to reject a reused PID during
+// recovery. Existing active rows deliberately remain active: startup can
+// quarantine them without ever signalling an identity it cannot prove.
+var migrationV16 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN process_start_identity TEXT NOT NULL DEFAULT ''`,
+}
+
+// v17 makes the host boot epoch part of the launch identity. A changed boot
+// proves an old process group is dead; a missing value remains fail-closed.
+var migrationV17 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN process_boot_identity TEXT NOT NULL DEFAULT ''`,
+}
+
+// v18 reconciles the provider runtime's closed phase lifecycle with the
+// existing evidence API. Earlier private schemas allowed generic successful
+// evidence ("passed") and left control-cancelled rows at outcome="running";
+// normalize those rows, then enforce one coherent state/outcome relation for
+// every future insert and update.
+var migrationV18 = []string{
+	`DROP TRIGGER IF EXISTS phase_run_state_outcome_update`,
+	`UPDATE phase_runs SET outcome='running' WHERE state='active' AND outcome=''`,
+	`UPDATE phase_runs SET outcome='completed' WHERE state='completed' AND outcome=''`,
+	`UPDATE phase_runs SET outcome='failed' WHERE state='failed' AND outcome=''`,
+	`UPDATE phase_runs SET outcome='cancelled' WHERE state='cancelled' AND outcome IN ('','running')`,
+	`CREATE TRIGGER phase_run_state_outcome_insert BEFORE INSERT ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome IN ('completed','passed')) OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
+	`CREATE TRIGGER phase_run_state_outcome_update BEFORE UPDATE OF state,outcome ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome IN ('completed','passed')) OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
+}

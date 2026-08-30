@@ -196,11 +196,11 @@ func TestScriptedProviderWritesInSortedOrderAndRejectsSymlinkEscape(t *testing.T
 		"z.txt":        []byte("must not be written before a failing path\n"),
 		"a/newdir/out": []byte("must not escape\n"),
 	}}
-	_, err := provider.Run(context.Background(), contracts.PhaseInput{
+	_, err := provider.Parse(context.Background(), contracts.PhaseInput{
 		Ticket:   domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-1"},
 		Phase:    domain.PhaseBuild,
 		Worktree: worktree,
-	})
+	}, contracts.CommandResult{})
 	if err == nil {
 		t.Fatal("symlink escape unexpectedly accepted")
 	}

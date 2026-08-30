@@ -2,6 +2,8 @@ package testkit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +16,11 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 )
+
+func digest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
 
 type ProviderBehavior string
 
@@ -58,6 +65,28 @@ type ScriptedProvider struct {
 	Crash    *CrashController
 }
 
+// Supervisor is a deterministic test process supervisor. Production runners
+// must supply an OS process-group supervisor; adapters never receive Signer.
+type Supervisor struct {
+	Signer   *contracts.DrainSigner
+	recorder func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error
+}
+
+func NewSupervisor() *Supervisor        { s, _ := contracts.NewDrainSigner(); return &Supervisor{Signer: s} }
+func (s *Supervisor) PublicKey() []byte { return s.Signer.PublicKey() }
+func (s *Supervisor) SetLaunchRecorder(recorder func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error) {
+	s.recorder = recorder
+}
+func (s *Supervisor) Run(_ context.Context, _ contracts.DrainRequest, invocation contracts.Invocation, _ contracts.PhaseInput) (contracts.CommandResult, error) {
+	if len(invocation.Argv) == 0 {
+		return contracts.CommandResult{}, errors.New("missing fixture argv")
+	}
+	return contracts.CommandResult{}, nil
+}
+func (s *Supervisor) Drain(_ context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
+	return s.Signer.ProveDrained(request)
+}
+
 func NewScriptedProvider(identity domain.ProviderIdentity) *ScriptedProvider {
 	return &ScriptedProvider{Identity: identity, Steps: make(map[domain.Phase][]ProviderStep)}
 }
@@ -69,6 +98,14 @@ func (p *ScriptedProvider) Probe(context.Context) (domain.ProviderIdentity, erro
 		return domain.ProviderIdentity{}, errors.New("testkit: incomplete provider identity")
 	}
 	return p.Identity, nil
+}
+
+func (p *ScriptedProvider) Binding(context.Context) (contracts.RuntimeBinding, error) {
+	identity, err := p.Probe(context.Background())
+	if err != nil {
+		return contracts.RuntimeBinding{}, err
+	}
+	return contracts.RuntimeBinding{Identity: identity, BinaryDigest: digest("binary:" + identity.Version), PolicyDigest: digest("policy:" + identity.Provider), FixtureDigest: digest("fixture:" + identity.Provider), AuthDigest: digest("auth:" + identity.Provider)}, nil
 }
 
 func (p *ScriptedProvider) Add(phase domain.Phase, step ProviderStep) {
@@ -96,7 +133,11 @@ func (p *ScriptedProvider) next(phase domain.Phase) ProviderStep {
 	return step
 }
 
-func (p *ScriptedProvider) Run(ctx context.Context, input contracts.PhaseInput) (contracts.PhaseResult, error) {
+func (p *ScriptedProvider) Invocation(context.Context, contracts.PhaseInput) (contracts.Invocation, error) {
+	return contracts.Invocation{Argv: []string{"fixture-provider"}}, nil
+}
+
+func (p *ScriptedProvider) Parse(ctx context.Context, input contracts.PhaseInput, _ contracts.CommandResult) (contracts.PhaseResult, error) {
 	if err := input.Ticket.Validate(); err != nil {
 		return contracts.PhaseResult{}, err
 	}
@@ -148,10 +189,10 @@ func (p *ScriptedProvider) Run(ctx context.Context, input contracts.PhaseInput) 
 		return contracts.PhaseResult{}, errors.New("testkit: provider exited before submission")
 	}
 	if step.Behavior == ProviderMalformed {
-		return contracts.PhaseResult{Outcome: "malformed", Artifact: []byte("not-json"), Provider: p.Identity}, errors.New("testkit: malformed structured output")
+		return contracts.PhaseResult{Outcome: "malformed", Artifact: []byte("not-json"), Transcript: step.Transcript, Provider: p.Identity, UsageTrusted: true}, errors.New("testkit: malformed structured output")
 	}
 	if step.Behavior == ProviderOversized {
-		return contracts.PhaseResult{Outcome: "oversized", Artifact: []byte(strings.Repeat("x", 2<<20)), Provider: p.Identity}, errors.New("testkit: oversized structured output")
+		return contracts.PhaseResult{Outcome: "oversized", Artifact: []byte(strings.Repeat("x", 2<<20)), Provider: p.Identity, UsageTrusted: true}, errors.New("testkit: oversized structured output")
 	}
 	if step.Behavior == ProviderSecret {
 		return contracts.PhaseResult{Outcome: "secret", Transcript: "token=fixture-secret-must-redact", Provider: p.Identity}, errors.New("testkit: secret output fixture")

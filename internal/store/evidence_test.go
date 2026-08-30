@@ -87,7 +87,7 @@ func TestEvidencePhaseWorktreeAndBoundedBudgets(t *testing.T) {
 	if err := database.StartPhaseAttempt(ctx, attempt); err != nil {
 		t.Fatal(err)
 	}
-	attempt.Outcome, attempt.UsageJSON = "ok", []byte(`{"tokens":12}`)
+	attempt.Outcome, attempt.UsageJSON = "completed", []byte(`{"tokens":12}`)
 	if err := database.CompletePhaseAttempt(ctx, attempt); err != nil {
 		t.Fatal(err)
 	}

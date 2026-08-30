@@ -9,12 +9,32 @@ import (
 
 	"github.com/nysa-company/sf/internal/cli"
 	"github.com/nysa-company/sf/internal/config"
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/processsupervisor"
+	"github.com/nysa-company/sf/internal/providercoord"
+	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/version"
 )
 
 func main() {
+	if len(os.Args) >= 3 && os.Args[1] == "__provider_gate" {
+		// FD 3 is held by the supervisor until the launch PID/PGID is durably
+		// recorded. EOF means the parent died before authority was published.
+		gate := os.NewFile(uintptr(3), "provider-launch-gate")
+		if gate == nil {
+			os.Exit(125)
+		}
+		var one [1]byte
+		if _, err := gate.Read(one[:]); err != nil {
+			os.Exit(125)
+		}
+		if err := syscall.Exec(os.Args[2], os.Args[2:], os.Environ()); err != nil {
+			os.Exit(126)
+		}
+		return
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = ""
@@ -27,9 +47,22 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	runDaemon := func(runCtx context.Context) error {
+		supervisor, err := processsupervisor.New(nil)
+		if err != nil {
+			return err
+		}
 		return daemon.Run(runCtx, daemon.Config{
 			Channel: channel, Paths: paths,
-			DaemonIdentity: fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
+			DaemonIdentity:       fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
+			RecoveryAuthorityKey: supervisor.PublicKey(),
+			ProviderSupervisor:   supervisor,
+			RecoveryDrainer:      supervisor,
+			ProviderCoordinatorFactory: func(database *store.Store, process contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
+				// Real provider adapters are intentionally not bundled. An empty
+				// qualified registry keeps production fail-closed until explicit
+				// provider qualification/configuration is implemented.
+				return providercoord.New(providercoord.NewRegistry(), nil, database, nil, process)
+			},
 		})
 	}
 	os.Exit(cli.ExecuteWithDaemon(ctx, os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}, runDaemon))

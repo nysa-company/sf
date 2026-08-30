@@ -118,7 +118,7 @@ func (s *Store) CompleteControlTransition(ctx context.Context, transition Transi
 			return ErrControlNotDrained
 		}
 		at := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='cancelled',completed_at=COALESCE(completed_at,?)
+		if _, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='cancelled',completed_at=COALESCE(completed_at,?),outcome='cancelled'
 			WHERE channel=? AND project_id=? AND ticket_id=? AND state='active'`, at, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket); err != nil {
 			return err
 		}
