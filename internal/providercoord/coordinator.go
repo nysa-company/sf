@@ -143,6 +143,13 @@ type Coordinator struct {
 	fatalErr   error
 }
 
+// Close is the lifecycle hook used by the foreground daemon. Provider
+// processes are supervised and joined by the runtime/recovery boundaries; the
+// coordinator itself currently owns no independent goroutine or descriptor.
+// Keeping this hook explicit makes that ownership auditable for later runtime
+// compositions without making daemon shutdown depend on a concrete type.
+func (c *Coordinator) Close() error { return nil }
+
 func New(reg *Registry, routes map[Role]Route, database *store.Store, clock Clock, supervisor contracts.ProcessSupervisor) (*Coordinator, error) {
 	if reg == nil || database == nil || supervisor == nil || len(supervisor.PublicKey()) != 32 {
 		return nil, errors.New("registry, store, and process supervisor required")

@@ -74,6 +74,28 @@ type RuntimeController interface {
 	MergeObserved(context.Context, domain.TicketRef) (bool, error)
 }
 
+// WorkflowRuntime is the daemon lifecycle boundary for a composed workflow
+// runtime. Implementations own their goroutines and must not return from
+// Close until those goroutines have stopped. The fence is supplied by the
+// foreground daemon, never invented by the runtime.
+type WorkflowRuntime interface {
+	Start(context.Context, domain.Fence) error
+	Close() error
+}
+
+// RuntimeDependencies are the already-open, authenticated authorities made
+// available to a future runtime composition. The Store is an API boundary;
+// this type deliberately exposes no database handle or SQL connection.
+type RuntimeDependencies struct {
+	Store               *store.Store
+	Engine              *engine.Engine
+	ProviderCoordinator *providercoord.Coordinator
+}
+
+// WorkflowRuntimeFactory is called only after durable recovery and event
+// projection have completed, and before the owner socket is exposed.
+type WorkflowRuntimeFactory func(RuntimeDependencies) (WorkflowRuntime, error)
+
 // idleRuntimeController is safe only for the current composition, which has
 // no provider/Git/GitHub runner. A later composition that can launch work must
 // inject its real supervisor and effect observer.
@@ -137,6 +159,10 @@ type Config struct {
 	// ProviderQualifier is invoked only through this authenticated foreground
 	// daemon, after its supervisor key is current in SQLite.
 	ProviderQualifier func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
+	// WorkflowRuntimeFactory composes the execution runtime after Store,
+	// Engine, and the optional provider coordinator exist. Nil intentionally
+	// means runtime execution is unavailable for this composition.
+	WorkflowRuntimeFactory WorkflowRuntimeFactory
 }
 
 type Daemon struct {
@@ -162,6 +188,7 @@ type Daemon struct {
 	repositoryCommandDrainer contracts.RepositoryCommandDrainer
 	providerCoordinator      *providercoord.Coordinator
 	providerQualifier        func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
+	runtime                  WorkflowRuntime
 	mu                       sync.Mutex
 	closed                   bool
 
@@ -197,8 +224,9 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
+	var coordinator *providercoord.Coordinator
 	fail := func(cause error) (*Daemon, error) {
-		_ = lease.Close()
+		cause = joinCloseError(cause, "close leader lease", lease.Close)
 		return nil, cause
 	}
 	if err := lease.Validate(); err != nil {
@@ -209,7 +237,12 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		return fail(err)
 	}
 	failStore := func(cause error) (*Daemon, error) {
-		_ = database.Close()
+		// Keep the ownership order explicit: no coordinator may outlive the
+		// Store it was composed against, and neither may outlive the lease.
+		if coordinator != nil {
+			cause = joinCloseError(cause, "close provider coordinator", coordinator.Close)
+		}
+		cause = joinCloseError(cause, "close store", database.Close)
 		return fail(cause)
 	}
 	if err := secureDatabaseFiles(configuration.Paths.Database); err != nil {
@@ -256,7 +289,6 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		}
 	}
 
-	var coordinator *providercoord.Coordinator
 	if configuration.ProviderCoordinatorFactory != nil {
 		coordinator, err = configuration.ProviderCoordinatorFactory(database, configuration.ProviderSupervisor)
 		if err != nil {
@@ -293,8 +325,40 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if err := instance.projectEvents(startupCtx); err != nil {
 		return failStore(fmt.Errorf("rebuild event projection: %w", err))
 	}
+	// Keep the startup timeout scoped to recovery/projection. A long-lived
+	// runtime follows the caller's process context instead of inheriting the
+	// bounded startup deadline.
+	if configuration.WorkflowRuntimeFactory != nil {
+		runtime, runtimeErr := configuration.WorkflowRuntimeFactory(RuntimeDependencies{
+			Store: database, Engine: instance.engine, ProviderCoordinator: coordinator,
+		})
+		if runtimeErr != nil {
+			if runtime != nil {
+				if closeErr := runtime.Close(); closeErr != nil {
+					runtimeErr = errors.Join(runtimeErr, closeErr)
+				}
+			}
+			return failStore(fmt.Errorf("compose workflow runtime: %w", runtimeErr))
+		}
+		if runtime == nil {
+			return failStore(errors.New("compose workflow runtime: factory returned nil runtime"))
+		}
+		if runtimeErr := runtime.Start(ctx, domain.Fence{LeaderEpoch: epoch}); runtimeErr != nil {
+			if closeErr := runtime.Close(); closeErr != nil {
+				runtimeErr = errors.Join(runtimeErr, closeErr)
+			}
+			return failStore(fmt.Errorf("start workflow runtime: %w", runtimeErr))
+		}
+		instance.runtime = runtime
+	}
 	server, err := transport.ListenWithExecutable(configuration.Paths.Socket, uint32(os.Getuid()), instance, instance.executable())
 	if err != nil {
+		if instance.runtime != nil {
+			if closeErr := instance.runtime.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+			instance.runtime = nil
+		}
 		return failStore(err)
 	}
 	instance.server = server
@@ -303,6 +367,13 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 
 func (daemon *Daemon) Serve(ctx context.Context) error {
 	err := daemon.server.Serve(ctx)
+	runtimeErr := daemon.closeRuntime()
+	if runtimeErr != nil {
+		if err != nil {
+			return errors.Join(err, runtimeErr)
+		}
+		return runtimeErr
+	}
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -461,15 +532,39 @@ func (daemon *Daemon) Close() error {
 	daemon.closed = true
 	var result error
 	if daemon.server != nil {
-		result = daemon.server.Close()
+		result = joinCloseError(result, "close daemon server", daemon.server.Close)
 	}
-	if err := daemon.engine.Close(); err != nil && result == nil {
-		result = err
+	if daemon.runtime != nil {
+		result = joinCloseError(result, "close workflow runtime", daemon.runtime.Close)
+		daemon.runtime = nil
 	}
-	if err := daemon.lease.Close(); err != nil && result == nil {
-		result = err
+	if daemon.providerCoordinator != nil {
+		result = joinCloseError(result, "close provider coordinator", daemon.providerCoordinator.Close)
 	}
+	result = joinCloseError(result, "close store", daemon.engine.Close)
+	result = joinCloseError(result, "close leader lease", daemon.lease.Close)
 	return result
+}
+
+func joinCloseError(cause error, resource string, closeFn func() error) error {
+	if err := closeFn(); err != nil {
+		return errors.Join(cause, fmt.Errorf("%s: %w", resource, err))
+	}
+	return cause
+}
+
+// closeRuntime serializes runtime joining with Daemon.Close. It is called
+// when Serve returns as well as during explicit shutdown, so a caller that
+// cancels Serve cannot race a runtime tick against Store closure.
+func (daemon *Daemon) closeRuntime() error {
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
+	if daemon.runtime == nil {
+		return nil
+	}
+	err := daemon.runtime.Close()
+	daemon.runtime = nil
+	return err
 }
 
 func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request api.Request) api.Response {
