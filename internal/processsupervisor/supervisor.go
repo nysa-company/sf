@@ -134,6 +134,39 @@ func (s *Supervisor) Drain(ctx context.Context, request contracts.DrainRequest) 
 	}
 	return s.Signer.ProveDrained(request)
 }
+
+// DrainPersisted is restart recovery: it accepts only the exact durable
+// PID/PGID identity published through the launch gate.
+func (s *Supervisor) DrainPersisted(ctx context.Context, request contracts.DrainRequest, pid, pgid int) (contracts.DrainProof, error) {
+	if pid <= 0 || pgid <= 0 {
+		return contracts.DrainProof{}, ErrUnclear
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		return contracts.DrainProof{}, ErrUnclear
+	}
+	r := &run{identity: Identity{PID: pid, PGID: pgid}, done: make(chan struct{}), streams: make(chan struct{})}
+	close(r.streams)
+	go func() {
+		for {
+			if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+				close(r.done)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	}()
+	if err := s.terminate(r); err != nil {
+		return contracts.DrainProof{}, err
+	}
+	if err := s.proveGone(r); err != nil {
+		return contracts.DrainProof{}, err
+	}
+	return s.Signer.ProveDrained(request)
+}
 func (s *Supervisor) terminate(r *run) error {
 	_ = signalGroup(r.identity.PGID, syscall.SIGTERM)
 	select {

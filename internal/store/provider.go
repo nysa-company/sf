@@ -57,6 +57,18 @@ type ProviderAttempt struct {
 	StartedAt, FinishedAt time.Time
 }
 
+func (s *Store) ProviderLaunchIdentity(ctx context.Context, claim ProviderAttemptClaim) (int, int, error) {
+	var pid, pgid int
+	err := s.db.QueryRowContext(ctx, `SELECT process_pid,process_pgid FROM provider_attempts WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND binding_digest=?`, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.BindingDigest).Scan(&pid, &pgid)
+	if err != nil {
+		return 0, 0, err
+	}
+	if pid <= 0 || pgid <= 0 {
+		return 0, 0, ErrProviderDrain
+	}
+	return pid, pgid, nil
+}
+
 func (s *Store) SetRecoveryAuthority(ctx context.Context, channel domain.Channel, leader uint64, key []byte) error {
 	if !channel.Valid() || leader == 0 || len(key) != 32 {
 		return ErrProviderAttempt

@@ -52,6 +52,7 @@ func main() {
 			Channel: channel, Paths: paths,
 			DaemonIdentity:       fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
 			RecoveryAuthorityKey: supervisor.PublicKey(),
+			RecoveryDrainer:      supervisor,
 		})
 	}
 	os.Exit(cli.ExecuteWithDaemon(ctx, os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}, runDaemon))

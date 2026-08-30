@@ -21,6 +21,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/api"
 	"github.com/nysa-company/sf/internal/config"
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/engine"
 	"github.com/nysa-company/sf/internal/events"
@@ -81,6 +82,9 @@ type Config struct {
 	// a durable attempt. A nil callback fails closed when claims exist.
 	RecoverProvider      func(context.Context, store.ProviderAttempt, uint64) error
 	RecoveryAuthorityKey []byte
+	RecoveryDrainer      interface {
+		DrainPersisted(context.Context, contracts.DrainRequest, int, int) (contracts.DrainProof, error)
+	}
 }
 
 type Daemon struct {
@@ -97,8 +101,11 @@ type Daemon struct {
 	ids             TicketIDGenerator
 	auth            operator.Authenticator
 	recoverProvider func(context.Context, store.ProviderAttempt, uint64) error
-	mu              sync.Mutex
-	closed          bool
+	recoveryDrainer interface {
+		DrainPersisted(context.Context, contracts.DrainRequest, int, int) (contracts.DrainProof, error)
+	}
+	mu     sync.Mutex
+	closed bool
 
 	projectionMu      sync.Mutex
 	projector         events.Projector
@@ -182,7 +189,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	}
 
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, recoverProvider: configuration.RecoverProvider}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -235,6 +242,21 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 		return fmt.Errorf("read provider recovery claims: %w", err)
 	}
 	for _, claim := range claims {
+		if daemon.recoveryDrainer != nil {
+			pid, pgid, identityErr := daemon.store.ProviderLaunchIdentity(ctx, claim.ProviderAttemptClaim)
+			if identityErr != nil {
+				return identityErr
+			}
+			req := contracts.DrainRequest{Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest}
+			proof, drainErr := daemon.recoveryDrainer.DrainPersisted(ctx, req, pid, pgid)
+			if drainErr != nil {
+				return drainErr
+			}
+			if err := daemon.store.RecoverProviderAttemptClaimWithProof(ctx, claim, daemon.epoch, proof, daemon.clock.Now()); err != nil {
+				return err
+			}
+			continue
+		}
 		if daemon.recoverProvider == nil {
 			return store.ErrProviderDrain
 		}
