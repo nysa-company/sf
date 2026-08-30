@@ -2,6 +2,8 @@ package testkit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,9 +51,13 @@ type Mutation struct {
 // an integration test. Mutations are recorded separately from response
 // deliveries: a dropped response still leaves one applied remote mutation.
 type FakeGHState struct {
-	Schema          string                            `json:"schema"`
-	Authenticated   bool                              `json:"authenticated"`
-	Repository      contracts.RepositoryIdentity      `json:"repository"`
+	Schema        string                       `json:"schema"`
+	Authenticated bool                         `json:"authenticated"`
+	Repository    contracts.RepositoryIdentity `json:"repository"`
+	// BaseHeadOID is the independently observable protected ref tip. Keeping
+	// it durable lets boundary tests move main between observations without
+	// pretending a PR's historical baseRefOid is the live protected ref.
+	BaseHeadOID     string                            `json:"base_head_oid"`
 	NextPR          int                               `json:"next_pr"`
 	PRs             []PullRequest                     `json:"prs"`
 	Checks          map[int][]contracts.RequiredCheck `json:"checks"`
@@ -73,6 +79,7 @@ func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, e
 	state := FakeGHState{
 		Schema:          "sf.testkit.fake-gh/v1",
 		Repository:      repository,
+		BaseHeadOID:     strings.Repeat("c", 40),
 		NextPR:          1,
 		Checks:          make(map[int][]contracts.RequiredCheck),
 		ResponseScripts: make(map[string][]ResponseMode),
@@ -82,6 +89,19 @@ func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, e
 		return nil, err
 	}
 	return f, nil
+}
+
+// SetBaseHeadOIDForTest advances or rewinds the fake protected ref. It is a
+// test-only remote mutation used to prove that guarded merge launch refuses a
+// base which moved after review.
+func (f *FakeGH) SetBaseHeadOIDForTest(oid string) error {
+	if !fakeOID(oid) {
+		return errors.New("testkit: base OID must be an exact SHA")
+	}
+	return f.withState(func() (bool, error) {
+		f.state.BaseHeadOID = oid
+		return true, nil
+	})
 }
 
 // OpenFakeGH loads existing durable state. It refuses an unknown schema rather
@@ -103,6 +123,9 @@ func OpenFakeGH(path string) (*FakeGH, error) {
 	}
 	if state.ResponseScripts == nil {
 		state.ResponseScripts = make(map[string][]ResponseMode)
+	}
+	if !fakeOID(state.BaseHeadOID) {
+		state.BaseHeadOID = strings.Repeat("c", 40)
 	}
 	return &FakeGH{path: path}, nil
 }
@@ -228,7 +251,14 @@ func (f *FakeGH) FindPullRequest(_ context.Context, want contracts.PullRequestId
 	return match, found, err
 }
 
-func (f *FakeGH) CreateDraftPullRequest(_ context.Context, _ domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
+func (f *FakeGH) CreateDraftPullRequest(_ context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
+	if err := validateFakeClaim(claim, "draft_pr", identity, title, body); err != nil {
+		return contracts.PullRequestIdentity{}, err
+	}
+	return f.createDraftUnchecked(identity, title, body)
+}
+
+func (f *FakeGH) createDraftUnchecked(identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
 	var result contracts.PullRequestIdentity
 	var operationErr error
 	err := f.withState(func() (bool, error) {
@@ -256,6 +286,9 @@ func (f *FakeGH) CreateDraftPullRequest(_ context.Context, _ domain.ExternalEffe
 			identity.Number = f.state.NextPR
 			f.state.NextPR++
 		}
+		if identity.BaseOID == "" {
+			identity.BaseOID = f.state.BaseHeadOID
+		}
 		identity.FactoryOwned = true
 		f.state.PRs = append(f.state.PRs, PullRequest{Identity: identity, Title: title, Body: body, Draft: true})
 		result, operationErr = f.finishMutationLocked("pr_create", identity)
@@ -264,7 +297,14 @@ func (f *FakeGH) CreateDraftPullRequest(_ context.Context, _ domain.ExternalEffe
 	return result, err
 }
 
-func (f *FakeGH) UpdatePullRequest(_ context.Context, _ domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) error {
+func (f *FakeGH) UpdatePullRequest(_ context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) error {
+	if err := validateFakeClaim(claim, "pr_edit", identity, title, body); err != nil {
+		return err
+	}
+	return f.updateUnchecked(identity, title, body)
+}
+
+func (f *FakeGH) updateUnchecked(identity contracts.PullRequestIdentity, title, body string) error {
 	return f.withState(func() (bool, error) {
 		index, err := f.findLocked(identity)
 		if err != nil {
@@ -295,7 +335,14 @@ func (f *FakeGH) RequiredChecks(_ context.Context, identity contracts.PullReques
 	return checks, err
 }
 
-func (f *FakeGH) MarkReady(_ context.Context, _ domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
+func (f *FakeGH) MarkReady(_ context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
+	if err := validateFakeClaim(claim, "pr_ready", identity); err != nil {
+		return err
+	}
+	return f.readyUnchecked(identity)
+}
+
+func (f *FakeGH) readyUnchecked(identity contracts.PullRequestIdentity) error {
 	return f.withState(func() (bool, error) {
 		index, err := f.findLocked(identity)
 		if err != nil {
@@ -313,11 +360,24 @@ func (f *FakeGH) MarkReady(_ context.Context, _ domain.ExternalEffectClaim, iden
 	})
 }
 
-func (f *FakeGH) MergeExactHead(_ context.Context, _ domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, headOID, method string, _ domain.MergeAuthorization) error {
+func (f *FakeGH) MergeExactHead(_ context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, headOID, method string, authorization domain.MergeAuthorization) error {
+	if err := validateFakeMergeAuthorization(identity, headOID, authorization); err != nil {
+		return err
+	}
+	if err := validateFakeClaim(claim, "merge", identity, headOID, method, authorization.ReviewedBaseSHA, authorization.CurrentBaseSHA, authorization.ReviewedBaseHeadOID, authorization.CurrentBaseHeadOID); err != nil {
+		return err
+	}
+	return f.mergeUnchecked(identity, headOID, method)
+}
+
+func (f *FakeGH) mergeUnchecked(identity contracts.PullRequestIdentity, headOID, method string) error {
 	return f.withState(func() (bool, error) {
 		index, err := f.findLocked(identity)
 		if err != nil {
 			return false, err
+		}
+		if f.state.PRs[index].Identity.BaseOID != f.state.BaseHeadOID {
+			return false, errors.New("fake-gh: protected base moved after authorization")
 		}
 		if headOID == "" || headOID != f.state.PRs[index].Identity.HeadOID || headOID != identity.HeadOID {
 			return false, errors.New("fake-gh: exact reviewed head mismatch")
@@ -398,6 +458,46 @@ func samePRSourceAndBase(a, b contracts.PullRequestIdentity) bool {
 
 func sameRepository(a, b contracts.RepositoryIdentity) bool {
 	return a.Host == b.Host && a.Owner == b.Owner && a.Name == b.Name
+}
+
+// EffectClaimForTest creates the exact durable-claim shape expected by the
+// in-process fake. It intentionally mirrors the public boundary digest so
+// tests cannot model an unfenced mutation as a successful remote call.
+func EffectClaimForTest(kind string, identity contracts.PullRequestIdentity, values ...string) domain.ExternalEffectClaim {
+	return domain.ExternalEffectClaim{
+		SemanticKey:   "fake-effect-" + kind,
+		Ref:           domain.TicketRef{Channel: domain.ChannelDev, Project: "fake-project", Ticket: "SF-00000001"},
+		Kind:          kind,
+		RequestDigest: fakeRequestDigest(kind, identity, values...),
+		TicketVersion: 1,
+		LeaderEpoch:   1,
+		RunnerEpoch:   1,
+		ClaimEpoch:    1,
+	}
+}
+
+func validateFakeClaim(claim domain.ExternalEffectClaim, kind string, identity contracts.PullRequestIdentity, values ...string) error {
+	if claim.Ref.Validate() != nil || claim.SemanticKey == "" || claim.Kind != kind || claim.TicketVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ClaimEpoch == 0 || claim.RequestDigest == "" || claim.RequestDigest != fakeRequestDigest(kind, identity, values...) {
+		return errors.New("fake-gh: exact durable effect claim is required")
+	}
+	return nil
+}
+
+func validateFakeMergeAuthorization(identity contracts.PullRequestIdentity, headOID string, authorization domain.MergeAuthorization) error {
+	base := authorization.ReviewedBaseSHA
+	if !authorization.Approved || !authorization.GatesGreen || authorization.ReviewedHead != headOID || authorization.CurrentHead != headOID || !fakeOID(base) || authorization.CurrentBaseSHA != base || authorization.ReviewedBaseHeadOID != base || authorization.CurrentBaseHeadOID != base || identity.BaseOID != base {
+		return errors.New("fake-gh: exact approved head/base authorization is required")
+	}
+	return nil
+}
+
+func fakeRequestDigest(operation string, identity contracts.PullRequestIdentity, values ...string) string {
+	input := operation + "\x00" + identity.Repository.Owner + "/" + identity.Repository.Name + "\x00" + identity.HeadOwner + "\x00" + identity.HeadRepository + "\x00" + identity.HeadRef + "\x00" + identity.HeadOID + "\x00" + identity.BaseRef + "\x00" + identity.BaseOID
+	for _, value := range values {
+		input += "\x00" + value
+	}
+	sum := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(sum[:])
 }
 
 func (f *FakeGH) beforeMutationLocked(operation string) (ResponseMode, error) {
@@ -519,6 +619,9 @@ func loadFakeGHState(path string) (FakeGHState, error) {
 	}
 	if state.ResponseScripts == nil {
 		state.ResponseScripts = make(map[string][]ResponseMode)
+	}
+	if !fakeOID(state.BaseHeadOID) {
+		state.BaseHeadOID = strings.Repeat("c", 40)
 	}
 	return state, nil
 }
@@ -651,6 +754,14 @@ func (f *FakeGH) runSourceRef(argv []string) ([]byte, error) {
 	ref := sourceRef
 	sha := strings.Repeat("a", 40)
 	snapshot := f.Snapshot()
+	if sourceOwner == snapshot.Repository.Owner && sourceRepo == snapshot.Repository.Name {
+		for _, pr := range snapshot.PRs {
+			if pr.Identity.BaseRef == ref {
+				sha = snapshot.BaseHeadOID
+				return json.Marshal(map[string]any{"object": map[string]string{"sha": sha}})
+			}
+		}
+	}
 	for _, pr := range snapshot.PRs {
 		if pr.Identity.HeadOwner == sourceOwner && pr.Identity.HeadRepository == sourceRepo && pr.Identity.HeadRef == ref {
 			sha = pr.Identity.HeadOID
@@ -858,7 +969,7 @@ func identityFromArgs(argv []string, number int) contracts.PullRequestIdentity {
 func (f *FakeGH) runCreate(argv []string) ([]byte, error) {
 	identity := identityFromArgs(argv, 0)
 	identityFromMarker(&identity, option(argv, "--body"))
-	pr, err := f.CreateDraftPullRequest(context.Background(), domain.ExternalEffectClaim{}, identity, option(argv, "--title"), option(argv, "--body"))
+	pr, err := f.createDraftUnchecked(identity, option(argv, "--title"), option(argv, "--body"))
 	if err != nil {
 		return nil, err
 	}
@@ -930,7 +1041,7 @@ func (f *FakeGH) runView(argv []string) ([]byte, error) {
 func (f *FakeGH) runEdit(argv []string) ([]byte, error) {
 	number := prNumber(argv)
 	identity := identityFromArgs(argv, number)
-	if err := f.UpdatePullRequest(context.Background(), domain.ExternalEffectClaim{}, identity, option(argv, "--title"), option(argv, "--body")); err != nil {
+	if err := f.updateUnchecked(identity, option(argv, "--title"), option(argv, "--body")); err != nil {
 		return nil, err
 	}
 	return []byte("{}"), nil
@@ -951,7 +1062,7 @@ func (f *FakeGH) runReady(argv []string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	if err := f.MarkReady(context.Background(), domain.ExternalEffectClaim{}, identity); err != nil {
+	if err := f.readyUnchecked(identity); err != nil {
 		return nil, err
 	}
 	return []byte("{}"), nil
@@ -987,7 +1098,7 @@ func (f *FakeGH) runMerge(argv []string) ([]byte, error) {
 	identity := identityFromArgs(argv, prNumber(argv))
 	headOID := option(argv, "--match-head-commit")
 	identity.HeadOID = headOID
-	if err := f.MergeExactHead(context.Background(), domain.ExternalEffectClaim{}, identity, headOID, mergeMethod(argv), domain.MergeAuthorization{}); err != nil {
+	if err := f.mergeUnchecked(identity, headOID, mergeMethod(argv)); err != nil {
 		return nil, err
 	}
 	return []byte("{}"), nil
@@ -1017,7 +1128,7 @@ func prJSON(pr PullRequest) map[string]any {
 		"headRefName":         identity.HeadRef,
 		"headRefOid":          identity.HeadOID,
 		"baseRefName":         identity.BaseRef,
-		"baseRefOid":          strings.Repeat("c", 40),
+		"baseRefOid":          pr.Identity.BaseOID,
 		"isDraft":             draft,
 		"title":               pr.Title,
 		"body":                body,
@@ -1041,4 +1152,16 @@ func prJSON(pr PullRequest) map[string]any {
 
 func ownershipMarkerForFake(value contracts.PullRequestIdentity) string {
 	return "<!-- sf:v1 repository=" + value.Repository.Owner + "/" + value.Repository.Name + " head=" + value.HeadOwner + "/" + value.HeadRepository + ":" + value.HeadRef + " oid=" + value.HeadOID + " base=" + value.BaseRef + " -->"
+}
+
+func fakeOID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }

@@ -65,7 +65,7 @@ func TestFakeGHSeparatesMutationFromResponseDeliveryAndBindsIdentity(t *testing.
 		HeadOID:        "0123456789012345678901234567890123456789",
 		BaseRef:        "main",
 	}
-	if _, err := remote.CreateDraftPullRequest(context.Background(), domain.ExternalEffectClaim{}, identity, "title", "body"); err == nil {
+	if _, err := remote.CreateDraftPullRequest(context.Background(), EffectClaimForTest("draft_pr", identity, "title", "body"), identity, "title", "body"); err == nil {
 		t.Fatal("expected dropped response")
 	}
 	if got := remote.MutationCount("pr_create"); got != 1 {
@@ -109,8 +109,54 @@ func TestFakeGHRequiresOwnedRecoveryAndRejectsHumanLookalike(t *testing.T) {
 		t.Fatalf("human-owned lookalike adopted: found=%v err=%v", found, err)
 	}
 	identity.FactoryOwned = false
-	if _, err := remote.CreateDraftPullRequest(context.Background(), domain.ExternalEffectClaim{}, identity, "title", "body"); err == nil || !strings.Contains(err.Error(), "human-owned") {
+	if _, err := remote.CreateDraftPullRequest(context.Background(), EffectClaimForTest("draft_pr", identity, "title", "body"), identity, "title", "body"); err == nil || !strings.Contains(err.Error(), "human-owned") {
 		t.Fatalf("human-owned lookalike did not block a factory create: %v", err)
+	}
+}
+
+func TestFakeGHRejectsUnfencedMutationClaimsAndBadMergeBinding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "remote.json")
+	remote, err := NewFakeGH(path, contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.SetAuthenticated(true); err != nil {
+		t.Fatal(err)
+	}
+	identity := fakePRIdentity()
+	if _, err := remote.CreateDraftPullRequest(context.Background(), domain.ExternalEffectClaim{}, identity, "title", "body"); err == nil {
+		t.Fatal("unclaimed create succeeded")
+	}
+	created, err := remote.CreateDraftPullRequest(context.Background(), EffectClaimForTest("draft_pr", identity, "title", "body"), identity, "title", "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.UpdatePullRequest(context.Background(), domain.ExternalEffectClaim{}, created, "next", "body"); err == nil {
+		t.Fatal("unclaimed edit succeeded")
+	}
+	if err := remote.MarkReady(context.Background(), domain.ExternalEffectClaim{}, created); err == nil {
+		t.Fatal("unclaimed ready succeeded")
+	}
+	if err := remote.MarkReady(context.Background(), EffectClaimForTest("pr_ready", created), created); err != nil {
+		t.Fatal(err)
+	}
+	base := created.BaseOID
+	authorization := domain.MergeAuthorization{ReviewedHead: created.HeadOID, CurrentHead: created.HeadOID, ReviewedBaseSHA: base, CurrentBaseSHA: base, ReviewedBaseHeadOID: base, CurrentBaseHeadOID: base, Approved: true, GatesGreen: true}
+	if err := remote.MergeExactHead(context.Background(), domain.ExternalEffectClaim{}, created, created.HeadOID, "squash", authorization); err == nil {
+		t.Fatal("unclaimed merge succeeded")
+	}
+	badAuthorization := authorization
+	badAuthorization.CurrentBaseHeadOID = strings.Repeat("d", 40)
+	badClaim := EffectClaimForTest("merge", created, created.HeadOID, "squash", badAuthorization.ReviewedBaseSHA, badAuthorization.CurrentBaseSHA, badAuthorization.ReviewedBaseHeadOID, badAuthorization.CurrentBaseHeadOID)
+	if err := remote.MergeExactHead(context.Background(), badClaim, created, created.HeadOID, "squash", badAuthorization); err == nil {
+		t.Fatal("split local/GitHub base binding merged")
+	}
+	if err := remote.SetBaseHeadOIDForTest(strings.Repeat("d", 40)); err != nil {
+		t.Fatal(err)
+	}
+	claim := EffectClaimForTest("merge", created, created.HeadOID, "squash", authorization.ReviewedBaseSHA, authorization.CurrentBaseSHA, authorization.ReviewedBaseHeadOID, authorization.CurrentBaseHeadOID)
+	if err := remote.MergeExactHead(context.Background(), claim, created, created.HeadOID, "squash", authorization); err == nil {
+		t.Fatal("merge after protected-base move succeeded")
 	}
 }
 

@@ -15,19 +15,45 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/testkit"
 )
 
-type verifierFunc func(context.Context, contracts.RepositoryIdentity, string, string) (contracts.ProtectedBranchObservation, error)
+type verifierFunc func(context.Context, contracts.RepositoryIdentity, string, string, string) (contracts.ProtectedBranchObservation, error)
 
 type mutationGuardFunc func(context.Context, domain.ExternalEffectClaim, func(context.Context) ([]byte, error)) ([]byte, error)
+
+// supervisedFakeRunner is intentionally a real command runner rather than a
+// canned Client method: the integration test below exercises the same bounded
+// argv/env/process seam that production composition uses. Its cleanup proof
+// models a supervisor that has drained every fake-gh child before the next
+// mutation handoff.
+type supervisedFakeRunner struct{}
+
+func (supervisedFakeRunner) Run(ctx context.Context, binary string, args, env []string) ([]byte, error) {
+	command := exec.CommandContext(ctx, binary, args...)
+	command.Env = env
+	return command.Output()
+}
+func (supervisedFakeRunner) Cleanup(context.Context) (CleanupProof, error) {
+	return CleanupProof{Drained: true}, nil
+}
+
+type contradictoryCleanupRunner struct{}
+
+func (contradictoryCleanupRunner) Run(context.Context, string, []string, []string) ([]byte, error) {
+	return []byte(`{}`), nil
+}
+func (contradictoryCleanupRunner) Cleanup(context.Context) (CleanupProof, error) {
+	return CleanupProof{Drained: true, Quarantined: true}, nil
+}
 
 func (f mutationGuardFunc) RunExternalMutation(ctx context.Context, claim domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 	return f(ctx, claim, start)
 }
 
-func (f verifierFunc) VerifyProtectedBranch(ctx context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
-	return f(ctx, repository, baseRef, mergeCommit)
+func (f verifierFunc) VerifyProtectedBranch(ctx context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
+	return f(ctx, repository, baseRef, mergeCommit, originalBaseOID)
 }
 
 func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdentity) {
@@ -48,8 +74,8 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build fake-gh: %v\n%s", err, output)
 	}
-	client := &Client{binaryPath: binary, home: filepath.Join(root, "home"), configDir: filepath.Join(root, "gh-config"), env: []string{"SF_FAKE_GH_STATE=" + state}, runner: commandRunnerFunc(runBounded), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, mutationGuard: fixtureGuard(), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
-		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
+	client := &Client{binaryPath: binary, home: filepath.Join(root, "home"), configDir: filepath.Join(root, "gh-config"), env: []string{"SF_FAKE_GH_STATE=" + state}, runner: commandRunnerFunc(runBounded), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, mutationGuard: fixtureGuard(), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
+		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
 	})}
 	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
 	return client, fake, identity
@@ -96,6 +122,82 @@ func createDraft(t *testing.T, client *Client, identity contracts.PullRequestIde
 	return match
 }
 
+func TestStoreClaimGuardAndClientComposeExactHeadFlow(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.Open(ctx, filepath.Join(root, "sf.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "example", Ticket: "SF-44"}
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "example", Path: root, BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "integration", Type: domain.TicketBug, MergeMode: domain.MergeGuarded}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "github-integration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/example/SF-44/publish", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}
+	state := filepath.Join(root, "fake-gh.json")
+	fake, err := testkit.NewFakeGH(state, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetAuthenticated(true); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(root, "fake-gh")
+	build := exec.Command("go", "build", "-o", binary, "./cmd/fake-gh")
+	build.Dir = filepath.Join("..", "..")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build fake-gh: %v\n%s", err, output)
+	}
+	verified := false
+	client, err := NewClient(binary, filepath.Join(root, "home"), filepath.Join(root, "gh-config"), supervisedFakeRunner{}, database.ValidateExternalEffectClaim, database.ExternalMutationGuard(), verifierFunc(func(_ context.Context, gotRepository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
+		verified = gotRepository == repository && baseRef == "main" && originalBaseOID == strings.Repeat("c", 40)
+		return contracts.ProtectedBranchObservation{Repository: gotRepository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.env = []string{"SF_FAKE_GH_STATE=" + state}
+	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
+	claim := func(kind, digest string) domain.ExternalEffectClaim {
+		fence := store.EffectFence{SemanticKey: "integration/" + kind, Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
+		if _, err := database.PlanEffect(ctx, store.EffectPlan{SemanticKey: fence.SemanticKey, Ref: ref, Kind: kind, TicketVersion: fence.TicketVersion, Fence: fence.Fence, RequestDigest: digest}); err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := database.ClaimEffect(ctx, fence)
+		if err != nil || !claimed.Claimed {
+			t.Fatalf("claim %s: %+v err=%v", kind, claimed, err)
+		}
+		return claimed.ExternalClaim()
+	}
+	created, err := client.CreateDraftPullRequest(ctx, claim("draft_pr", requestDigest("draft_pr", identity, "title", "body")), identity, "title", "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.MarkReady(ctx, claim("pr_ready", requestDigest("pr_ready", created)), created); err != nil {
+		t.Fatal(err)
+	}
+	authorization := testAuthorization(created)
+	mergeDigest := requestDigest("merge", created, created.HeadOID, "squash", authorization.ReviewedBaseSHA, authorization.CurrentBaseSHA, authorization.ReviewedBaseHeadOID, authorization.CurrentBaseHeadOID)
+	if err := client.MergeExactHead(ctx, claim("merge", mergeDigest), created, created.HeadOID, "squash", authorization); err != nil {
+		t.Fatal(err)
+	}
+	if !verified || fake.MutationCount("pr_merge") != 1 {
+		t.Fatalf("guarded exact-head flow verified=%v merge mutations=%d", verified, fake.MutationCount("pr_merge"))
+	}
+}
+
 func TestContractMutationRequiresClaimValidator(t *testing.T) {
 	client, _, identity := fixture(t)
 	claim := testClaim("draft_pr", identity, "title", "body")
@@ -113,8 +215,8 @@ func TestNewClientRejectsMissingAuthoritiesAndLiteralCannotRun(t *testing.T) {
 		return nil, nil
 	}), func(context.Context, domain.ExternalEffectClaim) error { return nil }, mutationGuardFunc(func(context.Context, domain.ExternalEffectClaim, func(context.Context) ([]byte, error)) ([]byte, error) {
 		return nil, nil
-	}), verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
-		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, Contains: true}, nil
+	}), verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
+		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
 	})); err != nil {
 		t.Fatalf("valid client rejected: %v", err)
 	}
@@ -235,7 +337,7 @@ func TestCreateFinalHandoffRefusesIfPRAppearsBeforeLaunch(t *testing.T) {
 }
 
 func TestCleanupUncertaintyNeverBecomesMutationSuccess(t *testing.T) {
-	client, fake, identity := fixture(t)
+	client, _, identity := fixture(t)
 	uncertainGuard := mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		_, _ = start(ctx)
 		return nil, ErrProcessCleanup
@@ -256,7 +358,7 @@ func TestCleanupUncertaintyNeverBecomesMutationSuccess(t *testing.T) {
 	}
 
 	client.mutationGuard = fixtureGuard()
-	if err := fake.MarkReady(context.Background(), domain.ExternalEffectClaim{}, created.Identity); err != nil {
+	if err := client.MarkReady(context.Background(), testClaim("pr_ready", created.Identity), created.Identity); err != nil {
 		t.Fatal(err)
 	}
 	readyClaim := testClaim("pr_ready", created.Identity)
@@ -278,8 +380,54 @@ func TestCleanupQuarantineIsNotACompletedProof(t *testing.T) {
 	if (CleanupProof{Quarantined: true}).valid() {
 		t.Fatal("quarantine was accepted as successful cleanup")
 	}
-	if !(CleanupProof{Drained: true, Quarantined: true}).valid() {
-		t.Fatal("drain proof was rejected")
+	if (CleanupProof{Drained: true, Quarantined: true}).valid() {
+		t.Fatal("contradictory drain/quarantine proof was accepted")
+	}
+}
+
+func TestContradictoryCleanupProofLatchesStoreMutationGate(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "sf.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "cleanup", Ticket: "SF-44"}
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "cleanup", Path: t.TempDir(), BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "cleanup", Type: domain.TicketBug, MergeMode: domain.MergeGuarded}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "cleanup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/cleanup/SF-44", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := store.EffectFence{SemanticKey: "cleanup-effect", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
+	if _, err := database.PlanEffect(ctx, store.EffectPlan{SemanticKey: fence.SemanticKey, Ref: ref, Kind: "pr_edit", TicketVersion: fence.TicketVersion, Fence: fence.Fence, RequestDigest: "cleanup"}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := database.ClaimEffect(ctx, fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: contradictoryCleanupRunner{}}
+	if _, err := database.ExternalMutationGuard().RunExternalMutation(ctx, claimed.ExternalClaim(), func(runCtx context.Context) ([]byte, error) {
+		return client.run(runCtx, "auth", "status", "--json", "hosts")
+	}); !errors.Is(err, ErrProcessCleanup) {
+		t.Fatalf("contradictory cleanup=%v", err)
+	}
+	short, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	defer cancel()
+	if _, err := database.ExternalMutationGuard().RunExternalMutation(short, claimed.ExternalClaim(), func(context.Context) ([]byte, error) {
+		t.Fatal("contradictory cleanup released the mutation gate")
+		return nil, nil
+	}); err == nil {
+		t.Fatal("contradictory cleanup gate was not latched")
 	}
 }
 
@@ -364,13 +512,13 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "1"}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksFailed) {
 		t.Fatalf("strict checks=%v", err)
 	}
-	if _, err := client.mergeRun(context.Background(), pr, pr.Identity.HeadOID, domain.MergeManual, "merge", nil); !errors.Is(err, ErrPolicyRefusal) {
+	if _, err := client.mergeRun(context.Background(), pr, pr.Identity.HeadOID, pr.Identity.BaseOID, domain.MergeManual, "merge", nil); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("manual merge=%v", err)
 	}
-	if _, err := client.mergeRun(context.Background(), pr, pr.Identity.HeadOID, domain.MergeAutonomous, "merge", nil); !errors.Is(err, ErrPolicyRefusal) {
+	if _, err := client.mergeRun(context.Background(), pr, pr.Identity.HeadOID, pr.Identity.BaseOID, domain.MergeAutonomous, "merge", nil); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("autonomous merge=%v", err)
 	}
-	if err := fake.MarkReady(context.Background(), domain.ExternalEffectClaim{}, pr.Identity); err != nil {
+	if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
 		t.Fatal(err)
 	}
 	pr.Draft = false
@@ -563,7 +711,7 @@ func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 		client, fake, identity := fixture(t)
 		pr := createDraft(t, client, identity, "title", "body")
 		claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "merge")
-		client.verifyProtectedBranch = verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+		client.verifyProtectedBranch = verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
 			return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
 		})
 		if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
@@ -573,6 +721,68 @@ func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 			t.Fatalf("mismatched proof=%v", err)
 		}
 	})
+}
+
+func TestMergeCrossBindsBaseAndRefusesMovedBaseDuringGuardedHandoff(t *testing.T) {
+	t.Run("split local and GitHub base witness is refused before launch", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		pr := createDraft(t, client, identity, "title", "body")
+		if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
+			t.Fatal(err)
+		}
+		authorization := testAuthorization(pr.Identity)
+		authorization.CurrentBaseHeadOID = strings.Repeat("d", 40)
+		claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "squash", authorization.ReviewedBaseSHA, authorization.CurrentBaseSHA, authorization.ReviewedBaseHeadOID, authorization.CurrentBaseHeadOID)
+		if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "squash", authorization); !errors.Is(err, ErrApprovalInvalid) {
+			t.Fatalf("split base witness=%v", err)
+		}
+		if got := fake.MutationCount("pr_merge"); got != 0 {
+			t.Fatalf("split base launched merge %d times", got)
+		}
+	})
+	t.Run("base movement after preflight but before launch is fenced", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		pr := createDraft(t, client, identity, "title", "body")
+		if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
+			t.Fatal(err)
+		}
+		client.mutationGuard = mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+			if err := fake.SetBaseHeadOIDForTest(strings.Repeat("d", 40)); err != nil {
+				return nil, err
+			}
+			return start(ctx)
+		})
+		claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "squash")
+		if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "squash", testAuthorization(pr.Identity)); !errors.Is(err, ErrPolicyRefusal) {
+			t.Fatalf("moved base handoff=%v", err)
+		}
+		if got := fake.MutationCount("pr_merge"); got != 0 {
+			t.Fatalf("moved base launched merge %d times", got)
+		}
+	})
+}
+
+func TestMergeLostResponseReconcilesFromOriginalBaseWitness(t *testing.T) {
+	client, fake, identity := fixture(t)
+	pr := createDraft(t, client, identity, "title", "body")
+	if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
+		t.Fatal(err)
+	}
+	var original string
+	client.verifyProtectedBranch = verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
+		original = originalBaseOID
+		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
+	})
+	claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "squash")
+	if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "squash", testAuthorization(pr.Identity)); err != nil {
+		t.Fatalf("lost-response merge=%v", err)
+	}
+	if original != pr.Identity.BaseOID || fake.MutationCount("pr_merge") != 1 {
+		t.Fatalf("reconciliation original=%q mutations=%d", original, fake.MutationCount("pr_merge"))
+	}
 }
 
 func TestMergeFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
@@ -676,8 +886,8 @@ func TestMergeNeverTrustsCLIExitWithoutFreshMergedObservation(t *testing.T) {
 				}
 				return nil, errors.New("unexpected gh argv")
 			})
-			if _, err := client.mergeRun(context.Background(), pr, identity.HeadOID, domain.MergeGuarded, "merge", func(args ...string) ([]byte, error) {
-				return client.mutateMergeExact(context.Background(), testClaim("merge", identity, identity.HeadOID, "merge"), identity, identity.HeadOID, args...)
+			if _, err := client.mergeRun(context.Background(), pr, identity.HeadOID, identity.BaseOID, domain.MergeGuarded, "merge", func(args ...string) ([]byte, error) {
+				return client.mutateMergeExact(context.Background(), testClaim("merge", identity, identity.HeadOID, "merge"), identity, identity.HeadOID, testAuthorization(identity), args...)
 			}); !errors.Is(err, ErrPolicyRefusal) {
 				t.Fatalf("merge must reject %s: %v", test.name, err)
 			}
@@ -749,6 +959,12 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 			return nil, nil
 		}
 		if args[0] == "api" {
+			if len(args) == 2 && args[1] == "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random" {
+				return []byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`), nil
+			}
+			if len(args) == 2 && args[1] == "repos/example/app/git/ref/heads/main" {
+				return []byte(`{"object":{"sha":"cccccccccccccccccccccccccccccccccccccccc"}}`), nil
+			}
 			return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}`), nil
 		}
 		if args[0] == "pr" && args[1] == "list" {
@@ -766,16 +982,16 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		return nil, errors.New("unexpected command")
 	}), mutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		return start(ctx)
-	}), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+	}), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
 		verified = repository == identity.Repository && baseRef == "main" && mergeCommit == strings.Repeat("b", 40)
-		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
+		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
 	})}
 	claim := testClaim("merge", identity, identity.HeadOID, "squash")
 	authorization := testAuthorization(identity)
 	if err := client.MergeExactHead(context.Background(), claim, identity, identity.HeadOID, "squash", authorization); err != nil || !verified {
 		t.Fatalf("proven merge verified=%v err=%v", verified, err)
 	}
-	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}}
+	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random"}, {"api", "repos/example/app/git/ref/heads/main"}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}, {"api", "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random"}, {"api", "repos/example/app/git/ref/heads/main"}, {"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, {"pr", "view", "7", "--repo", "example/app", "--json", prFields}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("official merge argv\n got: %#v\nwant: %#v", got, want)
 	}

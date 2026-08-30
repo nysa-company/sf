@@ -10,7 +10,10 @@ The approved normative design is in
 - The JSON state machine in `docs/plans` is the transition authority.
 - NDJSON events and logs are readable projections, never recovery inputs.
 - Git and GitHub mutations cross narrow fenced interfaces and reconcile remote
-  truth before any retry.
+  truth before any retry. Guarded merge binds the reviewed local base SHA and
+  GitHub base-ref OID to one exact witness, re-fetches source and protected
+  base refs inside the durable mutation handoff, and reconciles a lost response
+  by proving the merge from that original base witness.
 
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
 one custom Go state engine over the application schema; DBOS is retained only

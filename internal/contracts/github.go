@@ -9,7 +9,8 @@ import (
 
 // ErrExternalCleanupUncertain means a supervised external process may still
 // have descendants or output writers. Mutation guards must quarantine their
-// gate until a supervisor supplies a drain or quarantine proof.
+// gate until a supervisor supplies an unambiguous drained (not quarantined)
+// proof.
 var ErrExternalCleanupUncertain = errors.New("external process cleanup is uncertain")
 
 type RepositoryIdentity struct {
@@ -40,17 +41,23 @@ type RequiredCheck struct {
 }
 
 // ProtectedBranchVerifier is implemented by the Git boundary after it freshly
-// fetches the protected ref and proves merge-commit ancestry.
+// fetches the protected ref and proves that the observed merge is reachable
+// from a protected branch whose merge started at originalBaseOID.  The branch
+// tip is expected to change as part of a successful merge, so BaseHeadOID is
+// evidence of the post-merge observation, not a request to keep the old tip.
 type ProtectedBranchVerifier interface {
-	VerifyProtectedBranch(context.Context, RepositoryIdentity, string, string) (ProtectedBranchObservation, error)
+	VerifyProtectedBranch(context.Context, RepositoryIdentity, string, string, string) (ProtectedBranchObservation, error)
 }
 
 type ProtectedBranchObservation struct {
 	Repository  RepositoryIdentity
 	BaseRef     string
 	MergeCommit string
-	BaseHeadOID string
-	Contains    bool
+	// OriginalBaseOID is the sealed base witness carried from approval through
+	// post-merge reconciliation.
+	OriginalBaseOID string
+	BaseHeadOID     string
+	Contains        bool
 }
 
 // ExternalMutationGuard owns the final handoff from a durable effect claim to

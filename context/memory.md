@@ -13,6 +13,10 @@
   access after its supervisor returns. Guarded/manual remain the trusted
   provider/repository baseline.
 - No remote, Nysa mutation, or legacy retirement is currently authorized.
+- Guarded GitHub merges bind one exact reviewed/current local base SHA and
+  GitHub base-ref OID, re-check source and protected base refs inside the
+  durable mutation handoff, and reconcile a lost response from that original
+  base witness rather than requiring the post-merge branch tip to stay old.
 
 ## Log
 
@@ -51,3 +55,13 @@ portable lock for every operation, persists with unique atomic temporary files,
 and requires factory ownership for PR recovery. Provider fixtures sort writes,
 reject lexical and symlink worktree escapes, and keep escaped-child probes
 observable with a two-second maximum lifetime.
+
+### 2026-08-29 — GitHub merge base witness hardened
+
+The GitHub boundary rejects contradictory cleanup proof (`drained` plus
+`quarantined`), which leaves the Store mutation gate latched. It now cross-binds
+all reviewed/current local and GitHub base identifiers to one exact OID,
+re-fetches the source and base refs under the durable mutation guard, and passes
+the original base witness to protected-branch reconciliation. The durable fake
+GitHub direct interface validates exact effect claims and merge authorization;
+the command shim remains only the remote protocol exercised by the real client.
