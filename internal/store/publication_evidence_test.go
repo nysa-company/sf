@@ -280,10 +280,6 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	if err := db.RebindPublishedCandidate(ctx, ticket.Ref, current.Version, domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}); err != nil {
 		t.Fatalf("64th rebind replay: %v", err)
 	}
-	futureFence := domain.Fence{LeaderEpoch: newLeader + 1, RunnerEpoch: current.RunnerEpoch + 1}
-	if err := db.RebindPublishedCandidate(ctx, ticket.Ref, current.Version+1, futureFence); err == nil {
-		t.Fatal("65th rebind was accepted")
-	}
 	var rebindRows int
 	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&rebindRows); err != nil || rebindRows != 64 {
 		t.Fatalf("rebind cap residue rows=%d err=%v", rebindRows, err)
@@ -313,6 +309,37 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		t.Fatalf("backup publication load=%v", err)
 	}
 	copyDB.Close()
+	capMutant, err := Open(ctx, backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capLeader, err := capMutant.AcquireLeader(ctx, domain.ChannelDev, "publication-recovery-cap-65")
+	if err != nil {
+		capMutant.Close()
+		t.Fatal(err)
+	}
+	if _, err := capMutant.FenceRecoveredRunners(ctx, domain.ChannelDev, capLeader); err != nil {
+		capMutant.Close()
+		t.Fatal(err)
+	}
+	capTicket, _ := capMutant.Ticket(ctx, ticket.Ref)
+	if err := capMutant.RebindPublishedCandidate(ctx, ticket.Ref, capTicket.Version, domain.Fence{LeaderEpoch: capLeader, RunnerEpoch: capTicket.RunnerEpoch}); err == nil {
+		capMutant.Close()
+		t.Fatal("65th rebind was accepted")
+	}
+	if err := capMutant.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&rebindRows); err != nil || rebindRows != 64 {
+		capMutant.Close()
+		t.Fatalf("65th rebind row residue=%d err=%v", rebindRows, err)
+	}
+	if err := capMutant.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='publication_rebind'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&rebindRows); err != nil || rebindRows != 64 {
+		capMutant.Close()
+		t.Fatalf("65th rebind event residue=%d err=%v", rebindRows, err)
+	}
+	if _, err := capMutant.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
+		capMutant.Close()
+		t.Fatal("unrebound live publishing ticket was accepted after cap rejection")
+	}
+	capMutant.Close()
 	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}, EventPayload: "{}"}); err != nil {
 		t.Fatal(err)
 	}

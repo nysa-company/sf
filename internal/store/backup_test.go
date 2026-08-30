@@ -115,7 +115,7 @@ func TestPublicationV37FailsClosedForPopulatedLegacyPublish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.ExecContext(ctx, `INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('stable','legacy-publication','/legacy-publication','main'); INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES('stable','legacy-publication','SF-legacy-publication','legacy-source','feature','guarded','publishing',9,3,'legacy-publication-workflow')`); err != nil {
+	if _, err := raw.ExecContext(ctx, `INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('stable','legacy-publication','/legacy-publication','main'); INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES('stable','legacy-publication','SF-legacy-publication','legacy-source','feature','guarded','publishing',9,3,'legacy-publication-workflow'),('stable','legacy-publication','SF-legacy-waiting','legacy-waiting-source','feature','guarded','waiting_ci',12,4,'legacy-waiting-workflow')`); err != nil {
 		raw.Close()
 		t.Fatal(err)
 	}
@@ -134,17 +134,25 @@ func TestPublicationV37FailsClosedForPopulatedLegacyPublish(t *testing.T) {
 	if err := database.validateSchema(ctx); err != nil {
 		t.Fatalf("v37 required schema after populated upgrade: %v", err)
 	}
-	var state, resume, code string
-	var version uint64
-	if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='stable' AND project_id='legacy-publication' AND id='SF-legacy-publication'`).Scan(&state, &resume, &code, &version); err != nil {
-		t.Fatal(err)
-	}
-	if state != "blocked" || resume != "publishing" || code != "legacy_publication_evidence_unverifiable" || version != 10 {
-		t.Fatalf("legacy publication was not failed closed: %s/%s/%s/v%d", state, resume, code, version)
-	}
-	var eventCount int
-	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel='stable' AND project_id='legacy-publication' AND ticket_id='SF-legacy-publication' AND ticket_version=10 AND trigger='typed_blocker' AND from_state='publishing' AND to_state='blocked'`).Scan(&eventCount); err != nil || eventCount != 1 {
-		t.Fatalf("legacy publication blocker event count=%d err=%v", eventCount, err)
+	for _, legacy := range []struct {
+		id, resume string
+		version    uint64
+	}{
+		{id: "SF-legacy-publication", resume: "publishing", version: 10},
+		{id: "SF-legacy-waiting", resume: "waiting_ci", version: 13},
+	} {
+		var state, gotResume, code string
+		var version uint64
+		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='stable' AND project_id='legacy-publication' AND id=?`, legacy.id).Scan(&state, &gotResume, &code, &version); err != nil {
+			t.Fatal(err)
+		}
+		if state != "blocked" || gotResume != legacy.resume || code != "legacy_publication_evidence_unverifiable" || version != legacy.version {
+			t.Fatalf("legacy publication %s was not failed closed: %s/%s/%s/v%d", legacy.id, state, gotResume, code, version)
+		}
+		var eventCount int
+		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel='stable' AND project_id='legacy-publication' AND ticket_id=? AND ticket_version=? AND trigger='typed_blocker' AND from_state=? AND to_state='blocked'`, legacy.id, legacy.version, legacy.resume).Scan(&eventCount); err != nil || eventCount != 1 {
+			t.Fatalf("legacy publication %s blocker event count=%d err=%v", legacy.id, eventCount, err)
+		}
 	}
 	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v036-to-v037-*.sqlite"))
 	if err != nil || len(files) != 1 {
