@@ -95,6 +95,16 @@ func removeClaim(worktree Worktree) contracts.GitMutationClaim {
 	return claim
 }
 
+func commitClaim(worktree Worktree, parent string) contracts.GitMutationClaim {
+	claim, _ := testClaim(context.Background(), contracts.GitMutationClaim{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "commit", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: parent})
+	return claim
+}
+
+func pushClaim(worktree Worktree, head string) contracts.GitMutationClaim {
+	claim, _ := testClaim(context.Background(), contracts.GitMutationClaim{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "push", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: head})
+	return claim
+}
+
 func (a *memoryBranchAuthority) LoadBranch(_ context.Context, key string) (string, error) {
 	return a.branches[key], nil
 }
@@ -195,8 +205,7 @@ func fixture(t *testing.T) (context.Context, Runner, string, string) {
 	rawGit(t, repository, "commit", "-m", "base")
 	rawGit(t, repository, "remote", "add", "origin", remote)
 	rawGit(t, repository, "push", "origin", "main:refs/heads/main")
-	testClaimValue, _ := testClaim(ctx, contracts.GitMutationClaim{})
-	return ctx, Runner{Home: filepath.Join(root, "git-home"), ExecHelper: testExecHelper, TestLocalTransport: true, TestMutationClaim: testClaimValue, MutationAuthority: testMutationAuthority{}}, repository, remote
+	return ctx, Runner{Home: filepath.Join(root, "git-home"), ExecHelper: testExecHelper, TestLocalTransport: true, MutationAuthority: testMutationAuthority{}}, repository, remote
 }
 
 func TestAllocatorDelegatesBranchPersistenceToAuthority(t *testing.T) {
@@ -232,17 +241,17 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	pushed, err := runner.Push(ctx, worktree, head)
+	pushed, err := runner.Push(ctx, worktree, head, pushClaim(worktree, head))
 	if err != nil || pushed != head {
 		t.Fatalf("push=%q err=%v", pushed, err)
 	}
 	// A response lost after the server accepted the ref is reconciled by a
 	// fresh exact remote observation, so a replay cannot create a second push.
-	replayed, err := runner.Push(ctx, worktree, head)
+	replayed, err := runner.Push(ctx, worktree, head, pushClaim(worktree, head))
 	if err != nil || replayed != head {
 		t.Fatalf("replay=%q err=%v", replayed, err)
 	}
@@ -250,7 +259,7 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 	if !strings.HasPrefix(remoteHead, head+"\t") {
 		t.Fatalf("remote=%q head=%q", remoteHead, head)
 	}
-	if replay, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil || replay != head {
+	if replay, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)}); err != nil || replay != head {
 		t.Fatalf("commit replay=%q err=%v", replay, err)
 	}
 }
@@ -460,11 +469,11 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("one\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	firstHead, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("one")), Timestamp: time.Unix(2, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	firstHead, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("one")), Timestamp: time.Unix(2, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Push(ctx, worktree, firstHead); err != nil {
+	if _, err := runner.Push(ctx, worktree, firstHead, pushClaim(worktree, firstHead)); err != nil {
 		t.Fatal(err)
 	}
 	other := filepath.Join(t.TempDir(), "other")
@@ -481,10 +490,10 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "src", "local.txt"), []byte("local\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("local")), Timestamp: time.Unix(3, 0), BaseRef: "main", ExpectedParent: firstHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil {
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("local")), Timestamp: time.Unix(3, 0), BaseRef: "main", ExpectedParent: firstHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, firstHead)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Push(ctx, worktree, rawGit(t, path, "rev-parse", "HEAD")); !errors.Is(err, ErrUnexpectedRemote) {
+	if _, err := runner.Push(ctx, worktree, rawGit(t, path, "rev-parse", "HEAD"), pushClaim(worktree, rawGit(t, path, "rev-parse", "HEAD"))); !errors.Is(err, ErrUnexpectedRemote) {
 		t.Fatalf("unexpected remote push=%v", err)
 	}
 }
@@ -688,7 +697,7 @@ func TestCommitDoesNotAdoptSpoofWithMatchingParentAndSubject(t *testing.T) {
 		t.Fatal(err)
 	}
 	rawGit(t, worktree.Path, "update-ref", "refs/heads/"+branch, strings.TrimSpace(string(output)), worktree.Identity.BaseHead)
-	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: evidence, Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); !errors.Is(err, ErrUnsafeWorktree) {
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: evidence, Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)}); !errors.Is(err, ErrUnsafeWorktree) {
 		t.Fatalf("spoof commit adopted: %v", err)
 	}
 }
@@ -709,7 +718,7 @@ func TestPushRefusesMovedRemoteBaseBeforeCandidatePublication(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(8, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(8, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,7 +732,7 @@ func TestPushRefusesMovedRemoteBaseBeforeCandidatePublication(t *testing.T) {
 	rawGit(t, other, "add", "base.txt")
 	rawGit(t, other, "commit", "-m", "move base")
 	rawGit(t, other, "push", "origin", "main")
-	if _, err := runner.Push(ctx, worktree, head); !errors.Is(err, ErrUnexpectedRemote) {
+	if _, err := runner.Push(ctx, worktree, head, pushClaim(worktree, head)); !errors.Is(err, ErrUnexpectedRemote) {
 		t.Fatalf("moved base push=%v", err)
 	}
 	if remoteHead := rawGit(t, repository, "ls-remote", "--heads", "origin", "refs/heads/"+branch); remoteHead != "" {
@@ -782,7 +791,7 @@ func TestCommitRevalidatesResultingTreeAfterStagingRace(t *testing.T) {
 		command.Env = env
 		return command.CombinedOutput()
 	}
-	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(4, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); !errors.Is(err, ErrUnsafeWorktree) {
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(4, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)}); !errors.Is(err, ErrUnsafeWorktree) {
 		t.Fatalf("post-commit staged race=%v", err)
 	}
 	if !injected {
@@ -823,7 +832,7 @@ func TestCommitRejectsIndexRaceBeforeWriteTreeWithoutAdvancingBranch(t *testing.
 		command.Env = env
 		return command.CombinedOutput()
 	}
-	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(6, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); !errors.Is(err, ErrUnsafeWorktree) {
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(6, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)}); !errors.Is(err, ErrUnsafeWorktree) {
 		t.Fatalf("write-tree index race=%v", err)
 	}
 	if !injected {
@@ -862,7 +871,7 @@ func TestHTTPSCredentialHelperConfigurationFailsClosed(t *testing.T) {
 		t.Fatal("shell-form credential helper remains in git argv")
 	}
 	branch := "sf/dev/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef"
-	if _, err := (Runner{}).Push(context.Background(), Worktree{Branch: branch, Identity: Identity{PushOrigin: "https://example.test/owner/repository.git"}}, strings.Repeat("a", 40)); !errors.Is(err, ErrHTTPSCredentialBoundary) {
+	if _, err := (Runner{}).Push(context.Background(), Worktree{Branch: branch, Identity: Identity{PushOrigin: "https://example.test/owner/repository.git"}}, strings.Repeat("a", 40), contracts.GitMutationClaim{}); !errors.Is(err, ErrHTTPSCredentialBoundary) {
 		t.Fatalf("HTTPS publication did not fail closed: %v", err)
 	}
 }
@@ -904,7 +913,7 @@ func TestGitHubPublicationFailsClosedAfterExactLocalCandidateProof(t *testing.T)
 	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(7, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(7, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1242,11 +1251,11 @@ func TestSnapshotBindsPushURLAndUsesItForPublication(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "push.txt"), []byte("push\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("push")), Timestamp: time.Unix(5, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("push")), Timestamp: time.Unix(5, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Push(ctx, worktree, head); err != nil {
+	if _, err := runner.Push(ctx, worktree, head, pushClaim(worktree, head)); err != nil {
 		t.Fatal(err)
 	}
 	if got := rawGit(t, pushRemote, "rev-parse", "refs/heads/"+branch); got != head {
@@ -1344,7 +1353,7 @@ func TestMutationLeaseRefusalPrecedesCommitEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.MutationAuthority = testMutationAuthority{err: errors.New("writer remains")}
-	_, err = runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(9, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	_, err = runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(9, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
 	if !errors.Is(err, ErrIdentityMismatch) {
 		t.Fatalf("proofless commit=%v", err)
 	}
@@ -1429,7 +1438,7 @@ func TestVerifyProtectedBranchFreshWitness(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("merge\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("merge")), Timestamp: time.Unix(10, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("merge")), Timestamp: time.Unix(10, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
 	if err != nil {
 		t.Fatal(err)
 	}

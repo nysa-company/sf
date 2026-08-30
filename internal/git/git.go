@@ -193,10 +193,7 @@ type Runner struct {
 	// TestLocalTransport permits local bare origins only in hermetic tests. It
 	// must never be enabled by production configuration.
 	TestLocalTransport bool
-	// TestMutationClaim is only for hermetic package fixtures. Production must
-	// leave it zero and pass the complete durable claim to each mutation API.
-	TestMutationClaim contracts.GitMutationClaim
-	Run               func(context.Context, string, []string, []string) ([]byte, error)
+	Run                func(context.Context, string, []string, []string) ([]byte, error)
 }
 
 // commandConfigKeys are repository-local settings that can cause Git to run
@@ -409,11 +406,6 @@ func validMutationClaim(claim contracts.GitMutationClaim) bool {
 }
 
 func (r Runner) acquireSuppliedMutation(ctx context.Context, supplied, binding contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
-	if supplied.TicketRef.Validate() != nil && r.TestLocalTransport && r.TestMutationClaim.TicketRef.Validate() == nil {
-		supplied = r.TestMutationClaim
-		supplied.Repository, supplied.Worktree, supplied.Branch, supplied.Operation = binding.Repository, binding.Worktree, binding.Branch, binding.Operation
-		supplied.BaseRef, supplied.ExpectedBaseOID, supplied.ExpectedHeadOID = binding.BaseRef, binding.ExpectedBaseOID, binding.ExpectedHeadOID
-	}
 	return r.acquireMutation(ctx, supplied, binding.Repository, binding.Worktree, binding.Branch, binding.Operation, binding.BaseRef, binding.ExpectedBaseOID, binding.ExpectedHeadOID)
 }
 
@@ -2222,8 +2214,8 @@ type PushRequest struct {
 
 // Push is retained for existing callers; new effect owners should use
 // PushWithRequest to persist the candidate-branch observation explicitly.
-func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string) (string, error) {
-	return r.PushWithRequest(ctx, worktree, PushRequest{ExpectedHead: expectedHead})
+func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string, claim contracts.GitMutationClaim) (string, error) {
+	return r.PushWithRequest(ctx, worktree, PushRequest{ExpectedHead: expectedHead, MutationClaim: claim})
 }
 
 func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request PushRequest) (string, error) {
