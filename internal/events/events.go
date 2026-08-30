@@ -18,6 +18,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/redact"
+	"github.com/nysa-company/sf/internal/store"
 )
 
 const Schema = "sf.event/v1"
@@ -64,6 +65,60 @@ type SliceSource []Record
 
 func (source SliceSource) Events(context.Context) ([]Record, error) {
 	return append([]Record(nil), source...), nil
+}
+
+type StoreReader interface {
+	Events(context.Context, domain.Channel, uint64, int) ([]store.Event, error)
+}
+
+// StoreSource adapts the SQLite authority to the disposable NDJSON
+// projection. It pages by the durable event id so a large history never
+// depends on a single SQLite query or an offset that can drift.
+type StoreSource struct {
+	Store     StoreReader
+	Channel   domain.Channel
+	BatchSize int
+}
+
+func (source StoreSource) Events(ctx context.Context) ([]Record, error) {
+	if source.Store == nil || !source.Channel.Valid() {
+		return nil, errors.New("event store and valid channel are required")
+	}
+	batchSize := source.BatchSize
+	if batchSize == 0 {
+		batchSize = 4096
+	}
+	if batchSize < 1 || batchSize > 100_000 {
+		return nil, errors.New("event batch size must be between 1 and 100000")
+	}
+	var records []Record
+	var after uint64
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		batch, err := source.Store.Events(ctx, source.Channel, after, batchSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) > batchSize {
+			return nil, errors.New("SQLite event page exceeded the requested bound")
+		}
+		for _, item := range batch {
+			if item.ID <= after || item.Ref.Channel != source.Channel {
+				return nil, errors.New("SQLite returned an out-of-order or cross-channel event")
+			}
+			after = item.ID
+			records = append(records, Record{
+				Schema: Schema, ID: item.ID, Channel: item.Ref.Channel, Project: item.Ref.Project,
+				Ticket: item.Ref.Ticket, TicketVersion: item.TicketVersion, Trigger: item.Trigger,
+				From: item.From, To: item.To, Payload: json.RawMessage(item.Payload), CreatedAt: item.CreatedAt,
+			})
+		}
+		if len(batch) < batchSize {
+			return records, nil
+		}
+	}
 }
 
 type Projector struct {

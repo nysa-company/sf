@@ -23,8 +23,10 @@ import (
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/engine"
+	"github.com/nysa-company/sf/internal/events"
 	"github.com/nysa-company/sf/internal/leader"
 	"github.com/nysa-company/sf/internal/operator"
+	"github.com/nysa-company/sf/internal/redact"
 	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/ticket"
@@ -92,6 +94,11 @@ type Daemon struct {
 	auth    operator.Authenticator
 	mu      sync.Mutex
 	closed  bool
+
+	projectionMu      sync.Mutex
+	projector         events.Projector
+	projectionPath    string
+	projectionPending bool
 }
 
 // Start acquires the operating-system lease before it changes the durable
@@ -166,6 +173,12 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
 		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator}
+	home, _ := os.UserHomeDir()
+	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
+		configuration.Paths.Root:      "$CHANNEL_ROOT",
+		configuration.Paths.Worktrees: "$WORKTREE_ROOT",
+	})}
+	instance.projectionPath = filepath.Join(configuration.Paths.Events, "events.ndjson")
 	if instance.auth.ExpectedUID == 0 {
 		instance.auth.ExpectedUID = uint32(os.Getuid())
 	}
@@ -177,6 +190,9 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	}
 	if err := instance.Recover(startupCtx); err != nil {
 		return failStore(fmt.Errorf("recover durable state: %w", err))
+	}
+	if err := instance.projectEvents(startupCtx); err != nil {
+		return failStore(fmt.Errorf("rebuild event projection: %w", err))
 	}
 	server, err := transport.ListenWithExecutable(configuration.Paths.Socket, uint32(os.Getuid()), instance, instance.executable())
 	if err != nil {
@@ -246,19 +262,62 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 	if err != nil {
 		return daemon.failure(request, "operator_identity_required", "the socket peer is not authenticated for this operator label", false)
 	}
+	if daemon.eventProjectionPending() {
+		// A prior projection failure cannot affect authority. Retry it before
+		// answering the next authenticated request so a read can repair the
+		// disposable view without replaying any workflow effect.
+		_ = daemon.projectEvents(ctx)
+	}
+	var response api.Response
 	switch request.Method {
 	case "ticket.submit":
-		return daemon.submit(ctx, request, identity)
+		response = daemon.submit(ctx, request, identity)
 	case "ticket.status":
-		return daemon.statusTickets(ctx, request)
+		response = daemon.statusTickets(ctx, request)
 	case "ticket.show":
-		return daemon.show(ctx, request)
+		response = daemon.show(ctx, request)
 	case "ticket.start":
-		return daemon.startTicket(ctx, request, identity)
+		response = daemon.startTicket(ctx, request, identity)
 	case "daemon.status":
-		return daemon.status(request)
+		response = daemon.status(request)
 	default:
-		return daemon.failure(request, "not_ready", "this lifecycle operation is not enabled by the local daemon yet", false)
+		response = daemon.failure(request, "not_ready", "this lifecycle operation is not enabled by the local daemon yet", false)
+	}
+	if response.Mutation.Attempted {
+		if err := daemon.projectEvents(ctx); err != nil {
+			return daemon.projectionFailure(request, response)
+		}
+	}
+	return response
+}
+
+func (daemon *Daemon) projectEvents(ctx context.Context) error {
+	daemon.projectionMu.Lock()
+	defer daemon.projectionMu.Unlock()
+	err := daemon.projector.Rebuild(ctx, events.StoreSource{Store: daemon.store, Channel: daemon.channel}, daemon.projectionPath)
+	daemon.projectionPending = err != nil
+	return err
+}
+
+func (daemon *Daemon) eventProjectionPending() bool {
+	daemon.projectionMu.Lock()
+	defer daemon.projectionMu.Unlock()
+	return daemon.projectionPending
+}
+
+func (daemon *Daemon) projectionFailure(request api.Request, committed api.Response) api.Response {
+	ticketID := request.Ticket
+	if ticketID == "" && committed.Mutation.Kind == "ticket_submit" {
+		ticketID = committed.Mutation.Identity
+	}
+	argv := []string{daemon.executable(), "daemon", "status"}
+	if ticketID != "" {
+		argv = []string{daemon.executable(), "status", ticketID}
+	}
+	return api.Response{
+		Version: api.Version, RequestID: request.RequestID, OK: false, Mutation: committed.Mutation, Data: committed.Data,
+		Error:      &api.Error{Code: "projection_unavailable", Message: "the authority mutation committed, but the redacted event projection could not be refreshed", Retryable: true},
+		NextAction: &domain.NextAction{Code: "projection_unavailable", Argv: argv},
 	}
 }
 
@@ -476,7 +535,7 @@ func (daemon *Daemon) status(request api.Request) api.Response {
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
 	}
-	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "leader_epoch": daemon.epoch, "socket_ready": true})
+	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "leader_epoch": daemon.epoch, "socket_ready": true, "event_projection_ready": !daemon.eventProjectionPending()})
 }
 
 func (daemon *Daemon) success(request api.Request, mutation api.Mutation, value any) api.Response {

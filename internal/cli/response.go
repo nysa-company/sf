@@ -35,7 +35,7 @@ func exitCode(response api.Response) ExitCode {
 		return ExitInput
 	case "operator_action_required", "provider_auth_missing", "provider_unavailable", "auth_login_failed", "blocked_process", "uncertain_effect", "not_configured", "doctor_not_configured", "doctor_failed", "project_conflict", "init_failed", "unknown_project":
 		return ExitAction
-	case "daemon_unavailable", "provider_waiting", "checks_pending", "store_busy":
+	case "daemon_unavailable", "provider_waiting", "checks_pending", "store_busy", "projection_unavailable":
 		return ExitWait
 	case "policy_refusal", "safety_blocked", "unqualified_provider":
 		return ExitPolicy

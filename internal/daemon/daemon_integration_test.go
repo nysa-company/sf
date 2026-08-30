@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/nysa-company/sf/internal/cli"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/events"
 	"github.com/nysa-company/sf/internal/leader"
 	"github.com/nysa-company/sf/internal/operator"
 	"github.com/nysa-company/sf/internal/store"
@@ -227,6 +229,70 @@ func TestForegroundCLIListShowStartAndReplay(t *testing.T) {
 	}
 	if submit != 2 || start != 1 {
 		t.Fatalf("normative event counts submit=%d start=%d events=%+v", submit, start, events)
+	}
+}
+
+func TestDaemonRebuildsRedactedEventProjectionAfterMutations(t *testing.T) {
+	_, paths, _ := testDaemon(t)
+	ticketPath := writeTicket(t, t.TempDir(), "Projected ticket")
+	if code, _, errOut := executeCLI(t, context.Background(), paths, "submit", ticketPath, "--project", "demo"); code != 0 || errOut != "" {
+		t.Fatalf("submit code=%d stderr=%q", code, errOut)
+	}
+	if code, _, errOut := executeCLI(t, context.Background(), paths, "start", "SF-test-1"); code != 0 || errOut != "" {
+		t.Fatalf("start code=%d stderr=%q", code, errOut)
+	}
+	projectionPath := filepath.Join(paths.Events, "events.ndjson")
+	info, err := os.Lstat(projectionPath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("projection identity info=%v err=%v", info, err)
+	}
+	data, err := os.ReadFile(projectionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("projection lines=%d data=%s", len(lines), data)
+	}
+	for index, line := range lines {
+		var record events.Record
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("line %d record=%+v err=%v", index, record, err)
+		}
+		if err := record.Validate(); err != nil {
+			t.Fatalf("line %d record=%+v err=%v", index, record, err)
+		}
+	}
+	if !strings.Contains(string(data), `"trigger":"submit_valid"`) || !strings.Contains(string(data), `"trigger":"operator_start"`) {
+		t.Fatalf("projection lacks normative events: %s", data)
+	}
+}
+
+func TestProjectionFailureReportsCommittedMutationAndReadRepairsIt(t *testing.T) {
+	d, paths, _ := testDaemon(t)
+	original := d.projectionPath
+	d.projectionMu.Lock()
+	d.projectionPath = filepath.Join(paths.Root, "missing-parent", "events.ndjson")
+	d.projectionMu.Unlock()
+	ticketPath := writeTicket(t, t.TempDir(), "Projection repair")
+	code, output, errOut := executeCLI(t, context.Background(), paths, "submit", ticketPath, "--project", "demo")
+	if code != int(cli.ExitWait) || errOut != "" || !strings.Contains(output, "projection_unavailable") || !strings.Contains(output, "Mutation: attempted") || !strings.Contains(output, "sf status SF-test-1") {
+		t.Fatalf("submit code=%d output=%q stderr=%q", code, output, errOut)
+	}
+	if _, err := d.store.TicketByID(context.Background(), domain.ChannelStable, "SF-test-1"); err != nil {
+		t.Fatalf("committed ticket was lost: %v", err)
+	}
+	d.projectionMu.Lock()
+	d.projectionPath = original
+	d.projectionMu.Unlock()
+	request := api.Request{Version: api.Version, RequestID: "repair-projection", Method: "daemon.status", Parameters: []byte(`{}`)}
+	response, err := transport.Call(context.Background(), paths.Socket, request)
+	if err != nil || !response.OK || !strings.Contains(string(response.Data), `"event_projection_ready":true`) {
+		t.Fatalf("status response=%+v err=%v", response, err)
+	}
+	data, err := os.ReadFile(original)
+	if err != nil || !strings.Contains(string(data), "SF-test-1") {
+		t.Fatalf("repaired projection=%q err=%v", data, err)
 	}
 }
 
