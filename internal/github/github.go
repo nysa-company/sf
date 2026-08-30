@@ -41,9 +41,8 @@ var maxGHDeadline = 2 * time.Minute
 type Client struct {
 	Binary        string
 	Home          string
-	ConfigDir     string   // explicit existing gh auth/config authority, never a temp substitute
-	Env           []string // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
-	Run           func(context.Context, string, []string, []string) ([]byte, error)
+	ConfigDir     string        // explicit existing gh auth/config authority, never a temp substitute
+	Env           []string      // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
 	Runner        CommandRunner // required by NewClient; supervisor-owned in production
 	ValidateClaim func(context.Context, domain.ExternalEffectClaim) error
 	MutationGuard contracts.ExternalMutationGuard
@@ -178,7 +177,7 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 		return contracts.PullRequestIdentity{}, runErr
 	}
 	if number, ok := createdPRNumber(string(output)); ok {
-		if err := c.closeOrphan(ctx, durable, identity.Repository, number); err != nil {
+		if err := c.closeOrphan(ctx, durable, identity, number); err != nil {
 			return contracts.PullRequestIdentity{}, err
 		}
 	}
@@ -193,17 +192,19 @@ func createdPRNumber(output string) (int, bool) {
 	value, err := strconv.Atoi(strings.TrimSpace(output[last+1:]))
 	return value, err == nil && value > 0
 }
-func (c Client) closeOrphan(ctx context.Context, claim domain.ExternalEffectClaim, repository contracts.RepositoryIdentity, number int) error {
-	if number <= 0 || validRepository(repository) != nil {
+func (c Client) closeOrphan(ctx context.Context, claim domain.ExternalEffectClaim, want contracts.PullRequestIdentity, number int) error {
+	if number <= 0 || !validIdentity(want) {
 		return ErrPolicyRefusal
 	}
-	if _, err := c.mutate(ctx, claim, "pr", "close", fmt.Sprint(number), "--repo", repoArg(repository)); err != nil {
+	actual, err := c.viewOwnedNumber(ctx, want.Repository, number, want)
+	if err != nil || !sameExact(actual.Identity, want) || actual.State != "OPEN" {
 		return ErrPolicyRefusal
 	}
-	var value struct {
-		State string `json:"state"`
+	if _, err := c.mutate(ctx, claim, "pr", "close", fmt.Sprint(number), "--repo", repoArg(want.Repository)); err != nil {
+		return ErrPolicyRefusal
 	}
-	if err := c.json(ctx, &value, "pr", "view", fmt.Sprint(number), "--repo", repoArg(repository), "--json", "state"); err != nil || value.State != "CLOSED" {
+	closed, err := c.viewOwnedNumber(ctx, want.Repository, number, want)
+	if err != nil || !sameExact(closed.Identity, want) || closed.State != "CLOSED" {
 		return ErrPolicyRefusal
 	}
 	return ErrPolicyRefusal // the original claim remains uncertain; never confirm an orphan.
@@ -248,6 +249,14 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 		return ErrPolicyRefusal
 	}
 	if observeErr != nil {
+		current, sourceErr := c.viewSameSourceNumber(ctx, identity.Repository, identity.Number, identity)
+		if sourceErr == nil {
+			_, undoErr := c.mutate(ctx, durable, "pr", "ready", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--undo")
+			restored, restoreErr := c.viewSameSourceNumber(ctx, identity.Repository, identity.Number, identity)
+			if undoErr == nil && restoreErr == nil && restored.Draft {
+				return ErrPolicyRefusal
+			}
+		}
 		return ErrPolicyRefusal
 	}
 	if err == nil {
@@ -389,6 +398,9 @@ func (c Client) Observe(ctx context.Context, want contracts.PullRequestIdentity)
 	for _, value := range values {
 		candidate, err := value.identity(want.Repository)
 		if err != nil {
+			if errors.Is(err, ErrNoMatchingPR) {
+				continue
+			}
 			return PRMatch{}, err
 		}
 		if sameExact(candidate, want) {
@@ -631,9 +643,9 @@ func (c Client) mergeQueued(ctx context.Context, identity contracts.PullRequestI
 		return false, ErrPolicyRefusal
 	}
 	var response struct {
-		Data struct {
-			Repository struct {
-				PullRequest struct {
+		Data *struct {
+			Repository *struct {
+				PullRequest *struct {
 					MergeQueueEntry json.RawMessage `json:"mergeQueueEntry"`
 				} `json:"pullRequest"`
 			} `json:"repository"`
@@ -643,7 +655,14 @@ func (c Client) mergeQueued(ctx context.Context, identity contracts.PullRequestI
 	if err := c.json(ctx, &response, "api", "--hostname", "github.com", "graphql", "-f", "query="+query, "-F", "owner="+identity.Repository.Owner, "-F", "name="+identity.Repository.Name, "-F", fmt.Sprintf("number=%d", identity.Number)); err != nil {
 		return false, err
 	}
-	return presentJSON(response.Data.Repository.PullRequest.MergeQueueEntry), nil
+	if response.Data == nil || response.Data.Repository == nil || response.Data.Repository.PullRequest == nil || len(response.Data.Repository.PullRequest.MergeQueueEntry) == 0 {
+		return false, ErrMalformedResponse
+	}
+	entry := response.Data.Repository.PullRequest.MergeQueueEntry
+	if string(entry) != "null" && !json.Valid(entry) {
+		return false, ErrMalformedResponse
+	}
+	return presentJSON(entry), nil
 }
 
 func (c Client) view(ctx context.Context, identity contracts.PullRequestIdentity) (PRMatch, error) {
@@ -668,6 +687,39 @@ func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryI
 		return PRMatch{}, err
 	}
 	return value.match(parsed), nil
+}
+
+// viewOwnedNumber is the narrow orphan-cleanup proof: create output is only a
+// hint; closure is authorized only after this fresh full identity read.
+func (c Client) viewOwnedNumber(ctx context.Context, repository contracts.RepositoryIdentity, number int, want contracts.PullRequestIdentity) (PRMatch, error) {
+	if number <= 0 || !validIdentity(want) {
+		return PRMatch{}, ErrPolicyRefusal
+	}
+	var value prWire
+	if err := c.json(ctx, &value, "pr", "view", fmt.Sprint(number), "--repo", repoArg(repository), "--json", prFields); err != nil {
+		return PRMatch{}, err
+	}
+	parsed, err := value.identity(repository)
+	if err != nil || !sameExact(parsed, want) || parsed.Number != number {
+		return PRMatch{}, ErrPolicyRefusal
+	}
+	return value.match(parsed), nil
+}
+
+// viewSameSourceNumber deliberately permits a changed head OID only for ready
+// compensation; ownership marker, repository, source branch and base remain exact.
+func (c Client) viewSameSourceNumber(ctx context.Context, repository contracts.RepositoryIdentity, number int, want contracts.PullRequestIdentity) (PRMatch, error) {
+	var value prWire
+	if err := c.json(ctx, &value, "pr", "view", fmt.Sprint(number), "--repo", repoArg(repository), "--json", prFields); err != nil {
+		return PRMatch{}, err
+	}
+	owner, name, ok := strings.Cut(value.HeadRepository.NameWithOwner, "/")
+	if !ok || owner != want.HeadOwner || name != want.HeadRepository || value.HeadRepositoryOwner.Login != want.HeadOwner || value.HeadRef != want.HeadRef || value.BaseRef != want.BaseRef || !validOID(value.HeadOID) || !strings.Contains(value.Body, ownershipMarker(want)) {
+		return PRMatch{}, ErrPolicyRefusal
+	}
+	current := want
+	current.Number, current.HeadOID = number, value.HeadOID
+	return value.match(current), nil
 }
 
 const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest"
@@ -796,19 +848,6 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	}
 	if c.Runner != nil {
 		output, runErr := c.Runner.Run(ctx, c.binary(), args, env)
-		if len(output) > maxResponse {
-			return nil, ErrResponseTooLarge
-		}
-		if runErr != nil {
-			if isChecksPending(args, runErr) {
-				return nil, ErrChecksPending
-			}
-			return nil, fmt.Errorf("gh command failed")
-		}
-		return output, nil
-	}
-	if c.Run != nil { // explicit test/dev seam; NewClient never permits this fallback.
-		output, runErr := c.Run(ctx, c.binary(), args, env)
 		if len(output) > maxResponse {
 			return nil, ErrResponseTooLarge
 		}

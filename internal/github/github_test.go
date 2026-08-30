@@ -68,13 +68,13 @@ func TestContractMutationRequiresClaimValidator(t *testing.T) {
 }
 
 func TestAuthStatusAcceptsOfficialHostsStateShape(t *testing.T) {
-	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Run: func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 		want := []string{"auth", "status", "--json", "hosts"}
 		if !reflect.DeepEqual(args, want) {
 			return nil, errors.New("unexpected auth argv")
 		}
 		return []byte(`{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"sf-test","tokenSource":"keyring","scopes":"repo","gitProtocol":"https"}]}}`), nil
-	}}
+	})}
 	if err := client.AuthStatus(context.Background()); err != nil {
 		t.Fatalf("official auth status shape=%v", err)
 	}
@@ -284,7 +284,7 @@ func TestOfficialGHArgvGolden(t *testing.T) {
 	}
 	var got [][]string
 	listCalls := 0
-	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Run: func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 		got = append(got, append([]string(nil), args...))
 		switch args[0] + " " + args[1] {
 		case "pr list":
@@ -298,7 +298,7 @@ func TestOfficialGHArgvGolden(t *testing.T) {
 		default:
 			return nil, errors.New("unexpected command")
 		}
-	}}
+	})}
 	claim := EffectClaim{Plan: EffectPlan{SemanticKey: "key", Identity: identity}, Claimed: true}
 	if _, err := client.createOrAdopt(context.Background(), claim, "title", "body"); err != nil {
 		t.Fatal(err)
@@ -323,7 +323,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 	}
 	var got [][]string
 	verified := false
-	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Run: func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: t.TempDir(), Runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 		got = append(got, append([]string(nil), args...))
 		if args[0] == "pr" && args[1] == "merge" {
 			return nil, nil
@@ -332,7 +332,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 			return payload, nil
 		}
 		return nil, errors.New("unexpected command")
-	}, VerifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+	}), VerifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 		verified = repository == identity.Repository && baseRef == "main" && mergeCommit == strings.Repeat("b", 40)
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
 	})}
@@ -420,22 +420,22 @@ func TestWaitChecksPreservesCancellationAsPending(t *testing.T) {
 }
 
 func TestStrictJSONBoundedSanitizedCommandBoundary(t *testing.T) {
-	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: filepath.Join(t.TempDir(), "gh-config"), Run: func(context.Context, string, []string, []string) ([]byte, error) {
+	client := Client{Binary: "/bin/echo", Home: t.TempDir(), ConfigDir: filepath.Join(t.TempDir(), "gh-config"), Runner: commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
 		return []byte(`{"unknown":true}`), nil
-	}}
+	})}
 	var value struct{}
 	if err := client.json(context.Background(), &value, "repo", "view"); !errors.Is(err, ErrMalformedResponse) {
 		t.Fatalf("unknown json=%v", err)
 	}
-	client.Run = func(context.Context, string, []string, []string) ([]byte, error) {
+	client.Runner = commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
 		return make([]byte, maxResponse+1), nil
-	}
+	})
 	if _, err := client.run(context.Background(), "repo", "view"); !errors.Is(err, ErrResponseTooLarge) {
 		t.Fatalf("oversized=%v", err)
 	}
-	client.Run = func(context.Context, string, []string, []string) ([]byte, error) {
+	client.Runner = commandRunnerFunc(func(context.Context, string, []string, []string) ([]byte, error) {
 		return []byte("secret-token-in-output"), errors.New("failure")
-	}
+	})
 	if _, err := client.run(context.Background(), "repo", "view"); err == nil || err.Error() != "gh command failed" {
 		t.Fatalf("sanitized error=%v", err)
 	}

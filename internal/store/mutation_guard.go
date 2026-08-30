@@ -56,6 +56,9 @@ func (g *ExternalMutationGate) RunExternalMutation(ctx context.Context, claim do
 	if err := g.store.ValidateExternalEffectClaim(ctx, claim); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return start(ctx)
 }
 
