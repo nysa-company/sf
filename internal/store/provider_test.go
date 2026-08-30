@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
+	"github.com/nysa-company/sf/internal/workflowprompt"
 )
 
 var providerTestSigner, _ = contracts.NewDrainSigner()
@@ -70,6 +72,149 @@ func TestProviderAdmissionUsesPairCapacityAndFreshFences(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = reviewer
+}
+
+func TestPlanTransitionConsumesNewestSameFencePlannerResult(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "plan-newest")
+	ticket := setupProviderTicket(t, db, ctx, "SF-plan-newest", leader)
+	builder, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	artifact := []byte(`{"schema":"sf.planner/v1","acceptance":["a"],"proof":{"kind":"acceptance","command":["go","test"],"details":"d"},"paths":["internal"],"commands":[["go","test"]],"risks":["r"]}`)
+	if _, err := phaseartifact.Parse(domain.PhasePlanning, contracts.PhaseResult{Provider: runtime(builder).Identity, Artifact: artifact}, phaseartifact.Validation{TicketType: ticket.Type}); err != nil {
+		t.Fatalf("planner fixture: %v", err)
+	}
+	start := func() ProviderAttemptClaim {
+		claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.RecordProviderLaunch(ctx, claim, contracts.ProviderLaunch{PID: int(claim.ID), PGID: int(claim.ID), BootIdentity: "test", ProcessStartIdentity: fmt.Sprintf("plan-%d", claim.ID), Worktree: claim.Worktree}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: artifact, UsageTrusted: true, UsageUnits: 1}, phaseartifact.Validation{TicketType: ticket.Type}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		return claim
+	}
+	p1, p2 := start(), start()
+	_, parsed, err := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: p1.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: p1.Attempt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := *parsed.Planner
+	makePlan := func(claim ProviderAttemptClaim) PlanArtifact {
+		return PlanArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Document: PlanDocument{Planner: &plan, ProviderResult: &ProviderAttemptResultKey{AttemptID: claim.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: claim.Attempt}, Acceptance: plan.Acceptance, ProofKind: string(plan.Proof.Kind), Paths: plan.Paths, Commands: plan.Commands, Risks: plan.Risks}}
+	}
+	if _, err := db.RecordPlan(ctx, makePlan(p1)); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("old planner accepted: %v", err)
+	}
+	if _, err := db.RecordPlan(ctx, makePlan(p2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionPlan(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVerificationAndCandidateTransitionsConsumeNewestSameFenceResult(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "phase-newest")
+	ticket := setupProviderTicket(t, db, ctx, "SF-phase-newest", leader)
+	builder, reviewer := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	plan := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"a"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofAcceptance, Command: []string{"go", "test"}, Details: "d"}, Paths: []string{"internal"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"r"}}
+	pid, _ := workflowprompt.NewPlanIdentity(plan)
+	plannerRaw := []byte(`{"schema":"sf.planner/v1","acceptance":["a"],"proof":{"kind":"acceptance","command":["go","test"],"details":"d"},"paths":["internal"],"commands":[["go","test"]],"risks":["r"]}`)
+	launch := func(phase domain.Phase, role string, b contracts.RuntimeBinding, raw []byte, v phaseartifact.Validation) ProviderAttemptClaim {
+		c, e := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: phase, Role: role, Binding: b, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = db.RecordProviderLaunch(ctx, c, contracts.ProviderLaunch{PID: int(c.ID), PGID: int(c.ID), BootIdentity: "test", ProcessStartIdentity: fmt.Sprintf("%s-%d", phase, c.ID), Worktree: c.Worktree}); e != nil {
+			t.Fatal(e)
+		}
+		if _, e = db.CompleteProviderAttemptSuccess(ctx, c, proof(t, c), ticket.Version, fence, contracts.PhaseResult{Provider: c.Binding.Identity, Artifact: raw, UsageTrusted: true, UsageUnits: 1}, v, time.Now().UTC()); e != nil {
+			t.Fatal(e)
+		}
+		return c
+	}
+	p := launch(domain.PhasePlanning, "planner", runtime(builder), plannerRaw, phaseartifact.Validation{TicketType: ticket.Type})
+	pk := ProviderAttemptResultKey{AttemptID: p.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: p.Attempt}
+	if _, e := db.RecordPlan(ctx, PlanArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Document: PlanDocument{Planner: &plan, ProviderResult: &pk, Acceptance: plan.Acceptance, ProofKind: string(plan.Proof.Kind), Paths: plan.Paths, Commands: plan.Commands, Risks: plan.Risks}}); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := db.TransitionPlan(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); e != nil {
+		t.Fatal(e)
+	}
+	ticket, _ = db.Ticket(ctx, ticket.Ref)
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	verify := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: pid.Digest, ProofKind: phaseartifact.ProofAcceptance, OwnedFiles: []string{"internal"}, Command: []string{"go", "test"}, PrebuildOutcome: "red", EvidenceDigest: sha256Digest([]byte("v"))}
+	verifyRaw, _ := json.Marshal(verify)
+	r1 := launch(domain.PhaseVerification, "reviewer", runtime(reviewer), verifyRaw, phaseartifact.Validation{TicketType: ticket.Type, AcceptanceDigest: pid.Digest})
+	r2 := launch(domain.PhaseVerification, "reviewer", runtime(reviewer), verifyRaw, phaseartifact.Validation{TicketType: ticket.Type, AcceptanceDigest: pid.Digest})
+	intent, _ := workflowprompt.CanonicalVerificationIntentBytes(verify)
+	proofBytes, _ := workflowprompt.CanonicalVerificationProofBytes(verify)
+	ck := strings.Repeat("c", 40)
+	vr := func(c ProviderAttemptClaim) VerificationArtifact {
+		return VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proofBytes, OwnedFiles: verify.OwnedFiles, CheckpointID: ck, ProviderResult: &ProviderAttemptResultKey{AttemptID: c.ID, Ref: ticket.Ref, Phase: domain.PhaseVerification, Attempt: c.Attempt}, Checkpoint: CommitObservation{CommitOID: ck, ParentOID: strings.Repeat("a", 40), TreeOID: strings.Repeat("d", 40)}}
+	}
+	if _, e := db.RecordVerification(ctx, vr(r1)); !errors.Is(e, ErrEvidenceConflict) {
+		t.Fatalf("old reviewer=%v", e)
+	}
+	rev, e := db.RecordVerification(ctx, vr(r2))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = db.TransitionVerification(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateVerifying, To: domain.StateBuilding, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); e != nil {
+		t.Fatal(e)
+	}
+	ticket, _ = db.Ticket(ctx, ticket.Ref)
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	source := sha256Digest([]byte("source"))
+	if _, e := db.db.ExecContext(ctx, `UPDATE tickets SET source_digest=? WHERE channel=? AND project_id=? AND id=?`, source, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); e != nil {
+		t.Fatal(e)
+	}
+	buildRaw := []byte(`{"schema":"sf.builder/v1","summary":"b","changed_files":["internal/x.go"],"commands":[["go","test"]]}`)
+	b1 := launch(domain.PhaseBuild, "builder", runtime(builder), buildRaw, phaseartifact.Validation{TicketType: ticket.Type})
+	b2 := launch(domain.PhaseBuild, "builder", runtime(builder), buildRaw, phaseartifact.Validation{TicketType: ticket.Type})
+	_, parsed, e := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: b1.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: b1.Attempt})
+	if e != nil {
+		t.Fatal(e)
+	}
+	bd, _ := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
+	snap := domain.CandidateSnapshot{BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("e", 40), TreeSHA: strings.Repeat("f", 40), SourceDigest: source, VerificationIntentDigest: rev.IntentDigest, ProofDigest: rev.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: bd}
+	ce := func(c ProviderAttemptClaim) CandidateEvidence {
+		return CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snap, BuilderResult: ProviderAttemptResultKey{AttemptID: c.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: c.Attempt}, Commit: CommitObservation{CommitOID: snap.HeadSHA, ParentOID: ck, TreeOID: snap.TreeSHA}, Reason: "r"}
+	}
+	before := eventCount(t, db, ctx, ticket.Ref)
+	if _, e = db.RecordCandidate(ctx, ce(b1)); !errors.Is(e, ErrEvidenceConflict) {
+		t.Fatalf("old builder=%v", e)
+	}
+	if _, e = db.RecordCandidate(ctx, ce(b2)); e != nil {
+		t.Fatal(e)
+	}
+	stored, e := db.LatestCandidate(ctx, ticket.Ref)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = db.TransitionCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}, stored.Snapshot); e != nil {
+		t.Fatal(e)
+	}
+	if after := eventCount(t, db, ctx, ticket.Ref); after != before+2 {
+		t.Fatalf("events=%d want=%d", after, before+2)
+	}
+}
+
+func eventCount(t *testing.T, db *Store, ctx context.Context, ref domain.TicketRef) int {
+	t.Helper()
+	var n int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func TestRecordProviderLaunchBindsTheEntireClaimAndStartIdentity(t *testing.T) {

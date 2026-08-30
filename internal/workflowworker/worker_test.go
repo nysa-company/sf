@@ -145,6 +145,12 @@ type fakeEngine struct {
 func (e *fakeEngine) SignalCandidate(ctx context.Context, req contracts.SignalRequest, _ domain.CandidateSnapshot) (contracts.TransitionResult, error) {
 	return e.Signal(ctx, req)
 }
+func (e *fakeEngine) SignalPlan(ctx context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return e.Signal(ctx, req)
+}
+func (e *fakeEngine) SignalVerification(ctx context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return e.Signal(ctx, req)
+}
 
 func (e *fakeEngine) Signal(_ context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
 	e.signals++

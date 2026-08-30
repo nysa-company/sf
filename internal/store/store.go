@@ -1123,6 +1123,9 @@ func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) Transition(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if transition.Trigger == "phase_pass" && (transition.From == domain.StatePlanning || transition.From == domain.StateVerifying || transition.From == domain.StateBuilding) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
 	if err := transition.Ref.Validate(); err != nil {
 		return TransitionResult{}, err
 	}
@@ -1172,12 +1175,118 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	return result, err
 }
 
+// TransitionPlan consumes the current planner binding in the same SQLite write
+// as planning -> verifying. Caller attributes are never evidence authority.
+func (s *Store) TransitionPlan(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if transition.From != domain.StatePlanning || transition.To != domain.StateVerifying || transition.Trigger != "phase_pass" {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	return s.transitionWithEvidence(ctx, transition, func(ctx context.Context, conn *sql.Conn, version, runner uint64) error {
+		var digest, body string
+		var artifact []byte
+		var id int64
+		var attempt int
+		var phase, role, state, outcome string
+		err := conn.QueryRowContext(ctx, `SELECT p.digest,p.body,p.artifact_bytes,b.provider_attempt_id,b.provider_attempt,a.phase,a.role,a.state,a.outcome
+			FROM plans p JOIN plan_result_bindings b ON b.channel=p.channel AND b.project_id=p.project_id AND b.ticket_id=p.ticket_id AND b.plan_digest=p.digest
+			JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id
+			JOIN provider_attempts a ON a.id=r.provider_attempt_id
+			WHERE p.channel=? AND p.project_id=? AND p.ticket_id=? AND b.binding_ticket_version=? AND b.leader_epoch=? AND b.runner_epoch=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version, transition.Fence.LeaderEpoch, transition.Fence.RunnerEpoch).Scan(&digest, &body, &artifact, &id, &attempt, &phase, &role, &state, &outcome)
+		if err != nil || digest == "" || id <= 0 || attempt <= 0 || phase != "planning" || role != "planner" || state != "completed" || outcome != "completed" {
+			return ErrEvidenceConflict
+		}
+		var document PlanDocument
+		if !bytes.Equal([]byte(body), artifact) || sha256Digest(artifact) != digest || decodeEvidenceJSON(artifact, &document) != nil || document.ProviderResult == nil || document.ProviderResult.AttemptID != id || document.ProviderResult.Attempt != attempt || document.ProviderResult.Ref != transition.Ref || document.ProviderResult.Phase != domain.PhasePlanning {
+			return ErrEvidenceConflict
+		}
+		var actual int
+		if err := conn.QueryRowContext(ctx, `SELECT attempt FROM provider_attempts WHERE id=?`, id).Scan(&actual); err != nil || actual != attempt {
+			return ErrEvidenceConflict
+		}
+		return assertNewestBoundResult(ctx, conn, transition.Ref, domain.PhasePlanning, "planner", ProviderAttemptResultKey{AttemptID: id, Ref: transition.Ref, Phase: domain.PhasePlanning, Attempt: attempt})
+	})
+}
+
+// TransitionVerification consumes the current reviewer/checkpoint binding in
+// the same SQLite write as verifying -> building.
+func (s *Store) TransitionVerification(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if transition.From != domain.StateVerifying || transition.To != domain.StateBuilding || transition.Trigger != "phase_pass" {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	return s.transitionWithEvidence(ctx, transition, func(ctx context.Context, conn *sql.Conn, version, runner uint64) error {
+		var id int64
+		var attempt int
+		var phase, role, state, outcome, checkpoint, parent, tree, revisionCheckpoint string
+		err := conn.QueryRowContext(ctx, `SELECT b.provider_attempt_id,b.provider_attempt,a.phase,a.role,a.state,a.outcome,b.checkpoint_commit_oid,b.checkpoint_parent_oid,b.checkpoint_tree_oid,r.checkpoint_id
+			FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision
+			JOIN verification_result_bindings b ON b.channel=r.channel AND b.project_id=r.project_id AND b.ticket_id=r.ticket_id AND b.revision=r.revision
+			JOIN provider_attempt_results pr ON pr.provider_attempt_id=b.provider_attempt_id AND pr.channel=b.channel AND pr.project_id=b.project_id AND pr.ticket_id=b.ticket_id AND pr.phase='verification'
+			JOIN provider_attempts a ON a.id=pr.provider_attempt_id AND a.attempt=b.provider_attempt AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id
+			WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND b.binding_ticket_version=? AND b.leader_epoch=? AND b.runner_epoch=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version, transition.Fence.LeaderEpoch, transition.Fence.RunnerEpoch).Scan(&id, &attempt, &phase, &role, &state, &outcome, &checkpoint, &parent, &tree, &revisionCheckpoint)
+		if err != nil || id <= 0 || attempt <= 0 || phase != "verification" || role != "reviewer" || state != "completed" || outcome != "completed" || checkpoint != revisionCheckpoint || !validOID(checkpoint) || !validOID(parent) || !validOID(tree) {
+			return ErrEvidenceConflict
+		}
+		var actual int
+		if err := conn.QueryRowContext(ctx, `SELECT attempt FROM provider_attempts WHERE id=?`, id).Scan(&actual); err != nil || actual != attempt {
+			return ErrEvidenceConflict
+		}
+		return assertNewestBoundResult(ctx, conn, transition.Ref, domain.PhaseVerification, "reviewer", ProviderAttemptResultKey{AttemptID: id, Ref: transition.Ref, Phase: domain.PhaseVerification, Attempt: attempt})
+	})
+}
+
+func (s *Store) transitionWithEvidence(ctx context.Context, transition Transition, check func(context.Context, *sql.Conn, uint64, uint64) error) (TransitionResult, error) {
+	if transition.Ref.Validate() != nil || !transition.To.Valid() || !transition.From.Valid() || transition.Trigger == "" {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	if transition.EventPayload == "" {
+		transition.EventPayload = "{}"
+	}
+	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
+		return TransitionResult{}, err
+	}
+	var result TransitionResult
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		var version, runner uint64
+		var actual domain.State
+		if err := conn.QueryRowContext(ctx, `SELECT state,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&actual, &version, &runner); err != nil {
+			return err
+		}
+		if actual != transition.From || version != transition.ExpectedVersion {
+			return ErrStaleFence
+		}
+		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
+			return err
+		}
+		if err := check(ctx, conn, version, runner); err != nil {
+			return err
+		}
+		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?,resume_state=?,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
+		if err != nil {
+			return err
+		}
+		if n, _ := updated.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, transition.Trigger, transition.From, transition.To, transition.EventPayload, time.Now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return err
+		}
+		result.Version = version + 1
+		result.EventID, _ = created.LastInsertId()
+		return nil
+	})
+	return result, err
+}
+
 // TransitionCandidate atomically consumes one exact candidate generation with
 // the build transition.  A worker must not validate "latest" in one read and
 // signal in another: a newer same-version candidate could otherwise replace
 // the proof between those operations.
 func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, candidate domain.CandidateSnapshot) (TransitionResult, error) {
-	if err := transition.Ref.Validate(); err != nil || transition.From != domain.StateBuilding || transition.To == "" || transition.Trigger == "" || validateCandidate(candidate) != nil {
+	if err := transition.Ref.Validate(); err != nil || transition.From != domain.StateBuilding || transition.To != domain.StatePublishing || transition.Trigger != "phase_pass" || validateCandidate(candidate) != nil {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
 	if transition.EventPayload == "" {
@@ -1211,13 +1320,19 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 			return ErrEvidenceConflict
 		}
 		var attemptID int64
-		var attempt int
+		var attempt, actualAttempt int
 		var parent string
 		var phase, role, state, outcome string
 		if err := conn.QueryRowContext(ctx, `SELECT b.provider_attempt_id,b.provider_attempt,b.commit_parent_oid,r.phase,a.role,a.state,a.outcome
 			FROM candidate_result_bindings b JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id JOIN provider_attempts a ON a.id=r.provider_attempt_id
 			WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.generation=? AND b.binding_ticket_version=? AND b.leader_epoch=? AND b.runner_epoch=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, version, transition.Fence.LeaderEpoch, transition.Fence.RunnerEpoch).Scan(&attemptID, &attempt, &parent, &phase, &role, &state, &outcome); err != nil || attemptID <= 0 || attempt <= 0 || phase != "build" || role != "builder" || state != "completed" || outcome != "completed" || !validOID(parent) {
 			return ErrEvidenceConflict
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT attempt FROM provider_attempts WHERE id=?`, attemptID).Scan(&actualAttempt); err != nil || actualAttempt != attempt {
+			return ErrEvidenceConflict
+		}
+		if err := assertNewestBoundResult(ctx, conn, transition.Ref, domain.PhaseBuild, "builder", ProviderAttemptResultKey{AttemptID: attemptID, Ref: transition.Ref, Phase: domain.PhaseBuild, Attempt: attempt}); err != nil {
+			return err
 		}
 		var source, base, intent, proof string
 		if err := conn.QueryRowContext(ctx, `SELECT t.source_digest,w.base_sha,v.intent_digest,v.proof_digest FROM tickets t JOIN worktrees w ON w.channel=t.channel AND w.project_id=t.project_id AND w.ticket_id=t.id JOIN verifications v ON v.channel=t.channel AND v.project_id=t.project_id AND v.ticket_id=t.id WHERE t.channel=? AND t.project_id=? AND t.id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&source, &base, &intent, &proof); err != nil {

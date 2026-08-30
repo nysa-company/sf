@@ -601,11 +601,19 @@ var migrationV33 = []string{
 // v34 binds reusable reviewer and builder results to durable workflow
 // artifacts.  Event payloads are projections only and are never authority.
 var migrationV34 = []string{
+	`CREATE TABLE plan_result_bindings (
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, plan_digest TEXT NOT NULL,
+		binding_ticket_version INTEGER NOT NULL CHECK(binding_ticket_version > 0), leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > 0),
+		provider_attempt_id INTEGER NOT NULL CHECK(provider_attempt_id > 0), provider_attempt INTEGER NOT NULL CHECK(provider_attempt > 0),
+		PRIMARY KEY(channel,project_id,ticket_id,binding_ticket_version,leader_epoch,runner_epoch),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(provider_attempt_id) REFERENCES provider_attempt_results(provider_attempt_id)
+	)`,
 	`CREATE TABLE verification_result_bindings (
 		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, revision INTEGER NOT NULL,
-		binding_ticket_version INTEGER NOT NULL, leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL,
-		provider_attempt_id INTEGER NOT NULL, provider_attempt INTEGER NOT NULL,
-		checkpoint_commit_oid TEXT NOT NULL, checkpoint_parent_oid TEXT NOT NULL, checkpoint_tree_oid TEXT NOT NULL,
+		binding_ticket_version INTEGER NOT NULL CHECK(binding_ticket_version > 0), leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > 0),
+		provider_attempt_id INTEGER NOT NULL CHECK(provider_attempt_id > 0), provider_attempt INTEGER NOT NULL CHECK(provider_attempt > 0),
+		checkpoint_commit_oid TEXT NOT NULL CHECK(length(checkpoint_commit_oid) > 0), checkpoint_parent_oid TEXT NOT NULL CHECK(length(checkpoint_parent_oid) > 0), checkpoint_tree_oid TEXT NOT NULL CHECK(length(checkpoint_tree_oid) > 0),
 		PRIMARY KEY(channel,project_id,ticket_id,revision,binding_ticket_version,leader_epoch,runner_epoch),
 		FOREIGN KEY(channel,project_id,ticket_id,revision) REFERENCES verification_revisions(channel,project_id,ticket_id,revision),
 		FOREIGN KEY(provider_attempt_id) REFERENCES provider_attempt_results(provider_attempt_id),
@@ -613,11 +621,17 @@ var migrationV34 = []string{
 	)`,
 	`CREATE TABLE candidate_result_bindings (
 		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, generation INTEGER NOT NULL,
-		binding_ticket_version INTEGER NOT NULL, leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL,
-		provider_attempt_id INTEGER NOT NULL, provider_attempt INTEGER NOT NULL, commit_parent_oid TEXT NOT NULL,
+		binding_ticket_version INTEGER NOT NULL CHECK(binding_ticket_version > 0), leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch > 0),
+		provider_attempt_id INTEGER NOT NULL CHECK(provider_attempt_id > 0), provider_attempt INTEGER NOT NULL CHECK(provider_attempt > 0), commit_parent_oid TEXT NOT NULL CHECK(length(commit_parent_oid) > 0),
 		PRIMARY KEY(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch),
 		FOREIGN KEY(channel,project_id,ticket_id,generation) REFERENCES candidate_snapshots(channel,project_id,ticket_id,generation),
 		FOREIGN KEY(provider_attempt_id) REFERENCES provider_attempt_results(provider_attempt_id),
 		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
 	)`,
+	`CREATE TRIGGER plan_result_bindings_immutable_update BEFORE UPDATE ON plan_result_bindings BEGIN SELECT RAISE(ABORT,'plan result binding is append-only'); END`,
+	`CREATE TRIGGER plan_result_bindings_immutable_delete BEFORE DELETE ON plan_result_bindings BEGIN SELECT RAISE(ABORT,'plan result binding is append-only'); END`,
+	`CREATE TRIGGER verification_result_bindings_immutable_update BEFORE UPDATE ON verification_result_bindings BEGIN SELECT RAISE(ABORT,'verification result binding is append-only'); END`,
+	`CREATE TRIGGER verification_result_bindings_immutable_delete BEFORE DELETE ON verification_result_bindings BEGIN SELECT RAISE(ABORT,'verification result binding is append-only'); END`,
+	`CREATE TRIGGER candidate_result_bindings_immutable_update BEFORE UPDATE ON candidate_result_bindings BEGIN SELECT RAISE(ABORT,'candidate result binding is append-only'); END`,
+	`CREATE TRIGGER candidate_result_bindings_immutable_delete BEFORE DELETE ON candidate_result_bindings BEGIN SELECT RAISE(ABORT,'candidate result binding is append-only'); END`,
 }

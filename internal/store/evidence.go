@@ -173,11 +173,16 @@ func (s *Store) RecordPlan(ctx context.Context, artifact PlanArtifact) (string, 
 		if err := s.assertTicketFence(ctx, conn, artifact.Ref, artifact.ExpectedVersion, artifact.Fence); err != nil {
 			return err
 		}
+		if artifact.Document.ProviderResult != nil {
+			if err := assertNewestBoundResult(ctx, conn, artifact.Ref, domain.PhasePlanning, "planner", *artifact.Document.ProviderResult); err != nil {
+				return err
+			}
+		}
 		var existingDigest string
 		err := conn.QueryRowContext(ctx, `SELECT digest FROM plans WHERE channel=? AND project_id=? AND ticket_id=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket).Scan(&existingDigest)
 		if err == nil {
 			if existingDigest == digest {
-				return nil
+				return ensurePlanBinding(ctx, conn, artifact, digest)
 			}
 			return ErrEvidenceConflict
 		}
@@ -189,9 +194,44 @@ func (s *Store) RecordPlan(ctx context.Context, artifact PlanArtifact) (string, 
 		if err != nil {
 			return err
 		}
+		if err := ensurePlanBinding(ctx, conn, artifact, digest); err != nil {
+			return err
+		}
 		return evidenceEvent(ctx, conn, artifact.Ref, artifact.ExpectedVersion, "plan_recorded", map[string]string{"digest": digest})
 	})
 	return digest, err
+}
+
+func assertNewestBoundResult(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, phase domain.Phase, role string, key ProviderAttemptResultKey) error {
+	var id int64
+	var attempt int
+	err := conn.QueryRowContext(ctx, `SELECT r.provider_attempt_id,a.attempt FROM provider_attempts a LEFT JOIN provider_attempt_results r ON r.provider_attempt_id=a.id WHERE a.channel=? AND a.project_id=? AND a.ticket_id=? AND a.phase=? AND a.role=? AND a.finished_at IS NOT NULL ORDER BY a.attempt DESC,a.id DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, phase, role).Scan(&id, &attempt)
+	if err != nil || id != key.AttemptID || attempt != key.Attempt || key.Ref != ref || key.Phase != phase {
+		return ErrEvidenceConflict
+	}
+	return nil
+}
+
+func ensurePlanBinding(ctx context.Context, conn *sql.Conn, artifact PlanArtifact, digest string) error {
+	if artifact.Document.ProviderResult == nil {
+		return nil
+	}
+	key := *artifact.Document.ProviderResult
+	var id int64
+	var attempt int
+	var existingDigest string
+	err := conn.QueryRowContext(ctx, `SELECT plan_digest,provider_attempt_id,provider_attempt FROM plan_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND binding_ticket_version=? AND leader_epoch=? AND runner_epoch=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, artifact.ExpectedVersion, artifact.Fence.LeaderEpoch, artifact.Fence.RunnerEpoch).Scan(&existingDigest, &id, &attempt)
+	if err == nil {
+		if existingDigest == digest && id == key.AttemptID && attempt == key.Attempt {
+			return nil
+		}
+		return ErrEvidenceConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO plan_result_bindings(channel,project_id,ticket_id,plan_digest,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt) VALUES(?,?,?,?,?,?,?,?,?)`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, digest, artifact.ExpectedVersion, artifact.Fence.LeaderEpoch, artifact.Fence.RunnerEpoch, key.AttemptID, key.Attempt)
+	return err
 }
 
 func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArtifact) (VerificationRevision, error) {
@@ -237,6 +277,11 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		if err := s.assertTicketFence(ctx, conn, artifact.Ref, artifact.ExpectedVersion, artifact.Fence); err != nil {
 			return err
 		}
+		if artifact.ProviderResult != nil {
+			if err := assertNewestBoundResult(ctx, conn, artifact.Ref, domain.PhaseVerification, "reviewer", *artifact.ProviderResult); err != nil {
+				return err
+			}
+		}
 		var current uint64
 		if err := conn.QueryRowContext(ctx, `SELECT current_revision FROM verifications WHERE channel=? AND project_id=? AND ticket_id=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket).Scan(&current); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -254,8 +299,7 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 				if oldIntent == intentDigest && oldProof == proofDigest && oldCheckpoint == artifact.CheckpointID {
 					result.Revision = current
 					if artifact.ProviderResult != nil {
-						_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO verification_result_bindings(channel,project_id,ticket_id,revision,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current, artifact.ExpectedVersion, artifact.Fence.LeaderEpoch, artifact.Fence.RunnerEpoch, artifact.ProviderResult.AttemptID, artifact.ProviderResult.Attempt, artifact.Checkpoint.CommitOID, artifact.Checkpoint.ParentOID, artifact.Checkpoint.TreeOID)
-						if err != nil {
+						if err := ensureVerificationBinding(ctx, conn, artifact, current); err != nil {
 							return err
 						}
 					}
@@ -276,7 +320,7 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 			return err
 		}
 		if artifact.ProviderResult != nil {
-			if _, err := conn.ExecContext(ctx, `INSERT INTO verification_result_bindings(channel,project_id,ticket_id,revision,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, result.Revision, artifact.ExpectedVersion, artifact.Fence.LeaderEpoch, artifact.Fence.RunnerEpoch, artifact.ProviderResult.AttemptID, artifact.ProviderResult.Attempt, artifact.Checkpoint.CommitOID, artifact.Checkpoint.ParentOID, artifact.Checkpoint.TreeOID); err != nil {
+			if err := ensureVerificationBinding(ctx, conn, artifact, result.Revision); err != nil {
 				return err
 			}
 		}
@@ -294,6 +338,28 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		return evidenceEvent(ctx, conn, artifact.Ref, artifact.ExpectedVersion, "verification_recorded", map[string]any{"revision": result.Revision, "intent_digest": intentDigest, "proof_digest": proofDigest, "provider_attempt_id": artifact.ProviderResult.AttemptID, "provider_attempt": artifact.ProviderResult.Attempt, "provider_phase": artifact.ProviderResult.Phase, "checkpoint_commit": artifact.Checkpoint.CommitOID, "checkpoint_parent": artifact.Checkpoint.ParentOID, "checkpoint_tree": artifact.Checkpoint.TreeOID})
 	})
 	return result, err
+}
+
+func ensureVerificationBinding(ctx context.Context, conn *sql.Conn, artifact VerificationArtifact, revision uint64) error {
+	if artifact.ProviderResult == nil {
+		return nil
+	}
+	key := *artifact.ProviderResult
+	var id int64
+	var attempt int
+	var commit, parent, tree string
+	err := conn.QueryRowContext(ctx, `SELECT provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid FROM verification_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND revision=? AND binding_ticket_version=? AND leader_epoch=? AND runner_epoch=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, revision, artifact.ExpectedVersion, artifact.Fence.LeaderEpoch, artifact.Fence.RunnerEpoch).Scan(&id, &attempt, &commit, &parent, &tree)
+	if err == nil {
+		if id == key.AttemptID && attempt == key.Attempt && commit == artifact.Checkpoint.CommitOID && parent == artifact.Checkpoint.ParentOID && tree == artifact.Checkpoint.TreeOID {
+			return nil
+		}
+		return ErrEvidenceConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO verification_result_bindings(channel,project_id,ticket_id,revision,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, revision, artifact.ExpectedVersion, artifact.Fence.LeaderEpoch, artifact.Fence.RunnerEpoch, key.AttemptID, key.Attempt, artifact.Checkpoint.CommitOID, artifact.Checkpoint.ParentOID, artifact.Checkpoint.TreeOID)
+	return err
 }
 
 // RecordCandidate creates an immutable generation and always writes the full
@@ -383,11 +449,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			candidate := evidence.Snapshot
 			candidate.Generation = current
 			if existing == candidate {
-				_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES(?,?,?,?,?,?,?,?,?,?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, current, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.BuilderResult.AttemptID, evidence.BuilderResult.Attempt, evidence.Commit.ParentOID)
-				if err != nil {
-					return err
-				}
-				return nil
+				return ensureCandidateBinding(ctx, conn, evidence, current)
 			}
 		}
 		if evidence.Snapshot.Generation == 0 {
@@ -402,11 +464,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			if err != nil || existing != evidence.Snapshot {
 				return ErrEvidenceConflict
 			}
-			_, err = conn.ExecContext(ctx, `INSERT OR IGNORE INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES(?,?,?,?,?,?,?,?,?,?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, current, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.BuilderResult.AttemptID, evidence.BuilderResult.Attempt, evidence.Commit.ParentOID)
-			if err != nil {
-				return err
-			}
-			return nil
+			return ensureCandidateBinding(ctx, conn, evidence, current)
 		}
 		if evidence.Snapshot.Generation != current+1 {
 			return ErrEvidenceConflict
@@ -416,7 +474,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `INSERT INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES(?,?,?,?,?,?,?,?,?,?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, evidence.Snapshot.Generation, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.BuilderResult.AttemptID, evidence.BuilderResult.Attempt, evidence.Commit.ParentOID); err != nil {
+		if err := ensureCandidateBinding(ctx, conn, evidence, evidence.Snapshot.Generation); err != nil {
 			return err
 		}
 		for _, kind := range []string{"proof_result", "github_checks", "final_review", "approval"} {
@@ -432,6 +490,24 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		return evidenceEvent(ctx, conn, evidence.Ref, evidence.ExpectedVersion, "candidate_recorded", map[string]any{"generation": evidence.Snapshot.Generation, "head": evidence.Snapshot.HeadSHA, "builder_attempt_id": evidence.BuilderResult.AttemptID, "builder_attempt": evidence.BuilderResult.Attempt, "builder_evidence_digest": evidence.Snapshot.BuilderEvidenceDigest, "command_policy_digest": evidence.Snapshot.CommandPolicyDigest})
 	})
 	return receipts, err
+}
+
+func ensureCandidateBinding(ctx context.Context, conn *sql.Conn, evidence CandidateEvidence, generation uint64) error {
+	var id int64
+	var attempt int
+	var parent string
+	err := conn.QueryRowContext(ctx, `SELECT provider_attempt_id,provider_attempt,commit_parent_oid FROM candidate_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND generation=? AND binding_ticket_version=? AND leader_epoch=? AND runner_epoch=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, generation, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch).Scan(&id, &attempt, &parent)
+	if err == nil {
+		if id == evidence.BuilderResult.AttemptID && attempt == evidence.BuilderResult.Attempt && parent == evidence.Commit.ParentOID {
+			return nil
+		}
+		return ErrEvidenceConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES(?,?,?,?,?,?,?,?,?,?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, generation, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.BuilderResult.AttemptID, evidence.BuilderResult.Attempt, evidence.Commit.ParentOID)
+	return err
 }
 
 func (s *Store) StartPhaseAttempt(ctx context.Context, attempt PhaseAttempt) error {

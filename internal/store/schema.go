@@ -58,7 +58,7 @@ func (s *Store) validateSchema(ctx context.Context) error {
 			return err
 		}
 	}
-	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete"} {
+	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete", "plan_result_bindings_immutable_update", "plan_result_bindings_immutable_delete", "verification_result_bindings_immutable_update", "verification_result_bindings_immutable_delete", "candidate_result_bindings_immutable_update", "candidate_result_bindings_immutable_delete"} {
 		var count int
 		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigger).Scan(&count); err != nil || count != 1 {
 			return fmt.Errorf("required trigger %s is missing", trigger)
@@ -95,6 +95,8 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "plans", target: "tickets"},
 	{table: "verifications", target: "tickets"},
 	{table: "verification_revisions", target: "tickets"},
+	{table: "plan_result_bindings", target: "tickets"},
+	{table: "plan_result_bindings", target: "provider_attempt_results"},
 	{table: "verification_result_bindings", target: "verification_revisions"},
 	{table: "verification_result_bindings", target: "provider_attempt_results"},
 	{table: "candidate_snapshots", target: "tickets"},
@@ -157,6 +159,7 @@ var requiredSchema = map[string][]string{
 	"plans":                             {"ticket_id", "digest", "body"},
 	"verifications":                     {"ticket_id", "intent_digest", "proof_digest", "current_revision"},
 	"verification_revisions":            {"revision", "intent_bytes", "proof_bytes", "owned_files_json", "checkpoint_id"},
+	"plan_result_bindings":              {"plan_digest", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt"},
 	"verification_result_bindings":      {"revision", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt", "checkpoint_commit_oid", "checkpoint_parent_oid", "checkpoint_tree_oid"},
 	"candidate_snapshots":               {"generation", "base_sha", "head_sha", "tree_sha", "command_policy_digest", "builder_evidence_digest"},
 	"candidate_result_bindings":         {"generation", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt", "commit_parent_oid"},

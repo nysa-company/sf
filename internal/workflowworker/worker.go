@@ -50,6 +50,8 @@ type Evidence interface {
 // engine.Engine so guards and durable transition persistence are centralized.
 type StateMachine interface {
 	Signal(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
+	SignalPlan(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
+	SignalVerification(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 	SignalCandidate(context.Context, contracts.SignalRequest, domain.CandidateSnapshot) (contracts.TransitionResult, error)
 }
 
@@ -199,12 +201,41 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 func (w Worker) planning(ctx context.Context, ticket store.Ticket, fence domain.Fence) (bool, bool, error) {
 	plan, err := w.Evidence.Plan(ctx, ticket.Ref)
 	if err == nil {
+		if plan.TicketVersion != ticket.Version || plan.Fence != fence {
+			// A durable plan can survive a lost SignalPlan response, but its
+			// old fence is not transition authority.  Rebind only the exact
+			// newest recovered Planner result already named by that plan; never
+			// substitute a newer result into an older plan document.
+			if plan.Document.Planner == nil || plan.Document.ProviderResult == nil {
+				return false, false, ErrStaleEvidence
+			}
+			reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: ticket.Version, Fence: fence})
+			if reuseErr != nil || !reusable.Recovered || reusable.Key != *plan.Document.ProviderResult {
+				return false, false, ErrStaleEvidence
+			}
+			if _, parseErr := canonicalPlanner(reusable.Parsed); parseErr != nil {
+				return false, true, parseErr
+			}
+			// storedPlanIdentity canonically compares the immutable document to
+			// its exact historical provider result before RecordPlan appends the
+			// current-fence binding.
+			if _, identityErr := w.storedPlanIdentity(ctx, ticket, plan, fence); identityErr != nil {
+				return false, true, identityErr
+			}
+			if _, recordErr := w.Evidence.RecordPlan(ctx, store.PlanArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Document: plan.Document}); recordErr != nil {
+				return false, true, recordErr
+			}
+			plan, err = w.Evidence.Plan(ctx, ticket.Ref)
+			if err != nil || plan.TicketVersion != ticket.Version || plan.Fence != fence {
+				return false, true, ErrStaleEvidence
+			}
+		}
 		if _, err := w.storedPlanIdentity(ctx, ticket, plan, fence); err != nil {
 			return false, false, err
 		}
 		// Evidence-first replay closes the response-loss gap between RecordPlan
 		// and Engine.Signal. Engine still re-checks state/version/fence.
-		if err := w.signal(ctx, ticket, fence, "phase_pass", map[string]string{"typed_plan_valid": "true"}); err != nil {
+		if err := w.signalPlan(ctx, ticket, fence); err != nil {
 			return false, true, err
 		}
 		return true, true, nil
@@ -233,7 +264,7 @@ func (w Worker) planning(ctx context.Context, ticket store.Ticket, fence domain.
 		if _, recordErr := w.Evidence.RecordPlan(ctx, store.PlanArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Document: store.PlanDocument{Planner: &planner, ProviderResult: &reusable.Key, Acceptance: planner.Acceptance, ProofKind: string(planner.Proof.Kind), Paths: planner.Paths, Commands: planner.Commands, Risks: planner.Risks}}); recordErr != nil {
 			return false, true, recordErr
 		}
-		if err := w.signal(ctx, ticket, fence, "phase_pass", map[string]string{"typed_plan_valid": "true"}); err != nil {
+		if err := w.signalPlan(ctx, ticket, fence); err != nil {
 			return false, true, err
 		}
 		return true, true, nil
@@ -279,7 +310,7 @@ func (w Worker) planning(ctx context.Context, ticket store.Ticket, fence domain.
 		return false, false, err
 	}
 	_ = identity
-	if err := w.signal(ctx, ticket, fence, "phase_pass", map[string]string{"typed_plan_valid": "true"}); err != nil {
+	if err := w.signalPlan(ctx, ticket, fence); err != nil {
 		return false, false, err
 	}
 	return true, false, nil
@@ -320,7 +351,7 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 		if _, err := w.storedVerificationIdentity(ctx, ticket, planIdentity, verification, fence); err != nil {
 			return false, false, err
 		}
-		if err := w.signal(ctx, ticket, fence, "phase_pass", map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}); err != nil {
+		if err := w.signalVerification(ctx, ticket, fence); err != nil {
 			return false, true, err
 		}
 		return true, true, nil
@@ -336,7 +367,7 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 		if err := w.persistVerification(ctx, ticket, fence, PhaseRequest{}, planIdentity, artifact, reusable.Key); err != nil {
 			return false, true, err
 		}
-		if err := w.signal(ctx, ticket, fence, "phase_pass", map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}); err != nil {
+		if err := w.signalVerification(ctx, ticket, fence); err != nil {
 			return false, true, err
 		}
 		return true, true, nil
@@ -381,7 +412,7 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 	if err := w.persistVerification(ctx, ticket, fence, request, planIdentity, artifact, out.ProviderResult); err != nil {
 		return false, false, err
 	}
-	if err := w.signal(ctx, ticket, fence, "phase_pass", map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}); err != nil {
+	if err := w.signalVerification(ctx, ticket, fence); err != nil {
 		return false, false, err
 	}
 	return true, false, nil
@@ -530,6 +561,20 @@ func (w Worker) request(ctx context.Context, ticket store.Ticket, fence domain.F
 
 func (w Worker) signal(ctx context.Context, ticket store.Ticket, fence domain.Fence, trigger string, attributes map[string]string) error {
 	return w.signalPayload(ctx, ticket, fence, trigger, attributes, "{}")
+}
+func (w Worker) signalPlan(ctx context.Context, ticket store.Ticket, fence domain.Fence) error {
+	if fence.RunnerEpoch != ticket.RunnerEpoch {
+		return store.ErrStaleFence
+	}
+	_, err := w.Engine.SignalPlan(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: "phase_pass", Fence: fence, Attributes: map[string]string{"typed_plan_valid": "true"}, EventPayload: "{}"})
+	return err
+}
+func (w Worker) signalVerification(ctx context.Context, ticket store.Ticket, fence domain.Fence) error {
+	if fence.RunnerEpoch != ticket.RunnerEpoch {
+		return store.ErrStaleFence
+	}
+	_, err := w.Engine.SignalVerification(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: "phase_pass", Fence: fence, Attributes: map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}, EventPayload: "{}"})
+	return err
 }
 func (w Worker) signalPayload(ctx context.Context, ticket store.Ticket, fence domain.Fence, trigger string, attributes map[string]string, payload string) error {
 	if fence.RunnerEpoch != ticket.RunnerEpoch {
@@ -700,10 +745,10 @@ func (w Worker) persistCandidate(ctx context.Context, ticket store.Ticket, fence
 	return err
 }
 
-// Builder results are intentionally not reusable under the existing Store
-// authority.  Without a persisted exact Builder result key, a restart cannot
-// re-authenticate candidate evidence, so replay fails closed instead of
-// running the Builder again or accepting an ambiguous candidate.
+// A candidate replay is authorized only by its persisted exact Builder result
+// key. The worker re-authenticates that key and the materialized Git witness;
+// an absent, stale, or mismatched key fails closed rather than launching
+// Builder again or accepting an ambiguous candidate.
 func (w Worker) authenticateStoredCandidate(ctx context.Context, ticket store.Ticket, fence domain.Fence, plan workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, candidate store.StoredCandidate) error {
 	result, parsed, err := w.Evidence.LoadHistoricalProviderAttemptResult(ctx, candidate.BuilderResult)
 	if err != nil || result.Claim.Ref != ticket.Ref || result.Claim.Phase != domain.PhaseBuild || result.Claim.Role != "builder" || result.Claim.ID != candidate.BuilderResult.AttemptID || result.Claim.Attempt != candidate.BuilderResult.Attempt || parsed.Builder == nil {

@@ -987,11 +987,31 @@ func TestStaleRunnerCannotTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = database.Transition(ctx, Transition{Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: "{}"})
-	if !errors.Is(err, ErrStaleFence) {
+	if !errors.Is(err, ErrEvidenceConflict) {
 		t.Fatalf("stale runner transition=%v", err)
 	}
 	if invalidated.RunnerEpoch == started.RunnerEpoch {
 		t.Fatal("runner epoch did not advance")
+	}
+}
+
+func TestGenericPhasePassAndWrongDedicatedTargetsAreRejected(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-phase-authority"}
+	fence := domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1}
+	for _, tc := range []struct{ from, to domain.State }{{domain.StatePlanning, domain.StateVerifying}, {domain.StateVerifying, domain.StateBuilding}, {domain.StateBuilding, domain.StatePublishing}} {
+		if _, err := database.Transition(ctx, Transition{Ref: ref, ExpectedVersion: 1, From: tc.from, To: tc.to, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("generic %s->%s err=%v", tc.from, tc.to, err)
+		}
+	}
+	if _, err := database.TransitionPlan(ctx, Transition{Ref: ref, ExpectedVersion: 1, From: domain.StatePlanning, To: domain.StateBuilding, Trigger: "phase_pass", Fence: fence}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("plan wrong target=%v", err)
+	}
+	if _, err := database.TransitionVerification(ctx, Transition{Ref: ref, ExpectedVersion: 1, From: domain.StateVerifying, To: domain.StatePublishing, Trigger: "phase_pass", Fence: fence}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("verification wrong target=%v", err)
+	}
+	if _, err := database.TransitionCandidate(ctx, Transition{Ref: ref, ExpectedVersion: 1, From: domain.StateBuilding, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence}, domain.CandidateSnapshot{}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("candidate wrong target=%v", err)
 	}
 }
 
@@ -1034,7 +1054,7 @@ func TestLatePhaseCompletionIsFencedByTicketVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	advanced, err := database.Transition(ctx, Transition{Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: "{}"})
+	advanced, err := database.InvalidateRunner(ctx, ref, started.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1267,7 +1287,7 @@ func TestStaleEffectObservationRetainsOriginalTicketIdentity(t *testing.T) {
 	if err != nil || !claim.Claimed {
 		t.Fatalf("claim=%+v err=%v", claim, err)
 	}
-	if _, err := database.Transition(ctx, Transition{Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: base.Fence, EventPayload: "{}"}); err != nil {
+	if _, err := database.InvalidateRunner(ctx, ref, started.Version, base.Fence); err != nil {
 		t.Fatal(err)
 	}
 	newLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-b")

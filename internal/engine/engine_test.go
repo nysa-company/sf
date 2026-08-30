@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -40,6 +41,11 @@ func TestTransitionUsesNormativeStateMachineAndFencedStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := New(database, spec)
+	for _, tc := range []struct{ from, to domain.State }{{domain.StatePlanning, domain.StateVerifying}, {domain.StateVerifying, domain.StateBuilding}, {domain.StateBuilding, domain.StatePublishing}} {
+		if _, err := runtime.Transition(ctx, contracts.TransitionRequest{Ticket: ref, TicketVersion: 1, From: tc.from, Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1}, Attributes: map[string]string{"forged": "true"}}); !errors.Is(err, store.ErrEvidenceConflict) {
+			t.Fatalf("generic %s->%s bypass=%v", tc.from, tc.to, err)
+		}
+	}
 	var workflow contracts.WorkflowEngine = runtime
 	if err := workflow.Start(ctx, contracts.StartRequest{Ticket: ref, TicketVersion: 1, WorkflowID: "dev/nysa/SF-engine/planning", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1}}); err != nil {
 		t.Fatal(err)
@@ -48,34 +54,13 @@ func TestTransitionUsesNormativeStateMachineAndFencedStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := workflow.Transition(ctx, contracts.TransitionRequest{
+	_, err = workflow.Transition(ctx, contracts.TransitionRequest{
 		Ticket: ref, TicketVersion: started.Version, From: domain.StatePlanning,
 		Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch},
 		Attributes: map[string]string{"typed_plan_valid": "true"},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.To != domain.StateVerifying || result.TicketVersion != started.Version+1 || result.EventID == "" {
-		t.Fatalf("unexpected transition result: %+v", result)
-	}
-	signal, err := workflow.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: result.TicketVersion, From: domain.StateVerifying, Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Attributes: map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if signal.EventID == "" || signal.To != domain.StateBuilding {
-		t.Fatalf("signal receipt=%+v", signal)
-	}
-	built, err := database.Ticket(ctx, ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	published, err := workflow.Transition(ctx, contracts.TransitionRequest{Ticket: ref, TicketVersion: built.Version, From: domain.StateBuilding, Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: built.RunnerEpoch}, Attributes: map[string]string{"proof_green": "true", "diff_valid": "true", "git_control_plane_valid": "true", "candidate_checkpoint_committed": "true"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(published.Invalidated) != 4 || published.Invalidated[0] != "proof_result" {
-		t.Fatalf("normative invalidations=%v", published.Invalidated)
+	if !errors.Is(err, store.ErrEvidenceConflict) {
+		t.Fatalf("generic phase pass bypass=%v", err)
 	}
 	if err := workflow.Recover(ctx, contracts.RecoveryRequest{Channel: domain.ChannelDev, LeaderEpoch: leader}); err != nil {
 		t.Fatal(err)

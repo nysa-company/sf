@@ -171,8 +171,17 @@ func (s *Store) Plan(ctx context.Context, ref domain.TicketRef) (StoredPlan, err
 	var body string
 	var artifact []byte
 	var created string
-	err := s.db.QueryRowContext(ctx, `SELECT digest,body,artifact_bytes,ticket_version,leader_epoch,runner_epoch,created_at
-		FROM plans WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(
+	err := s.db.QueryRowContext(ctx, `SELECT p.digest,p.body,p.artifact_bytes,
+		COALESCE(b.binding_ticket_version,p.ticket_version),
+		COALESCE(b.leader_epoch,p.leader_epoch),
+		COALESCE(b.runner_epoch,p.runner_epoch),p.created_at
+		FROM plans p
+		LEFT JOIN plan_result_bindings b ON b.rowid=(
+			SELECT latest.rowid FROM plan_result_bindings latest
+			WHERE latest.channel=p.channel AND latest.project_id=p.project_id AND latest.ticket_id=p.ticket_id AND latest.plan_digest=p.digest
+			ORDER BY latest.binding_ticket_version DESC,latest.leader_epoch DESC,latest.runner_epoch DESC LIMIT 1
+		)
+		WHERE p.channel=? AND p.project_id=? AND p.ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(
 		&result.Digest, &body, &artifact, &result.TicketVersion, &result.Fence.LeaderEpoch, &result.Fence.RunnerEpoch, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -238,7 +247,7 @@ func (s *Store) CurrentVerification(ctx context.Context, ref domain.TicketRef) (
 	if result.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil || result.TicketVersion == 0 || result.Fence.LeaderEpoch == 0 || result.Fence.RunnerEpoch == 0 {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid FROM verification_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND revision=? ORDER BY binding_ticket_version DESC,leader_epoch DESC,runner_epoch DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, result.Revision.Revision).Scan(&result.TicketVersion, &result.Fence.LeaderEpoch, &result.Fence.RunnerEpoch, &result.ProviderResult.AttemptID, &result.ProviderResult.Attempt, &result.Checkpoint.CommitOID, &result.Checkpoint.ParentOID, &result.Checkpoint.TreeOID); err == nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT b.binding_ticket_version,b.leader_epoch,b.runner_epoch,b.provider_attempt_id,b.provider_attempt,b.checkpoint_commit_oid,b.checkpoint_parent_oid,b.checkpoint_tree_oid FROM verification_result_bindings b JOIN provider_attempt_results pr ON pr.provider_attempt_id=b.provider_attempt_id JOIN provider_attempts a ON a.id=pr.provider_attempt_id AND a.attempt=b.provider_attempt AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id AND a.phase='verification' AND a.role='reviewer' AND a.state='completed' AND a.outcome='completed' WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.revision=? ORDER BY b.binding_ticket_version DESC,b.leader_epoch DESC,b.runner_epoch DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, result.Revision.Revision).Scan(&result.TicketVersion, &result.Fence.LeaderEpoch, &result.Fence.RunnerEpoch, &result.ProviderResult.AttemptID, &result.ProviderResult.Attempt, &result.Checkpoint.CommitOID, &result.Checkpoint.ParentOID, &result.Checkpoint.TreeOID); err == nil {
 		result.ProviderResult.Ref, result.ProviderResult.Phase = ref, domain.PhaseVerification
 		if result.Checkpoint.CommitOID != result.Revision.CheckpointID || !validOID(result.Checkpoint.ParentOID) || !validOID(result.Checkpoint.TreeOID) {
 			return StoredVerification{}, ErrEvidenceConflict
@@ -276,7 +285,7 @@ func (s *Store) LatestCandidate(ctx context.Context, ref domain.TicketRef) (Stor
 	if result.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil {
 		return StoredCandidate{}, ErrEvidenceConflict
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid FROM candidate_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND generation=? ORDER BY binding_ticket_version DESC,leader_epoch DESC,runner_epoch DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, result.Snapshot.Generation).Scan(&result.TicketVersion, &result.Fence.LeaderEpoch, &result.Fence.RunnerEpoch, &result.BuilderResult.AttemptID, &result.BuilderResult.Attempt, &result.Commit.ParentOID); err == nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT b.binding_ticket_version,b.leader_epoch,b.runner_epoch,b.provider_attempt_id,b.provider_attempt,b.commit_parent_oid FROM candidate_result_bindings b JOIN provider_attempt_results pr ON pr.provider_attempt_id=b.provider_attempt_id JOIN provider_attempts a ON a.id=pr.provider_attempt_id AND a.attempt=b.provider_attempt AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id AND a.phase='build' AND a.role='builder' AND a.state='completed' AND a.outcome='completed' WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.generation=? ORDER BY b.binding_ticket_version DESC,b.leader_epoch DESC,b.runner_epoch DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, result.Snapshot.Generation).Scan(&result.TicketVersion, &result.Fence.LeaderEpoch, &result.Fence.RunnerEpoch, &result.BuilderResult.AttemptID, &result.BuilderResult.Attempt, &result.Commit.ParentOID); err == nil {
 		result.BuilderResult.Ref, result.BuilderResult.Phase = ref, domain.PhaseBuild
 		result.Commit.CommitOID, result.Commit.TreeOID = result.Snapshot.HeadSHA, result.Snapshot.TreeSHA
 	}

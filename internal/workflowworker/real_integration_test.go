@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -158,6 +159,162 @@ func TestWorkerRealStoreEnginePlanningVerifyingBuildingPublishing(t *testing.T) 
 	}
 }
 
+func TestWorkerPlanningRecoveryRebindsOnlyExactRecoveredPlanResult(t *testing.T) {
+	t.Run("rebinds an exact plan after RecordPlan before SignalPlan", func(t *testing.T) {
+		fixture := newRealPlanningRecoveryFixture(t)
+		defer fixture.db.Close()
+
+		if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil {
+			t.Fatal("expected injected SignalPlan response loss")
+		} else if !strings.Contains(err.Error(), "injected crash after plan evidence") {
+			t.Fatalf("first run failed before durable plan: %v", err)
+		}
+		oldPlan, err := fixture.db.Plan(fixture.ctx, fixture.ref)
+		if err != nil || oldPlan.Document.ProviderResult == nil || fixture.runner.calls[domain.PhasePlanning] != 1 {
+			t.Fatalf("old plan=%+v calls=%d err=%v", oldPlan, fixture.runner.calls[domain.PhasePlanning], err)
+		}
+		fixture.recover(t)
+
+		result, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence)
+		if err != nil || !result.Transitioned || !result.Replayed || result.State != domain.StateVerifying {
+			t.Fatalf("recovery result=%+v err=%v", result, err)
+		}
+		plan, err := fixture.db.Plan(fixture.ctx, fixture.ref)
+		if err != nil || plan.TicketVersion != result.Version-1 || plan.Fence != fixture.fence || plan.Document.ProviderResult == nil || *plan.Document.ProviderResult != *oldPlan.Document.ProviderResult {
+			t.Fatalf("rebound plan=%+v old=%+v err=%v", plan, oldPlan, err)
+		}
+		if fixture.runner.calls[domain.PhasePlanning] != 1 {
+			t.Fatalf("Planner reran after recovery: calls=%d", fixture.runner.calls[domain.PhasePlanning])
+		}
+	})
+
+	t.Run("rejects a newer recovered planner result that does not match the stored plan", func(t *testing.T) {
+		fixture := newRealPlanningRecoveryFixture(t)
+		defer fixture.db.Close()
+
+		if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil {
+			t.Fatal("expected injected SignalPlan response loss")
+		} else if !strings.Contains(err.Error(), "injected crash after plan evidence") {
+			t.Fatalf("first run failed before durable plan: %v", err)
+		}
+		oldPlan, err := fixture.db.Plan(fixture.ctx, fixture.ref)
+		if err != nil || oldPlan.Document.ProviderResult == nil {
+			t.Fatalf("old plan=%+v err=%v", oldPlan, err)
+		}
+		before, err := fixture.db.Ticket(fixture.ctx, fixture.ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request, err := fixture.worker.request(fixture.ctx, before, fixture.fence, domain.PhasePlanning, nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		newer, err := fixture.runner.Run(fixture.ctx, request)
+		if err != nil || newer.ProviderResult == *oldPlan.Document.ProviderResult {
+			t.Fatalf("newer planner result=%+v old=%+v err=%v", newer, *oldPlan.Document.ProviderResult, err)
+		}
+		fixture.recover(t)
+		current, err := fixture.db.Ticket(fixture.ctx, fixture.ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); !errors.Is(err, ErrStaleEvidence) {
+			t.Fatalf("mismatched recovered plan error=%v", err)
+		}
+		after, err := fixture.db.Ticket(fixture.ctx, fixture.ref)
+		if err != nil || after.State != domain.StatePlanning || after.Version != current.Version {
+			t.Fatalf("mismatched replay advanced ticket before=%+v after=%+v err=%v", current, after, err)
+		}
+		if fixture.runner.calls[domain.PhasePlanning] != 2 {
+			t.Fatalf("Planner reran after mismatched recovery: calls=%d", fixture.runner.calls[domain.PhasePlanning])
+		}
+	})
+}
+
+type realPlanningRecoveryFixture struct {
+	ctx     context.Context
+	db      *store.Store
+	ref     domain.TicketRef
+	fence   domain.Fence
+	worker  Worker
+	runner  *realRunner
+	machine *engine.Engine
+}
+
+func newRealPlanningRecoveryFixture(t *testing.T) *realPlanningRecoveryFixture {
+	t.Helper()
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "planning-recovery.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const projectPath = "/tmp/workflow-worker-plan-recovery"
+	config := []byte(`{"providers":"real-test"}`)
+	configDigest := realDigest(string(config))
+	if err := db.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "plan-recovery", Path: projectPath, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: configDigest, ConfigSnapshot: config}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "plan-recovery", Ticket: "SF-plan-recovery"}
+	if err := db.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: realDigest("plan recovery source"), Source: []byte("plan recovery source"), Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "plan-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := db.StartOrAdopt(ctx, ref, 1, "dev/plan-recovery/SF-plan-recovery", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}
+	if err := db.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: fence, Path: projectPath + "/SF-plan-recovery", Branch: "dev/plan-recovery/SF-plan-recovery", IdentityJSON: []byte(`{"repository":"/tmp/workflow-worker-plan-recovery"}`), BaseSHA: realOID("a"), HeadSHA: realOID("b")}); err != nil {
+		t.Fatal(err)
+	}
+	planner := realQualification(t, db, "44444444444444444444444444444444", "planner")
+	builder := realQualification(t, db, "55555555555555555555555555555555", "builder")
+	reviewer := realQualification(t, db, "66666666666666666666666666666666", "reviewer")
+	if _, _, err := db.SelectProviderSet(ctx, domain.ChannelDev, planner.ID, builder.ID, reviewer.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := statemachine.LoadEmbeddedApproved()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := contracts.NewDrainSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &realRunner{db: db, repository: projectPath, configDigest: configDigest, bindings: map[domain.Phase]contracts.RuntimeBinding{domain.PhasePlanning: realBinding(planner), domain.PhaseVerification: realBinding(reviewer), domain.PhaseBuild: realBinding(builder)}, signer: signer}
+	machine := engine.New(db, spec)
+	runtime := &realFaultEngine{StateMachine: machine, failPlanSignal: true}
+	checkpoint := &realCheckpoint{}
+	candidate := &realCandidate{}
+	return &realPlanningRecoveryFixture{ctx: ctx, db: db, ref: ref, fence: fence, worker: Worker{Evidence: db, Engine: runtime, Runner: runner, Checkpoint: checkpoint, Candidate: candidate, CheckpointMaterializer: checkpoint, CandidateMaterializer: candidate}, runner: runner, machine: machine}
+}
+
+func (f *realPlanningRecoveryFixture) recover(t *testing.T) {
+	t.Helper()
+	leader, err := f.db.AcquireLeader(f.ctx, domain.ChannelDev, "plan-recovery-restarted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ReconcileEffects(f.ctx, domain.ChannelDev, leader); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.FenceRecoveredRunners(f.ctx, domain.ChannelDev, leader); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.machine.RecoverChannel(f.ctx, domain.ChannelDev, leader); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+}
+
 type realFaultEvidence struct {
 	Evidence
 	failVerification, failCandidate bool
@@ -180,7 +337,7 @@ func (e *realFaultEvidence) RecordCandidate(ctx context.Context, value store.Can
 
 type realFaultEngine struct {
 	StateMachine
-	failVerificationSignal, failCandidateSignal bool
+	failPlanSignal, failVerificationSignal, failCandidateSignal bool
 }
 
 func (e *realFaultEngine) Signal(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
@@ -189,6 +346,20 @@ func (e *realFaultEngine) Signal(ctx context.Context, request contracts.SignalRe
 		return contracts.TransitionResult{}, fmt.Errorf("injected crash after verification evidence")
 	}
 	return e.StateMachine.Signal(ctx, request)
+}
+func (e *realFaultEngine) SignalPlan(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if e.failPlanSignal {
+		e.failPlanSignal = false
+		return contracts.TransitionResult{}, fmt.Errorf("injected crash after plan evidence")
+	}
+	return e.StateMachine.SignalPlan(ctx, request)
+}
+func (e *realFaultEngine) SignalVerification(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if e.failVerificationSignal {
+		e.failVerificationSignal = false
+		return contracts.TransitionResult{}, fmt.Errorf("injected crash after verification evidence")
+	}
+	return e.StateMachine.SignalVerification(ctx, request)
 }
 func (e *realFaultEngine) SignalCandidate(ctx context.Context, request contracts.SignalRequest, candidate domain.CandidateSnapshot) (contracts.TransitionResult, error) {
 	if e.failCandidateSignal {
@@ -200,6 +371,7 @@ func (e *realFaultEngine) SignalCandidate(ctx context.Context, request contracts
 
 type realRunner struct {
 	db           *store.Store
+	repository   string
 	configDigest string
 	bindings     map[domain.Phase]contracts.RuntimeBinding
 	signer       *contracts.DrainSigner
@@ -215,7 +387,11 @@ func (r *realRunner) Run(ctx context.Context, req PhaseRequest) (PhaseResult, er
 	r.calls[req.Phase]++
 	role := map[domain.Phase]string{domain.PhasePlanning: "planner", domain.PhaseVerification: "reviewer", domain.PhaseBuild: "builder"}[req.Phase]
 	binding := r.bindings[req.Phase]
-	claim, err := r.db.BeginProviderAttempt(ctx, store.ProviderAttemptRequest{Ref: req.Ticket.Ref, ExpectedVersion: req.Ticket.Version, Fence: req.Fence, Phase: req.Phase, Role: role, Binding: binding, ConfigDigest: r.configDigest, Capacity: 1, At: time.Now().UTC(), Repository: "/tmp/workflow-worker-real", Worktree: req.Worktree.Path, WorktreeIdentity: string(req.Worktree.IdentityJSON), BaseSHA: req.Worktree.BaseSHA, SupervisorKey: r.signer.PublicKey(), Input: contracts.PhaseInput{Ticket: req.Ticket.Ref, Phase: req.Phase, LeaderEpoch: req.Fence.LeaderEpoch, RunnerEpoch: req.Fence.RunnerEpoch, ExpectedVersion: req.Ticket.Version, Prompt: "real integration", Repository: "/tmp/workflow-worker-real", Worktree: req.Worktree.Path, WorktreeIdentity: string(req.Worktree.IdentityJSON), BaseSHA: req.Worktree.BaseSHA, AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}})
+	repository := r.repository
+	if repository == "" {
+		repository = "/tmp/workflow-worker-real"
+	}
+	claim, err := r.db.BeginProviderAttempt(ctx, store.ProviderAttemptRequest{Ref: req.Ticket.Ref, ExpectedVersion: req.Ticket.Version, Fence: req.Fence, Phase: req.Phase, Role: role, Binding: binding, ConfigDigest: r.configDigest, Capacity: 1, At: time.Now().UTC(), Repository: repository, Worktree: req.Worktree.Path, WorktreeIdentity: string(req.Worktree.IdentityJSON), BaseSHA: req.Worktree.BaseSHA, SupervisorKey: r.signer.PublicKey(), Input: contracts.PhaseInput{Ticket: req.Ticket.Ref, Phase: req.Phase, LeaderEpoch: req.Fence.LeaderEpoch, RunnerEpoch: req.Fence.RunnerEpoch, ExpectedVersion: req.Ticket.Version, Prompt: "real integration", Repository: repository, Worktree: req.Worktree.Path, WorktreeIdentity: string(req.Worktree.IdentityJSON), BaseSHA: req.Worktree.BaseSHA, AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}})
 	if err != nil {
 		return PhaseResult{}, fmt.Errorf("begin %s v%d fence=%+v: %w", req.Phase, req.Ticket.Version, req.Fence, err)
 	}

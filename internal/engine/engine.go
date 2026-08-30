@@ -53,6 +53,13 @@ func (e *Engine) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expecte
 }
 
 func (e *Engine) Transition(ctx context.Context, request contracts.TransitionRequest) (contracts.TransitionResult, error) {
+	if request.Trigger == "phase_pass" && (request.From == domain.StatePlanning || request.From == domain.StateVerifying || request.From == domain.StateBuilding) {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, request, e.store.Transition)
+}
+
+func (e *Engine) transition(ctx context.Context, request contracts.TransitionRequest, persist func(context.Context, store.Transition) (store.TransitionResult, error)) (contracts.TransitionResult, error) {
 	guards := make(map[string]bool, len(request.Attributes))
 	for key, value := range request.Attributes {
 		if value == "true" {
@@ -95,7 +102,7 @@ func (e *Engine) Transition(ctx context.Context, request contracts.TransitionReq
 	} else if strings.HasPrefix(transition.PhaseDisposition, "invalidate_runner_epoch") {
 		result, err = e.store.TransitionAndInvalidateRunner(ctx, persisted)
 	} else {
-		result, err = e.store.Transition(ctx, persisted)
+		result, err = persist(ctx, persisted)
 	}
 	if err != nil {
 		return contracts.TransitionResult{}, err
@@ -128,13 +135,34 @@ func (e *Engine) Signal(ctx context.Context, request contracts.SignalRequest) (c
 	})
 }
 
+// SignalPlan is the only planning phase-pass entry point. Store consumes the
+// current planner binding atomically with the state transition.
+func (e *Engine) SignalPlan(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if request.From != domain.StatePlanning || request.Trigger != "phase_pass" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: request.Trigger, Fence: request.Fence, Attributes: map[string]string{"typed_plan_valid": "true"}, EventPayload: request.EventPayload}, e.store.TransitionPlan)
+}
+
+// SignalVerification is the only verification phase-pass entry point.
+func (e *Engine) SignalVerification(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if request.From != domain.StateVerifying || request.Trigger != "phase_pass" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: request.Trigger, Fence: request.Fence, Attributes: map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}, EventPayload: request.EventPayload}, e.store.TransitionVerification)
+}
+
 // SignalCandidate consumes the exact candidate in the same SQLite write as
 // the state transition.  It is intentionally separate from Signal so no
 // caller can accidentally turn a candidate-bound build pass into a generic
 // transition after a stale read.
 func (e *Engine) SignalCandidate(ctx context.Context, request contracts.SignalRequest, candidate domain.CandidateSnapshot) (contracts.TransitionResult, error) {
-	guards := make(map[string]bool, len(request.Attributes))
-	for key, value := range request.Attributes {
+	if request.From != domain.StateBuilding || request.Trigger != "phase_pass" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	attributes := map[string]string{"proof_green": "true", "diff_valid": "true", "git_control_plane_valid": "true", "candidate_checkpoint_committed": "true"}
+	guards := make(map[string]bool, len(attributes))
+	for key, value := range attributes {
 		guards[key] = value == "true"
 	}
 	transition, err := e.spec.Select(string(request.From), request.Trigger, guards)
