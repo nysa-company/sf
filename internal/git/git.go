@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -113,7 +114,7 @@ func validateAllocatedBranch(channel domain.Channel, branch string) (string, err
 }
 
 func validRef(ref string) bool {
-	if ref == "" || len(ref) > 1024 || ref == "@" || strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") ||
+	if ref == "" || len(ref) > 1024 || ref == "@" || strings.HasPrefix(ref, "-") || strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") ||
 		strings.HasSuffix(ref, ".") || strings.Contains(ref, "..") || strings.Contains(ref, "@{") || strings.Contains(ref, "//") ||
 		strings.ContainsAny(ref, " ~^:?*[\\\x00\r\n\t") {
 		return false
@@ -239,6 +240,10 @@ func validateCommandConfig(data []byte) error {
 }
 
 func (r Runner) command(ctx context.Context, directory string, args ...string) ([]byte, error) {
+	return r.commandExpected(ctx, directory, 0, 0, args...)
+}
+
+func (r Runner) commandExpected(ctx context.Context, directory string, expectedDev, expectedIno uint64, args ...string) ([]byte, error) {
 	if directory == "" {
 		return nil, fmt.Errorf("git directory is required")
 	}
@@ -256,6 +261,9 @@ func (r Runner) command(ctx context.Context, directory string, args ...string) (
 		return nil, err
 	}
 	defer pinned.Close()
+	if expectedDev != 0 && (pinned.dev() != expectedDev || pinned.ino() != expectedIno) {
+		return nil, fmt.Errorf("%w: command directory identity changed", ErrIdentityMismatch)
+	}
 	gitDirectory := directory
 	if r.Run == nil {
 		gitDirectory = "."
@@ -272,7 +280,7 @@ func (r Runner) command(ctx context.Context, directory string, args ...string) (
 		}
 		return output, err
 	}
-	output, err := runBounded(ctx, r.binary(), argv, env, directory, pinned.file)
+	output, err := runBounded(ctx, r.binary(), argv, env, directory)
 	if verifyErr := pinned.verify(); verifyErr != nil {
 		return output, verifyErr
 	}
@@ -283,6 +291,10 @@ func (r Runner) command(ctx context.Context, directory string, args ...string) (
 }
 
 func (r Runner) commandEnv(ctx context.Context, directory string, extra []string, args ...string) ([]byte, error) {
+	return r.commandEnvExpected(ctx, directory, 0, 0, extra, args...)
+}
+
+func (r Runner) commandEnvExpected(ctx context.Context, directory string, expectedDev, expectedIno uint64, extra []string, args ...string) ([]byte, error) {
 	if directory == "" {
 		return nil, fmt.Errorf("git directory is required")
 	}
@@ -297,6 +309,9 @@ func (r Runner) commandEnv(ctx context.Context, directory string, extra []string
 		return nil, err
 	}
 	defer pinned.Close()
+	if expectedDev != 0 && (pinned.dev() != expectedDev || pinned.ino() != expectedIno) {
+		return nil, fmt.Errorf("%w: command directory identity changed", ErrIdentityMismatch)
+	}
 	gitDirectory := directory
 	if r.Run == nil {
 		gitDirectory = "."
@@ -313,7 +328,7 @@ func (r Runner) commandEnv(ctx context.Context, directory string, extra []string
 		}
 		return output, err
 	}
-	output, err := runBounded(ctx, r.binary(), argv, env, directory, pinned.file)
+	output, err := runBounded(ctx, r.binary(), argv, env, directory)
 	if verifyErr := pinned.verify(); verifyErr != nil {
 		return output, verifyErr
 	}
@@ -463,12 +478,51 @@ func samePathIdentity(a, b os.FileInfo) bool {
 
 func (p *pinnedDirectory) Close() error { return p.file.Close() }
 
-func runBounded(ctx context.Context, binary string, argv, env []string, directory string, pinned *os.File) ([]byte, error) {
+func (p *pinnedDirectory) dev() uint64 {
+	if stat, ok := p.info.Sys().(*syscall.Stat_t); ok {
+		return uint64(stat.Dev)
+	}
+	return 0
+}
+
+func (p *pinnedDirectory) ino() uint64 {
+	if stat, ok := p.info.Sys().(*syscall.Stat_t); ok {
+		return uint64(stat.Ino)
+	}
+	return 0
+}
+
+func runBounded(ctx context.Context, binary string, argv, env []string, directory string) ([]byte, error) {
 	command := exec.CommandContext(ctx, binary, argv...)
 	command.Dir = directory
-	command.ExtraFiles = []*os.File{pinned}
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.WaitDelay = 750 * time.Millisecond
 	command.Env = env
-	buffer := &boundedBuffer{limit: maxGitOutput}
+	runDone := make(chan struct{})
+	defer close(runDone)
+	killGroup := func(signal syscall.Signal) {
+		if command.Process != nil {
+			_ = syscall.Kill(-command.Process.Pid, signal)
+		}
+	}
+	command.Cancel = func() error {
+		killGroup(syscall.SIGTERM)
+		go func() {
+			timer := time.NewTimer(200 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				select {
+				case <-runDone:
+				default:
+					killGroup(syscall.SIGKILL)
+				}
+			case <-runDone:
+			}
+		}()
+		return nil
+	}
+	buffer := &boundedBuffer{limit: maxGitOutput, stop: func() { killGroup(syscall.SIGKILL) }}
 	command.Stdout, command.Stderr = buffer, buffer
 	err := command.Run()
 	if buffer.exceeded {
@@ -481,6 +535,8 @@ type boundedBuffer struct {
 	data     []byte
 	limit    int
 	exceeded bool
+	stop     func()
+	once     sync.Once
 }
 
 func (b *boundedBuffer) Write(value []byte) (int, error) {
@@ -490,6 +546,11 @@ func (b *boundedBuffer) Write(value []byte) (int, error) {
 			b.data = append(b.data, value[:remaining]...)
 		}
 		b.exceeded = true
+		b.once.Do(func() {
+			if b.stop != nil {
+				b.stop()
+			}
+		})
 		return len(value), nil
 	}
 	b.data = append(b.data, value...)
@@ -499,19 +560,27 @@ func (b *boundedBuffer) Write(value []byte) (int, error) {
 // Identity is recorded before untrusted work and reauthenticated before every
 // sf-owned commit, push, cleanup, or takeover boundary.
 type Identity struct {
-	Repository string
-	Worktree   string
-	GitFile    string
-	GitFileDev uint64
-	GitFileIno uint64
-	CommonDir  string
-	Origin     string
-	PushOrigin string
-	BaseRef    string
-	BaseHead   string
-	HeadRef    string
-	ConfigHash string
-	HooksHash  string
+	Repository    string
+	RepositoryDev uint64
+	RepositoryIno uint64
+	Worktree      string
+	WorktreeDev   uint64
+	WorktreeIno   uint64
+	GitFile       string
+	GitFileDev    uint64
+	GitFileIno    uint64
+	CommonDir     string
+	CommonDirDev  uint64
+	CommonDirIno  uint64
+	Origin        string
+	PushOrigin    string
+	PushOriginDev uint64
+	PushOriginIno uint64
+	BaseRef       string
+	BaseHead      string
+	HeadRef       string
+	ConfigHash    string
+	HooksHash     string
 }
 
 func canonicalExistingWorktree(path string) (string, error) {
@@ -530,6 +599,63 @@ func canonicalExistingWorktree(path string) (string, error) {
 		return "", fmt.Errorf("%w: worktree path cannot be canonicalized", ErrIdentityMismatch)
 	}
 	return canonical, nil
+}
+
+func directoryIdentity(path string) (uint64, uint64, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return 0, 0, fmt.Errorf("%w: directory must be a real directory", ErrIdentityMismatch)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, fmt.Errorf("%w: directory identity unavailable", ErrIdentityMismatch)
+	}
+	return uint64(stat.Dev), uint64(stat.Ino), nil
+}
+
+func localOriginIdentity(path string) (uint64, uint64, error) {
+	if !validAbsolutePath(path) {
+		return 0, 0, nil
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return 0, 0, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, fmt.Errorf("%w: local origin identity unavailable", ErrIdentityMismatch)
+	}
+	return uint64(stat.Dev), uint64(stat.Ino), nil
+}
+
+func verifyIdentityDirectories(identity Identity) error {
+	for _, item := range []struct {
+		path     string
+		dev, ino uint64
+	}{
+		{identity.Repository, identity.RepositoryDev, identity.RepositoryIno},
+		{identity.Worktree, identity.WorktreeDev, identity.WorktreeIno},
+		{identity.CommonDir, identity.CommonDirDev, identity.CommonDirIno},
+	} {
+		dev, ino, err := directoryIdentity(item.path)
+		if err != nil || dev != item.dev || ino != item.ino {
+			return fmt.Errorf("%w: authenticated directory identity changed", ErrIdentityMismatch)
+		}
+	}
+	if identity.PushOriginDev != 0 {
+		dev, ino, err := localOriginIdentity(identity.PushOrigin)
+		if err != nil || dev != identity.PushOriginDev || ino != identity.PushOriginIno {
+			return fmt.Errorf("%w: authenticated local origin identity changed", ErrIdentityMismatch)
+		}
+	}
+	return nil
 }
 
 func realSingleLinkFile(path string) (os.FileInfo, uint64, uint64, error) {
@@ -591,6 +717,10 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 	if err != nil {
 		return Identity{}, err
 	}
+	worktreeDev, worktreeIno, err := directoryIdentity(canonicalWorktree)
+	if err != nil {
+		return Identity{}, err
+	}
 	gitPointer := filepath.Join(canonicalWorktree, ".git")
 	gitInfo, gitDev, gitIno, err := realSingleLinkFile(gitPointer)
 	if err != nil {
@@ -625,6 +755,10 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 		return Identity{}, fmt.Errorf("%w: origin must have exactly one push URL", ErrIdentityMismatch)
 	}
 	pushOrigin, err := safeOrigin(pushLines[0])
+	if err != nil {
+		return Identity{}, err
+	}
+	pushOriginDev, pushOriginIno, err := localOriginIdentity(pushOrigin)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -672,6 +806,10 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 	if err != nil || !validAbsolutePath(common) {
 		return Identity{}, fmt.Errorf("%w: noncanonical git common directory", ErrIdentityMismatch)
 	}
+	commonDev, commonIno, err := directoryIdentity(common)
+	if err != nil {
+		return Identity{}, err
+	}
 	if err := realHooksRoot(filepath.Join(common, "hooks")); err != nil {
 		return Identity{}, err
 	}
@@ -687,6 +825,10 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 	}
 	if expectedRepository != "" && canonicalRepo != expectedRepository {
 		return Identity{}, fmt.Errorf("%w: common directory belongs to a different repository", ErrIdentityMismatch)
+	}
+	repositoryDev, repositoryIno, err := directoryIdentity(canonicalRepo)
+	if err != nil {
+		return Identity{}, err
 	}
 	// Ensure the pointer names precisely the linked worktree git directory.
 	pointerText := strings.TrimSpace(string(gitFile))
@@ -706,7 +848,7 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 	if !validOID(baseHead) || !validBranchOrHeadRef(headRef) || !validAbsolutePath(common) || !validAbsolutePath(canonicalRepo) || !validAbsolutePath(canonicalWorktree) {
 		return Identity{}, fmt.Errorf("%w: invalid git identity value", ErrIdentityMismatch)
 	}
-	return Identity{Repository: canonicalRepo, Worktree: canonicalWorktree, GitFile: string(gitFile), GitFileDev: gitDev, GitFileIno: gitIno, CommonDir: common, Origin: strings.TrimSpace(origin), PushOrigin: pushOrigin, BaseRef: baseRef, BaseHead: baseHead, HeadRef: headRef, ConfigHash: digest(config), HooksHash: hooksHash}, nil
+	return Identity{Repository: canonicalRepo, RepositoryDev: repositoryDev, RepositoryIno: repositoryIno, Worktree: canonicalWorktree, WorktreeDev: worktreeDev, WorktreeIno: worktreeIno, GitFile: string(gitFile), GitFileDev: gitDev, GitFileIno: gitIno, CommonDir: common, CommonDirDev: commonDev, CommonDirIno: commonIno, Origin: strings.TrimSpace(origin), PushOrigin: pushOrigin, PushOriginDev: pushOriginDev, PushOriginIno: pushOriginIno, BaseRef: baseRef, BaseHead: baseHead, HeadRef: headRef, ConfigHash: digest(config), HooksHash: hooksHash}, nil
 }
 
 func nonEmptyLines(data []byte) []string {
@@ -772,6 +914,30 @@ func (r Runner) rejectFeatures(ctx context.Context, worktree string) error {
 
 func (r Runner) one(ctx context.Context, directory string, args ...string) (string, error) {
 	output, err := r.command(ctx, directory, args...)
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(string(output))
+	if value == "" {
+		return "", fmt.Errorf("git %s returned empty output", strings.Join(args, " "))
+	}
+	return value, nil
+}
+
+func (r Runner) oneExpected(ctx context.Context, directory string, expectedDev, expectedIno uint64, args ...string) (string, error) {
+	output, err := r.commandExpected(ctx, directory, expectedDev, expectedIno, args...)
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(string(output))
+	if value == "" {
+		return "", fmt.Errorf("git %s returned empty output", strings.Join(args, " "))
+	}
+	return value, nil
+}
+
+func (r Runner) oneEnvExpected(ctx context.Context, directory string, expectedDev, expectedIno uint64, extra []string, args ...string) (string, error) {
+	output, err := r.commandEnvExpected(ctx, directory, expectedDev, expectedIno, extra, args...)
 	if err != nil {
 		return "", err
 	}
@@ -942,9 +1108,8 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 		return Worktree{}, err
 	}
 	repository = canonicalRepository
-	if _, err := os.Lstat(path); err == nil {
-		return Worktree{}, fmt.Errorf("%w: worktree path already exists", ErrIdentityMismatch)
-	} else if !errors.Is(err, os.ErrNotExist) {
+	repositoryDev, repositoryIno, err := directoryIdentity(repository)
+	if err != nil {
 		return Worktree{}, err
 	}
 	parent := filepath.Dir(path)
@@ -956,7 +1121,13 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	// the durable Worktree.Path is always this canonical spelling. A symlink at
 	// the worktree leaf itself was rejected above and is never followed.
 	path = filepath.Join(canonicalParent, filepath.Base(path))
-	if _, err := os.Lstat(path); err == nil {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink == 0 && info.IsDir() {
+			identity, snapErr := r.snapshotExpected(ctx, repository, path, baseRef)
+			if snapErr == nil && identity.HeadRef == branch {
+				return Worktree{Path: path, Branch: branch, Identity: identity}, nil
+			}
+		}
 		return Worktree{}, fmt.Errorf("%w: canonical worktree path already exists", ErrIdentityMismatch)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Worktree{}, err
@@ -964,7 +1135,10 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
 		return Worktree{}, err
 	}
-	if _, err := r.command(ctx, repository, "worktree", "add", "-b", branch, path, baseRef); err != nil {
+	if dev, ino, identityErr := directoryIdentity(repository); identityErr != nil || dev != repositoryDev || ino != repositoryIno {
+		return Worktree{}, fmt.Errorf("%w: primary repository changed before worktree creation", ErrIdentityMismatch)
+	}
+	if _, err := r.commandExpected(ctx, repository, repositoryDev, repositoryIno, "worktree", "add", "-b", branch, path, "--", baseRef); err != nil {
 		return Worktree{}, err
 	}
 	createdPath, err := openPinnedDirectory(path)
@@ -992,25 +1166,32 @@ func (r Runner) cleanupCreatedWorktree(ctx context.Context, repository, path, br
 	if createdPath == nil {
 		return fmt.Errorf("created worktree was not pinned")
 	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 	if err := createdPath.verify(); err != nil {
 		return err
 	}
 	if info, err := os.Lstat(path); err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.IsDir()) {
 		return fmt.Errorf("created worktree path was replaced")
 	}
-	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
+	if err := r.PreflightRepository(cleanupCtx, repository, baseRef); err != nil {
 		return fmt.Errorf("primary repository changed: %w", err)
 	}
-	if _, err := r.command(ctx, repository, "worktree", "remove", "--force", "--", path); err != nil {
+	repositoryDev, repositoryIno, err := directoryIdentity(repository)
+	if err != nil {
+		return err
+	}
+	if _, err := r.commandExpected(cleanupCtx, repository, repositoryDev, repositoryIno, "worktree", "remove", "--force", "--", path); err != nil {
 		if safeErr := safeRemoveTree(path, createdPath); safeErr != nil {
 			return fmt.Errorf("git removal left worktree quarantined: %v; pinned cleanup: %w", err, safeErr)
 		}
-		if _, pruneErr := r.command(ctx, repository, "worktree", "prune"); pruneErr != nil {
-			return pruneErr
+		_, pruneErr := r.commandExpected(cleanupCtx, repository, repositoryDev, repositoryIno, "worktree", "prune")
+		if pruneErr != nil {
+			err = errors.Join(err, pruneErr)
 		}
 	}
-	if _, err := r.command(ctx, repository, "branch", "-D", "--", branch); err != nil {
-		return err
+	if _, branchErr := r.commandExpected(cleanupCtx, repository, repositoryDev, repositoryIno, "branch", "-D", "--", branch); branchErr != nil {
+		return errors.Join(err, branchErr)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		if err == nil {
@@ -1052,6 +1233,11 @@ func safeRemoveTree(root string, pinned *pinnedDirectory) error {
 	if err := pinned.verify(); err != nil {
 		return err
 	}
+	var current unix.Stat_t
+	rootStat, ok := rootInfo.Sys().(*syscall.Stat_t)
+	if !ok || unix.Fstatat(int(parentFile.Fd()), filepath.Base(root), &current, unix.AT_SYMLINK_NOFOLLOW) != nil || current.Dev != rootStat.Dev || current.Ino != rootStat.Ino {
+		return fmt.Errorf("created worktree path was replaced before unlink")
+	}
 	return unix.Unlinkat(int(parentFile.Fd()), filepath.Base(root), unix.AT_REMOVEDIR)
 }
 
@@ -1063,16 +1249,29 @@ func removeDirectoryEntries(fd int, directory *os.File) error {
 	for _, name := range names {
 		childFD, openErr := unix.Openat(fd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 		if openErr == nil {
+			var opened unix.Stat_t
+			if err := unix.Fstat(childFD, &opened); err != nil {
+				_ = unix.Close(childFD)
+				return err
+			}
 			child := os.NewFile(uintptr(childFD), name)
 			removeErr := removeDirectoryEntries(childFD, child)
 			_ = child.Close()
 			if removeErr != nil {
 				return removeErr
 			}
+			var current unix.Stat_t
+			if err := unix.Fstatat(fd, name, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil || current.Dev != opened.Dev || current.Ino != opened.Ino {
+				return fmt.Errorf("directory entry %s was replaced", name)
+			}
 			if err := unix.Unlinkat(fd, name, unix.AT_REMOVEDIR); err != nil {
 				return err
 			}
 			continue
+		}
+		var current unix.Stat_t
+		if err := unix.Fstatat(fd, name, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return err
 		}
 		if err := unix.Unlinkat(fd, name, 0); err != nil {
 			return err
@@ -1089,6 +1288,9 @@ func (r Runner) InspectWorktree(ctx context.Context, worktree Worktree) error {
 		return err
 	}
 	if err := r.Reauthenticate(ctx, worktree.Identity); err != nil {
+		return err
+	}
+	if err := verifyIdentityDirectories(worktree.Identity); err != nil {
 		return err
 	}
 	if worktree.Identity.HeadRef != worktree.Branch {
@@ -1120,6 +1322,10 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 	if err := r.PreflightRepository(ctx, canonicalRepository, worktree.Identity.BaseRef); err != nil {
 		return err
 	}
+	repositoryDev, repositoryIno, err := directoryIdentity(canonicalRepository)
+	if err != nil || repositoryDev != worktree.Identity.RepositoryDev || repositoryIno != worktree.Identity.RepositoryIno {
+		return fmt.Errorf("%w: removal repository identity changed", ErrIdentityMismatch)
+	}
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return err
 	}
@@ -1138,10 +1344,13 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 		return err
 	}
 	defer pinnedWorktree.Close()
+	if pinnedWorktree.dev() != worktree.Identity.WorktreeDev || pinnedWorktree.ino() != worktree.Identity.WorktreeIno {
+		return fmt.Errorf("%w: removal worktree identity changed", ErrIdentityMismatch)
+	}
 	if err := pinnedWorktree.verify(); err != nil {
 		return err
 	}
-	_, err = r.command(ctx, canonicalRepository, "worktree", "remove", worktree.Path)
+	_, err = r.commandExpected(ctx, canonicalRepository, repositoryDev, repositoryIno, "worktree", "remove", "--", worktree.Path)
 	if err != nil {
 		if verifyErr := pinnedWorktree.verify(); verifyErr != nil {
 			return verifyErr
@@ -1303,11 +1512,12 @@ type CommitRequest struct {
 	EvidenceDigest, Message string
 	Timestamp               time.Time
 	BaseRef                 string
+	ExpectedParent          string
 	Policy                  DiffPolicy
 }
 
 func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitRequest) (string, error) {
-	if !validEvidenceDigest(request.EvidenceDigest) || (request.Message != "" && !boundedCommitText(request.Message, 4_000)) || request.Timestamp.IsZero() || !validRef(request.BaseRef) {
+	if !validEvidenceDigest(request.EvidenceDigest) || (request.Message != "" && !boundedCommitText(request.Message, 4_000)) || request.Timestamp.IsZero() || !validRef(request.BaseRef) || !validOID(request.ExpectedParent) {
 		return "", fmt.Errorf("candidate evidence digest and timestamp are required")
 	}
 	if request.BaseRef != worktree.Identity.BaseRef {
@@ -1316,10 +1526,27 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
-	if err := r.ValidateDiff(ctx, worktree.Path, request.BaseRef, request.Policy); err != nil {
+	if head, matched, err := r.reconcileCommit(ctx, worktree, request); err != nil {
+		return "", err
+	} else if matched {
+		postPolicy := request.Policy
+		postPolicy.ExpectedHead = head
+		if err := r.ValidateDiff(ctx, worktree.Path, request.BaseRef, postPolicy); err != nil {
+			return "", fmt.Errorf("%w: reconciled commit failed validation: %v", ErrUnsafeWorktree, err)
+		}
+		if output, statusErr := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "status", "--porcelain=v1"); statusErr != nil || strings.TrimSpace(string(output)) != "" {
+			return "", fmt.Errorf("%w: reconciled commit worktree is not clean", ErrUnsafeWorktree)
+		}
+		return head, nil
+	} else if head != request.ExpectedParent {
+		return "", fmt.Errorf("%w: candidate parent changed", ErrUnsafeWorktree)
+	}
+	prePolicy := request.Policy
+	prePolicy.ExpectedHead = request.ExpectedParent
+	if err := r.ValidateDiff(ctx, worktree.Path, request.BaseRef, prePolicy); err != nil {
 		return "", err
 	}
-	if _, err := r.command(ctx, worktree.Path, "add", "-A", "--"); err != nil {
+	if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "add", "-A", "--"); err != nil {
 		return "", err
 	}
 	// The index is mutable control-plane state. Reauthenticate and validate the
@@ -1327,7 +1554,13 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
-	if err := r.ValidateDiff(ctx, worktree.Path, request.BaseRef, request.Policy); err != nil {
+	head, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD")
+	if err != nil || head != request.ExpectedParent {
+		return "", fmt.Errorf("%w: candidate parent changed before commit", ErrUnsafeWorktree)
+	}
+	stagedPolicy := request.Policy
+	stagedPolicy.ExpectedHead = request.ExpectedParent
+	if err := r.ValidateDiff(ctx, worktree.Path, request.BaseRef, stagedPolicy); err != nil {
 		return "", err
 	}
 	// Reauthenticate immediately before the commit effect after all staging and
@@ -1335,15 +1568,29 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
+	if head, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD"); err != nil || head != request.ExpectedParent {
+		return "", fmt.Errorf("%w: candidate parent changed immediately before commit", ErrUnsafeWorktree)
+	}
 	message := "sf candidate " + request.EvidenceDigest
 	if request.Message != "" {
 		message += "\n\n" + request.Message
 	}
 	timestamp := request.Timestamp.UTC().Format(time.RFC3339)
-	if _, err := r.commandEnv(ctx, worktree.Path, []string{"GIT_AUTHOR_NAME=sf", "GIT_AUTHOR_EMAIL=sf@localhost", "GIT_COMMITTER_NAME=sf", "GIT_COMMITTER_EMAIL=sf@localhost", "GIT_AUTHOR_DATE=" + timestamp, "GIT_COMMITTER_DATE=" + timestamp}, "commit", "--no-verify", "-m", message); err != nil {
+	tree, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "write-tree")
+	if err != nil || !validOID(tree) {
+		return "", fmt.Errorf("%w: staged tree could not be persisted", ErrUnsafeWorktree)
+	}
+	newHead, err := r.oneEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, []string{"GIT_AUTHOR_NAME=sf", "GIT_AUTHOR_EMAIL=sf@localhost", "GIT_COMMITTER_NAME=sf", "GIT_COMMITTER_EMAIL=sf@localhost", "GIT_AUTHOR_DATE=" + timestamp, "GIT_COMMITTER_DATE=" + timestamp}, "commit-tree", tree, "-p", request.ExpectedParent, "-m", message)
+	if err != nil || !validOID(newHead) {
+		return "", fmt.Errorf("%w: candidate commit could not be created", ErrUnsafeWorktree)
+	}
+	// update-ref's old-value argument is the concurrency boundary: even if a
+	// second writer advances the branch after the final observation, this CAS
+	// refuses to rewrite or append to the unexpected parent.
+	if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "update-ref", "--no-deref", "refs/heads/"+worktree.Branch, newHead, request.ExpectedParent); err != nil {
 		return "", err
 	}
-	head, err := r.one(ctx, worktree.Path, "rev-parse", "HEAD")
+	head, err = r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD")
 	if err != nil {
 		return "", err
 	}
@@ -1358,10 +1605,36 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err := r.ValidateDiff(ctx, worktree.Path, request.BaseRef, postCommitPolicy); err != nil {
 		return "", fmt.Errorf("%w: post-commit candidate validation failed: %v", ErrUnsafeWorktree, err)
 	}
-	if output, err := r.command(ctx, worktree.Path, "status", "--porcelain=v1"); err != nil || strings.TrimSpace(string(output)) != "" {
+	if output, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "status", "--porcelain=v1"); err != nil || strings.TrimSpace(string(output)) != "" {
 		return "", fmt.Errorf("%w: post-commit worktree is not clean", ErrUnsafeWorktree)
 	}
 	return head, nil
+}
+
+func (r Runner) reconcileCommit(ctx context.Context, worktree Worktree, request CommitRequest) (string, bool, error) {
+	head, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD")
+	if err != nil {
+		return "", false, err
+	}
+	if head == request.ExpectedParent {
+		return head, false, nil
+	}
+	parents, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-list", "--parents", "-n", "1", "HEAD")
+	if err != nil {
+		return "", false, err
+	}
+	fields := strings.Fields(parents)
+	if len(fields) != 2 || fields[0] != head || fields[1] != request.ExpectedParent {
+		return head, false, nil
+	}
+	subject, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "log", "-1", "--format=%s", "HEAD")
+	if err != nil {
+		return "", false, err
+	}
+	if subject == "sf candidate "+request.EvidenceDigest {
+		return head, true, nil
+	}
+	return head, false, nil
 }
 
 func boundedCommitText(value string, maximum int) bool {
@@ -1391,7 +1664,7 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 	if err != nil {
 		return "", err
 	}
-	remote, err := r.remoteHead(ctx, worktree.Path, worktree.Identity.PushOrigin, worktree.Branch)
+	remote, err := r.remoteHead(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch)
 	if err != nil {
 		return "", err
 	}
@@ -1406,10 +1679,10 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 		if _, err := r.provePushHead(ctx, worktree, expectedHead); err != nil {
 			return "", err
 		}
-		if _, err := r.command(ctx, worktree.Path, "fetch", "--no-tags", worktree.Identity.PushOrigin, "refs/heads/"+worktree.Branch+":"+observationRef); err != nil {
+		if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "fetch", "--no-tags", worktree.Identity.PushOrigin, "refs/heads/"+worktree.Branch+":"+observationRef); err != nil {
 			return "", fmt.Errorf("%w: cannot observe remote %s", ErrUnexpectedRemote, remote)
 		}
-		if _, err := r.command(ctx, worktree.Path, "merge-base", "--is-ancestor", remote, expectedHead); err != nil {
+		if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "merge-base", "--is-ancestor", remote, expectedHead); err != nil {
 			return "", fmt.Errorf("%w: %s is not ancestor of %s", ErrUnexpectedRemote, remote, expectedHead)
 		}
 	}
@@ -1421,19 +1694,19 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 	if worktree.Identity.PushOrigin == "" {
 		return "", fmt.Errorf("%w: authenticated push URL is missing", ErrIdentityMismatch)
 	}
-	if _, err := r.command(ctx, worktree.Path, "push", worktree.Identity.PushOrigin, refspec); err != nil {
+	if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "push", worktree.Identity.PushOrigin, refspec); err != nil {
 		// The server may have accepted the ref while the response was lost. Only
 		// reconcile success when the exact expected candidate is observed.
 		if _, proveErr := r.provePushHead(ctx, worktree, expectedHead); proveErr != nil {
 			return "", err
 		}
-		observed, observeErr := r.remoteHead(ctx, worktree.Path, worktree.Identity.PushOrigin, worktree.Branch)
+		observed, observeErr := r.remoteHead(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch)
 		if observeErr == nil && observed == expectedHead {
 			return expectedHead, nil
 		}
 		return "", err
 	}
-	observed, err := r.remoteHead(ctx, worktree.Path, worktree.Identity.PushOrigin, worktree.Branch)
+	observed, err := r.remoteHead(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch)
 	if err != nil {
 		return "", err
 	}
@@ -1447,11 +1720,11 @@ func (r Runner) provePushHead(ctx context.Context, worktree Worktree, expectedHe
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
-	head, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", "HEAD^{commit}")
+	head, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
 		return "", err
 	}
-	branchHead, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", "refs/heads/"+worktree.Branch+"^{commit}")
+	branchHead, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "--verify", "refs/heads/"+worktree.Branch+"^{commit}")
 	if err != nil {
 		return "", err
 	}
@@ -1461,8 +1734,8 @@ func (r Runner) provePushHead(ctx context.Context, worktree Worktree, expectedHe
 	return head, nil
 }
 
-func (r Runner) remoteHead(ctx context.Context, directory, origin, branch string) (string, error) {
-	output, err := r.command(ctx, directory, "ls-remote", "--heads", origin, "refs/heads/"+branch)
+func (r Runner) remoteHead(ctx context.Context, directory string, expectedDev, expectedIno uint64, origin, branch string) (string, error) {
+	output, err := r.commandExpected(ctx, directory, expectedDev, expectedIno, "ls-remote", "--heads", origin, "refs/heads/"+branch)
 	if err != nil {
 		return "", err
 	}

@@ -140,7 +140,7 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(1, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +157,85 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 	remoteHead := rawGit(t, repository, "ls-remote", "--heads", "origin", "refs/heads/"+branch)
 	if !strings.HasPrefix(remoteHead, head+"\t") {
 		t.Fatalf("remote=%q head=%q", remoteHead, head)
+	}
+	if replay, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil || replay != head {
+		t.Fatalf("commit replay=%q err=%v", replay, err)
+	}
+}
+
+func TestCreateWorktreeAdoptsExistingAuthenticatedPath(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-adopt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	first, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Identity != second.Identity || first.Path != second.Path {
+		t.Fatalf("adopted identity changed: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestGitCancellationKillsProcessGroup(t *testing.T) {
+	root := t.TempDir()
+	script := filepath.Join(root, "git-wrapper")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n(sleep 5) &\nwhile :; do sleep 1; done\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(root, "directory")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := (Runner{Binary: script, Home: filepath.Join(root, "home")}).one(ctx, directory, "status")
+	if err == nil {
+		t.Fatal("canceled git command succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("descendant cleanup exceeded bound: %s", elapsed)
+	}
+}
+
+func TestCleanupUsesIndependentContextAfterCancellation(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-cancel-cleanup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	_, err = runner.CreateWorktree(ctx, repository, path, branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := openPinnedDirectory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pointer := filepath.Join(path, ".git")
+	if err := os.WriteFile(pointer, []byte("invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	err = runner.cleanupCreatedWorktree(canceled, repository, path, branch, "main", pinned)
+	_ = pinned.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("worktree remained: %v", statErr)
+	}
+	if output, branchErr := exec.Command("git", "-C", repository, "rev-parse", "--verify", "refs/heads/"+branch).CombinedOutput(); branchErr == nil {
+		t.Fatalf("branch remained after canceled cleanup: %q", output)
 	}
 }
 
@@ -257,10 +336,11 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("one\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("one")), Timestamp: time.Unix(2, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil {
+	firstHead, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("one")), Timestamp: time.Unix(2, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Push(ctx, worktree, rawGit(t, path, "rev-parse", "HEAD")); err != nil {
+	if _, err := runner.Push(ctx, worktree, firstHead); err != nil {
 		t.Fatal(err)
 	}
 	other := filepath.Join(t.TempDir(), "other")
@@ -277,7 +357,7 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "src", "local.txt"), []byte("local\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("local")), Timestamp: time.Unix(3, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil {
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("local")), Timestamp: time.Unix(3, 0), BaseRef: "main", ExpectedParent: firstHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runner.Push(ctx, worktree, rawGit(t, path, "rev-parse", "HEAD")); !errors.Is(err, ErrUnexpectedRemote) {
@@ -397,7 +477,7 @@ func TestDiffAllowsPreexistingExecutableAndSymlinkButRejectsChangedOnes(t *testi
 }
 
 func TestExactOIDRefPathAndChangedPathValidation(t *testing.T) {
-	if validOID("deadbeef") || validRef("main..bad") || validRepoPath("../escape") || validRepoPath("dir\\escape") {
+	if validOID("deadbeef") || validRef("main..bad") || validRef("--detach") || validRepoPath("../escape") || validRepoPath("dir\\escape") {
 		t.Fatal("unsafe identity value accepted")
 	}
 	if !validOID(strings.Repeat("a", 40)) || !validRef("refs/heads/main") || !validRepoPath("src/main.go") {
@@ -464,7 +544,7 @@ func TestCommitRevalidatesResultingTreeAfterStagingRace(t *testing.T) {
 	}
 	injected := false
 	runner.Run = func(ctx context.Context, binary string, argv, env []string) ([]byte, error) {
-		if !injected && slicesContain(argv, "commit") {
+		if !injected && slicesContainPrefix(argv, "commit") {
 			injected = true
 			if err := os.WriteFile(filepath.Join(worktree.Path, "outside.txt"), []byte("raced\n"), 0o600); err != nil {
 				return nil, err
@@ -479,7 +559,7 @@ func TestCommitRevalidatesResultingTreeAfterStagingRace(t *testing.T) {
 		command.Env = env
 		return command.CombinedOutput()
 	}
-	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(4, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); !errors.Is(err, ErrUnsafeWorktree) {
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(4, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); !errors.Is(err, ErrUnsafeWorktree) {
 		t.Fatalf("post-commit staged race=%v", err)
 	}
 	if !injected {
@@ -490,6 +570,15 @@ func TestCommitRevalidatesResultingTreeAfterStagingRace(t *testing.T) {
 func slicesContain(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func slicesContainPrefix(values []string, prefix string) bool {
+	for _, value := range values {
+		if strings.HasPrefix(value, prefix) {
 			return true
 		}
 	}
@@ -813,7 +902,7 @@ func TestSnapshotBindsPushURLAndUsesItForPublication(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "push.txt"), []byte("push\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("push")), Timestamp: time.Unix(5, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("push")), Timestamp: time.Unix(5, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
