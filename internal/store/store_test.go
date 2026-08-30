@@ -758,3 +758,38 @@ func TestOnlineBackupCanBeOpened(t *testing.T) {
 	}
 	defer backup.Close()
 }
+
+func TestOpenReadOnlyInspectsWithoutCreatingOrMutating(t *testing.T) {
+	ctx := context.Background()
+	missing := filepath.Join(t.TempDir(), "missing.sqlite")
+	if database, err := OpenReadOnly(ctx, missing); err == nil {
+		_ = database.Close()
+		t.Fatal("read-only open created a missing database")
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("missing database was created: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "state with spaces.sqlite")
+	writable, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writable.CreateProject(ctx, Project{Channel: domain.ChannelDev, ID: "readonly", Path: "/tmp/readonly", BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readonly, err := OpenReadOnly(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readonly.Close()
+	if project, err := readonly.Project(ctx, domain.ChannelDev, "readonly"); err != nil || project.Path != "/tmp/readonly" {
+		t.Fatalf("project=%+v err=%v", project, err)
+	}
+	if err := readonly.CreateProject(ctx, Project{Channel: domain.ChannelDev, ID: "mutation", Path: "/tmp/mutation", BaseRef: "main"}); err == nil {
+		t.Fatal("read-only store accepted a mutation")
+	}
+}

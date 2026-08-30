@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -33,6 +35,7 @@ var (
 	ErrBranchConflict        = errors.New("branch allocation conflicts with durable record")
 	ErrQualificationConflict = errors.New("provider qualification conflicts with durable record")
 	ErrProviderPairRefused   = errors.New("provider pair is not current, qualified, and independent")
+	ErrReadOnly              = errors.New("store is read-only")
 )
 
 const schemaVersion = 10
@@ -60,8 +63,9 @@ func migrationChecksum(statements []string) string {
 }
 
 type Store struct {
-	db     *sql.DB
-	commit func(context.Context, *sql.Conn) error
+	db       *sql.DB
+	commit   func(context.Context, *sql.Conn) error
+	readOnly bool
 }
 
 type Project struct {
@@ -159,6 +163,32 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	return s, nil
 }
 
+// OpenReadOnly opens an existing, fully migrated authority for diagnostics.
+// It never creates a database, changes write-affecting pragmas, or runs
+// migrations, so doctor/status cannot become a second state writer.
+func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, fmt.Errorf("read-only sqlite path must be absolute and clean")
+	}
+	uri := (&url.URL{Scheme: "file", Path: path}).String()
+	dsn := uri + "?mode=ro&_pragma=foreign_keys(1)&_pragma=query_only(1)&_pragma=busy_timeout(0)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open read-only sqlite: %w", err)
+	}
+	// Schema validation deliberately nests index-detail reads while the index
+	// listing cursor is open, so it needs the same small read pool as normal
+	// startup. query_only and mode=ro still make every connection non-mutating.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	value := &Store{db: db, commit: commitTransaction, readOnly: true}
+	if err := value.validateSchema(ctx); err != nil {
+		_ = db.Close()
+		return nil, normalizeBusy(ctx, err)
+	}
+	return value, nil
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) configure(ctx context.Context) error {
@@ -234,6 +264,9 @@ func (s *Store) migrate(ctx context.Context) error {
 // write begins an IMMEDIATE transaction and retries only locally, only while
 // ctx remains live. No background retry or leaked worker survives a deadline.
 func (s *Store) write(ctx context.Context, fn func(*sql.Conn) error) error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
 	backoff := time.Millisecond
 	for {
 		if err := ctx.Err(); err != nil {
