@@ -434,6 +434,9 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 	if _, err := daemon.store.FenceRecoveredRunners(ctx, daemon.channel, daemon.epoch); err != nil {
 		return fmt.Errorf("invalidate recovered runners: %w", err)
 	}
+	if err := daemon.store.RebindRecoveredPublishedCandidates(ctx, daemon.channel, daemon.epoch); err != nil {
+		return fmt.Errorf("rebind recovered publication witnesses: %w", err)
+	}
 	claims, err := daemon.store.ActiveProviderAttempts(ctx, daemon.channel)
 	if err != nil {
 		return fmt.Errorf("read provider recovery claims: %w", err)

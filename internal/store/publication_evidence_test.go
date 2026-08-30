@@ -82,7 +82,7 @@ func TestPublishedCandidateValidationAcceptsCanonicalPushWitness(t *testing.T) {
 	identity := []byte(`{"Origin":"https://github.com/acme/app.git","PushOrigin":"git@github.com:acme/app.git","BaseRef":"main","BaseHead":"` + remoteBase + `","HeadRef":"` + branch + `"}`)
 	policy := strings.Repeat("1", 64)
 	command := RepositoryCommandResultBinding{Key: contracts.RepositoryCommandResultKey{SemanticKey: "command", ClaimEpoch: 1}, TicketVersion: 5, LeaderEpoch: 1, RunnerEpoch: 1, CommandDigest: "sha256:" + strings.Repeat("2", 64), SpecDigest: "sha256:" + strings.Repeat("3", 64), PolicyDigest: "sha256:" + policy, ExecutablePath: "/usr/bin/true", ExecutableDigest: "sha256:" + strings.Repeat("4", 64)}
-	value := PublishedCandidateEvidence{Ref: ref, TicketVersion: 6, Fence: domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1}, Candidate: StoredCandidate{Snapshot: domain.CandidateSnapshot{Generation: 1, BaseSHA: base, HeadSHA: head, TreeSHA: tree, SourceDigest: strings.Repeat("5", 64), VerificationIntentDigest: strings.Repeat("6", 64), ProofDigest: strings.Repeat("7", 64), CommandPolicyDigest: policy, BuilderEvidenceDigest: strings.Repeat("8", 64)}, TicketVersion: 5, Fence: domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1}, BuilderResult: ProviderAttemptResultKey{AttemptID: 1, Ref: ref, Phase: domain.PhaseBuild, Attempt: 1}, Commit: CommitObservation{CommitOID: head, ParentOID: parent, TreeOID: tree}, CommandBinding: command}, ConfigGeneration: 1, ConfigDigest: strings.Repeat("9", 64), ConfigSnapshotDigest: strings.Repeat("a", 64), Worktree: StoredWorktree{Path: "/tmp/SF-published", Branch: branch, State: "registered", IdentityJSON: identity, BaseSHA: base, HeadSHA: parent, TicketVersion: 2, Fence: domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1}}, RemoteBranchRef: branch, RemoteBranchOID: head, RemoteBaseOID: remoteBase, PushEffect: PublicationEffectEvidence{SemanticKey: "push", Kind: PublicationPushEffectKind, RequestDigest: strings.Repeat("b", 64), ClaimEpoch: 1, ObservedIdentity: CanonicalPublicationPushObservation(branch, head)}, PullRequest: contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "acme", Name: "app"}, Number: 1, HeadOwner: "acme", HeadRepository: "app", HeadRef: branch, HeadOID: head, BaseRef: "main", BaseOID: remoteBase, FactoryOwned: true}, PullRequestState: "OPEN", PullRequestDraft: true, PullRequestObservedAt: time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC), PRCreateOrUpdateEffect: PublicationEffectEvidence{SemanticKey: "pr", Kind: PublicationPRCreateEffectKind, RequestDigest: "sha256:" + strings.Repeat("c", 64), ClaimEpoch: 1}}
+	value := PublishedCandidateEvidence{Ref: ref, TicketVersion: 6, Fence: domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1}, Candidate: StoredCandidate{Snapshot: domain.CandidateSnapshot{Generation: 1, BaseSHA: base, HeadSHA: head, TreeSHA: tree, SourceDigest: strings.Repeat("5", 64), VerificationIntentDigest: strings.Repeat("6", 64), ProofDigest: strings.Repeat("7", 64), CommandPolicyDigest: policy, BuilderEvidenceDigest: strings.Repeat("8", 64)}, TicketVersion: 5, Fence: domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1}, BuilderResult: ProviderAttemptResultKey{AttemptID: 1, Ref: ref, Phase: domain.PhaseBuild, Attempt: 1}, Commit: CommitObservation{CommitOID: head, ParentOID: parent, TreeOID: tree}, CommandBinding: command}, ConfigGeneration: 1, ConfigDigest: strings.Repeat("9", 64), ConfigSnapshotDigest: strings.Repeat("a", 64), Worktree: StoredWorktree{Path: "/tmp/SF-published", Branch: branch, State: "registered", IdentityJSON: identity, BaseSHA: base, HeadSHA: parent, TicketVersion: 2, Fence: domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1}}, RemoteBranchRef: branch, RemoteBranchOID: head, RemoteBaseOID: remoteBase, PushEffect: PublicationEffectEvidence{SemanticKey: "push", Kind: PublicationPushEffectKind, RequestDigest: strings.Repeat("b", 64), ClaimEpoch: 1, ObservedIdentity: CanonicalPublicationPushObservation(branch, head)}, PullRequest: contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "acme", Name: "app"}, Number: 1, HeadOwner: "acme", HeadRepository: "app", HeadRef: branch, HeadOID: head, BaseRef: "main", BaseOID: remoteBase, FactoryOwned: true}, PullRequestState: "OPEN", PullRequestDraft: true, PullRequestObservedAt: time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC), PRCreateOrUpdateEffect: PublicationEffectEvidence{SemanticKey: "pr", Kind: PublicationPRCreateEffectKind, RequestDigest: "sha256:" + strings.Repeat("c", 64), ClaimEpoch: 1}, CreatedAt: time.Date(2026, 8, 30, 0, 0, 1, 0, time.UTC)}
 	value.PRCreateOrUpdateEffect.ObservedIdentity = CanonicalPublicationPRObservation(value.PullRequest, value.PullRequestState, value.PullRequestDraft)
 	if err := validPublishedCandidateEvidence(value); err != nil {
 		t.Fatalf("canonical publication witness rejected: %v", err)
@@ -213,7 +213,7 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	}
 	remoteBase := candidate.Snapshot.BaseSHA
 	pr := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "acme", Name: "app"}, Number: 42, HeadOwner: "acme", HeadRepository: "app", HeadRef: worktree.Branch, HeadOID: candidate.Snapshot.HeadSHA, BaseRef: "main", BaseOID: remoteBase, FactoryOwned: true}
-	value := PublishedCandidateEvidence{Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence, Candidate: candidate, ConfigGeneration: ticket.ConfigGeneration, ConfigDigest: ticket.ConfigDigest, ConfigSnapshotDigest: sha256Digest(ticket.ConfigSnapshot), Worktree: worktree, RemoteBranchRef: worktree.Branch, RemoteBranchOID: candidate.Snapshot.HeadSHA, RemoteBaseOID: remoteBase, PullRequest: pr, PullRequestState: "OPEN", PullRequestDraft: true, PullRequestObservedAt: time.Now().UTC()}
+	value := PublishedCandidateEvidence{Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence, Candidate: candidate, ConfigGeneration: ticket.ConfigGeneration, ConfigDigest: ticket.ConfigDigest, ConfigSnapshotDigest: sha256Digest(ticket.ConfigSnapshot), Worktree: worktree, RemoteBranchRef: worktree.Branch, RemoteBranchOID: candidate.Snapshot.HeadSHA, RemoteBaseOID: remoteBase, PullRequest: pr, PullRequestState: "OPEN", PullRequestDraft: true, PullRequestObservedAt: time.Now().UTC(), CreatedAt: time.Now().UTC()}
 	value.PushEffect = PublicationEffectEvidence{SemanticKey: "publication-push", Kind: PublicationPushEffectKind, RequestDigest: strings.Repeat("1", 64), ClaimEpoch: 1, ObservedIdentity: CanonicalPublicationPushObservation(value.RemoteBranchRef, value.RemoteBranchOID)}
 	value.PRCreateOrUpdateEffect = PublicationEffectEvidence{SemanticKey: "publication-pr", Kind: PublicationPRCreateEffectKind, RequestDigest: "sha256:" + strings.Repeat("2", 64), ClaimEpoch: 1, ObservedIdentity: CanonicalPublicationPRObservation(pr, "OPEN", true)}
 	for _, effect := range []PublicationEffectEvidence{value.PushEffect, value.PRCreateOrUpdateEffect} {
@@ -238,7 +238,7 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		t.Fatalf("lost-response replay: %v", err)
 	}
 	loaded, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
-	if err != nil || !publicationEqual(loaded, value) || loaded.CurrentTicketVersion != ticket.Version {
+	if err != nil || loaded.WitnessDigest == "" || loaded.CreatedAt != value.CreatedAt || loaded.BuildTransitionCreatedAt.IsZero() || loaded.CurrentTicketVersion != ticket.Version {
 		t.Fatalf("publication load=%+v err=%v", loaded, err)
 	}
 	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "publication-recovery-1")
@@ -377,8 +377,15 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		t.Fatal("publishing rebind accepted an InvalidateRunner gap")
 	}
 	controlGap.Close()
-	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+	publicationTransition := Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}}
+	if _, err := db.Transition(ctx, publicationTransition); err == nil {
+		t.Fatal("generic publishing transition bypass was accepted")
+	}
+	if _, err := db.TransitionPublishedCandidate(ctx, publicationTransition); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := db.TransitionPublishedCandidate(ctx, publicationTransition); err != nil {
+		t.Fatalf("lost-response publication transition replay: %v", err)
 	}
 	if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
 		t.Fatalf("waiting_ci replay=%v", err)
@@ -443,22 +450,9 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	selfTicket, _ := selfTransition.Ticket(ctx, ticket.Ref)
-	if _, err := selfTransition.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: selfTicket.Version, From: domain.StateWaitingCI, To: domain.StateWaitingCI, Trigger: "recovery_self_transition", Fence: domain.Fence{LeaderEpoch: waitingBaseLeader, RunnerEpoch: selfTicket.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+	if _, err := selfTransition.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: selfTicket.Version, From: domain.StateWaitingCI, To: domain.StateWaitingCI, Trigger: "recovery_self_transition", Fence: domain.Fence{LeaderEpoch: waitingBaseLeader, RunnerEpoch: selfTicket.RunnerEpoch}, EventPayload: "{}"}); err == nil {
 		selfTransition.Close()
-		t.Fatal(err)
-	}
-	selfLeader, err := selfTransition.AcquireLeader(ctx, domain.ChannelDev, "waiting-self-transition-recovery")
-	if err != nil {
-		selfTransition.Close()
-		t.Fatal(err)
-	}
-	if _, err := selfTransition.FenceRecoveredRunners(ctx, domain.ChannelDev, selfLeader); err != nil {
-		selfTransition.Close()
-		t.Fatalf("fencing after self transition=%v", err)
-	}
-	if _, err := selfTransition.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
-		selfTransition.Close()
-		t.Fatal("waiting replay accepted a self-transition gap")
+		t.Fatal("generic publication recovery transition was accepted")
 	}
 	selfTransition.Close()
 	// Every recovery row is immutable and part of the exact waiting chain.
@@ -559,6 +553,7 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	for name, statement := range map[string]string{
 		"waiting-wrong-transition":   fmt.Sprintf(`UPDATE events SET trigger='wrong_transition' WHERE channel='%s' AND project_id='%s' AND ticket_id='%s' AND ticket_version=%d AND trigger='effects_confirmed'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, waitingVersion),
 		"waiting-missing-transition": fmt.Sprintf(`DELETE FROM events WHERE channel='%s' AND project_id='%s' AND ticket_id='%s' AND ticket_version=%d AND trigger='effects_confirmed'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, waitingVersion),
+		"waiting-event-timestamp":    fmt.Sprintf(`UPDATE events SET created_at='2026-08-30T00:00:00Z' WHERE channel='%s' AND project_id='%s' AND ticket_id='%s' AND ticket_version=%d AND trigger='effects_confirmed'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, waitingVersion),
 	} {
 		dir := t.TempDir()
 		if err := os.Chmod(dir, 0o700); err != nil {
@@ -607,7 +602,7 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	historical.Close()
 	// Tamper tests use independent backups so the good lifecycle fixture remains
 	// available for the waiting_ci assertion above.
-	for name, statement := range map[string]string{"witness": `UPDATE publication_evidence SET witness_digest='sha256:` + strings.Repeat("f", 64) + `'`, "effect": `UPDATE effects SET observed_identity='tampered' WHERE semantic_key='publication-push'`} {
+	for name, statement := range map[string]string{"witness": `UPDATE publication_evidence SET witness_digest='sha256:` + strings.Repeat("f", 64) + `'`, "witness-timestamp": `UPDATE publication_evidence SET created_at='2026-08-30T00:00:00Z'`, "effect": `UPDATE effects SET observed_identity='tampered' WHERE semantic_key='publication-push'`} {
 		dir := t.TempDir()
 		if err := os.Chmod(dir, 0o700); err != nil {
 			t.Fatal(err)
@@ -647,6 +642,10 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		},
 		"rebind-middle-prior-fence": func(mutant *Store) error {
 			_, err := mutant.db.ExecContext(ctx, `UPDATE publication_evidence_rebinds SET prior_leader_epoch=prior_leader_epoch+1 WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND ticket_version=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, candidate.Snapshot.Generation, candidate.Snapshot.HeadSHA, middleVersion)
+			return err
+		},
+		"rebind-middle-timestamp": func(mutant *Store) error {
+			_, err := mutant.db.ExecContext(ctx, `UPDATE publication_evidence_rebinds SET created_at='2026-08-30T00:00:00Z' WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND ticket_version=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, candidate.Snapshot.Generation, candidate.Snapshot.HeadSHA, middleVersion)
 			return err
 		},
 		"rebind-middle-delete": func(mutant *Store) error {

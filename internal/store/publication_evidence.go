@@ -54,6 +54,10 @@ type PublishedCandidateEvidence struct {
 	PRCreateOrUpdateEffect PublicationEffectEvidence
 	WitnessDigest          string
 	CreatedAt              time.Time
+	// BuildTransitionCreatedAt is the exact creation time of the authoritative
+	// building -> publishing event consumed by this witness. It is filled from
+	// SQLite, never accepted as a caller reconstruction.
+	BuildTransitionCreatedAt time.Time
 	// CurrentTicketVersion/Fence are the live publication authority after an
 	// explicit recovery rebind. TicketVersion/Fence remain the immutable
 	// publication effect claim identity and are never rewritten.
@@ -90,7 +94,23 @@ func publicationRebindPayload(value PublicationRebind) ([]byte, error) {
 		PriorFence          domain.Fence
 		TicketVersion       uint64
 		Fence               domain.Fence
-	}{value.Ref, value.CandidateGeneration, value.CandidateHeadOID, value.PriorWitnessDigest, value.PriorTicketVersion, value.PriorFence, value.TicketVersion, value.Fence})
+		CreatedAt           string
+	}{value.Ref, value.CandidateGeneration, value.CandidateHeadOID, value.PriorWitnessDigest, value.PriorTicketVersion, value.PriorFence, value.TicketVersion, value.Fence, value.CreatedAt.UTC().Format(time.RFC3339Nano)})
+}
+
+func canonicalPublicationTime(value time.Time) (time.Time, bool) {
+	if value.IsZero() || value.Location() != time.UTC || value.Format(time.RFC3339Nano) != value.UTC().Format(time.RFC3339Nano) {
+		return time.Time{}, false
+	}
+	return value, true
+}
+
+func parsePublicationTime(raw string) (time.Time, error) {
+	value, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil || value.Location() != time.UTC || value.Format(time.RFC3339Nano) != raw {
+		return time.Time{}, ErrPublicationEvidence
+	}
+	return value, nil
 }
 
 func publicationEffectKind(kind string) bool {
@@ -243,10 +263,15 @@ func publicationPayload(value PublishedCandidateEvidence) ([]byte, error) {
 		PullRequestDraft                                bool
 		PullRequestObservedAt                           string
 		PRCreateOrUpdateEffect                          PublicationEffectEvidence
-	}{value.Ref, value.TicketVersion, value.Fence, candidate, value.ConfigGeneration, value.ConfigDigest, value.ConfigSnapshotDigest, worktree, value.RemoteBranchRef, value.RemoteBranchOID, value.RemoteBaseOID, value.PushEffect, value.PullRequest, value.PullRequestState, value.PullRequestDraft, value.PullRequestObservedAt.Format(time.RFC3339Nano), value.PRCreateOrUpdateEffect})
+		CreatedAt                                       string
+		BuildTransitionCreatedAt                        string
+	}{value.Ref, value.TicketVersion, value.Fence, candidate, value.ConfigGeneration, value.ConfigDigest, value.ConfigSnapshotDigest, worktree, value.RemoteBranchRef, value.RemoteBranchOID, value.RemoteBaseOID, value.PushEffect, value.PullRequest, value.PullRequestState, value.PullRequestDraft, value.PullRequestObservedAt.Format(time.RFC3339Nano), value.PRCreateOrUpdateEffect, value.CreatedAt.UTC().Format(time.RFC3339Nano), value.BuildTransitionCreatedAt.UTC().Format(time.RFC3339Nano)})
 }
 
 func validPublishedCandidateEvidence(value PublishedCandidateEvidence) error {
+	if _, ok := canonicalPublicationTime(value.CreatedAt); !ok {
+		return ErrPublicationEvidence
+	}
 	if value.Ref.Validate() != nil || value.TicketVersion == 0 || value.Fence.LeaderEpoch == 0 || value.Fence.RunnerEpoch == 0 || value.Fence.ClaimEpoch != 0 || validateCandidate(value.Candidate.Snapshot) != nil || value.Candidate.TicketVersion+1 != value.TicketVersion || value.Candidate.Fence.LeaderEpoch == 0 || value.Candidate.Fence.RunnerEpoch == 0 || value.Candidate.Fence.ClaimEpoch != 0 || value.Candidate.BuilderResult.AttemptID <= 0 || value.Candidate.BuilderResult.Attempt <= 0 || !validOID(value.Candidate.Commit.ParentOID) || value.Candidate.CommandBinding.Key.SemanticKey == "" || value.Candidate.CommandBinding.Key.ClaimEpoch == 0 || !validClaimDigest(value.Candidate.CommandBinding.CommandDigest) || !validClaimDigest(value.Candidate.CommandBinding.SpecDigest) || !validClaimDigest(value.Candidate.CommandBinding.PolicyDigest) || !validStorePath(value.Candidate.CommandBinding.ExecutablePath) || !validClaimDigest(value.Candidate.CommandBinding.ExecutableDigest) || value.ConfigGeneration == 0 || !validDigest(value.ConfigDigest) || !validDigest(value.ConfigSnapshotDigest) || !validStorePath(value.Worktree.Path) || !boundedText(value.Worktree.Branch, 300) || !boundedText(value.Worktree.State, 100) || !validJSON(value.Worktree.IdentityJSON) || !validOID(value.Worktree.BaseSHA) || value.Worktree.TicketVersion == 0 || value.Worktree.Fence.LeaderEpoch == 0 || value.Worktree.Fence.RunnerEpoch == 0 || value.Worktree.Fence.ClaimEpoch != 0 || !validPublicationRef(value.RemoteBranchRef) || !validOID(value.RemoteBranchOID) || !validOID(value.RemoteBaseOID) || value.RemoteBranchOID != value.Candidate.Snapshot.HeadSHA || value.RemoteBranchRef != value.Worktree.Branch || value.Worktree.BaseSHA != value.Candidate.Snapshot.BaseSHA || value.RemoteBaseOID != value.Worktree.BaseSHA || !validPublicationEffect(value.PushEffect) || !validPublicationEffect(value.PRCreateOrUpdateEffect) || value.PushEffect.Kind != PublicationPushEffectKind || (value.PRCreateOrUpdateEffect.Kind != PublicationPRCreateEffectKind && value.PRCreateOrUpdateEffect.Kind != PublicationPRUpdateEffectKind) || value.PushEffect.SemanticKey == value.PRCreateOrUpdateEffect.SemanticKey || validPublicationPR(value.PullRequest, value.PullRequestState, value.PullRequestDraft, value.PullRequestObservedAt) == false || value.PullRequest.HeadOwner != value.PullRequest.Repository.Owner || value.PullRequest.HeadRepository != value.PullRequest.Repository.Name || value.PullRequest.HeadOID != value.Candidate.Snapshot.HeadSHA || value.PullRequest.BaseOID != value.RemoteBaseOID || value.PullRequest.HeadRef != value.Worktree.Branch || value.PullRequest.BaseRef == "" || !publicationOriginsMatch(value.Worktree.IdentityJSON, value.PullRequest, value.RemoteBaseOID) {
 		return ErrPublicationEvidence
 	}
@@ -272,10 +297,6 @@ func (s *Store) RecordPublishedCandidate(ctx context.Context, value PublishedCan
 	if err := validPublishedCandidateEvidence(value); err != nil {
 		return err
 	}
-	payload, err := publicationPayload(value)
-	if err != nil {
-		return ErrPublicationEvidence
-	}
 	// Candidate snapshots, their provider result, and their command binding are
 	// immutable authorities. Authenticate them before opening the publication
 	// write; the transaction below then rechecks the current ticket/fence and
@@ -288,7 +309,6 @@ func (s *Store) RecordPublishedCandidate(ctx context.Context, value PublishedCan
 	if err != nil || authenticatedWorktree.Path != value.Worktree.Path || authenticatedWorktree.Branch != value.Worktree.Branch || authenticatedWorktree.State != value.Worktree.State || !bytes.Equal(authenticatedWorktree.IdentityJSON, value.Worktree.IdentityJSON) || authenticatedWorktree.BaseSHA != value.Worktree.BaseSHA || authenticatedWorktree.TicketVersion != value.Worktree.TicketVersion || authenticatedWorktree.Fence != value.Worktree.Fence {
 		return ErrPublicationEvidence
 	}
-	digest := publicationIdentityDigest(payload)
 	return s.write(ctx, func(conn *sql.Conn) error {
 		var state string
 		var version, runner, configGeneration uint64
@@ -321,6 +341,19 @@ func (s *Store) RecordPublishedCandidate(ctx context.Context, value PublishedCan
 		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, value.TicketVersion).Scan(&consumed); err != nil || consumed != 1 {
 			return ErrPublicationEvidence
 		}
+		var buildEventCreated string
+		if err := conn.QueryRowContext(ctx, `SELECT created_at FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, value.TicketVersion).Scan(&buildEventCreated); err != nil {
+			return ErrPublicationEvidence
+		}
+		var err error
+		if value.BuildTransitionCreatedAt, err = parsePublicationTime(buildEventCreated); err != nil {
+			return ErrPublicationEvidence
+		}
+		payload, err := publicationPayload(value)
+		if err != nil {
+			return ErrPublicationEvidence
+		}
+		digest := publicationIdentityDigest(payload)
 		var path, branch, stateWT, identity string
 		var base string
 		var wtVersion, wtLeader, wtRunner uint64
@@ -340,7 +373,7 @@ func (s *Store) RecordPublishedCandidate(ctx context.Context, value PublishedCan
 		if err := checkPublicationEffect(ctx, conn, value.Ref, value.TicketVersion, value.Fence, value.PRCreateOrUpdateEffect); err != nil {
 			return err
 		}
-		_, err := conn.ExecContext(ctx, `INSERT INTO publication_evidence(channel,project_id,ticket_id,ticket_version,leader_epoch,runner_epoch,candidate_generation,candidate_ticket_version,candidate_leader_epoch,candidate_runner_epoch,candidate_base_sha,candidate_head_sha,candidate_tree_sha,candidate_source_digest,candidate_verification_intent_digest,candidate_proof_digest,candidate_command_policy_digest,candidate_builder_evidence_digest,candidate_builder_attempt_id,candidate_builder_attempt,candidate_commit_parent_oid,candidate_command_semantic_key,candidate_command_claim_epoch,candidate_command_ticket_version,candidate_command_leader_epoch,candidate_command_runner_epoch,candidate_command_digest,candidate_command_spec_digest,candidate_command_policy_claim_digest,candidate_command_executable_path,candidate_command_executable_digest,config_generation,config_digest,config_snapshot_digest,worktree_path,worktree_branch_ref,worktree_state,worktree_ticket_version,worktree_leader_epoch,worktree_runner_epoch,worktree_identity_json,worktree_identity_digest,worktree_base_sha,remote_branch_ref,remote_branch_oid,remote_base_oid,push_effect_semantic_key,push_effect_kind,push_effect_request_digest,push_effect_claim_epoch,push_effect_observed_identity,github_host,github_owner,github_name,github_pr_number,github_head_owner,github_head_repository,github_head_ref,github_head_oid,github_base_ref,github_base_oid,github_state,github_draft,github_factory_owned,github_observed_at,pr_effect_semantic_key,pr_effect_kind,pr_effect_request_digest,pr_effect_claim_epoch,pr_effect_observed_identity,witness_digest,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(channel,project_id,ticket_id,candidate_generation,candidate_head_sha) DO NOTHING`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, value.TicketVersion, value.Fence.LeaderEpoch, value.Fence.RunnerEpoch, value.Candidate.Snapshot.Generation, value.Candidate.TicketVersion, value.Candidate.Fence.LeaderEpoch, value.Candidate.Fence.RunnerEpoch, value.Candidate.Snapshot.BaseSHA, value.Candidate.Snapshot.HeadSHA, value.Candidate.Snapshot.TreeSHA, value.Candidate.Snapshot.SourceDigest, value.Candidate.Snapshot.VerificationIntentDigest, value.Candidate.Snapshot.ProofDigest, value.Candidate.Snapshot.CommandPolicyDigest, value.Candidate.Snapshot.BuilderEvidenceDigest, value.Candidate.BuilderResult.AttemptID, value.Candidate.BuilderResult.Attempt, value.Candidate.Commit.ParentOID, value.Candidate.CommandBinding.Key.SemanticKey, value.Candidate.CommandBinding.Key.ClaimEpoch, value.Candidate.CommandBinding.TicketVersion, value.Candidate.CommandBinding.LeaderEpoch, value.Candidate.CommandBinding.RunnerEpoch, value.Candidate.CommandBinding.CommandDigest, value.Candidate.CommandBinding.SpecDigest, value.Candidate.CommandBinding.PolicyDigest, value.Candidate.CommandBinding.ExecutablePath, value.Candidate.CommandBinding.ExecutableDigest, value.ConfigGeneration, value.ConfigDigest, value.ConfigSnapshotDigest, value.Worktree.Path, value.Worktree.Branch, value.Worktree.State, value.Worktree.TicketVersion, value.Worktree.Fence.LeaderEpoch, value.Worktree.Fence.RunnerEpoch, value.Worktree.IdentityJSON, sha256Digest(value.Worktree.IdentityJSON), value.Worktree.BaseSHA, value.RemoteBranchRef, value.RemoteBranchOID, value.RemoteBaseOID, value.PushEffect.SemanticKey, value.PushEffect.Kind, value.PushEffect.RequestDigest, value.PushEffect.ClaimEpoch, value.PushEffect.ObservedIdentity, value.PullRequest.Repository.Host, value.PullRequest.Repository.Owner, value.PullRequest.Repository.Name, value.PullRequest.Number, value.PullRequest.HeadOwner, value.PullRequest.HeadRepository, value.PullRequest.HeadRef, value.PullRequest.HeadOID, value.PullRequest.BaseRef, value.PullRequest.BaseOID, value.PullRequestState, boolInt(value.PullRequestDraft), boolInt(value.PullRequest.FactoryOwned), value.PullRequestObservedAt.Format(time.RFC3339Nano), value.PRCreateOrUpdateEffect.SemanticKey, value.PRCreateOrUpdateEffect.Kind, value.PRCreateOrUpdateEffect.RequestDigest, value.PRCreateOrUpdateEffect.ClaimEpoch, value.PRCreateOrUpdateEffect.ObservedIdentity, digest, time.Now().UTC().Format(time.RFC3339Nano))
+		_, err = conn.ExecContext(ctx, `INSERT INTO publication_evidence(channel,project_id,ticket_id,ticket_version,leader_epoch,runner_epoch,candidate_generation,candidate_ticket_version,candidate_leader_epoch,candidate_runner_epoch,candidate_base_sha,candidate_head_sha,candidate_tree_sha,candidate_source_digest,candidate_verification_intent_digest,candidate_proof_digest,candidate_command_policy_digest,candidate_builder_evidence_digest,candidate_builder_attempt_id,candidate_builder_attempt,candidate_commit_parent_oid,candidate_command_semantic_key,candidate_command_claim_epoch,candidate_command_ticket_version,candidate_command_leader_epoch,candidate_command_runner_epoch,candidate_command_digest,candidate_command_spec_digest,candidate_command_policy_claim_digest,candidate_command_executable_path,candidate_command_executable_digest,config_generation,config_digest,config_snapshot_digest,worktree_path,worktree_branch_ref,worktree_state,worktree_ticket_version,worktree_leader_epoch,worktree_runner_epoch,worktree_identity_json,worktree_identity_digest,worktree_base_sha,remote_branch_ref,remote_branch_oid,remote_base_oid,push_effect_semantic_key,push_effect_kind,push_effect_request_digest,push_effect_claim_epoch,push_effect_observed_identity,github_host,github_owner,github_name,github_pr_number,github_head_owner,github_head_repository,github_head_ref,github_head_oid,github_base_ref,github_base_oid,github_state,github_draft,github_factory_owned,github_observed_at,pr_effect_semantic_key,pr_effect_kind,pr_effect_request_digest,pr_effect_claim_epoch,pr_effect_observed_identity,build_transition_created_at,witness_digest,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(channel,project_id,ticket_id,candidate_generation,candidate_head_sha) DO NOTHING`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, value.TicketVersion, value.Fence.LeaderEpoch, value.Fence.RunnerEpoch, value.Candidate.Snapshot.Generation, value.Candidate.TicketVersion, value.Candidate.Fence.LeaderEpoch, value.Candidate.Fence.RunnerEpoch, value.Candidate.Snapshot.BaseSHA, value.Candidate.Snapshot.HeadSHA, value.Candidate.Snapshot.TreeSHA, value.Candidate.Snapshot.SourceDigest, value.Candidate.Snapshot.VerificationIntentDigest, value.Candidate.Snapshot.ProofDigest, value.Candidate.Snapshot.CommandPolicyDigest, value.Candidate.Snapshot.BuilderEvidenceDigest, value.Candidate.BuilderResult.AttemptID, value.Candidate.BuilderResult.Attempt, value.Candidate.Commit.ParentOID, value.Candidate.CommandBinding.Key.SemanticKey, value.Candidate.CommandBinding.Key.ClaimEpoch, value.Candidate.CommandBinding.TicketVersion, value.Candidate.CommandBinding.LeaderEpoch, value.Candidate.CommandBinding.RunnerEpoch, value.Candidate.CommandBinding.CommandDigest, value.Candidate.CommandBinding.SpecDigest, value.Candidate.CommandBinding.PolicyDigest, value.Candidate.CommandBinding.ExecutablePath, value.Candidate.CommandBinding.ExecutableDigest, value.ConfigGeneration, value.ConfigDigest, value.ConfigSnapshotDigest, value.Worktree.Path, value.Worktree.Branch, value.Worktree.State, value.Worktree.TicketVersion, value.Worktree.Fence.LeaderEpoch, value.Worktree.Fence.RunnerEpoch, value.Worktree.IdentityJSON, sha256Digest(value.Worktree.IdentityJSON), value.Worktree.BaseSHA, value.RemoteBranchRef, value.RemoteBranchOID, value.RemoteBaseOID, value.PushEffect.SemanticKey, value.PushEffect.Kind, value.PushEffect.RequestDigest, value.PushEffect.ClaimEpoch, value.PushEffect.ObservedIdentity, value.PullRequest.Repository.Host, value.PullRequest.Repository.Owner, value.PullRequest.Repository.Name, value.PullRequest.Number, value.PullRequest.HeadOwner, value.PullRequest.HeadRepository, value.PullRequest.HeadRef, value.PullRequest.HeadOID, value.PullRequest.BaseRef, value.PullRequest.BaseOID, value.PullRequestState, boolInt(value.PullRequestDraft), boolInt(value.PullRequest.FactoryOwned), value.PullRequestObservedAt.Format(time.RFC3339Nano), value.PRCreateOrUpdateEffect.SemanticKey, value.PRCreateOrUpdateEffect.Kind, value.PRCreateOrUpdateEffect.RequestDigest, value.PRCreateOrUpdateEffect.ClaimEpoch, value.PRCreateOrUpdateEffect.ObservedIdentity, value.BuildTransitionCreatedAt.Format(time.RFC3339Nano), digest, value.CreatedAt.Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}
@@ -361,6 +394,132 @@ func (s *Store) RecordPublicationEvidence(ctx context.Context, value PublishedCa
 
 func (s *Store) RecordPublishedCandidateEvidence(ctx context.Context, value PublishedCandidateEvidence) error {
 	return s.RecordPublishedCandidate(ctx, value)
+}
+
+// TransitionPublishedCandidate is the only Store boundary that may consume a
+// publication witness. It validates the exact immutable witness and both
+// confirmed effects, then commits publishing -> waiting_ci and its event in
+// one transaction. A lost response is authenticated as an exact replay.
+func (s *Store) TransitionPublishedCandidate(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if transition.From != domain.StatePublishing || transition.To != domain.StateWaitingCI || transition.Trigger != "effects_confirmed" || transition.Ref.Validate() != nil {
+		return TransitionResult{}, ErrPublicationEvidence
+	}
+	var result TransitionResult
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		value, found, err := loadPublicationEvidenceRow(ctx, conn, transition.Ref)
+		if err != nil || !found {
+			return ErrPublicationEvidence
+		}
+		if err := loadLatestPublicationRebind(ctx, conn, &value); err != nil {
+			return err
+		}
+		if err := checkPublicationEffect(ctx, conn, transition.Ref, value.TicketVersion, value.Fence, value.PushEffect); err != nil {
+			return err
+		}
+		if err := checkPublicationEffect(ctx, conn, transition.Ref, value.TicketVersion, value.Fence, value.PRCreateOrUpdateEffect); err != nil {
+			return err
+		}
+		var buildEvents int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing' AND created_at=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, value.TicketVersion, value.BuildTransitionCreatedAt.Format(time.RFC3339Nano)).Scan(&buildEvents); err != nil || buildEvents != 1 {
+			return ErrPublicationEvidence
+		}
+		payloadBytes, err := json.Marshal(struct {
+			WitnessDigest    string `json:"witness_digest"`
+			WitnessCreatedAt string `json:"witness_created_at"`
+		}{value.WitnessDigest, value.CreatedAt.Format(time.RFC3339Nano)})
+		if err != nil {
+			return ErrPublicationEvidence
+		}
+		payload := string(payloadBytes)
+		var state domain.State
+		var version, runner uint64
+		if err := conn.QueryRowContext(ctx, `SELECT state,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&state, &version, &runner); err != nil {
+			return err
+		}
+		if state == domain.StateWaitingCI && version == transition.ExpectedVersion+1 {
+			var eventID int64
+			var eventCreated, digest, witnessCreated string
+			err := conn.QueryRowContext(ctx, `SELECT e.id,e.created_at,p.witness_digest,p.witness_created_at FROM events e JOIN publication_transition_evidence p ON p.channel=e.channel AND p.project_id=e.project_id AND p.ticket_id=e.ticket_id AND p.ticket_version=e.ticket_version AND p.event_created_at=e.created_at WHERE e.channel=? AND e.project_id=? AND e.ticket_id=? AND e.ticket_version=? AND e.trigger='effects_confirmed' AND e.from_state='publishing' AND e.to_state='waiting_ci' AND e.payload=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version, payload).Scan(&eventID, &eventCreated, &digest, &witnessCreated)
+			if err != nil || digest != value.WitnessDigest || witnessCreated != value.CreatedAt.Format(time.RFC3339Nano) || eventCreated == "" {
+				return ErrPublicationEvidence
+			}
+			result.Version, result.EventID = version, eventID
+			return nil
+		}
+		if state != domain.StatePublishing || version != transition.ExpectedVersion || version != value.CurrentTicketVersion || runner != value.CurrentFence.RunnerEpoch {
+			return ErrStaleFence
+		}
+		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
+			return err
+		}
+		if transition.Fence != value.CurrentFence {
+			return ErrPublicationEvidence
+		}
+		now := time.Now().UTC()
+		created := now.Format(time.RFC3339Nano)
+		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state='waiting_ci',resume_state=NULL,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state='publishing' AND version=? AND runner_epoch=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version, runner)
+		if err != nil {
+			return err
+		}
+		if n, _ := updated.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		event, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, "effects_confirmed", domain.StatePublishing, domain.StateWaitingCI, payload, created)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO publication_transition_evidence(channel,project_id,ticket_id,witness_digest,witness_created_at,ticket_version,event_created_at) VALUES(?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, value.WitnessDigest, value.CreatedAt.Format(time.RFC3339Nano), version+1, created); err != nil {
+			return err
+		}
+		result.Version = version + 1
+		result.EventID, _ = event.LastInsertId()
+		return nil
+	})
+	return result, err
+}
+
+// RebindRecoveredPublishedCandidates is the production startup fence for the
+// publish boundary. It runs after FenceRecoveredRunners: every live
+// publishing ticket must append (or exactly replay) its recovery rebind and
+// then pass the full LoadPublishedCandidate authentication before the daemon
+// can continue it.
+func (s *Store) RebindRecoveredPublishedCandidates(ctx context.Context, channel domain.Channel, leaderEpoch uint64) error {
+	if !channel.Valid() || leaderEpoch == 0 {
+		return ErrPublicationEvidence
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT project_id,id,version,runner_epoch FROM tickets WHERE channel=? AND state='publishing' ORDER BY project_id,id`, channel)
+	if err != nil {
+		return err
+	}
+	type recovered struct {
+		ref             domain.TicketRef
+		version, runner uint64
+	}
+	var pending []recovered
+	for rows.Next() {
+		var project domain.ProjectID
+		var ticket domain.TicketID
+		var version, runner uint64
+		if err := rows.Scan(&project, &ticket, &version, &runner); err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, recovered{domain.TicketRef{Channel: channel, Project: project, Ticket: ticket}, version, runner})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, item := range pending {
+		if err := s.RebindPublishedCandidate(ctx, item.ref, item.version, domain.Fence{LeaderEpoch: leaderEpoch, RunnerEpoch: item.runner}); err != nil {
+			return err
+		}
+		if _, err := s.LoadPublishedCandidate(ctx, item.ref); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RebindPublishedCandidate records one controlled runner/leader recovery for
@@ -400,13 +559,13 @@ func (s *Store) RebindPublishedCandidate(ctx context.Context, ref domain.TicketR
 			if err := authenticateRunnerRecoveryStep(ctx, conn, ref, priorVersion, priorFence, currentVersion, existing.Fence); err != nil {
 				return err
 			}
-			expected := PublicationRebind{Ref: ref, CandidateGeneration: row.Candidate.Snapshot.Generation, CandidateHeadOID: row.Candidate.Snapshot.HeadSHA, PriorWitnessDigest: priorDigest, PriorTicketVersion: priorVersion, PriorFence: priorFence, TicketVersion: existing.TicketVersion, Fence: existing.Fence}
+			expected := PublicationRebind{Ref: ref, CandidateGeneration: row.Candidate.Snapshot.Generation, CandidateHeadOID: row.Candidate.Snapshot.HeadSHA, PriorWitnessDigest: priorDigest, PriorTicketVersion: priorVersion, PriorFence: priorFence, TicketVersion: existing.TicketVersion, Fence: existing.Fence, CreatedAt: existing.CreatedAt}
 			payload, err := publicationRebindPayload(expected)
 			if err != nil || existing.PriorWitnessDigest != expected.PriorWitnessDigest || existing.PriorTicketVersion != expected.PriorTicketVersion || existing.PriorFence != expected.PriorFence || existing.RebindDigest != publicationIdentityDigest(payload) || existing.Fence != currentFence {
 				return ErrPublicationEvidence
 			}
 			var events int
-			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='publication_rebind' AND from_state='publishing' AND to_state='publishing' AND payload=?`, ref.Channel, ref.Project, ref.Ticket, currentVersion, string(payload)).Scan(&events); err != nil || events != 1 {
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='publication_rebind' AND from_state='publishing' AND to_state='publishing' AND payload=? AND created_at=?`, ref.Channel, ref.Project, ref.Ticket, currentVersion, string(payload), existing.CreatedAt.Format(time.RFC3339Nano)).Scan(&events); err != nil || events != 1 {
 				return ErrPublicationEvidence
 			}
 			return nil
@@ -431,7 +590,7 @@ func (s *Store) RebindPublishedCandidate(ctx context.Context, ref domain.TicketR
 			return err
 		}
 		candidateHead := row.Candidate.Snapshot.HeadSHA
-		value := PublicationRebind{Ref: ref, CandidateGeneration: row.Candidate.Snapshot.Generation, CandidateHeadOID: candidateHead, PriorWitnessDigest: priorDigest, PriorTicketVersion: priorVersion, PriorFence: priorFence, TicketVersion: currentVersion, Fence: currentFence}
+		value := PublicationRebind{Ref: ref, CandidateGeneration: row.Candidate.Snapshot.Generation, CandidateHeadOID: candidateHead, PriorWitnessDigest: priorDigest, PriorTicketVersion: priorVersion, PriorFence: priorFence, TicketVersion: currentVersion, Fence: currentFence, CreatedAt: time.Now().UTC()}
 		payload, err := publicationRebindPayload(value)
 		if err != nil {
 			return ErrPublicationEvidence
@@ -455,10 +614,10 @@ func (s *Store) RebindPublishedCandidate(ctx context.Context, ref domain.TicketR
 		if rebindCount >= 64 {
 			return ErrPublicationEvidence
 		}
-		if _, err := conn.ExecContext(ctx, `INSERT INTO publication_evidence_rebinds(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, value.CandidateGeneration, value.CandidateHeadOID, value.PriorWitnessDigest, value.PriorTicketVersion, value.PriorFence.LeaderEpoch, value.PriorFence.RunnerEpoch, value.TicketVersion, value.Fence.LeaderEpoch, value.Fence.RunnerEpoch, value.RebindDigest, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO publication_evidence_rebinds(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, value.CandidateGeneration, value.CandidateHeadOID, value.PriorWitnessDigest, value.PriorTicketVersion, value.PriorFence.LeaderEpoch, value.PriorFence.RunnerEpoch, value.TicketVersion, value.Fence.LeaderEpoch, value.Fence.RunnerEpoch, value.RebindDigest, value.CreatedAt.Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
-		_, err = conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, currentVersion, "publication_rebind", domain.StatePublishing, domain.StatePublishing, string(payload), time.Now().UTC().Format(time.RFC3339Nano))
+		_, err = conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, currentVersion, "publication_rebind", domain.StatePublishing, domain.StatePublishing, string(payload), value.CreatedAt.Format(time.RFC3339Nano))
 		return err
 	})
 }
@@ -480,9 +639,9 @@ func loadPublicationEvidenceRow(ctx context.Context, q interface {
 	var value PublishedCandidateEvidence
 	var project, ticket string
 	var draft, owned int
-	var observed, created, identityDigest, worktreeState string
+	var observed, created, buildCreated, identityDigest, worktreeState string
 	var identity []byte
-	err := q.QueryRowContext(ctx, `SELECT channel,project_id,ticket_id,ticket_version,leader_epoch,runner_epoch,candidate_generation,candidate_ticket_version,candidate_leader_epoch,candidate_runner_epoch,candidate_base_sha,candidate_head_sha,candidate_tree_sha,candidate_source_digest,candidate_verification_intent_digest,candidate_proof_digest,candidate_command_policy_digest,candidate_builder_evidence_digest,candidate_builder_attempt_id,candidate_builder_attempt,candidate_commit_parent_oid,candidate_command_semantic_key,candidate_command_claim_epoch,candidate_command_ticket_version,candidate_command_leader_epoch,candidate_command_runner_epoch,candidate_command_digest,candidate_command_spec_digest,candidate_command_policy_claim_digest,candidate_command_executable_path,candidate_command_executable_digest,config_generation,config_digest,config_snapshot_digest,worktree_path,worktree_branch_ref,worktree_state,worktree_ticket_version,worktree_leader_epoch,worktree_runner_epoch,worktree_identity_json,worktree_identity_digest,worktree_base_sha,remote_branch_ref,remote_branch_oid,remote_base_oid,push_effect_semantic_key,push_effect_kind,push_effect_request_digest,push_effect_claim_epoch,push_effect_observed_identity,github_host,github_owner,github_name,github_pr_number,github_head_owner,github_head_repository,github_head_ref,github_head_oid,github_base_ref,github_base_oid,github_state,github_draft,github_factory_owned,github_observed_at,pr_effect_semantic_key,pr_effect_kind,pr_effect_request_digest,pr_effect_claim_epoch,pr_effect_observed_identity,witness_digest,created_at FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY candidate_generation DESC,candidate_head_sha DESC`, ref.Channel, ref.Project, ref.Ticket).Scan(
+	err := q.QueryRowContext(ctx, `SELECT channel,project_id,ticket_id,ticket_version,leader_epoch,runner_epoch,candidate_generation,candidate_ticket_version,candidate_leader_epoch,candidate_runner_epoch,candidate_base_sha,candidate_head_sha,candidate_tree_sha,candidate_source_digest,candidate_verification_intent_digest,candidate_proof_digest,candidate_command_policy_digest,candidate_builder_evidence_digest,candidate_builder_attempt_id,candidate_builder_attempt,candidate_commit_parent_oid,candidate_command_semantic_key,candidate_command_claim_epoch,candidate_command_ticket_version,candidate_command_leader_epoch,candidate_command_runner_epoch,candidate_command_digest,candidate_command_spec_digest,candidate_command_policy_claim_digest,candidate_command_executable_path,candidate_command_executable_digest,config_generation,config_digest,config_snapshot_digest,worktree_path,worktree_branch_ref,worktree_state,worktree_ticket_version,worktree_leader_epoch,worktree_runner_epoch,worktree_identity_json,worktree_identity_digest,worktree_base_sha,remote_branch_ref,remote_branch_oid,remote_base_oid,push_effect_semantic_key,push_effect_kind,push_effect_request_digest,push_effect_claim_epoch,push_effect_observed_identity,github_host,github_owner,github_name,github_pr_number,github_head_owner,github_head_repository,github_head_ref,github_head_oid,github_base_ref,github_base_oid,github_state,github_draft,github_factory_owned,github_observed_at,pr_effect_semantic_key,pr_effect_kind,pr_effect_request_digest,pr_effect_claim_epoch,pr_effect_observed_identity,build_transition_created_at,witness_digest,created_at FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY candidate_generation DESC,candidate_head_sha DESC`, ref.Channel, ref.Project, ref.Ticket).Scan(
 		&value.Ref.Channel, &project, &ticket, &value.TicketVersion, &value.Fence.LeaderEpoch, &value.Fence.RunnerEpoch,
 		&value.Candidate.Snapshot.Generation, &value.Candidate.TicketVersion, &value.Candidate.Fence.LeaderEpoch, &value.Candidate.Fence.RunnerEpoch, &value.Candidate.Snapshot.BaseSHA, &value.Candidate.Snapshot.HeadSHA, &value.Candidate.Snapshot.TreeSHA,
 		&value.Candidate.Snapshot.SourceDigest, &value.Candidate.Snapshot.VerificationIntentDigest, &value.Candidate.Snapshot.ProofDigest, &value.Candidate.Snapshot.CommandPolicyDigest, &value.Candidate.Snapshot.BuilderEvidenceDigest,
@@ -491,7 +650,7 @@ func loadPublicationEvidenceRow(ctx context.Context, q interface {
 		&value.ConfigGeneration, &value.ConfigDigest, &value.ConfigSnapshotDigest, &value.Worktree.Path, &value.Worktree.Branch, &worktreeState, &value.Worktree.TicketVersion, &value.Worktree.Fence.LeaderEpoch, &value.Worktree.Fence.RunnerEpoch, &identity, &identityDigest, &value.Worktree.BaseSHA,
 		&value.RemoteBranchRef, &value.RemoteBranchOID, &value.RemoteBaseOID, &value.PushEffect.SemanticKey, &value.PushEffect.Kind, &value.PushEffect.RequestDigest, &value.PushEffect.ClaimEpoch, &value.PushEffect.ObservedIdentity,
 		&value.PullRequest.Repository.Host, &value.PullRequest.Repository.Owner, &value.PullRequest.Repository.Name, &value.PullRequest.Number, &value.PullRequest.HeadOwner, &value.PullRequest.HeadRepository, &value.PullRequest.HeadRef, &value.PullRequest.HeadOID, &value.PullRequest.BaseRef, &value.PullRequest.BaseOID, &value.PullRequestState, &draft, &owned, &observed,
-		&value.PRCreateOrUpdateEffect.SemanticKey, &value.PRCreateOrUpdateEffect.Kind, &value.PRCreateOrUpdateEffect.RequestDigest, &value.PRCreateOrUpdateEffect.ClaimEpoch, &value.PRCreateOrUpdateEffect.ObservedIdentity, &value.WitnessDigest, &created)
+		&value.PRCreateOrUpdateEffect.SemanticKey, &value.PRCreateOrUpdateEffect.Kind, &value.PRCreateOrUpdateEffect.RequestDigest, &value.PRCreateOrUpdateEffect.ClaimEpoch, &value.PRCreateOrUpdateEffect.ObservedIdentity, &buildCreated, &value.WitnessDigest, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PublishedCandidateEvidence{}, false, nil
 	}
@@ -507,7 +666,10 @@ func loadPublicationEvidenceRow(ctx context.Context, q interface {
 	if value.PullRequestObservedAt, parseErr = time.Parse(time.RFC3339Nano, observed); parseErr != nil {
 		return PublishedCandidateEvidence{}, false, ErrPublicationEvidence
 	}
-	if value.CreatedAt, parseErr = time.Parse(time.RFC3339Nano, created); parseErr != nil {
+	if value.CreatedAt, parseErr = parsePublicationTime(created); parseErr != nil {
+		return PublishedCandidateEvidence{}, false, ErrPublicationEvidence
+	}
+	if value.BuildTransitionCreatedAt, parseErr = parsePublicationTime(buildCreated); parseErr != nil {
 		return PublishedCandidateEvidence{}, false, ErrPublicationEvidence
 	}
 	if value.Ref != ref || value.Worktree.IdentityJSON == nil || sha256Digest(value.Worktree.IdentityJSON) != identityDigest {
@@ -527,7 +689,7 @@ func loadLatestPublicationRebind(ctx context.Context, q interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, value *PublishedCandidateEvidence) error {
-	rows, err := q.QueryContext(ctx, `SELECT prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? ORDER BY ticket_version`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, value.Candidate.Snapshot.Generation, value.Candidate.Snapshot.HeadSHA)
+	rows, err := q.QueryContext(ctx, `SELECT prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest,created_at FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? ORDER BY ticket_version`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, value.Candidate.Snapshot.Generation, value.Candidate.Snapshot.HeadSHA)
 	if err != nil {
 		return err
 	}
@@ -542,8 +704,12 @@ func loadLatestPublicationRebind(ctx context.Context, q interface {
 			return ErrPublicationEvidence
 		}
 		var rebind PublicationRebind
-		if err := rows.Scan(&rebind.PriorWitnessDigest, &rebind.PriorTicketVersion, &rebind.PriorFence.LeaderEpoch, &rebind.PriorFence.RunnerEpoch, &rebind.TicketVersion, &rebind.Fence.LeaderEpoch, &rebind.Fence.RunnerEpoch, &rebind.RebindDigest); err != nil {
+		var created string
+		if err := rows.Scan(&rebind.PriorWitnessDigest, &rebind.PriorTicketVersion, &rebind.PriorFence.LeaderEpoch, &rebind.PriorFence.RunnerEpoch, &rebind.TicketVersion, &rebind.Fence.LeaderEpoch, &rebind.Fence.RunnerEpoch, &rebind.RebindDigest, &created); err != nil {
 			return err
+		}
+		if rebind.CreatedAt, err = parsePublicationTime(created); err != nil {
+			return ErrPublicationEvidence
 		}
 		rebind.Ref, rebind.CandidateGeneration, rebind.CandidateHeadOID = value.Ref, value.Candidate.Snapshot.Generation, value.Candidate.Snapshot.HeadSHA
 		payload, err := publicationRebindPayload(rebind)
@@ -554,10 +720,10 @@ func loadLatestPublicationRebind(ctx context.Context, q interface {
 			return err
 		}
 		var eventCount int
-		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='publication_rebind' AND from_state='publishing' AND to_state='publishing' AND payload=?`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, rebind.TicketVersion, string(payload)).Scan(&eventCount); err != nil || eventCount != 1 {
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='publication_rebind' AND from_state='publishing' AND to_state='publishing' AND payload=? AND created_at=?`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, rebind.TicketVersion, string(payload), rebind.CreatedAt.Format(time.RFC3339Nano)).Scan(&eventCount); err != nil || eventCount != 1 {
 			return ErrPublicationEvidence
 		}
-		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND NOT (trigger='publication_rebind' AND from_state='publishing' AND to_state='publishing')`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, rebind.TicketVersion).Scan(&eventCount); err != nil || eventCount != 0 {
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, rebind.TicketVersion).Scan(&eventCount); err != nil || eventCount != 1 {
 			return ErrPublicationEvidence
 		}
 		priorVersion, priorFence, priorDigest, found = rebind.TicketVersion, rebind.Fence, rebind.RebindDigest, true
@@ -577,7 +743,8 @@ func loadPublicationRebindAt(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, ref domain.TicketRef, generation uint64, head string, version uint64) (PublicationRebind, bool, error) {
 	var row PublicationRebind
-	err := q.QueryRowContext(ctx, `SELECT prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, generation, head, version).Scan(&row.PriorWitnessDigest, &row.PriorTicketVersion, &row.PriorFence.LeaderEpoch, &row.PriorFence.RunnerEpoch, &row.TicketVersion, &row.Fence.LeaderEpoch, &row.Fence.RunnerEpoch, &row.RebindDigest)
+	var created string
+	err := q.QueryRowContext(ctx, `SELECT prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest,created_at FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, generation, head, version).Scan(&row.PriorWitnessDigest, &row.PriorTicketVersion, &row.PriorFence.LeaderEpoch, &row.PriorFence.RunnerEpoch, &row.TicketVersion, &row.Fence.LeaderEpoch, &row.Fence.RunnerEpoch, &row.RebindDigest, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PublicationRebind{}, false, nil
 	}
@@ -585,6 +752,9 @@ func loadPublicationRebindAt(ctx context.Context, q interface {
 		return PublicationRebind{}, false, err
 	}
 	row.Ref, row.CandidateGeneration, row.CandidateHeadOID = ref, generation, head
+	if row.CreatedAt, err = parsePublicationTime(created); err != nil {
+		return PublicationRebind{}, false, ErrPublicationEvidence
+	}
 	return row, true, nil
 }
 
@@ -592,7 +762,8 @@ func loadPublicationRebindBefore(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, ref domain.TicketRef, generation uint64, head string, version uint64) (PublicationRebind, bool, error) {
 	var row PublicationRebind
-	err := q.QueryRowContext(ctx, `SELECT prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND ticket_version<? ORDER BY ticket_version DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, generation, head, version).Scan(&row.PriorWitnessDigest, &row.PriorTicketVersion, &row.PriorFence.LeaderEpoch, &row.PriorFence.RunnerEpoch, &row.TicketVersion, &row.Fence.LeaderEpoch, &row.Fence.RunnerEpoch, &row.RebindDigest)
+	var created string
+	err := q.QueryRowContext(ctx, `SELECT prior_witness_digest,prior_ticket_version,prior_leader_epoch,prior_runner_epoch,ticket_version,leader_epoch,runner_epoch,rebind_digest,created_at FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND ticket_version<? ORDER BY ticket_version DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, generation, head, version).Scan(&row.PriorWitnessDigest, &row.PriorTicketVersion, &row.PriorFence.LeaderEpoch, &row.PriorFence.RunnerEpoch, &row.TicketVersion, &row.Fence.LeaderEpoch, &row.Fence.RunnerEpoch, &row.RebindDigest, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PublicationRebind{}, false, nil
 	}
@@ -600,6 +771,9 @@ func loadPublicationRebindBefore(ctx context.Context, q interface {
 		return PublicationRebind{}, false, err
 	}
 	row.Ref, row.CandidateGeneration, row.CandidateHeadOID = ref, generation, head
+	if row.CreatedAt, err = parsePublicationTime(created); err != nil {
+		return PublicationRebind{}, false, ErrPublicationEvidence
+	}
 	return row, true, nil
 }
 
@@ -637,11 +811,18 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 		return PublishedCandidateEvidence{}, ErrPublicationEvidence
 	}
 	if waitingReplay {
-		var transitions int
-		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='effects_confirmed' AND from_state='publishing' AND to_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, waitingVersion).Scan(&transitions); err != nil || transitions != 1 {
+		payload, err := json.Marshal(struct {
+			WitnessDigest    string `json:"witness_digest"`
+			WitnessCreatedAt string `json:"witness_created_at"`
+		}{value.WitnessDigest, value.CreatedAt.Format(time.RFC3339Nano)})
+		if err != nil {
 			return PublishedCandidateEvidence{}, ErrPublicationEvidence
 		}
-		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND NOT (trigger='effects_confirmed' AND from_state='publishing' AND to_state='waiting_ci')`, ref.Channel, ref.Project, ref.Ticket, waitingVersion).Scan(&transitions); err != nil || transitions != 0 {
+		var transitions int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events e JOIN publication_transition_evidence p ON p.channel=e.channel AND p.project_id=e.project_id AND p.ticket_id=e.ticket_id AND p.ticket_version=e.ticket_version AND p.event_created_at=e.created_at WHERE e.channel=? AND e.project_id=? AND e.ticket_id=? AND e.ticket_version=? AND e.trigger='effects_confirmed' AND e.from_state='publishing' AND e.to_state='waiting_ci' AND e.payload=? AND p.witness_digest=? AND p.witness_created_at=?`, ref.Channel, ref.Project, ref.Ticket, waitingVersion, string(payload), value.WitnessDigest, value.CreatedAt.Format(time.RFC3339Nano)).Scan(&transitions); err != nil || transitions != 1 {
+			return PublishedCandidateEvidence{}, ErrPublicationEvidence
+		}
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, waitingVersion).Scan(&transitions); err != nil || transitions != 1 {
 			return PublishedCandidateEvidence{}, ErrPublicationEvidence
 		}
 		if ticket.Version < waitingVersion || ticket.RunnerEpoch < value.CurrentFence.RunnerEpoch || ticket.Version-waitingVersion != ticket.RunnerEpoch-value.CurrentFence.RunnerEpoch {

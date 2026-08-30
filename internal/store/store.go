@@ -57,7 +57,7 @@ var (
 	ErrPublicationEvidence     = errors.New("publication evidence is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 38
+const schemaVersion = 39
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -98,6 +98,7 @@ var migrationChecksums = map[int]string{
 	36: migrationChecksum(migrationV36),
 	37: migrationChecksum(migrationV37),
 	38: migrationChecksum(migrationV38),
+	39: migrationChecksum(migrationV39),
 }
 
 func migrationChecksum(statements []string) string {
@@ -420,6 +421,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV37
 			} else if version == 38 {
 				statements = migrationV38
+			} else if version == 39 {
+				statements = migrationV39
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1141,6 +1144,11 @@ func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) Transition(ctx context.Context, transition Transition) (TransitionResult, error) {
+	// Publication is a separate trust boundary. A caller must not be able to
+	// advance publishing based only on a ticket counter and arbitrary payload.
+	if publicationSensitiveTransition(transition.From, transition.To) {
+		return TransitionResult{}, ErrPublicationEvidence
+	}
 	if transition.Trigger == "phase_pass" && (transition.From == domain.StatePlanning || transition.From == domain.StateVerifying || transition.From == domain.StateBuilding) {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
@@ -1191,6 +1199,19 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		return nil
 	})
 	return result, err
+}
+
+func publicationSensitiveTransition(from, to domain.State) bool {
+	if to == domain.StatePublishing || to == domain.StateWaitingCI {
+		return true
+	}
+	if from != domain.StatePublishing && from != domain.StateWaitingCI {
+		return false
+	}
+	// An operator's stop/cancel path is a safety action, not publication
+	// continuation. All other publication exits must go through a dedicated
+	// evidence-bearing boundary.
+	return to != domain.StateStopping && to != domain.StateCancelling
 }
 
 // TransitionPlan consumes the current planner binding in the same SQLite write

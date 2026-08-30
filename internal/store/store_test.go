@@ -1009,7 +1009,7 @@ func TestGenericPhasePassAndWrongDedicatedTargetsAreRejected(t *testing.T) {
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-phase-authority"}
 	fence := domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1}
 	for _, tc := range []struct{ from, to domain.State }{{domain.StatePlanning, domain.StateVerifying}, {domain.StateVerifying, domain.StateBuilding}, {domain.StateBuilding, domain.StatePublishing}} {
-		if _, err := database.Transition(ctx, Transition{Ref: ref, ExpectedVersion: 1, From: tc.from, To: tc.to, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); !errors.Is(err, ErrEvidenceConflict) {
+		if _, err := database.Transition(ctx, Transition{Ref: ref, ExpectedVersion: 1, From: tc.from, To: tc.to, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); !errors.Is(err, ErrEvidenceConflict) && !errors.Is(err, ErrPublicationEvidence) {
 			t.Fatalf("generic %s->%s err=%v", tc.from, tc.to, err)
 		}
 	}

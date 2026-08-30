@@ -887,3 +887,23 @@ var migrationV38 = []string{
 	`UPDATE tickets SET state='blocked',resume_state=state,blocked_code='legacy_publication_recovery_unverifiable',version=version+1 WHERE EXISTS(SELECT 1 FROM publication_evidence p WHERE p.channel=tickets.channel AND p.project_id=tickets.project_id AND p.ticket_id=tickets.id) AND NOT EXISTS(SELECT 1 FROM publication_evidence p WHERE p.channel=tickets.channel AND p.project_id=tickets.project_id AND p.ticket_id=tickets.id AND p.candidate_generation=(SELECT MAX(latest.candidate_generation) FROM publication_evidence latest WHERE latest.channel=p.channel AND latest.project_id=p.project_id AND latest.ticket_id=p.ticket_id) AND (SELECT COUNT(*) FROM publication_evidence latest WHERE latest.channel=p.channel AND latest.project_id=p.project_id AND latest.ticket_id=p.ticket_id AND latest.candidate_generation=p.candidate_generation)=1 AND ((tickets.state='publishing' AND tickets.version=p.ticket_version AND tickets.runner_epoch=p.runner_epoch) OR (tickets.state='waiting_ci' AND tickets.version=p.ticket_version+1 AND tickets.runner_epoch=p.runner_epoch AND (SELECT COUNT(*) FROM events e WHERE e.channel=p.channel AND e.project_id=p.project_id AND e.ticket_id=p.ticket_id AND e.ticket_version=p.ticket_version+1 AND e.trigger='effects_confirmed' AND e.from_state='publishing' AND e.to_state='waiting_ci')=1 AND NOT EXISTS(SELECT 1 FROM events e WHERE e.channel=p.channel AND e.project_id=p.project_id AND e.ticket_id=p.ticket_id AND e.ticket_version=p.ticket_version+1 AND NOT(e.trigger='effects_confirmed' AND e.from_state='publishing' AND e.to_state='waiting_ci')))))`,
 	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,id,version,'typed_blocker',resume_state,'blocked','{"code":"legacy_publication_recovery_unverifiable","reason":"publication recovery advanced without an authenticated runner ledger","next_action":"start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tickets WHERE state='blocked' AND blocked_code='legacy_publication_recovery_unverifiable' AND resume_state IN ('publishing','waiting_ci')`,
 }
+
+// v39 repairs the initially shipped publication ledger. v37/v38 witness and
+// rebind digests did not cover their creation timestamps, and SQLite cannot
+// retrospectively prove them with the Go canonicalizer. There is no safe
+// active legacy subset, so fail closed rather than resume a forged publication.
+var migrationV39 = []string{
+	`ALTER TABLE publication_evidence ADD COLUMN build_transition_created_at TEXT NOT NULL DEFAULT ''`,
+	`CREATE TABLE publication_transition_evidence (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		witness_digest TEXT NOT NULL CHECK(length(witness_digest)=71), witness_created_at TEXT NOT NULL,
+		ticket_version INTEGER NOT NULL CHECK(ticket_version>0), event_created_at TEXT NOT NULL,
+		PRIMARY KEY(channel,project_id,ticket_id,ticket_version),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+	`CREATE UNIQUE INDEX publication_transition_evidence_witness ON publication_transition_evidence(channel,project_id,ticket_id,witness_digest)`,
+	`CREATE TRIGGER publication_transition_evidence_immutable_update BEFORE UPDATE ON publication_transition_evidence BEGIN SELECT RAISE(ABORT,'publication transition evidence is immutable'); END`,
+	`CREATE TRIGGER publication_transition_evidence_immutable_delete BEFORE DELETE ON publication_transition_evidence BEGIN SELECT RAISE(ABORT,'publication transition evidence is append-only'); END`,
+	`UPDATE tickets SET state='blocked',resume_state=state,blocked_code='legacy_publication_timestamp_unverifiable',version=version+1 WHERE state IN ('publishing','waiting_ci')`,
+	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,id,version,'typed_blocker',resume_state,'blocked','{"code":"legacy_publication_timestamp_unverifiable","reason":"publication timestamps predate authenticated digest coverage","next_action":"reconcile the external publication or start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tickets WHERE state='blocked' AND blocked_code='legacy_publication_timestamp_unverifiable' AND resume_state IN ('publishing','waiting_ci')`,
+}
