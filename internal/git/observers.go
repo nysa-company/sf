@@ -86,6 +86,22 @@ func (r Runner) ObserveCommit(ctx context.Context, worktree Worktree) (CommitObs
 	}
 	// Deriving the tree from the captured commit makes the tuple intrinsically
 	// consistent even if HEAD is moved and moved back while this read runs.
+	// Re-read HEAD as well so an ordinary move that remains in place is refused.
+	finalCommitOutput, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno,
+		"rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return CommitObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return CommitObservation{}, err
+	}
+	finalCommitOID, err := parseSingleOID(finalCommitOutput, "commit")
+	if err != nil {
+		return CommitObservation{}, err
+	}
+	if finalCommitOID != commitOID {
+		return CommitObservation{}, fmt.Errorf("%w: HEAD changed during commit observation", ErrUnexpectedRemote)
+	}
 	// The final identity check below closes the authenticated path and
 	// repository/config boundary after the complete read set.
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
@@ -170,7 +186,7 @@ func parseCommitParents(output []byte) (string, string, error) {
 	fields := strings.Split(text, " ")
 	// rev-list --parents for a non-root, non-merge commit is exactly HEAD and
 	// one parent. This also rejects extra lines/tokens and malformed output.
-	if len(fields) != 2 || strings.ContainsAny(text, "\r\n\t") || strings.TrimSpace(text) != text || !validOID(fields[0]) || !validOID(fields[1]) {
+	if len(fields) != 2 || strings.ContainsAny(text, "\r\n\t") || strings.TrimSpace(text) != text || !validOID(fields[0]) || !validOID(fields[1]) || len(fields[0]) != len(fields[1]) {
 		return "", "", fmt.Errorf("%w: commit must have exactly one canonical parent", ErrUnexpectedRemote)
 	}
 	return fields[0], fields[1], nil
