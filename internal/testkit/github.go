@@ -640,11 +640,19 @@ func (f *FakeGH) runSourceRef(argv []string) ([]byte, error) {
 	if index < 0 {
 		return nil, errors.New("fake-gh: unsupported source ref")
 	}
-	ref := path[index+len(marker):]
+	sourcePath, sourceRef, ok := strings.Cut(strings.TrimPrefix(path, "repos/"), marker)
+	if !ok {
+		return nil, errors.New("fake-gh: malformed source ref")
+	}
+	sourceOwner, sourceRepo, ok := strings.Cut(sourcePath, "/")
+	if !ok {
+		return nil, errors.New("fake-gh: malformed source repository")
+	}
+	ref := sourceRef
 	sha := strings.Repeat("a", 40)
 	snapshot := f.Snapshot()
 	for _, pr := range snapshot.PRs {
-		if pr.Identity.HeadRef == ref {
+		if pr.Identity.HeadOwner == sourceOwner && pr.Identity.HeadRepository == sourceRepo && pr.Identity.HeadRef == ref {
 			sha = pr.Identity.HeadOID
 			break
 		}
@@ -719,7 +727,7 @@ func validateOfficialArgv(argv []string) error {
 			return fmt.Errorf("fake-gh: incomplete %s", key)
 		}
 	case "pr ready":
-		allowed["--repo"], allowed["--undo"] = true, true
+		allowed["--repo"] = true
 		if prNumber(argv) <= 0 || option(argv, "--repo") == "" {
 			return fmt.Errorf("fake-gh: incomplete %s", key)
 		}
@@ -942,20 +950,6 @@ func (f *FakeGH) runReady(argv []string) ([]byte, error) {
 		}); err != nil {
 			return nil, err
 		}
-	}
-	if hasFlag(argv, "--undo") {
-		err := f.withState(func() (bool, error) {
-			index, err := f.findLocked(identity)
-			if err != nil {
-				return false, err
-			}
-			f.state.PRs[index].Draft, f.state.PRs[index].Ready = true, false
-			return true, nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		return []byte("{}"), nil
 	}
 	if err := f.MarkReady(context.Background(), domain.ExternalEffectClaim{}, identity); err != nil {
 		return nil, err

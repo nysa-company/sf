@@ -56,6 +56,12 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 }
 
 func testClaim(kind string, identity contracts.PullRequestIdentity, values ...string) domain.ExternalEffectClaim {
+	if kind == "merge" && identity.BaseOID == "" {
+		identity.BaseOID = strings.Repeat("c", 40)
+	}
+	if kind == "merge" && len(values) == 2 {
+		values = append(values, strings.Repeat("c", 40), strings.Repeat("c", 40), strings.Repeat("c", 40), strings.Repeat("c", 40))
+	}
 	return domain.ExternalEffectClaim{
 		SemanticKey:   "test-" + kind,
 		Ref:           domain.TicketRef{Channel: "dev", Project: "example", Ticket: "SF-44"},
@@ -66,6 +72,14 @@ func testClaim(kind string, identity contracts.PullRequestIdentity, values ...st
 		RunnerEpoch:   1,
 		ClaimEpoch:    1,
 	}
+}
+
+func testAuthorization(identity contracts.PullRequestIdentity) domain.MergeAuthorization {
+	base := identity.BaseOID
+	if base == "" {
+		base = strings.Repeat("c", 40)
+	}
+	return domain.MergeAuthorization{ReviewedHead: identity.HeadOID, CurrentHead: identity.HeadOID, ReviewedBaseSHA: base, CurrentBaseSHA: base, ReviewedBaseHeadOID: base, CurrentBaseHeadOID: base, Approved: true, GatesGreen: true}
 }
 
 func createDraft(t *testing.T, client *Client, identity contracts.PullRequestIdentity, title, body string) PRMatch {
@@ -253,10 +267,45 @@ func TestCleanupUncertaintyNeverBecomesMutationSuccess(t *testing.T) {
 
 	client.mutationGuard = fixtureGuard()
 	mergeClaim := testClaim("merge", created.Identity, created.Identity.HeadOID, "merge")
-	authorization := domain.MergeAuthorization{ReviewedHead: created.Identity.HeadOID, CurrentHead: created.Identity.HeadOID, Approved: true, GatesGreen: true}
+	authorization := testAuthorization(created.Identity)
 	client.mutationGuard = uncertainGuard
 	if err := client.MergeExactHead(context.Background(), mergeClaim, created.Identity, created.Identity.HeadOID, "merge", authorization); !errors.Is(err, ErrProcessCleanup) {
 		t.Fatalf("merge cleanup uncertainty=%v", err)
+	}
+}
+
+func TestCleanupQuarantineIsNotACompletedProof(t *testing.T) {
+	if (CleanupProof{Quarantined: true}).valid() {
+		t.Fatal("quarantine was accepted as successful cleanup")
+	}
+	if !(CleanupProof{Drained: true, Quarantined: true}).valid() {
+		t.Fatal("drain proof was rejected")
+	}
+}
+
+type quarantineRunner struct{}
+
+func (quarantineRunner) Run(context.Context, string, []string, []string) ([]byte, error) {
+	return []byte("{}"), nil
+}
+func (quarantineRunner) Cleanup(context.Context) (CleanupProof, error) {
+	return CleanupProof{Quarantined: true}, nil
+}
+
+func TestQuarantinedRunnerBlocksGuardedMutation(t *testing.T) {
+	client, _, identity := fixture(t)
+	client.runner = quarantineRunner{}
+	started := false
+	client.mutationGuard = mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+		started = true
+		return start(ctx)
+	})
+	claim := testClaim("pr_edit", identity, "title", "body")
+	if _, err := client.mutateExact(context.Background(), claim, identity, "pr", "edit", "1"); !errors.Is(err, ErrProcessCleanup) {
+		t.Fatalf("quarantined runner err=%v", err)
+	}
+	if !started {
+		t.Fatal("guarded callback did not run")
 	}
 }
 
@@ -328,7 +377,7 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
 		t.Fatal(err)
 	}
-	authorization := domain.MergeAuthorization{ReviewedHead: pr.Identity.HeadOID, CurrentHead: pr.Identity.HeadOID, Approved: true, GatesGreen: true}
+	authorization := testAuthorization(pr.Identity)
 	err = client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "squash", authorization)
 	if err != nil {
 		t.Fatalf("guarded merge err=%v", err)
@@ -345,7 +394,7 @@ func TestDraftAndNonOpenPRsCannotMergeOrBeAdopted(t *testing.T) {
 	client, _, identity := fixture(t)
 	pr := createDraft(t, client, identity, "title", "body")
 	claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "merge")
-	if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "merge", domain.MergeAuthorization{ReviewedHead: pr.Identity.HeadOID, CurrentHead: pr.Identity.HeadOID, Approved: true, GatesGreen: true}); !errors.Is(err, ErrPolicyRefusal) {
+	if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "merge", testAuthorization(pr.Identity)); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("draft merge=%v", err)
 	}
 	closedClient, closedFake, closedIdentity := fixture(t)
@@ -398,7 +447,6 @@ func TestMarkReadySynchronizeGapCompensatesChangedSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	phase := 0
-	undoCalled := false
 	client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 		if len(args) < 2 || args[0] != "pr" {
 			return nil, errors.New("unexpected command")
@@ -422,15 +470,6 @@ func TestMarkReadySynchronizeGapCompensatesChangedSource(t *testing.T) {
 			}
 			return newWire, nil
 		case "ready":
-			undo := false
-			for _, arg := range args {
-				undo = undo || arg == "--undo"
-			}
-			if undo {
-				undoCalled = true
-				phase = 3
-				return []byte("{}"), nil
-			}
 			phase = 2
 			return []byte("{}"), nil
 		default:
@@ -440,9 +479,6 @@ func TestMarkReadySynchronizeGapCompensatesChangedSource(t *testing.T) {
 	claim := testClaim("pr_ready", identity)
 	if err := client.MarkReady(context.Background(), claim, identity); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("changed-head ready=%v", err)
-	}
-	if !undoCalled {
-		t.Fatal("changed-head ready did not attempt exact number-scoped undo")
 	}
 }
 
@@ -519,7 +555,7 @@ func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 		if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
 			t.Fatal(err)
 		}
-		if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "merge", domain.MergeAuthorization{ReviewedHead: pr.Identity.HeadOID, CurrentHead: pr.Identity.HeadOID, Approved: true, GatesGreen: true}); !errors.Is(err, ErrPolicyRefusal) {
+		if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "merge", testAuthorization(pr.Identity)); !errors.Is(err, ErrPolicyRefusal) {
 			t.Fatalf("missing proof verifier=%v", err)
 		}
 	})
@@ -533,7 +569,7 @@ func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 		if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
 			t.Fatal(err)
 		}
-		if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "merge", domain.MergeAuthorization{ReviewedHead: pr.Identity.HeadOID, CurrentHead: pr.Identity.HeadOID, Approved: true, GatesGreen: true}); !errors.Is(err, ErrPolicyRefusal) {
+		if err := client.MergeExactHead(context.Background(), claim, pr.Identity, pr.Identity.HeadOID, "merge", testAuthorization(pr.Identity)); !errors.Is(err, ErrPolicyRefusal) {
 			t.Fatalf("mismatched proof=%v", err)
 		}
 	})
@@ -558,6 +594,11 @@ func TestMergeFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
 		{"base-changed", func(id contracts.PullRequestIdentity) map[string]any {
 			id.BaseRef = "release"
 			return mergeWire(id, "OPEN", "CLEAN", nil, nil)
+		}, false},
+		{"base-head-changed", func(id contracts.PullRequestIdentity) map[string]any {
+			wire := mergeWire(id, "OPEN", "CLEAN", nil, nil)
+			wire["baseRefOid"] = strings.Repeat("d", 40)
+			return wire
 		}, false},
 		{"auto-merge", func(id contracts.PullRequestIdentity) map[string]any {
 			return mergeWire(id, "OPEN", "CLEAN", nil, map[string]any{"enabledAt": "now"})
@@ -596,7 +637,7 @@ func TestMergeFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
 				}
 				return []byte("{}"), nil
 			})
-			authorization := domain.MergeAuthorization{ReviewedHead: identity.HeadOID, CurrentHead: identity.HeadOID, Approved: true, GatesGreen: true}
+			authorization := testAuthorization(identity)
 			claim := testClaim("merge", identity, identity.HeadOID, "squash")
 			if err := client.MergeExactHead(context.Background(), claim, identity, identity.HeadOID, "squash", authorization); !errors.Is(err, ErrPolicyRefusal) {
 				t.Fatalf("changed %s accepted: %v", test.name, err)
@@ -611,6 +652,7 @@ func TestMergeFinalHandoffRejectsChangedGuardedFields(t *testing.T) {
 func TestMergeNeverTrustsCLIExitWithoutFreshMergedObservation(t *testing.T) {
 	client, _, identity := fixture(t)
 	identity.Number = 1
+	identity.BaseOID = strings.Repeat("c", 40)
 	pr := PRMatch{Identity: identity, State: "OPEN"}
 	for _, test := range []struct {
 		name string
@@ -729,7 +771,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
 	})}
 	claim := testClaim("merge", identity, identity.HeadOID, "squash")
-	authorization := domain.MergeAuthorization{ReviewedHead: identity.HeadOID, CurrentHead: identity.HeadOID, Approved: true, GatesGreen: true}
+	authorization := testAuthorization(identity)
 	if err := client.MergeExactHead(context.Background(), claim, identity, identity.HeadOID, "squash", authorization); err != nil || !verified {
 		t.Fatalf("proven merge verified=%v err=%v", verified, err)
 	}

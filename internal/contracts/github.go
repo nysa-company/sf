@@ -26,7 +26,11 @@ type PullRequestIdentity struct {
 	HeadRef        string
 	HeadOID        string
 	BaseRef        string
-	FactoryOwned   bool
+	// BaseOID is the exact remote protected-branch tip observed on the PR.
+	// It is optional for non-merge identity lookups for compatibility, but a
+	// guarded merge requires it and binds it to the reviewed authorization.
+	BaseOID      string
+	FactoryOwned bool
 }
 
 type RequiredCheck struct {

@@ -82,7 +82,10 @@ type CleanupProof struct {
 	Quarantined bool
 }
 
-func (p CleanupProof) valid() bool { return p.Drained || p.Quarantined }
+// Quarantine is not a successful cleanup proof for a mutation.  It may be a
+// useful supervisor state, but descendants/output writers can still exist, so
+// the mutation gate must remain latched until they are drained.
+func (p CleanupProof) valid() bool { return p.Drained }
 
 type commandRunnerFunc func(context.Context, string, []string, []string) ([]byte, error)
 
@@ -273,46 +276,10 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 	if observeErr == nil && sameExact(observed.Identity, identity) && observed.State == "OPEN" && !observed.Merged && observed.Ready && !observed.Draft {
 		return nil
 	}
-	// GitHub exposes no expected-head CAS for ready. Compensate immediately on
-	// a changed/uncertain post-state: restore draft on the freshly observed PR,
-	// verify it, and leave the durable effect unconfirmed for reconciliation.
-	if observeErr == nil && observed.State == "OPEN" && !observed.Merged {
-		_, undoErr := c.mutateUndoReadyExact(ctx, durable, observed.Identity, "pr", "ready", fmt.Sprint(observed.Identity.Number), "--repo", repoArg(observed.Identity.Repository), "--undo")
-		if errors.Is(undoErr, ErrProcessCleanup) {
-			return undoErr
-		}
-		restored, restoreErr := c.Observe(ctx, observed.Identity)
-		if errors.Is(restoreErr, ErrProcessCleanup) {
-			return restoreErr
-		}
-		if undoErr != nil || restoreErr != nil || !sameExact(restored.Identity, observed.Identity) || !restored.Draft {
-			return ErrPolicyRefusal
-		}
-		return ErrPolicyRefusal
-	}
-	if observeErr != nil {
-		current, sourceErr := c.viewSameSourceNumber(ctx, identity.Repository, identity.Number, identity)
-		if errors.Is(sourceErr, ErrProcessCleanup) {
-			return sourceErr
-		}
-		if sourceErr == nil {
-			// Re-prove the exact currently observed identity inside the launch
-			// handoff; the number-scoped undo is never authorized by a stale
-			// pre-handoff read alone.
-			_, undoErr := c.mutateSameSourceExact(ctx, durable, identity, current.Identity, "pr", "ready", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--undo")
-			if errors.Is(undoErr, ErrProcessCleanup) {
-				return undoErr
-			}
-			restored, restoreErr := c.viewSameSourceNumber(ctx, identity.Repository, identity.Number, identity)
-			if errors.Is(restoreErr, ErrProcessCleanup) {
-				return restoreErr
-			}
-			if undoErr == nil && restoreErr == nil && sameExact(restored.Identity, current.Identity) && restored.Draft {
-				return ErrPolicyRefusal
-			}
-		}
-		return ErrPolicyRefusal
-	}
+	// GitHub exposes no expected-head CAS for ready. If the post-state is not
+	// the exact expected state, leave the original effect uncertain/blocked for
+	// reconciliation. A compensating --undo would be a second mutation without
+	// its own durable effect claim and could race a legitimate operator action.
 	return ErrPolicyRefusal
 }
 
@@ -326,11 +293,11 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 		return ErrPolicyRefusal
 	}
 	identity = observed.Identity
-	if err := c.validateClaim(ctx, durable, identity, "merge", requestDigest("merge", identity, headOID, method)); err != nil {
-		return err
-	}
-	if !authorization.Approved || !authorization.GatesGreen || authorization.ReviewedHead != headOID || authorization.CurrentHead != headOID {
+	if !authorization.Approved || !authorization.GatesGreen || authorization.ReviewedHead != headOID || authorization.CurrentHead != headOID || !validOID(authorization.ReviewedBaseSHA) || authorization.CurrentBaseSHA != authorization.ReviewedBaseSHA || !validOID(authorization.ReviewedBaseHeadOID) || authorization.CurrentBaseHeadOID != authorization.ReviewedBaseHeadOID || observed.Identity.BaseOID != authorization.ReviewedBaseHeadOID {
 		return ErrApprovalInvalid
+	}
+	if err := c.validateClaim(ctx, durable, identity, "merge", requestDigest("merge", identity, headOID, method, authorization.ReviewedBaseSHA, authorization.CurrentBaseSHA, authorization.ReviewedBaseHeadOID, authorization.CurrentBaseHeadOID)); err != nil {
+		return err
 	}
 	_, err = c.mergeRun(ctx, observed, headOID, domain.MergeGuarded, method, func(args ...string) ([]byte, error) {
 		return c.mutateMergeExact(ctx, durable, identity, headOID, args...)
@@ -370,7 +337,9 @@ func (c Client) mutateCreateExact(ctx context.Context, claim domain.ExternalEffe
 // durable effect.  PR absence alone cannot prove that the branch did not move
 // between the preflight observation and launch.
 func (c Client) observeSourceExact(ctx context.Context, identity contracts.PullRequestIdentity) error {
-	path := "repos/" + repoArg(identity.Repository) + "/git/ref/heads/" + identity.HeadRef
+	// The ref lives in the source repository, which may be a fork; querying the
+	// base repository would silently validate the wrong branch tip.
+	path := "repos/" + identity.HeadOwner + "/" + identity.HeadRepository + "/git/ref/heads/" + identity.HeadRef
 	output, err := c.run(ctx, "api", path)
 	if err != nil {
 		if errors.Is(err, ErrProcessCleanup) {
@@ -411,10 +380,6 @@ func readyLaunchSafe(observed PRMatch, identity contracts.PullRequestIdentity) b
 	return sameExact(observed.Identity, identity) && observed.State == "OPEN" && !observed.Merged && !observed.AutoMerge && !queueState(observed.MergeState)
 }
 
-func undoReadyLaunchSafe(observed PRMatch, identity contracts.PullRequestIdentity) bool {
-	return sameExact(observed.Identity, identity) && observed.State == "OPEN" && !observed.Merged && !observed.Draft && !observed.AutoMerge && !queueState(observed.MergeState)
-}
-
 func (c Client) mutateReadyExact(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, args ...string) ([]byte, error) {
 	if c.mutationGuard == nil {
 		return nil, ErrPolicyRefusal
@@ -431,44 +396,8 @@ func (c Client) mutateReadyExact(ctx context.Context, claim domain.ExternalEffec
 	})
 }
 
-func (c Client) mutateUndoReadyExact(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, args ...string) ([]byte, error) {
-	if c.mutationGuard == nil {
-		return nil, ErrPolicyRefusal
-	}
-	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
-		observed, err := c.view(runCtx, identity)
-		if errors.Is(err, ErrProcessCleanup) {
-			return nil, ErrProcessCleanup
-		}
-		if err != nil || !undoReadyLaunchSafe(observed, identity) {
-			return nil, ErrPolicyRefusal
-		}
-		return c.run(runCtx, args...)
-	})
-}
-
-// mutateSameSourceExact is the compensation variant used after a ready
-// synchronize gap. GitHub has no head CAS for the undo operation, so the
-// source identity (repository, branch, base, marker, and PR number) is
-// re-observed inside the durable launch handoff and the observed head OID must
-// still equal the one selected for compensation.
-func (c Client) mutateSameSourceExact(ctx context.Context, claim domain.ExternalEffectClaim, original, current contracts.PullRequestIdentity, args ...string) ([]byte, error) {
-	if c.mutationGuard == nil {
-		return nil, ErrPolicyRefusal
-	}
-	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
-		observed, err := c.viewSameSourceNumber(runCtx, original.Repository, original.Number, original)
-		if errors.Is(err, ErrProcessCleanup) {
-			return nil, ErrProcessCleanup
-		}
-		if err != nil || !sameExact(observed.Identity, current) || observed.State != "OPEN" || observed.Merged || observed.Draft {
-			return nil, ErrPolicyRefusal
-		}
-		return c.run(runCtx, args...)
-	})
-}
 func requestDigest(operation string, identity contracts.PullRequestIdentity, values ...string) string {
-	input := operation + "\x00" + repoArg(identity.Repository) + "\x00" + identity.HeadOwner + "\x00" + identity.HeadRepository + "\x00" + identity.HeadRef + "\x00" + identity.HeadOID + "\x00" + identity.BaseRef
+	input := operation + "\x00" + repoArg(identity.Repository) + "\x00" + identity.HeadOwner + "\x00" + identity.HeadRepository + "\x00" + identity.HeadRef + "\x00" + identity.HeadOID + "\x00" + identity.BaseRef + "\x00" + identity.BaseOID
 	for _, value := range values {
 		input += "\x00" + value
 	}
@@ -675,7 +604,7 @@ func evaluateChecks(actual []contracts.RequiredCheck, required []CheckIdentity) 
 }
 
 func mergeLaunchSafe(observed PRMatch, identity contracts.PullRequestIdentity, reviewedHead string) bool {
-	return sameExact(observed.Identity, identity) && observed.State == "OPEN" && !observed.Draft && !observed.Merged && !observed.AutoMerge && !queueState(observed.MergeState) && observed.Identity.BaseRef == identity.BaseRef && observed.Identity.HeadOID == reviewedHead
+	return sameExact(observed.Identity, identity) && validOID(identity.BaseOID) && observed.BaseHeadOID == identity.BaseOID && observed.State == "OPEN" && !observed.Draft && !observed.Merged && !observed.AutoMerge && !queueState(observed.MergeState) && observed.Identity.BaseRef == identity.BaseRef && observed.Identity.HeadOID == reviewedHead
 }
 
 func (c Client) mutateMergeExact(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, reviewedHead string, args ...string) ([]byte, error) {
@@ -741,7 +670,7 @@ func (c Client) mergeRun(ctx context.Context, pr PRMatch, reviewedHead string, m
 		return "", err
 	}
 	if observed.Merged {
-		if !sameExact(observed.Identity, pr.Identity) || observed.Identity.HeadOID != reviewedHead {
+		if !sameExact(observed.Identity, pr.Identity) || observed.Identity.HeadOID != reviewedHead || observed.BaseHeadOID != pr.Identity.BaseOID {
 			return MergeExternal, ErrExternalMerged
 		}
 		if observed.State != "MERGED" || observed.MergeCommit == "" || observed.Identity.BaseRef != pr.Identity.BaseRef || c.verifyProtectedBranch == nil {
@@ -824,22 +753,6 @@ func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryI
 	return value.match(parsed), nil
 }
 
-// viewSameSourceNumber deliberately permits a changed head OID only for ready
-// compensation; ownership marker, repository, source branch and base remain exact.
-func (c Client) viewSameSourceNumber(ctx context.Context, repository contracts.RepositoryIdentity, number int, want contracts.PullRequestIdentity) (PRMatch, error) {
-	var value prWire
-	if err := c.json(ctx, &value, "pr", "view", fmt.Sprint(number), "--repo", repoArg(repository), "--json", prFields); err != nil {
-		return PRMatch{}, err
-	}
-	owner, name, ok := strings.Cut(value.HeadRepository.NameWithOwner, "/")
-	if !ok || value.Number != number || owner != want.HeadOwner || name != want.HeadRepository || value.HeadRepositoryOwner.Login != want.HeadOwner || value.HeadRef != want.HeadRef || value.BaseRef != want.BaseRef || !validOID(value.HeadOID) || !strings.Contains(value.Body, ownershipMarker(want)) {
-		return PRMatch{}, ErrPolicyRefusal
-	}
-	current := want
-	current.Number, current.HeadOID = number, value.HeadOID
-	return value.match(current), nil
-}
-
 const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest"
 
 type prWire struct {
@@ -882,14 +795,14 @@ func (p prWire) identity(repository contracts.RepositoryIdentity) (contracts.Pul
 	if !ok || !validRepositoryPart(owner) || !validRepositoryPart(name) || p.HeadRepositoryOwner.Login != owner || p.Number <= 0 || p.HeadRef == "" || !validOID(p.HeadOID) || !validRef(p.HeadRef) || !validRef(p.BaseRef) {
 		return contracts.PullRequestIdentity{}, ErrMalformedResponse
 	}
-	identity := contracts.PullRequestIdentity{Repository: repository, Number: p.Number, HeadOwner: owner, HeadRepository: name, HeadRef: p.HeadRef, HeadOID: p.HeadOID, BaseRef: p.BaseRef, FactoryOwned: true}
+	identity := contracts.PullRequestIdentity{Repository: repository, Number: p.Number, HeadOwner: owner, HeadRepository: name, HeadRef: p.HeadRef, HeadOID: p.HeadOID, BaseRef: p.BaseRef, BaseOID: p.BaseOID, FactoryOwned: true}
 	if !strings.Contains(p.Body, ownershipMarker(identity)) {
 		return contracts.PullRequestIdentity{}, ErrNoMatchingPR
 	}
 	return identity, nil
 }
 func sameExact(left, right contracts.PullRequestIdentity) bool {
-	return left.Repository == right.Repository && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.HeadOID == right.HeadOID && left.BaseRef == right.BaseRef && left.FactoryOwned && right.FactoryOwned && (right.Number == 0 || left.Number == right.Number)
+	return left.Repository == right.Repository && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.HeadOID == right.HeadOID && left.BaseRef == right.BaseRef && (left.BaseOID == "" || right.BaseOID == "" || left.BaseOID == right.BaseOID) && left.FactoryOwned && right.FactoryOwned && (right.Number == 0 || left.Number == right.Number)
 }
 func adoptableDraft(match PRMatch) bool { return match.Draft && !match.Merged && match.State == "OPEN" }
 func validRepository(value contracts.RepositoryIdentity) error {

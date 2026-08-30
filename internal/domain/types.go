@@ -169,10 +169,14 @@ type ExternalEffectClaim struct {
 }
 
 type MergeAuthorization struct {
-	ReviewedHead string
-	CurrentHead  string
-	Approved     bool
-	GatesGreen   bool
+	ReviewedHead        string
+	CurrentHead         string
+	ReviewedBaseSHA     string
+	CurrentBaseSHA      string
+	ReviewedBaseHeadOID string
+	CurrentBaseHeadOID  string
+	Approved            bool
+	GatesGreen          bool
 }
 
 type ProviderIdentity struct {
