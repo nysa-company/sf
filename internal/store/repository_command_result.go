@@ -127,7 +127,9 @@ func (s *Store) CompleteRepositoryCommand(ctx context.Context, claim contracts.R
 	}
 	return s.write(ctx, func(c *sql.Conn) error {
 		key := contracts.RepositoryCommandResultKey{SemanticKey: claim.SemanticKey, ClaimEpoch: claim.ClaimEpoch}
-		if existing, found, loadErr := loadRepositoryCommandResult(ctx, c, key, false); loadErr != nil {
+		// A replay must authenticate the immutable terminal effect witness too:
+		// a response-loss retry is not allowed to bless a modified historical row.
+		if existing, found, loadErr := loadRepositoryCommandResult(ctx, c, key, true); loadErr != nil {
 			return loadErr
 		} else if found {
 			stdoutDigest, stderrDigest, lastDigest, fullDigest, digestErr := resultDigests(claim, result, existing.CreatedAt)
@@ -171,8 +173,9 @@ func (s *Store) CompleteRepositoryCommand(ctx context.Context, claim contracts.R
 }
 
 // LoadRepositoryCommandResult returns authenticated historical command
-// evidence. It intentionally does not inspect effects.observed_identity: that
-// legacy projection is never an input to result authority.
+// evidence. effects.observed_identity is used only as the independently
+// written, exact full-digest completion witness. It is never a source from
+// which result authority is inferred or backfilled.
 func (s *Store) LoadRepositoryCommandResult(ctx context.Context, key contracts.RepositoryCommandResultKey) (RepositoryCommandResult, error) {
 	if key.SemanticKey == "" || key.ClaimEpoch == 0 {
 		return RepositoryCommandResult{}, ErrRepositoryCommandResult
@@ -235,7 +238,7 @@ func loadRepositoryCommandResult(ctx context.Context, q repositoryResultQuerier,
 	// Results remain valid after lease and intent cleanup. If an intent still
 	// names this exact epoch it must agree byte-for-byte; if the effect is still
 	// at this epoch it must be terminal with the corresponding exit semantics.
-	// A later claim epoch is allowed as historical retry evidence.
+	// A semantic request with durable completion evidence cannot be re-claimed.
 	var effect Effect
 	var effectProject, effectTicket string
 	err = q.QueryRowContext(ctx, `SELECT semantic_key,channel,project_id,ticket_id,effect_kind,state,ticket_version,leader_epoch,runner_epoch,claim_epoch,request_digest,observed_identity FROM effects WHERE semantic_key=?`, out.Claim.SemanticKey).Scan(&effect.SemanticKey, &effect.Ref.Channel, &effectProject, &effectTicket, &effect.Kind, &effect.State, &effect.TicketVersion, &effect.LeaderEpoch, &effect.RunnerEpoch, &effect.ClaimEpoch, &effect.RequestDigest, &effect.ObservedIdentity)

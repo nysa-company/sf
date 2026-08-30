@@ -133,6 +133,12 @@ func TestRepositoryCommandResultRejectsSameRowPayloadAndDigestRewrite(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM repository_command_intents WHERE semantic_key=?`, claim.SemanticKey); err != nil {
+		t.Fatal(err)
+	}
 	forged := stored
 	forged.Result.Stdout = []byte("after")
 	stdout, stderr, last, full, err := resultDigests(forged.Claim, forged.Result, forged.CreatedAt)
