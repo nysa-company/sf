@@ -118,6 +118,9 @@ type Config struct {
 	// process groups. A missing verifier is acceptable only when no Git lease
 	// exists; otherwise recovery refuses before socket/listener exposure.
 	GitMutationDrainer contracts.GitMutationDrainer
+	// RepositoryCommandDrainer proves persisted credential-free command
+	// identities before effects, runners, or the socket are exposed.
+	RepositoryCommandDrainer contracts.RepositoryCommandDrainer
 	// ProviderCoordinatorFactory composes configured, qualified adapters after
 	// the daemon opens the authoritative Store. A nil factory leaves provider
 	// execution unavailable rather than inventing an adapter.
@@ -145,11 +148,12 @@ type Daemon struct {
 	recoveryDrainer interface {
 		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
-	gitMutationDrainer  contracts.GitMutationDrainer
-	providerCoordinator *providercoord.Coordinator
-	providerQualifier   func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
-	mu                  sync.Mutex
-	closed              bool
+	gitMutationDrainer       contracts.GitMutationDrainer
+	repositoryCommandDrainer contracts.RepositoryCommandDrainer
+	providerCoordinator      *providercoord.Coordinator
+	providerQualifier        func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
+	mu                       sync.Mutex
+	closed                   bool
 
 	projectionMu      sync.Mutex
 	projector         events.Projector
@@ -250,7 +254,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		}
 	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, providerCoordinator: coordinator, providerQualifier: configuration.ProviderQualifier}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinator: coordinator, providerQualifier: configuration.ProviderQualifier}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -304,6 +308,9 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 	// before any later composition can admit provider or repository writers.
 	if err := daemon.store.RecoverGitMutationLeases(ctx, daemon.channel, daemon.epoch, daemon.gitMutationDrainer); err != nil {
 		return fmt.Errorf("recover stranded git mutations: %w", err)
+	}
+	if err := daemon.store.RecoverRepositoryCommandLeases(ctx, daemon.channel, daemon.epoch, daemon.repositoryCommandDrainer); err != nil {
+		return fmt.Errorf("recover stranded repository commands: %w", err)
 	}
 	if _, err := daemon.store.ReconcileEffects(ctx, daemon.channel, daemon.epoch); err != nil {
 		return fmt.Errorf("reconcile stranded effects: %w", err)

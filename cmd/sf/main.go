@@ -37,6 +37,25 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) >= 3 && os.Args[1] == "__repository_command_gate" {
+		gate := os.NewFile(uintptr(3), "repository-command-launch-gate")
+		if gate == nil {
+			os.Exit(125)
+		}
+		var one [1]byte
+		if _, err := gate.Read(one[:]); err != nil {
+			os.Exit(125)
+		}
+		if err := os.Chdir("/dev/fd/4"); err != nil {
+			if err := os.Chdir("/proc/self/fd/4"); err != nil {
+				os.Exit(125)
+			}
+		}
+		if err := syscall.Exec(os.Args[2], os.Args[2:], os.Environ()); err != nil {
+			os.Exit(126)
+		}
+		return
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = ""
@@ -55,11 +74,12 @@ func main() {
 		}
 		return daemon.Run(runCtx, daemon.Config{
 			Channel: channel, Paths: paths,
-			DaemonIdentity:       fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
-			RecoveryAuthorityKey: supervisor.PublicKey(),
-			ProviderSupervisor:   supervisor,
-			RecoveryDrainer:      supervisor,
-			GitMutationDrainer:   git.MutationDrainer{},
+			DaemonIdentity:           fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
+			RecoveryAuthorityKey:     supervisor.PublicKey(),
+			ProviderSupervisor:       supervisor,
+			RecoveryDrainer:          supervisor,
+			GitMutationDrainer:       git.MutationDrainer{},
+			RepositoryCommandDrainer: processsupervisor.RepositoryCommandDrainer{},
 			ProviderCoordinatorFactory: func(database *store.Store, process contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
 				return codexprovider.Compose(context.Background(), channel, database, process)
 			},

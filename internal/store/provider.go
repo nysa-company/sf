@@ -375,6 +375,9 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		if activeGitWriter != 0 {
 			return ErrProviderAttempt
 		}
+		var activeCommandWriter int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE repository_path=? AND state IN ('active','quarantined')`, r.Repository).Scan(&activeCommandWriter); err != nil { return err }
+		if activeCommandWriter != 0 { return ErrProviderAttempt }
 		if r.Phase == domain.PhaseReview && r.Role == "reviewer" {
 			if err := validateFinalReviewEvidence(ctx, conn, r.Ref, r.ExpectedVersion, r.Fence, r.ExpectedHead, r.ExpectedProof); err != nil {
 				return err

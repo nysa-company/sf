@@ -108,6 +108,38 @@ type GitMutationAuthority interface {
 	AcquireGitMutation(context.Context, GitMutationClaim) (GitMutationLease, error)
 }
 
+// RepositoryCommandClaim is a Store-issued, immutable binding for a
+// credential-free command. The command boundary cannot mint or broaden it.
+type RepositoryCommandClaim struct {
+	TicketRef                                                        domain.TicketRef
+	SemanticKey, RequestDigest                                       string
+	TicketVersion, LeaderEpoch, RunnerEpoch, ClaimEpoch              uint64
+	Repository, Worktree, WorktreeIdentity, Branch, BaseRef, BaseSHA string
+	CommandDigest, SpecDigest, PolicyDigest                          string
+}
+
+type RepositoryCommandLaunch struct {
+	PID, PGID                          int
+	BootIdentity, ProcessStartIdentity string
+}
+type RepositoryCommandLease interface {
+	Check(context.Context) error
+	Release() error
+	RecordRepositoryCommandLaunch(context.Context, RepositoryCommandLaunch) error
+	FinishRepositoryCommandLaunch(context.Context, RepositoryCommandLaunch) error
+	Quarantine() error
+}
+type RepositoryCommandAuthority interface {
+	AcquireRepositoryCommand(context.Context, RepositoryCommandClaim) (RepositoryCommandLease, error)
+}
+
+type RepositoryCommandResultRecorder interface {
+	CompleteRepositoryCommand(context.Context, RepositoryCommandClaim, CommandResult) error
+}
+type RepositoryCommandDrainer interface {
+	DrainRepositoryCommand(context.Context, RepositoryCommandLaunch) error
+}
+
 // ProtectedBranchWitness is the durable recovery witness for a completed
 // merge. A verifier must freshly observe ProtectedRef at Origin and prove the
 // reported MergeOID remains contained by it and descends from OriginalBaseOID.

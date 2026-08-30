@@ -564,3 +564,36 @@ var migrationV32 = []string{
 	`ALTER TABLE git_mutation_leases ADD COLUMN prior_remote_observed INTEGER NOT NULL DEFAULT 0 CHECK(prior_remote_observed IN (0,1))`,
 	`ALTER TABLE git_mutation_leases ADD COLUMN prior_remote_oid TEXT NOT NULL DEFAULT ''`,
 }
+
+// v33 adds the credential-free, guarded repository-command authority.  It is
+// intentionally additive: v1-v32 migration bytes are compatibility evidence
+// and must never be rewritten.  An active lease is the repository-wide third
+// writer class alongside provider and Git mutation leases.
+var migrationV33 = []string{
+	`CREATE TABLE repository_command_intents (
+		semantic_key TEXT PRIMARY KEY, channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		request_digest TEXT NOT NULL, ticket_version INTEGER NOT NULL, leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL, claim_epoch INTEGER NOT NULL,
+		repository_path TEXT NOT NULL, worktree_path TEXT NOT NULL, worktree_identity TEXT NOT NULL, branch_ref TEXT NOT NULL, base_ref TEXT NOT NULL, base_sha TEXT NOT NULL,
+		command_digest TEXT NOT NULL, spec_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, executable_path TEXT NOT NULL, executable_digest TEXT NOT NULL, created_at TEXT NOT NULL,
+		FOREIGN KEY(semantic_key) REFERENCES effects(semantic_key), FOREIGN KEY(channel, project_id, ticket_id) REFERENCES tickets(channel, project_id, id)
+	)`,
+	`CREATE TABLE repository_command_leases (
+		repository_path TEXT PRIMARY KEY, semantic_key TEXT NOT NULL UNIQUE, nonce BLOB NOT NULL UNIQUE CHECK(length(nonce)=32),
+		channel TEXT NOT NULL, project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, request_digest TEXT NOT NULL,
+		ticket_version INTEGER NOT NULL, leader_epoch INTEGER NOT NULL, runner_epoch INTEGER NOT NULL, claim_epoch INTEGER NOT NULL,
+		worktree_path TEXT NOT NULL, worktree_identity TEXT NOT NULL, branch_ref TEXT NOT NULL, base_ref TEXT NOT NULL, base_sha TEXT NOT NULL,
+		command_digest TEXT NOT NULL, spec_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, executable_path TEXT NOT NULL, executable_digest TEXT NOT NULL,
+		state TEXT NOT NULL CHECK(state IN ('active','quarantined')),
+		launch_state TEXT NOT NULL CHECK(launch_state IN ('unrecorded','released','drained','quarantined')),
+		process_pid INTEGER NOT NULL DEFAULT 0, process_pgid INTEGER NOT NULL DEFAULT 0, process_boot_identity TEXT NOT NULL DEFAULT '', process_start_identity TEXT NOT NULL DEFAULT '',
+		acquired_at TEXT NOT NULL, launched_at TEXT NOT NULL DEFAULT '', FOREIGN KEY(semantic_key) REFERENCES repository_command_intents(semantic_key)
+	)`,
+	`CREATE INDEX repository_command_lease_recovery ON repository_command_leases(channel, state, launch_state)`,
+	`CREATE TABLE repository_command_process_groups (
+		repository_path TEXT NOT NULL, semantic_key TEXT NOT NULL, nonce BLOB NOT NULL,
+		process_pid INTEGER NOT NULL, process_pgid INTEGER NOT NULL, process_boot_identity TEXT NOT NULL, process_start_identity TEXT NOT NULL,
+		PRIMARY KEY(repository_path, process_pid, process_start_identity),
+		FOREIGN KEY(repository_path) REFERENCES repository_command_leases(repository_path) ON DELETE CASCADE
+	)`,
+	`CREATE INDEX repository_command_process_group_recovery ON repository_command_process_groups(repository_path, semantic_key, nonce)`,
+}

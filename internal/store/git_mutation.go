@@ -258,6 +258,9 @@ func (s *Store) AcquireGitMutation(ctx context.Context, claim contracts.GitMutat
 		if err := repositoryHasProviderWriter(ctx, conn, claim.Repository); err != nil {
 			return err
 		}
+		if err := repositoryHasCommandWriter(ctx, conn, claim.Repository); err != nil {
+			return err
+		}
 		result, err := conn.ExecContext(ctx, `INSERT INTO git_mutation_leases(repository_path,semantic_key,nonce,channel,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,state,launch_state,acquired_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active','unrecorded',?) ON CONFLICT(repository_path) DO NOTHING`, claim.Repository, claim.SemanticKey, nonce, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch, claim.Worktree, claim.Branch, claim.Operation, claim.BaseRef, claim.ExpectedBaseOID, claim.ExpectedHeadOID, time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
@@ -676,6 +679,13 @@ func repositoryHasProviderWriter(ctx context.Context, conn *sql.Conn, repository
 	if n != 0 {
 		return ErrProviderAttempt
 	}
+	return nil
+}
+
+func repositoryHasCommandWriter(ctx context.Context, conn *sql.Conn, repository string) error {
+	var n int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE repository_path=? AND state IN ('active','quarantined')`, repository).Scan(&n); err != nil { return err }
+	if n != 0 { return ErrRepositoryCommandLease }
 	return nil
 }
 

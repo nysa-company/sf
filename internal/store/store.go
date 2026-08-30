@@ -47,9 +47,11 @@ var (
 	ErrProviderRecoveryBlocked = errors.New("provider recovery is blocked by an invalid immutable launch claim")
 	ErrGitMutationIntent       = errors.New("git mutation intent is not a current executing effect")
 	ErrGitMutationLease        = errors.New("git mutation lease is unavailable or stale")
+	ErrRepositoryCommandIntent = errors.New("repository command intent is not a current executing effect")
+	ErrRepositoryCommandLease  = errors.New("repository command lease is unavailable or stale")
 )
 
-const schemaVersion = 32
+const schemaVersion = 33
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -84,6 +86,7 @@ var migrationChecksums = map[int]string{
 	30: migrationChecksum(migrationV30),
 	31: migrationChecksum(migrationV31),
 	32: migrationChecksum(migrationV32),
+	33: migrationChecksum(migrationV33),
 }
 
 func migrationChecksum(statements []string) string {
@@ -373,6 +376,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV31
 			} else if version == 32 {
 				statements = migrationV32
+			} else if version == 33 {
+				statements = migrationV33
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
