@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 )
 
@@ -50,6 +51,18 @@ func TestMain(m *testing.M) {
 }
 
 type memoryBranchAuthority struct{ branches map[string]string }
+
+type testMutationAuthority struct{ err error }
+type testMutationLease struct{ err error }
+
+func (a testMutationAuthority) AcquireGitMutation(_ context.Context, _ contracts.GitMutationClaim) (contracts.GitMutationLease, error) {
+	if a.err != nil {
+		return nil, a.err
+	}
+	return testMutationLease{}, nil
+}
+func (l testMutationLease) Check(context.Context) error { return l.err }
+func (testMutationLease) Release() error                { return nil }
 
 func (a *memoryBranchAuthority) LoadBranch(_ context.Context, key string) (string, error) {
 	return a.branches[key], nil
@@ -151,7 +164,7 @@ func fixture(t *testing.T) (context.Context, Runner, string, string) {
 	rawGit(t, repository, "commit", "-m", "base")
 	rawGit(t, repository, "remote", "add", "origin", remote)
 	rawGit(t, repository, "push", "origin", "main:refs/heads/main")
-	return ctx, Runner{Home: filepath.Join(root, "git-home"), ExecHelper: testExecHelper}, repository, remote
+	return ctx, Runner{Home: filepath.Join(root, "git-home"), ExecHelper: testExecHelper, TestLocalTransport: true, MutationAuthority: testMutationAuthority{}}, repository, remote
 }
 
 func TestAllocatorDelegatesBranchPersistenceToAuthority(t *testing.T) {
@@ -800,7 +813,7 @@ func TestHTTPSCredentialHelperConfigurationFailsClosed(t *testing.T) {
 
 func TestGitHubSSHTransportUsesOnlyExactHelperEnvironment(t *testing.T) {
 	root := t.TempDir()
-	runner := Runner{SSHHelper: filepath.Join(root, "sf-ssh"), SSHBinary: filepath.Join(root, "ssh"), SSHKnownHosts: filepath.Join(root, "known-hosts"), SSHAgentSock: filepath.Join(root, "agent.sock")}
+	runner := Runner{SSHHelper: filepath.Join(root, "sf-ssh"), SSHBinary: filepath.Join(root, "ssh"), SSHKnownHosts: filepath.Join(root, "known-hosts"), SSHAgentSock: filepath.Join(root, "agent.sock"), TestLocalTransport: true}
 	env, enabled, err := runner.githubSSHPushEnvironment("ssh://git@ssh.github.com:443/owner/repository.git")
 	if err != nil || !enabled {
 		t.Fatalf("ssh environment enabled=%v err=%v", enabled, err)
@@ -1193,6 +1206,11 @@ func TestFDExecutionGateKeepsOriginalDirectoryAfterRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pinned.Close()
+	caps, err := openGitCapabilities(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer caps.Close()
 	moved := directory + ".moved"
 	if err := os.Rename(directory, moved); err != nil {
 		t.Fatal(err)
@@ -1204,7 +1222,7 @@ func TestFDExecutionGateKeepsOriginalDirectoryAfterRename(t *testing.T) {
 	if err := os.WriteFile(foreign, []byte("do not touch"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	output, err := runBounded(context.Background(), testExecHelper, "/usr/bin/git", []string{"-C", ".", "rev-parse", "--show-toplevel"}, []string{"PATH=/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}, []*os.File{pinned.file})
+	output, err := runBounded(context.Background(), testExecHelper, "/usr/bin/git", []string{"-C", ".", "rev-parse", "--show-toplevel"}, []string{"PATH=/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}, []*os.File{pinned.file, caps.gitDir.file, caps.commonDir.file})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1213,6 +1231,93 @@ func TestFDExecutionGateKeepsOriginalDirectoryAfterRename(t *testing.T) {
 	}
 	if data, err := os.ReadFile(foreign); err != nil || string(data) != "do not touch" {
 		t.Fatalf("foreign replacement touched: %q %v", data, err)
+	}
+}
+
+func TestMutationsRequireExternalLeaseAndDoNotCreateWorktree(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	runner.MutationAuthority = nil
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-no-lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main"); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("proofless create=%v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("proofless create changed filesystem: %v", err)
+	}
+}
+
+func TestMutationLeaseRefusalPrecedesCommitEffect(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-refused-lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("candidate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner.MutationAuthority = testMutationAuthority{err: errors.New("writer remains")}
+	_, err = runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(9, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	if !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("proofless commit=%v", err)
+	}
+	if head := rawGit(t, worktree.Path, "rev-parse", "HEAD"); head != worktree.Identity.BaseHead {
+		t.Fatalf("refused lease advanced head=%q", head)
+	}
+	if status := rawGit(t, worktree.Path, "status", "--porcelain"); status == "" {
+		t.Fatal("refused lease staged or erased candidate")
+	}
+}
+
+func TestProductionRefusesLocalOrigin(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	runner.TestLocalTransport = false
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-local-origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main"); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("production local origin=%v", err)
+	}
+}
+
+func TestVerifyProtectedBranchFreshWitness(t *testing.T) {
+	ctx, runner, repository, remote := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-protected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "main.txt"), []byte("merge\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("merge")), Timestamp: time.Unix(10, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawGit(t, repository, "merge", "--ff-only", branch)
+	rawGit(t, repository, "push", "origin", "main")
+	witness := contracts.ProtectedBranchWitness{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Origin: remote, ProtectedRef: "main", OriginalBaseOID: worktree.Identity.BaseHead, MergeOID: head}
+	if err := runner.VerifyProtectedBranch(ctx, witness); err != nil {
+		t.Fatalf("fresh witness=%v", err)
+	}
+	witness.MergeOID = strings.Repeat("b", 40)
+	if err := runner.VerifyProtectedBranch(ctx, witness); !errors.Is(err, ErrUnexpectedRemote) {
+		t.Fatalf("mismatched merge witness=%v", err)
+	}
+	witness.MergeOID, witness.OriginalBaseOID = head, strings.Repeat("a", 40)
+	if err := runner.VerifyProtectedBranch(ctx, witness); !errors.Is(err, ErrUnexpectedRemote) {
+		t.Fatalf("mismatched base witness=%v", err)
 	}
 }
 

@@ -20,7 +20,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/gitssh"
 	"golang.org/x/sys/unix"
 )
 
@@ -185,7 +187,13 @@ type Runner struct {
 	// ExecHelper is the packaged sf-git-exec capability gate. Production Git
 	// commands never use Cmd.Dir's mutable pathname once this is configured.
 	ExecHelper string
-	Run        func(context.Context, string, []string, []string) ([]byte, error)
+	// MutationAuthority is supplied by the daemon supervisor. A nil authority
+	// refuses every Git mutation; read-only inspection remains available.
+	MutationAuthority contracts.GitMutationAuthority
+	// TestLocalTransport permits local bare origins only in hermetic tests. It
+	// must never be enabled by production configuration.
+	TestLocalTransport bool
+	Run                func(context.Context, string, []string, []string) ([]byte, error)
 }
 
 // commandConfigKeys are repository-local settings that can cause Git to run
@@ -285,8 +293,16 @@ func (r Runner) commandExpected(ctx context.Context, directory string, expectedD
 		}
 		return output, err
 	}
-	output, err := runBounded(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file})
+	caps, capErr := openGitCapabilities(directory)
+	if capErr != nil {
+		return nil, capErr
+	}
+	defer caps.Close()
+	output, err := runBounded(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file, caps.gitDir.file, caps.commonDir.file})
 	if verifyErr := pinned.verify(); verifyErr != nil {
+		return output, verifyErr
+	}
+	if verifyErr := caps.verify(); verifyErr != nil {
 		return output, verifyErr
 	}
 	if err != nil {
@@ -333,8 +349,16 @@ func (r Runner) commandEnvExpected(ctx context.Context, directory string, expect
 		}
 		return output, err
 	}
-	output, err := runBounded(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file})
+	caps, capErr := openGitCapabilities(directory)
+	if capErr != nil {
+		return nil, capErr
+	}
+	defer caps.Close()
+	output, err := runBounded(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file, caps.gitDir.file, caps.commonDir.file})
 	if verifyErr := pinned.verify(); verifyErr != nil {
+		return output, verifyErr
+	}
+	if verifyErr := caps.verify(); verifyErr != nil {
 		return output, verifyErr
 	}
 	if err != nil {
@@ -374,6 +398,34 @@ func (r Runner) binary() string {
 }
 
 func (r Runner) execHelper() string { return r.ExecHelper }
+
+func (r Runner) acquireMutation(ctx context.Context, repository, worktree, branch, operation string) (contracts.GitMutationLease, error) {
+	if r.MutationAuthority == nil {
+		return nil, fmt.Errorf("%w: no external mutation authority for %s", ErrIdentityMismatch, operation)
+	}
+	lease, err := r.MutationAuthority.AcquireGitMutation(ctx, contracts.GitMutationClaim{Repository: repository, Worktree: worktree, Branch: branch, Operation: operation})
+	if err != nil {
+		return nil, fmt.Errorf("%w: mutation authority refused %s: %v", ErrIdentityMismatch, operation, err)
+	}
+	if lease == nil {
+		return nil, fmt.Errorf("%w: mutation authority returned no lease", ErrIdentityMismatch)
+	}
+	if err := lease.Check(ctx); err != nil {
+		_ = lease.Release()
+		return nil, fmt.Errorf("%w: mutation lease is not current: %v", ErrIdentityMismatch, err)
+	}
+	return lease, nil
+}
+
+func requireMutationLease(ctx context.Context, lease contracts.GitMutationLease) error {
+	if lease == nil {
+		return fmt.Errorf("%w: missing mutation lease", ErrIdentityMismatch)
+	}
+	if err := lease.Check(ctx); err != nil {
+		return fmt.Errorf("%w: mutation lease expired: %v", ErrIdentityMismatch, err)
+	}
+	return nil
+}
 
 func (r Runner) environment(extra []string) ([]string, error) {
 	if !validAbsolutePath(r.binary()) {
@@ -433,6 +485,48 @@ func ownedByCurrentOrRoot(info os.FileInfo) bool {
 func linkCountIsNotOne(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return !ok || stat.Nlink != 1
+}
+
+func openTrustedExecutable(path string) (*os.File, error) {
+	if !validAbsolutePath(path) {
+		return nil, fmt.Errorf("runner execution helper path is unsafe")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || !ownedByCurrentOrRoot(info) || linkCountIsNotOne(info) || !secureExecutableParents(path) {
+		return nil, fmt.Errorf("runner execution helper is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := file.Stat()
+	if err != nil || !sameFileIdentity(info, opened) {
+		_ = file.Close()
+		return nil, fmt.Errorf("runner execution helper changed while opening")
+	}
+	return file, nil
+}
+
+func secureExecutableParents(path string) bool {
+	canonical, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil || !validAbsolutePath(canonical) {
+		return false
+	}
+	for dir := canonical; ; dir = filepath.Dir(dir) {
+		info, err := os.Lstat(dir)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return false
+		}
+		if info.Mode().Perm()&0o022 != 0 {
+			return false
+		}
+		if !ownedByCurrentOrRoot(info) && dir != string(filepath.Separator) {
+			return false
+		}
+		if dir == string(filepath.Separator) {
+			return true
+		}
+	}
 }
 
 // validExtraEnvironment is deliberately positive-only. In particular, an
@@ -553,52 +647,103 @@ func (p *pinnedDirectory) ino() uint64 {
 	return 0
 }
 
-// openGitCapabilities pins the worktree's .git indirection and common object
-// directory before invoking Git. The inherited descriptors are passed as
-// /dev/fd paths, so replacing either pathname after this point cannot redirect
-// object, ref, or worktree mutations.
-func openGitCapabilities(directory string) (*os.File, *os.File, error) {
+// gitCapabilities pins every pathname Git resolves below a linked worktree.
+// Git on macOS cannot use /dev/fd/N as GIT_DIR, so the helper authenticates the
+// live .git pointer against these descriptors immediately before exec and the
+// caller verifies their pathname identities immediately afterwards. The
+// mutation lease excludes a concurrent repository writer across that interval.
+type gitCapabilities struct {
+	gitDir, commonDir *pinnedDirectory
+}
+
+func (c *gitCapabilities) Close() {
+	if c == nil {
+		return
+	}
+	if c.gitDir != nil {
+		_ = c.gitDir.Close()
+	}
+	if c.commonDir != nil {
+		_ = c.commonDir.Close()
+	}
+}
+
+func (c *gitCapabilities) verify() error {
+	if c == nil || c.gitDir == nil || c.commonDir == nil {
+		return fmt.Errorf("%w: missing git control-plane capabilities", ErrIdentityMismatch)
+	}
+	if err := c.gitDir.verify(); err != nil {
+		return err
+	}
+	return c.commonDir.verify()
+}
+
+func openGitCapabilities(directory string) (*gitCapabilities, error) {
 	pointer := filepath.Join(directory, ".git")
 	info, err := os.Lstat(pointer)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	gitPath := pointer
 	commonPath := pointer
 	if info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
 		data, err := os.ReadFile(pointer)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		text := strings.TrimSpace(string(data))
 		if !strings.HasPrefix(text, "gitdir: ") {
-			return nil, nil, fmt.Errorf("%w: malformed git pointer", ErrIdentityMismatch)
+			return nil, fmt.Errorf("%w: malformed git pointer", ErrIdentityMismatch)
 		}
 		gitPath = strings.TrimSpace(strings.TrimPrefix(text, "gitdir: "))
 		if !validAbsolutePath(gitPath) {
-			return nil, nil, fmt.Errorf("%w: noncanonical git pointer", ErrIdentityMismatch)
+			return nil, fmt.Errorf("%w: noncanonical git pointer", ErrIdentityMismatch)
 		}
-		commonPath = filepath.Dir(filepath.Dir(gitPath))
+		commondir, readErr := os.ReadFile(filepath.Join(gitPath, "commondir"))
+		if readErr != nil {
+			return nil, readErr
+		}
+		value := strings.TrimSpace(string(commondir))
+		if value == "" || filepath.IsAbs(value) {
+			return nil, fmt.Errorf("%w: malformed git commondir", ErrIdentityMismatch)
+		}
+		commonPath = filepath.Clean(filepath.Join(gitPath, value))
 	} else if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return nil, nil, fmt.Errorf("%w: unsafe git directory", ErrIdentityMismatch)
+		return nil, fmt.Errorf("%w: unsafe git directory", ErrIdentityMismatch)
 	}
 	gitDir, err := openPinnedDirectory(gitPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	commonDir, err := openPinnedDirectory(commonPath)
 	if err != nil {
 		_ = gitDir.Close()
-		return nil, nil, err
+		return nil, err
 	}
-	return gitDir.file, commonDir.file, nil
+	return &gitCapabilities{gitDir: gitDir, commonDir: commonDir}, nil
 }
 
 func runBounded(ctx context.Context, helper, binary string, argv, env []string, directories []*os.File) ([]byte, error) {
-	if len(directories) != 1 || directories[0] == nil {
+	if len(directories) != 3 || directories[0] == nil || directories[1] == nil || directories[2] == nil {
 		return nil, fmt.Errorf("pinned command directory is required")
 	}
-	command := exec.CommandContext(ctx, helper, append([]string{"--fd=3", "--", binary}, argv...)...)
+	helperFile, err := openTrustedExecutable(helper)
+	if err != nil {
+		return nil, err
+	}
+	helperInfo, err := helperFile.Stat()
+	helperHash, hashErr := fileHash(helperFile)
+	_ = helperFile.Close()
+	if err != nil {
+		return nil, err
+	}
+	if hashErr != nil {
+		return nil, hashErr
+	}
+	// macOS rejects execve("/dev/fd/N") for this binary, so the trusted
+	// repository contract supplies the final exclusion between this immediate
+	// authentication and exec. The pathname is verified again after Git exits.
+	command := exec.CommandContext(ctx, helper, append([]string{"--worktree-fd=3", "--git-dir-fd=4", "--common-dir-fd=5", "--", binary}, argv...)...)
 	// ExtraFiles maps the authenticated O_DIRECTORY fd to descriptor 3 before
 	// the helper fchdir+execs Git. No mutable worktree spelling is used by the
 	// child after the caller has opened it.
@@ -632,11 +777,32 @@ func runBounded(ctx context.Context, helper, binary string, argv, env []string, 
 	}
 	buffer := &boundedBuffer{limit: maxGitOutput, stop: func() { killGroup(syscall.SIGKILL) }}
 	command.Stdout, command.Stderr = buffer, buffer
-	err := command.Run()
+	err = command.Run()
+	currentFile, openErr := openTrustedExecutable(helper)
+	if openErr != nil {
+		return buffer.data, fmt.Errorf("%w: execution helper changed during git command", ErrIdentityMismatch)
+	}
+	current, statErr := currentFile.Stat()
+	currentHash, hashErr := fileHash(currentFile)
+	_ = currentFile.Close()
+	if statErr != nil || hashErr != nil || !sameFileIdentity(helperInfo, current) || helperHash != currentHash {
+		return buffer.data, fmt.Errorf("%w: execution helper changed during git command", ErrIdentityMismatch)
+	}
 	if buffer.exceeded {
 		return buffer.data, ErrOutputBound
 	}
 	return buffer.data, err
+}
+
+func fileHash(file *os.File) (string, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 type boundedBuffer struct {
@@ -873,6 +1039,9 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 	if err != nil {
 		return Identity{}, err
 	}
+	if validAbsolutePath(origin) && !r.TestLocalTransport {
+		return Identity{}, fmt.Errorf("%w: local origins are reserved for hermetic TestLocal transport", ErrIdentityMismatch)
+	}
 	pushURLs, err := r.command(ctx, worktree, "remote", "get-url", "--all", "--push", "origin")
 	if err != nil {
 		return Identity{}, err
@@ -884,6 +1053,9 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 	pushOrigin, err := safeOrigin(pushLines[0])
 	if err != nil {
 		return Identity{}, err
+	}
+	if validAbsolutePath(pushOrigin) && !r.TestLocalTransport {
+		return Identity{}, fmt.Errorf("%w: local push origins are reserved for hermetic TestLocal transport", ErrIdentityMismatch)
 	}
 	pushOriginDev, pushOriginIno, err := localOriginIdentity(pushOrigin)
 	if err != nil {
@@ -1252,6 +1424,17 @@ func (r Runner) PreflightRepository(ctx context.Context, repository, baseRef str
 	if err != nil || bare != "false" {
 		return fmt.Errorf("%w: bare repository refused", ErrIdentityMismatch)
 	}
+	origin, err := r.one(ctx, repository, "remote", "get-url", "origin")
+	if err != nil {
+		return err
+	}
+	origin, err = safeOrigin(origin)
+	if err != nil {
+		return err
+	}
+	if validAbsolutePath(origin) && !r.TestLocalTransport {
+		return fmt.Errorf("%w: local origins are reserved for hermetic TestLocal transport", ErrIdentityMismatch)
+	}
 	_, err = r.one(ctx, repository, "rev-parse", "--verify", baseRef+"^{commit}")
 	return err
 }
@@ -1318,6 +1501,17 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	}
 	if dev, ino, identityErr := directoryIdentity(repository); identityErr != nil || dev != repositoryDev || ino != repositoryIno {
 		return Worktree{}, fmt.Errorf("%w: primary repository changed before worktree creation", ErrIdentityMismatch)
+	}
+	lease, err := r.acquireMutation(ctx, repository, path, branch, "create-worktree")
+	if err != nil {
+		return Worktree{}, err
+	}
+	defer lease.Release()
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return Worktree{}, err
+	}
+	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
+		return Worktree{}, err
 	}
 	if _, err := r.commandExpected(ctx, repository, repositoryDev, repositoryIno, "worktree", "add", "-b", branch, path, "--", baseRef); err != nil {
 		return Worktree{}, err
@@ -1513,6 +1707,14 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 	// status returns empty output for clean, so do not use one() here.
 	if output, statusErr := r.command(ctx, worktree.Path, "status", "--porcelain=v1"); statusErr != nil || strings.TrimSpace(string(output)) != "" {
 		return fmt.Errorf("%w: worktree status is not clean", ErrUnsafeWorktree)
+	}
+	lease, err := r.acquireMutation(ctx, canonicalRepository, worktree.Path, worktree.Branch, "remove-worktree")
+	if err != nil {
+		return err
+	}
+	defer lease.Release()
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return err
 	}
 	// Status is only an observation. Reauthenticate again immediately before
 	// the removal effect so a path, pointer, hook, or config swap cannot turn
@@ -1791,6 +1993,14 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
+	lease, err := r.acquireMutation(ctx, worktree.Identity.Repository, worktree.Path, worktree.Branch, "commit")
+	if err != nil {
+		return "", err
+	}
+	defer lease.Release()
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return "", err
+	}
 	if head, matched, err := r.reconcileCommit(ctx, worktree, request); err != nil {
 		return "", err
 	} else if matched {
@@ -1809,6 +2019,9 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	prePolicy := request.Policy
 	prePolicy.ExpectedHead = request.ExpectedParent
 	if err := r.ValidateDiff(ctx, worktree.Path, request.BaseRef, prePolicy); err != nil {
+		return "", err
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
 	if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "add", "-A", "--"); err != nil {
@@ -1854,6 +2067,9 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if head, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD"); err != nil || head != request.ExpectedParent {
 		return "", fmt.Errorf("%w: candidate parent changed before commit-tree", ErrUnsafeWorktree)
 	}
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return "", err
+	}
 	newHead, err := r.oneEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, deterministicCommitEnv(timestamp), "commit-tree", tree, "-p", request.ExpectedParent, "-m", message)
 	if err != nil || !validOID(newHead) {
 		return "", fmt.Errorf("%w: candidate commit could not be created", ErrUnsafeWorktree)
@@ -1861,6 +2077,9 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	// update-ref's old-value argument is the concurrency boundary: even if a
 	// second writer advances the branch after the final observation, this CAS
 	// refuses to rewrite or append to the unexpected parent.
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return "", err
+	}
 	if _, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "update-ref", "--no-deref", "refs/heads/"+worktree.Branch, newHead, request.ExpectedParent); err != nil {
 		return "", err
 	}
@@ -1996,6 +2215,14 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 	if remote != request.ExpectedPriorHead {
 		return "", fmt.Errorf("%w: candidate branch does not match durable observation", ErrUnexpectedRemote)
 	}
+	lease, err := r.acquireMutation(ctx, worktree.Identity.Repository, worktree.Path, worktree.Branch, "push")
+	if err != nil {
+		return "", err
+	}
+	defer lease.Release()
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return "", err
+	}
 	// Reauthenticate and prove the exact candidate immediately before push.
 	if _, err := r.provePushHead(ctx, worktree, request.ExpectedHead); err != nil {
 		return "", err
@@ -2003,6 +2230,9 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 	refspec := request.ExpectedHead + ":refs/heads/" + worktree.Branch
 	if worktree.Identity.PushOrigin == "" {
 		return "", fmt.Errorf("%w: authenticated push URL is missing", ErrIdentityMismatch)
+	}
+	if err := requireMutationLease(ctx, lease); err != nil {
+		return "", err
 	}
 	if _, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, sshEnv, "push", worktree.Identity.PushOrigin, refspec); err != nil {
 		// The server may have accepted the ref while the response was lost. Only
@@ -2047,6 +2277,9 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 
 func (r Runner) githubSSHPushEnvironment(origin string) ([]string, bool, error) {
 	if validAbsolutePath(origin) {
+		if !r.TestLocalTransport {
+			return nil, false, fmt.Errorf("%w: local transport is test-only", ErrIdentityMismatch)
+		}
 		return nil, false, nil
 	}
 	parsed, err := url.Parse(origin)
@@ -2056,6 +2289,20 @@ func (r Runner) githubSSHPushEnvironment(origin string) ([]string, bool, error) 
 	for _, item := range []struct{ path, name string }{{r.SSHHelper, "ssh helper"}, {r.SSHBinary, "ssh binary"}, {r.SSHKnownHosts, "known hosts"}, {r.SSHAgentSock, "agent socket"}} {
 		if !validAbsolutePath(item.path) {
 			return nil, false, fmt.Errorf("%w: %s is required", ErrHTTPSCredentialBoundary, item.name)
+		}
+	}
+	if !r.TestLocalTransport {
+		if r.SSHBinary != "/usr/bin/ssh" {
+			return nil, false, fmt.Errorf("%w: runner requires root-owned /usr/bin/ssh", ErrIdentityMismatch)
+		}
+		helper, err := openTrustedExecutable(r.SSHHelper)
+		if err != nil {
+			return nil, false, err
+		}
+		_ = helper.Close()
+		known, err := os.ReadFile(r.SSHKnownHosts)
+		if err != nil || string(known) != gitssh.PinnedKnownHosts {
+			return nil, false, fmt.Errorf("%w: github known-hosts asset is not pinned", ErrIdentityMismatch)
 		}
 	}
 	return []string{"GIT_SSH=" + r.SSHHelper, "GIT_SSH_VARIANT=ssh", "SF_GIT_SSH_BINARY=" + r.SSHBinary, "SF_GIT_SSH_KNOWN_HOSTS=" + r.SSHKnownHosts, "SF_GIT_SSH_REPOSITORY=" + strings.TrimSuffix(strings.TrimPrefix(parsed.Path, "/"), ".git"), "SSH_AUTH_SOCK=" + r.SSHAgentSock}, true, nil
@@ -2149,4 +2396,54 @@ func (r Runner) remoteHeadEnv(ctx context.Context, directory string, expectedDev
 		return "", fmt.Errorf("%w: invalid remote object id", ErrUnexpectedRemote)
 	}
 	return fields[0], nil
+}
+
+// VerifyProtectedBranch is a read-only recovery verifier. It never trusts a
+// cached provider report: it reauthenticates the supplied worktree, observes
+// the exact protected ref from the canonical origin, and proves the reported
+// merge object is both retained by that ref and descended from the persisted
+// original base. The observed ref object must already be present locally; a
+// missing object fails closed rather than fetching (which would mutate local
+// repository state during recovery).
+func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.ProtectedBranchWitness) error {
+	if !validAbsolutePath(witness.Repository) || !validAbsolutePath(witness.Worktree) || !validRef(witness.ProtectedRef) || !validOID(witness.OriginalBaseOID) || !validOID(witness.MergeOID) {
+		return fmt.Errorf("%w: invalid protected-branch witness", ErrIdentityMismatch)
+	}
+	origin, err := safeOrigin(witness.Origin)
+	if err != nil {
+		return err
+	}
+	if validAbsolutePath(origin) && !r.TestLocalTransport {
+		return fmt.Errorf("%w: local protected origin is test-only", ErrIdentityMismatch)
+	}
+	identity, err := r.snapshotExpected(ctx, witness.Repository, witness.Worktree, witness.ProtectedRef)
+	if err != nil {
+		return err
+	}
+	if identity.Repository != witness.Repository || identity.Origin != origin {
+		return fmt.Errorf("%w: protected-branch repository or origin changed", ErrIdentityMismatch)
+	}
+	extra, _, err := r.githubSSHPushEnvironment(origin)
+	if err != nil {
+		return err
+	}
+	remote, err := r.remoteHeadEnv(ctx, identity.Worktree, identity.WorktreeDev, identity.WorktreeIno, origin, witness.ProtectedRef, extra)
+	if err != nil || remote == "" {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: protected ref is absent", ErrUnexpectedRemote)
+	}
+	for _, oid := range []string{witness.OriginalBaseOID, witness.MergeOID, remote} {
+		if _, err := r.commandExpected(ctx, identity.Worktree, identity.WorktreeDev, identity.WorktreeIno, "cat-file", "-e", oid+"^{commit}"); err != nil {
+			return fmt.Errorf("%w: protected witness object unavailable", ErrUnexpectedRemote)
+		}
+	}
+	if _, err := r.commandExpected(ctx, identity.Worktree, identity.WorktreeDev, identity.WorktreeIno, "merge-base", "--is-ancestor", witness.OriginalBaseOID, witness.MergeOID); err != nil {
+		return fmt.Errorf("%w: merge does not descend from original base", ErrUnexpectedRemote)
+	}
+	if _, err := r.commandExpected(ctx, identity.Worktree, identity.WorktreeDev, identity.WorktreeIno, "merge-base", "--is-ancestor", witness.MergeOID, remote); err != nil {
+		return fmt.Errorf("%w: protected ref does not contain reported merge", ErrUnexpectedRemote)
+	}
+	return nil
 }
