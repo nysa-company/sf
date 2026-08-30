@@ -32,6 +32,41 @@ func allocatorForTest() Allocator {
 	}
 }
 
+type lookupBranchAuthority struct {
+	stored string
+	called bool
+}
+
+func (a *lookupBranchAuthority) LoadBranch(_ context.Context, _ string) (string, error) {
+	a.called = true
+	return a.stored, nil
+}
+
+func (a *lookupBranchAuthority) LoadOrStoreBranch(_ context.Context, _ string, proposed string) (string, error) {
+	return proposed, nil
+}
+
+func TestAllocatorReadsPersistedBranchBeforeRandomGeneration(t *testing.T) {
+	stored := "sf/dev/project-ticket-existing"
+	authority := &lookupBranchAuthority{stored: stored}
+	allocator := Allocator{Authority: authority, Random: errorReader{}}
+	branch, err := allocator.Allocate(context.Background(), domain.ChannelDev, "project", "SF-existing")
+	if err != nil || branch != stored || !authority.called {
+		t.Fatalf("persisted branch=%q err=%v lookup=%v", branch, err, authority.called)
+	}
+}
+
+func TestAllocatorRejectsPersistedBranchFromAnotherChannel(t *testing.T) {
+	authority := &lookupBranchAuthority{stored: "sf/stable/project-ticket-existing"}
+	if _, err := (Allocator{Authority: authority, Random: errorReader{}}).Allocate(context.Background(), domain.ChannelDev, "project", "SF-existing"); err == nil {
+		t.Fatal("persisted branch crossed channel boundary")
+	}
+}
+
+type errorReader struct{}
+
+func (errorReader) Read([]byte) (int, error) { return 0, errors.New("random generation must not run") }
+
 func rawGit(t *testing.T, directory string, args ...string) string {
 	t.Helper()
 	command := exec.Command("git", append([]string{"-C", directory}, args...)...)
@@ -105,13 +140,13 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pushed, err := runner.Push(ctx, worktree)
+	pushed, err := runner.Push(ctx, worktree, head)
 	if err != nil || pushed != head {
 		t.Fatalf("push=%q err=%v", pushed, err)
 	}
 	// A response lost after the server accepted the ref is reconciled by a
 	// fresh exact remote observation, so a replay cannot create a second push.
-	replayed, err := runner.Push(ctx, worktree)
+	replayed, err := runner.Push(ctx, worktree, head)
 	if err != nil || replayed != head {
 		t.Fatalf("replay=%q err=%v", replayed, err)
 	}
@@ -221,7 +256,7 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("one")), Timestamp: time.Unix(2, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Push(ctx, worktree); err != nil {
+	if _, err := runner.Push(ctx, worktree, rawGit(t, path, "rev-parse", "HEAD")); err != nil {
 		t.Fatal(err)
 	}
 	other := filepath.Join(t.TempDir(), "other")
@@ -241,7 +276,7 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("local")), Timestamp: time.Unix(3, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Push(ctx, worktree); !errors.Is(err, ErrUnexpectedRemote) {
+	if _, err := runner.Push(ctx, worktree, rawGit(t, path, "rev-parse", "HEAD")); !errors.Is(err, ErrUnexpectedRemote) {
 		t.Fatalf("unexpected remote push=%v", err)
 	}
 }
@@ -500,5 +535,122 @@ func TestGitDeadlineIsCappedAndCredentialHelperRejectsShellSyntax(t *testing.T) 
 	unsafe := Runner{Home: filepath.Join(root, "other-home"), GHBinary: unsafeBinary, GHConfigDir: config, Run: runner.Run}
 	if _, err := unsafe.one(context.Background(), "/repo", "status"); err == nil {
 		t.Fatal("shell-bearing credential helper path was accepted")
+	}
+}
+
+func TestValidateDiffRenameIncludesDeletedEndpoint(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-rename")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(worktree.Path, "src", "main.txt"), filepath.Join(worktree.Path, "safe.txt")); err != nil {
+		t.Fatal(err)
+	}
+	// The new endpoint is allowed, but the deleted endpoint is outside policy.
+	// Rename detection must not hide that deletion.
+	if err := runner.ValidateDiff(ctx, worktree.Path, "main", DiffPolicy{AllowedPaths: []string{"safe.txt"}}); !errors.Is(err, ErrUnsafeWorktree) {
+		t.Fatalf("rename deletion bypassed policy: %v", err)
+	}
+}
+
+func TestSnapshotRejectsGitPointerSymlinkAndHardlink(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-pointer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pointer := filepath.Join(worktree.Path, ".git")
+	contents, err := os.ReadFile(pointer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(pointer); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "pointer"), pointer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Snapshot(ctx, worktree.Path, "main"); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("git pointer symlink accepted: %v", err)
+	}
+	if err := os.Remove(pointer); err != nil {
+		t.Fatal(err)
+	}
+	backing := filepath.Join(t.TempDir(), "pointer")
+	if err := os.WriteFile(backing, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(backing, pointer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Snapshot(ctx, worktree.Path, "main"); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("git pointer hardlink accepted: %v", err)
+	}
+}
+
+func TestInspectRejectsWorktreePathRebinding(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree.Path = filepath.Join(t.TempDir(), "attacker")
+	if err := runner.InspectWorktree(ctx, worktree); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("rebound worktree path accepted: %v", err)
+	}
+}
+
+func TestCreateWorktreeCleansAfterSnapshotAuthenticationFailure(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-cleanup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	canonicalPath, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalPath = filepath.Join(canonicalPath, filepath.Base(path))
+	var sabotage bool
+	runner.Run = func(runCtx context.Context, binary string, argv, env []string) ([]byte, error) {
+		if sabotage && slicesContain(argv, "--show-toplevel") && slicesContain(argv, canonicalPath) {
+			sabotage = false
+			pointer := filepath.Join(path, ".git")
+			if err := os.Remove(pointer); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(pointer, []byte("not a git pointer\n"), 0o600); err != nil {
+				return nil, err
+			}
+		}
+		command := exec.CommandContext(runCtx, binary, argv...)
+		command.Env = env
+		return command.CombinedOutput()
+	}
+	sabotage = true
+	if _, err := runner.CreateWorktree(ctx, repository, path, branch, "main"); err == nil {
+		t.Fatal("snapshot authentication failure was accepted")
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed worktree remained after cleanup: %v", err)
+	}
+	command := exec.Command("git", "-C", repository, "rev-parse", "--verify", "refs/heads/"+branch)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("failed worktree branch remained: %q", output)
 	}
 }

@@ -23,10 +23,11 @@ import (
 )
 
 var (
-	ErrIdentityMismatch = errors.New("git repository identity mismatch")
-	ErrUnsafeWorktree   = errors.New("git worktree is unsafe")
-	ErrUnexpectedRemote = errors.New("remote branch head is unexpected")
-	ErrOutputBound      = errors.New("git output exceeded bound")
+	ErrIdentityMismatch    = errors.New("git repository identity mismatch")
+	ErrUnsafeWorktree      = errors.New("git worktree is unsafe")
+	ErrUnexpectedRemote    = errors.New("remote branch head is unexpected")
+	ErrOutputBound         = errors.New("git output exceeded bound")
+	ErrWorktreeQuarantined = errors.New("created worktree could not be safely cleaned up")
 )
 
 const maxGitOutput = 1 << 20
@@ -35,6 +36,14 @@ const maxGitOutput = 1 << 20
 // never creates a second persistence authority for ticket branch identity.
 type BranchAuthority interface {
 	LoadOrStoreBranch(context.Context, string, string) (string, error)
+}
+
+// PersistedBranchAuthority is the stronger form implemented by the SQLite
+// store. Looking up an allocation first is important: random generation must
+// never happen before we have established that this ticket has no durable
+// branch identity to replay.
+type PersistedBranchAuthority interface {
+	LoadBranch(context.Context, string) (string, error)
 }
 
 type Allocator struct {
@@ -46,6 +55,16 @@ func (a Allocator) Allocate(ctx context.Context, channel domain.Channel, project
 	if !channel.Valid() || project == "" || ticket == "" || a.Authority == nil {
 		return "", fmt.Errorf("allocator requires channel, project, ticket, and SQLite branch authority")
 	}
+	key := string(channel) + "\x00" + string(project) + "\x00" + string(ticket)
+	if lookup, ok := a.Authority.(PersistedBranchAuthority); ok {
+		stored, err := lookup.LoadBranch(ctx, key)
+		if err != nil {
+			return "", err
+		}
+		if stored != "" {
+			return validateAllocatedBranch(channel, stored)
+		}
+	}
 	random := a.Random
 	if random == nil {
 		random = rand.Reader
@@ -55,11 +74,11 @@ func (a Allocator) Allocate(ctx context.Context, channel domain.Channel, project
 		return "", fmt.Errorf("random branch suffix: %w", err)
 	}
 	proposed := fmt.Sprintf("sf/%s/%s/%s-%s", channel, digestPart(string(project)), digestPart(string(ticket)), hex.EncodeToString(suffix[:]))
-	stored, err := a.Authority.LoadOrStoreBranch(ctx, string(channel)+"\x00"+string(project)+"\x00"+string(ticket), proposed)
+	stored, err := a.Authority.LoadOrStoreBranch(ctx, key, proposed)
 	if err != nil {
 		return "", err
 	}
-	return validateBranch(stored)
+	return validateAllocatedBranch(channel, stored)
 }
 
 func digestPart(value string) string {
@@ -68,20 +87,32 @@ func digestPart(value string) string {
 }
 
 func validateBranch(branch string) (string, error) {
-	if !strings.HasPrefix(branch, "sf/") || !validRef(branch) {
+	if !validRef(branch) || (len(strings.Split(branch, "/")) < 3) || (strings.HasPrefix(branch, "sf/stable/") == false && strings.HasPrefix(branch, "sf/dev/") == false) {
 		return "", fmt.Errorf("invalid persisted branch %q", branch)
 	}
 	return branch, nil
 }
 
+func validateAllocatedBranch(channel domain.Channel, branch string) (string, error) {
+	if !channel.Valid() || !strings.HasPrefix(branch, "sf/"+string(channel)+"/") {
+		return "", fmt.Errorf("invalid persisted branch %q", branch)
+	}
+	return validateBranch(branch)
+}
+
 func validRef(ref string) bool {
-	if ref == "" || strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") ||
-		strings.Contains(ref, "..") || strings.Contains(ref, "@{") || strings.Contains(ref, "//") ||
-		strings.ContainsAny(ref, " ~^:?*[\\\x00\r\n") {
+	if ref == "" || len(ref) > 1024 || ref == "@" || strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") ||
+		strings.HasSuffix(ref, ".") || strings.Contains(ref, "..") || strings.Contains(ref, "@{") || strings.Contains(ref, "//") ||
+		strings.ContainsAny(ref, " ~^:?*[\\\x00\r\n\t") {
 		return false
 	}
+	for _, value := range []byte(ref) {
+		if value < 0x20 || value == 0x7f {
+			return false
+		}
+	}
 	for _, component := range strings.Split(ref, "/") {
-		if component == "" || component == "." || component == ".." || strings.HasSuffix(component, ".lock") {
+		if component == "" || component == "." || component == ".." || strings.HasPrefix(component, ".") || strings.HasSuffix(component, ".") || strings.HasSuffix(component, ".lock") {
 			return false
 		}
 	}
@@ -306,6 +337,8 @@ type Identity struct {
 	Repository string
 	Worktree   string
 	GitFile    string
+	GitFileDev uint64
+	GitFileIno uint64
 	CommonDir  string
 	Origin     string
 	BaseRef    string
@@ -315,6 +348,68 @@ type Identity struct {
 	HooksHash  string
 }
 
+func canonicalExistingWorktree(path string) (string, error) {
+	if !validAbsolutePath(path) {
+		return "", fmt.Errorf("%w: absolute clean worktree path required", ErrIdentityMismatch)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", fmt.Errorf("%w: worktree must be a real directory", ErrIdentityMismatch)
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("%w: worktree path cannot be canonicalized", ErrIdentityMismatch)
+	}
+	return canonical, nil
+}
+
+func realSingleLinkFile(path string) (os.FileInfo, uint64, uint64, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, 0, 0, fmt.Errorf("%w: %s must be a regular file", ErrIdentityMismatch, path)
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		if stat.Nlink != 1 {
+			return nil, 0, 0, fmt.Errorf("%w: %s has multiple links", ErrIdentityMismatch, path)
+		}
+		return info, uint64(stat.Dev), uint64(stat.Ino), nil
+	}
+	return info, 0, 0, nil
+}
+
+func sameFileIdentity(a, b os.FileInfo) bool {
+	if a == nil || b == nil || a.Mode() != b.Mode() || a.Size() != b.Size() {
+		return false
+	}
+	aStat, aOK := a.Sys().(*syscall.Stat_t)
+	bStat, bOK := b.Sys().(*syscall.Stat_t)
+	return aOK && bOK && aStat.Dev == bStat.Dev && aStat.Ino == bStat.Ino && aStat.Nlink == bStat.Nlink
+}
+
+func realHooksRoot(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("%w: hooks root must be a real directory", ErrIdentityMismatch)
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil || canonical != path {
+		return fmt.Errorf("%w: hooks root is not canonical", ErrIdentityMismatch)
+	}
+	return nil
+}
+
 func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identity, error) {
 	if err := rejectGitEnvironment(os.Environ()); err != nil {
 		return Identity{}, err
@@ -322,7 +417,16 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	if !validAbsolutePath(worktree) || !validRef(baseRef) {
 		return Identity{}, fmt.Errorf("%w: invalid worktree path or base ref", ErrIdentityMismatch)
 	}
-	_, err := r.one(ctx, worktree, "rev-parse", "--show-toplevel")
+	canonicalWorktree, err := canonicalExistingWorktree(worktree)
+	if err != nil {
+		return Identity{}, err
+	}
+	gitPointer := filepath.Join(canonicalWorktree, ".git")
+	gitInfo, gitDev, gitIno, err := realSingleLinkFile(gitPointer)
+	if err != nil {
+		return Identity{}, err
+	}
+	_, err = r.one(ctx, worktree, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return Identity{}, err
 	}
@@ -350,14 +454,35 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	if err != nil {
 		return Identity{}, err
 	}
-	gitFile, err := os.ReadFile(filepath.Join(worktree, ".git"))
+	file, err := os.Open(gitPointer)
 	if err != nil {
 		return Identity{}, fmt.Errorf("read worktree git pointer: %w", err)
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !sameFileIdentity(gitInfo, openedInfo) {
+		return Identity{}, fmt.Errorf("%w: worktree git pointer changed while opening", ErrIdentityMismatch)
+	}
+	gitFile, err := io.ReadAll(file)
+	if err != nil {
+		return Identity{}, fmt.Errorf("read worktree git pointer: %w", err)
+	}
+	finalInfo, finalErr := os.Lstat(gitPointer)
+	if finalErr != nil || !sameFileIdentity(gitInfo, finalInfo) || gitInfo.Size() != int64(len(gitFile)) {
+		return Identity{}, fmt.Errorf("%w: worktree git pointer changed while reading", ErrIdentityMismatch)
 	}
 	if err := r.rejectFeatures(ctx, worktree); err != nil {
 		return Identity{}, err
 	}
-	hooksHash, err := treeDigest(filepath.Join(strings.TrimSpace(common), "hooks"))
+	common = strings.TrimSpace(common)
+	common, err = filepath.EvalSymlinks(common)
+	if err != nil || !validAbsolutePath(common) {
+		return Identity{}, fmt.Errorf("%w: noncanonical git common directory", ErrIdentityMismatch)
+	}
+	if err := realHooksRoot(filepath.Join(common, "hooks")); err != nil {
+		return Identity{}, err
+	}
+	hooksHash, err := treeDigest(filepath.Join(common, "hooks"))
 	if err != nil {
 		return Identity{}, err
 	}
@@ -367,17 +492,25 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	if err != nil {
 		return Identity{}, err
 	}
-	canonicalWorktree, err := filepath.EvalSymlinks(worktree)
-	if err != nil {
-		return Identity{}, err
+	// Ensure the pointer names precisely the linked worktree git directory.
+	pointerText := strings.TrimSpace(string(gitFile))
+	if !strings.HasPrefix(pointerText, "gitdir:") || strings.TrimSpace(strings.TrimPrefix(pointerText, "gitdir:")) == "" || strings.Contains(strings.TrimPrefix(pointerText, "gitdir:"), "\n") {
+		return Identity{}, fmt.Errorf("%w: malformed worktree git pointer", ErrIdentityMismatch)
+	}
+	pointerTarget := strings.TrimSpace(strings.TrimPrefix(pointerText, "gitdir:"))
+	if !validAbsolutePath(pointerTarget) {
+		return Identity{}, fmt.Errorf("%w: noncanonical worktree git pointer", ErrIdentityMismatch)
+	}
+	pointerTarget, err = filepath.EvalSymlinks(pointerTarget)
+	if err != nil || pointerTarget != filepath.Join(common, "worktrees", filepath.Base(pointerTarget)) {
+		return Identity{}, fmt.Errorf("%w: worktree git pointer escapes common directory", ErrIdentityMismatch)
 	}
 	baseHead = strings.TrimSpace(baseHead)
 	headRef = strings.TrimSpace(headRef)
-	common = strings.TrimSpace(common)
 	if !validOID(baseHead) || !validBranchOrHeadRef(headRef) || !validAbsolutePath(common) || !validAbsolutePath(canonicalRepo) || !validAbsolutePath(canonicalWorktree) {
 		return Identity{}, fmt.Errorf("%w: invalid git identity value", ErrIdentityMismatch)
 	}
-	return Identity{Repository: canonicalRepo, Worktree: canonicalWorktree, GitFile: string(gitFile), CommonDir: common, Origin: strings.TrimSpace(origin), BaseRef: baseRef, BaseHead: baseHead, HeadRef: headRef, ConfigHash: digest(config), HooksHash: hooksHash}, nil
+	return Identity{Repository: canonicalRepo, Worktree: canonicalWorktree, GitFile: string(gitFile), GitFileDev: gitDev, GitFileIno: gitIno, CommonDir: common, Origin: strings.TrimSpace(origin), BaseRef: baseRef, BaseHead: baseHead, HeadRef: headRef, ConfigHash: digest(config), HooksHash: hooksHash}, nil
 }
 
 func validBranchOrHeadRef(value string) bool {
@@ -482,6 +615,16 @@ func digest(data []byte) string {
 }
 
 func treeDigest(root string) (string, error) {
+	if info, err := os.Lstat(root); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return "", fmt.Errorf("%w: hook root must be a real directory", ErrIdentityMismatch)
+		}
+		if canonical, evalErr := filepath.EvalSymlinks(root); evalErr != nil || canonical != root {
+			return "", fmt.Errorf("%w: hook root is not canonical", ErrIdentityMismatch)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
 	hash := sha256.New()
 	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if errors.Is(err, os.ErrNotExist) {
@@ -566,6 +709,25 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	if _, err := validateBranch(branch); err != nil {
 		return Worktree{}, err
 	}
+	if _, err := os.Lstat(path); err == nil {
+		return Worktree{}, fmt.Errorf("%w: worktree path already exists", ErrIdentityMismatch)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Worktree{}, err
+	}
+	parent := filepath.Dir(path)
+	canonicalParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return Worktree{}, fmt.Errorf("%w: worktree parent is unavailable", ErrIdentityMismatch)
+	}
+	// Parent aliases are harmless once resolved before Git creates anything;
+	// the durable Worktree.Path is always this canonical spelling. A symlink at
+	// the worktree leaf itself was rejected above and is never followed.
+	path = filepath.Join(canonicalParent, filepath.Base(path))
+	if _, err := os.Lstat(path); err == nil {
+		return Worktree{}, fmt.Errorf("%w: canonical worktree path already exists", ErrIdentityMismatch)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Worktree{}, err
+	}
 	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
 		return Worktree{}, err
 	}
@@ -574,12 +736,91 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	}
 	identity, err := r.Snapshot(ctx, path, baseRef)
 	if err != nil {
+		if cleanupErr := r.cleanupCreatedWorktree(ctx, repository, path, branch); cleanupErr != nil {
+			return Worktree{}, fmt.Errorf("%w: snapshot failed: %v; cleanup failed: %w", ErrWorktreeQuarantined, err, cleanupErr)
+		}
 		return Worktree{}, err
 	}
 	return Worktree{Path: path, Branch: branch, Identity: identity}, nil
 }
 
+func (r Runner) cleanupCreatedWorktree(ctx context.Context, repository, path, branch string) error {
+	// Never recursively remove a path after identity authentication failed. Git
+	// owns the creation record and can remove it without following a replaced
+	// path. If the path was replaced by a symlink, leave it quarantined rather
+	// than risking deletion outside the requested worktree.
+	if info, err := os.Lstat(path); err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.IsDir()) {
+		return fmt.Errorf("created worktree path was replaced")
+	}
+	if _, err := r.command(ctx, repository, "worktree", "remove", "--force", "--", path); err != nil {
+		// A malformed or swapped .git pointer can make Git unable to remove its
+		// own checkout. Remove only a tree that is proven to contain no links or
+		// special files, then prune Git's stale worktree registration.
+		if safeErr := safeRemoveTree(path); safeErr != nil {
+			return fmt.Errorf("git removal: %v; safe filesystem cleanup: %w", err, safeErr)
+		}
+		if _, pruneErr := r.command(ctx, repository, "worktree", "prune"); pruneErr != nil {
+			return pruneErr
+		}
+	}
+	if _, err := r.command(ctx, repository, "branch", "-D", "--", branch); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return fmt.Errorf("worktree path remains after cleanup")
+		}
+		return err
+	}
+	return nil
+}
+
+func safeRemoveTree(root string) error {
+	if info, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	} else if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("created worktree path is not a real directory")
+	}
+	var paths []string
+	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root {
+			return nil
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("created worktree contains a symlink")
+		}
+		// Removing a hardlink removes only this directory entry and cannot alter
+		// the other inode owner, so it is safe during cleanup. Hardlinks remain
+		// prohibited for candidate validation and authenticated .git pointers.
+		paths = append(paths, path)
+		return nil
+	}); err != nil {
+		return err
+	}
+	for index := len(paths) - 1; index >= 0; index-- {
+		if err := os.Remove(paths[index]); err != nil {
+			return err
+		}
+	}
+	return os.Remove(root)
+}
+
 func (r Runner) InspectWorktree(ctx context.Context, worktree Worktree) error {
+	if worktree.Path == "" || worktree.Path != worktree.Identity.Worktree {
+		return fmt.Errorf("%w: worktree path is not bound to authenticated identity", ErrIdentityMismatch)
+	}
+	if _, err := canonicalExistingWorktree(worktree.Path); err != nil {
+		return err
+	}
 	if err := r.Reauthenticate(ctx, worktree.Identity); err != nil {
 		return err
 	}
@@ -619,6 +860,12 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 	if output, statusErr := r.command(ctx, worktree.Path, "status", "--porcelain=v1"); statusErr != nil || strings.TrimSpace(string(output)) != "" {
 		return fmt.Errorf("%w: worktree status is not clean", ErrUnsafeWorktree)
 	}
+	// Status is only an observation. Reauthenticate again immediately before
+	// the removal effect so a path, pointer, hook, or config swap cannot turn
+	// this command into deletion of an unrelated checkout.
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return err
+	}
 	_, err = r.command(ctx, canonicalRepository, "worktree", "remove", worktree.Path)
 	return err
 }
@@ -632,6 +879,9 @@ type DiffPolicy struct {
 func (r Runner) ValidateDiff(ctx context.Context, worktree, baseRef string, policy DiffPolicy) error {
 	if !validAbsolutePath(worktree) || !validRef(baseRef) || len(policy.AllowedPaths) == 0 {
 		return fmt.Errorf("allowed paths are required")
+	}
+	if _, err := canonicalExistingWorktree(worktree); err != nil {
+		return err
 	}
 	for _, allowedPath := range policy.AllowedPaths {
 		if !validRepoPath(strings.Trim(allowedPath, "/")) {
@@ -656,15 +906,15 @@ func (r Runner) ValidateDiff(ctx context.Context, worktree, baseRef string, poli
 	if _, err := r.command(ctx, worktree, "merge-base", "--is-ancestor", baseRef, "HEAD"); err != nil {
 		return fmt.Errorf("%w: history does not descend from base", ErrUnsafeWorktree)
 	}
-	changed, err := r.command(ctx, worktree, "diff", "--name-only", "-z", baseRef+"..HEAD")
+	changed, err := r.command(ctx, worktree, "diff", "--no-renames", "--name-only", "-z", baseRef+"..HEAD")
 	if err != nil {
 		return err
 	}
-	unstaged, err := r.command(ctx, worktree, "diff", "--name-only", "-z")
+	unstaged, err := r.command(ctx, worktree, "diff", "--no-renames", "--name-only", "-z")
 	if err != nil {
 		return err
 	}
-	staged, err := r.command(ctx, worktree, "diff", "--cached", "--name-only", "-z")
+	staged, err := r.command(ctx, worktree, "diff", "--no-renames", "--cached", "--name-only", "-z")
 	if err != nil {
 		return err
 	}
@@ -771,6 +1021,9 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if !validEvidenceDigest(request.EvidenceDigest) || (request.Message != "" && !boundedCommitText(request.Message, 4_000)) || request.Timestamp.IsZero() || !validRef(request.BaseRef) {
 		return "", fmt.Errorf("candidate evidence digest and timestamp are required")
 	}
+	if request.BaseRef != worktree.Identity.BaseRef {
+		return "", fmt.Errorf("%w: commit base ref does not match authenticated base", ErrIdentityMismatch)
+	}
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
@@ -786,6 +1039,11 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 		return "", err
 	}
 	if err := r.ValidateDiff(ctx, worktree.Path, request.BaseRef, request.Policy); err != nil {
+		return "", err
+	}
+	// Reauthenticate immediately before the commit effect after all staging and
+	// validation, binding the final Git command to the durable identity.
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return "", err
 	}
 	message := "sf candidate " + request.EvidenceDigest
@@ -830,44 +1088,56 @@ func validEvidenceDigest(value string) bool {
 	return err == nil && len(decoded) == sha256.Size && strings.ToLower(encoded) == encoded
 }
 
-func (r Runner) Push(ctx context.Context, worktree Worktree) (string, error) {
+// Push publishes exactly expectedHead. Callers must carry the candidate SHA
+// from the durable commit/effect record; Push never chooses a moving local
+// head on their behalf.
+func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string) (string, error) {
 	if _, err := validateBranch(worktree.Branch); err != nil {
 		return "", err
 	}
-	if err := r.InspectWorktree(ctx, worktree); err != nil {
-		return "", err
+	if !validOID(expectedHead) {
+		return "", fmt.Errorf("%w: invalid expected candidate head", ErrUnexpectedRemote)
 	}
-	local, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", worktree.Branch+"^{commit}")
+	_, err := r.provePushHead(ctx, worktree, expectedHead)
 	if err != nil {
 		return "", err
-	}
-	if !validOID(local) {
-		return "", fmt.Errorf("%w: invalid local object id", ErrIdentityMismatch)
 	}
 	remote, err := r.remoteHead(ctx, worktree.Path, worktree.Branch)
 	if err != nil {
 		return "", err
 	}
-	if remote == local {
-		return local, nil
+	if remote == expectedHead {
+		return expectedHead, nil
 	}
 	if remote != "" {
 		if !validOID(remote) {
 			return "", fmt.Errorf("%w: invalid remote object id", ErrUnexpectedRemote)
 		}
 		observationRef := "refs/sf/observed/" + digest([]byte(worktree.Branch + remote))[7:]
+		if _, err := r.provePushHead(ctx, worktree, expectedHead); err != nil {
+			return "", err
+		}
 		if _, err := r.command(ctx, worktree.Path, "fetch", "--no-tags", "origin", "refs/heads/"+worktree.Branch+":"+observationRef); err != nil {
 			return "", fmt.Errorf("%w: cannot observe remote %s", ErrUnexpectedRemote, remote)
 		}
-		if _, err := r.command(ctx, worktree.Path, "merge-base", "--is-ancestor", remote, local); err != nil {
-			return "", fmt.Errorf("%w: %s is not ancestor of %s", ErrUnexpectedRemote, remote, local)
+		if _, err := r.command(ctx, worktree.Path, "merge-base", "--is-ancestor", remote, expectedHead); err != nil {
+			return "", fmt.Errorf("%w: %s is not ancestor of %s", ErrUnexpectedRemote, remote, expectedHead)
 		}
 	}
-	refspec := local + ":refs/heads/" + worktree.Branch
+	// Reauthenticate and prove the exact candidate immediately before push.
+	if _, err := r.provePushHead(ctx, worktree, expectedHead); err != nil {
+		return "", err
+	}
+	refspec := expectedHead + ":refs/heads/" + worktree.Branch
 	if _, err := r.command(ctx, worktree.Path, "push", "origin", refspec); err != nil {
+		// The server may have accepted the ref while the response was lost. Only
+		// reconcile success when the exact expected candidate is observed.
+		if _, proveErr := r.provePushHead(ctx, worktree, expectedHead); proveErr != nil {
+			return "", err
+		}
 		observed, observeErr := r.remoteHead(ctx, worktree.Path, worktree.Branch)
-		if observeErr == nil && observed == local {
-			return local, nil
+		if observeErr == nil && observed == expectedHead {
+			return expectedHead, nil
 		}
 		return "", err
 	}
@@ -875,10 +1145,28 @@ func (r Runner) Push(ctx context.Context, worktree Worktree) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if observed != local {
+	if observed != expectedHead {
 		return "", fmt.Errorf("%w: push did not converge", ErrUnexpectedRemote)
 	}
-	return local, nil
+	return expectedHead, nil
+}
+
+func (r Runner) provePushHead(ctx context.Context, worktree Worktree, expectedHead string) (string, error) {
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	head, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return "", err
+	}
+	branchHead, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", "refs/heads/"+worktree.Branch+"^{commit}")
+	if err != nil {
+		return "", err
+	}
+	if !validOID(head) || head != expectedHead || branchHead != expectedHead {
+		return "", fmt.Errorf("%w: local candidate head changed", ErrUnexpectedRemote)
+	}
+	return head, nil
 }
 
 func (r Runner) remoteHead(ctx context.Context, directory, branch string) (string, error) {
