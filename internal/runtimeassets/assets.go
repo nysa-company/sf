@@ -89,7 +89,7 @@ func authenticate(path string) (string, error) {
 	}
 	opened, statErr := file.Stat()
 	closeErr := file.Close()
-	if statErr != nil || !os.SameFile(canonicalInfo, opened) {
+	if statErr != nil || !os.SameFile(canonicalInfo, opened) || !safeExecutable(opened) {
 		return "", fmt.Errorf("%w: executable changed while opening", ErrUnsafeBundle)
 	}
 	if closeErr != nil {
