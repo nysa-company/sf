@@ -69,7 +69,7 @@ func TestMalformedOutputFallsBackAndNeverPersistsSecrets(t *testing.T) {
 	}
 	r := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: time.Second, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}}
 	result := c.Run(ctx, r)
-	if result.Code != Failed || len(result.Attempts) != 1 {
+	if result.Code != Failed || len(result.Attempts) != 1 || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
 		t.Fatalf("result=%+v", result)
 	}
 	rawSecret := sha256.Sum256([]byte(secret))
@@ -77,6 +77,55 @@ func TestMalformedOutputFallsBackAndNeverPersistsSecrets(t *testing.T) {
 		t.Fatalf("unsafe digest=%+v", result.Attempts[0])
 	}
 }
+
+func TestCompletedResultExposesOnlyTheDurableAttemptKey(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != Completed {
+		t.Fatalf("result=%+v", result)
+	}
+	want := store.ProviderAttemptResultKey{AttemptID: result.ProviderResult.AttemptID, Ref: ref, Phase: domain.PhasePlanning, Attempt: 1}
+	if result.ProviderResult != want {
+		t.Fatalf("provider result key=%+v want=%+v", result.ProviderResult, want)
+	}
+	if _, _, err := database.LoadHistoricalProviderAttemptResult(context.Background(), result.ProviderResult); err != nil {
+		t.Fatalf("result key was not durably persisted: %v", err)
+	}
+}
+
+func TestFallbackCompletionExposesFallbackAttemptKey(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Behavior: testkit.ProviderMalformed}}
+	// The Store-selected planner qualification is the primary identity. Keep
+	// that durable identity while using a distinct route alias to exercise the
+	// coordinator's fallback path without weakening provider qualification.
+	fallback := &aliasedProvider{ScriptedProvider: testkit.NewScriptedProvider(id("cursor", "cursor-family"))}
+	fallback.Add(domain.PhasePlanning, testkit.ProviderStep{Artifact: plannerArtifact()})
+	coordinator.registry.providers["claude"] = fallback
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != Completed {
+		t.Fatalf("fallback result=%+v", result)
+	}
+	if result.ProviderResult.AttemptID <= 0 || result.ProviderResult.Ref != ref || result.ProviderResult.Phase != domain.PhasePlanning || result.ProviderResult.Attempt != 2 {
+		t.Fatalf("fallback provider result key=%+v", result.ProviderResult)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+	if attempts[0].Binding.Identity.Provider != "cursor" || attempts[1].Binding.Identity.Provider != "cursor" {
+		t.Fatalf("attempt providers=%q,%q", attempts[0].Binding.Identity.Provider, attempts[1].Binding.Identity.Provider)
+	}
+	if _, _, err := database.LoadHistoricalProviderAttemptResult(context.Background(), result.ProviderResult); err != nil {
+		t.Fatalf("fallback key was not durably persisted: %v", err)
+	}
+}
+
+type aliasedProvider struct{ *testkit.ScriptedProvider }
+
+func (p *aliasedProvider) Name() string { return "claude" }
 
 type undrainedProvider struct {
 	*testkit.ScriptedProvider
@@ -91,6 +140,11 @@ func (s refusingSupervisor) Drain(context.Context, contracts.DrainRequest) (cont
 }
 
 type faultingSupervisor struct {
+	*testkit.Supervisor
+	onDrain func()
+}
+
+type faultAfterDrainSupervisor struct {
 	*testkit.Supervisor
 	onDrain func()
 }
@@ -111,6 +165,13 @@ func (s faultingSupervisor) Drain(ctx context.Context, request contracts.DrainRe
 	return contracts.DrainProof{}, fmt.Errorf("tracked process group remains live")
 }
 
+func (s faultAfterDrainSupervisor) Drain(ctx context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
+	if s.onDrain != nil {
+		s.onDrain()
+	}
+	return s.Signer.ProveDrained(request)
+}
+
 func TestPersistenceFailureLatchesCoordinatorAndPreservesActiveClaim(t *testing.T) {
 	var database *store.Store
 	supervisor := &faultingSupervisor{Supervisor: testkit.NewSupervisor()}
@@ -119,7 +180,7 @@ func TestPersistenceFailureLatchesCoordinatorAndPreservesActiveClaim(t *testing.
 		database.SetWriteFaultForTest(func() error { return errors.New("injected quarantine write failure") })
 	}
 	first := coordinator.Run(context.Background(), request)
-	if !first.NeedsOperator || !first.PersistenceFailure {
+	if !first.NeedsOperator || !first.PersistenceFailure || first.ProviderResult != (store.ProviderAttemptResultKey{}) {
 		t.Fatalf("persistence failure was not surfaced: %+v", first)
 	}
 	attempts, err := database.ProviderAttempts(context.Background(), ref)
@@ -127,8 +188,46 @@ func TestPersistenceFailureLatchesCoordinatorAndPreservesActiveClaim(t *testing.
 		t.Fatalf("active claim was not preserved after failed quarantine: %+v err=%v", attempts, err)
 	}
 	second := coordinator.Run(context.Background(), request)
-	if !second.NeedsOperator || second.Code != NeedsOperator {
+	if !second.NeedsOperator || second.Code != NeedsOperator || second.ProviderResult != (store.ProviderAttemptResultKey{}) {
 		t.Fatalf("latched coordinator admitted a later run: %+v", second)
+	}
+}
+
+func TestCompletionPersistenceFailureDoesNotExposeProviderResultKey(t *testing.T) {
+	var database *store.Store
+	supervisor := &faultAfterDrainSupervisor{Supervisor: testkit.NewSupervisor()}
+	database, request, coordinator, _, primary := newCoordinatorFixture(t, supervisor)
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
+	supervisor.onDrain = func() {
+		database.SetWriteFaultForTest(func() error { return errors.New("injected completion write failure") })
+	}
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != NeedsOperator || !result.PersistenceFailure || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
+		t.Fatalf("completion persistence result=%+v", result)
+	}
+}
+
+func TestCanceledResultDoesNotExposeProviderResultKey(t *testing.T) {
+	database, request, coordinator, ref, _ := newCoordinatorFixture(t, testkit.NewSupervisor())
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	result := coordinator.Run(ctx, request)
+	if !result.NeedsOperator || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
+		attempts, _ := database.ProviderAttempts(context.Background(), ref)
+		t.Logf("canceled attempts=%+v", attempts)
+		t.Fatalf("canceled result=%+v", result)
+	}
+}
+
+func TestBudgetExhaustionDoesNotExposeProviderResultKey(t *testing.T) {
+	_, request, coordinator, _, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact(), UsageUnits: 101}}
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != BudgetExhausted || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
+		t.Fatalf("budget result=%+v", result)
 	}
 }
 

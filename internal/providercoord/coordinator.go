@@ -63,11 +63,15 @@ type Receipt struct {
 	ErrorCode                        string
 }
 type Result struct {
-	Code          Outcome
-	Parsed        *phaseartifact.Parsed
-	Attempts      []Receipt
-	NeedsOperator bool
-	CostUsed      int64
+	Code   Outcome
+	Parsed *phaseartifact.Parsed
+	// ProviderResult is populated only after Store has durably committed the
+	// completed attempt. A zero key means that no immutable result was
+	// persisted; callers must never derive one from receipts.
+	ProviderResult store.ProviderAttemptResultKey
+	Attempts       []Receipt
+	NeedsOperator  bool
+	CostUsed       int64
 	// PersistenceFailure distinguishes an operator stop caused by uncertain
 	// durable state from an ordinary provider/admission failure.
 	PersistenceFailure bool
@@ -330,8 +334,9 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		receipts = append(receipts, receipt)
 		finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		var finishErr error
+		var durableResult store.ProviderAttemptResult
 		if state == "completed" {
-			_, finishErr = c.store.CompleteProviderAttemptSuccess(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, raw, r.Validation, c.clock.Now())
+			durableResult, finishErr = c.store.CompleteProviderAttemptSuccess(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, raw, r.Validation, c.clock.Now())
 		} else {
 			finishErr = c.store.FinishProviderAttempt(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, state, outcome, max(raw.UsageUnits, 0), c.clock.Now())
 		}
@@ -361,7 +366,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 		if state == "completed" {
-			return Result{Code: Completed, Parsed: &parsed, Attempts: receipts, CostUsed: spent}
+			return Result{Code: Completed, Parsed: &parsed, ProviderResult: store.ProviderAttemptResultKey{AttemptID: durableResult.AttemptID, Ref: durableResult.Claim.Ref, Phase: durableResult.Claim.Phase, Attempt: durableResult.Claim.Attempt}, Attempts: receipts, CostUsed: spent}
 		}
 	}
 	return Result{Code: Failed, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
