@@ -318,7 +318,7 @@ func defaultOperatorLabel() string {
 func (a *app) doctorCommand() *cobra.Command {
 	var repo string
 	command := &cobra.Command{Use: "doctor", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		report := RunDoctor(cmd.Context(), DoctorDeps{Channel: a.channel, Repo: repo})
+		report := RunDoctor(cmd.Context(), productionDoctorDeps(a.channel, repo))
 		return a.emit(reportResponse(report))
 	}}
 	command.Flags().StringVar(&repo, "repo", "", "trusted repository path")

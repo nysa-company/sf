@@ -8,11 +8,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/nysa-company/sf/internal/api"
+	localauth "github.com/nysa-company/sf/internal/auth"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/redact"
+	"github.com/nysa-company/sf/internal/store"
 )
 
 const doctorSchema = "sf.doctor/v1"
@@ -36,10 +40,28 @@ type DoctorCheck struct {
 }
 
 type DoctorReport struct {
-	Schema             string         `json:"schema"`
-	Channel            domain.Channel `json:"channel"`
-	Checks             []DoctorCheck  `json:"checks"`
-	AutonomousEligible bool           `json:"autonomous_eligible"`
+	Schema             string              `json:"schema"`
+	Channel            domain.Channel      `json:"channel"`
+	Checks             []DoctorCheck       `json:"checks"`
+	Authentication     []authStatusView    `json:"authentication"`
+	ProviderPair       *DoctorProviderPair `json:"provider_pair,omitempty"`
+	AutonomousEligible bool                `json:"autonomous_eligible"`
+	CredentialsStored  bool                `json:"credentials_stored_by_sf"`
+}
+
+type DoctorProviderPair struct {
+	Builder     DoctorProviderQualification `json:"builder"`
+	Reviewer    DoctorProviderQualification `json:"reviewer"`
+	Independent bool                        `json:"independent"`
+}
+
+type DoctorProviderQualification struct {
+	Role          string                     `json:"role"`
+	Provider      string                     `json:"provider"`
+	Model         string                     `json:"model"`
+	Family        string                     `json:"family"`
+	Version       string                     `json:"version"`
+	Qualification store.QualificationProfile `json:"qualification"`
 }
 
 // DoctorDeps is the injected, read-only registry used by Doctor. Tests can
@@ -54,6 +76,8 @@ type DoctorDeps struct {
 	StatFS     func(string) (*syscall.Statfs_t, error)
 	CurrentUID func() uint32
 	Worktree   func(context.Context, string) error
+	AuthStatus func(context.Context) []localauth.Status
+	Pair       func(context.Context, domain.Channel) (store.ProviderPair, error)
 }
 
 func (deps DoctorDeps) defaults() DoctorDeps {
@@ -99,11 +123,30 @@ func (deps DoctorDeps) defaults() DoctorDeps {
 	return deps
 }
 
-// RunDoctor performs only local read-only probes. It never contacts a daemon,
-// provider, gh authentication endpoint, or container runtime.
+func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
+	deps := (DoctorDeps{Channel: channel, Repo: repo}).defaults()
+	manager := localauth.NewManager()
+	deps.AuthStatus = manager.StatusAll
+	databasePath := deps.Paths.Database
+	deps.Pair = func(ctx context.Context, selected domain.Channel) (store.ProviderPair, error) {
+		database, err := store.OpenReadOnly(ctx, databasePath)
+		if err != nil {
+			return store.ProviderPair{}, err
+		}
+		defer database.Close()
+		return database.ProviderPair(ctx, selected)
+	}
+	return deps
+}
+
+// RunDoctor performs only read-only probes. It never contacts the daemon,
+// mutates channel state, invokes provider inference, or starts a container.
 func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	deps = deps.defaults()
-	report := DoctorReport{Schema: doctorSchema, Channel: deps.Channel, AutonomousEligible: false}
+	report := DoctorReport{
+		Schema: doctorSchema, Channel: deps.Channel, Checks: []DoctorCheck{},
+		Authentication: []authStatusView{}, AutonomousEligible: false, CredentialsStored: false,
+	}
 	if !deps.Channel.Valid() {
 		report.Checks = append(report.Checks, failedCheck("channel", "channel is invalid", deps.Binary, "doctor"))
 		return report
@@ -123,9 +166,216 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 		report.Checks = append(report.Checks, DoctorCheck{ID: "repository_worktree", Status: CheckPass, Summary: "selected repository is a Git worktree"})
 	}
 	report.Checks = append(report.Checks, checkExecutable(deps, "gh", "gh executable is available"))
+	pair, pairAvailable := checkProviderPair(ctx, deps, &report)
+	checkAuthentication(ctx, deps, pair, pairAvailable, &report)
 	report.Checks = append(report.Checks, DoctorCheck{ID: "container_runtime", Status: CheckNotRun, Summary: "Docker and Colima are not required"})
 	report.Checks = append(report.Checks, DoctorCheck{ID: "autonomous_mode", Status: CheckPass, Summary: "autonomous mode is disabled by policy"})
 	return report
+}
+
+func checkProviderPair(ctx context.Context, deps DoctorDeps, report *DoctorReport) (store.ProviderPair, bool) {
+	if deps.Pair == nil {
+		report.Checks = append(report.Checks,
+			DoctorCheck{ID: "authority_database", Status: CheckNotRun, Summary: "authority inspection was not configured"},
+			DoctorCheck{ID: "provider_pair", Status: CheckNotRun, Summary: "provider qualification inspection was not configured"},
+		)
+		return store.ProviderPair{}, false
+	}
+	pair, err := deps.Pair(ctx, deps.Channel)
+	if errors.Is(err, store.ErrNotFound) {
+		report.Checks = append(report.Checks,
+			DoctorCheck{ID: "authority_database", Status: CheckPass, Summary: "authority database is readable and schema-compatible"},
+			failedCheck("provider_pair", "a current independent provider pair is not selected", deps.Binary, "providers", "qualify", "--help"),
+		)
+		return store.ProviderPair{}, false
+	}
+	if err != nil {
+		report.Checks = append(report.Checks,
+			failedCheck("authority_database", "authority database is missing, unreadable, or schema-incompatible", deps.Binary, "init", "--help"),
+			DoctorCheck{ID: "provider_pair", Status: CheckNotRun, Summary: "provider pair was not read because authority inspection failed"},
+		)
+		return store.ProviderPair{}, false
+	}
+	if !validDoctorPair(pair, deps.Channel) {
+		report.Checks = append(report.Checks,
+			DoctorCheck{ID: "authority_database", Status: CheckPass, Summary: "authority database is readable and schema-compatible"},
+			failedCheck("provider_pair", "the selected provider pair is invalid or no longer independent", deps.Binary, "providers", "qualify", "--help"),
+		)
+		return store.ProviderPair{}, false
+	}
+	report.ProviderPair = &DoctorProviderPair{
+		Builder:     doctorQualification("builder", pair.Builder),
+		Reviewer:    doctorQualification("reviewer", pair.Reviewer),
+		Independent: true,
+	}
+	report.Checks = append(report.Checks,
+		DoctorCheck{ID: "authority_database", Status: CheckPass, Summary: "authority database is readable and schema-compatible"},
+		DoctorCheck{ID: "provider_pair", Status: CheckPass, Summary: "selected provider pair is current, qualified, and independent"},
+	)
+	return pair, true
+}
+
+func validDoctorPair(pair store.ProviderPair, channel domain.Channel) bool {
+	if pair.Channel != channel || pair.Builder.ID <= 0 || pair.Reviewer.ID <= 0 || pair.Builder.ID == pair.Reviewer.ID || pair.SelectedAt.IsZero() {
+		return false
+	}
+	if pair.Builder.Channel != channel || pair.Reviewer.Channel != channel || pair.Builder.Provider.Family == pair.Reviewer.Provider.Family {
+		return false
+	}
+	return safeDoctorProvider(pair.Builder.Provider) && safeDoctorProvider(pair.Reviewer.Provider) &&
+		passingQualification(pair.Builder.Profile) && passingQualification(pair.Reviewer.Profile)
+}
+
+func safeDoctorProvider(identity domain.ProviderIdentity) bool {
+	provider, err := localauth.ParseProvider(identity.Provider)
+	if err != nil || provider == localauth.GitHub {
+		return false
+	}
+	return safeDoctorField(identity.Model, 200) && safeDoctorField(identity.Family, 100) && safeDoctorField(identity.Version, 200)
+}
+
+func passingQualification(profile store.QualificationProfile) bool {
+	return profile == store.QualificationGuarded || profile == store.QualificationAutonomous
+}
+
+func doctorQualification(role string, value store.ProviderQualification) DoctorProviderQualification {
+	return DoctorProviderQualification{
+		Role: role, Provider: value.Provider.Provider, Model: value.Provider.Model,
+		Family: value.Provider.Family, Version: value.Provider.Version, Qualification: value.Profile,
+	}
+}
+
+func checkAuthentication(ctx context.Context, deps DoctorDeps, pair store.ProviderPair, pairAvailable bool, report *DoctorReport) {
+	if deps.AuthStatus == nil {
+		report.Checks = append(report.Checks, DoctorCheck{ID: "authentication", Status: CheckNotRun, Summary: "authentication inspection was not configured"})
+		return
+	}
+	views, byProvider, valid := normalizeDoctorAuth(deps.Channel, deps.AuthStatus(ctx))
+	report.Authentication = views
+	if !valid {
+		report.Checks = append(report.Checks, failedCheck("authentication", "authentication probe results were incomplete or invalid", deps.Binary, "auth", "status"))
+	}
+	report.Checks = append(report.Checks, requiredAuthCheck(deps.Binary, "github_auth", "GitHub", localauth.GitHub, byProvider))
+	if !pairAvailable {
+		return
+	}
+	roles := []struct {
+		id       string
+		label    string
+		provider string
+	}{
+		{id: "builder_auth", label: "Builder", provider: pair.Builder.Provider.Provider},
+		{id: "reviewer_auth", label: "Reviewer", provider: pair.Reviewer.Provider.Provider},
+	}
+	for _, role := range roles {
+		provider, err := localauth.ParseProvider(role.provider)
+		if err != nil || provider == localauth.GitHub {
+			report.Checks = append(report.Checks, failedCheck(role.id, role.label+" provider is not supported", deps.Binary, "providers", "qualify", "--help"))
+			continue
+		}
+		report.Checks = append(report.Checks, requiredAuthCheck(deps.Binary, role.id, role.label, provider, byProvider))
+	}
+}
+
+func normalizeDoctorAuth(channel domain.Channel, statuses []localauth.Status) ([]authStatusView, map[localauth.Provider]authStatusView, bool) {
+	valid := true
+	raw := make(map[localauth.Provider]localauth.Status, len(statuses))
+	for _, status := range statuses {
+		if _, err := localauth.ParseProvider(string(status.Provider)); err != nil {
+			valid = false
+			continue
+		}
+		if _, exists := raw[status.Provider]; exists {
+			valid = false
+			continue
+		}
+		raw[status.Provider] = status
+	}
+	views := make([]authStatusView, 0, len(localauth.Providers()))
+	byProvider := make(map[localauth.Provider]authStatusView, len(localauth.Providers()))
+	for _, provider := range localauth.Providers() {
+		status, exists := raw[provider]
+		if !exists || !validDoctorAuthStatus(status) {
+			valid = false
+			status = localauth.Status{Provider: provider, Executable: doctorExecutable(provider), State: localauth.StateProbeFailed, Reason: "authentication result was unavailable or invalid"}
+		} else {
+			status.Reason = doctorAuthReason(status.State)
+		}
+		view := authView(channel, status)
+		views = append(views, view)
+		byProvider[provider] = view
+	}
+	return views, byProvider, valid
+}
+
+func validDoctorAuthStatus(status localauth.Status) bool {
+	if status.Executable != doctorExecutable(status.Provider) || !safeDoctorVersion(status.Version) {
+		return false
+	}
+	switch status.State {
+	case localauth.StateAuthenticated:
+		return status.Installed && status.Authenticated && status.Version != ""
+	case localauth.StateUnauthenticated:
+		return status.Installed && !status.Authenticated && status.Version != ""
+	case localauth.StateUnavailable:
+		return !status.Installed && !status.Authenticated && status.Version == ""
+	case localauth.StateProbeFailed:
+		return !status.Authenticated
+	default:
+		return false
+	}
+}
+
+func safeDoctorVersion(value string) bool {
+	if value == "" {
+		return true
+	}
+	return safeDoctorField(value, 200)
+}
+
+func safeDoctorField(value string, maximum int) bool {
+	return value != "" && len(value) <= maximum && strings.TrimSpace(value) == value &&
+		!strings.ContainsAny(value, "\x00\r\n\t") && redact.String(value) == value
+}
+
+func doctorExecutable(provider localauth.Provider) string {
+	switch provider {
+	case localauth.GitHub:
+		return "gh"
+	case localauth.Cursor:
+		return "cursor-agent"
+	case localauth.Claude:
+		return "claude"
+	case localauth.Codex:
+		return "codex"
+	default:
+		return ""
+	}
+}
+
+func doctorAuthReason(state localauth.State) string {
+	switch state {
+	case localauth.StateAuthenticated:
+		return ""
+	case localauth.StateUnauthenticated:
+		return "official CLI reports no active authentication"
+	case localauth.StateUnavailable:
+		return "official CLI executable is unavailable"
+	default:
+		return "authentication could not be verified safely"
+	}
+}
+
+func requiredAuthCheck(binary, id, label string, provider localauth.Provider, statuses map[localauth.Provider]authStatusView) DoctorCheck {
+	status, ok := statuses[provider]
+	if ok && status.State == localauth.StateAuthenticated && status.Installed && status.Authenticated {
+		return DoctorCheck{ID: id, Status: CheckPass, Summary: label + " authentication is active"}
+	}
+	action := []string{binary, "auth", "status"}
+	if ok && status.State == localauth.StateUnauthenticated {
+		action = []string{binary, "auth", "login", string(provider)}
+	}
+	return DoctorCheck{ID: id, Status: CheckFail, Summary: label + " authentication is unavailable or unverified", NextAction: &domain.NextAction{Code: "provider_auth_missing", Argv: action}}
 }
 
 func reportResponse(report DoctorReport) api.Response {
