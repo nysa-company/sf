@@ -313,6 +313,7 @@ func (s *Store) RecordPublishedCandidate(ctx context.Context, value PublishedCan
 		if err := conn.QueryRowContext(ctx, `SELECT generation,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY generation DESC LIMIT 1`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket).Scan(&generation, &candidate.BaseSHA, &candidate.HeadSHA, &candidate.TreeSHA, &candidate.SourceDigest, &candidate.VerificationIntentDigest, &candidate.ProofDigest, &candidate.CommandPolicyDigest, &candidate.BuilderEvidenceDigest); err != nil {
 			return ErrPublicationEvidence
 		}
+		candidate.Generation = generation
 		if generation != value.Candidate.Snapshot.Generation || candidate != value.Candidate.Snapshot {
 			return ErrPublicationEvidence
 		}
