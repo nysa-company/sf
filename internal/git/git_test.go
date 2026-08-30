@@ -17,6 +17,10 @@ import (
 
 type memoryBranchAuthority struct{ branches map[string]string }
 
+func (a *memoryBranchAuthority) LoadBranch(_ context.Context, key string) (string, error) {
+	return a.branches[key], nil
+}
+
 func (a *memoryBranchAuthority) LoadOrStoreBranch(_ context.Context, key, proposed string) (string, error) {
 	if existing := a.branches[key]; existing != "" {
 		return existing, nil
@@ -47,7 +51,7 @@ func (a *lookupBranchAuthority) LoadOrStoreBranch(_ context.Context, _ string, p
 }
 
 func TestAllocatorReadsPersistedBranchBeforeRandomGeneration(t *testing.T) {
-	stored := "sf/dev/project-ticket-existing"
+	stored := "sf/dev/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef"
 	authority := &lookupBranchAuthority{stored: stored}
 	allocator := Allocator{Authority: authority, Random: errorReader{}}
 	branch, err := allocator.Allocate(context.Background(), domain.ChannelDev, "project", "SF-existing")
@@ -57,7 +61,7 @@ func TestAllocatorReadsPersistedBranchBeforeRandomGeneration(t *testing.T) {
 }
 
 func TestAllocatorRejectsPersistedBranchFromAnotherChannel(t *testing.T) {
-	authority := &lookupBranchAuthority{stored: "sf/stable/project-ticket-existing"}
+	authority := &lookupBranchAuthority{stored: "sf/stable/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef"}
 	if _, err := (Allocator{Authority: authority, Random: errorReader{}}).Allocate(context.Background(), domain.ChannelDev, "project", "SF-existing"); err == nil {
 		t.Fatal("persisted branch crossed channel boundary")
 	}
@@ -284,6 +288,7 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 func TestRunnerExactArgvScrubsHooksAndCredentialEnvironment(t *testing.T) {
 	var got []string
 	var environment []string
+	directory := t.TempDir()
 	t.Setenv("SF_HOST_SECRET", "must-not-reach-git")
 	runner := Runner{Home: filepath.Join(t.TempDir(), "isolated-home"), Run: func(_ context.Context, binary string, argv, env []string) ([]byte, error) {
 		if binary != "/usr/bin/git" {
@@ -292,10 +297,13 @@ func TestRunnerExactArgvScrubsHooksAndCredentialEnvironment(t *testing.T) {
 		got, environment = argv, env
 		return []byte("deadbeef\n"), nil
 	}}
-	if _, err := runner.one(context.Background(), "/repo", "rev-parse", "HEAD"); err != nil {
+	if _, err := runner.one(context.Background(), directory, "rev-parse", "HEAD"); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"-C", "/repo", "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always", "rev-parse", "HEAD"}
+	want := []string{"-C", directory, "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always",
+		"-c", "credential.helper=", "-c", "core.fsmonitor=false", "-c", "core.sshCommand=",
+		"-c", "core.askPass=", "-c", "core.pager=", "-c", "commit.gpgsign=false",
+		"-c", "tag.gpgsign=false", "-c", "interactive.diffFilter=", "rev-parse", "HEAD"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("argv=%q", got)
 	}
@@ -321,13 +329,14 @@ func TestRunnerRequiresSecureAbsoluteHomeAndBoundsSeamOutput(t *testing.T) {
 	if err := os.Chmod(home, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (Runner{Home: home}).one(context.Background(), "/repo", "rev-parse", "HEAD"); err == nil {
+	directory := t.TempDir()
+	if _, err := (Runner{Home: home}).one(context.Background(), directory, "rev-parse", "HEAD"); err == nil {
 		t.Fatal("broad HOME was accepted")
 	}
 	runner := Runner{Home: filepath.Join(t.TempDir(), "isolated-home"), Run: func(context.Context, string, []string, []string) ([]byte, error) {
 		return bytes.Repeat([]byte("x"), maxGitOutput+1), nil
 	}}
-	if _, err := runner.one(context.Background(), "/repo", "rev-parse", "HEAD"); !errors.Is(err, ErrOutputBound) {
+	if _, err := runner.one(context.Background(), directory, "rev-parse", "HEAD"); !errors.Is(err, ErrOutputBound) {
 		t.Fatalf("bounded output=%v", err)
 	}
 }
@@ -502,7 +511,7 @@ func TestHTTPSCredentialHelperUsesExplicitGHConfigOnly(t *testing.T) {
 		argv, env = gotArgv, gotEnv
 		return []byte("ok\n"), nil
 	}}
-	if _, err := runner.one(context.Background(), "/repo", "status"); err != nil {
+	if _, err := runner.one(context.Background(), root, "status"); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(strings.Join(argv, "\x00"), "credential.helper=!"+ghBinary+" auth git-credential") || !strings.Contains(strings.Join(env, "\n"), "GH_CONFIG_DIR="+runner.GHConfigDir) {
@@ -512,6 +521,10 @@ func TestHTTPSCredentialHelperUsesExplicitGHConfigOnly(t *testing.T) {
 
 func TestGitDeadlineIsCappedAndCredentialHelperRejectsShellSyntax(t *testing.T) {
 	root := t.TempDir()
+	directory := filepath.Join(root, "directory")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	parent, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
 	defer cancel()
 	runner := Runner{Home: filepath.Join(root, "git-home"), Run: func(ctx context.Context, _ string, _ []string, _ []string) ([]byte, error) {
@@ -521,7 +534,7 @@ func TestGitDeadlineIsCappedAndCredentialHelperRejectsShellSyntax(t *testing.T) 
 		}
 		return []byte("ok\n"), nil
 	}}
-	if _, err := runner.one(parent, "/repo", "status"); err != nil {
+	if _, err := runner.one(parent, directory, "status"); err != nil {
 		t.Fatal(err)
 	}
 	unsafeBinary := filepath.Join(root, "gh;touch-pwned")
@@ -533,7 +546,7 @@ func TestGitDeadlineIsCappedAndCredentialHelperRejectsShellSyntax(t *testing.T) 
 		t.Fatal(err)
 	}
 	unsafe := Runner{Home: filepath.Join(root, "other-home"), GHBinary: unsafeBinary, GHConfigDir: config, Run: runner.Run}
-	if _, err := unsafe.one(context.Background(), "/repo", "status"); err == nil {
+	if _, err := unsafe.one(context.Background(), directory, "status"); err == nil {
 		t.Fatal("shell-bearing credential helper path was accepted")
 	}
 }
@@ -614,6 +627,90 @@ func TestInspectRejectsWorktreePathRebinding(t *testing.T) {
 	}
 }
 
+func TestSnapshotBindsRequestedRepositoryAndTopLevel(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-bind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(t.TempDir(), "foreign")
+	if err := os.Mkdir(foreign, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.snapshotExpected(ctx, foreign, worktree.Path, "main"); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("foreign requested repository accepted: %v", err)
+	}
+}
+
+func TestSnapshotRejectsHooksRootSymlink(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-hooks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	common := worktree.Identity.CommonDir
+	hooks := filepath.Join(common, "hooks")
+	backup := hooks + ".real"
+	if err := os.Rename(hooks, backup); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Rename(backup, hooks)
+	if err := os.Symlink(filepath.Join(t.TempDir(), "foreign-hooks"), hooks); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Snapshot(ctx, worktree.Path, "main"); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("hooks root symlink accepted: %v", err)
+	}
+}
+
+func TestRemoveRejectsWorktreeReplacementAtEffect(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-remove-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPath := worktree.Path
+	replacement := targetPath + ".replacement"
+	replaced := false
+	runner.Run = func(runCtx context.Context, binary string, argv, env []string) ([]byte, error) {
+		if !replaced && slicesContain(argv, "remove") && slicesContain(argv, targetPath) {
+			replaced = true
+			if err := os.Rename(targetPath, replacement); err != nil {
+				return nil, err
+			}
+			if err := os.Mkdir(targetPath, 0o700); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+		command := exec.CommandContext(runCtx, binary, argv...)
+		command.Env = env
+		return command.CombinedOutput()
+	}
+	if err := runner.RemoveWorktree(ctx, repository, worktree, WorktreeState{}); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("worktree replacement reached removal effect: %v", err)
+	}
+	if !replaced {
+		t.Fatal("removal race fixture did not run")
+	}
+	if _, err := os.Stat(replacement); err != nil {
+		t.Fatalf("replacement fixture disappeared: %v", err)
+	}
+}
+
 func TestCreateWorktreeCleansAfterSnapshotAuthenticationFailure(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-cleanup")
@@ -652,5 +749,115 @@ func TestCreateWorktreeCleansAfterSnapshotAuthenticationFailure(t *testing.T) {
 	command := exec.Command("git", "-C", repository, "rev-parse", "--verify", "refs/heads/"+branch)
 	if output, err := command.CombinedOutput(); err == nil {
 		t.Fatalf("failed worktree branch remained: %q", output)
+	}
+}
+
+func TestSnapshotRejectsCommandBearingRepositoryConfig(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	for _, key := range []string{
+		"credential.helper",
+		"filter.evil.clean",
+		"core.fsmonitor",
+		"url.https://evil/.insteadOf",
+		"core.gitproxy",
+		"core.pager",
+		"interactive.diffFilter",
+		"remote.origin.uploadpack",
+		"submodule.evil.update",
+	} {
+		marker := filepath.Join(t.TempDir(), "must-not-run")
+		value := marker
+		if key == "credential.helper" {
+			value = "!touch " + marker
+		} else if key == "url.https://evil/.insteadOf" {
+			value = "https://trusted/"
+		}
+		if err := exec.Command("git", "-C", repository, "config", key, value).Run(); err != nil {
+			t.Fatal(err)
+		}
+		branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", domain.TicketID("SF-config-"+key))
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "worktree")
+		worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main")
+		if !errors.Is(err, ErrIdentityMismatch) || worktree.Path != "" {
+			t.Fatalf("command-bearing config %q accepted: worktree=%+v err=%v", key, worktree, err)
+		}
+		if _, statErr := os.Lstat(marker); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("command-bearing config %q executed helper: %v", key, statErr)
+		}
+	}
+}
+
+func TestSnapshotBindsPushURLAndUsesItForPublication(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	pushRemote := filepath.Join(t.TempDir(), "push.git")
+	rawGit(t, t.TempDir(), "init", "--bare", pushRemote)
+	rawGit(t, repository, "remote", "set-url", "--push", "origin", pushRemote)
+	canonicalPushRemote, err := filepath.EvalSymlinks(pushRemote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-push-url")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := runner.CreateWorktree(ctx, repository, filepath.Join(t.TempDir(), "worktree"), branch, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worktree.Identity.PushOrigin != canonicalPushRemote {
+		t.Fatalf("push origin=%q want=%q", worktree.Identity.PushOrigin, canonicalPushRemote)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "src", "push.txt"), []byte("push\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	head, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("push")), Timestamp: time.Unix(5, 0), BaseRef: "main", Policy: DiffPolicy{AllowedPaths: []string{"src"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Push(ctx, worktree, head); err != nil {
+		t.Fatal(err)
+	}
+	if got := rawGit(t, pushRemote, "rev-parse", "refs/heads/"+branch); got != head {
+		t.Fatalf("push remote head=%q want=%q", got, head)
+	}
+}
+
+func TestCommandRejectsDirectoryReplacementDuringRun(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "directory")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	replacement := directory + ".replacement"
+	runner := Runner{Home: filepath.Join(t.TempDir(), "home"), Run: func(_ context.Context, _ string, _ []string, _ []string) ([]byte, error) {
+		if err := os.Rename(directory, replacement); err != nil {
+			return nil, err
+		}
+		return nil, os.Mkdir(directory, 0o700)
+	}}
+	if _, err := runner.one(context.Background(), directory, "status"); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("directory replacement accepted: %v", err)
+	}
+}
+
+func TestStrictBranchGrammarMatchesGit(t *testing.T) {
+	valid := "sf/dev/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef"
+	if _, err := validateAllocatedBranch(domain.ChannelDev, valid); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []string{
+		"sf/stable/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef",
+		"sf/dev/0123456789abcdef/0123456789abcdef-no-random-suffix",
+		"sf/dev/.foo/0123456789abcdef-0123456789abcdef0123456789abcdef",
+		"sf/dev/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcde.",
+	} {
+		if _, err := validateAllocatedBranch(domain.ChannelDev, invalid); err == nil {
+			t.Fatalf("invalid branch accepted: %q", invalid)
+		}
+	}
+	if err := exec.Command("git", "check-ref-format", valid).Run(); err != nil {
+		t.Fatalf("valid allocated branch rejected by Git: %v", err)
 	}
 }

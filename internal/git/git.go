@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -33,18 +34,17 @@ var (
 const maxGitOutput = 1 << 20
 
 // BranchAuthority is implemented by the daemon's SQLite-backed store. Git
-// never creates a second persistence authority for ticket branch identity.
+// never creates a second persistence authority for ticket branch identity;
+// loading must be available as a separate operation so allocation can replay
+// a durable identity before consuming randomness.
 type BranchAuthority interface {
+	LoadBranch(context.Context, string) (string, error)
 	LoadOrStoreBranch(context.Context, string, string) (string, error)
 }
 
-// PersistedBranchAuthority is the stronger form implemented by the SQLite
-// store. Looking up an allocation first is important: random generation must
-// never happen before we have established that this ticket has no durable
-// branch identity to replay.
-type PersistedBranchAuthority interface {
-	LoadBranch(context.Context, string) (string, error)
-}
+// PersistedBranchAuthority is retained as a compatibility name for callers
+// that documented the stronger lookup contract separately.
+type PersistedBranchAuthority = BranchAuthority
 
 type Allocator struct {
 	Authority BranchAuthority
@@ -56,14 +56,12 @@ func (a Allocator) Allocate(ctx context.Context, channel domain.Channel, project
 		return "", fmt.Errorf("allocator requires channel, project, ticket, and SQLite branch authority")
 	}
 	key := string(channel) + "\x00" + string(project) + "\x00" + string(ticket)
-	if lookup, ok := a.Authority.(PersistedBranchAuthority); ok {
-		stored, err := lookup.LoadBranch(ctx, key)
-		if err != nil {
-			return "", err
-		}
-		if stored != "" {
-			return validateAllocatedBranch(channel, stored)
-		}
+	stored, err := a.Authority.LoadBranch(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	if stored != "" {
+		return validateAllocatedBranch(channel, stored)
 	}
 	random := a.Random
 	if random == nil {
@@ -74,7 +72,7 @@ func (a Allocator) Allocate(ctx context.Context, channel domain.Channel, project
 		return "", fmt.Errorf("random branch suffix: %w", err)
 	}
 	proposed := fmt.Sprintf("sf/%s/%s/%s-%s", channel, digestPart(string(project)), digestPart(string(ticket)), hex.EncodeToString(suffix[:]))
-	stored, err := a.Authority.LoadOrStoreBranch(ctx, key, proposed)
+	stored, err = a.Authority.LoadOrStoreBranch(ctx, key, proposed)
 	if err != nil {
 		return "", err
 	}
@@ -87,10 +85,24 @@ func digestPart(value string) string {
 }
 
 func validateBranch(branch string) (string, error) {
-	if !validRef(branch) || (len(strings.Split(branch, "/")) < 3) || (strings.HasPrefix(branch, "sf/stable/") == false && strings.HasPrefix(branch, "sf/dev/") == false) {
+	parts := strings.Split(branch, "/")
+	if !validRef(branch) || len(parts) != 4 || parts[0] != "sf" || (parts[1] != "stable" && parts[1] != "dev") ||
+		!validHexPart(parts[2], 8) {
+		return "", fmt.Errorf("invalid persisted branch %q", branch)
+	}
+	name := strings.Split(parts[3], "-")
+	if len(name) != 2 || !validHexPart(name[0], 8) || !validHexPart(name[1], 16) {
 		return "", fmt.Errorf("invalid persisted branch %q", branch)
 	}
 	return branch, nil
+}
+
+func validHexPart(value string, bytes int) bool {
+	if len(value) != bytes*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil && strings.ToLower(value) == value
 }
 
 func validateAllocatedBranch(channel domain.Channel, branch string) (string, error) {
@@ -170,6 +182,62 @@ type Runner struct {
 	Run         func(context.Context, string, []string, []string) ([]byte, error)
 }
 
+// commandConfigKeys are repository-local settings that can cause Git to run
+// another program or redirect an effect. The factory owns the command surface;
+// these settings therefore fail closed even when they were present before a
+// worktree was created.
+func commandConfigKey(key string) bool {
+	key = strings.ToLower(key)
+	for _, exact := range []string{
+		"alias.*", "credential.helper", "core.askpass", "core.editor", "core.fsmonitor",
+		"core.fsmonitorhookpath", "core.sshcommand", "core.gitproxy", "core.pager",
+		"commit.gpgsign", "interactive.difffilter", "sequence.editor", "merge.tool",
+		"difftool.prompt", "gpg.program", "gpg.ssh.program", "merge.guitool", "pager.branch",
+		"pager.config", "pager.diff", "pager.grep", "pager.log", "pager.show", "pager.tag",
+		"tag.gpgsign", "user.signingkey",
+	} {
+		if key == exact || (exact == "alias.*" && strings.HasPrefix(key, "alias.")) {
+			return true
+		}
+	}
+	for _, prefix := range []string{
+		"filter.", "diff.", "difftool.", "merge.", "mergetool.", "include", "url.",
+		"http.", "credential.", "ssh.", "submodule.", "pager.",
+	} {
+		if strings.HasPrefix(key, prefix) {
+			// pushurl is authenticated separately and is not itself executable.
+			if strings.HasSuffix(key, ".pushurl") && key == "remote.origin.pushurl" {
+				continue
+			}
+			if strings.HasSuffix(key, ".url") && key == "remote.origin.url" {
+				continue
+			}
+			return true
+		}
+	}
+	if strings.HasPrefix(key, "remote.") {
+		for _, safe := range []string{"remote.origin.url", "remote.origin.fetch", "remote.origin.pushurl"} {
+			if key == safe {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func validateCommandConfig(data []byte) error {
+	for _, field := range splitNUL(data) {
+		// --name-only --show-origin emits origin and key as alternating NUL
+		// fields; accepting an origin as a key is harmless, while command keys
+		// must be rejected.
+		if commandConfigKey(field) {
+			return fmt.Errorf("%w: command-bearing repository config %q", ErrIdentityMismatch, field)
+		}
+	}
+	return nil
+}
+
 func (r Runner) command(ctx context.Context, directory string, args ...string) ([]byte, error) {
 	if directory == "" {
 		return nil, fmt.Errorf("git directory is required")
@@ -179,23 +247,35 @@ func (r Runner) command(ctx context.Context, directory string, args ...string) (
 	// names origin after identity reauthentication.
 	ctx, cancel := boundedGitContext(ctx)
 	defer cancel()
-	argv := []string{"-C", directory, "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"}
-	if r.GHBinary != "" {
-		argv = append(argv, "-c", "credential.helper=!"+r.GHBinary+" auth git-credential")
-	}
-	argv = append(argv, args...)
 	env, err := r.environment(nil)
 	if err != nil {
 		return nil, err
 	}
+	pinned, err := openPinnedDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+	defer pinned.Close()
+	gitDirectory := directory
+	if r.Run == nil {
+		gitDirectory = "."
+	}
+	argv := r.commandArgs(gitDirectory, args...)
+	argv = append(argv, args...)
 	if r.Run != nil {
 		output, err := r.Run(ctx, r.binary(), argv, env)
+		if verifyErr := pinned.verify(); verifyErr != nil {
+			return output, verifyErr
+		}
 		if len(output) > maxGitOutput {
 			return output[:maxGitOutput], ErrOutputBound
 		}
 		return output, err
 	}
-	output, err := runBounded(ctx, r.binary(), argv, env)
+	output, err := runBounded(ctx, r.binary(), argv, env, directory, pinned.file)
+	if verifyErr := pinned.verify(); verifyErr != nil {
+		return output, verifyErr
+	}
 	if err != nil {
 		return output, fmt.Errorf("git command failed: %w", err)
 	}
@@ -208,27 +288,62 @@ func (r Runner) commandEnv(ctx context.Context, directory string, extra []string
 	}
 	ctx, cancel := boundedGitContext(ctx)
 	defer cancel()
-	argv := []string{"-C", directory, "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"}
-	if r.GHBinary != "" {
-		argv = append(argv, "-c", "credential.helper=!"+r.GHBinary+" auth git-credential")
-	}
-	argv = append(argv, args...)
 	env, err := r.environment(extra)
 	if err != nil {
 		return nil, err
 	}
+	pinned, err := openPinnedDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+	defer pinned.Close()
+	gitDirectory := directory
+	if r.Run == nil {
+		gitDirectory = "."
+	}
+	argv := r.commandArgs(gitDirectory, args...)
+	argv = append(argv, args...)
 	if r.Run != nil {
 		output, err := r.Run(ctx, r.binary(), argv, env)
+		if verifyErr := pinned.verify(); verifyErr != nil {
+			return output, verifyErr
+		}
 		if len(output) > maxGitOutput {
 			return output[:maxGitOutput], ErrOutputBound
 		}
 		return output, err
 	}
-	output, err := runBounded(ctx, r.binary(), argv, env)
+	output, err := runBounded(ctx, r.binary(), argv, env, directory, pinned.file)
+	if verifyErr := pinned.verify(); verifyErr != nil {
+		return output, verifyErr
+	}
 	if err != nil {
 		return output, fmt.Errorf("git command failed: %w", err)
 	}
 	return output, nil
+}
+
+func (r Runner) commandArgs(gitDirectory string, args ...string) []string {
+	argv := []string{"-C", gitDirectory, "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"}
+	// Config inspection must see the repository's unmodified effective keys so
+	// command-bearing settings cannot be hidden by these safety overrides.
+	inspectConfig := len(args) > 0 && args[0] == "config"
+	if !inspectConfig {
+		argv = append(argv,
+			"-c", "credential.helper=",
+			"-c", "core.fsmonitor=false",
+			"-c", "core.sshCommand=",
+			"-c", "core.askPass=",
+			"-c", "core.pager=",
+			"-c", "commit.gpgsign=false",
+			"-c", "tag.gpgsign=false",
+			"-c", "interactive.diffFilter=",
+		)
+	}
+	if r.GHBinary != "" {
+		argv = append(argv, "-c", "credential.helper=!"+r.GHBinary+" auth git-credential")
+	}
+	return argv
 }
 
 func (r Runner) home() string {
@@ -300,8 +415,58 @@ func boundedGitContext(parent context.Context) (context.Context, context.CancelF
 	return context.WithTimeout(parent, maximum)
 }
 
-func runBounded(ctx context.Context, binary string, argv, env []string) ([]byte, error) {
+type pinnedDirectory struct {
+	path string
+	file *os.File
+	info os.FileInfo
+}
+
+func openPinnedDirectory(path string) (*pinnedDirectory, error) {
+	if !validAbsolutePath(path) {
+		return nil, fmt.Errorf("%w: absolute command directory required", ErrIdentityMismatch)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, fmt.Errorf("%w: command directory must be a real directory", ErrIdentityMismatch)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := file.Stat()
+	if err != nil || !sameFileIdentity(info, opened) {
+		file.Close()
+		return nil, fmt.Errorf("%w: command directory changed while opening", ErrIdentityMismatch)
+	}
+	return &pinnedDirectory{path: path, file: file, info: info}, nil
+}
+
+func (p *pinnedDirectory) verify() error {
+	current, err := os.Lstat(p.path)
+	if err != nil || !samePathIdentity(p.info, current) {
+		return fmt.Errorf("%w: command directory changed during effect", ErrIdentityMismatch)
+	}
+	return nil
+}
+
+func samePathIdentity(a, b os.FileInfo) bool {
+	if a == nil || b == nil || a.Mode() != b.Mode() {
+		return false
+	}
+	aStat, aOK := a.Sys().(*syscall.Stat_t)
+	bStat, bOK := b.Sys().(*syscall.Stat_t)
+	return aOK && bOK && aStat.Dev == bStat.Dev && aStat.Ino == bStat.Ino
+}
+
+func (p *pinnedDirectory) Close() error { return p.file.Close() }
+
+func runBounded(ctx context.Context, binary string, argv, env []string, directory string, pinned *os.File) ([]byte, error) {
 	command := exec.CommandContext(ctx, binary, argv...)
+	command.Dir = directory
+	command.ExtraFiles = []*os.File{pinned}
 	command.Env = env
 	buffer := &boundedBuffer{limit: maxGitOutput}
 	command.Stdout, command.Stderr = buffer, buffer
@@ -341,6 +506,7 @@ type Identity struct {
 	GitFileIno uint64
 	CommonDir  string
 	Origin     string
+	PushOrigin string
 	BaseRef    string
 	BaseHead   string
 	HeadRef    string
@@ -411,6 +577,10 @@ func realHooksRoot(path string) error {
 }
 
 func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identity, error) {
+	return r.snapshotExpected(ctx, "", worktree, baseRef)
+}
+
+func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktree, baseRef string) (Identity, error) {
 	if err := rejectGitEnvironment(os.Environ()); err != nil {
 		return Identity{}, err
 	}
@@ -426,9 +596,13 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	if err != nil {
 		return Identity{}, err
 	}
-	_, err = r.one(ctx, worktree, "rev-parse", "--show-toplevel")
+	top, err := r.one(ctx, worktree, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return Identity{}, err
+	}
+	top, err = filepath.EvalSymlinks(top)
+	if err != nil || top != canonicalWorktree {
+		return Identity{}, fmt.Errorf("%w: worktree top-level does not match requested path", ErrIdentityMismatch)
 	}
 	common, err := r.one(ctx, worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
@@ -442,6 +616,18 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	if err != nil {
 		return Identity{}, err
 	}
+	pushURLs, err := r.command(ctx, worktree, "remote", "get-url", "--all", "--push", "origin")
+	if err != nil {
+		return Identity{}, err
+	}
+	pushLines := nonEmptyLines(pushURLs)
+	if len(pushLines) != 1 {
+		return Identity{}, fmt.Errorf("%w: origin must have exactly one push URL", ErrIdentityMismatch)
+	}
+	pushOrigin, err := safeOrigin(pushLines[0])
+	if err != nil {
+		return Identity{}, err
+	}
 	baseHead, err := r.one(ctx, worktree, "rev-parse", "--verify", baseRef+"^{commit}")
 	if err != nil {
 		return Identity{}, err
@@ -452,6 +638,13 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	}
 	config, err := r.command(ctx, worktree, "config", "--null", "--list", "--show-origin")
 	if err != nil {
+		return Identity{}, err
+	}
+	configKeys, err := r.command(ctx, worktree, "config", "--null", "--name-only", "--list", "--show-origin")
+	if err != nil {
+		return Identity{}, err
+	}
+	if err := validateCommandConfig(configKeys); err != nil {
 		return Identity{}, err
 	}
 	file, err := os.Open(gitPointer)
@@ -492,6 +685,9 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	if err != nil {
 		return Identity{}, err
 	}
+	if expectedRepository != "" && canonicalRepo != expectedRepository {
+		return Identity{}, fmt.Errorf("%w: common directory belongs to a different repository", ErrIdentityMismatch)
+	}
 	// Ensure the pointer names precisely the linked worktree git directory.
 	pointerText := strings.TrimSpace(string(gitFile))
 	if !strings.HasPrefix(pointerText, "gitdir:") || strings.TrimSpace(strings.TrimPrefix(pointerText, "gitdir:")) == "" || strings.Contains(strings.TrimPrefix(pointerText, "gitdir:"), "\n") {
@@ -510,7 +706,17 @@ func (r Runner) Snapshot(ctx context.Context, worktree, baseRef string) (Identit
 	if !validOID(baseHead) || !validBranchOrHeadRef(headRef) || !validAbsolutePath(common) || !validAbsolutePath(canonicalRepo) || !validAbsolutePath(canonicalWorktree) {
 		return Identity{}, fmt.Errorf("%w: invalid git identity value", ErrIdentityMismatch)
 	}
-	return Identity{Repository: canonicalRepo, Worktree: canonicalWorktree, GitFile: string(gitFile), GitFileDev: gitDev, GitFileIno: gitIno, CommonDir: common, Origin: strings.TrimSpace(origin), BaseRef: baseRef, BaseHead: baseHead, HeadRef: headRef, ConfigHash: digest(config), HooksHash: hooksHash}, nil
+	return Identity{Repository: canonicalRepo, Worktree: canonicalWorktree, GitFile: string(gitFile), GitFileDev: gitDev, GitFileIno: gitIno, CommonDir: common, Origin: strings.TrimSpace(origin), PushOrigin: pushOrigin, BaseRef: baseRef, BaseHead: baseHead, HeadRef: headRef, ConfigHash: digest(config), HooksHash: hooksHash}, nil
+}
+
+func nonEmptyLines(data []byte) []string {
+	var lines []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }
 
 func validBranchOrHeadRef(value string) bool {
@@ -518,7 +724,7 @@ func validBranchOrHeadRef(value string) bool {
 }
 
 func (r Runner) Reauthenticate(ctx context.Context, expected Identity) error {
-	actual, err := r.Snapshot(ctx, expected.Worktree, expected.BaseRef)
+	actual, err := r.snapshotExpected(ctx, expected.Repository, expected.Worktree, expected.BaseRef)
 	if err != nil {
 		return err
 	}
@@ -678,13 +884,17 @@ func (r Runner) PreflightRepository(ctx context.Context, repository, baseRef str
 	if !validAbsolutePath(repository) || !validRef(baseRef) {
 		return fmt.Errorf("canonical repository path and base ref are required")
 	}
+	canonicalRepository, err := canonicalExistingRepository(repository)
+	if err != nil {
+		return err
+	}
+	repository = canonicalRepository
 	actual, err := r.one(ctx, repository, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return err
 	}
 	actual, err = filepath.EvalSymlinks(actual)
-	canonicalRepository, canonicalErr := filepath.EvalSymlinks(repository)
-	if err != nil || canonicalErr != nil || actual != canonicalRepository {
+	if err != nil || actual != canonicalRepository {
 		return fmt.Errorf("%w: primary repository path changed", ErrIdentityMismatch)
 	}
 	info, err := os.Lstat(filepath.Join(repository, ".git"))
@@ -699,6 +909,24 @@ func (r Runner) PreflightRepository(ctx context.Context, repository, baseRef str
 	return err
 }
 
+func canonicalExistingRepository(path string) (string, error) {
+	if !validAbsolutePath(path) {
+		return "", fmt.Errorf("%w: absolute clean repository path required", ErrIdentityMismatch)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", fmt.Errorf("%w: repository must be a real directory", ErrIdentityMismatch)
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	return canonical, nil
+}
+
 func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, baseRef string) (Worktree, error) {
 	if !validAbsolutePath(repository) || !validAbsolutePath(path) || !validRef(baseRef) {
 		return Worktree{}, fmt.Errorf("canonical repository/worktree paths and base ref are required")
@@ -709,6 +937,11 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	if _, err := validateBranch(branch); err != nil {
 		return Worktree{}, err
 	}
+	canonicalRepository, err := canonicalExistingRepository(repository)
+	if err != nil {
+		return Worktree{}, err
+	}
+	repository = canonicalRepository
 	if _, err := os.Lstat(path); err == nil {
 		return Worktree{}, fmt.Errorf("%w: worktree path already exists", ErrIdentityMismatch)
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -734,30 +967,43 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	if _, err := r.command(ctx, repository, "worktree", "add", "-b", branch, path, baseRef); err != nil {
 		return Worktree{}, err
 	}
-	identity, err := r.Snapshot(ctx, path, baseRef)
+	createdPath, err := openPinnedDirectory(path)
 	if err != nil {
-		if cleanupErr := r.cleanupCreatedWorktree(ctx, repository, path, branch); cleanupErr != nil {
+		return Worktree{}, fmt.Errorf("%w: created worktree could not be pinned: %v", ErrWorktreeQuarantined, err)
+	}
+	identity, err := r.snapshotExpected(ctx, repository, path, baseRef)
+	if err != nil {
+		cleanupErr := r.cleanupCreatedWorktree(ctx, repository, path, branch, baseRef, createdPath)
+		_ = createdPath.Close()
+		if cleanupErr != nil {
 			return Worktree{}, fmt.Errorf("%w: snapshot failed: %v; cleanup failed: %w", ErrWorktreeQuarantined, err, cleanupErr)
 		}
 		return Worktree{}, err
 	}
+	_ = createdPath.Close()
 	return Worktree{Path: path, Branch: branch, Identity: identity}, nil
 }
 
-func (r Runner) cleanupCreatedWorktree(ctx context.Context, repository, path, branch string) error {
-	// Never recursively remove a path after identity authentication failed. Git
-	// owns the creation record and can remove it without following a replaced
-	// path. If the path was replaced by a symlink, leave it quarantined rather
-	// than risking deletion outside the requested worktree.
+func (r Runner) cleanupCreatedWorktree(ctx context.Context, repository, path, branch, baseRef string, createdPath *pinnedDirectory) error {
+	// Never recursively remove a path after identity authentication failed. The
+	// primary checkout is rechecked immediately before Git's ownership-aware
+	// cleanup; if either check fails, leave the path quarantined rather than
+	// mutating an unauthenticated checkout.
+	if createdPath == nil {
+		return fmt.Errorf("created worktree was not pinned")
+	}
+	if err := createdPath.verify(); err != nil {
+		return err
+	}
 	if info, err := os.Lstat(path); err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.IsDir()) {
 		return fmt.Errorf("created worktree path was replaced")
 	}
+	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
+		return fmt.Errorf("primary repository changed: %w", err)
+	}
 	if _, err := r.command(ctx, repository, "worktree", "remove", "--force", "--", path); err != nil {
-		// A malformed or swapped .git pointer can make Git unable to remove its
-		// own checkout. Remove only a tree that is proven to contain no links or
-		// special files, then prune Git's stale worktree registration.
-		if safeErr := safeRemoveTree(path); safeErr != nil {
-			return fmt.Errorf("git removal: %v; safe filesystem cleanup: %w", err, safeErr)
+		if safeErr := safeRemoveTree(path, createdPath); safeErr != nil {
+			return fmt.Errorf("git removal left worktree quarantined: %v; pinned cleanup: %w", err, safeErr)
 		}
 		if _, pruneErr := r.command(ctx, repository, "worktree", "prune"); pruneErr != nil {
 			return pruneErr
@@ -775,43 +1021,64 @@ func (r Runner) cleanupCreatedWorktree(ctx context.Context, repository, path, br
 	return nil
 }
 
-func safeRemoveTree(root string) error {
-	if info, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return err
-	} else if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("created worktree path is not a real directory")
+// safeRemoveTree removes only entries reached through an already-open file
+// descriptor. It is used solely for a just-created worktree whose Git pointer
+// made authentication fail; it never follows a replacement path or symlink.
+func safeRemoveTree(root string, pinned *pinnedDirectory) error {
+	if pinned == nil {
+		return fmt.Errorf("missing pinned worktree")
 	}
-	var paths []string
-	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == root {
-			return nil
-		}
-		info, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("created worktree contains a symlink")
-		}
-		// Removing a hardlink removes only this directory entry and cannot alter
-		// the other inode owner, so it is safe during cleanup. Hardlinks remain
-		// prohibited for candidate validation and authenticated .git pointers.
-		paths = append(paths, path)
-		return nil
-	}); err != nil {
+	if err := pinned.verify(); err != nil {
 		return err
 	}
-	for index := len(paths) - 1; index >= 0; index-- {
-		if err := os.Remove(paths[index]); err != nil {
+	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	rootFile := os.NewFile(uintptr(rootFD), root)
+	defer rootFile.Close()
+	rootInfo, err := rootFile.Stat()
+	if err != nil || !samePathIdentity(pinned.info, rootInfo) {
+		return fmt.Errorf("created worktree changed before cleanup")
+	}
+	if err := removeDirectoryEntries(rootFD, rootFile); err != nil {
+		return err
+	}
+	parentFile, err := os.Open(filepath.Dir(root))
+	if err != nil {
+		return err
+	}
+	defer parentFile.Close()
+	if err := pinned.verify(); err != nil {
+		return err
+	}
+	return unix.Unlinkat(int(parentFile.Fd()), filepath.Base(root), unix.AT_REMOVEDIR)
+}
+
+func removeDirectoryEntries(fd int, directory *os.File) error {
+	names, err := directory.Readdirnames(-1)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		childFD, openErr := unix.Openat(fd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+		if openErr == nil {
+			child := os.NewFile(uintptr(childFD), name)
+			removeErr := removeDirectoryEntries(childFD, child)
+			_ = child.Close()
+			if removeErr != nil {
+				return removeErr
+			}
+			if err := unix.Unlinkat(fd, name, unix.AT_REMOVEDIR); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := unix.Unlinkat(fd, name, 0); err != nil {
 			return err
 		}
 	}
-	return os.Remove(root)
+	return nil
 }
 
 func (r Runner) InspectWorktree(ctx context.Context, worktree Worktree) error {
@@ -866,8 +1133,30 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
 		return err
 	}
+	pinnedWorktree, err := openPinnedDirectory(worktree.Path)
+	if err != nil {
+		return err
+	}
+	defer pinnedWorktree.Close()
+	if err := pinnedWorktree.verify(); err != nil {
+		return err
+	}
 	_, err = r.command(ctx, canonicalRepository, "worktree", "remove", worktree.Path)
-	return err
+	if err != nil {
+		if verifyErr := pinnedWorktree.verify(); verifyErr != nil {
+			return verifyErr
+		}
+		return err
+	}
+	// A successful Git removal is expected to unlink the authenticated path.
+	// If anything remains, it must still be the pinned inode; never accept a
+	// replacement as proof that the requested worktree was removed.
+	if _, statErr := os.Lstat(worktree.Path); statErr == nil {
+		return pinnedWorktree.verify()
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	return nil
 }
 
 type DiffPolicy struct {
@@ -1102,7 +1391,7 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 	if err != nil {
 		return "", err
 	}
-	remote, err := r.remoteHead(ctx, worktree.Path, worktree.Branch)
+	remote, err := r.remoteHead(ctx, worktree.Path, worktree.Identity.PushOrigin, worktree.Branch)
 	if err != nil {
 		return "", err
 	}
@@ -1117,7 +1406,7 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 		if _, err := r.provePushHead(ctx, worktree, expectedHead); err != nil {
 			return "", err
 		}
-		if _, err := r.command(ctx, worktree.Path, "fetch", "--no-tags", "origin", "refs/heads/"+worktree.Branch+":"+observationRef); err != nil {
+		if _, err := r.command(ctx, worktree.Path, "fetch", "--no-tags", worktree.Identity.PushOrigin, "refs/heads/"+worktree.Branch+":"+observationRef); err != nil {
 			return "", fmt.Errorf("%w: cannot observe remote %s", ErrUnexpectedRemote, remote)
 		}
 		if _, err := r.command(ctx, worktree.Path, "merge-base", "--is-ancestor", remote, expectedHead); err != nil {
@@ -1129,19 +1418,22 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 		return "", err
 	}
 	refspec := expectedHead + ":refs/heads/" + worktree.Branch
-	if _, err := r.command(ctx, worktree.Path, "push", "origin", refspec); err != nil {
+	if worktree.Identity.PushOrigin == "" {
+		return "", fmt.Errorf("%w: authenticated push URL is missing", ErrIdentityMismatch)
+	}
+	if _, err := r.command(ctx, worktree.Path, "push", worktree.Identity.PushOrigin, refspec); err != nil {
 		// The server may have accepted the ref while the response was lost. Only
 		// reconcile success when the exact expected candidate is observed.
 		if _, proveErr := r.provePushHead(ctx, worktree, expectedHead); proveErr != nil {
 			return "", err
 		}
-		observed, observeErr := r.remoteHead(ctx, worktree.Path, worktree.Branch)
+		observed, observeErr := r.remoteHead(ctx, worktree.Path, worktree.Identity.PushOrigin, worktree.Branch)
 		if observeErr == nil && observed == expectedHead {
 			return expectedHead, nil
 		}
 		return "", err
 	}
-	observed, err := r.remoteHead(ctx, worktree.Path, worktree.Branch)
+	observed, err := r.remoteHead(ctx, worktree.Path, worktree.Identity.PushOrigin, worktree.Branch)
 	if err != nil {
 		return "", err
 	}
@@ -1169,8 +1461,8 @@ func (r Runner) provePushHead(ctx context.Context, worktree Worktree, expectedHe
 	return head, nil
 }
 
-func (r Runner) remoteHead(ctx context.Context, directory, branch string) (string, error) {
-	output, err := r.command(ctx, directory, "ls-remote", "--heads", "origin", "refs/heads/"+branch)
+func (r Runner) remoteHead(ctx context.Context, directory, origin, branch string) (string, error) {
+	output, err := r.command(ctx, directory, "ls-remote", "--heads", origin, "refs/heads/"+branch)
 	if err != nil {
 		return "", err
 	}
