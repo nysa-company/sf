@@ -67,6 +67,72 @@ func TestMalformedOutputFallsBackAndNeverPersistsSecrets(t *testing.T) {
 		t.Fatalf("unsafe digest=%+v", result.Attempts[0])
 	}
 }
+
+type undrainedProvider struct {
+	*testkit.ScriptedProvider
+	drained bool
+	request contracts.DrainRequest
+}
+
+func (p *undrainedProvider) Drain(_ context.Context, request contracts.DrainRequest) (contracts.DrainResult, error) {
+	p.request = request
+	return contracts.DrainResult{Drained: p.drained}, nil
+}
+
+func TestCancellationQuarantinesWhenProviderDoesNotDrain(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	raw := []byte("frozen")
+	sum := sha256.Sum256(raw)
+	digest := fmt.Sprintf("%x", sum)
+	if err := db.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "p", Path: "/tmp/p", BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: raw}); err != nil {
+		t.Fatal(err)
+	}
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "cancel-test")
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "SF-cancel"}
+	if err := db.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "source", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := db.StartOrAdopt(ctx, ref, 1, "dev/p/SF-cancel", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := &undrainedProvider{ScriptedProvider: testkit.NewScriptedProvider(id("cursor", "cursor-family")), drained: false}
+	primary.Add(domain.PhasePlanning, testkit.ProviderStep{Behavior: testkit.ProviderHang})
+	fallback := testkit.NewScriptedProvider(id("claude", "claude-family"))
+	recordQual(t, db, primary.ScriptedProvider)
+	recordQual(t, db, fallback)
+	registry := NewRegistry()
+	if err := registry.Register(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(ctx, fallback); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(registry, map[Role]Route{RolePlanner: {Primary: "cursor", Fallback: "claude"}}, db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: t.TempDir(), Worktree: t.TempDir(), AllowedPaths: []string{"x"}, Timeout: time.Second, Profile: contracts.ProfileGuarded, Schema: []byte("schema")}}
+	callCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	result := c.Run(callCtx, request)
+	if !result.NeedsOperator {
+		t.Fatalf("cancellation result=%+v", result)
+	}
+	attempts, err := db.ProviderAttempts(ctx, ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "quarantined" {
+		t.Fatalf("quarantined attempts=%+v err=%v", attempts, err)
+	}
+	claim := attempts[0]
+	if primary.request.Ref != claim.Ref || primary.request.Phase != claim.Phase || primary.request.Attempt != claim.Attempt || primary.request.RunnerEpoch != claim.RunnerEpoch || primary.request.ExpectedVersion != claim.ExpectedVersion || primary.request.LeaseKey != claim.LeaseKey || primary.request.BindingDigest != claim.BindingDigest {
+		t.Fatalf("drain request was not exact: request=%+v claim=%+v", primary.request, claim)
+	}
+}
 func id(name, family string) domain.ProviderIdentity {
 	return domain.ProviderIdentity{Provider: name, Model: name + "-model", Family: family, Version: "v1"}
 }

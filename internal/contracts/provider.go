@@ -48,6 +48,20 @@ type RuntimeBinding struct {
 	AuthDigest    string
 }
 
+// DrainRequest identifies exactly one provider process group. Supervisors must
+// not interpret this as permission to drain every process for an account.
+type DrainRequest struct {
+	Identity        domain.ProviderIdentity
+	Ref             domain.TicketRef
+	Phase           domain.Phase
+	Attempt         int
+	LeaderEpoch     uint64
+	RunnerEpoch     uint64
+	ExpectedVersion uint64
+	LeaseKey        string
+	BindingDigest   string
+}
+
 // DrainResult is supplied by the process supervisor after cancellation or
 // recovery. A false value keeps the durable claim quarantined.
 type DrainResult struct{ Drained bool }
@@ -57,5 +71,5 @@ type Provider interface {
 	Probe(context.Context) (domain.ProviderIdentity, error)
 	Binding(context.Context) (RuntimeBinding, error)
 	Run(context.Context, PhaseInput) (PhaseResult, error)
-	Drain(context.Context) (DrainResult, error)
+	Drain(context.Context, DrainRequest) (DrainResult, error)
 }

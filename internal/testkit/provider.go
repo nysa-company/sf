@@ -86,7 +86,7 @@ func (p *ScriptedProvider) Binding(context.Context) (contracts.RuntimeBinding, e
 	return contracts.RuntimeBinding{Identity: identity, BinaryDigest: digest("binary:" + identity.Version), PolicyDigest: digest("policy:" + identity.Provider), FixtureDigest: digest("fixture:" + identity.Provider), AuthDigest: digest("auth:" + identity.Provider)}, nil
 }
 
-func (p *ScriptedProvider) Drain(context.Context) (contracts.DrainResult, error) {
+func (p *ScriptedProvider) Drain(context.Context, contracts.DrainRequest) (contracts.DrainResult, error) {
 	return contracts.DrainResult{Drained: true}, nil
 }
 

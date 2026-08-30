@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"time"
@@ -21,6 +23,8 @@ type ProviderAttemptRequest struct {
 	ConfigDigest    string
 	Capacity        int
 	At              time.Time
+	ExpectedHead    string
+	ExpectedProof   string
 }
 type ProviderAttemptClaim struct {
 	ID              int64
@@ -31,12 +35,95 @@ type ProviderAttemptClaim struct {
 	Binding         contracts.RuntimeBinding
 	QualificationID int64
 	LeaseKey        string
+	BindingDigest   string
+	LeaderEpoch     uint64
+	RunnerEpoch     uint64
+	ExpectedVersion uint64
 }
 type ProviderAttempt struct {
 	ProviderAttemptClaim
 	State, Outcome        string
 	UsageUnits            int64
 	StartedAt, FinishedAt time.Time
+}
+
+// ValidateFinalReviewEvidence binds a final Reviewer launch to the newest
+// durable candidate. Caller-supplied head/proof values are only hints until
+// this check proves they match SQLite authority.
+func (s *Store) ValidateFinalReviewEvidence(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, expectedHead, expectedProof string) error {
+	if ref.Validate() != nil || expectedVersion == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || expectedHead == "" || expectedProof == "" {
+		return ErrEvidenceConflict
+	}
+	return validateFinalReviewEvidence(ctx, s.db, ref, expectedVersion, fence, expectedHead, expectedProof)
+}
+
+type rowQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func validateFinalReviewEvidence(ctx context.Context, query rowQueryer, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, expectedHead, expectedProof string) error {
+	var head, proof, intent, source, ticketSource string
+	var ticketVersion, runner, candidateRunner uint64
+	var verificationIntent, verificationProof sql.NullString
+	if err := query.QueryRowContext(ctx, `SELECT c.head_sha,c.proof_digest,c.verification_intent_digest,c.source_digest,t.version,t.runner_epoch,c.runner_epoch,t.source_digest,v.intent_digest,v.proof_digest
+		FROM candidate_snapshots c
+		JOIN tickets t ON t.channel=c.channel AND t.project_id=c.project_id AND t.id=c.ticket_id
+		LEFT JOIN verifications v ON v.channel=c.channel AND v.project_id=c.project_id AND v.ticket_id=c.ticket_id
+		WHERE c.channel=? AND c.project_id=? AND c.ticket_id=? ORDER BY c.generation DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket).Scan(&head, &proof, &intent, &source, &ticketVersion, &runner, &candidateRunner, &ticketSource, &verificationIntent, &verificationProof); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrEvidenceConflict
+		}
+		return normalizeBusy(ctx, err)
+	}
+	var leader uint64
+	if err := query.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&leader); err != nil {
+		return normalizeBusy(ctx, err)
+	}
+	if leader != fence.LeaderEpoch || head != expectedHead || proof != expectedProof || ticketVersion > expectedVersion || candidateRunner != fence.RunnerEpoch || runner != fence.RunnerEpoch || source != ticketSource || !verificationIntent.Valid || !verificationProof.Valid || intent != verificationIntent.String || proof != verificationProof.String {
+		return ErrEvidenceConflict
+	}
+	return nil
+}
+
+// ActiveProviderAttempts returns durable claims that still require process
+// supervision during restart. Callers must drain each exact provider before
+// invoking RecoverProviderAttempts.
+func (s *Store) ActiveProviderAttempts(ctx context.Context, channel domain.Channel) ([]ProviderAttempt, error) {
+	if !channel.Valid() {
+		return nil, errors.New("valid channel is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,project_id,ticket_id,phase,attempt,provider,model,family,version,role,state,outcome,usage_units,started_at,finished_at,qualification_id,binding_digest,provider_lease_key,leader_epoch,runner_epoch,expected_ticket_version FROM provider_attempts WHERE channel=? AND state IN ('active','quarantined') ORDER BY id`, channel)
+	if err != nil {
+		return nil, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	var out []ProviderAttempt
+	for rows.Next() {
+		var value ProviderAttempt
+		var project, ticket, started, finished string
+		var qualification sql.NullInt64
+		if err := rows.Scan(&value.ID, &project, &ticket, &value.Phase, &value.Attempt, &value.Binding.Identity.Provider, &value.Binding.Identity.Model, &value.Binding.Identity.Family, &value.Binding.Identity.Version, &value.Role, &value.State, &value.Outcome, &value.UsageUnits, &started, &finished, &qualification, &value.BindingDigest, &value.LeaseKey, &value.LeaderEpoch, &value.RunnerEpoch, &value.ExpectedVersion); err != nil {
+			return nil, err
+		}
+		value.Ref = domain.TicketRef{Channel: channel, Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
+		if qualification.Valid {
+			value.QualificationID = qualification.Int64
+		}
+		if started != "" {
+			value.StartedAt, err = time.Parse(time.RFC3339Nano, started)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if finished != "" {
+			value.FinishedAt, err = time.Parse(time.RFC3339Nano, finished)
+			if err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, value)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptRequest) (ProviderAttemptClaim, error) {
@@ -55,11 +142,16 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 			}
 			return err
 		}
-		if domain.State(state).Terminal() || state == string(domain.StateBlocked) || version != r.ExpectedVersion || config == "" || config != r.ConfigDigest {
+		if domain.State(state).Terminal() || state == string(domain.StateBlocked) || version != r.ExpectedVersion || config == "" || config != r.ConfigDigest || !providerAdmissionState(domain.State(state), r.Phase, r.Role) {
 			return ErrStaleFence
 		}
 		if err := s.currentFence(ctx, conn, r.Ref.Channel, version, runner, r.Fence); err != nil {
 			return err
+		}
+		if r.Phase == domain.PhaseReview && r.Role == "reviewer" {
+			if err := validateFinalReviewEvidence(ctx, conn, r.Ref, r.ExpectedVersion, r.Fence, r.ExpectedHead, r.ExpectedProof); err != nil {
+				return err
+			}
 		}
 		createdAt, err := time.Parse(time.RFC3339Nano, created)
 		if err != nil {
@@ -71,6 +163,9 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		qualification, err := currentRuntimeQualification(ctx, conn, r.Ref.Channel, r.Role, r.Binding)
 		if err != nil {
 			return err
+		}
+		if qualification.ID <= 0 {
+			return ErrProviderPairRefused
 		}
 		var spent int64
 		if err = conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(usage_units),0) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=?`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket).Scan(&spent); err != nil {
@@ -105,12 +200,12 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		if !ok {
 			return ErrProviderCapacity
 		}
-		if _, err = conn.ExecContext(ctx, `INSERT INTO phase_runs(channel,project_id,ticket_id,phase,attempt,state,leader_epoch,runner_epoch,expected_ticket_version) VALUES(?,?,?,?,?,'active',?,?,?)`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, prior, r.Fence.LeaderEpoch, r.Fence.RunnerEpoch, r.ExpectedVersion); err != nil {
+		outcome := "running"
+		if _, err = conn.ExecContext(ctx, `INSERT INTO phase_runs(channel,project_id,ticket_id,phase,attempt,state,leader_epoch,runner_epoch,expected_ticket_version,provider,model,family,provider_version,started_at,outcome) VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?)`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, prior, r.Fence.LeaderEpoch, r.Fence.RunnerEpoch, r.ExpectedVersion, r.Binding.Identity.Provider, r.Binding.Identity.Model, r.Binding.Identity.Family, r.Binding.Identity.Version, r.At.UTC().Format(time.RFC3339Nano), outcome); err != nil {
 			return err
 		}
-		outcome := "running"
 		bindingDigest := bindingDigest(r.Binding)
-		row, err := conn.ExecContext(ctx, `INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,usage_units,started_at,finished_at,qualification_id,binding_digest,provider_lease_key) VALUES(?,?,?,?,?,?,?,?,? ,? ,?,'active',0,?,'',?,?,?)`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, prior, r.Binding.Identity.Provider, r.Binding.Identity.Model, r.Binding.Identity.Family, r.Binding.Identity.Version, outcome, r.Role, r.At.UTC().Format(time.RFC3339Nano), qualification.ID, bindingDigest, lease.ScopeKey)
+		row, err := conn.ExecContext(ctx, `INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,usage_units,started_at,finished_at,qualification_id,binding_digest,provider_lease_key,leader_epoch,runner_epoch,expected_ticket_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, prior, r.Binding.Identity.Provider, r.Binding.Identity.Model, r.Binding.Identity.Family, r.Binding.Identity.Version, outcome, r.Role, "active", 0, r.At.UTC().Format(time.RFC3339Nano), "", qualification.ID, bindingDigest, lease.ScopeKey, r.Fence.LeaderEpoch, r.Fence.RunnerEpoch, r.ExpectedVersion)
 		if err != nil {
 			return err
 		}
@@ -118,14 +213,120 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		if err != nil {
 			return err
 		}
-		claim = ProviderAttemptClaim{ID: id, Ref: r.Ref, Phase: r.Phase, Role: r.Role, Attempt: prior, Binding: r.Binding, QualificationID: qualification.ID, LeaseKey: lease.ScopeKey}
+		claim = ProviderAttemptClaim{ID: id, Ref: r.Ref, Phase: r.Phase, Role: r.Role, Attempt: prior, Binding: r.Binding, QualificationID: qualification.ID, LeaseKey: lease.ScopeKey, BindingDigest: bindingDigest, LeaderEpoch: r.Fence.LeaderEpoch, RunnerEpoch: r.Fence.RunnerEpoch, ExpectedVersion: r.ExpectedVersion}
 		return nil
 	})
 	return claim, err
 }
 
 func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttemptClaim, expected uint64, fence domain.Fence, state, outcome string, usage int64, finished time.Time) error {
-	if claim.ID <= 0 || !validAttemptState(state) || !safeOutcome(outcome) || usage < 0 || finished.IsZero() {
+	if claim.ID <= 0 || claim.ExpectedVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || !validAttemptState(state) || !safeOutcome(outcome) || usage < 0 || finished.IsZero() {
+		return ErrProviderAttempt
+	}
+	if claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch {
+		return ErrStaleFence
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		var version, runner uint64
+		var persisted ProviderAttemptClaim
+		var persistedRole, persistedState, persistedBinding string
+		var persistedQualification sql.NullInt64
+		if err := conn.QueryRowContext(ctx, `SELECT version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&version, &runner); err != nil {
+			return err
+		}
+		if version != expected {
+			return ErrStaleFence
+		}
+		if claim.ExpectedVersion != expected {
+			return ErrStaleFence
+		}
+		if err := s.currentFence(ctx, conn, claim.Ref.Channel, version, runner, fence); err != nil {
+			return err
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT provider,model,family,version,role,state,qualification_id,binding_digest FROM provider_attempts WHERE id=?`, claim.ID).Scan(&persisted.Binding.Identity.Provider, &persisted.Binding.Identity.Model, &persisted.Binding.Identity.Family, &persisted.Binding.Identity.Version, &persistedRole, &persistedState, &persistedQualification, &persistedBinding); err != nil {
+			return err
+		}
+		if persistedRole != claim.Role || persistedState != "active" || !persistedQualification.Valid || persistedQualification.Int64 != claim.QualificationID || persistedBinding == "" || persistedBinding != bindingDigest(claim.Binding) || claim.BindingDigest != "" && claim.BindingDigest != persistedBinding {
+			return ErrStaleFence
+		}
+		var maxCost, spent, maxDuration int64
+		if err := conn.QueryRowContext(ctx, `SELECT max_cost_micro_usd FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&maxCost); err != nil {
+			return err
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(usage_units),0) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? AND id<>?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.ID).Scan(&spent); err != nil {
+			return err
+		}
+		if maxCost <= 0 || usage > maxCost-spent {
+			return ErrBudgetExhausted
+		}
+		var created string
+		if err := conn.QueryRowContext(ctx, `SELECT created_at,max_duration_ns FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&created, &maxDuration); err != nil {
+			return err
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, created)
+		if err != nil {
+			return err
+		}
+		if maxDuration <= 0 || finished.After(createdAt.Add(time.Duration(maxDuration))) {
+			return ErrBudgetExhausted
+		}
+		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state=?,outcome=?,usage_units=?,finished_at=? WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND state='active'`, state, outcome, usage, finished.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion)
+		if err != nil {
+			return err
+		}
+		n, _ := row.RowsAffected()
+		if n != 1 {
+			return ErrStaleFence
+		}
+		row, err = conn.ExecContext(ctx, `UPDATE phase_runs SET state=?,completed_at=?,provider=?,model=?,family=?,provider_version=?,outcome=? WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND state='active' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND provider=? AND model=? AND family=? AND provider_version=?`, state, finished.UTC().Format(time.RFC3339Nano), claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version, outcome, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version)
+		if err != nil {
+			return err
+		}
+		n, _ = row.RowsAffected()
+		if n != 1 {
+			return ErrStaleFence
+		}
+		_, err = conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND scope='provider' AND scope_key=? AND project_id=? AND ticket_id=? AND runner_epoch=?`, claim.Ref.Channel, claim.LeaseKey, claim.Ref.Project, claim.Ref.Ticket, claim.RunnerEpoch)
+		return err
+	})
+}
+
+// QuarantineProviderAttempt keeps a fenced claim and its capacity reserved
+// when the supervisor cannot prove that the provider is drained. It is
+// intentionally terminal only for the attempt row; the active phase remains
+// blocked until recovery establishes a real drain proof.
+func (s *Store) QuarantineProviderAttempt(ctx context.Context, claim ProviderAttemptClaim, expected uint64, fence domain.Fence, at time.Time) error {
+	if claim.ID <= 0 || claim.ExpectedVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ExpectedVersion != expected || claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch || at.IsZero() {
+		return ErrProviderAttempt
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		var version, runner uint64
+		if err := conn.QueryRowContext(ctx, `SELECT version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&version, &runner); err != nil {
+			return err
+		}
+		if version != expected {
+			return ErrStaleFence
+		}
+		if err := s.currentFence(ctx, conn, claim.Ref.Channel, version, runner, fence); err != nil {
+			return ErrStaleFence
+		}
+		result, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='quarantined',outcome='undrained' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND state='active'`, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		return nil
+	})
+}
+
+// FailProviderAttemptBudget closes a drained attempt without recording usage
+// beyond the ticket ceiling. It is used when a provider reports more units
+// than remain; the ticket is blocked for operator reconciliation rather than
+// releasing a still-active claim.
+func (s *Store) FailProviderAttemptBudget(ctx context.Context, claim ProviderAttemptClaim, expected uint64, fence domain.Fence, at time.Time) error {
+	if claim.ID <= 0 || claim.ExpectedVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ExpectedVersion != expected || claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch || at.IsZero() {
 		return ErrProviderAttempt
 	}
 	return s.write(ctx, func(conn *sql.Conn) error {
@@ -139,23 +340,21 @@ func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttempt
 		if err := s.currentFence(ctx, conn, claim.Ref.Channel, version, runner, fence); err != nil {
 			return err
 		}
-		row, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state=?,outcome=?,usage_units=?,finished_at=? WHERE id=? AND state='active'`, state, outcome, usage, finished.UTC().Format(time.RFC3339Nano), claim.ID)
+		result, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='failed',outcome='budget_exhausted',usage_units=0,finished_at=? WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND state='active'`, at.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion)
 		if err != nil {
 			return err
 		}
-		n, _ := row.RowsAffected()
-		if n != 1 {
+		if n, _ := result.RowsAffected(); n != 1 {
 			return ErrStaleFence
 		}
-		row, err = conn.ExecContext(ctx, `UPDATE phase_runs SET state=?,completed_at=? WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND state='active'`, state, finished.UTC().Format(time.RFC3339Nano), claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt)
+		result, err = conn.ExecContext(ctx, `UPDATE phase_runs SET state='failed',completed_at=? WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND state='active' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=?`, at.UTC().Format(time.RFC3339Nano), claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion)
 		if err != nil {
 			return err
 		}
-		n, _ = row.RowsAffected()
-		if n != 1 {
+		if n, _ := result.RowsAffected(); n != 1 {
 			return ErrStaleFence
 		}
-		_, err = conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND scope='provider' AND scope_key=? AND project_id=? AND ticket_id=? AND runner_epoch=?`, claim.Ref.Channel, claim.LeaseKey, claim.Ref.Project, claim.Ref.Ticket, fence.RunnerEpoch)
+		_, err = conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND scope='provider' AND scope_key=? AND project_id=? AND ticket_id=? AND runner_epoch=?`, claim.Ref.Channel, claim.LeaseKey, claim.Ref.Project, claim.Ref.Ticket, claim.RunnerEpoch)
 		return err
 	})
 }
@@ -167,6 +366,10 @@ func (s *Store) RecoverProviderAttempts(ctx context.Context, ref domain.TicketRe
 		return ErrProviderAttempt
 	}
 	if !drained {
+		err := s.quarantineProviderAttempts(ctx, ref, staleRunner, leader, at)
+		if err != nil {
+			return err
+		}
 		return ErrProviderDrain
 	}
 	return s.write(ctx, func(conn *sql.Conn) error {
@@ -183,10 +386,10 @@ func (s *Store) RecoverProviderAttempts(ctx context.Context, ref domain.TicketRe
 		if currentRunner == staleRunner {
 			return ErrProviderDrain
 		}
-		if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='cancelled',outcome='drained_recovery',finished_at=? WHERE channel=? AND project_id=? AND ticket_id=? AND state='active'`, at.UTC().Format(time.RFC3339Nano), ref.Channel, ref.Project, ref.Ticket); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='cancelled',outcome='drained_recovery',finished_at=? WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined') AND leader_epoch=? AND runner_epoch=?`, at.UTC().Format(time.RFC3339Nano), ref.Channel, ref.Project, ref.Ticket, leader, staleRunner); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='cancelled',completed_at=? WHERE channel=? AND project_id=? AND ticket_id=? AND state='active'`, at.UTC().Format(time.RFC3339Nano), ref.Channel, ref.Project, ref.Ticket); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='cancelled',completed_at=? WHERE channel=? AND project_id=? AND ticket_id=? AND state='active' AND leader_epoch=? AND runner_epoch=?`, at.UTC().Format(time.RFC3339Nano), ref.Channel, ref.Project, ref.Ticket, leader, staleRunner); err != nil {
 			return err
 		}
 		_, err := conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND project_id=? AND ticket_id=? AND runner_epoch=? AND scope='provider'`, ref.Channel, ref.Project, ref.Ticket, staleRunner)
@@ -194,8 +397,80 @@ func (s *Store) RecoverProviderAttempts(ctx context.Context, ref domain.TicketRe
 	})
 }
 
+// RecoverProviderAttemptClaim is the restart-safe recovery primitive. Unlike
+// the legacy ref-based helper, it carries the original leader epoch and every
+// persisted claim identity, so a new leader can release only this exact old
+// runner after the supervisor proves that runner drained.
+func (s *Store) RecoverProviderAttemptClaim(ctx context.Context, claim ProviderAttempt, leader uint64, drained bool, at time.Time) error {
+	if claim.Ref.Validate() != nil || claim.ID <= 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ExpectedVersion == 0 || claim.BindingDigest == "" || claim.LeaseKey == "" || leader == 0 || at.IsZero() {
+		return ErrProviderAttempt
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		var currentLeader, currentRunner uint64
+		if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, claim.Ref.Channel).Scan(&currentLeader); err != nil {
+			return err
+		}
+		if currentLeader != leader {
+			return ErrStaleFence
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&currentRunner); err != nil {
+			return err
+		}
+		if currentRunner == claim.RunnerEpoch {
+			return ErrProviderDrain
+		}
+		var state string
+		if err := conn.QueryRowContext(ctx, `SELECT state FROM provider_attempts WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=? AND provider_lease_key=?`, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest, claim.LeaseKey).Scan(&state); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrStaleFence
+			}
+			return err
+		}
+		if !drained {
+			if state == "active" {
+				if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='quarantined',outcome='undrained_recovery' WHERE id=? AND state='active'`, claim.ID); err != nil {
+					return err
+				}
+			}
+			return ErrProviderDrain
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='cancelled',outcome='drained_recovery',finished_at=? WHERE id=? AND state IN ('active','quarantined')`, at.UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
+			return err
+		}
+		result, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='cancelled',completed_at=?,outcome='drained_recovery' WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND state='active' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND provider=? AND model=? AND family=? AND provider_version=?`, at.UTC().Format(time.RFC3339Nano), claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		_, err = conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND scope='provider' AND scope_key=? AND project_id=? AND ticket_id=? AND runner_epoch=?`, claim.Ref.Channel, claim.LeaseKey, claim.Ref.Project, claim.Ref.Ticket, claim.RunnerEpoch)
+		return err
+	})
+}
+
+func (s *Store) quarantineProviderAttempts(ctx context.Context, ref domain.TicketRef, staleRunner, leader uint64, at time.Time) error {
+	return s.write(ctx, func(conn *sql.Conn) error {
+		var currentLeader, currentRunner uint64
+		if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&currentLeader); err != nil {
+			return err
+		}
+		if currentLeader != leader {
+			return ErrStaleFence
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&currentRunner); err != nil {
+			return err
+		}
+		if currentRunner == staleRunner {
+			return ErrProviderDrain
+		}
+		_, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='quarantined',outcome='undrained_recovery' WHERE channel=? AND project_id=? AND ticket_id=? AND state='active' AND leader_epoch=? AND runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, leader, staleRunner)
+		return err
+	})
+}
+
 func (s *Store) ProviderAttempts(ctx context.Context, ref domain.TicketRef) ([]ProviderAttempt, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,phase,attempt,provider,model,family,version,role,state,outcome,usage_units,started_at,finished_at,qualification_id,binding_digest,provider_lease_key FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY id`, ref.Channel, ref.Project, ref.Ticket)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,phase,attempt,provider,model,family,version,role,state,outcome,usage_units,started_at,finished_at,qualification_id,binding_digest,provider_lease_key,leader_epoch,runner_epoch,expected_ticket_version FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY id`, ref.Channel, ref.Project, ref.Ticket)
 	if err != nil {
 		return nil, normalizeBusy(ctx, err)
 	}
@@ -204,13 +479,19 @@ func (s *Store) ProviderAttempts(ctx context.Context, ref domain.TicketRef) ([]P
 	for rows.Next() {
 		var v ProviderAttempt
 		var started, finished string
-		if err := rows.Scan(&v.ID, &v.Phase, &v.Attempt, &v.Binding.Identity.Provider, &v.Binding.Identity.Model, &v.Binding.Identity.Family, &v.Binding.Identity.Version, &v.Role, &v.State, &v.Outcome, &v.UsageUnits, &started, &finished, &v.QualificationID, &v.Binding.BinaryDigest, &v.LeaseKey); err != nil {
+		var qualification sql.NullInt64
+		if err := rows.Scan(&v.ID, &v.Phase, &v.Attempt, &v.Binding.Identity.Provider, &v.Binding.Identity.Model, &v.Binding.Identity.Family, &v.Binding.Identity.Version, &v.Role, &v.State, &v.Outcome, &v.UsageUnits, &started, &finished, &qualification, &v.BindingDigest, &v.LeaseKey, &v.LeaderEpoch, &v.RunnerEpoch, &v.ExpectedVersion); err != nil {
 			return nil, err
 		}
+		if qualification.Valid {
+			v.QualificationID = qualification.Int64
+		}
 		var err error
-		v.StartedAt, err = time.Parse(time.RFC3339Nano, started)
-		if err != nil {
-			return nil, err
+		if started != "" {
+			v.StartedAt, err = time.Parse(time.RFC3339Nano, started)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if finished != "" {
 			v.FinishedAt, err = time.Parse(time.RFC3339Nano, finished)
@@ -237,8 +518,8 @@ func currentRuntimeQualification(ctx context.Context, conn *sql.Conn, channel do
 			col = "reviewer_qualification_id"
 		}
 		query += ` JOIN provider_pair_selections p ON p.channel=q.channel AND q.id=p.` + col
-		where += ` AND NOT EXISTS (SELECT 1 FROM provider_qualifications newer WHERE newer.channel=q.channel AND newer.provider=q.provider AND newer.model=q.model AND newer.family=q.family AND newer.provider_version=q.provider_version AND newer.id>q.id)`
 	}
+	where += ` AND NOT EXISTS (SELECT 1 FROM provider_qualifications newer WHERE newer.channel=q.channel AND newer.provider=q.provider AND newer.model=q.model AND newer.family=q.family AND newer.provider_version=q.provider_version AND newer.id>q.id) AND NOT EXISTS (SELECT 1 FROM provider_qualifications disabled WHERE disabled.channel=q.channel AND disabled.provider=q.provider AND disabled.provider_version=q.provider_version AND disabled.profile='disabled' AND disabled.id>q.id)`
 	value, err := scanQualification(conn.QueryRowContext(ctx, query+where, args...))
 	if err != nil {
 		return ProviderQualification{}, ErrProviderPairRefused
@@ -272,6 +553,20 @@ func validProviderPhase(p domain.Phase) bool {
 	}
 	return false
 }
+func providerAdmissionState(state domain.State, phase domain.Phase, role string) bool {
+	switch {
+	case role == "planner" && phase == domain.PhasePlanning:
+		return state == domain.StatePlanning
+	case role == "builder" && phase == domain.PhaseBuild:
+		return state == domain.StateBuilding
+	case role == "reviewer" && phase == domain.PhaseVerification:
+		return state == domain.StateVerifying
+	case role == "reviewer" && phase == domain.PhaseReview:
+		return state == domain.StateReviewing
+	default:
+		return false
+	}
+}
 func validProviderRole(v string) bool { return v == "planner" || v == "builder" || v == "reviewer" }
 func validAttemptState(v string) bool { return v == "completed" || v == "failed" || v == "cancelled" }
 func safeOutcome(v string) bool {
@@ -286,4 +581,10 @@ func validRuntimeBinding(v contracts.RuntimeBinding) bool {
 func hexDigest(v string) bool {
 	return len(v) == 64 && strings.ToLower(v) == v && strings.Trim(v, "0123456789abcdef") == ""
 }
-func bindingDigest(v contracts.RuntimeBinding) string { return v.BinaryDigest } // exact qualification already binds binary/policy/fixture; no credential-bearing data is stored.
+func bindingDigest(v contracts.RuntimeBinding) string {
+	// Include every runtime fact, including the account digest, while never
+	// persisting credential material itself. The qualification ID separately
+	// anchors the non-secret facts to the durable root authority.
+	sum := sha256.Sum256([]byte(v.Identity.Provider + "\x00" + v.Identity.Model + "\x00" + v.Identity.Family + "\x00" + v.Identity.Version + "\x00" + v.BinaryDigest + "\x00" + v.PolicyDigest + "\x00" + v.FixtureDigest + "\x00" + v.AuthDigest))
+	return hex.EncodeToString(sum[:])
+}

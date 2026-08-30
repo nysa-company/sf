@@ -77,23 +77,27 @@ type Config struct {
 	// StartupTimeout bounds migrations, recovery, and all startup-only SQLite
 	// operations even when the process context is long-lived.
 	StartupTimeout time.Duration
+	// RecoverProvider must drain the exact provider process group represented by
+	// a durable attempt. A nil callback fails closed when claims exist.
+	RecoverProvider func(context.Context, store.ProviderAttempt, uint64) error
 }
 
 type Daemon struct {
-	channel domain.Channel
-	paths   config.ChannelPaths
-	lease   *leader.Lease
-	store   *store.Store
-	engine  *engine.Engine
-	spec    statemachine.Spec
-	doctor  func(context.Context, store.Project) error
-	server  *transport.Server
-	epoch   uint64
-	clock   Clock
-	ids     TicketIDGenerator
-	auth    operator.Authenticator
-	mu      sync.Mutex
-	closed  bool
+	channel         domain.Channel
+	paths           config.ChannelPaths
+	lease           *leader.Lease
+	store           *store.Store
+	engine          *engine.Engine
+	spec            statemachine.Spec
+	doctor          func(context.Context, store.Project) error
+	server          *transport.Server
+	epoch           uint64
+	clock           Clock
+	ids             TicketIDGenerator
+	auth            operator.Authenticator
+	recoverProvider func(context.Context, store.ProviderAttempt, uint64) error
+	mu              sync.Mutex
+	closed          bool
 
 	projectionMu      sync.Mutex
 	projector         events.Projector
@@ -172,7 +176,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	}
 
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, recoverProvider: configuration.RecoverProvider}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -219,6 +223,18 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 	}
 	if _, err := daemon.store.FenceRecoveredRunners(ctx, daemon.channel, daemon.epoch); err != nil {
 		return fmt.Errorf("invalidate recovered runners: %w", err)
+	}
+	claims, err := daemon.store.ActiveProviderAttempts(ctx, daemon.channel)
+	if err != nil {
+		return fmt.Errorf("read provider recovery claims: %w", err)
+	}
+	for _, claim := range claims {
+		if daemon.recoverProvider == nil {
+			return store.ErrProviderDrain
+		}
+		if err := daemon.recoverProvider(ctx, claim, daemon.epoch); err != nil {
+			return fmt.Errorf("recover provider attempt %d: %w", claim.ID, err)
+		}
 	}
 	return daemon.engine.RecoverChannel(ctx, daemon.channel, daemon.epoch)
 }

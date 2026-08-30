@@ -80,8 +80,12 @@ func (r *Registry) Register(ctx context.Context, p contracts.Provider) error {
 	if e != nil || id.Provider != p.Name() {
 		return errors.New("provider identity probe failed")
 	}
-	if _, e = p.Binding(ctx); e != nil {
-		return e
+	binding, e := p.Binding(ctx)
+	if e != nil || binding.Identity != id || !validBinding(binding) {
+		if e != nil {
+			return e
+		}
+		return errors.New("provider runtime binding probe failed")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -90,6 +94,15 @@ func (r *Registry) Register(ctx context.Context, p contracts.Provider) error {
 	}
 	r.providers[p.Name()] = p
 	return nil
+}
+
+func validBinding(binding contracts.RuntimeBinding) bool {
+	for _, digest := range []string{binding.BinaryDigest, binding.PolicyDigest, binding.FixtureDigest, binding.AuthDigest} {
+		if len(digest) != 64 || strings.ToLower(digest) != digest || strings.Trim(digest, "0123456789abcdef") != "" {
+			return false
+		}
+	}
+	return binding.Identity.Provider != "" && binding.Identity.Model != "" && binding.Identity.Family != "" && binding.Identity.Version != ""
 }
 func (r *Registry) get(name string) (contracts.Provider, bool) {
 	r.mu.RLock()
@@ -144,6 +157,11 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 	if err != nil || ticket.Version != r.ExpectedVersion || ticket.RunnerEpoch != r.Fence.RunnerEpoch || ticket.ConfigDigest == "" || ticket.ConfigDigest != r.ConfigDigest {
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	}
+	if r.Input.Phase == domain.PhaseReview {
+		if err := c.store.ValidateFinalReviewEvidence(ctx, r.Input.Ticket, r.ExpectedVersion, r.Fence, r.Validation.ExpectedReviewedHead, r.Validation.ExpectedProofDigest); err != nil {
+			return Result{Code: NeedsOperator, NeedsOperator: true}
+		}
+	}
 	route, ok := c.routes[r.Role]
 	if !ok {
 		return Result{Code: NeedsOperator, NeedsOperator: true}
@@ -166,7 +184,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		if err != nil || binding.Identity.Provider != name {
 			continue
 		}
-		remaining := time.Until(ticket.CreatedAt.Add(ticket.MaxDuration))
+		remaining := ticket.CreatedAt.Add(ticket.MaxDuration).Sub(c.clock.Now())
 		if remaining <= 0 {
 			return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
@@ -175,7 +193,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			timeout = remaining
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now()})
+		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest})
 		if err != nil {
 			cancel()
 			if errors.Is(err, store.ErrProviderCapacity) {
@@ -188,8 +206,24 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		input.Timeout = timeout
 		raw, runErr := p.Run(attemptCtx, input)
 		cancel()
+		cancelled := ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
+		// Returning from Run, including a provider error, is not proof that its
+		// process group drained. Every terminal path must obtain an explicit
+		// supervisor proof before releasing the durable claim and lease.
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		drain, drainErr := p.Drain(drainCtx, drainRequest(claim))
+		drainCancel()
+		if drainErr != nil || !drain.Drained {
+			quarantineCtx, quarantineCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = c.store.QuarantineProviderAttempt(quarantineCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
+			quarantineCancel()
+			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+		}
 		state, outcome := "failed", "failed"
-		valid := runErr == nil && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0
+		if cancelled {
+			state, outcome = "cancelled", "cancelled"
+		}
+		valid := !cancelled && runErr == nil && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0
 		var parsed phaseartifact.Parsed
 		if valid {
 			parsed, err = phaseartifact.Parse(input.Phase, raw, r.Validation)
@@ -212,11 +246,20 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		finishErr := c.store.FinishProviderAttempt(finishCtx, claim, r.ExpectedVersion, r.Fence, state, outcome, max(raw.UsageUnits, 0), c.clock.Now())
 		finishCancel()
 		if finishErr != nil {
+			if errors.Is(finishErr, store.ErrBudgetExhausted) {
+				quarantineCtx, quarantineCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = c.store.FailProviderAttemptBudget(quarantineCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
+				quarantineCancel()
+				return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			}
 			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 		spent += max(raw.UsageUnits, 0)
 		if !raw.UsageTrusted {
 			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+		}
+		if cancelled {
+			return Result{Code: Canceled, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 		if spent >= ticket.MaxCostMicroUSD {
 			return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
@@ -231,15 +274,47 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 // Recover drains a provider before releasing an old fenced claim. It does not
 // guess from PID or time alone.
 func (c *Coordinator) Recover(ctx context.Context, ref domain.TicketRef, staleRunner, leader uint64, name string) error {
-	p, ok := c.registry.get(name)
-	if !ok {
-		return errors.New("provider unavailable")
-	}
-	drain, err := p.Drain(ctx)
+	claims, err := c.store.ActiveProviderAttempts(ctx, ref.Channel)
 	if err != nil {
 		return err
 	}
-	return c.store.RecoverProviderAttempts(ctx, ref, staleRunner, leader, drain.Drained, c.clock.Now())
+	var match *store.ProviderAttempt
+	for index := range claims {
+		claim := &claims[index]
+		if claim.Ref == ref && claim.RunnerEpoch == staleRunner && claim.Binding.Identity.Provider == name {
+			if match != nil {
+				return errors.New("multiple provider recovery claims match")
+			}
+			match = claim
+		}
+	}
+	if match == nil {
+		return store.ErrNotFound
+	}
+	return c.RecoverClaim(ctx, *match, leader)
+}
+
+func (c *Coordinator) recoverClaim(ctx context.Context, claim store.ProviderAttempt, leader uint64) error {
+	p, ok := c.registry.get(claim.Binding.Identity.Provider)
+	if !ok {
+		return errors.New("provider unavailable")
+	}
+	drain, err := p.Drain(ctx, drainRequest(claim.ProviderAttemptClaim))
+	if err != nil {
+		return err
+	}
+	return c.store.RecoverProviderAttemptClaim(ctx, claim, leader, drain.Drained, c.clock.Now())
+}
+
+// RecoverClaim is the daemon integration boundary. It uses the provider and
+// stale runner identity persisted with the claim, so callers cannot recover a
+// different provider by guessing a name.
+func (c *Coordinator) RecoverClaim(ctx context.Context, claim store.ProviderAttempt, leader uint64) error {
+	return c.recoverClaim(ctx, claim, leader)
+}
+
+func drainRequest(claim store.ProviderAttemptClaim) contracts.DrainRequest {
+	return contracts.DrainRequest{Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest}
 }
 func validate(r Request) error {
 	if !r.Role.valid() || r.Input.Ticket.Validate() != nil || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.ConfigDigest == "" || len(r.ConfigDigest) != 64 || r.Input.Profile != contracts.ProfileGuarded || r.Input.Timeout <= 0 || r.Input.Timeout > 10*time.Minute || strings.TrimSpace(r.Input.Prompt) == "" || len(r.Input.Prompt) > 64<<10 || !cleanAbs(r.Input.Repository) || !cleanAbs(r.Input.Worktree) || len(r.Input.Schema) == 0 || len(r.Input.Schema) > 1<<20 {

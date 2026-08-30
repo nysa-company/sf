@@ -291,3 +291,12 @@ var migrationV11 = []string{
 	`CREATE UNIQUE INDEX one_active_provider_attempt ON provider_attempts(channel, project_id, ticket_id) WHERE state='active'`,
 	`CREATE INDEX provider_attempt_recovery ON provider_attempts(channel, state, started_at)`,
 }
+
+// v12 binds each provider attempt to the exact fenced launch that created it.
+// The defaults preserve readability of pre-v11 rows; new admission always
+// writes non-zero values and validates them before completion.
+var migrationV12 = []string{
+	`ALTER TABLE provider_attempts ADD COLUMN leader_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE provider_attempts ADD COLUMN runner_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE provider_attempts ADD COLUMN expected_ticket_version INTEGER NOT NULL DEFAULT 0`,
+}
