@@ -30,8 +30,46 @@ func TestApprovedSpecMatchesDomain(t *testing.T) {
 	if got, want := len(spec.States), len(domain.AllStates()); got != want {
 		t.Fatalf("states=%d want=%d", got, want)
 	}
-	if got, want := len(spec.Transitions), 40; got != want {
+	if got, want := len(spec.Transitions), 42; got != want {
 		t.Fatalf("transitions=%d want=%d", got, want)
+	}
+}
+
+func TestBuilderVerificationAmendmentPathPreservesProofUntilAccepted(t *testing.T) {
+	spec := loadApprovedSpec(t)
+	requested, err := spec.Select(string(domain.StateBuilding), "verification_amendment_requested", map[string]bool{
+		"amendment_request_valid": true,
+		"correction_available":    true,
+	})
+	if err != nil {
+		t.Fatalf("select amendment request: %v", err)
+	}
+	if requested.ID != "build_requests_verification_amendment" || requested.To != string(domain.StateVerifying) || len(requested.Invalidates) != 0 {
+		t.Fatalf("request transition=%+v", requested)
+	}
+
+	rejected, err := spec.Select(string(domain.StateVerifying), "amendment_rejected", map[string]bool{
+		"fresh_reviewer":                       true,
+		"original_verification_intent_current": true,
+		"correction_available":                 true,
+	})
+	if err != nil {
+		t.Fatalf("select amendment rejection: %v", err)
+	}
+	if rejected.ID != "verification_amendment_rejected" || rejected.To != string(domain.StateBuilding) || len(rejected.Invalidates) != 0 {
+		t.Fatalf("rejection transition=%+v", rejected)
+	}
+
+	accepted, err := spec.Select(string(domain.StateVerifying), "amendment_accepted", map[string]bool{
+		"fresh_reviewer":           true,
+		"old_and_new_digest_bound": true,
+		"correction_available":     true,
+	})
+	if err != nil {
+		t.Fatalf("select amendment acceptance: %v", err)
+	}
+	if accepted.ID != "verification_amended" || accepted.To != string(domain.StateBuilding) || len(accepted.Invalidates) != 1 || accepted.Invalidates[0] != "proof" {
+		t.Fatalf("acceptance transition=%+v", accepted)
 	}
 }
 

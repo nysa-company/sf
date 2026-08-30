@@ -91,6 +91,26 @@
       "invalidates": ["proof"]
     },
     {
+      "id": "build_requests_verification_amendment",
+      "from": ["building"],
+      "trigger": "verification_amendment_requested",
+      "guards": ["amendment_request_valid", "correction_available"],
+      "to": "verifying",
+      "phase_disposition": "start_verification_amendment_review",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
+      "id": "verification_amendment_rejected",
+      "from": ["verifying"],
+      "trigger": "amendment_rejected",
+      "guards": ["fresh_reviewer", "original_verification_intent_current", "correction_available"],
+      "to": "building",
+      "phase_disposition": "start_build_retry_with_original_verification",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
       "id": "build_pass",
       "from": ["building"],
       "trigger": "phase_pass",

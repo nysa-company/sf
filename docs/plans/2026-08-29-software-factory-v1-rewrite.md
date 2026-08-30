@@ -660,6 +660,11 @@ before sf creates a new verification checkpoint and Builder continues. Tests
 are protected from silent weakening, not
 declared immutable forever.
 
+The amendment request itself moves `building` to `verifying` without
+invalidating the current proof. A rejection returns to a new Builder attempt
+with the original verification intent still authoritative. Only an accepted
+amendment records a new checkpoint and invalidates the prior proof gates.
+
 This implements verification-first development while avoiding the legacy
 global Git chronology rules. It follows the useful TDD principle of defining a
 failing behavior before implementation without treating commit order as the
