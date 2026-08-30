@@ -938,9 +938,12 @@ func validateOfficialArgv(argv []string) error {
 			return fmt.Errorf("fake-gh: incomplete %s", key)
 		}
 	case "pr checks":
-		allowed["--repo"], allowed["--json"] = true, true
+		allowed["--repo"], allowed["--json"], allowed["--required"] = true, true, true
 		if prNumber(argv) <= 0 {
 			return fmt.Errorf("fake-gh: %s requires a number", key)
+		}
+		if !hasFlag(argv, "--required") {
+			return fmt.Errorf("fake-gh: %s must request the server-defined required set", key)
 		}
 		if err := require("--json", "name,state,workflow,link,bucket"); err != nil {
 			return err

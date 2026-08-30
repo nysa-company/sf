@@ -534,6 +534,9 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	client, fake, identity := fixture(t)
 	pr := createDraft(t, client, identity, "title", "body")
 	claim := testClaim("merge", pr.Identity, pr.Identity.HeadOID, "squash")
+	if _, err := client.RequiredChecks(context.Background(), pr.Identity); !errors.Is(err, ErrChecksFailed) {
+		t.Fatalf("empty server-required check set=%v", err)
+	}
 	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "1", State: "SUCCESS"}); err != nil {
 		t.Fatal(err)
 	}

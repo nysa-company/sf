@@ -619,11 +619,17 @@ func (c Client) checks(ctx context.Context, identity contracts.PullRequestIdenti
 	// may intentionally omit Number while binding the exact source identity.
 	identity = before.Identity
 	var wire []checkWire
-	if err := c.json(ctx, &wire, "pr", "checks", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--json", "name,state,workflow,link,bucket"); err != nil {
+	// Ask GitHub for the server-defined required set. Without --required, an
+	// optional successful check could make a caller-provided subset appear
+	// authoritative while a required workflow has not even created a run yet.
+	if err := c.json(ctx, &wire, "pr", "checks", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--required", "--json", "name,state,workflow,link,bucket"); err != nil {
 		return nil, err
 	}
 	after, err := c.Observe(ctx, identity)
 	if err != nil || !sameExact(after.Identity, identity) || after.State != "OPEN" || after.Merged {
+		return nil, ErrChecksFailed
+	}
+	if len(wire) == 0 {
 		return nil, ErrChecksFailed
 	}
 	checks := make([]contracts.RequiredCheck, 0, len(wire))
