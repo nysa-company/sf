@@ -1,6 +1,6 @@
 # Software Factory v1 verification plan
 
-Status: Draft companion to the v1 replacement plan
+Status: Approved verification companion; local implementation in progress
 
 Applies to: the new Go repository
 Goal: prove that the simple factory delivers tickets without duplicate effects,

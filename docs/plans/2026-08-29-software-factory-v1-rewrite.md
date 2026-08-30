@@ -1,6 +1,6 @@
 # Software Factory v1 replacement
 
-Status: Draft for joint approval; implementation has not started
+Status: Approved; local implementation in progress
 
 Plan owner: Sofia, with Codex as plan author
 
