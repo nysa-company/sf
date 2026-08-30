@@ -46,7 +46,7 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build fake-gh: %v\n%s", err, output)
 	}
-	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), ConfigDir: filepath.Join(root, "gh-config"), Env: []string{"SF_FAKE_GH_STATE=" + state}, ValidateClaim: func(context.Context, domain.ExternalEffectClaim) error { return nil }, MutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), ConfigDir: filepath.Join(root, "gh-config"), Env: []string{"SF_FAKE_GH_STATE=" + state}, Runner: commandRunnerFunc(runBounded), ValidateClaim: func(context.Context, domain.ExternalEffectClaim) error { return nil }, MutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
 		return start(ctx)
 	}), VerifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
@@ -77,6 +77,23 @@ func TestAuthStatusAcceptsOfficialHostsStateShape(t *testing.T) {
 	}}
 	if err := client.AuthStatus(context.Background()); err != nil {
 		t.Fatalf("official auth status shape=%v", err)
+	}
+}
+
+func TestMergeQueueGraphQLFailsClosedBeforeMerge(t *testing.T) {
+	client, _, identity := fixture(t)
+	identity.Number = 7
+	called := false
+	client.Runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		called = true
+		if len(args) < 4 || args[0] != "api" || args[1] != "--hostname" || args[2] != "github.com" || args[3] != "graphql" {
+			return nil, errors.New("wrong queue argv")
+		}
+		return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":{"position":1}}}}}`), nil
+	})
+	queued, err := client.mergeQueued(context.Background(), identity)
+	if err != nil || !queued || !called {
+		t.Fatalf("queue observation queued=%v called=%v err=%v", queued, called, err)
 	}
 }
 
@@ -185,18 +202,6 @@ func TestDraftAndNonOpenPRsCannotMergeOrBeAdopted(t *testing.T) {
 	}
 }
 
-func TestMergeQueueEntryRefusesBeforeCommand(t *testing.T) {
-	client, _, identity := fixture(t)
-	identity.Number = 1
-	called := false
-	client.Run = func(context.Context, string, []string, []string) ([]byte, error) { called = true; return nil, nil }
-	plan, _ := client.Plan(identity, "queue")
-	claim, _ := client.Claim(plan)
-	if _, err := client.merge(context.Background(), claim, PRMatch{Identity: identity, State: "OPEN", MergeQueued: true}, identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) || called {
-		t.Fatalf("queue merge err=%v command=%v", err, called)
-	}
-}
-
 func TestMergeRequiresFreshProtectedBranchProof(t *testing.T) {
 	t.Run("unavailable verifier is never success", func(t *testing.T) {
 		client, fake, identity := fixture(t)
@@ -253,7 +258,7 @@ func TestMergeNeverTrustsCLIExitWithoutFreshMergedObservation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			client.Run = func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+			client.Runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
 				if len(args) >= 2 && args[0] == "pr" && args[1] == "merge" {
 					return nil, nil // gh may report success for a non-merge operation.
 				}
@@ -261,7 +266,7 @@ func TestMergeNeverTrustsCLIExitWithoutFreshMergedObservation(t *testing.T) {
 					return payload, nil
 				}
 				return nil, errors.New("unexpected gh argv")
-			}
+			})
 			if _, err := client.merge(context.Background(), claim, pr, identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) {
 				t.Fatalf("merge must reject %s: %v", test.name, err)
 			}
@@ -396,7 +401,7 @@ func TestWaitChecksBoundsBackgroundContext(t *testing.T) {
 	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "one", State: "PENDING"}); err != nil {
 		t.Fatal(err)
 	}
-	client.Run = func(_ context.Context, _ string, args, _ []string) ([]byte, error) { return fake.Run(args) }
+	client.Runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) { return fake.Run(args) })
 	old := maxGHDeadline
 	maxGHDeadline = 300 * time.Millisecond
 	t.Cleanup(func() { maxGHDeadline = old })

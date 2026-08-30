@@ -13,6 +13,7 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -43,6 +44,7 @@ type Client struct {
 	ConfigDir     string   // explicit existing gh auth/config authority, never a temp substitute
 	Env           []string // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
 	Run           func(context.Context, string, []string, []string) ([]byte, error)
+	Runner        CommandRunner // required by NewClient; supervisor-owned in production
 	ValidateClaim func(context.Context, domain.ExternalEffectClaim) error
 	MutationGuard contracts.ExternalMutationGuard
 	// VerifyProtectedBranch is supplied by the Git boundary.  It is the
@@ -61,8 +63,16 @@ type PRMatch struct {
 	State                string
 	MergeState           string
 	AutoMerge            bool
-	MergeQueued          bool
 }
+type CommandRunner interface {
+	Run(context.Context, string, []string, []string) ([]byte, error)
+}
+type commandRunnerFunc func(context.Context, string, []string, []string) ([]byte, error)
+
+func (f commandRunnerFunc) Run(ctx context.Context, binary string, args, env []string) ([]byte, error) {
+	return f(ctx, binary, args, env)
+}
+
 type EffectPlan struct {
 	SemanticKey string
 	Identity    contracts.PullRequestIdentity
@@ -84,11 +94,11 @@ var _ contracts.GitHub = (*Client)(nil)
 // NewClient is the production wiring point. The orchestrator supplies the
 // Store mutation handoff and the Git-boundary protected-branch verifier; a
 // guarded merge client is never constructed without both authorities.
-func NewClient(binary, home, configDir string, validate func(context.Context, domain.ExternalEffectClaim) error, guard contracts.ExternalMutationGuard, verifier contracts.ProtectedBranchVerifier) (*Client, error) {
-	if binary == "" || !filepath.IsAbs(binary) || home == "" || !filepath.IsAbs(home) || configDir == "" || !filepath.IsAbs(configDir) || validate == nil || guard == nil || verifier == nil {
+func NewClient(binary, home, configDir string, runner CommandRunner, validate func(context.Context, domain.ExternalEffectClaim) error, guard contracts.ExternalMutationGuard, verifier contracts.ProtectedBranchVerifier) (*Client, error) {
+	if binary == "" || !filepath.IsAbs(binary) || home == "" || !filepath.IsAbs(home) || configDir == "" || !filepath.IsAbs(configDir) || runner == nil || validate == nil || guard == nil || verifier == nil {
 		return nil, ErrPolicyRefusal
 	}
-	return &Client{Binary: binary, Home: home, ConfigDir: configDir, ValidateClaim: validate, MutationGuard: guard, VerifyProtectedBranch: verifier}, nil
+	return &Client{Binary: binary, Home: home, ConfigDir: configDir, Runner: runner, ValidateClaim: validate, MutationGuard: guard, VerifyProtectedBranch: verifier}, nil
 }
 
 type authHost struct {
@@ -157,7 +167,7 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 		return contracts.PullRequestIdentity{}, err
 	}
 	markedBody := body + "\n\n" + ownershipMarker(identity)
-	_, runErr := c.mutate(ctx, durable, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
+	output, runErr := c.mutate(ctx, durable, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
 	// Both a delivered response and a lost response are reconciled by the same
 	// exact ownership observation; command output is never object evidence.
 	match, observeErr := c.Observe(ctx, identity)
@@ -167,18 +177,47 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 	if runErr != nil {
 		return contracts.PullRequestIdentity{}, runErr
 	}
+	if number, ok := createdPRNumber(string(output)); ok {
+		if err := c.closeOrphan(ctx, durable, identity.Repository, number); err != nil {
+			return contracts.PullRequestIdentity{}, err
+		}
+	}
 	return contracts.PullRequestIdentity{}, observeErr
+}
+
+func createdPRNumber(output string) (int, bool) {
+	last := strings.LastIndex(strings.TrimSpace(output), "/")
+	if last < 0 {
+		return 0, false
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(output[last+1:]))
+	return value, err == nil && value > 0
+}
+func (c Client) closeOrphan(ctx context.Context, claim domain.ExternalEffectClaim, repository contracts.RepositoryIdentity, number int) error {
+	if number <= 0 || validRepository(repository) != nil {
+		return ErrPolicyRefusal
+	}
+	if _, err := c.mutate(ctx, claim, "pr", "close", fmt.Sprint(number), "--repo", repoArg(repository)); err != nil {
+		return ErrPolicyRefusal
+	}
+	var value struct {
+		State string `json:"state"`
+	}
+	if err := c.json(ctx, &value, "pr", "view", fmt.Sprint(number), "--repo", repoArg(repository), "--json", "state"); err != nil || value.State != "CLOSED" {
+		return ErrPolicyRefusal
+	}
+	return ErrPolicyRefusal // the original claim remains uncertain; never confirm an orphan.
 }
 func (c Client) UpdatePullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) error {
 	observed, err := c.Observe(ctx, identity)
 	if err != nil {
 		return err
 	}
-	identity = observed.Identity
-	if err := c.validateClaim(ctx, durable, identity, "pr_update", requestDigest("pr_update", identity, title, body)); err != nil {
-		return err
+	marked := body + "\n\n" + ownershipMarker(observed.Identity)
+	if sameExact(observed.Identity, identity) && observed.Title == title && observed.Body == marked {
+		return nil // idempotent read only; v1 PR metadata is immutable after creation.
 	}
-	return c.updateWithClaim(ctx, durable, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, observed, title, body)
+	return ErrPolicyRefusal
 }
 func (c Client) RequiredChecks(ctx context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
 	return c.checks(ctx, identity)
@@ -197,6 +236,17 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 	if observeErr == nil && sameExact(observed.Identity, identity) && observed.Ready && !observed.Draft {
 		return nil
 	}
+	// GitHub exposes no expected-head CAS for ready. Compensate immediately on
+	// a changed/uncertain post-state: restore draft on the freshly observed PR,
+	// verify it, and leave the durable effect unconfirmed for reconciliation.
+	if observeErr == nil {
+		_, undoErr := c.mutateExact(ctx, durable, observed.Identity, "pr", "ready", fmt.Sprint(observed.Identity.Number), "--repo", repoArg(observed.Identity.Repository), "--undo")
+		restored, restoreErr := c.Observe(ctx, observed.Identity)
+		if undoErr != nil || restoreErr != nil || !sameExact(restored.Identity, observed.Identity) || !restored.Draft {
+			return ErrPolicyRefusal
+		}
+		return ErrPolicyRefusal
+	}
 	if observeErr != nil {
 		return ErrPolicyRefusal
 	}
@@ -211,7 +261,8 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	if err != nil {
 		return err
 	}
-	if c.VerifyProtectedBranch == nil || observed.Draft || observed.Merged || observed.AutoMerge || observed.MergeQueued || queueState(observed.MergeState) || observed.State != "OPEN" {
+	queued, queueErr := c.mergeQueued(ctx, observed.Identity)
+	if queueErr != nil || c.VerifyProtectedBranch == nil || observed.Draft || observed.Merged || observed.AutoMerge || queued || queueState(observed.MergeState) || observed.State != "OPEN" {
 		return ErrPolicyRefusal
 	}
 	identity = observed.Identity
@@ -530,7 +581,7 @@ func (c Client) mergeRun(ctx context.Context, claim EffectClaim, pr PRMatch, rev
 	if mode == domain.MergeAutonomous {
 		return "", fmt.Errorf("%w: autonomous merge is unavailable without a passing native profile", ErrPolicyRefusal)
 	}
-	if mode != domain.MergeGuarded || !claim.Claimed || pr.Draft || pr.Merged || pr.AutoMerge || pr.MergeQueued || queueState(pr.MergeState) || pr.State != "" && pr.State != "OPEN" || reviewedHead == "" || reviewedHead != pr.Identity.HeadOID || method != "merge" && method != "squash" && method != "rebase" {
+	if mode != domain.MergeGuarded || !claim.Claimed || pr.Draft || pr.Merged || pr.AutoMerge || queueState(pr.MergeState) || pr.State != "" && pr.State != "OPEN" || reviewedHead == "" || reviewedHead != pr.Identity.HeadOID || method != "merge" && method != "squash" && method != "rebase" {
 		return "", ErrPolicyRefusal
 	}
 	args := []string{"pr", "merge", fmt.Sprint(pr.Identity.Number), "--repo", repoArg(pr.Identity.Repository), "--match-head-commit", reviewedHead, "--" + method}
@@ -573,6 +624,28 @@ func (a ApprovalBinding) Validate() error {
 	return nil
 }
 
+// mergeQueued uses GraphQL because gh pr view/list --json do not expose the
+// merge queue entry on supported gh releases. Any non-null entry fails closed.
+func (c Client) mergeQueued(ctx context.Context, identity contracts.PullRequestIdentity) (bool, error) {
+	if !validIdentity(identity) || identity.Number <= 0 {
+		return false, ErrPolicyRefusal
+	}
+	var response struct {
+		Data struct {
+			Repository struct {
+				PullRequest struct {
+					MergeQueueEntry json.RawMessage `json:"mergeQueueEntry"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+	query := "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}"
+	if err := c.json(ctx, &response, "api", "--hostname", "github.com", "graphql", "-f", "query="+query, "-F", "owner="+identity.Repository.Owner, "-F", "name="+identity.Repository.Name, "-F", fmt.Sprintf("number=%d", identity.Number)); err != nil {
+		return false, err
+	}
+	return presentJSON(response.Data.Repository.PullRequest.MergeQueueEntry), nil
+}
+
 func (c Client) view(ctx context.Context, identity contracts.PullRequestIdentity) (PRMatch, error) {
 	var value prWire
 	if err := c.json(ctx, &value, "pr", "view", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--json", prFields); err != nil {
@@ -597,7 +670,7 @@ func (c Client) viewNumber(ctx context.Context, repository contracts.RepositoryI
 	return value.match(parsed), nil
 }
 
-const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest,mergeQueueEntry"
+const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest"
 
 type prWire struct {
 	Number         int `json:"number"`
@@ -621,7 +694,6 @@ type prWire struct {
 	State            string          `json:"state"`
 	MergeState       string          `json:"mergeStateStatus"`
 	AutoMergeRequest json.RawMessage `json:"autoMergeRequest"`
-	MergeQueueEntry  json.RawMessage `json:"mergeQueueEntry"`
 }
 
 func (p prWire) match(identity contracts.PullRequestIdentity) PRMatch {
@@ -629,7 +701,7 @@ func (p prWire) match(identity contracts.PullRequestIdentity) PRMatch {
 	if p.MergeCommit != nil && validOID(p.MergeCommit.OID) {
 		mergeCommit = p.MergeCommit.OID
 	}
-	return PRMatch{Identity: identity, Draft: p.Draft, Merged: p.MergedAt != nil, Ready: !p.Draft, Title: p.Title, Body: p.Body, MergeCommit: mergeCommit, BaseHeadOID: p.BaseOID, State: p.State, MergeState: p.MergeState, AutoMerge: presentJSON(p.AutoMergeRequest), MergeQueued: presentJSON(p.MergeQueueEntry)}
+	return PRMatch{Identity: identity, Draft: p.Draft, Merged: p.MergedAt != nil, Ready: !p.Draft, Title: p.Title, Body: p.Body, MergeCommit: mergeCommit, BaseHeadOID: p.BaseOID, State: p.State, MergeState: p.MergeState, AutoMerge: presentJSON(p.AutoMergeRequest)}
 }
 
 func presentJSON(value json.RawMessage) bool { return len(value) > 0 && string(value) != "null" }
@@ -722,7 +794,20 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if c.Run != nil {
+	if c.Runner != nil {
+		output, runErr := c.Runner.Run(ctx, c.binary(), args, env)
+		if len(output) > maxResponse {
+			return nil, ErrResponseTooLarge
+		}
+		if runErr != nil {
+			if isChecksPending(args, runErr) {
+				return nil, ErrChecksPending
+			}
+			return nil, fmt.Errorf("gh command failed")
+		}
+		return output, nil
+	}
+	if c.Run != nil { // explicit test/dev seam; NewClient never permits this fallback.
 		output, runErr := c.Run(ctx, c.binary(), args, env)
 		if len(output) > maxResponse {
 			return nil, ErrResponseTooLarge
@@ -735,17 +820,7 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 		}
 		return output, nil
 	}
-	output, runErr := runBounded(ctx, c.binary(), args, env)
-	if errors.Is(runErr, ErrResponseTooLarge) {
-		return nil, runErr
-	}
-	if runErr != nil {
-		if isChecksPending(args, runErr) {
-			return nil, ErrChecksPending
-		}
-		return nil, fmt.Errorf("gh command failed")
-	}
-	return output, nil
+	return nil, ErrPolicyRefusal
 }
 
 func isChecksPending(args []string, err error) bool {

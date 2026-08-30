@@ -63,7 +63,7 @@ type FakeGHState struct {
 const (
 	fakeGHLockRetry    = 5 * time.Millisecond
 	fakeGHLockDeadline = 5 * time.Second
-	prJSONFields       = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest,mergeQueueEntry"
+	prJSONFields       = "number,title,body,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergedAt,mergeCommit,state,mergeStateStatus,autoMergeRequest"
 )
 
 func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, error) {
@@ -606,6 +606,9 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 	if len(argv) >= 2 && argv[0] == "repo" && argv[1] == "view" {
 		return f.runRepoView(argv)
 	}
+	if len(argv) >= 2 && argv[0] == "api" && argv[1] == "--hostname" {
+		return []byte(`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}`), nil
+	}
 	if len(argv) >= 2 && argv[0] == "pr" {
 		switch argv[1] {
 		case "create":
@@ -643,6 +646,11 @@ func validateOfficialArgv(argv []string) error {
 	}
 	allowed := map[string]bool{}
 	switch key {
+	case "api --hostname":
+		// Exact GraphQL queue lookup; fake supports only the production shape.
+		if len(argv) < 6 || argv[2] != "github.com" || argv[3] != "graphql" {
+			return fmt.Errorf("fake-gh: incomplete %s", key)
+		}
 	case "auth status":
 		allowed["--json"] = true
 		if err := require("--json", "hosts"); err != nil {
@@ -689,7 +697,7 @@ func validateOfficialArgv(argv []string) error {
 			return fmt.Errorf("fake-gh: incomplete %s", key)
 		}
 	case "pr ready":
-		allowed["--repo"] = true
+		allowed["--repo"], allowed["--undo"] = true, true
 		if prNumber(argv) <= 0 || option(argv, "--repo") == "" {
 			return fmt.Errorf("fake-gh: incomplete %s", key)
 		}
@@ -910,6 +918,20 @@ func (f *FakeGH) runReady(argv []string) ([]byte, error) {
 			return nil, err
 		}
 	}
+	if hasFlag(argv, "--undo") {
+		err := f.withState(func() (bool, error) {
+			index, err := f.findLocked(identity)
+			if err != nil {
+				return false, err
+			}
+			f.state.PRs[index].Draft, f.state.PRs[index].Ready = true, false
+			return true, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []byte("{}"), nil
+	}
 	if err := f.MarkReady(context.Background(), domain.ExternalEffectClaim{}, identity); err != nil {
 		return nil, err
 	}
@@ -995,7 +1017,6 @@ func prJSON(pr PullRequest) map[string]any {
 	}
 	value["autoMergeRequest"] = nil
 	value["mergeStateStatus"] = "CLEAN"
-	value["mergeQueueEntry"] = nil
 	return value
 }
 
