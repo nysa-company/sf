@@ -262,6 +262,9 @@ func TestGitMutationRecoveryFactsAreOneWayAndVisibleToRecovery(t *testing.T) {
 	if err := facts.RecordPreparedCommit(ctx, strings.Repeat("d", 40), tree); !errors.Is(err, ErrGitMutationLease) {
 		t.Fatalf("conflicting replay=%v", err)
 	}
+	if err := facts.RecordPreparedCommit(ctx, strings.Repeat("d", 64), strings.Repeat("e", 64)); !errors.Is(err, ErrGitMutationLease) {
+		t.Fatalf("mixed-width commit fact=%v", err)
+	}
 	recovery, err := db.ActiveGitMutationLeases(ctx, domain.ChannelDev)
 	if err != nil || len(recovery) != 1 || recovery[0].PreparedCommitOID != commit || recovery[0].PreparedTreeOID != tree {
 		t.Fatalf("recovery facts=%+v err=%v", recovery, err)
@@ -315,6 +318,10 @@ func TestGitMutationPushFactsDistinguishUnrecordedAbsentAndPresent(t *testing.T)
 	if err := absent.RecordPushPriorRemote(ctx, strings.Repeat("a", 40)); !errors.Is(err, ErrGitMutationLease) {
 		t.Fatalf("absence overwrite=%v", err)
 	}
+	db, ctx, mixed := newPush("SF-git-facts-mixed-width")
+	if err := mixed.RecordPushPriorRemote(ctx, strings.Repeat("a", 64)); !errors.Is(err, ErrGitMutationLease) {
+		t.Fatalf("mixed-width prior remote=%v", err)
+	}
 	db, ctx, present := newPush("SF-git-facts-present")
 	want := strings.Repeat("a", 40)
 	if err := present.RecordPushPriorRemote(ctx, want); err != nil {
@@ -322,6 +329,93 @@ func TestGitMutationPushFactsDistinguishUnrecordedAbsentAndPresent(t *testing.T)
 	}
 	if err := db.db.QueryRowContext(ctx, `SELECT prior_remote_observed,prior_remote_oid FROM git_mutation_leases`).Scan(&observed, &oid); err != nil || observed != 1 || oid != want {
 		t.Fatalf("recorded presence observed=%d oid=%q err=%v", observed, oid, err)
+	}
+}
+
+func TestActiveGitMutationLeasesQuarantinesInvalidRecoveryFacts(t *testing.T) {
+	for name, tamper := range map[string]func(t *testing.T, db *Store, ctx context.Context, intent GitMutationIntent){
+		"intent lease mismatch": func(t *testing.T, db *Store, ctx context.Context, intent GitMutationIntent) {
+			t.Helper()
+			if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_intents SET prepared_commit_oid=?,prepared_tree_oid=? WHERE semantic_key=?`, strings.Repeat("b", 40), strings.Repeat("c", 40), intent.SemanticKey); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"partial commit": func(t *testing.T, db *Store, ctx context.Context, intent GitMutationIntent) {
+			t.Helper()
+			if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_leases SET prepared_commit_oid=? WHERE repository_path=?`, strings.Repeat("b", 40), intent.Repository); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"invalid remote oid": func(t *testing.T, db *Store, ctx context.Context, intent GitMutationIntent) {
+			t.Helper()
+			if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_leases SET prior_remote_observed=1,prior_remote_oid='not-an-oid' WHERE repository_path=?`, intent.Repository); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"invalid observed flag": func(t *testing.T, db *Store, ctx context.Context, intent GitMutationIntent) {
+			t.Helper()
+			if _, err := db.db.ExecContext(ctx, `PRAGMA ignore_check_constraints=ON`); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _, _ = db.db.ExecContext(context.Background(), `PRAGMA ignore_check_constraints=OFF`) }()
+			if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_leases SET prior_remote_observed=2 WHERE repository_path=?`, intent.Repository); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"mixed oid width": func(t *testing.T, db *Store, ctx context.Context, intent GitMutationIntent) {
+			t.Helper()
+			if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_leases SET prepared_commit_oid=?,prepared_tree_oid=? WHERE repository_path=?`, strings.Repeat("b", 64), strings.Repeat("c", 64), intent.Repository); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"wrong operation": func(t *testing.T, db *Store, ctx context.Context, intent GitMutationIntent) {
+			t.Helper()
+			if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_leases SET operation='push' WHERE repository_path=?`, intent.Repository); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			intent := gitIntentFixture(t, db, ctx, "SF-git-recovery-"+strings.ReplaceAll(name, " ", "-"))
+			claim, err := db.IssueGitMutationClaim(ctx, intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.AcquireGitMutation(ctx, claim); err != nil {
+				t.Fatal(err)
+			}
+			tamper(t, db, ctx, intent)
+			if _, err := db.ActiveGitMutationLeases(ctx, domain.ChannelDev); !errors.Is(err, ErrGitMutationLease) {
+				t.Fatalf("invalid recovery facts accepted: %v", err)
+			}
+			var state, launch string
+			if err := db.db.QueryRowContext(ctx, `SELECT state,launch_state FROM git_mutation_leases WHERE repository_path=?`, intent.Repository).Scan(&state, &launch); err != nil || state != "quarantined" || launch != "quarantined" {
+				t.Fatalf("lease was not quarantined: state=%q launch=%q err=%v", state, launch, err)
+			}
+		})
+	}
+}
+
+func TestGitMutationContractClaimRequiresCanonicalSemanticKeyAndOIDWidth(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := gitIntentFixture(t, db, ctx, "SF-git-contract-key")
+	claim, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validContractClaim(claim) {
+		t.Fatal("canonical claim refused")
+	}
+	tampered := claim
+	tampered.SemanticKey = "arbitrary-key"
+	if validContractClaim(tampered) {
+		t.Fatal("arbitrary semantic key accepted")
+	}
+	tampered = claim
+	tampered.ExpectedHeadOID = strings.Repeat("b", 64)
+	if validContractClaim(tampered) {
+		t.Fatal("mixed-width claim accepted")
 	}
 }
 

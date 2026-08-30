@@ -89,7 +89,7 @@ func validGitIntent(i GitMutationIntent) bool {
 	return i.Ref.Validate() == nil && i.SemanticKey == CanonicalGitMutationSemanticKey(i) && validClaimDigest(i.RequestDigest) && i.TicketVersion != 0 &&
 		i.Fence.LeaderEpoch != 0 && i.Fence.RunnerEpoch != 0 && validStorePath(i.Repository) && validStorePath(i.Worktree) &&
 		i.Branch != "" && validGitOperation(i.Operation) && i.BaseRef != "" && validStoreOID(i.ExpectedBaseOID) &&
-		(i.ExpectedHeadOID == "" || validStoreOID(i.ExpectedHeadOID))
+		validGitOIDWidth(i.ExpectedBaseOID, i.ExpectedHeadOID)
 }
 
 func validGitOperation(operation string) bool {
@@ -110,6 +110,21 @@ func validStoreOID(v string) bool {
 	}
 	for _, c := range v {
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// validGitOIDWidth binds every object in one Git mutation to the repository
+// object format established by ExpectedBaseOID. A SHA-1/SHA-256 mixture is
+// never a recoverable fact, even though each individual string is an OID.
+func validGitOIDWidth(base string, oids ...string) bool {
+	if !validStoreOID(base) {
+		return false
+	}
+	for _, oid := range oids {
+		if oid != "" && (!validStoreOID(oid) || len(oid) != len(base)) {
 			return false
 		}
 	}
@@ -274,7 +289,7 @@ func (l *gitMutationLease) Check(ctx context.Context) error {
 // update-ref can make it reachable.  The same exact replay is harmless, while
 // any changed or partially tampered value is refused.
 func (l *gitMutationLease) RecordPreparedCommit(ctx context.Context, commit, tree string) error {
-	if l == nil || l.store == nil || l.claim.Operation != "commit" || !validStoreOID(commit) || !validStoreOID(tree) {
+	if l == nil || l.store == nil || l.claim.Operation != "commit" || !validGitOIDWidth(l.claim.ExpectedBaseOID, l.claim.ExpectedHeadOID, commit, tree) {
 		return ErrGitMutationLease
 	}
 	return l.store.write(ctx, func(conn *sql.Conn) error {
@@ -330,7 +345,7 @@ func (l *gitMutationLease) RecordPreparedCommit(ctx context.Context, commit, tre
 // branch was absent; a non-empty OID must be canonical. The separate flag
 // keeps that fact distinct from an old, unrecorded default row.
 func (l *gitMutationLease) RecordPushPriorRemote(ctx context.Context, oid string) error {
-	if l == nil || l.store == nil || l.claim.Operation != "push" || (oid != "" && !validStoreOID(oid)) {
+	if l == nil || l.store == nil || l.claim.Operation != "push" || !validGitOIDWidth(l.claim.ExpectedBaseOID, l.claim.ExpectedHeadOID, oid) {
 		return ErrGitMutationLease
 	}
 	return l.store.write(ctx, func(conn *sql.Conn) error {
@@ -450,8 +465,7 @@ func (s *Store) ActiveGitMutationLeases(ctx context.Context, channel domain.Chan
 	if err != nil {
 		return nil, normalizeBusy(ctx, err)
 	}
-	defer rows.Close()
-	var out []GitMutationRecovery
+	var candidates []GitMutationRecovery
 	for rows.Next() {
 		var r GitMutationRecovery
 		var project, ticket string
@@ -459,9 +473,36 @@ func (s *Store) ActiveGitMutationLeases(ctx context.Context, channel domain.Chan
 			return nil, err
 		}
 		r.Claim.TicketRef = domain.TicketRef{Channel: channel, Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
-		out = append(out, r)
+		candidates = append(candidates, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, r := range candidates {
+		facts, err := s.GitMutationIntentFacts(ctx, r.Claim.SemanticKey)
+		prior := 0
+		if facts.PriorRemoteObserved {
+			prior = 1
+		}
+		if err != nil || facts.Claim != r.Claim || !validContractClaim(r.Claim) || !validGitMutationFacts(r.Claim.Operation, r.Claim.ExpectedBaseOID, r.Claim.ExpectedHeadOID, r.PreparedCommitOID, r.PreparedTreeOID, r.PriorRemoteObserved, r.PriorRemoteOID) || facts.PreparedCommitOID != r.PreparedCommitOID || facts.PreparedTreeOID != r.PreparedTreeOID || prior != r.PriorRemoteObserved || facts.PriorRemoteOID != r.PriorRemoteOID {
+			// A recovery reader must never silently skip an inconsistent lease:
+			// preserve the concrete repository exclusion for operator recovery.
+			_ = s.quarantineGitMutationLease(ctx, r)
+			return nil, ErrGitMutationLease
+		}
+	}
+	return candidates, nil
+}
+
+func (s *Store) quarantineGitMutationLease(ctx context.Context, lease GitMutationRecovery) error {
+	return s.write(ctx, func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET state='quarantined',launch_state='quarantined' WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active'`, lease.Claim.Repository, lease.Claim.SemanticKey, lease.Nonce)
+		return err
+	})
 }
 
 // GitMutationIntentFacts loads the exact immutable recovery facts by semantic
@@ -490,21 +531,10 @@ func (s *Store) GitMutationIntentFacts(ctx context.Context, semanticKey string) 
 	if !validGitIntent(intent) || !validContractClaim(out.Claim) || effectChannel != string(out.Claim.TicketRef.Channel) || effectProject != string(out.Claim.TicketRef.Project) || effectTicket != string(out.Claim.TicketRef.Ticket) || effectKind != "git/"+out.Claim.Operation || (effectState != string(EffectExecuting) && effectState != string(EffectUncertain)) || effectRequest != out.Claim.RequestDigest || effectVersion != out.Claim.TicketVersion || effectLeader != out.Claim.LeaderEpoch || effectRunner != out.Claim.RunnerEpoch || effectClaim != out.Claim.ClaimEpoch {
 		return GitMutationIntentFacts{}, ErrGitMutationIntent
 	}
-	switch out.Claim.Operation {
-	case "commit":
-		if (out.PreparedCommitOID == "") != (out.PreparedTreeOID == "") || (out.PreparedCommitOID != "" && (!validStoreOID(out.PreparedCommitOID) || !validStoreOID(out.PreparedTreeOID))) || prior != 0 || out.PriorRemoteOID != "" {
-			return GitMutationIntentFacts{}, ErrGitMutationIntent
-		}
-	case "push":
-		if out.PreparedCommitOID != "" || out.PreparedTreeOID != "" || (prior != 0 && prior != 1) || (out.PriorRemoteOID != "" && !validStoreOID(out.PriorRemoteOID)) || (prior == 0 && out.PriorRemoteOID != "") {
-			return GitMutationIntentFacts{}, ErrGitMutationIntent
-		}
-		out.PriorRemoteObserved = prior == 1
-	default:
-		if out.PreparedCommitOID != "" || out.PreparedTreeOID != "" || prior != 0 || out.PriorRemoteOID != "" {
-			return GitMutationIntentFacts{}, ErrGitMutationIntent
-		}
+	if !validGitMutationFacts(out.Claim.Operation, out.Claim.ExpectedBaseOID, out.Claim.ExpectedHeadOID, out.PreparedCommitOID, out.PreparedTreeOID, prior, out.PriorRemoteOID) {
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
 	}
+	out.PriorRemoteObserved = prior == 1
 	return out, nil
 }
 
@@ -550,9 +580,30 @@ func (s *Store) RecoverGitMutationLeases(ctx context.Context, channel domain.Cha
 }
 
 func validContractClaim(c contracts.GitMutationClaim) bool {
-	return c.TicketRef.Validate() == nil && c.SemanticKey != "" && validClaimDigest(c.RequestDigest) && c.TicketVersion != 0 && c.LeaderEpoch != 0 && c.RunnerEpoch != 0 && c.ClaimEpoch != 0 && validStorePath(c.Repository) && validStorePath(c.Worktree) && c.Branch != "" && validGitOperation(c.Operation) && c.BaseRef != "" && validStoreOID(c.ExpectedBaseOID) && (c.ExpectedHeadOID == "" || validStoreOID(c.ExpectedHeadOID))
+	if c.ClaimEpoch == 0 {
+		return false
+	}
+	intent := GitMutationIntent{EffectFence: EffectFence{SemanticKey: c.SemanticKey, Ref: c.TicketRef, TicketVersion: c.TicketVersion, Fence: domain.Fence{LeaderEpoch: c.LeaderEpoch, RunnerEpoch: c.RunnerEpoch}}, RequestDigest: c.RequestDigest, Repository: c.Repository, Worktree: c.Worktree, Branch: c.Branch, Operation: c.Operation, BaseRef: c.BaseRef, ExpectedBaseOID: c.ExpectedBaseOID, ExpectedHeadOID: c.ExpectedHeadOID}
+	return validGitIntent(intent)
+}
+
+func validGitMutationFacts(operation, base, expectedHead, preparedCommit, preparedTree string, priorObserved int, priorOID string) bool {
+	if !validGitOIDWidth(base, expectedHead) {
+		return false
+	}
+	switch operation {
+	case "commit":
+		return priorObserved == 0 && priorOID == "" && ((preparedCommit == "" && preparedTree == "") || validGitOIDWidth(base, preparedCommit, preparedTree))
+	case "push":
+		return preparedCommit == "" && preparedTree == "" && (priorObserved == 0 && priorOID == "" || priorObserved == 1 && validGitOIDWidth(base, priorOID))
+	default:
+		return preparedCommit == "" && preparedTree == "" && priorObserved == 0 && priorOID == ""
+	}
 }
 func (s *Store) assertGitIntentCurrent(ctx context.Context, conn *sql.Conn, c contracts.GitMutationClaim) error {
+	if !validContractClaim(c) {
+		return ErrGitMutationIntent
+	}
 	if err := s.assertTicketFence(ctx, conn, c.TicketRef, c.TicketVersion, domain.Fence{LeaderEpoch: c.LeaderEpoch, RunnerEpoch: c.RunnerEpoch}); err != nil {
 		return err
 	}

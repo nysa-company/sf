@@ -252,6 +252,65 @@ func TestObserveRemoteBranchRejectsUnboundBranchAndOrigin(t *testing.T) {
 	}
 }
 
+func TestObserveRemoteBranchRejectsOriginDriftDuringRemoteRead(t *testing.T) {
+	ctx, realRunner, worktree, _ := observerWorktree(t)
+	config, err := realRunner.command(ctx, worktree.Path, "config", "--null", "--list", "--show-origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	configKeys, err := realRunner.command(ctx, worktree.Path, "config", "--null", "--name-only", "--list", "--show-origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oid := strings.Repeat("a", 40)
+	originReads := 0
+	runner := Runner{Home: filepath.Join(t.TempDir(), "git-home"), ExecHelper: testExecHelper, TestLocalTransport: true}
+	runner.Run = func(_ context.Context, _ string, argv, _ []string) ([]byte, error) {
+		suffix := func(want ...string) bool {
+			if len(argv) < len(want) {
+				return false
+			}
+			for i := range want {
+				if argv[len(argv)-len(want)+i] != want[i] {
+					return false
+				}
+			}
+			return true
+		}
+		switch {
+		case suffix("rev-parse", "--show-toplevel"):
+			return []byte(worktree.Path + "\n"), nil
+		case suffix("rev-parse", "--path-format=absolute", "--git-common-dir"):
+			return []byte(worktree.Identity.CommonDir + "\n"), nil
+		case suffix("remote", "get-url", "origin"):
+			originReads++
+			if originReads > 1 {
+				return []byte("https://github.com/other/repository.git\n"), nil
+			}
+			return []byte(worktree.Identity.Origin + "\n"), nil
+		case suffix("remote", "get-url", "--all", "--push", "origin"):
+			return []byte(worktree.Identity.PushOrigin + "\n"), nil
+		case suffix("rev-parse", "--verify", worktree.Identity.BaseRef+"^{commit}"):
+			return []byte(worktree.Identity.BaseHead + "\n"), nil
+		case suffix("symbolic-ref", "--quiet", "--short", "HEAD"):
+			return []byte(worktree.Branch + "\n"), nil
+		case suffix("config", "--null", "--list", "--show-origin"):
+			return config, nil
+		case suffix("config", "--null", "--name-only", "--list", "--show-origin"):
+			return configKeys, nil
+		case suffix("submodule", "status", "--recursive"), suffix("for-each-ref", "--format=%(refname)", "refs/replace"):
+			return nil, nil
+		case suffix("ls-remote", "--heads", worktree.Identity.Origin, "refs/heads/"+worktree.Branch):
+			return []byte(oid + "\trefs/heads/" + worktree.Branch + "\n"), nil
+		default:
+			return nil, fmt.Errorf("unexpected injected git argv: %v", argv)
+		}
+	}
+	if _, err := runner.ObserveRemoteBranch(ctx, worktree, worktree.Identity.Origin, worktree.Branch); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("origin drift during remote read accepted: %v", err)
+	}
+}
+
 func TestSafeOriginRejectsCredentialBearingSSHOrigin(t *testing.T) {
 	_, err := safeOrigin("ssh://git:secret@ssh.github.com:443/owner/repository.git")
 	if !errors.Is(err, ErrIdentityMismatch) {

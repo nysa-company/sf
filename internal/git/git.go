@@ -2369,10 +2369,14 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 		}
 		return "", fmt.Errorf("%w: remote base moved", ErrUnexpectedRemote)
 	}
-	remote, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, transportEnv)
+	// Use the strict observer for the candidate ref. Unlike the generic remote
+	// helper, it rejects whitespace/duplicate ls-remote output and rechecks the
+	// complete worktree + configured-origin identity after the remote command.
+	remoteObservation, err := r.ObserveRemoteBranch(ctx, worktree, worktree.Identity.PushOrigin, worktree.Branch)
 	if err != nil {
 		return "", err
 	}
+	remote := remoteObservation.OID
 	if remote == request.ExpectedHead {
 		return request.ExpectedHead, nil
 	}
@@ -2399,8 +2403,8 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 		if _, proveErr := r.provePushHead(ctx, worktree, request.ExpectedHead); proveErr != nil {
 			return "", err
 		}
-		observed, observeErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, transportEnv)
-		if observeErr == nil && observed == request.ExpectedHead {
+		observed, observeErr := r.ObserveRemoteBranch(ctx, worktree, worktree.Identity.PushOrigin, worktree.Branch)
+		if observeErr == nil && observed.OID == request.ExpectedHead {
 			baseAfter, baseErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
 			if baseErr != nil {
 				return "", baseErr
@@ -2412,11 +2416,11 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 		}
 		return "", err
 	}
-	observed, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.PushOrigin, worktree.Branch, transportEnv)
+	observed, err := r.ObserveRemoteBranch(ctx, worktree, worktree.Identity.PushOrigin, worktree.Branch)
 	if err != nil {
 		return "", err
 	}
-	if observed != request.ExpectedHead {
+	if observed.OID != request.ExpectedHead {
 		return "", fmt.Errorf("%w: push did not converge", ErrUnexpectedRemote)
 	}
 	// Git's ordinary candidate-ref push cannot atomically compare-and-swap a
