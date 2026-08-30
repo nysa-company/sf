@@ -379,6 +379,9 @@ func TestRecoverMergeIntentUsesCurrentUncertainFence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := database.db.ExecContext(ctx, `UPDATE tickets SET state='merging' WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
 	base := EffectFence{SemanticKey: "merge/recovery", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
 	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: base.SemanticKey, Ref: ref, Kind: "merge", TicketVersion: base.TicketVersion, Fence: base.Fence, RequestDigest: "merge-digest"}); err != nil {
 		t.Fatal(err)
@@ -461,6 +464,9 @@ func TestRecoverMergeIntentRejectsStaleTamperedAndRacedFence(t *testing.T) {
 	}
 	leader, _ := database.AcquireLeader(ctx, domain.ChannelDev, "daemon")
 	started, _ := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-merge-stale/merge", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if _, err := database.db.ExecContext(ctx, `UPDATE tickets SET state='merging' WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
 	base := EffectFence{SemanticKey: "merge/stale", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
 	_, _ = database.PlanEffect(ctx, EffectPlan{SemanticKey: base.SemanticKey, Ref: ref, Kind: "merge", TicketVersion: base.TicketVersion, Fence: base.Fence, RequestDigest: "digest"})
 	claim, _ := database.ClaimEffect(ctx, base)
@@ -505,6 +511,72 @@ func TestRecoverMergeIntentRejectsStaleTamperedAndRacedFence(t *testing.T) {
 	})
 	if _, err := database.RecoverMergeIntent(ctx, intent.SemanticKey, observer); !errors.Is(err, ErrStaleFence) || !called {
 		t.Fatalf("raced recovery err=%v called=%v", err, called)
+	}
+}
+
+func TestRecoverMergeIntentRejectsRunnerInvalidatingControlTransition(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-merge-control"}
+	if err := database.CreateTicket(ctx, ticket(ref, "merge-control")); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-launch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-merge-control/merge", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.ExecContext(ctx, `UPDATE tickets SET state='merging' WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	base := EffectFence{SemanticKey: "merge/control", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
+	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: base.SemanticKey, Ref: ref, Kind: "merge", TicketVersion: base.TicketVersion, Fence: base.Fence, RequestDigest: "merge-control-digest"}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := database.ClaimEffect(ctx, base)
+	if err != nil || !claim.Claimed {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	intent := domain.MergeIntent{Ref: ref, SemanticKey: claim.Effect.SemanticKey, RequestDigest: claim.Effect.RequestDigest, TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 9, HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "rule-main", StrictStatusChecks: true, AdminEnforced: true, Method: "squash"}
+	if err := database.RecordMergeIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	recoveryLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ReconcileEffects(ctx, domain.ChannelDev, recoveryLeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := simulateFenceRecoveredRunner(ctx, database, ref); err != nil {
+		t.Fatal(err)
+	}
+	current, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.TransitionAndInvalidateRunner(ctx, Transition{Ref: ref, ExpectedVersion: current.Version, From: domain.StateMerging, To: domain.StateStopping, ResumeState: domain.StateMerging, Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: recoveryLeader, RunnerEpoch: current.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	nextLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-after-control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ReconcileEffects(ctx, domain.ChannelDev, nextLeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := simulateFenceRecoveredRunner(ctx, database, ref); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	observer := mergeIntentObserverFunc(func(context.Context, domain.MergeIntent) (string, error) {
+		called = true
+		return "unexpected", nil
+	})
+	if _, err := database.RecoverMergeIntent(ctx, intent.SemanticKey, observer); !errors.Is(err, ErrStaleFence) || called {
+		t.Fatalf("control-invalidated recovery err=%v observer_called=%v", err, called)
 	}
 }
 

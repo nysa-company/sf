@@ -52,10 +52,18 @@ func (s *Store) recoverySnapshot(ctx context.Context, intent domain.MergeIntent)
 	if err := recoveryLinked(intent, prior); err != nil {
 		return mergeRecoverySnapshot{}, err
 	}
+	var state domain.State
 	var version, runner, leader uint64
-	err = s.db.QueryRowContext(ctx, `SELECT t.version, t.runner_epoch, d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&version, &runner, &leader)
+	err = s.db.QueryRowContext(ctx, `SELECT t.state, t.version, t.runner_epoch, d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&state, &version, &runner, &leader)
 	if err != nil {
 		return mergeRecoverySnapshot{}, normalizeBusy(ctx, err)
+	}
+	// Equal version/runner advances are not unique to startup fencing: pause,
+	// take, and cancel also invalidate the runner while moving the ticket into a
+	// control state. A merge witness is recoverable only while its normative
+	// owner is still exactly the merging state.
+	if state != domain.StateMerging {
+		return mergeRecoverySnapshot{}, ErrStaleFence
 	}
 	live := EffectFence{SemanticKey: prior.SemanticKey, Ref: prior.Ref, TicketVersion: version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: runner, ClaimEpoch: prior.ClaimEpoch}}
 	if prior.State == EffectConfirmed {
@@ -116,11 +124,12 @@ func (s *Store) confirmRecoveredMerge(ctx context.Context, intent domain.MergeIn
 		if current.State != EffectUncertain || current != snapshot.prior {
 			return ErrStaleFence
 		}
+		var state domain.State
 		var version, runner uint64
-		if err := conn.QueryRowContext(ctx, `SELECT version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&version, &runner); err != nil {
+		if err := conn.QueryRowContext(ctx, `SELECT state, version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&state, &version, &runner); err != nil {
 			return err
 		}
-		if version != snapshot.live.TicketVersion || runner != snapshot.live.Fence.RunnerEpoch || !equalRecoveryAdvance(current.TicketVersion, current.RunnerEpoch, version, runner) {
+		if state != domain.StateMerging || version != snapshot.live.TicketVersion || runner != snapshot.live.Fence.RunnerEpoch || !equalRecoveryAdvance(current.TicketVersion, current.RunnerEpoch, version, runner) {
 			return ErrStaleFence
 		}
 		if err := s.currentFence(ctx, conn, intent.Ref.Channel, version, runner, snapshot.live.Fence); err != nil {
