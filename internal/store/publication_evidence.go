@@ -397,6 +397,9 @@ func (s *Store) RebindPublishedCandidate(ctx context.Context, ref domain.TicketR
 					return ErrPublicationEvidence
 				}
 			}
+			if err := authenticateRunnerRecoveryStep(ctx, conn, ref, priorVersion, priorFence, currentVersion, existing.Fence); err != nil {
+				return err
+			}
 			expected := PublicationRebind{Ref: ref, CandidateGeneration: row.Candidate.Snapshot.Generation, CandidateHeadOID: row.Candidate.Snapshot.HeadSHA, PriorWitnessDigest: priorDigest, PriorTicketVersion: priorVersion, PriorFence: priorFence, TicketVersion: existing.TicketVersion, Fence: existing.Fence}
 			payload, err := publicationRebindPayload(expected)
 			if err != nil || existing.PriorWitnessDigest != expected.PriorWitnessDigest || existing.PriorTicketVersion != expected.PriorTicketVersion || existing.PriorFence != expected.PriorFence || existing.RebindDigest != publicationIdentityDigest(payload) || existing.Fence != currentFence {
@@ -423,6 +426,9 @@ func (s *Store) RebindPublishedCandidate(ctx context.Context, ref domain.TicketR
 		}
 		if state != string(domain.StatePublishing) || version != currentVersion || runner != currentFence.RunnerEpoch || leader != currentFence.LeaderEpoch || currentVersion != priorVersion+1 || currentFence.RunnerEpoch != priorFence.RunnerEpoch+1 {
 			return ErrStaleFence
+		}
+		if err := authenticateRunnerRecoveryStep(ctx, conn, ref, priorVersion, priorFence, currentVersion, currentFence); err != nil {
+			return err
 		}
 		candidateHead := row.Candidate.Snapshot.HeadSHA
 		value := PublicationRebind{Ref: ref, CandidateGeneration: row.Candidate.Snapshot.Generation, CandidateHeadOID: candidateHead, PriorWitnessDigest: priorDigest, PriorTicketVersion: priorVersion, PriorFence: priorFence, TicketVersion: currentVersion, Fence: currentFence}
@@ -544,8 +550,14 @@ func loadLatestPublicationRebind(ctx context.Context, q interface {
 		if err != nil || publicationIdentityDigest(payload) != rebind.RebindDigest || rebind.PriorWitnessDigest != priorDigest || rebind.PriorTicketVersion != priorVersion || rebind.PriorFence != priorFence || rebind.TicketVersion != priorVersion+1 || rebind.Fence.RunnerEpoch != priorFence.RunnerEpoch+1 || rebind.Fence.LeaderEpoch == 0 || rebind.Fence.ClaimEpoch != 0 || priorFence.ClaimEpoch != 0 {
 			return ErrPublicationEvidence
 		}
+		if err := authenticateRunnerRecoveryStep(ctx, q, value.Ref, priorVersion, priorFence, rebind.TicketVersion, rebind.Fence); err != nil {
+			return err
+		}
 		var eventCount int
 		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='publication_rebind' AND from_state='publishing' AND to_state='publishing' AND payload=?`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, rebind.TicketVersion, string(payload)).Scan(&eventCount); err != nil || eventCount != 1 {
+			return ErrPublicationEvidence
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND NOT (trigger='publication_rebind' AND from_state='publishing' AND to_state='publishing')`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, rebind.TicketVersion).Scan(&eventCount); err != nil || eventCount != 0 {
 			return ErrPublicationEvidence
 		}
 		priorVersion, priorFence, priorDigest, found = rebind.TicketVersion, rebind.Fence, rebind.RebindDigest, true
@@ -635,14 +647,15 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 		if ticket.Version < waitingVersion || ticket.RunnerEpoch < value.CurrentFence.RunnerEpoch || ticket.Version-waitingVersion != ticket.RunnerEpoch-value.CurrentFence.RunnerEpoch {
 			return PublishedCandidateEvidence{}, ErrPublicationEvidence
 		}
-		var leader uint64
-		if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&leader); err != nil || (ticket.RunnerEpoch == value.CurrentFence.RunnerEpoch && leader != value.CurrentFence.LeaderEpoch) || (ticket.RunnerEpoch > value.CurrentFence.RunnerEpoch && leader <= value.CurrentFence.LeaderEpoch) {
-			return PublishedCandidateEvidence{}, ErrPublicationEvidence
-		}
 	}
 	var leader uint64
 	if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&leader); err != nil || (!waitingReplay && leader != value.CurrentFence.LeaderEpoch) {
 		return PublishedCandidateEvidence{}, ErrStaleFence
+	}
+	if waitingReplay {
+		if err := validateWaitingRecoveryLedger(ctx, s.db, ref, waitingVersion, value.CurrentFence.RunnerEpoch, value.CurrentFence.LeaderEpoch, ticket.Version, ticket.RunnerEpoch, leader); err != nil {
+			return PublishedCandidateEvidence{}, err
+		}
 	}
 	candidate, err := s.LatestCandidate(ctx, ref)
 	if err != nil || !publicationCandidateEqual(candidate, value.Candidate) {

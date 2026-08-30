@@ -39,12 +39,75 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 		if current != leaderEpoch {
 			return ErrStaleFence
 		}
-		result, err := conn.ExecContext(ctx, `UPDATE tickets SET runner_epoch=runner_epoch+1, version=version+1
-			WHERE channel=? AND state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling')`, channel)
+		rows, err := conn.QueryContext(ctx, `SELECT project_id,id,version,runner_epoch FROM tickets WHERE channel=? AND state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling') ORDER BY project_id,id`, channel)
 		if err != nil {
 			return err
 		}
-		changed, _ = result.RowsAffected()
+		type activeTicket struct {
+			project domain.ProjectID
+			id      domain.TicketID
+			version uint64
+			runner  uint64
+		}
+		var active []activeTicket
+		for rows.Next() {
+			var ticket activeTicket
+			if err := rows.Scan(&ticket.project, &ticket.id, &ticket.version, &ticket.runner); err != nil {
+				rows.Close()
+				return err
+			}
+			active = append(active, ticket)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		for _, ticket := range active {
+			ref := domain.TicketRef{Channel: channel, Project: ticket.project, Ticket: ticket.id}
+			latest, found, err := loadLatestRunnerRecovery(ctx, conn, ref)
+			if err != nil {
+				return err
+			}
+			if found {
+				if !validRunnerRecovery(latest) {
+					return ErrPublicationEvidence
+				}
+				if latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner && latest.LeaderEpoch == leaderEpoch {
+					continue // lost-response replay under the same leader
+				}
+				// A control invalidation may advance the ticket without writing a
+				// recovery row. It must not strand startup fencing; publication
+				// consumers will reject the resulting non-contiguous lineage.
+				if latest.TicketVersion > ticket.version || latest.RunnerEpoch > ticket.runner || leaderEpoch <= latest.LeaderEpoch {
+					return ErrStaleFence
+				}
+			}
+			priorLeader := uint64(0)
+			if found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
+				priorLeader = latest.LeaderEpoch
+			} else if found && latest.TicketVersion+1 == ticket.version && latest.RunnerEpoch+1 == ticket.runner {
+				priorLeader = latest.LeaderEpoch
+			} else if publication, ok, err := s.publicationRecoveryBaseline(ctx, conn, ref, ticket.version, ticket.runner); err != nil {
+				return err
+			} else if ok {
+				priorLeader = publication
+			}
+			result, err := conn.ExecContext(ctx, `UPDATE tickets SET runner_epoch=runner_epoch+1, version=version+1 WHERE channel=? AND project_id=? AND id=? AND version=? AND runner_epoch=? AND state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling')`, channel, ticket.project, ticket.id, ticket.version, ticket.runner)
+			if err != nil {
+				return err
+			}
+			updated, _ := result.RowsAffected()
+			if updated != 1 {
+				return ErrStaleFence
+			}
+			step := RunnerRecoveryLedger{Ref: ref, PriorTicketVersion: ticket.version, PriorRunnerEpoch: ticket.runner, PriorLeaderEpoch: priorLeader, TicketVersion: ticket.version + 1, RunnerEpoch: ticket.runner + 1, LeaderEpoch: leaderEpoch, CreatedAt: time.Now().UTC()}
+			step.RecoveryDigest = runnerRecoveryDigest(step)
+			if err := recordRunnerRecovery(ctx, conn, step); err != nil {
+				return err
+			}
+			changed++
+		}
 		return nil
 	})
 	return changed, err

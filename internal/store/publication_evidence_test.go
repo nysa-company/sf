@@ -309,6 +309,14 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		t.Fatalf("backup publication load=%v", err)
 	}
 	copyDB.Close()
+	controlGapDir := t.TempDir()
+	if err := os.Chmod(controlGapDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	controlGapPath := controlGapDir + "/publication-control-gap.sqlite"
+	if err := db.Backup(ctx, controlGapPath); err != nil {
+		t.Fatal(err)
+	}
 	capMutant, err := Open(ctx, backup)
 	if err != nil {
 		t.Fatal(err)
@@ -340,12 +348,58 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		t.Fatal("unrebound live publishing ticket was accepted after cap rejection")
 	}
 	capMutant.Close()
+	controlGap, err := Open(ctx, controlGapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gapTicket, _ := controlGap.Ticket(ctx, ticket.Ref)
+	var gapDBLeader uint64
+	if err := controlGap.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ticket.Ref.Channel).Scan(&gapDBLeader); err != nil {
+		controlGap.Close()
+		t.Fatal(err)
+	}
+	if _, err := controlGap.InvalidateRunner(ctx, ticket.Ref, gapTicket.Version, domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: gapTicket.RunnerEpoch}); err != nil {
+		controlGap.Close()
+		t.Fatalf("invalidation leader=%d dbLeader=%d ticketVersion=%d runner=%d: %v", newLeader, gapDBLeader, gapTicket.Version, gapTicket.RunnerEpoch, err)
+	}
+	gapLeader, err := controlGap.AcquireLeader(ctx, domain.ChannelDev, "publication-control-gap-recovery")
+	if err != nil {
+		controlGap.Close()
+		t.Fatal(err)
+	}
+	if _, err := controlGap.FenceRecoveredRunners(ctx, domain.ChannelDev, gapLeader); err != nil {
+		controlGap.Close()
+		t.Fatalf("publishing fencing after control invalidation=%v", err)
+	}
+	gapTicket, _ = controlGap.Ticket(ctx, ticket.Ref)
+	if err := controlGap.RebindPublishedCandidate(ctx, ticket.Ref, gapTicket.Version, domain.Fence{LeaderEpoch: gapLeader, RunnerEpoch: gapTicket.RunnerEpoch}); err == nil {
+		controlGap.Close()
+		t.Fatal("publishing rebind accepted an InvalidateRunner gap")
+	}
+	controlGap.Close()
 	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}, EventPayload: "{}"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
 		t.Fatalf("waiting_ci replay=%v", err)
 	}
+	waitingBaseDir := t.TempDir()
+	if err := os.Chmod(waitingBaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	waitingBase := waitingBaseDir + "/waiting-base.sqlite"
+	if err := db.Backup(ctx, waitingBase); err != nil {
+		t.Fatal(err)
+	}
+	selfBaseDir := t.TempDir()
+	if err := os.Chmod(selfBaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	selfBase := selfBaseDir + "/waiting-self.sqlite"
+	if err := db.Backup(ctx, selfBase); err != nil {
+		t.Fatal(err)
+	}
+	waitingBaseLeader := newLeader
 	for recovery := 1; recovery <= 2; recovery++ {
 		newLeader, err = db.AcquireLeader(ctx, domain.ChannelDev, fmt.Sprintf("waiting-recovery-%d", recovery))
 		if err != nil {
@@ -358,7 +412,150 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 			t.Fatalf("waiting_ci recovery %d=%v", recovery, err)
 		}
 	}
+	// A direct runner invalidation has no recovery-ledger proof. Startup
+	// fencing remains available after that control gap, but publication replay
+	// must fail closed rather than treating the counters as recovery evidence.
+	invalidated, err := Open(ctx, waitingBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidTicket, _ := invalidated.Ticket(ctx, ticket.Ref)
+	if _, err := invalidated.InvalidateRunner(ctx, ticket.Ref, invalidTicket.Version, domain.Fence{LeaderEpoch: waitingBaseLeader, RunnerEpoch: invalidTicket.RunnerEpoch}); err != nil {
+		invalidated.Close()
+		t.Fatal(err)
+	}
+	invalidLeader, err := invalidated.AcquireLeader(ctx, domain.ChannelDev, "waiting-invalidation-recovery")
+	if err != nil {
+		invalidated.Close()
+		t.Fatal(err)
+	}
+	if _, err := invalidated.FenceRecoveredRunners(ctx, domain.ChannelDev, invalidLeader); err != nil {
+		invalidated.Close()
+		t.Fatalf("fencing after control invalidation=%v", err)
+	}
+	if _, err := invalidated.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
+		invalidated.Close()
+		t.Fatal("waiting replay accepted a direct invalidation gap")
+	}
+	invalidated.Close()
+	selfTransition, err := Open(ctx, selfBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selfTicket, _ := selfTransition.Ticket(ctx, ticket.Ref)
+	if _, err := selfTransition.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: selfTicket.Version, From: domain.StateWaitingCI, To: domain.StateWaitingCI, Trigger: "recovery_self_transition", Fence: domain.Fence{LeaderEpoch: waitingBaseLeader, RunnerEpoch: selfTicket.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+		selfTransition.Close()
+		t.Fatal(err)
+	}
+	selfLeader, err := selfTransition.AcquireLeader(ctx, domain.ChannelDev, "waiting-self-transition-recovery")
+	if err != nil {
+		selfTransition.Close()
+		t.Fatal(err)
+	}
+	if _, err := selfTransition.FenceRecoveredRunners(ctx, domain.ChannelDev, selfLeader); err != nil {
+		selfTransition.Close()
+		t.Fatalf("fencing after self transition=%v", err)
+	}
+	if _, err := selfTransition.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
+		selfTransition.Close()
+		t.Fatal("waiting replay accepted a self-transition gap")
+	}
+	selfTransition.Close()
+	// Every recovery row is immutable and part of the exact waiting chain.
+	// Mutating, deleting, or relocating one row therefore invalidates replay.
 	waitingVersion := publicationLatestVersion + 1
+	var firstRecoveryVersion, latestRecoveryVersion uint64
+	if err := db.db.QueryRowContext(ctx, `SELECT MIN(ticket_version),MAX(ticket_version) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, waitingVersion).Scan(&firstRecoveryVersion, &latestRecoveryVersion); err != nil || firstRecoveryVersion == 0 || latestRecoveryVersion == 0 {
+		t.Fatalf("recovery ledger bounds first=%d latest=%d err=%v", firstRecoveryVersion, latestRecoveryVersion, err)
+	}
+	ledgerTamper := map[string]struct {
+		statement string
+		trigger   string
+		version   uint64
+	}{
+		"ledger-latest-digest": {statement: `UPDATE runner_recovery_ledger SET recovery_digest='sha256:` + strings.Repeat("f", 64) + `' WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, trigger: "update", version: latestRecoveryVersion},
+		"ledger-latest-leader": {statement: `UPDATE runner_recovery_ledger SET leader_epoch=leader_epoch+1 WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, trigger: "update", version: latestRecoveryVersion},
+		"ledger-middle-delete": {statement: `DELETE FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, trigger: "delete", version: firstRecoveryVersion},
+	}
+	for name, tamper := range ledgerTamper {
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := dir + "/" + name + ".sqlite"
+		if err := db.Backup(ctx, path); err != nil {
+			t.Fatal(err)
+		}
+		mutant, err := Open(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mutant.db.ExecContext(ctx, `DROP TRIGGER runner_recovery_ledger_immutable_`+tamper.trigger); err != nil {
+			mutant.Close()
+			t.Fatal(err)
+		}
+		result, err := mutant.db.ExecContext(ctx, tamper.statement, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, tamper.version)
+		if err != nil {
+			mutant.Close()
+			t.Fatal(err)
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			mutant.Close()
+			t.Fatalf("tampered %s affected=%d err=%v", name, changed, err)
+		}
+		if _, err := mutant.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
+			mutant.Close()
+			t.Fatalf("tampered %s ledger was accepted", name)
+		}
+		mutant.Close()
+	}
+	duplicateDir := t.TempDir()
+	if err := os.Chmod(duplicateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	duplicatePath := duplicateDir + "/duplicate.sqlite"
+	if err := db.Backup(ctx, duplicatePath); err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := Open(ctx, duplicatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var duplicateInsertErr error
+	_, duplicateInsertErr = duplicate.db.ExecContext(ctx, `INSERT INTO runner_recovery_ledger SELECT channel,project_id,ticket_id,prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket)
+	if duplicateInsertErr == nil {
+		duplicate.Close()
+		t.Fatal("duplicate recovery ledger row was accepted")
+	}
+	duplicate.Close()
+	wrongDir := t.TempDir()
+	if err := os.Chmod(wrongDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wrongPath := wrongDir + "/wrong-predecessor.sqlite"
+	if err := db.Backup(ctx, wrongPath); err != nil {
+		t.Fatal(err)
+	}
+	wrong, err := Open(ctx, wrongPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, found, err := loadLatestRunnerRecovery(ctx, wrong.db, ticket.Ref)
+	if err != nil || !found {
+		wrong.Close()
+		t.Fatalf("latest recovery row found=%v err=%v", found, err)
+	}
+	wrongStep := RunnerRecoveryLedger{Ref: ticket.Ref, PriorTicketVersion: latest.TicketVersion + 5, PriorRunnerEpoch: latest.RunnerEpoch + 5, PriorLeaderEpoch: latest.LeaderEpoch, TicketVersion: latest.TicketVersion + 6, RunnerEpoch: latest.RunnerEpoch + 6, LeaderEpoch: latest.LeaderEpoch + 1, CreatedAt: time.Now().UTC()}
+	wrongStep.RecoveryDigest = runnerRecoveryDigest(wrongStep)
+	if _, err := wrong.db.ExecContext(ctx, `INSERT INTO runner_recovery_ledger(channel,project_id,ticket_id,prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, wrongStep.PriorTicketVersion, wrongStep.PriorRunnerEpoch, wrongStep.PriorLeaderEpoch, wrongStep.TicketVersion, wrongStep.RunnerEpoch, wrongStep.LeaderEpoch, wrongStep.RecoveryDigest, wrongStep.CreatedAt.Format(time.RFC3339Nano)); err != nil {
+		wrong.Close()
+		t.Fatal(err)
+	}
+	if _, err := wrong.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
+		wrong.Close()
+		t.Fatal("wrong-predecessor recovery row was accepted")
+	}
+	wrong.Close()
 	for name, statement := range map[string]string{
 		"waiting-wrong-transition":   fmt.Sprintf(`UPDATE events SET trigger='wrong_transition' WHERE channel='%s' AND project_id='%s' AND ticket_id='%s' AND ticket_version=%d AND trigger='effects_confirmed'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, waitingVersion),
 		"waiting-missing-transition": fmt.Sprintf(`DELETE FROM events WHERE channel='%s' AND project_id='%s' AND ticket_id='%s' AND ticket_version=%d AND trigger='effects_confirmed'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, waitingVersion),
@@ -399,7 +596,7 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := historical.db.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, publicationLatestVersion, "effects_confirmed", "publishing", "waiting_ci", "{}", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := historical.db.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, loaded.TicketVersion, "effects_confirmed", "publishing", "waiting_ci", "{}", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		historical.Close()
 		t.Fatal(err)
 	}

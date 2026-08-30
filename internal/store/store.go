@@ -57,7 +57,7 @@ var (
 	ErrPublicationEvidence     = errors.New("publication evidence is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 37
+const schemaVersion = 38
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -97,6 +97,7 @@ var migrationChecksums = map[int]string{
 	35: migrationChecksum(migrationV35),
 	36: migrationChecksum(migrationV36),
 	37: migrationChecksum(migrationV37),
+	38: migrationChecksum(migrationV38),
 }
 
 func migrationChecksum(statements []string) string {
@@ -417,6 +418,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV36
 			} else if version == 37 {
 				statements = migrationV37
+			} else if version == 38 {
+				statements = migrationV38
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {

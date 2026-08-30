@@ -865,3 +865,25 @@ var migrationV37 = []string{
 	`UPDATE tickets SET state='blocked',resume_state=state,blocked_code='legacy_publication_evidence_unverifiable',version=version+1 WHERE state IN ('publishing','waiting_ci')`,
 	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,id,version,'typed_blocker',resume_state,'blocked','{"code":"legacy_publication_evidence_unverifiable","reason":"publication evidence predates the authenticated witness schema","next_action":"reconcile the external publication or start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tickets WHERE state='blocked' AND blocked_code='legacy_publication_evidence_unverifiable' AND resume_state IN ('publishing','waiting_ci')`,
 }
+
+// v38 records every durable runner fencing advance. Publication recovery and
+// waiting-ci replay consume these rows as the only proof of a +1/+1 recovery;
+// a changed ticket counter alone is never sufficient. Existing v37
+// publication rows are preserved only when their current state is an exact,
+// unadvanced publishing or baseline waiting-ci identity.
+var migrationV38 = []string{
+	`CREATE TABLE runner_recovery_ledger (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		prior_ticket_version INTEGER NOT NULL CHECK(prior_ticket_version > 0), prior_runner_epoch INTEGER NOT NULL CHECK(prior_runner_epoch > 0), prior_leader_epoch INTEGER NOT NULL CHECK(prior_leader_epoch >= 0),
+		ticket_version INTEGER NOT NULL CHECK(ticket_version=prior_ticket_version+1), runner_epoch INTEGER NOT NULL CHECK(runner_epoch=prior_runner_epoch+1), leader_epoch INTEGER NOT NULL CHECK(leader_epoch > 0),
+		recovery_digest TEXT NOT NULL CHECK(length(recovery_digest)=71), created_at TEXT NOT NULL,
+		PRIMARY KEY(channel,project_id,ticket_id,ticket_version),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+	`CREATE UNIQUE INDEX runner_recovery_ledger_digest ON runner_recovery_ledger(recovery_digest)`,
+	`CREATE INDEX runner_recovery_ledger_ticket ON runner_recovery_ledger(channel,project_id,ticket_id,ticket_version)`,
+	`CREATE TRIGGER runner_recovery_ledger_immutable_update BEFORE UPDATE ON runner_recovery_ledger BEGIN SELECT RAISE(ABORT,'runner recovery ledger is immutable'); END`,
+	`CREATE TRIGGER runner_recovery_ledger_immutable_delete BEFORE DELETE ON runner_recovery_ledger BEGIN SELECT RAISE(ABORT,'runner recovery ledger is append-only'); END`,
+	`UPDATE tickets SET state='blocked',resume_state=state,blocked_code='legacy_publication_recovery_unverifiable',version=version+1 WHERE EXISTS(SELECT 1 FROM publication_evidence p WHERE p.channel=tickets.channel AND p.project_id=tickets.project_id AND p.ticket_id=tickets.id) AND NOT EXISTS(SELECT 1 FROM publication_evidence p WHERE p.channel=tickets.channel AND p.project_id=tickets.project_id AND p.ticket_id=tickets.id AND p.candidate_generation=(SELECT MAX(latest.candidate_generation) FROM publication_evidence latest WHERE latest.channel=p.channel AND latest.project_id=p.project_id AND latest.ticket_id=p.ticket_id) AND (SELECT COUNT(*) FROM publication_evidence latest WHERE latest.channel=p.channel AND latest.project_id=p.project_id AND latest.ticket_id=p.ticket_id AND latest.candidate_generation=p.candidate_generation)=1 AND ((tickets.state='publishing' AND tickets.version=p.ticket_version AND tickets.runner_epoch=p.runner_epoch) OR (tickets.state='waiting_ci' AND tickets.version=p.ticket_version+1 AND tickets.runner_epoch=p.runner_epoch AND (SELECT COUNT(*) FROM events e WHERE e.channel=p.channel AND e.project_id=p.project_id AND e.ticket_id=p.ticket_id AND e.ticket_version=p.ticket_version+1 AND e.trigger='effects_confirmed' AND e.from_state='publishing' AND e.to_state='waiting_ci')=1 AND NOT EXISTS(SELECT 1 FROM events e WHERE e.channel=p.channel AND e.project_id=p.project_id AND e.ticket_id=p.ticket_id AND e.ticket_version=p.ticket_version+1 AND NOT(e.trigger='effects_confirmed' AND e.from_state='publishing' AND e.to_state='waiting_ci')))))`,
+	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,id,version,'typed_blocker',resume_state,'blocked','{"code":"legacy_publication_recovery_unverifiable","reason":"publication recovery advanced without an authenticated runner ledger","next_action":"start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tickets WHERE state='blocked' AND blocked_code='legacy_publication_recovery_unverifiable' AND resume_state IN ('publishing','waiting_ci')`,
+}

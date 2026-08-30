@@ -154,12 +154,157 @@ func TestPublicationV37FailsClosedForPopulatedLegacyPublish(t *testing.T) {
 			t.Fatalf("legacy publication %s blocker event count=%d err=%v", legacy.id, eventCount, err)
 		}
 	}
-	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v036-to-v037-*.sqlite"))
+	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v036-to-v038-*.sqlite"))
 	if err != nil || len(files) != 1 {
 		t.Fatalf("v36 populated backup files=%v err=%v", files, err)
 	}
 	if got := rawSchemaVersion(t, files[0]); got != 36 {
 		t.Fatalf("populated backup schema=%d want=36", got)
+	}
+}
+
+// A v37 database can contain a publication row without any v38 recovery
+// ledger. Migration preserves only the exact, unadvanced witness identities;
+// every advanced or ambiguous row receives a typed blocker and remains
+// recoverable through the pre-migration backup.
+func TestPublicationV37ToV38DispositionForPopulatedRows(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "v37.sqlite")
+	createDatabaseAtVersion(t, path, 37)
+	seedV37PublicationRows(t, path)
+	backups := filepath.Join(root, "backups")
+	if err := os.Mkdir(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := OpenChannel(ctx, path, backups, domain.ChannelStable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.validateSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct {
+		id, state, resume, code string
+		version                 int
+	}{
+		{id: "SF-v37-safe-publishing", state: "publishing", version: 9},
+		{id: "SF-v37-safe-waiting", state: "waiting_ci", version: 10},
+		{id: "SF-v37-unsafe-advanced", state: "blocked", resume: "publishing", code: "legacy_publication_recovery_unverifiable", version: 12},
+	} {
+		var state, resume, code string
+		var version int
+		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),COALESCE(blocked_code,''),version FROM tickets WHERE channel='stable' AND project_id='v37-disposition' AND id=?`, want.id).Scan(&state, &resume, &code, &version); err != nil {
+			t.Fatal(err)
+		}
+		if state != want.state || resume != want.resume || code != want.code || version != want.version {
+			t.Fatalf("%s disposition=%s/%s/%s/v%d want=%s/%s/%s/v%d", want.id, state, resume, code, version, want.state, want.resume, want.code, want.version)
+		}
+	}
+	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v037-to-v038-*.sqlite"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("v37 backup files=%v err=%v", files, err)
+	}
+	if got := rawSchemaVersion(t, files[0]); got != 37 {
+		t.Fatalf("v37 backup schema=%d", got)
+	}
+}
+
+// seedV37PublicationRows is deliberately a migration fixture, not a
+// production setup path. It discovers the v37 columns so the fixture remains
+// explicit about every NOT NULL field while avoiding a second production
+// serializer. Only the migration's state/version disposition is under test.
+func seedV37PublicationRows(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys=ON; INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('stable','v37-disposition','/v37-disposition','main'); INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES ('stable','v37-disposition','SF-v37-safe-publishing','source-publishing','feature','guarded','publishing',9,3,'v37-publishing'),('stable','v37-disposition','SF-v37-safe-waiting','source-waiting','feature','guarded','waiting_ci',10,3,'v37-waiting'),('stable','v37-disposition','SF-v37-unsafe-advanced','source-unsafe','feature','guarded','publishing',11,4,'v37-unsafe')`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(publication_evidence)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var columns []string
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		columns = append(columns, name)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	argsFor := func(ticket string, version, runner int) []any {
+		args := make([]any, len(columns))
+		marker := fmt.Sprintf("%x", sha256.Sum256([]byte(ticket)))
+		hex := marker[:40]
+		for i, column := range columns {
+			switch {
+			case column == "channel":
+				args[i] = "stable"
+			case column == "project_id":
+				args[i] = "v37-disposition"
+			case column == "ticket_id":
+				args[i] = ticket
+			case column == "ticket_version":
+				args[i] = version
+			case column == "runner_epoch":
+				args[i] = runner
+			case column == "leader_epoch":
+				args[i] = 1
+			case column == "candidate_generation", column == "candidate_ticket_version", column == "candidate_leader_epoch", column == "candidate_runner_epoch":
+				args[i] = 1
+			case strings.HasSuffix(column, "attempt_id"):
+				args[i] = 1
+			case strings.HasSuffix(column, "attempt"), strings.HasSuffix(column, "claim_epoch"), column == "github_pr_number":
+				args[i] = 1
+			case column == "github_draft", column == "github_factory_owned":
+				args[i] = 1
+			case column == "github_host":
+				args[i] = "github.com"
+			case column == "github_state":
+				args[i] = "OPEN"
+			case column == "github_observed_at", column == "created_at":
+				args[i] = time.Now().UTC().Format(time.RFC3339Nano)
+			case column == "worktree_identity_json":
+				args[i] = []byte(`{}`)
+			case strings.Contains(column, "sha") || strings.Contains(column, "oid"):
+				args[i] = hex
+			case strings.Contains(column, "digest"):
+				if column == "witness_digest" || column == "prior_witness_digest" || column == "rebind_digest" {
+					args[i] = "sha256:" + marker
+				} else {
+					args[i] = strings.Repeat("b", 64)
+				}
+			default:
+				args[i] = "v37"
+			}
+		}
+		return args
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(columns)), ",")
+	insert := fmt.Sprintf("INSERT INTO publication_evidence(%s) VALUES(%s)", strings.Join(columns, ","), placeholders)
+	for _, row := range []struct {
+		id   string
+		v, r int
+	}{{"SF-v37-safe-publishing", 9, 3}, {"SF-v37-safe-waiting", 9, 3}, {"SF-v37-unsafe-advanced", 9, 3}} {
+		args := argsFor(row.id, row.v, row.r)
+		if _, err := db.ExecContext(ctx, insert, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES('stable','v37-disposition','SF-v37-safe-waiting',10,'effects_confirmed','publishing','waiting_ci','{}',?)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -844,6 +989,8 @@ func testMigration(version int) []string {
 		return migrationV35
 	case 36:
 		return migrationV36
+	case 37:
+		return migrationV37
 	default:
 		return nil
 	}
