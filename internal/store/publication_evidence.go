@@ -437,6 +437,13 @@ func (s *Store) TransitionPublishedCandidate(ctx context.Context, transition Tra
 			return err
 		}
 		if state == domain.StateWaitingCI && version == transition.ExpectedVersion+1 {
+			if runner != value.CurrentFence.RunnerEpoch || transition.Fence != value.CurrentFence {
+				return ErrStaleFence
+			}
+			var leader uint64
+			if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, transition.Ref.Channel).Scan(&leader); err != nil || leader != transition.Fence.LeaderEpoch {
+				return ErrStaleFence
+			}
 			var eventID int64
 			var eventCreated, digest, witnessCreated string
 			err := conn.QueryRowContext(ctx, `SELECT e.id,e.created_at,p.witness_digest,p.witness_created_at FROM events e JOIN publication_transition_evidence p ON p.channel=e.channel AND p.project_id=e.project_id AND p.ticket_id=e.ticket_id AND p.ticket_version=e.ticket_version AND p.event_created_at=e.created_at WHERE e.channel=? AND e.project_id=? AND e.ticket_id=? AND e.ticket_version=? AND e.trigger='effects_confirmed' AND e.from_state='publishing' AND e.to_state='waiting_ci' AND e.payload=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version, payload).Scan(&eventID, &eventCreated, &digest, &witnessCreated)
@@ -481,30 +488,32 @@ func (s *Store) TransitionPublishedCandidate(ctx context.Context, transition Tra
 // RebindRecoveredPublishedCandidates is the production startup fence for the
 // publish boundary. It runs after FenceRecoveredRunners: every live
 // publishing ticket must append (or exactly replay) its recovery rebind and
-// then pass the full LoadPublishedCandidate authentication before the daemon
-// can continue it.
+// then pass the full LoadPublishedCandidate authentication; waiting_ci rows
+// must pass that same load before the daemon can continue either state.
 func (s *Store) RebindRecoveredPublishedCandidates(ctx context.Context, channel domain.Channel, leaderEpoch uint64) error {
 	if !channel.Valid() || leaderEpoch == 0 {
 		return ErrPublicationEvidence
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT project_id,id,version,runner_epoch FROM tickets WHERE channel=? AND state='publishing' ORDER BY project_id,id`, channel)
+	rows, err := s.db.QueryContext(ctx, `SELECT project_id,id,state,version,runner_epoch FROM tickets WHERE channel=? AND state IN ('publishing','waiting_ci') ORDER BY project_id,id`, channel)
 	if err != nil {
 		return err
 	}
 	type recovered struct {
 		ref             domain.TicketRef
+		state           domain.State
 		version, runner uint64
 	}
 	var pending []recovered
 	for rows.Next() {
 		var project domain.ProjectID
 		var ticket domain.TicketID
+		var state domain.State
 		var version, runner uint64
-		if err := rows.Scan(&project, &ticket, &version, &runner); err != nil {
+		if err := rows.Scan(&project, &ticket, &state, &version, &runner); err != nil {
 			rows.Close()
 			return err
 		}
-		pending = append(pending, recovered{domain.TicketRef{Channel: channel, Project: project, Ticket: ticket}, version, runner})
+		pending = append(pending, recovered{domain.TicketRef{Channel: channel, Project: project, Ticket: ticket}, state, version, runner})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -512,8 +521,10 @@ func (s *Store) RebindRecoveredPublishedCandidates(ctx context.Context, channel 
 	}
 	rows.Close()
 	for _, item := range pending {
-		if err := s.RebindPublishedCandidate(ctx, item.ref, item.version, domain.Fence{LeaderEpoch: leaderEpoch, RunnerEpoch: item.runner}); err != nil {
-			return err
+		if item.state == domain.StatePublishing {
+			if err := s.RebindPublishedCandidate(ctx, item.ref, item.version, domain.Fence{LeaderEpoch: leaderEpoch, RunnerEpoch: item.runner}); err != nil {
+				return err
+			}
 		}
 		if _, err := s.LoadPublishedCandidate(ctx, item.ref); err != nil {
 			return err
@@ -563,6 +574,11 @@ func (s *Store) RebindPublishedCandidate(ctx context.Context, ref domain.TicketR
 			payload, err := publicationRebindPayload(expected)
 			if err != nil || existing.PriorWitnessDigest != expected.PriorWitnessDigest || existing.PriorTicketVersion != expected.PriorTicketVersion || existing.PriorFence != expected.PriorFence || existing.RebindDigest != publicationIdentityDigest(payload) || existing.Fence != currentFence {
 				return ErrPublicationEvidence
+			}
+			var state string
+			var version, runner, leader uint64
+			if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &leader); err != nil || state != string(domain.StatePublishing) || version != currentVersion || runner != currentFence.RunnerEpoch || leader != currentFence.LeaderEpoch {
+				return ErrStaleFence
 			}
 			var events int
 			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='publication_rebind' AND from_state='publishing' AND to_state='publishing' AND payload=? AND created_at=?`, ref.Channel, ref.Project, ref.Ticket, currentVersion, string(payload), existing.CreatedAt.Format(time.RFC3339Nano)).Scan(&events); err != nil || events != 1 {

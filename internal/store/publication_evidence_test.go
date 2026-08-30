@@ -280,6 +280,9 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	if err := db.RebindPublishedCandidate(ctx, ticket.Ref, current.Version, domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}); err != nil {
 		t.Fatalf("64th rebind replay: %v", err)
 	}
+	if err := db.RebindPublishedCandidate(ctx, ticket.Ref, current.Version, domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch + 1}); err == nil {
+		t.Fatal("wrong-fence rebind replay was accepted")
+	}
 	var rebindRows int
 	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&rebindRows); err != nil || rebindRows != 64 {
 		t.Fatalf("rebind cap residue rows=%d err=%v", rebindRows, err)
@@ -317,6 +320,27 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	if err := db.Backup(ctx, controlGapPath); err != nil {
 		t.Fatal(err)
 	}
+	leftStateDir := t.TempDir()
+	if err := os.Chmod(leftStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	leftStatePath := leftStateDir + "/publication-left-state.sqlite"
+	if err := db.Backup(ctx, leftStatePath); err != nil {
+		t.Fatal(err)
+	}
+	leftState, err := Open(ctx, leftStatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := leftState.TransitionAndInvalidateRunner(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateStopping, ResumeState: domain.StatePublishing, Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+		leftState.Close()
+		t.Fatal(err)
+	}
+	if err := leftState.RebindPublishedCandidate(ctx, ticket.Ref, current.Version, domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}); err == nil {
+		leftState.Close()
+		t.Fatal("left-state rebind replay was accepted")
+	}
+	leftState.Close()
 	capMutant, err := Open(ctx, backup)
 	if err != nil {
 		t.Fatal(err)
@@ -326,18 +350,32 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		capMutant.Close()
 		t.Fatal(err)
 	}
-	if _, err := capMutant.FenceRecoveredRunners(ctx, domain.ChannelDev, capLeader); err != nil {
+	capTicket, _ := capMutant.Ticket(ctx, ticket.Ref)
+	if capTicket.State != domain.StatePublishing {
+		capMutant.Close()
+		t.Fatalf("cap fixture state=%s want publishing", capTicket.State)
+	}
+	var capRecoveryRows int
+	if err := capMutant.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&capRecoveryRows); err != nil {
 		capMutant.Close()
 		t.Fatal(err)
 	}
-	capTicket, _ := capMutant.Ticket(ctx, ticket.Ref)
-	if err := capMutant.RebindPublishedCandidate(ctx, ticket.Ref, capTicket.Version, domain.Fence{LeaderEpoch: capLeader, RunnerEpoch: capTicket.RunnerEpoch}); err == nil {
+	if _, err := capMutant.FenceRecoveredRunners(ctx, domain.ChannelDev, capLeader); err == nil {
 		capMutant.Close()
-		t.Fatal("65th rebind was accepted")
+		t.Fatal("startup fencing advanced a publication past the rebind cap")
+	}
+	capAfter, err := capMutant.Ticket(ctx, ticket.Ref)
+	if err != nil || capAfter.Version != capTicket.Version || capAfter.RunnerEpoch != capTicket.RunnerEpoch {
+		capMutant.Close()
+		t.Fatalf("cap refusal mutated ticket before=%+v after=%+v err=%v", capTicket, capAfter, err)
 	}
 	if err := capMutant.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&rebindRows); err != nil || rebindRows != 64 {
 		capMutant.Close()
 		t.Fatalf("65th rebind row residue=%d err=%v", rebindRows, err)
+	}
+	if err := capMutant.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&rebindRows); err != nil || rebindRows != capRecoveryRows {
+		capMutant.Close()
+		t.Fatalf("cap refusal runner ledger residue=%d want=%d err=%v", rebindRows, capRecoveryRows, err)
 	}
 	if err := capMutant.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='publication_rebind'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&rebindRows); err != nil || rebindRows != 64 {
 		capMutant.Close()
@@ -367,14 +405,9 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		controlGap.Close()
 		t.Fatal(err)
 	}
-	if _, err := controlGap.FenceRecoveredRunners(ctx, domain.ChannelDev, gapLeader); err != nil {
+	if _, err := controlGap.FenceRecoveredRunners(ctx, domain.ChannelDev, gapLeader); err == nil {
 		controlGap.Close()
-		t.Fatalf("publishing fencing after control invalidation=%v", err)
-	}
-	gapTicket, _ = controlGap.Ticket(ctx, ticket.Ref)
-	if err := controlGap.RebindPublishedCandidate(ctx, ticket.Ref, gapTicket.Version, domain.Fence{LeaderEpoch: gapLeader, RunnerEpoch: gapTicket.RunnerEpoch}); err == nil {
-		controlGap.Close()
-		t.Fatal("publishing rebind accepted an InvalidateRunner gap")
+		t.Fatal("publication recovery cap allowed a control-invalidation gap to advance")
 	}
 	controlGap.Close()
 	publicationTransition := Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}}
@@ -386,6 +419,11 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	}
 	if _, err := db.TransitionPublishedCandidate(ctx, publicationTransition); err != nil {
 		t.Fatalf("lost-response publication transition replay: %v", err)
+	}
+	wrongPublicationFence := publicationTransition
+	wrongPublicationFence.Fence.RunnerEpoch++
+	if _, err := db.TransitionPublishedCandidate(ctx, wrongPublicationFence); err == nil {
+		t.Fatal("wrong-fence publication transition replay was accepted")
 	}
 	if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
 		t.Fatalf("waiting_ci replay=%v", err)
@@ -406,6 +444,58 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	if err := db.Backup(ctx, selfBase); err != nil {
 		t.Fatal(err)
 	}
+	waitingCapDir := t.TempDir()
+	if err := os.Chmod(waitingCapDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	waitingCapPath := waitingCapDir + "/waiting-cap.sqlite"
+	if err := db.Backup(ctx, waitingCapPath); err != nil {
+		t.Fatal(err)
+	}
+	waitingCap, err := Open(ctx, waitingCapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for recovery := 1; recovery <= 64; recovery++ {
+		leader, err := waitingCap.AcquireLeader(ctx, domain.ChannelDev, fmt.Sprintf("waiting-cap-%d", recovery))
+		if err != nil {
+			waitingCap.Close()
+			t.Fatal(err)
+		}
+		if _, err := waitingCap.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err != nil {
+			waitingCap.Close()
+			t.Fatalf("waiting cap recovery %d=%v", recovery, err)
+		}
+	}
+	waitingCapBefore, err := waitingCap.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		waitingCap.Close()
+		t.Fatal(err)
+	}
+	var waitingLedgerRows int
+	if err := waitingCap.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, publicationLatestVersion+1).Scan(&waitingLedgerRows); err != nil || waitingLedgerRows != 64 {
+		waitingCap.Close()
+		t.Fatalf("waiting cap ledger rows=%d err=%v", waitingLedgerRows, err)
+	}
+	leader, err := waitingCap.AcquireLeader(ctx, domain.ChannelDev, "waiting-cap-65")
+	if err != nil {
+		waitingCap.Close()
+		t.Fatal(err)
+	}
+	if _, err := waitingCap.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err == nil {
+		waitingCap.Close()
+		t.Fatal("65th waiting recovery was accepted")
+	}
+	waitingCapAfter, err := waitingCap.Ticket(ctx, ticket.Ref)
+	if err != nil || waitingCapAfter.Version != waitingCapBefore.Version || waitingCapAfter.RunnerEpoch != waitingCapBefore.RunnerEpoch {
+		waitingCap.Close()
+		t.Fatalf("waiting cap refusal mutated ticket before=%+v after=%+v err=%v", waitingCapBefore, waitingCapAfter, err)
+	}
+	if err := waitingCap.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, publicationLatestVersion+1).Scan(&waitingLedgerRows); err != nil || waitingLedgerRows != 64 {
+		waitingCap.Close()
+		t.Fatalf("waiting cap refusal ledger rows=%d err=%v", waitingLedgerRows, err)
+	}
+	waitingCap.Close()
 	waitingBaseLeader := newLeader
 	for recovery := 1; recovery <= 2; recovery++ {
 		newLeader, err = db.AcquireLeader(ctx, domain.ChannelDev, fmt.Sprintf("waiting-recovery-%d", recovery))

@@ -39,20 +39,21 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 		if current != leaderEpoch {
 			return ErrStaleFence
 		}
-		rows, err := conn.QueryContext(ctx, `SELECT project_id,id,version,runner_epoch FROM tickets WHERE channel=? AND state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling') ORDER BY project_id,id`, channel)
+		rows, err := conn.QueryContext(ctx, `SELECT project_id,id,state,version,runner_epoch FROM tickets WHERE channel=? AND state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling') ORDER BY project_id,id`, channel)
 		if err != nil {
 			return err
 		}
 		type activeTicket struct {
 			project domain.ProjectID
 			id      domain.TicketID
+			state   domain.State
 			version uint64
 			runner  uint64
 		}
 		var active []activeTicket
 		for rows.Next() {
 			var ticket activeTicket
-			if err := rows.Scan(&ticket.project, &ticket.id, &ticket.version, &ticket.runner); err != nil {
+			if err := rows.Scan(&ticket.project, &ticket.id, &ticket.state, &ticket.version, &ticket.runner); err != nil {
 				rows.Close()
 				return err
 			}
@@ -81,6 +82,48 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				// consumers will reject the resulting non-contiguous lineage.
 				if latest.TicketVersion > ticket.version || latest.RunnerEpoch > ticket.runner || leaderEpoch <= latest.LeaderEpoch {
 					return ErrStaleFence
+				}
+			}
+			// Runner recovery is also an append-only, bounded authority. A
+			// same-leader lost-response returned above is the only replay allowed
+			// at the cap; a new leader must not grow a chain that readers refuse.
+			recoveryFloor := uint64(0)
+			if ticket.state == domain.StateWaitingCI {
+				publication, found, err := loadPublicationEvidenceRow(ctx, conn, ref)
+				if err != nil || !found {
+					return ErrPublicationEvidence
+				}
+				if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
+					return ErrPublicationEvidence
+				}
+				recoveryFloor = publication.CurrentTicketVersion + 1 // exact waiting-ci transition version
+			}
+			var recoveryCount int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, channel, ticket.project, ticket.id, recoveryFloor).Scan(&recoveryCount); err != nil {
+				return err
+			}
+			if recoveryCount >= 64 {
+				return ErrPublicationEvidence
+			}
+			// Do not advance a publishing ticket into a recovery state that can
+			// never be rebound. The 64-row rebind cap is a terminal recovery
+			// limit, so check it before changing either ticket counters or the
+			// runner ledger. The surrounding Store write rolls back every ticket
+			// in this startup pass if one is capped.
+			if ticket.state == domain.StatePublishing {
+				publication, found, err := loadPublicationEvidenceRow(ctx, conn, ref)
+				if err != nil || !found {
+					return ErrPublicationEvidence
+				}
+				if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil || publication.CurrentTicketVersion != ticket.version || publication.CurrentFence.RunnerEpoch != ticket.runner {
+					return ErrPublicationEvidence
+				}
+				var rebinds int
+				if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=?`, channel, ticket.project, ticket.id, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA).Scan(&rebinds); err != nil {
+					return err
+				}
+				if rebinds >= 64 {
+					return ErrPublicationEvidence
 				}
 			}
 			priorLeader := uint64(0)

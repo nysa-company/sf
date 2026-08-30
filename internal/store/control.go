@@ -16,11 +16,13 @@ import (
 // these writes atomic prevents an old provider completion from landing in the
 // gap between entering stopping/cancelling and advancing the runner epoch.
 //
-// The workflow engine remains responsible for selecting the transition from
-// the approved state-machine artifact. This boundary only provides the fenced
-// persistence primitive used by dispositions that explicitly invalidate the
-// runner.
+// The workflow engine selects from the approved state-machine artifact, but
+// this boundary independently admits only its two runner-invalidating control
+// dispositions. It is never a generic lifecycle persistence escape hatch.
 func (s *Store) TransitionAndInvalidateRunner(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if !validRunnerInvalidatingControlTransition(transition) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
 	if err := transition.Ref.Validate(); err != nil {
 		return TransitionResult{}, err
 	}
@@ -73,6 +75,39 @@ func (s *Store) TransitionAndInvalidateRunner(ctx context.Context, transition Tr
 		return nil
 	})
 	return result, err
+}
+
+// validRunnerInvalidatingControlTransition is deliberately narrower than the
+// state-machine selector. This Store primitive has enough authority to change
+// both lifecycle state and runner epoch, so it may persist only the two
+// operator control dispositions that require that atomic invalidation. Every
+// normal phase progression, including all publication entry/continuation, must
+// use its evidence-bearing Store boundary instead.
+func validRunnerInvalidatingControlTransition(transition Transition) bool {
+	pauseState := func(state domain.State) bool {
+		switch state {
+		case domain.StatePlanning, domain.StateVerifying, domain.StateBuilding, domain.StatePublishing, domain.StateWaitingCI, domain.StateReviewing, domain.StateWaitingApproval, domain.StateWaitingManualMerge, domain.StateMerging, domain.StateReconciling:
+			return true
+		default:
+			return false
+		}
+	}
+	cancelState := func(state domain.State) bool {
+		switch state {
+		case domain.StateQueued, domain.StatePlanning, domain.StateVerifying, domain.StateBuilding, domain.StatePublishing, domain.StateWaitingCI, domain.StateReviewing, domain.StateWaitingApproval, domain.StateWaitingManualMerge, domain.StateMerging, domain.StateReconciling, domain.StatePaused, domain.StateBlocked, domain.StateStopping:
+			return true
+		default:
+			return false
+		}
+	}
+	switch transition.Trigger {
+	case "operator_pause_or_take":
+		return transition.To == domain.StateStopping && transition.ResumeState == transition.From && pauseState(transition.From)
+	case "operator_cancel":
+		return transition.To == domain.StateCancelling && transition.ResumeState == "" && cancelState(transition.From)
+	default:
+		return false
+	}
 }
 
 // CompleteControlTransition commits a drained stopping/cancelling transition,

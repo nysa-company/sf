@@ -56,6 +56,43 @@ func TestTransitionAndInvalidateRunnerIsAtomicAndFenced(t *testing.T) {
 	}
 }
 
+func TestTransitionAndInvalidateRunnerRejectsPublicationAndNonControlPairs(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-control-publication-bypass"}
+	if err := database.CreateTicket(ctx, ticket(ref, "control-publication-bypass")); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "control-daemon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, queued.Version, "dev/nysa/SF-control-publication-bypass/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: queued.RunnerEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}
+	for name, transition := range map[string]Transition{
+		"building-to-publishing": {Ref: ref, ExpectedVersion: started.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: fence},
+		"publishing-to-waiting":  {Ref: ref, ExpectedVersion: started.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence},
+		"blocked-to-publishing":  {Ref: ref, ExpectedVersion: started.Version, From: domain.StateBlocked, To: domain.StatePublishing, Trigger: "operator_resume", Fence: fence},
+		"pause-wrong-resume":     {Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateStopping, ResumeState: domain.StateBuilding, Trigger: "operator_pause_or_take", Fence: fence},
+		"cancel-wrong-resume":    {Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateCancelling, ResumeState: domain.StatePlanning, Trigger: "operator_cancel", Fence: fence},
+		"cancel-wrong-trigger":   {Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateCancelling, Trigger: "operator_pause_or_take", Fence: fence},
+	} {
+		if _, err := database.TransitionAndInvalidateRunner(ctx, transition); err == nil {
+			t.Fatalf("%s control bypass was accepted", name)
+		}
+		after, err := database.Ticket(ctx, ref)
+		if err != nil || after.State != started.State || after.Version != started.Version || after.RunnerEpoch != started.RunnerEpoch {
+			t.Fatalf("%s mutated ticket=%+v err=%v", name, after, err)
+		}
+	}
+}
+
 func TestCompleteControlTransitionClosesPhaseAndReleasesCapacity(t *testing.T) {
 	database, ctx := openTestStore(t)
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-control-complete"}
