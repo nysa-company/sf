@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -49,7 +50,7 @@ func phaseProviderResult(key store.ProviderAttemptResultKey, request workflowwor
 	}}
 }
 
-func bindCoordinatorResult(t *testing.T, coordinator *fakePlannerCoordinator, evidence *phaseStore, key store.ProviderAttemptResultKey) {
+func bindCoordinatorResult(t *testing.T, coordinator *fakePlannerCoordinator, evidence *phaseStore, key store.ProviderAttemptResultKey, timeout time.Duration) {
 	t.Helper()
 	coordinator.onRun = func(request providercoord.Request) {
 		result := evidence.results[key.AttemptID]
@@ -60,6 +61,9 @@ func bindCoordinatorResult(t *testing.T, coordinator *fakePlannerCoordinator, ev
 		input.LeaderEpoch = result.Claim.LeaderEpoch
 		input.RunnerEpoch = result.Claim.RunnerEpoch
 		input.ExpectedVersion = result.Claim.ExpectedVersion
+		if timeout > 0 {
+			input.Timeout = timeout
+		}
 		payload, digest, err := contracts.CanonicalPhaseInput(input)
 		if err != nil {
 			t.Fatalf("canonical provider input: %v", err)
@@ -120,7 +124,7 @@ func TestPhaseRunnerVerificationUsesStoredPlannerWitness(t *testing.T) {
 	evidence.results[key.AttemptID] = result
 	evidence.parsed[key.AttemptID] = phaseartifact.Parsed{Phase: domain.PhaseVerification, Provider: result.Claim.Binding.Identity, Verify: artifact}
 	coordinator.result = providercoord.Result{Code: providercoord.Completed, ProviderResult: key, Parsed: &phaseartifact.Parsed{Phase: domain.PhaseBuild}}
-	bindCoordinatorResult(t, coordinator, evidence, key)
+	bindCoordinatorResult(t, coordinator, evidence, key, time.Minute)
 
 	out, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request)
 	if err != nil || out.ProviderResult != key {
@@ -140,7 +144,7 @@ func TestPhaseRunnerBuildUsesExactVerificationAndRejectsRefusals(t *testing.T) {
 	evidence.results[key.AttemptID] = result
 	evidence.parsed[key.AttemptID] = phaseartifact.Parsed{Phase: domain.PhaseBuild, Provider: result.Claim.Binding.Identity, Builder: &builder}
 	coordinator.result = providercoord.Result{Code: providercoord.Completed, ProviderResult: key}
-	bindCoordinatorResult(t, coordinator, evidence, key)
+	bindCoordinatorResult(t, coordinator, evidence, key, 0)
 
 	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); err != nil {
 		t.Fatal(err)
@@ -172,15 +176,46 @@ func TestPhaseRunnerRefusesCoordinatorKeyWithDifferentLaunchInput(t *testing.T) 
 	evidence.results[key.AttemptID] = result
 	evidence.parsed[key.AttemptID] = phaseartifact.Parsed{Phase: domain.PhaseVerification, Provider: result.Claim.Binding.Identity, Verify: evidence.parsed[12].Verify}
 	coordinator.result = providercoord.Result{Code: providercoord.Completed, ProviderResult: key}
-	bindCoordinatorResult(t, coordinator, evidence, key)
+	bindCoordinatorResult(t, coordinator, evidence, key, 0)
 	bind := coordinator.onRun
 	coordinator.onRun = func(input providercoord.Request) {
 		bind(input)
 		stored := evidence.results[key.AttemptID]
 		stored.Claim.Input.Prompt = "substituted historical prompt"
+		payload, digest, err := contracts.CanonicalPhaseInput(stored.Claim.Input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored.Claim.Input.RequestDigest, stored.Claim.RequestDigest, stored.Claim.RequestPayload = digest, digest, payload
 		evidence.results[key.AttemptID] = stored
 	}
 	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); !errors.Is(err, ErrProviderResultInvalid) {
 		t.Fatalf("mismatched durable input err=%v", err)
+	}
+}
+
+func TestPhaseRunnerRefusesWidenedCoordinatorTimeout(t *testing.T) {
+	request, evidence, coordinator, _, _ := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying
+	key := store.ProviderAttemptResultKey{AttemptID: 16, Ref: request.Ticket.Ref, Phase: domain.PhaseVerification, Attempt: 4}
+	result := phaseProviderResult(key, request, providercoord.RoleReviewer)
+	evidence.results[key.AttemptID] = result
+	evidence.parsed[key.AttemptID] = phaseartifact.Parsed{Phase: domain.PhaseVerification, Provider: result.Claim.Binding.Identity, Verify: evidence.parsed[12].Verify}
+	coordinator.result = providercoord.Result{Code: providercoord.Completed, ProviderResult: key}
+	bindCoordinatorResult(t, coordinator, evidence, key, 0)
+	bind := coordinator.onRun
+	coordinator.onRun = func(input providercoord.Request) {
+		bind(input)
+		stored := evidence.results[key.AttemptID]
+		stored.Claim.Input.Timeout = input.Input.Timeout + time.Second
+		payload, digest, err := contracts.CanonicalPhaseInput(stored.Claim.Input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored.Claim.Input.RequestDigest, stored.Claim.RequestDigest, stored.Claim.RequestPayload = digest, digest, payload
+		evidence.results[key.AttemptID] = stored
+	}
+	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); !errors.Is(err, ErrProviderResultInvalid) {
+		t.Fatalf("widened timeout err=%v", err)
 	}
 }

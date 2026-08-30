@@ -253,6 +253,13 @@ func matchesLaunchInput(claim store.ProviderAttemptClaim, key store.ProviderAtte
 	input.LeaderEpoch = claim.LeaderEpoch
 	input.RunnerEpoch = claim.RunnerEpoch
 	input.ExpectedVersion = claim.ExpectedVersion
+	// Coordinator may constrain a launch to the ticket's remaining duration.
+	// That is the sole permitted post-prompt difference; all other launch
+	// input fields remain byte-for-byte bound by the canonical request digest.
+	if claim.Input.Timeout <= 0 || claim.Input.Timeout > input.Timeout {
+		return false
+	}
+	input.Timeout = claim.Input.Timeout
 	payload, digest, err := contracts.CanonicalPhaseInput(input)
 	if err != nil {
 		return false

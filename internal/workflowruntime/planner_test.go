@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
@@ -104,6 +105,25 @@ func TestPlannerRunnerMapsCodexPlannerAndReturnsAuthenticatedKey(t *testing.T) {
 	}
 	if coordinator.request.Role != providercoord.RolePlanner || coordinator.request.Input.Phase != domain.PhasePlanning || coordinator.request.ConfigDigest != request.Ticket.ConfigDigest || coordinator.request.Input.Provider != (domain.ProviderIdentity{}) || !strings.Contains(coordinator.request.Input.Prompt, "important title") || !strings.Contains(coordinator.request.Input.Prompt, "must retain acceptance") || !strings.Contains(coordinator.request.Input.Prompt, "ticket") {
 		t.Fatalf("provider request=%+v", coordinator.request)
+	}
+}
+
+func TestPlannerRunnerAcceptsCoordinatorNarrowedTimeout(t *testing.T) {
+	request, evidence, coordinator := plannerFixture(t)
+	bind := coordinator.onRun
+	coordinator.onRun = func(input providercoord.Request) {
+		bind(input)
+		stored := evidence.result
+		stored.Claim.Input.Timeout = time.Minute
+		payload, digest, err := contracts.CanonicalPhaseInput(stored.Claim.Input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored.Claim.Input.RequestDigest, stored.Claim.RequestDigest, stored.Claim.RequestPayload = digest, digest, payload
+		evidence.result = stored
+	}
+	if _, err := (PlannerRunner{Store: evidence, Coordinator: coordinator}).RunArtifact(context.Background(), request); err != nil {
+		t.Fatalf("narrowed timeout rejected: %v", err)
 	}
 }
 
