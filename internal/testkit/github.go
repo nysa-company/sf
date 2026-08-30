@@ -51,14 +51,29 @@ type Mutation struct {
 // GitHub adapter. Rule parameters remain generic so malformed wire shapes can
 // be tested without making the fake more permissive than GitHub.
 type FakeRuleset struct {
-	ID           int64                  `json:"id"`
-	Target       string                 `json:"target"`
-	Source       string                 `json:"source"`
-	SourceType   string                 `json:"source_type"`
-	Enforcement  string                 `json:"enforcement"`
-	Conditions   *FakeRulesetConditions `json:"conditions"`
-	Rules        []FakeRulesetRule      `json:"rules"`
-	BypassActors []any                  `json:"bypass_actors"`
+	ID                   int64                  `json:"id"`
+	Name                 string                 `json:"name"`
+	Target               string                 `json:"target"`
+	Source               string                 `json:"source"`
+	SourceType           string                 `json:"source_type"`
+	Enforcement          string                 `json:"enforcement"`
+	Conditions           *FakeRulesetConditions `json:"conditions"`
+	Rules                []FakeRulesetRule      `json:"rules"`
+	BypassActors         []any                  `json:"bypass_actors"`
+	NodeID               string                 `json:"node_id"`
+	Links                FakeRulesetLinks       `json:"_links"`
+	CreatedAt            string                 `json:"created_at"`
+	UpdatedAt            string                 `json:"updated_at"`
+	CurrentUserCanBypass string                 `json:"current_user_can_bypass"`
+}
+
+type FakeRulesetLinks struct {
+	Self FakeRulesetLink `json:"self"`
+	HTML FakeRulesetLink `json:"html"`
+}
+
+type FakeRulesetLink struct {
+	Href string `json:"href"`
 }
 
 type FakeRulesetConditions struct {
@@ -169,11 +184,38 @@ func (f *FakeGH) SetProtectionWitnessForTest(strict, admin bool, bypassAllowance
 // the classic branch-protection witness.
 func (f *FakeGH) SetRulesetsForTest(rulesets ...FakeRuleset) error {
 	return f.withState(func() (bool, error) {
+		for index := range rulesets {
+			normalizeFakeRuleset(&rulesets[index], f.state.Repository)
+		}
 		f.state.Rulesets = append([]FakeRuleset(nil), rulesets...)
 		f.state.ActiveRulesetCount = len(rulesets)
 		f.state.ClassicProtection = false
 		return true, nil
 	})
+}
+
+func normalizeFakeRuleset(ruleset *FakeRuleset, repository contracts.RepositoryIdentity) {
+	if ruleset.Name == "" {
+		ruleset.Name = "ruleset-" + strconv.FormatInt(ruleset.ID, 10)
+	}
+	if ruleset.NodeID == "" {
+		ruleset.NodeID = "RRS_fake_" + strconv.FormatInt(ruleset.ID, 10)
+	}
+	if ruleset.Links.Self.Href == "" {
+		ruleset.Links.Self.Href = "https://api.github.com/repos/" + repository.Owner + "/" + repository.Name + "/rulesets/" + strconv.FormatInt(ruleset.ID, 10)
+	}
+	if ruleset.Links.HTML.Href == "" {
+		ruleset.Links.HTML.Href = "https://github.com/" + repository.Owner + "/" + repository.Name + "/rules/" + strconv.FormatInt(ruleset.ID, 10)
+	}
+	if ruleset.CreatedAt == "" {
+		ruleset.CreatedAt = "2023-07-15T08:43:03Z"
+	}
+	if ruleset.UpdatedAt == "" {
+		ruleset.UpdatedAt = "2023-08-23T16:29:47Z"
+	}
+	if ruleset.CurrentUserCanBypass == "" {
+		ruleset.CurrentUserCanBypass = "never"
+	}
 }
 
 func (f *FakeGH) SetBypassForcePushAllowancesForTest(count int) error {
@@ -828,10 +870,23 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 		return f.runRepoView(argv)
 	}
 	if len(argv) >= 5 && argv[0] == "api" && option(argv, "--hostname") == "github.com" && option(argv, "--method") == "GET" && strings.Contains(argv[len(argv)-1], "/rules/branches/") {
-		if f.Snapshot().ActiveRulesetCount != 0 {
-			return []byte(`[{"type":"pull_request"}]`), nil
+		snapshot := f.Snapshot()
+		if len(snapshot.Rulesets) == 0 {
+			if snapshot.ActiveRulesetCount != 0 {
+				return []byte(`[{"type":"pull_request"}]`), nil
+			}
+			return []byte(`[]`), nil
 		}
-		return []byte(`[]`), nil
+		var applied []map[string]any
+		for _, ruleset := range snapshot.Rulesets {
+			if ruleset.Enforcement != "active" {
+				continue
+			}
+			for _, rule := range ruleset.Rules {
+				applied = append(applied, map[string]any{"type": rule.Type, "ruleset_source_type": ruleset.SourceType, "ruleset_source": ruleset.Source, "ruleset_id": ruleset.ID, "parameters": rule.Parameters})
+			}
+		}
+		return json.Marshal(applied)
 	}
 	if len(argv) >= 5 && argv[0] == "api" && option(argv, "--hostname") == "github.com" && option(argv, "--method") == "GET" && strings.Contains(argv[len(argv)-1], "/rulesets") {
 		snapshot := f.Snapshot()
@@ -944,7 +999,7 @@ func validateOfficialArgv(argv []string) error {
 	switch key {
 	case "api --hostname":
 		// Exact GraphQL lookup or a github.com-pinned active-rules REST lookup.
-		if len(argv) >= 6 && argv[2] == "github.com" && argv[3] == "--method" && argv[4] == "GET" && strings.HasPrefix(argv[5], "repos/") && ((strings.Contains(argv[5], "/rules/branches/") && strings.HasSuffix(argv[5], "?per_page=1&page=1")) || strings.Contains(argv[5], "/rulesets")) {
+		if len(argv) >= 6 && argv[2] == "github.com" && argv[3] == "--method" && argv[4] == "GET" && strings.HasPrefix(argv[5], "repos/") && ((strings.Contains(argv[5], "/rules/branches/") && strings.HasSuffix(argv[5], "?per_page=100&page=1")) || strings.Contains(argv[5], "/rulesets")) {
 			allowed["--method"] = true
 			break
 		}
@@ -953,7 +1008,7 @@ func validateOfficialArgv(argv []string) error {
 		}
 	case "api --method":
 		allowed["--method"] = true
-		if len(argv) != 4 || argv[2] != "GET" || !strings.HasPrefix(argv[3], "repos/") || !strings.Contains(argv[3], "/rules/branches/") || !strings.HasSuffix(argv[3], "?per_page=1&page=1") {
+		if len(argv) != 4 || argv[2] != "GET" || !strings.HasPrefix(argv[3], "repos/") || !strings.Contains(argv[3], "/rules/branches/") || !strings.HasSuffix(argv[3], "?per_page=100&page=1") {
 			return fmt.Errorf("fake-gh: incomplete %s", key)
 		}
 	case "auth status":

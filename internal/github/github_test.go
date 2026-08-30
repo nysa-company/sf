@@ -903,6 +903,8 @@ func exactRepositoryRuleset() testkit.FakeRuleset {
 		Rules: []testkit.FakeRulesetRule{
 			{Type: "pull_request", Parameters: map[string]any{"allowed_merge_methods": []any{"squash"}}},
 			{Type: "required_status_checks", Parameters: map[string]any{"strict_required_status_checks_policy": true, "required_status_checks": []any{map[string]any{"context": "ci"}, map[string]any{"context": "test-immutability"}}}},
+			{Type: "non_fast_forward"},
+			{Type: "deletion"},
 		},
 		BypassActors: []any{},
 	}
@@ -957,6 +959,8 @@ func TestStrictProtectionRulesetFailsClosedForWeakOrAmbiguousPolicy(t *testing.T
 		}},
 		{"duplicate-pr", func(rule *testkit.FakeRuleset) { rule.Rules = append(rule.Rules, rule.Rules[0]) }},
 		{"duplicate-check-rule", func(rule *testkit.FakeRuleset) { rule.Rules = append(rule.Rules, rule.Rules[1]) }},
+		{"duplicate-non-fast-forward", func(rule *testkit.FakeRuleset) { rule.Rules = append(rule.Rules, rule.Rules[2]) }},
+		{"deletion-parameters", func(rule *testkit.FakeRuleset) { rule.Rules[3].Parameters = map[string]any{"unexpected": true} }},
 		{"non-strict-checks", func(rule *testkit.FakeRuleset) {
 			rule.Rules[1].Parameters["strict_required_status_checks_policy"] = false
 		}},
@@ -989,22 +993,33 @@ func TestStrictProtectionRulesetFailsClosedForWeakOrAmbiguousPolicy(t *testing.T
 			t.Fatalf("ambiguous rulesets accepted: %v", err)
 		}
 	})
-	for _, enforcement := range []string{"active", "evaluate"} {
-		t.Run("applicable-organization-ruleset-"+enforcement, func(t *testing.T) {
-			client, fake, identity := fixture(t)
-			repositoryRule, organizationRule := exactRepositoryRuleset(), exactRepositoryRuleset()
-			organizationRule.ID = 43
-			organizationRule.SourceType = "Organization"
-			organizationRule.Source = "example"
-			organizationRule.Enforcement = enforcement
-			if err := fake.SetRulesetsForTest(repositoryRule, organizationRule); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
-				t.Fatalf("applicable organization ruleset accepted: %v", err)
-			}
-		})
-	}
+	t.Run("applicable-active-organization-ruleset", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		repositoryRule, organizationRule := exactRepositoryRuleset(), exactRepositoryRuleset()
+		organizationRule.ID = 43
+		organizationRule.SourceType = "Organization"
+		organizationRule.Source = "example"
+		if err := fake.SetRulesetsForTest(repositoryRule, organizationRule); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+			t.Fatalf("applicable active organization ruleset accepted: %v", err)
+		}
+	})
+	t.Run("evaluate-organization-ruleset-is-not-enforced", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		repositoryRule, organizationRule := exactRepositoryRuleset(), exactRepositoryRuleset()
+		organizationRule.ID = 43
+		organizationRule.SourceType = "Organization"
+		organizationRule.Source = "example"
+		organizationRule.Enforcement = "evaluate"
+		if err := fake.SetRulesetsForTest(repositoryRule, organizationRule); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); err != nil {
+			t.Fatalf("evaluate-only parent blocked exact active witness: %v", err)
+		}
+	})
 	t.Run("inactive-organization-ruleset", func(t *testing.T) {
 		client, fake, identity := fixture(t)
 		repositoryRule, organizationRule := exactRepositoryRuleset(), exactRepositoryRuleset()
@@ -1019,6 +1034,18 @@ func TestStrictProtectionRulesetFailsClosedForWeakOrAmbiguousPolicy(t *testing.T
 			t.Fatalf("inactive organization ruleset blocked exact witness: %v", err)
 		}
 	})
+}
+
+func TestStrictProtectionRejectsMixedClassicAndRulesetWitness(t *testing.T) {
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, "\x00"), "graphql") {
+			return []byte(`{"data":{"repository":{"ref":{"branchProtectionRule":{"id":"classic","pattern":"main","requiresStrictStatusChecks":true,"isAdminEnforced":true,"bypassPullRequestAllowances":{"totalCount":0},"bypassForcePushAllowances":{"totalCount":0}}}}}}`), nil
+		}
+		return []byte(`[{"type":"pull_request","ruleset_source_type":"Repository","ruleset_source":"example/app","ruleset_id":42,"parameters":{}}]`), nil
+	})}
+	if _, err := client.strictProtection(context.Background(), contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, "main", "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+		t.Fatalf("mixed classic/ruleset witness accepted: %v", err)
+	}
 }
 
 func TestStrictProtectionCanonicalizesIntegrationIDsAndRefusesMalformedValues(t *testing.T) {
@@ -1051,6 +1078,46 @@ func TestStrictProtectionCanonicalizesIntegrationIDsAndRefusesMalformedValues(t 
 			}
 		})
 	}
+}
+
+func TestRulesetDetailMetadataIsExplicitAndFailClosed(t *testing.T) {
+	t.Run("malformed-documented-extra", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		ruleset := exactRepositoryRuleset()
+		ruleset.CreatedAt = "not-a-timestamp"
+		if err := fake.SetRulesetsForTest(ruleset); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+			t.Fatalf("malformed timestamp accepted: %v", err)
+		}
+	})
+	t.Run("authenticated-bypass", func(t *testing.T) {
+		client, fake, identity := fixture(t)
+		ruleset := exactRepositoryRuleset()
+		ruleset.CurrentUserCanBypass = "always"
+		if err := fake.SetRulesetsForTest(ruleset); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.strictProtection(context.Background(), identity.Repository, identity.BaseRef, "squash"); !errors.Is(err, ErrGuardedMergeUnavailable) {
+			t.Fatalf("current user bypass accepted: %v", err)
+		}
+	})
+	t.Run("unknown-field", func(t *testing.T) {
+		client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+			endpoint := args[len(args)-1]
+			if strings.Contains(endpoint, "/rules/branches/") {
+				return []byte(`[{"type":"pull_request","ruleset_source_type":"Repository","ruleset_source":"example/app","ruleset_id":42,"parameters":{}}]`), nil
+			}
+			if strings.Contains(endpoint, "/rulesets/42") {
+				return []byte(`{"id":42,"name":"exact","target":"branch","source":"example/app","source_type":"Repository","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},"rules":[{"type":"pull_request","parameters":{"allowed_merge_methods":["squash"]}},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"required_status_checks":[{"context":"ci"}]}},{"type":"non_fast_forward"},{"type":"deletion"}],"bypass_actors":[],"node_id":"RRS_fake_42","_links":{"self":{"href":"https://api.github.com/repos/example/app/rulesets/42"},"html":{"href":"https://github.com/example/app/rules/42"}},"created_at":"2023-07-15T08:43:03Z","updated_at":"2023-08-23T16:29:47Z","current_user_can_bypass":"never","unexpected":true}`), nil
+			}
+			return nil, errors.New("unexpected command")
+		})}
+		if _, err := client.rulesetProtection(context.Background(), contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, "main", "squash", appliedRulesetRef{ID: 42, SourceType: "Repository", Source: "example/app"}); !errors.Is(err, ErrGuardedMergeUnavailable) {
+			t.Fatalf("unknown detail field accepted: %v", err)
+		}
+	})
 }
 
 func TestStrictProtectionRefusesFullRulesetPage(t *testing.T) {
@@ -1250,7 +1317,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 	}
 	queue := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}
 	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$qualifiedRef:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedRef){branchProtectionRule{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app", "-F", "qualifiedRef=refs/heads/main"}
-	rules := []string{"api", "--hostname", "github.com", "--method", "GET", "repos/example/app/rules/branches/main?per_page=1&page=1"}
+	rules := []string{"api", "--hostname", "github.com", "--method", "GET", "repos/example/app/rules/branches/main?per_page=100&page=1"}
 	view := []string{"pr", "view", "7", "--repo", "example/app", "--json", prFields}
 	want := [][]string{{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields}, queue, protection, rules, view, queue, protection, rules, {"pr", "merge", "7", "--repo", "example/app", "--match-head-commit", identity.HeadOID, "--squash"}, view}
 	if !reflect.DeepEqual(got, want) {

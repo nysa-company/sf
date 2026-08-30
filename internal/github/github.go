@@ -702,6 +702,14 @@ type strictProtectionWitness struct {
 	Checks             []string
 }
 
+type appliedBranchRule struct {
+	Type              string         `json:"type"`
+	RulesetSourceType string         `json:"ruleset_source_type"`
+	RulesetSource     string         `json:"ruleset_source"`
+	RulesetID         int64          `json:"ruleset_id"`
+	Parameters        map[string]any `json:"parameters"`
+}
+
 func sameProtectionWitness(left, right strictProtectionWitness) bool {
 	leftChecks, rightChecks := append([]string(nil), left.Checks...), append([]string(nil), right.Checks...)
 	sort.Strings(leftChecks)
@@ -747,23 +755,60 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 	if err := c.json(ctx, &response, "api", "--hostname", "github.com", "graphql", "-f", "query="+query, "-F", "owner="+repository.Owner, "-F", "name="+repository.Name, "-F", "qualifiedRef=refs/heads/"+baseRef); err != nil {
 		return strictProtectionWitness{}, err
 	}
-	if response.Data != nil && response.Data.Repository != nil && response.Data.Repository.Ref != nil && response.Data.Repository.Ref.BranchProtectionRule != nil {
-		var activeRules []json.RawMessage
-		endpoint := "repos/" + repoArg(repository) + "/rules/branches/" + url.PathEscape(baseRef) + "?per_page=1&page=1"
-		if err := c.json(ctx, &activeRules, "api", "--hostname", "github.com", "--method", "GET", endpoint); err != nil {
+	var activeRules []appliedBranchRule
+	endpoint := "repos/" + repoArg(repository) + "/rules/branches/" + url.PathEscape(baseRef) + "?per_page=100&page=1"
+	if err := c.json(ctx, &activeRules, "api", "--hostname", "github.com", "--method", "GET", endpoint); err != nil || len(activeRules) >= 100 {
+		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+	}
+	// GitHub's exact-branch rules endpoint returns every active rule that
+	// applies to this ref, including inherited organization/enterprise rules.
+	// It avoids treating a lossy ruleset-list summary or wildcard matching as
+	// authority. A direct rule mixed with a ruleset is ambiguous by design.
+	rulesets := map[int64]appliedRulesetRef{}
+	for _, rule := range activeRules {
+		if rule.RulesetID == 0 {
+			continue
+		}
+		if rule.Type == "" || !bounded(rule.RulesetSourceType, 64) || !bounded(rule.RulesetSource, 256) {
 			return strictProtectionWitness{}, ErrGuardedMergeUnavailable
-		} else if len(activeRules) == 0 {
+		}
+		candidate := appliedRulesetRef{ID: rule.RulesetID, SourceType: rule.RulesetSourceType, Source: rule.RulesetSource}
+		if existing, found := rulesets[rule.RulesetID]; found && existing != candidate {
+			return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+		}
+		rulesets[rule.RulesetID] = candidate
+	}
+	if len(rulesets) == 0 {
+		if len(activeRules) == 0 && response.Data != nil && response.Data.Repository != nil && response.Data.Repository.Ref != nil && response.Data.Repository.Ref.BranchProtectionRule != nil {
 			rule := response.Data.Repository.Ref.BranchProtectionRule
 			if rule.Pattern == baseRef && rule.ID != "" && rule.RequiresStrictStatusChecks && rule.IsAdminEnforced && rule.BypassPullRequestAllowances.TotalCount == 0 && rule.BypassForcePushAllowances.TotalCount == 0 {
 				return strictProtectionWitness{Kind: "classic", ID: rule.ID, AdminEnforced: true}, nil
 			}
 		}
+		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+	}
+	hasClassicRule := response.Data != nil && response.Data.Repository != nil && response.Data.Repository.Ref != nil && response.Data.Repository.Ref.BranchProtectionRule != nil
+	if hasClassicRule || len(rulesets) != 1 || len(activeRules) != lenRulesetRules(activeRules) {
+		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+	}
+	var selected appliedRulesetRef
+	for _, selected = range rulesets {
 	}
 	method := ""
 	if len(requestedMethod) == 1 {
 		method = requestedMethod[0]
 	}
-	return c.rulesetProtection(ctx, repository, baseRef, method)
+	return c.rulesetProtection(ctx, repository, baseRef, method, selected)
+}
+
+func lenRulesetRules(rules []appliedBranchRule) int {
+	count := 0
+	for _, rule := range rules {
+		if rule.RulesetID != 0 {
+			count++
+		}
+	}
+	return count
 }
 
 type rulesetRefCondition struct {
@@ -780,8 +825,18 @@ type rulesetRule struct {
 	Parameters map[string]any `json:"parameters"`
 }
 
+type rulesetLink struct {
+	Href string `json:"href"`
+}
+
+type rulesetLinks struct {
+	Self *rulesetLink `json:"self"`
+	HTML *rulesetLink `json:"html"`
+}
+
 type rulesetWire struct {
 	ID           int64              `json:"id"`
+	Name         string             `json:"name"`
 	Target       string             `json:"target"`
 	Source       string             `json:"source"`
 	SourceType   string             `json:"source_type"`
@@ -789,46 +844,29 @@ type rulesetWire struct {
 	Conditions   *rulesetConditions `json:"conditions"`
 	Rules        []rulesetRule      `json:"rules"`
 	BypassActors []json.RawMessage  `json:"bypass_actors"`
+	NodeID       string             `json:"node_id"`
+	Links        *rulesetLinks      `json:"_links"`
+	CreatedAt    string             `json:"created_at"`
+	UpdatedAt    string             `json:"updated_at"`
+	// This is a separate, direct signal about the authenticated merge actor.
+	// It must never be inferred from (or substituted for) bypass_actors.
+	CurrentUserCanBypass string `json:"current_user_can_bypass"`
 }
 
-func (c Client) rulesetProtection(ctx context.Context, repository contracts.RepositoryIdentity, baseRef, method string) (strictProtectionWitness, error) {
-	var listed []rulesetWire
-	endpoint := "repos/" + repoArg(repository) + "/rulesets?per_page=100&page=1"
-	if err := c.json(ctx, &listed, "api", "--hostname", "github.com", "--method", "GET", endpoint); err != nil {
-		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
-	}
-	// A full page cannot prove uniqueness: an additional policy may be on the
-	// next page. Never turn the first 100 entries into a complete witness.
-	if len(listed) >= 100 {
-		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
-	}
-	var candidates []rulesetWire
-	for _, candidate := range listed {
-		if candidate.Target != "branch" || (candidate.Enforcement != "active" && candidate.Enforcement != "evaluate") {
-			continue
-		}
-		if candidate.Conditions == nil || candidate.Conditions.RefName == nil || rulesetMayApply(candidate.Conditions.RefName.Include, baseRef) {
-			// The endpoint can include inherited organization or enterprise
-			// rulesets. Their semantics are not part of this exact repository
-			// witness, so an applicable active/evaluate parent is ambiguity, not
-			// something to silently omit from ActiveRulesetCount.
-			if candidate.SourceType != "Repository" || candidate.Source != repository.Owner+"/"+repository.Name || candidate.Enforcement != "active" {
-				return strictProtectionWitness{}, ErrGuardedMergeUnavailable
-			}
-			candidates = append(candidates, candidate)
-		}
-	}
-	if len(candidates) != 1 || candidates[0].ID <= 0 {
-		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
-	}
+type appliedRulesetRef struct {
+	ID                 int64
+	SourceType, Source string
+}
+
+func (c Client) rulesetProtection(ctx context.Context, repository contracts.RepositoryIdentity, baseRef, method string, expected appliedRulesetRef) (strictProtectionWitness, error) {
 	var detail rulesetWire
-	if err := c.json(ctx, &detail, "api", "--hostname", "github.com", "--method", "GET", "repos/"+repoArg(repository)+"/rulesets/"+fmt.Sprint(candidates[0].ID)); err != nil || detail.ID != candidates[0].ID {
+	if err := c.json(ctx, &detail, "api", "--hostname", "github.com", "--method", "GET", "repos/"+repoArg(repository)+"/rulesets/"+fmt.Sprint(expected.ID)); err != nil || detail.ID != expected.ID || !validRulesetMetadata(detail) {
 		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 	}
-	if detail.Target != "branch" || detail.SourceType != "Repository" || detail.Source != repository.Owner+"/"+repository.Name || detail.Enforcement != "active" || detail.Conditions == nil || detail.Conditions.RefName == nil || len(detail.Conditions.RefName.Include) != 1 || detail.Conditions.RefName.Include[0] != "refs/heads/"+baseRef || len(detail.Conditions.RefName.Exclude) != 0 || detail.BypassActors == nil || len(detail.BypassActors) != 0 {
+	if detail.Target != "branch" || detail.SourceType != expected.SourceType || detail.Source != expected.Source || detail.SourceType != "Repository" || detail.Source != repository.Owner+"/"+repository.Name || detail.Enforcement != "active" || detail.Conditions == nil || detail.Conditions.RefName == nil || len(detail.Conditions.RefName.Include) != 1 || detail.Conditions.RefName.Include[0] != "refs/heads/"+baseRef || len(detail.Conditions.RefName.Exclude) != 0 || detail.BypassActors == nil || len(detail.BypassActors) != 0 || detail.CurrentUserCanBypass != "never" {
 		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 	}
-	var pullRules, statusRules int
+	var pullRules, statusRules, nonFastForwardRules, deletionRules int
 	var checks []string
 	for _, rule := range detail.Rules {
 		switch rule.Type {
@@ -854,13 +892,23 @@ func (c Client) rulesetProtection(ctx context.Context, repository contracts.Repo
 				}
 				checks = append(checks, identity)
 			}
+		case "non_fast_forward":
+			nonFastForwardRules++
+			if len(rule.Parameters) != 0 {
+				return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+			}
+		case "deletion":
+			deletionRules++
+			if len(rule.Parameters) != 0 {
+				return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+			}
 		default:
-			// The accepted Nysa witness is intentionally only the two policy
+			// The accepted Nysa witness is intentionally only the four policy
 			// types whose merge semantics are explicitly established here.
 			return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 		}
 	}
-	if pullRules != 1 || statusRules != 1 || len(checks) == 0 {
+	if pullRules != 1 || statusRules != 1 || nonFastForwardRules != 1 || deletionRules != 1 || len(checks) == 0 {
 		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 	}
 	sort.Strings(checks)
@@ -868,17 +916,13 @@ func (c Client) rulesetProtection(ctx context.Context, repository contracts.Repo
 	return strictProtectionWitness{Kind: "ruleset", ID: fmt.Sprint(detail.ID), AdminEnforced: true, ActiveRulesetCount: 1, Checks: checks, ChecksDigest: hex.EncodeToString(digest[:])}, nil
 }
 
-func rulesetMayApply(include []string, baseRef string) bool {
-	if len(include) == 0 {
-		return true
+func validRulesetMetadata(value rulesetWire) bool {
+	if value.ID <= 0 || !bounded(value.Name, 256) || !bounded(value.Source, 256) || !bounded(value.SourceType, 64) || !bounded(value.NodeID, 512) || value.Links == nil || value.Links.Self == nil || value.Links.HTML == nil || !bounded(value.Links.Self.Href, 4096) || !bounded(value.Links.HTML.Href, 4096) {
+		return false
 	}
-	wanted := "refs/heads/" + baseRef
-	for _, pattern := range include {
-		if pattern == wanted || strings.ContainsAny(pattern, "*?") || pattern == "~ALL" {
-			return true
-		}
-	}
-	return false
+	_, createdErr := time.Parse(time.RFC3339, value.CreatedAt)
+	_, updatedErr := time.Parse(time.RFC3339, value.UpdatedAt)
+	return createdErr == nil && updatedErr == nil
 }
 
 func validAllowedMergeMethods(value any, wanted string) bool {
