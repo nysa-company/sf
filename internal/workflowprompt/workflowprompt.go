@@ -35,6 +35,11 @@ const (
 	MaxPathItems        = 256
 	MaxCheckItems       = 128
 	MaxCheckName        = 256
+	// GitHub check external IDs may contain a workflow/link identifier. The
+	// contract allows link IDs up to 2048 bytes and workflow IDs up to 512;
+	// 3 KiB leaves bounded room for either representation while failing closed
+	// above the largest supported value.
+	MaxCheckExternalID = 3 << 10
 	// MaxEvidenceBytes is the prompt pipeline's narrower canonical-artifact
 	// bound. phaseartifact.MaxBytes remains the parser's general 1 MiB bound;
 	// downstream prompts reject artifacts that cannot fit safely in a prompt.
@@ -746,7 +751,7 @@ func validateChecksShape(v ChecksIdentity) error {
 		if err := bounded("check name", check.Name, MaxCheckName, false); err != nil {
 			return err
 		}
-		if err := bounded("check external id", check.ExternalID, MaxIdentityText, false); err != nil {
+		if err := bounded("check external id", check.ExternalID, MaxCheckExternalID, false); err != nil {
 			return err
 		}
 		if check.Status != "success" {

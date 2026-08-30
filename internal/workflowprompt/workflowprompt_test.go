@@ -376,6 +376,17 @@ func TestChecksIdentityRequiresExactSuccessfulObservedSet(t *testing.T) {
 	}
 }
 
+func TestCheckExternalIDBoundCoversGitHubLongIdentifiers(t *testing.T) {
+	for _, size := range []int{512, 2048, MaxCheckExternalID} {
+		if _, err := NewChecksIdentity("observation-long", testOID, []Check{{Name: "unit", ExternalID: strings.Repeat("x", size), Status: "success"}}); err != nil {
+			t.Fatalf("external ID length %d rejected: %v", size, err)
+		}
+	}
+	if _, err := NewChecksIdentity("observation-too-long", testOID, []Check{{Name: "unit", ExternalID: strings.Repeat("x", MaxCheckExternalID+1), Status: "success"}}); err == nil {
+		t.Fatal("external ID over the fail-closed bound accepted")
+	}
+}
+
 func TestPromptBoundIncludesFinalNewline(t *testing.T) {
 	if rendered, err := render(strings.Repeat("x", MaxPromptBytes-1)); err != nil || len(rendered) != MaxPromptBytes || rendered[len(rendered)-1] != '\n' {
 		t.Fatalf("max-sized prompt err=%v len=%d", err, len(rendered))
