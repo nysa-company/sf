@@ -18,12 +18,16 @@ type CommandSpec struct {
 }
 
 type CommandResult struct {
-	ExitCode        int
-	Stdout          []byte
-	Stderr          []byte
-	StdoutTruncated bool
-	StderrTruncated bool
-	Duration        time.Duration
+	ExitCode int
+	Stdout   []byte
+	Stderr   []byte
+	// OutputLastMessage is the supervisor-owned, bounded final artifact file
+	// produced by Codex --output-last-message. JSONL is telemetry only.
+	OutputLastMessage          []byte
+	StdoutTruncated            bool
+	StderrTruncated            bool
+	OutputLastMessageTruncated bool
+	Duration                   time.Duration
 }
 
 type CommandExecutor interface {

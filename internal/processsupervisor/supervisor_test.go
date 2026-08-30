@@ -19,7 +19,7 @@ func TestMaterializeOutputSchemaUsesPrivateSupervisorFileAndBoundsStdin(t *testi
 		Stdin:        []byte("untrusted ticket prompt"),
 		OutputSchema: []byte(`{"type":"object"}`),
 	}
-	arguments, err := materializeOutputSchema(invocation, temporary)
+	arguments, _, err := materializeInvocationFiles(invocation, temporary)
 	if err != nil || arguments[3] == contracts.OutputSchemaPlaceholder || filepath.Dir(arguments[3]) != temporary {
 		t.Fatalf("arguments=%q err=%v", arguments, err)
 	}
@@ -32,12 +32,12 @@ func TestMaterializeOutputSchemaUsesPrivateSupervisorFileAndBoundsStdin(t *testi
 		t.Fatalf("schema contents=%q err=%v", contents, err)
 	}
 	invocation.Stdin = make([]byte, 64<<10+1)
-	if _, err := materializeOutputSchema(invocation, temporary); err == nil {
+	if _, _, err := materializeInvocationFiles(invocation, temporary); err == nil {
 		t.Fatal("oversized provider stdin was accepted")
 	}
 	invocation.Stdin = nil
 	invocation.Argv = []string{"/fixture/codex", "exec", "-"}
-	if _, err := materializeOutputSchema(invocation, temporary); err == nil {
+	if _, _, err := materializeInvocationFiles(invocation, temporary); err == nil {
 		t.Fatal("schema without a placeholder was accepted")
 	}
 }

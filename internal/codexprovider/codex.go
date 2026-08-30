@@ -214,14 +214,20 @@ func (a *Adapter) Invocation(_ context.Context, input contracts.PhaseInput) (con
 		return contracts.Invocation{}, errors.New("Codex phase has no supported sandbox")
 	}
 	// `-` is the documented exec stdin prompt marker. The argv is fixed except
-	// for the supervisor-owned schema placeholder and authenticated worktree;
-	// untrusted ticket text never becomes an argv element.
+	// for supervisor-owned private output paths and the authenticated worktree;
+	// untrusted ticket text never becomes an argv element. The permissions
+	// profile is deliberately code-owned, not project/user configuration.
 	return contracts.Invocation{
-		Argv:         []string{a.executable, "exec", "--ephemeral", "--json", "--ignore-user-config", "--model", a.model, "--sandbox", sandbox, "-C", input.Worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "-"},
-		Stdin:        []byte(input.Prompt),
-		OutputSchema: append([]byte(nil), input.Schema...),
-		AuthHome:     a.authHome,
+		Argv:               codexArgv(a.executable, a.model, input.Worktree, sandbox),
+		Stdin:              []byte(input.Prompt),
+		OutputSchema:       append([]byte(nil), input.Schema...),
+		CaptureLastMessage: true,
+		AuthHome:           a.authHome,
 	}, nil
+}
+
+func codexArgv(executable, model, worktree, access string) []string {
+	return []string{executable, "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules", "--profile", "sf-guarded", "--config", `permissions.sf-guarded.extends=":` + access + `"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="` + access + `"}`, "--config", `permissions.sf-guarded.network.enabled=false`, "--model", model, "-C", worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-"}
 }
 
 func sandboxForPhase(phase domain.Phase) (string, bool) {
@@ -229,7 +235,7 @@ func sandboxForPhase(phase domain.Phase) (string, bool) {
 	case domain.PhasePlanning, domain.PhaseReview:
 		return "read-only", true
 	case domain.PhaseVerification, domain.PhaseBuild:
-		return "workspace-write", true
+		return "workspace", true
 	default:
 		return "", false
 	}
@@ -239,17 +245,18 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	if err := ctx.Err(); err != nil {
 		return contracts.PhaseResult{}, err
 	}
-	if result.StdoutTruncated || result.StderrTruncated || len(result.Stdout) > maxJSONL || len(result.Stderr) > maxJSONL {
+	if result.StdoutTruncated || result.StderrTruncated || result.OutputLastMessageTruncated || len(result.Stdout) > maxJSONL || len(result.Stderr) > maxJSONL || len(result.OutputLastMessage) > 1<<20 {
 		return contracts.PhaseResult{}, ErrOutputTooLarge
 	}
 	if result.ExitCode != 0 {
 		return contracts.PhaseResult{}, fmt.Errorf("codex exec exited %d", result.ExitCode)
 	}
-	artifact, transcript, usage, usageTrusted, err := parseJSONL(result.Stdout, result.Stderr)
+	transcript, usage, usageTrusted, err := parseJSONL(result.Stdout, result.Stderr)
 	if err != nil {
 		return contracts.PhaseResult{}, err
 	}
-	if !json.Valid(artifact) || len(artifact) > 1<<20 {
+	artifact := bytes.TrimSpace(result.OutputLastMessage)
+	if len(artifact) == 0 || !json.Valid(artifact) || len(artifact) > 1<<20 {
 		return contracts.PhaseResult{}, ErrNoFinalArtifact
 	}
 	// Codex reports token counts, not an authoritative monetary charge. Keep
@@ -280,7 +287,7 @@ func (a *Adapter) capabilities(ctx context.Context) error {
 		return ErrCapability
 	}
 	output := string(result.Output)
-	for _, required := range []string{"--json", "--output-schema", "--sandbox", "--ephemeral", "--ignore-user-config", "--model", "-C"} {
+	for _, required := range []string{"--json", "--output-schema", "--output-last-message", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--profile", "--config", "--model", "-C"} {
 		if !strings.Contains(output, required) {
 			return ErrCapability
 		}
@@ -397,20 +404,19 @@ func normalizeProbes(values []string) []string {
 	return result
 }
 
-func parseJSONL(stdout, stderr []byte) ([]byte, string, int64, bool, error) {
+func parseJSONL(stdout, stderr []byte) (string, int64, bool, error) {
 	if len(stdout) == 0 || len(stdout) > maxJSONL {
-		return nil, "", 0, false, ErrOutputTooLarge
+		return "", 0, false, ErrOutputTooLarge
 	}
 	lines := bytes.Split(bytes.TrimSpace(stdout), []byte{'\n'})
 	if len(lines) == 0 || len(lines) > maxEvents {
-		return nil, "", 0, false, ErrMalformedJSONL
+		return "", 0, false, ErrMalformedJSONL
 	}
-	var final []byte
 	var usage int64
 	usageTrusted := false
 	for _, line := range lines {
 		if len(line) == 0 || len(line) > maxJSONL {
-			return nil, "", 0, false, ErrMalformedJSONL
+			return "", 0, false, ErrMalformedJSONL
 		}
 		var event struct {
 			Type string `json:"type"`
@@ -423,38 +429,28 @@ func parseJSONL(stdout, stderr []byte) ([]byte, string, int64, bool, error) {
 		}
 		decoder := json.NewDecoder(bytes.NewReader(line))
 		if err := decoder.Decode(&event); err != nil || event.Type == "" {
-			return nil, "", 0, false, ErrMalformedJSONL
+			return "", 0, false, ErrMalformedJSONL
 		}
 		var extra any
 		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-			return nil, "", 0, false, ErrMalformedJSONL
+			return "", 0, false, ErrMalformedJSONL
 		}
 		if event.Type == "error" {
-			return nil, "", 0, false, errors.New("codex returned a structured error")
-		}
-		if event.Type == "item.completed" && event.Item.Type == "agent_message" {
-			text := strings.TrimSpace(event.Item.Text)
-			if text == "" || len(text) > 1<<20 || !json.Valid([]byte(text)) || final != nil {
-				return nil, "", 0, false, ErrNoFinalArtifact
-			}
-			final = []byte(text)
+			return "", 0, false, errors.New("codex returned a structured error")
 		}
 		if event.Type == "turn.completed" && len(event.Usage) != 0 {
 			units, valid := parseUsage(event.Usage)
 			if !valid || usageTrusted {
-				return nil, "", 0, false, ErrMalformedJSONL
+				return "", 0, false, ErrMalformedJSONL
 			}
 			usage, usageTrusted = units, true
 		}
-	}
-	if final == nil {
-		return nil, "", 0, false, ErrNoFinalArtifact
 	}
 	transcript := redact.String(string(stdout) + "\n" + string(stderr))
 	if len(transcript) > maxJSONL {
 		transcript = transcript[:maxJSONL]
 	}
-	return final, transcript, usage, usageTrusted, nil
+	return transcript, usage, usageTrusted, nil
 }
 
 func parseUsage(raw json.RawMessage) (int64, bool) {

@@ -69,7 +69,7 @@ func TestCodexInvocationUsesBoundedStdinAndPinnedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{adapter.executable, "exec", "--ephemeral", "--json", "--ignore-user-config", "--model", "gpt-5.6-luna", "--sandbox", "read-only", "-C", worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "-"}
+	want := codexArgv(adapter.executable, "gpt-5.6-luna", worktree, "read-only")
 	if !reflect.DeepEqual(invocation.Argv, want) || string(invocation.Stdin) != input.Prompt || string(invocation.OutputSchema) != string(input.Schema) || invocation.AuthHome != adapter.authHome {
 		t.Fatalf("invocation=%+v", invocation)
 	}
@@ -78,7 +78,7 @@ func TestCodexInvocationUsesBoundedStdinAndPinnedSchema(t *testing.T) {
 	}
 	input.Phase = domain.PhaseBuild
 	build, err := adapter.Invocation(context.Background(), input)
-	if err != nil || build.Argv[8] != "workspace-write" {
+	if err != nil || !strings.Contains(strings.Join(build.Argv, " "), `extends=":workspace"`) {
 		t.Fatalf("build invocation=%+v err=%v", build, err)
 	}
 	input.Phase = domain.PhasePublish
@@ -92,7 +92,7 @@ func TestCodexParseRejectsMalformedOversizedAndNonzeroOutput(t *testing.T) {
 	identity, _ := adapter.Probe(context.Background())
 	input := contracts.PhaseInput{Provider: identity}
 	valid := []byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"schema\\\":\\\"sf.builder/v1\\\"}\"},\"future\":true}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":8,\"total_tokens\":20}}\n")
-	result, err := adapter.Parse(context.Background(), input, contracts.CommandResult{ExitCode: 0, Stdout: valid, Stderr: []byte("progress password=keep-out")})
+	result, err := adapter.Parse(context.Background(), input, contracts.CommandResult{ExitCode: 0, Stdout: valid, OutputLastMessage: []byte(`{"schema":"sf.builder/v1"}`), Stderr: []byte("progress password=keep-out")})
 	if err != nil || string(result.Artifact) != `{"schema":"sf.builder/v1"}` || result.UsageTrusted || result.UsageUnits != 0 || !result.TokenUsageTrusted || result.TokenUsage != 20 || strings.Contains(result.Transcript, "keep-out") {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -109,7 +109,7 @@ func TestCodexParseRejectsMalformedOversizedAndNonzeroOutput(t *testing.T) {
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := adapter.Parse(cancelled, input, contracts.CommandResult{ExitCode: 0, Stdout: valid}); !errors.Is(err, context.Canceled) {
+	if _, err := adapter.Parse(cancelled, input, contracts.CommandResult{ExitCode: 0, Stdout: valid, OutputLastMessage: []byte(`{}`)}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled parse err=%v", err)
 	}
 }
@@ -244,8 +244,8 @@ func (s *compositionSupervisor) Drain(_ context.Context, request contracts.Drain
 }
 func (s *compositionSupervisor) SetLaunchRecorder(func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error) {
 }
-func (s *compositionSupervisor) RegisterExecutable(identity domain.ProviderIdentity, path string) (string, error) {
-	s.registered = append(s.registered, identity)
+func (s *compositionSupervisor) RegisterRuntime(binding contracts.RuntimeBinding, path, _ string) (string, error) {
+	s.registered = append(s.registered, binding.Identity)
 	return digestFile(path)
 }
 
@@ -325,7 +325,8 @@ func newJSONSupervisor(t *testing.T) *jsonSupervisor {
 }
 func (s *jsonSupervisor) PublicKey() []byte { return s.signer.PublicKey() }
 func (s *jsonSupervisor) Run(context.Context, contracts.DrainRequest, contracts.Invocation, contracts.PhaseInput) (contracts.CommandResult, error) {
-	return contracts.CommandResult{ExitCode: 0, Stdout: []byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"schema\\\":\\\"sf.planner/v1\\\",\\\"acceptance\\\":[\\\"works\\\"],\\\"proof\\\":{\\\"kind\\\":\\\"acceptance\\\",\\\"command\\\":[\\\"go\\\",\\\"test\\\"],\\\"details\\\":\\\"proof\\\"},\\\"paths\\\":[\\\"internal/x.go\\\"],\\\"commands\\\":[[\\\"go\\\",\\\"test\\\"]],\\\"risks\\\":[\\\"risk\\\"],\\\"questions\\\":[]}\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3,\"total_tokens\":7}}\n")}, nil
+	artifact := []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"proof"},"paths":["internal/x.go"],"commands":[["go","test"]],"risks":["risk"],"questions":[]}`)
+	return contracts.CommandResult{ExitCode: 0, OutputLastMessage: artifact, Stdout: []byte("{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3,\"total_tokens\":7}}\n")}, nil
 }
 func (s *jsonSupervisor) Drain(_ context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
 	return s.signer.ProveDrained(request)
@@ -413,7 +414,7 @@ func adapterFixture(t *testing.T, route, model string) (*Adapter, *fakeProbe) {
 }
 
 func requiredHelp() []byte {
-	return []byte("exec --json --output-schema FILE --sandbox MODE --ephemeral --ignore-user-config --model NAME -C DIR\n")
+	return []byte("exec --json --output-schema FILE --output-last-message FILE --ephemeral --ignore-user-config --ignore-rules --profile NAME --config KEY=VALUE --model NAME -C DIR\n")
 }
 
 func privateDir(t *testing.T, name string) string {

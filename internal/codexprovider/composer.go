@@ -14,7 +14,7 @@ import (
 )
 
 type executableRegistrar interface {
-	RegisterExecutable(domain.ProviderIdentity, string) (string, error)
+	RegisterRuntime(contracts.RuntimeBinding, string, string) (string, error)
 }
 
 // Compose constructs no routes unless a current, exact guarded qualification
@@ -55,7 +55,7 @@ func ComposeProfiles(ctx context.Context, channel domain.Channel, database *stor
 		if _, exists := byIdentity[binding.Identity]; exists {
 			continue
 		}
-		registeredDigest, registerErr := registrar.RegisterExecutable(binding.Identity, adapter.executable)
+		registeredDigest, registerErr := registrar.RegisterRuntime(binding, adapter.executable, adapter.authHome)
 		if registerErr != nil || registeredDigest != binding.BinaryDigest || registry.Register(ctx, adapter) != nil {
 			continue
 		}
