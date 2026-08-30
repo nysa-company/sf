@@ -242,6 +242,10 @@ func (daemon *Daemon) Serve(ctx context.Context) error {
 	return err
 }
 
+// Epoch exposes the durable leader fence to the production composition and
+// integration harnesses without exposing the Store itself.
+func (daemon *Daemon) Epoch() uint64 { return daemon.epoch }
+
 func (daemon *Daemon) Recover(ctx context.Context) error {
 	if err := daemon.lease.Validate(); err != nil {
 		return err
