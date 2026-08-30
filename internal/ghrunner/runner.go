@@ -435,7 +435,7 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 			currentRun.ownerDone = true
 		case <-bounded.Done():
 			cancelled = true
-			terminated := r.terminate(currentRun, runDeadline)
+			terminated := r.terminate(currentRun, bounded, runDeadline)
 			currentRun.identityUncertain.Store(!terminated)
 			remaining := time.Until(runDeadline)
 			if remaining > 0 {
@@ -621,7 +621,7 @@ func quarantine() (github.CleanupProof, error) {
 	return github.CleanupProof{Quarantined: true}, ErrExternalCleanupUncertain
 }
 
-func (r *Runner) terminate(current *run, deadline time.Time) bool {
+func (r *Runner) terminate(current *run, bounded context.Context, deadline time.Time) bool {
 	if current == nil || current.pid <= 0 || current.pgid != current.pid {
 		return false
 	}
@@ -632,9 +632,39 @@ func (r *Runner) terminate(current *run, deadline time.Time) bool {
 		err := signalGroup(current.pgid, syscall.SIGKILL)
 		return err == nil || errors.Is(err, syscall.ESRCH)
 	}
-	observation, cancelObservation := observationContext(deadline)
-	defer cancelObservation()
-	if err := observeLeader(observation, current); err != nil {
+	// Parent cancellation can close bounded before its derived deadline. Give a
+	// final identity observation only a small independent handoff window; if an
+	// injected reader stalls, force-kill the known launch group rather than
+	// letting the reader delay cancellation.
+	if bounded.Err() != nil {
+		observation, cancelObservation := context.WithTimeout(context.Background(), termWait)
+		observeErr := observeLeader(observation, current)
+		cancelObservation()
+		if observeErr != nil {
+			_ = signalGroup(current.pgid, syscall.SIGKILL)
+			select {
+			case <-current.ownerGone:
+				return false
+			case <-time.After(killWait):
+				return false
+			}
+		}
+		_ = signalGroup(current.pgid, syscall.SIGTERM)
+		select {
+		case <-current.ownerGone:
+			return true
+		case <-time.After(termWait):
+		}
+		_ = signalGroup(current.pgid, syscall.SIGKILL)
+		select {
+		case <-current.ownerGone:
+			return true
+		case <-time.After(killWait):
+			return false
+		}
+	}
+	if err := observeLeader(bounded, current); err != nil {
+		_ = signalGroup(current.pgid, syscall.SIGKILL)
 		return false
 	}
 	if err := signalGroup(current.pgid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
@@ -651,7 +681,7 @@ func (r *Runner) terminate(current *run, deadline time.Time) bool {
 		case <-time.After(wait):
 		}
 	}
-	if err := observeLeader(observation, current); err != nil {
+	if err := observeLeader(bounded, current); err != nil {
 		_ = signalGroup(current.pgid, syscall.SIGKILL)
 		return false
 	}
@@ -751,10 +781,6 @@ func boundedProcessStartIdentity(ctx context.Context, pid int) (string, error) {
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-}
-
-func observationContext(deadline time.Time) (context.Context, context.CancelFunc) {
-	return context.WithDeadline(context.Background(), deadline)
 }
 
 func waitGroupGone(ctx context.Context, pgid int) error {

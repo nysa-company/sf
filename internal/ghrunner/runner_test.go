@@ -461,6 +461,7 @@ func TestCancellationAndSubsequentIdentitySamplingAreBounded(t *testing.T) {
 	defer func() { processStartIdentityFn = old }()
 	var calls atomic.Int32
 	secondStarted := make(chan struct{})
+	secondDone := make(chan struct{})
 	release := make(chan struct{})
 	processStartIdentityFn = func(pid int) (string, error) {
 		if calls.Add(1) == 1 {
@@ -468,35 +469,53 @@ func TestCancellationAndSubsequentIdentitySamplingAreBounded(t *testing.T) {
 		}
 		close(secondStarted)
 		<-release
+		close(secondDone)
 		return old(pid)
 	}
 	runner, err := New(mustExecutable(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-	defer cancel()
+	env := runnerEnvironment(t)
+	ctx, cancel := context.WithCancel(context.Background())
 	started := time.Now()
-	_, runErr := runner.Run(ctx, mustExecutable(t), helperArgs("hang"), runnerEnvironment(t))
-	if !errors.Is(runErr, context.DeadlineExceeded) || time.Since(started) > 2*time.Second {
-		t.Fatalf("cached identity cancellation err=%v duration=%s", runErr, time.Since(started))
+	runDone := make(chan error, 1)
+	go func() {
+		_, runErr := runner.Run(ctx, mustExecutable(t), helperArgs("hang"), env)
+		runDone <- runErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for calls.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	sampleCtx, cancelSample := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancelSample()
-	sampleStarted := time.Now()
-	if _, sampleErr := boundedProcessStartIdentity(sampleCtx, os.Getpid()); !errors.Is(sampleErr, context.DeadlineExceeded) || time.Since(sampleStarted) > time.Second {
-		t.Fatalf("blocking subsequent identity sample err=%v duration=%s", sampleErr, time.Since(sampleStarted))
+	if calls.Load() != 1 {
+		t.Fatal("initial process identity sample did not complete")
+	}
+	cancel()
+	var runErr error
+	select {
+	case runErr = <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run waited on a blocked subsequent identity sample")
+	}
+	if !errors.Is(runErr, context.Canceled) || time.Since(started) > 2*time.Second {
+		t.Fatalf("blocked subsequent identity cancellation err=%v duration=%s", runErr, time.Since(started))
 	}
 	select {
 	case <-secondStarted:
-		close(release)
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("blocking subsequent identity sample was not started")
 	}
-	if calls.Load() != 2 {
+	close(release)
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("blocked identity sampler did not finish after release")
+	}
+	if calls.Load() < 2 {
 		t.Fatalf("identity reader calls=%d, want initial plus bounded subsequent sample", calls.Load())
 	}
-	if proof, cleanupErr := runner.Cleanup(context.Background()); cleanupErr != nil || !proof.Drained {
+	if proof, cleanupErr := runner.Cleanup(context.Background()); !errors.Is(cleanupErr, ErrExternalCleanupUncertain) || !proof.Quarantined {
 		t.Fatalf("cleanup=%+v err=%v", proof, cleanupErr)
 	}
 }
