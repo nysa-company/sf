@@ -69,6 +69,7 @@ var (
 	ErrCleanupInProgress        = errors.New("gh cleanup is already in progress")
 	hostBootIdentityFn          = hostBootIdentity
 	processStartIdentityFn      = processStartIdentity
+	validatedEnvironmentFn      = validatedEnvironment
 )
 
 // Runner is safe for one production GitHub client. It is not a pool: a
@@ -245,7 +246,7 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 		r.mu.Unlock()
 		return nil, err
 	}
-	safeEnv, err := validatedEnvironment(env)
+	safeEnv, err := validatedEnvironmentFn(env)
 	if err != nil {
 		r.markPrelaunchLocked()
 		r.mu.Unlock()
@@ -275,10 +276,10 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 	// Revalidate the canonical environment immediately before Start as well;
 	// an attacker may chmod, replace, or retarget a directory after the first
 	// validation performed before taking the runner lock.
-	safeEnv, err = validatedEnvironment(env)
+	safeEnv, err = validatedEnvironmentFn(env)
 	if err != nil {
+		r.markPrelaunchLocked()
 		r.mu.Unlock()
-		r.markPrelaunch()
 		return nil, err
 	}
 	command := exec.Command(r.snapshotPath, args...)

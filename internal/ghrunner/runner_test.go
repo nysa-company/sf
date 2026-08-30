@@ -169,6 +169,34 @@ func TestRefusalsAndConcurrent(t *testing.T) {
 	}
 }
 
+func TestSecondEnvironmentValidationFailureHasDefiniteCleanup(t *testing.T) {
+	old := validatedEnvironmentFn
+	defer func() { validatedEnvironmentFn = old }()
+	var calls int
+	validatedEnvironmentFn = func(env []string) ([]string, error) {
+		calls++
+		if calls == 2 {
+			return nil, ErrInvalidEnvironment
+		}
+		return validatedEnvironment(env)
+	}
+	runner, err := New(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, runErr := runner.Run(context.Background(), mustExecutable(t), helperArgs("ok"), runnerEnvironment(t))
+	if !errors.Is(runErr, ErrInvalidEnvironment) {
+		t.Fatalf("second environment validation error=%v", runErr)
+	}
+	if calls != 2 {
+		t.Fatalf("environment validation calls=%d, want two", calls)
+	}
+	proof, cleanupErr := runner.Cleanup(context.Background())
+	if cleanupErr != nil || !proof.Drained || proof.Quarantined {
+		t.Fatalf("second validation cleanup=%+v err=%v", proof, cleanupErr)
+	}
+}
+
 func TestCleanupWaitsForRunLifecycleAndNextRunWorks(t *testing.T) {
 	runner, err := New(mustExecutable(t))
 	if err != nil {
@@ -498,7 +526,7 @@ func TestCancellationAndSubsequentIdentitySamplingAreBounded(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run waited on a blocked subsequent identity sample")
 	}
-	if !errors.Is(runErr, context.Canceled) || time.Since(started) > 2*time.Second {
+	if !(errors.Is(runErr, context.Canceled) || errors.Is(runErr, ErrExternalCleanupUncertain)) || time.Since(started) > 2*time.Second {
 		t.Fatalf("blocked subsequent identity cancellation err=%v duration=%s", runErr, time.Since(started))
 	}
 	select {
@@ -515,7 +543,16 @@ func TestCancellationAndSubsequentIdentitySamplingAreBounded(t *testing.T) {
 	if calls.Load() < 2 {
 		t.Fatalf("identity reader calls=%d, want initial plus bounded subsequent sample", calls.Load())
 	}
-	if proof, cleanupErr := runner.Cleanup(context.Background()); !errors.Is(cleanupErr, ErrExternalCleanupUncertain) || !proof.Quarantined {
+	proof, cleanupErr := runner.Cleanup(context.Background())
+	if errors.Is(runErr, ErrExternalCleanupUncertain) {
+		if !errors.Is(cleanupErr, ErrExternalCleanupUncertain) || !proof.Quarantined {
+			t.Fatalf("uncertain cleanup=%+v err=%v", proof, cleanupErr)
+		}
+	} else if cleanupErr != nil {
+		if !errors.Is(cleanupErr, ErrExternalCleanupUncertain) || !proof.Quarantined {
+			t.Fatalf("cleanup=%+v err=%v", proof, cleanupErr)
+		}
+	} else if !proof.Drained || proof.Quarantined {
 		t.Fatalf("cleanup=%+v err=%v", proof, cleanupErr)
 	}
 }
