@@ -31,7 +31,7 @@ type RepositoryCommandSupervisor struct {
 }
 
 func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.RepositoryCommandClaim, spec contracts.CommandSpec, policy executionpolicy.CommandSnapshot, lease contracts.RepositoryCommandLease) (contracts.CommandResult, error) {
-	if lease == nil || len(spec.Argv) == 0 || spec.Directory != claim.Worktree || spec.Timeout <= 0 || policy.Authorize(spec.Argv) != nil || policy.Digest() != claim.PolicyDigest {
+	if lease == nil || spec.Profile != contracts.ProfileGuarded || len(spec.Argv) == 0 || spec.Directory != claim.Worktree || spec.Timeout <= 0 || spec.Timeout > 45*time.Minute || s.SoftDrain > 30*time.Second || s.HardDrain > 30*time.Second || policy.Authorize(spec.Argv) != nil || policy.Digest() != claim.PolicyDigest {
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	argvBytes, err := json.Marshal(spec.Argv)
@@ -53,8 +53,23 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	if err != nil {
 		return contracts.CommandResult{}, err
 	}
+	resolved, err = filepath.EvalSymlinks(resolved)
+	if err != nil {
+		return contracts.CommandResult{}, err
+	}
 	if _, err = authenticateExecutable(resolved); err != nil {
 		return contracts.CommandResult{}, err
+	}
+	if claim.ExecutablePath != resolved {
+		return contracts.CommandResult{}, ErrUnclear
+	}
+	fileBytes, err := os.ReadFile(resolved)
+	if err != nil {
+		return contracts.CommandResult{}, err
+	}
+	fileSum := sha256.Sum256(fileBytes)
+	if claim.ExecutableDigest != "sha256:"+hex.EncodeToString(fileSum[:]) {
+		return contracts.CommandResult{}, ErrUnclear
 	}
 	if actual, err := filepath.EvalSymlinks(spec.Directory); err != nil || actual != claim.Worktree {
 		return contracts.CommandResult{}, ErrUnclear
@@ -164,10 +179,18 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	select {
 	case waitErr = <-wait:
 	case <-runCtx.Done():
+		if pgid, err := syscall.Getpgid(launch.PID); err != nil || pgid != launch.PGID {
+			_ = lease.Quarantine()
+			return contracts.CommandResult{}, ErrUnclear
+		}
 		_ = signalGroup(launch.PGID, syscall.SIGTERM)
 		select {
 		case waitErr = <-wait:
 		case <-time.After(s.drainSoft()):
+			if pgid, err := syscall.Getpgid(launch.PID); err != nil || pgid != launch.PGID {
+				_ = lease.Quarantine()
+				return contracts.CommandResult{}, ErrUnclear
+			}
 			_ = signalGroup(launch.PGID, syscall.SIGKILL)
 			waitErr = <-wait
 		}
@@ -274,6 +297,10 @@ func (d RepositoryCommandDrainer) DrainRepositoryCommand(ctx context.Context, l 
 	if start != l.ProcessStartIdentity {
 		return ErrUnclear
 	}
+	pgid, err := syscall.Getpgid(l.PID)
+	if err != nil || pgid != l.PGID {
+		return ErrUnclear
+	}
 	if err := signalGroup(l.PGID, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 		return err
 	}
@@ -286,7 +313,7 @@ func (d RepositoryCommandDrainer) DrainRepositoryCommand(ctx context.Context, l 
 		return ctx.Err()
 	case <-time.After(soft):
 	}
-	if syscall.Kill(-l.PGID, 0) == nil {
+	if current, err := syscall.Getpgid(l.PID); err == nil && current == l.PGID && syscall.Kill(-l.PGID, 0) == nil {
 		_ = signalGroup(l.PGID, syscall.SIGKILL)
 	}
 	hard := d.HardDrain

@@ -175,6 +175,8 @@ func EvaluateRepositoryCommand(argv []string) CommandDecision {
 	}
 	executable := strings.ToLower(filepath.Base(argv[0]))
 	switch executable {
+	case "sh", "bash", "zsh", "dash", "fish", "env", "command":
+		return deny("shell_evaluation_forbidden", "shell and command wrappers are forbidden; use an exact executable argv")
 	case "gh":
 		return deny("github_cli_forbidden", "repository commands cannot invoke gh")
 	case "curl", "wget", "ftp", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat":

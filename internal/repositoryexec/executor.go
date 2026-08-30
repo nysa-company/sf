@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/executionpolicy"
@@ -47,6 +48,15 @@ func CommandDigest(argv []string) (string, error) {
 	return "sha256:" + hex.EncodeToString(s[:]), nil
 }
 
+func ExecutableDigest(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	s := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(s[:]), nil
+}
+
 // SpecDigest binds every launch-affecting field. Stdin is hashed by the
 // caller after it has been bounded and materialized.
 func SpecDigest(spec contracts.CommandSpec, stdinDigest string) (string, error) {
@@ -66,7 +76,7 @@ func SpecDigest(spec contracts.CommandSpec, stdinDigest string) (string, error) 
 }
 
 func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult, error) {
-	if e.Authority == nil || len(req.Spec.Argv) == 0 || req.Spec.Directory != req.Claim.Worktree || req.Policy.Digest() != req.Claim.PolicyDigest {
+	if e.Authority == nil || req.Spec.Profile != contracts.ProfileGuarded || len(req.Spec.Argv) == 0 || req.Spec.Directory != req.Claim.Worktree || req.Spec.Timeout <= 0 || req.Spec.Timeout > 45*time.Minute || req.Policy.Digest() != req.Claim.PolicyDigest {
 		return contracts.CommandResult{}, ErrInvalidBinding
 	}
 	digest, err := CommandDigest(req.Spec.Argv)
@@ -103,6 +113,13 @@ func (e Executor) Run(ctx context.Context, req Request) (contracts.CommandResult
 		return contracts.CommandResult{}, err
 	}
 	result, runErr := e.Supervisor.Run(ctx, req.Claim, req.Spec, req.Policy, lease)
+	if runErr != nil && result.ExitCode < 0 {
+		if recorder, ok := e.Authority.(contracts.RepositoryCommandResultRecorder); ok {
+			_ = recorder.MarkRepositoryCommandUncertain(ctx, req.Claim, runErr.Error())
+		}
+		_ = lease.Quarantine()
+		return result, runErr
+	}
 	if recorder, ok := e.Authority.(contracts.RepositoryCommandResultRecorder); ok && (runErr == nil || result.ExitCode >= 0) {
 		if err := recorder.CompleteRepositoryCommand(ctx, req.Claim, result); err != nil {
 			_ = lease.Quarantine()

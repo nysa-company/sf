@@ -116,6 +116,7 @@ type RepositoryCommandClaim struct {
 	TicketVersion, LeaderEpoch, RunnerEpoch, ClaimEpoch              uint64
 	Repository, Worktree, WorktreeIdentity, Branch, BaseRef, BaseSHA string
 	CommandDigest, SpecDigest, PolicyDigest                          string
+	ExecutablePath, ExecutableDigest                                 string
 }
 
 type RepositoryCommandLaunch struct {
@@ -135,6 +136,7 @@ type RepositoryCommandAuthority interface {
 
 type RepositoryCommandResultRecorder interface {
 	CompleteRepositoryCommand(context.Context, RepositoryCommandClaim, CommandResult) error
+	MarkRepositoryCommandUncertain(context.Context, RepositoryCommandClaim, string) error
 }
 type RepositoryCommandDrainer interface {
 	DrainRepositoryCommand(context.Context, RepositoryCommandLaunch) error

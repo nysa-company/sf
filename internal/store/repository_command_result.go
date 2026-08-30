@@ -42,3 +42,22 @@ func (s *Store) CompleteRepositoryCommand(ctx context.Context, claim contracts.R
 }
 
 var _ contracts.RepositoryCommandResultRecorder = (*Store)(nil)
+
+func (s *Store) MarkRepositoryCommandUncertain(ctx context.Context, claim contracts.RepositoryCommandClaim, reason string) error {
+	if !validRepositoryCommandClaim(claim) || reason == "" {
+		return ErrRepositoryCommandIntent
+	}
+	return s.write(ctx, func(c *sql.Conn) error {
+		if err := s.assertRepositoryCommandCurrent(ctx, c, claim); err != nil {
+			return err
+		}
+		result, err := c.ExecContext(ctx, `UPDATE effects SET state='uncertain',observed_identity=? WHERE semantic_key=? AND state='executing' AND claim_epoch=?`, "uncertain:"+reason, claim.SemanticKey, claim.ClaimEpoch)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return ErrRepositoryCommandIntent
+		}
+		return nil
+	})
+}
