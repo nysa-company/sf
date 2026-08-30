@@ -12,6 +12,49 @@ import (
 
 var ErrPreparedCommitRecovery = errors.New("prepared git commit recovery is uncertain")
 
+// RetireUnpreparedGitCommit proves that a failed commit never reached the
+// durable prepared-object boundary. It removes the immutable child intent in
+// the same transaction that makes the effect retryable; otherwise the unique
+// semantic key would strand every deterministic retry behind an old intent.
+func (s *Store) RetireUnpreparedGitCommit(ctx context.Context, claim contracts.GitMutationClaim) error {
+	if s == nil || !validContractClaim(claim) || claim.Operation != "commit" {
+		return ErrGitMutationIntent
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		facts, err := gitMutationIntentFactsFrom(ctx, conn, claim.SemanticKey)
+		if err != nil || facts.Claim != claim || facts.Effect.State != EffectExecuting || facts.PreparedCommitOID != "" || facts.PreparedTreeOID != "" {
+			return ErrGitMutationIntent
+		}
+		if err := s.assertTicketFence(ctx, conn, claim.TicketRef, claim.TicketVersion, domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}); err != nil {
+			return err
+		}
+		if err := repositoryHasProviderWriter(ctx, conn, claim.Repository); err != nil {
+			return err
+		}
+		if err := repositoryHasCommandWriter(ctx, conn, claim.Repository); err != nil {
+			return err
+		}
+		if err := repositoryHasGitWriter(ctx, conn, claim.Repository); err != nil {
+			return err
+		}
+		deleted, err := conn.ExecContext(ctx, `DELETE FROM git_mutation_intents WHERE semantic_key=? AND claim_epoch=? AND operation='commit' AND prepared_commit_oid='' AND prepared_tree_oid=''`, claim.SemanticKey, claim.ClaimEpoch)
+		if err != nil {
+			return err
+		}
+		if n, _ := deleted.RowsAffected(); n != 1 {
+			return ErrGitMutationIntent
+		}
+		changed, err := conn.ExecContext(ctx, `UPDATE effects SET state='failed',observed_identity='' WHERE semantic_key=? AND state='executing' AND claim_epoch=? AND leader_epoch=? AND runner_epoch=? AND ticket_version=?`, claim.SemanticKey, claim.ClaimEpoch, claim.LeaderEpoch, claim.RunnerEpoch, claim.TicketVersion)
+		if err != nil {
+			return err
+		}
+		if n, _ := changed.RowsAffected(); n != 1 {
+			return ErrStaleFence
+		}
+		return nil
+	})
+}
+
 // ConfirmPreparedCommit is the normal-path counterpart to recovery.  Git has
 // already recorded the immutable commit/tree tuple before making the ref
 // reachable; this final Store write accepts only an authenticated observation

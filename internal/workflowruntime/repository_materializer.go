@@ -40,14 +40,14 @@ func (m RepositoryMaterializer) MaterializeVerificationCheckpoint(ctx context.Co
 		return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
 	}
 	provider, parsed, err := m.Store.LoadHistoricalProviderAttemptResult(ctx, key)
-	if err != nil || provider.Claim.Ref != request.Ticket.Ref || provider.Claim.Phase != "verification" || provider.Claim.Role != "reviewer" || parsed.Verify == nil || !sameJSON(*parsed.Verify, artifact) {
+	if err != nil || !providerMatches(request, provider, key, domain.PhaseVerification, "reviewer") || parsed.Verify == nil || !sameJSON(*parsed.Verify, artifact) {
 		return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
 	}
 	command, result, err := m.runCommand(ctx, request, store.RepositoryCommandPurposePrebuildVerification, key, artifact, "")
 	if err != nil || !verificationOutcome(artifact.PrebuildOutcome, result.Result.ExitCode) {
 		return workflowworker.VerificationCheckpoint{}, materializeErr(err)
 	}
-	observation, err := m.commit(ctx, request, request.Worktree.BaseSHA, artifact.OwnedFiles, commitDigest("verification-checkpoint", request, key, command, result.ResultDigest, artifact))
+	observation, err := m.commit(ctx, request, request.Worktree.BaseSHA, artifact.OwnedFiles, nil, commitDigest("verification-checkpoint", request, key, command, result.ResultDigest, artifact))
 	if err != nil {
 		return workflowworker.VerificationCheckpoint{}, err
 	}
@@ -71,7 +71,7 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
 	}
 	provider, parsed, err := m.Store.LoadHistoricalProviderAttemptResult(ctx, key)
-	if err != nil || provider.Claim.Ref != request.Ticket.Ref || provider.Claim.Phase != "build" || provider.Claim.Role != "builder" || parsed.Builder == nil || !sameJSON(*parsed.Builder, builder) {
+	if err != nil || !providerMatches(request, provider, key, domain.PhaseBuild, "builder") || parsed.Builder == nil || !sameJSON(*parsed.Builder, builder) {
 		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
 	}
 	command, result, err := m.runCommand(ctx, request, store.RepositoryCommandPurposePostbuildCandidate, key, phaseartifact.Verification{}, verification.CheckpointID)
@@ -88,7 +88,7 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 			return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
 		}
 	}
-	observation, err := m.commit(ctx, request, verification.CheckpointID, allowed, commitDigest("candidate", request, key, command, result.ResultDigest, struct {
+	observation, err := m.commit(ctx, request, verification.CheckpointID, allowed, verification.OwnedFiles, commitDigest("candidate", request, key, command, result.ResultDigest, struct {
 		Plan         workflowprompt.PlanIdentity
 		Verification workflowprompt.VerificationIdentity
 		Builder      phaseartifact.Builder
@@ -123,6 +123,10 @@ func (m RepositoryMaterializer) runCommand(ctx context.Context, request workflow
 		return contracts.RepositoryCommandResultKey{}, store.RepositoryCommandResult{}, err
 	}
 	argv := append([]string(nil), effective.Commands.Verify.Argv...)
+	worktree, err := m.worktree(request)
+	if err != nil || effective.Repository == "" || effective.Repository != worktree.Identity.Repository || effective.BaseBranch != worktree.Identity.BaseRef {
+		return contracts.RepositoryCommandResultKey{}, store.RepositoryCommandResult{}, ErrRepositoryMaterialization
+	}
 	if purpose == store.RepositoryCommandPurposePrebuildVerification && !equalArgv(argv, verification.Command) {
 		return contracts.RepositoryCommandResultKey{}, store.RepositoryCommandResult{}, ErrRepositoryMaterialization
 	}
@@ -173,7 +177,15 @@ func (m RepositoryMaterializer) runCommand(ctx context.Context, request workflow
 	}
 	if effect, effectErr := m.Store.Effect(ctx, semantic); effectErr == nil && (effect.State == store.EffectConfirmed || effect.State == store.EffectFailed) {
 		result, loadErr := m.Store.LoadRepositoryCommandResult(ctx, contracts.RepositoryCommandResultKey{SemanticKey: semantic, ClaimEpoch: effect.ClaimEpoch})
-		return result.Key, result, loadErr
+		if loadErr == nil {
+			return result.Key, result, nil
+		}
+		// A failed effect before the repository child launched has no immutable
+		// result. PlanEffect may safely bind the same deterministic request for a
+		// new claim; a confirmed effect without its result is tampering/ambiguity.
+		if effect.State != store.EffectFailed || !errors.Is(loadErr, store.ErrNotFound) {
+			return contracts.RepositoryCommandResultKey{}, store.RepositoryCommandResult{}, loadErr
+		}
 	} else if effectErr == nil && (effect.State == store.EffectExecuting || effect.State == store.EffectUncertain) {
 		return contracts.RepositoryCommandResultKey{}, store.RepositoryCommandResult{}, ErrRepositoryMaterialization
 	}
@@ -203,7 +215,7 @@ func (m RepositoryMaterializer) runCommand(ctx context.Context, request workflow
 	return key, result, nil
 }
 
-func (m RepositoryMaterializer) commit(ctx context.Context, request workflowworker.PhaseRequest, parent string, paths []string, evidence string) (store.CommitObservation, error) {
+func (m RepositoryMaterializer) commit(ctx context.Context, request workflowworker.PhaseRequest, parent string, paths, protected []string, evidence string) (store.CommitObservation, error) {
 	worktree, err := m.worktree(request)
 	if err != nil {
 		return store.CommitObservation{}, err
@@ -235,7 +247,7 @@ func (m RepositoryMaterializer) commit(ctx context.Context, request workflowwork
 	if err != nil {
 		return store.CommitObservation{}, err
 	}
-	if _, err = runner.Commit(ctx, worktree, git.CommitRequest{EvidenceDigest: evidence, Timestamp: time.Unix(0, 0).UTC(), BaseRef: worktree.Identity.BaseRef, ExpectedParent: parent, Policy: git.DiffPolicy{AllowedPaths: paths}, MutationClaim: claim}); err != nil {
+	if _, err = runner.Commit(ctx, worktree, git.CommitRequest{EvidenceDigest: evidence, Timestamp: time.Unix(0, 0).UTC(), BaseRef: worktree.Identity.BaseRef, ExpectedParent: parent, Policy: git.DiffPolicy{AllowedPaths: paths, ProtectedPaths: protected}, MutationClaim: claim}); err != nil {
 		m.settleCommitFailure(ctx, claim)
 		return store.CommitObservation{}, err
 	}
@@ -287,6 +299,10 @@ func sameJSON(left, right any) bool {
 	b, be := json.Marshal(right)
 	return ae == nil && be == nil && bytes.Equal(a, b)
 }
+func providerMatches(request workflowworker.PhaseRequest, result store.ProviderAttemptResult, key store.ProviderAttemptResultKey, phase domain.Phase, role string) bool {
+	claim := result.Claim
+	return key.Ref == request.Ticket.Ref && key.AttemptID == result.AttemptID && key.Attempt == claim.Attempt && key.Phase == phase && claim.Ref == request.Ticket.Ref && claim.Phase == phase && claim.Role == role && claim.ExpectedVersion == request.Ticket.Version && claim.LeaderEpoch == request.Fence.LeaderEpoch && claim.RunnerEpoch == request.Fence.RunnerEpoch && claim.Worktree == request.Worktree.Path && claim.WorktreeIdentity == string(request.Worktree.IdentityJSON) && claim.BaseSHA == request.Worktree.BaseSHA
+}
 func containsPath(paths []string, path string) bool {
 	for _, p := range paths {
 		if p == path || strings.HasPrefix(path, strings.TrimSuffix(p, "/")+"/") {
@@ -308,9 +324,10 @@ func (m RepositoryMaterializer) settleCommitFailure(ctx context.Context, claim c
 		_, _ = m.Store.MarkEffectUncertain(ctx, fence)
 		return
 	}
-	// No visible ref mutation can precede RecordPreparedCommit. Retire this
-	// safe absence so the deterministic request can be issued again.
-	_, _ = m.Store.FailEffect(ctx, fence)
+	// No visible ref mutation can precede RecordPreparedCommit. Retire both the
+	// exact child intent and effect so the deterministic key can be issued
+	// again; merely marking the effect failed leaves the unique intent behind.
+	_ = m.Store.RetireUnpreparedGitCommit(ctx, claim)
 }
 
 func commitDigest(kind string, request workflowworker.PhaseRequest, provider store.ProviderAttemptResultKey, command contracts.RepositoryCommandResultKey, resultDigest string, value any) string {

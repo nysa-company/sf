@@ -2051,7 +2051,11 @@ func (r Runner) RemoveWorktree(ctx context.Context, repository string, worktree 
 }
 
 type DiffPolicy struct {
-	AllowedPaths    []string
+	AllowedPaths []string
+	// ProtectedPaths must be byte-identical to ExpectedHead in the immutable
+	// tree accepted for a candidate. This prevents Builder's untrusted changed
+	// file declaration from silently rewriting the verification checkpoint.
+	ProtectedPaths  []string
 	AllowExecutable bool
 	ExpectedHead    string
 }
@@ -2208,14 +2212,40 @@ func (r Runner) validateImmutableTree(ctx context.Context, worktree, baseRef, tr
 		return err
 	}
 	if len(paths) == 0 {
-		return nil
+		return r.validateProtectedTreePaths(ctx, worktree, tree, policy)
 	}
 	args := append([]string{"ls-tree", "-r", "-z", tree, "--"}, paths...)
 	entries, err := r.command(ctx, worktree, args...)
 	if err != nil {
 		return err
 	}
-	return validateImmutableTreeEntries(entries, policy)
+	if err := validateImmutableTreeEntries(entries, policy); err != nil {
+		return err
+	}
+	return r.validateProtectedTreePaths(ctx, worktree, tree, policy)
+}
+
+func (r Runner) validateProtectedTreePaths(ctx context.Context, worktree, tree string, policy DiffPolicy) error {
+	if len(policy.ProtectedPaths) == 0 {
+		return nil
+	}
+	if !validOID(policy.ExpectedHead) {
+		return fmt.Errorf("%w: protected paths require an expected parent", ErrUnsafeWorktree)
+	}
+	for _, path := range policy.ProtectedPaths {
+		if !validRepoPath(strings.Trim(path, "/")) {
+			return fmt.Errorf("%w: invalid protected path", ErrUnsafeWorktree)
+		}
+	}
+	args := append([]string{"diff", "--no-renames", "--name-only", "-z", policy.ExpectedHead, tree, "--"}, policy.ProtectedPaths...)
+	changed, err := r.command(ctx, worktree, args...)
+	if err != nil {
+		return err
+	}
+	if len(splitNUL(changed)) != 0 {
+		return fmt.Errorf("%w: candidate modified protected verification paths", ErrUnsafeWorktree)
+	}
+	return nil
 }
 
 func validateImmutableTreeEntries(data []byte, policy DiffPolicy) error {
@@ -2364,7 +2394,9 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	if err != nil || !validOID(tree) {
 		return "", fmt.Errorf("%w: staged tree could not be persisted", ErrUnsafeWorktree)
 	}
-	if err := r.validateImmutableTree(ctx, worktree.Path, request.BaseRef, tree, request.Policy); err != nil {
+	treePolicy := request.Policy
+	treePolicy.ExpectedHead = request.ExpectedParent
+	if err := r.validateImmutableTree(ctx, worktree.Path, request.BaseRef, tree, treePolicy); err != nil {
 		return "", err
 	}
 	// The tree is immutable, but the control plane and parent are not. Prove

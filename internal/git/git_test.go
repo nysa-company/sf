@@ -328,6 +328,32 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 	}
 }
 
+func TestCommitRefusesProtectedCheckpointPath(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-protected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("checkpoint\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("checkpoint")), Timestamp: time.Unix(31, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("builder overwrote proof\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(32, 0), BaseRef: "main", ExpectedParent: checkpoint, Policy: DiffPolicy{AllowedPaths: []string{"src"}, ProtectedPaths: []string{"src/main.txt"}}, MutationClaim: commitClaim(worktree, checkpoint)}); !errors.Is(err, ErrUnsafeWorktree) {
+		t.Fatalf("protected checkpoint path err=%v", err)
+	}
+}
+
 func TestCreateWorktreeAdoptsExistingAuthenticatedPath(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
 	authority := &countingMutationAuthority{}

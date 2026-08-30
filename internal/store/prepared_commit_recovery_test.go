@@ -98,6 +98,35 @@ func TestConfirmPreparedCommitRefusesActiveLeaseAndMismatch(t *testing.T) {
 	}
 }
 
+func TestRetireUnpreparedGitCommitMakesDeterministicRetryPossible(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := gitIntentFixture(t, db, ctx, "SF-prepared-retire")
+	claim, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireGitMutation(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RetireUnpreparedGitCommit(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GitMutationIntentFacts(ctx, intent.SemanticKey); !errors.Is(err, ErrGitMutationIntent) {
+		t.Fatalf("retired facts err=%v", err)
+	}
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "git/commit", TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil || retry.ClaimEpoch != claim.ClaimEpoch+1 {
+		t.Fatalf("retry=%+v err=%v", retry, err)
+	}
+}
+
 func TestConfirmRecoveredPreparedCommitIsExactAndIdempotentAcrossRunnerFence(t *testing.T) {
 	db, ctx, intent, claim, commit, tree, leader := preparedCommitRecoveryFixture(t, "SF-prepared-confirm")
 	observation := contracts.PreparedCommitObservation{CommitOID: commit, ParentOID: intent.ExpectedHeadOID, TreeOID: tree}
