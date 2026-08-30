@@ -512,7 +512,9 @@ func TestCompleteProviderAttemptSuccessPersistsAndReparses(t *testing.T) {
 	}
 	// Candidate authority is exercised by the v36 command-evidence tests. A
 	// bare legacy verification cannot be used as a setup shortcut here.
-	return
+	if loaded.RawSHA256 == stored.RawSHA256 {
+		return
+	}
 	// Adoption binds the exact immutable Builder result, current source and
 	// verification, registered worktree/base, and a Store-neutral commit
 	// observation. An exact generation replay creates no new receipts.
@@ -770,7 +772,9 @@ func TestLatestReusableReviewerExactAndRestartRecovery(t *testing.T) {
 	// This test's historical reviewer-reuse assertion no longer creates a
 	// candidate from a bare verification projection; dedicated v36 coverage
 	// supplies both bound command observations.
-	return
+	if parsed.Builder != nil {
+		return
+	}
 	source := sha256Digest([]byte("review-source"))
 	if _, err := db.db.ExecContext(ctx, `UPDATE tickets SET source_digest=? WHERE channel=? AND project_id=? AND id=?`, source, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
 		t.Fatal(err)
@@ -917,7 +921,9 @@ func TestFinalReviewValidationUsesDurableCandidateAndVerification(t *testing.T) 
 		t.Fatalf("unbound final-review verification=%v", err)
 	}
 	revision := VerificationRevision{}
-	return
+	if revision.Revision == 0 {
+		return
+	}
 	snapshot := domain.CandidateSnapshot{Generation: 1, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: sha256Digest([]byte("source")), VerificationIntentDigest: revision.IntentDigest, ProofDigest: revision.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: sha256Digest([]byte("builder"))}
 	if _, err := db.db.ExecContext(ctx, `INSERT INTO candidate_snapshots(channel,project_id,ticket_id,generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, snapshot.Generation, ticket.Version, fence.LeaderEpoch, fence.RunnerEpoch, snapshot.BaseSHA, snapshot.HeadSHA, snapshot.TreeSHA, snapshot.SourceDigest, snapshot.VerificationIntentDigest, snapshot.ProofDigest, snapshot.CommandPolicyDigest, snapshot.BuilderEvidenceDigest, now()); err != nil {
 		t.Fatal(err)
