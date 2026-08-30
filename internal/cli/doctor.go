@@ -78,6 +78,7 @@ type DoctorDeps struct {
 	Worktree   func(context.Context, string) error
 	AuthStatus func(context.Context) []localauth.Status
 	Pair       func(context.Context, domain.Channel) (store.ProviderPair, error)
+	Attempts   func(context.Context, domain.Channel) ([]store.ProviderAttempt, error)
 }
 
 func (deps DoctorDeps) defaults() DoctorDeps {
@@ -136,6 +137,14 @@ func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
 		defer database.Close()
 		return database.ProviderPair(ctx, selected)
 	}
+	deps.Attempts = func(ctx context.Context, selected domain.Channel) ([]store.ProviderAttempt, error) {
+		database, err := store.OpenReadOnly(ctx, databasePath)
+		if err != nil {
+			return nil, err
+		}
+		defer database.Close()
+		return database.ActiveProviderAttempts(ctx, selected)
+	}
 	return deps
 }
 
@@ -167,10 +176,30 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	}
 	report.Checks = append(report.Checks, checkExecutable(deps, "gh", "gh executable is available"))
 	pair, pairAvailable := checkProviderPair(ctx, deps, &report)
+	checkQuarantinedProviders(ctx, deps, &report)
 	checkAuthentication(ctx, deps, pair, pairAvailable, &report)
 	report.Checks = append(report.Checks, DoctorCheck{ID: "container_runtime", Status: CheckNotRun, Summary: "Docker and Colima are not required"})
 	report.Checks = append(report.Checks, DoctorCheck{ID: "autonomous_mode", Status: CheckPass, Summary: "autonomous mode is disabled by policy"})
 	return report
+}
+
+func checkQuarantinedProviders(ctx context.Context, deps DoctorDeps, report *DoctorReport) {
+	if deps.Attempts == nil {
+		report.Checks = append(report.Checks, DoctorCheck{ID: "provider_recovery", Status: CheckNotRun, Summary: "provider recovery inspection was not configured"})
+		return
+	}
+	attempts, err := deps.Attempts(ctx, deps.Channel)
+	if err != nil {
+		report.Checks = append(report.Checks, DoctorCheck{ID: "provider_recovery", Status: CheckNotRun, Summary: "provider recovery claims could not be inspected"})
+		return
+	}
+	for _, attempt := range attempts {
+		if attempt.State == "quarantined" {
+			report.Checks = append(report.Checks, failedCheck("provider_recovery", "a provider process claim is quarantined; verify the host reboot state and recover only after the worktree is safe", deps.Binary, "doctor", "--json"))
+			return
+		}
+	}
+	report.Checks = append(report.Checks, DoctorCheck{ID: "provider_recovery", Status: CheckPass, Summary: "no quarantined provider process claims were found"})
 }
 
 func checkProviderPair(ctx context.Context, deps DoctorDeps, report *DoctorReport) (store.ProviderPair, bool) {

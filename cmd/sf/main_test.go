@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,9 +13,65 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/config"
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/processsupervisor"
 	"github.com/nysa-company/sf/internal/store"
 )
+
+func TestCompiledDevGateRestartDrainsRecordedGroupBeforeCallerContinues(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "sf-dev")
+	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sf-dev: %v\n%s", err, output)
+	}
+	owner, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.Executable = binary
+	launches := make(chan contracts.ProviderLaunch, 1)
+	request := contracts.DrainRequest{ClaimID: 9, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-gate-restart"}, Phase: domain.PhaseBuild, Attempt: 1, Identity: domain.ProviderIdentity{Provider: "fixture", Model: "fixture", Family: "fixture", Version: "1"}, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, LeaseKey: "provider/fixture", BindingDigest: strings.Repeat("a", 64)}
+	owner.SetLaunchRecorder(func(_ context.Context, got contracts.DrainRequest, launch contracts.ProviderLaunch) error {
+		if got != request {
+			return fmt.Errorf("unexpected launch request")
+		}
+		launches <- launch
+		return nil
+	})
+	finished := make(chan error, 1)
+	go func() {
+		_, err := owner.Run(context.Background(), request, contracts.Invocation{Argv: []string{"/bin/sh", "-c", "sleep 10"}}, contracts.PhaseInput{Worktree: t.TempDir()})
+		finished <- err
+	}()
+	var launch contracts.ProviderLaunch
+	select {
+	case launch = <-launches:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gate did not durably publish launch")
+	}
+	// A new supervisor models the post-crash daemon. It can only signal after
+	// reading and validating the durable identity emitted before gate release.
+	restarted, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.DrainPersisted(context.Background(), request, launch); err != nil {
+		t.Fatalf("restart drain: %v", err)
+	}
+	select {
+	case err := <-finished:
+		if err == nil {
+			t.Fatal("owner run unexpectedly succeeded after recovery termination")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider group survived recovery drain")
+	}
+	if err := syscall.Kill(-launch.PGID, 0); err != syscall.ESRCH {
+		t.Fatalf("provider group still exists: %v", err)
+	}
+}
 
 func TestProductionForegroundDaemonServesAnotherCLIClient(t *testing.T) {
 	home, err := os.MkdirTemp("/tmp", "sfh-")

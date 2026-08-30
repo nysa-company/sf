@@ -34,9 +34,12 @@ type Identity struct {
 }
 
 type Supervisor struct {
-	Signer               *contracts.DrainSigner
-	Recorder             LaunchRecorder
-	Env                  []string
+	Signer   *contracts.DrainSigner
+	Recorder LaunchRecorder
+	Env      []string
+	// Executable is the sf binary that implements __provider_gate. It is only
+	// overridden by compiled-boundary tests; production uses os.Executable.
+	Executable           string
 	SoftDrain, HardDrain time.Duration
 	mu                   sync.Mutex
 	runs                 map[string]*run
@@ -79,9 +82,13 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	if len(invocation.Argv) == 0 || !filepath.IsAbs(invocation.Argv[0]) || input.Worktree == "" || filepath.Clean(input.Worktree) != input.Worktree {
 		return contracts.CommandResult{}, errors.New("guarded argv and worktree required")
 	}
-	self, err := os.Executable()
-	if err != nil {
-		return contracts.CommandResult{}, err
+	self := s.Executable
+	if self == "" {
+		var err error
+		self, err = os.Executable()
+		if err != nil {
+			return contracts.CommandResult{}, err
+		}
 	}
 	gateRead, gateWrite, err := os.Pipe()
 	if err != nil {
