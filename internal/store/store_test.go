@@ -496,6 +496,56 @@ func TestEffectClaimsReconcileAndFenceLateResponse(t *testing.T) {
 	}
 }
 
+func TestExternalMutationGateDrainsForcedGapBeforeStaleStart(t *testing.T) {
+	database, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-gate"}
+	if err := database.CreateTicket(ctx, ticket(ref, "gate")); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, ref, 1, "dev/nysa/SF-gate/planning", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := EffectFence{SemanticKey: "gate-effect", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
+	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: base.SemanticKey, Ref: ref, Kind: "pr_update", TicketVersion: base.TicketVersion, Fence: base.Fence, RequestDigest: "digest"}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := database.ClaimEffect(ctx, base)
+	if err != nil || !claimed.Claimed {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	claim := claimed.ExternalClaim()
+	entered, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := database.ExternalMutationGuard().RunExternalMutation(ctx, claim, func(context.Context) ([]byte, error) { close(entered); <-release; return nil, nil })
+		done <- err
+	}()
+	<-entered
+	drained := make(chan error, 1)
+	go func() { drained <- database.DrainExternalMutations(ctx, ref) }()
+	select {
+	case err := <-drained:
+		t.Fatalf("drain returned before command drained: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("started mutation=%v", err)
+	}
+	if err := <-drained; err != nil {
+		t.Fatalf("drain=%v", err)
+	}
+	startedStale := false
+	if _, err := database.ExternalMutationGuard().RunExternalMutation(ctx, claim, func(context.Context) ([]byte, error) { startedStale = true; return nil, nil }); !errors.Is(err, ErrStaleFence) || startedStale {
+		t.Fatalf("stale start err=%v started=%v", err, startedStale)
+	}
+}
+
 func TestEffectSemanticKeyCannotBeReplannedDifferently(t *testing.T) {
 	database, ctx := openTestStore(t)
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-8"}

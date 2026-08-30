@@ -322,6 +322,9 @@ func (f *FakeGH) MergeExactHead(_ context.Context, _ domain.ExternalEffectClaim,
 		if headOID == "" || headOID != f.state.PRs[index].Identity.HeadOID || headOID != identity.HeadOID {
 			return false, errors.New("fake-gh: exact reviewed head mismatch")
 		}
+		if f.state.PRs[index].Draft {
+			return false, errors.New("fake-gh: draft pull request cannot merge")
+		}
 		if method != "merge" && method != "squash" && method != "rebase" {
 			return false, errors.New("fake-gh: unsupported merge method")
 		}
@@ -915,6 +918,19 @@ func (f *FakeGH) runReady(argv []string) ([]byte, error) {
 
 func (f *FakeGH) runChecks(argv []string) ([]byte, error) {
 	identity := identityFromArgs(argv, prNumber(argv))
+	if identity.HeadRef == "" {
+		if err := f.withState(func() (bool, error) {
+			for _, candidate := range f.state.PRs {
+				if candidate.Identity.Number == identity.Number && sameRepository(candidate.Identity.Repository, identity.Repository) {
+					identity = candidate.Identity
+					return false, nil
+				}
+			}
+			return false, errors.New("fake-gh: pull request identity not found")
+		}); err != nil {
+			return nil, err
+		}
+	}
 	checks, err := f.RequiredChecks(context.Background(), identity)
 	if err != nil {
 		return nil, err

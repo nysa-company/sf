@@ -34,6 +34,8 @@ var (
 
 const maxResponse = 1 << 20
 
+var maxGHDeadline = 2 * time.Minute
+
 type Client struct {
 	Binary        string
 	Home          string
@@ -41,6 +43,7 @@ type Client struct {
 	Env           []string // only SF_FAKE_GH_STATE is permitted for fake-gh tests.
 	Run           func(context.Context, string, []string, []string) ([]byte, error)
 	ValidateClaim func(context.Context, domain.ExternalEffectClaim) error
+	MutationGuard contracts.ExternalMutationGuard
 	// VerifyProtectedBranch is supplied by the Git boundary.  It is the
 	// authority that freshly fetches the protected base ref and proves that the
 	// reported merge commit is contained by that exact ref.
@@ -129,6 +132,9 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 		return contracts.PullRequestIdentity{}, err
 	}
 	if match, err := c.Observe(ctx, identity); err == nil {
+		if !adoptableDraft(match) {
+			return contracts.PullRequestIdentity{}, ErrPolicyRefusal
+		}
 		return match.Identity, nil
 	} else if !errors.Is(err, ErrNoMatchingPR) {
 		return contracts.PullRequestIdentity{}, err
@@ -139,7 +145,7 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 		return contracts.PullRequestIdentity{}, err
 	}
 	markedBody := body + "\n\n" + ownershipMarker(identity)
-	_, runErr := c.run(ctx, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
+	_, runErr := c.mutate(ctx, durable, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
 	// Both a delivered response and a lost response are reconciled by the same
 	// exact ownership observation; command output is never object evidence.
 	match, observeErr := c.Observe(ctx, identity)
@@ -160,7 +166,7 @@ func (c Client) UpdatePullRequest(ctx context.Context, durable domain.ExternalEf
 	if err := c.validateClaim(ctx, durable, identity, "pr_update", requestDigest("pr_update", identity, title, body)); err != nil {
 		return err
 	}
-	return c.updateOrObserve(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, observed, title, body)
+	return c.updateWithClaim(ctx, durable, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, observed, title, body)
 }
 func (c Client) RequiredChecks(ctx context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
 	return c.checks(ctx, identity)
@@ -174,7 +180,7 @@ func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClai
 	if err := c.validateClaim(ctx, durable, identity, "pr_ready", requestDigest("pr_ready", identity)); err != nil {
 		return err
 	}
-	_, err = c.run(ctx, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository))
+	_, err = c.mutate(ctx, durable, "pr", "ready", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository))
 	if err == nil {
 		return nil
 	}
@@ -190,7 +196,7 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	if err != nil {
 		return err
 	}
-	if observed.Merged || observed.AutoMerge || queueState(observed.MergeState) || observed.State != "OPEN" {
+	if observed.Draft || observed.Merged || observed.AutoMerge || queueState(observed.MergeState) || observed.State != "OPEN" {
 		return ErrPolicyRefusal
 	}
 	identity = observed.Identity
@@ -200,15 +206,24 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	if !authorization.Approved || !authorization.GatesGreen || authorization.ReviewedHead != headOID || authorization.CurrentHead != headOID {
 		return ErrApprovalInvalid
 	}
-	_, err = c.merge(ctx, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, observed, headOID, domain.MergeGuarded, method)
+	_, err = c.mergeWithClaim(ctx, durable, EffectClaim{Plan: EffectPlan{SemanticKey: durable.SemanticKey, Identity: identity}, Claimed: true}, observed, headOID, domain.MergeGuarded, method)
 	return err
 }
 
 func (c Client) validateClaim(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, requiredKind, digest string) error {
-	if c.ValidateClaim == nil || claim.SemanticKey == "" || claim.Kind != requiredKind || claim.RequestDigest != digest || !validIdentity(identity) {
+	if c.ValidateClaim == nil || c.MutationGuard == nil || claim.SemanticKey == "" || claim.Kind != requiredKind || claim.RequestDigest != digest || !validIdentity(identity) {
 		return ErrPolicyRefusal
 	}
 	return c.ValidateClaim(ctx, claim)
+}
+
+func (c Client) mutate(ctx context.Context, claim domain.ExternalEffectClaim, args ...string) ([]byte, error) {
+	if c.MutationGuard == nil {
+		return nil, ErrPolicyRefusal
+	}
+	return c.MutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+		return c.run(runCtx, args...)
+	})
 }
 func requestDigest(operation string, identity contracts.PullRequestIdentity, values ...string) string {
 	input := operation + "\x00" + repoArg(identity.Repository) + "\x00" + identity.HeadOwner + "\x00" + identity.HeadRepository + "\x00" + identity.HeadRef + "\x00" + identity.HeadOID + "\x00" + identity.BaseRef
@@ -314,6 +329,9 @@ func (c Client) createOrAdopt(ctx context.Context, claim EffectClaim, title, bod
 		return PRMatch{}, ErrPolicyRefusal
 	}
 	if match, err := c.Observe(ctx, claim.Plan.Identity); err == nil {
+		if !adoptableDraft(match) {
+			return PRMatch{}, ErrPolicyRefusal
+		}
 		return match, nil
 	} else if !errors.Is(err, ErrNoMatchingPR) {
 		return PRMatch{}, err
@@ -344,7 +362,25 @@ func (c Client) updateOrObserve(ctx context.Context, claim EffectClaim, current 
 	return err
 }
 
+func (c Client) updateWithClaim(ctx context.Context, durable domain.ExternalEffectClaim, claim EffectClaim, current PRMatch, title, body string) error {
+	if !claim.Claimed || !sameExact(current.Identity, claim.Plan.Identity) || !validTitle(title) || !validBody(body) {
+		return ErrPolicyRefusal
+	}
+	_, err := c.mutate(ctx, durable, "pr", "edit", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--title", title, "--body", body+"\n\n"+ownershipMarker(current.Identity))
+	if err == nil {
+		return nil
+	}
+	markedBody := body + "\n\n" + ownershipMarker(current.Identity)
+	observed, observeErr := c.Observe(ctx, current.Identity)
+	if observeErr == nil && observed.Identity.Number == current.Identity.Number && observed.Title == title && observed.Body == markedBody {
+		return nil
+	}
+	return err
+}
+
 func (c Client) WaitChecks(ctx context.Context, identity contracts.PullRequestIdentity, required []CheckIdentity, initial, maximum time.Duration) ([]contracts.RequiredCheck, error) {
+	ctx, cancel := boundedGHContext(ctx)
+	defer cancel()
 	if initial <= 0 {
 		initial = 50 * time.Millisecond
 	}
@@ -353,11 +389,20 @@ func (c Client) WaitChecks(ctx context.Context, identity contracts.PullRequestId
 	}
 	delay := initial
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrChecksPending, err)
+		}
 		checks, err := c.checks(ctx, identity)
-		if err != nil {
+		if err != nil && !errors.Is(err, ErrChecksPending) {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("%w: %v", ErrChecksPending, ctx.Err())
+			}
 			return nil, err
 		}
-		status := evaluateChecks(checks, required)
+		status := err
+		if status == nil {
+			status = evaluateChecks(checks, required)
+		}
 		if status == nil {
 			return checks, nil
 		}
@@ -432,20 +477,28 @@ func evaluateChecks(actual []contracts.RequiredCheck, required []CheckIdentity) 
 }
 
 func (c Client) merge(ctx context.Context, claim EffectClaim, pr PRMatch, reviewedHead string, mode domain.MergeMode, method string) (MergeOutcome, error) {
+	return c.mergeRun(ctx, claim, pr, reviewedHead, mode, method, func(args ...string) ([]byte, error) { return c.run(ctx, args...) })
+}
+
+func (c Client) mergeWithClaim(ctx context.Context, durable domain.ExternalEffectClaim, claim EffectClaim, pr PRMatch, reviewedHead string, mode domain.MergeMode, method string) (MergeOutcome, error) {
+	return c.mergeRun(ctx, claim, pr, reviewedHead, mode, method, func(args ...string) ([]byte, error) { return c.mutate(ctx, durable, args...) })
+}
+
+func (c Client) mergeRun(ctx context.Context, claim EffectClaim, pr PRMatch, reviewedHead string, mode domain.MergeMode, method string, mutate func(...string) ([]byte, error)) (MergeOutcome, error) {
 	if mode == domain.MergeManual {
 		return "", fmt.Errorf("%w: manual mode never mutates readiness or merge", ErrPolicyRefusal)
 	}
 	if mode == domain.MergeAutonomous {
 		return "", fmt.Errorf("%w: autonomous merge is unavailable without a passing native profile", ErrPolicyRefusal)
 	}
-	if mode != domain.MergeGuarded || !claim.Claimed || pr.Merged || pr.AutoMerge || queueState(pr.MergeState) || pr.State != "" && pr.State != "OPEN" || reviewedHead == "" || reviewedHead != pr.Identity.HeadOID || method != "merge" && method != "squash" && method != "rebase" {
+	if mode != domain.MergeGuarded || !claim.Claimed || pr.Draft || pr.Merged || pr.AutoMerge || queueState(pr.MergeState) || pr.State != "" && pr.State != "OPEN" || reviewedHead == "" || reviewedHead != pr.Identity.HeadOID || method != "merge" && method != "squash" && method != "rebase" {
 		return "", ErrPolicyRefusal
 	}
 	args := []string{"pr", "merge", fmt.Sprint(pr.Identity.Number), "--repo", repoArg(pr.Identity.Repository), "--match-head-commit", reviewedHead, "--" + method}
 	// A CLI exit status is never merge evidence.  In particular a dropped
 	// response, a successful queue enrollment, and a successful auto-merge
 	// request must all be distinguished by a fresh exact PR observation.
-	_, _ = c.run(ctx, args...)
+	_, _ = mutate(args...)
 	observed, err := c.viewNumber(ctx, pr.Identity.Repository, pr.Identity.Number)
 	if err != nil {
 		return "", err
@@ -556,6 +609,7 @@ func (p prWire) identity(repository contracts.RepositoryIdentity) (contracts.Pul
 func sameExact(left, right contracts.PullRequestIdentity) bool {
 	return left.Repository == right.Repository && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.HeadOID == right.HeadOID && left.BaseRef == right.BaseRef && left.FactoryOwned && right.FactoryOwned && (right.Number == 0 || left.Number == right.Number)
 }
+func adoptableDraft(match PRMatch) bool { return match.Draft && !match.Merged && match.State == "OPEN" }
 func validRepository(value contracts.RepositoryIdentity) error {
 	if value.Host != "github.com" || !validRepositoryPart(value.Owner) || !validRepositoryPart(value.Name) {
 		return ErrPolicyRefusal
@@ -631,6 +685,9 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 			return nil, ErrResponseTooLarge
 		}
 		if runErr != nil {
+			if isChecksPending(args, runErr) {
+				return nil, ErrChecksPending
+			}
 			return nil, fmt.Errorf("gh command failed")
 		}
 		return output, nil
@@ -640,9 +697,20 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 		return nil, runErr
 	}
 	if runErr != nil {
+		if isChecksPending(args, runErr) {
+			return nil, ErrChecksPending
+		}
 		return nil, fmt.Errorf("gh command failed")
 	}
 	return output, nil
+}
+
+func isChecksPending(args []string, err error) bool {
+	if len(args) < 2 || args[0] != "pr" || args[1] != "checks" {
+		return false
+	}
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == 8
 }
 func (c Client) binary() string {
 	if c.Binary != "" {
@@ -665,10 +733,10 @@ func (c Client) environment() ([]string, error) {
 }
 
 func boundedGHContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if deadline, ok := parent.Deadline(); ok && time.Until(deadline) <= 2*time.Minute {
+	if deadline, ok := parent.Deadline(); ok && time.Until(deadline) <= maxGHDeadline {
 		return parent, func() {}
 	}
-	return context.WithTimeout(parent, 2*time.Minute)
+	return context.WithTimeout(parent, maxGHDeadline)
 }
 
 func runBounded(ctx context.Context, binary string, args, env []string) ([]byte, error) {

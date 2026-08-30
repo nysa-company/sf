@@ -48,8 +48,9 @@ func migrationChecksum(statements []string) string {
 }
 
 type Store struct {
-	db     *sql.DB
-	commit func(context.Context, *sql.Conn) error
+	db        *sql.DB
+	commit    func(context.Context, *sql.Conn) error
+	mutations *ExternalMutationGate
 }
 
 type Project struct {
@@ -122,6 +123,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
 	s := &Store{db: db, commit: commitTransaction}
+	s.mutations = &ExternalMutationGate{store: s, revoked: make(map[domain.TicketRef]mutationRevocation)}
 	if err := s.configure(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -535,6 +537,9 @@ func (s *Store) AcquireLeader(ctx context.Context, channel domain.Channel, ident
 	if !channel.Valid() || identity == "" {
 		return 0, fmt.Errorf("valid channel and daemon identity are required")
 	}
+	if err := s.DrainChannelExternalMutations(ctx, channel); err != nil {
+		return 0, err
+	}
 	var epoch uint64
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx, `INSERT INTO daemon_instances(channel, leader_epoch, identity, updated_at)
@@ -555,6 +560,9 @@ func (s *Store) AcquireLeader(ctx context.Context, channel domain.Channel, ident
 func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, workflowID string, fence domain.Fence) (Ticket, error) {
 	if workflowID == "" {
 		return Ticket{}, fmt.Errorf("stable workflow id is required")
+	}
+	if err := s.DrainExternalMutations(ctx, ref); err != nil {
+		return Ticket{}, err
 	}
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var state domain.State
@@ -683,6 +691,9 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	if !transition.To.Valid() || !transition.From.Valid() || transition.Trigger == "" {
 		return TransitionResult{}, fmt.Errorf("valid from/to state and trigger are required")
 	}
+	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
+		return TransitionResult{}, err
+	}
 	var result TransitionResult
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var version, runner uint64
@@ -718,6 +729,9 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 }
 
 func (s *Store) InvalidateRunner(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence) (Ticket, error) {
+	if err := s.DrainExternalMutations(ctx, ref); err != nil {
+		return Ticket{}, err
+	}
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var version, runner uint64
 		if err := conn.QueryRowContext(ctx, `SELECT version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&version, &runner); err != nil {

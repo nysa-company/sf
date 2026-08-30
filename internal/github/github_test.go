@@ -18,6 +18,12 @@ import (
 
 type verifierFunc func(context.Context, contracts.RepositoryIdentity, string, string) (contracts.ProtectedBranchObservation, error)
 
+type mutationGuardFunc func(context.Context, domain.ExternalEffectClaim, func(context.Context) ([]byte, error)) ([]byte, error)
+
+func (f mutationGuardFunc) RunExternalMutation(ctx context.Context, claim domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+	return f(ctx, claim, start)
+}
+
 func (f verifierFunc) VerifyProtectedBranch(ctx context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 	return f(ctx, repository, baseRef, mergeCommit)
 }
@@ -40,7 +46,9 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build fake-gh: %v\n%s", err, output)
 	}
-	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), ConfigDir: filepath.Join(root, "gh-config"), Env: []string{"SF_FAKE_GH_STATE=" + state}, ValidateClaim: func(context.Context, domain.ExternalEffectClaim) error { return nil }, VerifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
+	client := &Client{Binary: binary, Home: filepath.Join(root, "home"), ConfigDir: filepath.Join(root, "gh-config"), Env: []string{"SF_FAKE_GH_STATE=" + state}, ValidateClaim: func(context.Context, domain.ExternalEffectClaim) error { return nil }, MutationGuard: mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+		return start(ctx)
+	}), VerifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit string) (contracts.ProtectedBranchObservation, error) {
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, BaseHeadOID: strings.Repeat("c", 40), Contains: true}, nil
 	})}
 	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
@@ -134,6 +142,10 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeAutonomous, "merge"); !errors.Is(err, ErrPolicyRefusal) {
 		t.Fatalf("autonomous merge=%v", err)
 	}
+	if err := fake.MarkReady(context.Background(), domain.ExternalEffectClaim{}, pr.Identity); err != nil {
+		t.Fatal(err)
+	}
+	pr.Draft = false
 	if err := fake.SetResponse("pr_merge", testkit.ResponseDropAfterCall); err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +158,30 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	}
 	if err := (ApprovalBinding{ReviewedHead: pr.Identity.HeadOID, CurrentHead: "changed"}).Validate(); !errors.Is(err, ErrApprovalInvalid) {
 		t.Fatalf("approval invalidation=%v", err)
+	}
+}
+
+func TestDraftAndNonOpenPRsCannotMergeOrBeAdopted(t *testing.T) {
+	client, _, identity := fixture(t)
+	plan, _ := client.Plan(identity, "draft-policy")
+	claim, _ := client.Claim(plan)
+	pr, err := client.createOrAdopt(context.Background(), claim, "title", "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.merge(context.Background(), claim, pr, pr.Identity.HeadOID, domain.MergeGuarded, "merge"); !errors.Is(err, ErrPolicyRefusal) {
+		t.Fatalf("draft merge=%v", err)
+	}
+	closedClient, closedFake, closedIdentity := fixture(t)
+	closed := closedIdentity
+	closed.Number = 1
+	if err := closedFake.InjectPullRequestForTest(testkit.PullRequest{Identity: closed, Draft: true, Merged: true}); err != nil {
+		t.Fatal(err)
+	}
+	closedPlan, _ := closedClient.Plan(closedIdentity, "closed-policy")
+	closedClaim, _ := closedClient.Claim(closedPlan)
+	if _, err := closedClient.createOrAdopt(context.Background(), closedClaim, "title", "body"); !errors.Is(err, ErrPolicyRefusal) {
+		t.Fatalf("merged draft adoption=%v", err)
 	}
 }
 
@@ -334,6 +370,35 @@ func TestChecksAllowExtrasButFailureDominatesPending(t *testing.T) {
 	actual[1].State = "FAILURE"
 	if err := evaluateChecks(actual, []CheckIdentity{{Name: "required", ExternalID: "one"}}); !errors.Is(err, ErrChecksFailed) {
 		t.Fatalf("failure precedence=%v", err)
+	}
+}
+
+func TestWaitChecksBoundsBackgroundContext(t *testing.T) {
+	client, fake, identity := fixture(t)
+	plan, _ := client.Plan(identity, "checks-deadline")
+	claim, _ := client.Claim(plan)
+	pr, err := client.createOrAdopt(context.Background(), claim, "title", "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "one", State: "PENDING"}); err != nil {
+		t.Fatal(err)
+	}
+	client.Run = func(_ context.Context, _ string, args, _ []string) ([]byte, error) { return fake.Run(args) }
+	old := maxGHDeadline
+	maxGHDeadline = 300 * time.Millisecond
+	t.Cleanup(func() { maxGHDeadline = old })
+	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "one"}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksPending) {
+		t.Fatalf("bounded background polling=%v", err)
+	}
+}
+
+func TestWaitChecksPreservesCancellationAsPending(t *testing.T) {
+	client, _, identity := fixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.WaitChecks(ctx, identity, nil, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksPending) {
+		t.Fatalf("cancelled checks=%v", err)
 	}
 }
 

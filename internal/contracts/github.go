@@ -43,6 +43,14 @@ type ProtectedBranchObservation struct {
 	Contains    bool
 }
 
+// ExternalMutationGuard owns the final handoff from a durable effect claim to
+// process start. Implementations must hold authorization through start and
+// drain/invalidate it before pause, cancellation, takeover, or leader change.
+// Adapters never substitute a second best-effort SQLite read for this guard.
+type ExternalMutationGuard interface {
+	RunExternalMutation(context.Context, domain.ExternalEffectClaim, func(context.Context) ([]byte, error)) ([]byte, error)
+}
+
 type GitHub interface {
 	AuthStatus(context.Context) error
 	Repository(context.Context, RepositoryIdentity) (RepositoryIdentity, error)
