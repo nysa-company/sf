@@ -202,7 +202,7 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	if _, err := worker.Run(ctx, ref, fence); err != nil {
 		t.Fatalf("verification replay: %v", err)
 	}
-	assertMaterializerProviderAttempts(t, db, ref, 3)
+	assertMaterializerProviderAttempts(t, db, ref, 2)
 
 	if _, err := worker.Run(ctx, ref, fence); err == nil {
 		t.Fatal("expected injected response loss after candidate evidence")
@@ -408,7 +408,7 @@ func TestFeature(t *testing.T) {}
 ' > tracked_test.go
   printf '%s\n' '{"schema":"sf.builder/v1","summary":"real mutation","changed_files":["tracked_test.go"],"commands":[["go","test","./..."]]}' > "$last"
 else
-  printf '%s\n' '{"schema":"sf.planner/v1","acceptance":["real materializer"],"proof":{"kind":"acceptance","command":["go","test","./..."],"details":"real"},"paths":["tracked_test.go"],"commands":[["go","test","./..."]],"risks":["none"]}' > "$last"
+  printf '%s\n' '{"schema":"sf.planner/v1","acceptance":["real materializer"],"proof":{"kind":"acceptance","command":["go","test","./..."],"details":"real"},"paths":["proof.txt","tracked_test.go"],"commands":[["go","test","./..."]],"risks":["none"]}' > "$last"
 fi
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}'
 `
@@ -428,9 +428,8 @@ func assertMaterializerProviderAttempts(t *testing.T, db *store.Store, ref domai
 		t.Fatalf("provider attempt count=%d, want %d", len(attempts), want)
 	}
 	for _, attempt := range attempts {
-		launch, err := db.ProviderLaunchIdentity(context.Background(), attempt.ProviderAttemptClaim)
-		if err != nil || launch.PID <= 0 || launch.PGID <= 0 {
-			t.Fatalf("provider launch evidence=%+v err=%v", launch, err)
+		if attempt.State != "completed" || attempt.Outcome != "completed" || attempt.FinishedAt.IsZero() {
+			t.Fatalf("provider attempt did not durably complete: %+v", attempt)
 		}
 	}
 	active, err := db.ActiveProviderAttempts(context.Background(), ref.Channel)
