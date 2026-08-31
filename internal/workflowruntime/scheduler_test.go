@@ -138,6 +138,16 @@ func TestSchedulerPrePublishingAdmissionInvokesBlockerWithoutWorktree(t *testing
 	}
 }
 
+func TestSchedulerObservesManualMergeWithoutWorktree(t *testing.T) {
+	manual := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "manual"}, domain.StateWaitingManualMerge)
+	ensurer := &fakeEnsure{err: store.ErrNotFound}
+	worker := &fakeWorker{}
+	result := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{manual}}, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != manual.Ref || len(ensurer.calls) != 0 {
+		t.Fatalf("manual result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
 func TestSchedulerBindsEachTicketRunnerEpochToTheSameLeader(t *testing.T) {
 	first := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "first"}, domain.StatePlanning)
 	first.RunnerEpoch = 3

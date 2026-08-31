@@ -556,7 +556,7 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	if err != nil {
 		return err
 	}
-	if err := c.mergeIntents.RecordMergeIntent(ctx, domain.MergeIntent{Ref: durable.Ref, SemanticKey: durable.SemanticKey, RequestDigest: durable.RequestDigest, TicketVersion: durable.TicketVersion, LeaderEpoch: durable.LeaderEpoch, RunnerEpoch: durable.RunnerEpoch, ClaimEpoch: durable.ClaimEpoch, RepositoryHost: identity.Repository.Host, RepositoryOwner: identity.Repository.Owner, RepositoryName: identity.Repository.Name, PullRequestNumber: identity.Number, HeadOID: headOID, BaseRef: identity.BaseRef, OriginalBaseOID: baseOID, ProtectionRuleID: protection.ID, ProtectionKind: protection.Kind, ProtectionChecksDigest: protection.ChecksDigest, StrictStatusChecks: true, AdminEnforced: protection.AdminEnforced, ActiveRulesetCount: uint32(protection.ActiveRulesetCount), Method: method}); err != nil {
+	if err := c.mergeIntents.RecordMergeIntent(ctx, domain.MergeIntent{Ref: durable.Ref, SemanticKey: durable.SemanticKey, RequestDigest: durable.RequestDigest, TicketVersion: durable.TicketVersion, LeaderEpoch: durable.LeaderEpoch, RunnerEpoch: durable.RunnerEpoch, ClaimEpoch: durable.ClaimEpoch, RepositoryHost: identity.Repository.Host, RepositoryOwner: identity.Repository.Owner, RepositoryName: identity.Repository.Name, PullRequestNumber: identity.Number, HeadOwner: identity.HeadOwner, HeadRepository: identity.HeadRepository, HeadRef: identity.HeadRef, HeadOID: headOID, BaseRef: identity.BaseRef, OriginalBaseOID: baseOID, ProtectionRuleID: protection.ID, ProtectionKind: protection.Kind, ProtectionChecksDigest: protection.ChecksDigest, StrictStatusChecks: true, AdminEnforced: protection.AdminEnforced, ActiveRulesetCount: uint32(protection.ActiveRulesetCount), Method: method}); err != nil {
 		return err
 	}
 	args := []string{"pr", "merge", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--match-head-commit", headOID, "--" + method}
@@ -1595,9 +1595,9 @@ func (c Client) ObserveMergeIntent(ctx context.Context, intent domain.MergeInten
 	if intent.RepositoryHost != "github.com" || !intent.StrictStatusChecks || !intent.AdminEnforced || intent.ValidateProtectionWitness() != nil {
 		return "", ErrPolicyRefusal
 	}
-	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: intent.RepositoryHost, Owner: intent.RepositoryOwner, Name: intent.RepositoryName}, Number: intent.PullRequestNumber, HeadOID: intent.HeadOID, BaseRef: intent.BaseRef, FactoryOwned: true}
+	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: intent.RepositoryHost, Owner: intent.RepositoryOwner, Name: intent.RepositoryName}, Number: intent.PullRequestNumber, HeadOwner: intent.HeadOwner, HeadRepository: intent.HeadRepository, HeadRef: intent.HeadRef, HeadOID: intent.HeadOID, BaseRef: intent.BaseRef, FactoryOwned: true}
 	observed, err := c.viewNumber(ctx, identity.Repository, identity.Number)
-	if err != nil || !observed.Merged || observed.Identity.Repository != identity.Repository || observed.Identity.Number != identity.Number || observed.Identity.HeadOID != intent.HeadOID || observed.Identity.BaseRef != intent.BaseRef || !observed.Identity.FactoryOwned || observed.MergeCommit == "" {
+	if err != nil || !observed.Merged || !sameMergeIdentity(observed.Identity, identity) || observed.Identity.HeadOID != intent.HeadOID || observed.Identity.BaseRef != intent.BaseRef || observed.MergeCommit == "" {
 		return "", ErrExternalMerged
 	}
 	if err := c.reconcileStrictMerge(ctx, observed.Identity, intent.HeadOID, intent.OriginalBaseOID); err != nil {

@@ -6,6 +6,7 @@ package mergeproof
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 
 	"github.com/nysa-company/sf/internal/contracts"
@@ -63,8 +64,36 @@ func (c Coordinator) VerifyProtectedBranch(ctx context.Context, repository contr
 		BaseRef: baseRef, ExpectedBaseOID: originalBaseOID, ExpectedHeadOID: mergeCommit,
 	}
 	gitIntent.SemanticKey = store.CanonicalGitMutationSemanticKey(gitIntent)
-	if _, err := c.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: gitIntent.SemanticKey, Ref: intent.Ref, Kind: "git/protected-ref-fetch", TicketVersion: version, Fence: fence, RequestDigest: request}); err != nil {
+	// Check before PlanEffect as well as after it. A startup fence advances the
+	// parent merge ticket, while an already-confirmed child proof intentionally
+	// retains its immutable launch fence. PlanEffect correctly refuses to
+	// reinterpret that confirmed effect under the new fence; this explicit
+	// recovery path instead authenticates its immutable facts below.
+	if existing, err := c.Store.Effect(ctx, gitIntent.SemanticKey); err == nil && existing.State == store.EffectConfirmed {
+		if err := c.confirmedProofMatches(ctx, existing, gitIntent); err != nil {
+			return contracts.ProtectedBranchObservation{}, err
+		}
+		return protectedObservation(repository, baseRef, mergeCommit, originalBaseOID), nil
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return contracts.ProtectedBranchObservation{}, err
+	}
+	effect, err := c.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: gitIntent.SemanticKey, Ref: intent.Ref, Kind: "git/protected-ref-fetch", TicketVersion: version, Fence: fence, RequestDigest: request})
+	if err != nil {
+		return contracts.ProtectedBranchObservation{}, err
+	}
+	// GitHub can apply the merge and then lose its response after this child
+	// proof has been durably confirmed. A restart must authenticate that exact
+	// immutable proof rather than trying to issue the already-confirmed Git
+	// effect again. The Store fact reader validates both the intent and effect
+	// copies, including every fenced immutable Git field.
+	if effect.State == store.EffectConfirmed {
+		if err := c.confirmedProofMatches(ctx, effect, gitIntent); err != nil {
+			return contracts.ProtectedBranchObservation{}, err
+		}
+		return protectedObservation(repository, baseRef, mergeCommit, originalBaseOID), nil
+	}
+	if effect.State != store.EffectPlanned && effect.State != store.EffectFailed {
+		return contracts.ProtectedBranchObservation{}, store.ErrGitMutationIntent
 	}
 	claim, err := c.Store.IssueGitMutationClaim(ctx, gitIntent)
 	if err != nil {
@@ -76,7 +105,19 @@ func (c Coordinator) VerifyProtectedBranch(ctx context.Context, repository contr
 	if _, err := c.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: claim.SemanticKey, Ref: claim.TicketRef, TicketVersion: claim.TicketVersion, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}, baseRef+"@"+mergeCommit); err != nil {
 		return contracts.ProtectedBranchObservation{}, err
 	}
-	return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: mergeCommit, Contains: true}, nil
+	return protectedObservation(repository, baseRef, mergeCommit, originalBaseOID), nil
+}
+
+func (c Coordinator) confirmedProofMatches(ctx context.Context, effect store.Effect, intent store.GitMutationIntent) error {
+	facts, err := c.Store.GitMutationIntentFacts(ctx, intent.SemanticKey)
+	if err != nil || effect != facts.Effect || facts.Effect.State != store.EffectConfirmed || facts.Claim.TicketRef != intent.Ref || facts.Claim.SemanticKey != intent.SemanticKey || facts.Claim.RequestDigest != intent.RequestDigest || facts.Claim.Repository != intent.Repository || facts.Claim.Worktree != intent.Worktree || facts.Claim.Branch != intent.Branch || facts.Claim.Operation != intent.Operation || facts.Claim.BaseRef != intent.BaseRef || facts.Claim.ExpectedBaseOID != intent.ExpectedBaseOID || facts.Claim.ExpectedHeadOID != intent.ExpectedHeadOID || facts.ObservedIdentity != intent.BaseRef+"@"+intent.ExpectedHeadOID {
+		return store.ErrEvidenceConflict
+	}
+	return nil
+}
+
+func protectedObservation(repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) contracts.ProtectedBranchObservation {
+	return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: mergeCommit, Contains: true}
 }
 
 func digest(values ...string) string {

@@ -642,10 +642,10 @@ func TestCIV41RowsSurviveV42V43MigrationAndRemainImmutable(t *testing.T) {
 		}
 	}
 	if observations != 1 || checks != 1 || evidence != 1 || bindings != 1 || completions != 1 {
-		t.Fatalf("v41 authority rows lost during v42-v44 migration: observations=%d checks=%d evidence=%d bindings=%d completions=%d", observations, checks, evidence, bindings, completions)
+		t.Fatalf("v41 authority rows lost during v42-v47 migration: observations=%d checks=%d evidence=%d bindings=%d completions=%d", observations, checks, evidence, bindings, completions)
 	}
 	var version int
-	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 44 {
+	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 47 {
 		t.Fatalf("migrated schema=%d err=%v", version, err)
 	}
 	if _, err := database.db.ExecContext(ctx, `UPDATE ci_observations SET diagnostic_text='tampered' WHERE observation_id=1`); err == nil {

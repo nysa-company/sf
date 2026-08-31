@@ -207,6 +207,20 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 			result.Outcome = OutcomeInvoked
 			return result
 		}
+		if ticket.State == domain.StateWaitingManualMerge {
+			// Manual merge reconciliation is read-only GitHub observation. It
+			// must not be held hostage by an unavailable local checkout, because
+			// it neither changes GitHub nor launches a Git operation.
+			workerResult, workerErr := s.Worker.Run(runCtx, ticket.Ref, candidateFence)
+			end()
+			result.Worker = workerResult
+			if workerErr != nil {
+				result.Outcome, result.Err = classifyWorker(workerErr)
+				return result
+			}
+			result.Outcome = OutcomeInvoked
+			return result
+		}
 		worktree, ensureErr := s.Worktrees.Ensure(runCtx, worktreecoord.EnsureRequest{Ref: ticket.Ref, Version: ticket.Version, Fence: candidateFence})
 		if ensureErr != nil {
 			end()

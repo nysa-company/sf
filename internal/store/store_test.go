@@ -402,8 +402,53 @@ func TestV29ToV30MigrationPreservesClassicMergeIntent(t *testing.T) {
 		t.Fatalf("v30 merge intent columns: %v", err)
 	}
 	intent, found, err := database.MergeIntent(ctx, "merge/v30")
-	if err != nil || !found || intent.ProtectionKind != "" || intent.ProtectionChecksDigest != "" || validMergeIntent(intent) != nil {
+	if err != nil || !found || intent.ProtectionKind != "" || intent.ProtectionChecksDigest != "" || validMergeIntent(intent) == nil {
 		t.Fatalf("v30 classic intent=%+v found=%v err=%v", intent, found, err)
+	}
+}
+
+func TestV46ToV47AddsMergeIntentSourceTupleAndFailsLegacyRowsClosed(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "v46.sqlite")
+	createDatabaseAtVersion(t, path, 46)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES ('stable','nysa','/tmp/nysa','main')`,
+		`INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES ('stable','nysa','SF-v47','legacy','bug','guarded','merging',3,2,'workflow')`,
+		`INSERT INTO effects(semantic_key,channel,project_id,ticket_id,effect_kind,state,ticket_version,leader_epoch,runner_epoch,claim_epoch,request_digest) VALUES ('merge/v47','stable','nysa','SF-v47','merge','uncertain',3,4,2,5,'digest')`,
+		`INSERT INTO merge_intents(semantic_key,channel,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_host,repository_owner,repository_name,pull_request_number,head_oid,base_ref,original_base_oid,protection_rule_id,protection_kind,protection_checks_digest,strict_status_checks,admin_enforced,active_ruleset_count,method,created_at) VALUES ('merge/v47','stable','nysa','SF-v47','digest',3,4,2,5,'github.com','example','app',7,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','main','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','rule-main','classic','',1,1,0,'squash','legacy')`,
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			_ = raw.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backups := filepath.Join(root, "backups")
+	if err := os.Mkdir(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := OpenChannel(ctx, path, backups, domain.ChannelStable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := hasColumns(ctx, database.db, "merge_intents", "head_owner", "head_repository", "head_ref"); err != nil {
+		t.Fatalf("v47 source columns: %v", err)
+	}
+	intent, found, err := database.MergeIntent(ctx, "merge/v47")
+	if err != nil || !found || intent.HeadOwner != "" || intent.HeadRepository != "" || intent.HeadRef != "" || validMergeIntent(intent) == nil {
+		t.Fatalf("legacy v46 intent=%+v found=%v err=%v", intent, found, err)
+	}
+	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v046-to-v047-*.sqlite"))
+	if err != nil || len(files) != 1 || rawSchemaVersion(t, files[0]) != 46 {
+		t.Fatalf("v46 backup=%v err=%v", files, err)
 	}
 }
 
@@ -429,7 +474,7 @@ func TestValidMergeIntentRulesetWitnessRoundTripAndTamper(t *testing.T) {
 	if err != nil || !claim.Claimed {
 		t.Fatalf("claim=%+v err=%v", claim, err)
 	}
-	intent := domain.MergeIntent{Ref: ref, SemanticKey: claim.Effect.SemanticKey, RequestDigest: claim.Effect.RequestDigest, TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 7, HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "42", ProtectionKind: "ruleset", ProtectionChecksDigest: strings.Repeat("a", 64), StrictStatusChecks: true, AdminEnforced: true, ActiveRulesetCount: 1, Method: "squash"}
+	intent := domain.MergeIntent{Ref: ref, SemanticKey: claim.Effect.SemanticKey, RequestDigest: claim.Effect.RequestDigest, TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 7, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/branch", HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "42", ProtectionKind: "ruleset", ProtectionChecksDigest: strings.Repeat("a", 64), StrictStatusChecks: true, AdminEnforced: true, ActiveRulesetCount: 1, Method: "squash"}
 	if err := database.RecordMergeIntent(ctx, intent); err != nil {
 		t.Fatal(err)
 	}
@@ -443,6 +488,16 @@ func TestValidMergeIntentRulesetWitnessRoundTripAndTamper(t *testing.T) {
 	tampered, found, err := database.MergeIntent(ctx, intent.SemanticKey)
 	if err != nil || !found || validMergeIntent(tampered) == nil {
 		t.Fatalf("tampered ruleset intent=%+v found=%v err=%v", tampered, found, err)
+	}
+	if _, err := database.db.ExecContext(ctx, `UPDATE merge_intents SET protection_checks_digest=?, head_ref='other-source' WHERE semantic_key=?`, intent.ProtectionChecksDigest, intent.SemanticKey); err != nil {
+		t.Fatal(err)
+	}
+	tampered, found, err = database.MergeIntent(ctx, intent.SemanticKey)
+	if err != nil || !found || tampered.HeadRef != "other-source" || validMergeIntent(tampered) != nil {
+		// A changed source tuple remains syntactically valid. Record-level
+		// equality in ObserveMergeIntent is what rejects it against GitHub;
+		// this assertion proves it is retained rather than erased on read.
+		t.Fatalf("source tuple round trip=%+v found=%v err=%v", tampered, found, err)
 	}
 	for _, invalid := range []domain.MergeIntent{
 		func() domain.MergeIntent { value := intent; value.ProtectionKind = "classic"; return value }(),
@@ -480,7 +535,7 @@ func TestRecoverMergeIntentUsesCurrentUncertainFence(t *testing.T) {
 	if err != nil || !claim.Claimed {
 		t.Fatalf("claim=%+v err=%v", claim, err)
 	}
-	intent := domain.MergeIntent{Ref: ref, SemanticKey: claim.Effect.SemanticKey, RequestDigest: claim.Effect.RequestDigest, TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 7, HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "rule-main", StrictStatusChecks: true, AdminEnforced: true, Method: "squash"}
+	intent := domain.MergeIntent{Ref: ref, SemanticKey: claim.Effect.SemanticKey, RequestDigest: claim.Effect.RequestDigest, TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 7, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/branch", HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "rule-main", StrictStatusChecks: true, AdminEnforced: true, Method: "squash"}
 	if err := database.RecordMergeIntent(ctx, intent); err != nil {
 		t.Fatal(err)
 	}
@@ -560,7 +615,7 @@ func TestRecoverMergeIntentRejectsStaleTamperedAndRacedFence(t *testing.T) {
 	base := EffectFence{SemanticKey: "merge/stale", Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
 	_, _ = database.PlanEffect(ctx, EffectPlan{SemanticKey: base.SemanticKey, Ref: ref, Kind: "merge", TicketVersion: base.TicketVersion, Fence: base.Fence, RequestDigest: "digest"})
 	claim, _ := database.ClaimEffect(ctx, base)
-	intent := domain.MergeIntent{Ref: ref, SemanticKey: "merge/stale", RequestDigest: "digest", TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 1, HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "rule", StrictStatusChecks: true, AdminEnforced: true, Method: "merge"}
+	intent := domain.MergeIntent{Ref: ref, SemanticKey: "merge/stale", RequestDigest: "digest", TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 1, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/branch", HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "rule", StrictStatusChecks: true, AdminEnforced: true, Method: "merge"}
 	if err := database.RecordMergeIntent(ctx, intent); err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +684,7 @@ func TestRecoverMergeIntentRejectsRunnerInvalidatingControlTransition(t *testing
 	if err != nil || !claim.Claimed {
 		t.Fatalf("claim=%+v err=%v", claim, err)
 	}
-	intent := domain.MergeIntent{Ref: ref, SemanticKey: claim.Effect.SemanticKey, RequestDigest: claim.Effect.RequestDigest, TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 9, HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "rule-main", StrictStatusChecks: true, AdminEnforced: true, Method: "squash"}
+	intent := domain.MergeIntent{Ref: ref, SemanticKey: claim.Effect.SemanticKey, RequestDigest: claim.Effect.RequestDigest, TicketVersion: claim.Effect.TicketVersion, LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 9, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/branch", HeadOID: strings.Repeat("a", 40), BaseRef: "main", OriginalBaseOID: strings.Repeat("b", 40), ProtectionRuleID: "rule-main", StrictStatusChecks: true, AdminEnforced: true, Method: "squash"}
 	if err := database.RecordMergeIntent(ctx, intent); err != nil {
 		t.Fatal(err)
 	}

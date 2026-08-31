@@ -1121,3 +1121,20 @@ var migrationV44 = []string{
 	`CREATE TRIGGER final_review_repair_boundaries_immutable_update BEFORE UPDATE ON final_review_repair_boundaries BEGIN SELECT RAISE(ABORT,'final review repair boundary is immutable'); END`,
 	`CREATE TRIGGER final_review_repair_boundaries_immutable_delete BEFORE DELETE ON final_review_repair_boundaries BEGIN SELECT RAISE(ABORT,'final review repair boundary is append-only'); END`,
 }
+
+// v45 and v46 are reserved for the runner-start recovery and CI-repair
+// migrations that land before this branch. They are intentionally empty only
+// in this pre-integration worktree; integration replaces them with those
+// append-only migrations before this branch's v47 is applied.
+var migrationV45 = []string{}
+var migrationV46 = []string{}
+
+// v47 closes the merge-recovery identity gap. A guarded merge intent must
+// retain the complete PR source tuple, not merely its number and head OID.
+// Existing intents receive blank values and therefore fail closed under
+// validMergeIntent rather than being retroactively treated as source-bound.
+var migrationV47 = []string{
+	`ALTER TABLE merge_intents ADD COLUMN head_owner TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE merge_intents ADD COLUMN head_repository TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE merge_intents ADD COLUMN head_ref TEXT NOT NULL DEFAULT ''`,
+}
