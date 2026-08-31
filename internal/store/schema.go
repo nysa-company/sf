@@ -70,6 +70,12 @@ func (s *Store) validateSchema(ctx context.Context) error {
 			return fmt.Errorf("required trigger %s is missing", trigger)
 		}
 	}
+	for _, trigger := range []string{"manual_merge_observations_immutable_update", "manual_merge_observations_immutable_delete"} {
+		var count int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigger).Scan(&count); err != nil || count != 1 {
+			return fmt.Errorf("required trigger %s is missing", trigger)
+		}
+	}
 	rows, err := s.db.QueryContext(ctx, "PRAGMA foreign_key_check")
 	if err != nil {
 		return fmt.Errorf("foreign key check: %w", err)
@@ -147,6 +153,8 @@ var requiredCompositeForeignKeys = []compositeForeignKeyRequirement{
 		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"target_generation", "generation"}, foreignKeyColumn{"builder_binding_ticket_version", "binding_ticket_version"}, foreignKeyColumn{"builder_binding_leader_epoch", "leader_epoch"}, foreignKeyColumn{"builder_binding_runner_epoch", "runner_epoch"}, foreignKeyColumn{"builder_result_attempt_id", "provider_attempt_id"}, foreignKeyColumn{"builder_result_attempt", "provider_attempt"}),
 	compositeForeignKey("candidate_repair_completions", "candidate_snapshots",
 		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"target_generation", "generation"}, foreignKeyColumn{"final_candidate_head_sha", "head_sha"}, foreignKeyColumn{"final_candidate_tree_sha", "tree_sha"}),
+	compositeForeignKey("manual_merge_observations", "publication_evidence",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"candidate_generation", "candidate_generation"}, foreignKeyColumn{"candidate_head_sha", "candidate_head_sha"}, foreignKeyColumn{"candidate_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"publication_witness_digest", "witness_digest"}, foreignKeyColumn{"publication_host", "github_host"}, foreignKeyColumn{"publication_owner", "github_owner"}, foreignKeyColumn{"publication_name", "github_name"}, foreignKeyColumn{"publication_pr_number", "github_pr_number"}, foreignKeyColumn{"publication_head_owner", "github_head_owner"}, foreignKeyColumn{"publication_head_repository", "github_head_repository"}, foreignKeyColumn{"publication_head_ref", "github_head_ref"}, foreignKeyColumn{"publication_head_oid", "github_head_oid"}, foreignKeyColumn{"publication_base_ref", "github_base_ref"}, foreignKeyColumn{"publication_base_oid", "github_base_oid"}, foreignKeyColumn{"publication_factory_owned", "github_factory_owned"}),
 }
 
 var requiredForeignKeys = []foreignKeyRequirement{
@@ -220,6 +228,7 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "candidate_repair_completions", target: "candidate_result_bindings"},
 	{table: "final_review_repair_boundaries", target: "tickets"},
 	{table: "final_review_repair_boundaries", target: "ticket_budget_uses"},
+	{table: "manual_merge_observations", target: "tickets"},
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {
@@ -328,7 +337,7 @@ var requiredSchema = map[string][]string{
 	"branch_allocations":                   {"authority_key", "channel", "project_id", "ticket_id", "branch_ref", "created_at"},
 	"provider_qualifications":              {"id", "channel", "run_id", "provider", "model", "family", "provider_version", "binary_digest", "policy_digest", "fixture_digest", "profile", "failed_probes_json", "reason_code", "created_at", "auth_digest", "auth_mode", "probe_digest", "attested_leader_epoch", "attestation_signature"},
 	"provider_pair_selections":             {"channel", "builder_qualification_id", "reviewer_qualification_id", "selected_at"},
-	"merge_intents":                        {"semantic_key", "original_base_oid", "head_oid", "base_ref", "protection_rule_id", "protection_kind", "protection_checks_digest", "strict_status_checks", "admin_enforced", "active_ruleset_count"},
+	"merge_intents":                        {"semantic_key", "original_base_oid", "head_owner", "head_repository", "head_ref", "head_oid", "base_ref", "protection_rule_id", "protection_kind", "protection_checks_digest", "strict_status_checks", "admin_enforced", "active_ruleset_count"},
 	"external_mutation_quarantine":         {"singleton", "reason", "observed_at"},
 	"git_mutation_intents":                 {"semantic_key", "request_digest", "ticket_version", "leader_epoch", "runner_epoch", "claim_epoch", "repository_path", "worktree_path", "branch_ref", "operation", "base_ref", "expected_base_oid", "expected_head_oid", "prepared_commit_oid", "prepared_tree_oid", "prior_remote_observed", "prior_remote_oid"},
 	"git_mutation_leases":                  {"repository_path", "semantic_key", "nonce", "state", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "prepared_commit_oid", "prepared_tree_oid", "prior_remote_observed", "prior_remote_oid"},
@@ -351,6 +360,7 @@ var requiredSchema = map[string][]string{
 	"candidate_repair_completions":         {"channel", "project_id", "ticket_id", "target_generation", "builder_result_attempt_id", "builder_result_attempt", "builder_result_phase", "builder_result_role", "builder_binding_ticket_version", "builder_binding_leader_epoch", "builder_binding_runner_epoch", "final_candidate_head_sha", "final_candidate_tree_sha", "completion_digest", "completed_at"},
 	"final_review_repair_boundaries":       {"channel", "project_id", "ticket_id", "target_state", "transition_ticket_version", "reviewer_attempt_id", "reviewer_attempt", "reviewer_typed_sha256", "prior_verification_revision", "amendment_reason", "requester", "correction_budget_kind", "correction_budget_request_id", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "created_at"},
 	"runner_start_authorities":             {"channel", "project_id", "ticket_id", "start_ticket_version", "runner_epoch", "leader_epoch", "workflow_id", "workflow_digest", "created_at", "authority_digest"},
+	"manual_merge_observations":            {"observation_id", "channel", "project_id", "ticket_id", "current_ticket_version", "current_leader_epoch", "current_runner_epoch", "candidate_generation", "candidate_head_sha", "candidate_base_sha", "candidate_tree_sha", "publication_witness_digest", "publication_host", "publication_owner", "publication_name", "publication_pr_number", "publication_head_owner", "publication_head_repository", "publication_head_ref", "publication_head_oid", "publication_base_ref", "publication_base_oid", "publication_factory_owned", "observed_host", "observed_owner", "observed_name", "observed_pr_number", "observed_head_owner", "observed_head_repository", "observed_head_ref", "observed_head_oid", "observed_base_ref", "observed_base_oid", "observed_factory_owned", "merge_commit", "observed_protected_base", "observation_digest", "created_at"},
 }
 
 type indexRequirement struct {
@@ -428,6 +438,9 @@ var requiredIndexes = []indexRequirement{
 	{table: "runner_start_authorities", name: "runner_start_authority_ticket", columns: []string{"channel", "project_id", "ticket_id"}, nonUnique: true},
 	{table: "final_review_repair_boundaries", name: "final_review_repair_boundaries_target", columns: []string{"channel", "project_id", "ticket_id", "target_state", "transition_ticket_version"}, nonUnique: true},
 	{table: "final_review_repair_boundaries", name: "final_review_repair_boundaries_reviewer", columns: []string{"channel", "project_id", "ticket_id", "reviewer_attempt_id", "reviewer_attempt", "transition_ticket_version"}},
+	{table: "manual_merge_observations", name: "manual_merge_observations_ticket", columns: []string{"channel", "project_id", "ticket_id", "observation_id"}, nonUnique: true},
+	{table: "manual_merge_observations", name: "manual_merge_observations_digest", columns: []string{"observation_digest"}},
+	{table: "publication_evidence", name: "publication_evidence_manual_merge_authority", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "witness_digest", "github_host", "github_owner", "github_name", "github_pr_number", "github_head_owner", "github_head_repository", "github_head_ref", "github_head_oid", "github_base_ref", "github_base_oid", "github_factory_owned"}},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {

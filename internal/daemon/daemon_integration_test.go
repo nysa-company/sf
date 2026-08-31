@@ -918,6 +918,20 @@ func TestSubmitRejectsUnregisteredProjectBeforeTicketPersistence(t *testing.T) {
 	}
 }
 
+func TestSubmitRefusesAutonomousWorkflowBeforeAdmission(t *testing.T) {
+	d, _, _ := testDaemonForChannel(t, domain.ChannelDev)
+	source := "---\nmerge: autonomous\n---\n# Autonomous\n\nDo not start this workflow.\n\n## Acceptance\n- It is refused before admission\n"
+	request := api.Request{Version: api.Version, RequestID: "autonomous-refusal", Method: "ticket.submit", Parameters: []byte(`{"channel":"dev","project":"demo","source":` + strconv.Quote(source) + `}`)}
+	response := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, request)
+	if response.OK || response.Error == nil || response.Error.Code != "autonomy_blocked" || response.Mutation.Attempted {
+		t.Fatalf("autonomous submission response=%+v", response)
+	}
+	tickets, err := d.store.Tickets(context.Background(), domain.ChannelDev, "demo", 10)
+	if err != nil || len(tickets) != 0 {
+		t.Fatalf("autonomous submission persisted tickets=%+v err=%v", tickets, err)
+	}
+}
+
 func writeTicket(t *testing.T, dir, title string) string {
 	t.Helper()
 	path := filepath.Join(dir, strings.ToLower(strings.ReplaceAll(title, " ", "-"))+".md")

@@ -515,6 +515,10 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					return postErr
 				} else if postFound {
 					priorLeader = postLeader
+				} else if mergeLeader, mergeFound, mergeErr := s.normalPostPublicationRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); mergeErr != nil {
+					return mergeErr
+				} else if mergeFound {
+					priorLeader = mergeLeader
 				} else if publication, ok, publicationErr := s.publicationRecoveryBaseline(ctx, conn, ref, ticket.version, ticket.runner); publicationErr != nil {
 					return publicationErr
 				} else if ok {
@@ -526,11 +530,22 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				} else if postFound {
 					priorLeader = postLeader
 				}
-				publication, ok, err := s.publicationRecoveryBaseline(ctx, conn, ref, ticket.version, ticket.runner)
-				if err != nil {
-					return err
-				} else if ok {
-					priorLeader = publication
+				if priorLeader == 0 {
+					mergeLeader, mergeFound, mergeErr := s.normalPostPublicationRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch)
+					if mergeErr != nil {
+						return mergeErr
+					}
+					if mergeFound {
+						priorLeader = mergeLeader
+					}
+				}
+				if priorLeader == 0 {
+					publication, ok, err := s.publicationRecoveryBaseline(ctx, conn, ref, ticket.version, ticket.runner)
+					if err != nil {
+						return err
+					} else if ok {
+						priorLeader = publication
+					}
 				}
 			}
 			if priorLeader == 0 {

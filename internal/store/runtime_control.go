@@ -389,14 +389,53 @@ func (s *Store) authenticatePostPublicationState(ctx context.Context, conn *sql.
 			return ErrControlNotDrained
 		}
 		return nil
-	case domain.StateMerging, domain.StateReconciling:
+	case domain.StateMerging:
 		if err := s.authenticatePostPublicationMergeState(ctx, conn, ref, baselineVersion, baselineFence); err != nil {
+			return ErrControlNotDrained
+		}
+		return nil
+	case domain.StateReconciling:
+		var mergeMode domain.MergeMode
+		if err := conn.QueryRowContext(ctx, `SELECT merge_mode FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&mergeMode); err != nil {
+			return ErrControlNotDrained
+		}
+		if mergeMode == domain.MergeManual {
+			if err := s.authenticatePostPublicationManualReconcile(ctx, conn, ref, baselineVersion, baselineFence); err != nil {
+				return ErrControlNotDrained
+			}
+			return nil
+		}
+		if mergeMode != domain.MergeGuarded || s.authenticatePostPublicationMergeState(ctx, conn, ref, baselineVersion, baselineFence) != nil {
 			return ErrControlNotDrained
 		}
 		return nil
 	default:
 		return ErrControlNotDrained
 	}
+}
+
+func (s *Store) authenticatePostPublicationManualReconcile(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, baselineVersion uint64, baselineFence domain.Fence) error {
+	value, found, err := loadManualMergeObservation(ctx, conn, ref)
+	if err != nil || !found || validManualMergeObservation(value) != nil || value.CurrentTicketVersion == ^uint64(0) {
+		return ErrPublicationEvidence
+	}
+	if err := s.authenticateManualMergePublication(ctx, conn, value); err != nil {
+		return err
+	}
+	reconciling := normalRecoveryEndpoint{version: value.CurrentTicketVersion + 1, runner: value.CurrentFence.RunnerEpoch, leader: value.CurrentFence.LeaderEpoch}
+	var events, stateChanges int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='external_merge_observed' AND from_state='waiting_manual_merge' AND to_state='reconciling' AND payload=?`, ref.Channel, ref.Project, ref.Ticket, reconciling.version, manualMergeObservationEventPayload(value.ObservationDigest)).Scan(&events, &stateChanges); err != nil || events != 1 || stateChanges != 1 {
+		return ErrPublicationEvidence
+	}
+	leader, err := normalRecoveryLeaderAt(ctx, conn, ref, reconciling, baselineVersion, baselineFence.RunnerEpoch)
+	if err != nil || leader != baselineFence.LeaderEpoch {
+		return ErrPublicationEvidence
+	}
+	var intents, mergeEffects int
+	if err := conn.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?),(SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND effect_kind='merge')`, ref.Channel, ref.Project, ref.Ticket, ref.Channel, ref.Project, ref.Ticket).Scan(&intents, &mergeEffects); err != nil || intents != 0 || mergeEffects != 0 {
+		return ErrPublicationEvidence
+	}
+	return nil
 }
 
 func (s *Store) authenticatePostPublicationReviewCompletion(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, target domain.State, baselineVersion uint64, baselineFence domain.Fence) error {

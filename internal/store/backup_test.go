@@ -1009,6 +1009,8 @@ func testMigration(version int) []string {
 		return migrationV45
 	case 46:
 		return migrationV46
+	case 47:
+		return migrationV47
 	default:
 		return nil
 	}

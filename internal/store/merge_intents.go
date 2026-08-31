@@ -27,10 +27,10 @@ func (s *Store) RecordMergeIntent(ctx context.Context, intent domain.MergeIntent
 		if effect.Ref != intent.Ref || effect.Kind != "merge" || effect.RequestDigest != intent.RequestDigest || effect.State != EffectExecuting || effect.TicketVersion != intent.TicketVersion || effect.LeaderEpoch != intent.LeaderEpoch || effect.RunnerEpoch != intent.RunnerEpoch || effect.ClaimEpoch != intent.ClaimEpoch {
 			return ErrStaleFence
 		}
-		result, err := conn.ExecContext(ctx, `INSERT INTO merge_intents(semantic_key, channel, project_id, ticket_id, request_digest, ticket_version, leader_epoch, runner_epoch, claim_epoch, repository_host, repository_owner, repository_name, pull_request_number, head_oid, base_ref, original_base_oid, protection_rule_id, protection_kind, protection_checks_digest, strict_status_checks, admin_enforced, active_ruleset_count, method, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		result, err := conn.ExecContext(ctx, `INSERT INTO merge_intents(semantic_key, channel, project_id, ticket_id, request_digest, ticket_version, leader_epoch, runner_epoch, claim_epoch, repository_host, repository_owner, repository_name, pull_request_number, head_owner, head_repository, head_ref, head_oid, base_ref, original_base_oid, protection_rule_id, protection_kind, protection_checks_digest, strict_status_checks, admin_enforced, active_ruleset_count, method, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(semantic_key) DO NOTHING`,
-			intent.SemanticKey, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket, intent.RequestDigest, intent.TicketVersion, intent.LeaderEpoch, intent.RunnerEpoch, intent.ClaimEpoch, intent.RepositoryHost, intent.RepositoryOwner, intent.RepositoryName, intent.PullRequestNumber, intent.HeadOID, intent.BaseRef, intent.OriginalBaseOID, intent.ProtectionRuleID, intent.ProtectionKind, intent.ProtectionChecksDigest, boolInt(intent.StrictStatusChecks), boolInt(intent.AdminEnforced), intent.ActiveRulesetCount, intent.Method, time.Now().UTC().Format(time.RFC3339Nano))
+			intent.SemanticKey, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket, intent.RequestDigest, intent.TicketVersion, intent.LeaderEpoch, intent.RunnerEpoch, intent.ClaimEpoch, intent.RepositoryHost, intent.RepositoryOwner, intent.RepositoryName, intent.PullRequestNumber, intent.HeadOwner, intent.HeadRepository, intent.HeadRef, intent.HeadOID, intent.BaseRef, intent.OriginalBaseOID, intent.ProtectionRuleID, intent.ProtectionKind, intent.ProtectionChecksDigest, boolInt(intent.StrictStatusChecks), boolInt(intent.AdminEnforced), intent.ActiveRulesetCount, intent.Method, time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}
@@ -52,6 +52,77 @@ func (s *Store) MergeIntent(ctx context.Context, semanticKey string) (domain.Mer
 	return mergeIntentFrom(ctx, s.db, semanticKey)
 }
 
+// MergeIntentForProof returns only the currently live durable merge intent
+// matching a GitHub post-merge observation.  A GitHub adapter receives no Git
+// authority; this lookup lets the root composition mint a separate fenced Git
+// proof effect from the already-recorded merge intent.
+func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, name, baseRef, originalBaseOID, mergeOID string) (domain.MergeIntent, error) {
+	if repositoryHost != "github.com" || owner == "" || name == "" || baseRef == "" || !validOID(originalBaseOID) || !validOID(mergeOID) || len(originalBaseOID) != len(mergeOID) {
+		return domain.MergeIntent{}, ErrEvidenceConflict
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return domain.MergeIntent{}, normalizeBusy(ctx, err)
+	}
+	defer conn.Close()
+	rows, err := conn.QueryContext(ctx, `SELECT m.semantic_key,t.state FROM merge_intents m JOIN effects e ON e.semantic_key=m.semantic_key JOIN tickets t ON t.channel=m.channel AND t.project_id=m.project_id AND t.id=m.ticket_id
+		WHERE m.repository_host=? AND m.repository_owner=? AND m.repository_name=? AND m.base_ref=? AND m.original_base_oid=?
+		AND e.effect_kind='merge' AND ((t.state='merging' AND e.state IN ('executing','uncertain')) OR (t.state='reconciling' AND e.state='confirmed')) ORDER BY m.created_at DESC`, repositoryHost, owner, name, baseRef, originalBaseOID)
+	if err != nil {
+		return domain.MergeIntent{}, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	var key string
+	var state domain.State
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(&key, &state); err != nil {
+			return domain.MergeIntent{}, err
+		}
+		count++
+		if count > 1 {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return domain.MergeIntent{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return domain.MergeIntent{}, err
+	}
+	if count != 1 {
+		return domain.MergeIntent{}, ErrNotFound
+	}
+	intent, found, err := mergeIntentFrom(ctx, conn, key)
+	if err != nil || !found || intent.OriginalBaseOID != originalBaseOID || intent.BaseRef != baseRef {
+		return domain.MergeIntent{}, ErrEvidenceConflict
+	}
+	if state == domain.StateReconciling {
+		// Reconciling is recovery-only: the parent merge and child protected-ref
+		// proof have already completed. Authenticate the immutable confirmed
+		// merge endpoint, its one state transition, and every subsequent signed
+		// runner recovery before exposing the intent again.
+		confirmed, err := s.confirmedMergeRecoveryEndpoint(ctx, conn, intent.Ref)
+		if err != nil || confirmed.version == ^uint64(0) {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+		reconciling := normalRecoveryEndpoint{version: confirmed.version + 1, runner: confirmed.runner, leader: confirmed.leader}
+		var events, stateChanges int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='merge_observed' AND from_state='merging' AND to_state='reconciling'`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket, reconciling.version).Scan(&events, &stateChanges); err != nil || events != 1 || stateChanges != 1 {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+		var version, runner, leader uint64
+		var liveState domain.State
+		if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&liveState, &version, &runner, &leader); err != nil || liveState != domain.StateReconciling {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+		if currentLeader, err := normalRecoveryLeaderAt(ctx, conn, intent.Ref, reconciling, version, runner); err != nil || currentLeader != leader {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+	}
+	return intent, nil
+}
+
 type mergeIntentQuerier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
@@ -59,7 +130,7 @@ type mergeIntentQuerier interface {
 func mergeIntentFrom(ctx context.Context, q mergeIntentQuerier, semanticKey string) (domain.MergeIntent, bool, error) {
 	var intent domain.MergeIntent
 	var strict, admin int
-	err := q.QueryRowContext(ctx, `SELECT channel, project_id, ticket_id, request_digest, ticket_version, leader_epoch, runner_epoch, claim_epoch, repository_host, repository_owner, repository_name, pull_request_number, head_oid, base_ref, original_base_oid, protection_rule_id, protection_kind, protection_checks_digest, strict_status_checks, admin_enforced, active_ruleset_count, method FROM merge_intents WHERE semantic_key=?`, semanticKey).Scan(&intent.Ref.Channel, &intent.Ref.Project, &intent.Ref.Ticket, &intent.RequestDigest, &intent.TicketVersion, &intent.LeaderEpoch, &intent.RunnerEpoch, &intent.ClaimEpoch, &intent.RepositoryHost, &intent.RepositoryOwner, &intent.RepositoryName, &intent.PullRequestNumber, &intent.HeadOID, &intent.BaseRef, &intent.OriginalBaseOID, &intent.ProtectionRuleID, &intent.ProtectionKind, &intent.ProtectionChecksDigest, &strict, &admin, &intent.ActiveRulesetCount, &intent.Method)
+	err := q.QueryRowContext(ctx, `SELECT channel, project_id, ticket_id, request_digest, ticket_version, leader_epoch, runner_epoch, claim_epoch, repository_host, repository_owner, repository_name, pull_request_number, head_owner, head_repository, head_ref, head_oid, base_ref, original_base_oid, protection_rule_id, protection_kind, protection_checks_digest, strict_status_checks, admin_enforced, active_ruleset_count, method FROM merge_intents WHERE semantic_key=?`, semanticKey).Scan(&intent.Ref.Channel, &intent.Ref.Project, &intent.Ref.Ticket, &intent.RequestDigest, &intent.TicketVersion, &intent.LeaderEpoch, &intent.RunnerEpoch, &intent.ClaimEpoch, &intent.RepositoryHost, &intent.RepositoryOwner, &intent.RepositoryName, &intent.PullRequestNumber, &intent.HeadOwner, &intent.HeadRepository, &intent.HeadRef, &intent.HeadOID, &intent.BaseRef, &intent.OriginalBaseOID, &intent.ProtectionRuleID, &intent.ProtectionKind, &intent.ProtectionChecksDigest, &strict, &admin, &intent.ActiveRulesetCount, &intent.Method)
 	if err == sql.ErrNoRows {
 		return domain.MergeIntent{}, false, nil
 	}
@@ -94,7 +165,7 @@ func validMergeIntent(intent domain.MergeIntent) error {
 	if err := intent.Ref.Validate(); err != nil {
 		return err
 	}
-	if intent.SemanticKey == "" || intent.RequestDigest == "" || intent.TicketVersion == 0 || intent.LeaderEpoch == 0 || intent.RunnerEpoch == 0 || intent.ClaimEpoch == 0 || intent.RepositoryHost != "github.com" || intent.RepositoryOwner == "" || intent.RepositoryName == "" || intent.PullRequestNumber <= 0 || intent.HeadOID == "" || intent.BaseRef == "" || intent.OriginalBaseOID == "" || intent.ProtectionRuleID == "" || !intent.StrictStatusChecks || !intent.AdminEnforced || (intent.Method != "merge" && intent.Method != "squash" && intent.Method != "rebase") {
+	if intent.SemanticKey == "" || intent.RequestDigest == "" || intent.TicketVersion == 0 || intent.LeaderEpoch == 0 || intent.RunnerEpoch == 0 || intent.ClaimEpoch == 0 || intent.RepositoryHost != "github.com" || intent.RepositoryOwner == "" || intent.RepositoryName == "" || intent.PullRequestNumber <= 0 || intent.HeadOwner == "" || intent.HeadRepository == "" || intent.HeadRef == "" || intent.HeadOID == "" || intent.BaseRef == "" || intent.OriginalBaseOID == "" || intent.ProtectionRuleID == "" || !intent.StrictStatusChecks || !intent.AdminEnforced || (intent.Method != "merge" && intent.Method != "squash" && intent.Method != "rebase") {
 		return fmt.Errorf("invalid merge intent")
 	}
 	return intent.ValidateProtectionWitness()

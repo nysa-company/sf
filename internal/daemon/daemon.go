@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -790,6 +791,10 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		response = daemon.recoverTicket(ctx, request, identity)
 	case "ticket.cancel":
 		response = daemon.controlTicket(ctx, request, identity, "cancel")
+	case "ticket.approve":
+		response = daemon.operatorDecision(ctx, request, identity, "approved")
+	case "ticket.reject":
+		response = daemon.operatorDecision(ctx, request, identity, "rejected")
 	case "daemon.status":
 		response = daemon.status(request, identity)
 	case "provider.qualify":
@@ -1030,7 +1035,7 @@ func (daemon *Daemon) submit(ctx context.Context, request api.Request, _ domain.
 		return daemon.failure(request, submitErrorCode(err), "ticket project registration could not be read", errors.Is(err, store.ErrBusy))
 	}
 	if parsed.MergeMode == domain.MergeAutonomous {
-		return daemon.failure(request, "autonomous_unavailable", "autonomous submission is disabled until an OS-enforced profile is qualified", false)
+		return daemon.failure(request, "autonomy_blocked", "autonomous workflows are unsupported until a separately approved native profile and pilot are qualified", false)
 	}
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
@@ -1249,6 +1254,70 @@ func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ do
 type controlParameters struct {
 	Operator string         `json:"operator"`
 	Channel  domain.Channel `json:"channel"`
+}
+
+type operatorDecisionParameters struct {
+	Operator string         `json:"operator"`
+	Reason   string         `json:"reason"`
+	Channel  domain.Channel `json:"channel"`
+}
+
+// operatorDecision keeps approval and rejection on the owner-only socket
+// path. The displayed operator label is only a comparison value: the UID used
+// by Store comes from the peer-authenticated identity above.
+func (daemon *Daemon) operatorDecision(ctx context.Context, request api.Request, identity domain.OperatorIdentity, decision string) api.Response {
+	var parameters operatorDecisionParameters
+	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) || (decision != "approved" && decision != "rejected") {
+		return daemon.failure(request, "invalid_decision", "approval or rejection requires the authenticated operator and daemon channel", false)
+	}
+	if decision == "approved" && parameters.Reason != "" {
+		return daemon.failure(request, "invalid_decision", "approval does not accept a reason", false)
+	}
+	if decision == "rejected" && (!boundedOperatorReason(parameters.Reason)) {
+		return daemon.failure(request, "invalid_decision", "rejection requires a bounded non-empty reason", false)
+	}
+	if err := daemon.lease.Validate(); err != nil {
+		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	}
+	ref, response := daemon.ticketRefByID(ctx, request)
+	if response != nil {
+		return *response
+	}
+	stored, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	candidate, err := daemon.store.RecoverableCandidate(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "approval_evidence_unavailable", "the exact reviewed candidate is unavailable", errors.Is(err, store.ErrBusy))
+	}
+	reasonDigest := ""
+	if parameters.Reason != "" {
+		sum := sha256.Sum256([]byte(parameters.Reason))
+		reasonDigest = fmt.Sprintf("%x", sum[:])
+	}
+	result, err := daemon.store.ApplyOperatorDecision(ctx, store.OperatorDecisionRequest{OperatorDecision: store.OperatorDecision{
+		Ref: ref, ExpectedVersion: stored.Version, Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, ReviewedHead: candidate.Snapshot.HeadSHA, OperatorUID: identity.UID, Decision: decision,
+	}, ReasonDigest: reasonDigest})
+	if err != nil {
+		code, message := "decision_refused", "the decision is not valid for the current reviewed head"
+		if errors.Is(err, store.ErrStaleFence) {
+			code, message = "approval_head_changed", "the reviewed candidate changed; refresh checks and review before deciding"
+		}
+		if errors.Is(err, store.ErrBusy) {
+			code, message = "decision_unavailable", "the decision could not be durably recorded yet"
+		}
+		return daemon.failure(request, code, message, errors.Is(err, store.ErrBusy))
+	}
+	updated, err := daemon.store.Ticket(ctx, ref)
+	if err != nil || updated.Version != result.Version {
+		return daemon.failure(request, "decision_state_unavailable", "the durable decision state could not be confirmed", true)
+	}
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_" + decision, Identity: string(ref.Ticket)}, ticketView(updated))
+}
+
+func boundedOperatorReason(value string) bool {
+	return len(value) > 0 && len(value) <= 4096 && strings.TrimSpace(value) == value
 }
 
 func (daemon *Daemon) controlTicket(ctx context.Context, request api.Request, identity domain.OperatorIdentity, intent string) api.Response {
@@ -1874,7 +1943,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	case "recover_mode_refused", "recover_transition_refused":
 		argv = []string{binary, "recover", "--help"}
 	}
-	if code == "invalid_control" || code == "invalid_ticket_reference" {
+	if code == "invalid_control" || code == "invalid_ticket_reference" || code == "invalid_decision" || code == "decision_refused" || code == "approval_head_changed" {
 		if verb != "" && verb != request.Method {
 			argv = []string{binary, verb, "--help"}
 		}

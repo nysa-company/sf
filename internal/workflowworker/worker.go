@@ -220,9 +220,14 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 // candidate, proof, result binding, and current fence in one transaction.
 func (w Worker) reviewing(ctx context.Context, ticket store.Ticket, fence domain.Fence) (bool, bool, error) {
 	if ticket.MergeMode == domain.MergeAutonomous {
-		// Autonomous merge is deliberately unavailable in the local guarded
-		// runtime until the separately approved qualification phase exists.
-		return false, false, ErrUnsupportedState
+		blocker, ok := w.Engine.(interface {
+			SignalAutonomyBlocked(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
+		})
+		if !ok {
+			return false, false, ErrUnsupportedState
+		}
+		_, err := blocker.SignalAutonomyBlocked(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: "review_pass", Fence: fence})
+		return err == nil, false, err
 	}
 	candidate, err := w.Evidence.RecoverableCandidate(ctx, ticket.Ref)
 	if err != nil {

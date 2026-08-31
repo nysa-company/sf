@@ -112,8 +112,12 @@ type FakeGHState struct {
 	// BaseHeadOID is the independently observable protected ref tip. Keeping
 	// it durable lets boundary tests move main between observations without
 	// pretending a PR's historical baseRefOid is the live protected ref.
-	BaseHeadOID                 string                            `json:"base_head_oid"`
-	BaseRef                     string                            `json:"base_ref"`
+	BaseHeadOID string `json:"base_head_oid"`
+	BaseRef     string `json:"base_ref"`
+	// MergeCommitOID lets an integration fixture bind FakeGH's hosted merge
+	// result to a real commit in its private Git remote. Production adapters
+	// never read or write this test-only remote fact.
+	MergeCommitOID              string                            `json:"merge_commit_oid,omitempty"`
 	StrictStatusChecks          bool                              `json:"strict_status_checks"`
 	AdminEnforced               bool                              `json:"admin_enforced"`
 	ActiveRulesetCount          int                               `json:"active_ruleset_count"`
@@ -146,6 +150,7 @@ func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, e
 		Repository:         repository,
 		BaseHeadOID:        strings.Repeat("c", 40),
 		BaseRef:            "main",
+		MergeCommitOID:     strings.Repeat("b", 40),
 		StrictStatusChecks: true,
 		AdminEnforced:      true,
 		ClassicProtection:  true,
@@ -170,6 +175,42 @@ func (f *FakeGH) SetBaseHeadOIDForTest(oid string) error {
 	return f.withState(func() (bool, error) {
 		f.state.BaseHeadOID = oid
 		return true, nil
+	})
+}
+
+// SetMergeCommitForTest binds the next successful hosted merge to an exact
+// fixture commit. Composition tests use it with the real protected-ref
+// verifier against a private bare repository.
+func (f *FakeGH) SetMergeCommitForTest(oid string) error {
+	if !fakeOID(oid) {
+		return errors.New("testkit: merge commit OID must be an exact SHA")
+	}
+	return f.withState(func() (bool, error) {
+		f.state.MergeCommitOID = oid
+		return true, nil
+	})
+}
+
+// SetPullRequestMergedForTest models a human completing a manual-mode PR. It
+// changes only the hermetic hosted state and deliberately does not increment
+// the factory mutation counter.
+func (f *FakeGH) SetPullRequestMergedForTest(number int, mergeCommit string) error {
+	if number <= 0 || !fakeOID(mergeCommit) {
+		return errors.New("testkit: exact pull request and merge commit are required")
+	}
+	return f.withState(func() (bool, error) {
+		for index := range f.state.PRs {
+			if f.state.PRs[index].Identity.Number != number {
+				continue
+			}
+			f.state.PRs[index].Draft = false
+			f.state.PRs[index].Ready = true
+			f.state.PRs[index].Merged = true
+			f.state.PRs[index].MergeCommit = mergeCommit
+			f.state.BaseHeadOID = mergeCommit
+			return true, nil
+		}
+		return false, errors.New("testkit: pull request not found")
 	})
 }
 
@@ -321,6 +362,9 @@ func OpenFakeGH(path string) (*FakeGH, error) {
 	}
 	if !fakeOID(state.BaseHeadOID) {
 		state.BaseHeadOID = strings.Repeat("c", 40)
+	}
+	if !fakeOID(state.MergeCommitOID) {
+		state.MergeCommitOID = strings.Repeat("b", 40)
 	}
 	return &FakeGH{path: path}, nil
 }
@@ -478,6 +522,48 @@ func (f *FakeGH) ObserveDraftPullRequest(_ context.Context, want contracts.PullR
 		return contracts.PullRequestIdentity{}, "", false, false, err
 	}
 	return match.Identity, "OPEN", match.Draft, true, nil
+}
+
+// ObservePublishedPullRequest models the authenticated all-state observation
+// used after publication. It permits protected-base movement only once this
+// exact factory PR is independently marked merged.
+func (f *FakeGH) ObservePublishedPullRequest(_ context.Context, want contracts.PullRequestIdentity) (contracts.PublishedPullRequestObservation, error) {
+	var result contracts.PublishedPullRequestObservation
+	err := f.withState(func() (bool, error) {
+		var match *PullRequest
+		for index := range f.state.PRs {
+			candidate := &f.state.PRs[index]
+			if !samePublishedSource(candidate.Identity, want) {
+				continue
+			}
+			if candidate.Identity.Number != want.Number || !candidate.Identity.FactoryOwned || !strings.Contains(candidate.Body, ownershipMarkerForFake(candidate.Identity)) {
+				return false, errors.New("fake-gh: published pull request identity drifted")
+			}
+			if match != nil {
+				return false, errors.New("fake-gh: ambiguous published pull requests")
+			}
+			match = candidate
+		}
+		if match == nil {
+			return false, errors.New("fake-gh: published pull request not found")
+		}
+		if !match.Merged && match.Identity.BaseOID != want.BaseOID {
+			return false, errors.New("fake-gh: unmerged published pull request base drifted")
+		}
+		state := "OPEN"
+		identity := match.Identity
+		baseHead := identity.BaseOID
+		if match.Merged {
+			state = "MERGED"
+			// Production gh reports the current protected-base OID after merge,
+			// which may differ from the publication-time base witness.
+			identity.BaseOID = f.state.BaseHeadOID
+			baseHead = f.state.BaseHeadOID
+		}
+		result = contracts.PublishedPullRequestObservation{Identity: identity, Draft: match.Draft, Merged: match.Merged, Ready: match.Ready, Title: match.Title, Body: match.Body, MergeCommit: match.MergeCommit, BaseHeadOID: baseHead, State: state}
+		return false, nil
+	})
+	return result, err
 }
 
 func (f *FakeGH) ObserveFactoryPullRequestOutput(_ context.Context, want contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, string, bool, bool, error) {
@@ -668,10 +754,9 @@ func (f *FakeGH) RequiredChecks(_ context.Context, identity contracts.PullReques
 	return checks, err
 }
 
-// ObserveCIRequiredCheckPolicy supplies the same authenticated, read-only
-// policy/check boundary used by the production poller. The fake's durable
-// state is intentionally the source of truth so restart tests do not rely on
-// an in-memory test-only policy.
+// ObserveCIRequiredCheckPolicy provides the complete protected-branch policy
+// witness used by Store's CI authority. It is intentionally separate from
+// RequiredChecks so integration tests cannot treat a check list as policy.
 func (f *FakeGH) ObserveCIRequiredCheckPolicy(_ context.Context, identity contracts.PullRequestIdentity) (contracts.CIRequiredCheckPolicyObservation, error) {
 	var result contracts.CIRequiredCheckPolicyObservation
 	err := f.withState(func() (bool, error) {
@@ -679,16 +764,15 @@ func (f *FakeGH) ObserveCIRequiredCheckPolicy(_ context.Context, identity contra
 		if err != nil {
 			return false, err
 		}
-		pr := f.state.PRs[index].Identity
-		if !identityMatches(pr, identity) || pr.BaseOID == "" {
-			return false, errors.New("fake-gh: pull request identity drifted")
+		if f.state.PRs[index].Identity.BaseOID != f.state.BaseHeadOID {
+			return false, errors.New("fake-gh: protected base moved during CI policy observation")
 		}
-		checks := append([]contracts.RequiredCheck(nil), f.state.Checks[pr.Number]...)
-		result = contracts.CIRequiredCheckPolicyObservation{
-			PullRequest: pr, ProtectedBranchRef: pr.BaseRef, ProtectedBranchOID: pr.BaseOID,
-			PolicySourceDigest: strings.Repeat("a", 64), AuthenticatedPrincipal: "fake-gh",
-			RequiredChecks: checks, ObservedAt: time.Now().UTC(),
+		checks := append([]contracts.RequiredCheck(nil), f.state.Checks[identity.Number]...)
+		if len(checks) == 0 {
+			return false, errors.New("fake-gh: required checks are unavailable")
 		}
+		source := sha256.Sum256([]byte("fake-gh-policy/" + strconv.Itoa(identity.Number) + "/" + f.state.BaseHeadOID))
+		result = contracts.CIRequiredCheckPolicyObservation{PullRequest: identity, ProtectedBranchRef: identity.BaseRef, ProtectedBranchOID: f.state.BaseHeadOID, PolicySourceDigest: hex.EncodeToString(source[:]), AuthenticatedPrincipal: "fake-gh", RequiredChecks: checks, ObservedAt: time.Now().UTC()}
 		return false, nil
 	})
 	return result, err
@@ -761,7 +845,7 @@ func (f *FakeGH) mergeUnchecked(identity contracts.PullRequestIdentity, headOID,
 		// A hosted merge produces a new immutable merge result.  The fake keeps
 		// it distinct from the reviewed head so the boundary cannot mistake a
 		// head OID for protected-branch evidence.
-		f.state.PRs[index].MergeCommit = strings.Repeat("b", 40)
+		f.state.PRs[index].MergeCommit = f.state.MergeCommitOID
 		// The protected ref advances to the merge result. PR baseRefOid remains
 		// the original PR witness, so reconciliation must not compare it to this
 		// live post-merge tip.
@@ -821,6 +905,16 @@ func samePRSourceAndBase(a, b contracts.PullRequestIdentity) bool {
 		a.HeadRepository == b.HeadRepository &&
 		a.HeadRef == b.HeadRef &&
 		a.BaseRef == b.BaseRef
+}
+
+func samePublishedSource(a, b contracts.PullRequestIdentity) bool {
+	return sameRepository(a.Repository, b.Repository) &&
+		a.HeadOwner == b.HeadOwner &&
+		a.HeadRepository == b.HeadRepository &&
+		a.HeadRef == b.HeadRef &&
+		a.HeadOID == b.HeadOID &&
+		a.BaseRef == b.BaseRef &&
+		a.FactoryOwned && b.FactoryOwned
 }
 
 func sameRepository(a, b contracts.RepositoryIdentity) bool {
@@ -992,6 +1086,9 @@ func loadFakeGHState(path string) (FakeGHState, error) {
 	}
 	if !fakeOID(state.BaseHeadOID) {
 		state.BaseHeadOID = strings.Repeat("c", 40)
+	}
+	if !fakeOID(state.MergeCommitOID) {
+		state.MergeCommitOID = strings.Repeat("b", 40)
 	}
 	return state, nil
 }

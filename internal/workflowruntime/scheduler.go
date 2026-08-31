@@ -207,6 +207,21 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 			result.Outcome = OutcomeInvoked
 			return result
 		}
+		if ticket.State == domain.StateWaitingManualMerge || ticket.State == domain.StateReconciling {
+			// Manual merge observation and guarded/manual reconciliation are
+			// read-only GitHub observations. They
+			// must not be held hostage by an unavailable local checkout, because
+			// they neither change GitHub nor launch a Git operation.
+			workerResult, workerErr := s.Worker.Run(runCtx, ticket.Ref, candidateFence)
+			end()
+			result.Worker = workerResult
+			if workerErr != nil {
+				result.Outcome, result.Err = classifyWorker(workerErr)
+				return result
+			}
+			result.Outcome = OutcomeInvoked
+			return result
+		}
 		if ticket.State == domain.StateWaitingCI {
 			// CI is a read-only wait state. Its worker owns durable observation
 			// replay, but it never needs a local checkout just to poll GitHub.
@@ -256,7 +271,7 @@ func (s Scheduler) activeState(state domain.State) bool {
 	// while a pre-publishing runtime uses the same admission to durably block.
 	// waiting_ci is a bounded, read-only observation state. It must not create
 	// a worktree or launch a provider, but one scheduler tick may poll it.
-	return state == domain.StatePlanning || state == domain.StateVerifying || state == domain.StateBuilding || state == domain.StatePublishing || state == domain.StateWaitingCI || state == domain.StateReviewing
+	return state == domain.StatePlanning || state == domain.StateVerifying || state == domain.StateBuilding || state == domain.StatePublishing || state == domain.StateWaitingCI || state == domain.StateReviewing || state == domain.StateWaitingManualMerge || state == domain.StateMerging || state == domain.StateReconciling
 }
 
 func classify(err error, fence domain.Fence, ref domain.TicketRef) TickResult {

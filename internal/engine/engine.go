@@ -165,7 +165,19 @@ func (e *Engine) SignalCandidate(ctx context.Context, request contracts.SignalRe
 	if request.From != domain.StateBuilding || request.Trigger != "phase_pass" {
 		return contracts.TransitionResult{}, store.ErrEvidenceConflict
 	}
+	ticket, err := e.store.Ticket(ctx, request.Ticket)
+	if err != nil {
+		return contracts.TransitionResult{}, err
+	}
+	if ticket.State != request.From || ticket.Version != request.TicketVersion {
+		return contracts.TransitionResult{}, store.ErrStaleFence
+	}
 	attributes := map[string]string{"proof_green": "true", "diff_valid": "true", "git_control_plane_valid": "true", "candidate_checkpoint_committed": "true"}
+	if ticket.Type == domain.TicketSpike {
+		attributes["ticket_type_spike"] = "true"
+	} else {
+		attributes["ticket_type_not_spike"] = "true"
+	}
 	guards := make(map[string]bool, len(attributes))
 	for key, value := range attributes {
 		guards[key] = value == "true"
@@ -173,13 +185,6 @@ func (e *Engine) SignalCandidate(ctx context.Context, request contracts.SignalRe
 	transition, err := e.spec.Select(string(request.From), request.Trigger, guards)
 	if err != nil {
 		return contracts.TransitionResult{}, err
-	}
-	ticket, err := e.store.Ticket(ctx, request.Ticket)
-	if err != nil {
-		return contracts.TransitionResult{}, err
-	}
-	if ticket.State != request.From || ticket.Version != request.TicketVersion {
-		return contracts.TransitionResult{}, store.ErrStaleFence
 	}
 	target, err := statemachine.ResolveTarget(transition.To, string(request.From), string(ticket.ResumeState), string(ticket.ResumeState))
 	if err != nil {
@@ -229,6 +234,16 @@ func (e *Engine) SignalFinalReview(ctx context.Context, request contracts.Signal
 		return contracts.TransitionResult{}, store.ErrEvidenceConflict
 	}
 	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: request.Trigger, Fence: request.Fence, Attributes: attributes, EventPayload: request.EventPayload}, e.store.TransitionFinalReview)
+}
+
+// SignalAutonomyBlocked consumes the same authenticated final-review pass as
+// a normal review exit, but records the normative closed autonomy prerequisite
+// rather than offering an approval shortcut.
+func (e *Engine) SignalAutonomyBlocked(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if request.From != domain.StateReviewing || request.Trigger != "review_pass" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: "review_pass", Fence: request.Fence, Attributes: map[string]string{"ticket_type_not_spike": "true", "merge_mode_autonomous": "true", "autonomy_ineligible": "true"}, EventPayload: `{"code":"autonomy_ineligible"}`}, e.store.TransitionFinalReview)
 }
 
 // SignalFinalReviewRepair derives the state-machine branch from the durable

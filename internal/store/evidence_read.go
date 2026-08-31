@@ -141,9 +141,10 @@ func (s *Store) finalReviewAuthorityFrom(ctx context.Context, q candidateEvidenc
 		return FinalReviewAuthority{}, ErrStaleFence
 	}
 	var state domain.State
+	var ticketType domain.TicketType
 	var version, runner, leader uint64
 	var source string
-	if err := q.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch,t.source_digest FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &leader, &source); err != nil || state != domain.StateReviewing || version != expectedVersion || runner != fence.RunnerEpoch || leader != fence.LeaderEpoch {
+	if err := q.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch,t.source_digest,t.ticket_type FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &leader, &source, &ticketType); err != nil || state != domain.StateReviewing || version != expectedVersion || runner != fence.RunnerEpoch || leader != fence.LeaderEpoch {
 		return FinalReviewAuthority{}, ErrStaleFence
 	}
 	// Audit the complete ledger even when the candidate's green CI transition
@@ -159,6 +160,13 @@ func (s *Store) finalReviewAuthorityFrom(ctx context.Context, q candidateEvidenc
 	verification, err := s.verificationEvidenceForCandidateFrom(ctx, q, ref)
 	if err != nil || candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest || candidate.Commit.ParentOID != verification.Checkpoint.CommitOID {
 		return FinalReviewAuthority{}, ErrEvidenceConflict
+	}
+	if ticketType == domain.TicketSpike {
+		_, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, q, verification.ProviderResult)
+		if err != nil || parsed.Verify == nil || parsed.Verify.PrebuildOutcome != "report_ready" {
+			return FinalReviewAuthority{}, ErrEvidenceConflict
+		}
+		return FinalReviewAuthority{Candidate: candidate, Verification: verification}, nil
 	}
 	observation, checks, reviewVersion, err := finalReviewCIAuthorityFrom(ctx, q, ref, candidate)
 	if err != nil {

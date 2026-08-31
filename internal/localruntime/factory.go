@@ -12,13 +12,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/daemon/runtimecontrol"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/ghrunner"
 	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/github"
+	"github.com/nysa-company/sf/internal/mergeproof"
 	"github.com/nysa-company/sf/internal/processsupervisor"
 	"github.com/nysa-company/sf/internal/providercoord"
 	"github.com/nysa-company/sf/internal/publication"
@@ -168,7 +168,7 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 			gitRunner.GHBinaryDigest = capability.Digest
 			repositorySupervisor.GitRunner = gitRunner
 			materializer.Git = gitRunner
-			githubClient, clientErr := github.NewStoreClient(configuration.GHBinary, configuration.OwnerHome, configuration.GHConfigDir, gh, dependencies.Store, unavailableMergeVerifier{})
+			githubClient, clientErr := github.NewStoreClient(configuration.GHBinary, configuration.OwnerHome, configuration.GHConfigDir, gh, dependencies.Store, mergeproof.Coordinator{Store: dependencies.Store, Git: gitRunner})
 			if clientErr != nil {
 				return daemon.WorkflowRuntimeComponents{}, fmt.Errorf("compose GitHub client: %w", errors.Join(clientErr, gh.Close()))
 			}
@@ -233,12 +233,6 @@ func (r *managedRuntime) Close() error {
 		err = errors.Join(err, r.gh.Close())
 	}
 	return err
-}
-
-type unavailableMergeVerifier struct{}
-
-func (unavailableMergeVerifier) VerifyProtectedBranch(context.Context, contracts.RepositoryIdentity, string, string, string) (contracts.ProtectedBranchObservation, error) {
-	return contracts.ProtectedBranchObservation{}, errors.New("protected-branch merge verification is not available in local publication runtime")
 }
 
 func validateExistingDirectory(path, label string) error {

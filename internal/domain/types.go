@@ -201,10 +201,17 @@ type MergeIntent struct {
 	RepositoryOwner   string
 	RepositoryName    string
 	PullRequestNumber int
-	HeadOID           string
-	BaseRef           string
-	OriginalBaseOID   string
-	ProtectionRuleID  string
+	// HeadOwner, HeadRepository, and HeadRef bind the complete source identity
+	// that GitHub reports for the reviewed pull request. A PR number and head
+	// object alone are not a restart-safe source witness: a repository can
+	// retain a number while its source metadata changes.
+	HeadOwner        string
+	HeadRepository   string
+	HeadRef          string
+	HeadOID          string
+	BaseRef          string
+	OriginalBaseOID  string
+	ProtectionRuleID string
 	// ProtectionKind records whether the witnessed merge gate was classic
 	// branch protection or an exact repository ruleset. Empty is retained only
 	// for pre-v30 classic rows.

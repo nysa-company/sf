@@ -1026,6 +1026,388 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 	return control.stop.leader, true, nil
 }
 
+// normalPostPublicationRecoveryPredecessor is the no-control restart bridge
+// for post-publication states. It derives the predecessor from immutable
+// final-review, approval, and (when present) merge evidence, never from state
+// counters alone.
+func (s *Store) normalPostPublicationRecoveryPredecessor(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64) (uint64, bool, error) {
+	if version == 0 || runner == 0 || newLeader == 0 {
+		return 0, false, nil
+	}
+	current := normalRecoveryEndpoint{version: version, runner: runner}
+	switch state {
+	case domain.StateWaitingApproval, domain.StateWaitingManualMerge:
+		baseline, err := s.finalReviewRecoveryEndpoint(ctx, conn, ref, state)
+		if err != nil {
+			return 0, false, err
+		}
+		if baseline.leader >= newLeader {
+			return 0, false, ErrPublicationEvidence
+		}
+		current.leader, err = normalRecoveryLeaderAt(ctx, conn, ref, baseline, version, runner)
+		if err != nil {
+			return 0, false, err
+		}
+		if current.leader >= newLeader {
+			return 0, false, ErrPublicationEvidence
+		}
+		return current.leader, true, nil
+	case domain.StateMerging:
+		baseline, err := s.approvalRecoveryEndpoint(ctx, conn, ref)
+		if err != nil {
+			return 0, false, err
+		}
+		if baseline.leader >= newLeader {
+			return 0, false, ErrPublicationEvidence
+		}
+		current.leader, err = normalRecoveryLeaderAt(ctx, conn, ref, baseline, version, runner)
+		if err != nil {
+			return 0, false, err
+		}
+		if current.leader >= newLeader {
+			return 0, false, ErrPublicationEvidence
+		}
+		intent, found, err := singleRecoveryMergeIntent(ctx, conn, ref)
+		if err != nil {
+			return 0, false, err
+		}
+		// A daemon may die immediately after approval and before the merge intent
+		// is written. Once an intent exists, however, its exact immutable launch
+		// tuple and the stranded effect are mandatory recovery authority.
+		if found {
+			if err := s.authenticateMergingRecoveryEffect(ctx, conn, ref, baseline, current, newLeader, intent); err != nil {
+				return 0, false, ErrPublicationEvidence
+			}
+		} else if err := authenticateUnissuedMergeEffect(ctx, conn, ref, current, newLeader); err != nil {
+			return 0, false, ErrPublicationEvidence
+		}
+		return current.leader, true, nil
+	case domain.StateReconciling:
+		if manual, found, err := loadManualMergeObservation(ctx, conn, ref); err != nil {
+			return 0, false, err
+		} else if found {
+			if err := validManualMergeObservation(manual); err != nil || manual.CurrentTicketVersion == ^uint64(0) {
+				return 0, false, ErrPublicationEvidence
+			}
+			reconciling := normalRecoveryEndpoint{version: manual.CurrentTicketVersion + 1, runner: manual.CurrentFence.RunnerEpoch, leader: manual.CurrentFence.LeaderEpoch}
+			var events, stateChanges int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='external_merge_observed' AND from_state='waiting_manual_merge' AND to_state='reconciling' AND payload=?`, ref.Channel, ref.Project, ref.Ticket, reconciling.version, manualMergeObservationEventPayload(manual.ObservationDigest)).Scan(&events, &stateChanges); err != nil || events != 1 || stateChanges != 1 {
+				return 0, false, ErrPublicationEvidence
+			}
+			current.leader, err = normalRecoveryLeaderAt(ctx, conn, ref, reconciling, version, runner)
+			if err != nil {
+				return 0, false, err
+			}
+			if current.leader >= newLeader {
+				return 0, false, ErrPublicationEvidence
+			}
+			return current.leader, true, nil
+		}
+		baseline, err := s.confirmedMergeRecoveryEndpoint(ctx, conn, ref)
+		if err != nil {
+			return 0, false, err
+		}
+		if baseline.version == ^uint64(0) {
+			return 0, false, ErrPublicationEvidence
+		}
+		reconciling := normalRecoveryEndpoint{version: baseline.version + 1, runner: baseline.runner, leader: baseline.leader}
+		var transitions, stateChanges int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='merge_observed' AND from_state='merging' AND to_state='reconciling'`, ref.Channel, ref.Project, ref.Ticket, reconciling.version).Scan(&transitions, &stateChanges); err != nil || transitions != 1 || stateChanges != 1 {
+			return 0, false, ErrPublicationEvidence
+		}
+		current.leader, err = normalRecoveryLeaderAt(ctx, conn, ref, reconciling, version, runner)
+		if err != nil {
+			return 0, false, err
+		}
+		if current.leader >= newLeader {
+			return 0, false, ErrPublicationEvidence
+		}
+		return current.leader, true, nil
+	default:
+		return 0, false, nil
+	}
+}
+
+type normalRecoveryEndpoint struct {
+	version uint64
+	runner  uint64
+	leader  uint64
+}
+
+func (s *Store) finalReviewRecoveryEndpoint(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State) (normalRecoveryEndpoint, error) {
+	if state != domain.StateWaitingApproval && state != domain.StateWaitingManualMerge {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
+	if err != nil {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	observation, reviewVersion, err := s.authenticateHistoricalFinalReview(ctx, conn, ref, candidate)
+	if err != nil || reviewVersion == ^uint64(0) || observation.ObservedFence.LeaderEpoch == 0 || observation.ObservedFence.RunnerEpoch == 0 {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	endpoint := normalRecoveryEndpoint{version: reviewVersion + 1, runner: observation.ObservedFence.RunnerEpoch, leader: observation.ObservedFence.LeaderEpoch}
+	if err := s.authenticatePostPublicationReviewCompletion(ctx, conn, ref, state, endpoint.version, domain.Fence{LeaderEpoch: endpoint.leader, RunnerEpoch: endpoint.runner}); err != nil {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	return endpoint, nil
+}
+
+func (s *Store) approvalRecoveryEndpoint(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) (normalRecoveryEndpoint, error) {
+	waiting, err := s.finalReviewRecoveryEndpoint(ctx, conn, ref, domain.StateWaitingApproval)
+	if err != nil {
+		return normalRecoveryEndpoint{}, err
+	}
+	candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
+	if err != nil {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	var approvalVersion uint64
+	var approvals int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0) FROM approvals WHERE channel=? AND project_id=? AND ticket_id=? AND reviewed_head=? AND decision='approved' AND invalidated=0`, ref.Channel, ref.Project, ref.Ticket, candidate.Snapshot.HeadSHA).Scan(&approvals, &approvalVersion); err != nil || approvals != 1 || approvalVersion == 0 {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	if approvalVersion < waiting.version || approvalVersion-waiting.version > 64 || waiting.runner > ^uint64(0)-(approvalVersion-waiting.version) {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	preApprovalLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, waiting, approvalVersion, waiting.runner+(approvalVersion-waiting.version))
+	if err != nil {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	if approvalVersion == ^uint64(0) {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	var payload string
+	var events, stateChanges int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0),COALESCE(MAX(payload),'') FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_approved' AND from_state='waiting_approval' AND to_state='merging'`, ref.Channel, ref.Project, ref.Ticket, approvalVersion+1).Scan(&events, &stateChanges, &payload); err != nil || events != 1 || stateChanges != 1 {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	var approved map[string]string
+	if json.Unmarshal([]byte(payload), &approved) != nil || approved["head"] != candidate.Snapshot.HeadSHA || (approved["reason_digest"] != "" && !validSHA256(approved["reason_digest"])) {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	canonical, err := json.Marshal(approved)
+	if err != nil || string(canonical) != payload || len(approved) > 2 {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	return normalRecoveryEndpoint{version: approvalVersion + 1, runner: waiting.runner + (approvalVersion - waiting.version), leader: preApprovalLeader}, nil
+}
+
+// normalRecoveryLeaderAt authenticates a historical endpoint through only
+// contiguous +1/+1 runner-recovery rows. Unlike validateRunnerRecoveryLedger,
+// it deliberately stops at targetVersion so immutable merge intent/effect
+// endpoints remain provable after later daemon restarts append more rows.
+func normalRecoveryLeaderAt(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, source normalRecoveryEndpoint, targetVersion, targetRunner uint64) (uint64, error) {
+	if source.version == 0 || source.runner == 0 || source.leader == 0 || targetVersion < source.version || targetRunner < source.runner || targetVersion-source.version != targetRunner-source.runner || targetVersion-source.version > 64 {
+		return 0, ErrPublicationEvidence
+	}
+	if err := validateRunnerRecoveryCardinality(ctx, conn, ref); err != nil {
+		return 0, err
+	}
+	if targetVersion == source.version {
+		return source.leader, nil
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, source.version, targetVersion)
+	if err != nil {
+		return 0, err
+	}
+	steps := make([]RunnerRecoveryLedger, 0, targetVersion-source.version)
+	for rows.Next() {
+		var step RunnerRecoveryLedger
+		var createdAt string
+		if err := rows.Scan(&step.PriorTicketVersion, &step.PriorRunnerEpoch, &step.PriorLeaderEpoch, &step.TicketVersion, &step.RunnerEpoch, &step.LeaderEpoch, &step.RecoveryDigest, &createdAt); err != nil {
+			return 0, err
+		}
+		step.Ref = ref
+		step.CreatedAt, err = parseRunnerRecoveryTime(createdAt)
+		if err != nil || !validRunnerRecovery(step) {
+			rows.Close()
+			return 0, ErrPublicationEvidence
+		}
+		steps = append(steps, step)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	expected := source
+	var previousCreated time.Time
+	for _, step := range steps {
+		if step.PriorTicketVersion != expected.version || step.PriorRunnerEpoch != expected.runner || step.PriorLeaderEpoch != expected.leader {
+			return 0, ErrPublicationEvidence
+		}
+		if !previousCreated.IsZero() && !step.CreatedAt.After(previousCreated) {
+			return 0, ErrPublicationEvidence
+		}
+		var transitions int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, step.TicketVersion).Scan(&transitions); err != nil || transitions != 0 {
+			return 0, ErrPublicationEvidence
+		}
+		expected = normalRecoveryEndpoint{version: step.TicketVersion, runner: step.RunnerEpoch, leader: step.LeaderEpoch}
+		previousCreated = step.CreatedAt
+	}
+	if uint64(len(steps)) != targetVersion-source.version || expected.version != targetVersion || expected.runner != targetRunner {
+		return 0, ErrPublicationEvidence
+	}
+	return expected.leader, nil
+}
+
+// authenticateUnissuedMergeEffect handles only the proven pre-handoff crash
+// window. MergeExactHead records the immutable intent before it enters the
+// mutation guard, so an uncertain claim with no intent cannot have launched a
+// hosted merge. Confirmed/executing rows without an intent are contradictory
+// and fail closed.
+func authenticateUnissuedMergeEffect(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, current normalRecoveryEndpoint, newLeader uint64) error {
+	rows, err := conn.QueryContext(ctx, `SELECT semantic_key,effect_kind,state,ticket_version,leader_epoch,runner_epoch,claim_epoch,request_digest,observed_identity FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND effect_kind='merge' ORDER BY semantic_key`, ref.Channel, ref.Project, ref.Ticket)
+	if err != nil {
+		return err
+	}
+	var effects []Effect
+	for rows.Next() {
+		var effect Effect
+		if err := rows.Scan(&effect.SemanticKey, &effect.Kind, &effect.State, &effect.TicketVersion, &effect.LeaderEpoch, &effect.RunnerEpoch, &effect.ClaimEpoch, &effect.RequestDigest, &effect.ObservedIdentity); err != nil {
+			rows.Close()
+			return err
+		}
+		effect.Ref = ref
+		effects = append(effects, effect)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(effects) == 0 {
+		return nil
+	}
+	if len(effects) != 1 {
+		return ErrPublicationEvidence
+	}
+	effect := effects[0]
+	if effect.State == EffectPlanned {
+		return nil
+	}
+	if effect.State != EffectUncertain || effect.ObservedIdentity != "" || effect.TicketVersion != current.version || effect.RunnerEpoch != current.runner || effect.LeaderEpoch != newLeader || effect.ClaimEpoch == 0 || effect.RequestDigest == "" {
+		return ErrPublicationEvidence
+	}
+	return nil
+}
+
+func singleRecoveryMergeIntent(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) (domain.MergeIntent, bool, error) {
+	rows, err := conn.QueryContext(ctx, `SELECT semantic_key FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY semantic_key`, ref.Channel, ref.Project, ref.Ticket)
+	if err != nil {
+		return domain.MergeIntent{}, false, err
+	}
+	var key string
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(&key); err != nil {
+			return domain.MergeIntent{}, false, err
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return domain.MergeIntent{}, false, err
+	}
+	rows.Close()
+	if count == 0 {
+		return domain.MergeIntent{}, false, nil
+	}
+	if count != 1 {
+		return domain.MergeIntent{}, false, ErrPublicationEvidence
+	}
+	intent, found, err := mergeIntentFrom(ctx, conn, key)
+	if err != nil || !found || intent.Ref != ref || validMergeIntent(intent) != nil {
+		return domain.MergeIntent{}, false, ErrPublicationEvidence
+	}
+	publication, err := loadCIPublicationBase(ctx, conn, ref)
+	if err != nil {
+		return domain.MergeIntent{}, false, ErrPublicationEvidence
+	}
+	pr := publication.PullRequest
+	if intent.RepositoryHost != pr.Repository.Host || intent.RepositoryOwner != pr.Repository.Owner || intent.RepositoryName != pr.Repository.Name || intent.PullRequestNumber != pr.Number || intent.HeadOwner != pr.HeadOwner || intent.HeadRepository != pr.HeadRepository || intent.HeadRef != pr.HeadRef || intent.HeadOID != pr.HeadOID || intent.BaseRef != pr.BaseRef || intent.OriginalBaseOID != pr.BaseOID {
+		return domain.MergeIntent{}, false, ErrPublicationEvidence
+	}
+	return intent, true, nil
+}
+
+func (s *Store) authenticateMergingRecoveryEffect(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, approval, current normalRecoveryEndpoint, newLeader uint64, intent domain.MergeIntent) error {
+	intentEndpoint := normalRecoveryEndpoint{version: intent.TicketVersion, runner: intent.RunnerEpoch, leader: intent.LeaderEpoch}
+	if intentEndpoint.version < approval.version || intentEndpoint.runner < approval.runner {
+		return ErrPublicationEvidence
+	}
+	intentLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, approval, intentEndpoint.version, intentEndpoint.runner)
+	if err != nil || intentLeader != intentEndpoint.leader {
+		return ErrPublicationEvidence
+	}
+	effect, err := effectFrom(ctx, conn, intent.SemanticKey)
+	if err != nil || effect.Ref != ref || effect.Kind != "merge" || effect.RequestDigest != intent.RequestDigest {
+		return ErrPublicationEvidence
+	}
+	switch effect.State {
+	case EffectUncertain:
+		if effect.ObservedIdentity != "" || effect.TicketVersion != intent.TicketVersion || effect.RunnerEpoch != intent.RunnerEpoch || effect.LeaderEpoch != newLeader || current.version < intent.TicketVersion || current.runner < intent.RunnerEpoch {
+			return ErrPublicationEvidence
+		}
+		delta := current.version - intent.TicketVersion
+		if delta != current.runner-intent.RunnerEpoch || delta == ^uint64(0) || intent.ClaimEpoch > ^uint64(0)-delta-1 {
+			return ErrPublicationEvidence
+		}
+		minimumClaim := intent.ClaimEpoch + delta + 1
+		if effect.ClaimEpoch < minimumClaim || newLeader <= intent.LeaderEpoch || effect.ClaimEpoch-intent.ClaimEpoch > newLeader-intent.LeaderEpoch {
+			return ErrPublicationEvidence
+		}
+	case EffectConfirmed, EffectFailed:
+		effectEndpoint := normalRecoveryEndpoint{version: effect.TicketVersion, runner: effect.RunnerEpoch, leader: effect.LeaderEpoch}
+		leader, err := normalRecoveryLeaderAt(ctx, conn, ref, intentEndpoint, effectEndpoint.version, effectEndpoint.runner)
+		if err != nil || leader != effectEndpoint.leader || effectEndpoint.version < intentEndpoint.version || effectEndpoint.version > current.version || effectEndpoint.runner > current.runner {
+			return ErrPublicationEvidence
+		}
+		delta := effectEndpoint.version - intentEndpoint.version
+		if intent.ClaimEpoch > ^uint64(0)-delta || effect.ClaimEpoch < intent.ClaimEpoch+delta || effect.LeaderEpoch < intent.LeaderEpoch || effect.ClaimEpoch-intent.ClaimEpoch > effect.LeaderEpoch-intent.LeaderEpoch || (effect.State == EffectConfirmed && effect.ObservedIdentity == "") || (effect.State == EffectFailed && effect.ObservedIdentity != "") {
+			return ErrPublicationEvidence
+		}
+		if currentLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, effectEndpoint, current.version, current.runner); err != nil || currentLeader != current.leader {
+			return ErrPublicationEvidence
+		}
+	default:
+		return ErrPublicationEvidence
+	}
+	return nil
+}
+
+func (s *Store) confirmedMergeRecoveryEndpoint(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) (normalRecoveryEndpoint, error) {
+	approval, err := s.approvalRecoveryEndpoint(ctx, conn, ref)
+	if err != nil {
+		return normalRecoveryEndpoint{}, err
+	}
+	intent, found, err := singleRecoveryMergeIntent(ctx, conn, ref)
+	if err != nil || !found {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	intentEndpoint := normalRecoveryEndpoint{version: intent.TicketVersion, runner: intent.RunnerEpoch, leader: intent.LeaderEpoch}
+	leader, err := normalRecoveryLeaderAt(ctx, conn, ref, approval, intentEndpoint.version, intentEndpoint.runner)
+	if err != nil || leader != intentEndpoint.leader {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	effect, err := effectFrom(ctx, conn, intent.SemanticKey)
+	if err != nil || effect.Ref != ref || effect.Kind != "merge" || effect.RequestDigest != intent.RequestDigest || effect.State != EffectConfirmed || effect.ObservedIdentity == "" || effect.TicketVersion < intent.TicketVersion || effect.RunnerEpoch < intent.RunnerEpoch {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	effectEndpoint := normalRecoveryEndpoint{version: effect.TicketVersion, runner: effect.RunnerEpoch, leader: effect.LeaderEpoch}
+	leader, err = normalRecoveryLeaderAt(ctx, conn, ref, intentEndpoint, effectEndpoint.version, effectEndpoint.runner)
+	if err != nil || leader != effectEndpoint.leader {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	delta := effectEndpoint.version - intentEndpoint.version
+	if intent.ClaimEpoch > ^uint64(0)-delta || effect.ClaimEpoch < intent.ClaimEpoch+delta || effect.LeaderEpoch < intent.LeaderEpoch || effect.ClaimEpoch-intent.ClaimEpoch > effect.LeaderEpoch-intent.LeaderEpoch {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	return effectEndpoint, nil
+}
+
 func postPublicationControlTripletPresent(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version uint64) (bool, error) {
 	if !postPublicationState(state) || version < 3 {
 		return false, nil

@@ -60,7 +60,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 46
+const schemaVersion = 48
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -109,6 +109,8 @@ var migrationChecksums = map[int]string{
 	44: migrationChecksum(migrationV44),
 	45: migrationChecksum(migrationV45),
 	46: migrationChecksum(migrationV46),
+	47: migrationChecksum(migrationV47),
+	48: migrationChecksum(migrationV48),
 }
 
 func migrationChecksum(statements []string) string {
@@ -480,6 +482,10 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV45
 			} else if version == 46 {
 				statements = migrationV46
+			} else if version == 47 {
+				statements = migrationV47
+			} else if version == 48 {
+				statements = migrationV48
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1417,7 +1423,7 @@ func (s *Store) TransitionVerification(ctx context.Context, transition Transitio
 // method is the missing lifecycle consumer that closes the crash window after
 // provider completion but before the transition response reaches the worker.
 func (s *Store) TransitionFinalReview(ctx context.Context, transition Transition) (TransitionResult, error) {
-	if transition.From != domain.StateReviewing || transition.Trigger != "review_pass" || (transition.To != domain.StateWaitingApproval && transition.To != domain.StateWaitingManualMerge && transition.To != domain.StateDone) {
+	if transition.From != domain.StateReviewing || transition.Trigger != "review_pass" || (transition.To != domain.StateWaitingApproval && transition.To != domain.StateWaitingManualMerge && transition.To != domain.StateDone && transition.To != domain.StateBlocked) {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
 	return s.transitionWithEvidence(ctx, transition, func(ctx context.Context, conn *sql.Conn, version, runner uint64) error {
@@ -1426,7 +1432,7 @@ func (s *Store) TransitionFinalReview(ctx context.Context, transition Transition
 		if err := conn.QueryRowContext(ctx, `SELECT ticket_type,merge_mode FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&ticketType, &mergeMode); err != nil {
 			return err
 		}
-		if (ticketType == domain.TicketSpike && transition.To != domain.StateDone) || (ticketType != domain.TicketSpike && ((mergeMode == domain.MergeGuarded && transition.To != domain.StateWaitingApproval) || (mergeMode == domain.MergeManual && transition.To != domain.StateWaitingManualMerge) || mergeMode == domain.MergeAutonomous || transition.To == domain.StateDone)) {
+		if (ticketType == domain.TicketSpike && transition.To != domain.StateDone) || (ticketType != domain.TicketSpike && ((mergeMode == domain.MergeGuarded && transition.To != domain.StateWaitingApproval) || (mergeMode == domain.MergeManual && transition.To != domain.StateWaitingManualMerge) || (mergeMode == domain.MergeAutonomous && transition.To != domain.StateBlocked) || (mergeMode != domain.MergeAutonomous && transition.To == domain.StateDone))) {
 			return ErrEvidenceConflict
 		}
 		authority, _, reviewer, err := s.finalReviewerResult(ctx, conn, transition.Ref, version, transition.Fence)
@@ -1573,7 +1579,7 @@ func (s *Store) transitionWithEvidence(ctx context.Context, transition Transitio
 // signal in another: a newer same-version candidate could otherwise replace
 // the proof between those operations.
 func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, candidate domain.CandidateSnapshot) (TransitionResult, error) {
-	if err := transition.Ref.Validate(); err != nil || transition.From != domain.StateBuilding || transition.To != domain.StatePublishing || transition.Trigger != "phase_pass" || validateCandidate(candidate) != nil {
+	if err := transition.Ref.Validate(); err != nil || transition.From != domain.StateBuilding || (transition.To != domain.StatePublishing && transition.To != domain.StateReviewing) || transition.Trigger != "phase_pass" || validateCandidate(candidate) != nil {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
 	if transition.EventPayload == "" {
@@ -1610,6 +1616,10 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 		}
 		if actual != transition.From || version != transition.ExpectedVersion {
 			return ErrStaleFence
+		}
+		var ticketType domain.TicketType
+		if err := conn.QueryRowContext(ctx, `SELECT ticket_type FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&ticketType); err != nil || (ticketType == domain.TicketSpike) != (transition.To == domain.StateReviewing) {
+			return ErrEvidenceConflict
 		}
 		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
 			return err

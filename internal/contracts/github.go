@@ -65,6 +65,24 @@ type CIRequiredCheckPolicyObserver interface {
 	ObserveCIRequiredCheckPolicy(context.Context, PullRequestIdentity) (CIRequiredCheckPolicyObservation, error)
 }
 
+// PublishedPullRequestObservation is the authenticated all-state PR witness
+// used after publication. It lives in contracts so runtime composition and
+// hermetic fakes do not need to import the concrete GitHub client.
+type PublishedPullRequestObservation struct {
+	Identity             PullRequestIdentity
+	Draft, Merged, Ready bool
+	Title, Body          string
+	MergeCommit          string
+	BaseHeadOID          string
+	State                string
+	MergeState           string
+	AutoMerge            bool
+}
+
+type PublishedPullRequestObserver interface {
+	ObservePublishedPullRequest(context.Context, PullRequestIdentity) (PublishedPullRequestObservation, error)
+}
+
 // MergeBranchVerifier is implemented by a merge-proof coordinator after it
 // arranges a freshly authorized protected-ref fetch and proves that the
 // observed merge is reachable from a protected branch whose merge started at

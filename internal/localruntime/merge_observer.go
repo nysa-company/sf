@@ -7,7 +7,6 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
-	gh "github.com/nysa-company/sf/internal/github"
 	"github.com/nysa-company/sf/internal/store"
 )
 
@@ -26,12 +25,23 @@ type historicalPublicationStore interface {
 }
 
 func (o publishedMergeObserver) MergeObserved(ctx context.Context, ref domain.TicketRef) (bool, error) {
+	observation, err := o.Observe(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	return observation.Observed.Merged, nil
+}
+
+// Observe returns the complete read-only witness used by the manual merge
+// Store boundary. MergeObserved remains the compatibility wrapper used by
+// cancellation and older callers.
+func (o publishedMergeObserver) Observe(ctx context.Context, ref domain.TicketRef) (store.ManualMergeObservation, error) {
 	if o.Store == nil || o.GitHub == nil {
-		return false, errors.New("published merge observer is not configured")
+		return store.ManualMergeObservation{}, errors.New("published merge observer is not configured")
 	}
 	prePublication, err := o.Store.MergeObservationPrePublication(ctx, ref)
 	if err != nil {
-		return false, err
+		return store.ManualMergeObservation{}, err
 	}
 	evidence, err := o.Store.LoadHistoricalPublishedCandidate(ctx, ref)
 	if errors.Is(err, store.ErrNotFound) {
@@ -39,33 +49,36 @@ func (o publishedMergeObserver) MergeObserved(ctx context.Context, ref domain.Ti
 		// publication effect or merge intent exists. An effect-before-witness
 		// crash must remain a hard cancellation ambiguity.
 		if prePublication {
-			return false, nil
+			return store.ManualMergeObservation{}, nil
 		}
-		return false, store.ErrPublicationEvidence
+		return store.ManualMergeObservation{}, store.ErrPublicationEvidence
 	}
 	if err != nil {
-		return false, err
+		return store.ManualMergeObservation{}, err
 	}
 	observer, ok := o.GitHub.(interface {
-		ObservePublishedPullRequest(context.Context, contracts.PullRequestIdentity) (gh.PRMatch, error)
+		ObservePublishedPullRequest(context.Context, contracts.PullRequestIdentity) (contracts.PublishedPullRequestObservation, error)
 	})
 	if !ok {
-		return false, errors.New("GitHub client does not provide authenticated published-PR observation")
+		return store.ManualMergeObservation{}, errors.New("GitHub client does not provide authenticated published-PR observation")
 	}
 	observed, err := observer.ObservePublishedPullRequest(ctx, evidence.PullRequest)
 	if err != nil {
-		return false, err
+		return store.ManualMergeObservation{}, err
 	}
 	if !samePublishedIdentity(observed.Identity, evidence.PullRequest) {
-		return false, errors.New("published pull request identity changed during merge observation")
+		return store.ManualMergeObservation{}, errors.New("published pull request identity changed during merge observation")
 	}
 	if !validMergeObservation(observed) {
-		return false, errors.New("published pull request merge observation is malformed")
+		return store.ManualMergeObservation{}, errors.New("published pull request merge observation is malformed")
 	}
-	return observed.Merged, nil
+	if !observed.Merged {
+		return store.ManualMergeObservation{}, nil
+	}
+	return store.NewManualMergeObservation(evidence, observed), nil
 }
 
-func validMergeObservation(observed gh.PRMatch) bool {
+func validMergeObservation(observed contracts.PublishedPullRequestObservation) bool {
 	if observed.State != "OPEN" && observed.State != "CLOSED" && observed.State != "MERGED" {
 		return false
 	}
