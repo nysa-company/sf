@@ -444,6 +444,73 @@ func TestPreflightCreateLostResponseAndExactAdoption(t *testing.T) {
 	}
 }
 
+func TestPublicationInventoryRejectsForeignAndAmbiguousOpenSourceBase(t *testing.T) {
+	makePR := func(identity contracts.PullRequestIdentity, owned bool) testkit.PullRequest {
+		body := "human"
+		if owned {
+			body = ownershipMarker(identity)
+		}
+		identity.FactoryOwned = owned
+		return testkit.PullRequest{Identity: identity, Body: body, Title: "title", Draft: true}
+	}
+	for _, tc := range []struct {
+		name string
+		prs  func(contracts.PullRequestIdentity) []testkit.PullRequest
+		want error
+	}{
+		{"foreign", func(i contracts.PullRequestIdentity) []testkit.PullRequest {
+			i.Number = 7
+			return []testkit.PullRequest{makePR(i, false)}
+		}, ErrPolicyRefusal},
+		{"duplicate owned", func(i contracts.PullRequestIdentity) []testkit.PullRequest {
+			a, b := i, i
+			a.Number, b.Number = 7, 8
+			return []testkit.PullRequest{makePR(a, true), makePR(b, true)}
+		}, ErrAmbiguousPR},
+		{"owned and foreign", func(i contracts.PullRequestIdentity) []testkit.PullRequest {
+			a, b := i, i
+			a.Number, b.Number = 7, 8
+			return []testkit.PullRequest{makePR(a, true), makePR(b, false)}
+		}, ErrPolicyRefusal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, fake, identity := fixture(t)
+			for _, pr := range tc.prs(identity) {
+				if err := fake.InjectPullRequestForTest(pr); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, _, err := client.ObservePublicationCandidate(context.Background(), identity); !errors.Is(err, tc.want) {
+				t.Fatalf("inventory err=%v", err)
+			}
+			claim := testClaim("draft_pr", identity, "title", "body")
+			if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, tc.want) {
+				t.Fatalf("create err=%v", err)
+			}
+			if fake.MutationCount("pr_create") != 0 {
+				t.Fatal("foreign or ambiguous PR permitted create")
+			}
+		})
+	}
+}
+
+func TestPublicationInventoryIgnoresClosedAndNonmatchingPRs(t *testing.T) {
+	client, fake, identity := fixture(t)
+	closed := identity
+	closed.Number, closed.FactoryOwned = 7, false
+	if err := fake.InjectPullRequestForTest(testkit.PullRequest{Identity: closed, Body: "human", Draft: true, Merged: true}); err != nil {
+		t.Fatal(err)
+	}
+	nonmatching := identity
+	nonmatching.Number, nonmatching.HeadRef, nonmatching.FactoryOwned = 8, "sf/dev/other", false
+	if err := fake.InjectPullRequestForTest(testkit.PullRequest{Identity: nonmatching, Body: "human", Draft: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := client.ObservePublicationCandidate(context.Background(), identity); err != nil || found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+}
+
 func TestCreateUncertainNeverAttemptsNumberOnlyOrphanClose(t *testing.T) {
 	client, _, identity := fixture(t)
 	var closed bool

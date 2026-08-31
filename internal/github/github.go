@@ -243,12 +243,12 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 	if err := c.validateClaim(ctx, durable, identity, "draft_pr", requestDigest("draft_pr", identity, title, body)); err != nil {
 		return contracts.PullRequestIdentity{}, err
 	}
-	if match, err := c.Observe(ctx, identity); err == nil {
+	if match, found, err := c.ObservePublicationCandidate(ctx, identity); err == nil && found {
 		if !adoptableDraft(match) {
 			return contracts.PullRequestIdentity{}, ErrPolicyRefusal
 		}
 		return match.Identity, nil
-	} else if !errors.Is(err, ErrNoMatchingPR) {
+	} else if err != nil {
 		return contracts.PullRequestIdentity{}, err
 	}
 	// Validate after the exact absence observation and immediately before the
@@ -266,11 +266,11 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 	}
 	// Both a delivered response and a lost response are reconciled by the same
 	// exact ownership observation; command output is never object evidence.
-	match, observeErr := c.Observe(ctx, identity)
+	match, found, observeErr := c.ObservePublicationCandidate(ctx, identity)
 	if errors.Is(observeErr, ErrProcessCleanup) {
 		return contracts.PullRequestIdentity{}, observeErr
 	}
-	if observeErr == nil && adoptableDraft(match) {
+	if observeErr == nil && found && adoptableDraft(match) {
 		return match.Identity, nil
 	}
 	if observeErr == nil {
@@ -427,7 +427,7 @@ func (c Client) mutateCreateExact(ctx context.Context, claim domain.ExternalEffe
 			}
 			return nil, ErrPolicyRefusal
 		}
-		if _, err := c.Observe(runCtx, identity); !errors.Is(err, ErrNoMatchingPR) {
+		if _, found, err := c.ObservePublicationCandidate(runCtx, identity); err != nil || found {
 			if errors.Is(err, ErrProcessCleanup) {
 				return nil, ErrProcessCleanup
 			}
@@ -581,36 +581,56 @@ func activeLogin(hosts map[string][]authHost) (string, error) {
 // result. Head owner/repository/ref/OID/base are all compared; a branch name
 // alone can never be adopted.
 func (c Client) Observe(ctx context.Context, want contracts.PullRequestIdentity) (PRMatch, error) {
+	match, found, err := c.ObservePublicationCandidate(ctx, want)
+	if err != nil {
+		return PRMatch{}, err
+	}
+	if !found {
+		return PRMatch{}, ErrNoMatchingPR
+	}
+	return match, nil
+}
+
+// ObservePublicationCandidate inventories the bounded pull-request list for
+// the exact source and base selected for publication.  It deliberately sees
+// unmarked PRs as well: an open human PR sharing this source/base is not
+// semantic absence and must block creation rather than permit a duplicate.
+// It returns found=false only when no open matching PR exists.
+func (c Client) ObservePublicationCandidate(ctx context.Context, want contracts.PullRequestIdentity) (PRMatch, bool, error) {
 	if !validIdentity(want) {
-		return PRMatch{}, ErrPolicyRefusal
+		return PRMatch{}, false, ErrPolicyRefusal
 	}
 	var values []prWire
 	if err := c.json(ctx, &values, "pr", "list", "--repo", repoArg(want.Repository), "--state", "all", "--limit", "100", "--json", prFields); err != nil {
-		return PRMatch{}, err
+		return PRMatch{}, false, err
 	}
 	if len(values) == 100 {
-		return PRMatch{}, ErrAmbiguousPR
+		return PRMatch{}, false, ErrAmbiguousPR
 	}
 	var matches []PRMatch
 	for _, value := range values {
-		candidate, err := value.identity(want.Repository)
+		candidate, err := value.identityUnmarked(want.Repository)
 		if err != nil {
-			if errors.Is(err, ErrNoMatchingPR) {
-				continue
-			}
-			return PRMatch{}, err
+			return PRMatch{}, false, err
 		}
-		if sameExact(candidate, want) {
-			matches = append(matches, value.match(candidate))
+		// Closed/merged rows are historical and cannot be adopted or block a
+		// new draft. Every open row sharing the exact source and base ref is
+		// nevertheless material, even if its ownership marker is absent.
+		if candidate.HeadOwner != want.HeadOwner || candidate.HeadRepository != want.HeadRepository || candidate.HeadRef != want.HeadRef || candidate.HeadOID != want.HeadOID || candidate.BaseRef != want.BaseRef || value.State != "OPEN" || value.MergedAt != nil {
+			continue
 		}
+		if !strings.Contains(value.Body, ownershipMarker(candidate)) || !sameExact(candidate, want) {
+			return PRMatch{}, false, ErrPolicyRefusal
+		}
+		matches = append(matches, value.match(candidate))
 	}
 	switch len(matches) {
 	case 0:
-		return PRMatch{}, ErrNoMatchingPR
+		return PRMatch{}, false, nil
 	case 1:
-		return matches[0], nil
+		return matches[0], true, nil
 	default:
-		return PRMatch{}, ErrAmbiguousPR
+		return PRMatch{}, false, ErrAmbiguousPR
 	}
 }
 
