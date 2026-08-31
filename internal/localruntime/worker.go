@@ -15,6 +15,7 @@ import (
 var ErrPublishingUnavailable = errors.New("publishing capability is unavailable")
 
 const publishingUnavailableCode = "publication_runtime_unavailable"
+const ciUnavailableCode = "ci_runtime_unavailable"
 
 // Worker is the state dispatch boundary for the local runtime. It performs a
 // fresh Store read for every scheduler admission, then delegates the three
@@ -26,6 +27,7 @@ type Worker struct {
 	Engine      workflowworker.StateMachine
 	Workflow    workflowworker.Worker
 	Publication pub.Worker
+	CI          CIWorker
 	// PublicationEnabled is explicit so a pre-publishing composition cannot
 	// accidentally treat a zero publication worker as a successful phase.
 	PublicationEnabled bool
@@ -65,12 +67,50 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 			Transitioned: result.Transitioned,
 			Replayed:     result.Replayed,
 		}, err
+	case domain.StateWaitingCI:
+		if w.CI.Observer == nil {
+			return w.blockCI(ctx, ticket, fence)
+		}
+		return w.CI.Run(ctx, ref, fence)
 	default:
-		// waiting_ci and all control/terminal states are inert. The scheduler
-		// normally filters them, but keeping this dispatch boundary inert makes
-		// direct calls safe as well.
+		// Control and terminal states are inert. The scheduler normally filters
+		// them, but keeping this dispatch boundary inert makes direct calls safe.
 		return workflowworker.RunResult{Ref: ref, State: ticket.State, Version: ticket.Version}, nil
 	}
+}
+
+func (w Worker) blockCI(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {
+	if w.Engine == nil {
+		return workflowworker.RunResult{Ref: ticket.Ref, State: ticket.State, Version: ticket.Version}, ErrCIUnavailable
+	}
+	binary := "sf"
+	if ticket.Ref.Channel == domain.ChannelDev {
+		binary = "sf-dev"
+	}
+	payload, err := json.Marshal(struct {
+		Code       string `json:"code"`
+		Reason     string `json:"reason"`
+		NextAction string `json:"next_action"`
+		Guidance   string `json:"guidance"`
+	}{
+		Code:       ciUnavailableCode,
+		Reason:     "CI observation is unavailable because the GitHub CLI or its authentication is not configured",
+		NextAction: binary + " doctor",
+		Guidance:   "install gh and authenticate GitHub; sf never creates or copies credentials",
+	})
+	if err != nil {
+		return workflowworker.RunResult{Ref: ticket.Ref, State: ticket.State, Version: ticket.Version}, err
+	}
+	transition, err := w.Engine.Signal(ctx, contracts.SignalRequest{
+		Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State,
+		Trigger: "typed_blocker", Fence: fence,
+		Attributes:   map[string]string{"no_unreconciled_external_mutation": "true"},
+		EventPayload: string(payload),
+	})
+	if err != nil {
+		return workflowworker.RunResult{Ref: ticket.Ref, State: ticket.State, Version: ticket.Version}, err
+	}
+	return workflowworker.RunResult{Ref: ticket.Ref, State: domain.StateBlocked, Version: transition.TicketVersion, Transitioned: true}, nil
 }
 
 func (w Worker) blockPublishing(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {

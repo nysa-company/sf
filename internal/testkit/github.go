@@ -118,6 +118,7 @@ type FakeGHState struct {
 	AdminEnforced               bool                              `json:"admin_enforced"`
 	ActiveRulesetCount          int                               `json:"active_ruleset_count"`
 	ClassicProtection           bool                              `json:"classic_protection"`
+	RequiredStatusCheckContexts []string                          `json:"required_status_check_contexts,omitempty"`
 	Rulesets                    []FakeRuleset                     `json:"rulesets,omitempty"`
 	BypassPullRequestAllowances int                               `json:"bypass_pull_request_allowances"`
 	BypassForcePushAllowances   int                               `json:"bypass_force_push_allowances"`
@@ -179,6 +180,20 @@ func (f *FakeGH) SetBranchProtectionForTest(strict bool, bypassAllowances int) e
 	return f.withState(func() (bool, error) {
 		f.state.StrictStatusChecks = strict
 		f.state.BypassPullRequestAllowances = bypassAllowances
+		return true, nil
+	})
+}
+
+// SetRequiredStatusCheckContextsForTest configures the exact classic branch
+// protection contexts emitted by the GraphQL protection witness.
+func (f *FakeGH) SetRequiredStatusCheckContextsForTest(contexts ...string) error {
+	for _, context := range contexts {
+		if strings.TrimSpace(context) == "" {
+			return errors.New("testkit: required status context is empty")
+		}
+	}
+	return f.withState(func() (bool, error) {
+		f.state.RequiredStatusCheckContexts = append([]string(nil), contexts...)
 		return true, nil
 	})
 }
@@ -653,6 +668,32 @@ func (f *FakeGH) RequiredChecks(_ context.Context, identity contracts.PullReques
 	return checks, err
 }
 
+// ObserveCIRequiredCheckPolicy supplies the same authenticated, read-only
+// policy/check boundary used by the production poller. The fake's durable
+// state is intentionally the source of truth so restart tests do not rely on
+// an in-memory test-only policy.
+func (f *FakeGH) ObserveCIRequiredCheckPolicy(_ context.Context, identity contracts.PullRequestIdentity) (contracts.CIRequiredCheckPolicyObservation, error) {
+	var result contracts.CIRequiredCheckPolicyObservation
+	err := f.withState(func() (bool, error) {
+		index, err := f.findLocked(identity)
+		if err != nil {
+			return false, err
+		}
+		pr := f.state.PRs[index].Identity
+		if !identityMatches(pr, identity) || pr.BaseOID == "" {
+			return false, errors.New("fake-gh: pull request identity drifted")
+		}
+		checks := append([]contracts.RequiredCheck(nil), f.state.Checks[pr.Number]...)
+		result = contracts.CIRequiredCheckPolicyObservation{
+			PullRequest: pr, ProtectedBranchRef: pr.BaseRef, ProtectedBranchOID: pr.BaseOID,
+			PolicySourceDigest: strings.Repeat("a", 64), AuthenticatedPrincipal: "fake-gh",
+			RequiredChecks: checks, ObservedAt: time.Now().UTC(),
+		}
+		return false, nil
+	})
+	return result, err
+}
+
 func (f *FakeGH) MarkReady(_ context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
 	if err := validateFakeClaim(claim, "pr_ready", identity); err != nil {
 		return err
@@ -1086,6 +1127,7 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 			value := map[string]any{
 				"data": map[string]any{"repository": map[string]any{"ref": map[string]any{"branchProtectionRule": map[string]any{
 					"id": "fake-rule-main", "pattern": "main", "requiresStrictStatusChecks": snapshot.StrictStatusChecks, "isAdminEnforced": snapshot.AdminEnforced,
+					"requiredStatusCheckContexts": snapshot.RequiredStatusCheckContexts,
 					"bypassPullRequestAllowances": map[string]int{"totalCount": snapshot.BypassPullRequestAllowances}, "bypassForcePushAllowances": map[string]int{"totalCount": snapshot.BypassForcePushAllowances},
 				}}}},
 			}

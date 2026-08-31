@@ -224,7 +224,7 @@ func TestFactoryComposesSnapshotBoundPublicationCapability(t *testing.T) {
 		t.Fatal(err)
 	}
 	dispatcher, ok := managed.runtime.Scheduler.Worker.(Worker)
-	if !ok || dispatcher.Publication.Git.GHBinary != capability.Path || dispatcher.Publication.Git.GHBinaryDigest != capability.Digest {
+	if !ok || dispatcher.Publication.Git.GHBinary != capability.Path || dispatcher.Publication.Git.GHBinaryDigest != capability.Digest || dispatcher.CI.Observer == nil {
 		t.Fatalf("worker does not use gh snapshot: worker=%T capability=%+v", managed.runtime.Scheduler.Worker, capability)
 	}
 	if err := components.Runtime.Close(); err != nil {

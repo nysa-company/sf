@@ -28,7 +28,7 @@ func TestCICorrectionV41SchemaIsAppendOnlyAndValidated(t *testing.T) {
 	if version != schemaVersion || len(migrationChecksums) != schemaVersion {
 		t.Fatalf("schema version/checksum history=%d/%d", version, len(migrationChecksums))
 	}
-	for _, table := range []string{"ci_required_check_policies", "ci_observations", "ci_observation_checks", "ci_transition_evidence", "candidate_repair_bindings", "candidate_repair_completions"} {
+	for _, table := range []string{"ci_required_check_policies", "ci_observations", "ci_observation_checks", "ci_transition_evidence", "candidate_repair_bindings", "candidate_repair_completions", "ci_poll_schedules", "ci_poll_attempts", "ci_poll_retry_epochs"} {
 		var count int
 		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("required table %s count=%d err=%v", table, count, err)
@@ -105,6 +105,22 @@ func TestCICorrectionCompositeForeignKeysAreExact(t *testing.T) {
 		{"candidate_repair_completions", "provider_attempt_results", []foreignKeyPair{{"builder_result_attempt", "attempt"}, {"builder_result_attempt_id", "provider_attempt_id"}, {"builder_result_phase", "phase"}, {"builder_result_role", "role"}, {"channel", "channel"}, {"project_id", "project_id"}, {"ticket_id", "ticket_id"}}},
 		{"candidate_repair_completions", "candidate_result_bindings", []foreignKeyPair{{"builder_binding_leader_epoch", "leader_epoch"}, {"builder_binding_runner_epoch", "runner_epoch"}, {"builder_binding_ticket_version", "binding_ticket_version"}, {"builder_result_attempt", "provider_attempt"}, {"builder_result_attempt_id", "provider_attempt_id"}, {"channel", "channel"}, {"project_id", "project_id"}, {"target_generation", "generation"}, {"ticket_id", "ticket_id"}}},
 		{"candidate_repair_completions", "candidate_snapshots", []foreignKeyPair{{"channel", "channel"}, {"final_candidate_head_sha", "head_sha"}, {"final_candidate_tree_sha", "tree_sha"}, {"project_id", "project_id"}, {"target_generation", "generation"}, {"ticket_id", "ticket_id"}}},
+	} {
+		assertExactForeignKey(t, database.db, check.table, check.parent, check.pairs...)
+	}
+}
+
+func TestCIV46PollingForeignKeysAreExact(t *testing.T) {
+	database, _ := openTestStore(t)
+	defer database.Close()
+	for _, check := range []struct {
+		table, parent string
+		pairs         []foreignKeyPair
+	}{
+		{"ci_poll_schedules", "tickets", []foreignKeyPair{{"channel", "channel"}, {"project_id", "project_id"}, {"ticket_id", "id"}}},
+		{"ci_poll_schedules", "publication_evidence", []foreignKeyPair{{"candidate_generation", "candidate_generation"}, {"candidate_head_sha", "candidate_head_sha"}, {"candidate_tree_sha", "candidate_tree_sha"}, {"channel", "channel"}, {"project_id", "project_id"}, {"publication_witness_digest", "witness_digest"}, {"ticket_id", "ticket_id"}}},
+		{"ci_poll_attempts", "ci_poll_schedules", []foreignKeyPair{{"candidate_generation", "candidate_generation"}, {"candidate_head_sha", "candidate_head_sha"}, {"candidate_tree_sha", "candidate_tree_sha"}, {"channel", "channel"}, {"project_id", "project_id"}, {"publication_witness_digest", "publication_witness_digest"}, {"ticket_id", "ticket_id"}}},
+		{"ci_poll_retry_epochs", "ci_poll_schedules", []foreignKeyPair{{"candidate_generation", "candidate_generation"}, {"candidate_head_sha", "candidate_head_sha"}, {"candidate_tree_sha", "candidate_tree_sha"}, {"channel", "channel"}, {"project_id", "project_id"}, {"publication_witness_digest", "publication_witness_digest"}, {"ticket_id", "ticket_id"}}},
 	} {
 		assertExactForeignKey(t, database.db, check.table, check.parent, check.pairs...)
 	}

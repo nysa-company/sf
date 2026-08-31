@@ -87,9 +87,8 @@ type CIRequiredCheckPolicy struct {
 	authenticated            bool
 }
 
-// CorrectionBudgetAuthority is not a request to consume a budget. It is the
-// exact identity of a budget use that was authenticated and persisted by the
-// existing budget API before this transition is attempted.
+// CorrectionBudgetAuthority identifies the exact correction request the Store
+// may allocate atomically with its red CI transition.
 type CorrectionBudgetAuthority struct {
 	Ref           domain.TicketRef
 	RequestID     string
@@ -152,6 +151,10 @@ func canonicalCIState(value string) (string, bool) {
 		return "pending", true
 	case "success":
 		return "success", true
+	case "skipped":
+		return "skipped", true
+	case "neutral":
+		return "neutral", true
 	case "failure", "failed", "error", "timed_out", "timed-out", "action_required":
 		return "failure", true
 	case "cancelled", "canceled", "cancelled_failure":
@@ -234,41 +237,36 @@ func canonicalCIRequiredSetDigest(checks []CIObservationCheck) string {
 	return ciDigest(body)
 }
 
+// canonicalCIPolicySetDigest deliberately contains only protected-branch
+// context names. A check run's URL/external id changes on rerun and belongs to
+// the immutable observation, never the policy identity.
+func canonicalCIPolicySetDigest(checks []CIObservationCheck) string {
+	names := make([]string, len(checks))
+	for i, check := range checks {
+		names[i] = check.CanonicalName
+	}
+	body, _ := json.Marshal(names)
+	return ciDigest(body)
+}
+
 func canonicalCIPolicyChecks(checks []CIObservationCheck) ([]CIObservationCheck, error) {
 	if len(checks) == 0 || len(checks) > maxCIChecks {
 		return nil, ErrCIObservation
 	}
 	out := make([]CIObservationCheck, len(checks))
-	seen := make(map[string]struct{}, len(checks))
 	seenNames := make(map[string]struct{}, len(checks))
-	seenIDs := make(map[string]struct{}, len(checks))
 	for i, check := range checks {
 		name, ok := canonicalCIText(check.CanonicalName, 255)
-		external, extOK := canonicalCIText(check.ExternalID, 255)
-		if !ok || !extOK || name == "" || external == "" {
-			return nil, ErrCIObservation
-		}
-		key := name + "\x00" + external
-		if _, exists := seen[key]; exists {
+		if !ok || name == "" {
 			return nil, ErrCIObservation
 		}
 		if _, exists := seenNames[name]; exists {
 			return nil, ErrCIObservation
 		}
-		if _, exists := seenIDs[external]; exists {
-			return nil, ErrCIObservation
-		}
-		seen[key] = struct{}{}
 		seenNames[name] = struct{}{}
-		seenIDs[external] = struct{}{}
-		out[i] = CIObservationCheck{CanonicalName: name, ExternalID: external}
+		out[i] = CIObservationCheck{CanonicalName: name}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CanonicalName == out[j].CanonicalName {
-			return out[i].ExternalID < out[j].ExternalID
-		}
-		return out[i].CanonicalName < out[j].CanonicalName
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i].CanonicalName < out[j].CanonicalName })
 	return out, nil
 }
 
@@ -290,7 +288,7 @@ func canonicalCIPolicy(value CIRequiredCheckPolicy) (CIRequiredCheckPolicy, erro
 	if len(canonicalCIPolicyJSON(checks)) > maxCIDiagnosticJSON {
 		return CIRequiredCheckPolicy{}, ErrCIObservation
 	}
-	digest := canonicalCIRequiredSetDigest(checks)
+	digest := canonicalCIPolicySetDigest(checks)
 	if value.RequiredSetDigest != "" && value.RequiredSetDigest != digest {
 		return CIRequiredCheckPolicy{}, ErrCIObservation
 	}
@@ -561,6 +559,14 @@ func (s *Store) authenticateCurrentCIObservation(ctx context.Context, q ciQuery,
 // leader/runner fence; every such advance must be an exact contiguous,
 // authenticated checks_pending evidence row.
 func loadCICurrentPublication(ctx context.Context, q ciQuery, ref domain.TicketRef) (PublishedCandidateEvidence, error) {
+	return loadCICurrentPublicationAt(ctx, q, ref, 0)
+}
+
+// loadCICurrentPublicationAt validates the complete CI chain at a particular
+// ticket-local leader when nonzero. Startup fencing uses that form after the
+// daemon leader has advanced but before it appends the next signed recovery
+// row; ordinary readers pass zero and require the durable daemon leader.
+func loadCICurrentPublicationAt(ctx context.Context, q ciQuery, ref domain.TicketRef, ticketLeader uint64) (PublishedCandidateEvidence, error) {
 	publication, err := loadCIPublicationBase(ctx, q, ref)
 	if err != nil {
 		return PublishedCandidateEvidence{}, err
@@ -569,6 +575,9 @@ func loadCICurrentPublication(ctx context.Context, q ciQuery, ref domain.TicketR
 	var version, runner, leader uint64
 	if err := q.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &leader); err != nil {
 		return PublishedCandidateEvidence{}, normalizeBusy(ctx, err)
+	}
+	if ticketLeader != 0 {
+		leader = ticketLeader
 	}
 	if state != string(domain.StateWaitingCI) || runner < publication.CurrentFence.RunnerEpoch || (runner == publication.CurrentFence.RunnerEpoch && leader != publication.CurrentFence.LeaderEpoch) {
 		return PublishedCandidateEvidence{}, ErrPublicationEvidence
@@ -615,6 +624,17 @@ func loadCICurrentPublication(ctx context.Context, q ciQuery, ref domain.TicketR
 	if err := validateCIWaitingVersionEvents(ctx, q, ref, waitingVersion, string(payloadBytes), publication); err != nil {
 		return PublishedCandidateEvidence{}, ciPublicationFailure("publication waiting event")
 	}
+	// A single exhausted-poll -> operator-resume pair consumes two ticket
+	// versions without an external CI observation. It is distinct from a
+	// pending observation and is accepted only by its exact immutable events.
+	pollPair, hasPollPair, err := findCIPollResumePair(ctx, q, ref, waitingVersion, version)
+	if err != nil {
+		return PublishedCandidateEvidence{}, err
+	}
+	pollControlVersions := uint64(0)
+	if hasPollPair {
+		pollControlVersions = 2
+	}
 	rows, err := q.QueryContext(ctx, `SELECT c.ticket_version,c.event_id,c.event_created_at,c.candidate_generation,c.candidate_head_sha,c.candidate_tree_sha,c.observation_classification,c.observation_digest,c.observation_ticket_version,c.observation_leader_epoch,c.observation_runner_epoch,c.prior_publication_witness_digest,c.prior_state,c.resulting_state,c.resulting_trigger,c.transition_digest,e.id,e.created_at,e.from_state,e.to_state,e.trigger,e.payload FROM ci_transition_evidence c JOIN events e ON e.channel=c.channel AND e.project_id=c.project_id AND e.ticket_id=c.ticket_id AND e.ticket_version=c.ticket_version AND e.id=c.event_id WHERE c.channel=? AND c.project_id=? AND c.ticket_id=? AND c.ticket_version>? ORDER BY c.ticket_version`, ref.Channel, ref.Project, ref.Ticket, waitingVersion)
 	if err != nil {
 		return PublishedCandidateEvidence{}, normalizeBusy(ctx, err)
@@ -624,6 +644,9 @@ func loadCICurrentPublication(ctx context.Context, q ciQuery, ref domain.TicketR
 	chainRunner, chainLeader := publication.CurrentFence.RunnerEpoch, publication.CurrentFence.LeaderEpoch
 	chainCount := 0
 	for rows.Next() {
+		if hasPollPair && expectedVersion == pollPair.exhaustedVersion {
+			expectedVersion = pollPair.resumeVersion + 1
+		}
 		chainCount++
 		var evidenceVersion, eventID, generation, observationVersion, observationLeader, observationRunner int64
 		var eventCreated, head, tree, classification, observationDigest, witness, priorState, resultingState, trigger, transitionDigest string
@@ -672,7 +695,10 @@ func loadCICurrentPublication(ctx context.Context, q ciQuery, ref domain.TicketR
 		return PublishedCandidateEvidence{}, ErrPublicationEvidence
 	}
 	var recoveryCount int
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, waitingVersion, version).Scan(&recoveryCount); err != nil || chainCount+recoveryCount != int(version-waitingVersion) {
+	if hasPollPair && (pollPair.exhaustedVersion < waitingVersion+1 || pollPair.resumeVersion > version) {
+		return PublishedCandidateEvidence{}, ciPublicationFailure("poll resume placement")
+	}
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, waitingVersion, version).Scan(&recoveryCount); err != nil || chainCount+recoveryCount+int(pollControlVersions) != int(version-waitingVersion) {
 		return PublishedCandidateEvidence{}, ciPublicationFailure("pending CI chain cardinality")
 	}
 	return publication, nil
@@ -698,7 +724,14 @@ func validateCIRecoveryLedger(ctx context.Context, q ciQuery, ref domain.TicketR
 	}
 	defer rows.Close()
 	expectedVersion, expectedRunner, expectedLeader := baselineVersion, baselineRunner, baselineLeader
+	pollPair, hasPollPair, err := findCIPollResumePair(ctx, q, ref, baselineVersion, liveVersion)
+	if err != nil {
+		return err
+	}
 	for rows.Next() {
+		if hasPollPair && expectedVersion == pollPair.exhaustedVersion {
+			expectedVersion = pollPair.resumeVersion
+		}
 		var step RunnerRecoveryLedger
 		var created string
 		if err := rows.Scan(&step.PriorTicketVersion, &step.PriorRunnerEpoch, &step.PriorLeaderEpoch, &step.TicketVersion, &step.RunnerEpoch, &step.LeaderEpoch, &step.RecoveryDigest, &created); err != nil {
@@ -711,11 +744,18 @@ func validateCIRecoveryLedger(ctx context.Context, q ciQuery, ref domain.TicketR
 		}
 		if step.PriorTicketVersion > expectedVersion {
 			var evidence, events int
-			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND resulting_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, expectedVersion, step.PriorTicketVersion).Scan(&evidence); err != nil || evidence != int(step.PriorTicketVersion-expectedVersion) {
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND resulting_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, expectedVersion, step.PriorTicketVersion).Scan(&evidence); err != nil {
 				return ciPublicationFailure("CI recovery gap evidence")
 			}
-			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, expectedVersion, step.PriorTicketVersion).Scan(&events); err != nil || events != evidence {
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, expectedVersion, step.PriorTicketVersion).Scan(&events); err != nil {
 				return ciPublicationFailure("CI recovery gap events")
+			}
+			controlCount := 0
+			if hasPollPair && pollPair.exhaustedVersion > expectedVersion && pollPair.resumeVersion <= step.PriorTicketVersion {
+				controlCount = 2
+			}
+			if evidence != int(step.PriorTicketVersion-expectedVersion)-controlCount || events != evidence+controlCount {
+				return ciPublicationFailure("CI recovery gap cardinality")
 			}
 		}
 		var events int
@@ -731,6 +771,27 @@ func validateCIRecoveryLedger(ctx context.Context, q ciQuery, ref domain.TicketR
 	// evidence may advance the ticket while retaining the current fence. The
 	// CI chain below authenticates those rows individually; this check only
 	// proves that no unaccounted version was smuggled into a recovery gap.
+	if hasPollPair && expectedVersion <= pollPair.exhaustedVersion {
+		// The control pair itself has no CI evidence rows. Any versions before
+		// exhaustion must already be accounted for by pending evidence or signed
+		// recovery rows; the pair then advances the contiguous expectation to the
+		// resumed waiting-ci version.
+		var evidence, events, recovery int
+		predecessorStart := expectedVersion + 1
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>=? AND ticket_version<? AND resulting_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, predecessorStart, pollPair.exhaustedVersion).Scan(&evidence); err != nil {
+			return ciPublicationFailure("CI poll pair predecessor evidence")
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>=? AND ticket_version<?`, ref.Channel, ref.Project, ref.Ticket, predecessorStart, pollPair.exhaustedVersion).Scan(&recovery); err != nil {
+			return ciPublicationFailure("CI poll pair predecessor recovery")
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>=? AND ticket_version<?`, ref.Channel, ref.Project, ref.Ticket, predecessorStart, pollPair.exhaustedVersion).Scan(&events); err != nil || events != evidence {
+			return ciPublicationFailure("CI poll pair predecessor events")
+		}
+		if pollPair.exhaustedVersion > predecessorStart && evidence+recovery != int(pollPair.exhaustedVersion-predecessorStart) {
+			return ciPublicationFailure("CI poll pair predecessor cardinality")
+		}
+		expectedVersion = pollPair.resumeVersion
+	}
 	if liveVersion > expectedVersion {
 		var evidence, events int
 		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND resulting_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, expectedVersion, liveVersion).Scan(&evidence); err != nil || evidence != int(liveVersion-expectedVersion) {
@@ -822,7 +883,7 @@ func canonicalCIPolicyJSON(checks []CIObservationCheck) string {
 	}
 	items := make([]identity, len(checks))
 	for i, check := range checks {
-		items[i] = identity{check.CanonicalName, check.ExternalID}
+		items[i] = identity{check.CanonicalName, ""}
 	}
 	body, _ := json.Marshal(items)
 	return string(body)
@@ -869,11 +930,11 @@ func scanCurrentCIPolicy(ctx context.Context, q ciQuery, ref domain.TicketRef, p
 }
 
 func policyMatchesObservation(policy CIRequiredCheckPolicy, observation CIObservation) bool {
-	if policy.Ref != observation.Ref || policy.CandidateGeneration != observation.CandidateGeneration || policy.CandidateHeadSHA != observation.CandidateHeadSHA || policy.CandidateTreeSHA != observation.CandidateTreeSHA || policy.PublicationWitnessDigest != observation.PublicationWitnessDigest || policy.PolicyWitnessDigest != observation.PolicyWitnessDigest || policy.RequiredSetDigest != observation.RequiredSetDigest || len(policy.RequiredChecks) != len(observation.RequiredChecks) {
+	if policy.Ref != observation.Ref || policy.CandidateGeneration != observation.CandidateGeneration || policy.CandidateHeadSHA != observation.CandidateHeadSHA || policy.CandidateTreeSHA != observation.CandidateTreeSHA || policy.PublicationWitnessDigest != observation.PublicationWitnessDigest || policy.PolicyWitnessDigest != observation.PolicyWitnessDigest || len(policy.RequiredChecks) != len(observation.RequiredChecks) {
 		return false
 	}
 	for i := range policy.RequiredChecks {
-		if policy.RequiredChecks[i].CanonicalName != observation.RequiredChecks[i].CanonicalName || policy.RequiredChecks[i].ExternalID != observation.RequiredChecks[i].ExternalID {
+		if policy.RequiredChecks[i].CanonicalName != observation.RequiredChecks[i].CanonicalName {
 			return false
 		}
 	}
@@ -1108,7 +1169,16 @@ func (s *Store) RecordCandidateRepairCompletion(ctx context.Context, input Candi
 	}
 	return s.ciWrite(ctx, input.Ref, func(conn *sql.Conn) error {
 		if err := s.assertTicketFence(ctx, conn, input.Ref, input.BuilderBindingTicketVersion, input.BuilderBindingFence); err != nil {
-			return err
+			// Builder completion may be durable before a daemon crash. The
+			// successor binding remains immutable at its original builder fence,
+			// but a signed runner-recovery ledger may prove the exact current
+			// building owner derived from it. Do not accept a leader-only or
+			// caller-reconstructed rebind.
+			var state string
+			var version, runner, leader uint64
+			if scanErr := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, input.Ref.Channel, input.Ref.Project, input.Ref.Ticket).Scan(&state, &version, &runner, &leader); scanErr != nil || state != string(domain.StateBuilding) || version <= input.BuilderBindingTicketVersion || runner <= input.BuilderBindingFence.RunnerEpoch || validateRunnerRecoveryLedger(ctx, conn, input.Ref, input.BuilderBindingTicketVersion, input.BuilderBindingFence.RunnerEpoch, input.BuilderBindingFence.LeaderEpoch, version, runner, leader) != nil {
+				return err
+			}
 		}
 		var predecessor uint64
 		if err := conn.QueryRowContext(ctx, `SELECT predecessor_generation FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, input.Ref.Channel, input.Ref.Project, input.Ref.Ticket, input.TargetGeneration).Scan(&predecessor); err != nil {
@@ -1168,19 +1238,94 @@ func (s *Store) LoadCIObservation(ctx context.Context, ref domain.TicketRef) (CI
 	return s.LoadCurrentCIObservation(ctx, ref)
 }
 
-func correctionBudgetPresent(ctx context.Context, q ciQuery, authority CorrectionBudgetAuthority, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
-	if authority.Ref != ref || authority.TicketVersion != version || authority.Fence != fence || authority.Fence.ClaimEpoch != 0 || authority.RequestID == "" || !boundedText(authority.RequestID, 300) {
-		return false, ErrBudgetExhausted
+// validateCorrectionBudgetLedger rejects any correction use that is not joined
+// to its exact red transition and repair binding. A legacy/crash orphan fails
+// closed rather than silently authorizing a repair.
+func validateCorrectionBudgetLedger(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) error {
+	var orphanCount int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses u WHERE u.channel=? AND u.project_id=? AND u.ticket_id=? AND u.kind='correction' AND substr(u.request_id,1,7)='ci-red/' AND NOT EXISTS (
+		SELECT 1 FROM candidate_repair_bindings b
+		JOIN ci_transition_evidence c ON c.channel=b.channel AND c.project_id=b.project_id AND c.ticket_id=b.ticket_id AND c.candidate_generation=b.predecessor_generation AND c.candidate_head_sha=b.predecessor_head_sha AND c.candidate_tree_sha=b.predecessor_tree_sha AND c.observation_classification=b.red_observation_classification AND c.observation_digest=b.red_observation_digest AND c.prior_publication_witness_digest=b.predecessor_publication_witness_digest AND c.observation_ticket_version=b.consumed_ticket_version AND c.observation_leader_epoch=b.consumed_leader_epoch AND c.observation_runner_epoch=b.consumed_runner_epoch AND c.ticket_version=b.red_transition_ticket_version AND c.transition_digest=b.red_transition_digest
+		WHERE b.channel=u.channel AND b.project_id=u.project_id AND b.ticket_id=u.ticket_id AND b.correction_budget_kind=u.kind AND b.correction_budget_request_id=u.request_id AND b.consumed_ticket_version=u.ticket_version AND b.consumed_leader_epoch=u.leader_epoch AND b.consumed_runner_epoch=u.runner_epoch
+		AND EXISTS (SELECT 1 FROM events e WHERE e.channel=u.channel AND e.project_id=u.project_id AND e.ticket_id=u.ticket_id AND e.ticket_version=u.ticket_version AND e.trigger='budget_correction' AND e.from_state='waiting_ci' AND e.to_state='waiting_ci' AND json_extract(e.payload,'$.request_id')=u.request_id)
+	)`, ref.Channel, ref.Project, ref.Ticket).Scan(&orphanCount); err != nil {
+		return normalizeBusy(ctx, err)
 	}
-	var found, sameFence int
-	err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses u JOIN ticket_counters c ON c.channel=u.channel AND c.project_id=u.project_id AND c.ticket_id=u.ticket_id AND c.kind=u.kind WHERE u.channel=? AND u.project_id=? AND u.ticket_id=? AND u.kind='correction' AND u.request_id=? AND u.ticket_version=? AND u.leader_epoch=? AND u.runner_epoch=? AND c.used>0 AND c.used<=c.limit_count AND EXISTS (SELECT 1 FROM events e WHERE e.channel=u.channel AND e.project_id=u.project_id AND e.ticket_id=u.ticket_id AND e.ticket_version=u.ticket_version AND e.trigger='budget_correction' AND json_extract(e.payload,'$.request_id')=u.request_id)`, ref.Channel, ref.Project, ref.Ticket, authority.RequestID, version, fence.LeaderEpoch, fence.RunnerEpoch).Scan(&found)
+	if orphanCount != 0 {
+		return ErrCIObservation
+	}
+	return nil
+}
+
+func ciRedCorrectionRequestID(observationDigest string) (string, bool) {
+	if !validCIAuthorityDigest(observationDigest) {
+		return "", false
+	}
+	requestID := "ci-red/" + strings.TrimPrefix(observationDigest, "sha256:")
+	return requestID, boundedText(requestID, 300)
+}
+
+// consumeCorrectionBudget allocates one correction budget use inside the
+// caller's CI transaction.
+func consumeCorrectionBudget(ctx context.Context, conn *sql.Conn, authority CorrectionBudgetAuthority, ref domain.TicketRef, version uint64, fence domain.Fence, observationDigest string) (bool, error) {
+	if err := validateCorrectionBudgetLedger(ctx, conn, ref); err != nil {
+		return false, err
+	}
+	expectedRequestID, validRequest := ciRedCorrectionRequestID(observationDigest)
+	if !validRequest || authority.Ref != ref || authority.TicketVersion != version || authority.Fence != fence || authority.Fence.ClaimEpoch != 0 || authority.RequestID != expectedRequestID {
+		return false, nil
+	}
+	var used, limit int
+	err := conn.QueryRowContext(ctx, `SELECT used,limit_count FROM ticket_counters WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ref.Channel, ref.Project, ref.Ticket).Scan(&used, &limit)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO ticket_counters(channel,project_id,ticket_id,kind,used,limit_count) VALUES(?,?,?,?,0,2)`, ref.Channel, ref.Project, ref.Ticket, "correction"); err != nil {
+			return false, err
+		}
+		used, limit = 0, 2
+	} else if err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	if limit != 2 || used < 0 || used > limit {
+		return false, ErrCIObservation
+	}
+	var useCount int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ref.Channel, ref.Project, ref.Ticket).Scan(&useCount); err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	if useCount != used {
+		return false, ErrCIObservation
+	}
+	var existingVersion, existingLeader, existingRunner uint64
+	err = conn.QueryRowContext(ctx, `SELECT ticket_version,leader_epoch,runner_epoch FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND request_id=?`, ref.Channel, ref.Project, ref.Ticket, authority.RequestID).Scan(&existingVersion, &existingLeader, &existingRunner)
+	if err == nil {
+		// A durable transition with this request is replayed above. Reaching
+		// this branch means the request is an orphan or a mismatched attempt;
+		// never reuse a budget row without its exact red transition/binding.
+		if existingVersion != version || existingLeader != fence.LeaderEpoch || existingRunner != fence.RunnerEpoch {
+			return false, ErrCIObservation
+		}
+		return false, ErrCIObservation
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, normalizeBusy(ctx, err)
+	}
+	if used >= limit {
+		return false, nil
+	}
+	updated, err := conn.ExecContext(ctx, `UPDATE ticket_counters SET used=used+1 WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND used<limit_count`, ref.Channel, ref.Project, ref.Ticket)
 	if err != nil {
-		return false, normalizeBusy(ctx, err)
+		return false, err
 	}
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses u WHERE u.channel=? AND u.project_id=? AND u.ticket_id=? AND u.kind='correction' AND u.ticket_version=? AND u.leader_epoch=? AND u.runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, version, fence.LeaderEpoch, fence.RunnerEpoch).Scan(&sameFence); err != nil {
-		return false, normalizeBusy(ctx, err)
+	if count, _ := updated.RowsAffected(); count != 1 {
+		return false, ErrCIObservation
 	}
-	return found == 1 && sameFence == 1, nil
+	if _, err := conn.ExecContext(ctx, `INSERT INTO ticket_budget_uses(channel,project_id,ticket_id,kind,request_id,ticket_version,leader_epoch,runner_epoch,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, "correction", authority.RequestID, version, fence.LeaderEpoch, fence.RunnerEpoch, now()); err != nil {
+		return false, err
+	}
+	if err := evidenceEvent(ctx, conn, ref, version, "budget_correction", map[string]string{"request_id": authority.RequestID}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func ciTransitionDigest(ref domain.TicketRef, observation CIObservation, resultVersion uint64, eventID int64, eventCreated, resultingState, trigger, payload string) string {
@@ -1197,9 +1342,8 @@ func ciTransitionDigest(ref domain.TicketRef, observation CIObservation, resultV
 
 // ConsumeCIObservation atomically appends ci_transition_evidence and its
 // canonical event while advancing waiting_ci. Pending self-transitions and
-// green transitions need no budget. Red transitions require an exact,
-// separately persisted authority; otherwise the ticket is paused with the
-// normative ci_red_exhausted reason.
+// green transitions need no budget. Red transitions allocate at most one
+// correction use in this same transaction; exhaustion pauses with no new use.
 func (s *Store) ConsumeCIObservation(ctx context.Context, request CIObservationTransition) (TransitionResult, error) {
 	if request.Ref.Validate() != nil || request.ObservationDigest == "" || request.ExpectedVersion == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 {
 		return TransitionResult{}, ErrCIObservation
@@ -1215,6 +1359,9 @@ func (s *Store) ConsumeCIObservation(ctx context.Context, request CIObservationT
 		}
 		if request.ObservationDigest == "" || observation.ObservationDigest != request.ObservationDigest || observation.ObservedTicketVersion != request.ExpectedVersion || observation.ObservedFence != request.Fence {
 			return ErrStaleFence
+		}
+		if err := validateCorrectionBudgetLedger(ctx, conn, request.Ref); err != nil {
+			return err
 		}
 		var replayVersion, replayEventID, replayGeneration int64
 		var replayHead, replayTree, replayWitness string
@@ -1244,19 +1391,26 @@ func (s *Store) ConsumeCIObservation(ctx context.Context, request CIObservationT
 		observation = latest
 		resulting := domain.StateReviewing
 		trigger := "checks_green"
+		budgetAuthorized := false
 		if observation.Classification == "pending" {
 			resulting, trigger = domain.StateWaitingCI, "checks_pending"
 		} else if observation.Classification == "red" {
 			resulting, trigger = domain.StatePaused, "checks_red"
+			authority := CorrectionBudgetAuthority{}
 			if request.CorrectionBudget != nil {
-				present, budgetErr := correctionBudgetPresent(ctx, conn, *request.CorrectionBudget, request.Ref, observation.ObservedTicketVersion, observation.ObservedFence)
-				if budgetErr != nil && !errors.Is(budgetErr, ErrBudgetExhausted) {
-					// A malformed/stale authority is the exhausted branch for a
-					// known red observation. Actual SQLite failures remain fatal.
-					return budgetErr
-				}
-				if budgetErr == nil && present {
-					resulting = domain.StateBuilding
+				authority = *request.CorrectionBudget
+			}
+			var budgetErr error
+			budgetAuthorized, budgetErr = consumeCorrectionBudget(ctx, conn, authority, request.Ref, observation.ObservedTicketVersion, observation.ObservedFence, observation.ObservationDigest)
+			if budgetErr != nil {
+				return budgetErr
+			}
+			if budgetAuthorized {
+				resulting = domain.StateBuilding
+			}
+			if budgetAuthorized {
+				if err := s.injectedCIConsumeFault("after_correction_budget"); err != nil {
+					return err
 				}
 			}
 		}

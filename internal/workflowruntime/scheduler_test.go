@@ -105,7 +105,7 @@ func TestSchedulerDoesNotRunSecondPhaseAndBusyIsBenign(t *testing.T) {
 	}
 }
 
-func TestSchedulerAdmitsPublishingExactlyOnceAndLeavesWaitingCIInert(t *testing.T) {
+func TestSchedulerAdmitsPublishingAndPollsWaitingCIWithoutAWorktree(t *testing.T) {
 	publishing := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "publishing"}, domain.StatePublishing)
 	waiting := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "b", Ticket: "waiting"}, domain.StateWaitingCI)
 	ensurer := &fakeEnsure{}
@@ -119,10 +119,12 @@ func TestSchedulerAdmitsPublishingExactlyOnceAndLeavesWaitingCIInert(t *testing.
 	if len(ensurer.calls) != 1 || ensurer.calls[0].Ref != publishing.Ref {
 		t.Fatalf("first ensure calls=%v", ensurer.calls)
 	}
-	idle := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{waiting}}, &fakeEnsure{}, &fakeWorker{})
-	result := idle.Tick(context.Background(), fence)
-	if result.Outcome != OutcomeIdle {
-		t.Fatalf("waiting_ci result=%+v", result)
+	ciEnsurer := &fakeEnsure{}
+	ciWorker := &fakeWorker{}
+	poller := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{waiting}}, ciEnsurer, ciWorker)
+	result := poller.Tick(context.Background(), fence)
+	if result.Outcome != OutcomeInvoked || len(ciWorker.calls) != 1 || ciWorker.calls[0] != waiting.Ref || len(ciEnsurer.calls) != 0 {
+		t.Fatalf("waiting_ci result=%+v worker=%v ensures=%v", result, ciWorker.calls, ciEnsurer.calls)
 	}
 }
 
