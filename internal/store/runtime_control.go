@@ -699,13 +699,30 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 		}
 		if control.authority != control.stop {
 			// A prior daemon may have fenced the resumed endpoint before the
-			// rearm retry ran. Accept that successor only when the authority is
-			// exactly the +1/+1 signed recovery endpoint from the immutable stop
-			// chain; arbitrary authority gaps remain stale.
-			if control.stop.version > ^uint64(0)-2 || control.authority.version != control.stop.version+2 || control.authority.runner != control.stop.runner || control.authority.leader != control.stop.leader || control.authority.version == ^uint64(0) || control.authority.runner == ^uint64(0) || proof.Ticket.Version != control.authority.version+1 || proof.Ticket.RunnerEpoch != control.authority.runner+1 || (stopped.State != "" && proof.Ticket.State != stopped.State) {
+			// rearm retry ran. The immutable resumed endpoint is stop+2; later
+			// authorities are accepted only through every signed +1/+1 ledger row
+			// from that endpoint. Never infer depth from counters alone.
+			if control.stop.version > ^uint64(0)-2 || control.stop.runner == ^uint64(0) || control.authority.version < control.stop.version+2 || control.authority.version == ^uint64(0) || control.authority.runner == ^uint64(0) || proof.Ticket.Version != control.authority.version+1 || proof.Ticket.RunnerEpoch != control.authority.runner+1 || (stopped.State != "" && proof.Ticket.State != stopped.State) {
 				return ErrStaleFence
 			}
-			if err := validateRunnerRecoveryLedger(txCtx, conn, ref, control.authority.version, control.authority.runner, control.authority.leader, proof.Ticket.Version, proof.Ticket.RunnerEpoch, leader); err != nil {
+			if control.authority.version == control.stop.version+2 {
+				if control.authority.runner != control.stop.runner || control.authority.leader != control.stop.leader {
+					return ErrStaleFence
+				}
+			} else {
+				if control.authority.version <= control.stop.version+2 || control.authority.runner <= control.stop.runner || control.authority.leader == 0 || control.authority.leader >= leader {
+					return ErrStaleFence
+				}
+			}
+			// Authenticate the complete recovery chain from the immutable
+			// resumed endpoint through the current proof endpoint. The final
+			// row must be the exact authority predecessor; otherwise a stale
+			// authority could be paired with an unrelated future recovery.
+			if err := validateRunnerRecoveryLedger(txCtx, conn, ref, control.stop.version+2, control.stop.runner, control.stop.leader, proof.Ticket.Version, proof.Ticket.RunnerEpoch, leader); err != nil {
+				return ErrStaleFence
+			}
+			finalRecovery, found, err := loadRunnerRecoveryAt(txCtx, conn, ref, proof.Ticket.Version)
+			if err != nil || !found || finalRecovery.PriorTicketVersion != control.authority.version || finalRecovery.PriorRunnerEpoch != control.authority.runner || finalRecovery.PriorLeaderEpoch != control.authority.leader || finalRecovery.TicketVersion != proof.Ticket.Version || finalRecovery.RunnerEpoch != proof.Ticket.RunnerEpoch || finalRecovery.LeaderEpoch != leader {
 				return ErrStaleFence
 			}
 		}
@@ -788,7 +805,11 @@ func authenticatePostPublicationResume(ctx context.Context, conn *sql.Conn, ref 
 		if err != nil || !found || recovery.PriorTicketVersion != stopped.Version+3 || recovery.PriorRunnerEpoch != stopped.RunnerEpoch+1 || recovery.RunnerEpoch != stopped.RunnerEpoch+2 {
 			return ErrStaleFence
 		}
-		if err := validateRunnerRecoveryLedger(ctx, conn, ref, stopped.Version+3, recovery.PriorRunnerEpoch, recovery.PriorLeaderEpoch, current.Version, current.RunnerEpoch, recovery.LeaderEpoch); err != nil {
+		var currentLeader uint64
+		if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&currentLeader); err != nil || currentLeader == 0 {
+			return ErrStaleFence
+		}
+		if err := validateRunnerRecoveryLedger(ctx, conn, ref, stopped.Version+3, recovery.PriorRunnerEpoch, recovery.PriorLeaderEpoch, current.Version, current.RunnerEpoch, currentLeader); err != nil {
 			return ErrStaleFence
 		}
 	}

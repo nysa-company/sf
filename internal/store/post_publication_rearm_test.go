@@ -421,8 +421,8 @@ func TestFenceRecoveredRunnersAcceptsArmedPostPublicationRearm(t *testing.T) {
 	}
 }
 
-func TestFenceRecoveredRunnersAcceptsSecondArmedPostPublicationCrash(t *testing.T) {
-	for _, target := range []domain.State{domain.StateWaitingCI, domain.StateMerging} {
+func TestFenceRecoveredRunnersAcceptsRepeatedArmedPostPublicationCrashes(t *testing.T) {
+	for _, target := range []domain.State{domain.StatePublishing, domain.StateWaitingCI, domain.StateReviewing, domain.StateWaitingApproval, domain.StateWaitingManualMerge, domain.StateMerging, domain.StateReconciling} {
 		t.Run(string(target), func(t *testing.T) {
 			fixture, current, fence := preparePostPublicationRearmState(t, target)
 			stopped, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fence, target)
@@ -503,6 +503,64 @@ func TestFenceRecoveredRunnersAcceptsSecondArmedPostPublicationCrash(t *testing.
 			}
 			if secondLive.Version != firstLive.Version+1 || secondLive.RunnerEpoch != firstLive.RunnerEpoch+1 {
 				t.Fatalf("second fence counters first=%+v second=%+v", firstLive, secondLive)
+			}
+			thirdStopped, err := second.StoppedRuntimeTicket(t.Context(), resumed.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			thirdCapability, err := second.PostPublicationRearmProof(t.Context(), resumed.Ref, thirdStopped)
+			if err != nil || thirdCapability == nil {
+				t.Fatalf("third rearm capability=%v err=%v", thirdCapability, err)
+			}
+			if err := second.ActivateRearm(t.Context(), thirdCapability, func(admission *RuntimeAdmissionCapability) error {
+				if _, _, _, ok := admission.ConsumeRuntimeAdmission(); !ok {
+					return errors.New("third admission capability was not consumed")
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var thirdPath string
+			if err := second.db.QueryRowContext(t.Context(), `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&thirdPath); err != nil || thirdPath == "" {
+				t.Fatalf("third database path=%q err=%v", thirdPath, err)
+			}
+			if err := second.Close(); err != nil {
+				t.Fatal(err)
+			}
+			third, err := Open(t.Context(), thirdPath)
+			if err != nil {
+				t.Fatalf("third reopen: %v", err)
+			}
+			defer third.Close()
+			leader4, err := third.AcquireLeader(t.Context(), domain.ChannelDev, "second-crash-third-reopen-"+string(target))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed, err := third.FenceRecoveredRunners(t.Context(), domain.ChannelDev, leader4); err != nil || changed != 1 {
+				t.Fatalf("third fence changed=%d err=%v", changed, err)
+			}
+			thirdLive, err := third.Ticket(t.Context(), resumed.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if thirdLive.Version != secondLive.Version+1 || thirdLive.RunnerEpoch != secondLive.RunnerEpoch+1 {
+				t.Fatalf("third fence counters second=%+v third=%+v", secondLive, thirdLive)
+			}
+			finalStopped, err := third.StoppedRuntimeTicket(t.Context(), resumed.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			finalCapability, err := third.PostPublicationRearmProof(t.Context(), resumed.Ref, finalStopped)
+			if err != nil || finalCapability == nil {
+				t.Fatalf("final rearm capability=%v err=%v", finalCapability, err)
+			}
+			if err := third.ActivateRearm(t.Context(), finalCapability, func(admission *RuntimeAdmissionCapability) error {
+				if _, _, _, ok := admission.ConsumeRuntimeAdmission(); !ok {
+					return errors.New("final admission capability was not consumed")
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("final activate: %v", err)
 			}
 		})
 	}
