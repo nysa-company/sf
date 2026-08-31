@@ -33,7 +33,7 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 		"doctor_required": ExitAction, "start_refused": ExitAction, "submit_refused": ExitAction,
 		"terminal_replay_requires_new": ExitAction, "not_ready": ExitAction, "runtime_activation_failed": ExitAction,
 		"runtime_already_active": ExitAction,
-		"daemon_unavailable":     ExitWait, "provider_waiting": ExitWait, "checks_pending": ExitWait,
+		"daemon_unavailable":     ExitWait, "daemon_stopping": ExitWait, "provider_waiting": ExitWait, "checks_pending": ExitWait,
 		"store_busy": ExitWait, "projection_unavailable": ExitWait, "external_state_unavailable": ExitWait,
 		"control_state_unavailable": ExitWait, "evidence_unavailable": ExitWait, "logs_unavailable": ExitWait,
 		"status_unavailable": ExitWait, "capacity_unavailable": ExitWait, "leader_lost": ExitWait,
@@ -61,14 +61,19 @@ func TestRuntimeActivationResponsesRemainActionable(t *testing.T) {
 	}{
 		{code: "runtime_activation_failed", argv: []string{"sf-dev", "providers", "qualify", "--builder", "codex", "--reviewer", "codex"}},
 		{code: "runtime_already_active", argv: []string{"sf-dev", "daemon", "status"}},
+		{code: "daemon_stopping", argv: []string{"sf-dev", "daemon", "status"}},
 	} {
 		t.Run(test.code, func(t *testing.T) {
 			response := api.Response{Version: api.Version, RequestID: test.code, Error: &api.Error{Code: test.code}, NextAction: &domain.NextAction{Code: test.code, Argv: test.argv}}
 			if err := validateCLIResponse(response); err != nil {
 				t.Fatalf("response validation: %v", err)
 			}
-			if exitCode(response) != ExitAction {
-				t.Fatalf("exit=%d, want action", exitCode(response))
+			want := ExitAction
+			if test.code == "daemon_stopping" {
+				want = ExitWait
+			}
+			if exitCode(response) != want {
+				t.Fatalf("exit=%d, want %d", exitCode(response), want)
 			}
 		})
 	}

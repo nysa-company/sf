@@ -209,10 +209,15 @@ type Daemon struct {
 	recoveryDrainer interface {
 		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
-	gitMutationDrainer         contracts.GitMutationDrainer
-	preparedCommitObserver     contracts.PreparedCommitObserver
-	repositoryCommandDrainer   contracts.RepositoryCommandDrainer
-	providerCoordinator        *providercoord.Coordinator
+	gitMutationDrainer       contracts.GitMutationDrainer
+	preparedCommitObserver   contracts.PreparedCommitObserver
+	repositoryCommandDrainer contracts.RepositoryCommandDrainer
+	providerCoordinator      *providercoord.Coordinator
+	// closeProviderCoordinator is a narrow lifecycle adapter. Production leaves
+	// it nil and uses Coordinator.Close directly; keeping the operation here
+	// makes the composition ownership order testable without exposing a Store or
+	// coordinator implementation detail through Config.
+	closeProviderCoordinator   func(*providercoord.Coordinator) error
 	providerCoordinatorFactory func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error)
 	providerSupervisor         contracts.ProcessSupervisor
 	providerQualifier          func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
@@ -673,7 +678,7 @@ func (daemon *Daemon) Close() error {
 	daemon.providerCoordinator = nil
 	daemon.runtimeMu.Unlock()
 	if coordinator != nil {
-		result = joinCloseError(result, "close provider coordinator", coordinator.Close)
+		result = joinCloseError(result, "close provider coordinator", func() error { return daemon.closeCoordinator(coordinator) })
 	}
 	result = joinCloseError(result, "close store", daemon.engine.Close)
 	result = joinCloseError(result, "close leader lease", daemon.lease.Close)
@@ -859,7 +864,7 @@ func (daemon *Daemon) activateQualifiedRuntimeLocked() error {
 	coordinator, err := daemon.providerCoordinatorFactory(daemon.store, daemon.providerSupervisor)
 	if err != nil {
 		if coordinator != nil {
-			if closeErr := coordinator.Close(); closeErr != nil {
+			if closeErr := daemon.closeCoordinator(coordinator); closeErr != nil {
 				err = errors.Join(err, closeErr)
 			}
 		}
@@ -870,45 +875,59 @@ func (daemon *Daemon) activateQualifiedRuntimeLocked() error {
 	}
 	components, err := daemon.runtimeFactory(RuntimeDependencies{Store: daemon.store, Engine: daemon.engine, ProviderCoordinator: coordinator})
 	if err != nil {
-		if closeErr := coordinator.Close(); closeErr != nil {
-			err = errors.Join(err, closeErr)
-		}
-		if components.Runtime != nil {
-			if closeErr := components.Runtime.Close(); closeErr != nil {
-				err = errors.Join(err, closeErr)
-			}
-		}
+		// A factory may have handed its partial Runtime the exact coordinator
+		// before reporting an error. Its cleanup therefore owns that dependency
+		// until Runtime.Close has joined all of the runtime's goroutines.
+		err = closePartialRuntimeComposition(err, components.Runtime, func() error { return daemon.closeCoordinator(coordinator) })
 		return fmt.Errorf("compose qualified workflow runtime: %w", err)
 	}
 	if err := validateRuntimeComponents(components); err != nil {
-		if components.Runtime != nil {
-			err = errors.Join(err, components.Runtime.Close())
-		}
-		if closeErr := coordinator.Close(); closeErr != nil {
-			err = errors.Join(err, closeErr)
-		}
+		err = closePartialRuntimeComposition(err, components.Runtime, func() error { return daemon.closeCoordinator(coordinator) })
 		return err
 	}
 	if components.Runtime == nil {
-		if closeErr := coordinator.Close(); closeErr != nil {
-			return closeErr
-		}
-		return errors.New("qualified provider has no executable workflow runtime")
+		return closePartialRuntimeComposition(errors.New("qualified provider has no executable workflow runtime"), nil, func() error { return daemon.closeCoordinator(coordinator) })
 	}
 	// The startup coordinator was intentionally idle. Retire it before the new
 	// runtime can start so a cleanup failure cannot make us report an activation
 	// failure after a real runtime is already live.
 	if daemon.providerCoordinator != nil && daemon.providerCoordinator != coordinator {
-		if err := daemon.providerCoordinator.Close(); err != nil {
-			return errors.Join(err, components.Runtime.Close(), coordinator.Close())
+		if err := daemon.closeCoordinator(daemon.providerCoordinator); err != nil {
+			return errors.Join(err, components.Runtime.Close(), daemon.closeCoordinator(coordinator))
 		}
 	}
 	if err := components.Runtime.Start(daemon.runtimeContext, domain.Fence{LeaderEpoch: daemon.epoch}); err != nil {
-		err = errors.Join(err, components.Runtime.Close(), coordinator.Close())
+		err = closePartialRuntimeComposition(err, components.Runtime, func() error { return daemon.closeCoordinator(coordinator) })
 		return fmt.Errorf("start qualified workflow runtime: %w", err)
 	}
 	daemon.runtime, daemon.control, daemon.providerCoordinator = components.Runtime, components.Controller, coordinator
 	return nil
+}
+
+func (daemon *Daemon) closeCoordinator(coordinator *providercoord.Coordinator) error {
+	if coordinator == nil {
+		return nil
+	}
+	if daemon.closeProviderCoordinator != nil {
+		return daemon.closeProviderCoordinator(coordinator)
+	}
+	return coordinator.Close()
+}
+
+// closePartialRuntimeComposition keeps the partial-composition ownership
+// order explicit: a Runtime receives the coordinator through
+// RuntimeDependencies, so it must close before that coordinator. The caller
+// supplies the coordinator closer rather than exposing a concrete coordinator
+// type to this generic lifecycle helper. errors.Join preserves the original
+// composition failure and every cleanup failure for operator diagnosis.
+func closePartialRuntimeComposition(cause error, runtime WorkflowRuntime, closeCoordinator func() error) error {
+	if runtime != nil {
+		cause = joinCloseError(cause, "close workflow runtime", runtime.Close)
+	}
+	if closeCoordinator != nil {
+		cause = joinCloseError(cause, "close provider coordinator", closeCoordinator)
+	}
+	return cause
 }
 
 func validateRuntimeComponents(components WorkflowRuntimeComponents) error {
@@ -1550,6 +1569,9 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 		argv = []string{binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"}
 	}
 	if code == "runtime_already_active" {
+		argv = []string{binary, "daemon", "status"}
+	}
+	if code == "daemon_stopping" {
 		argv = []string{binary, "daemon", "status"}
 	}
 	if code == "terminal_replay_requires_new" {

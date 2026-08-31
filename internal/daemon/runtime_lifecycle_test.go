@@ -435,6 +435,112 @@ func TestQualificationReportsCommittedActivationFailure(t *testing.T) {
 	}
 }
 
+func TestClosePartialRuntimeCompositionPreservesRuntimeCoordinatorOwnershipAndErrors(t *testing.T) {
+	factoryErr := errors.New("runtime factory failed")
+	runtimeErr := errors.New("partial runtime close failed")
+	coordinatorErr := errors.New("partial coordinator close failed")
+	coordinatorOpen := true
+	order := make([]string, 0, 2)
+	runtime := &fakeWorkflowRuntime{closeFn: func() error {
+		if !coordinatorOpen {
+			t.Fatal("partial runtime observed a closed coordinator")
+		}
+		order = append(order, "runtime")
+		return runtimeErr
+	}}
+
+	got := closePartialRuntimeComposition(factoryErr, runtime, func() error {
+		if !coordinatorOpen {
+			t.Fatal("coordinator closed more than once")
+		}
+		coordinatorOpen = false
+		order = append(order, "coordinator")
+		return coordinatorErr
+	})
+	if coordinatorOpen {
+		t.Fatal("partial coordinator was not closed")
+	}
+	if strings.Join(order, ",") != "runtime,coordinator" {
+		t.Fatalf("partial composition close order=%v, want runtime then coordinator", order)
+	}
+	for _, want := range []error{factoryErr, runtimeErr, coordinatorErr} {
+		if !errors.Is(got, want) {
+			t.Fatalf("cleanup error=%v, missing %v", got, want)
+		}
+	}
+}
+
+func TestQualifiedActivationFactoryFailureClosesPartialRuntimeBeforeCoordinator(t *testing.T) {
+	initialCoordinator := &providercoord.Coordinator{}
+	qualifiedCoordinator := &providercoord.Coordinator{}
+	coordinatorCalls := 0
+	cfg, _ := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		// Startup is deliberately idle. The second invocation below is the
+		// actual post-qualification activation path under test.
+		return WorkflowRuntimeComponents{}, nil
+	})
+	cfg.ProviderCoordinatorFactory = func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
+		coordinatorCalls++
+		if coordinatorCalls == 1 {
+			return initialCoordinator, nil
+		}
+		return qualifiedCoordinator, nil
+	}
+	d, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	factoryErr := errors.New("qualified runtime factory failed")
+	runtimeErr := errors.New("qualified partial runtime close failed")
+	coordinatorErr := errors.New("qualified coordinator close failed")
+	coordinatorOpen := true
+	order := make([]string, 0, 2)
+	partial := &fakeWorkflowRuntime{closeFn: func() error {
+		if !coordinatorOpen {
+			t.Fatal("partial activation runtime observed a closed coordinator")
+		}
+		order = append(order, "runtime")
+		return runtimeErr
+	}}
+	d.runtimeFactory = func(deps RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		if deps.ProviderCoordinator != qualifiedCoordinator {
+			t.Fatalf("qualified coordinator=%p, want %p", deps.ProviderCoordinator, qualifiedCoordinator)
+		}
+		return WorkflowRuntimeComponents{Runtime: partial}, factoryErr
+	}
+	d.closeProviderCoordinator = func(got *providercoord.Coordinator) error {
+		if got != qualifiedCoordinator {
+			t.Fatalf("closed coordinator=%p, want qualified coordinator %p", got, qualifiedCoordinator)
+		}
+		if !coordinatorOpen {
+			t.Fatal("qualified coordinator closed more than once")
+		}
+		coordinatorOpen = false
+		order = append(order, "coordinator")
+		return coordinatorErr
+	}
+
+	d.runtimeMu.Lock()
+	err = d.activateQualifiedRuntimeLocked()
+	d.runtimeMu.Unlock()
+	if coordinatorOpen {
+		t.Fatal("activation did not close its qualified coordinator")
+	}
+	if strings.Join(order, ",") != "runtime,coordinator" {
+		t.Fatalf("activation cleanup order=%v, want runtime then coordinator", order)
+	}
+	for _, want := range []error{factoryErr, runtimeErr, coordinatorErr} {
+		if !errors.Is(err, want) {
+			t.Fatalf("activation error=%v, missing %v", err, want)
+		}
+	}
+	if d.runtime != nil || d.providerCoordinator != nil {
+		t.Fatalf("failed activation installed runtime/coordinator %T/%p", d.runtime, d.providerCoordinator)
+	}
+}
+
 func TestRequalificationDoesNotReplaceAnActiveRuntime(t *testing.T) {
 	var qualified bool
 	var factoryCalls int

@@ -35,7 +35,7 @@ func exitCode(response api.Response) ExitCode {
 		return ExitInput
 	case "operator_action_required", "operator_identity_required", "provider_auth_missing", "provider_unavailable", "auth_login_failed", "blocked_process", "uncertain_effect", "external_merge_observed", "invalid_transition", "control_drain_failed", "control_completion_failed", "not_configured", "not_ready", "doctor_not_configured", "doctor_failed", "project_conflict", "init_failed", "unknown_project", "doctor_required", "start_refused", "submit_refused", "terminal_replay_requires_new", "runtime_activation_failed", "runtime_already_active":
 		return ExitAction
-	case "daemon_unavailable", "provider_waiting", "checks_pending", "store_busy", "projection_unavailable", "external_state_unavailable", "control_state_unavailable", "evidence_unavailable", "logs_unavailable", "status_unavailable", "capacity_unavailable", "leader_lost", "ticket_id_unavailable":
+	case "daemon_unavailable", "daemon_stopping", "provider_waiting", "checks_pending", "store_busy", "projection_unavailable", "external_state_unavailable", "control_state_unavailable", "evidence_unavailable", "logs_unavailable", "status_unavailable", "capacity_unavailable", "leader_lost", "ticket_id_unavailable":
 		return ExitWait
 	case "policy_refusal", "safety_blocked", "unqualified_provider", "evidence_conflict", "autonomous_unavailable":
 		return ExitPolicy
