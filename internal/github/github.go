@@ -452,6 +452,62 @@ func (c Client) UpdatePullRequest(ctx context.Context, durable domain.ExternalEf
 func (c Client) RequiredChecks(ctx context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
 	return c.checks(ctx, identity)
 }
+
+// ObserveCIRequiredCheckPolicy is the read-only CI authority boundary. It
+// composes the exact PR identity, authenticated principal, protected-branch
+// witness, and GitHub's required-check response into one value for Store.
+func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contracts.PullRequestIdentity) (contracts.CIRequiredCheckPolicyObservation, error) {
+	observed, err := c.Observe(ctx, identity)
+	if err != nil || observed.State != "OPEN" || observed.Merged || !sameExact(observed.Identity, identity) || observed.Identity.BaseOID == "" {
+		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
+	}
+	principal, err := c.Preflight(ctx, identity.Repository)
+	if err != nil {
+		return contracts.CIRequiredCheckPolicyObservation{}, err
+	}
+	protection, err := c.strictProtection(ctx, identity.Repository, identity.BaseRef)
+	if err != nil {
+		return contracts.CIRequiredCheckPolicyObservation{}, err
+	}
+	checks, err := c.checks(ctx, observed.Identity)
+	if err != nil {
+		return contracts.CIRequiredCheckPolicyObservation{}, err
+	}
+	// Required-check observation is a separate GitHub read from protected
+	// branch policy. Re-sample the policy after the check list and bind both
+	// reads to the same witness; otherwise a concurrent ruleset change could
+	// authenticate checks against a policy that was never observed atomically.
+	protectionAfter, err := c.strictProtection(ctx, identity.Repository, identity.BaseRef)
+	if err != nil {
+		return contracts.CIRequiredCheckPolicyObservation{}, err
+	}
+	if !sameProtectionWitness(protection, protectionAfter) {
+		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
+	}
+	canonical := make([]map[string]string, 0, len(checks))
+	for _, check := range checks {
+		canonical = append(canonical, map[string]string{"name": check.Name, "external_id": check.ExternalID})
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		if canonical[i]["name"] != canonical[j]["name"] {
+			return canonical[i]["name"] < canonical[j]["name"]
+		}
+		return canonical[i]["external_id"] < canonical[j]["external_id"]
+	})
+	body, err := json.Marshal(struct {
+		Protection strictProtectionWitness `json:"protection"`
+		Checks     []map[string]string     `json:"checks"`
+	}{protection, canonical})
+	if err != nil {
+		return contracts.CIRequiredCheckPolicyObservation{}, err
+	}
+	source := sha256.Sum256(body)
+	return contracts.CIRequiredCheckPolicyObservation{
+		PullRequest: observed.Identity, ProtectedBranchRef: observed.Identity.BaseRef,
+		ProtectedBranchOID: observed.Identity.BaseOID, PolicySourceDigest: hex.EncodeToString(source[:]),
+		AuthenticatedPrincipal: principal.Login, RequiredChecks: checks, ObservedAt: time.Now().UTC(),
+	}, nil
+}
 func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
 	observed, err := c.Observe(ctx, identity)
 	if err != nil {

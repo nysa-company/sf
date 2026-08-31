@@ -78,10 +78,17 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					continue // lost-response replay under the same leader
 				}
 				// A control invalidation may advance the ticket without writing a
-				// recovery row. It must not strand startup fencing; publication
-				// consumers will reject the resulting non-contiguous lineage.
+				// recovery row, but only its sealed runtime-control authority may
+				// authenticate that one-version gap. Counter arithmetic alone must
+				// not let a forged ticket update bridge the recovery ledger.
 				if latest.TicketVersion > ticket.version || latest.RunnerEpoch > ticket.runner || leaderEpoch <= latest.LeaderEpoch {
 					return ErrStaleFence
+				}
+				if latest.TicketVersion+1 == ticket.version && latest.RunnerEpoch+1 == ticket.runner && ticket.state != domain.StateWaitingCI {
+					var controlVersion, controlRunner, controlLeader uint64
+					if err := conn.QueryRowContext(ctx, `SELECT authority_version,authority_runner_epoch,authority_leader_epoch FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=? AND state='sealed'`, channel, ticket.project, ticket.id).Scan(&controlVersion, &controlRunner, &controlLeader); err != nil || controlVersion != ticket.version || controlRunner != ticket.runner || controlLeader != latest.LeaderEpoch {
+						return ErrPublicationEvidence
+					}
 				}
 			}
 			// Runner recovery is also an append-only, bounded authority. Its cap
@@ -135,6 +142,33 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				return err
 			} else if ok {
 				priorLeader = publication
+			}
+			if priorLeader == 0 {
+				provider, providerFound, providerErr := providerRecoveryBaseline(ctx, conn, ref, ticket.state, ticket.version, ticket.runner)
+				if providerErr != nil {
+					return providerErr
+				}
+				if providerFound {
+					if provider >= leaderEpoch {
+						return ErrPublicationEvidence
+					}
+					priorLeader = provider
+				}
+			}
+			if priorLeader == 0 && !found && ticket.state == domain.StatePlanning && ticket.version == 2 && ticket.runner == 1 {
+				startAuthority, authorityFound, authorityErr := loadRunnerStartAuthority(ctx, conn, ref, ticket.version, ticket.runner)
+				if authorityErr != nil {
+					return authorityErr
+				}
+				if authorityFound {
+					if startAuthority.LeaderEpoch >= leaderEpoch || validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version) != nil {
+						return ErrPublicationEvidence
+					}
+					priorLeader = startAuthority.LeaderEpoch
+				}
+			}
+			if priorLeader == 0 {
+				return ErrPublicationEvidence
 			}
 			result, err := conn.ExecContext(ctx, `UPDATE tickets SET runner_epoch=runner_epoch+1, version=version+1 WHERE channel=? AND project_id=? AND id=? AND version=? AND runner_epoch=? AND state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling')`, channel, ticket.project, ticket.id, ticket.version, ticket.runner)
 			if err != nil {
@@ -242,7 +276,11 @@ func (s *Store) StartWithOwnership(ctx context.Context, ref domain.TicketRef, ex
 			if _, err := conn.ExecContext(ctx, `INSERT INTO workflow_owners(channel, project_id, ticket_id, workflow_id, state, created_at) VALUES (?, ?, ?, ?, 'owned', ?)`, ref.Channel, ref.Project, ref.Ticket, workflowID, at.UTC().Format(time.RFC3339Nano)); err != nil {
 				return err
 			}
-			if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'operator_start', 'queued', 'planning', '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, at.UTC().Format(time.RFC3339Nano)); err != nil {
+			createdAt := at.UTC().Format(time.RFC3339Nano)
+			if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'operator_start', 'queued', 'planning', '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, createdAt); err != nil {
+				return err
+			}
+			if err := recordRunnerStartAuthority(ctx, conn, ref, version, fence, workflowID, createdAt); err != nil {
 				return err
 			}
 		}

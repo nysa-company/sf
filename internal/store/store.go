@@ -55,9 +55,10 @@ var (
 	ErrRepositoryCommandLease  = errors.New("repository command lease is unavailable or stale")
 	ErrRepositoryCommandResult = errors.New("repository command result is missing, malformed, or conflicts with durable evidence")
 	ErrPublicationEvidence     = errors.New("publication evidence is missing, malformed, stale, or conflicts with durable evidence")
+	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 41
+const schemaVersion = 43
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -101,6 +102,8 @@ var migrationChecksums = map[int]string{
 	39: migrationChecksum(migrationV39),
 	40: migrationChecksum(migrationV40),
 	41: migrationChecksum(migrationV41),
+	42: migrationChecksum(migrationV42),
+	43: migrationChecksum(migrationV43),
 }
 
 func migrationChecksum(statements []string) string {
@@ -442,6 +445,10 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV40
 			} else if version == 41 {
 				statements = migrationV41
+			} else if version == 42 {
+				statements = migrationV42
+			} else if version == 43 {
+				statements = migrationV43
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1058,9 +1065,12 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expected
 		if !stateChanged {
 			return nil
 		}
-		_, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at)
-			VALUES (?, ?, ?, ?, 'start_or_adopt', ?, ?, '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, state, domain.StatePlanning, time.Now().UTC().Format(time.RFC3339Nano))
-		return err
+		createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at)
+			VALUES (?, ?, ?, ?, 'start_or_adopt', ?, ?, '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, state, domain.StatePlanning, createdAt); err != nil {
+			return err
+		}
+		return recordRunnerStartAuthority(ctx, conn, ref, version, fence, workflowID, createdAt)
 	})
 	if err != nil {
 		return Ticket{}, err
@@ -1364,6 +1374,24 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
+	// A failed repair-gated transition must not drain and revoke the very
+	// builder fence needed to record its missing completion. Keep the durable
+	// check inside the write transaction below as the race-safe authority; this
+	// read-only preflight only prevents a known-missing completion from causing
+	// an unrelated revocation side effect.
+	var repairPending int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation).Scan(&repairPending); err != nil {
+		return TransitionResult{}, err
+	}
+	if repairPending > 0 {
+		var completed int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=? AND final_candidate_head_sha=? AND final_candidate_tree_sha=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, candidate.HeadSHA, candidate.TreeSHA).Scan(&completed); err != nil {
+			return TransitionResult{}, err
+		}
+		if completed != 1 {
+			return TransitionResult{}, ErrEvidenceConflict
+		}
+	}
 	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
 		return TransitionResult{}, err
 	}
@@ -1387,6 +1415,16 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 		}
 		if stored != candidate {
 			return ErrEvidenceConflict
+		}
+		var repairPending int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation).Scan(&repairPending); err != nil {
+			return err
+		}
+		if repairPending > 0 {
+			var completed int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=? AND final_candidate_head_sha=? AND final_candidate_tree_sha=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, candidate.HeadSHA, candidate.TreeSHA).Scan(&completed); err != nil || completed != 1 {
+				return ErrEvidenceConflict
+			}
 		}
 		authenticated, err := s.LatestCandidate(ctx, transition.Ref)
 		if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != version || authenticated.Fence != transition.Fence || authenticated.CommandBinding.TicketVersion != version || authenticated.CommandBinding.LeaderEpoch != transition.Fence.LeaderEpoch || authenticated.CommandBinding.RunnerEpoch != transition.Fence.RunnerEpoch || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {

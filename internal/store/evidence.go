@@ -473,6 +473,17 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation), 0) FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&current); err != nil {
 			return err
 		}
+		// A red CI transition opens one immutable repair lineage. A Builder
+		// result in the old generation must not bypass that pending successor.
+		var pendingRepair int
+		if current > 0 {
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND predecessor_generation=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, current).Scan(&pendingRepair); err != nil {
+				return err
+			}
+			if pendingRepair != 0 && evidence.Snapshot.Generation != current+1 {
+				return ErrEvidenceConflict
+			}
+		}
 		if evidence.Snapshot.Generation == 0 && current > 0 {
 			var existing domain.CandidateSnapshot
 			if err := conn.QueryRowContext(ctx, `SELECT generation,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? AND generation=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, current).Scan(&existing.Generation, &existing.BaseSHA, &existing.HeadSHA, &existing.TreeSHA, &existing.SourceDigest, &existing.VerificationIntentDigest, &existing.ProofDigest, &existing.CommandPolicyDigest, &existing.BuilderEvidenceDigest); err != nil {

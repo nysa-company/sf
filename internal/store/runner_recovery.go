@@ -26,6 +26,163 @@ type RunnerRecoveryLedger struct {
 	CreatedAt          time.Time
 }
 
+// runnerStartAuthority is the immutable source endpoint recorded alongside
+// queued->planning. It is deliberately separate from the event projection:
+// an event is not a one-row-per-ticket authority and cannot be replayed as the
+// physical start fence after a daemon restart.
+type runnerStartAuthority struct {
+	Ref                domain.TicketRef
+	StartTicketVersion uint64
+	RunnerEpoch        uint64
+	LeaderEpoch        uint64
+	WorkflowID         string
+	WorkflowDigest     string
+	CreatedAt          time.Time
+	AuthorityDigest    string
+}
+
+type runnerStartAuthorityDigestPayload struct {
+	Channel            domain.Channel `json:"channel"`
+	Project            string         `json:"project"`
+	Ticket             string         `json:"ticket"`
+	StartTicketVersion uint64         `json:"start_ticket_version"`
+	RunnerEpoch        uint64         `json:"runner_epoch"`
+	LeaderEpoch        uint64         `json:"leader_epoch"`
+	WorkflowID         string         `json:"workflow_id"`
+	CreatedAt          string         `json:"created_at"`
+}
+
+func runnerStartAuthorityPayload(ref domain.TicketRef, version, runner, leader uint64, workflowID, createdAt string) ([]byte, error) {
+	if ref.Validate() != nil || version != 2 || runner != 1 || leader == 0 || !boundedText(workflowID, 300) || createdAt == "" {
+		return nil, ErrPublicationEvidence
+	}
+	return json.Marshal(runnerStartAuthorityDigestPayload{Channel: ref.Channel, Project: string(ref.Project), Ticket: string(ref.Ticket), StartTicketVersion: version, RunnerEpoch: runner, LeaderEpoch: leader, WorkflowID: workflowID, CreatedAt: createdAt})
+}
+
+func recordRunnerStartAuthority(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, version uint64, fence domain.Fence, workflowID, createdAt string) error {
+	payload, err := runnerStartAuthorityPayload(ref, version, fence.RunnerEpoch, fence.LeaderEpoch, workflowID, createdAt)
+	if err != nil {
+		return ErrPublicationEvidence
+	}
+	if _, err := parseRunnerRecoveryTime(createdAt); err != nil {
+		return ErrPublicationEvidence
+	}
+	workflowDigest := publicationIdentityDigest([]byte(workflowID))
+	authorityDigest := publicationIdentityDigest(payload)
+	_, err = conn.ExecContext(ctx, `INSERT INTO runner_start_authorities(channel,project_id,ticket_id,start_ticket_version,runner_epoch,leader_epoch,workflow_id,workflow_digest,created_at,authority_digest) VALUES(?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, version, fence.RunnerEpoch, fence.LeaderEpoch, workflowID, workflowDigest, createdAt, authorityDigest)
+	return err
+}
+
+func loadRunnerStartAuthority(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, liveVersion, expectedRunner uint64) (runnerStartAuthority, bool, error) {
+	if ref.Validate() != nil || liveVersion != 2 || expectedRunner != 1 {
+		return runnerStartAuthority{}, false, ErrPublicationEvidence
+	}
+	var authority runnerStartAuthority
+	var createdAt, persistedWorkflowID string
+	err := q.QueryRowContext(ctx, `SELECT a.start_ticket_version,a.runner_epoch,a.leader_epoch,a.workflow_id,a.workflow_digest,a.created_at,a.authority_digest,t.workflow_id FROM runner_start_authorities a JOIN tickets t ON t.channel=a.channel AND t.project_id=a.project_id AND t.id=a.ticket_id WHERE a.channel=? AND a.project_id=? AND a.ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&authority.StartTicketVersion, &authority.RunnerEpoch, &authority.LeaderEpoch, &authority.WorkflowID, &authority.WorkflowDigest, &createdAt, &authority.AuthorityDigest, &persistedWorkflowID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return runnerStartAuthority{}, false, nil
+	}
+	if err != nil {
+		return runnerStartAuthority{}, false, err
+	}
+	authority.Ref = ref
+	authority.CreatedAt, err = parseRunnerRecoveryTime(createdAt)
+	if err != nil || authority.StartTicketVersion != 2 || authority.StartTicketVersion > liveVersion || authority.RunnerEpoch != 1 || authority.RunnerEpoch != expectedRunner || authority.LeaderEpoch == 0 || !boundedText(authority.WorkflowID, 300) || authority.WorkflowID != persistedWorkflowID || authority.WorkflowDigest != publicationIdentityDigest([]byte(authority.WorkflowID)) {
+		return runnerStartAuthority{}, false, ErrPublicationEvidence
+	}
+	payload, err := runnerStartAuthorityPayload(ref, authority.StartTicketVersion, authority.RunnerEpoch, authority.LeaderEpoch, authority.WorkflowID, createdAt)
+	if err != nil || authority.AuthorityDigest != publicationIdentityDigest(payload) {
+		return runnerStartAuthority{}, false, ErrPublicationEvidence
+	}
+	return authority, true, nil
+}
+
+// validateInitialLifecycleAdvance authenticates the ordinary ticket history
+// before the first recovery row. In the queued->planning crash window this
+// proves the durable start event that the runner-start authority accompanies;
+// it never infers a predecessor from counters alone.
+func validateInitialLifecycleAdvance(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, endVersion uint64) error {
+	if endVersion == 0 {
+		return ErrPublicationEvidence
+	}
+	var initialCount int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=1 AND ((trigger='submit_valid' AND from_state='none' AND to_state='queued' AND payload='{}') OR (trigger='ticket_submitted' AND from_state='queued' AND to_state='queued' AND payload='{}'))`, ref.Channel, ref.Project, ref.Ticket).Scan(&initialCount); err != nil || initialCount != 1 {
+		return ErrPublicationEvidence
+	}
+	var initialTrigger, initialPayload string
+	var initialFrom, initialTo domain.State
+	if err := q.QueryRowContext(ctx, `SELECT trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=1 AND ((trigger='submit_valid' AND from_state='none' AND to_state='queued' AND payload='{}') OR (trigger='ticket_submitted' AND from_state='queued' AND to_state='queued' AND payload='{}'))`, ref.Channel, ref.Project, ref.Ticket).Scan(&initialTrigger, &initialFrom, &initialTo, &initialPayload); err != nil || initialPayload != "{}" || initialTo != domain.StateQueued || !((initialTrigger == "submit_valid" && initialFrom == domain.State("none")) || (initialTrigger == "ticket_submitted" && initialFrom == domain.StateQueued)) {
+		return ErrPublicationEvidence
+	}
+	var initialStateChanges int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=1 AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket).Scan(&initialStateChanges); err != nil || (initialTrigger == "submit_valid" && initialStateChanges != 1) || (initialTrigger == "ticket_submitted" && initialStateChanges != 0) {
+		return ErrPublicationEvidence
+	}
+	if endVersion == 1 {
+		return nil
+	}
+	var startCount int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=2 AND trigger IN ('operator_start','start_or_adopt') AND from_state='queued' AND to_state='planning' AND payload='{}'`, ref.Channel, ref.Project, ref.Ticket).Scan(&startCount); err != nil || startCount != 1 {
+		return ErrPublicationEvidence
+	}
+	var lastID int64
+	var startTrigger, startPayload string
+	var startFrom, startTo domain.State
+	if err := q.QueryRowContext(ctx, `SELECT id,trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=2 AND trigger IN ('operator_start','start_or_adopt') AND from_state='queued' AND to_state='planning' AND payload='{}'`, ref.Channel, ref.Project, ref.Ticket).Scan(&lastID, &startTrigger, &startFrom, &startTo, &startPayload); err != nil || startPayload != "{}" || startFrom != domain.StateQueued || startTo != domain.StatePlanning || (startTrigger != "operator_start" && startTrigger != "start_or_adopt") {
+		return ErrPublicationEvidence
+	}
+	var startStateChanges int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=2 AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket).Scan(&startStateChanges); err != nil || startStateChanges != 1 {
+		return ErrPublicationEvidence
+	}
+	if endVersion == 2 {
+		return nil
+	}
+	rows, err := q.QueryContext(ctx, `SELECT id,ticket_version,trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND from_state<>to_state ORDER BY ticket_version,id`, ref.Channel, ref.Project, ref.Ticket, 2, endVersion)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	last := uint64(2)
+	prior := domain.StatePlanning
+	for rows.Next() {
+		var id int64
+		var version uint64
+		var trigger, payload string
+		var from, to domain.State
+		if err := rows.Scan(&id, &version, &trigger, &from, &to, &payload); err != nil || id <= lastID || version != last+1 || trigger == "" || !from.Valid() || !to.Valid() || !json.Valid([]byte(payload)) || len(payload) > maxEvidenceJSON || from != prior || !validInitialLifecycleTransition(trigger, from, to) {
+			return ErrPublicationEvidence
+		}
+		lastID = id
+		last, prior = version, to
+	}
+	if err := rows.Err(); err != nil || last != endVersion {
+		return ErrPublicationEvidence
+	}
+	return nil
+}
+
+func validInitialLifecycleTransition(trigger string, from, to domain.State) bool {
+	switch {
+	case from == domain.StatePlanning && to == domain.StateVerifying:
+		return trigger == "phase_pass"
+	case from == domain.StateVerifying && to == domain.StateBuilding:
+		return trigger == "phase_pass"
+	case from == domain.StateBuilding && to == domain.StatePublishing:
+		return trigger == "phase_pass"
+	case from == domain.StatePublishing && to == domain.StateWaitingCI:
+		return trigger == "effects_confirmed"
+	default:
+		return false
+	}
+}
+
 func validateWaitingRecoveryLedger(ctx context.Context, q interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
@@ -97,7 +254,7 @@ func runnerRecoveryPayload(value RunnerRecoveryLedger) ([]byte, error) {
 }
 
 func validRunnerRecovery(value RunnerRecoveryLedger) bool {
-	if value.Ref.Validate() != nil || value.PriorTicketVersion == 0 || value.PriorRunnerEpoch == 0 || value.TicketVersion != value.PriorTicketVersion+1 || value.RunnerEpoch != value.PriorRunnerEpoch+1 || value.LeaderEpoch == 0 || (value.PriorLeaderEpoch > 0 && value.LeaderEpoch <= value.PriorLeaderEpoch) || value.CreatedAt.IsZero() || !validClaimDigest(value.RecoveryDigest) {
+	if value.Ref.Validate() != nil || value.PriorTicketVersion == 0 || value.PriorRunnerEpoch == 0 || value.PriorLeaderEpoch == 0 || value.TicketVersion != value.PriorTicketVersion+1 || value.RunnerEpoch != value.PriorRunnerEpoch+1 || value.LeaderEpoch == 0 || value.LeaderEpoch <= value.PriorLeaderEpoch || value.CreatedAt.IsZero() || !validClaimDigest(value.RecoveryDigest) {
 		return false
 	}
 	payload, err := runnerRecoveryPayload(value)
@@ -217,4 +374,60 @@ func (s *Store) publicationRecoveryBaseline(ctx context.Context, conn *sql.Conn,
 		return 0, false, nil
 	}
 	return publication.CurrentFence.LeaderEpoch, true, nil
+}
+
+// providerRecoveryBaseline authenticates the original provider launch fence
+// when a daemon dies after admitting a phase attempt but before any recovery
+// row exists. The attempt itself is the durable source endpoint; matching
+// counters without rehydrating its immutable qualification/input is not.
+func providerRecoveryBaseline(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, state domain.State, version, runner uint64) (uint64, bool, error) {
+	phase, role, ok := recoveryProviderPhase(state)
+	if !ok {
+		return 0, false, nil
+	}
+	rows, err := q.QueryContext(ctx, `SELECT id FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND role=? AND expected_ticket_version=? AND runner_epoch=? AND state IN ('active','quarantined') ORDER BY id`, ref.Channel, ref.Project, ref.Ticket, phase, role, version, runner)
+	if err != nil {
+		return 0, false, err
+	}
+	defer rows.Close()
+	var id int64
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(&id); err != nil {
+			return 0, false, err
+		}
+		count++
+		if count > 1 {
+			return 0, false, ErrPublicationEvidence
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, false, err
+	}
+	if count == 0 {
+		return 0, false, nil
+	}
+	claim, err := loadAuthenticatedProviderAttemptClaim(ctx, q, id)
+	if err != nil || claim.Ref != ref || claim.ExpectedVersion != version || claim.RunnerEpoch != runner || claim.Phase != phase || claim.Role != role || claim.LeaderEpoch == 0 {
+		return 0, false, ErrPublicationEvidence
+	}
+	return claim.LeaderEpoch, true, nil
+}
+
+func recoveryProviderPhase(state domain.State) (domain.Phase, string, bool) {
+	switch state {
+	case domain.StatePlanning:
+		return domain.PhasePlanning, "planner", true
+	case domain.StateVerifying:
+		return domain.PhaseVerification, "reviewer", true
+	case domain.StateBuilding:
+		return domain.PhaseBuild, "builder", true
+	case domain.StateReviewing:
+		return domain.PhaseReview, "reviewer", true
+	default:
+		return "", "", false
+	}
 }
