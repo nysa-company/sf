@@ -691,17 +691,31 @@ func (s *Store) WorktreeCreationIntent(ctx context.Context, ref domain.TicketRef
 	return facts, nil
 }
 
-// PublicationPushIntent returns the sole durable candidate-push authority for
-// a ticket. It is recovery-only: callers can reconcile the immutable remote
-// target but cannot mint, rebind, or claim an effect from these facts.
-func (s *Store) PublicationPushIntent(ctx context.Context, ref domain.TicketRef) (GitMutationIntentFacts, error) {
+// PublicationPushIntent returns the durable candidate-push authority for a
+// ticket. When semanticKey is supplied it selects the current candidate's
+// exact immutable target; confirmed pushes for prior candidate generations are
+// historical evidence and do not block a correction. Any other unresolved
+// push remains a competing live authority and fails closed.
+func (s *Store) PublicationPushIntent(ctx context.Context, ref domain.TicketRef, semanticKeys ...string) (GitMutationIntentFacts, error) {
 	if err := ref.Validate(); err != nil {
 		return GitMutationIntentFacts{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT i.semantic_key FROM git_mutation_intents i
+	if len(semanticKeys) > 1 || (len(semanticKeys) == 1 && semanticKeys[0] == "") {
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
+	currentKey := ""
+	if len(semanticKeys) == 1 {
+		currentKey = semanticKeys[0]
+	}
+	stateClause := "e.state IN ('executing','uncertain')"
+	if currentKey == "" {
+		stateClause = "e.state IN ('executing','uncertain','confirmed')"
+	}
+	query := `SELECT i.semantic_key FROM git_mutation_intents i
 		JOIN effects e ON e.semantic_key=i.semantic_key
 		WHERE i.channel=? AND i.project_id=? AND i.ticket_id=? AND i.operation='push'
-		AND e.state IN ('executing','uncertain','confirmed') ORDER BY i.semantic_key`, ref.Channel, ref.Project, ref.Ticket)
+		AND ` + stateClause + ` ORDER BY i.semantic_key`
+	rows, err := s.db.QueryContext(ctx, query, ref.Channel, ref.Project, ref.Ticket)
 	if err != nil {
 		return GitMutationIntentFacts{}, normalizeBusy(ctx, err)
 	}
@@ -717,13 +731,26 @@ func (s *Store) PublicationPushIntent(ctx context.Context, ref domain.TicketRef)
 	if err := rows.Err(); err != nil {
 		return GitMutationIntentFacts{}, err
 	}
-	if len(keys) == 0 {
-		return GitMutationIntentFacts{}, ErrNotFound
-	}
-	if len(keys) != 1 {
+	if len(keys) > 1 || (len(keys) == 1 && currentKey != "" && keys[0] != currentKey) {
 		return GitMutationIntentFacts{}, ErrGitMutationIntent
 	}
-	facts, err := s.GitMutationIntentFacts(ctx, keys[0])
+	if currentKey == "" {
+		if len(keys) == 0 {
+			return GitMutationIntentFacts{}, ErrNotFound
+		}
+		currentKey = keys[0]
+	}
+	var state EffectState
+	if err := s.db.QueryRowContext(ctx, `SELECT state FROM effects WHERE semantic_key=? AND channel=? AND project_id=? AND ticket_id=? AND effect_kind='git/push'`, currentKey, ref.Channel, ref.Project, ref.Ticket).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return GitMutationIntentFacts{}, ErrNotFound
+		}
+		return GitMutationIntentFacts{}, normalizeBusy(ctx, err)
+	}
+	if state != EffectExecuting && state != EffectUncertain && state != EffectConfirmed {
+		return GitMutationIntentFacts{}, ErrNotFound
+	}
+	facts, err := s.GitMutationIntentFacts(ctx, currentKey)
 	if err != nil || facts.Claim.TicketRef != ref || facts.Claim.Operation != "push" || facts.Effect.Kind != "git/push" || (facts.Effect.State != EffectExecuting && facts.Effect.State != EffectUncertain && facts.Effect.State != EffectConfirmed) {
 		if err != nil {
 			return GitMutationIntentFacts{}, err

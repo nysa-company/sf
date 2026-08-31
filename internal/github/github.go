@@ -285,7 +285,24 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 		return match.Identity, nil
 	}
 	if observeErr == nil {
-		return contracts.PullRequestIdentity{}, ErrPolicyRefusal
+		// A clean absence after the mutation handoff is not proof that no PR
+		// was created. This includes a command error: gh may have applied the
+		// mutation before losing its response. Reconcile instead of retrying
+		// (or attempting a number-only close) on every such path. A closed
+		// exact PR is the one deterministic conflict we can safely report.
+		if found {
+			return contracts.PullRequestIdentity{}, ErrPolicyRefusal
+		}
+		if runErr != nil {
+			conflict, conflictErr := c.observeClosedPublicationConflict(ctx, identity)
+			if conflictErr != nil {
+				return contracts.PullRequestIdentity{}, fmt.Errorf("%w: %v", ErrCreateUncertain, conflictErr)
+			}
+			if conflict {
+				return contracts.PullRequestIdentity{}, ErrPolicyRefusal
+			}
+		}
+		return contracts.PullRequestIdentity{}, fmt.Errorf("%w: command result unavailable", ErrCreateUncertain)
 	}
 	if runErr != nil {
 		return contracts.PullRequestIdentity{}, fmt.Errorf("%w: command result unavailable", ErrCreateUncertain)
@@ -342,6 +359,9 @@ func (c Client) RequiredChecks(ctx context.Context, identity contracts.PullReque
 func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
 	observed, err := c.Observe(ctx, identity)
 	if err != nil {
+		if errors.Is(err, ErrNoMatchingPR) {
+			return ErrPolicyRefusal
+		}
 		return err
 	}
 	if observed.State != "OPEN" || observed.Merged {
@@ -656,6 +676,32 @@ func (c Client) ObservePublicationCandidate(ctx context.Context, want contracts.
 	default:
 		return PRMatch{}, false, ErrAmbiguousPR
 	}
+}
+
+// observeClosedPublicationConflict is intentionally separate from
+// ObservePublicationCandidate: closed rows are historical for inventory, but
+// a closed PR with the exact source/head is a deterministic create conflict
+// when the create command itself has failed. It lets CreateDraft preserve the
+// operation-facing refusal without treating an arbitrary gh error as safe to
+// retry.
+func (c Client) observeClosedPublicationConflict(ctx context.Context, want contracts.PullRequestIdentity) (bool, error) {
+	var values []prWire
+	if err := c.json(ctx, &values, "pr", "list", "--repo", repoArg(want.Repository), "--state", "all", "--limit", "100", "--json", prFields); err != nil {
+		return false, err
+	}
+	if len(values) == 100 {
+		return false, ErrAmbiguousPR
+	}
+	for _, value := range values {
+		candidate, err := value.identityUnmarked(want.Repository)
+		if err != nil {
+			return false, err
+		}
+		if candidate.HeadOwner == want.HeadOwner && candidate.HeadRepository == want.HeadRepository && candidate.HeadRef == want.HeadRef && candidate.HeadOID == want.HeadOID && candidate.BaseRef == want.BaseRef && (value.State != "OPEN" || value.MergedAt != nil) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (c Client) WaitChecks(ctx context.Context, identity contracts.PullRequestIdentity, required []CheckIdentity, initial, maximum time.Duration) ([]contracts.RequiredCheck, error) {

@@ -121,3 +121,11 @@ type GitHub interface {
 type DraftPullRequestObserver interface {
 	ObserveDraftPullRequest(context.Context, PullRequestIdentity) (identity PullRequestIdentity, state string, draft bool, found bool, err error)
 }
+
+// DraftPullRequestRefresher is the correction-only continuity boundary. It
+// identifies the already-owned PR by its durable number/source and returns
+// the same PR after its branch head has advanced to expected. It must refuse
+// foreign, missing, closed, or ambiguous rows.
+type DraftPullRequestRefresher interface {
+	RefreshFactoryPullRequestIdentity(context.Context, PullRequestIdentity, PullRequestIdentity) (PullRequestIdentity, error)
+}

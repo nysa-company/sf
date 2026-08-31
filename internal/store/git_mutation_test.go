@@ -156,6 +156,45 @@ func TestPublicationPushIntentRecoversOnlyOneAuthenticatedPush(t *testing.T) {
 	}
 }
 
+func TestPublicationPushIntentAllowsConfirmedPriorCandidateWhenCurrentKeyIsBound(t *testing.T) {
+	db, ctx := openTestStore(t)
+	first := gitIntentFixture(t, db, ctx, "SF-push-correction")
+	first.Operation, first.ExpectedHeadOID = "push", strings.Repeat("b", 40)
+	first.SemanticKey = CanonicalGitMutationSemanticKey(first)
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: first.SemanticKey, Ref: first.Ref, Kind: "git/push", TicketVersion: first.TicketVersion, Fence: first.Fence, RequestDigest: first.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	firstClaim, err := db.IssueGitMutationClaim(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ConfirmEffect(ctx, EffectFence{SemanticKey: firstClaim.SemanticKey, Ref: first.Ref, TicketVersion: firstClaim.TicketVersion, Fence: domain.Fence{LeaderEpoch: firstClaim.LeaderEpoch, RunnerEpoch: firstClaim.RunnerEpoch, ClaimEpoch: firstClaim.ClaimEpoch}}, "push-observed:b"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A correction creates a new immutable push key for generation two. The
+	// old confirmed row remains history, but must not be selected as the live
+	// authority for the current candidate.
+	second := first
+	second.ExpectedHeadOID = strings.Repeat("c", 40)
+	second.RequestDigest = gitDigest("c")
+	second.SemanticKey = CanonicalGitMutationSemanticKey(second)
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: second.SemanticKey, Ref: second.Ref, Kind: "git/push", TicketVersion: second.TicketVersion, Fence: second.Fence, RequestDigest: second.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	secondClaim, err := db.IssueGitMutationClaim(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := db.PublicationPushIntent(ctx, first.Ref, second.SemanticKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if facts.Claim.SemanticKey != secondClaim.SemanticKey || facts.Claim.ExpectedHeadOID != second.ExpectedHeadOID || facts.Effect.State != EffectExecuting {
+		t.Fatalf("current correction facts=%+v", facts)
+	}
+}
+
 func TestPublicationPushIntentFailsClosedForUncertainDuplicateAndMalformedRows(t *testing.T) {
 	db, ctx := openTestStore(t)
 	intent := gitIntentFixture(t, db, ctx, "SF-push-intent-edges")

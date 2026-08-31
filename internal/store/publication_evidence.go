@@ -875,6 +875,41 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 	return value, nil
 }
 
+// LoadHistoricalPublishedCandidate authenticates the most recent publication
+// witness without requiring it to be bound to the ticket's latest candidate.
+// It is used only to carry a single factory PR identity across a candidate
+// correction; it never authorizes a ticket transition or external mutation.
+func (s *Store) LoadHistoricalPublishedCandidate(ctx context.Context, ref domain.TicketRef) (PublishedCandidateEvidence, error) {
+	if err := ref.Validate(); err != nil {
+		return PublishedCandidateEvidence{}, err
+	}
+	value, found, err := loadPublicationEvidenceRow(ctx, s.db, ref)
+	if err != nil {
+		return PublishedCandidateEvidence{}, err
+	}
+	if !found {
+		return PublishedCandidateEvidence{}, ErrNotFound
+	}
+	if err := loadLatestPublicationRebind(ctx, s.db, &value); err != nil {
+		return PublishedCandidateEvidence{}, err
+	}
+	if err := s.validateStoredPublicationEffect(ctx, ref, value.TicketVersion, value.Fence, value.PushEffect); err != nil {
+		return PublishedCandidateEvidence{}, err
+	}
+	if err := s.validateStoredPublicationEffect(ctx, ref, value.TicketVersion, value.Fence, value.PRCreateOrUpdateEffect); err != nil {
+		return PublishedCandidateEvidence{}, err
+	}
+	worktree, err := s.Worktree(ctx, ref)
+	// The allocation identity is durable across a candidate correction, but
+	// its ticket/fence/base fields describe the historical registration and
+	// may advance while the same branch/checkout is retained. Path, branch,
+	// state, and full identity remain fixed ownership evidence.
+	if err != nil || worktree.Path != value.Worktree.Path || worktree.Branch != value.Worktree.Branch || worktree.State != value.Worktree.State || !bytes.Equal(worktree.IdentityJSON, value.Worktree.IdentityJSON) {
+		return PublishedCandidateEvidence{}, ErrPublicationEvidence
+	}
+	return value, nil
+}
+
 func publicationCandidateEqual(left, right StoredCandidate) bool {
 	left.CreatedAt, right.CreatedAt = time.Time{}, time.Time{}
 	return left.TicketVersion == right.TicketVersion && left.Fence == right.Fence && left.Snapshot == right.Snapshot && left.BuilderResult == right.BuilderResult && left.Commit == right.Commit && left.CommandBinding == right.CommandBinding

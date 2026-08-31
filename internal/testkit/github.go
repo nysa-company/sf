@@ -434,6 +434,36 @@ func (f *FakeGH) ObserveDraftPullRequest(_ context.Context, want contracts.PullR
 	return match.Identity, "OPEN", match.Draft, true, nil
 }
 
+// RefreshFactoryPullRequestIdentity models the production correction lookup:
+// the durable PR number and source branch stay fixed while its head advances.
+func (f *FakeGH) RefreshFactoryPullRequestIdentity(_ context.Context, prior, expected contracts.PullRequestIdentity) (contracts.PullRequestIdentity, error) {
+	var match contracts.PullRequestIdentity
+	count := 0
+	err := f.withState(func() (bool, error) {
+		if prior.Number <= 0 || !prior.FactoryOwned || !expected.FactoryOwned || !samePRSourceAndBase(prior, expected) || prior.HeadOID == expected.HeadOID {
+			return false, errors.New("fake-gh: invalid correction identity")
+		}
+		for _, pr := range f.state.PRs {
+			if pr.Identity.Number != prior.Number {
+				if samePRSourceAndBase(pr.Identity, prior) {
+					return false, errors.New("fake-gh: ambiguous correction pull request")
+				}
+				continue
+			}
+			if !samePRSourceAndBase(pr.Identity, prior) || pr.Identity.HeadOID != expected.HeadOID || pr.Merged || !strings.Contains(pr.Body, ownershipMarkerForFake(prior)) && !strings.Contains(pr.Body, ownershipMarkerForFake(expected)) {
+				return false, errors.New("fake-gh: correction pull request drifted")
+			}
+			count++
+			match = pr.Identity
+		}
+		if count != 1 {
+			return false, errors.New("fake-gh: correction pull request missing or ambiguous")
+		}
+		return false, nil
+	})
+	return match, err
+}
+
 func (f *FakeGH) CreateDraftPullRequest(_ context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
 	if err := validateFakeClaim(claim, "draft_pr", identity, title, body); err != nil {
 		return contracts.PullRequestIdentity{}, err

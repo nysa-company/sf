@@ -70,6 +70,7 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		return Result{}, err
 	}
 	result := Result{Ref: ref, State: ticket.State, Version: ticket.Version}
+	var priorPublication *store.PublishedCandidateEvidence
 	if ticket.State == domain.StateWaitingCI {
 		return result, nil
 	}
@@ -100,7 +101,14 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		result.State, result.Version, result.Transitioned, result.Replayed = domain.StateWaitingCI, ticket.Version+1, true, true
 		return result, nil
 	} else if !errors.Is(err, store.ErrNotFound) {
-		return result, err
+		// A valid witness for an earlier candidate is retained across a bounded
+		// correction. It supplies the only PR identity that may be updated; an
+		// unverifiable row remains a hard publication blocker.
+		prior, historyErr := w.Store.LoadHistoricalPublishedCandidate(ctx, ref)
+		if historyErr != nil {
+			return result, err
+		}
+		priorPublication = &prior
 	}
 
 	project, err := w.Store.Project(ctx, ref.Channel, ref.Project)
@@ -110,6 +118,9 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	candidate, err := w.Store.LatestCandidate(ctx, ref)
 	if err != nil {
 		return result, err
+	}
+	if priorPublication != nil && priorPublication.Candidate.Snapshot == candidate.Snapshot {
+		return result, store.ErrPublicationEvidence
 	}
 	worktree, err := w.Store.Worktree(ctx, ref)
 	if err != nil {
@@ -141,14 +152,18 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	}
 	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: repository.Owner, HeadRepository: repository.Name, HeadRef: worktree.Branch, HeadOID: candidate.Snapshot.HeadSHA, BaseRef: project.BaseRef, BaseOID: candidate.Snapshot.BaseSHA, FactoryOwned: true}
 	title, body := publicationText(ticket, candidate)
-	pr, observedAt, err := w.ensureDraft(ctx, ticket, fence, observer, identity, title, body)
+	pr, observedAt, err := w.ensureDraft(ctx, ticket, fence, observer, identity, title, body, priorPublication)
 	if err != nil {
 		return result, err
 	}
 	if err := w.validatePublished(ctx, observer, gitWorktree, candidate, pr); err != nil {
 		return result, err
 	}
-	prEffect, err := w.Store.Effect(ctx, draftKey(identity, title, body))
+	prEffectKey := draftKey(identity, title, body)
+	if priorPublication != nil {
+		prEffectKey = draftUpdateKey(pr, title, body)
+	}
+	prEffect, err := w.Store.Effect(ctx, prEffectKey)
 	if err != nil {
 		return result, err
 	}
@@ -193,7 +208,7 @@ func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domai
 		}
 		return w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: intent.SemanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}, store.CanonicalPublicationPushObservation(worktree.Branch, head))
 	}
-	if facts, err := w.Store.PublicationPushIntent(ctx, ticket.Ref); err == nil {
+	if facts, err := w.Store.PublicationPushIntent(ctx, ticket.Ref, intent.SemanticKey); err == nil {
 		if facts.Claim.Repository != project.Path || facts.Claim.Worktree != worktree.Path || facts.Claim.Branch != worktree.Branch || facts.Claim.BaseRef != project.BaseRef || facts.Claim.ExpectedBaseOID != candidate.Snapshot.BaseSHA || facts.Claim.ExpectedHeadOID != candidate.Snapshot.HeadSHA {
 			return store.Effect{}, ErrPublicationDrift
 		}
@@ -243,7 +258,10 @@ func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domai
 	return execute()
 }
 
-func (w Worker) ensureDraft(ctx context.Context, ticket store.Ticket, fence domain.Fence, observer contracts.DraftPullRequestObserver, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, time.Time, error) {
+func (w Worker) ensureDraft(ctx context.Context, ticket store.Ticket, fence domain.Fence, observer contracts.DraftPullRequestObserver, identity contracts.PullRequestIdentity, title, body string, historical *store.PublishedCandidateEvidence) (contracts.PullRequestIdentity, time.Time, error) {
+	if historical != nil {
+		return w.ensureDraftCorrection(ctx, ticket, fence, identity, title, body, historical.PullRequest)
+	}
 	key, request := draftKey(identity, title, body), githubboundary.CanonicalDraftPullRequestRequestDigest(identity, title, body)
 	effect, err := w.Store.Effect(ctx, key)
 	if errors.Is(err, store.ErrNotFound) {
@@ -264,6 +282,17 @@ func (w Worker) ensureDraft(ctx context.Context, ticket store.Ticket, fence doma
 	}
 	if found && (!samePR(observed, identity) || state != "OPEN" || !draft) {
 		return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
+	}
+	// A process can die after the absence observation has settled an old
+	// attempt but before it has replanned the effect. On restart the row is
+	// already failed, so ClaimEffect alone would retain the old ticket/leader
+	// identity and strand the retry. Failed is safe to rebind precisely because
+	// the preceding observation proved semantic absence.
+	if !found && effect.State == store.EffectFailed && (effect.TicketVersion != ticket.Version || effect.LeaderEpoch != fence.LeaderEpoch || effect.RunnerEpoch != fence.RunnerEpoch) {
+		effect, err = w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: key, Ref: ticket.Ref, Kind: "draft_pr", TicketVersion: ticket.Version, Fence: fence, RequestDigest: request})
+		if err != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, err
+		}
 	}
 	if effect.State == store.EffectConfirmed {
 		if !found || effect.ObservedIdentity != store.CanonicalPublicationPRObservation(observed, state, draft) {
@@ -322,6 +351,83 @@ func (w Worker) ensureDraft(ctx context.Context, ticket store.Ticket, fence doma
 			return contracts.PullRequestIdentity{}, time.Time{}, err
 		}
 	} else if _, err := w.Store.ReconcileInvalidatedEffect(ctx, store.InvalidatedEffectObservation{Prior: prior, Current: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence}}); err != nil {
+		return contracts.PullRequestIdentity{}, time.Time{}, err
+	}
+	return observed, time.Now().UTC(), nil
+}
+
+func (w Worker) ensureDraftCorrection(ctx context.Context, ticket store.Ticket, fence domain.Fence, expected contracts.PullRequestIdentity, title, body string, prior contracts.PullRequestIdentity) (contracts.PullRequestIdentity, time.Time, error) {
+	refresher, ok := w.GitHub.(contracts.DraftPullRequestRefresher)
+	if !ok || prior.Number <= 0 {
+		return contracts.PullRequestIdentity{}, time.Time{}, ErrBoundaryUnavailable
+	}
+	expected.Number = prior.Number
+	current, err := refresher.RefreshFactoryPullRequestIdentity(ctx, prior, expected)
+	if err != nil {
+		return contracts.PullRequestIdentity{}, time.Time{}, ErrPublicationDrift
+	}
+	key := draftUpdateKey(current, title, body)
+	request := githubboundary.CanonicalPullRequestUpdateRequestDigest(current, title, body)
+	effect, err := w.Store.Effect(ctx, key)
+	if errors.Is(err, store.ErrNotFound) {
+		if _, err = w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: key, Ref: ticket.Ref, Kind: store.PublicationPRUpdateEffectKind, TicketVersion: ticket.Version, Fence: fence, RequestDigest: request}); err != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, err
+		}
+		effect, err = w.Store.Effect(ctx, key)
+	}
+	if err != nil || effect.Ref != ticket.Ref || effect.Kind != store.PublicationPRUpdateEffectKind || effect.RequestDigest != request {
+		if err != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, err
+		}
+		return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
+	}
+	if effect.State == store.EffectConfirmed {
+		observed, state, draft, found, observeErr := w.GitHub.(contracts.DraftPullRequestObserver).ObserveDraftPullRequest(ctx, current)
+		if observeErr != nil || !found || !samePR(observed, current) || state != "OPEN" || !draft || effect.ObservedIdentity != store.CanonicalPublicationPRObservation(observed, state, draft) {
+			return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
+		}
+		return observed, time.Now().UTC(), nil
+	}
+	observer, ok := w.GitHub.(contracts.DraftPullRequestObserver)
+	if !ok {
+		return contracts.PullRequestIdentity{}, time.Time{}, ErrBoundaryUnavailable
+	}
+	if effect.State == store.EffectExecuting || effect.State == store.EffectUncertain {
+		observed, state, draft, found, observeErr := observer.ObserveDraftPullRequest(ctx, current)
+		if observeErr == nil && found && samePR(observed, current) && state == "OPEN" && draft {
+			confirmed, confirmErr := w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: effect.LeaderEpoch, RunnerEpoch: effect.RunnerEpoch, ClaimEpoch: effect.ClaimEpoch}}, store.CanonicalPublicationPRObservation(observed, state, draft))
+			if confirmErr != nil {
+				return contracts.PullRequestIdentity{}, time.Time{}, confirmErr
+			}
+			_ = confirmed
+			return observed, time.Now().UTC(), nil
+		}
+		return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
+	}
+	if effect.TicketVersion != ticket.Version || effect.LeaderEpoch != fence.LeaderEpoch || effect.RunnerEpoch != fence.RunnerEpoch {
+		effect, err = w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: key, Ref: ticket.Ref, Kind: store.PublicationPRUpdateEffectKind, TicketVersion: ticket.Version, Fence: fence, RequestDigest: request})
+		if err != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, err
+		}
+	}
+	claim, err := w.Store.ClaimEffect(ctx, store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
+	if err != nil || !claim.Claimed {
+		if err != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, err
+		}
+		return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
+	}
+	if err := w.GitHub.UpdatePullRequest(ctx, claim.ExternalClaim(), current, title, body); err != nil {
+		return contracts.PullRequestIdentity{}, time.Time{}, err
+	}
+	observed, state, draft, found, err := observer.ObserveDraftPullRequest(ctx, current)
+	if err != nil || !found || !samePR(observed, current) || state != "OPEN" || !draft {
+		if err != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, err
+		}
+		return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
+	}
+	if _, err := w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}}, store.CanonicalPublicationPRObservation(observed, state, draft)); err != nil {
 		return contracts.PullRequestIdentity{}, time.Time{}, err
 	}
 	return observed, time.Now().UTC(), nil
@@ -392,6 +498,9 @@ func pushRequestDigest(ref domain.TicketRef, repository string, worktree store.S
 }
 func draftKey(identity contracts.PullRequestIdentity, title, body string) string {
 	return "github/draft-pr/v1/" + githubboundary.CanonicalDraftPullRequestRequestDigest(identity, title, body)
+}
+func draftUpdateKey(identity contracts.PullRequestIdentity, title, body string) string {
+	return "github/draft-pr-update/v1/" + githubboundary.CanonicalPullRequestUpdateRequestDigest(identity, title, body)
 }
 func digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 func samePR(left, right contracts.PullRequestIdentity) bool {
