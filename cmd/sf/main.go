@@ -15,6 +15,7 @@ import (
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/git"
+	"github.com/nysa-company/sf/internal/localruntime"
 	"github.com/nysa-company/sf/internal/processsupervisor"
 	"github.com/nysa-company/sf/internal/providercoord"
 	"github.com/nysa-company/sf/internal/store"
@@ -124,6 +125,11 @@ func main() {
 			ProviderQualifier: func(qualifyCtx context.Context, database *store.Store, value domain.Channel, builder, reviewer string) (any, error) {
 				return codexprovider.QualifyLocalPair(qualifyCtx, database, value, builder, reviewer, supervisor)
 			},
+			WorkflowRuntimeFactory: localruntime.Factory(localruntime.Config{
+				Channel: channel,
+				GitHome: filepath.Join(filepath.Dir(paths.Socket), "git-home"),
+				Workers: 2,
+			}),
 		})
 	}
 	os.Exit(cli.ExecuteWithDaemon(ctx, os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}, runDaemon))
