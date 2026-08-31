@@ -231,6 +231,16 @@ func (e *Engine) SignalFinalReview(ctx context.Context, request contracts.Signal
 	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: request.Trigger, Fence: request.Fence, Attributes: attributes, EventPayload: request.EventPayload}, e.store.TransitionFinalReview)
 }
 
+// SignalAutonomyBlocked consumes the same authenticated final-review pass as
+// a normal review exit, but records the normative closed autonomy prerequisite
+// rather than offering an approval shortcut.
+func (e *Engine) SignalAutonomyBlocked(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if request.From != domain.StateReviewing || request.Trigger != "review_pass" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: "review_pass", Fence: request.Fence, Attributes: map[string]string{"ticket_type_not_spike": "true", "merge_mode_autonomous": "true", "autonomy_ineligible": "true"}, EventPayload: `{"code":"autonomy_ineligible"}`}, e.store.TransitionFinalReview)
+}
+
 // SignalFinalReviewRepair derives the state-machine branch from the durable
 // reviewer owner, then lets Store consume that same immutable result/budget.
 func (e *Engine) SignalFinalReviewRepair(ctx context.Context, request contracts.SignalRequest, owner string) (contracts.TransitionResult, error) {

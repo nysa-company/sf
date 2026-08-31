@@ -68,12 +68,46 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		}, err
 	case domain.StateMerging:
 		return w.merge(ctx, ticket, fence)
+	case domain.StateWaitingManualMerge:
+		return w.observeManualMerge(ctx, ticket, fence)
 	default:
 		// waiting_ci and all control/terminal states are inert. The scheduler
 		// normally filters them, but keeping this dispatch boundary inert makes
 		// direct calls safe as well.
 		return workflowworker.RunResult{Ref: ref, State: ticket.State, Version: ticket.Version}, nil
 	}
+}
+
+// observeManualMerge is intentionally read-only.  Manual mode never marks a
+// PR ready or asks GitHub to merge; it only advances after the authenticated
+// published-PR observer proves the reviewed source head was externally merged.
+func (w Worker) observeManualMerge(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {
+	result := workflowworker.RunResult{Ref: ticket.Ref, State: ticket.State, Version: ticket.Version, Phase: domain.PhaseReconcile}
+	if !w.PublicationEnabled || w.Engine == nil || w.Publication.GitHub == nil {
+		return result, ErrPublishingUnavailable
+	}
+	observer := publishedMergeObserver{Store: w.Store, GitHub: w.Publication.GitHub}
+	merged, err := observer.MergeObserved(ctx, ticket.Ref)
+	if err != nil {
+		return result, err
+	}
+	if !merged {
+		return result, nil
+	}
+	transition, err := w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: domain.StateWaitingManualMerge, Trigger: "external_merge_observed", Fence: fence, Attributes: map[string]string{"merged_pr_identity_exact": "true", "merged_source_head_equals_reviewed_head": "true", "required_checks_green": "true", "mode_completion_policy_satisfied": "true"}})
+	if err != nil {
+		return result, err
+	}
+	_, err = w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: transition.TicketVersion, From: domain.StateReconciling, Trigger: "reconcile_pass", Fence: fence, Attributes: map[string]string{"terminal_remote_truth_exact": "true"}})
+	if err != nil {
+		return result, err
+	}
+	current, err := w.Store.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		return result, err
+	}
+	result.State, result.Version, result.Transitioned = current.State, current.Version, true
+	return result, nil
 }
 
 func (w Worker) merge(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {

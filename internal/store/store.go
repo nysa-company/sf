@@ -1388,7 +1388,7 @@ func (s *Store) TransitionVerification(ctx context.Context, transition Transitio
 // method is the missing lifecycle consumer that closes the crash window after
 // provider completion but before the transition response reaches the worker.
 func (s *Store) TransitionFinalReview(ctx context.Context, transition Transition) (TransitionResult, error) {
-	if transition.From != domain.StateReviewing || transition.Trigger != "review_pass" || (transition.To != domain.StateWaitingApproval && transition.To != domain.StateWaitingManualMerge && transition.To != domain.StateDone) {
+	if transition.From != domain.StateReviewing || transition.Trigger != "review_pass" || (transition.To != domain.StateWaitingApproval && transition.To != domain.StateWaitingManualMerge && transition.To != domain.StateDone && transition.To != domain.StateBlocked) {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
 	return s.transitionWithEvidence(ctx, transition, func(ctx context.Context, conn *sql.Conn, version, runner uint64) error {
@@ -1397,7 +1397,7 @@ func (s *Store) TransitionFinalReview(ctx context.Context, transition Transition
 		if err := conn.QueryRowContext(ctx, `SELECT ticket_type,merge_mode FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&ticketType, &mergeMode); err != nil {
 			return err
 		}
-		if (ticketType == domain.TicketSpike && transition.To != domain.StateDone) || (ticketType != domain.TicketSpike && ((mergeMode == domain.MergeGuarded && transition.To != domain.StateWaitingApproval) || (mergeMode == domain.MergeManual && transition.To != domain.StateWaitingManualMerge) || mergeMode == domain.MergeAutonomous || transition.To == domain.StateDone)) {
+		if (ticketType == domain.TicketSpike && transition.To != domain.StateDone) || (ticketType != domain.TicketSpike && ((mergeMode == domain.MergeGuarded && transition.To != domain.StateWaitingApproval) || (mergeMode == domain.MergeManual && transition.To != domain.StateWaitingManualMerge) || (mergeMode == domain.MergeAutonomous && transition.To != domain.StateBlocked) || (mergeMode != domain.MergeAutonomous && transition.To == domain.StateDone))) {
 			return ErrEvidenceConflict
 		}
 		authority, _, reviewer, err := s.finalReviewerResult(ctx, conn, transition.Ref, version, transition.Fence)
