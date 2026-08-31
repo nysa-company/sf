@@ -682,6 +682,48 @@ func (s *Store) WorktreeCreationIntent(ctx context.Context, ref domain.TicketRef
 	return facts, nil
 }
 
+// PublicationPushIntent returns the sole durable candidate-push authority for
+// a ticket. It is recovery-only: callers can reconcile the immutable remote
+// target but cannot mint, rebind, or claim an effect from these facts.
+func (s *Store) PublicationPushIntent(ctx context.Context, ref domain.TicketRef) (GitMutationIntentFacts, error) {
+	if err := ref.Validate(); err != nil {
+		return GitMutationIntentFacts{}, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT i.semantic_key FROM git_mutation_intents i
+		JOIN effects e ON e.semantic_key=i.semantic_key
+		WHERE i.channel=? AND i.project_id=? AND i.ticket_id=? AND i.operation='push'
+		AND e.state IN ('executing','uncertain','confirmed') ORDER BY i.semantic_key`, ref.Channel, ref.Project, ref.Ticket)
+	if err != nil {
+		return GitMutationIntentFacts{}, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return GitMutationIntentFacts{}, err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return GitMutationIntentFacts{}, err
+	}
+	if len(keys) == 0 {
+		return GitMutationIntentFacts{}, ErrNotFound
+	}
+	if len(keys) != 1 {
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
+	facts, err := s.GitMutationIntentFacts(ctx, keys[0])
+	if err != nil || facts.Claim.TicketRef != ref || facts.Claim.Operation != "push" || facts.Effect.Kind != "git/push" || (facts.Effect.State != EffectExecuting && facts.Effect.State != EffectUncertain && facts.Effect.State != EffectConfirmed) {
+		if err != nil {
+			return GitMutationIntentFacts{}, err
+		}
+		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
+	return facts, nil
+}
+
 // RecoverGitMutationLeases is deliberately proof-before-release.  Nothing in
 // this method infers safety from elapsed time, a new leader, or a PID alone.
 func (s *Store) RecoverGitMutationLeases(ctx context.Context, channel domain.Channel, leader uint64, drainer contracts.GitMutationDrainer) error {

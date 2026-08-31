@@ -129,6 +129,33 @@ func TestWorktreeCreationIntentRecoversExecutingAndConfirmedIdentity(t *testing.
 	}
 }
 
+func TestPublicationPushIntentRecoversOnlyOneAuthenticatedPush(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := gitIntentFixture(t, db, ctx, "SF-push-recovery")
+	intent.Operation, intent.ExpectedHeadOID = "push", strings.Repeat("b", 40)
+	intent.SemanticKey = CanonicalGitMutationSemanticKey(intent)
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "git/push", TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := db.PublicationPushIntent(ctx, intent.Ref)
+	if err != nil || facts.Claim != claim || facts.Effect.State != EffectExecuting {
+		t.Fatalf("executing=%+v err=%v", facts, err)
+	}
+	if _, err := db.ConfirmEffect(ctx, EffectFence{SemanticKey: claim.SemanticKey, Ref: claim.TicketRef, TicketVersion: claim.TicketVersion, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}, "push-observed"); err != nil {
+		t.Fatal(err)
+	}
+	if facts, err = db.PublicationPushIntent(ctx, intent.Ref); err != nil || facts.Effect.State != EffectConfirmed {
+		t.Fatalf("confirmed=%+v err=%v", facts, err)
+	}
+	if _, err := db.PublicationPushIntent(ctx, domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-none"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("none=%v", err)
+	}
+}
+
 func TestGitMutationLeaseReleaseIsBoundedWhenSQLiteIsBusy(t *testing.T) {
 	db, ctx := openTestStore(t)
 	intent := gitIntentFixture(t, db, ctx, "SF-git-release-busy")
