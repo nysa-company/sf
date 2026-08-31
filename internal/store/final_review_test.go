@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
-	"github.com/nysa-company/sf/internal/workflowprompt"
 )
 
 type finalReviewFixture struct {
@@ -54,48 +54,50 @@ func finalReviewLifecycleFixtureFor(t *testing.T, ticketType domain.TicketType, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	var witness, host, owner, repo, headOwner, headRepo, headRef, headOID, baseRef, baseOID string
-	var number int
-	err = db.db.QueryRowContext(ctx, `SELECT witness_digest,github_host,github_owner,github_name,github_pr_number,github_head_owner,github_head_repository,github_head_ref,github_head_oid,github_base_ref,github_base_oid FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=?`, waiting.Ref.Channel, waiting.Ref.Project, waiting.Ref.Ticket).Scan(&witness, &host, &owner, &repo, &number, &headOwner, &headRepo, &headRef, &headOID, &baseRef, &baseOID)
+	publication, err := db.LoadPublishedCandidate(ctx, waiting.Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
-	observedAt := time.Now().UTC().Format(time.RFC3339Nano)
-	observationDigest := publicationIdentityDigest([]byte("final-review-green-observation:" + string(waiting.Ref.Ticket)))
-	checks := []workflowprompt.Check{{Name: "unit", ExternalID: "run-1", Status: "success"}}
-	checkIdentity, err := workflowprompt.NewChecksIdentity("fixture", candidate.Snapshot.HeadSHA, checks)
+	policy := CIRequiredCheckPolicy{
+		Ref: waiting.Ref, CandidateGeneration: candidate.Snapshot.Generation,
+		CandidateHeadSHA: candidate.Snapshot.HeadSHA, CandidateTreeSHA: candidate.Snapshot.TreeSHA,
+		PublicationWitnessDigest: publication.WitnessDigest, ProtectedBranchRef: publication.PullRequest.BaseRef,
+		ProtectedBranchOID: publication.PullRequest.BaseOID, PolicySourceDigest: strings.Repeat("a", 64),
+		AuthenticatedPrincipal: "fixture", RequiredChecks: []CIObservationCheck{{CanonicalName: "unit", ExternalID: "run-1"}},
+		authenticated: true,
+	}
+	canonicalPolicy, err := canonicalCIPolicy(policy)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.db.ExecContext(ctx, `INSERT INTO ci_observations(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,publication_witness_digest,pr_host,pr_owner,pr_repo,pr_number,pr_head_owner,pr_head_repo,pr_head_ref,pr_head_oid,pr_base_ref,pr_base_oid,pr_factory_owned,pr_open,pr_draft,observed_ticket_version,observed_leader_epoch,observed_runner_epoch,observed_at,required_set_digest,required_check_count,classification,diagnostic_digest,diagnostic_text,diagnostic_json,observation_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, waiting.Ref.Channel, waiting.Ref.Project, waiting.Ref.Ticket, candidate.Snapshot.Generation, candidate.Snapshot.HeadSHA, candidate.Snapshot.TreeSHA, witness, host, owner, repo, number, headOwner, headRepo, headRef, headOID, baseRef, baseOID, 1, 1, 1, waiting.Version, fence.LeaderEpoch, waiting.RunnerEpoch, observedAt, checkIdentity.SetDigest, len(checks), "green", "", "", "", observationDigest); err != nil {
+	if err := db.RecordCIRequiredCheckPolicy(ctx, policy); err != nil {
 		t.Fatal(err)
 	}
-	var observationID int64
-	if err := db.db.QueryRowContext(ctx, `SELECT observation_id FROM ci_observations WHERE observation_digest=?`, observationDigest).Scan(&observationID); err != nil {
-		t.Fatal(err)
+	observation := CIObservation{
+		Ref: waiting.Ref, CandidateGeneration: candidate.Snapshot.Generation,
+		CandidateHeadSHA: candidate.Snapshot.HeadSHA, CandidateTreeSHA: candidate.Snapshot.TreeSHA,
+		PublicationWitnessDigest: publication.WitnessDigest, PolicyWitnessDigest: canonicalPolicy.PolicyWitnessDigest,
+		PullRequest: publication.PullRequest, ObservedTicketVersion: waiting.Version,
+		ObservedFence: fence, ObservedAt: time.Now().UTC(),
+		RequiredChecks: []CIObservationCheck{{CanonicalName: "unit", ExternalID: "run-1", NormalizedState: "success"}},
+		Classification: "green",
 	}
-	if _, err := db.db.ExecContext(ctx, `INSERT INTO ci_observation_checks(observation_id,observation_digest,canonical_name,external_id,normalized_state,failing_diagnostic_digest,failing_diagnostic_text) VALUES(?,?,?,?,?,?,?)`, observationID, observationDigest, checks[0].Name, checks[0].ExternalID, checks[0].Status, "", ""); err != nil {
-		t.Fatal(err)
-	}
-	created := time.Now().UTC().Format(time.RFC3339Nano)
-	event, err := db.db.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, waiting.Ref.Channel, waiting.Ref.Project, waiting.Ref.Ticket, waiting.Version+1, "checks_green", domain.StateWaitingCI, domain.StateReviewing, `{}`, created)
+	canonicalObservation, err := canonicalCIObservation(observation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	eventID, err := event.LastInsertId()
-	if err != nil {
+	if err := db.RecordCIObservation(ctx, observation); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.db.ExecContext(ctx, `UPDATE tickets SET state='reviewing',resume_state=NULL,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state='waiting_ci' AND version=?`, waiting.Ref.Channel, waiting.Ref.Project, waiting.Ref.Ticket, waiting.Version); err != nil {
-		t.Fatal(err)
-	}
-	transitionDigest := publicationIdentityDigest([]byte("final-review-green-transition:" + string(waiting.Ref.Ticket)))
-	if _, err := db.db.ExecContext(ctx, `INSERT INTO ci_transition_evidence(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,ticket_version,event_id,event_created_at,observation_classification,observation_digest,observation_ticket_version,observation_leader_epoch,observation_runner_epoch,prior_publication_witness_digest,prior_state,resulting_state,resulting_trigger,transition_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, waiting.Ref.Channel, waiting.Ref.Project, waiting.Ref.Ticket, candidate.Snapshot.Generation, candidate.Snapshot.HeadSHA, candidate.Snapshot.TreeSHA, waiting.Version+1, eventID, created, "green", observationDigest, waiting.Version, fence.LeaderEpoch, waiting.RunnerEpoch, witness, domain.StateWaitingCI, domain.StateReviewing, "checks_green", transitionDigest, created); err != nil {
+	if _, err := db.ConsumeCIObservation(ctx, CIObservationTransition{Ref: waiting.Ref, ObservationDigest: canonicalObservation.ObservationDigest, ExpectedVersion: waiting.Version, Fence: fence}); err != nil {
 		t.Fatal(err)
 	}
 	ticket, err := db.Ticket(ctx, waiting.Ref)
 	if err != nil || ticket.State != domain.StateReviewing {
 		t.Fatalf("reviewing ticket=%+v err=%v", ticket, err)
+	}
+	if _, _, _, err := finalReviewCIAuthorityFrom(ctx, db.db, waiting.Ref, candidate); err != nil {
+		t.Fatalf("fixture CI chain: %v", err)
 	}
 	return finalReviewFixture{db: db, ctx: ctx, ticket: ticket, fence: domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: ticket.RunnerEpoch}, candidate: candidate}
 }
@@ -369,5 +371,52 @@ func TestFinalReviewAuthorityRejectsMissingAndForgedCILineage(t *testing.T) {
 	}
 	if _, err := fixture.db.FinalReviewAuthority(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence); !errors.Is(err, ErrEvidenceConflict) && !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("forged recovery lineage accepted: %v", err)
+	}
+}
+
+func TestFinalReviewAuthorityRejectsLegacyAndTamperedV43CILineage(t *testing.T) {
+	t.Run("legacy blank policy witness", func(t *testing.T) {
+		fixture := finalReviewLifecycleFixture(t)
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `DROP TRIGGER ci_observations_immutable_update`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE ci_observations SET policy_witness_digest='' WHERE channel=? AND project_id=? AND ticket_id=?`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.FinalReviewAuthority(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("legacy blank policy witness accepted: %v", err)
+		}
+	})
+	t.Run("observation check tamper", func(t *testing.T) {
+		fixture := finalReviewLifecycleFixture(t)
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `DROP TRIGGER ci_observation_checks_immutable_update`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE ci_observation_checks SET normalized_state='failure'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.FinalReviewAuthority(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("tampered CI observation accepted: %v", err)
+		}
+	})
+	t.Run("green transition event tamper", func(t *testing.T) {
+		fixture := finalReviewLifecycleFixture(t)
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE events SET payload='{}' WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='checks_green'`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.FinalReviewAuthority(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("tampered CI transition event accepted: %v", err)
+		}
+	})
+}
+
+func TestFinalReviewTransitionAuthenticatesCILineageOnWriteConnection(t *testing.T) {
+	fixture := finalReviewLifecycleFixture(t)
+	completeFinalReview(t, fixture)
+	fixture.db.db.SetMaxOpenConns(1)
+	ctx, cancel := context.WithTimeout(fixture.ctx, time.Second)
+	defer cancel()
+	if _, err := fixture.db.TransitionFinalReview(ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, From: domain.StateReviewing, To: domain.StateWaitingApproval, Trigger: "review_pass", Fence: fixture.fence, EventPayload: `{}`}); err != nil {
+		t.Fatalf("single-connection final review transition: %v", err)
 	}
 }

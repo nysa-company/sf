@@ -50,7 +50,7 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		return workflowworker.RunResult{Ref: ref}, err
 	}
 	switch ticket.State {
-	case domain.StatePlanning, domain.StateVerifying, domain.StateBuilding:
+	case domain.StatePlanning, domain.StateVerifying, domain.StateBuilding, domain.StateReviewing:
 		return w.Workflow.Run(ctx, ref, fence)
 	case domain.StatePublishing:
 		if !w.PublicationEnabled {

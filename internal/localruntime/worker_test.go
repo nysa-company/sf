@@ -1,6 +1,7 @@
 package localruntime
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -10,7 +11,17 @@ import (
 	"github.com/nysa-company/sf/internal/engine"
 	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
+	"github.com/nysa-company/sf/internal/workflowruntime"
+	"github.com/nysa-company/sf/internal/workflowworker"
+	"github.com/nysa-company/sf/internal/worktreecoord"
 )
+
+type reviewingEnsurer struct{ calls int }
+
+func (e *reviewingEnsurer) Ensure(context.Context, worktreecoord.EnsureRequest) (store.StoredWorktree, error) {
+	e.calls++
+	return store.StoredWorktree{Path: "/tmp/reviewing-worktree", State: "registered"}, nil
+}
 
 func TestPrePublishingWorkerBlocksPublishingWithActionableChannelGuidance(t *testing.T) {
 	database := openStore(t)
@@ -83,5 +94,27 @@ func TestPrePublishingBlockRejectsUnreconciledPublicationEffect(t *testing.T) {
 	ticket, err := database.Ticket(t.Context(), ref)
 	if err != nil || ticket.State != domain.StatePublishing || ticket.BlockedCode != "" {
 		t.Fatalf("unreconciled publication blocker mutated ticket=%+v err=%v", ticket, err)
+	}
+}
+
+func TestProductionSchedulerDispatchesReviewingTicketToWorkflowWorker(t *testing.T) {
+	database := openStore(t)
+	if err := database.CreateProject(t.Context(), store.Project{Channel: domain.ChannelDev, ID: "nysa", Path: "/tmp/nysa", BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-reviewing-dispatch"}
+	if err := database.CreateTicket(t.Context(), store.Ticket{Ref: ref, State: domain.StateReviewing, SourceDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(t.Context(), ref.Channel, "reviewing-dispatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ensurer := &reviewingEnsurer{}
+	dispatcher := Worker{Store: database, Workflow: workflowworker.Worker{Evidence: database, Engine: engine.New(database, statemachine.Spec{})}}
+	scheduler := workflowruntime.NewScheduler(domain.ChannelDev, workflowruntime.StoreTicketSource{Store: database}, ensurer, dispatcher)
+	result := scheduler.Tick(t.Context(), domain.Fence{LeaderEpoch: leader})
+	if result.Outcome != workflowruntime.OutcomeWorker || result.Ref != ref || result.Worker.Phase != domain.PhaseReview || ensurer.calls != 1 {
+		t.Fatalf("reviewing scheduler dispatch=%+v worktree_calls=%d", result, ensurer.calls)
 	}
 }
