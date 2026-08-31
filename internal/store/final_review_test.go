@@ -40,7 +40,18 @@ func finalReviewLifecycleFixture(t *testing.T) finalReviewFixture {
 }
 
 func finalReviewLifecycleFixtureFor(t *testing.T, ticketType domain.TicketType, mergeMode domain.MergeMode) finalReviewFixture {
+	return finalReviewLifecycleFixtureForPending(t, ticketType, mergeMode, 0)
+}
+
+func finalReviewLifecycleFixtureWithPending(t *testing.T, pending int) finalReviewFixture {
+	return finalReviewLifecycleFixtureForPending(t, domain.TicketFeature, domain.MergeGuarded, pending)
+}
+
+func finalReviewLifecycleFixtureForPending(t *testing.T, ticketType domain.TicketType, mergeMode domain.MergeMode, pending int) finalReviewFixture {
 	t.Helper()
+	if pending < 0 || pending > 4 {
+		t.Fatalf("invalid pending CI fixture count=%d", pending)
+	}
 	db, ctx, publishing, fence := publicationLifecycleFixtureFor(t, ticketType, mergeMode)
 	recordFixturePublication(t, db, ctx, publishing, fence)
 	if _, err := db.TransitionPublishedCandidate(ctx, Transition{Ref: publishing.Ref, ExpectedVersion: publishing.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence, EventPayload: `{}`}); err != nil {
@@ -73,28 +84,38 @@ func finalReviewLifecycleFixtureFor(t *testing.T, ticketType domain.TicketType, 
 	if err := db.RecordCIRequiredCheckPolicy(ctx, policy); err != nil {
 		t.Fatal(err)
 	}
-	observation := CIObservation{
-		Ref: waiting.Ref, CandidateGeneration: candidate.Snapshot.Generation,
-		CandidateHeadSHA: candidate.Snapshot.HeadSHA, CandidateTreeSHA: candidate.Snapshot.TreeSHA,
-		PublicationWitnessDigest: publication.WitnessDigest, PolicyWitnessDigest: canonicalPolicy.PolicyWitnessDigest,
-		PullRequest: publication.PullRequest, ObservedTicketVersion: waiting.Version,
-		ObservedFence: fence, ObservedAt: time.Now().UTC(),
-		RequiredChecks: []CIObservationCheck{{CanonicalName: "unit", ExternalID: "run-1", NormalizedState: "success"}},
-		Classification: "green",
+	record := func(classification, state string) {
+		observation := CIObservation{
+			Ref: waiting.Ref, CandidateGeneration: candidate.Snapshot.Generation,
+			CandidateHeadSHA: candidate.Snapshot.HeadSHA, CandidateTreeSHA: candidate.Snapshot.TreeSHA,
+			PublicationWitnessDigest: publication.WitnessDigest, PolicyWitnessDigest: canonicalPolicy.PolicyWitnessDigest,
+			PullRequest: publication.PullRequest, ObservedTicketVersion: waiting.Version,
+			ObservedFence: fence, ObservedAt: time.Now().UTC(),
+			RequiredChecks: []CIObservationCheck{{CanonicalName: "unit", ExternalID: "run-1", NormalizedState: state}},
+			Classification: classification,
+		}
+		canonicalObservation, err := canonicalCIObservation(observation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.RecordCIObservation(ctx, observation); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ConsumeCIObservation(ctx, CIObservationTransition{Ref: waiting.Ref, ObservationDigest: canonicalObservation.ObservationDigest, ExpectedVersion: waiting.Version, Fence: fence}); err != nil {
+			t.Fatal(err)
+		}
+		waiting, err = db.Ticket(ctx, waiting.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	canonicalObservation, err := canonicalCIObservation(observation)
-	if err != nil {
-		t.Fatal(err)
+	for i := 0; i < pending; i++ {
+		record("pending", "pending")
 	}
-	if err := db.RecordCIObservation(ctx, observation); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ConsumeCIObservation(ctx, CIObservationTransition{Ref: waiting.Ref, ObservationDigest: canonicalObservation.ObservationDigest, ExpectedVersion: waiting.Version, Fence: fence}); err != nil {
-		t.Fatal(err)
-	}
-	ticket, err := db.Ticket(ctx, waiting.Ref)
-	if err != nil || ticket.State != domain.StateReviewing {
-		t.Fatalf("reviewing ticket=%+v err=%v", ticket, err)
+	record("green", "success")
+	ticket := waiting
+	if ticket.State != domain.StateReviewing {
+		t.Fatalf("reviewing ticket=%+v", ticket)
 	}
 	if _, _, _, err := finalReviewCIAuthorityFrom(ctx, db.db, waiting.Ref, candidate); err != nil {
 		t.Fatalf("fixture CI chain: %v", err)
@@ -406,6 +427,57 @@ func TestFinalReviewAuthorityRejectsLegacyAndTamperedV43CILineage(t *testing.T) 
 		}
 		if _, err := fixture.db.FinalReviewAuthority(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence); !errors.Is(err, ErrEvidenceConflict) {
 			t.Fatalf("tampered CI transition event accepted: %v", err)
+		}
+	})
+}
+
+func TestFinalReviewAuthorityAuthenticatesCompletePendingToGreenChain(t *testing.T) {
+	fixture := finalReviewLifecycleFixtureWithPending(t, 2)
+	authority, err := fixture.db.FinalReviewAuthority(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence)
+	if err != nil || authority.Candidate.Snapshot != fixture.candidate.Snapshot || len(authority.Checks.Required) != 1 || authority.Checks.Required[0].Status != "success" {
+		t.Fatalf("pending-to-green authority=%+v err=%v", authority, err)
+	}
+}
+
+func TestFinalReviewAuthorityRejectsBrokenPendingToGreenChain(t *testing.T) {
+	t.Run("missing pending transition", func(t *testing.T) {
+		fixture := finalReviewLifecycleFixtureWithPending(t, 2)
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `DROP TRIGGER ci_transition_evidence_immutable_delete`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `DELETE FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND observation_classification='pending'`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.FinalReviewAuthority(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("missing pending chain accepted: %v", err)
+		}
+	})
+	t.Run("out of order pending transition is physically rejected", func(t *testing.T) {
+		fixture := finalReviewLifecycleFixtureWithPending(t, 2)
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `DROP TRIGGER ci_transition_evidence_immutable_update`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE ci_transition_evidence SET ticket_version=ticket_version+10 WHERE channel=? AND project_id=? AND ticket_id=? AND observation_classification='pending'`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket); err == nil {
+			t.Fatal("out-of-order pending transition accepted")
+		}
+		if _, err := fixture.db.FinalReviewAuthority(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence); err != nil {
+			t.Fatalf("rejected out-of-order write corrupted CI authority: %v", err)
+		}
+	})
+	t.Run("tampered pending event", func(t *testing.T) {
+		fixture := finalReviewLifecycleFixtureWithPending(t, 1)
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE events SET payload='{}' WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='checks_pending'`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.FinalReviewAuthority(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("tampered pending chain accepted: %v", err)
+		}
+	})
+	t.Run("duplicate transition is physically rejected", func(t *testing.T) {
+		fixture := finalReviewLifecycleFixtureWithPending(t, 1)
+		_, err := fixture.db.db.ExecContext(fixture.ctx, `INSERT INTO ci_transition_evidence(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,ticket_version,event_id,event_created_at,observation_classification,observation_digest,observation_ticket_version,observation_leader_epoch,observation_runner_epoch,prior_publication_witness_digest,prior_state,resulting_state,resulting_trigger,transition_digest,created_at) SELECT channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,ticket_version,event_id,event_created_at,observation_classification,observation_digest,observation_ticket_version,observation_leader_epoch,observation_runner_epoch,prior_publication_witness_digest,prior_state,resulting_state,resulting_trigger,transition_digest,created_at FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND observation_classification='pending'`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket)
+		if err == nil {
+			t.Fatal("duplicate pending transition accepted")
 		}
 	})
 }

@@ -642,10 +642,10 @@ func TestCIV41RowsSurviveV42V43MigrationAndRemainImmutable(t *testing.T) {
 		}
 	}
 	if observations != 1 || checks != 1 || evidence != 1 || bindings != 1 || completions != 1 {
-		t.Fatalf("v41 authority rows lost during v42-v44 migration: observations=%d checks=%d evidence=%d bindings=%d completions=%d", observations, checks, evidence, bindings, completions)
+		t.Fatalf("v41 authority rows lost during v42-v45 migration: observations=%d checks=%d evidence=%d bindings=%d completions=%d", observations, checks, evidence, bindings, completions)
 	}
 	var version int
-	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 44 {
+	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != schemaVersion {
 		t.Fatalf("migrated schema=%d err=%v", version, err)
 	}
 	if _, err := database.db.ExecContext(ctx, `UPDATE ci_observations SET diagnostic_text='tampered' WHERE observation_id=1`); err == nil {
@@ -701,16 +701,16 @@ func TestV41PlanningWithoutRunnerStartAuthorityBlocksDuringV45UpgradeAndRestart(
 	}
 	ref := domain.TicketRef{Channel: domain.ChannelStable, Project: "legacy-planning", Ticket: "SF-legacy-planning"}
 	assertDisposition := func() {
-		var state, resume, code, trigger, from, to string
+		var state, resume, code, trigger, from, to, payload string
 		var version, events, authorities int
-		if err := database.db.QueryRowContext(ctx, `SELECT state,resume_state,blocked_code,version FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &resume, &code, &version); err != nil {
+		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &resume, &code, &version); err != nil {
 			t.Fatal(err)
 		}
-		if state != "blocked" || resume != "planning" || code != "legacy_runner_start_authority_unverifiable" || version != 3 {
+		if state != "blocked" || resume != "" || code != "legacy_runner_start_authority_unverifiable" || version != 3 {
 			t.Fatalf("planning disposition=%s/%s/%s/v%d", state, resume, code, version)
 		}
-		if err := database.db.QueryRowContext(ctx, `SELECT trigger,from_state,to_state FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=3`, ref.Channel, ref.Project, ref.Ticket).Scan(&trigger, &from, &to); err != nil || trigger != "typed_blocker" || from != "planning" || to != "blocked" {
-			t.Fatalf("planning blocker event=%s/%s/%s err=%v", trigger, from, to, err)
+		if err := database.db.QueryRowContext(ctx, `SELECT trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=3`, ref.Channel, ref.Project, ref.Ticket).Scan(&trigger, &from, &to, &payload); err != nil || trigger != "typed_blocker" || from != "planning" || to != "blocked" || !strings.Contains(payload, "submit a fresh ticket") {
+			t.Fatalf("planning blocker event=%s/%s/%s payload=%s err=%v", trigger, from, to, payload, err)
 		}
 		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&events); err != nil || events != 1 {
 			t.Fatalf("planning events=%d err=%v", events, err)
