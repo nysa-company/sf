@@ -198,6 +198,37 @@ func TestPublicationPushIntentFailsClosedForUncertainDuplicateAndMalformedRows(t
 	}
 }
 
+func TestPublicationPushIntentReclaimsOnlyProvenAbsentImmutableTarget(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := gitIntentFixture(t, db, ctx, "SF-push-reclaim")
+	intent.Operation, intent.ExpectedHeadOID = "push", strings.Repeat("b", 40)
+	intent.SemanticKey = CanonicalGitMutationSemanticKey(intent)
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "git/push", TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ObserveEffect(ctx, EffectObservation{EffectFence: EffectFence{SemanticKey: first.SemanticKey, Ref: first.TicketRef, TicketVersion: first.TicketVersion, Fence: domain.Fence{LeaderEpoch: first.LeaderEpoch, RunnerEpoch: first.RunnerEpoch, ClaimEpoch: first.ClaimEpoch}}, Present: false}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "git/push", TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.SemanticKey != first.SemanticKey || second.ClaimEpoch != first.ClaimEpoch+1 || second.ExpectedHeadOID != first.ExpectedHeadOID || second.ExpectedBaseOID != first.ExpectedBaseOID {
+		t.Fatalf("reclaim changed immutable target first=%+v second=%+v", first, second)
+	}
+	facts, err := db.PublicationPushIntent(ctx, intent.Ref)
+	if err != nil || facts.Claim != second || facts.Effect.State != EffectExecuting {
+		t.Fatalf("reclaimed facts=%+v err=%v", facts, err)
+	}
+}
+
 func TestGitMutationLeaseReleaseIsBoundedWhenSQLiteIsBusy(t *testing.T) {
 	db, ctx := openTestStore(t)
 	intent := gitIntentFixture(t, db, ctx, "SF-git-release-busy")
