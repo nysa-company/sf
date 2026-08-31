@@ -158,6 +158,46 @@ func TestWorkerReplansProvenAbsentDraftAfterCrash(t *testing.T) {
 	}
 }
 
+func TestWorkerFailsFinalCreateIdentityConflictBeforeStart(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		owned bool
+	}{
+		{name: "human-owned", owned: false},
+		{name: "factory-owned", owned: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newPublicationFixture(t)
+			defer f.close()
+			github := &createIdentityConflictAtHandoff{FakeGH: f.github, owned: test.owned}
+			w := publication.Worker{Store: f.db, Git: f.runner, GitHub: github}
+			if _, err := w.Run(f.ctx, f.ref, f.fence); !errors.Is(err, contracts.ErrDraftCreateBeforeStart) {
+				t.Fatalf("final create conflict err=%v", err)
+			}
+			if got := f.github.MutationCount("pr_create"); got != 0 {
+				t.Fatalf("final create conflict launched create %d times", got)
+			}
+
+			ticket, err := f.db.Ticket(f.ctx, f.ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worktree, err := f.db.Worktree(f.ctx, f.ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "acme", Name: "app"}, HeadOwner: "acme", HeadRepository: "app", HeadRef: worktree.Branch, HeadOID: f.candidate.Snapshot.HeadSHA, BaseRef: "main", BaseOID: f.candidate.Snapshot.BaseSHA, FactoryOwned: true}
+			title := "sf: " + string(ticket.Ref.Ticket)
+			body := "<!-- sf:publication/v1 -->\n\nticket: " + string(ticket.Ref.Ticket) + "\ncandidate: " + f.candidate.Snapshot.HeadSHA + "\nsource: " + ticket.SourceDigest
+			key := "github/draft-pr/v1/" + githubboundary.CanonicalDraftPullRequestRequestDigest(identity, title, body)
+			effect, err := f.db.Effect(f.ctx, key)
+			if err != nil || effect.State != store.EffectFailed {
+				t.Fatalf("final create conflict effect=%+v err=%v", effect, err)
+			}
+		})
+	}
+}
+
 func TestWorkerReconcilesLostCreateWithoutBlindReplay(t *testing.T) {
 	f := newPublicationFixture(t)
 	defer f.close()
@@ -287,6 +327,26 @@ func (g *driftAfterOutputWitness) ObserveFactoryPullRequestOutput(ctx context.Co
 		}
 	}
 	return identity, state, draft, applied, err
+}
+
+// createIdentityConflictAtHandoff adds a conflicting PR after the Worker's
+// absence observation and immediately before FakeGH's final create boundary.
+type createIdentityConflictAtHandoff struct {
+	*testkit.FakeGH
+	owned    bool
+	injected bool
+}
+
+func (g *createIdentityConflictAtHandoff) CreateDraftPullRequest(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
+	if !g.injected {
+		conflict := identity
+		conflict.Number, conflict.FactoryOwned = 7, g.owned
+		if err := g.InjectPullRequestForTest(testkit.PullRequest{Identity: conflict, Draft: true}); err != nil {
+			return contracts.PullRequestIdentity{}, err
+		}
+		g.injected = true
+	}
+	return g.FakeGH.CreateDraftPullRequest(ctx, claim, identity, title, body)
 }
 
 type publicationFixture struct {

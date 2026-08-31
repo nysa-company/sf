@@ -625,7 +625,7 @@ func TestFakeCreateExistingIdentityConflictRemainsDeterministic(t *testing.T) {
 			if err := fake.InjectPullRequestForTest(testkit.PullRequest{Identity: existing, Draft: true}); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := fake.CreateDraftPullRequest(context.Background(), testkit.EffectClaimForTest("draft_pr", identity, "title", "body"), identity, "title", "body"); err == nil || !strings.Contains(err.Error(), test.text) || errors.Is(err, contracts.ErrDraftCreateUncertain) {
+			if _, err := fake.CreateDraftPullRequest(context.Background(), testkit.EffectClaimForTest("draft_pr", identity, "title", "body"), identity, "title", "body"); err == nil || !strings.Contains(err.Error(), test.text) || !errors.Is(err, contracts.ErrDraftCreateBeforeStart) || errors.Is(err, contracts.ErrDraftCreateUncertain) {
 				t.Fatalf("existing %s conflict err=%v", test.name, err)
 			}
 			if got := fake.MutationCount("pr_create"); got != 0 {

@@ -36,6 +36,9 @@ type fakeCreatePolicyConflict struct{ err error }
 
 func (e *fakeCreatePolicyConflict) Error() string { return e.err.Error() }
 func (e *fakeCreatePolicyConflict) Unwrap() error { return e.err }
+func (e *fakeCreatePolicyConflict) Is(target error) bool {
+	return target == contracts.ErrDraftCreateBeforeStart
+}
 
 // PullRequest is the durable fake-remote record. Identity intentionally
 // includes head repository/ref/OID and the sf ownership bit; headRefName alone
