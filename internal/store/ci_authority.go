@@ -1243,7 +1243,7 @@ func (s *Store) LoadCIObservation(ctx context.Context, ref domain.TicketRef) (CI
 // closed rather than silently authorizing a repair.
 func validateCorrectionBudgetLedger(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) error {
 	var orphanCount int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses u WHERE u.channel=? AND u.project_id=? AND u.ticket_id=? AND u.kind='correction' AND NOT EXISTS (
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses u WHERE u.channel=? AND u.project_id=? AND u.ticket_id=? AND u.kind='correction' AND substr(u.request_id,1,7)='ci-red/' AND NOT EXISTS (
 		SELECT 1 FROM candidate_repair_bindings b
 		JOIN ci_transition_evidence c ON c.channel=b.channel AND c.project_id=b.project_id AND c.ticket_id=b.ticket_id AND c.candidate_generation=b.predecessor_generation AND c.candidate_head_sha=b.predecessor_head_sha AND c.candidate_tree_sha=b.predecessor_tree_sha AND c.observation_classification=b.red_observation_classification AND c.observation_digest=b.red_observation_digest AND c.prior_publication_witness_digest=b.predecessor_publication_witness_digest AND c.observation_ticket_version=b.consumed_ticket_version AND c.observation_leader_epoch=b.consumed_leader_epoch AND c.observation_runner_epoch=b.consumed_runner_epoch AND c.ticket_version=b.red_transition_ticket_version AND c.transition_digest=b.red_transition_digest
 		WHERE b.channel=u.channel AND b.project_id=u.project_id AND b.ticket_id=u.ticket_id AND b.correction_budget_kind=u.kind AND b.correction_budget_request_id=u.request_id AND b.consumed_ticket_version=u.ticket_version AND b.consumed_leader_epoch=u.leader_epoch AND b.consumed_runner_epoch=u.runner_epoch
@@ -1257,13 +1257,22 @@ func validateCorrectionBudgetLedger(ctx context.Context, conn *sql.Conn, ref dom
 	return nil
 }
 
+func ciRedCorrectionRequestID(observationDigest string) (string, bool) {
+	if !validCIAuthorityDigest(observationDigest) {
+		return "", false
+	}
+	requestID := "ci-red/" + strings.TrimPrefix(observationDigest, "sha256:")
+	return requestID, boundedText(requestID, 300)
+}
+
 // consumeCorrectionBudget allocates one correction budget use inside the
 // caller's CI transaction.
-func consumeCorrectionBudget(ctx context.Context, conn *sql.Conn, authority CorrectionBudgetAuthority, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+func consumeCorrectionBudget(ctx context.Context, conn *sql.Conn, authority CorrectionBudgetAuthority, ref domain.TicketRef, version uint64, fence domain.Fence, observationDigest string) (bool, error) {
 	if err := validateCorrectionBudgetLedger(ctx, conn, ref); err != nil {
 		return false, err
 	}
-	if authority.Ref != ref || authority.TicketVersion != version || authority.Fence != fence || authority.Fence.ClaimEpoch != 0 || !boundedText(authority.RequestID, 300) {
+	expectedRequestID, validRequest := ciRedCorrectionRequestID(observationDigest)
+	if !validRequest || authority.Ref != ref || authority.TicketVersion != version || authority.Fence != fence || authority.Fence.ClaimEpoch != 0 || authority.RequestID != expectedRequestID {
 		return false, nil
 	}
 	var used, limit int
@@ -1392,7 +1401,7 @@ func (s *Store) ConsumeCIObservation(ctx context.Context, request CIObservationT
 				authority = *request.CorrectionBudget
 			}
 			var budgetErr error
-			budgetAuthorized, budgetErr = consumeCorrectionBudget(ctx, conn, authority, request.Ref, observation.ObservedTicketVersion, observation.ObservedFence)
+			budgetAuthorized, budgetErr = consumeCorrectionBudget(ctx, conn, authority, request.Ref, observation.ObservedTicketVersion, observation.ObservedFence, observation.ObservationDigest)
 			if budgetErr != nil {
 				return budgetErr
 			}

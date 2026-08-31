@@ -718,6 +718,15 @@ func redCIConsumptionFixture(t *testing.T) (*Store, Ticket, PublishedCandidateEv
 	return db, ticket, publication, loaded
 }
 
+func redCICorrectionAuthority(t *testing.T, ticket Ticket, observation CIObservation) CorrectionBudgetAuthority {
+	t.Helper()
+	requestID, ok := ciRedCorrectionRequestID(observation.ObservationDigest)
+	if !ok {
+		t.Fatalf("invalid red observation digest %q", observation.ObservationDigest)
+	}
+	return CorrectionBudgetAuthority{Ref: ticket.Ref, RequestID: requestID, TicketVersion: ticket.Version, Fence: observation.ObservedFence}
+}
+
 func ciAuthorityLintPolicy() []CIObservationCheck {
 	return []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint"}}
 }
@@ -926,7 +935,7 @@ func TestCIObservationAtomicBudgetRollbackBeforeTransition(t *testing.T) {
 		}
 		return nil
 	})
-	authority := CorrectionBudgetAuthority{Ref: ticket.Ref, RequestID: "atomic-rollback", TicketVersion: ticket.Version, Fence: loaded.ObservedFence}
+	authority := redCICorrectionAuthority(t, ticket, loaded)
 	_, err := db.ConsumeCIObservation(t.Context(), CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority})
 	if !errors.Is(err, faultErr) {
 		t.Fatalf("faulted atomic CI consume err=%v", err)
@@ -953,7 +962,7 @@ func TestCIObservationAtomicBudgetRollbackBeforeTransition(t *testing.T) {
 func TestCIObservationAtomicBudgetCommittedLostResponseReplay(t *testing.T) {
 	db, ticket, _, loaded := redCIConsumptionFixture(t)
 	defer db.Close()
-	authority := CorrectionBudgetAuthority{Ref: ticket.Ref, RequestID: "atomic-commit", TicketVersion: ticket.Version, Fence: loaded.ObservedFence}
+	authority := redCICorrectionAuthority(t, ticket, loaded)
 	request := CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}
 	first, err := db.ConsumeCIObservation(t.Context(), request)
 	if err != nil {
@@ -984,25 +993,24 @@ func TestCIObservationAtomicBudgetCommittedLostResponseReplay(t *testing.T) {
 func TestCIObservationAtomicBudgetExhaustionHasNoDanglingUse(t *testing.T) {
 	db, ticket, _, loaded := redCIConsumptionFixture(t)
 	defer db.Close()
-	// These rows model a legacy/crash orphan: even with their generic budget
-	// evidence present, they have no exact red transition and repair binding.
-	// The new Store reducer must reject them rather than treating them as an
-	// exhausted authority or allocating a third use.
-	for _, requestID := range []string{"existing-one", "existing-two"} {
+	// The correction limit is ticket-global. These non-CI correction uses are
+	// legitimate members of that shared budget domain, but CI-red lineage must
+	// not misclassify them as candidate-repair orphans.
+	for _, requestID := range []string{"final-review/1/one", "final-review/2/two"} {
 		if _, err := db.ConsumeBudget(t.Context(), BudgetUse{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, Kind: "correction", RequestID: requestID}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	authority := CorrectionBudgetAuthority{Ref: ticket.Ref, RequestID: "should-not-allocate", TicketVersion: ticket.Version, Fence: loaded.ObservedFence}
-	if _, err := db.ConsumeCIObservation(t.Context(), CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}); !errors.Is(err, ErrCIObservation) {
-		t.Fatalf("orphan exhausted atomic CI consume err=%v", err)
+	authority := redCICorrectionAuthority(t, ticket, loaded)
+	if _, err := db.ConsumeCIObservation(t.Context(), CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}); err != nil {
+		t.Fatalf("exhausted atomic CI consume err=%v", err)
 	}
 	var uses int
 	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&uses); err != nil {
 		t.Fatal(err)
 	}
 	current, err := db.Ticket(t.Context(), ticket.Ref)
-	if err != nil || uses != 2 || current.State != domain.StateWaitingCI || current.Version != ticket.Version {
+	if err != nil || uses != 2 || current.State != domain.StatePaused || current.ResumeState != domain.StateWaitingCI || current.Version != ticket.Version+1 {
 		t.Fatalf("exhausted atomic CI state uses=%d ticket=%+v err=%v", uses, current, err)
 	}
 	var bindings int
@@ -1011,6 +1019,46 @@ func TestCIObservationAtomicBudgetExhaustionHasNoDanglingUse(t *testing.T) {
 	}
 	if bindings != 0 {
 		t.Fatalf("exhausted atomic CI created repair binding count=%d", bindings)
+	}
+}
+
+func TestCIObservationSharesGlobalBudgetWithNonCICorrectionDomain(t *testing.T) {
+	db, ticket, _, loaded := redCIConsumptionFixture(t)
+	defer db.Close()
+	if _, err := db.ConsumeBudget(t.Context(), BudgetUse{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, Kind: "correction", RequestID: "final-review/1/prior"}); err != nil {
+		t.Fatal(err)
+	}
+	authority := redCICorrectionAuthority(t, ticket, loaded)
+	if _, err := db.ConsumeCIObservation(t.Context(), CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}); err != nil {
+		t.Fatal(err)
+	}
+	var uses, bindings int
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&uses); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.Ticket(t.Context(), ticket.Ref)
+	if err != nil || uses != 2 || bindings != 1 || current.State != domain.StateBuilding {
+		t.Fatalf("cross-domain correction budget uses=%d bindings=%d ticket=%+v err=%v", uses, bindings, current, err)
+	}
+}
+
+func TestCIObservationRejectsWrongCorrectionBudgetDomainWithoutSpending(t *testing.T) {
+	db, ticket, _, loaded := redCIConsumptionFixture(t)
+	defer db.Close()
+	authority := CorrectionBudgetAuthority{Ref: ticket.Ref, RequestID: "final-review/not-ci", TicketVersion: ticket.Version, Fence: loaded.ObservedFence}
+	if _, err := db.ConsumeCIObservation(t.Context(), CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}); err != nil {
+		t.Fatal(err)
+	}
+	var uses int
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&uses); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.Ticket(t.Context(), ticket.Ref)
+	if err != nil || uses != 0 || current.State != domain.StatePaused || current.ResumeState != domain.StateWaitingCI {
+		t.Fatalf("wrong-domain correction authority spent budget uses=%d ticket=%+v err=%v", uses, current, err)
 	}
 }
 
@@ -1034,8 +1082,7 @@ func TestCIObservationValidRepairBudgetRequiresSuccessorCompletion(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	requestID := "repair-request"
-	authority := CorrectionBudgetAuthority{Ref: ticket.Ref, RequestID: requestID, TicketVersion: ticket.Version, Fence: loaded.ObservedFence}
+	authority := redCICorrectionAuthority(t, ticket, loaded)
 	if _, err := db.ConsumeCIObservation(ctx, CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}); err != nil {
 		t.Fatal(err)
 	}
