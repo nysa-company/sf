@@ -330,6 +330,73 @@ func TestQualificationActivatesIdleRuntimeOnlyAfterQualifierCommits(t *testing.T
 	}
 }
 
+func TestQualificationOverTransportStartsRuntimeWithDaemonLifetime(t *testing.T) {
+	processCtx, cancelProcess := context.WithCancel(context.Background())
+	defer cancelProcess()
+	var qualified bool
+	started := make(chan struct{})
+	runtime := &fakeWorkflowRuntime{started: started}
+	cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		if !qualified {
+			return WorkflowRuntimeComponents{}, nil
+		}
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
+	cfg.ProviderCoordinatorFactory = func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
+		return &providercoord.Coordinator{}, nil
+	}
+	cfg.ProviderQualifier = func(context.Context, *store.Store, domain.Channel, string, string) (any, error) {
+		qualified = true
+		return map[string]string{"durable": "qualified"}, nil
+	}
+	d, err := Start(processCtx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	serveCtx, stopServe := context.WithCancel(context.Background())
+	defer stopServe()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- d.Serve(serveCtx) }()
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	response, err := transport.Call(requestCtx, paths.Socket, qualificationRequest())
+	if err != nil || !response.OK {
+		t.Fatalf("qualification response=%+v err=%v", response, err)
+	}
+	cancelRequest()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("qualified runtime did not start")
+	}
+	runtime.mu.Lock()
+	runtimeCtx := runtime.ctx
+	runtime.mu.Unlock()
+	if runtimeCtx == nil {
+		t.Fatal("qualified runtime did not receive a context")
+	}
+	select {
+	case <-runtimeCtx.Done():
+		t.Fatal("qualification request cancellation stopped the runtime")
+	case <-time.After(25 * time.Millisecond):
+	}
+	cancelProcess()
+	select {
+	case <-runtimeCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("daemon process context did not stop qualified runtime")
+	}
+	stopServe()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop")
+	}
+}
+
 func TestQualificationReportsCommittedActivationFailure(t *testing.T) {
 	var qualified bool
 	runtime := &fakeWorkflowRuntime{startErr: errors.New("start refused"), closed: make(chan struct{})}
@@ -394,7 +461,7 @@ func TestRequalificationDoesNotReplaceAnActiveRuntime(t *testing.T) {
 	if response := d.qualifyProvider(context.Background(), qualificationRequest()); !response.OK {
 		t.Fatalf("first qualification=%+v", response)
 	}
-	if response := d.qualifyProvider(context.Background(), qualificationRequest()); !response.OK {
+	if response := d.qualifyProvider(context.Background(), qualificationRequest()); response.OK || response.Error == nil || response.Error.Code != "runtime_already_active" {
 		t.Fatalf("requalification=%+v", response)
 	}
 	if factoryCalls != 2 || d.runtime != runtime || d.control != runtime {
@@ -405,6 +472,81 @@ func TestRequalificationDoesNotReplaceAnActiveRuntime(t *testing.T) {
 		t.Fatal("requalification closed active runtime")
 	default:
 	}
+}
+
+func TestActiveRuntimeRefusesRequalificationBeforePairMutation(t *testing.T) {
+	var qualified bool
+	qualifierCalls := 0
+	runtime := &fakeWorkflowRuntime{}
+	cfg, _ := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		if !qualified {
+			return WorkflowRuntimeComponents{}, nil
+		}
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
+	cfg.ProviderCoordinatorFactory = func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
+		return &providercoord.Coordinator{}, nil
+	}
+	cfg.ProviderQualifier = func(ctx context.Context, database *store.Store, channel domain.Channel, _ string, _ string) (any, error) {
+		qualifierCalls++
+		if qualifierCalls > 1 {
+			// If this runs, it deliberately changes the selected pair. The second
+			// request must be rejected before the qualifier can reach this code.
+			_, _, err := selectFixtureProviderPair(ctx, database, channel, "c")
+			return nil, err
+		}
+		qualified = true
+		pair, _, err := selectFixtureProviderPair(ctx, database, channel, "a")
+		return pair, err
+	}
+	d, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if response := d.qualifyProvider(context.Background(), qualificationRequest()); !response.OK {
+		t.Fatalf("first qualification=%+v", response)
+	}
+	before, err := d.store.ProviderPair(context.Background(), d.channel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := d.qualifyProvider(context.Background(), qualificationRequest())
+	if response.OK || response.Error == nil || response.Error.Code != "runtime_already_active" || response.Mutation.Attempted {
+		t.Fatalf("active requalification=%+v", response)
+	}
+	if response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join([]string{"sf", "daemon", "run"}, "\x00") {
+		t.Fatalf("active requalification action=%+v", response.NextAction)
+	}
+	if qualifierCalls != 1 {
+		t.Fatalf("active runtime invoked qualifier %d times", qualifierCalls)
+	}
+	after, err := d.store.ProviderPair(context.Background(), d.channel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Builder.ID != before.Builder.ID || after.Reviewer.ID != before.Reviewer.ID || !after.SelectedAt.Equal(before.SelectedAt) {
+		t.Fatalf("provider pair changed before=%+v after=%+v", before, after)
+	}
+}
+
+func selectFixtureProviderPair(ctx context.Context, database *store.Store, channel domain.Channel, suffix string) (store.ProviderPair, bool, error) {
+	digest := strings.Repeat("a", 64)
+	builder, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{
+		Channel: channel, RunID: strings.Repeat("1", 31) + suffix, Provider: domain.ProviderIdentity{Provider: "fixture-builder-" + suffix, Model: "builder", Family: "builder-family-" + suffix, Version: "1"},
+		BinaryDigest: digest, PolicyDigest: digest, FixtureDigest: digest, Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return store.ProviderPair{}, false, err
+	}
+	reviewer, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{
+		Channel: channel, RunID: strings.Repeat("2", 31) + suffix, Provider: domain.ProviderIdentity{Provider: "fixture-reviewer-" + suffix, Model: "reviewer", Family: "reviewer-family-" + suffix, Version: "1"},
+		BinaryDigest: digest, PolicyDigest: digest, FixtureDigest: digest, Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return store.ProviderPair{}, false, err
+	}
+	return database.SelectProviderPair(ctx, channel, builder.ID, reviewer.ID, time.Now().UTC())
 }
 
 func TestCloseWaitsForQualificationActivation(t *testing.T) {
@@ -446,16 +588,71 @@ func TestCloseWaitsForQualificationActivation(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	close(release)
-	if response := <-qualifyDone; !response.OK {
+	if response := <-qualifyDone; response.OK || response.Error == nil || response.Error.Code != "runtime_activation_failed" || !response.Mutation.Attempted {
 		t.Fatalf("qualification response=%+v", response)
 	}
 	if err := <-closeDone; err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-runtime.closed:
-	case <-time.After(time.Second):
-		t.Fatal("Close did not join activated runtime")
+	if d.runtime != nil {
+		t.Fatalf("Close allowed runtime activation after sealing shutdown: %T", d.runtime)
+	}
+}
+
+func TestCloseFirstRejectsWaitingLifecycleHandlers(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call func(*Daemon) api.Response
+	}{
+		{name: "qualification", call: func(d *Daemon) api.Response { return d.qualifyProvider(context.Background(), qualificationRequest()) }},
+		{name: "control", call: func(d *Daemon) api.Response {
+			return d.controlTicket(context.Background(), api.Request{Version: api.Version, RequestID: "control"}, domain.OperatorIdentity{}, "pause")
+		}},
+		{name: "resume", call: func(d *Daemon) api.Response {
+			return d.resumeTicket(context.Background(), api.Request{Version: api.Version, RequestID: "resume"}, domain.OperatorIdentity{})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, _ := lifecycleConfig(t, nil)
+			cfg.ProviderQualifier = func(context.Context, *store.Store, domain.Channel, string, string) (any, error) {
+				t.Fatal("Close-first qualification reached durable qualifier")
+				return nil, nil
+			}
+			d, err := Start(context.Background(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.runtimeMu.Lock()
+			entered := make(chan struct{})
+			responseDone := make(chan api.Response, 1)
+			go func() {
+				close(entered)
+				responseDone <- test.call(d)
+			}()
+			<-entered
+			closeDone := make(chan error, 1)
+			go func() { closeDone <- d.Close() }()
+			deadline := time.Now().Add(time.Second)
+			for !d.isClosed() && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if !d.isClosed() {
+				t.Fatal("Close did not seal handler admission")
+			}
+			d.runtimeMu.Unlock()
+			response := <-responseDone
+			if response.OK || response.Error == nil || response.Error.Code != "daemon_stopping" {
+				t.Fatalf("response=%+v", response)
+			}
+			select {
+			case err := <-closeDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Close deadlocked with waiting lifecycle handler")
+			}
+		})
 	}
 }
 

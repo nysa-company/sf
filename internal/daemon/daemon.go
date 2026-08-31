@@ -218,10 +218,22 @@ type Daemon struct {
 	providerQualifier          func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
 	runtimeFactory             WorkflowRuntimeFactory
 	runtime                    WorkflowRuntime
-	mu                         sync.Mutex
-	closed                     bool
-	serving                    bool
-	runtimeStopped             bool
+	// mu protects daemon process state and handler admission only. It is never
+	// held while waiting for socket handlers, runtime shutdown, Store close, or
+	// any other external I/O.
+	mu        sync.Mutex
+	handlers  sync.WaitGroup
+	closeDone chan struct{}
+	closeErr  error
+	closed    bool
+	serving   bool
+	// runtimeMu serializes the exact runtime/controller/coordinator bundle and
+	// operator control transitions. Its lock order is independent: Close first
+	// seals handler admission under mu, releases it, waits handlers, then takes
+	// runtimeMu to detach the bundle.
+	runtimeMu      sync.Mutex
+	runtimeStopped bool
+	runtimeContext context.Context
 
 	projectionMu      sync.Mutex
 	projector         events.Projector
@@ -323,6 +335,12 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	if configuration.ProviderCoordinatorFactory != nil {
 		coordinator, err = configuration.ProviderCoordinatorFactory(database, configuration.ProviderSupervisor)
 		if err != nil {
+			if coordinator != nil {
+				if closeErr := coordinator.Close(); closeErr != nil {
+					err = errors.Join(err, closeErr)
+				}
+				coordinator = nil
+			}
 			return failStore(fmt.Errorf("compose provider coordinator: %w", err))
 		}
 	}
@@ -331,7 +349,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		preparedCommitObserver = git.PreparedCommitObserver{Runner: *configuration.GitRunner, Resolve: registeredWorktreeResolver(database)}
 	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, preparedCommitObserver: preparedCommitObserver, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinator: coordinator, providerCoordinatorFactory: configuration.ProviderCoordinatorFactory, providerSupervisor: configuration.ProviderSupervisor, providerQualifier: configuration.ProviderQualifier, runtimeFactory: configuration.WorkflowRuntimeFactory}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, preparedCommitObserver: preparedCommitObserver, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinatorFactory: configuration.ProviderCoordinatorFactory, providerSupervisor: configuration.ProviderSupervisor, providerQualifier: configuration.ProviderQualifier, runtimeFactory: configuration.WorkflowRuntimeFactory, runtimeContext: ctx}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -390,17 +408,23 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 				}
 				return failStore(runtimeErr)
 			}
-			// Install the pair before starting it. Nothing can expose the socket
-			// until this exact runtime/controller composition is live.
-			instance.runtime, instance.control = components.Runtime, components.Controller
+			// Nothing can expose the socket until this exact pair has started.
+			// Do not publish a partially-started runtime to later lifecycle work.
 			if runtimeErr := components.Runtime.Start(ctx, domain.Fence{LeaderEpoch: epoch}); runtimeErr != nil {
 				if closeErr := components.Runtime.Close(); closeErr != nil {
 					runtimeErr = errors.Join(runtimeErr, closeErr)
 				}
-				instance.runtime = nil
 				return failStore(fmt.Errorf("start workflow runtime: %w", runtimeErr))
 			}
+			instance.runtime, instance.control, instance.providerCoordinator = components.Runtime, components.Controller, coordinator
 		}
+	}
+	if instance.runtime == nil && coordinator != nil {
+		if err := coordinator.Close(); err != nil {
+			coordinator = nil
+			return failStore(fmt.Errorf("close idle provider coordinator: %w", err))
+		}
+		coordinator = nil
 	}
 	server, err := transport.ListenWithExecutable(configuration.Paths.Socket, uint32(os.Getuid()), instance, instance.executable())
 	if err != nil {
@@ -605,24 +629,50 @@ func runForeground(ctx context.Context, daemon foregroundDaemon) error {
 
 func (daemon *Daemon) Close() error {
 	daemon.mu.Lock()
-	defer daemon.mu.Unlock()
 	if daemon.closed {
-		return nil
+		done := daemon.closeDone
+		daemon.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		daemon.mu.Lock()
+		defer daemon.mu.Unlock()
+		return daemon.closeErr
 	}
 	daemon.closed = true
+	daemon.closeDone = make(chan struct{})
+	server := daemon.server
+	daemon.mu.Unlock()
+
+	// Server.Close waits for transport workers. Never hold daemon.mu or
+	// runtimeMu here: a worker may be finishing qualification/control and needs
+	// those locks to return before Close can safely tear down Store.
 	var result error
-	if daemon.server != nil {
-		result = joinCloseError(result, "close daemon server", daemon.server.Close)
+	if server != nil {
+		result = joinCloseError(result, "close daemon server", server.Close)
 	}
-	if daemon.runtime != nil {
-		result = joinCloseError(result, "close workflow runtime", daemon.runtime.Close)
-		daemon.runtime = nil
+	// Handle also covers direct in-process callers, which are not counted by
+	// transport.Server. Handler admission is sealed before this wait.
+	daemon.handlers.Wait()
+	daemon.runtimeMu.Lock()
+	daemon.runtimeStopped = true
+	runtime := daemon.runtime
+	coordinator := daemon.providerCoordinator
+	daemon.runtime, daemon.providerCoordinator = nil, nil
+	daemon.control = idleRuntimeController{}
+	daemon.runtimeMu.Unlock()
+	if runtime != nil {
+		result = joinCloseError(result, "close workflow runtime", runtime.Close)
 	}
-	if daemon.providerCoordinator != nil {
-		result = joinCloseError(result, "close provider coordinator", daemon.providerCoordinator.Close)
+	if coordinator != nil {
+		result = joinCloseError(result, "close provider coordinator", coordinator.Close)
 	}
 	result = joinCloseError(result, "close store", daemon.engine.Close)
 	result = joinCloseError(result, "close leader lease", daemon.lease.Close)
+	daemon.mu.Lock()
+	daemon.closeErr = result
+	close(daemon.closeDone)
+	daemon.mu.Unlock()
 	return result
 }
 
@@ -637,18 +687,26 @@ func joinCloseError(cause error, resource string, closeFn func() error) error {
 // when Serve returns as well as during explicit shutdown, so a caller that
 // cancels Serve cannot race a runtime tick against Store closure.
 func (daemon *Daemon) closeRuntime() error {
-	daemon.mu.Lock()
-	defer daemon.mu.Unlock()
+	// Store remains open until Close joins transport/direct handlers. runtimeMu
+	// is enough here to keep a concurrent qualification or control operation
+	// from using a detached runtime while Serve is ending.
+	daemon.runtimeMu.Lock()
 	daemon.runtimeStopped = true
-	if daemon.runtime == nil {
+	runtime := daemon.runtime
+	daemon.runtime = nil
+	daemon.control = idleRuntimeController{}
+	daemon.runtimeMu.Unlock()
+	if runtime == nil {
 		return nil
 	}
-	err := daemon.runtime.Close()
-	daemon.runtime = nil
-	return err
+	return runtime.Close()
 }
 
 func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request api.Request) api.Response {
+	if !daemon.beginHandler() {
+		return daemon.failure(request, "daemon_stopping", "the local daemon is stopping", true)
+	}
+	defer daemon.handlers.Done()
 	if err := request.Validate(); err != nil {
 		return daemon.failure(request, "invalid_request", "request envelope is invalid", false)
 	}
@@ -695,6 +753,22 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 	return response
 }
 
+func (daemon *Daemon) beginHandler() bool {
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
+	if daemon.closed {
+		return false
+	}
+	daemon.handlers.Add(1)
+	return true
+}
+
+func (daemon *Daemon) isClosed() bool {
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
+	return daemon.closed
+}
+
 func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) api.Response {
 	if daemon.providerQualifier == nil {
 		return daemon.failure(request, "provider_unavailable", "provider qualification is not configured for this daemon", false)
@@ -709,10 +783,16 @@ func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) 
 	// Qualification changes the durable binding that a newly composed runtime
 	// would use. Serialize it with Close and controller replacement so neither
 	// a Store close nor an idle-controller drain can race activation.
-	daemon.mu.Lock()
-	defer daemon.mu.Unlock()
-	if daemon.closed || daemon.runtimeStopped {
+	daemon.runtimeMu.Lock()
+	defer daemon.runtimeMu.Unlock()
+	if daemon.isClosed() || daemon.runtimeStopped {
 		return daemon.failure(request, "daemon_stopping", "provider qualification is unavailable while the daemon is stopping", true)
+	}
+	// A later qualification can change the selected durable pair beneath a
+	// live coordinator. There is no atomic runtime handoff yet, so reject it
+	// before the qualifier receives Store authority.
+	if daemon.runtime != nil {
+		return daemon.failure(request, "runtime_already_active", "the qualified local workflow runtime is already active; stop it before a foreground restart", false)
 	}
 	value, err := daemon.providerQualifier(ctx, daemon.store, daemon.channel, parameters.Builder, parameters.Reviewer)
 	if err != nil {
@@ -722,7 +802,7 @@ func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) 
 		}
 		return response
 	}
-	if err := daemon.activateQualifiedRuntimeLocked(ctx); err != nil {
+	if err := daemon.activateQualifiedRuntimeLocked(); err != nil {
 		response := daemon.failure(request, "runtime_activation_failed", "provider qualification was recorded, but the local workflow runtime could not be activated; retry qualification or restart the daemon", true)
 		response.Mutation = api.Mutation{Attempted: true, Kind: "provider.qualify", Identity: string(daemon.channel), Observed: true}
 		if encoded, encodeErr := json.Marshal(value); encodeErr == nil {
@@ -734,15 +814,15 @@ func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) 
 }
 
 // activateQualifiedRuntimeLocked installs the first executable local runtime
-// after a durable qualification. daemon.mu must be held. Requalification of
+// after a durable qualification. daemon.runtimeMu must be held. Requalification of
 // an already running daemon deliberately leaves its exact coordinator/runtime
 // pair in place: replacing it would require proving a handoff with no work in
 // flight, which this lifecycle does not yet provide.
-func (daemon *Daemon) activateQualifiedRuntimeLocked(ctx context.Context) error {
+func (daemon *Daemon) activateQualifiedRuntimeLocked() error {
 	if daemon.runtime != nil {
 		return nil
 	}
-	if daemon.runtimeStopped || daemon.closed {
+	if daemon.runtimeStopped || daemon.isClosed() {
 		return errors.New("daemon runtime is stopping")
 	}
 	if daemon.providerCoordinatorFactory == nil || daemon.runtimeFactory == nil {
@@ -750,6 +830,11 @@ func (daemon *Daemon) activateQualifiedRuntimeLocked(ctx context.Context) error 
 	}
 	coordinator, err := daemon.providerCoordinatorFactory(daemon.store, daemon.providerSupervisor)
 	if err != nil {
+		if coordinator != nil {
+			if closeErr := coordinator.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+		}
 		return fmt.Errorf("compose qualified provider coordinator: %w", err)
 	}
 	if coordinator == nil {
@@ -790,7 +875,7 @@ func (daemon *Daemon) activateQualifiedRuntimeLocked(ctx context.Context) error 
 			return errors.Join(err, components.Runtime.Close(), coordinator.Close())
 		}
 	}
-	if err := components.Runtime.Start(ctx, domain.Fence{LeaderEpoch: daemon.epoch}); err != nil {
+	if err := components.Runtime.Start(daemon.runtimeContext, domain.Fence{LeaderEpoch: daemon.epoch}); err != nil {
 		err = errors.Join(err, components.Runtime.Close(), coordinator.Close())
 		return fmt.Errorf("start qualified workflow runtime: %w", err)
 	}
@@ -1104,8 +1189,11 @@ func (daemon *Daemon) controlTicket(ctx context.Context, request api.Request, id
 	// Keep one controller for the whole durable stop/drain transition. This
 	// also serializes a first qualified-runtime installation with a control
 	// request that began while the daemon still had only the idle controller.
-	daemon.mu.Lock()
-	defer daemon.mu.Unlock()
+	daemon.runtimeMu.Lock()
+	defer daemon.runtimeMu.Unlock()
+	if daemon.isClosed() || daemon.runtimeStopped {
+		return daemon.failure(request, "daemon_stopping", "ticket control is unavailable while the daemon is stopping", true)
+	}
 	var parameters controlParameters
 	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) {
 		return daemon.failure(request, "invalid_control", "control requires the authenticated operator and daemon channel", false)
@@ -1239,8 +1327,11 @@ func (daemon *Daemon) retireRuntimeControl(ctx context.Context, ref domain.Ticke
 func (daemon *Daemon) resumeTicket(ctx context.Context, request api.Request, identity domain.OperatorIdentity) api.Response {
 	// See controlTicket: a rearm must use one exact runtime/control bundle and
 	// cannot interleave with its first installation after qualification.
-	daemon.mu.Lock()
-	defer daemon.mu.Unlock()
+	daemon.runtimeMu.Lock()
+	defer daemon.runtimeMu.Unlock()
+	if daemon.isClosed() || daemon.runtimeStopped {
+		return daemon.failure(request, "daemon_stopping", "ticket resume is unavailable while the daemon is stopping", true)
+	}
 	var parameters controlParameters
 	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) {
 		return daemon.failure(request, "invalid_resume", "resume requires the authenticated operator and daemon channel", false)
@@ -1426,6 +1517,12 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	}
 	if code == "unqualified_provider" {
 		argv = []string{binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"}
+	}
+	if code == "runtime_activation_failed" {
+		argv = []string{binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"}
+	}
+	if code == "runtime_already_active" {
+		argv = []string{binary, "daemon", "run"}
 	}
 	if code == "terminal_replay_requires_new" {
 		argv = []string{binary, "submit", "--help"}
