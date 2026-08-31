@@ -1495,7 +1495,7 @@ func (daemon *Daemon) resumeTicket(ctx context.Context, request api.Request, ide
 		default:
 			code, message := "takeover_changes_unadopted", "operator changes are retained but cannot yet enter an authenticated Builder cycle"
 			if inspection.ChangeKind == "verification_changes" {
-				code, message = "takeover_verification_changes_unadopted", "verification-owned files changed; create an authenticated verification amendment before resuming"
+				code, message = "takeover_verification_changes_unadopted", "verification-owned files changed; restore verification-owned files to the authenticated baseline, then resume the ticket"
 			} else if inspection.ChangeKind == "source_out_of_scope" {
 				code, message = "takeover_source_out_of_scope", "operator changes are outside the approved Planner paths; retain them and amend the plan before resuming"
 			}
@@ -1857,8 +1857,10 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	// the malformed request omitted its ticket. Do not collapse them into
 	// doctor: the daemon already knows which control surface can recover.
 	switch code {
-	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_verification_changes_unadopted", "takeover_source_out_of_scope":
+	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_source_out_of_scope":
 		argv = []string{binary, "take", "--help"}
+	case "takeover_verification_changes_unadopted":
+		argv = []string{binary, operatorVerb("resume"), "--help"}
 	case "invalid_resume":
 		argv = []string{binary, "resume", "--help"}
 	case "invalid_retry":
@@ -1879,11 +1881,17 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	}
 	if request.Ticket != "" {
 		switch code {
-		case "takeover_changes_unadopted", "takeover_verification_changes_unadopted", "takeover_source_out_of_scope":
+		case "takeover_changes_unadopted", "takeover_source_out_of_scope":
 			// `take` is intentionally idempotent and prints the authenticated
 			// retained path again. It is the only safe next action for edits
 			// that have not crossed the Builder/proof authority.
 			argv = []string{binary, "take", request.Ticket}
+		case "takeover_verification_changes_unadopted":
+			// The prerequisite is deliberately manual: the daemon must not adopt
+			// verification-owned edits or invent an amendment. Once the operator
+			// restores/commits the approved files, this executable action retries
+			// the authenticated takeover inspection and resume boundary.
+			argv = []string{binary, operatorVerb("resume"), request.Ticket}
 		case "retry_required":
 			argv = []string{binary, "retry", request.Ticket}
 		case "takeover_inspection_failed":

@@ -895,6 +895,23 @@ func (s *Store) publicationRecoveryBaseline(ctx context.Context, conn *sql.Conn,
 	if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
 		return 0, false, err
 	}
+	// An operator pause/take invalidates the runner atomically at stopping,
+	// then records drained->paused and resume as two ordinary ticket events.
+	// For waiting_ci that places the resumed endpoint four versions after the
+	// publication witness (publishing->waiting_ci, stop, paused, resume) and
+	// advances the runner once. Authenticate that exact control triplet before
+	// using the witness leader as the predecessor for startup fencing.
+	if publication.CurrentTicketVersion <= ^uint64(0)-4 &&
+		publication.CurrentFence.RunnerEpoch < ^uint64(0) &&
+		publication.CurrentTicketVersion+4 == version &&
+		publication.CurrentFence.RunnerEpoch+1 == runner {
+		stopped := Ticket{Ref: ref, Version: publication.CurrentTicketVersion + 1, RunnerEpoch: publication.CurrentFence.RunnerEpoch, State: domain.StateWaitingCI}
+		current := Ticket{Ref: ref, Version: version, RunnerEpoch: runner, State: domain.StateWaitingCI}
+		stop := mutationRevocation{version: publication.CurrentTicketVersion + 2, runner: runner, leader: publication.CurrentFence.LeaderEpoch}
+		if authenticatePostPublicationResume(ctx, conn, ref, stopped, current, stop) == nil {
+			return publication.CurrentFence.LeaderEpoch, true, nil
+		}
+	}
 	// A publishing witness may be consumed by the one-version
 	// publishing->waiting_ci transition before its first recovery fence. In
 	// that case the current ticket is exactly one version beyond the witness,

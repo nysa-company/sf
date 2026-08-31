@@ -256,7 +256,16 @@ func (c *Controller) Rearm(ctx context.Context, ref domain.TicketRef) error {
 		}
 		entry.stopped, entry.hasStop = stopped, true
 	}
-	capability, err := c.store.RearmProof(ctx, ref, stopped)
+	current, err := c.store.Ticket(ctx, ref)
+	if err != nil {
+		return err
+	}
+	var capability *store.RuntimeRearmCapability
+	if current.State == domain.StatePublishing || current.State == domain.StateWaitingCI || current.State == domain.StateReviewing || current.State == domain.StateWaitingApproval || current.State == domain.StateWaitingManualMerge || current.State == domain.StateMerging || current.State == domain.StateReconciling {
+		capability, err = c.store.PostPublicationRearmProof(ctx, ref, stopped)
+	} else {
+		capability, err = c.store.RearmProof(ctx, ref, stopped)
+	}
 	if err != nil {
 		return err
 	}
