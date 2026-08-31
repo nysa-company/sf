@@ -642,10 +642,10 @@ func TestCIV41RowsSurviveV42V43MigrationAndRemainImmutable(t *testing.T) {
 		}
 	}
 	if observations != 1 || checks != 1 || evidence != 1 || bindings != 1 || completions != 1 {
-		t.Fatalf("v41 authority rows lost during v42-v44 migration: observations=%d checks=%d evidence=%d bindings=%d completions=%d", observations, checks, evidence, bindings, completions)
+		t.Fatalf("v41 authority rows lost during v42-v45 migration: observations=%d checks=%d evidence=%d bindings=%d completions=%d", observations, checks, evidence, bindings, completions)
 	}
 	var version int
-	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 44 {
+	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != schemaVersion {
 		t.Fatalf("migrated schema=%d err=%v", version, err)
 	}
 	if _, err := database.db.ExecContext(ctx, `UPDATE ci_observations SET diagnostic_text='tampered' WHERE observation_id=1`); err == nil {
@@ -676,5 +676,76 @@ func TestCIV41RowsSurviveV42V43MigrationAndRemainImmutable(t *testing.T) {
 	}
 	if info, err := os.Stat(files[0]); err != nil || !info.Mode().IsRegular() {
 		t.Fatalf("invalid migration backup info=%v err=%v", info, err)
+	}
+}
+
+func TestV41PlanningWithoutRunnerStartAuthorityBlocksDuringV45UpgradeAndRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v41-planning.sqlite")
+	createDatabaseAtVersion(t, path, 41)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.ExecContext(ctx, `INSERT INTO daemon_instances(channel,leader_epoch,identity,updated_at) VALUES('stable',7,'legacy-daemon','now'); INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('stable','legacy-planning','/legacy-planning','main'); INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES('stable','legacy-planning','SF-legacy-planning','legacy-source','feature','guarded','planning',2,1,'legacy-planning-workflow')`)
+	if closeErr := raw.Close(); err != nil || closeErr != nil {
+		t.Fatalf("seed v41 planning err=%v close=%v", err, closeErr)
+	}
+	backups := filepath.Join(t.TempDir(), "backups")
+	if err := os.Mkdir(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := OpenChannel(ctx, path, backups, domain.ChannelStable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelStable, Project: "legacy-planning", Ticket: "SF-legacy-planning"}
+	assertDisposition := func() {
+		var state, resume, code, trigger, from, to, payload string
+		var version, events, authorities int
+		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &resume, &code, &version); err != nil {
+			t.Fatal(err)
+		}
+		if state != "blocked" || resume != "" || code != "legacy_runner_start_authority_unverifiable" || version != 3 {
+			t.Fatalf("planning disposition=%s/%s/%s/v%d", state, resume, code, version)
+		}
+		if err := database.db.QueryRowContext(ctx, `SELECT trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=3`, ref.Channel, ref.Project, ref.Ticket).Scan(&trigger, &from, &to, &payload); err != nil || trigger != "typed_blocker" || from != "planning" || to != "blocked" || !strings.Contains(payload, "submit a fresh ticket") {
+			t.Fatalf("planning blocker event=%s/%s/%s payload=%s err=%v", trigger, from, to, payload, err)
+		}
+		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&events); err != nil || events != 1 {
+			t.Fatalf("planning events=%d err=%v", events, err)
+		}
+		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_start_authorities WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&authorities); err != nil || authorities != 0 {
+			t.Fatalf("unexpected reconstructed authority=%d err=%v", authorities, err)
+		}
+	}
+	assertDisposition()
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err = OpenChannel(ctx, path, backups, domain.ChannelStable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	assertDisposition()
+	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v041-to-v045-*.sqlite"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("v41-to-v45 backup=%v err=%v", files, err)
+	}
+	backup, err := sql.Open("sqlite", files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	var backupVersion, backupPlanning int
+	if err := backup.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&backupVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := backup.QueryRowContext(ctx, `SELECT COUNT(*) FROM tickets WHERE state='planning' AND version=2 AND runner_epoch=1`).Scan(&backupPlanning); err != nil {
+		t.Fatal(err)
+	}
+	if backupVersion != 41 || backupPlanning != 1 {
+		t.Fatalf("backup changed legacy planning evidence: schema=%d planning=%d", backupVersion, backupPlanning)
 	}
 }

@@ -1121,3 +1121,14 @@ var migrationV44 = []string{
 	`CREATE TRIGGER final_review_repair_boundaries_immutable_update BEFORE UPDATE ON final_review_repair_boundaries BEGIN SELECT RAISE(ABORT,'final review repair boundary is immutable'); END`,
 	`CREATE TRIGGER final_review_repair_boundaries_immutable_delete BEFORE DELETE ON final_review_repair_boundaries BEGIN SELECT RAISE(ABORT,'final review repair boundary is append-only'); END`,
 }
+
+// v45 explicitly dispositions planning rows created before v42 recorded a
+// runner-start authority. The missing immutable source endpoint cannot be
+// reconstructed from a mutable active ticket, so recovery is fail-closed and
+// leaves a terminally blocked legacy row plus an auditable event. A later
+// operator resume cannot honestly mint the missing historical start witness,
+// so the safe recovery action is to submit a fresh ticket.
+var migrationV45 = []string{
+	`UPDATE tickets SET state='blocked',resume_state=NULL,blocked_code='legacy_runner_start_authority_unverifiable',version=version+1 WHERE state='planning' AND version=2 AND runner_epoch=1 AND NOT EXISTS(SELECT 1 FROM runner_start_authorities r WHERE r.channel=tickets.channel AND r.project_id=tickets.project_id AND r.ticket_id=tickets.id)`,
+	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,id,version,'typed_blocker','planning','blocked','{"code":"legacy_runner_start_authority_unverifiable","reason":"planning ticket predates immutable runner-start authority","next_action":"submit a fresh ticket; this legacy ticket cannot be resumed safely"}',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tickets WHERE state='blocked' AND resume_state IS NULL AND blocked_code='legacy_runner_start_authority_unverifiable'`,
+}
