@@ -745,9 +745,9 @@ func TestV41PlanningWithoutRunnerStartAuthorityBlocksDuringV45UpgradeAndRestart(
 	}
 	defer database.Close()
 	assertDisposition()
-	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v041-to-v045-*.sqlite"))
+	files, err := filepath.Glob(filepath.Join(backups, fmt.Sprintf("sf-schema-v041-to-v%03d-*.sqlite", schemaVersion)))
 	if err != nil || len(files) != 1 {
-		t.Fatalf("v41-to-v45 backup=%v err=%v", files, err)
+		t.Fatalf("v41-to-v%d backup=%v err=%v", schemaVersion, files, err)
 	}
 	backup, err := sql.Open("sqlite", files[0])
 	if err != nil {

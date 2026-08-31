@@ -42,6 +42,15 @@ func (e *ciBlockEngine) SignalVerification(context.Context, contracts.SignalRequ
 func (e *ciBlockEngine) SignalCandidate(context.Context, contracts.SignalRequest, domain.CandidateSnapshot) (contracts.TransitionResult, error) {
 	return contracts.TransitionResult{}, errors.New("unexpected candidate signal")
 }
+func (e *ciBlockEngine) SignalFinalReview(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return contracts.TransitionResult{}, errors.New("unexpected final review signal")
+}
+func (e *ciBlockEngine) SignalFinalReviewRepair(context.Context, contracts.SignalRequest, string) (contracts.TransitionResult, error) {
+	return contracts.TransitionResult{}, errors.New("unexpected final review repair signal")
+}
+func (e *ciBlockEngine) SignalFinalReviewNeedsOperator(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return contracts.TransitionResult{}, errors.New("unexpected final review operator signal")
+}
 
 var _ workflowworker.StateMachine = (*ciBlockEngine)(nil)
 
