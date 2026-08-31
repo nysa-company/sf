@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,11 +19,14 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/engine"
 	gitboundary "github.com/nysa-company/sf/internal/git"
 	githubboundary "github.com/nysa-company/sf/internal/github"
 	"github.com/nysa-company/sf/internal/localruntime"
+	"github.com/nysa-company/sf/internal/mergeproof"
 	"github.com/nysa-company/sf/internal/phaseartifact"
 	"github.com/nysa-company/sf/internal/publication"
+	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/testkit"
 	"github.com/nysa-company/sf/internal/workflowprompt"
@@ -58,6 +62,512 @@ func TestWorkerPublishesRealCandidateExactlyOnce(t *testing.T) {
 	}
 	if f.github.MutationCount("pr_create") != 1 || f.gitPushCount != 1 {
 		t.Fatalf("replay mutated push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
+	}
+}
+
+// TestGuardedApprovalMergeRecoversLostProofResponse composes the production
+// local-runtime merge path with the real Store, production GitHub client, and
+// real protected-ref coordinator. The FakeGH supervisor advances only the
+// fixture's private bare remote at the hosted-merge boundary, so the proof is
+// an actual Git fetch/ancestry check rather than a fabricated Store witness.
+func TestGuardedApprovalMergeRecoversLostProofResponse(t *testing.T) {
+	f := newPublicationFixture(t)
+	defer f.close()
+
+	// Publication is real: it records immutable candidate/PR evidence and
+	// advances publishing -> waiting_ci before any approval exists.
+	if _, err := (publication.Worker{Store: f.db, Git: f.runner, GitHub: f.github}).Run(f.ctx, f.ref, f.fence); err != nil {
+		t.Fatalf("publish candidate: %v", err)
+	}
+	published, err := f.db.LoadPublishedCandidate(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.github.SetBaseHeadOIDForTest(published.PullRequest.BaseOID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.github.SetRulesetsForTest(guardedFixtureRuleset()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.github.SetChecks(published.PullRequest.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "fixture-unit", State: "SUCCESS"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Waiting CI and final review each consume their real Store evidence before
+	// the operator's exact-head decision can enter merging.
+	spec, err := statemachine.LoadEmbeddedApproved()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflowEngine := engine.New(f.db, spec)
+	ticket, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: f.fence.LeaderEpoch, RunnerEpoch: ticket.RunnerEpoch}
+	ciResult, err := (localruntime.CIWorker{Store: f.db, Observer: f.github}).Run(f.ctx, f.ref, fence)
+	if err != nil || !ciResult.Transitioned || ciResult.State != domain.StateReviewing {
+		t.Fatalf("CI result=%+v err=%v", ciResult, err)
+	}
+	ticket, err = f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	completePublishedFinalReview(t, f, ticket, fence)
+	if _, err := f.db.TransitionFinalReview(f.ctx, store.Transition{Ref: f.ref, ExpectedVersion: ticket.Version, From: domain.StateReviewing, To: domain.StateWaitingApproval, Trigger: "review_pass", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatalf("final review transition: %v", err)
+	}
+
+	ticket, err = f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	approval, err := f.db.ApplyOperatorDecision(f.ctx, store.OperatorDecisionRequest{OperatorDecision: store.OperatorDecision{Ref: f.ref, ExpectedVersion: ticket.Version, Fence: fence, ReviewedHead: published.Candidate.Snapshot.HeadSHA, OperatorUID: 501, Decision: "approved"}})
+	if err != nil || approval.Version != ticket.Version+1 {
+		t.Fatalf("approval=%+v err=%v", approval, err)
+	}
+	// A daemon can also crash after the atomic approval transition but before
+	// the merge worker has recorded any intent. That restart has no external
+	// mutation to reconcile, yet must authenticate the exact review+approval
+	// lineage before it installs the next runner fence.
+	preMergeLeader, err := f.db.AcquireLeader(f.ctx, f.ref.Channel, "guarded-merge-before-intent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effects, err := f.db.ReconcileEffects(f.ctx, f.ref.Channel, preMergeLeader); err != nil || len(effects) != 0 {
+		t.Fatalf("pre-intent effect reconciliation=%+v err=%v", effects, err)
+	}
+	if changed, err := f.db.FenceRecoveredRunners(f.ctx, f.ref.Channel, preMergeLeader); err != nil || changed != 1 {
+		t.Fatalf("pre-intent restart fence changed=%d err=%v", changed, err)
+	}
+
+	// Crash after the local merge effect is claimed but before MergeExactHead
+	// persists its immutable merge intent. Durable intent absence proves the
+	// external handoff never began, so recovery may retire this revoked claim
+	// and authorize exactly one fresh attempt under the new runner fence.
+	preIntentTicket, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preIntentFence := domain.Fence{LeaderEpoch: preMergeLeader, RunnerEpoch: preIntentTicket.RunnerEpoch}
+	mergeKey := "merge/" + string(f.ref.Channel) + "/" + string(f.ref.Project) + "/" + string(f.ref.Ticket) + "/" + published.Candidate.Snapshot.HeadSHA
+	mergeAuthorization := domain.MergeAuthorization{ReviewedHead: published.Candidate.Snapshot.HeadSHA, CurrentHead: published.Candidate.Snapshot.HeadSHA, ReviewedBaseSHA: published.Candidate.Snapshot.BaseSHA, CurrentBaseSHA: published.Candidate.Snapshot.BaseSHA, ReviewedBaseHeadOID: published.PullRequest.BaseOID, CurrentBaseHeadOID: published.PullRequest.BaseOID, Approved: true, GatesGreen: true}
+	mergeDigest := githubboundary.CanonicalMergeRequestDigest(published.PullRequest, published.Candidate.Snapshot.HeadSHA, "squash", mergeAuthorization)
+	if _, err := f.db.PlanEffect(f.ctx, store.EffectPlan{SemanticKey: mergeKey, Ref: f.ref, Kind: "merge", TicketVersion: preIntentTicket.Version, Fence: preIntentFence, RequestDigest: mergeDigest}); err != nil {
+		t.Fatalf("plan pre-intent merge effect: %v", err)
+	}
+	claimed, err := f.db.ClaimEffect(f.ctx, store.EffectFence{SemanticKey: mergeKey, Ref: f.ref, TicketVersion: preIntentTicket.Version, Fence: preIntentFence})
+	if err != nil || !claimed.Claimed {
+		t.Fatalf("claim pre-intent merge effect=%+v err=%v", claimed, err)
+	}
+	if _, found, err := f.db.MergeIntent(f.ctx, mergeKey); err != nil || found {
+		t.Fatalf("pre-intent claim unexpectedly has intent found=%v err=%v", found, err)
+	}
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	preIntentDB, err := store.Open(f.ctx, filepath.Join(filepath.Dir(f.bare), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db = preIntentDB
+	preMergeLeader, err = preIntentDB.AcquireLeader(f.ctx, f.ref.Channel, "guarded-merge-after-claim-before-intent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effects, err := preIntentDB.ReconcileEffects(f.ctx, f.ref.Channel, preMergeLeader); err != nil || len(effects) != 1 || effects[0].SemanticKey != mergeKey || effects[0].State != store.EffectUncertain {
+		t.Fatalf("pre-intent claimed effect reconciliation=%+v err=%v", effects, err)
+	}
+	if changed, err := preIntentDB.FenceRecoveredRunners(f.ctx, f.ref.Channel, preMergeLeader); err != nil || changed != 1 {
+		t.Fatalf("pre-intent claimed effect fence changed=%d err=%v", changed, err)
+	}
+	f.runner.MutationAuthority = preIntentDB
+	workflowEngine = engine.New(preIntentDB, spec)
+
+	// Materialize the exact hosted-merge result locally but do not advance the
+	// bare protected ref until FakeGH receives its one guarded merge command.
+	project, err := f.db.Project(f.ctx, f.ref.Channel, f.ref.Project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := f.db.Worktree(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, project.Path, "merge", "--squash", worktree.Branch)
+	runGit(t, project.Path, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "guarded hosted merge")
+	mergeCommit := gitOutput(t, project.Path, "rev-parse", "HEAD")
+	if err := f.github.SetMergeCommitForTest(mergeCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	proofFetches := 0
+	priorRun := f.runner.Run
+	f.runner.Run = func(ctx context.Context, binary string, args []string, env []string) ([]byte, error) {
+		for _, arg := range args {
+			if arg == "fetch" {
+				proofFetches++
+				break
+			}
+		}
+		return priorRun(ctx, binary, args, env)
+	}
+	advanceFixtureMain := func() error {
+		command := exec.Command("/usr/bin/git", "-C", project.Path, "push", f.bare, mergeCommit+":refs/heads/main")
+		if output, err := command.CombinedOutput(); err != nil {
+			return fmt.Errorf("advance fixture protected ref: %w: %s", err, output)
+		}
+		return nil
+	}
+
+	// The first verifier call commits the protected-ref proof, then simulates
+	// a response lost before github.Client can settle the parent merge effect.
+	// Its restart call must reuse that immutable proof without a second merge or
+	// protected-ref fetch.
+	lostProof := &lostProofResponseVerifier{Coordinator: mergeproof.Coordinator{Store: f.db, Git: f.runner}, loseNext: true}
+	client := newStoreBackedFakeGHClient(t, f, lostProof, advanceFixtureMain)
+	merging, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mergeFence := domain.Fence{LeaderEpoch: preMergeLeader, RunnerEpoch: merging.RunnerEpoch}
+	worker := localruntime.NewWorker(f.db, workflowworker.Worker{}, publication.Worker{Store: f.db, Git: f.runner, GitHub: client})
+	worker.Engine = workflowEngine
+	if _, err := worker.Run(f.ctx, f.ref, mergeFence); err == nil {
+		t.Fatal("lost protected-proof response unexpectedly settled merge")
+	}
+	uncertain, err := f.db.Effect(f.ctx, mergeKey)
+	if err != nil || uncertain.State != store.EffectUncertain || f.github.MutationCount("pr_merge") != 1 || proofFetches != 1 {
+		t.Fatalf("lost response effect=%+v err=%v merge_calls=%d proof_fetches=%d", uncertain, err, f.github.MutationCount("pr_merge"), proofFetches)
+	}
+
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := store.Open(f.ctx, filepath.Join(filepath.Dir(f.bare), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db = restarted
+	newLeader, err := restarted.AcquireLeader(f.ctx, f.ref.Channel, "guarded-merge-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReconcile, err := restarted.ReconcileEffects(f.ctx, f.ref.Channel, newLeader)
+	if err != nil || len(firstReconcile) != 1 || firstReconcile[0].SemanticKey != mergeKey || firstReconcile[0].State != store.EffectUncertain {
+		t.Fatalf("restart effect reconciliation=%+v err=%v", firstReconcile, err)
+	}
+	if replay, err := restarted.ReconcileEffects(f.ctx, f.ref.Channel, newLeader); err != nil || len(replay) != 1 || replay[0].ClaimEpoch != firstReconcile[0].ClaimEpoch {
+		t.Fatalf("same-leader reconcile was not idempotent first=%+v replay=%+v err=%v", firstReconcile, replay, err)
+	}
+	// Crash after ReconcileEffects but before FenceRecoveredRunners. The next
+	// daemon leader may advance the uncertain claim once more, but the unchanged
+	// ticket endpoint must still be fenceable without replaying the merge.
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err = store.Open(f.ctx, filepath.Join(filepath.Dir(f.bare), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db = restarted
+	fenceLeader, err := restarted.AcquireLeader(f.ctx, f.ref.Channel, "guarded-merge-after-reconcile-crash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effects, err := restarted.ReconcileEffects(f.ctx, f.ref.Channel, fenceLeader); err != nil || len(effects) != 1 || effects[0].SemanticKey != mergeKey || effects[0].ClaimEpoch <= firstReconcile[0].ClaimEpoch {
+		t.Fatalf("restart effect reconciliation=%+v err=%v", effects, err)
+	}
+	if changed, err := restarted.FenceRecoveredRunners(f.ctx, f.ref.Channel, fenceLeader); err != nil || changed != 1 {
+		t.Fatalf("restart fence changed=%d err=%v", changed, err)
+	}
+	recovered, err := restarted.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Crash once more after the first runner fence but before the resumed
+	// worker observes GitHub. Production recovery must again reconcile the
+	// stranded effect before advancing the ticket fence, without authorizing a
+	// second hosted merge or protected-ref fetch.
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err = store.Open(f.ctx, filepath.Join(filepath.Dir(f.bare), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db = restarted
+	secondLeader, err := restarted.AcquireLeader(f.ctx, f.ref.Channel, "guarded-merge-second-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effects, err := restarted.ReconcileEffects(f.ctx, f.ref.Channel, secondLeader); err != nil || len(effects) != 1 || effects[0].SemanticKey != mergeKey || effects[0].State != store.EffectUncertain {
+		t.Fatalf("second restart effect reconciliation=%+v err=%v", effects, err)
+	}
+	if changed, err := restarted.FenceRecoveredRunners(f.ctx, f.ref.Channel, secondLeader); err != nil || changed != 1 {
+		t.Fatalf("second restart fence changed=%d err=%v", changed, err)
+	}
+	recovered, err = restarted.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.github.MutationCount("pr_merge"); got != 1 || proofFetches != 1 {
+		t.Fatalf("second restart replayed external mutation merge_calls=%d proof_fetches=%d", got, proofFetches)
+	}
+	f.runner.MutationAuthority = restarted
+	restartedClient := newStoreBackedFakeGHClient(t, f, mergeproof.Coordinator{Store: restarted, Git: f.runner}, advanceFixtureMain)
+	restartedWorker := localruntime.NewWorker(restarted, workflowworker.Worker{}, publication.Worker{Store: restarted, Git: f.runner, GitHub: restartedClient})
+	restartedWorker.Engine = &failReconcileOnceEngine{StateMachine: engine.New(restarted, spec)}
+	if _, err := restartedWorker.Run(f.ctx, f.ref, domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: recovered.RunnerEpoch}); err == nil {
+		t.Fatal("post-merge reconcile crash was not injected")
+	}
+	stranded, err := restarted.Ticket(f.ctx, f.ref)
+	if err != nil || stranded.State != domain.StateReconciling {
+		t.Fatalf("post-merge stranded ticket=%+v err=%v", stranded, err)
+	}
+	if got := f.github.MutationCount("pr_merge"); got != 1 || proofFetches != 1 {
+		t.Fatalf("post-merge crash replayed external mutation merge_calls=%d proof_fetches=%d", got, proofFetches)
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err = store.Open(f.ctx, filepath.Join(filepath.Dir(f.bare), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db = restarted
+	postMergeLeader, err := restarted.AcquireLeader(f.ctx, f.ref.Channel, "guarded-merge-post-observation-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effects, err := restarted.ReconcileEffects(f.ctx, f.ref.Channel, postMergeLeader); err != nil || len(effects) != 0 {
+		t.Fatalf("post-merge effect reconciliation=%+v err=%v", effects, err)
+	}
+	if changed, err := restarted.FenceRecoveredRunners(f.ctx, f.ref.Channel, postMergeLeader); err != nil || changed != 1 {
+		t.Fatalf("post-merge restart fence changed=%d err=%v", changed, err)
+	}
+	recovered, err = restarted.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.runner.MutationAuthority = restarted
+	restartedClient = newStoreBackedFakeGHClient(t, f, mergeproof.Coordinator{Store: restarted, Git: f.runner}, advanceFixtureMain)
+	restartedWorker = localruntime.NewWorker(restarted, workflowworker.Worker{}, publication.Worker{Store: restarted, Git: f.runner, GitHub: restartedClient})
+	restartedWorker.Engine = engine.New(restarted, spec)
+	result, err := restartedWorker.Run(f.ctx, f.ref, domain.Fence{LeaderEpoch: postMergeLeader, RunnerEpoch: recovered.RunnerEpoch})
+	if err != nil || !result.Transitioned || result.State != domain.StateDone {
+		t.Fatalf("post-merge restart reconciliation result=%+v err=%v", result, err)
+	}
+	if got := f.github.MutationCount("pr_merge"); got != 1 || proofFetches != 1 {
+		t.Fatalf("post-merge restart replayed external mutation merge_calls=%d proof_fetches=%d", got, proofFetches)
+	}
+	confirmed, err := restarted.Effect(f.ctx, mergeKey)
+	if err != nil || confirmed.State != store.EffectConfirmed {
+		t.Fatalf("recovered merge effect=%+v err=%v", confirmed, err)
+	}
+}
+
+type failReconcileOnceEngine struct {
+	workflowworker.StateMachine
+	failed bool
+}
+
+func (e *failReconcileOnceEngine) Signal(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if request.From == domain.StateReconciling && !e.failed {
+		e.failed = true
+		return contracts.TransitionResult{}, errors.New("fixture: crash before reconcile_pass")
+	}
+	return e.StateMachine.Signal(ctx, request)
+}
+
+func TestManualMergeObservationRecoversCrashBeforeReconcilePass(t *testing.T) {
+	f := newPublicationFixtureMode(t, domain.MergeManual)
+	defer f.close()
+	if _, err := (publication.Worker{Store: f.db, Git: f.runner, GitHub: f.github}).Run(f.ctx, f.ref, f.fence); err != nil {
+		t.Fatalf("publish candidate: %v", err)
+	}
+	published, err := f.db.LoadPublishedCandidate(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.github.SetBaseHeadOIDForTest(published.PullRequest.BaseOID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.github.SetChecks(published.PullRequest.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "fixture-unit", State: "SUCCESS"}); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := statemachine.LoadEmbeddedApproved()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseEngine := engine.New(f.db, spec)
+	ticket, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: f.fence.LeaderEpoch, RunnerEpoch: ticket.RunnerEpoch}
+	if result, err := (localruntime.CIWorker{Store: f.db, Observer: f.github}).Run(f.ctx, f.ref, fence); err != nil || result.State != domain.StateReviewing {
+		t.Fatalf("CI result=%+v err=%v", result, err)
+	}
+	ticket, err = f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	completePublishedFinalReview(t, f, ticket, fence)
+	if _, err := f.db.TransitionFinalReview(f.ctx, store.Transition{Ref: f.ref, ExpectedVersion: ticket.Version, From: domain.StateReviewing, To: domain.StateWaitingManualMerge, Trigger: "review_pass", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.github.SetPullRequestMergedForTest(published.PullRequest.Number, strings.Repeat("d", 40)); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fault := &failReconcileOnceEngine{StateMachine: baseEngine}
+	worker := localruntime.NewWorker(f.db, workflowworker.Worker{}, publication.Worker{Store: f.db, Git: f.runner, GitHub: f.github})
+	worker.Engine = fault
+	_, firstErr := worker.Run(f.ctx, f.ref, domain.Fence{LeaderEpoch: f.fence.LeaderEpoch, RunnerEpoch: waiting.RunnerEpoch})
+	if firstErr == nil {
+		t.Fatal("manual observation unexpectedly crossed injected reconcile crash")
+	}
+	stranded, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil || stranded.State != domain.StateReconciling {
+		t.Fatalf("stranded ticket=%+v err=%v first_run_err=%v", stranded, err, firstErr)
+	}
+	if _, err := f.db.ManualMergeObservation(f.ctx, f.ref); err != nil {
+		t.Fatalf("manual observation was not durable: %v", err)
+	}
+	if got := f.github.MutationCount("pr_merge"); got != 0 {
+		t.Fatalf("manual observation invoked factory merge %d times", got)
+	}
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := store.Open(f.ctx, filepath.Join(filepath.Dir(f.bare), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db = restarted
+	leader, err := restarted.AcquireLeader(f.ctx, f.ref.Channel, "manual-reconcile-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effects, err := restarted.ReconcileEffects(f.ctx, f.ref.Channel, leader); err != nil || len(effects) != 0 {
+		t.Fatalf("manual restart effects=%+v err=%v", effects, err)
+	}
+	if changed, err := restarted.FenceRecoveredRunners(f.ctx, f.ref.Channel, leader); err != nil || changed != 1 {
+		t.Fatalf("manual restart fence changed=%d err=%v", changed, err)
+	}
+	recovered, err := restarted.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedWorker := localruntime.NewWorker(restarted, workflowworker.Worker{}, publication.Worker{Store: restarted, Git: f.runner, GitHub: f.github})
+	restartedWorker.Engine = engine.New(restarted, spec)
+	result, err := restartedWorker.Run(f.ctx, f.ref, domain.Fence{LeaderEpoch: leader, RunnerEpoch: recovered.RunnerEpoch})
+	if err != nil || !result.Transitioned || result.State != domain.StateDone {
+		t.Fatalf("manual recovery result=%+v err=%v", result, err)
+	}
+	if got := f.github.MutationCount("pr_merge"); got != 0 {
+		t.Fatalf("manual recovery invoked factory merge %d times", got)
+	}
+}
+
+type fakeGHSupervisor struct {
+	github     *testkit.FakeGH
+	afterMerge func() error
+}
+
+func (r fakeGHSupervisor) Run(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+	output, err := r.github.Run(args)
+	if len(args) >= 2 && args[0] == "pr" && args[1] == "merge" && r.afterMerge != nil {
+		if advanceErr := r.afterMerge(); advanceErr != nil {
+			return output, advanceErr
+		}
+	}
+	return output, err
+}
+
+func (fakeGHSupervisor) Cleanup(context.Context) (githubboundary.CleanupProof, error) {
+	return githubboundary.CleanupProof{Drained: true}, nil
+}
+
+type lostProofResponseVerifier struct {
+	mergeproof.Coordinator
+	loseNext bool
+}
+
+func (v *lostProofResponseVerifier) VerifyProtectedBranch(ctx context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
+	proof, err := v.Coordinator.VerifyProtectedBranch(ctx, repository, baseRef, mergeCommit, originalBaseOID)
+	if err == nil && v.loseNext {
+		v.loseNext = false
+		return contracts.ProtectedBranchObservation{}, errors.New("fixture: protected proof response lost")
+	}
+	return proof, err
+}
+
+func newStoreBackedFakeGHClient(t *testing.T, f *publicationFixture, verifier contracts.MergeBranchVerifier, afterMerge func() error) *githubboundary.Client {
+	t.Helper()
+	client, err := githubboundary.NewStoreClient("/usr/bin/fake-gh", f.runner.Home, f.runner.Home, fakeGHSupervisor{github: f.github, afterMerge: afterMerge}, f.db, verifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func completePublishedFinalReview(t *testing.T, f *publicationFixture, ticket store.Ticket, fence domain.Fence) {
+	t.Helper()
+	pair, err := f.db.ProviderPair(f.ctx, f.ref.Channel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := f.db.Worktree(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := f.db.RecoverableCandidate(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := contracts.NewDrainSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := store.ProviderAttemptRequest{Ref: f.ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseReview, Role: "reviewer", Binding: runtimeBinding(pair.Reviewer), ConfigDigest: ticket.ConfigDigest, Capacity: 1, At: time.Now().UTC(), ExpectedHead: candidate.Snapshot.HeadSHA, ExpectedProof: candidate.Snapshot.ProofDigest, Repository: mustProjectPath(t, f.db, f.ref), Worktree: worktree.Path, WorktreeIdentity: string(worktree.IdentityJSON), BaseSHA: worktree.BaseSHA, SupervisorKey: signer.PublicKey()}
+	request.Input = contracts.PhaseInput{Ticket: request.Ref, Phase: request.Phase, LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Prompt: "final review", Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA, AllowedPaths: []string{"."}, Provider: request.Binding.Identity, AuthMode: request.Binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}
+	claim, err := f.db.BeginProviderAttempt(f.ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.RecordProviderLaunch(f.ctx, claim, contracts.ProviderLaunch{PID: int(claim.ID), PGID: int(claim.ID), BootIdentity: "guarded-merge", ProcessStartIdentity: fmt.Sprintf("guarded-merge-%d", claim.ID), Worktree: claim.Worktree}); err != nil {
+		t.Fatal(err)
+	}
+	drain := contracts.DrainRequest{ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt, LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey, BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest, AuthDigest: claim.Binding.AuthDigest, AuthMode: claim.Binding.AuthMode, Repository: claim.Repository, Worktree: claim.Worktree, WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA, RequestDigest: claim.RequestDigest}
+	proof, err := signer.ProveDrained(drain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: []byte(fmt.Sprintf(`{"schema":"sf.reviewer/v1","decision":"pass","repair_owner":"","findings":[],"reviewed_head":"%s","proof_digest":"%s"}`, candidate.Snapshot.HeadSHA, candidate.Snapshot.ProofDigest)), UsageTrusted: true, UsageUnits: 1}
+	if _, err := f.db.CompleteProviderAttemptSuccess(f.ctx, claim, proof, ticket.Version, fence, raw, phaseartifact.Validation{TicketType: ticket.Type, ExpectedReviewedHead: candidate.Snapshot.HeadSHA, ExpectedProofDigest: candidate.Snapshot.ProofDigest}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func guardedFixtureRuleset() testkit.FakeRuleset {
+	return testkit.FakeRuleset{
+		ID: 42, Target: "branch", Source: "acme/app", SourceType: "Repository", Enforcement: "active",
+		Conditions: &testkit.FakeRulesetConditions{RefName: &testkit.FakeRulesetRefCondition{Include: []string{"refs/heads/main"}, Exclude: []string{}}},
+		Rules: []testkit.FakeRulesetRule{
+			{Type: "pull_request", Parameters: map[string]any{"allowed_merge_methods": []any{"squash"}}},
+			{Type: "required_status_checks", Parameters: map[string]any{"strict_required_status_checks_policy": true, "required_status_checks": []any{map[string]any{"context": "unit"}}}},
+			{Type: "non_fast_forward"},
+			{Type: "deletion"},
+		},
+		BypassActors: []any{},
 	}
 }
 
@@ -480,6 +990,10 @@ type publicationFixture struct {
 }
 
 func newPublicationFixture(t *testing.T) *publicationFixture {
+	return newPublicationFixtureMode(t, domain.MergeGuarded)
+}
+
+func newPublicationFixtureMode(t *testing.T, mergeMode domain.MergeMode) *publicationFixture {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
@@ -542,7 +1056,7 @@ func newPublicationFixture(t *testing.T) *publicationFixture {
 	}
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "app", Ticket: "SF-publication-e2e"}
 	source := []byte("publication source")
-	if err := db.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: digestHex(source), Source: source, Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+	if err := db.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: digestHex(source), Source: source, Type: domain.TicketFeature, MergeMode: mergeMode, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}

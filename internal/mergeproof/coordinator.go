@@ -38,7 +38,7 @@ func (c Coordinator) VerifyProtectedBranch(ctx context.Context, repository contr
 		return contracts.ProtectedBranchObservation{}, store.ErrEvidenceConflict
 	}
 	ticket, err := c.Store.Ticket(ctx, intent.Ref)
-	if err != nil || ticket.State != domain.StateMerging {
+	if err != nil || (ticket.State != domain.StateMerging && ticket.State != domain.StateReconciling) {
 		return contracts.ProtectedBranchObservation{}, store.ErrStaleFence
 	}
 	project, err := c.Store.Project(ctx, intent.Ref.Channel, intent.Ref.Project)
@@ -76,6 +76,12 @@ func (c Coordinator) VerifyProtectedBranch(ctx context.Context, repository contr
 		return protectedObservation(repository, baseRef, mergeCommit, originalBaseOID), nil
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return contracts.ProtectedBranchObservation{}, err
+	}
+	if ticket.State == domain.StateReconciling {
+		// The transition to reconciling happens only after the child proof was
+		// confirmed. Recovery may reuse that exact proof, but it must never mint a
+		// new Git claim after the parent merge is terminal.
+		return contracts.ProtectedBranchObservation{}, store.ErrEvidenceConflict
 	}
 	effect, err := c.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: gitIntent.SemanticKey, Ref: intent.Ref, Kind: "git/protected-ref-fetch", TicketVersion: version, Fence: fence, RequestDigest: request})
 	if err != nil {

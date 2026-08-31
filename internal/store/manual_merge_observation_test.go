@@ -23,7 +23,7 @@ func TestManualMergeObservationAuthorityIsAtomicAndFailsClosedOnTamper(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	observed := contracts.PublishedPullRequestObservation{Identity: publication.PullRequest, State: "MERGED", Merged: true, MergeCommit: strings.Repeat("c", 40), BaseHeadOID: publication.PullRequest.BaseOID}
+	observed := contracts.PublishedPullRequestObservation{Identity: publication.PullRequest, State: "MERGED", Merged: true, Ready: true, Title: "volatile title", Body: "volatile body", MergeCommit: strings.Repeat("c", 40), BaseHeadOID: publication.PullRequest.BaseOID}
 	authority := NewManualMergeObservation(publication, observed)
 	authority, err = fixture.db.BindManualMergeObservation(fixture.ctx, waiting.Ref, authority, domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: waiting.RunnerEpoch})
 	if err != nil {
@@ -54,4 +54,3 @@ func TestManualMergeObservationAuthorityIsAtomicAndFailsClosedOnTamper(t *testin
 		t.Fatalf("tampered observation err=%v", err)
 	}
 }
-

@@ -2,8 +2,10 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 )
 
@@ -251,6 +253,67 @@ func TestPostPublicationRearmProofAuthenticatesMergingAndReconciling(t *testing.
 				t.Fatalf("state=%s capability=%v err=%v", target, capability, err)
 			}
 		})
+	}
+}
+
+func TestPostPublicationRearmProofAuthenticatesManualReconcilingAfterRestart(t *testing.T) {
+	fixture := finalReviewLifecycleFixtureFor(t, domain.TicketFeature, domain.MergeManual)
+	completeFinalReview(t, fixture)
+	current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
+	if _, err := fixture.db.TransitionFinalReview(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateReviewing, To: domain.StateWaitingManualMerge, Trigger: "review_pass", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := fixture.db.Ticket(fixture.ctx, current.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := fixture.db.LoadHistoricalPublishedCandidate(fixture.ctx, current.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := contracts.PublishedPullRequestObservation{Identity: publication.PullRequest, State: "MERGED", Merged: true, MergeCommit: strings.Repeat("d", 40), BaseHeadOID: publication.PullRequest.BaseOID}
+	authority, err := fixture.db.BindManualMergeObservation(fixture.ctx, current.Ref, NewManualMergeObservation(publication, observed), domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: waiting.RunnerEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.RecordManualMergeObservation(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: waiting.Version, From: domain.StateWaitingManualMerge, To: domain.StateReconciling, Trigger: "external_merge_observed", Fence: authority.CurrentFence}, authority); err != nil {
+		t.Fatal(err)
+	}
+	reconciling, err := fixture.db.Ticket(fixture.ctx, current.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, resumed := postPublicationPauseResumeAt(t, fixture.db, reconciling, domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: reconciling.RunnerEpoch}, domain.StateReconciling)
+	var path string
+	if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+		t.Fatalf("database path=%q err=%v", path, err)
+	}
+	if err := fixture.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(fixture.ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	leader, err := reopened.AcquireLeader(fixture.ctx, domain.ChannelDev, "manual-reconciling-rearm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := reopened.FenceRecoveredRunners(fixture.ctx, domain.ChannelDev, leader); err != nil || changed != 1 {
+		t.Fatalf("manual reconciling fence changed=%d err=%v", changed, err)
+	}
+	recovered, err := reopened.StoppedRuntimeTicket(fixture.ctx, resumed.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := reopened.PostPublicationRearmProof(fixture.ctx, resumed.Ref, recovered)
+	if err != nil || capability == nil {
+		t.Fatalf("manual reconciling rearm capability=%v err=%v", capability, err)
 	}
 }
 

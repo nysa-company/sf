@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -70,6 +71,8 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		}, err
 	case domain.StateMerging:
 		return w.merge(ctx, ticket, fence)
+	case domain.StateReconciling:
+		return w.reconcile(ctx, ticket, fence)
 	case domain.StateWaitingManualMerge:
 		return w.observeManualMerge(ctx, ticket, fence)
 	case domain.StateWaitingCI:
@@ -93,18 +96,22 @@ func (w Worker) observeManualMerge(ctx context.Context, ticket store.Ticket, fen
 		return result, ErrPublishingUnavailable
 	}
 	observer := publishedMergeObserver{Store: w.Store, GitHub: w.Publication.GitHub}
-	merged, err := observer.MergeObserved(ctx, ticket.Ref)
+	observation, err := observer.Observe(ctx, ticket.Ref)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("observe manual merge: %w", err)
 	}
-	if !merged {
+	if !observation.Observed.Merged {
 		return result, nil
 	}
-	transition, err := w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: domain.StateWaitingManualMerge, Trigger: "external_merge_observed", Fence: fence, Attributes: map[string]string{"merged_pr_identity_exact": "true", "merged_source_head_equals_reviewed_head": "true", "required_checks_green": "true", "mode_completion_policy_satisfied": "true"}})
+	observation, err = w.Store.BindManualMergeObservation(ctx, ticket.Ref, observation, fence)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("bind manual merge observation: %w", err)
 	}
-	_, err = w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: transition.TicketVersion, From: domain.StateReconciling, Trigger: "reconcile_pass", Fence: fence, Attributes: map[string]string{"terminal_remote_truth_exact": "true"}})
+	transition, err := w.Store.RecordManualMergeObservation(ctx, store.Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateWaitingManualMerge, To: domain.StateReconciling, Trigger: "external_merge_observed", Fence: fence}, observation)
+	if err != nil {
+		return result, fmt.Errorf("record manual merge observation: %w", err)
+	}
+	_, err = w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: transition.Version, From: domain.StateReconciling, Trigger: "reconcile_pass", Fence: fence, Attributes: map[string]string{"terminal_remote_truth_exact": "true"}})
 	if err != nil {
 		return result, err
 	}
@@ -171,7 +178,7 @@ func (w Worker) merge(ctx context.Context, ticket store.Ticket, fence domain.Fen
 	method := "squash"
 	mergeDigest := githubboundary.CanonicalMergeRequestDigest(identity, candidate.Snapshot.HeadSHA, method, authorization)
 	mergeKey := "merge/" + string(ticket.Ref.Channel) + "/" + string(ticket.Ref.Project) + "/" + string(ticket.Ref.Ticket) + "/" + candidate.Snapshot.HeadSHA
-	mergeConfirmed, err := w.reconcileMerge(ctx, mergeKey)
+	mergeConfirmed, err := w.reconcileMerge(ctx, ticket, fence, mergeKey)
 	if err != nil {
 		return result, err
 	}
@@ -252,7 +259,7 @@ func (w Worker) reconcileReady(ctx context.Context, ticket store.Ticket, fence d
 // merge response. Store verifies the immutable merge intent and promotes the
 // uncertain old claim only after GitHub re-observes the exact protected-branch
 // merge proof; it never issues another merge call.
-func (w Worker) reconcileMerge(ctx context.Context, key string) (bool, error) {
+func (w Worker) reconcileMerge(ctx context.Context, ticket store.Ticket, fence domain.Fence, key string) (bool, error) {
 	effect, err := w.Store.Effect(ctx, key)
 	if errors.Is(err, store.ErrNotFound) {
 		return false, nil
@@ -271,10 +278,87 @@ func (w Worker) reconcileMerge(ctx context.Context, key string) (bool, error) {
 		return false, store.ErrEffectBusy
 	}
 	recovered, err := w.Store.RecoverMergeIntent(ctx, key, observer)
+	if errors.Is(err, store.ErrNotFound) && ticket.State == domain.StateMerging {
+		if _, found, intentErr := w.Store.MergeIntent(ctx, key); intentErr != nil || found {
+			if intentErr != nil {
+				return false, intentErr
+			}
+			return false, store.ErrEvidenceConflict
+		}
+		// MergeExactHead persists its immutable intent before entering the
+		// mutation guard. Its durable absence therefore proves this revoked claim
+		// never crossed the external handoff and may be retired, not replayed.
+		_, settleErr := w.Store.ReconcileInvalidatedEffect(ctx, store.InvalidatedEffectObservation{
+			Prior:   store.EffectObservation{EffectFence: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: effect.TicketVersion, Fence: domain.Fence{LeaderEpoch: effect.LeaderEpoch, RunnerEpoch: effect.RunnerEpoch, ClaimEpoch: effect.ClaimEpoch}}, Present: false},
+			Current: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence},
+		})
+		return false, settleErr
+	}
 	if err != nil {
 		return false, err
 	}
 	return recovered.State == store.EffectConfirmed, nil
+}
+
+// reconcile completes a guarded merge after a crash between merge_observed
+// and reconcile_pass. It re-observes the immutable merge intent through the
+// same production GitHub/protected-ref boundary; a confirmed proof is reused
+// by mergeproof.Coordinator and no new merge mutation is authorized.
+func (w Worker) reconcile(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {
+	result := workflowworker.RunResult{Ref: ticket.Ref, State: ticket.State, Version: ticket.Version, Phase: domain.PhaseReconcile}
+	if !w.PublicationEnabled || w.Publication.Store == nil || w.Publication.GitHub == nil || w.Engine == nil {
+		return result, ErrPublishingUnavailable
+	}
+	if ticket.MergeMode == domain.MergeManual {
+		observer := publishedMergeObserver{Store: w.Store, GitHub: w.Publication.GitHub}
+		observation, err := observer.Observe(ctx, ticket.Ref)
+		if err != nil {
+			return result, err
+		}
+		if !observation.Observed.Merged {
+			return result, store.ErrPublicationEvidence
+		}
+		if err := w.Store.ReconcileManualMergeObservation(ctx, ticket.Ref, observation); err != nil {
+			return result, err
+		}
+		transition, err := w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: domain.StateReconciling, Trigger: "reconcile_pass", Fence: fence, Attributes: map[string]string{"terminal_remote_truth_exact": "true"}})
+		if err != nil {
+			return result, err
+		}
+		result.State, result.Version, result.Transitioned = transition.To, transition.TicketVersion, true
+		return result, nil
+	}
+	if ticket.MergeMode != domain.MergeGuarded {
+		return result, ErrPublishingUnavailable
+	}
+	candidate, err := w.Store.RecoverableCandidate(ctx, ticket.Ref)
+	if err != nil {
+		return result, err
+	}
+	key := "merge/" + string(ticket.Ref.Channel) + "/" + string(ticket.Ref.Project) + "/" + string(ticket.Ref.Ticket) + "/" + candidate.Snapshot.HeadSHA
+	if confirmed, err := w.reconcileMerge(ctx, ticket, fence, key); err != nil || !confirmed {
+		if err != nil {
+			return result, err
+		}
+		return result, store.ErrEvidenceConflict
+	}
+	intent, found, err := w.Store.MergeIntent(ctx, key)
+	if err != nil || !found {
+		return result, store.ErrEvidenceConflict
+	}
+	observer, ok := w.Publication.GitHub.(contracts.MergeIntentObserver)
+	if !ok {
+		return result, store.ErrEffectBusy
+	}
+	if _, err := observer.ObserveMergeIntent(ctx, intent); err != nil {
+		return result, err
+	}
+	transition, err := w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: domain.StateReconciling, Trigger: "reconcile_pass", Fence: fence, Attributes: map[string]string{"terminal_remote_truth_exact": "true"}})
+	if err != nil {
+		return result, err
+	}
+	result.State, result.Version, result.Transitioned = transition.To, transition.TicketVersion, true
+	return result, nil
 }
 
 func (w Worker) blockCI(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {

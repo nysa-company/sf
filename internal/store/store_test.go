@@ -446,7 +446,7 @@ func TestV46ToV47AddsMergeIntentSourceTupleAndFailsLegacyRowsClosed(t *testing.T
 	if err != nil || !found || intent.HeadOwner != "" || intent.HeadRepository != "" || intent.HeadRef != "" || validMergeIntent(intent) == nil {
 		t.Fatalf("legacy v46 intent=%+v found=%v err=%v", intent, found, err)
 	}
-	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v046-to-v047-*.sqlite"))
+	files, err := filepath.Glob(filepath.Join(backups, fmt.Sprintf("sf-schema-v046-to-v%03d-*.sqlite", schemaVersion)))
 	if err != nil || len(files) != 1 || rawSchemaVersion(t, files[0]) != 46 {
 		t.Fatalf("v46 backup=%v err=%v", files, err)
 	}

@@ -150,6 +150,16 @@ func TestSchedulerObservesManualMergeWithoutWorktree(t *testing.T) {
 	}
 }
 
+func TestSchedulerReconcilesObservedMergeWithoutWorktree(t *testing.T) {
+	reconciling := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "reconciling"}, domain.StateReconciling)
+	ensurer := &fakeEnsure{err: store.ErrNotFound}
+	worker := &fakeWorker{}
+	result := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{reconciling}}, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != reconciling.Ref || len(ensurer.calls) != 0 {
+		t.Fatalf("reconciling result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
 func TestSchedulerBindsEachTicketRunnerEpochToTheSameLeader(t *testing.T) {
 	first := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "first"}, domain.StatePlanning)
 	first.RunnerEpoch = 3

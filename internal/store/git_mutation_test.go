@@ -686,10 +686,14 @@ func TestGitMutationLeaseSurvivesFenceChangeUntilRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ReconcileEffects(ctx, domain.ChannelDev, intent.Fence.LeaderEpoch); err != nil {
+	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "git-authority-restart")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := lease.Check(ctx); !errors.Is(err, ErrGitMutationIntent) {
+	if _, err := db.ReconcileEffects(ctx, domain.ChannelDev, newLeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Check(ctx); !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("fenced lease check=%v", err)
 	}
 	if err := lease.Release(); !errors.Is(err, ErrGitMutationLease) {

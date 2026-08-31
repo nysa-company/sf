@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -36,6 +37,14 @@ type ManualMergeObservation struct {
 // and fresh merged-PR response into the narrow manual authority. Current
 // ticket/fence and the digest are filled by the Store transition boundary.
 func NewManualMergeObservation(publication PublishedCandidateEvidence, observed contracts.PublishedPullRequestObservation) ManualMergeObservation {
+	// Presentation fields such as Ready, Title, Body, MergeState, and
+	// AutoMerge are deliberately not durable authority. Canonicalize at this
+	// boundary so a Store round trip compares only the exact persisted merge
+	// identity and proof facts.
+	observed = contracts.PublishedPullRequestObservation{
+		Identity: observed.Identity, Draft: observed.Draft, Merged: observed.Merged,
+		MergeCommit: observed.MergeCommit, BaseHeadOID: observed.BaseHeadOID, State: observed.State,
+	}
 	return ManualMergeObservation{
 		Ref: publication.Ref, CandidateGeneration: publication.Candidate.Snapshot.Generation,
 		CandidateHeadSHA: publication.Candidate.Snapshot.HeadSHA, CandidateBaseSHA: publication.Candidate.Snapshot.BaseSHA,
@@ -109,6 +118,30 @@ func manualMergeObservationEventPayload(digest string) string {
 	return string(payload)
 }
 
+// authenticateManualMergePublication revalidates the publication authority
+// referenced by a manual observation on the caller's SQLite connection. It is
+// shared by the initial transition and post-pause rearm so neither path trusts
+// the append-only observation row without its exact candidate/PR/effect chain.
+func (s *Store) authenticateManualMergePublication(ctx context.Context, conn *sql.Conn, value ManualMergeObservation) error {
+	publication, found, err := loadPublicationEvidenceRow(ctx, conn, value.Ref)
+	if err != nil || !found {
+		return fmt.Errorf("%w: publication row", ErrPublicationEvidence)
+	}
+	if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
+		return fmt.Errorf("%w: publication rebind", ErrPublicationEvidence)
+	}
+	if err := validPublishedCandidateEvidence(publication); err != nil || publication.PullRequest != value.Publication || publication.Candidate.Snapshot.Generation != value.CandidateGeneration || publication.Candidate.Snapshot.HeadSHA != value.CandidateHeadSHA || publication.Candidate.Snapshot.BaseSHA != value.CandidateBaseSHA || publication.Candidate.Snapshot.TreeSHA != value.CandidateTreeSHA || publication.WitnessDigest != value.PublicationWitnessDigest {
+		return fmt.Errorf("%w: publication identity", ErrPublicationEvidence)
+	}
+	if err := validateStoredPublicationEffectQuery(ctx, conn, value.Ref, publication.TicketVersion, publication.Fence, publication.PushEffect); err != nil {
+		return fmt.Errorf("%w: push effect", ErrPublicationEvidence)
+	}
+	if err := validateStoredPublicationEffectQuery(ctx, conn, value.Ref, publication.TicketVersion, publication.Fence, publication.PRCreateOrUpdateEffect); err != nil {
+		return fmt.Errorf("%w: pull request effect", ErrPublicationEvidence)
+	}
+	return nil
+}
+
 // RecordManualMergeObservation atomically appends the observation authority
 // and advances waiting_manual_merge to reconciling. No GitHub operation is
 // performed here; retrying after a crash only reads this authority.
@@ -144,27 +177,14 @@ func (s *Store) RecordManualMergeObservation(ctx context.Context, transition Tra
 		// this PR was the candidate admitted to manual mode.
 		endpoint, err := s.finalReviewRecoveryEndpoint(ctx, conn, transition.Ref, domain.StateWaitingManualMerge)
 		if err != nil || endpoint.version > version || endpoint.runner > runner {
-			return ErrPublicationEvidence
+			return fmt.Errorf("%w: final review endpoint", ErrPublicationEvidence)
 		}
 		leader, err := normalRecoveryLeaderAt(ctx, conn, transition.Ref, endpoint, version, runner)
 		if err != nil || leader != transition.Fence.LeaderEpoch {
-			return ErrStaleFence
+			return fmt.Errorf("%w: manual merge endpoint", ErrStaleFence)
 		}
-		publication, found, err := loadPublicationEvidenceRow(ctx, conn, transition.Ref)
-		if err != nil || !found {
-			return ErrPublicationEvidence
-		}
-		if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
-			return ErrPublicationEvidence
-		}
-		if err := validPublishedCandidateEvidence(publication); err != nil || publication.PullRequest != value.Publication || publication.Candidate.Snapshot.Generation != value.CandidateGeneration || publication.Candidate.Snapshot.HeadSHA != value.CandidateHeadSHA || publication.Candidate.Snapshot.BaseSHA != value.CandidateBaseSHA || publication.Candidate.Snapshot.TreeSHA != value.CandidateTreeSHA {
-			return ErrPublicationEvidence
-		}
-		if err := validateStoredPublicationEffectQuery(ctx, conn, transition.Ref, publication.TicketVersion, publication.Fence, publication.PushEffect); err != nil {
-			return ErrPublicationEvidence
-		}
-		if err := validateStoredPublicationEffectQuery(ctx, conn, transition.Ref, publication.TicketVersion, publication.Fence, publication.PRCreateOrUpdateEffect); err != nil {
-			return ErrPublicationEvidence
+		if err := s.authenticateManualMergePublication(ctx, conn, value); err != nil {
+			return err
 		}
 
 		_, err = conn.ExecContext(ctx, `INSERT INTO manual_merge_observations(channel,project_id,ticket_id,current_ticket_version,current_leader_epoch,current_runner_epoch,candidate_generation,candidate_head_sha,candidate_base_sha,candidate_tree_sha,publication_witness_digest,publication_host,publication_owner,publication_name,publication_pr_number,publication_head_owner,publication_head_repository,publication_head_ref,publication_head_oid,publication_base_ref,publication_base_oid,publication_factory_owned,observed_host,observed_owner,observed_name,observed_pr_number,observed_head_owner,observed_head_repository,observed_head_ref,observed_head_oid,observed_base_ref,observed_base_oid,observed_factory_owned,merge_commit,observed_protected_base,observation_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?) ON CONFLICT(channel,project_id,ticket_id,candidate_generation,candidate_head_sha) DO NOTHING`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, value.CurrentTicketVersion, value.CurrentFence.LeaderEpoch, value.CurrentFence.RunnerEpoch, value.CandidateGeneration, value.CandidateHeadSHA, value.CandidateBaseSHA, value.CandidateTreeSHA, value.PublicationWitnessDigest, value.Publication.Repository.Host, value.Publication.Repository.Owner, value.Publication.Repository.Name, value.Publication.Number, value.Publication.HeadOwner, value.Publication.HeadRepository, value.Publication.HeadRef, value.Publication.HeadOID, value.Publication.BaseRef, value.Publication.BaseOID, boolInt(value.Publication.FactoryOwned), value.Observed.Identity.Repository.Host, value.Observed.Identity.Repository.Owner, value.Observed.Identity.Repository.Name, value.Observed.Identity.Number, value.Observed.Identity.HeadOwner, value.Observed.Identity.HeadRepository, value.Observed.Identity.HeadRef, value.Observed.Identity.HeadOID, value.Observed.Identity.BaseRef, value.Observed.Identity.BaseOID, boolInt(value.Observed.Identity.FactoryOwned), value.MergeCommit, value.ObservedProtectedBase, value.ObservationDigest, time.Now().UTC().Format(time.RFC3339Nano))

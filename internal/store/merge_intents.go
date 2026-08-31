@@ -60,17 +60,23 @@ func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, 
 	if repositoryHost != "github.com" || owner == "" || name == "" || baseRef == "" || !validOID(originalBaseOID) || !validOID(mergeOID) || len(originalBaseOID) != len(mergeOID) {
 		return domain.MergeIntent{}, ErrEvidenceConflict
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT m.semantic_key FROM merge_intents m JOIN effects e ON e.semantic_key=m.semantic_key JOIN tickets t ON t.channel=m.channel AND t.project_id=m.project_id AND t.id=m.ticket_id
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return domain.MergeIntent{}, normalizeBusy(ctx, err)
+	}
+	defer conn.Close()
+	rows, err := conn.QueryContext(ctx, `SELECT m.semantic_key,t.state FROM merge_intents m JOIN effects e ON e.semantic_key=m.semantic_key JOIN tickets t ON t.channel=m.channel AND t.project_id=m.project_id AND t.id=m.ticket_id
 		WHERE m.repository_host=? AND m.repository_owner=? AND m.repository_name=? AND m.base_ref=? AND m.original_base_oid=?
-		AND t.state='merging' AND e.effect_kind='merge' AND e.state IN ('executing','uncertain') ORDER BY m.created_at DESC`, repositoryHost, owner, name, baseRef, originalBaseOID)
+		AND e.effect_kind='merge' AND ((t.state='merging' AND e.state IN ('executing','uncertain')) OR (t.state='reconciling' AND e.state='confirmed')) ORDER BY m.created_at DESC`, repositoryHost, owner, name, baseRef, originalBaseOID)
 	if err != nil {
 		return domain.MergeIntent{}, normalizeBusy(ctx, err)
 	}
 	defer rows.Close()
 	var key string
+	var state domain.State
 	count := 0
 	for rows.Next() {
-		if err := rows.Scan(&key); err != nil {
+		if err := rows.Scan(&key, &state); err != nil {
 			return domain.MergeIntent{}, err
 		}
 		count++
@@ -81,12 +87,38 @@ func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, 
 	if err := rows.Err(); err != nil {
 		return domain.MergeIntent{}, err
 	}
+	if err := rows.Close(); err != nil {
+		return domain.MergeIntent{}, err
+	}
 	if count != 1 {
 		return domain.MergeIntent{}, ErrNotFound
 	}
-	intent, found, err := s.MergeIntent(ctx, key)
+	intent, found, err := mergeIntentFrom(ctx, conn, key)
 	if err != nil || !found || intent.OriginalBaseOID != originalBaseOID || intent.BaseRef != baseRef {
 		return domain.MergeIntent{}, ErrEvidenceConflict
+	}
+	if state == domain.StateReconciling {
+		// Reconciling is recovery-only: the parent merge and child protected-ref
+		// proof have already completed. Authenticate the immutable confirmed
+		// merge endpoint, its one state transition, and every subsequent signed
+		// runner recovery before exposing the intent again.
+		confirmed, err := s.confirmedMergeRecoveryEndpoint(ctx, conn, intent.Ref)
+		if err != nil || confirmed.version == ^uint64(0) {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+		reconciling := normalRecoveryEndpoint{version: confirmed.version + 1, runner: confirmed.runner, leader: confirmed.leader}
+		var events, stateChanges int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='merge_observed' AND from_state='merging' AND to_state='reconciling'`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket, reconciling.version).Scan(&events, &stateChanges); err != nil || events != 1 || stateChanges != 1 {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+		var version, runner, leader uint64
+		var liveState domain.State
+		if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&liveState, &version, &runner, &leader); err != nil || liveState != domain.StateReconciling {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+		if currentLeader, err := normalRecoveryLeaderAt(ctx, conn, intent.Ref, reconciling, version, runner); err != nil || currentLeader != leader {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
 	}
 	return intent, nil
 }

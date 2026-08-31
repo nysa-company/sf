@@ -474,7 +474,7 @@ func (s *Store) ReconcileEffects(ctx context.Context, channel domain.Channel, le
 		// the identity of an old effect.
 		if _, err := conn.ExecContext(ctx, `UPDATE effects
 			SET state='uncertain', leader_epoch=?, claim_epoch=claim_epoch+1
-			WHERE channel=? AND state IN ('executing','uncertain')`, leaderEpoch, channel); err != nil {
+			WHERE channel=? AND state IN ('executing','uncertain') AND leader_epoch<>?`, leaderEpoch, channel, leaderEpoch); err != nil {
 			return err
 		}
 		rows, err := conn.QueryContext(ctx, `SELECT semantic_key, channel, project_id, ticket_id, effect_kind, state, ticket_version, leader_epoch, runner_epoch, claim_epoch, request_digest, observed_identity FROM effects WHERE channel=? AND state='uncertain' ORDER BY semantic_key`, channel)
