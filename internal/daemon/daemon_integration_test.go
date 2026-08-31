@@ -157,7 +157,7 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 			for code, want := range map[string][]string{
 				"autonomous_unavailable":       {binary, "providers", "qualify", "--help"},
 				"runtime_activation_failed":    {binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"},
-				"runtime_already_active":       {binary, "daemon", "run"},
+				"runtime_already_active":       {binary, "daemon", "status"},
 				"terminal_replay_requires_new": {binary, "submit", "--help"},
 				"unknown_project":              {binary, "init", "--help"},
 				"invalid_submit":               {binary, "submit", "--help"},

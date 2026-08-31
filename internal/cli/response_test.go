@@ -53,3 +53,23 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 		}
 	}
 }
+
+func TestRuntimeActivationResponsesRemainActionable(t *testing.T) {
+	for _, test := range []struct {
+		code string
+		argv []string
+	}{
+		{code: "runtime_activation_failed", argv: []string{"sf-dev", "providers", "qualify", "--builder", "codex", "--reviewer", "codex"}},
+		{code: "runtime_already_active", argv: []string{"sf-dev", "daemon", "status"}},
+	} {
+		t.Run(test.code, func(t *testing.T) {
+			response := api.Response{Version: api.Version, RequestID: test.code, Error: &api.Error{Code: test.code}, NextAction: &domain.NextAction{Code: test.code, Argv: test.argv}}
+			if err := validateCLIResponse(response); err != nil {
+				t.Fatalf("response validation: %v", err)
+			}
+			if exitCode(response) != ExitAction {
+				t.Fatalf("exit=%d, want action", exitCode(response))
+			}
+		})
+	}
+}

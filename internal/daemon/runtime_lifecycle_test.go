@@ -515,7 +515,7 @@ func TestActiveRuntimeRefusesRequalificationBeforePairMutation(t *testing.T) {
 	if response.OK || response.Error == nil || response.Error.Code != "runtime_already_active" || response.Mutation.Attempted {
 		t.Fatalf("active requalification=%+v", response)
 	}
-	if response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join([]string{"sf", "daemon", "run"}, "\x00") {
+	if response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join([]string{"sf", "daemon", "status"}, "\x00") {
 		t.Fatalf("active requalification action=%+v", response.NextAction)
 	}
 	if qualifierCalls != 1 {
@@ -866,5 +866,91 @@ func TestDaemonCloseJoinsRuntimeBeforeStoreAndIsIdempotent(t *testing.T) {
 	}
 	if err := daemon.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestServeAndCloseJoinOneRuntimeShutdownBeforeAuthorityTeardown(t *testing.T) {
+	release := make(chan struct{})
+	closeEntered := make(chan struct{})
+	var runtimeStore *store.Store
+	var closeMu sync.Mutex
+	closeCalls := 0
+	runtime := &fakeWorkflowRuntime{closeFn: func() error {
+		closeMu.Lock()
+		closeCalls++
+		first := closeCalls == 1
+		closeMu.Unlock()
+		if !first {
+			return errors.New("runtime Close called more than once")
+		}
+		close(closeEntered)
+		<-release
+		if _, err := runtimeStore.Project(context.Background(), domain.ChannelStable, "demo"); err != nil {
+			return fmt.Errorf("store closed before shared runtime join: %w", err)
+		}
+		return nil
+	}}
+	coordinator := &providercoord.Coordinator{}
+	cfg, _ := lifecycleConfig(t, func(deps RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		runtimeStore = deps.Store
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
+	cfg.ProviderCoordinatorFactory = func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
+		return coordinator, nil
+	}
+	d, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- d.Serve(serveCtx) }()
+	cancelServe()
+	select {
+	case <-closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Serve cancellation did not begin runtime shutdown")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before shared runtime shutdown completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	d.runtimeMu.Lock()
+	if d.providerCoordinator != coordinator {
+		d.runtimeMu.Unlock()
+		t.Fatal("Close detached coordinator before joining runtime shutdown")
+	}
+	d.runtimeMu.Unlock()
+	if _, err := runtimeStore.Project(context.Background(), domain.ChannelStable, "demo"); err != nil {
+		t.Fatalf("Close shut Store before runtime shutdown completed: %v", err)
+	}
+	close(release)
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not join runtime shutdown")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not complete after runtime shutdown")
+	}
+	closeMu.Lock()
+	if closeCalls != 1 {
+		closeMu.Unlock()
+		t.Fatalf("runtime Close calls=%d, want 1", closeCalls)
+	}
+	closeMu.Unlock()
+	if _, err := runtimeStore.Project(context.Background(), domain.ChannelStable, "demo"); err == nil {
+		t.Fatal("Store remained open after Close")
 	}
 }

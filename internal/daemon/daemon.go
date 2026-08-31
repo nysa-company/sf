@@ -234,6 +234,11 @@ type Daemon struct {
 	runtimeMu      sync.Mutex
 	runtimeStopped bool
 	runtimeContext context.Context
+	// runtimeCloseDone is created exactly once when a published runtime begins
+	// closing. Every lifecycle caller joins it before closing its coordinator or
+	// Store, so shutdown cannot race runtime-owned goroutines.
+	runtimeCloseDone chan struct{}
+	runtimeCloseErr  error
 
 	projectionMu      sync.Mutex
 	projector         events.Projector
@@ -654,16 +659,15 @@ func (daemon *Daemon) Close() error {
 	// Handle also covers direct in-process callers, which are not counted by
 	// transport.Server. Handler admission is sealed before this wait.
 	daemon.handlers.Wait()
-	daemon.runtimeMu.Lock()
-	daemon.runtimeStopped = true
-	runtime := daemon.runtime
-	coordinator := daemon.providerCoordinator
-	daemon.runtime, daemon.providerCoordinator = nil, nil
-	daemon.control = idleRuntimeController{}
-	daemon.runtimeMu.Unlock()
-	if runtime != nil {
-		result = joinCloseError(result, "close workflow runtime", runtime.Close)
+	if runtimeErr, initiated := daemon.shutdownRuntime(); initiated && runtimeErr != nil {
+		result = errors.Join(result, fmt.Errorf("close workflow runtime: %w", runtimeErr))
 	}
+	// shutdownRuntime has joined the runtime's Close before this detaches the
+	// exact paired coordinator. Store teardown remains strictly after both.
+	daemon.runtimeMu.Lock()
+	coordinator := daemon.providerCoordinator
+	daemon.providerCoordinator = nil
+	daemon.runtimeMu.Unlock()
 	if coordinator != nil {
 		result = joinCloseError(result, "close provider coordinator", coordinator.Close)
 	}
@@ -687,19 +691,39 @@ func joinCloseError(cause error, resource string, closeFn func() error) error {
 // when Serve returns as well as during explicit shutdown, so a caller that
 // cancels Serve cannot race a runtime tick against Store closure.
 func (daemon *Daemon) closeRuntime() error {
-	// Store remains open until Close joins transport/direct handlers. runtimeMu
-	// is enough here to keep a concurrent qualification or control operation
-	// from using a detached runtime while Serve is ending.
+	err, _ := daemon.shutdownRuntime()
+	return err
+}
+
+// shutdownRuntime detaches a published runtime once and joins that same Close
+// operation for every caller. It never holds runtimeMu while calling Close.
+func (daemon *Daemon) shutdownRuntime() (error, bool) {
 	daemon.runtimeMu.Lock()
 	daemon.runtimeStopped = true
+	if done := daemon.runtimeCloseDone; done != nil {
+		daemon.runtimeMu.Unlock()
+		<-done
+		daemon.runtimeMu.Lock()
+		err := daemon.runtimeCloseErr
+		daemon.runtimeMu.Unlock()
+		return err, false
+	}
 	runtime := daemon.runtime
 	daemon.runtime = nil
 	daemon.control = idleRuntimeController{}
-	daemon.runtimeMu.Unlock()
 	if runtime == nil {
-		return nil
+		daemon.runtimeMu.Unlock()
+		return nil, false
 	}
-	return runtime.Close()
+	done := make(chan struct{})
+	daemon.runtimeCloseDone = done
+	daemon.runtimeMu.Unlock()
+	err := runtime.Close()
+	daemon.runtimeMu.Lock()
+	daemon.runtimeCloseErr = err
+	close(done)
+	daemon.runtimeMu.Unlock()
+	return err, true
 }
 
 func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request api.Request) api.Response {
@@ -792,7 +816,7 @@ func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) 
 	// live coordinator. There is no atomic runtime handoff yet, so reject it
 	// before the qualifier receives Store authority.
 	if daemon.runtime != nil {
-		return daemon.failure(request, "runtime_already_active", "the qualified local workflow runtime is already active; stop it before a foreground restart", false)
+		return daemon.failure(request, "runtime_already_active", "the qualified local workflow runtime is already active; inspect daemon status, then stop the foreground daemon before requalifying", false)
 	}
 	value, err := daemon.providerQualifier(ctx, daemon.store, daemon.channel, parameters.Builder, parameters.Reviewer)
 	if err != nil {
@@ -1522,7 +1546,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 		argv = []string{binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"}
 	}
 	if code == "runtime_already_active" {
-		argv = []string{binary, "daemon", "run"}
+		argv = []string{binary, "daemon", "status"}
 	}
 	if code == "terminal_replay_requires_new" {
 		argv = []string{binary, "submit", "--help"}
