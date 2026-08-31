@@ -331,3 +331,63 @@ func TestPostPublicationRearmProofAfterRestartAcrossStates(t *testing.T) {
 		})
 	}
 }
+
+func TestFenceRecoveredRunnersRejectsMissingPostPublicationControl(t *testing.T) {
+	db, _, current := postPublicationPauseResume(t)
+	ctx := t.Context()
+	var path string
+	if err := db.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+		t.Fatalf("database path=%q err=%v", path, err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket); err != nil {
+		t.Fatalf("delete runtime control: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+	leader, err := reopened.AcquireLeader(ctx, domain.ChannelDev, "missing-postpub-control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("missing post-publication control was accepted: %v", err)
+	}
+}
+
+func TestFenceRecoveredRunnersRejectsCorruptPostPublicationControl(t *testing.T) {
+	fixture := finalReviewLifecycleFixture(t)
+	ctx := fixture.ctx
+	current, err := fixture.db.Ticket(ctx, fixture.ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
+	_, current = postPublicationPauseResumeAt(t, fixture.db, current, fence, domain.StateReviewing)
+	var path string
+	if err := fixture.db.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+		t.Fatalf("database path=%q err=%v", path, err)
+	}
+	if _, err := fixture.db.db.ExecContext(ctx, `UPDATE runtime_ticket_controls SET authority_version=authority_version+1 WHERE channel=? AND project_id=? AND ticket_id=?`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket); err != nil {
+		t.Fatalf("corrupt runtime control: %v", err)
+	}
+	if err := fixture.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+	leader, err := reopened.AcquireLeader(ctx, domain.ChannelDev, "corrupt-postpub-control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("corrupt post-publication control was accepted: %v", err)
+	}
+}

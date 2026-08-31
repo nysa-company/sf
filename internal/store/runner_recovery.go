@@ -954,14 +954,21 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 		return 0, false, err
 	}
 	if controls == 0 {
+		triplet, err := postPublicationControlTripletPresent(ctx, conn, ref, state, version)
+		if err != nil {
+			return 0, false, err
+		}
+		if triplet {
+			return 0, false, ErrPublicationEvidence
+		}
 		return 0, false, nil
 	}
 	control, err := runtimeControlFrom(ctx, conn, ref)
 	if err != nil {
-		return 0, false, err
+		return 0, false, ErrPublicationEvidence
 	}
 	if control.state != "sealed" || control.authority != control.stop || control.stop.version != version-2 || control.stop.runner != runner || control.stop.leader == 0 || control.stop.leader >= newLeader {
-		return 0, false, nil
+		return 0, false, ErrPublicationEvidence
 	}
 	baseline := Ticket{Ref: ref, Version: version - 3, RunnerEpoch: runner - 1, State: state}
 	current := Ticket{Ref: ref, Version: version, RunnerEpoch: runner, State: state}
@@ -972,4 +979,37 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 		return 0, false, nil
 	}
 	return control.stop.leader, true, nil
+}
+
+func postPublicationControlTripletPresent(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version uint64) (bool, error) {
+	if !postPublicationState(state) || version < 3 {
+		return false, nil
+	}
+	checks := []struct {
+		version uint64
+		trigger string
+		from    domain.State
+		to      domain.State
+	}{
+		{version - 2, "operator_pause_or_take", state, domain.StateStopping},
+		{version - 1, "process_and_effects_drained", domain.StateStopping, domain.StatePaused},
+		{version, "operator_resume|operator_retry", domain.StatePaused, state},
+	}
+	for _, check := range checks {
+		var matching, total int
+		triggerClause := "trigger=?"
+		args := []any{ref.Channel, ref.Project, ref.Ticket, check.version, ref.Channel, ref.Project, ref.Ticket, check.version, check.trigger, check.from, check.to}
+		if check.trigger == "operator_resume|operator_retry" {
+			triggerClause = "trigger IN ('operator_resume','operator_retry')"
+			args = []any{ref.Channel, ref.Project, ref.Ticket, check.version, ref.Channel, ref.Project, ref.Ticket, check.version, check.from, check.to}
+		}
+		query := `SELECT COALESCE((SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?),0),COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND ` + triggerClause + ` AND from_state=? AND to_state=?`
+		if err := conn.QueryRowContext(ctx, query, args...).Scan(&total, &matching); err != nil {
+			return false, err
+		}
+		if total != 1 || matching != 1 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
