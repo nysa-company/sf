@@ -77,12 +77,12 @@ func nodeClosureFor(path string) (nodeClosure, error) {
 	if err != nil {
 		return nodeClosure{}, err
 	}
+	if info.Size() < 0 || info.Size() > nodeClosureFileBytes || info.Size() > nodeClosureBytes {
+		return nodeClosure{}, ErrUnclear
+	}
 	digest, err := executableFileDigest(path)
 	if err != nil {
 		return nodeClosure{}, err
-	}
-	if info.Size() < 0 || info.Size() > nodeClosureFileBytes || info.Size() > nodeClosureBytes {
-		return nodeClosure{}, ErrUnclear
 	}
 	c := nodeClosure{Executable: path, Digest: digest, Mode: info.Mode().Perm(), Size: info.Size(), Bytes: info.Size()}
 	seen := map[string]bool{path: true}
@@ -210,7 +210,7 @@ func secureNodeSource(path string) (os.FileInfo, error) {
 // nodeClosureIdentity names both the executable and all non-system libraries;
 // its canonical JSON form is deliberately not a bare aggregate dylib hash.
 func nodeClosureIdentity(c nodeClosure) (string, error) {
-	if c.Executable == "" || c.Digest == "" || c.Size < 0 || c.Size > nodeClosureFileBytes || c.Bytes < c.Size || c.Bytes > nodeClosureBytes {
+	if c.Executable == "" || c.Digest == "" || len(c.Entries) > nodeClosureEntries || c.Size < 0 || c.Size > nodeClosureFileBytes || c.Bytes < c.Size || c.Bytes > nodeClosureBytes {
 		return "", ErrUnclear
 	}
 	entries := append([]nodeClosureEntry(nil), c.Entries...)
@@ -390,8 +390,9 @@ func node22Identity(name string) (string, string, error) {
 }
 
 // runNode uses the same durable Store lease and fd-pinned worktree as Go, but
-// never inserts Node test wrappers. Seatbelt denies process-fork/exec and
-// Node's own permissions deny child, worker, write, addon, and network APIs.
+// never inserts Node test wrappers. Seatbelt denies network and
+// process-fork/exec; Node's own permissions/flags add child, worker, write,
+// and addon defense in depth.
 func (s RepositoryCommandSupervisor) runNode(ctx context.Context, claim contracts.RepositoryCommandClaim, spec contracts.CommandSpec, policy executionpolicy.CommandSnapshot, lease contracts.RepositoryCommandLease) (contracts.CommandResult, error) {
 	if lease == nil || spec.Profile != contracts.ProfileGuarded || len(spec.Argv) != 2 || spec.Argv[0] != "node" || spec.Argv[1] != "--test" || spec.Directory != claim.Worktree || spec.Timeout <= 0 || spec.Timeout > 45*time.Minute || s.SoftDrain > 30*time.Second || s.HardDrain > 30*time.Second || policy.Authorize(spec.Argv) != nil || policy.Digest() != claim.PolicyDigest {
 		return contracts.CommandResult{}, ErrUnclear
@@ -482,7 +483,7 @@ func (s RepositoryCommandSupervisor) runNode(ctx context.Context, claim contract
 		return contracts.CommandResult{}, err
 	}
 	flags := []string{"--permission", "--allow-fs-read=" + claim.Worktree, "--allow-fs-read=" + filepath.Dir(library), "--no-addons", "--experimental-test-isolation=none", "--test-concurrency=1", "--no-experimental-fetch", "--no-experimental-websocket", "--no-experimental-sqlite", "--no-experimental-strip-types", "--no-global-search-paths", "--test"}
-	env = append(env, "DYLD_LIBRARY_PATH="+library, "SF_REPOSITORY_NODE_WORKTREE="+claim.Worktree, "SF_REPOSITORY_NODE_CLOSURE="+filepath.Dir(library))
+	env = append(env, "DYLD_LIBRARY_PATH="+library, "OPENSSL_CONF=/dev/null", "SF_REPOSITORY_NODE_WORKTREE="+claim.Worktree, "SF_REPOSITORY_NODE_CLOSURE="+filepath.Dir(library))
 	gateRead, gateWrite, err := os.Pipe()
 	if err != nil {
 		return contracts.CommandResult{}, err

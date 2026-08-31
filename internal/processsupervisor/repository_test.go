@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -249,9 +251,10 @@ func TestStageGoToolchainRejectsExcessiveDepth(t *testing.T) {
 }
 
 type repositoryTestLease struct {
-	mu     sync.Mutex
-	launch contracts.RepositoryCommandLaunch
-	groups []contracts.RepositoryCommandLaunch
+	mu       sync.Mutex
+	launch   contracts.RepositoryCommandLaunch
+	groups   []contracts.RepositoryCommandLaunch
+	finished bool
 }
 
 func (l *repositoryTestLease) Check(context.Context) error { return nil }
@@ -264,6 +267,9 @@ func (l *repositoryTestLease) RecordRepositoryCommandLaunch(_ context.Context, v
 	return nil
 }
 func (l *repositoryTestLease) FinishRepositoryCommandLaunch(context.Context, contracts.RepositoryCommandLaunch) error {
+	l.mu.Lock()
+	l.finished = true
+	l.mu.Unlock()
 	return nil
 }
 func (l *repositoryTestLease) RecordRepositoryCommandProcessGroup(_ context.Context, v contracts.RepositoryCommandLaunch) error {
@@ -271,6 +277,12 @@ func (l *repositoryTestLease) RecordRepositoryCommandProcessGroup(_ context.Cont
 	l.groups = append(l.groups, v)
 	l.mu.Unlock()
 	return nil
+}
+
+func (l *repositoryTestLease) launchFinished() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.finished && l.launch.PID > 0 && l.launch.PGID == l.launch.PID
 }
 func (l *repositoryTestLease) groupCount() int {
 	l.mu.Lock()
@@ -378,6 +390,139 @@ func TestRepositoryCommandRunsGoTestThroughTrackedStrictGate(t *testing.T) {
 	}
 	if lease.groupCount() == 0 {
 		t.Fatal("Go test binary crossed no durable process-group gate")
+	}
+}
+
+// This exercises the composed Node boundary rather than a profile fragment:
+// compiled sf fd gate, durable lease, private Mach-O closure, Node permission
+// flags, and in-process Seatbelt. The listener is deliberately live so a
+// refusal cannot be mistaken for an ordinary connection-refused result.
+func TestRepositoryCommandRunsDependencyFreeNode22ThroughGate(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("repository command product boundary is macOS")
+	}
+	if _, err := os.Stat("/opt/homebrew/bin/node"); err != nil {
+		t.Skip("Homebrew Node is unavailable")
+	}
+	repo := t.TempDir()
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRepositoryCommand(t, repo, "git", "init")
+	mustRepositoryCommand(t, repo, "git", "checkout", "-b", "main")
+	mustRepositoryCommand(t, repo, "git", "config", "user.email", "sf@example.test")
+	mustRepositoryCommand(t, repo, "git", "config", "user.name", "SF")
+	mustRepositoryCommand(t, repo, "git", "remote", "add", "origin", "ssh://git@ssh.github.com:443/example/repository.git")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	var connections int32
+	accepted := make(chan struct{})
+	go func() {
+		defer close(accepted)
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			atomic.AddInt32(&connections, 1)
+			_ = c.Close()
+		}
+	}()
+	if err := os.Mkdir(filepath.Join(repo, "test"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "package.json"), []byte(`{"name":"node-proof","private":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "listener-port"), []byte(fmt.Sprintf("%d", listener.Addr().(*net.TCPAddr).Port)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	testSource := `import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import net from 'node:net';
+import { spawnSync } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
+const root = new URL('../', import.meta.url);
+test('permission and seatbelt proof', async () => {
+  assert.equal(fs.readFileSync(new URL('../listener-port', import.meta.url), 'utf8').trim().length > 0, true);
+  assert.throws(() => fs.writeFileSync(new URL('./forbidden-write', import.meta.url), 'x'));
+  assert.throws(() => spawnSync('/bin/echo', ['escaped']));
+  assert.throws(() => new Worker('process.exit(0)', { eval: true }));
+  const port = Number(fs.readFileSync(new URL('../listener-port', import.meta.url), 'utf8'));
+  await new Promise((resolve, reject) => { const socket = net.connect({host:'127.0.0.1', port}); socket.once('error', resolve); socket.once('connect', () => reject(new Error('network connected'))); });
+});
+`
+	if err := os.WriteFile(filepath.Join(repo, "test", "node-gate.test.mjs"), []byte(testSource), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustRepositoryCommand(t, repo, "git", "add", ".")
+	mustRepositoryCommand(t, repo, "git", "commit", "-m", "initial")
+	worktree := filepath.Join(t.TempDir(), "worktree")
+	mustRepositoryCommand(t, repo, "git", "worktree", "add", "-b", "ticket/node-proof", worktree)
+	helper := filepath.Join(t.TempDir(), "sf-git-exec")
+	buildHelper := exec.Command("go", "build", "-o", helper, "./cmd/sf-git-exec")
+	buildHelper.Dir = root
+	if out, err := buildHelper.CombinedOutput(); err != nil {
+		t.Fatalf("build Git helper: %v: %s", err, out)
+	}
+	gitHome := filepath.Join(t.TempDir(), "git-home")
+	if err := os.Mkdir(gitHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := gitboundary.Runner{Binary: "/usr/bin/git", ExecHelper: helper, Home: gitHome}
+	identity, err := runner.Snapshot(context.Background(), worktree, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree = identity.Worktree
+	identityRaw, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodePath, nodeDigest, err := RepositoryExecutableIdentity("node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := contracts.CommandSpec{Argv: []string{"node", "--test"}, Directory: worktree, Timeout: 90 * time.Second, Profile: contracts.ProfileGuarded}
+	policy, err := executionpolicy.NewCommandSnapshot(spec.Argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv, _ := json.Marshal(spec.Argv)
+	argvSum := sha256.Sum256(argv)
+	empty := sha256.Sum256(nil)
+	specBytes, _ := json.Marshal(struct {
+		Argv        []string
+		Directory   string
+		Timeout     int64
+		Profile     contracts.ExecutionProfile
+		StdinDigest string
+	}{spec.Argv, spec.Directory, spec.Timeout.Nanoseconds(), spec.Profile, "sha256:" + hex.EncodeToString(empty[:])})
+	specSum := sha256.Sum256(specBytes)
+	claim := contracts.RepositoryCommandClaim{TicketRef: domain.TicketRef{Channel: domain.ChannelDev, Project: "proof", Ticket: "node-proof"}, SemanticKey: "repository-command/node-proof", RequestDigest: "sha256:" + strings.Repeat("a", 64), TicketVersion: 1, LeaderEpoch: 1, RunnerEpoch: 1, ClaimEpoch: 1, Repository: identity.Repository, Worktree: worktree, WorktreeIdentity: string(identityRaw), Branch: identity.HeadRef, BaseRef: identity.BaseRef, BaseSHA: identity.BaseHead, CommandDigest: "sha256:" + hex.EncodeToString(argvSum[:]), SpecDigest: "sha256:" + hex.EncodeToString(specSum[:]), PolicyDigest: policy.Digest(), ExecutablePath: nodePath, ExecutableDigest: nodeDigest}
+	sf := filepath.Join(t.TempDir(), "sf")
+	build := exec.Command("go", "build", "-o", sf, "./cmd/sf")
+	build.Dir = root
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sf gate: %v: %s", err, out)
+	}
+	lease := &repositoryTestLease{}
+	result, err := (RepositoryCommandSupervisor{Executable: sf, GitRunner: runner, SoftDrain: time.Second, HardDrain: time.Second}).Run(context.Background(), claim, spec, policy, lease)
+	_ = listener.Close()
+	<-accepted
+	if err != nil || !result.Observed || result.ExitCode != 0 {
+		t.Fatalf("repository Node verification result=%+v err=%v", result, err)
+	}
+	if !lease.launchFinished() || lease.groupCount() != 0 {
+		t.Fatalf("Node launch lifecycle=%+v groups=%d", lease.launch, lease.groupCount())
+	}
+	if atomic.LoadInt32(&connections) != 0 {
+		t.Fatalf("Seatbelt allowed %d localhost connections", connections)
 	}
 }
 
