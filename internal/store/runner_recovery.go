@@ -938,3 +938,38 @@ func (s *Store) publicationRecoveryBaseline(ctx context.Context, conn *sql.Conn,
 	}
 	return publication.CurrentFence.LeaderEpoch, true, nil
 }
+
+// postPublicationRecoveryBaseline authenticates a restart after an operator
+// pause/take has been resumed in a publication-sensitive state. The durable
+// stop row identifies the invalidated endpoint, while the three exact control
+// events identify the resumed endpoint. Business evidence is then checked at
+// the pre-stop endpoint before its leader is used as the predecessor for a
+// normal signed +1/+1 recovery row.
+func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64) (uint64, bool, error) {
+	if !postPublicationState(state) || version < 3 || runner <= 1 || newLeader == 0 {
+		return 0, false, nil
+	}
+	var controls int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&controls); err != nil {
+		return 0, false, err
+	}
+	if controls == 0 {
+		return 0, false, nil
+	}
+	control, err := runtimeControlFrom(ctx, conn, ref)
+	if err != nil {
+		return 0, false, err
+	}
+	if control.state != "sealed" || control.authority != control.stop || control.stop.version != version-2 || control.stop.runner != runner || control.stop.leader == 0 || control.stop.leader >= newLeader {
+		return 0, false, nil
+	}
+	baseline := Ticket{Ref: ref, Version: version - 3, RunnerEpoch: runner - 1, State: state}
+	current := Ticket{Ref: ref, Version: version, RunnerEpoch: runner, State: state}
+	if err := authenticatePostPublicationResume(ctx, conn, ref, baseline, current, control.stop); err != nil {
+		return 0, false, nil
+	}
+	if err := s.authenticatePostPublicationState(ctx, conn, ref, state, baseline.Version, domain.Fence{LeaderEpoch: control.stop.leader, RunnerEpoch: baseline.RunnerEpoch}); err != nil {
+		return 0, false, nil
+	}
+	return control.stop.leader, true, nil
+}

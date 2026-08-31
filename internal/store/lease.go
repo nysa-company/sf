@@ -221,8 +221,8 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 			// recovery resource consumed before that transition. A same-leader
 			// lost-response returned above is the only replay allowed at the cap.
 			if ticket.state == domain.StateWaitingCI {
-				publication, found, err := loadPublicationEvidenceRow(ctx, conn, ref)
-				if err != nil || !found {
+				publication, publicationFound, err := loadPublicationEvidenceRow(ctx, conn, ref)
+				if err != nil || !publicationFound {
 					return ErrPublicationEvidence
 				}
 				if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
@@ -442,12 +442,21 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					return controlErr
 				} else if controlFound && validateRunnerControlAdvance(ctx, conn, ref, latest.TicketVersion, latest.RunnerEpoch, latest.LeaderEpoch, ticket.version, ticket.runner, controlLeader) == nil {
 					priorLeader = controlLeader
+				} else if postLeader, postFound, postErr := s.postPublicationRecoveryBaseline(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); postErr != nil {
+					return postErr
+				} else if postFound {
+					priorLeader = postLeader
 				} else if publication, ok, publicationErr := s.publicationRecoveryBaseline(ctx, conn, ref, ticket.version, ticket.runner); publicationErr != nil {
 					return publicationErr
 				} else if ok {
 					priorLeader = publication
 				}
 			} else if priorLeader == 0 {
+				if postLeader, postFound, postErr := s.postPublicationRecoveryBaseline(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); postErr != nil {
+					return postErr
+				} else if postFound {
+					priorLeader = postLeader
+				}
 				publication, ok, err := s.publicationRecoveryBaseline(ctx, conn, ref, ticket.version, ticket.runner)
 				if err != nil {
 					return err

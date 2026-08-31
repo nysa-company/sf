@@ -253,3 +253,81 @@ func TestPostPublicationRearmProofAuthenticatesMergingAndReconciling(t *testing.
 		})
 	}
 }
+
+func TestPostPublicationRearmProofAfterRestartAcrossStates(t *testing.T) {
+	for _, target := range []domain.State{
+		domain.StateReviewing,
+		domain.StateWaitingApproval,
+		domain.StateWaitingManualMerge,
+		domain.StateMerging,
+		domain.StateReconciling,
+	} {
+		t.Run(string(target), func(t *testing.T) {
+			mergeMode := domain.MergeGuarded
+			if target == domain.StateWaitingManualMerge {
+				mergeMode = domain.MergeManual
+			}
+			fixture := finalReviewLifecycleFixtureFor(t, domain.TicketFeature, mergeMode)
+			if target != domain.StateReviewing {
+				completeFinalReview(t, fixture)
+				current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
+				to := domain.StateWaitingApproval
+				if target == domain.StateWaitingManualMerge {
+					to = domain.StateWaitingManualMerge
+				}
+				if _, err := fixture.db.TransitionFinalReview(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateReviewing, To: to, Trigger: "review_pass", Fence: fence, EventPayload: `{}`}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
+			if target == domain.StateMerging || target == domain.StateReconciling {
+				if _, err := fixture.db.Transition(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: current.Version, From: current.State, To: target, Trigger: "merge_start", Fence: fence, EventPayload: `{}`}); err != nil {
+					t.Fatalf("transition to %s: %v", target, err)
+				}
+				current, err = fixture.db.Ticket(fixture.ctx, current.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fence.RunnerEpoch = current.RunnerEpoch
+				bindTerminalMergeEffect(t, fixture.db, fixture, current, fence, "merge/rearm/restart/"+string(target))
+			}
+			_, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fence, target)
+
+			var path string
+			if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+				t.Fatalf("database path=%q err=%v", path, err)
+			}
+			if err := fixture.db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := Open(fixture.ctx, path)
+			if err != nil {
+				t.Fatalf("reopen store: %v", err)
+			}
+			defer reopened.Close()
+			leader, err := reopened.AcquireLeader(fixture.ctx, domain.ChannelDev, "postpub-state-reopen-"+string(target))
+			if err != nil {
+				t.Fatalf("acquire replacement leader: %v", err)
+			}
+			if changed, err := reopened.FenceRecoveredRunners(fixture.ctx, domain.ChannelDev, leader); err != nil || changed != 1 {
+				t.Fatalf("fence changed=%d err=%v", changed, err)
+			}
+			recovered, err := reopened.StoppedRuntimeTicket(fixture.ctx, resumed.Ref)
+			if err != nil {
+				t.Fatalf("load recovered stop tuple: %v", err)
+			}
+			capability, err := reopened.PostPublicationRearmProof(fixture.ctx, resumed.Ref, recovered)
+			if err != nil || capability == nil {
+				t.Fatalf("state=%s capability=%v err=%v", target, capability, err)
+			}
+		})
+	}
+}
