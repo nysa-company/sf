@@ -766,6 +766,14 @@ func CanonicalPullRequestUpdateRequestDigest(identity contracts.PullRequestIdent
 	return requestDigest("pr_edit", identity, title, body)
 }
 
+func CanonicalReadyRequestDigest(identity contracts.PullRequestIdentity) string {
+	return requestDigest("pr_ready", identity)
+}
+
+func CanonicalMergeRequestDigest(identity contracts.PullRequestIdentity, headOID, method string, authorization domain.MergeAuthorization) string {
+	return requestDigest("merge", identity, headOID, method, authorization.ReviewedBaseSHA, authorization.CurrentBaseSHA, authorization.ReviewedBaseHeadOID, authorization.CurrentBaseHeadOID)
+}
+
 func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryIdentity) (Principal, error) {
 	if err := validRepository(repository); err != nil {
 		return Principal{}, err

@@ -7,6 +7,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	githubboundary "github.com/nysa-company/sf/internal/github"
 	pub "github.com/nysa-company/sf/internal/publication"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/workflowworker"
@@ -65,12 +66,96 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 			Transitioned: result.Transitioned,
 			Replayed:     result.Replayed,
 		}, err
+	case domain.StateMerging:
+		return w.merge(ctx, ticket, fence)
 	default:
 		// waiting_ci and all control/terminal states are inert. The scheduler
 		// normally filters them, but keeping this dispatch boundary inert makes
 		// direct calls safe as well.
 		return workflowworker.RunResult{Ref: ref, State: ticket.State, Version: ticket.Version}, nil
 	}
+}
+
+func (w Worker) merge(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {
+	result := workflowworker.RunResult{Ref: ticket.Ref, State: ticket.State, Version: ticket.Version, Phase: domain.PhaseMerge}
+	if !w.PublicationEnabled || w.Publication.Store == nil || w.Publication.GitHub == nil || w.Engine == nil || ticket.MergeMode != domain.MergeGuarded {
+		return result, ErrPublishingUnavailable
+	}
+	candidate, err := w.Store.RecoverableCandidate(ctx, ticket.Ref)
+	if err != nil {
+		return result, err
+	}
+	published, err := w.Store.LoadHistoricalPublishedCandidate(ctx, ticket.Ref)
+	if err != nil || published.PullRequest.HeadOID != candidate.Snapshot.HeadSHA {
+		return result, store.ErrEvidenceConflict
+	}
+	approved := false
+	decisions, err := w.Store.OperatorDecisions(ctx, ticket.Ref)
+	if err != nil {
+		return result, err
+	}
+	for _, decision := range decisions {
+		if decision.Decision == "approved" && !decision.Invalidated && decision.ReviewedHead == candidate.Snapshot.HeadSHA {
+			approved = true
+		}
+	}
+	if !approved {
+		return result, store.ErrEvidenceConflict
+	}
+	identity := published.PullRequest
+	authorization := domain.MergeAuthorization{ReviewedHead: candidate.Snapshot.HeadSHA, CurrentHead: candidate.Snapshot.HeadSHA, ReviewedBaseSHA: candidate.Snapshot.BaseSHA, CurrentBaseSHA: candidate.Snapshot.BaseSHA, ReviewedBaseHeadOID: identity.BaseOID, CurrentBaseHeadOID: identity.BaseOID, Approved: true, GatesGreen: true}
+	readyDigest := githubboundary.CanonicalReadyRequestDigest(identity)
+	readyKey := "merge-ready/" + string(ticket.Ref.Channel) + "/" + string(ticket.Ref.Project) + "/" + string(ticket.Ref.Ticket) + "/" + candidate.Snapshot.HeadSHA
+	if _, err := w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: readyKey, Ref: ticket.Ref, Kind: "pr_ready", TicketVersion: ticket.Version, Fence: fence, RequestDigest: readyDigest}); err != nil {
+		return result, err
+	}
+	ready, err := w.Store.ClaimEffect(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
+	if err != nil {
+		return result, err
+	}
+	if ready.Claimed {
+		if err := w.Publication.GitHub.MarkReady(ctx, ready.ExternalClaim(), identity); err != nil {
+			_, _ = w.Store.MarkEffectUncertain(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: ready.Effect.LeaderEpoch, RunnerEpoch: ready.Effect.RunnerEpoch, ClaimEpoch: ready.Effect.ClaimEpoch}})
+			return result, err
+		}
+		if _, err := w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: ready.Effect.LeaderEpoch, RunnerEpoch: ready.Effect.RunnerEpoch, ClaimEpoch: ready.Effect.ClaimEpoch}}, "ready/"+candidate.Snapshot.HeadSHA); err != nil {
+			return result, err
+		}
+	}
+	method := "squash"
+	mergeDigest := githubboundary.CanonicalMergeRequestDigest(identity, candidate.Snapshot.HeadSHA, method, authorization)
+	mergeKey := "merge/" + string(ticket.Ref.Channel) + "/" + string(ticket.Ref.Project) + "/" + string(ticket.Ref.Ticket) + "/" + candidate.Snapshot.HeadSHA
+	if _, err := w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: mergeKey, Ref: ticket.Ref, Kind: "merge", TicketVersion: ticket.Version, Fence: fence, RequestDigest: mergeDigest}); err != nil {
+		return result, err
+	}
+	claim, err := w.Store.ClaimEffect(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
+	if err != nil {
+		return result, err
+	}
+	if !claim.Claimed {
+		return result, store.ErrEffectBusy
+	}
+	if err := w.Publication.GitHub.MergeExactHead(ctx, claim.ExternalClaim(), identity, candidate.Snapshot.HeadSHA, method, authorization); err != nil {
+		_, _ = w.Store.MarkEffectUncertain(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}})
+		return result, err
+	}
+	if _, err := w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}}, "merged/"+candidate.Snapshot.HeadSHA); err != nil {
+		return result, err
+	}
+	transition, err := w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: domain.StateMerging, Trigger: "merge_observed", Fence: fence, Attributes: map[string]string{"source_head_equals_reviewed_head": "true", "protected_branch_contains_merge": "true"}})
+	if err != nil {
+		return result, err
+	}
+	_, err = w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: transition.TicketVersion, From: domain.StateReconciling, Trigger: "reconcile_pass", Fence: fence, Attributes: map[string]string{"terminal_remote_truth_exact": "true"}})
+	if err != nil {
+		return result, err
+	}
+	done, err := w.Store.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		return result, err
+	}
+	result.State, result.Version, result.Transitioned = done.State, done.Version, true
+	return result, nil
 }
 
 func (w Worker) blockPublishing(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {
