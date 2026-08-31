@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -113,6 +114,64 @@ func TestRegisterRuntimeFailureAndMissingCachePreserveOrReplaceExactly(t *testin
 	}
 }
 
+func TestStagedRuntimeMatchesRequiresPrivateExecutableAndDirectory(t *testing.T) {
+	newSnapshot := func(t *testing.T) (*stagedExecutable, string) {
+		t.Helper()
+		directory, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(directory, "provider")
+		contents := []byte("#!/bin/sh\nexit 0\n")
+		if err := os.WriteFile(path, contents, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(contents)
+		return &stagedExecutable{path: path, directory: directory}, hex.EncodeToString(digest[:])
+	}
+
+	t.Run("valid private executable", func(t *testing.T) {
+		snapshot, digest := newSnapshot(t)
+		if !stagedRuntimeMatches(snapshot, digest) {
+			t.Fatal("private executable snapshot was rejected")
+		}
+	})
+	t.Run("missing execute bit", func(t *testing.T) {
+		snapshot, digest := newSnapshot(t)
+		if err := os.Chmod(snapshot.path, 0o400); err != nil {
+			t.Fatal(err)
+		}
+		if stagedRuntimeMatches(snapshot, digest) {
+			t.Fatal("non-executable staged runtime was accepted")
+		}
+	})
+	t.Run("non-private parent mode", func(t *testing.T) {
+		snapshot, digest := newSnapshot(t)
+		if err := os.Chmod(snapshot.directory, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if stagedRuntimeMatches(snapshot, digest) {
+			t.Fatal("group-readable staged runtime directory was accepted")
+		}
+	})
+	t.Run("symlinked parent", func(t *testing.T) {
+		snapshot, digest := newSnapshot(t)
+		moved := snapshot.directory + "-moved"
+		if err := os.Rename(snapshot.directory, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(moved, snapshot.directory); err != nil {
+			t.Fatal(err)
+		}
+		if stagedRuntimeMatches(snapshot, digest) {
+			t.Fatal("symlinked staged runtime directory was accepted")
+		}
+	})
+}
+
 func TestSupervisorCloseNeverDeletesLegacyExecutable(t *testing.T) {
 	supervisor, err := New(nil)
 	if err != nil {
@@ -147,6 +206,137 @@ func TestSupervisorCloseReclaimsStagedRuntimeAndIsIdempotent(t *testing.T) {
 	}
 	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err == nil {
 		t.Fatal("closed supervisor accepted a new runtime")
+	}
+}
+
+func TestSupervisorCompletedRuntimeRunDoesNotLeakSnapshotReference(t *testing.T) {
+	supervisor, binding, executable, authHome := runtimeRegistration(t)
+	supervisor.Recorder = recordingLaunches(func(context.Context, contracts.DrainRequest, Identity, string) error { return nil })
+	contents := []byte("#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = '--output-last-message' ]; then out=\"$2\"; shift 2; continue; fi\n  shift\ndone\nsleep 1\nprintf '{}' > \"$out\"\n")
+	if err := os.WriteFile(executable, contents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	binding.BinaryDigest = hex.EncodeToString(digest[:])
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	staged := supervisor.trusted[binding.Identity].stagedDir
+	request, invocation, input := codexRunFixture(t, executable, binding, authHome)
+	if _, err := supervisor.Run(context.Background(), request, invocation, input); err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Fatalf("completed runtime Run leaked staged snapshot %q: %v", staged, err)
+	}
+}
+
+func TestSupervisorCloseRetainsStagedRuntimeUntilPipeHoldingEscapeeWaits(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(root, "ready")
+	release := filepath.Join(root, "release")
+	escapee := buildDetachedPipeHolder(t, root, ready, release)
+	provider := filepath.Join(root, "codex")
+	program := fmt.Sprintf("#!/bin/sh\n\"%s\" &\nwhile [ ! -f \"%s\" ]; do sleep 0.01; done\nexit 0\n", escapee, ready)
+	if err := os.WriteFile(provider, []byte(program), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(program))
+	authHome := filepath.Join(root, "codex-home")
+	if err := os.Mkdir(authHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authHome, "auth.json"), []byte(`{"tokens":{"access_token":"fixture"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	supervisor, err := New(recordingLaunches(func(context.Context, contracts.DrainRequest, Identity, string) error { return nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor.Executable = testProviderGate(t)
+	supervisor.SoftDrain, supervisor.HardDrain = 100*time.Millisecond, 100*time.Millisecond
+	binding := contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"}, BinaryDigest: hex.EncodeToString(digest[:]), PolicyDigest: supervisor.PolicyDigest(), FixtureDigest: strings.Repeat("a", 64), AuthDigest: strings.Repeat("b", 64), AuthMode: "chatgpt_subscription"}
+	if _, err := supervisor.RegisterRuntime(binding, provider, authHome); err != nil {
+		t.Fatal(err)
+	}
+	staged := supervisor.trusted[binding.Identity].stagedDir
+	request, invocation, input := codexRunFixture(t, provider, binding, authHome)
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := supervisor.Run(runCtx, request, invocation, input)
+		runDone <- err
+	}()
+	awaitFile(t, ready, time.Second)
+	defer func() { _ = os.WriteFile(release, []byte("release"), 0o600) }()
+	cancel()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrUnclear) {
+			t.Fatalf("canceled run error=%v, want ErrUnclear", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled Run did not return while escapee held its pipes")
+	}
+	if err := supervisor.Close(); !errors.Is(err, ErrUnclear) {
+		t.Fatalf("Close=%v, want ErrUnclear", err)
+	}
+	if _, err := os.Stat(staged); err != nil {
+		t.Fatalf("Close reclaimed staged evidence before wait completion: %v", err)
+	}
+	if err := os.WriteFile(release, []byte("release"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	awaitMissing(t, staged, 2*time.Second)
+}
+
+func buildDetachedPipeHolder(t *testing.T, directory, ready, release string) string {
+	t.Helper()
+	source := filepath.Join(directory, "escapee.go")
+	binary := filepath.Join(directory, "escapee")
+	program := fmt.Sprintf("package main\nimport (\"os\"; \"syscall\"; \"time\")\nfunc main() { if _, err := syscall.Setsid(); err != nil { os.Exit(2) }; if err := os.WriteFile(%q, []byte(\"ready\"), 0600); err != nil { os.Exit(3) }; for { if _, err := os.Stat(%q); err == nil { return }; time.Sleep(5 * time.Millisecond) } }\n", ready, release)
+	if err := os.WriteFile(source, []byte(program), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("go", "build", "-o", binary, source)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build pipe-holding escapee: %v\n%s", err, output)
+	}
+	return binary
+}
+
+func awaitFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %q", path)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func awaitMissing(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %q to be reclaimed", path)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

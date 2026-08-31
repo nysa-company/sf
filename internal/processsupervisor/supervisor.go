@@ -86,22 +86,26 @@ type stagedExecutable struct {
 	cleaning        bool
 }
 type run struct {
-	identity    Identity
-	worktree    string
-	done        chan struct{}
-	streams     chan struct{}
-	finished    chan struct{}
-	snapshot    *stagedExecutable
-	doneOnce    sync.Once
-	streamsOnce sync.Once
+	identity        Identity
+	worktree        string
+	done            chan struct{}
+	streams         chan struct{}
+	finished        chan struct{}
+	releaseSnapshot func()
+	completeOnce    sync.Once
 }
 
 func (r *run) completeWait() {
 	if r == nil {
 		return
 	}
-	r.doneOnce.Do(func() { close(r.done) })
-	r.streamsOnce.Do(func() { close(r.streams) })
+	r.completeOnce.Do(func() {
+		close(r.done)
+		close(r.streams)
+		if r.releaseSnapshot != nil {
+			r.releaseSnapshot()
+		}
+	})
 }
 
 func New(recorder LaunchRecorder) (*Supervisor, error) {
@@ -232,11 +236,15 @@ func runtimeBindingMatches(current, candidate trustedExecutable, binding contrac
 // filesystem fault; treating that as a successful registration would defer a
 // deterministic configuration failure until a later provider launch.
 func stagedRuntimeMatches(snapshot *stagedExecutable, digest string) bool {
-	if snapshot == nil || snapshot.path == "" || snapshot.directory == "" || filepath.Dir(snapshot.path) != snapshot.directory || digest == "" {
+	if snapshot == nil || snapshot.path == "" || snapshot.directory == "" || !filepath.IsAbs(snapshot.path) || filepath.Clean(snapshot.path) != snapshot.path || !filepath.IsAbs(snapshot.directory) || filepath.Clean(snapshot.directory) != snapshot.directory || filepath.Dir(snapshot.path) != snapshot.directory || digest == "" {
+		return false
+	}
+	directory, err := os.Lstat(snapshot.directory)
+	if err != nil || directory.Mode()&os.ModeSymlink != 0 || !directory.IsDir() || directory.Mode().Perm()&0o077 != 0 || !trustedOwner(directory) {
 		return false
 	}
 	info, err := os.Lstat(snapshot.path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || info.Size() > 128<<20 || !trustedOwner(info) {
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 || info.Size() > 128<<20 || !trustedOwner(info) {
 		return false
 	}
 	file, err := os.Open(snapshot.path)
@@ -608,7 +616,14 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	if trustedErr != nil {
 		return contracts.CommandResult{}, trustedErr
 	}
-	defer releaseSnapshot()
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(releaseSnapshot) }
+	releasedToWait := false
+	defer func() {
+		if !releasedToWait {
+			release()
+		}
+	}()
 	if invocation.Argv[0] != trusted.path {
 		return contracts.CommandResult{}, errors.New("provider invocation executable does not match qualification")
 	}
@@ -709,7 +724,11 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 		s.mu.Unlock()
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: startIdentity}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{}), finished: make(chan struct{}), snapshot: trusted.snapshot}
+	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: startIdentity}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{}), finished: make(chan struct{}), releaseSnapshot: release}
+	// Once a process exists, its staged runtime remains referenced until the
+	// single cmd.Wait path has observed both process exit and stream closure.
+	// The deferred release above remains the prelaunch/startup failure fallback.
+	releasedToWait = true
 	s.runs[requestKey] = r
 	s.mu.Unlock()
 	defer close(r.finished)
