@@ -24,7 +24,7 @@ func TestCICorrectionV41SchemaIsAppendOnlyAndValidated(t *testing.T) {
 	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 41 || len(migrationChecksums) != 41 {
+	if version != schemaVersion || len(migrationChecksums) != schemaVersion || migrationChecksums[41] != migrationChecksum(migrationV41) {
 		t.Fatalf("schema version/checksum history=%d/%d", version, len(migrationChecksums))
 	}
 	for _, table := range []string{"ci_observations", "ci_observation_checks", "ci_transition_evidence", "candidate_repair_bindings", "candidate_repair_completions"} {

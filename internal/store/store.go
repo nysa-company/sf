@@ -57,7 +57,7 @@ var (
 	ErrPublicationEvidence     = errors.New("publication evidence is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 41
+const schemaVersion = 42
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -101,6 +101,7 @@ var migrationChecksums = map[int]string{
 	39: migrationChecksum(migrationV39),
 	40: migrationChecksum(migrationV40),
 	41: migrationChecksum(migrationV41),
+	42: migrationChecksum(migrationV42),
 }
 
 func migrationChecksum(statements []string) string {
@@ -442,6 +443,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV40
 			} else if version == 41 {
 				statements = migrationV41
+			} else if version == 42 {
+				statements = migrationV42
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1058,9 +1061,12 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expected
 		if !stateChanged {
 			return nil
 		}
-		_, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at)
-			VALUES (?, ?, ?, ?, 'start_or_adopt', ?, ?, '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, state, domain.StatePlanning, time.Now().UTC().Format(time.RFC3339Nano))
-		return err
+		createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at)
+			VALUES (?, ?, ?, ?, 'start_or_adopt', ?, ?, '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, state, domain.StatePlanning, createdAt); err != nil {
+			return err
+		}
+		return recordRunnerStartAuthority(ctx, conn, ref, version, fence, workflowID, createdAt)
 	})
 	if err != nil {
 		return Ticket{}, err
@@ -1167,6 +1173,15 @@ func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) Transition(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if transition.Trigger == "typed_blocker" && transition.To == domain.StateBlocked && (transition.From == domain.StatePublishing || transition.From == domain.StateWaitingCI) {
+		return s.TransitionPublishedBlock(ctx, transition)
+	}
+	// Publication retries that exhaust their bounded budget are an authenticated
+	// pause, not a generic publication exit.  Keep the witness as the source of
+	// truth so the subsequent operator resume can prove this exact pause.
+	if semanticPublicationPauseTransition(transition) {
+		return s.TransitionPublishedPause(ctx, transition)
+	}
 	// Publication is a separate trust boundary. A caller must not be able to
 	// advance publishing based only on a ticket counter and arbitrary payload.
 	if publicationSensitiveTransition(transition.From, transition.To) {
@@ -1187,6 +1202,16 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
 		return TransitionResult{}, errors.New("transition event payload must be bounded JSON")
 	}
+	blockedCode := ""
+	if transition.To == domain.StateBlocked && transition.Trigger == "typed_blocker" {
+		var blocker struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal([]byte(transition.EventPayload), &blocker) != nil || blocker.Code == "" || !boundedText(blocker.Code, 128) {
+			return TransitionResult{}, ErrEvidenceConflict
+		}
+		blockedCode = blocker.Code
+	}
 	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
 		return TransitionResult{}, err
 	}
@@ -1206,7 +1231,7 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
 			return err
 		}
-		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?, resume_state=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
+		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?, resume_state=?, blocked_code=CASE WHEN ?<>'' THEN ? WHEN state='blocked' THEN '' ELSE blocked_code END, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), blockedCode, blockedCode, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
 		if err != nil {
 			return err
 		}
@@ -1295,8 +1320,8 @@ func (s *Store) TransitionVerification(ctx context.Context, transition Transitio
 		if err := assertNewestBoundResult(ctx, conn, transition.Ref, domain.PhaseVerification, "reviewer", ProviderAttemptResultKey{AttemptID: id, Ref: transition.Ref, Phase: domain.PhaseVerification, Attempt: attempt}); err != nil {
 			return err
 		}
-		stored, err := s.CurrentVerification(ctx, transition.Ref)
-		if err != nil || stored.Revision.Revision == 0 || stored.Revision.CheckpointID != revisionCheckpoint || stored.ProviderResult.AttemptID != id || stored.ProviderResult.Attempt != attempt || stored.TicketVersion != version || stored.Fence != transition.Fence || stored.CommandBinding.TicketVersion != version || stored.CommandBinding.LeaderEpoch != transition.Fence.LeaderEpoch || stored.CommandBinding.RunnerEpoch != transition.Fence.RunnerEpoch {
+		stored, err := s.currentVerificationFrom(ctx, conn, transition.Ref)
+		if err != nil || stored.Revision.Revision == 0 || stored.Revision.CheckpointID != revisionCheckpoint || stored.ProviderResult.AttemptID != id || stored.ProviderResult.Attempt != attempt || stored.TicketVersion != version || stored.Fence != transition.Fence {
 			return ErrEvidenceConflict
 		}
 		return nil
@@ -1388,8 +1413,8 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 		if stored != candidate {
 			return ErrEvidenceConflict
 		}
-		authenticated, err := s.LatestCandidate(ctx, transition.Ref)
-		if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != version || authenticated.Fence != transition.Fence || authenticated.CommandBinding.TicketVersion != version || authenticated.CommandBinding.LeaderEpoch != transition.Fence.LeaderEpoch || authenticated.CommandBinding.RunnerEpoch != transition.Fence.RunnerEpoch || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {
+		authenticated, err := s.latestCandidateFrom(ctx, conn, transition.Ref, true)
+		if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != version || authenticated.Fence != transition.Fence || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {
 			return ErrEvidenceConflict
 		}
 		var attemptID int64

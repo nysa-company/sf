@@ -41,8 +41,24 @@ func (m RepositoryMaterializer) MaterializeVerificationCheckpoint(ctx context.Co
 		return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
 	}
 	provider, parsed, err := m.Store.LoadHistoricalProviderAttemptResult(ctx, key)
-	if err != nil || !providerMatches(request, provider, key, domain.PhaseVerification, "reviewer") || parsed.Verify == nil || !sameJSON(*parsed.Verify, artifact) {
+	if err != nil || !providerMatches(request, provider, key, domain.PhaseVerification, "reviewer") || m.Store.ProviderResultReachesFence(ctx, key, request.Ticket.Version, request.Fence) != nil || parsed.Verify == nil || !sameJSON(*parsed.Verify, artifact) {
 		return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
+	}
+	if prior := request.RecoveryVerification; prior != nil {
+		if prior.ProviderResult != key || prior.Checkpoint.CommitOID != prior.Revision.CheckpointID || prior.CommandBinding.Key.SemanticKey == "" {
+			return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
+		}
+		if err := m.Store.ProviderResultReachesFence(ctx, prior.ProviderResult, request.Ticket.Version, request.Fence); err != nil {
+			return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
+		}
+		observed, err := m.observe(ctx, request)
+		if err != nil || observed != prior.Checkpoint || observed.ParentOID != request.Worktree.BaseSHA {
+			return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
+		}
+		if _, err := m.Store.LoadRepositoryCommandResult(ctx, prior.CommandBinding.Key); err != nil {
+			return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
+		}
+		return workflowworker.VerificationCheckpoint{ID: prior.Revision.CheckpointID, Commit: prior.Checkpoint, CommandResult: prior.CommandBinding.Key}, nil
 	}
 	command, result, err := m.runCommand(ctx, request, store.RepositoryCommandPurposePrebuildVerification, key, artifact, "")
 	if err != nil || !verificationOutcome(artifact.PrebuildOutcome, result.Result.ExitCode) {
@@ -72,7 +88,7 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
 	}
 	provider, parsed, err := m.Store.LoadHistoricalProviderAttemptResult(ctx, key)
-	if err != nil || !providerMatches(request, provider, key, domain.PhaseBuild, "builder") || parsed.Builder == nil || !sameJSON(*parsed.Builder, builder) {
+	if err != nil || !providerMatches(request, provider, key, domain.PhaseBuild, "builder") || m.Store.ProviderResultReachesFence(ctx, key, request.Ticket.Version, request.Fence) != nil || parsed.Builder == nil || !sameJSON(*parsed.Builder, builder) {
 		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
 	}
 	// Re-establish the durable Planner scope before starting the post-build
@@ -114,7 +130,10 @@ func (m RepositoryMaterializer) replayCandidate(ctx context.Context, request wor
 	if err := candidateMatches(request, verification, builder, candidate); err != nil {
 		return workflowworker.CandidateWitness{}, err
 	}
-	durable, err := m.Store.LatestCandidate(ctx, request.Ticket.Ref)
+	if err := m.Store.ProviderResultReachesFence(ctx, candidate.BuilderResult, request.Ticket.Version, request.Fence); err != nil {
+		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
+	}
+	durable, err := m.Store.RecoverableCandidate(ctx, request.Ticket.Ref)
 	if err != nil || !reflect.DeepEqual(durable, candidate) {
 		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
 	}
@@ -131,7 +150,7 @@ func (m RepositoryMaterializer) replayCandidate(ctx context.Context, request wor
 
 func candidateMatches(request workflowworker.PhaseRequest, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, candidate store.StoredCandidate) error {
 	digest, err := phaseartifact.BuilderEvidenceDigest(builder)
-	if err != nil || candidate.BuilderResult.AttemptID == 0 || candidate.TicketVersion != request.Ticket.Version || candidate.Fence != request.Fence || candidate.Commit.CommitOID != candidate.Snapshot.HeadSHA || candidate.Commit.TreeOID != candidate.Snapshot.TreeSHA || candidate.Commit.ParentOID != verification.CheckpointID || candidate.Snapshot.BaseSHA != request.Worktree.BaseSHA || candidate.Snapshot.SourceDigest != request.Ticket.SourceDigest || candidate.Snapshot.VerificationIntentDigest != verification.IntentDigest || candidate.Snapshot.ProofDigest != verification.ProofDigest || candidate.Snapshot.BuilderEvidenceDigest != digest || candidate.CommandBinding.Key.SemanticKey == "" || candidate.CommandBinding.Key.ClaimEpoch == 0 {
+	if err != nil || candidate.BuilderResult.AttemptID == 0 || candidate.Commit.CommitOID != candidate.Snapshot.HeadSHA || candidate.Commit.TreeOID != candidate.Snapshot.TreeSHA || candidate.Commit.ParentOID != verification.CheckpointID || candidate.Snapshot.BaseSHA != request.Worktree.BaseSHA || candidate.Snapshot.SourceDigest != request.Ticket.SourceDigest || candidate.Snapshot.VerificationIntentDigest != verification.IntentDigest || candidate.Snapshot.ProofDigest != verification.ProofDigest || candidate.Snapshot.BuilderEvidenceDigest != digest || candidate.CommandBinding.Key.SemanticKey == "" || candidate.CommandBinding.Key.ClaimEpoch == 0 {
 		return ErrRepositoryMaterialization
 	}
 	return nil
@@ -412,7 +431,7 @@ func sameJSON(left, right any) bool {
 }
 func providerMatches(request workflowworker.PhaseRequest, result store.ProviderAttemptResult, key store.ProviderAttemptResultKey, phase domain.Phase, role string) bool {
 	claim := result.Claim
-	return key.Ref == request.Ticket.Ref && key.AttemptID == result.AttemptID && key.Attempt == claim.Attempt && key.Phase == phase && claim.Ref == request.Ticket.Ref && claim.Phase == phase && claim.Role == role && claim.ExpectedVersion == request.Ticket.Version && claim.LeaderEpoch == request.Fence.LeaderEpoch && claim.RunnerEpoch == request.Fence.RunnerEpoch && claim.Worktree == request.Worktree.Path && claim.WorktreeIdentity == string(request.Worktree.IdentityJSON) && claim.BaseSHA == request.Worktree.BaseSHA
+	return key.Ref == request.Ticket.Ref && key.AttemptID == result.AttemptID && key.Attempt == claim.Attempt && key.Phase == phase && claim.Ref == request.Ticket.Ref && claim.Phase == phase && claim.Role == role && claim.Worktree == request.Worktree.Path && claim.WorktreeIdentity == string(request.Worktree.IdentityJSON) && claim.BaseSHA == request.Worktree.BaseSHA
 }
 func containsPath(paths []string, path string) bool {
 	for _, p := range paths {

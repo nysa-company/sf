@@ -1049,3 +1049,21 @@ var migrationV41 = []string{
 	`UPDATE tickets SET state='blocked',resume_state='waiting_ci',blocked_code='legacy_ci_observation_unverifiable',version=version+1 WHERE state='waiting_ci'`,
 	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,id,version,'typed_blocker','waiting_ci','blocked','{"code":"legacy_ci_observation_unverifiable","reason":"CI observation predates authenticated v41 evidence","next_action":"reconcile CI externally or start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tickets WHERE state='blocked' AND blocked_code='legacy_ci_observation_unverifiable' AND resume_state='waiting_ci'`,
 }
+
+// v42 records the exact source endpoint created by a real queued->planning
+// admission. Unlike an audit event, this is one immutable physical row per
+// ticket, with a digest over every authority-bearing field.
+var migrationV42 = []string{
+	`CREATE TABLE runner_start_authorities (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		start_ticket_version INTEGER NOT NULL CHECK(start_ticket_version=2), runner_epoch INTEGER NOT NULL CHECK(runner_epoch=1), leader_epoch INTEGER NOT NULL CHECK(leader_epoch>0),
+		workflow_id TEXT NOT NULL, workflow_digest TEXT NOT NULL CHECK(length(workflow_digest)=71), created_at TEXT NOT NULL,
+		authority_digest TEXT NOT NULL CHECK(length(authority_digest)=71),
+		PRIMARY KEY(channel,project_id,ticket_id), UNIQUE(authority_digest),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+	`CREATE UNIQUE INDEX runner_start_authority_digest ON runner_start_authorities(authority_digest)`,
+	`CREATE INDEX runner_start_authority_ticket ON runner_start_authorities(channel,project_id,ticket_id)`,
+	`CREATE TRIGGER runner_start_authorities_immutable_update BEFORE UPDATE ON runner_start_authorities BEGIN SELECT RAISE(ABORT,'runner start authority is immutable'); END`,
+	`CREATE TRIGGER runner_start_authorities_immutable_delete BEFORE DELETE ON runner_start_authorities BEGIN SELECT RAISE(ABORT,'runner start authority is append-only'); END`,
+}

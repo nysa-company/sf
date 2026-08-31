@@ -152,7 +152,10 @@ func (s *Store) ValidateCurrentCandidateForBuildTransition(ctx context.Context, 
 	if candidate.Snapshot.BaseSHA != worktree.BaseSHA {
 		return StoredCandidate{}, ErrEvidenceConflict
 	}
-	verification, err := s.CurrentVerification(ctx, ref)
+	// A candidate is bound to an immutable verification revision that predates
+	// the Builder result. Authenticate that exact revision directly rather than
+	// requiring its reviewer binding to traverse later candidate recovery rows.
+	verification, err := s.verificationEvidenceForCandidate(ctx, ref)
 	if err != nil {
 		return StoredCandidate{}, err
 	}
@@ -209,13 +212,20 @@ func (s *Store) Plan(ctx context.Context, ref domain.TicketRef) (StoredPlan, err
 }
 
 func (s *Store) CurrentVerification(ctx context.Context, ref domain.TicketRef) (StoredVerification, error) {
+	return s.currentVerificationFrom(ctx, s.db, ref)
+}
+
+// currentVerificationFrom is the strict verification reader for callers that
+// already hold Store's write connection. It keeps the ticket/leader/event and
+// immutable command/provider/checkpoint checks in one SQLite view.
+func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef) (StoredVerification, error) {
 	if err := ref.Validate(); err != nil {
 		return StoredVerification{}, err
 	}
 	var result StoredVerification
 	var owned, created string
 	var amends sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT r.revision,r.ticket_version,r.leader_epoch,r.runner_epoch,
+	err := q.QueryRowContext(ctx, `SELECT r.revision,r.ticket_version,r.leader_epoch,r.runner_epoch,
 		r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id,
 		r.amends_revision,r.amendment_reason,r.requester,r.created_at
 		FROM verifications v JOIN verification_revisions r
@@ -249,7 +259,7 @@ func (s *Store) CurrentVerification(ctx context.Context, ref domain.TicketRef) (
 	if result.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil || result.TicketVersion == 0 || result.Fence.LeaderEpoch == 0 || result.Fence.RunnerEpoch == 0 {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT b.binding_ticket_version,b.leader_epoch,b.runner_epoch,b.provider_attempt_id,b.provider_attempt,b.checkpoint_commit_oid,b.checkpoint_parent_oid,b.checkpoint_tree_oid FROM verification_result_bindings b JOIN provider_attempt_results pr ON pr.provider_attempt_id=b.provider_attempt_id JOIN provider_attempts a ON a.id=pr.provider_attempt_id AND a.attempt=b.provider_attempt AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id AND a.phase='verification' AND a.role='reviewer' AND a.state='completed' AND a.outcome='completed' WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.revision=? ORDER BY b.binding_ticket_version DESC,b.leader_epoch DESC,b.runner_epoch DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, result.Revision.Revision).Scan(&result.TicketVersion, &result.Fence.LeaderEpoch, &result.Fence.RunnerEpoch, &result.ProviderResult.AttemptID, &result.ProviderResult.Attempt, &result.Checkpoint.CommitOID, &result.Checkpoint.ParentOID, &result.Checkpoint.TreeOID); err == nil {
+	if err := q.QueryRowContext(ctx, `SELECT b.binding_ticket_version,b.leader_epoch,b.runner_epoch,b.provider_attempt_id,b.provider_attempt,b.checkpoint_commit_oid,b.checkpoint_parent_oid,b.checkpoint_tree_oid FROM verification_result_bindings b JOIN provider_attempt_results pr ON pr.provider_attempt_id=b.provider_attempt_id JOIN provider_attempts a ON a.id=pr.provider_attempt_id AND a.attempt=b.provider_attempt AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id AND a.phase='verification' AND a.role='reviewer' AND a.state='completed' AND a.outcome='completed' WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.revision=? ORDER BY b.binding_ticket_version DESC,b.leader_epoch DESC,b.runner_epoch DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, result.Revision.Revision).Scan(&result.TicketVersion, &result.Fence.LeaderEpoch, &result.Fence.RunnerEpoch, &result.ProviderResult.AttemptID, &result.ProviderResult.Attempt, &result.Checkpoint.CommitOID, &result.Checkpoint.ParentOID, &result.Checkpoint.TreeOID); err == nil {
 		result.ProviderResult.Ref, result.ProviderResult.Phase = ref, domain.PhaseVerification
 		if result.Checkpoint.CommitOID != result.Revision.CheckpointID || !validOID(result.Checkpoint.ParentOID) || !validOID(result.Checkpoint.TreeOID) {
 			return StoredVerification{}, ErrEvidenceConflict
@@ -258,12 +268,27 @@ func (s *Store) CurrentVerification(ctx context.Context, ref domain.TicketRef) (
 	if result.ProviderResult.AttemptID == 0 || result.Checkpoint.CommitOID == "" {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
-	binding, err := loadVerificationCommandBinding(ctx, s.db, ref, result.Revision.Revision)
-	if err != nil || binding.TicketVersion != result.TicketVersion || binding.LeaderEpoch != result.Fence.LeaderEpoch || binding.RunnerEpoch != result.Fence.RunnerEpoch {
+	// This is the strict current verification reader. It admits the normal,
+	// unrecovered verifying->building handoff, but never silently consumes a
+	// prior-fence revision after a runner recovery. Immutable evidence remains
+	// available through RecoverableVerification for that recovery rebind.
+	var ticketVersion, ticketRunner, leader uint64
+	if err := q.QueryRowContext(ctx, `SELECT t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&ticketVersion, &ticketRunner, &leader); err != nil || ticketVersion == 0 || ticketRunner == 0 || leader == 0 {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	exact := ticketVersion == result.TicketVersion && ticketRunner == result.Fence.RunnerEpoch && leader == result.Fence.LeaderEpoch
+	if !exact {
+		var transitions int
+		if ticketVersion != result.TicketVersion+1 || ticketRunner != result.Fence.RunnerEpoch || leader != result.Fence.LeaderEpoch || q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='verifying' AND to_state='building'`, ref.Channel, ref.Project, ref.Ticket, ticketVersion).Scan(&transitions) != nil || transitions != 1 {
+			return StoredVerification{}, ErrEvidenceConflict
+		}
+	}
+	binding, err := loadVerificationCommandBinding(ctx, q, ref, result.Revision.Revision)
+	if err != nil {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
 	result.CommandBinding = binding
-	if err := s.reauthenticateStoredVerificationCommand(ctx, ref, result); err != nil {
+	if err := s.reauthenticateStoredVerificationCommandFrom(ctx, q, ref, result); err != nil {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
 	// Events are human/audit projections only. Provider, checkpoint, and
@@ -271,13 +296,49 @@ func (s *Store) CurrentVerification(ctx context.Context, ref domain.TicketRef) (
 	return result, nil
 }
 
+// RecoverableVerification reads the immutable revision/binding tuple solely
+// for an append-only live-fence recovery rebind. It is not current transition
+// authority: RecordVerification must authenticate the reviewer result through
+// LatestReusableProviderAttempt at the caller's exact live fence.
+func (s *Store) RecoverableVerification(ctx context.Context, ref domain.TicketRef) (StoredVerification, error) {
+	if err := ref.Validate(); err != nil {
+		return StoredVerification{}, err
+	}
+	return s.verificationEvidenceForCandidate(ctx, ref)
+}
+
 func (s *Store) LatestCandidate(ctx context.Context, ref domain.TicketRef) (StoredCandidate, error) {
+	return s.latestCandidate(ctx, ref, true)
+}
+
+// RecoverableCandidate loads the immutable candidate/binding tuple for an
+// append-only live-fence rebind. The subsequent RecordCandidate call is the
+// authority check for the Builder source-to-live chain; ordinary readers must
+// use LatestCandidate, which rejects a stale historical binding.
+func (s *Store) RecoverableCandidate(ctx context.Context, ref domain.TicketRef) (StoredCandidate, error) {
+	return s.latestCandidate(ctx, ref, false)
+}
+
+func (s *Store) latestCandidate(ctx context.Context, ref domain.TicketRef, authenticateFence bool) (StoredCandidate, error) {
+	return s.latestCandidateFrom(ctx, s.db, ref, authenticateFence)
+}
+
+// latestCandidateFrom lets a recovery fence inspect the immutable candidate
+// and binding under its own write connection.  The caller chooses whether to
+// authenticate a live fence; recovery uses false and subsequently proves the
+// Builder result before appending a binding at the new fence.
+type candidateEvidenceQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func (s *Store) latestCandidateFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, authenticateFence bool) (StoredCandidate, error) {
 	if err := ref.Validate(); err != nil {
 		return StoredCandidate{}, err
 	}
 	var result StoredCandidate
 	var created string
-	err := s.db.QueryRowContext(ctx, `SELECT generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,
+	err := q.QueryRowContext(ctx, `SELECT generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,
 		source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest,created_at
 		FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY generation DESC LIMIT 1`,
 		ref.Channel, ref.Project, ref.Ticket).Scan(
@@ -297,20 +358,26 @@ func (s *Store) LatestCandidate(ctx context.Context, ref domain.TicketRef) (Stor
 	if result.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil {
 		return StoredCandidate{}, ErrEvidenceConflict
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT b.binding_ticket_version,b.leader_epoch,b.runner_epoch,b.provider_attempt_id,b.provider_attempt,b.commit_parent_oid FROM candidate_result_bindings b JOIN provider_attempt_results pr ON pr.provider_attempt_id=b.provider_attempt_id JOIN provider_attempts a ON a.id=pr.provider_attempt_id AND a.attempt=b.provider_attempt AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id AND a.phase='build' AND a.role='builder' AND a.state='completed' AND a.outcome='completed' WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.generation=? ORDER BY b.binding_ticket_version DESC,b.leader_epoch DESC,b.runner_epoch DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, result.Snapshot.Generation).Scan(&result.TicketVersion, &result.Fence.LeaderEpoch, &result.Fence.RunnerEpoch, &result.BuilderResult.AttemptID, &result.BuilderResult.Attempt, &result.Commit.ParentOID); err == nil {
+	if err := q.QueryRowContext(ctx, `SELECT b.binding_ticket_version,b.leader_epoch,b.runner_epoch,b.provider_attempt_id,b.provider_attempt,b.commit_parent_oid FROM candidate_result_bindings b JOIN provider_attempt_results pr ON pr.provider_attempt_id=b.provider_attempt_id JOIN provider_attempts a ON a.id=pr.provider_attempt_id AND a.attempt=b.provider_attempt AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id AND a.phase='build' AND a.role='builder' AND a.state='completed' AND a.outcome='completed' WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.generation=? ORDER BY b.binding_ticket_version DESC,b.leader_epoch DESC,b.runner_epoch DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, result.Snapshot.Generation).Scan(&result.TicketVersion, &result.Fence.LeaderEpoch, &result.Fence.RunnerEpoch, &result.BuilderResult.AttemptID, &result.BuilderResult.Attempt, &result.Commit.ParentOID); err == nil {
 		result.BuilderResult.Ref, result.BuilderResult.Phase = ref, domain.PhaseBuild
 		result.Commit.CommitOID, result.Commit.TreeOID = result.Snapshot.HeadSHA, result.Snapshot.TreeSHA
 	}
 	if result.BuilderResult.AttemptID == 0 || result.Commit.ParentOID == "" {
 		return StoredCandidate{}, ErrEvidenceConflict
 	}
-	binding, err := loadCandidateCommandBinding(ctx, s.db, ref, result.Snapshot.Generation)
-	if err != nil || binding.TicketVersion != result.TicketVersion || binding.LeaderEpoch != result.Fence.LeaderEpoch || binding.RunnerEpoch != result.Fence.RunnerEpoch || !candidatePolicyMatches(result.Snapshot.CommandPolicyDigest, binding.PolicyDigest) {
+	binding, err := loadCandidateCommandBinding(ctx, q, ref, result.Snapshot.Generation)
+	if err != nil || !candidatePolicyMatches(result.Snapshot.CommandPolicyDigest, binding.PolicyDigest) {
 		return StoredCandidate{}, ErrEvidenceConflict
 	}
 	result.CommandBinding = binding
-	if err := s.reauthenticateStoredCandidateCommand(ctx, ref, result); err != nil {
-		return StoredCandidate{}, ErrEvidenceConflict
+	if authenticateFence {
+		if err := s.reauthenticateStoredCandidateCommandFrom(ctx, q, ref, result); err != nil {
+			return StoredCandidate{}, ErrEvidenceConflict
+		}
+		var liveVersion, liveRunner, liveLeader uint64
+		if err := q.QueryRowContext(ctx, `SELECT t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&liveVersion, &liveRunner, &liveLeader); err != nil || liveVersion != result.TicketVersion || liveRunner != result.Fence.RunnerEpoch || liveLeader != result.Fence.LeaderEpoch {
+			return StoredCandidate{}, ErrStaleFence
+		}
 	}
 	return result, nil
 }

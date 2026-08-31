@@ -64,7 +64,7 @@ func (s *Store) validateSchema(ctx context.Context) error {
 			return err
 		}
 	}
-	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete", "plan_result_bindings_immutable_update", "plan_result_bindings_immutable_delete", "verification_result_bindings_immutable_update", "verification_result_bindings_immutable_delete", "candidate_result_bindings_immutable_update", "candidate_result_bindings_immutable_delete", "repository_command_results_immutable_update", "repository_command_results_immutable_delete", "verification_command_result_bindings_immutable_update", "verification_command_result_bindings_immutable_delete", "candidate_command_result_bindings_immutable_update", "candidate_command_result_bindings_immutable_delete", "publication_evidence_immutable_update", "publication_evidence_immutable_delete", "publication_evidence_rebinds_immutable_update", "publication_evidence_rebinds_immutable_delete", "publication_transition_evidence_immutable_update", "publication_transition_evidence_immutable_delete", "runner_recovery_ledger_immutable_update", "runner_recovery_ledger_immutable_delete", "ci_observations_immutable_update", "ci_observations_immutable_delete", "ci_observation_checks_immutable_update", "ci_observation_checks_immutable_delete", "ci_transition_evidence_immutable_update", "ci_transition_evidence_immutable_delete", "ci_transition_evidence_requires_checks", "candidate_repair_bindings_immutable_update", "candidate_repair_bindings_immutable_delete", "candidate_repair_completions_immutable_update", "candidate_repair_completions_immutable_delete"} {
+	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete", "plan_result_bindings_immutable_update", "plan_result_bindings_immutable_delete", "verification_result_bindings_immutable_update", "verification_result_bindings_immutable_delete", "candidate_result_bindings_immutable_update", "candidate_result_bindings_immutable_delete", "repository_command_results_immutable_update", "repository_command_results_immutable_delete", "verification_command_result_bindings_immutable_update", "verification_command_result_bindings_immutable_delete", "candidate_command_result_bindings_immutable_update", "candidate_command_result_bindings_immutable_delete", "publication_evidence_immutable_update", "publication_evidence_immutable_delete", "publication_evidence_rebinds_immutable_update", "publication_evidence_rebinds_immutable_delete", "publication_transition_evidence_immutable_update", "publication_transition_evidence_immutable_delete", "runner_recovery_ledger_immutable_update", "runner_recovery_ledger_immutable_delete", "runner_start_authorities_immutable_update", "runner_start_authorities_immutable_delete", "ci_observations_immutable_update", "ci_observations_immutable_delete", "ci_observation_checks_immutable_update", "ci_observation_checks_immutable_delete", "ci_transition_evidence_immutable_update", "ci_transition_evidence_immutable_delete", "ci_transition_evidence_requires_checks", "candidate_repair_bindings_immutable_update", "candidate_repair_bindings_immutable_delete", "candidate_repair_completions_immutable_update", "candidate_repair_completions_immutable_delete"} {
 		var count int
 		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigger).Scan(&count); err != nil || count != 1 {
 			return fmt.Errorf("required trigger %s is missing", trigger)
@@ -182,6 +182,7 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "publication_evidence", target: "tickets"},
 	{table: "publication_evidence_rebinds", target: "publication_evidence"},
 	{table: "runner_recovery_ledger", target: "tickets"},
+	{table: "runner_start_authorities", target: "tickets"},
 	{table: "runtime_ticket_controls", target: "tickets"},
 	{table: "ci_observations", target: "tickets"},
 	{table: "ci_observations", target: "candidate_snapshots"},
@@ -325,6 +326,7 @@ var requiredSchema = map[string][]string{
 	"ci_transition_evidence":               {"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "ticket_version", "event_id", "event_created_at", "observation_classification", "observation_digest", "observation_ticket_version", "observation_leader_epoch", "observation_runner_epoch", "prior_publication_witness_digest", "prior_state", "resulting_state", "resulting_trigger", "transition_digest", "created_at"},
 	"candidate_repair_bindings":            {"channel", "project_id", "ticket_id", "target_generation", "predecessor_generation", "predecessor_head_sha", "predecessor_tree_sha", "predecessor_publication_witness_digest", "pr_host", "pr_owner", "pr_repo", "pr_number", "branch_ref", "remote_head_oid", "base_ref", "remote_base_oid", "red_observation_digest", "red_observation_classification", "red_transition_ticket_version", "red_transition_digest", "correction_budget_kind", "correction_budget_request_id", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "repair_context_digest", "created_at"},
 	"candidate_repair_completions":         {"channel", "project_id", "ticket_id", "target_generation", "builder_result_attempt_id", "builder_result_attempt", "builder_result_phase", "builder_result_role", "builder_binding_ticket_version", "builder_binding_leader_epoch", "builder_binding_runner_epoch", "final_candidate_head_sha", "final_candidate_tree_sha", "completion_digest", "completed_at"},
+	"runner_start_authorities":             {"channel", "project_id", "ticket_id", "start_ticket_version", "runner_epoch", "leader_epoch", "workflow_id", "workflow_digest", "created_at", "authority_digest"},
 }
 
 type indexRequirement struct {
@@ -395,6 +397,8 @@ var requiredIndexes = []indexRequirement{
 	{table: "candidate_repair_bindings", name: "candidate_repair_bindings_predecessor_lineage", columns: []string{"channel", "project_id", "ticket_id", "predecessor_generation", "predecessor_head_sha", "predecessor_tree_sha"}, nonUnique: true},
 	{table: "candidate_repair_bindings", name: "candidate_repair_bindings_context_digest", columns: []string{"repair_context_digest"}},
 	{table: "candidate_repair_completions", name: "candidate_repair_completions_digest", columns: []string{"completion_digest"}},
+	{table: "runner_start_authorities", name: "runner_start_authority_digest", columns: []string{"authority_digest"}},
+	{table: "runner_start_authorities", name: "runner_start_authority_ticket", columns: []string{"channel", "project_id", "ticket_id"}, nonUnique: true},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {

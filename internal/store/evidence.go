@@ -265,6 +265,7 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		return VerificationRevision{}, fmt.Errorf("bounded verification checkpoint and owned files are required")
 	}
 	var providerVerify *phaseartifact.Verification
+	var provider ProviderAttemptResult
 	if artifact.ProviderResult != nil {
 		result, parsed, loadErr := s.LoadHistoricalProviderAttemptResult(ctx, *artifact.ProviderResult)
 		if loadErr != nil || result.Claim.Role != "reviewer" || result.Claim.Phase != domain.PhaseVerification || result.Claim.Ref != artifact.Ref || parsed.Verify == nil {
@@ -282,6 +283,7 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 			return VerificationRevision{}, ErrEvidenceConflict
 		}
 		providerVerify = parsed.Verify
+		provider = result
 	} else {
 		// A verification artifact without the typed provider declaration has no
 		// command to authenticate against frozen configuration.
@@ -323,7 +325,7 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 				}
 				if oldIntent == intentDigest && oldProof == proofDigest && oldCheckpoint == artifact.CheckpointID {
 					result.Revision = current
-					if err := ensureVerificationBinding(ctx, conn, artifact, current); err != nil {
+					if err := ensureVerificationBinding(ctx, conn, artifact, current, provider); err != nil {
 						return err
 					}
 					if err := ensureVerificationCommandBinding(ctx, conn, artifact.Ref, current, commandBinding); err != nil {
@@ -345,7 +347,7 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		if err != nil {
 			return err
 		}
-		if err := ensureVerificationBinding(ctx, conn, artifact, result.Revision); err != nil {
+		if err := ensureVerificationBinding(ctx, conn, artifact, result.Revision, provider); err != nil {
 			return err
 		}
 		if err := ensureVerificationCommandBinding(ctx, conn, artifact.Ref, result.Revision, commandBinding); err != nil {
@@ -364,11 +366,14 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 	return result, err
 }
 
-func ensureVerificationBinding(ctx context.Context, conn *sql.Conn, artifact VerificationArtifact, revision uint64) error {
+func ensureVerificationBinding(ctx context.Context, conn *sql.Conn, artifact VerificationArtifact, revision uint64, provider ProviderAttemptResult) error {
 	if artifact.ProviderResult == nil {
 		return nil
 	}
 	key := *artifact.ProviderResult
+	if err := providerResultReachesFence(ctx, conn, key, provider, artifact.ExpectedVersion, artifact.Fence); err != nil {
+		return ErrEvidenceConflict
+	}
 	var id int64
 	var attempt int
 	var commit, parent, tree string
@@ -423,7 +428,11 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if err := conn.QueryRowContext(ctx, `SELECT state,source_digest FROM tickets WHERE channel=? AND project_id=? AND id=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&state, &source); err != nil {
 			return err
 		}
-		if domain.State(state) != domain.StateBuilding || source != evidence.Snapshot.SourceDigest {
+		liveState := domain.State(state)
+		if (liveState != domain.StateBuilding && liveState != domain.StatePublishing) || source != evidence.Snapshot.SourceDigest {
+			return ErrEvidenceConflict
+		}
+		if liveState == domain.StatePublishing && evidence.Snapshot.Generation == 0 {
 			return ErrEvidenceConflict
 		}
 		var newest ProviderAttemptResultKey
@@ -481,7 +490,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			candidate := evidence.Snapshot
 			candidate.Generation = current
 			if existing == candidate {
-				if err := ensureCandidateBinding(ctx, conn, evidence, current); err != nil {
+				if err := ensureCandidateBinding(ctx, conn, evidence, current, builder); err != nil {
 					return err
 				}
 				return ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding)
@@ -499,10 +508,16 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			if err != nil || existing != evidence.Snapshot {
 				return ErrEvidenceConflict
 			}
-			if err := ensureCandidateBinding(ctx, conn, evidence, current); err != nil {
+			if err := ensureCandidateBinding(ctx, conn, evidence, current, builder); err != nil {
 				return err
 			}
 			return ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding)
+		}
+		if liveState == domain.StatePublishing {
+			// Publishing recovery can only append a live binding to the latest
+			// immutable candidate. It must never mint a new generation, receipts,
+			// or a post-transition invalidation.
+			return ErrEvidenceConflict
 		}
 		if evidence.Snapshot.Generation != current+1 {
 			return ErrEvidenceConflict
@@ -512,7 +527,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if err != nil {
 			return err
 		}
-		if err := ensureCandidateBinding(ctx, conn, evidence, evidence.Snapshot.Generation); err != nil {
+		if err := ensureCandidateBinding(ctx, conn, evidence, evidence.Snapshot.Generation, builder); err != nil {
 			return err
 		}
 		if err := ensureCandidateCommandBinding(ctx, conn, evidence.Ref, evidence.Snapshot.Generation, commandBinding); err != nil {
@@ -533,7 +548,10 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 	return receipts, err
 }
 
-func ensureCandidateBinding(ctx context.Context, conn *sql.Conn, evidence CandidateEvidence, generation uint64) error {
+func ensureCandidateBinding(ctx context.Context, conn *sql.Conn, evidence CandidateEvidence, generation uint64, provider ProviderAttemptResult) error {
+	if err := providerResultReachesFence(ctx, conn, evidence.BuilderResult, provider, evidence.ExpectedVersion, evidence.Fence); err != nil {
+		return ErrEvidenceConflict
+	}
 	var id int64
 	var attempt int
 	var parent string
