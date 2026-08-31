@@ -401,8 +401,8 @@ func TestRepositoryCommandRunsDependencyFreeNode22ThroughGate(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("repository command product boundary is macOS")
 	}
-	if _, err := os.Stat("/opt/homebrew/bin/node"); err != nil {
-		t.Skip("Homebrew Node is unavailable")
+	if _, err := resolveFixedNodeExecutable("node"); err != nil {
+		t.Skip("no approved Node executable is available")
 	}
 	repo := t.TempDir()
 	root, err := filepath.Abs(filepath.Join("..", ".."))

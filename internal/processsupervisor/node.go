@@ -520,6 +520,17 @@ func (s RepositoryCommandSupervisor) runNode(ctx context.Context, claim contract
 		_ = lease.Quarantine()
 		return contracts.CommandResult{}, ErrUnclear
 	}
+	// Config admission used a path before the durable command lease existed.
+	// Repeat it from the authenticated worktree directory descriptor after the
+	// final Git reauthentication and immediately before opening the launch gate,
+	// so a pathname replacement cannot redirect the source closure Node receives
+	// after Fchdir.
+	if err := nodeclosure.ValidateDirectoryFD(int(worktreeFD.Fd())); err != nil {
+		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		_ = lease.Quarantine()
+		return contracts.CommandResult{}, ErrUnclear
+	}
 	if _, err := gateWrite.Write([]byte{1}); err != nil {
 		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()

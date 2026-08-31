@@ -76,8 +76,14 @@ npm: source `node --test` for a bounded dependency-free JavaScript/CJS/MJS
 worktree. `package.json` is a regular non-symlink JSON object no larger than
 1 MiB and may not declare dependencies, workspaces, or bundled packages. The
 worktree has no symlinks, `node_modules`, native `.node` add-ons, or TypeScript
-source, and must contain an official Node test-discovery file. Zero tests
-refuse rather than turning local verification into a no-op.
+source, and must contain an official Node test-discovery file. The launch-time
+validator repeats that bounded discovery check through the authenticated
+worktree directory descriptor immediately before the fd-gated exec. Node treats
+each discovered file as a test-file subtest even when that file does not
+register nested `node:test` calls; the contract is therefore one exact official
+discovery file plus successful execution of the fixed `node --test` recipe, not
+source parsing of test bodies. No discovered files refuses rather than turning
+local verification into an empty invocation.
 
 The implementation resolves only code-owned Node paths, authenticates major
 22, copies the complete non-system Mach-O closure to an owner-only stage, and

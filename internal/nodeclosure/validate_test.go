@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func writeNodeFixture(t *testing.T, packageJSON string, files map[string]string) string {
@@ -87,15 +89,53 @@ func TestValidateRefusesDependencyAndWorktreeEscapes(t *testing.T) {
 }
 
 func TestOfficialTestFileMatchesNodeDiscoveryPatterns(t *testing.T) {
-	for _, name := range []string{"test/smoke.js", "nested/test-smoke.cjs", "nested/smoke-test.mjs", "nested/smoke.test.js"} {
-		if !officialTestFile(name) {
-			t.Fatalf("%q was not recognized", name)
+	for _, test := range []struct {
+		name string
+		want bool
+	}{
+		{"nested/smoke.test.js", true},
+		{"nested/smoke-test.cjs", true},
+		{"nested/smoke_test.mjs", true},
+		{"nested/test-smoke.js", true},
+		{"nested/test.js", true},
+		{"test/smoke.js", true},
+		{"nested/test/deeper/smoke.mjs", true},
+		{"nested/TEST/smoke.js", false},
+		{"nested/SMOKE.TEST.JS", false},
+		{"nested/smoke.TEST.js", false},
+		{"nested/test-smoke.ts", false},
+		{"src/smoke.js", false},
+		{"test/smoke.ts", false},
+	} {
+		if got := officialTestFile(test.name); got != test.want {
+			t.Fatalf("officialTestFile(%q)=%v want %v", test.name, got, test.want)
 		}
 	}
-	for _, name := range []string{"nested/test-smoke.ts", "src/smoke.js", "test/smoke.ts"} {
-		if officialTestFile(name) {
-			t.Fatalf("%q was incorrectly recognized", name)
-		}
+}
+
+func TestValidateDirectoryFDStaysBoundToOpenedWorktree(t *testing.T) {
+	parent := t.TempDir()
+	worktree := filepath.Join(parent, "worktree")
+	if err := os.Rename(writeNodeFixture(t, `{"name":"proof"}`, map[string]string{"test/smoke.test.js": ""}), worktree); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Open(worktree, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	replacement := writeNodeFixture(t, `{"dependencies":{"x":"1"}}`, map[string]string{"test/smoke.test.js": ""})
+	if err := os.Rename(worktree, filepath.Join(parent, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, worktree); err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(worktree); !errors.Is(err, ErrDependencies) {
+		t.Fatalf("replacement path validation error=%v", err)
+	}
+	if err := ValidateDirectoryFD(fd); err != nil {
+		t.Fatalf("opened worktree FD was redirected by pathname swap: %v", err)
 	}
 }
 
