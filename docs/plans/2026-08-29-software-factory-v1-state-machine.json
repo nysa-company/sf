@@ -114,9 +114,19 @@
       "id": "build_pass",
       "from": ["building"],
       "trigger": "phase_pass",
-      "guards": ["proof_green", "diff_valid", "git_control_plane_valid", "candidate_checkpoint_committed"],
+      "guards": ["ticket_type_not_spike", "proof_green", "diff_valid", "git_control_plane_valid", "candidate_checkpoint_committed"],
       "to": "publishing",
       "phase_disposition": "complete_build_start_publish",
+      "allowed_effects": ["local_commit"],
+      "invalidates": ["candidate"]
+    },
+    {
+      "id": "build_pass_spike",
+      "from": ["building"],
+      "trigger": "phase_pass",
+      "guards": ["ticket_type_spike", "proof_green", "diff_valid", "git_control_plane_valid", "candidate_checkpoint_committed"],
+      "to": "reviewing",
+      "phase_disposition": "complete_build_start_report_review",
       "allowed_effects": ["local_commit"],
       "invalidates": ["candidate"]
     },

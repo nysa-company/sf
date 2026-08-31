@@ -1544,7 +1544,7 @@ func (s *Store) transitionWithEvidence(ctx context.Context, transition Transitio
 // signal in another: a newer same-version candidate could otherwise replace
 // the proof between those operations.
 func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, candidate domain.CandidateSnapshot) (TransitionResult, error) {
-	if err := transition.Ref.Validate(); err != nil || transition.From != domain.StateBuilding || transition.To != domain.StatePublishing || transition.Trigger != "phase_pass" || validateCandidate(candidate) != nil {
+	if err := transition.Ref.Validate(); err != nil || transition.From != domain.StateBuilding || (transition.To != domain.StatePublishing && transition.To != domain.StateReviewing) || transition.Trigger != "phase_pass" || validateCandidate(candidate) != nil {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
 	if transition.EventPayload == "" {
@@ -1581,6 +1581,10 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 		}
 		if actual != transition.From || version != transition.ExpectedVersion {
 			return ErrStaleFence
+		}
+		var ticketType domain.TicketType
+		if err := conn.QueryRowContext(ctx, `SELECT ticket_type FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&ticketType); err != nil || (ticketType == domain.TicketSpike) != (transition.To == domain.StateReviewing) {
+			return ErrEvidenceConflict
 		}
 		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
 			return err

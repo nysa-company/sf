@@ -1015,6 +1015,9 @@ func (daemon *Daemon) submit(ctx context.Context, request api.Request, _ domain.
 		}
 		return daemon.failure(request, submitErrorCode(err), "ticket project registration could not be read", errors.Is(err, store.ErrBusy))
 	}
+	if parsed.MergeMode == domain.MergeAutonomous {
+		return daemon.failure(request, "autonomy_blocked", "autonomous workflows are unsupported until a separately approved native profile and pilot are qualified", false)
+	}
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
 	}
