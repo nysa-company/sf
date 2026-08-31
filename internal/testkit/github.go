@@ -28,6 +28,15 @@ const (
 	ResponseErrorAfter    ResponseMode = "error_after_mutation"
 )
 
+// fakeCreatePolicyConflict marks a deterministic refusal found before the
+// fake hands a create mutation to its response/mutation simulator. Keeping the
+// original error as the message preserves the contract-test diagnostic while
+// allowing CreateDraftPullRequest to distinguish it from a lost response.
+type fakeCreatePolicyConflict struct{ err error }
+
+func (e *fakeCreatePolicyConflict) Error() string { return e.err.Error() }
+func (e *fakeCreatePolicyConflict) Unwrap() error { return e.err }
+
 // PullRequest is the durable fake-remote record. Identity intentionally
 // includes head repository/ref/OID and the sf ownership bit; headRefName alone
 // is never enough to adopt or merge a PR.
@@ -101,6 +110,7 @@ type FakeGHState struct {
 	// it durable lets boundary tests move main between observations without
 	// pretending a PR's historical baseRefOid is the live protected ref.
 	BaseHeadOID                 string                            `json:"base_head_oid"`
+	BaseRef                     string                            `json:"base_ref"`
 	StrictStatusChecks          bool                              `json:"strict_status_checks"`
 	AdminEnforced               bool                              `json:"admin_enforced"`
 	ActiveRulesetCount          int                               `json:"active_ruleset_count"`
@@ -131,6 +141,7 @@ func NewFakeGH(path string, repository contracts.RepositoryIdentity) (*FakeGH, e
 		Schema:             "sf.testkit.fake-gh/v1",
 		Repository:         repository,
 		BaseHeadOID:        strings.Repeat("c", 40),
+		BaseRef:            "main",
 		StrictStatusChecks: true,
 		AdminEnforced:      true,
 		ClassicProtection:  true,
@@ -549,7 +560,8 @@ func (f *FakeGH) CreateDraftPullRequest(_ context.Context, claim domain.External
 		return contracts.PullRequestIdentity{}, err
 	}
 	created, err := f.createDraftUnchecked(identity, title, body)
-	if err != nil && !errors.Is(err, contracts.ErrDraftCreateBeforeStart) {
+	var policyConflict *fakeCreatePolicyConflict
+	if err != nil && !errors.Is(err, contracts.ErrDraftCreateBeforeStart) && !errors.As(err, &policyConflict) {
 		return contracts.PullRequestIdentity{}, fmt.Errorf("%w: fake-gh create response unavailable", contracts.ErrDraftCreateUncertain)
 	}
 	return created, err
@@ -568,9 +580,9 @@ func (f *FakeGH) createDraftUnchecked(identity contracts.PullRequestIdentity, ti
 		for _, existing := range f.state.PRs {
 			if samePRSourceAndBase(existing.Identity, identity) {
 				if !existing.Identity.FactoryOwned {
-					return false, errors.New("fake-gh: human-owned pull request conflicts with the factory identity")
+					return false, &fakeCreatePolicyConflict{err: errors.New("fake-gh: human-owned pull request conflicts with the factory identity")}
 				}
-				return false, errors.New("fake-gh: matching pull request already exists")
+				return false, &fakeCreatePolicyConflict{err: errors.New("fake-gh: matching pull request already exists")}
 			}
 		}
 		if mode, err := f.beforeMutationLocked("pr_create"); err != nil {
@@ -1126,13 +1138,12 @@ func (f *FakeGH) runSourceRef(argv []string) ([]byte, error) {
 	ref := sourceRef
 	sha := strings.Repeat("a", 40)
 	snapshot := f.Snapshot()
-	if sourceOwner == snapshot.Repository.Owner && sourceRepo == snapshot.Repository.Name {
-		for _, pr := range snapshot.PRs {
-			if pr.Identity.BaseRef == ref {
-				sha = snapshot.BaseHeadOID
-				return json.Marshal(map[string]any{"object": map[string]string{"sha": sha}})
-			}
-		}
+	baseRef := snapshot.BaseRef
+	if baseRef == "" { // tolerate test state written before BaseRef was added.
+		baseRef = "main"
+	}
+	if sourceOwner == snapshot.Repository.Owner && sourceRepo == snapshot.Repository.Name && ref == baseRef {
+		return json.Marshal(map[string]any{"object": map[string]string{"sha": snapshot.BaseHeadOID}})
 	}
 	for _, pr := range snapshot.PRs {
 		if pr.Identity.HeadOwner == sourceOwner && pr.Identity.HeadRepository == sourceRepo && pr.Identity.HeadRef == ref {

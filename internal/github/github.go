@@ -546,6 +546,15 @@ func (c Client) mutateCreateExact(ctx context.Context, claim domain.ExternalEffe
 	}
 	handedOff := false
 	output, err := c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+		// GitHub has no create-side base/head CAS. Re-read the protected base
+		// inside the durable launch gate so the PR is only launched from the
+		// exact reviewed base object, alongside the source and absence witnesses.
+		if err := c.observeBaseExact(runCtx, identity, identity.BaseOID); err != nil {
+			if errors.Is(err, ErrProcessCleanup) || errors.Is(err, ErrCleanupQuarantineFatal) {
+				return nil, err
+			}
+			return nil, ErrPolicyRefusal
+		}
 		if err := c.observeSourceExact(runCtx, identity); err != nil {
 			if errors.Is(err, ErrProcessCleanup) || errors.Is(err, ErrCleanupQuarantineFatal) {
 				return nil, err

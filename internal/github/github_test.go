@@ -610,6 +610,31 @@ func TestPublicationInventoryIgnoresClosedAndNonmatchingPRs(t *testing.T) {
 	}
 }
 
+func TestFakeCreateExistingIdentityConflictRemainsDeterministic(t *testing.T) {
+	for _, test := range []struct {
+		name, text string
+		owned      bool
+	}{
+		{name: "human-owned", text: "human-owned", owned: false},
+		{name: "factory-owned", text: "matching pull request", owned: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, fake, identity := fixture(t)
+			existing := identity
+			existing.Number, existing.FactoryOwned = 7, test.owned
+			if err := fake.InjectPullRequestForTest(testkit.PullRequest{Identity: existing, Draft: true}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fake.CreateDraftPullRequest(context.Background(), testkit.EffectClaimForTest("draft_pr", identity, "title", "body"), identity, "title", "body"); err == nil || !strings.Contains(err.Error(), test.text) || errors.Is(err, contracts.ErrDraftCreateUncertain) {
+				t.Fatalf("existing %s conflict err=%v", test.name, err)
+			}
+			if got := fake.MutationCount("pr_create"); got != 0 {
+				t.Fatalf("existing %s launched create %d times", test.name, got)
+			}
+		})
+	}
+}
+
 func TestCreateUncertainNeverAttemptsNumberOnlyOrphanClose(t *testing.T) {
 	client, _, identity := fixture(t)
 	var closed bool
@@ -617,6 +642,8 @@ func TestCreateUncertainNeverAttemptsNumberOnlyOrphanClose(t *testing.T) {
 		switch {
 		case len(args) >= 2 && args[0] == "pr" && args[1] == "list":
 			return []byte("[]"), nil
+		case len(args) >= 2 && args[0] == "api" && args[1] == "repos/example/app/git/ref/heads/main":
+			return []byte(`{"object":{"sha":"cccccccccccccccccccccccccccccccccccccccc"}}`), nil
 		case len(args) >= 2 && args[0] == "api":
 			return []byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`), nil
 		case len(args) >= 2 && args[0] == "pr" && args[1] == "create":
@@ -644,6 +671,9 @@ func TestCreateFinalHandoffRefusesIfPRAppearsBeforeLaunch(t *testing.T) {
 		if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
 			return []byte("[]"), nil
 		}
+		if len(args) >= 2 && args[0] == "api" && args[1] == "repos/example/app/git/ref/heads/main" {
+			return []byte(`{"object":{"sha":"cccccccccccccccccccccccccccccccccccccccc"}}`), nil
+		}
 		if len(args) >= 2 && args[0] == "api" {
 			return []byte(`{"object":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`), nil
 		}
@@ -658,6 +688,80 @@ func TestCreateFinalHandoffRefusesIfPRAppearsBeforeLaunch(t *testing.T) {
 	}
 	if created {
 		t.Fatal("create launched after exact in-handoff identity appeared")
+	}
+}
+
+func TestCreateFinalHandoffRefusesMovedProtectedBase(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		prepare func(*Client, *testkit.FakeGH) error
+	}{
+		{
+			name: "before-handoff",
+			prepare: func(_ *Client, fake *testkit.FakeGH) error {
+				return fake.SetBaseHeadOIDForTest(strings.Repeat("d", 40))
+			},
+		},
+		{
+			name: "inside-handoff",
+			prepare: func(client *Client, fake *testkit.FakeGH) error {
+				client.mutationGuard = mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+					if err := fake.SetBaseHeadOIDForTest(strings.Repeat("d", 40)); err != nil {
+						return nil, err
+					}
+					return start(ctx)
+				})
+				return nil
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, fake, identity := fixture(t)
+			if err := test.prepare(client, fake); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.CreateDraftPullRequest(context.Background(), testClaim("draft_pr", identity, "title", "body"), identity, "title", "body"); !errors.Is(err, ErrCreateBeforeStart) {
+				t.Fatalf("base move err=%v", err)
+			}
+			if got := fake.MutationCount("pr_create"); got != 0 {
+				t.Fatalf("base move launched create %d times", got)
+			}
+		})
+	}
+}
+
+func TestCreateFinalHandoffRefusesUnavailableOrMalformedBaseObservation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		baseReply []byte
+		baseErr   error
+	}{
+		{name: "unavailable", baseErr: errors.New("base unavailable")},
+		{name: "malformed", baseReply: []byte(`{"object":{}}`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, fake, identity := fixture(t)
+			created := false
+			client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+				switch args[0] + " " + args[1] {
+				case "pr list":
+					return []byte("[]"), nil
+				case "api repos/example/app/git/ref/heads/main":
+					return test.baseReply, test.baseErr
+				case "pr create":
+					created = true
+					return []byte("{}"), nil
+				default:
+					return nil, errors.New("unexpected command")
+				}
+			})
+			if _, err := client.CreateDraftPullRequest(context.Background(), testClaim("draft_pr", identity, "title", "body"), identity, "title", "body"); !errors.Is(err, ErrCreateBeforeStart) {
+				t.Fatalf("base observation err=%v", err)
+			}
+			if created || fake.MutationCount("pr_create") != 0 {
+				t.Fatal("unavailable or malformed base observation launched create")
+			}
+		})
 	}
 }
 
@@ -1722,6 +1826,8 @@ func TestOfficialGHArgvGolden(t *testing.T) {
 			return []byte("https://github.com/example/app/pull/7\n"), nil
 		case "api repos/example/app/git/ref/heads/sf/dev/example/SF-44-random":
 			return []byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`), nil
+		case "api repos/example/app/git/ref/heads/main":
+			return []byte(`{"object":{"sha":"cccccccccccccccccccccccccccccccccccccccc"}}`), nil
 		default:
 			return nil, errors.New("unexpected command")
 		}
@@ -1734,6 +1840,7 @@ func TestOfficialGHArgvGolden(t *testing.T) {
 	}
 	want := [][]string{
 		{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields},
+		{"api", "repos/example/app/git/ref/heads/main"},
 		{"api", "repos/example/app/git/ref/heads/sf/dev/example/SF-44-random"},
 		{"pr", "list", "--repo", "example/app", "--state", "all", "--limit", "100", "--json", prFields},
 		{"pr", "create", "--repo", "example/app", "--head", "example:sf/dev/example/SF-44-random", "--base", "main", "--draft", "--title", "title", "--body", "body\n\n" + ownershipMarker(identity)},
