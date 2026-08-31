@@ -108,16 +108,16 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	configDigest := setupProviderProject(t, db, ctx)
 	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "publication-lifecycle")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture acquire leader: %v", err)
 	}
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "provider", Ticket: "SF-publication-lifecycle"}
 	source := sha256Digest([]byte("publication-source"))
 	if err := db.CreateTicket(ctx, Ticket{Ref: ref, SourceDigest: source, Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture create ticket: %v", err)
 	}
 	ticket, err := db.StartOrAdopt(ctx, ref, 1, "dev/provider/SF-publication-lifecycle", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture start or adopt: %v", err)
 	}
 	branch := testAllocatedBranch(ref, strings.Repeat("ab", 16))
 	base := strings.Repeat("a", 40)
@@ -125,10 +125,10 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	registrationFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
 	branchKey := string(ref.Channel) + "\x00" + string(ref.Project) + "\x00" + string(ref.Ticket)
 	if _, err := db.LoadOrStoreBranchUnderFence(ctx, branchKey, branch, ticket.Version, registrationFence); err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture register branch: %v", err)
 	}
 	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: registrationFence, Path: "/tmp/provider/SF-publication-lifecycle", Branch: branch, IdentityJSON: identity, BaseSHA: base, HeadSHA: base}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture register worktree: %v", err)
 	}
 	builder, reviewerQual := setupProviderPair(t, db, ctx)
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
@@ -138,13 +138,13 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 		request.Input.WorktreeIdentity = string(identity)
 		claim, err := db.BeginProviderAttempt(ctx, request)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("publication fixture begin %s/%s attempt: %v", phase, role, err)
 		}
 		if err := db.RecordProviderLaunch(ctx, claim, contracts.ProviderLaunch{PID: int(claim.ID), PGID: int(claim.ID), BootIdentity: "publication", ProcessStartIdentity: fmt.Sprintf("publication-%d", claim.ID), Worktree: claim.Worktree}); err != nil {
-			t.Fatal(err)
+			t.Fatalf("publication fixture record %s/%s launch: %v", phase, role, err)
 		}
 		if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: raw, UsageTrusted: true, UsageUnits: 1}, validation, time.Now().UTC()); err != nil {
-			t.Fatal(err)
+			t.Fatalf("publication fixture complete %s/%s attempt: %v", phase, role, err)
 		}
 		return claim
 	}
@@ -153,10 +153,10 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	planner := launch(domain.PhasePlanning, "planner", runtime(builder), plannerRaw, phaseartifact.Validation{TicketType: ticket.Type})
 	planKey := ProviderAttemptResultKey{AttemptID: planner.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: planner.Attempt}
 	if _, err := db.RecordPlan(ctx, PlanArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Document: PlanDocument{Planner: &plan, ProviderResult: &planKey, Acceptance: plan.Acceptance, ProofKind: string(plan.Proof.Kind), Paths: plan.Paths, Commands: plan.Commands, Risks: plan.Risks}}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture record plan: %v", err)
 	}
 	if _, err := db.TransitionPlan(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture transition plan: %v", err)
 	}
 	ticket, _ = db.Ticket(ctx, ticket.Ref)
 	fence.RunnerEpoch = ticket.RunnerEpoch
@@ -170,10 +170,10 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	verificationKey := ProviderAttemptResultKey{AttemptID: reviewerClaim.ID, Ref: ticket.Ref, Phase: domain.PhaseVerification, Attempt: reviewerClaim.Attempt}
 	command := completeEvidenceRepositoryCommand(t, db, ctx, RepositoryCommandPurposePrebuildVerification, ticket.Ref, ticket.Version, fence, verificationKey, sha256Digest(intent), sha256Digest(proofBytes), "", "", 1)
 	if _, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proofBytes, OwnedFiles: verification.OwnedFiles, CheckpointID: checkpoint, ProviderResult: &verificationKey, Checkpoint: CommitObservation{CommitOID: checkpoint, ParentOID: base, TreeOID: strings.Repeat("d", 40)}, CommandResult: command}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture record verification: %v", err)
 	}
 	if _, err := db.TransitionVerification(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateVerifying, To: domain.StateBuilding, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture transition verification: %v", err)
 	}
 	ticket, _ = db.Ticket(ctx, ticket.Ref)
 	fence.RunnerEpoch = ticket.RunnerEpoch
@@ -181,7 +181,7 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	built := launch(domain.PhaseBuild, "builder", runtime(builder), builderRaw, phaseartifact.Validation{TicketType: ticket.Type})
 	_, parsed, err := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: built.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: built.Attempt})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture load builder result: %v", err)
 	}
 	builderDigest, _ := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
 	policy := sha256Digest([]byte("publication-policy"))
@@ -189,14 +189,14 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	builtKey := ProviderAttemptResultKey{AttemptID: built.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: built.Attempt}
 	candidateCommand := completeEvidenceRepositoryCommand(t, db, ctx, RepositoryCommandPurposePostbuildCandidate, ticket.Ref, ticket.Version, fence, builtKey, sha256Digest(intent), sha256Digest(proofBytes), checkpoint, "sha256:"+policy, 0)
 	if _, err := db.RecordCandidate(ctx, CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snapshot, BuilderResult: builtKey, Commit: CommitObservation{CommitOID: snapshot.HeadSHA, ParentOID: checkpoint, TreeOID: snapshot.TreeSHA}, Reason: "publication", CommandResult: candidateCommand}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture record candidate: %v", err)
 	}
 	stored, err := db.RecoverableCandidate(ctx, ticket.Ref)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture load candidate: %v", err)
 	}
 	if _, err := db.TransitionCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}, stored.Snapshot); err != nil {
-		t.Fatal(err)
+		t.Fatalf("publication fixture transition candidate: %v", err)
 	}
 	ticket, _ = db.Ticket(ctx, ticket.Ref)
 	return db, ctx, ticket, fence

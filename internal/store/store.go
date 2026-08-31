@@ -1443,8 +1443,13 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 				return ErrEvidenceConflict
 			}
 		}
-		authenticated, err := s.LatestCandidate(ctx, transition.Ref)
-		if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != version || authenticated.Fence != transition.Fence || authenticated.CommandBinding.TicketVersion != version || authenticated.CommandBinding.LeaderEpoch != transition.Fence.LeaderEpoch || authenticated.CommandBinding.RunnerEpoch != transition.Fence.RunnerEpoch || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {
+		// Re-authenticate on the transaction connection.  A separate pooled
+		// connection can observe a different snapshot (or block behind this
+		// write), turning an otherwise valid same-fence candidate into a false
+		// evidence conflict.  The transaction-scoped reader also keeps the
+		// candidate proof and ticket fence in one authenticated snapshot.
+		authenticated, err := s.latestCandidateFrom(ctx, conn, transition.Ref, true)
+		if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != version || authenticated.Fence != transition.Fence || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {
 			return ErrEvidenceConflict
 		}
 		var attemptID int64

@@ -18,11 +18,15 @@ func ciAuthorityPublishedFixture(t *testing.T) (*Store, Ticket, domain.Fence) {
 	db, ctx, ticket, fence := publicationLifecycleFixture(t)
 	worktree, err := db.Worktree(ctx, ticket.Ref)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("CI fixture load worktree: %v", err)
 	}
-	candidate, err := db.LatestCandidate(ctx, ticket.Ref)
+	// The publication lifecycle is still in publishing here: its immutable
+	// publication witness is recorded immediately below.  Use the same
+	// candidate-only authenticated reader as the publication path rather than
+	// requiring the strict current-publication witness prematurely.
+	candidate, err := db.RecoverableCandidate(ctx, ticket.Ref)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("CI fixture load candidate: %v", err)
 	}
 	pr := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "acme", Name: "app"}, Number: 101, HeadOwner: "acme", HeadRepository: "app", HeadRef: worktree.Branch, HeadOID: candidate.Snapshot.HeadSHA, BaseRef: "main", BaseOID: candidate.Snapshot.BaseSHA, FactoryOwned: true}
 	value := PublishedCandidateEvidence{Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence, Candidate: candidate, ConfigGeneration: ticket.ConfigGeneration, ConfigDigest: ticket.ConfigDigest, ConfigSnapshotDigest: sha256Digest(ticket.ConfigSnapshot), Worktree: worktree, RemoteBranchRef: worktree.Branch, RemoteBranchOID: candidate.Snapshot.HeadSHA, RemoteBaseOID: candidate.Snapshot.BaseSHA, PullRequest: pr, PullRequestState: "OPEN", PullRequestDraft: true, PullRequestObservedAt: time.Now().UTC(), CreatedAt: time.Now().UTC()}
@@ -30,25 +34,25 @@ func ciAuthorityPublishedFixture(t *testing.T) (*Store, Ticket, domain.Fence) {
 	value.PRCreateOrUpdateEffect = PublicationEffectEvidence{SemanticKey: "ci-pr", Kind: PublicationPRCreateEffectKind, RequestDigest: "sha256:" + strings.Repeat("2", 64), ClaimEpoch: 1, ObservedIdentity: CanonicalPublicationPRObservation(pr, "OPEN", true)}
 	for _, effect := range []PublicationEffectEvidence{value.PushEffect, value.PRCreateOrUpdateEffect} {
 		if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: effect.SemanticKey, Ref: ticket.Ref, Kind: effect.Kind, TicketVersion: ticket.Version, Fence: fence, RequestDigest: effect.RequestDigest}); err != nil {
-			t.Fatal(err)
+			t.Fatalf("CI fixture plan %s effect: %v", effect.SemanticKey, err)
 		}
 		claim, err := db.ClaimEffect(ctx, EffectFence{SemanticKey: effect.SemanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("CI fixture claim %s effect: %v", effect.SemanticKey, err)
 		}
 		if _, err := db.ConfirmEffect(ctx, EffectFence{SemanticKey: effect.SemanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}}, effect.ObservedIdentity); err != nil {
-			t.Fatal(err)
+			t.Fatalf("CI fixture confirm %s effect: %v", effect.SemanticKey, err)
 		}
 	}
 	if err := db.RecordPublishedCandidate(ctx, value); err != nil {
-		t.Fatal(err)
+		t.Fatalf("CI fixture record publication: %v", err)
 	}
 	if _, err := db.TransitionPublishedCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("CI fixture transition publication: %v", err)
 	}
 	ticket, err = db.Ticket(ctx, ticket.Ref)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("CI fixture reload ticket: %v", err)
 	}
 	return db, ticket, fence
 }
