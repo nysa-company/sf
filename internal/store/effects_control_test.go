@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 
@@ -97,30 +98,43 @@ func TestInvalidatedEffectAbsenceCanBeSafelyRebound(t *testing.T) {
 }
 
 func TestInvalidatedEffectPresenceIsConfirmedAndNeverRebound(t *testing.T) {
-	database, ref, leader, started, prior := claimedEffectBeforeControl(t, "effect-control-present")
+	database, ref, _, started, prior := claimedEffectBeforeControl(t, "effect-control-present")
 	ctx := t.Context()
-	_, err := database.TransitionAndInvalidateRunner(ctx, Transition{
-		Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateStopping,
-		ResumeState: domain.StatePlanning, Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: "{}",
-	})
+	newLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "effect-control-present-restart")
 	if err != nil {
 		t.Fatal(err)
 	}
-	stopping, err := database.Ticket(ctx, ref)
-	if err != nil {
-		t.Fatal(err)
+	uncertain, err := database.ReconcileEffects(ctx, domain.ChannelDev, newLeader)
+	if err != nil || len(uncertain) != 1 {
+		t.Fatalf("reconcile=%+v err=%v", uncertain, err)
 	}
-	current := EffectFence{SemanticKey: prior.SemanticKey, Ref: ref, TicketVersion: stopping.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopping.RunnerEpoch}}
-	observation := InvalidatedEffectObservation{Prior: EffectObservation{EffectFence: prior, Present: true, Identity: "remote@abc"}, Current: current}
+	current := EffectFence{SemanticKey: prior.SemanticKey, Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: uncertain[0].RunnerEpoch}}
+	recoveredPrior := EffectFence{SemanticKey: uncertain[0].SemanticKey, Ref: uncertain[0].Ref, TicketVersion: uncertain[0].TicketVersion, Fence: domain.Fence{LeaderEpoch: uncertain[0].LeaderEpoch, RunnerEpoch: uncertain[0].RunnerEpoch, ClaimEpoch: uncertain[0].ClaimEpoch}}
+	observation := InvalidatedEffectObservation{Prior: EffectObservation{EffectFence: recoveredPrior, Present: true, Identity: "remote@abc"}, Current: current}
 	confirmed, err := database.ReconcileInvalidatedEffect(ctx, observation)
-	if err != nil || confirmed.State != EffectConfirmed || confirmed.ObservedIdentity != "remote@abc" {
+	if err != nil || confirmed.State != EffectConfirmed || confirmed.ObservedIdentity != "remote@abc" || confirmed.TicketVersion != current.TicketVersion || confirmed.LeaderEpoch != current.Fence.LeaderEpoch || confirmed.RunnerEpoch != current.Fence.RunnerEpoch || confirmed.ClaimEpoch != recoveredPrior.Fence.ClaimEpoch+1 {
 		t.Fatalf("confirmed=%+v err=%v", confirmed, err)
 	}
 	if replay, err := database.ReconcileInvalidatedEffect(ctx, observation); err != nil || replay.State != EffectConfirmed {
 		t.Fatalf("replay=%+v err=%v", replay, err)
 	}
-	if _, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: prior.SemanticKey, Ref: ref, Kind: "branch_push", TicketVersion: stopping.Version, Fence: current.Fence, RequestDigest: "request"}); !errors.Is(err, ErrEffectKey) && !errors.Is(err, ErrStaleFence) {
-		t.Fatalf("confirmed stale effect was rebound: %v", err)
+	if _, err := database.ConfirmEffect(ctx, prior, "late-response"); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("late response=%v", err)
+	}
+	if err := database.write(ctx, func(conn *sql.Conn) error {
+		return checkPublicationEffect(ctx, conn, ref, current.TicketVersion, current.Fence, PublicationEffectEvidence{
+			SemanticKey: prior.SemanticKey, Kind: "branch_push", RequestDigest: "request", ClaimEpoch: confirmed.ClaimEpoch, ObservedIdentity: confirmed.ObservedIdentity,
+		})
+	}); err != nil {
+		t.Fatalf("current publication witness=%v", err)
+	}
+	replanned, err := database.PlanEffect(ctx, EffectPlan{SemanticKey: prior.SemanticKey, Ref: ref, Kind: "branch_push", TicketVersion: started.Version, Fence: current.Fence, RequestDigest: "request"})
+	if err != nil || replanned.State != EffectConfirmed || replanned.ClaimEpoch != confirmed.ClaimEpoch || replanned.ObservedIdentity != confirmed.ObservedIdentity {
+		t.Fatalf("confirmed effect was not idempotently reused: effect=%+v err=%v", replanned, err)
+	}
+	reused, err := database.ClaimEffect(ctx, EffectFence{SemanticKey: prior.SemanticKey, Ref: ref, TicketVersion: started.Version, Fence: current.Fence})
+	if err != nil || reused.Claimed || reused.Effect.ClaimEpoch != confirmed.ClaimEpoch {
+		t.Fatalf("confirmed effect was re-executed: claim=%+v err=%v", reused, err)
 	}
 	wrong := observation
 	wrong.Prior.Fence.ClaimEpoch++

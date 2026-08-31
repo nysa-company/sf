@@ -157,7 +157,7 @@ func TestDraftCorrectionReconcilesAppliedUpdateAfterFenceBump(t *testing.T) {
 		t.Fatalf("reconciled=%+v mutations=%d", got, fake.MutationCount("pr_edit"))
 	}
 	effect, err := db.Effect(ctx, key)
-	if err != nil || effect.State != store.EffectConfirmed {
+	if err != nil || effect.State != store.EffectConfirmed || effect.TicketVersion != advanced.Version || effect.LeaderEpoch != newFence.LeaderEpoch || effect.RunnerEpoch != newFence.RunnerEpoch || effect.ClaimEpoch != claim.Effect.ClaimEpoch+1 {
 		t.Fatalf("effect=%+v err=%v", effect, err)
 	}
 }

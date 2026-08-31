@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -266,11 +267,32 @@ type InvalidatedEffectObservation struct {
 	Current EffectFence
 }
 
+// invalidatedEffectReconciliationPayload is the append-only audit binding for
+// a read-only observation made after the original executor was revoked.  The
+// effect row is the current witness; this payload preserves the old claim that
+// crossed the external boundary and the live fence that authenticated the
+// reconciliation.
+type invalidatedEffectReconciliationPayload struct {
+	SemanticKey        string `json:"semantic_key"`
+	Present            bool   `json:"present"`
+	PriorTicketVersion uint64 `json:"prior_ticket_version"`
+	PriorLeaderEpoch   uint64 `json:"prior_leader_epoch"`
+	PriorRunnerEpoch   uint64 `json:"prior_runner_epoch"`
+	PriorClaimEpoch    uint64 `json:"prior_claim_epoch"`
+	CurrentTicket      uint64 `json:"current_ticket_version"`
+	CurrentLeader      uint64 `json:"current_leader_epoch"`
+	CurrentRunner      uint64 `json:"current_runner_epoch"`
+	CurrentClaim       uint64 `json:"current_claim_epoch"`
+	ObservedIdentity   string `json:"observed_identity,omitempty"`
+}
+
 // ReconcileInvalidatedEffect records a conclusive semantic observation after
 // the original runner can no longer write. Proven presence confirms the old
-// effect; proven absence marks it failed so a later PlanEffect may rebind the
-// same semantic key to the current ticket identity. It never performs or
-// retries the external mutation itself.
+// effect and promotes its witness to the exact live ticket/leader/runner
+// fence, incrementing claim_epoch so a late response from the revoked claim is
+// rejected. The old boundary claim remains in the audit event. Proven absence
+// marks it failed so a later PlanEffect may rebind the same semantic key. It
+// never performs or retries the external mutation itself.
 func (s *Store) ReconcileInvalidatedEffect(ctx context.Context, observation InvalidatedEffectObservation) (Effect, error) {
 	prior := observation.Prior
 	if err := prior.Ref.Validate(); err != nil {
@@ -295,10 +317,40 @@ func (s *Store) ReconcileInvalidatedEffect(ctx context.Context, observation Inva
 		if err != nil {
 			return err
 		}
-		if current.Ref != prior.Ref || current.TicketVersion != prior.TicketVersion || current.LeaderEpoch != prior.Fence.LeaderEpoch || current.RunnerEpoch != prior.Fence.RunnerEpoch || current.ClaimEpoch != prior.Fence.ClaimEpoch {
+		if current.Ref != prior.Ref {
 			return ErrStaleFence
 		}
-		if current.TicketVersion == observation.Current.TicketVersion && current.LeaderEpoch == observation.Current.Fence.LeaderEpoch && current.RunnerEpoch == observation.Current.Fence.RunnerEpoch {
+		// A promoted confirmation is replay-safe. Require the exact audit payload
+		// before accepting an already-current row; an unauthenticated row that
+		// merely happens to have the same identity is not sufficient.
+		if prior.Present && current.State == EffectConfirmed && current.TicketVersion == observation.Current.TicketVersion && current.LeaderEpoch == observation.Current.Fence.LeaderEpoch && current.RunnerEpoch == observation.Current.Fence.RunnerEpoch && current.ObservedIdentity == prior.Identity {
+			payload, marshalErr := json.Marshal(invalidatedEffectReconciliationPayload{
+				SemanticKey: prior.SemanticKey, Present: true,
+				PriorTicketVersion: prior.TicketVersion, PriorLeaderEpoch: prior.Fence.LeaderEpoch, PriorRunnerEpoch: prior.Fence.RunnerEpoch, PriorClaimEpoch: prior.Fence.ClaimEpoch,
+				CurrentTicket: observation.Current.TicketVersion, CurrentLeader: observation.Current.Fence.LeaderEpoch, CurrentRunner: observation.Current.Fence.RunnerEpoch, CurrentClaim: current.ClaimEpoch, ObservedIdentity: prior.Identity,
+			})
+			if marshalErr != nil {
+				return marshalErr
+			}
+			var count int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='invalidated_effect_reconciled' AND payload=?`, prior.Ref.Channel, prior.Ref.Project, prior.Ref.Ticket, observation.Current.TicketVersion, string(payload)).Scan(&count); err != nil {
+				return err
+			}
+			if count == 1 {
+				effect = current
+				return nil
+			}
+			return ErrStaleFence
+		}
+		if current.TicketVersion != prior.TicketVersion || current.LeaderEpoch != prior.Fence.LeaderEpoch || current.RunnerEpoch != prior.Fence.RunnerEpoch || current.ClaimEpoch != prior.Fence.ClaimEpoch {
+			return ErrStaleFence
+		}
+		// Leader recovery may already have moved the row to the live leader and
+		// incremented its claim epoch. The uncertain state is the durable proof
+		// that this is still a revoked execution, even though the ticket/leader/
+		// runner tuple now equals Current. A still-executing row at the same
+		// tuple has not been invalidated and must use ObserveEffect instead.
+		if current.TicketVersion == observation.Current.TicketVersion && current.LeaderEpoch == observation.Current.Fence.LeaderEpoch && current.RunnerEpoch == observation.Current.Fence.RunnerEpoch && current.State != EffectUncertain {
 			return errors.New("invalidated effect reconciliation requires a revoked claim")
 		}
 		if current.State == target && current.ObservedIdentity == prior.Identity {
@@ -308,16 +360,33 @@ func (s *Store) ReconcileInvalidatedEffect(ctx context.Context, observation Inva
 		if current.State != EffectExecuting && current.State != EffectUncertain {
 			return fmt.Errorf("cannot reconcile invalidated effect in state %q", current.State)
 		}
-		updated, err := conn.ExecContext(ctx, `UPDATE effects SET state=?,observed_identity=?
+		newClaimEpoch := current.ClaimEpoch
+		newTicketVersion, newLeaderEpoch, newRunnerEpoch := prior.TicketVersion, prior.Fence.LeaderEpoch, prior.Fence.RunnerEpoch
+		if prior.Present {
+			newClaimEpoch++
+			if newClaimEpoch == 0 {
+				return ErrStaleFence
+			}
+			newTicketVersion, newLeaderEpoch, newRunnerEpoch = observation.Current.TicketVersion, observation.Current.Fence.LeaderEpoch, observation.Current.Fence.RunnerEpoch
+		}
+		updated, err := conn.ExecContext(ctx, `UPDATE effects SET state=?,observed_identity=?,ticket_version=?,leader_epoch=?,runner_epoch=?,claim_epoch=?
 			WHERE semantic_key=? AND state IN ('executing','uncertain') AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?`,
-			target, prior.Identity, prior.SemanticKey, prior.TicketVersion, prior.Fence.LeaderEpoch, prior.Fence.RunnerEpoch, prior.Fence.ClaimEpoch)
+			target, prior.Identity, newTicketVersion, newLeaderEpoch, newRunnerEpoch, newClaimEpoch, prior.SemanticKey, prior.TicketVersion, prior.Fence.LeaderEpoch, prior.Fence.RunnerEpoch, prior.Fence.ClaimEpoch)
 		if err != nil {
 			return err
 		}
 		if changed, _ := updated.RowsAffected(); changed != 1 {
 			return ErrStaleFence
 		}
-		if err := evidenceEvent(ctx, conn, prior.Ref, observation.Current.TicketVersion, "invalidated_effect_reconciled", map[string]any{"semantic_key": prior.SemanticKey, "present": prior.Present}); err != nil {
+		payload, err := json.Marshal(invalidatedEffectReconciliationPayload{
+			SemanticKey: prior.SemanticKey, Present: prior.Present,
+			PriorTicketVersion: prior.TicketVersion, PriorLeaderEpoch: prior.Fence.LeaderEpoch, PriorRunnerEpoch: prior.Fence.RunnerEpoch, PriorClaimEpoch: prior.Fence.ClaimEpoch,
+			CurrentTicket: observation.Current.TicketVersion, CurrentLeader: observation.Current.Fence.LeaderEpoch, CurrentRunner: observation.Current.Fence.RunnerEpoch, CurrentClaim: newClaimEpoch, ObservedIdentity: prior.Identity,
+		})
+		if err != nil {
+			return err
+		}
+		if err := evidenceEvent(ctx, conn, prior.Ref, observation.Current.TicketVersion, "invalidated_effect_reconciled", json.RawMessage(payload)); err != nil {
 			return err
 		}
 		effect, err = effectFrom(ctx, conn, prior.SemanticKey)
