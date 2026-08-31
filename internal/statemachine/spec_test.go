@@ -30,7 +30,7 @@ func TestApprovedSpecMatchesDomain(t *testing.T) {
 	if got, want := len(spec.States), len(domain.AllStates()); got != want {
 		t.Fatalf("states=%d want=%d", got, want)
 	}
-	if got, want := len(spec.Transitions), 43; got != want {
+	if got, want := len(spec.Transitions), 44; got != want {
 		t.Fatalf("transitions=%d want=%d", got, want)
 	}
 }
