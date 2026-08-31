@@ -1477,6 +1477,31 @@ func TestStrictProtectionAcceptsExactRepositoryRuleset(t *testing.T) {
 	}
 }
 
+func TestObserveCIRequiredCheckPolicyRejectsProtectionWitnessRace(t *testing.T) {
+	client, fake, identity := fixture(t)
+	if err := fake.SetRulesetsForTest(exactRepositoryRuleset()); err != nil {
+		t.Fatal(err)
+	}
+	pr := createDraft(t, client, identity, "title", "body")
+	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "ci", ExternalID: "ci", State: "SUCCESS"}); err != nil {
+		t.Fatal(err)
+	}
+	original := client.runner
+	client.runner = commandRunnerFunc(func(ctx context.Context, binary string, args, env []string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "pr" && args[1] == "checks" {
+			changed := exactRepositoryRuleset()
+			changed.Rules[1].Parameters["required_status_checks"] = []any{map[string]any{"context": "ci"}}
+			if err := fake.SetRulesetsForTest(changed); err != nil {
+				return nil, err
+			}
+		}
+		return original.Run(ctx, binary, args, env)
+	})
+	if _, err := client.ObserveCIRequiredCheckPolicy(context.Background(), pr.Identity); err == nil {
+		t.Fatalf("protection witness race accepted: %v", err)
+	}
+}
+
 func TestMergeBindsRulesetCheckDigestIntoIntent(t *testing.T) {
 	client, fake, identity := fixture(t)
 	if err := fake.SetRulesetsForTest(exactRepositoryRuleset()); err != nil {

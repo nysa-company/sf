@@ -1067,3 +1067,32 @@ var migrationV42 = []string{
 	`CREATE TRIGGER runner_start_authorities_immutable_update BEFORE UPDATE ON runner_start_authorities BEGIN SELECT RAISE(ABORT,'runner start authority is immutable'); END`,
 	`CREATE TRIGGER runner_start_authorities_immutable_delete BEFORE DELETE ON runner_start_authorities BEGIN SELECT RAISE(ABORT,'runner start authority is append-only'); END`,
 }
+
+// v43 persists the server/policy-defined required check set separately from
+// observations. A CI observation may only classify after it proves exact
+// equality with this immutable witness; callers cannot select a convenient
+// subset of checks and call it green.
+var migrationV43 = []string{
+	`ALTER TABLE ci_observations ADD COLUMN policy_witness_digest TEXT NOT NULL DEFAULT '' CHECK(length(policy_witness_digest) IN (0,71))`,
+	`CREATE TABLE ci_required_check_policies (
+		policy_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		candidate_generation INTEGER NOT NULL CHECK(candidate_generation > 0), candidate_head_sha TEXT NOT NULL CHECK(length(candidate_head_sha) BETWEEN 1 AND 128), candidate_tree_sha TEXT NOT NULL CHECK(length(candidate_tree_sha) BETWEEN 1 AND 128), publication_witness_digest TEXT NOT NULL CHECK(length(publication_witness_digest)=71),
+		protected_branch_ref TEXT NOT NULL CHECK(length(protected_branch_ref) BETWEEN 1 AND 255), protected_branch_oid TEXT NOT NULL CHECK(length(protected_branch_oid) BETWEEN 1 AND 128), policy_source_digest TEXT NOT NULL CHECK(length(policy_source_digest) IN (64,71)), authenticated_principal TEXT NOT NULL CHECK(length(authenticated_principal) BETWEEN 1 AND 300), policy_witness_digest TEXT NOT NULL CHECK(length(policy_witness_digest)=71),
+		required_set_digest TEXT NOT NULL CHECK(length(required_set_digest)=64), required_check_count INTEGER NOT NULL CHECK(required_check_count > 0), required_checks_json TEXT NOT NULL CHECK(length(required_checks_json) BETWEEN 1 AND 65536 AND json_valid(required_checks_json)=1),
+		created_at TEXT NOT NULL CHECK(length(created_at) BETWEEN 1 AND 128),
+		UNIQUE(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,publication_witness_digest),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha) REFERENCES candidate_snapshots(channel,project_id,ticket_id,generation,head_sha,tree_sha),
+		FOREIGN KEY(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,publication_witness_digest) REFERENCES publication_evidence(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,witness_digest)
+	)`,
+	`CREATE UNIQUE INDEX ci_required_check_policies_digest ON ci_required_check_policies(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,publication_witness_digest)`,
+	`CREATE UNIQUE INDEX ci_required_check_policies_witness ON ci_required_check_policies(policy_witness_digest)`,
+	`CREATE INDEX ci_required_check_policies_latest ON ci_required_check_policies(channel,project_id,ticket_id,candidate_generation DESC,policy_id DESC)`,
+	`CREATE TRIGGER ci_required_check_policies_immutable_update BEFORE UPDATE ON ci_required_check_policies BEGIN SELECT RAISE(ABORT,'CI required check policy is immutable'); END`,
+	`CREATE TRIGGER ci_required_check_policies_immutable_delete BEFORE DELETE ON ci_required_check_policies BEGIN SELECT RAISE(ABORT,'CI required check policy is append-only'); END`,
+	`DROP TRIGGER ci_transition_evidence_requires_checks`,
+	`CREATE TRIGGER ci_transition_evidence_requires_checks BEFORE INSERT ON ci_transition_evidence WHEN EXISTS(SELECT 1 FROM ci_observations o WHERE o.channel=NEW.channel AND o.project_id=NEW.project_id AND o.ticket_id=NEW.ticket_id AND o.candidate_generation=NEW.candidate_generation AND o.candidate_head_sha=NEW.candidate_head_sha AND o.candidate_tree_sha=NEW.candidate_tree_sha AND o.classification=NEW.observation_classification AND o.observation_digest=NEW.observation_digest AND o.observed_ticket_version=NEW.observation_ticket_version AND o.observed_leader_epoch=NEW.observation_leader_epoch AND o.observed_runner_epoch=NEW.observation_runner_epoch AND (o.required_check_count<>(SELECT COUNT(*) FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest) OR (o.classification='red' AND NOT EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state IN ('failure','cancelled')))
+		OR (o.classification='pending' AND (EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state IN ('failure','cancelled')) OR NOT EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state='pending')))
+		OR (o.classification='green' AND EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state<>'success')))) BEGIN SELECT RAISE(ABORT,'ci observation check reducer mismatch'); END`,
+}

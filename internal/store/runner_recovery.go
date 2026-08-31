@@ -269,6 +269,62 @@ func validateRunnerRecoveryCardinality(ctx context.Context, q interface {
 	return nil
 }
 
+// validateWaitingRecoveryLedger authenticates the recovery rows which may
+// precede the first CI observation. The publication->waiting_ci transition is
+// the baseline version, so a recovery row at that version is never accepted;
+// each later row must be contiguous and must not have a competing event.
+func validateWaitingRecoveryLedger(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, baselineVersion, baselineRunner, baselineLeader, liveVersion, liveRunner, liveLeader uint64) error {
+	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
+		return err
+	}
+	if _, found, err := loadRunnerRecoveryAt(ctx, q, ref, baselineVersion); err != nil {
+		return err
+	} else if found {
+		return ErrPublicationEvidence
+	}
+	rows, err := q.QueryContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, baselineVersion)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	expectedVersion, expectedRunner, expectedLeader := baselineVersion, baselineRunner, baselineLeader
+	var count int
+	for rows.Next() {
+		count++
+		if count > 64 {
+			return ErrPublicationEvidence
+		}
+		var step RunnerRecoveryLedger
+		var createdAt string
+		if err := rows.Scan(&step.PriorTicketVersion, &step.PriorRunnerEpoch, &step.PriorLeaderEpoch, &step.TicketVersion, &step.RunnerEpoch, &step.LeaderEpoch, &step.RecoveryDigest, &createdAt); err != nil {
+			return err
+		}
+		step.CreatedAt, err = parseRunnerRecoveryTime(createdAt)
+		if err != nil {
+			return ErrPublicationEvidence
+		}
+		step.Ref = ref
+		if !validRunnerRecovery(step) || step.PriorTicketVersion != expectedVersion || step.PriorRunnerEpoch != expectedRunner || step.PriorLeaderEpoch != expectedLeader || step.TicketVersion != expectedVersion+1 || step.RunnerEpoch != expectedRunner+1 || step.LeaderEpoch <= expectedLeader {
+			return ErrPublicationEvidence
+		}
+		var events int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, step.TicketVersion).Scan(&events); err != nil || events != 0 {
+			return ErrPublicationEvidence
+		}
+		expectedVersion, expectedRunner, expectedLeader = step.TicketVersion, step.RunnerEpoch, step.LeaderEpoch
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if liveVersion != expectedVersion || liveRunner != expectedRunner || liveLeader != expectedLeader {
+		return ErrPublicationEvidence
+	}
+	return nil
+}
+
 // validateRunnerControlAdvance proves the only non-ledger runner advance that
 // can sit between recovery rows: a complete operator pause/take handoff. The
 // control primitive increments runner_epoch atomically with its exact event;

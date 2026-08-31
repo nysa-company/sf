@@ -56,9 +56,10 @@ var (
 	ErrRepositoryCommandResult = errors.New("repository command result is missing, malformed, or conflicts with durable evidence")
 	ErrPublicationEvidence     = errors.New("publication evidence is missing, malformed, stale, or conflicts with durable evidence")
 	ErrPublicationBlockUnsafe  = errors.New("publication blocker requires publication and merge effects to be reconciled")
+	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 42
+const schemaVersion = 43
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -103,6 +104,7 @@ var migrationChecksums = map[int]string{
 	40: migrationChecksum(migrationV40),
 	41: migrationChecksum(migrationV41),
 	42: migrationChecksum(migrationV42),
+	43: migrationChecksum(migrationV43),
 }
 
 func migrationChecksum(statements []string) string {
@@ -446,6 +448,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV41
 			} else if version == 42 {
 				statements = migrationV42
+			} else if version == 43 {
+				statements = migrationV43
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1429,6 +1433,22 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
+	// A repair-gated transition must not revoke the builder fence before its
+	// missing successor completion can be recorded. The same check is repeated
+	// inside the write transaction below for race-safe authority.
+	var repairPending int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation).Scan(&repairPending); err != nil {
+		return TransitionResult{}, err
+	}
+	if repairPending > 0 {
+		var completed int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=? AND final_candidate_head_sha=? AND final_candidate_tree_sha=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, candidate.HeadSHA, candidate.TreeSHA).Scan(&completed); err != nil {
+			return TransitionResult{}, err
+		}
+		if completed != 1 {
+			return TransitionResult{}, ErrEvidenceConflict
+		}
+	}
 	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
 		return TransitionResult{}, err
 	}
@@ -1453,6 +1473,21 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 		if stored != candidate {
 			return ErrEvidenceConflict
 		}
+		var repairPending int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation).Scan(&repairPending); err != nil {
+			return err
+		}
+		if repairPending > 0 {
+			var completed int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=? AND final_candidate_head_sha=? AND final_candidate_tree_sha=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, candidate.HeadSHA, candidate.TreeSHA).Scan(&completed); err != nil || completed != 1 {
+				return ErrEvidenceConflict
+			}
+		}
+		// Re-authenticate on the transaction connection.  A separate pooled
+		// connection can observe a different snapshot (or block behind this
+		// write), turning an otherwise valid same-fence candidate into a false
+		// evidence conflict.  The transaction-scoped reader also keeps the
+		// candidate proof and ticket fence in one authenticated snapshot.
 		authenticated, err := s.latestCandidateFrom(ctx, conn, transition.Ref, true)
 		if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != version || authenticated.Fence != transition.Fence || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {
 			return ErrEvidenceConflict

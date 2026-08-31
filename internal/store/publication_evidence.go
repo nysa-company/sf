@@ -240,8 +240,11 @@ func publicationIdentityDigest(value []byte) string {
 }
 
 func publicationPayload(value PublishedCandidateEvidence) ([]byte, error) {
-	// Keep this envelope explicit and stable. CreatedAt and WitnessDigest are
-	// intentionally excluded so an exact lost-response replay hashes alike.
+	// Keep this envelope explicit and stable. WitnessDigest, CreatedAt, and the
+	// live PR observation timestamp are intentionally excluded so a lost
+	// response can replay the same immutable publication identity even when the
+	// caller observes it again at a different instant. BuildTransitionCreatedAt
+	// remains covered because it binds the witness to the durable phase event.
 	candidate := value.Candidate
 	candidate.CreatedAt = time.Time{}
 	worktree := value.Worktree
@@ -261,11 +264,9 @@ func publicationPayload(value PublishedCandidateEvidence) ([]byte, error) {
 		PullRequest                                     contracts.PullRequestIdentity
 		PullRequestState                                string
 		PullRequestDraft                                bool
-		PullRequestObservedAt                           string
 		PRCreateOrUpdateEffect                          PublicationEffectEvidence
-		CreatedAt                                       string
 		BuildTransitionCreatedAt                        string
-	}{value.Ref, value.TicketVersion, value.Fence, candidate, value.ConfigGeneration, value.ConfigDigest, value.ConfigSnapshotDigest, worktree, value.RemoteBranchRef, value.RemoteBranchOID, value.RemoteBaseOID, value.PushEffect, value.PullRequest, value.PullRequestState, value.PullRequestDraft, value.PullRequestObservedAt.Format(time.RFC3339Nano), value.PRCreateOrUpdateEffect, value.CreatedAt.UTC().Format(time.RFC3339Nano), value.BuildTransitionCreatedAt.UTC().Format(time.RFC3339Nano)})
+	}{value.Ref, value.TicketVersion, value.Fence, candidate, value.ConfigGeneration, value.ConfigDigest, value.ConfigSnapshotDigest, worktree, value.RemoteBranchRef, value.RemoteBranchOID, value.RemoteBaseOID, value.PushEffect, value.PullRequest, value.PullRequestState, value.PullRequestDraft, value.PRCreateOrUpdateEffect, value.BuildTransitionCreatedAt.UTC().Format(time.RFC3339Nano)})
 }
 
 func validPublishedCandidateEvidence(value PublishedCandidateEvidence) error {
@@ -437,7 +438,7 @@ func (s *Store) TransitionPublishedBlock(ctx context.Context, transition Transit
 	var blocker struct {
 		Code string `json:"code"`
 	}
-	if json.Unmarshal([]byte(transition.EventPayload), &blocker) != nil || blocker.Code == "" || !boundedText(blocker.Code, 128) {
+	if json.Unmarshal([]byte(transition.EventPayload), &blocker) != nil || !validBlockedCode(blocker.Code) {
 		return TransitionResult{}, ErrPublicationEvidence
 	}
 	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
@@ -613,7 +614,7 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 			if blockedCode == "" || version == 0 || resumeState != transition.To {
 				return ErrPublicationEvidence
 			}
-			if !boundedText(blockedCode, 128) {
+			if !validBlockedCode(blockedCode) {
 				return ErrPublicationEvidence
 			}
 		}
@@ -822,7 +823,7 @@ func authenticateBlockedResume(ctx context.Context, q interface {
 }
 
 func blockedResumeEventPayload(code string) (string, error) {
-	if !boundedText(code, 128) {
+	if !validBlockedCode(code) {
 		return "", ErrPublicationEvidence
 	}
 	payload, err := json.Marshal(struct {
@@ -882,7 +883,7 @@ func authenticateBlockedPublicationResume(ctx context.Context, q interface {
 	if len(payload) > maxEvidenceJSON || json.Unmarshal([]byte(payload), &blocker) != nil || blocker.Code == "" {
 		return ErrPublicationEvidence
 	}
-	if !boundedText(blocker.Code, 128) {
+	if !validBlockedCode(blocker.Code) {
 		return ErrPublicationEvidence
 	}
 	var resumePayload string

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -24,10 +25,10 @@ func TestCICorrectionV41SchemaIsAppendOnlyAndValidated(t *testing.T) {
 	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != schemaVersion || len(migrationChecksums) != schemaVersion || migrationChecksums[41] != migrationChecksum(migrationV41) {
+	if version != schemaVersion || len(migrationChecksums) != schemaVersion {
 		t.Fatalf("schema version/checksum history=%d/%d", version, len(migrationChecksums))
 	}
-	for _, table := range []string{"ci_observations", "ci_observation_checks", "ci_transition_evidence", "candidate_repair_bindings", "candidate_repair_completions"} {
+	for _, table := range []string{"ci_required_check_policies", "ci_observations", "ci_observation_checks", "ci_transition_evidence", "candidate_repair_bindings", "candidate_repair_completions"} {
 		var count int
 		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("required table %s count=%d err=%v", table, count, err)
@@ -593,5 +594,87 @@ func TestCIV41MigrationFailsClosedForLegacyWaitingCI(t *testing.T) {
 	}
 	if state != "blocked" || resume != "waiting_ci" || code != "legacy_ci_observation_unverifiable" || version != 5 {
 		t.Fatalf("legacy waiting-ci disposition=%s/%s/%s/v%d", state, resume, code, version)
+	}
+}
+
+func TestCIV41RowsSurviveV42V43MigrationAndRemainImmutable(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v41-ci.sqlite")
+	createDatabaseAtVersion(t, path, 41)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('dev','nysa','/nysa','main')`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	// Reuse the real v41 authority fixture against the staged raw database;
+	// only the migration runner is bypassed, not any fixture or FK/trigger.
+	staged := &Store{db: raw, commit: func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, "COMMIT")
+		return err
+	}}
+	insertV41Fixture(t, staged, ctx)
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	backups := filepath.Join(t.TempDir(), "backups")
+	if err := os.Mkdir(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := OpenChannel(ctx, path, backups, domain.ChannelStable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var observations, checks, evidence, bindings, completions int
+	for table, target := range map[string]*int{
+		"ci_observations":              &observations,
+		"ci_observation_checks":        &checks,
+		"ci_transition_evidence":       &evidence,
+		"candidate_repair_bindings":    &bindings,
+		"candidate_repair_completions": &completions,
+	} {
+		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table).Scan(target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if observations != 1 || checks != 1 || evidence != 1 || bindings != 1 || completions != 1 {
+		t.Fatalf("v41 authority rows lost during v42/v43 migration: observations=%d checks=%d evidence=%d bindings=%d completions=%d", observations, checks, evidence, bindings, completions)
+	}
+	var version int
+	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 43 {
+		t.Fatalf("migrated schema=%d err=%v", version, err)
+	}
+	if _, err := database.db.ExecContext(ctx, `UPDATE ci_observations SET diagnostic_text='tampered' WHERE observation_id=1`); err == nil {
+		t.Fatal("migrated CI observation lost immutable trigger")
+	}
+	var startAuthorityTrigger int
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='runner_start_authorities_immutable_update'`).Scan(&startAuthorityTrigger); err != nil || startAuthorityTrigger != 1 {
+		t.Fatalf("migrated runner start authority lost immutable trigger: count=%d err=%v", startAuthorityTrigger, err)
+	}
+	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v*-to-v*.sqlite"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("stable v41 migration backup=%v err=%v", files, err)
+	}
+	backup, err := sql.Open("sqlite", files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	var backupVersion, backupObservations int
+	if err := backup.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&backupVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := backup.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_observations`).Scan(&backupObservations); err != nil {
+		t.Fatal(err)
+	}
+	if backupVersion != 41 || backupObservations != 1 {
+		t.Fatalf("backup lost staged v41 authority rows: version=%d observations=%d", backupVersion, backupObservations)
+	}
+	if info, err := os.Stat(files[0]); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("invalid migration backup info=%v err=%v", info, err)
 	}
 }

@@ -3,6 +3,7 @@ package contracts
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
 )
@@ -39,6 +40,29 @@ type RequiredCheck struct {
 	Name       string
 	ExternalID string
 	State      string
+}
+
+// CIRequiredCheckPolicyObservation is the authenticated result of observing
+// the protected branch policy and its required checks.  It is deliberately a
+// separate boundary from RequiredChecks: a check endpoint alone does not prove
+// which protected ref, source snapshot, or principal supplied the policy.
+type CIRequiredCheckPolicyObservation struct {
+	PullRequest            PullRequestIdentity
+	ProtectedBranchRef     string
+	ProtectedBranchOID     string
+	PolicySourceDigest     string
+	AuthenticatedPrincipal string
+	PolicyWitnessDigest    string
+	RequiredChecks         []RequiredCheck
+	ObservedAt             time.Time
+}
+
+// CIRequiredCheckPolicyObserver is the injectable production boundary for a
+// GitHub adapter. Implementations must authenticate the GitHub response and
+// return one complete protected-branch witness; Store persists and rechecks
+// every field before reducing any later CI observation.
+type CIRequiredCheckPolicyObserver interface {
+	ObserveCIRequiredCheckPolicy(context.Context, PullRequestIdentity) (CIRequiredCheckPolicyObservation, error)
 }
 
 // MergeBranchVerifier is implemented by a merge-proof coordinator after it
