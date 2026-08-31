@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -161,6 +162,39 @@ func TestEvidencePhaseWorktreeAndBoundedBudgets(t *testing.T) {
 	}
 	if used, err := database.ConsumeBudget(ctx, BudgetUse{Ref: ref, ExpectedVersion: version, Fence: fence, Kind: "correction", RequestID: "two"}); err != nil || used != 2 {
 		t.Fatalf("budget replay used=%d err=%v", used, err)
+	}
+}
+
+func TestConsumeBudgetCorrectionRequestIDBounds(t *testing.T) {
+	for _, length := range []int{255, 256, 300, 301} {
+		length := length
+		t.Run(fmt.Sprintf("length-%d", length), func(t *testing.T) {
+			database, ctx, ref, version, fence := evidenceFixture(t)
+			requestID := strings.Repeat("r", length)
+			used, err := database.ConsumeBudget(ctx, BudgetUse{Ref: ref, ExpectedVersion: version, Fence: fence, Kind: "correction", RequestID: requestID})
+			if length <= 300 {
+				if err != nil || used != 1 {
+					t.Fatalf("request id length=%d used=%d err=%v", length, used, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("request id length 301 was accepted")
+			}
+			var budgetRows, counterUsed int
+			if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND request_id=?`, ref.Channel, ref.Project, ref.Ticket, requestID).Scan(&budgetRows); err != nil {
+				t.Fatal(err)
+			}
+			if budgetRows != 0 {
+				t.Fatalf("request id length 301 persisted %d budget rows", budgetRows)
+			}
+			if err := database.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT used FROM ticket_counters WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'),0)`, ref.Channel, ref.Project, ref.Ticket).Scan(&counterUsed); err != nil {
+				t.Fatal(err)
+			}
+			if counterUsed != 0 {
+				t.Fatalf("request id length 301 incremented correction counter to %d", counterUsed)
+			}
+		})
 	}
 }
 

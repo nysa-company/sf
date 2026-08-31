@@ -24,7 +24,7 @@ var (
 
 const (
 	MaxSpecBytes   = 1 << 20
-	ApprovedSHA256 = "fa6d5f41fcc70c61728b43eb1cefd2c366fcc5f708e0ef023c2f511585b95974"
+	ApprovedSHA256 = "ff4548c598f6f2789890571983db56fe8cb343d762924b36a615502e3c71a74d"
 )
 
 type StateDefinition struct {

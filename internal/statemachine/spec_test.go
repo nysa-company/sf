@@ -30,8 +30,26 @@ func TestApprovedSpecMatchesDomain(t *testing.T) {
 	if got, want := len(spec.States), len(domain.AllStates()); got != want {
 		t.Fatalf("states=%d want=%d", got, want)
 	}
-	if got, want := len(spec.Transitions), 42; got != want {
+	if got, want := len(spec.Transitions), 43; got != want {
 		t.Fatalf("transitions=%d want=%d", got, want)
+	}
+}
+
+func TestCIRedSelectionExhaustionIsExclusive(t *testing.T) {
+	spec := loadApprovedSpec(t)
+	available, err := spec.Select(string(domain.StateWaitingCI), "checks_red", map[string]bool{"correction_available": true})
+	if err != nil || available.ID != "ci_red_repair" || available.To != string(domain.StateBuilding) {
+		t.Fatalf("available transition=%+v err=%v", available, err)
+	}
+	exhausted, err := spec.Select(string(domain.StateWaitingCI), "checks_red", map[string]bool{"correction_exhausted": true})
+	if err != nil || exhausted.ID != "ci_red_exhausted" || exhausted.To != string(domain.StatePaused) || exhausted.ResumeState != string(domain.StateWaitingCI) || exhausted.PhaseDisposition != "pause" || len(exhausted.AllowedEffects) != 0 || len(exhausted.Invalidates) != 0 {
+		t.Fatalf("exhausted transition=%+v err=%v", exhausted, err)
+	}
+	if _, err := spec.Select(string(domain.StateWaitingCI), "checks_red", map[string]bool{"correction_available": true, "correction_exhausted": true}); !errors.Is(err, ErrAmbiguousTransition) {
+		t.Fatalf("both correction guards should be ambiguous, got %v", err)
+	}
+	if _, err := spec.Select(string(domain.StateWaitingCI), "checks_red", nil); !errors.Is(err, ErrNoTransition) {
+		t.Fatalf("missing correction guard should refuse, got %v", err)
 	}
 }
 

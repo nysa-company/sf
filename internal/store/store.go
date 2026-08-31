@@ -57,7 +57,7 @@ var (
 	ErrPublicationEvidence     = errors.New("publication evidence is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 40
+const schemaVersion = 41
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -100,6 +100,7 @@ var migrationChecksums = map[int]string{
 	38: migrationChecksum(migrationV38),
 	39: migrationChecksum(migrationV39),
 	40: migrationChecksum(migrationV40),
+	41: migrationChecksum(migrationV41),
 }
 
 func migrationChecksum(statements []string) string {
@@ -260,6 +261,12 @@ func open(ctx context.Context, path string, policy openPolicy) (*Store, error) {
 		return nil, normalizeBusy(ctx, err)
 	}
 	if err := s.migrate(ctx); err != nil {
+		db.Close()
+		return nil, normalizeBusy(ctx, err)
+	}
+	// Refuse malformed or incomplete schemas before any startup recovery writer
+	// can mutate runtime controls or reconcile legacy provider claims.
+	if err := s.validateSchema(ctx); err != nil {
 		db.Close()
 		return nil, normalizeBusy(ctx, err)
 	}
@@ -433,6 +440,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV39
 			} else if version == 40 {
 				statements = migrationV40
+			} else if version == 41 {
+				statements = migrationV41
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {

@@ -161,6 +161,17 @@
       "invalidates": ["candidate"]
     },
     {
+      "id": "ci_red_exhausted",
+      "from": ["waiting_ci"],
+      "trigger": "checks_red",
+      "guards": ["correction_exhausted"],
+      "to": "paused",
+      "resume_state": "waiting_ci",
+      "phase_disposition": "pause",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
       "id": "review_repair",
       "from": ["reviewing"],
       "trigger": "review_repair",

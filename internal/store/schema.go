@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // integrity checks the database before schema code trusts it. PRAGMA results
@@ -53,12 +54,17 @@ func (s *Store) validateSchema(ctx context.Context) error {
 			return err
 		}
 	}
+	for _, required := range requiredCompositeForeignKeys {
+		if err := hasExactForeignKey(ctx, s.db, required); err != nil {
+			return err
+		}
+	}
 	for _, index := range requiredIndexes {
 		if err := hasIndex(ctx, s.db, index); err != nil {
 			return err
 		}
 	}
-	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete", "plan_result_bindings_immutable_update", "plan_result_bindings_immutable_delete", "verification_result_bindings_immutable_update", "verification_result_bindings_immutable_delete", "candidate_result_bindings_immutable_update", "candidate_result_bindings_immutable_delete", "repository_command_results_immutable_update", "repository_command_results_immutable_delete", "verification_command_result_bindings_immutable_update", "verification_command_result_bindings_immutable_delete", "candidate_command_result_bindings_immutable_update", "candidate_command_result_bindings_immutable_delete", "publication_evidence_immutable_update", "publication_evidence_immutable_delete", "publication_evidence_rebinds_immutable_update", "publication_evidence_rebinds_immutable_delete", "publication_transition_evidence_immutable_update", "publication_transition_evidence_immutable_delete", "runner_recovery_ledger_immutable_update", "runner_recovery_ledger_immutable_delete"} {
+	for _, trigger := range []string{"provider_attempt_results_immutable_update", "provider_attempt_results_immutable_delete", "plan_result_bindings_immutable_update", "plan_result_bindings_immutable_delete", "verification_result_bindings_immutable_update", "verification_result_bindings_immutable_delete", "candidate_result_bindings_immutable_update", "candidate_result_bindings_immutable_delete", "repository_command_results_immutable_update", "repository_command_results_immutable_delete", "verification_command_result_bindings_immutable_update", "verification_command_result_bindings_immutable_delete", "candidate_command_result_bindings_immutable_update", "candidate_command_result_bindings_immutable_delete", "publication_evidence_immutable_update", "publication_evidence_immutable_delete", "publication_evidence_rebinds_immutable_update", "publication_evidence_rebinds_immutable_delete", "publication_transition_evidence_immutable_update", "publication_transition_evidence_immutable_delete", "runner_recovery_ledger_immutable_update", "runner_recovery_ledger_immutable_delete", "ci_observations_immutable_update", "ci_observations_immutable_delete", "ci_observation_checks_immutable_update", "ci_observation_checks_immutable_delete", "ci_transition_evidence_immutable_update", "ci_transition_evidence_immutable_delete", "ci_transition_evidence_requires_checks", "candidate_repair_bindings_immutable_update", "candidate_repair_bindings_immutable_delete", "candidate_repair_completions_immutable_update", "candidate_repair_completions_immutable_delete"} {
 		var count int
 		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigger).Scan(&count); err != nil || count != 1 {
 			return fmt.Errorf("required trigger %s is missing", trigger)
@@ -78,6 +84,55 @@ func (s *Store) validateSchema(ctx context.Context) error {
 type foreignKeyRequirement struct {
 	table  string
 	target string
+}
+
+type foreignKeyColumn struct{ from, to string }
+
+type compositeForeignKeyRequirement struct {
+	table, target string
+	columns       []foreignKeyColumn
+}
+
+func compositeForeignKey(table, target string, columns ...foreignKeyColumn) compositeForeignKeyRequirement {
+	return compositeForeignKeyRequirement{table: table, target: target, columns: columns}
+}
+
+// v41 authority rows use exact composite keys. Parent-table presence alone is
+// insufficient: accepting a subset or differently ordered mapping would let a
+// valid value from another candidate, ticket, or fence satisfy the FK.
+var requiredCompositeForeignKeys = []compositeForeignKeyRequirement{
+	compositeForeignKey("ci_observations", "candidate_snapshots",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"candidate_generation", "generation"}, foreignKeyColumn{"candidate_head_sha", "head_sha"}, foreignKeyColumn{"candidate_tree_sha", "tree_sha"}),
+	compositeForeignKey("ci_observations", "publication_evidence",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"candidate_generation", "candidate_generation"}, foreignKeyColumn{"candidate_head_sha", "candidate_head_sha"}, foreignKeyColumn{"candidate_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"publication_witness_digest", "witness_digest"}, foreignKeyColumn{"pr_host", "github_host"}, foreignKeyColumn{"pr_owner", "github_owner"}, foreignKeyColumn{"pr_repo", "github_name"}, foreignKeyColumn{"pr_number", "github_pr_number"}, foreignKeyColumn{"pr_head_owner", "github_head_owner"}, foreignKeyColumn{"pr_head_repo", "github_head_repository"}, foreignKeyColumn{"pr_head_ref", "github_head_ref"}, foreignKeyColumn{"pr_head_oid", "github_head_oid"}, foreignKeyColumn{"pr_base_ref", "github_base_ref"}, foreignKeyColumn{"pr_base_oid", "github_base_oid"}, foreignKeyColumn{"pr_open", "github_open"}, foreignKeyColumn{"pr_draft", "github_draft"}, foreignKeyColumn{"pr_factory_owned", "github_factory_owned"}),
+	compositeForeignKey("ci_observation_checks", "ci_observations",
+		foreignKeyColumn{"observation_id", "observation_id"}, foreignKeyColumn{"observation_digest", "observation_digest"}),
+	compositeForeignKey("ci_transition_evidence", "events",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"ticket_version", "ticket_version"}, foreignKeyColumn{"event_id", "id"}, foreignKeyColumn{"event_created_at", "created_at"}, foreignKeyColumn{"prior_state", "from_state"}, foreignKeyColumn{"resulting_state", "to_state"}, foreignKeyColumn{"resulting_trigger", "trigger"}),
+	compositeForeignKey("ci_transition_evidence", "ci_observations",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"candidate_generation", "candidate_generation"}, foreignKeyColumn{"candidate_head_sha", "candidate_head_sha"}, foreignKeyColumn{"candidate_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"observation_classification", "classification"}, foreignKeyColumn{"observation_digest", "observation_digest"}, foreignKeyColumn{"observation_ticket_version", "observed_ticket_version"}, foreignKeyColumn{"observation_leader_epoch", "observed_leader_epoch"}, foreignKeyColumn{"observation_runner_epoch", "observed_runner_epoch"}),
+	compositeForeignKey("ci_transition_evidence", "publication_evidence",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"candidate_generation", "candidate_generation"}, foreignKeyColumn{"candidate_head_sha", "candidate_head_sha"}, foreignKeyColumn{"candidate_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"prior_publication_witness_digest", "witness_digest"}),
+	compositeForeignKey("candidate_repair_bindings", "candidate_snapshots",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"predecessor_generation", "generation"}, foreignKeyColumn{"predecessor_head_sha", "head_sha"}, foreignKeyColumn{"predecessor_tree_sha", "tree_sha"}),
+	compositeForeignKey("candidate_repair_bindings", "ci_observations",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"predecessor_generation", "candidate_generation"}, foreignKeyColumn{"predecessor_head_sha", "candidate_head_sha"}, foreignKeyColumn{"predecessor_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"red_observation_classification", "classification"}, foreignKeyColumn{"red_observation_digest", "observation_digest"}),
+	compositeForeignKey("candidate_repair_bindings", "publication_evidence",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"predecessor_generation", "candidate_generation"}, foreignKeyColumn{"predecessor_head_sha", "candidate_head_sha"}, foreignKeyColumn{"predecessor_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"predecessor_publication_witness_digest", "witness_digest"}, foreignKeyColumn{"pr_host", "github_host"}, foreignKeyColumn{"pr_owner", "github_owner"}, foreignKeyColumn{"pr_repo", "github_name"}, foreignKeyColumn{"pr_number", "github_pr_number"}, foreignKeyColumn{"branch_ref", "remote_branch_ref"}, foreignKeyColumn{"remote_head_oid", "remote_branch_oid"}, foreignKeyColumn{"base_ref", "github_base_ref"}, foreignKeyColumn{"remote_base_oid", "remote_base_oid"}),
+	compositeForeignKey("candidate_repair_bindings", "ci_transition_evidence",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"predecessor_generation", "candidate_generation"}, foreignKeyColumn{"predecessor_head_sha", "candidate_head_sha"}, foreignKeyColumn{"predecessor_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"red_observation_classification", "observation_classification"}, foreignKeyColumn{"red_observation_digest", "observation_digest"}, foreignKeyColumn{"predecessor_publication_witness_digest", "prior_publication_witness_digest"}, foreignKeyColumn{"consumed_ticket_version", "observation_ticket_version"}, foreignKeyColumn{"consumed_leader_epoch", "observation_leader_epoch"}, foreignKeyColumn{"consumed_runner_epoch", "observation_runner_epoch"}, foreignKeyColumn{"red_transition_ticket_version", "ticket_version"}, foreignKeyColumn{"red_transition_digest", "transition_digest"}),
+	compositeForeignKey("candidate_repair_bindings", "ticket_budget_uses",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"correction_budget_kind", "kind"}, foreignKeyColumn{"correction_budget_request_id", "request_id"}, foreignKeyColumn{"consumed_ticket_version", "ticket_version"}, foreignKeyColumn{"consumed_leader_epoch", "leader_epoch"}, foreignKeyColumn{"consumed_runner_epoch", "runner_epoch"}),
+	compositeForeignKey("candidate_repair_completions", "candidate_repair_bindings",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"target_generation", "target_generation"}),
+	compositeForeignKey("candidate_repair_completions", "provider_attempts",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"builder_result_phase", "phase"}, foreignKeyColumn{"builder_result_role", "role"}, foreignKeyColumn{"builder_result_attempt", "attempt"}, foreignKeyColumn{"builder_result_attempt_id", "id"}),
+	compositeForeignKey("candidate_repair_completions", "provider_attempt_results",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"builder_result_phase", "phase"}, foreignKeyColumn{"builder_result_role", "role"}, foreignKeyColumn{"builder_result_attempt", "attempt"}, foreignKeyColumn{"builder_result_attempt_id", "provider_attempt_id"}),
+	compositeForeignKey("candidate_repair_completions", "candidate_result_bindings",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"target_generation", "generation"}, foreignKeyColumn{"builder_binding_ticket_version", "binding_ticket_version"}, foreignKeyColumn{"builder_binding_leader_epoch", "leader_epoch"}, foreignKeyColumn{"builder_binding_runner_epoch", "runner_epoch"}, foreignKeyColumn{"builder_result_attempt_id", "provider_attempt_id"}, foreignKeyColumn{"builder_result_attempt", "provider_attempt"}),
+	compositeForeignKey("candidate_repair_completions", "candidate_snapshots",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"target_generation", "generation"}, foreignKeyColumn{"final_candidate_head_sha", "head_sha"}, foreignKeyColumn{"final_candidate_tree_sha", "tree_sha"}),
 }
 
 var requiredForeignKeys = []foreignKeyRequirement{
@@ -128,6 +183,23 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "publication_evidence_rebinds", target: "publication_evidence"},
 	{table: "runner_recovery_ledger", target: "tickets"},
 	{table: "runtime_ticket_controls", target: "tickets"},
+	{table: "ci_observations", target: "tickets"},
+	{table: "ci_observations", target: "candidate_snapshots"},
+	{table: "ci_observations", target: "publication_evidence"},
+	{table: "ci_observation_checks", target: "ci_observations"},
+	{table: "ci_transition_evidence", target: "tickets"},
+	{table: "ci_transition_evidence", target: "events"},
+	{table: "ci_transition_evidence", target: "ci_observations"},
+	{table: "ci_transition_evidence", target: "publication_evidence"},
+	{table: "candidate_repair_bindings", target: "tickets"},
+	{table: "candidate_repair_bindings", target: "candidate_snapshots"},
+	{table: "candidate_repair_bindings", target: "publication_evidence"},
+	{table: "candidate_repair_bindings", target: "ci_observations"},
+	{table: "candidate_repair_completions", target: "candidate_repair_bindings"},
+	{table: "candidate_repair_completions", target: "candidate_snapshots"},
+	{table: "candidate_repair_completions", target: "provider_attempt_results"},
+	{table: "candidate_repair_completions", target: "provider_attempts"},
+	{table: "candidate_repair_completions", target: "candidate_result_bindings"},
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {
@@ -150,6 +222,58 @@ func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error 
 		return err
 	}
 	return fmt.Errorf("required foreign key %s -> %s is missing", table, target)
+}
+
+func hasExactForeignKey(ctx context.Context, db *sql.DB, required compositeForeignKeyRequirement) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA foreign_key_list("+required.table+")")
+	if err != nil {
+		return fmt.Errorf("inspect foreign keys for %s: %w", required.table, err)
+	}
+	defer rows.Close()
+	type group struct {
+		target  string
+		columns []foreignKeyColumn
+	}
+	groups := map[int]*group{}
+	for rows.Next() {
+		var id, seq int
+		var target, from, to, onUpdate, onDelete, match string
+		if err := rows.Scan(&id, &seq, &target, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			return err
+		}
+		if groups[id] == nil {
+			groups[id] = &group{target: target}
+		}
+		groups[id].columns = append(groups[id].columns, foreignKeyColumn{from: from, to: to})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	want := append([]foreignKeyColumn(nil), required.columns...)
+	sort.Slice(want, func(i, j int) bool { return want[i].from < want[j].from })
+	for _, candidate := range groups {
+		if candidate.target != required.target {
+			continue
+		}
+		actual := append([]foreignKeyColumn(nil), candidate.columns...)
+		sort.Slice(actual, func(i, j int) bool { return actual[i].from < actual[j].from })
+		if sameForeignKeyColumns(actual, want) {
+			return nil
+		}
+	}
+	return fmt.Errorf("required exact foreign key %s -> %s is missing or mismatched", required.table, required.target)
+}
+
+func sameForeignKeyColumns(actual, expected []foreignKeyColumn) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range actual {
+		if actual[index] != expected[index] {
+			return false
+		}
+	}
+	return true
 }
 
 var requiredSchema = map[string][]string{
@@ -177,7 +301,7 @@ var requiredSchema = map[string][]string{
 	"candidate_result_bindings":            {"generation", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt", "commit_parent_oid"},
 	"invalidation_receipts":                {"generation", "kind", "reason"},
 	"ticket_counters":                      {"kind", "used", "limit_count"},
-	"ticket_budget_uses":                   {"kind", "request_id", "ticket_version"},
+	"ticket_budget_uses":                   {"kind", "request_id", "ticket_version", "leader_epoch", "runner_epoch"},
 	"branch_allocations":                   {"authority_key", "channel", "project_id", "ticket_id", "branch_ref", "created_at"},
 	"provider_qualifications":              {"id", "channel", "run_id", "provider", "model", "family", "provider_version", "binary_digest", "policy_digest", "fixture_digest", "profile", "failed_probes_json", "reason_code", "created_at", "auth_digest", "auth_mode", "probe_digest", "attested_leader_epoch", "attestation_signature"},
 	"provider_pair_selections":             {"channel", "builder_qualification_id", "reviewer_qualification_id", "selected_at"},
@@ -191,11 +315,16 @@ var requiredSchema = map[string][]string{
 	"repository_command_results":           {"semantic_key", "claim_epoch", "channel", "project_id", "ticket_id", "request_digest", "ticket_version", "leader_epoch", "runner_epoch", "repository_path", "worktree_path", "worktree_identity", "branch_ref", "base_ref", "base_sha", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest", "exit_code", "stdout", "stderr", "output_last_message", "stdout_truncated", "stderr_truncated", "output_last_message_truncated", "duration_ns", "observed_at", "stdout_digest", "stderr_digest", "output_last_message_digest", "result_digest", "created_at"},
 	"verification_command_result_bindings": {"revision", "binding_ticket_version", "leader_epoch", "runner_epoch", "semantic_key", "claim_epoch", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest", "expected_outcome"},
 	"candidate_command_result_bindings":    {"generation", "binding_ticket_version", "leader_epoch", "runner_epoch", "semantic_key", "claim_epoch", "command_digest", "spec_digest", "policy_digest", "executable_path", "executable_digest"},
-	"publication_evidence":                 {"channel", "project_id", "ticket_id", "ticket_version", "leader_epoch", "runner_epoch", "candidate_generation", "candidate_ticket_version", "candidate_leader_epoch", "candidate_runner_epoch", "candidate_base_sha", "candidate_head_sha", "candidate_tree_sha", "candidate_source_digest", "candidate_verification_intent_digest", "candidate_proof_digest", "candidate_command_policy_digest", "candidate_builder_evidence_digest", "candidate_builder_attempt_id", "candidate_builder_attempt", "candidate_commit_parent_oid", "candidate_command_semantic_key", "candidate_command_claim_epoch", "candidate_command_ticket_version", "candidate_command_leader_epoch", "candidate_command_runner_epoch", "candidate_command_digest", "candidate_command_spec_digest", "candidate_command_policy_claim_digest", "candidate_command_executable_path", "candidate_command_executable_digest", "config_generation", "config_digest", "config_snapshot_digest", "worktree_path", "worktree_branch_ref", "worktree_state", "worktree_ticket_version", "worktree_leader_epoch", "worktree_runner_epoch", "worktree_identity_json", "worktree_identity_digest", "worktree_base_sha", "remote_branch_ref", "remote_branch_oid", "remote_base_oid", "push_effect_semantic_key", "push_effect_kind", "push_effect_request_digest", "push_effect_claim_epoch", "push_effect_observed_identity", "github_host", "github_owner", "github_name", "github_pr_number", "github_head_owner", "github_head_repository", "github_head_ref", "github_head_oid", "github_base_ref", "github_base_oid", "github_state", "github_draft", "github_factory_owned", "github_observed_at", "pr_effect_semantic_key", "pr_effect_kind", "pr_effect_request_digest", "pr_effect_claim_epoch", "pr_effect_observed_identity", "build_transition_created_at", "witness_digest", "created_at"},
+	"publication_evidence":                 {"channel", "project_id", "ticket_id", "ticket_version", "leader_epoch", "runner_epoch", "candidate_generation", "candidate_ticket_version", "candidate_leader_epoch", "candidate_runner_epoch", "candidate_base_sha", "candidate_head_sha", "candidate_tree_sha", "candidate_source_digest", "candidate_verification_intent_digest", "candidate_proof_digest", "candidate_command_policy_digest", "candidate_builder_evidence_digest", "candidate_builder_attempt_id", "candidate_builder_attempt", "candidate_commit_parent_oid", "candidate_command_semantic_key", "candidate_command_claim_epoch", "candidate_command_ticket_version", "candidate_command_leader_epoch", "candidate_command_runner_epoch", "candidate_command_digest", "candidate_command_spec_digest", "candidate_command_policy_claim_digest", "candidate_command_executable_path", "candidate_command_executable_digest", "config_generation", "config_digest", "config_snapshot_digest", "worktree_path", "worktree_branch_ref", "worktree_state", "worktree_ticket_version", "worktree_leader_epoch", "worktree_runner_epoch", "worktree_identity_json", "worktree_identity_digest", "worktree_base_sha", "remote_branch_ref", "remote_branch_oid", "remote_base_oid", "push_effect_semantic_key", "push_effect_kind", "push_effect_request_digest", "push_effect_claim_epoch", "push_effect_observed_identity", "github_host", "github_owner", "github_name", "github_pr_number", "github_head_owner", "github_head_repository", "github_head_ref", "github_head_oid", "github_base_ref", "github_base_oid", "github_state", "github_open", "github_draft", "github_factory_owned", "github_observed_at", "pr_effect_semantic_key", "pr_effect_kind", "pr_effect_request_digest", "pr_effect_claim_epoch", "pr_effect_observed_identity", "build_transition_created_at", "witness_digest", "created_at"},
 	"publication_evidence_rebinds":         {"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "prior_witness_digest", "prior_ticket_version", "prior_leader_epoch", "prior_runner_epoch", "ticket_version", "leader_epoch", "runner_epoch", "rebind_digest", "created_at"},
 	"publication_transition_evidence":      {"channel", "project_id", "ticket_id", "witness_digest", "witness_created_at", "ticket_version", "event_created_at"},
 	"runner_recovery_ledger":               {"channel", "project_id", "ticket_id", "prior_ticket_version", "prior_runner_epoch", "prior_leader_epoch", "ticket_version", "runner_epoch", "leader_epoch", "recovery_digest", "created_at"},
 	"runtime_ticket_controls":              {"channel", "project_id", "ticket_id", "state", "generation", "stop_version", "stop_leader_epoch", "stop_runner_epoch", "authority_version", "authority_leader_epoch", "authority_runner_epoch", "updated_at"},
+	"ci_observations":                      {"observation_id", "channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "publication_witness_digest", "pr_host", "pr_owner", "pr_repo", "pr_number", "pr_head_owner", "pr_head_repo", "pr_head_ref", "pr_head_oid", "pr_base_ref", "pr_base_oid", "pr_factory_owned", "pr_open", "pr_draft", "observed_ticket_version", "observed_leader_epoch", "observed_runner_epoch", "observed_at", "required_set_digest", "required_check_count", "classification", "diagnostic_digest", "diagnostic_text", "diagnostic_json", "observation_digest"},
+	"ci_observation_checks":                {"observation_id", "observation_digest", "canonical_name", "external_id", "normalized_state", "failing_diagnostic_digest", "failing_diagnostic_text"},
+	"ci_transition_evidence":               {"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "ticket_version", "event_id", "event_created_at", "observation_classification", "observation_digest", "observation_ticket_version", "observation_leader_epoch", "observation_runner_epoch", "prior_publication_witness_digest", "prior_state", "resulting_state", "resulting_trigger", "transition_digest", "created_at"},
+	"candidate_repair_bindings":            {"channel", "project_id", "ticket_id", "target_generation", "predecessor_generation", "predecessor_head_sha", "predecessor_tree_sha", "predecessor_publication_witness_digest", "pr_host", "pr_owner", "pr_repo", "pr_number", "branch_ref", "remote_head_oid", "base_ref", "remote_base_oid", "red_observation_digest", "red_observation_classification", "red_transition_ticket_version", "red_transition_digest", "correction_budget_kind", "correction_budget_request_id", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "repair_context_digest", "created_at"},
+	"candidate_repair_completions":         {"channel", "project_id", "ticket_id", "target_generation", "builder_result_attempt_id", "builder_result_attempt", "builder_result_phase", "builder_result_role", "builder_binding_ticket_version", "builder_binding_leader_epoch", "builder_binding_runner_epoch", "final_candidate_head_sha", "final_candidate_tree_sha", "completion_digest", "completed_at"},
 }
 
 type indexRequirement struct {
@@ -238,6 +367,34 @@ var requiredIndexes = []indexRequirement{
 	{table: "runner_recovery_ledger", name: "runner_recovery_ledger_digest", columns: []string{"recovery_digest"}},
 	{table: "runner_recovery_ledger", name: "runner_recovery_ledger_ticket", columns: []string{"channel", "project_id", "ticket_id", "ticket_version"}, nonUnique: true},
 	{table: "runtime_ticket_controls", name: "runtime_ticket_controls_state", columns: []string{"channel", "state"}, nonUnique: true},
+	{table: "candidate_snapshots", name: "candidate_snapshot_generation_head", columns: []string{"channel", "project_id", "ticket_id", "generation", "head_sha"}},
+	{table: "candidate_snapshots", name: "candidate_snapshot_generation_head_tree", columns: []string{"channel", "project_id", "ticket_id", "generation", "head_sha", "tree_sha"}},
+	{table: "publication_evidence", name: "publication_evidence_candidate_witness", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "witness_digest"}},
+	{table: "publication_evidence", name: "publication_evidence_candidate_witness_tree", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "witness_digest"}},
+	{table: "publication_evidence", name: "publication_evidence_ci_authority", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "witness_digest", "github_host", "github_owner", "github_name", "github_pr_number", "github_head_owner", "github_head_repository", "github_head_ref", "github_head_oid", "github_base_ref", "github_base_oid", "github_open", "github_draft", "github_factory_owned"}},
+	{table: "publication_evidence", name: "publication_evidence_repair_authority", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "witness_digest", "github_host", "github_owner", "github_name", "github_pr_number", "remote_branch_ref", "remote_branch_oid", "github_base_ref", "remote_base_oid"}},
+	{table: "provider_attempts", name: "provider_attempts_builder_identity", columns: []string{"channel", "project_id", "ticket_id", "phase", "role", "attempt", "id"}},
+	{table: "provider_attempt_results", name: "provider_attempt_results_builder_identity", columns: []string{"channel", "project_id", "ticket_id", "phase", "role", "attempt", "provider_attempt_id"}},
+	{table: "candidate_result_bindings", name: "candidate_result_bindings_completion_identity", columns: []string{"channel", "project_id", "ticket_id", "generation", "binding_ticket_version", "leader_epoch", "runner_epoch", "provider_attempt_id", "provider_attempt"}},
+	{table: "events", name: "events_identity", columns: []string{"channel", "project_id", "ticket_id", "ticket_version", "id", "created_at"}},
+	{table: "events", name: "events_transition_identity", columns: []string{"channel", "project_id", "ticket_id", "ticket_version", "id", "created_at", "from_state", "to_state", "trigger"}},
+	{table: "ticket_budget_uses", name: "ticket_budget_uses_correction_identity", columns: []string{"channel", "project_id", "ticket_id", "kind", "request_id", "ticket_version", "leader_epoch", "runner_epoch"}},
+	{table: "ci_observations", name: "ci_observations_latest", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "observed_at", "observation_id"}, nonUnique: true},
+	{table: "ci_observation_checks", name: "ci_observation_checks_observation", columns: []string{"observation_id", "canonical_name", "external_id"}, nonUnique: true},
+	{table: "ci_transition_evidence", name: "ci_transition_evidence_chain", columns: []string{"channel", "project_id", "ticket_id", "ticket_version", "event_id"}, nonUnique: true},
+	{table: "candidate_repair_bindings", name: "candidate_repair_bindings_predecessor", columns: []string{"channel", "project_id", "ticket_id", "predecessor_generation", "predecessor_head_sha"}, nonUnique: true},
+	{table: "candidate_repair_bindings", name: "candidate_repair_bindings_target", columns: []string{"channel", "project_id", "ticket_id", "target_generation"}, nonUnique: true},
+	{table: "ci_observations", name: "ci_observations_candidate_digest", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "observation_digest"}},
+	{table: "ci_observations", name: "ci_observations_candidate_tree_digest", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "observation_digest"}},
+	{table: "ci_observations", name: "ci_observations_candidate_tree_classification_digest", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "classification", "observation_digest"}},
+	{table: "ci_observations", name: "ci_observations_transition_authority", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "classification", "observation_digest", "observed_ticket_version", "observed_leader_epoch", "observed_runner_epoch"}},
+	{table: "ci_observations", name: "ci_observations_digest", columns: []string{"observation_digest"}},
+	{table: "ci_transition_evidence", name: "ci_transition_evidence_digest", columns: []string{"transition_digest"}},
+	{table: "ci_transition_evidence", name: "ci_transition_evidence_red_identity", columns: []string{"channel", "project_id", "ticket_id", "ticket_version", "observation_classification", "transition_digest"}},
+	{table: "ci_transition_evidence", name: "ci_transition_evidence_authority", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "observation_classification", "observation_digest", "prior_publication_witness_digest", "observation_ticket_version", "observation_leader_epoch", "observation_runner_epoch", "ticket_version", "transition_digest"}},
+	{table: "candidate_repair_bindings", name: "candidate_repair_bindings_predecessor_lineage", columns: []string{"channel", "project_id", "ticket_id", "predecessor_generation", "predecessor_head_sha", "predecessor_tree_sha"}, nonUnique: true},
+	{table: "candidate_repair_bindings", name: "candidate_repair_bindings_context_digest", columns: []string{"repair_context_digest"}},
+	{table: "candidate_repair_completions", name: "candidate_repair_completions_digest", columns: []string{"completion_digest"}},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {
