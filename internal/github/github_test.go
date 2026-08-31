@@ -2114,12 +2114,30 @@ func TestChecksAllowExtrasButFailureDominatesPending(t *testing.T) {
 }
 
 func TestRequiredChecksMatchProtectionRequiresExactConfiguredSet(t *testing.T) {
-	protection := strictProtectionWitness{Checks: []string{"lint\x00-", "unit\x00-"}}
+	protection := strictProtectionWitness{Kind: "ruleset", Checks: []string{"lint\x00-", "unit\x00-"}}
 	if !requiredChecksMatchProtection([]contracts.RequiredCheck{{Name: "unit", ExternalID: "run-1"}, {Name: "lint", ExternalID: "run-2"}}, protection) {
 		t.Fatal("exact configured check set was refused")
 	}
 	if requiredChecksMatchProtection([]contracts.RequiredCheck{{Name: "lint", ExternalID: "run-2"}}, protection) || requiredChecksMatchProtection([]contracts.RequiredCheck{{Name: "lint", ExternalID: "run-2"}, {Name: "unit", ExternalID: "run-1"}, {Name: "extra", ExternalID: "run-3"}}, protection) {
 		t.Fatal("subset or extra check set was accepted")
+	}
+}
+
+func TestObserveCIRequiredCheckPolicyAcceptsClassicProtectionContexts(t *testing.T) {
+	client, fake, identity := fixture(t)
+	if err := fake.SetRequiredStatusCheckContextsForTest("lint", "unit"); err != nil {
+		t.Fatal(err)
+	}
+	pr := createDraft(t, client, identity, "title", "body")
+	if err := fake.SetChecks(pr.Identity.Number,
+		contracts.RequiredCheck{Name: "lint", ExternalID: "https://github.com/example/app/actions/runs/1", State: "SUCCESS"},
+		contracts.RequiredCheck{Name: "unit", ExternalID: "https://github.com/example/app/actions/runs/2", State: "SUCCESS"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := client.ObserveCIRequiredCheckPolicy(context.Background(), pr.Identity)
+	if err != nil || len(policy.RequiredChecks) != 2 {
+		t.Fatalf("classic policy observation=%+v err=%v", policy, err)
 	}
 }
 

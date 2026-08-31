@@ -28,7 +28,7 @@ func TestCICorrectionV41SchemaIsAppendOnlyAndValidated(t *testing.T) {
 	if version != schemaVersion || len(migrationChecksums) != schemaVersion {
 		t.Fatalf("schema version/checksum history=%d/%d", version, len(migrationChecksums))
 	}
-	for _, table := range []string{"ci_required_check_policies", "ci_observations", "ci_observation_checks", "ci_transition_evidence", "candidate_repair_bindings", "candidate_repair_completions", "ci_poll_schedules", "ci_poll_attempts"} {
+	for _, table := range []string{"ci_required_check_policies", "ci_observations", "ci_observation_checks", "ci_transition_evidence", "candidate_repair_bindings", "candidate_repair_completions", "ci_poll_schedules", "ci_poll_attempts", "ci_poll_retry_epochs"} {
 		var count int
 		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("required table %s count=%d err=%v", table, count, err)

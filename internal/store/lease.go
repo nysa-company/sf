@@ -192,19 +192,22 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					return ErrStaleFence
 				}
 			}
+			latestFound := found
+			var waitingPublication PublishedCandidateEvidence
 			// Runner recovery is also an append-only, bounded authority. Its cap
 			// is lifetime-wide for the ticket: publication's waiting-ci semantic
 			// chain starts at the transition, but must not reset the finite
 			// recovery resource consumed before that transition. A same-leader
 			// lost-response returned above is the only replay allowed at the cap.
 			if ticket.state == domain.StateWaitingCI {
-				publication, found, err := loadPublicationEvidenceRow(ctx, conn, ref)
-				if err != nil || !found {
+				publication, publicationFound, err := loadPublicationEvidenceRow(ctx, conn, ref)
+				if err != nil || !publicationFound {
 					return ErrPublicationEvidence
 				}
 				if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
 					return ErrPublicationEvidence
 				}
+				waitingPublication = publication
 			}
 			// AcquireLeader advances the daemon epoch before this startup fence can
 			// append a ticket-local recovery row. A waiting_ci ticket with pending
@@ -217,14 +220,12 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND observation_classification='pending' AND resulting_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket).Scan(&pendingEvidence); err != nil {
 					return err
 				}
-				if pendingEvidence > 0 {
-					ciWaitingPriorLeader = latest.LeaderEpoch
-					if !found {
-						publication, publicationFound, publicationErr := loadPublicationEvidenceRow(ctx, conn, ref)
-						if publicationErr != nil || !publicationFound || loadLatestPublicationRebind(ctx, conn, &publication) != nil {
-							return ErrPublicationEvidence
-						}
-						ciWaitingPriorLeader = publication.CurrentFence.LeaderEpoch
+				waitingVersion := waitingPublication.CurrentTicketVersion + 1
+				pollRetryResume := ticket.version >= waitingVersion+2 && ticket.runner == waitingPublication.CurrentFence.RunnerEpoch && authenticateCIPollResume(ctx, conn, ref, waitingVersion+1, waitingVersion+2)
+				if pendingEvidence > 0 || pollRetryResume {
+					ciWaitingPriorLeader = waitingPublication.CurrentFence.LeaderEpoch
+					if latestFound {
+						ciWaitingPriorLeader = latest.LeaderEpoch
 					}
 					if ciWaitingPriorLeader == 0 || ciWaitingPriorLeader >= leaderEpoch {
 						return ErrPublicationEvidence

@@ -524,10 +524,20 @@ func requiredChecksMatchProtection(checks []contracts.RequiredCheck, protection 
 	for _, configured := range protection.Checks {
 		parts := strings.SplitN(configured, "\x00", 2)
 		name := parts[0]
-		// `gh pr checks --required` exposes run URL/external identity, not a
-		// ruleset integration id. A nonzero integration requirement therefore
-		// cannot be proven by this observer and must fail closed.
-		if len(parts) != 2 || (parts[1] != "-" && parts[1] != "0") {
+		if protection.Kind == "classic" {
+			// Classic branch protection exposes only context names. A delimiter
+			// would be malformed here; check-run URLs remain observation facts.
+			if len(parts) != 1 {
+				return false
+			}
+		} else if protection.Kind == "ruleset" {
+			// `gh pr checks --required` exposes run URL/external identity, not a
+			// ruleset integration id. A nonzero integration requirement therefore
+			// cannot be proven by this observer and must fail closed.
+			if len(parts) != 2 || (parts[1] != "-" && parts[1] != "0") {
+				return false
+			}
+		} else {
 			return false
 		}
 		if !bounded(name, 1024) || want[name] {

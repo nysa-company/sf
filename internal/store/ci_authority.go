@@ -625,12 +625,19 @@ func loadCICurrentPublicationAt(ctx context.Context, q ciQuery, ref domain.Ticke
 	if err := validateCIWaitingVersionEvents(ctx, q, ref, waitingVersion, string(payloadBytes), publication); err != nil {
 		return PublishedCandidateEvidence{}, ciPublicationFailure("publication waiting event")
 	}
+	pollControlVersions := uint64(0)
+	// A single exhausted-poll -> operator-resume pair consumes two ticket
+	// versions without an external CI observation. It is distinct from a
+	// pending observation and is accepted only by its exact immutable events.
+	if version >= waitingVersion+2 && authenticateCIPollResume(ctx, q, ref, waitingVersion+1, waitingVersion+2) {
+		pollControlVersions = 2
+	}
 	rows, err := q.QueryContext(ctx, `SELECT c.ticket_version,c.event_id,c.event_created_at,c.candidate_generation,c.candidate_head_sha,c.candidate_tree_sha,c.observation_classification,c.observation_digest,c.observation_ticket_version,c.observation_leader_epoch,c.observation_runner_epoch,c.prior_publication_witness_digest,c.prior_state,c.resulting_state,c.resulting_trigger,c.transition_digest,e.id,e.created_at,e.from_state,e.to_state,e.trigger,e.payload FROM ci_transition_evidence c JOIN events e ON e.channel=c.channel AND e.project_id=c.project_id AND e.ticket_id=c.ticket_id AND e.ticket_version=c.ticket_version AND e.id=c.event_id WHERE c.channel=? AND c.project_id=? AND c.ticket_id=? AND c.ticket_version>? ORDER BY c.ticket_version`, ref.Channel, ref.Project, ref.Ticket, waitingVersion)
 	if err != nil {
 		return PublishedCandidateEvidence{}, normalizeBusy(ctx, err)
 	}
 	defer rows.Close()
-	expectedVersion := waitingVersion + 1
+	expectedVersion := waitingVersion + 1 + pollControlVersions
 	chainRunner, chainLeader := publication.CurrentFence.RunnerEpoch, publication.CurrentFence.LeaderEpoch
 	chainCount := 0
 	for rows.Next() {
@@ -682,7 +689,7 @@ func loadCICurrentPublicationAt(ctx context.Context, q ciQuery, ref domain.Ticke
 		return PublishedCandidateEvidence{}, ErrPublicationEvidence
 	}
 	var recoveryCount int
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, waitingVersion, version).Scan(&recoveryCount); err != nil || chainCount+recoveryCount != int(version-waitingVersion) {
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, waitingVersion, version).Scan(&recoveryCount); err != nil || chainCount+recoveryCount+int(pollControlVersions) != int(version-waitingVersion) {
 		return PublishedCandidateEvidence{}, ciPublicationFailure("pending CI chain cardinality")
 	}
 	return publication, nil
@@ -708,6 +715,9 @@ func validateCIRecoveryLedger(ctx context.Context, q ciQuery, ref domain.TicketR
 	}
 	defer rows.Close()
 	expectedVersion, expectedRunner, expectedLeader := baselineVersion, baselineRunner, baselineLeader
+	if liveVersion >= baselineVersion+2 && authenticateCIPollResume(ctx, q, ref, baselineVersion+1, baselineVersion+2) {
+		expectedVersion = baselineVersion + 2
+	}
 	for rows.Next() {
 		var step RunnerRecoveryLedger
 		var created string

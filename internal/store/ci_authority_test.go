@@ -284,6 +284,93 @@ func TestCIPollAdmissionBackoffCapAndRestart(t *testing.T) {
 	if err != nil || paused.State != domain.StatePaused || paused.ResumeState != domain.StateWaitingCI {
 		t.Fatalf("CI poll cap ticket=%+v err=%v", paused, err)
 	}
+	if _, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateWaitingCI, Trigger: "operator_resume", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatalf("resume one bounded CI retry window: %v", err)
+	}
+	// The resume itself is exact durable authority for epoch 2. Its attempt
+	// number restarts at one, while the immutable attempt ledger remains 1..24.
+	retry, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+	if err != nil || !retry.Due || retry.Attempt != 1 {
+		t.Fatalf("retry epoch first admission=%+v err=%v", retry, err)
+	}
+	// Simulate a caller losing the successful admission response. The durable
+	// retry-epoch insert and attempt must make the replay non-due, rather than
+	// minting a second retry epoch or a second external read authorization.
+	lostResponseReplay, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, retry.NextPoll.Add(-time.Nanosecond))
+	if err != nil || lostResponseReplay.Due || lostResponseReplay.Attempt != 0 {
+		t.Fatalf("retry epoch lost-response replay=%+v err=%v", lostResponseReplay, err)
+	}
+	var epochs, durableAttempts int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_poll_retry_epochs`).Scan(&epochs); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_poll_attempts`).Scan(&durableAttempts); err != nil || epochs != 1 || durableAttempts != ciPollMaxAttempts+1 {
+		t.Fatalf("retry epoch idempotency epochs=%d attempts=%d err=%v", epochs, durableAttempts, err)
+	}
+	next = retry.NextPoll
+	for attempt := 2; attempt <= ciPollMaxAttempts; attempt++ {
+		admission, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+		if err != nil || !admission.Due || admission.Attempt != attempt {
+			t.Fatalf("retry epoch attempt %d admission=%+v err=%v", attempt, admission, err)
+		}
+		next = admission.NextPoll
+	}
+	terminal, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+	if err != nil || !terminal.Expired || terminal.PauseCode != "ci_poll_retry_attempts_exhausted" {
+		t.Fatalf("retry terminal admission=%+v err=%v", terminal, err)
+	}
+	events, err := db.Events(ctx, ticket.Ref.Channel, 0, 100)
+	if err != nil || len(events) == 0 || !strings.Contains(events[len(events)-1].Payload, "submit a fresh ticket") {
+		t.Fatalf("retry terminal action events=%+v err=%v", events, err)
+	}
+}
+
+func TestCIPollRetryEpochSurvivesLeaderRecoveryBeforeFirstRetry(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	ctx := t.Context()
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	admission, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start)
+	if err != nil || !admission.Due {
+		t.Fatalf("first admission=%+v err=%v", admission, err)
+	}
+	next := admission.NextPoll
+	for attempt := 2; attempt <= ciPollMaxAttempts; attempt++ {
+		admission, err = db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+		if err != nil || !admission.Due {
+			t.Fatalf("initial attempt %d admission=%+v err=%v", attempt, admission, err)
+		}
+		next = admission.NextPoll
+	}
+	if exhausted, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next); err != nil || !exhausted.Expired {
+		t.Fatalf("initial exhaustion=%+v err=%v", exhausted, err)
+	}
+	paused, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateWaitingCI, Trigger: "operator_resume", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatalf("resume retry epoch: %v", err)
+	}
+	// Crash after the exact resume but before the first retry admission. The
+	// recovered runner must traverse the signed ledger and preserve the one
+	// remaining retry epoch, not reinterpret version-1 as a fresh resume.
+	leader, err := db.AcquireLeader(ctx, ticket.Ref.Channel, "ci-poll-retry-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, ticket.Ref.Channel, leader); err != nil || changed != 1 {
+		t.Fatalf("fence resumed CI poller changed=%d err=%v", changed, err)
+	}
+	recovered, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || recovered.Version != paused.Version+2 || recovered.RunnerEpoch != fence.RunnerEpoch+1 {
+		t.Fatalf("recovered resumed ticket=%+v err=%v", recovered, err)
+	}
+	retryFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: recovered.RunnerEpoch}
+	retry, err := db.AdmitCIPoll(ctx, ticket.Ref, retryFence, next)
+	if err != nil || !retry.Due || retry.Attempt != 1 {
+		t.Fatalf("recovered first retry admission=%+v err=%v", retry, err)
+	}
 }
 
 func TestCIPollAdmissionDeadlinePausesWithExplicitAction(t *testing.T) {

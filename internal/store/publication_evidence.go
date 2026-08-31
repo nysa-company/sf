@@ -656,6 +656,7 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 			return ErrPublicationEvidence
 		}
 		semanticResume := pausedResume && authenticateSemanticPublicationResume(ctx, conn, transition.Ref, version, newVersion, transition.To) == nil
+		ciPollResume := pausedResume && transition.To == domain.StateWaitingCI && authenticateCIPollResume(ctx, conn, transition.Ref, version, newVersion)
 		if semanticResume {
 			if !found {
 				return ErrPublicationEvidence
@@ -679,6 +680,25 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 				}
 			}
 			// Semantic pause/resume keeps the same runner and has no rebind row.
+			result.Version = newVersion
+			return nil
+		}
+		if ciPollResume {
+			if !found {
+				return ErrPublicationEvidence
+			}
+			if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
+				return err
+			}
+			// A CI polling pause happens after effects_confirmed. It changes no
+			// external publication witness and is admitted only at this exact
+			// N+2 -> N+3 control boundary.
+			if publication.CurrentFence.RunnerEpoch != runner || publication.CurrentFence.LeaderEpoch != transition.Fence.LeaderEpoch || publication.CurrentTicketVersion > ^uint64(0)-3 || publication.CurrentTicketVersion+2 != version {
+				return ErrPublicationEvidence
+			}
+			if err := authenticatePublishedWaitingEvent(ctx, conn, transition.Ref, publication, publication.CurrentTicketVersion+1); err != nil {
+				return err
+			}
 			result.Version = newVersion
 			return nil
 		}
