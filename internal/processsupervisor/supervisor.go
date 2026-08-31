@@ -162,9 +162,10 @@ func (s *Supervisor) RegisterExecutable(identity domain.ProviderIdentity, path s
 
 // RegisterRuntime installs the exact qualification binding and credential-home
 // path used by an adapter. Credential bytes are never opened or copied. The
-// executable is copied to a supervisor-owned immutable snapshot: on Darwin a
-// same-UID attacker can still race the source before the copy, but cannot
-// alter the staged bytes after their digest is checked against qualification.
+// executable is copied to a supervisor-owned staged snapshot and checked
+// against qualification. A same-UID actor can still race the source or
+// replace the staged path before launch; descriptor-level pinning is outside
+// this supervisor's documented trust boundary.
 func (s *Supervisor) RegisterRuntime(binding contracts.RuntimeBinding, executable, authHome string) (string, error) {
 	if s == nil || binding.Identity.Provider != "codex" || binding.BinaryDigest == "" || binding.PolicyDigest != environmentPolicyDigest() || binding.AuthDigest == "" || binding.AuthMode != "chatgpt_subscription" || authHome == "" {
 		return "", errors.New("complete Codex runtime binding is required")
