@@ -757,12 +757,7 @@ exit 98
 	if err := os.WriteFile(fakeCodex, []byte(fake), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	binary := filepath.Join(t.TempDir(), "sf-dev")
-	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")
-	build.Dir = "."
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build sf-dev: %v\n%s", err, output)
-	}
+	binary := buildDevRuntimeBundle(t)
 	paths, err := config.PathsFor(home, domain.ChannelDev)
 	if err != nil {
 		t.Fatal(err)
@@ -800,6 +795,58 @@ exit 98
 	if !strings.Contains(string(output), `"independent":true`) || !strings.Contains(string(output), `"model_call_made":false`) || strings.Contains(string(output), `"auth.json"`) {
 		t.Fatalf("unsafe qualification response: %s", output)
 	}
+	// A second request must be rejected before qualification because the first
+	// successful request activated the exact local runtime bundle.
+	requalify := exec.Command(binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex", "--json")
+	requalify.Env = environment
+	output, err = requalify.CombinedOutput()
+	exitError, ok := err.(*exec.ExitError)
+	if !ok || exitError.ExitCode() != 3 || !strings.Contains(string(output), `"code":"runtime_already_active"`) {
+		t.Fatalf("active runtime requalification error=%v output=%s", err, output)
+	}
+	if err := foreground.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := foreground.Wait(); err != nil {
+		t.Fatalf("graceful SIGINT runtime drain: %v\ndaemon=%s", err, daemonOutput.String())
+	}
+	if _, err := os.Lstat(paths.Socket); !os.IsNotExist(err) {
+		t.Fatalf("socket remained after graceful SIGINT: %v", err)
+	}
+}
+
+// buildDevRuntimeBundle installs the complete development channel bundle in a
+// private directory. Production runtime activation resolves sf-dev and its
+// sibling sf-git-exec-dev by exact name; packaging the other channel helpers
+// and known-host asset here keeps this compiled fixture faithful to build-dev.
+func buildDevRuntimeBundle(t *testing.T) string {
+	t.Helper()
+	bundle := t.TempDir()
+	ldflags := "-X github.com/nysa-company/sf/internal/version.Channel=dev"
+	for _, target := range []struct {
+		name        string
+		packagePath string
+	}{
+		{name: "sf-dev", packagePath: "."},
+		{name: "sf-ssh-dev", packagePath: "../../cmd/sf-ssh"},
+		{name: "sf-git-exec-dev", packagePath: "../../cmd/sf-git-exec"},
+		{name: "sf-git-credential-dev", packagePath: "../../cmd/sf-git-credential"},
+	} {
+		binary := filepath.Join(bundle, target.name)
+		build := exec.Command("go", "build", "-ldflags", ldflags, "-o", binary, target.packagePath)
+		build.Dir = "."
+		if output, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("build development runtime asset %s: %v\n%s", target.name, err, output)
+		}
+	}
+	knownHosts, err := os.ReadFile(filepath.Join("..", "..", "internal", "gitssh", "github_known_hosts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "github_known_hosts"), knownHosts, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(bundle, "sf-dev")
 }
 
 func TestCompiledChannelBinaryReportsExecutableUnknownProjectRecovery(t *testing.T) {

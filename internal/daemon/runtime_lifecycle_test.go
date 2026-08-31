@@ -813,9 +813,10 @@ func TestServeReturnsRuntimeCloseFailureOnCancellation(t *testing.T) {
 		t.Fatal("Serve did not stop")
 	}
 	// Serve has already joined and detached the runtime; Close can still close
-	// the remaining listener/authorities without invoking it a second time.
-	if err := daemon.Close(); err != nil {
-		t.Fatal(err)
+	// the remaining listener/authorities without invoking it a second time, and
+	// returns the cached shutdown failure to every explicit caller.
+	if err := daemon.Close(); !errors.Is(err, runtimeErr) {
+		t.Fatalf("Close error=%v, want cached runtime close failure", err)
 	}
 	if _, err := os.Stat(paths.Socket); !os.IsNotExist(err) {
 		t.Fatalf("socket remained after Serve/Close: %v", err)
@@ -872,6 +873,7 @@ func TestDaemonCloseJoinsRuntimeBeforeStoreAndIsIdempotent(t *testing.T) {
 func TestServeAndCloseJoinOneRuntimeShutdownBeforeAuthorityTeardown(t *testing.T) {
 	release := make(chan struct{})
 	closeEntered := make(chan struct{})
+	runtimeErr := errors.New("runtime close failed")
 	var runtimeStore *store.Store
 	var closeMu sync.Mutex
 	closeCalls := 0
@@ -888,7 +890,7 @@ func TestServeAndCloseJoinOneRuntimeShutdownBeforeAuthorityTeardown(t *testing.T
 		if _, err := runtimeStore.Project(context.Background(), domain.ChannelStable, "demo"); err != nil {
 			return fmt.Errorf("store closed before shared runtime join: %w", err)
 		}
-		return nil
+		return runtimeErr
 	}}
 	coordinator := &providercoord.Coordinator{}
 	cfg, _ := lifecycleConfig(t, func(deps RuntimeDependencies) (WorkflowRuntimeComponents, error) {
@@ -930,16 +932,16 @@ func TestServeAndCloseJoinOneRuntimeShutdownBeforeAuthorityTeardown(t *testing.T
 	close(release)
 	select {
 	case err := <-serveDone:
-		if err != nil {
-			t.Fatal(err)
+		if !errors.Is(err, runtimeErr) {
+			t.Fatalf("Serve error=%v, want runtime close failure", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Serve did not join runtime shutdown")
 	}
 	select {
 	case err := <-closeDone:
-		if err != nil {
-			t.Fatal(err)
+		if !errors.Is(err, runtimeErr) {
+			t.Fatalf("concurrent Close error=%v, want shared runtime close failure", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Close did not complete after runtime shutdown")
@@ -952,5 +954,8 @@ func TestServeAndCloseJoinOneRuntimeShutdownBeforeAuthorityTeardown(t *testing.T
 	closeMu.Unlock()
 	if _, err := runtimeStore.Project(context.Background(), domain.ChannelStable, "demo"); err == nil {
 		t.Fatal("Store remained open after Close")
+	}
+	if err := d.Close(); !errors.Is(err, runtimeErr) {
+		t.Fatalf("later Close error=%v, want cached runtime close failure", err)
 	}
 }

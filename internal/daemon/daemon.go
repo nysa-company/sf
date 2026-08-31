@@ -659,7 +659,11 @@ func (daemon *Daemon) Close() error {
 	// Handle also covers direct in-process callers, which are not counted by
 	// transport.Server. Handler admission is sealed before this wait.
 	daemon.handlers.Wait()
-	if runtimeErr, initiated := daemon.shutdownRuntime(); initiated && runtimeErr != nil {
+	// Every caller joins the one shared runtime shutdown result. Serve may have
+	// initiated it first, but Close still owns authority teardown and therefore
+	// must report the same runtime failure to its caller and cache it for later
+	// Close calls.
+	if runtimeErr, _ := daemon.shutdownRuntime(); runtimeErr != nil {
 		result = errors.Join(result, fmt.Errorf("close workflow runtime: %w", runtimeErr))
 	}
 	// shutdownRuntime has joined the runtime's Close before this detaches the
