@@ -202,8 +202,14 @@ func TestRearmRequiresNewStoreProvenActiveIdentity(t *testing.T) {
 	if _, err := database.Transition(t.Context(), store.Transition{Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "test_next_prepublication_phase", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: "{}"}); err != nil {
 		t.Fatal(err)
 	}
+	if needed, err := controller.RuntimeRearmNeeded(t.Context(), ref); err != nil || !needed {
+		t.Fatalf("sealed resume retry needed=%v err=%v", needed, err)
+	}
 	if err := controller.Rearm(t.Context(), ref); err != nil {
 		t.Fatalf("new active durable identity was not rearmed: %v", err)
+	}
+	if needed, err := controller.RuntimeRearmNeeded(t.Context(), ref); err != nil || needed {
+		t.Fatalf("armed replay needed=%v err=%v", needed, err)
 	}
 	controller.mu.Lock()
 	entry := controller.tickets[ref]

@@ -473,6 +473,59 @@ func (s *Store) RearmProof(ctx context.Context, ref domain.TicketRef, stopped Ti
 	return &RuntimeRearmCapability{ref: ref, version: proof.Ticket.Version, fence: proof.Fence, issued: true}, nil
 }
 
+// RuntimeRearmNeeded is a read-only retry discriminator for the narrow crash
+// window after an operator-resume transition commits but before the controller
+// installs its runtime admission. It never opens admission itself. A caller
+// may retry Rearm only while the exact durable control row remains sealed;
+// armed/open rows prove an earlier rearm was already attempted.
+func (s *Store) RuntimeRearmNeeded(ctx context.Context, ref domain.TicketRef) (bool, error) {
+	if s == nil || ref.Validate() != nil {
+		return false, ErrStaleFence
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	defer conn.Close()
+	control, err := runtimeControlFrom(ctx, conn, ref)
+	if err != nil {
+		return false, err
+	}
+	var state domain.State
+	if err := conn.QueryRowContext(ctx, `SELECT state FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrNotFound
+		}
+		return false, normalizeBusy(ctx, err)
+	}
+	if !prePublicationState(state) || (control.state != "sealed" && control.state != "armed" && control.state != "open") {
+		return false, ErrStaleFence
+	}
+	return control.state == "sealed", nil
+}
+
+// RetryablePause authenticates the exact terminal event that put a ticket in
+// its current paused state. It is deliberately a ticket-scoped query rather
+// than a bounded event-feed scan: a quiet paused ticket must not lose its
+// retry path merely because other tickets produced many later audit events.
+func (s *Store) RetryablePause(ctx context.Context, ticket Ticket) (bool, error) {
+	if s == nil || ticket.Ref.Validate() != nil || ticket.State != domain.StatePaused || ticket.Version == 0 || ticket.ResumeState == "" {
+		return false, nil
+	}
+	var trigger string
+	err := s.db.QueryRowContext(ctx, `SELECT trigger FROM events
+		WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?
+		AND from_state=? AND to_state='paused'
+		ORDER BY id DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.Version, ticket.ResumeState).Scan(&trigger)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	return trigger == "retry_or_correction_exhausted" || trigger == "ci_red_exhausted", nil
+}
+
 // ActivateRearm is the only proof-to-runtime handoff. It holds the mutation
 // gate, consumes the opaque proof, and checks the newer durable identity.
 // It then releases the gate while the hard latch remains closed to install
