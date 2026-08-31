@@ -213,16 +213,68 @@ func TestPostPublicationRearmProofRejectsUnboundMergeState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// No merge intent/effect exists in this reviewing fixture. The generic
-	// transition is allowed to construct the state for this negative test, but
-	// the post-publication authority must refuse to rearm without merge proof.
+	// A generic Store transition cannot manufacture guarded merging and bypass
+	// ApplyOperatorDecision's exact-head approval authority.
 	if _, err := fixture.db.Transition(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: current.Version, From: current.State, To: domain.StateMerging, Trigger: "operator_resume", Fence: fixture.fence, EventPayload: `{}`}); err != nil {
-		t.Fatal(err)
+		if !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("generic guarded merge entry=%v", err)
+		}
+		return
 	}
-	current, _ = fixture.db.Ticket(fixture.ctx, current.Ref)
-	stopped, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fixture.fence, domain.StateMerging)
-	if _, err := fixture.db.PostPublicationRearmProof(fixture.ctx, resumed.Ref, stopped); !errors.Is(err, ErrControlNotDrained) {
-		t.Fatalf("unbound merge state rearmed: %v", err)
+	t.Fatal("generic guarded merge entry succeeded")
+}
+
+func TestGenericMergeEntryTransitionAllowsOnlyControlResumeOrRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		from       domain.State
+		trigger    string
+		wantRefuse bool
+	}{
+		{name: "reviewing forged", from: domain.StateReviewing, trigger: "operator_resume", wantRefuse: true},
+		{name: "paused arbitrary", from: domain.StatePaused, trigger: "forged", wantRefuse: true},
+		{name: "paused resume", from: domain.StatePaused, trigger: "operator_resume"},
+		{name: "paused retry", from: domain.StatePaused, trigger: "operator_retry"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := genericMergeEntryTransition(Transition{From: tc.from, To: domain.StateMerging, Trigger: tc.trigger}); got != tc.wantRefuse {
+				t.Fatalf("generic merge entry refused=%v, want %v", got, tc.wantRefuse)
+			}
+		})
+	}
+}
+
+func TestPostPublicationRearmProofRejectsMergingWithoutApprovalOrExactClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Store, finalReviewFixture, Ticket)
+	}{
+		{
+			name: "approval removed",
+			mutate: func(db *Store, fixture finalReviewFixture, current Ticket) {
+				if _, err := db.db.ExecContext(fixture.ctx, `DELETE FROM approvals WHERE channel=? AND project_id=? AND ticket_id=?`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket); err != nil {
+					t.Fatalf("delete approval: %v", err)
+				}
+			},
+		},
+		{
+			name: "same endpoint claim mismatch",
+			mutate: func(db *Store, fixture finalReviewFixture, current Ticket) {
+				if _, err := db.db.ExecContext(fixture.ctx, `UPDATE merge_intents SET claim_epoch=claim_epoch+1 WHERE channel=? AND project_id=? AND ticket_id=?`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket); err != nil {
+					t.Fatalf("tamper merge claim epoch: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
+			defer fixture.db.Close()
+			tc.mutate(fixture.db, fixture, current)
+			stopped, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fence, domain.StateMerging)
+			if _, err := fixture.db.PostPublicationRearmProof(fixture.ctx, resumed.Ref, stopped); !errors.Is(err, ErrControlNotDrained) {
+				t.Fatalf("%s merging rearmed: %v", tc.name, err)
+			}
+		})
 	}
 }
 

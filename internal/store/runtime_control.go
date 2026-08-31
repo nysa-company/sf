@@ -497,46 +497,32 @@ func (s *Store) authenticateHistoricalFinalReview(ctx context.Context, conn *sql
 }
 
 func (s *Store) authenticatePostPublicationMergeState(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, baselineVersion uint64, baselineFence domain.Fence) error {
-	publication, err := loadCIPublicationBase(ctx, conn, ref)
+	// Merging is guarded authority, not merely a publication-shaped state.  A
+	// pause/resume must therefore re-establish the final-review and exact-head
+	// operator approval chain before it can reuse either a failed or a confirmed
+	// merge effect.
+	approval, err := s.approvalRecoveryEndpoint(ctx, conn, ref)
 	if err != nil {
-		return err
-	}
-	candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
-	if err != nil || !publicationCandidateEqual(candidate, publication.Candidate) {
 		return ErrPublicationEvidence
 	}
-	rows, err := conn.QueryContext(ctx, `SELECT semantic_key FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket)
+	intent, found, err := singleRecoveryMergeIntent(ctx, conn, ref)
+	if err != nil || !found {
+		return ErrPublicationEvidence
+	}
+	current := normalRecoveryEndpoint{version: baselineVersion, runner: baselineFence.RunnerEpoch, leader: baselineFence.LeaderEpoch}
+	if err := s.authenticateMergingRecoveryEffect(ctx, conn, ref, approval, current, baselineFence.LeaderEpoch, intent); err != nil {
+		return ErrPublicationEvidence
+	}
+	// The common no-recovery case has one immutable claim.  A later signed
+	// recovery may promote the effect claim, which authenticateMergingRecoveryEffect
+	// validates above; do not mistake that authenticated promotion for a free
+	// claim-epoch substitution.
+	effect, err := effectFrom(ctx, conn, intent.SemanticKey)
 	if err != nil {
-		return err
+		return ErrPublicationEvidence
 	}
-	defer rows.Close()
-	count := 0
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return err
-		}
-		intent, found, err := mergeIntentFrom(ctx, conn, key)
-		if err != nil || !found || intent.Ref != ref || intent.TicketVersion != baselineVersion || intent.LeaderEpoch != baselineFence.LeaderEpoch || intent.RunnerEpoch != baselineFence.RunnerEpoch || validMergeIntent(intent) != nil {
-			return ErrEvidenceConflict
-		}
-		// A syntactically valid merge intent is not enough after a pause/resume:
-		// bind it to the exact publication witness that established the current
-		// candidate/PR.  This rejects a stale prior-generation intent even when
-		// its own immutable protection witness is internally valid.
-		pr := publication.PullRequest
-		if intent.RepositoryHost != pr.Repository.Host || intent.RepositoryOwner != pr.Repository.Owner || intent.RepositoryName != pr.Repository.Name || intent.PullRequestNumber != pr.Number || intent.HeadOID != pr.HeadOID || intent.BaseRef != pr.BaseRef || intent.OriginalBaseOID != pr.BaseOID {
-			return ErrEvidenceConflict
-		}
-		var kind, state, digest, identity string
-		var version, runner, leader, claimEpoch uint64
-		if err := conn.QueryRowContext(ctx, `SELECT effect_kind,state,request_digest,observed_identity,ticket_version,leader_epoch,runner_epoch,claim_epoch FROM effects WHERE semantic_key=?`, key).Scan(&kind, &state, &digest, &identity, &version, &leader, &runner, &claimEpoch); err != nil || kind != "merge" || (EffectState(state) != EffectConfirmed && EffectState(state) != EffectFailed) || digest != intent.RequestDigest || version != baselineVersion || leader != baselineFence.LeaderEpoch || runner != baselineFence.RunnerEpoch || claimEpoch == 0 || (EffectState(state) == EffectConfirmed && identity == "") {
-			return ErrEvidenceConflict
-		}
-		count++
-	}
-	if err := rows.Err(); err != nil || count != 1 {
-		return ErrEvidenceConflict
+	if effect.TicketVersion == intent.TicketVersion && effect.RunnerEpoch == intent.RunnerEpoch && effect.LeaderEpoch == intent.LeaderEpoch && effect.ClaimEpoch != intent.ClaimEpoch {
+		return ErrPublicationEvidence
 	}
 	return nil
 }

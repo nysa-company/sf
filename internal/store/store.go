@@ -1220,6 +1220,9 @@ func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) Transition(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if genericMergeEntryTransition(transition) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
 	if guardedMergeObservationTransition(transition) {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
@@ -1313,6 +1316,14 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 
 func guardedMergeObservationTransition(transition Transition) bool {
 	return transition.From == domain.StateMerging && transition.To == domain.StateReconciling && transition.Trigger == "merge_observed"
+}
+
+// StateMerging is entered through ApplyOperatorDecision for guarded tickets.
+// The only generic path retained here is the authenticated paused -> merging
+// resume/retry used after the sealed post-publication control triplet; all
+// other direct entries would bypass the exact-head approval authority.
+func genericMergeEntryTransition(transition Transition) bool {
+	return transition.To == domain.StateMerging && !(transition.From == domain.StatePaused && (transition.Trigger == "operator_resume" || transition.Trigger == "operator_retry"))
 }
 
 func publicationSensitiveTransition(from, to domain.State) bool {
