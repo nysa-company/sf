@@ -332,6 +332,241 @@ func TestPostPublicationRearmProofAfterRestartAcrossStates(t *testing.T) {
 	}
 }
 
+func preparePostPublicationRearmState(t *testing.T, target domain.State) (finalReviewFixture, Ticket, domain.Fence) {
+	t.Helper()
+	if target == domain.StatePublishing {
+		db, ctx, ticket, fence := publicationLifecycleFixture(t)
+		return finalReviewFixture{db: db, ctx: ctx, ticket: ticket, fence: fence}, ticket, fence
+	}
+	if target == domain.StateWaitingCI {
+		db, ticket, fence := ciAuthorityPublishedFixture(t)
+		return finalReviewFixture{db: db, ctx: t.Context(), ticket: ticket, fence: fence}, ticket, fence
+	}
+	mergeMode := domain.MergeGuarded
+	if target == domain.StateWaitingManualMerge {
+		mergeMode = domain.MergeManual
+	}
+	fixture := finalReviewLifecycleFixtureFor(t, domain.TicketFeature, mergeMode)
+	if target != domain.StateReviewing {
+		completeFinalReview(t, fixture)
+		current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
+		to := domain.StateWaitingApproval
+		if target == domain.StateWaitingManualMerge {
+			to = domain.StateWaitingManualMerge
+		}
+		if _, err := fixture.db.TransitionFinalReview(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateReviewing, To: to, Trigger: "review_pass", Fence: fence, EventPayload: `{}`}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
+	if target == domain.StateMerging || target == domain.StateReconciling {
+		if _, err := fixture.db.Transition(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: current.Version, From: current.State, To: target, Trigger: "merge_start", Fence: fence, EventPayload: `{}`}); err != nil {
+			t.Fatalf("transition to %s: %v", target, err)
+		}
+		current, err = fixture.db.Ticket(fixture.ctx, current.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence.RunnerEpoch = current.RunnerEpoch
+		bindTerminalMergeEffect(t, fixture.db, fixture, current, fence, "merge/rearm/armed/"+string(target))
+	}
+	return fixture, current, fence
+}
+
+func TestFenceRecoveredRunnersAcceptsArmedPostPublicationRearm(t *testing.T) {
+	for _, target := range []domain.State{domain.StatePublishing, domain.StateWaitingCI, domain.StateReviewing, domain.StateWaitingApproval, domain.StateWaitingManualMerge, domain.StateMerging, domain.StateReconciling} {
+		t.Run(string(target), func(t *testing.T) {
+			fixture, current, fence := preparePostPublicationRearmState(t, target)
+			stopped, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fence, target)
+			capability, err := fixture.db.PostPublicationRearmProof(t.Context(), resumed.Ref, stopped)
+			if err != nil || capability == nil {
+				t.Fatalf("pre-crash rearm capability=%v err=%v", capability, err)
+			}
+			consumed := false
+			if err := fixture.db.ActivateRearm(t.Context(), capability, func(admission *RuntimeAdmissionCapability) error {
+				_, _, _, ok := admission.ConsumeRuntimeAdmission()
+				consumed = ok
+				return nil
+			}); err != nil || !consumed {
+				t.Fatalf("activate before crash consumed=%v err=%v", consumed, err)
+			}
+			var path string
+			if err := fixture.db.db.QueryRowContext(t.Context(), `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+				t.Fatalf("database path=%q err=%v", path, err)
+			}
+			if err := fixture.db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := Open(t.Context(), path)
+			if err != nil {
+				t.Fatalf("reopen store: %v", err)
+			}
+			defer reopened.Close()
+			leader, err := reopened.AcquireLeader(t.Context(), domain.ChannelDev, "armed-postpub-reopen-"+string(target))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed, err := reopened.FenceRecoveredRunners(t.Context(), domain.ChannelDev, leader); err != nil || changed != 1 {
+				t.Fatalf("armed recovery changed=%d err=%v", changed, err)
+			}
+		})
+	}
+}
+
+func TestFenceRecoveredRunnersAcceptsSecondArmedPostPublicationCrash(t *testing.T) {
+	for _, target := range []domain.State{domain.StateWaitingCI, domain.StateMerging} {
+		t.Run(string(target), func(t *testing.T) {
+			fixture, current, fence := preparePostPublicationRearmState(t, target)
+			stopped, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fence, target)
+			capability, err := fixture.db.PostPublicationRearmProof(t.Context(), resumed.Ref, stopped)
+			if err != nil || capability == nil {
+				t.Fatalf("first rearm capability=%v err=%v", capability, err)
+			}
+			if err := fixture.db.ActivateRearm(t.Context(), capability, func(admission *RuntimeAdmissionCapability) error {
+				if _, _, _, ok := admission.ConsumeRuntimeAdmission(); !ok {
+					return errors.New("first admission capability was not consumed")
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("first activate: %v", err)
+			}
+			var path string
+			if err := fixture.db.db.QueryRowContext(t.Context(), `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+				t.Fatalf("first database path=%q err=%v", path, err)
+			}
+			if err := fixture.db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			first, err := Open(t.Context(), path)
+			if err != nil {
+				t.Fatalf("first reopen: %v", err)
+			}
+			leader2, err := first.AcquireLeader(t.Context(), domain.ChannelDev, "second-crash-first-reopen-"+string(target))
+			if err != nil {
+				first.Close()
+				t.Fatal(err)
+			}
+			if changed, err := first.FenceRecoveredRunners(t.Context(), domain.ChannelDev, leader2); err != nil || changed != 1 {
+				first.Close()
+				t.Fatalf("first fence changed=%d err=%v", changed, err)
+			}
+			firstLive, err := first.Ticket(t.Context(), resumed.Ref)
+			if err != nil {
+				first.Close()
+				t.Fatal(err)
+			}
+			stoppedAgain, err := first.StoppedRuntimeTicket(t.Context(), resumed.Ref)
+			if err != nil {
+				first.Close()
+				t.Fatalf("load immutable stop after first fence: %v", err)
+			}
+			secondCapability, err := first.PostPublicationRearmProof(t.Context(), resumed.Ref, stoppedAgain)
+			if err != nil || secondCapability == nil {
+				first.Close()
+				t.Fatalf("second rearm capability=%v err=%v", secondCapability, err)
+			}
+			if err := first.ActivateRearm(t.Context(), secondCapability, func(admission *RuntimeAdmissionCapability) error {
+				if _, _, _, ok := admission.ConsumeRuntimeAdmission(); !ok {
+					return errors.New("second admission capability was not consumed")
+				}
+				return nil
+			}); err != nil {
+				first.Close()
+				t.Fatalf("second activate: %v", err)
+			}
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			second, err := Open(t.Context(), path)
+			if err != nil {
+				t.Fatalf("second reopen: %v", err)
+			}
+			defer second.Close()
+			leader3, err := second.AcquireLeader(t.Context(), domain.ChannelDev, "second-crash-second-reopen-"+string(target))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed, err := second.FenceRecoveredRunners(t.Context(), domain.ChannelDev, leader3); err != nil || changed != 1 {
+				t.Fatalf("second fence changed=%d err=%v", changed, err)
+			}
+			secondLive, err := second.Ticket(t.Context(), resumed.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if secondLive.Version != firstLive.Version+1 || secondLive.RunnerEpoch != firstLive.RunnerEpoch+1 {
+				t.Fatalf("second fence counters first=%+v second=%+v", firstLive, secondLive)
+			}
+		})
+	}
+}
+
+func TestFenceRecoveredRunnersRejectsTamperedArmedPostPublicationAuthority(t *testing.T) {
+	fixture, current, fence := preparePostPublicationRearmState(t, domain.StateWaitingApproval)
+	stopped, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fence, domain.StateWaitingApproval)
+	capability, err := fixture.db.PostPublicationRearmProof(t.Context(), resumed.Ref, stopped)
+	if err != nil || capability == nil {
+		t.Fatalf("rearm capability=%v err=%v", capability, err)
+	}
+	if err := fixture.db.ActivateRearm(t.Context(), capability, func(admission *RuntimeAdmissionCapability) error {
+		_, _, _, ok := admission.ConsumeRuntimeAdmission()
+		if !ok {
+			return errors.New("admission capability was not consumed")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("activate before tamper: %v", err)
+	}
+	if _, err := fixture.db.db.ExecContext(t.Context(), `UPDATE runtime_ticket_controls SET authority_leader_epoch=authority_leader_epoch+1 WHERE channel=? AND project_id=? AND ticket_id=?`, resumed.Ref.Channel, resumed.Ref.Project, resumed.Ref.Ticket); err != nil {
+		t.Fatalf("tamper armed authority: %v", err)
+	}
+	var path string
+	if err := fixture.db.db.QueryRowContext(t.Context(), `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+		t.Fatalf("database path=%q err=%v", path, err)
+	}
+	if err := fixture.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+	leader, err := reopened.AcquireLeader(t.Context(), domain.ChannelDev, "tampered-armed-postpub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := reopened.Ticket(t.Context(), resumed.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeRows int
+	if err := reopened.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, resumed.Ref.Channel, resumed.Ref.Project, resumed.Ref.Ticket).Scan(&beforeRows); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.FenceRecoveredRunners(t.Context(), domain.ChannelDev, leader); !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("tampered armed authority was accepted: %v", err)
+	}
+	after, err := reopened.Ticket(t.Context(), resumed.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var afterRows int
+	if err := reopened.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, resumed.Ref.Channel, resumed.Ref.Project, resumed.Ref.Ticket).Scan(&afterRows); err != nil {
+		t.Fatal(err)
+	}
+	if after.Version != before.Version || after.RunnerEpoch != before.RunnerEpoch || afterRows != beforeRows {
+		t.Fatalf("tampered authority mutated recovery state before=%+v/%d after=%+v/%d", before, beforeRows, after, afterRows)
+	}
+}
+
 func TestFenceRecoveredRunnersRejectsMissingPostPublicationControl(t *testing.T) {
 	db, _, current := postPublicationPauseResume(t)
 	ctx := t.Context()

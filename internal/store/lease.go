@@ -273,44 +273,55 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				} else if found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
 					priorLeader = latest.LeaderEpoch
 				} else {
-					// A candidate can be durable before the build->publishing
-					// signal, while publication evidence is intentionally absent
-					// until the external boundary runs. Authenticate that exact
-					// candidate and transition as the first recovery predecessor.
-					candidate, candidateErr := s.latestCandidateFrom(ctx, conn, ref, false)
-					if candidateErr != nil || candidate.TicketVersion == ^uint64(0) || candidate.TicketVersion >= ticket.version {
-						return ErrPublicationEvidence
-					}
-					var transitions int
-					if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, channel, ticket.project, ticket.id, candidate.TicketVersion+1).Scan(&transitions); err != nil || transitions != 1 {
-						return ErrPublicationEvidence
-					}
-					priorLeader = candidate.Fence.LeaderEpoch
-					exactLatest := found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner
-					if exactLatest {
-						priorLeader = latest.LeaderEpoch
-					}
-					if controlLeader, controlFound, controlErr := loadRuntimeControlEndpointLeader(ctx, conn, ref, ticket.version, ticket.runner); controlErr != nil {
-						return controlErr
-					} else if controlFound {
-						priorLeader = controlLeader
-					} else if !exactLatest && (ticket.version != candidate.TicketVersion+1 || ticket.runner != candidate.Fence.RunnerEpoch) {
-						return ErrPublicationEvidence
-					}
-					if priorLeader == 0 || priorLeader >= leaderEpoch {
-						return ErrPublicationEvidence
-					}
-					if !found && candidate.Fence.RunnerEpoch == 1 {
-						if err := validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version); err != nil {
+					// A candidate-only publishing ticket can also be resumed through
+					// the sealed post-publication control boundary before its external
+					// publication witness exists. Authenticate that exact stop/resume
+					// chain and pre-stop candidate here; otherwise the ordinary
+					// candidate-only path below would reject the resumed counter gap.
+					if postLeader, postFound, postErr := s.postPublicationRecoveryBaseline(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); postErr != nil {
+						return postErr
+					} else if postFound {
+						priorLeader = postLeader
+					} else {
+						// A candidate can be durable before the build->publishing
+						// signal, while publication evidence is intentionally absent
+						// until the external boundary runs. Authenticate that exact
+						// candidate and transition as the first recovery predecessor.
+						candidate, candidateErr := s.latestCandidateFrom(ctx, conn, ref, false)
+						if candidateErr != nil || candidate.TicketVersion == ^uint64(0) || candidate.TicketVersion >= ticket.version {
 							return ErrPublicationEvidence
 						}
-					}
-					// This is a startup-only pre-fence proof.  The builder result
-					// must reach the exact old endpoint, never the new daemon leader:
-					// the signed recovery row below is what transfers authority.
-					provider, _, providerErr := s.loadHistoricalProviderAttemptResult(ctx, conn, candidate.BuilderResult)
-					if providerErr != nil || provider.Claim.ExpectedVersion != candidate.TicketVersion || provider.Claim.RunnerEpoch != candidate.Fence.RunnerEpoch || provider.Claim.LeaderEpoch != candidate.Fence.LeaderEpoch || provider.Claim.Ref != ref || provider.Claim.Phase != domain.PhaseBuild || provider.Claim.Role != "builder" || providerResultReachesHistoricalFence(ctx, conn, candidate.BuilderResult, provider, ticket.version, domain.Fence{LeaderEpoch: priorLeader, RunnerEpoch: ticket.runner}) != nil {
-						return ErrPublicationEvidence
+						var transitions int
+						if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, channel, ticket.project, ticket.id, candidate.TicketVersion+1).Scan(&transitions); err != nil || transitions != 1 {
+							return ErrPublicationEvidence
+						}
+						priorLeader = candidate.Fence.LeaderEpoch
+						exactLatest := found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner
+						if exactLatest {
+							priorLeader = latest.LeaderEpoch
+						}
+						if controlLeader, controlFound, controlErr := loadRuntimeControlEndpointLeader(ctx, conn, ref, ticket.version, ticket.runner); controlErr != nil {
+							return controlErr
+						} else if controlFound {
+							priorLeader = controlLeader
+						} else if !exactLatest && (ticket.version != candidate.TicketVersion+1 || ticket.runner != candidate.Fence.RunnerEpoch) {
+							return ErrPublicationEvidence
+						}
+						if priorLeader == 0 || priorLeader >= leaderEpoch {
+							return ErrPublicationEvidence
+						}
+						if !found && candidate.Fence.RunnerEpoch == 1 {
+							if err := validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version); err != nil {
+								return ErrPublicationEvidence
+							}
+						}
+						// This is a startup-only pre-fence proof.  The builder result
+						// must reach the exact old endpoint, never the new daemon leader:
+						// the signed recovery row below is what transfers authority.
+						provider, _, providerErr := s.loadHistoricalProviderAttemptResult(ctx, conn, candidate.BuilderResult)
+						if providerErr != nil || provider.Claim.ExpectedVersion != candidate.TicketVersion || provider.Claim.RunnerEpoch != candidate.Fence.RunnerEpoch || provider.Claim.LeaderEpoch != candidate.Fence.LeaderEpoch || provider.Claim.Ref != ref || provider.Claim.Phase != domain.PhaseBuild || provider.Claim.Role != "builder" || providerResultReachesHistoricalFence(ctx, conn, candidate.BuilderResult, provider, ticket.version, domain.Fence{LeaderEpoch: priorLeader, RunnerEpoch: ticket.runner}) != nil {
+							return ErrPublicationEvidence
+						}
 					}
 				}
 			}

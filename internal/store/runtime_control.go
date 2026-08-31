@@ -339,10 +339,22 @@ func (s *Store) authenticatePostPublicationState(ctx context.Context, conn *sql.
 		// witness.  The authenticated candidate is the fresh boundary here;
 		// once publication has been recorded, its row is checked below instead.
 		candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
-		if err != nil {
+		if err != nil || candidate.Fence != baselineFence {
 			return ErrControlNotDrained
 		}
-		if candidate.TicketVersion != baselineVersion || candidate.Fence != baselineFence {
+		if candidate.TicketVersion == baselineVersion {
+			return nil
+		}
+		// TransitionCandidate records the immutable candidate at the building
+		// endpoint, then the authenticated phase_pass advances the ticket into
+		// publishing.  A pause/resume proof for a publishing ticket therefore
+		// authenticates this one exact predecessor event rather than requiring an
+		// impossible candidate row at the publishing version.
+		if candidate.TicketVersion == ^uint64(0) || candidate.TicketVersion+1 != baselineVersion {
+			return ErrControlNotDrained
+		}
+		var transitions int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, ref.Channel, ref.Project, ref.Ticket, baselineVersion).Scan(&transitions); err != nil || transitions != 1 {
 			return ErrControlNotDrained
 		}
 		return nil
@@ -682,8 +694,20 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 		if stopped.Version < ^uint64(0) && stopped.RunnerEpoch < ^uint64(0) {
 			stopMatches = stopMatches || (control.stop.version == stopped.Version+1 && control.stop.runner == stopped.RunnerEpoch+1)
 		}
-		if err != nil || control.state != "sealed" || control.authority != control.stop || !stopMatches {
+		if err != nil || control.state != "sealed" || !stopMatches {
 			return ErrStaleFence
+		}
+		if control.authority != control.stop {
+			// A prior daemon may have fenced the resumed endpoint before the
+			// rearm retry ran. Accept that successor only when the authority is
+			// exactly the +1/+1 signed recovery endpoint from the immutable stop
+			// chain; arbitrary authority gaps remain stale.
+			if control.stop.version > ^uint64(0)-2 || control.authority.version != control.stop.version+2 || control.authority.runner != control.stop.runner || control.authority.leader != control.stop.leader || control.authority.version == ^uint64(0) || control.authority.runner == ^uint64(0) || proof.Ticket.Version != control.authority.version+1 || proof.Ticket.RunnerEpoch != control.authority.runner+1 || (stopped.State != "" && proof.Ticket.State != stopped.State) {
+				return ErrStaleFence
+			}
+			if err := validateRunnerRecoveryLedger(txCtx, conn, ref, control.authority.version, control.authority.runner, control.authority.leader, proof.Ticket.Version, proof.Ticket.RunnerEpoch, leader); err != nil {
+				return ErrStaleFence
+			}
 		}
 		if !latched || proof.Ticket.Version < stopped.Version || proof.Ticket.RunnerEpoch < stopped.RunnerEpoch || !postPublicationState(proof.Ticket.State) {
 			return ErrStaleFence

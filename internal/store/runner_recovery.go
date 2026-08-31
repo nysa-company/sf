@@ -967,16 +967,61 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 	if err != nil {
 		return 0, false, ErrPublicationEvidence
 	}
-	if control.state != "sealed" || control.authority != control.stop || control.stop.version != version-2 || control.stop.runner != runner || control.stop.leader == 0 || control.stop.leader >= newLeader {
+	if control.state != "sealed" || control.stop.version == 0 || control.stop.runner == 0 || control.stop.leader == 0 {
 		return 0, false, ErrPublicationEvidence
 	}
-	baseline := Ticket{Ref: ref, Version: version - 3, RunnerEpoch: runner - 1, State: state}
+	if control.authority != control.stop {
+		// ActivateRearm records the resumed live tuple as authority before the
+		// scheduler's first Begin. A crash in that narrow handoff restores the
+		// row as sealed; accept it only when the authority is exactly the current
+		// ticket identity and the original stop/resume chain still authenticates.
+		if control.authority.version == version && control.authority.runner == runner {
+			if control.authority.leader == 0 || control.authority.leader >= newLeader || control.stop.version > ^uint64(0)-2 || control.stop.runner > ^uint64(0)-1 {
+				return 0, false, ErrPublicationEvidence
+			}
+			// With no intervening recovery, authority is the resumed endpoint
+			// itself: stop+2 in the ticket stream and the original leader. When
+			// a prior startup already fenced that endpoint, authority is instead
+			// the later current tuple. Authenticate the complete signed ledger
+			// from the resumed stop endpoint to that authority; never infer it
+			// from the counter gap.
+			if version == control.stop.version+2 && runner == control.stop.runner {
+				if control.authority.leader != control.stop.leader {
+					return 0, false, ErrPublicationEvidence
+				}
+			} else {
+				if version <= control.stop.version+2 || runner <= control.stop.runner || control.authority.leader <= control.stop.leader {
+					return 0, false, ErrPublicationEvidence
+				}
+				if err := validateRunnerRecoveryLedger(ctx, conn, ref, control.stop.version+2, control.stop.runner, control.stop.leader, version, runner, control.authority.leader); err != nil {
+					return 0, false, ErrPublicationEvidence
+				}
+			}
+		} else {
+			// A valid but stale control row can remain after a later independently
+			// authenticated phase/publication transition. It must not suppress that
+			// authority, while malformed/current control gaps remain fail-closed.
+			if control.authority.version > version || control.authority.runner > runner || control.authority.leader == 0 {
+				return 0, false, ErrPublicationEvidence
+			}
+			return 0, false, nil
+		}
+	} else if control.stop.version != version-2 || control.stop.runner != runner {
+		return 0, false, ErrPublicationEvidence
+	}
+	if control.stop.version == 0 || control.stop.runner <= 1 {
+		return 0, false, ErrPublicationEvidence
+	}
+	baseline := Ticket{Ref: ref, Version: control.stop.version - 1, RunnerEpoch: control.stop.runner - 1, State: state}
 	current := Ticket{Ref: ref, Version: version, RunnerEpoch: runner, State: state}
 	if err := authenticatePostPublicationResume(ctx, conn, ref, baseline, current, control.stop); err != nil {
 		return 0, false, nil
 	}
 	if err := s.authenticatePostPublicationState(ctx, conn, ref, state, baseline.Version, domain.Fence{LeaderEpoch: control.stop.leader, RunnerEpoch: baseline.RunnerEpoch}); err != nil {
 		return 0, false, nil
+	}
+	if control.authority != control.stop {
+		return control.authority.leader, true, nil
 	}
 	return control.stop.leader, true, nil
 }
