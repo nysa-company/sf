@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -111,7 +112,7 @@ func main() {
 		if err != nil {
 			return err
 		}
-		return daemon.Run(runCtx, daemon.Config{
+		runErr := daemon.Run(runCtx, daemon.Config{
 			Channel: channel, Paths: paths,
 			DaemonIdentity:           fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
 			RecoveryAuthorityKey:     supervisor.PublicKey(),
@@ -131,6 +132,7 @@ func main() {
 				Workers: 2,
 			}),
 		})
+		return errors.Join(runErr, supervisor.Close())
 	}
 	os.Exit(cli.ExecuteWithDaemon(ctx, os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}, runDaemon))
 }

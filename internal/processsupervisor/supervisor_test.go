@@ -274,7 +274,23 @@ func TestSupervisorCloseRetainsStagedRuntimeUntilPipeHoldingEscapeeWaits(t *test
 		_, err := supervisor.Run(runCtx, request, invocation, input)
 		runDone <- err
 	}()
-	awaitFile(t, ready, time.Second)
+	// Compiling and scheduling the detached fixture is not itself a product
+	// timeout contract. Keep this setup bound generous enough for loaded CI,
+	// while still reporting an early Run failure immediately below.
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		select {
+		case err := <-runDone:
+			t.Fatalf("provider Run returned before detached child became ready: %v", err)
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for detached child readiness at %q", ready)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 	defer func() { _ = os.WriteFile(release, []byte("release"), 0o600) }()
 	cancel()
 	select {
