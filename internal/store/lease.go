@@ -17,6 +17,47 @@ var ErrLeaseCapacity = errors.New("lease capacity is exhausted")
 
 type phaseRecoveryBaseline struct{ version, runner, leader, currentLeader uint64 }
 
+// reviewRepairRecoveryPredecessor is the single startup bridge for the crash
+// window after an atomic final-review repair transition and before the fresh
+// target-phase claim exists. It is intentionally narrower than normal phase
+// recovery: the marker must name this exact state/version/runner and bind the
+// completed final reviewer plus the correction budget it consumed.
+func reviewRepairRecoveryPredecessor(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64) (uint64, bool, error) {
+	if (state != domain.StateBuilding && state != domain.StateVerifying) || version == 0 || runner == 0 || newLeader == 0 {
+		return 0, false, nil
+	}
+	var attemptID int64
+	var attempt int
+	var typedSHA, requestID string
+	var consumedVersion, consumedLeader, consumedRunner uint64
+	err := conn.QueryRowContext(ctx, `SELECT reviewer_attempt_id,reviewer_attempt,reviewer_typed_sha256,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch
+		FROM final_review_repair_boundaries WHERE channel=? AND project_id=? AND ticket_id=? AND target_state=? AND transition_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, state, version).Scan(&attemptID, &attempt, &typedSHA, &requestID, &consumedVersion, &consumedLeader, &consumedRunner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if attemptID <= 0 || attempt <= 0 || !validSHA256(typedSHA) || !boundedText(requestID, 300) || consumedVersion+1 != version || consumedLeader == 0 || consumedLeader >= newLeader || consumedRunner != runner {
+		return 0, false, ErrPublicationEvidence
+	}
+	var storedAttempt int
+	var storedTyped, phase, role, attemptState, outcome string
+	var expected, claimLeader, claimRunner uint64
+	if err := conn.QueryRowContext(ctx, `SELECT a.attempt,r.typed_sha256,a.phase,a.role,a.state,a.outcome,a.expected_ticket_version,a.leader_epoch,a.runner_epoch
+		FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id WHERE r.provider_attempt_id=? AND r.channel=? AND r.project_id=? AND r.ticket_id=?`, attemptID, ref.Channel, ref.Project, ref.Ticket).Scan(&storedAttempt, &storedTyped, &phase, &role, &attemptState, &outcome, &expected, &claimLeader, &claimRunner); err != nil || storedAttempt != attempt || storedTyped != typedSHA || phase != string(domain.PhaseReview) || role != "reviewer" || attemptState != "completed" || outcome != "completed" || expected != consumedVersion || claimLeader != consumedLeader || claimRunner != consumedRunner {
+		return 0, false, ErrPublicationEvidence
+	}
+	var uses, transitions int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND request_id=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, requestID, consumedVersion, consumedLeader, consumedRunner).Scan(&uses); err != nil || uses != 1 {
+		return 0, false, ErrPublicationEvidence
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='review_repair' AND from_state='reviewing' AND to_state=?`, ref.Channel, ref.Project, ref.Ticket, version, state).Scan(&transitions); err != nil || transitions != 1 {
+		return 0, false, ErrPublicationEvidence
+	}
+	return consumedLeader, true, nil
+}
+
 func recoveryProviderPhase(state domain.State) (domain.Phase, string, bool) {
 	switch state {
 	case domain.StatePlanning:
@@ -25,6 +66,11 @@ func recoveryProviderPhase(state domain.State) (domain.Phase, string, bool) {
 		return domain.PhaseVerification, "reviewer", true
 	case domain.StateBuilding:
 		return domain.PhaseBuild, "builder", true
+	case domain.StateReviewing:
+		// A completed final Reviewer result is a durable recovery predecessor
+		// just like Planner/Verifier/Builder. Its source endpoint is the
+		// authenticated checks_green transition, not a publication shortcut.
+		return domain.PhaseReview, "reviewer", true
 	default:
 		return "", "", false
 	}
@@ -268,6 +314,11 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					}
 				}
 			}
+			if repairLeader, repairFound, repairErr := reviewRepairRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); repairErr != nil {
+				return repairErr
+			} else if repairFound {
+				priorLeader = repairLeader
+			}
 			if phase, role, ok := recoveryProviderPhase(ticket.state); ok {
 				baseline, baselineFound, baselineErr := s.loadPhaseRecoveryBaseline(ctx, conn, ref, phase, role)
 				if baselineErr != nil {
@@ -276,7 +327,7 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				if baselineFound && found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
 					baseline.currentLeader = latest.LeaderEpoch
 				}
-				if baselineFound {
+				if baselineFound && priorLeader == 0 {
 					// The recovery row being appended starts from the authenticated
 					// pre-fence endpoint, not the provider claim's original leader.
 					// Prefer an exact prior ledger row, then the durable control
@@ -312,7 +363,7 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					if err := validateRunnerRecoveryLedger(ctx, conn, ref, baseline.version, baseline.runner, baseline.leader, ticket.version, ticket.runner, priorLeader); err != nil {
 						return ErrPublicationEvidence
 					}
-				} else if ticket.state == domain.StateVerifying {
+				} else if !baselineFound && ticket.state == domain.StateVerifying {
 					// Planning may have been consumed by the exact planning->verifying
 					// transition before the first reviewer claim was issued. That is a
 					// narrow predecessor: the completed Planner source, one canonical

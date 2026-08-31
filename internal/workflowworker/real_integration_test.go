@@ -564,6 +564,15 @@ func (e *realFaultEngine) SignalCandidate(ctx context.Context, request contracts
 	}
 	return e.StateMachine.SignalCandidate(ctx, request, candidate)
 }
+func (e *realFaultEngine) SignalFinalReview(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return e.StateMachine.SignalFinalReview(ctx, request)
+}
+func (e *realFaultEngine) SignalFinalReviewRepair(ctx context.Context, request contracts.SignalRequest, owner string) (contracts.TransitionResult, error) {
+	return e.StateMachine.SignalFinalReviewRepair(ctx, request, owner)
+}
+func (e *realFaultEngine) SignalFinalReviewNeedsOperator(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return e.StateMachine.SignalFinalReviewNeedsOperator(ctx, request)
+}
 
 type realRunner struct {
 	db           *store.Store

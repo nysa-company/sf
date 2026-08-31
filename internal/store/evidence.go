@@ -251,6 +251,35 @@ func ensurePlanBinding(ctx context.Context, conn *sql.Conn, artifact PlanArtifac
 	return err
 }
 
+type reviewRepairAmendment struct {
+	PriorRevision uint64
+	Reason        string
+	Requester     string
+}
+
+// reviewRepairVerificationAmendment exposes only the Store-authenticated
+// amendment context created by a reviewer-owned final-review repair. It never
+// trusts a Worker-provided reason or lets a builder repair alter verification.
+func reviewRepairVerificationAmendment(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, version uint64) (reviewRepairAmendment, bool, error) {
+	var result reviewRepairAmendment
+	var transitionVersion uint64
+	var state domain.State
+	err := conn.QueryRowContext(ctx, `SELECT b.prior_verification_revision,b.amendment_reason,b.requester,b.transition_ticket_version,t.state
+		FROM final_review_repair_boundaries b JOIN tickets t ON t.channel=b.channel AND t.project_id=b.project_id AND t.id=b.ticket_id
+		WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.target_state='verifying' AND b.transition_ticket_version<=?
+		ORDER BY b.transition_ticket_version DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&result.PriorRevision, &result.Reason, &result.Requester, &transitionVersion, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return reviewRepairAmendment{}, false, nil
+	}
+	if err != nil {
+		return reviewRepairAmendment{}, false, err
+	}
+	if state != domain.StateVerifying || transitionVersion == 0 || transitionVersion > version || result.PriorRevision == 0 || !boundedText(result.Reason, 2_000) || !boundedText(result.Requester, 200) {
+		return reviewRepairAmendment{}, false, ErrEvidenceConflict
+	}
+	return result, true, nil
+}
+
 func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArtifact) (VerificationRevision, error) {
 	if err := artifact.Ref.Validate(); err != nil {
 		return VerificationRevision{}, err
@@ -312,6 +341,39 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		var current uint64
 		if err := conn.QueryRowContext(ctx, `SELECT current_revision FROM verifications WHERE channel=? AND project_id=? AND ticket_id=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket).Scan(&current); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
+		}
+		if artifact.AmendsRevision == 0 {
+			amendment, found, amendmentErr := reviewRepairVerificationAmendment(ctx, conn, artifact.Ref, artifact.ExpectedVersion)
+			if amendmentErr != nil {
+				return amendmentErr
+			}
+			if found {
+				artifact.AmendsRevision, artifact.Reason, artifact.Requester = amendment.PriorRevision, amendment.Reason, amendment.Requester
+				result.Amends = amendment.PriorRevision
+				if current == amendment.PriorRevision {
+					// First persistence of the newly reviewed verification below.
+				} else if current > amendment.PriorRevision {
+					// A crash may occur after the amended revision is durable but
+					// before the phase transition. A recovered exact provider result
+					// must append only its live binding, never try to create a second
+					// amendment revision or reject the boundary-derived metadata.
+					var storedAmends uint64
+					var storedReason, storedRequester, storedIntent, storedProof, storedCheckpoint string
+					if err := conn.QueryRowContext(ctx, `SELECT COALESCE(amends_revision,0),amendment_reason,requester,intent_digest,proof_digest,checkpoint_id FROM verification_revisions WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current).Scan(&storedAmends, &storedReason, &storedRequester, &storedIntent, &storedProof, &storedCheckpoint); err != nil {
+						return err
+					}
+					if storedAmends != amendment.PriorRevision || storedReason != amendment.Reason || storedRequester != amendment.Requester || storedIntent != intentDigest || storedProof != proofDigest || storedCheckpoint != artifact.CheckpointID {
+						return ErrEvidenceConflict
+					}
+					result.Revision = current
+					if err := ensureVerificationBinding(ctx, conn, artifact, current, provider); err != nil {
+						return err
+					}
+					return ensureVerificationCommandBinding(ctx, conn, artifact.Ref, current, commandBinding)
+				} else {
+					return ErrEvidenceConflict
+				}
+			}
 		}
 		if current > 0 {
 			var oldIntent string
@@ -691,6 +753,18 @@ func (s *Store) RecordOperatorDecision(ctx context.Context, decision OperatorDec
 		if err := s.assertTicketFence(ctx, conn, decision.Ref, decision.ExpectedVersion, decision.Fence); err != nil {
 			return err
 		}
+		var state domain.State
+		var mergeMode domain.MergeMode
+		if err := conn.QueryRowContext(ctx, `SELECT state,merge_mode FROM tickets WHERE channel=? AND project_id=? AND id=?`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket).Scan(&state, &mergeMode); err != nil {
+			return err
+		}
+		// A decision is meaningful only after the exact candidate has reached
+		// its final-review waiting boundary.  In particular, no caller can
+		// pre-approve a building/reviewing head and carry that authority over a
+		// later review or candidate refresh.
+		if (decision.Decision == "approved" && (state != domain.StateWaitingApproval || mergeMode != domain.MergeGuarded)) || (decision.Decision == "rejected" && state != domain.StateWaitingApproval && state != domain.StateWaitingManualMerge) {
+			return ErrEvidenceConflict
+		}
 		var head string
 		if err := conn.QueryRowContext(ctx, `SELECT head_sha FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY generation DESC LIMIT 1`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket).Scan(&head); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -735,32 +809,74 @@ func (s *Store) ConsumeBudget(ctx context.Context, use BudgetUse) (int, error) {
 	}
 	used := 0
 	err := s.write(ctx, func(conn *sql.Conn) error {
-		if err := s.assertTicketFence(ctx, conn, use.Ref, use.ExpectedVersion, use.Fence); err != nil {
-			return err
-		}
-		_, err := conn.ExecContext(ctx, `INSERT INTO ticket_counters(channel, project_id, ticket_id, kind, used, limit_count) VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT(channel, project_id, ticket_id, kind) DO NOTHING`, use.Ref.Channel, use.Ref.Project, use.Ref.Ticket, use.Kind, limit)
-		if err != nil {
-			return err
-		}
-		result, err := conn.ExecContext(ctx, `INSERT INTO ticket_budget_uses(channel, project_id, ticket_id, kind, request_id, ticket_version, leader_epoch, runner_epoch, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(channel, project_id, ticket_id, kind, request_id) DO NOTHING`, use.Ref.Channel, use.Ref.Project, use.Ref.Ticket, use.Kind, use.RequestID, use.ExpectedVersion, use.Fence.LeaderEpoch, use.Fence.RunnerEpoch, now())
-		if err != nil {
-			return err
-		}
-		if inserted, _ := result.RowsAffected(); inserted == 1 {
-			updated, err := conn.ExecContext(ctx, `UPDATE ticket_counters SET used=used+1 WHERE channel=? AND project_id=? AND ticket_id=? AND kind=? AND used<limit_count`, use.Ref.Channel, use.Ref.Project, use.Ref.Ticket, use.Kind)
-			if err != nil {
-				return err
-			}
-			if count, _ := updated.RowsAffected(); count != 1 {
-				return ErrBudgetExhausted
-			}
-			if err := evidenceEvent(ctx, conn, use.Ref, use.ExpectedVersion, "budget_"+use.Kind, map[string]string{"request_id": use.RequestID}); err != nil {
-				return err
-			}
-		}
-		return conn.QueryRowContext(ctx, `SELECT used FROM ticket_counters WHERE channel=? AND project_id=? AND ticket_id=? AND kind=?`, use.Ref.Channel, use.Ref.Project, use.Ref.Ticket, use.Kind).Scan(&used)
+		var err error
+		used, err = s.consumeBudgetFrom(ctx, conn, use)
+		return err
 	})
 	return used, err
+}
+
+func (s *Store) consumeBudgetFrom(ctx context.Context, conn *sql.Conn, use BudgetUse) (int, error) {
+	return s.consumeBudgetAtFence(ctx, conn, use, true)
+}
+
+// consumeBudgetDuringTransition is for a lifecycle transaction that has
+// already drained external mutations. DrainExternalMutations intentionally
+// revokes the pre-transition fence, so re-entering assertTicketFence here
+// would reject the transition's own exact authority. The caller still holds
+// the Store write transaction and this helper rechecks the ticket version,
+// runner epoch, and daemon leader before charging the bounded counter.
+func (s *Store) consumeBudgetDuringTransition(ctx context.Context, conn *sql.Conn, use BudgetUse) (int, error) {
+	return s.consumeBudgetAtFence(ctx, conn, use, false)
+}
+
+func (s *Store) consumeBudgetAtFence(ctx context.Context, conn *sql.Conn, use BudgetUse, requireUnrevoked bool) (int, error) {
+	limit := 0
+	if use.Kind == "correction" {
+		limit = 2
+	} else if use.Kind == "fallback" {
+		limit = 1
+	}
+	if limit == 0 || !boundedText(use.RequestID, 300) {
+		return 0, ErrEvidenceConflict
+	}
+	if requireUnrevoked {
+		if err := s.assertTicketFence(ctx, conn, use.Ref, use.ExpectedVersion, use.Fence); err != nil {
+			return 0, err
+		}
+	} else {
+		var version, runner uint64
+		if err := conn.QueryRowContext(ctx, `SELECT version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, use.Ref.Channel, use.Ref.Project, use.Ref.Ticket).Scan(&version, &runner); err != nil || version != use.ExpectedVersion {
+			return 0, ErrStaleFence
+		}
+		if err := s.currentFence(ctx, conn, use.Ref.Channel, version, runner, use.Fence); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `INSERT INTO ticket_counters(channel, project_id, ticket_id, kind, used, limit_count) VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT(channel, project_id, ticket_id, kind) DO NOTHING`, use.Ref.Channel, use.Ref.Project, use.Ref.Ticket, use.Kind, limit); err != nil {
+		return 0, err
+	}
+	result, err := conn.ExecContext(ctx, `INSERT INTO ticket_budget_uses(channel, project_id, ticket_id, kind, request_id, ticket_version, leader_epoch, runner_epoch, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(channel, project_id, ticket_id, kind, request_id) DO NOTHING`, use.Ref.Channel, use.Ref.Project, use.Ref.Ticket, use.Kind, use.RequestID, use.ExpectedVersion, use.Fence.LeaderEpoch, use.Fence.RunnerEpoch, now())
+	if err != nil {
+		return 0, err
+	}
+	if inserted, _ := result.RowsAffected(); inserted == 1 {
+		updated, err := conn.ExecContext(ctx, `UPDATE ticket_counters SET used=used+1 WHERE channel=? AND project_id=? AND ticket_id=? AND kind=? AND used<limit_count`, use.Ref.Channel, use.Ref.Project, use.Ref.Ticket, use.Kind)
+		if err != nil {
+			return 0, err
+		}
+		if count, _ := updated.RowsAffected(); count != 1 {
+			return 0, ErrBudgetExhausted
+		}
+		if err := evidenceEvent(ctx, conn, use.Ref, use.ExpectedVersion, "budget_"+use.Kind, map[string]string{"request_id": use.RequestID}); err != nil {
+			return 0, err
+		}
+	}
+	var used int
+	if err := conn.QueryRowContext(ctx, `SELECT used FROM ticket_counters WHERE channel=? AND project_id=? AND ticket_id=? AND kind=?`, use.Ref.Channel, use.Ref.Project, use.Ref.Ticket, use.Kind).Scan(&used); err != nil {
+		return 0, err
+	}
+	return used, nil
 }
 
 func evidenceEvent(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, version uint64, trigger string, payload any) error {

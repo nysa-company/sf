@@ -200,7 +200,7 @@ func (s *Store) ValidateFinalReviewEvidence(ctx context.Context, ref domain.Tick
 	if ref.Validate() != nil || expectedVersion == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || expectedHead == "" || expectedProof == "" {
 		return ErrEvidenceConflict
 	}
-	return validateFinalReviewEvidence(ctx, s.db, ref, expectedVersion, fence, expectedHead, expectedProof)
+	return s.validateFinalReviewEvidence(ctx, s.db, ref, expectedVersion, fence, expectedHead, expectedProof)
 }
 
 type rowQueryer interface {
@@ -208,34 +208,10 @@ type rowQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func validateFinalReviewEvidence(ctx context.Context, query rowQueryer, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, expectedHead, expectedProof string) error {
-	var head, proof, intent, source, ticketSource string
-	var ticketVersion, runner, candidateVersion, candidateLeader, candidateRunner uint64
-	var verificationIntent, verificationProof sql.NullString
-	if err := query.QueryRowContext(ctx, `SELECT c.head_sha,c.proof_digest,c.verification_intent_digest,c.source_digest,c.ticket_version,c.leader_epoch,c.runner_epoch,t.version,t.runner_epoch,t.source_digest,v.intent_digest,v.proof_digest
-		FROM candidate_snapshots c
-		JOIN tickets t ON t.channel=c.channel AND t.project_id=c.project_id AND t.id=c.ticket_id
-		LEFT JOIN verifications v ON v.channel=c.channel AND v.project_id=c.project_id AND v.ticket_id=c.ticket_id
-		WHERE c.channel=? AND c.project_id=? AND c.ticket_id=? ORDER BY c.generation DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket).Scan(&head, &proof, &intent, &source, &candidateVersion, &candidateLeader, &candidateRunner, &ticketVersion, &runner, &ticketSource, &verificationIntent, &verificationProof); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrEvidenceConflict
-		}
-		return normalizeBusy(ctx, err)
-	}
-	var leader uint64
-	if err := query.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&leader); err != nil {
-		return normalizeBusy(ctx, err)
-	}
-	if leader != fence.LeaderEpoch || head != expectedHead || proof != expectedProof || candidateVersion > expectedVersion || ticketVersion > expectedVersion || runner != fence.RunnerEpoch || source != ticketSource || candidateLeader == 0 || candidateRunner == 0 || !verificationIntent.Valid || !verificationProof.Valid || intent != verificationIntent.String || proof != verificationProof.String {
+func (s *Store) validateFinalReviewEvidence(ctx context.Context, query rowQueryer, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, expectedHead, expectedProof string) error {
+	authority, err := s.finalReviewAuthorityFrom(ctx, query, ref, expectedVersion, fence)
+	if err != nil || authority.Candidate.Snapshot.HeadSHA != expectedHead || authority.Candidate.Snapshot.ProofDigest != expectedProof {
 		return ErrEvidenceConflict
-	}
-	if candidateRunner != runner || candidateLeader != leader {
-		// Start at the exact candidate endpoint. Picking an arbitrary later
-		// ledger predecessor would leave candidate->bridge unproved and could
-		// silently skip an unauthenticated runner/leader gap.
-		if validateRunnerRecoveryLedger(ctx, query, ref, candidateVersion, candidateRunner, candidateLeader, expectedVersion, runner, leader) != nil {
-			return ErrEvidenceConflict
-		}
 	}
 	return nil
 }
@@ -494,7 +470,7 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 			return ErrProviderAttempt
 		}
 		if r.Phase == domain.PhaseReview && r.Role == "reviewer" {
-			if err := validateFinalReviewEvidence(ctx, conn, r.Ref, r.ExpectedVersion, r.Fence, r.ExpectedHead, r.ExpectedProof); err != nil {
+			if err := s.validateFinalReviewEvidence(ctx, conn, r.Ref, r.ExpectedVersion, r.Fence, r.ExpectedHead, r.ExpectedProof); err != nil {
 				return err
 			}
 		}
@@ -872,6 +848,50 @@ func (s *Store) loadHistoricalProviderAttemptResult(ctx context.Context, query r
 	return out, parsed, nil
 }
 
+// reviewRepairBoundaryFrom proves that a final-review repair permanently cuts
+// off an earlier target-phase result. The boundary is keyed to the repair
+// transition version (not a runner fence), so it remains effective after a
+// crash/restart recovery advances the runner epoch.
+func reviewRepairBoundaryFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, phase domain.Phase, liveVersion uint64, historicalVersion uint64) (bool, error) {
+	target := domain.State("")
+	switch phase {
+	case domain.PhaseVerification:
+		target = domain.StateVerifying
+	case domain.PhaseBuild:
+		target = domain.StateBuilding
+	default:
+		return false, ErrEvidenceConflict
+	}
+	var transitionVersion, attemptID int64
+	var attempt int
+	var typedSHA, requestID string
+	err := q.QueryRowContext(ctx, `SELECT transition_ticket_version,reviewer_attempt_id,reviewer_attempt,reviewer_typed_sha256,correction_budget_request_id
+		FROM final_review_repair_boundaries
+		WHERE channel=? AND project_id=? AND ticket_id=? AND target_state=? AND transition_ticket_version<=?
+		ORDER BY transition_ticket_version DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, target, liveVersion).Scan(&transitionVersion, &attemptID, &attempt, &typedSHA, &requestID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	if transitionVersion <= 0 || attemptID <= 0 || attempt <= 0 || !validSHA256(typedSHA) || !boundedText(requestID, 300) {
+		return false, ErrEvidenceConflict
+	}
+	var storedAttempt int
+	var storedTyped, phaseName, role, state, outcome string
+	if err := q.QueryRowContext(ctx, `SELECT a.attempt,r.typed_sha256,a.phase,a.role,a.state,a.outcome
+		FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id
+		WHERE r.provider_attempt_id=? AND r.channel=? AND r.project_id=? AND r.ticket_id=?`, attemptID, ref.Channel, ref.Project, ref.Ticket).Scan(&storedAttempt, &storedTyped, &phaseName, &role, &state, &outcome); err != nil || storedAttempt != attempt || storedTyped != typedSHA || phaseName != string(domain.PhaseReview) || role != "reviewer" || state != "completed" || outcome != "completed" {
+		return false, ErrEvidenceConflict
+	}
+	var uses int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND request_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, requestID, transitionVersion-1).Scan(&uses); err != nil || uses != 1 {
+		return false, ErrEvidenceConflict
+	}
+	return historicalVersion < uint64(transitionVersion), nil
+}
+
 // LatestReusableProviderAttemptResult returns exactly the newest completed
 // Planner or Reviewer result. It intentionally never falls back to an older
 // row when that newest row is malformed or stale: doing so would let a restart
@@ -944,6 +964,20 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if live.Version != request.ExpectedVersion || live.RunnerEpoch != request.Fence.RunnerEpoch || liveLeader != request.Fence.LeaderEpoch {
 		return LatestReusableProviderAttemptResult{}, ErrStaleFence
 	}
+	if request.Phase == domain.PhaseVerification || request.Phase == domain.PhaseBuild {
+		boundary, boundaryErr := reviewRepairBoundaryFrom(ctx, s.db, request.Ref, request.Phase, live.Version, historical.Claim.ExpectedVersion)
+		if boundaryErr != nil {
+			return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+		}
+		if boundary {
+			// The boundary itself is the authenticated authority to reject a
+			// predecessor result. Check it after proving the caller's exact live
+			// fence, but before generic runner-recovery validation that only
+			// knows normal phase bridges. A fresh same-cycle result has an
+			// expected version at or beyond the boundary and is not hidden.
+			return LatestReusableProviderAttemptResult{}, ErrNotFound
+		}
+	}
 	if err := validateRunnerRecoveryAuthority(ctx, s.db, request.Ref, request.ExpectedVersion, request.Fence); err != nil {
 		return LatestReusableProviderAttemptResult{}, ErrStaleFence
 	}
@@ -995,8 +1029,8 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if err != nil || candidate.Snapshot.HeadSHA != validation.ExpectedReviewedHead || candidate.Snapshot.ProofDigest != validation.ExpectedProofDigest || result.Parsed.Reviewer.ReviewedHead != validation.ExpectedReviewedHead || result.Parsed.Reviewer.ProofDigest != validation.ExpectedProofDigest {
 		return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
 	}
-	verification, err := s.CurrentVerification(ctx, request.Ref)
-	if err != nil || verification.Revision.IntentDigest != candidate.Snapshot.VerificationIntentDigest || verification.Revision.ProofDigest != candidate.Snapshot.ProofDigest {
+	authority, err := s.FinalReviewAuthority(ctx, request.Ref, request.ExpectedVersion, request.Fence)
+	if err != nil || authority.Candidate.Snapshot != candidate.Snapshot || authority.Verification.Revision.IntentDigest != candidate.Snapshot.VerificationIntentDigest || authority.Verification.Revision.ProofDigest != candidate.Snapshot.ProofDigest {
 		return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
 	}
 	return result, nil

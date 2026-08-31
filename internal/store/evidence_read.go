@@ -6,10 +6,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/workflowprompt"
 )
 
 // StoredPlan is the authenticated Planner checkpoint used by recovery.
@@ -113,6 +115,94 @@ type StoredOperatorDecision struct {
 	Invalidated   bool
 	CreatedAt     time.Time
 	TicketVersion uint64
+}
+
+// FinalReviewAuthority is the single read-only authority presented to the
+// final-review adapter. It joins the immutable candidate and pre-build proof
+// with the exact green CI transition that entered reviewing. It intentionally
+// does not reuse CurrentVerification: that reader is for the earlier
+// verifying/building boundary and must fail closed once a candidate exists.
+type FinalReviewAuthority struct {
+	Candidate    StoredCandidate
+	Verification StoredVerification
+	Checks       workflowprompt.ChecksIdentity
+}
+
+// FinalReviewAuthority authenticates the current reviewing endpoint. A
+// restart may retain older candidate/proof bindings, but only an exact green
+// CI transition plus the signed recovery lineage may carry them to the live
+// reviewing fence.
+func (s *Store) FinalReviewAuthority(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence) (FinalReviewAuthority, error) {
+	return s.finalReviewAuthorityFrom(ctx, s.db, ref, expectedVersion, fence)
+}
+
+func (s *Store) finalReviewAuthorityFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence) (FinalReviewAuthority, error) {
+	if ref.Validate() != nil || expectedVersion == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return FinalReviewAuthority{}, ErrStaleFence
+	}
+	var state domain.State
+	var version, runner, leader uint64
+	var source string
+	if err := q.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch,t.source_digest FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &leader, &source); err != nil || state != domain.StateReviewing || version != expectedVersion || runner != fence.RunnerEpoch || leader != fence.LeaderEpoch {
+		return FinalReviewAuthority{}, ErrStaleFence
+	}
+	// Audit the complete ledger even when the candidate's green CI transition
+	// happens to be at the live fence. A forged future recovery row must make
+	// the reviewing authority fail closed rather than being ignored as unused.
+	if err := validateRunnerRecoveryAuthority(ctx, q, ref, expectedVersion, fence); err != nil {
+		return FinalReviewAuthority{}, ErrStaleFence
+	}
+	candidate, err := s.latestCandidateFrom(ctx, q, ref, false)
+	if err != nil || candidate.Snapshot.SourceDigest != source {
+		return FinalReviewAuthority{}, ErrEvidenceConflict
+	}
+	verification, err := s.verificationEvidenceForCandidateFrom(ctx, q, ref)
+	if err != nil || candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest || candidate.Commit.ParentOID != verification.Checkpoint.CommitOID {
+		return FinalReviewAuthority{}, ErrEvidenceConflict
+	}
+	var observationID int64
+	var observedVersion, observedLeader, observedRunner, reviewVersion uint64
+	var count int
+	var requiredSetDigest string
+	err = q.QueryRowContext(ctx, `SELECT o.observation_id,o.observed_ticket_version,o.observed_leader_epoch,o.observed_runner_epoch,e.ticket_version,o.required_check_count,o.required_set_digest
+		FROM ci_transition_evidence e JOIN ci_observations o ON o.channel=e.channel AND o.project_id=e.project_id AND o.ticket_id=e.ticket_id AND o.candidate_generation=e.candidate_generation AND o.candidate_head_sha=e.candidate_head_sha AND o.candidate_tree_sha=e.candidate_tree_sha AND o.classification=e.observation_classification AND o.observation_digest=e.observation_digest AND o.observed_ticket_version=e.observation_ticket_version AND o.observed_leader_epoch=e.observation_leader_epoch AND o.observed_runner_epoch=e.observation_runner_epoch
+		WHERE e.channel=? AND e.project_id=? AND e.ticket_id=? AND e.candidate_generation=? AND e.candidate_head_sha=? AND e.candidate_tree_sha=? AND e.observation_classification='green' AND e.resulting_state='reviewing' AND e.resulting_trigger='checks_green'
+		ORDER BY e.ticket_version DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, candidate.Snapshot.Generation, candidate.Snapshot.HeadSHA, candidate.Snapshot.TreeSHA).Scan(&observationID, &observedVersion, &observedLeader, &observedRunner, &reviewVersion, &count, &requiredSetDigest)
+	if err != nil || observationID <= 0 || count <= 0 || reviewVersion == 0 || reviewVersion != observedVersion+1 || observedLeader == 0 || observedRunner == 0 || !validSHA256(requiredSetDigest) {
+		return FinalReviewAuthority{}, ErrEvidenceConflict
+	}
+	// Reviewing can survive a leader/runner recovery, but the recovery proof
+	// must begin at the exact CI-created reviewing endpoint; candidate rows
+	// themselves predate publication and cannot be used as a loose shortcut.
+	if reviewVersion != expectedVersion || observedRunner != fence.RunnerEpoch || observedLeader != fence.LeaderEpoch {
+		if err := validateRunnerRecoveryLedger(ctx, q, ref, reviewVersion, observedRunner, observedLeader, expectedVersion, fence.RunnerEpoch, fence.LeaderEpoch); err != nil {
+			return FinalReviewAuthority{}, ErrStaleFence
+		}
+	}
+	rows, err := q.QueryContext(ctx, `SELECT canonical_name,external_id,normalized_state FROM ci_observation_checks WHERE observation_id=? ORDER BY canonical_name,external_id`, observationID)
+	if err != nil {
+		return FinalReviewAuthority{}, err
+	}
+	defer rows.Close()
+	checks := make([]workflowprompt.Check, 0, count)
+	for rows.Next() {
+		var check workflowprompt.Check
+		if err := rows.Scan(&check.Name, &check.ExternalID, &check.Status); err != nil {
+			return FinalReviewAuthority{}, err
+		}
+		if check.Status != "success" && check.Status != "skipped" && check.Status != "neutral" {
+			return FinalReviewAuthority{}, ErrEvidenceConflict
+		}
+		checks = append(checks, check)
+	}
+	if rows.Err() != nil || len(checks) != count {
+		return FinalReviewAuthority{}, ErrEvidenceConflict
+	}
+	identity, err := workflowprompt.NewChecksIdentity(fmt.Sprintf("%d", observationID), candidate.Snapshot.HeadSHA, checks)
+	if err != nil || identity.SetDigest != requiredSetDigest {
+		return FinalReviewAuthority{}, ErrEvidenceConflict
+	}
+	return FinalReviewAuthority{Candidate: candidate, Verification: verification, Checks: identity}, nil
 }
 
 // ValidateCurrentCandidateForBuildTransition authenticates the exact
@@ -273,10 +363,34 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 	// prior-fence revision after a runner recovery. Immutable evidence remains
 	// available through RecoverableVerification for that recovery rebind.
 	var ticketVersion, ticketRunner, leader uint64
-	if err := q.QueryRowContext(ctx, `SELECT t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&ticketVersion, &ticketRunner, &leader); err != nil || ticketVersion == 0 || ticketRunner == 0 || leader == 0 {
+	var ticketState domain.State
+	if err := q.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&ticketState, &ticketVersion, &ticketRunner, &leader); err != nil || ticketVersion == 0 || ticketRunner == 0 || leader == 0 {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
 	exact := ticketVersion == result.TicketVersion && ticketRunner == result.Fence.RunnerEpoch && leader == result.Fence.LeaderEpoch
+	if !exact {
+		boundaryPhase := domain.PhaseVerification
+		if ticketState == domain.StateBuilding {
+			boundaryPhase = domain.PhaseBuild
+		}
+		boundary, boundaryErr := reviewRepairBoundaryFrom(ctx, q, ref, boundaryPhase, ticketVersion, result.TicketVersion)
+		if boundaryErr != nil {
+			return StoredVerification{}, ErrEvidenceConflict
+		}
+		if boundary && ticketState == domain.StateVerifying {
+			// A reviewer-owned repair starts a new verification cycle. Hiding
+			// the old revision makes both Worker and PhaseRunner launch a fresh
+			// verifier instead of treating it as a normal restart predecessor.
+			return StoredVerification{}, ErrNotFound
+		}
+		if boundary && ticketState == domain.StateBuilding {
+			// A builder-owned repair still needs the prior verification as its
+			// immutable input, but the boundary separately rejects reuse of the
+			// prior Builder result. The final-review transition authenticated this
+			// verification when it consumed the repair decision.
+			exact = true
+		}
+	}
 	if !exact {
 		var transitions int
 		if ticketVersion != result.TicketVersion+1 || ticketRunner != result.Fence.RunnerEpoch || leader != result.Fence.LeaderEpoch || q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='verifying' AND to_state='building'`, ref.Channel, ref.Project, ref.Ticket, ticketVersion).Scan(&transitions) != nil || transitions != 1 {

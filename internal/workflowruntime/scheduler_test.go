@@ -82,6 +82,17 @@ func TestSchedulerIgnoresQueuedAndInvokesOneStableFirstTicket(t *testing.T) {
 	}
 }
 
+func TestSchedulerInvokesReviewingTicket(t *testing.T) {
+	reviewing := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "review"}, domain.StateReviewing)
+	ensurer := &fakeEnsure{}
+	worker := &fakeWorker{}
+	scheduler := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{reviewing}}, ensurer, worker)
+	result := scheduler.Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != reviewing.Ref {
+		t.Fatalf("result=%+v calls=%v", result, worker.calls)
+	}
+}
+
 func TestSchedulerDoesNotRunSecondPhaseAndBusyIsBenign(t *testing.T) {
 	first := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "first"}, domain.StatePlanning)
 	second := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "second"}, domain.StateBuilding)

@@ -199,6 +199,62 @@ func (e *Engine) SignalCandidate(ctx context.Context, request contracts.SignalRe
 	return contracts.TransitionResult{To: target, TicketVersion: result.Version, Invalidated: invalidations(e.spec, transition.Invalidates), EventID: fmt.Sprint(result.EventID)}, nil
 }
 
+// SignalFinalReview is the sole final-review pass entry point.  The Store
+// consumes the completed immutable Reviewer result with the reviewing exit,
+// so a stale provider response can never advance a newer candidate.
+func (e *Engine) SignalFinalReview(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if request.From != domain.StateReviewing || request.Trigger != "review_pass" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	ticket, err := e.store.Ticket(ctx, request.Ticket)
+	if err != nil || ticket.State != domain.StateReviewing || ticket.Version != request.TicketVersion {
+		return contracts.TransitionResult{}, store.ErrStaleFence
+	}
+	attributes := map[string]string{}
+	if ticket.Type == domain.TicketSpike {
+		attributes["ticket_type_spike"] = "true"
+		attributes["report_present"] = "true"  // Store independently proves it.
+		attributes["no_merge_effect"] = "true" // Store independently proves it.
+	} else if ticket.MergeMode == domain.MergeGuarded {
+		attributes["ticket_type_not_spike"] = "true"
+		attributes["merge_mode_guarded"] = "true"
+		attributes["all_nonapproval_gates_green"] = "true"
+	} else if ticket.MergeMode == domain.MergeManual {
+		attributes["ticket_type_not_spike"] = "true"
+		attributes["merge_mode_manual"] = "true"
+		attributes["all_nonapproval_gates_green"] = "true"
+	} else {
+		// Autonomous merging remains deliberately unavailable until its separate
+		// qualified merge authority is composed.
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: request.Trigger, Fence: request.Fence, Attributes: attributes, EventPayload: request.EventPayload}, e.store.TransitionFinalReview)
+}
+
+// SignalFinalReviewRepair derives the state-machine branch from the durable
+// reviewer owner, then lets Store consume that same immutable result/budget.
+func (e *Engine) SignalFinalReviewRepair(ctx context.Context, request contracts.SignalRequest, owner string) (contracts.TransitionResult, error) {
+	if request.From != domain.StateReviewing || request.Trigger != "review_repair" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	attributes := map[string]string{"correction_available": "true"}
+	if owner == "builder" {
+		attributes["repair_owner_builder"] = "true"
+	} else if owner == "reviewer" {
+		attributes["repair_owner_verification"] = "true"
+	} else {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: request.Trigger, Fence: request.Fence, Attributes: attributes, EventPayload: request.EventPayload}, e.store.TransitionReviewRepair)
+}
+
+func (e *Engine) SignalFinalReviewNeedsOperator(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if request.From != domain.StateReviewing {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: "typed_blocker", Fence: request.Fence, Attributes: map[string]string{"no_unreconciled_external_mutation": "true"}, EventPayload: `{"code":"review_needs_operator"}`}, e.store.TransitionReviewNeedsOperator)
+}
+
 func (e *Engine) Recover(ctx context.Context, request contracts.RecoveryRequest) error {
 	return e.store.BlockOrphanedWorkflows(ctx, request.Channel, request.LeaderEpoch)
 }

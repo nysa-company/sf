@@ -554,111 +554,8 @@ func TestCompleteProviderAttemptSuccessPersistsAndReparses(t *testing.T) {
 	if err != nil || parsed.Builder == nil || loaded.RawSHA256 != stored.RawSHA256 || loaded.Claim.BindingDigest != claim.BindingDigest || loaded.Claim.LeaseKey != claim.LeaseKey || !bytes.Equal(loaded.Claim.SupervisorKey, claim.SupervisorKey) || loaded.Claim.Input.RequestDigest != claim.Input.RequestDigest {
 		t.Fatalf("load=%+v parsed=%+v err=%v", loaded, parsed, err)
 	}
-	// Candidate authority is exercised by the v36 command-evidence tests. A
-	// bare legacy verification cannot be used as a setup shortcut here.
-	if loaded.RawSHA256 == stored.RawSHA256 {
-		return
-	}
-	// Adoption binds the exact immutable Builder result, current source and
-	// verification, registered worktree/base, and a Store-neutral commit
-	// observation. An exact generation replay creates no new receipts.
-	source := sha256Digest([]byte("candidate source"))
-	if _, err := db.db.ExecContext(ctx, `UPDATE tickets SET source_digest=? WHERE channel=? AND project_id=? AND id=?`, source, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
-		t.Fatal(err)
-	}
-	revision, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: []byte("candidate intent"), Proof: []byte("candidate proof"), OwnedFiles: []string{"verify.txt"}, CheckpointID: strings.Repeat("d", 40)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	builderDigest, err := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot := domain.CandidateSnapshot{Generation: 1, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: source, VerificationIntentDigest: revision.IntentDigest, ProofDigest: revision.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: builderDigest}
-	evidence := CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snapshot, BuilderResult: ProviderAttemptResultKey{AttemptID: claim.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: claim.Attempt}, Commit: CommitObservation{CommitOID: snapshot.HeadSHA, ParentOID: strings.Repeat("d", 40), TreeOID: snapshot.TreeSHA}, Reason: "candidate created"}
-	wrongParent := evidence
-	wrongParent.Commit.ParentOID = snapshot.BaseSHA
-	if _, err := db.RecordCandidate(ctx, wrongParent); !errors.Is(err, ErrEvidenceConflict) {
-		t.Fatalf("protected base accepted as implementation parent: %v", err)
-	}
-	if receipts, err := db.RecordCandidate(ctx, evidence); err != nil || len(receipts) != 4 {
-		t.Fatalf("candidate receipts=%+v err=%v", receipts, err)
-	}
-	storedCandidate, err := db.LatestCandidate(ctx, ticket.Ref)
-	if err != nil || storedCandidate.Snapshot != snapshot || storedCandidate.TicketVersion != ticket.Version || storedCandidate.Fence != fence {
-		t.Fatalf("first candidate round-trip=%+v err=%v", storedCandidate, err)
-	}
-	if receipts, err := db.RecordCandidate(ctx, evidence); err != nil || len(receipts) != 0 {
-		t.Fatalf("candidate replay receipts=%+v err=%v", receipts, err)
-	}
-	zero := evidence
-	zero.Snapshot.Generation = 0
-	if receipts, err := db.RecordCandidate(ctx, zero); err != nil || len(receipts) != 0 {
-		t.Fatalf("zero-generation candidate replay receipts=%+v err=%v", receipts, err)
-	}
-	if err := db.RecordOperatorDecision(ctx, OperatorDecision{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, ReviewedHead: snapshot.HeadSHA, OperatorUID: 501, Decision: "approved"}); err != nil {
-		t.Fatal(err)
-	}
-	next := evidence
-	next.Snapshot.Generation = 0
-	next.Snapshot.HeadSHA = strings.Repeat("e", 40)
-	next.Snapshot.TreeSHA = strings.Repeat("f", 40)
-	next.Commit.CommitOID, next.Commit.TreeOID = next.Snapshot.HeadSHA, next.Snapshot.TreeSHA
-	if receipts, err := db.RecordCandidate(ctx, next); err != nil || len(receipts) != 4 {
-		t.Fatalf("next candidate receipts=%+v err=%v", receipts, err)
-	}
-	storedCandidate, err = db.LatestCandidate(ctx, ticket.Ref)
-	if err != nil || storedCandidate.Snapshot.Generation != 2 || storedCandidate.Snapshot.HeadSHA != next.Snapshot.HeadSHA || storedCandidate.Snapshot.TreeSHA != next.Snapshot.TreeSHA || storedCandidate.Snapshot.BuilderEvidenceDigest != next.Snapshot.BuilderEvidenceDigest || storedCandidate.TicketVersion != ticket.Version || storedCandidate.Fence != fence {
-		t.Fatalf("second candidate round-trip=%+v err=%v", storedCandidate, err)
-	}
-	decisions, err := db.OperatorDecisions(ctx, ticket.Ref)
-	if err != nil || len(decisions) != 1 || !decisions[0].Invalidated {
-		t.Fatalf("approval invalidation=%+v err=%v", decisions, err)
-	}
-	if _, err := db.RecordCandidate(ctx, evidence); !errors.Is(err, ErrEvidenceConflict) {
-		t.Fatalf("older explicit generation replay=%v", err)
-	}
-	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempt_results SET raw_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE provider_attempt_id=?`, claim.ID); err == nil {
-		t.Fatal("immutable result updated")
-	}
-	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); err != nil {
-		t.Fatalf("exact replay=%v", err)
-	}
-	conflict := raw
-	conflict.Artifact = []byte(`{"schema":"sf.builder/v1","summary":"different","changed_files":["main.go"],"commands":[["go","test","./..."]]}`)
-	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, conflict, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); !errors.Is(err, ErrProviderAttempt) {
-		t.Fatalf("conflicting replay=%v", err)
-	}
-	advanced, err := db.InvalidateRunner(ctx, ticket.Ref, ticket.Version, fence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	staleBuilder := evidence
-	staleBuilder.ExpectedVersion = advanced.Version
-	staleBuilder.Fence.RunnerEpoch = advanced.RunnerEpoch
-	if _, err := db.RecordCandidate(ctx, staleBuilder); !errors.Is(err, ErrEvidenceConflict) {
-		t.Fatalf("builder result survived runner recovery: %v", err)
-	}
-	if _, err := db.db.ExecContext(ctx, `UPDATE daemon_instances SET leader_epoch=leader_epoch+1 WHERE channel=?`, ticket.Ref.Channel); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := db.LoadProviderAttemptResult(ctx, claim, ticket.Version, fence); !errors.Is(err, ErrProviderAttempt) {
-		t.Fatalf("stale current fence load=%v", err)
-	}
-	if _, err := db.db.ExecContext(ctx, `UPDATE daemon_instances SET leader_epoch=? WHERE channel=?`, leader, ticket.Ref.Channel); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.db.ExecContext(ctx, `UPDATE provider_qualifications SET binary_digest='dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' WHERE id=?`, claim.QualificationID); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: claim.ID, Ref: claim.Ref, Phase: claim.Phase, Attempt: claim.Attempt}); !errors.Is(err, ErrProviderAttempt) {
-		t.Fatalf("tampered qualification load=%v", err)
-	}
-	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempts SET worktree_path='tampered' WHERE id=?`, claim.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := db.LoadProviderAttemptResult(ctx, claim, ticket.Version, fence); err == nil {
-		t.Fatalf("tampered source load=%v", err)
+	if loaded.RawSHA256 != stored.RawSHA256 {
+		t.Fatal("stored provider result digest drifted")
 	}
 }
 
@@ -1341,7 +1238,7 @@ func TestFailProviderAttemptBudgetMarksLaunchDrained(t *testing.T) {
 	}
 }
 
-func TestFinalReviewValidationUsesDurableCandidateAndVerification(t *testing.T) {
+func TestFinalReviewValidationRejectsUnboundEvidence(t *testing.T) {
 	db, ctx := openTestStore(t)
 	setupProviderProject(t, db, ctx)
 	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "review-evidence")
@@ -1358,26 +1255,12 @@ func TestFinalReviewValidationUsesDurableCandidateAndVerification(t *testing.T) 
 	if _, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: []string{"verify.txt"}, CheckpointID: strings.Repeat("d", 40)}); !errors.Is(err, ErrEvidenceConflict) {
 		t.Fatalf("unbound final-review verification=%v", err)
 	}
-	revision := VerificationRevision{}
-	if revision.Revision == 0 {
-		return
-	}
-	snapshot := domain.CandidateSnapshot{Generation: 1, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: sha256Digest([]byte("source")), VerificationIntentDigest: revision.IntentDigest, ProofDigest: revision.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: sha256Digest([]byte("builder"))}
-	if _, err := db.db.ExecContext(ctx, `INSERT INTO candidate_snapshots(channel,project_id,ticket_id,generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, snapshot.Generation, ticket.Version, fence.LeaderEpoch, fence.RunnerEpoch, snapshot.BaseSHA, snapshot.HeadSHA, snapshot.TreeSHA, snapshot.SourceDigest, snapshot.VerificationIntentDigest, snapshot.ProofDigest, snapshot.CommandPolicyDigest, snapshot.BuilderEvidenceDigest, now()); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.ValidateFinalReviewEvidence(ctx, ticket.Ref, ticket.Version, fence, snapshot.HeadSHA, snapshot.ProofDigest); err != nil {
-		t.Fatalf("durable review evidence rejected: %v", err)
-	}
-	if err := db.ValidateFinalReviewEvidence(ctx, ticket.Ref, ticket.Version, fence, snapshot.HeadSHA, sha256Digest([]byte("wrong"))); !errors.Is(err, ErrEvidenceConflict) {
-		t.Fatalf("caller proof claim accepted: %v", err)
-	}
-	advanced, err := db.InvalidateRunner(ctx, ticket.Ref, ticket.Version, fence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.ValidateFinalReviewEvidence(ctx, ticket.Ref, advanced.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: advanced.RunnerEpoch}, snapshot.HeadSHA, snapshot.ProofDigest); !errors.Is(err, ErrEvidenceConflict) {
-		t.Fatalf("stale candidate accepted after runner fence: %v", err)
+	// No unbound verification/candidate may authorize final review. The full
+	// positive/recovery chain is covered by the Store-backed final-review
+	// worker tests; keep this fixture deliberately negative rather than
+	// returning before it validates anything.
+	if err := db.ValidateFinalReviewEvidence(ctx, ticket.Ref, ticket.Version, fence, strings.Repeat("b", 40), sha256Digest([]byte("proof"))); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("unbound final review evidence accepted: %v", err)
 	}
 }
 

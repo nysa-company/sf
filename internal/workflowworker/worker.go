@@ -58,6 +58,9 @@ type StateMachine interface {
 	SignalPlan(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 	SignalVerification(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 	SignalCandidate(context.Context, contracts.SignalRequest, domain.CandidateSnapshot) (contracts.TransitionResult, error)
+	SignalFinalReview(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
+	SignalFinalReviewRepair(context.Context, contracts.SignalRequest, string) (contracts.TransitionResult, error)
+	SignalFinalReviewNeedsOperator(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 }
 
 // PhaseRequest carries only authenticated Store facts and the current fence.
@@ -186,6 +189,9 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	case domain.StateBuilding:
 		result.Phase = domain.PhaseBuild
 		result.Transitioned, result.Replayed, err = w.building(ctx, ticket, fence)
+	case domain.StateReviewing:
+		result.Phase = domain.PhaseReview
+		result.Transitioned, result.Replayed, err = w.reviewing(ctx, ticket, fence)
 	default:
 		// Waiting states and terminal/control states are scheduler or
 		// operator boundaries; the worker never publishes or reviews them.
@@ -206,6 +212,74 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	}
 	result.State, result.Version = current.State, current.Version
 	return result, nil
+}
+
+// reviewing consumes only an immutable, Store-authenticated final Reviewer
+// result.  A completed result is replayed after a response-loss crash instead
+// of paying for another review.  The Store transition re-checks the exact
+// candidate, proof, result binding, and current fence in one transaction.
+func (w Worker) reviewing(ctx context.Context, ticket store.Ticket, fence domain.Fence) (bool, bool, error) {
+	if ticket.MergeMode == domain.MergeAutonomous {
+		// Autonomous merge is deliberately unavailable in the local guarded
+		// runtime until the separately approved qualification phase exists.
+		return false, false, ErrUnsupportedState
+	}
+	candidate, err := w.Evidence.RecoverableCandidate(ctx, ticket.Ref)
+	if err != nil {
+		return false, false, err
+	}
+	if candidate.Snapshot.HeadSHA == "" || candidate.Snapshot.ProofDigest == "" {
+		return false, false, ErrStaleEvidence
+	}
+	signal := func(reviewer *phaseartifact.Reviewer, replayed bool) (bool, bool, error) {
+		if reviewer == nil || reviewer.ReviewedHead != candidate.Snapshot.HeadSHA || reviewer.ProofDigest != candidate.Snapshot.ProofDigest {
+			return false, replayed, ErrStaleEvidence
+		}
+		switch reviewer.Decision {
+		case phaseartifact.ReviewPass:
+			if err := w.signalFinalReview(ctx, ticket, fence); err != nil {
+				return false, replayed, err
+			}
+		case phaseartifact.ReviewRepair:
+			if err := w.signalFinalReviewRepair(ctx, ticket, fence, reviewer.RepairOwner); err != nil {
+				return false, replayed, err
+			}
+		case phaseartifact.ReviewNeedsOperator:
+			if err := w.signalFinalReviewNeedsOperator(ctx, ticket, fence); err != nil {
+				return false, replayed, err
+			}
+		default:
+			return false, replayed, ErrStaleEvidence
+		}
+		return true, replayed, nil
+	}
+	if reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseReview, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence}); reuseErr == nil {
+		if reusable.Key.Ref != ticket.Ref || reusable.Key.Phase != domain.PhaseReview || reusable.Key.AttemptID <= 0 || reusable.Parsed.Reviewer == nil {
+			return false, true, ErrStaleEvidence
+		}
+		return signal(reusable.Parsed.Reviewer, true)
+	} else if !errors.Is(reuseErr, store.ErrNotFound) {
+		return false, false, reuseErr
+	}
+	if w.Runner == nil {
+		return false, false, ErrNoPhaseRunner
+	}
+	request, err := w.request(ctx, ticket, fence, domain.PhaseReview, nil, nil, &candidate)
+	if err != nil {
+		return false, false, err
+	}
+	if err := w.Evidence.AssertTicketFence(ctx, ticket.Ref, ticket.Version, fence); err != nil {
+		return false, false, err
+	}
+	out, err := w.Runner.Run(ctx, request)
+	if err != nil {
+		return false, false, err
+	}
+	result, parsed, err := w.Evidence.LoadCurrentProviderAttemptResult(ctx, out.ProviderResult, ticket.Version, fence)
+	if err != nil || out.ProviderResult.Ref != ticket.Ref || out.ProviderResult.Phase != domain.PhaseReview || result.Claim.Role != "reviewer" || parsed.Reviewer == nil {
+		return false, false, ErrStaleEvidence
+	}
+	return signal(parsed.Reviewer, false)
 }
 
 func (w Worker) planning(ctx context.Context, ticket store.Ticket, fence domain.Fence) (bool, bool, error) {
@@ -520,23 +594,29 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 			return false, false, err
 		}
 		reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: ticket.Version, Fence: fence})
-		if reuseErr != nil || !reusable.Recovered || reusable.Key != old.BuilderResult {
+		if errors.Is(reuseErr, store.ErrNotFound) {
+			// An authenticated final-review repair boundary deliberately makes
+			// the old candidate's Builder result unavailable. Continue below to
+			// launch the fresh Builder cycle instead of trying to rebind it.
+			err = store.ErrNotFound
+		} else if reuseErr != nil || !reusable.Recovered || reusable.Key != old.BuilderResult {
 			return false, false, ErrStaleEvidence
+		} else {
+			if err := w.rebindStoredCandidate(ctx, ticket, fence, old, reusable); err != nil {
+				return false, true, err
+			}
+			candidate, err = w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
+			if err != nil {
+				return false, true, err
+			}
+			// RecordCandidate plus the Store reload above prove the exact immutable
+			// Builder/command chain. This recovered path must not re-materialize or
+			// re-observe the candidate boundary before signaling it.
+			if err := w.signalCandidate(ctx, ticket, fence, candidate.Snapshot); err != nil {
+				return false, true, err
+			}
+			return true, true, nil
 		}
-		if err := w.rebindStoredCandidate(ctx, ticket, fence, old, reusable); err != nil {
-			return false, true, err
-		}
-		candidate, err = w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
-		if err != nil {
-			return false, true, err
-		}
-		// RecordCandidate plus the Store reload above prove the exact immutable
-		// Builder/command chain. This recovered path must not re-materialize or
-		// re-observe the candidate boundary before signaling it.
-		if err := w.signalCandidate(ctx, ticket, fence, candidate.Snapshot); err != nil {
-			return false, true, err
-		}
-		return true, true, nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {
 		return false, false, err
@@ -666,6 +746,30 @@ func (w Worker) signalCandidate(ctx context.Context, ticket store.Ticket, fence 
 		return store.ErrStaleFence
 	}
 	_, err := w.Engine.SignalCandidate(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: "phase_pass", Fence: fence, Attributes: map[string]string{"proof_green": "true", "diff_valid": "true", "git_control_plane_valid": "true", "candidate_checkpoint_committed": "true"}, EventPayload: "{}"}, candidate)
+	return err
+}
+
+func (w Worker) signalFinalReview(ctx context.Context, ticket store.Ticket, fence domain.Fence) error {
+	if fence.RunnerEpoch != ticket.RunnerEpoch {
+		return store.ErrStaleFence
+	}
+	_, err := w.Engine.SignalFinalReview(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: "review_pass", Fence: fence, EventPayload: "{}"})
+	return err
+}
+
+func (w Worker) signalFinalReviewRepair(ctx context.Context, ticket store.Ticket, fence domain.Fence, owner string) error {
+	if fence.RunnerEpoch != ticket.RunnerEpoch {
+		return store.ErrStaleFence
+	}
+	_, err := w.Engine.SignalFinalReviewRepair(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: "review_repair", Fence: fence, EventPayload: "{}"}, owner)
+	return err
+}
+
+func (w Worker) signalFinalReviewNeedsOperator(ctx context.Context, ticket store.Ticket, fence domain.Fence) error {
+	if fence.RunnerEpoch != ticket.RunnerEpoch {
+		return store.ErrStaleFence
+	}
+	_, err := w.Engine.SignalFinalReviewNeedsOperator(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Fence: fence})
 	return err
 }
 

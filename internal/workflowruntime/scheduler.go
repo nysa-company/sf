@@ -243,7 +243,7 @@ func (s Scheduler) activeState(state domain.State) bool {
 	// while a pre-publishing runtime uses the same admission to durably block.
 	// waiting_ci is intentionally absent. It is a passive observation state and
 	// must never cause a scheduler retry or external command.
-	return state == domain.StatePlanning || state == domain.StateVerifying || state == domain.StateBuilding || state == domain.StatePublishing
+	return state == domain.StatePlanning || state == domain.StateVerifying || state == domain.StateBuilding || state == domain.StatePublishing || state == domain.StateReviewing
 }
 
 func classify(err error, fence domain.Fence, ref domain.TicketRef) TickResult {

@@ -23,6 +23,7 @@ type phaseStore struct {
 	plan      store.StoredPlan
 	verify    store.StoredVerification
 	hasVerify bool
+	final     *store.FinalReviewAuthority
 	results   map[int64]store.ProviderAttemptResult
 	parsed    map[int64]phaseartifact.Parsed
 	asserts   int
@@ -45,6 +46,12 @@ func (s *phaseStore) CurrentVerification(context.Context, domain.TicketRef) (sto
 		return store.StoredVerification{}, store.ErrNotFound
 	}
 	return s.verify, nil
+}
+func (s *phaseStore) FinalReviewAuthority(context.Context, domain.TicketRef, uint64, domain.Fence) (store.FinalReviewAuthority, error) {
+	if s.final != nil {
+		return *s.final, nil
+	}
+	return store.FinalReviewAuthority{}, store.ErrNotFound
 }
 func (s *phaseStore) AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error {
 	s.asserts++
@@ -198,6 +205,44 @@ func TestPhaseRunnerBuildUsesExactVerificationAndRejectsRefusals(t *testing.T) {
 	evidence.plan.Document.Planner.Paths = []string{"."}
 	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); !errors.Is(err, ErrProviderResultInvalid) || coordinator.calls != 0 {
 		t.Fatalf("tampered plan err=%v calls=%d", err, coordinator.calls)
+	}
+}
+
+func TestPhaseRunnerFinalReviewUsesStoreAuthenticatedCandidateAndChecks(t *testing.T) {
+	request, evidence, coordinator, plan, verification := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseReview, domain.StateReviewing
+	evidence.ticket = request.Ticket
+	builder := phaseartifact.Builder{Schema: "sf.builder/v1", Summary: "implemented", ChangedFiles: []string{"internal/feature.go"}, Commands: [][]string{{"go", "test", "./..."}}}
+	builderDigest, err := phaseartifact.BuilderEvidenceDigest(builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builderKey := store.ProviderAttemptResultKey{AttemptID: 18, Ref: request.Ticket.Ref, Phase: domain.PhaseBuild, Attempt: 1}
+	builderResult := phaseProviderResult(builderKey, request, providercoord.RoleBuilder)
+	evidence.results[builderKey.AttemptID] = builderResult
+	evidence.parsed[builderKey.AttemptID] = phaseartifact.Parsed{Phase: domain.PhaseBuild, Provider: builderResult.Claim.Binding.Identity, Builder: &builder}
+	candidate := store.StoredCandidate{Snapshot: domain.CandidateSnapshot{Generation: 1, BaseSHA: request.Worktree.BaseSHA, HeadSHA: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", TreeSHA: "ffffffffffffffffffffffffffffffffffffffff", SourceDigest: request.Ticket.SourceDigest, VerificationIntentDigest: verification.IntentDigest, ProofDigest: verification.ProofDigest, CommandPolicyDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", BuilderEvidenceDigest: builderDigest}, TicketVersion: request.Ticket.Version, Fence: request.Fence, BuilderResult: builderKey, Commit: store.CommitObservation{CommitOID: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", ParentOID: evidence.verify.Checkpoint.CommitOID, TreeOID: "ffffffffffffffffffffffffffffffffffffffff"}}
+	checks, err := workflowprompt.NewChecksIdentity("42", candidate.Snapshot.HeadSHA, []workflowprompt.Check{{Name: "unit", ExternalID: "run-1", Status: "success"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence.final = &store.FinalReviewAuthority{Candidate: candidate, Verification: evidence.verify, Checks: checks}
+	request.Candidate = &candidate
+	key := store.ProviderAttemptResultKey{AttemptID: 19, Ref: request.Ticket.Ref, Phase: domain.PhaseReview, Attempt: 1}
+	result := phaseProviderResult(key, request, providercoord.RoleReviewer)
+	reviewer := phaseartifact.Reviewer{Schema: "sf.reviewer/v1", Decision: phaseartifact.ReviewPass, ReviewedHead: candidate.Snapshot.HeadSHA, ProofDigest: candidate.Snapshot.ProofDigest}
+	evidence.results[key.AttemptID] = result
+	evidence.parsed[key.AttemptID] = phaseartifact.Parsed{Phase: domain.PhaseReview, Provider: result.Claim.Binding.Identity, Reviewer: &reviewer}
+	coordinator.result = providercoord.Result{Code: providercoord.Completed, ProviderResult: key}
+	bindCoordinatorResult(t, coordinator, evidence, key, 0)
+
+	out, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request)
+	if err != nil || out.ProviderResult != key {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+	want := phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ExpectedReviewedHead: candidate.Snapshot.HeadSHA, ExpectedProofDigest: candidate.Snapshot.ProofDigest}
+	if coordinator.request.Role != providercoord.RoleReviewer || coordinator.request.Input.Phase != domain.PhaseReview || !reflect.DeepEqual(coordinator.request.Validation, want) {
+		t.Fatalf("request=%+v", coordinator.request)
 	}
 }
 

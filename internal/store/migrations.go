@@ -1096,3 +1096,28 @@ var migrationV43 = []string{
 		OR (o.classification='pending' AND (EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state IN ('failure','cancelled')) OR NOT EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state='pending')))
 		OR (o.classification='green' AND EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state<>'success')))) BEGIN SELECT RAISE(ABORT,'ci observation check reducer mismatch'); END`,
 }
+
+// v44 makes a final-review repair an explicit, immutable predecessor boundary.
+// A repair moves back to Building or Verifying, but the result from that target
+// phase belongs to the rejected candidate generation and must never be replayed
+// into the next cycle, including after a runner recovery.
+var migrationV44 = []string{
+	`CREATE TABLE final_review_repair_boundaries (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		target_state TEXT NOT NULL CHECK(target_state IN ('verifying','building')),
+		transition_ticket_version INTEGER NOT NULL CHECK(transition_ticket_version > 0),
+		reviewer_attempt_id INTEGER NOT NULL CHECK(reviewer_attempt_id > 0), reviewer_attempt INTEGER NOT NULL CHECK(reviewer_attempt > 0), reviewer_typed_sha256 TEXT NOT NULL CHECK(length(reviewer_typed_sha256)=64),
+		prior_verification_revision INTEGER NOT NULL CHECK(prior_verification_revision > 0), amendment_reason TEXT NOT NULL CHECK(length(amendment_reason) BETWEEN 1 AND 2000), requester TEXT NOT NULL CHECK(length(requester) BETWEEN 1 AND 200),
+		correction_budget_kind TEXT NOT NULL CHECK(correction_budget_kind='correction'), correction_budget_request_id TEXT NOT NULL CHECK(length(correction_budget_request_id) BETWEEN 1 AND 300),
+		consumed_ticket_version INTEGER NOT NULL CHECK(consumed_ticket_version > 0), consumed_leader_epoch INTEGER NOT NULL CHECK(consumed_leader_epoch > 0), consumed_runner_epoch INTEGER NOT NULL CHECK(consumed_runner_epoch > 0),
+		created_at TEXT NOT NULL CHECK(length(created_at) BETWEEN 1 AND 128),
+		PRIMARY KEY(channel,project_id,ticket_id,transition_ticket_version),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(channel,project_id,ticket_id,correction_budget_kind,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch) REFERENCES ticket_budget_uses(channel,project_id,ticket_id,kind,request_id,ticket_version,leader_epoch,runner_epoch),
+		CHECK(transition_ticket_version=consumed_ticket_version+1)
+	)`,
+	`CREATE INDEX final_review_repair_boundaries_target ON final_review_repair_boundaries(channel,project_id,ticket_id,target_state,transition_ticket_version DESC)`,
+	`CREATE UNIQUE INDEX final_review_repair_boundaries_reviewer ON final_review_repair_boundaries(channel,project_id,ticket_id,reviewer_attempt_id,reviewer_attempt,transition_ticket_version)`,
+	`CREATE TRIGGER final_review_repair_boundaries_immutable_update BEFORE UPDATE ON final_review_repair_boundaries BEGIN SELECT RAISE(ABORT,'final review repair boundary is immutable'); END`,
+	`CREATE TRIGGER final_review_repair_boundaries_immutable_delete BEFORE DELETE ON final_review_repair_boundaries BEGIN SELECT RAISE(ABORT,'final review repair boundary is append-only'); END`,
+}

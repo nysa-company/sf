@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/phaseartifact"
 	_ "modernc.org/sqlite"
 )
 
@@ -59,7 +60,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 43
+const schemaVersion = 44
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -105,6 +106,7 @@ var migrationChecksums = map[int]string{
 	41: migrationChecksum(migrationV41),
 	42: migrationChecksum(migrationV42),
 	43: migrationChecksum(migrationV43),
+	44: migrationChecksum(migrationV44),
 }
 
 func migrationChecksum(statements []string) string {
@@ -450,6 +452,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV42
 			} else if version == 43 {
 				statements = migrationV43
+			} else if version == 44 {
+				statements = migrationV44
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -677,6 +681,9 @@ func (s *Store) CreateTicket(ctx context.Context, ticket Ticket) error {
 	if ticket.SourceDigest == "" || !ticket.Type.Valid() || !ticket.MergeMode.Valid() {
 		return fmt.Errorf("ticket source digest, type, and merge mode are required")
 	}
+	if ticket.Type == domain.TicketSpike && ticket.MergeMode == domain.MergeAutonomous {
+		return fmt.Errorf("spike tickets cannot request autonomous merge")
+	}
 	if ticket.State == "" {
 		ticket.State = domain.StateQueued
 	}
@@ -768,6 +775,9 @@ func (s *Store) submitTicket(ctx context.Context, ticket Ticket, allowNew bool, 
 func validateTicketInput(ticket Ticket) error {
 	if ticket.SourceDigest == "" || !ticket.Type.Valid() || !ticket.MergeMode.Valid() {
 		return fmt.Errorf("ticket source digest, type, and merge mode are required")
+	}
+	if ticket.Type == domain.TicketSpike && ticket.MergeMode == domain.MergeAutonomous {
+		return fmt.Errorf("spike tickets cannot request autonomous merge")
 	}
 	if len(ticket.Source) > 0 {
 		sum := sha256.Sum256(ticket.Source)
@@ -1372,6 +1382,106 @@ func (s *Store) TransitionVerification(ctx context.Context, transition Transitio
 	})
 }
 
+// TransitionFinalReview consumes the exact final Reviewer attempt in the same
+// transaction as reviewing -> waiting_*.  Provider-result rows are immutable
+// and already bind the parsed pass artifact to the current ticket fence; this
+// method is the missing lifecycle consumer that closes the crash window after
+// provider completion but before the transition response reaches the worker.
+func (s *Store) TransitionFinalReview(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if transition.From != domain.StateReviewing || transition.Trigger != "review_pass" || (transition.To != domain.StateWaitingApproval && transition.To != domain.StateWaitingManualMerge && transition.To != domain.StateDone) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	return s.transitionWithEvidence(ctx, transition, func(ctx context.Context, conn *sql.Conn, version, runner uint64) error {
+		var ticketType domain.TicketType
+		var mergeMode domain.MergeMode
+		if err := conn.QueryRowContext(ctx, `SELECT ticket_type,merge_mode FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&ticketType, &mergeMode); err != nil {
+			return err
+		}
+		if (ticketType == domain.TicketSpike && transition.To != domain.StateDone) || (ticketType != domain.TicketSpike && ((mergeMode == domain.MergeGuarded && transition.To != domain.StateWaitingApproval) || (mergeMode == domain.MergeManual && transition.To != domain.StateWaitingManualMerge) || mergeMode == domain.MergeAutonomous || transition.To == domain.StateDone)) {
+			return ErrEvidenceConflict
+		}
+		authority, _, reviewer, err := s.finalReviewerResult(ctx, conn, transition.Ref, version, transition.Fence)
+		if err != nil || reviewer.Decision != phaseartifact.ReviewPass {
+			return ErrEvidenceConflict
+		}
+		if ticketType == domain.TicketSpike {
+			_, verification, err := s.loadHistoricalProviderAttemptResult(ctx, conn, authority.Verification.ProviderResult)
+			if err != nil || verification.Verify == nil || verification.Verify.PrebuildOutcome != "report_ready" {
+				return ErrEvidenceConflict
+			}
+			var mergeEffects, mergeIntents int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND effect_kind='merge'`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&mergeEffects); err != nil || mergeEffects != 0 {
+				return ErrEvidenceConflict
+			}
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&mergeIntents); err != nil || mergeIntents != 0 {
+				return ErrEvidenceConflict
+			}
+		}
+		return nil
+	})
+}
+
+// TransitionReviewRepair consumes an exact Reviewer repair result and its
+// durable correction budget in the same transaction as the lifecycle move.
+func (s *Store) TransitionReviewRepair(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if transition.From != domain.StateReviewing || transition.Trigger != "review_repair" || (transition.To != domain.StateBuilding && transition.To != domain.StateVerifying) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	return s.transitionWithEvidence(ctx, transition, func(ctx context.Context, conn *sql.Conn, version, runner uint64) error {
+		authority, result, reviewer, err := s.finalReviewerResult(ctx, conn, transition.Ref, version, transition.Fence)
+		if err != nil || reviewer.Decision != phaseartifact.ReviewRepair || (reviewer.RepairOwner == "builder" && transition.To != domain.StateBuilding) || (reviewer.RepairOwner == "reviewer" && transition.To != domain.StateVerifying) || (reviewer.RepairOwner != "builder" && reviewer.RepairOwner != "reviewer") {
+			return ErrEvidenceConflict
+		}
+		requestID := fmt.Sprintf("final-review/%d/%s", result.AttemptID, result.TypedSHA256)
+		if _, err = s.consumeBudgetDuringTransition(ctx, conn, BudgetUse{Ref: transition.Ref, ExpectedVersion: version, Fence: transition.Fence, Kind: "correction", RequestID: requestID}); err != nil {
+			return err
+		}
+		// This immutable row is the repair-cycle cutover.  It intentionally
+		// names the exact final-review result and budget use that invalidated
+		// the previous target-phase result, so a later worker/recovery cannot
+		// mistake that old Builder or Verifier output for a replay candidate.
+		reason := strings.Join(reviewer.Findings, "\n")
+		if authority.Verification.Revision.Revision == 0 || !boundedText(reason, 2_000) {
+			return ErrEvidenceConflict
+		}
+		_, err = conn.ExecContext(ctx, `INSERT INTO final_review_repair_boundaries(channel,project_id,ticket_id,target_state,transition_ticket_version,reviewer_attempt_id,reviewer_attempt,reviewer_typed_sha256,prior_verification_revision,amendment_reason,requester,correction_budget_kind,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.To, version+1, result.AttemptID, result.Claim.Attempt, result.TypedSHA256, authority.Verification.Revision.Revision, reason, "final-reviewer", "correction", requestID, version, transition.Fence.LeaderEpoch, runner, time.Now().UTC().Format(time.RFC3339Nano))
+		return err
+	})
+}
+
+// TransitionReviewNeedsOperator records an exact reviewer escalation as a
+// typed blocked state. It never treats provider prose as a resume authority.
+func (s *Store) TransitionReviewNeedsOperator(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if transition.From != domain.StateReviewing || transition.Trigger != "typed_blocker" || transition.To != domain.StateBlocked || transition.ResumeState != domain.StateReviewing || transition.EventPayload != `{"code":"review_needs_operator"}` {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	return s.transitionWithEvidence(ctx, transition, func(ctx context.Context, conn *sql.Conn, version, runner uint64) error {
+		_, _, reviewer, err := s.finalReviewerResult(ctx, conn, transition.Ref, version, transition.Fence)
+		if err != nil || reviewer.Decision != phaseartifact.ReviewNeedsOperator || reviewer.RepairOwner != "operator" {
+			return ErrEvidenceConflict
+		}
+		return nil
+	})
+}
+
+func (s *Store) finalReviewerResult(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, version uint64, fence domain.Fence) (FinalReviewAuthority, ProviderAttemptResult, phaseartifact.Reviewer, error) {
+	authority, err := s.finalReviewAuthorityFrom(ctx, conn, ref, version, fence)
+	if err != nil {
+		return FinalReviewAuthority{}, ProviderAttemptResult{}, phaseartifact.Reviewer{}, ErrEvidenceConflict
+	}
+	var attemptID int64
+	var attempt int
+	if err := conn.QueryRowContext(ctx, `SELECT r.provider_attempt_id,r.attempt FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id WHERE r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase='review' AND r.role='reviewer' AND a.state='completed' AND a.outcome='completed' ORDER BY r.provider_attempt_id DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket).Scan(&attemptID, &attempt); err != nil || attemptID <= 0 || attempt <= 0 {
+		return FinalReviewAuthority{}, ProviderAttemptResult{}, phaseartifact.Reviewer{}, ErrEvidenceConflict
+	}
+	key := ProviderAttemptResultKey{AttemptID: attemptID, Ref: ref, Phase: domain.PhaseReview, Attempt: attempt}
+	result, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, conn, key)
+	if err != nil || result.Claim.Role != "reviewer" || parsed.Reviewer == nil || parsed.Reviewer.ReviewedHead != authority.Candidate.Snapshot.HeadSHA || parsed.Reviewer.ProofDigest != authority.Candidate.Snapshot.ProofDigest || providerResultReachesFence(ctx, conn, key, result, version, fence) != nil {
+		return FinalReviewAuthority{}, ProviderAttemptResult{}, phaseartifact.Reviewer{}, ErrEvidenceConflict
+	}
+	return authority, result, *parsed.Reviewer, nil
+}
+
 func (s *Store) transitionWithEvidence(ctx context.Context, transition Transition, check func(context.Context, *sql.Conn, uint64, uint64) error) (TransitionResult, error) {
 	if transition.Ref.Validate() != nil || !transition.To.Valid() || !transition.From.Valid() || transition.Trigger == "" {
 		return TransitionResult{}, ErrEvidenceConflict
@@ -1381,6 +1491,16 @@ func (s *Store) transitionWithEvidence(ctx context.Context, transition Transitio
 	}
 	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
 		return TransitionResult{}, ErrEvidenceConflict
+	}
+	blockedCode := ""
+	if transition.To == domain.StateBlocked && transition.Trigger == "typed_blocker" {
+		var blocker struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal([]byte(transition.EventPayload), &blocker) != nil || !boundedText(blocker.Code, 128) {
+			return TransitionResult{}, ErrEvidenceConflict
+		}
+		blockedCode = blocker.Code
 	}
 	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
 		return TransitionResult{}, err
@@ -1401,7 +1521,7 @@ func (s *Store) transitionWithEvidence(ctx context.Context, transition Transitio
 		if err := check(ctx, conn, version, runner); err != nil {
 			return err
 		}
-		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?,resume_state=?,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
+		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?,resume_state=?,blocked_code=CASE WHEN ?<>'' THEN ? WHEN state='blocked' THEN '' ELSE blocked_code END,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), blockedCode, blockedCode, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
 		if err != nil {
 			return err
 		}

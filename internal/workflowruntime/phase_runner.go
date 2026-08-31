@@ -26,13 +26,14 @@ type PhaseEvidence interface {
 	Worktree(context.Context, domain.TicketRef) (store.StoredWorktree, error)
 	Plan(context.Context, domain.TicketRef) (store.StoredPlan, error)
 	CurrentVerification(context.Context, domain.TicketRef) (store.StoredVerification, error)
+	FinalReviewAuthority(context.Context, domain.TicketRef, uint64, domain.Fence) (store.FinalReviewAuthority, error)
 	AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error
 	LoadCurrentProviderAttemptResult(context.Context, store.ProviderAttemptResultKey, uint64, domain.Fence) (store.ProviderAttemptResult, phaseartifact.Parsed, error)
 }
 
-// PhaseRunner adapts the qualified coordinator to workflowworker for the
-// three pre-publishing phases. Final review is intentionally not admitted
-// here: publishing owns its exact-head orchestration.
+// PhaseRunner adapts the qualified coordinator to workflowworker for every
+// provider phase that has Store-authenticated evidence. Publication remains
+// outside this boundary; review is admitted only from FinalReviewAuthority.
 type PhaseRunner struct {
 	Store       PhaseEvidence
 	Coordinator PlannerCoordinator
@@ -63,9 +64,46 @@ func (r PhaseRunner) Run(ctx context.Context, request workflowworker.PhaseReques
 		return r.verification(ctx, request)
 	case domain.PhaseBuild:
 		return r.build(ctx, request)
+	case domain.PhaseReview:
+		return r.finalReview(ctx, request)
 	default:
 		return workflowworker.PhaseResult{}, ErrPhaseBoundaryUnavailable
 	}
+}
+
+func (r PhaseRunner) finalReview(ctx context.Context, request workflowworker.PhaseRequest) (workflowworker.PhaseResult, error) {
+	if request.Candidate == nil {
+		return workflowworker.PhaseResult{}, ErrIdentityMismatch
+	}
+	project, effective, worktree, err := r.admit(ctx, request, domain.StateReviewing, "reviewer")
+	if err != nil {
+		return workflowworker.PhaseResult{}, err
+	}
+	authority, err := r.Store.FinalReviewAuthority(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+	if err != nil || authority.Candidate.Snapshot != request.Candidate.Snapshot {
+		return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+	}
+	_, plan, err := r.planIdentity(ctx, request, project, worktree)
+	if err != nil {
+		return workflowworker.PhaseResult{}, err
+	}
+	verification, err := r.finalVerificationIdentity(ctx, request, project, worktree, plan, authority.Verification)
+	if err != nil {
+		return workflowworker.PhaseResult{}, err
+	}
+	_, parsed, err := r.loadHistorical(ctx, authority.Candidate.BuilderResult, request.Ticket.Ref, project, worktree, domain.PhaseBuild, providercoord.RoleBuilder)
+	if err != nil || parsed.Builder == nil {
+		return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+	}
+	candidate, err := workflowprompt.NewCandidateIdentity(authority.Candidate.Snapshot.BaseSHA, authority.Candidate.Snapshot.HeadSHA, authority.Candidate.Snapshot.TreeSHA, authority.Candidate.Snapshot.SourceDigest, authority.Candidate.Snapshot.VerificationIntentDigest, authority.Candidate.Snapshot.ProofDigest, authority.Candidate.Snapshot.CommandPolicyDigest, *parsed.Builder, authority.Candidate.Snapshot.BuilderEvidenceDigest)
+	if err != nil {
+		return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+	}
+	input, err := workflowprompt.FinalReviewer(workflowprompt.FinalReviewerInput{Ticket: phaseTicket(request.Ticket), Workspace: phaseWorkspace(project, worktree, plan.Plan.Paths), Plan: plan, Verification: verification, Candidate: candidate, Checks: authority.Checks, Runtime: phaseRuntime(effective.PhaseTimeout)})
+	if err != nil {
+		return workflowworker.PhaseResult{}, ErrConfigSnapshotInvalid
+	}
+	return r.run(ctx, request, project, worktree, providercoord.RoleReviewer, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ExpectedReviewedHead: candidate.HeadSHA, ExpectedProofDigest: candidate.ProofDigest})
 }
 
 func (r PhaseRunner) verification(ctx context.Context, request workflowworker.PhaseRequest) (workflowworker.PhaseResult, error) {
@@ -243,6 +281,24 @@ func (r PhaseRunner) verificationIdentity(ctx context.Context, request workfloww
 	return identity, nil
 }
 
+func (r PhaseRunner) finalVerificationIdentity(ctx context.Context, request workflowworker.PhaseRequest, project store.Project, worktree store.StoredWorktree, plan workflowprompt.PlanIdentity, verification store.StoredVerification) (workflowprompt.VerificationIdentity, error) {
+	if verification.ProviderResult.AttemptID <= 0 || verification.ProviderResult.Ref != request.Ticket.Ref || verification.ProviderResult.Phase != domain.PhaseVerification || verification.Checkpoint.CommitOID != verification.Revision.CheckpointID || verification.Checkpoint.ParentOID == "" || verification.Checkpoint.TreeOID == "" {
+		return workflowprompt.VerificationIdentity{}, ErrProviderResultInvalid
+	}
+	_, parsed, err := r.loadHistorical(ctx, verification.ProviderResult, request.Ticket.Ref, project, worktree, domain.PhaseVerification, providercoord.RoleReviewer)
+	if err != nil || parsed.Verify == nil {
+		return workflowprompt.VerificationIdentity{}, ErrProviderResultInvalid
+	}
+	identity, err := workflowprompt.NewVerificationIdentity(*parsed.Verify, verification.Revision.IntentDigest, verification.Revision.ProofDigest, verification.Revision.CheckpointID)
+	if err != nil || !reflect.DeepEqual(identity.OwnedFiles, verification.Revision.OwnedFiles) {
+		return workflowprompt.VerificationIdentity{}, ErrProviderResultInvalid
+	}
+	if _, err := workflowprompt.ValidateVerificationIdentity(phaseTicket(request.Ticket), plan, identity); err != nil {
+		return workflowprompt.VerificationIdentity{}, ErrProviderResultInvalid
+	}
+	return identity, nil
+}
+
 func (r PhaseRunner) run(ctx context.Context, request workflowworker.PhaseRequest, project store.Project, worktree store.StoredWorktree, role providercoord.Role, input contracts.PhaseInput, validation phaseartifact.Validation) (workflowworker.PhaseResult, error) {
 	// This is intentionally the last operation before entering the coordinator.
 	// Historical predecessor evidence may have old fences; the newly launched
@@ -317,6 +373,8 @@ func parsedForPhase(parsed phaseartifact.Parsed, phase domain.Phase) bool {
 		return parsed.Verify != nil
 	case domain.PhaseBuild:
 		return parsed.Builder != nil
+	case domain.PhaseReview:
+		return parsed.Reviewer != nil
 	default:
 		return false
 	}

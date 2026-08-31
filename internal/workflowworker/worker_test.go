@@ -92,7 +92,7 @@ func (f *fakeEvidence) LoadCurrentProviderAttemptResult(_ context.Context, key s
 		copy.AcceptanceDigest = identity.Digest
 		p.Verify = &copy
 	}
-	return store.ProviderAttemptResult{Claim: store.ProviderAttemptClaim{ID: key.AttemptID, Attempt: key.Attempt, Ref: testRef, Phase: key.Phase, ExpectedVersion: f.ticket.Version, LeaderEpoch: testFence.LeaderEpoch, RunnerEpoch: testFence.RunnerEpoch, Role: map[domain.Phase]string{domain.PhasePlanning: "planner", domain.PhaseVerification: "reviewer", domain.PhaseBuild: "builder"}[key.Phase]}}, p, nil
+	return store.ProviderAttemptResult{Claim: store.ProviderAttemptClaim{ID: key.AttemptID, Attempt: key.Attempt, Ref: testRef, Phase: key.Phase, ExpectedVersion: f.ticket.Version, LeaderEpoch: testFence.LeaderEpoch, RunnerEpoch: testFence.RunnerEpoch, Role: map[domain.Phase]string{domain.PhasePlanning: "planner", domain.PhaseVerification: "reviewer", domain.PhaseBuild: "builder", domain.PhaseReview: "reviewer"}[key.Phase]}}, p, nil
 }
 func (f *fakeEvidence) LoadHistoricalProviderAttemptResult(ctx context.Context, key store.ProviderAttemptResultKey) (store.ProviderAttemptResult, phaseartifact.Parsed, error) {
 	return f.LoadCurrentProviderAttemptResult(ctx, key, f.ticket.Version, testFence)
@@ -151,6 +151,31 @@ type fakeEngine struct {
 func (e *fakeEngine) SignalCandidate(ctx context.Context, req contracts.SignalRequest, _ domain.CandidateSnapshot) (contracts.TransitionResult, error) {
 	return e.Signal(ctx, req)
 }
+func (e *fakeEngine) SignalFinalReview(ctx context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if e.state.Type == domain.TicketSpike {
+		req.Attributes = map[string]string{"ticket_type_spike": "true", "report_present": "true", "no_merge_effect": "true"}
+	} else if e.state.MergeMode == domain.MergeGuarded {
+		req.Attributes = map[string]string{"ticket_type_not_spike": "true", "merge_mode_guarded": "true", "all_nonapproval_gates_green": "true"}
+	} else {
+		req.Attributes = map[string]string{"ticket_type_not_spike": "true", "merge_mode_manual": "true", "all_nonapproval_gates_green": "true"}
+	}
+	return e.Signal(ctx, req)
+}
+
+func (e *fakeEngine) SignalFinalReviewRepair(ctx context.Context, req contracts.SignalRequest, owner string) (contracts.TransitionResult, error) {
+	req.Attributes = map[string]string{"correction_available": "true"}
+	if owner == "builder" {
+		req.Attributes["repair_owner_builder"] = "true"
+	} else {
+		req.Attributes["repair_owner_verification"] = "true"
+	}
+	return e.Signal(ctx, req)
+}
+func (e *fakeEngine) SignalFinalReviewNeedsOperator(ctx context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
+	req.Trigger = "typed_blocker"
+	req.EventPayload = `{"code":"review_needs_operator"}`
+	return e.Signal(ctx, req)
+}
 func (e *fakeEngine) SignalPlan(ctx context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
 	return e.Signal(ctx, req)
 }
@@ -177,6 +202,24 @@ func (e *fakeEngine) Signal(_ context.Context, req contracts.SignalRequest) (con
 		case domain.StateBuilding:
 			e.state.State = domain.StatePublishing
 		}
+	case "review_pass":
+		if req.From == domain.StateReviewing {
+			if req.Attributes["ticket_type_spike"] == "true" {
+				e.state.State = domain.StateDone
+			} else if req.Attributes["merge_mode_guarded"] == "true" {
+				e.state.State = domain.StateWaitingApproval
+			} else {
+				e.state.State = domain.StateWaitingManualMerge
+			}
+		}
+	case "review_repair":
+		if req.Attributes["repair_owner_builder"] == "true" {
+			e.state.State = domain.StateBuilding
+		} else {
+			e.state.State = domain.StateVerifying
+		}
+	case "typed_blocker":
+		e.state.State = domain.StateBlocked
 	case "needs_operator_input":
 		e.state.State = domain.StatePaused
 	case "verification_amendment_requested":
@@ -253,6 +296,16 @@ func builderOutput(amend bool) fakePhase {
 	}
 	return fakePhase{parsed: phaseartifact.Parsed{Phase: domain.PhaseBuild, Provider: provider(), Builder: b}, result: PhaseResult{ProviderResult: store.ProviderAttemptResultKey{AttemptID: 3, Ref: testRef, Phase: domain.PhaseBuild, Attempt: 1}}}
 }
+func finalReviewOutput() fakePhase {
+	return finalReviewOutcome(phaseartifact.ReviewPass, "")
+}
+func finalReviewOutcome(decision phaseartifact.ReviewDecision, owner string) fakePhase {
+	r := &phaseartifact.Reviewer{Schema: "sf.reviewer/v1", Decision: decision, RepairOwner: owner, ReviewedHead: oid, ProofDigest: digest}
+	if decision != phaseartifact.ReviewPass {
+		r.Findings = []string{"fix exact finding"}
+	}
+	return fakePhase{parsed: phaseartifact.Parsed{Phase: domain.PhaseReview, Provider: provider(), Reviewer: r}, result: PhaseResult{ProviderResult: store.ProviderAttemptResultKey{AttemptID: 4, Ref: testRef, Phase: domain.PhaseReview, Attempt: 1}}}
+}
 
 func newWorker(state domain.State, runner *fakeRunner, evidence *fakeEvidence, engine *fakeEngine) Worker {
 	evidence.ticket = ticket(state)
@@ -306,6 +359,71 @@ func TestPlannerPassAndQuestions(t *testing.T) {
 				t.Fatalf("plans=%d", e.plans)
 			}
 		})
+	}
+}
+
+func TestFinalReviewPassTransitionsOnlyToModeWaitingStateAndReplays(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode domain.MergeMode
+		want domain.State
+	}{{"guarded", domain.MergeGuarded, domain.StateWaitingApproval}, {"manual", domain.MergeManual, domain.StateWaitingManualMerge}} {
+		t.Run(tc.name, func(t *testing.T) {
+			evidence := &fakeEvidence{hasCandidate: true, candidate: store.StoredCandidate{Snapshot: domain.CandidateSnapshot{Generation: 1, BaseSHA: oid, HeadSHA: oid, TreeSHA: oid, SourceDigest: digest, VerificationIntentDigest: digest, ProofDigest: digest, CommandPolicyDigest: digest, BuilderEvidenceDigest: digest}, TicketVersion: 1, Fence: testFence}}
+			engine := &fakeEngine{}
+			runner := &fakeRunner{outputs: []fakePhase{finalReviewOutput()}}
+			worker := newWorker(domain.StateReviewing, runner, evidence, engine)
+			evidence.ticket.MergeMode = tc.mode
+			if got, err := worker.Run(context.Background(), testRef, testFence); err != nil || !got.Transitioned || got.Replayed || engine.state.State != tc.want {
+				t.Fatalf("fresh run=%+v err=%v state=%s", got, err, engine.state.State)
+			}
+
+			// Recreate the reviewing snapshot as it would appear after a crash
+			// before SignalFinalReview's response. The immutable attempt is
+			// reused; no second provider call is allowed.
+			evidence.ticket.State, evidence.ticket.Version = domain.StateReviewing, 1
+			engine.state = &evidence.ticket
+			if got, err := worker.Run(context.Background(), testRef, testFence); err != nil || !got.Transitioned || !got.Replayed || len(runner.requests) != 1 || engine.state.State != tc.want {
+				t.Fatalf("replay=%+v err=%v calls=%d state=%s", got, err, len(runner.requests), engine.state.State)
+			}
+		})
+	}
+}
+
+func TestFinalReviewRepairOperatorAndSpikeOutcomesAreTyped(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		decision   phaseartifact.ReviewDecision
+		owner      string
+		ticketType domain.TicketType
+		mergeMode  domain.MergeMode
+		want       domain.State
+	}{
+		{name: "builder repair", decision: phaseartifact.ReviewRepair, owner: "builder", ticketType: domain.TicketFeature, mergeMode: domain.MergeGuarded, want: domain.StateBuilding},
+		{name: "reviewer repair", decision: phaseartifact.ReviewRepair, owner: "reviewer", ticketType: domain.TicketFeature, mergeMode: domain.MergeGuarded, want: domain.StateVerifying},
+		{name: "operator escalation", decision: phaseartifact.ReviewNeedsOperator, owner: "operator", ticketType: domain.TicketFeature, mergeMode: domain.MergeGuarded, want: domain.StateBlocked},
+		{name: "spike report only", decision: phaseartifact.ReviewPass, ticketType: domain.TicketSpike, mergeMode: domain.MergeManual, want: domain.StateDone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			evidence := &fakeEvidence{hasCandidate: true, candidate: store.StoredCandidate{Snapshot: domain.CandidateSnapshot{Generation: 1, BaseSHA: oid, HeadSHA: oid, TreeSHA: oid, SourceDigest: digest, VerificationIntentDigest: digest, ProofDigest: digest, CommandPolicyDigest: digest, BuilderEvidenceDigest: digest}, TicketVersion: 1, Fence: testFence}}
+			engine := &fakeEngine{}
+			worker := newWorker(domain.StateReviewing, &fakeRunner{outputs: []fakePhase{finalReviewOutcome(tc.decision, tc.owner)}}, evidence, engine)
+			evidence.ticket.Type, evidence.ticket.MergeMode = tc.ticketType, tc.mergeMode
+			if got, err := worker.Run(context.Background(), testRef, testFence); err != nil || !got.Transitioned || engine.state.State != tc.want {
+				t.Fatalf("run=%+v err=%v state=%s", got, err, engine.state.State)
+			}
+		})
+	}
+
+	// Autonomous review cannot invoke or replay a provider result until the
+	// separately qualified merge authority is composed.
+	evidence := &fakeEvidence{hasCandidate: true, candidate: store.StoredCandidate{Snapshot: domain.CandidateSnapshot{Generation: 1, BaseSHA: oid, HeadSHA: oid, TreeSHA: oid, SourceDigest: digest, VerificationIntentDigest: digest, ProofDigest: digest, CommandPolicyDigest: digest, BuilderEvidenceDigest: digest}, TicketVersion: 1, Fence: testFence}}
+	engine := &fakeEngine{}
+	runner := &fakeRunner{outputs: []fakePhase{finalReviewOutput()}}
+	worker := newWorker(domain.StateReviewing, runner, evidence, engine)
+	evidence.ticket.MergeMode = domain.MergeAutonomous
+	if _, err := worker.Run(context.Background(), testRef, testFence); !errors.Is(err, ErrUnsupportedState) || len(runner.requests) != 0 || engine.signals != 0 {
+		t.Fatalf("autonomous review err=%v calls=%d signals=%d", err, len(runner.requests), engine.signals)
 	}
 }
 

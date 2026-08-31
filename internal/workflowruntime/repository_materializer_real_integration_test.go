@@ -349,6 +349,15 @@ func (e *materializerFaultEngine) SignalCandidate(ctx context.Context, req contr
 	}
 	return e.StateMachine.SignalCandidate(ctx, req, candidate)
 }
+func (e *materializerFaultEngine) SignalFinalReview(ctx context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return e.StateMachine.SignalFinalReview(ctx, req)
+}
+func (e *materializerFaultEngine) SignalFinalReviewRepair(ctx context.Context, req contracts.SignalRequest, owner string) (contracts.TransitionResult, error) {
+	return e.StateMachine.SignalFinalReviewRepair(ctx, req, owner)
+}
+func (e *materializerFaultEngine) SignalFinalReviewNeedsOperator(ctx context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return e.StateMachine.SignalFinalReviewNeedsOperator(ctx, req)
+}
 
 func newMaterializerGitFixture(t *testing.T) (repository, worktree, base string) {
 	t.Helper()

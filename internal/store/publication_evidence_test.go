@@ -106,6 +106,10 @@ func TestPublishedCandidateValidationAcceptsCanonicalPushWitness(t *testing.T) {
 // GitHub/network adapter: the two confirmed effects below are Store witnesses
 // supplied by a caller after its external reconciliation.
 func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket, domain.Fence) {
+	return publicationLifecycleFixtureFor(t, domain.TicketFeature, domain.MergeGuarded)
+}
+
+func publicationLifecycleFixtureFor(t *testing.T, ticketType domain.TicketType, mergeMode domain.MergeMode) (*Store, context.Context, Ticket, domain.Fence) {
 	t.Helper()
 	db, ctx := openTestStore(t)
 	configDigest := setupProviderProject(t, db, ctx)
@@ -115,7 +119,7 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	}
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "provider", Ticket: "SF-publication-lifecycle"}
 	source := sha256Digest([]byte("publication-source"))
-	if err := db.CreateTicket(ctx, Ticket{Ref: ref, SourceDigest: source, Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+	if err := db.CreateTicket(ctx, Ticket{Ref: ref, SourceDigest: source, Type: ticketType, MergeMode: mergeMode, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
 		t.Fatalf("publication fixture create ticket: %v", err)
 	}
 	ticket, err := db.StartOrAdopt(ctx, ref, 1, "dev/provider/SF-publication-lifecycle", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
@@ -151,8 +155,15 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 		}
 		return claim
 	}
-	plan := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"a"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofAcceptance, Command: []string{"go", "test"}, Details: "d"}, Paths: []string{"internal"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"r"}}
-	plannerRaw := []byte(`{"schema":"sf.planner/v1","acceptance":["a"],"proof":{"kind":"acceptance","command":["go","test"],"details":"d"},"paths":["internal"],"commands":[["go","test"]],"risks":["r"]}`)
+	proofKind := phaseartifact.ProofAcceptance
+	if ticket.Type == domain.TicketSpike {
+		proofKind = phaseartifact.ProofReport
+	}
+	plan := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"a"}, Proof: phaseartifact.ProofPlan{Kind: proofKind, Command: []string{"go", "test"}, Details: "d"}, Paths: []string{"internal"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"r"}}
+	plannerRaw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
 	planner := launch(domain.PhasePlanning, "planner", runtime(builder), plannerRaw, phaseartifact.Validation{TicketType: ticket.Type})
 	planKey := ProviderAttemptResultKey{AttemptID: planner.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: planner.Attempt}
 	if _, err := db.RecordPlan(ctx, PlanArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Document: PlanDocument{Planner: &plan, ProviderResult: &planKey, Acceptance: plan.Acceptance, ProofKind: string(plan.Proof.Kind), Paths: plan.Paths, Commands: plan.Commands, Risks: plan.Risks}}); err != nil {
@@ -164,14 +175,20 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	ticket, _ = db.Ticket(ctx, ticket.Ref)
 	fence.RunnerEpoch = ticket.RunnerEpoch
 	planID, _ := workflowprompt.NewPlanIdentity(plan)
-	verification := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: planID.Digest, ProofKind: phaseartifact.ProofAcceptance, OwnedFiles: []string{"internal"}, Command: []string{"go", "test", "./..."}, PrebuildOutcome: "red", EvidenceDigest: sha256Digest([]byte("publication-verification"))}
+	prebuildOutcome := "red"
+	prebuildExit := 1
+	if ticket.Type == domain.TicketSpike {
+		prebuildOutcome = "report_ready"
+		prebuildExit = 0
+	}
+	verification := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: planID.Digest, ProofKind: proofKind, OwnedFiles: []string{"internal"}, Command: []string{"go", "test", "./..."}, PrebuildOutcome: prebuildOutcome, EvidenceDigest: sha256Digest([]byte("publication-verification"))}
 	verificationRaw, _ := json.Marshal(verification)
 	reviewerClaim := launch(domain.PhaseVerification, "reviewer", runtime(reviewerQual), verificationRaw, phaseartifact.Validation{TicketType: ticket.Type, AcceptanceDigest: planID.Digest})
 	intent, _ := workflowprompt.CanonicalVerificationIntentBytes(verification)
 	proofBytes, _ := workflowprompt.CanonicalVerificationProofBytes(verification)
 	checkpoint := strings.Repeat("c", 40)
 	verificationKey := ProviderAttemptResultKey{AttemptID: reviewerClaim.ID, Ref: ticket.Ref, Phase: domain.PhaseVerification, Attempt: reviewerClaim.Attempt}
-	command := completeEvidenceRepositoryCommand(t, db, ctx, RepositoryCommandPurposePrebuildVerification, ticket.Ref, ticket.Version, fence, verificationKey, sha256Digest(intent), sha256Digest(proofBytes), "", "", 1)
+	command := completeEvidenceRepositoryCommand(t, db, ctx, RepositoryCommandPurposePrebuildVerification, ticket.Ref, ticket.Version, fence, verificationKey, sha256Digest(intent), sha256Digest(proofBytes), "", "", prebuildExit)
 	if _, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proofBytes, OwnedFiles: verification.OwnedFiles, CheckpointID: checkpoint, ProviderResult: &verificationKey, Checkpoint: CommitObservation{CommitOID: checkpoint, ParentOID: base, TreeOID: strings.Repeat("d", 40)}, CommandResult: command}); err != nil {
 		t.Fatalf("publication fixture record verification: %v", err)
 	}

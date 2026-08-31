@@ -658,6 +658,12 @@ func validateInitialLifecycleAdvance(ctx context.Context, q interface {
 		if !validInitialLifecycleTransition(trigger, from, to) {
 			return ErrPublicationEvidence
 		}
+		if trigger == "checks_green" {
+			var ciTransitions int
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND event_id=? AND event_created_at=(SELECT created_at FROM events WHERE id=?) AND observation_classification='green' AND prior_state='waiting_ci' AND resulting_state='reviewing' AND resulting_trigger='checks_green'`, ref.Channel, ref.Project, ref.Ticket, version, id, id).Scan(&ciTransitions); err != nil || ciTransitions != 1 {
+				return ErrPublicationEvidence
+			}
+		}
 		prior = to
 	}
 	if err := rows.Err(); err != nil {
@@ -683,6 +689,8 @@ func validInitialLifecycleTransition(trigger string, from, to domain.State) bool
 		return trigger == "phase_pass"
 	case from == domain.StatePublishing && to == domain.StateWaitingCI:
 		return trigger == "effects_confirmed"
+	case from == domain.StateWaitingCI && to == domain.StateReviewing:
+		return trigger == "checks_green"
 	default:
 		return false
 	}
