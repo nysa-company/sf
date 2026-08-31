@@ -11,6 +11,7 @@ import (
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	gitboundary "github.com/nysa-company/sf/internal/git"
 	githubboundary "github.com/nysa-company/sf/internal/github"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/testkit"
@@ -20,8 +21,8 @@ func TestPublicationKeysAreDeterministicAndCandidateBound(t *testing.T) {
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-publication"}
 	worktree := store.StoredWorktree{Path: "/tmp/publication", Branch: "sf/dev/1111111111111111/2222222222222222-33333333333333333333333333333333"}
 	candidate := store.StoredCandidate{Snapshot: domain.CandidateSnapshot{BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}}
-	first := pushRequestDigest(ref, "/tmp/repository", worktree, candidate)
-	if first != pushRequestDigest(ref, "/tmp/repository", worktree, candidate) || !strings.HasPrefix(first, "sha256:") {
+	first := pushRequestDigest(ref, "/tmp/repository", worktree, candidate, "")
+	if first != pushRequestDigest(ref, "/tmp/repository", worktree, candidate, "") || !strings.HasPrefix(first, "sha256:") {
 		t.Fatalf("push request is not stable: %q", first)
 	}
 	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "nysa", Name: "app"}, HeadOwner: "nysa", HeadRepository: "app", HeadRef: worktree.Branch, HeadOID: candidate.Snapshot.HeadSHA, BaseRef: "main", BaseOID: candidate.Snapshot.BaseSHA, FactoryOwned: true}
@@ -31,8 +32,11 @@ func TestPublicationKeysAreDeterministicAndCandidateBound(t *testing.T) {
 	}
 	changed := candidate
 	changed.Snapshot.HeadSHA = strings.Repeat("c", 40)
-	if pushRequestDigest(ref, "/tmp/repository", worktree, changed) == first {
+	if pushRequestDigest(ref, "/tmp/repository", worktree, changed, "") == first {
 		t.Fatal("candidate head did not affect push request")
+	}
+	if pushRequestDigest(ref, "/tmp/repository", worktree, candidate, strings.Repeat("a", 40)) == first {
+		t.Fatal("prior candidate head did not affect push request")
 	}
 }
 
@@ -66,7 +70,31 @@ func TestSamePRRequiresThePublishedBaseAndOwnedIdentity(t *testing.T) {
 	}
 }
 
-func TestDraftCorrectionReconcilesAppliedUpdateAfterFenceBump(t *testing.T) {
+func TestCorrectionWorktreeIdentityPermitsOnlyProtectedBaseRefresh(t *testing.T) {
+	prior := gitboundary.Identity{Repository: "/repo", RepositoryDev: 1, RepositoryIno: 2, Worktree: "/worktree", WorktreeDev: 3, WorktreeIno: 4, GitFile: "/worktree/.git", GitFileDev: 5, GitFileIno: 6, CommonDir: "/repo/.git", CommonDirDev: 7, CommonDirIno: 8, Origin: "https://github.com/acme/app.git", PushOrigin: "https://github.com/acme/app.git", PushOriginDev: 9, PushOriginIno: 10, BaseRef: "main", BaseHead: strings.Repeat("a", 40), HeadRef: "sf/dev/correction", ConfigHash: "config", HooksHash: "hooks"}
+	current := prior
+	current.BaseHead = strings.Repeat("b", 40)
+	if !sameCorrectionWorktreeIdentity(prior, current) {
+		t.Fatal("protected-base refresh rejected")
+	}
+	current = prior
+	current.BaseHead = strings.Repeat("b", 40)
+	current.PushOrigin = "https://github.com/acme/other.git"
+	if sameCorrectionWorktreeIdentity(prior, current) {
+		t.Fatal("push-origin substitution accepted during base refresh")
+	}
+}
+
+func TestDraftCorrectionReplansUnappliedUpdateAfterFenceBump(t *testing.T) {
+	runDraftCorrectionFenceRecovery(t, testkit.ResponseErrorBefore, 0, 1)
+}
+
+func TestDraftCorrectionReconcilesLostAppliedUpdateAfterFenceBump(t *testing.T) {
+	runDraftCorrectionFenceRecovery(t, testkit.ResponseDropAfterCall, 1, 1)
+}
+
+func runDraftCorrectionFenceRecovery(t *testing.T, response testkit.ResponseMode, beforeRecovery, afterRecovery int) {
+	t.Helper()
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "sf.sqlite"))
 	if err != nil {
@@ -129,14 +157,14 @@ func TestDraftCorrectionReconcilesAppliedUpdateAfterFenceBump(t *testing.T) {
 	if err != nil || !claim.Claimed {
 		t.Fatalf("claim=%+v err=%v", claim, err)
 	}
-	if err := fake.SetResponse("pr_edit", testkit.ResponseDropAfterCall); err != nil {
+	if err := fake.SetResponse("pr_edit", response); err != nil {
 		t.Fatal(err)
 	}
-	if err := fake.UpdatePullRequest(ctx, claim.ExternalClaim(), current, "new", "new body"); err == nil {
-		t.Fatal("lost update response unexpectedly succeeded")
+	if err := fake.UpdateFactoryPullRequest(ctx, claim.ExternalClaim(), old, current, "new", "new body"); err == nil {
+		t.Fatal("simulated update loss unexpectedly succeeded")
 	}
-	if got := fake.MutationCount("pr_edit"); got != 1 {
-		t.Fatalf("update mutations=%d", got)
+	if got := fake.MutationCount("pr_edit"); got != beforeRecovery {
+		t.Fatalf("before recovery mutations=%d want=%d", got, beforeRecovery)
 	}
 
 	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "correction-recovery-restart")
@@ -151,10 +179,10 @@ func TestDraftCorrectionReconcilesAppliedUpdateAfterFenceBump(t *testing.T) {
 	worker := Worker{Store: db, GitHub: fake}
 	got, _, err := worker.ensureDraftCorrection(ctx, advanced, newFence, current, "new", "new body", old)
 	if err != nil {
-		t.Fatalf("reconcile applied update=%v", err)
+		t.Fatalf("recover correction update=%v", err)
 	}
-	if !samePR(got, current) || fake.MutationCount("pr_edit") != 1 {
-		t.Fatalf("reconciled=%+v mutations=%d", got, fake.MutationCount("pr_edit"))
+	if !samePR(got, current) || fake.MutationCount("pr_edit") != afterRecovery {
+		t.Fatalf("recovered=%+v mutations=%d want=%d", got, fake.MutationCount("pr_edit"), afterRecovery)
 	}
 	effect, err := db.Effect(ctx, key)
 	if err != nil || effect.State != store.EffectConfirmed || effect.TicketVersion != advanced.Version || effect.LeaderEpoch != newFence.LeaderEpoch || effect.RunnerEpoch != newFence.RunnerEpoch || effect.ClaimEpoch != claim.Effect.ClaimEpoch+1 {

@@ -163,6 +163,50 @@ func TestWorkerRejectsRemoteDriftAfterPublishedWitnessRecord(t *testing.T) {
 	}
 }
 
+func TestWorkerRefusesExactPRTextDriftBeforeTransitionAndOnReplay(t *testing.T) {
+	f := newPublicationFixture(t)
+	defer f.close()
+	github := &driftAfterOutputWitness{FakeGH: f.github}
+	w := publication.Worker{Store: f.db, Git: f.runner, GitHub: github}
+	if _, err := w.Run(f.ctx, f.ref, f.fence); !errors.Is(err, publication.ErrPullRequest) {
+		t.Fatalf("post-confirm text drift err=%v", err)
+	}
+	if _, err := f.db.PublishedCandidate(f.ctx, f.ref); err != nil {
+		t.Fatalf("witness was not durable before text-drift rejection: %v", err)
+	}
+	if _, err := w.Run(f.ctx, f.ref, f.fence); !errors.Is(err, publication.ErrPublicationDrift) {
+		t.Fatalf("text-drift replay err=%v", err)
+	}
+	ticket, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil || ticket.State != domain.StatePublishing {
+		t.Fatalf("ticket after text drift=%+v err=%v", ticket, err)
+	}
+}
+
+// driftAfterOutputWitness changes title after the first exact-output witness.
+// That places the edit strictly between the RecordPublishedCandidate validation
+// and the immediate pre-transition validation.
+type driftAfterOutputWitness struct {
+	*testkit.FakeGH
+	calls int
+}
+
+func (g *driftAfterOutputWitness) ObserveFactoryPullRequestOutput(ctx context.Context, want contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, string, bool, bool, error) {
+	identity, state, draft, applied, err := g.FakeGH.ObserveFactoryPullRequestOutput(ctx, want, title, body)
+	g.calls++
+	if err == nil && applied && g.calls == 1 {
+		for _, pr := range g.FakeGH.Snapshot().PRs {
+			if pr.Identity.Number == identity.Number {
+				if err := g.FakeGH.SetPullRequestTextForTest(identity.Number, "foreign title", pr.Body); err != nil {
+					return contracts.PullRequestIdentity{}, "", false, false, err
+				}
+				break
+			}
+		}
+	}
+	return identity, state, draft, applied, err
+}
+
 type publicationFixture struct {
 	ctx            context.Context
 	db             *store.Store

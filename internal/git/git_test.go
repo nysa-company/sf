@@ -328,6 +328,65 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 	}
 }
 
+func TestPushWithRequestCorrectionRequiresExactPriorRemote(t *testing.T) {
+	ctx, runner, repository, remote := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-correction-push")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("generation one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prior, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("generation-one")), Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := runner.PushWithRequest(ctx, worktree, PushRequest{ExpectedHead: prior, MutationClaim: pushClaim(worktree, prior)}); err != nil || got != prior {
+		t.Fatalf("initial push=%q err=%v", got, err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("generation two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("generation-two")), Timestamp: time.Unix(2, 0), BaseRef: "main", ExpectedParent: prior, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, prior)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts := &factMutationLease{}
+	runner.MutationAuthority = factMutationAuthority{lease: facts}
+	request := PushRequest{ExpectedHead: next, ExpectedPriorHead: prior, MutationClaim: pushClaim(worktree, next)}
+	if got, err := runner.PushWithRequest(ctx, worktree, request); err != nil || got != next || facts.priorRemoteOID != prior {
+		t.Fatalf("exact fast-forward push=%q err=%v recorded-prior=%q", got, err, facts.priorRemoteOID)
+	}
+	if got := rawGit(t, remote, "rev-parse", "refs/heads/"+branch); got != next {
+		t.Fatalf("remote fast-forward=%q want=%q", got, next)
+	}
+
+	// A correction is not a branch-create retry. A missing remote ref cannot
+	// satisfy the durable prior-head proof and must not be recreated.
+	rawGit(t, remote, "update-ref", "-d", "refs/heads/"+branch)
+	if _, err := runner.PushWithRequest(ctx, worktree, request); !errors.Is(err, ErrUnexpectedRemote) {
+		t.Fatalf("missing correction remote err=%v", err)
+	}
+	if _, err := exec.Command("git", "-C", remote, "rev-parse", "--verify", "refs/heads/"+branch).CombinedOutput(); err == nil {
+		t.Fatal("missing correction remote was recreated")
+	}
+
+	// Nor may an unrelated remote tip be adopted just because the local
+	// candidate is fast-forwardable from it.
+	rawGit(t, remote, "update-ref", "refs/heads/"+branch, worktree.Identity.BaseHead)
+	if _, err := runner.PushWithRequest(ctx, worktree, request); !errors.Is(err, ErrUnexpectedRemote) {
+		t.Fatalf("diverged correction remote err=%v", err)
+	}
+	if got := rawGit(t, remote, "rev-parse", "refs/heads/"+branch); got != worktree.Identity.BaseHead {
+		t.Fatalf("diverged correction remote changed=%q want=%q", got, worktree.Identity.BaseHead)
+	}
+}
+
 func TestCommitRefusesProtectedCheckpointPath(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-protected")

@@ -193,6 +193,18 @@ func (c Client) ObserveDraftPullRequest(ctx context.Context, identity contracts.
 	return match.Identity, match.State, match.Draft, true, nil
 }
 
+// ObserveFactoryPullRequestOutput is the publication-transition witness. The
+// exact current marker proves ownership while title/body prove that the effect
+// request that was confirmed is still the live PR output.
+func (c Client) ObserveFactoryPullRequestOutput(ctx context.Context, expected contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, string, bool, bool, error) {
+	match, found, err := c.ObservePublicationCandidate(ctx, expected)
+	if err != nil || !found {
+		return contracts.PullRequestIdentity{}, "", false, false, err
+	}
+	applied := match.State == "OPEN" && match.Draft && match.Title == title && match.Body == body+"\n\n"+ownershipMarker(match.Identity)
+	return match.Identity, match.State, match.Draft, applied, nil
+}
+
 // RefreshFactoryPullRequestIdentity re-observes one already-persisted factory
 // pull request after a correction advances its source head. It is deliberately
 // a continuity check, not a branch-name lookup: both the prior identity and
@@ -203,31 +215,92 @@ func (c Client) ObserveDraftPullRequest(ctx context.Context, identity contracts.
 // new marker. Either is sufficient, but a missing or substituted marker never
 // authorizes adoption.
 func (c Client) RefreshFactoryPullRequestIdentity(ctx context.Context, prior, expected contracts.PullRequestIdentity) (contracts.PullRequestIdentity, error) {
+	match, err := c.refreshFactoryPullRequest(ctx, prior, expected)
+	if err != nil {
+		return contracts.PullRequestIdentity{}, err
+	}
+	return match.Identity, nil
+}
+
+// ObserveFactoryPullRequestUpdate is the correction output witness.  Unlike
+// the create observer, it does not treat a known PR with stale title/body as
+// an applied effect. The prior marker remains a continuity proof only; the
+// requested replacement body must carry the new identity marker.
+func (c Client) ObserveFactoryPullRequestUpdate(ctx context.Context, prior, expected contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, string, bool, bool, error) {
+	match, err := c.refreshFactoryPullRequest(ctx, prior, expected)
+	if err != nil {
+		return contracts.PullRequestIdentity{}, "", false, false, err
+	}
+	marked := body + "\n\n" + ownershipMarker(match.Identity)
+	applied := match.State == "OPEN" && match.Draft && match.Title == title && match.Body == marked
+	return match.Identity, match.State, match.Draft, applied, nil
+}
+
+// UpdateFactoryPullRequest is intentionally separate from UpdatePullRequest:
+// a correction may still carry the old marker before the edit, which must be
+// authenticated against the durable prior identity rather than accepted by the
+// ordinary current-marker observer.
+func (c Client) UpdateFactoryPullRequest(ctx context.Context, durable domain.ExternalEffectClaim, prior, expected contracts.PullRequestIdentity, title, body string) error {
+	current, err := c.refreshFactoryPullRequest(ctx, prior, expected)
+	if err != nil {
+		return err
+	}
+	if !sameExact(current.Identity, expected) || current.State != "OPEN" || current.Merged || !current.Draft {
+		return ErrPolicyRefusal
+	}
+	marked := body + "\n\n" + ownershipMarker(current.Identity)
+	if err := c.validateClaim(ctx, durable, current.Identity, "pr_edit", requestDigest("pr_edit", current.Identity, title, body)); err != nil {
+		return err
+	}
+	if current.Title == title && current.Body == marked {
+		return nil
+	}
+	_, runErr := c.mutateFactoryCorrectionExact(ctx, durable, prior, expected, current.Identity, "pr", "edit", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--title", title, "--body", marked)
+	if errors.Is(runErr, ErrProcessCleanup) {
+		return runErr
+	}
+	_, _, _, applied, observeErr := c.ObserveFactoryPullRequestUpdate(ctx, prior, expected, title, body)
+	if errors.Is(observeErr, ErrProcessCleanup) {
+		return observeErr
+	}
+	if observeErr == nil && applied {
+		return nil
+	}
+	if observeErr != nil {
+		return ErrPolicyRefusal
+	}
+	if runErr != nil {
+		return runErr
+	}
+	return ErrPolicyRefusal
+}
+
+func (c Client) refreshFactoryPullRequest(ctx context.Context, prior, expected contracts.PullRequestIdentity) (PRMatch, error) {
 	if !validPersistedPRIdentity(prior) || !validPersistedPRIdentity(expected) || !sameRefreshContinuity(prior, expected) || prior.HeadOID == expected.HeadOID {
-		return contracts.PullRequestIdentity{}, ErrPolicyRefusal
+		return PRMatch{}, ErrPolicyRefusal
 	}
 	var values []prWire
 	if err := c.json(ctx, &values, "pr", "list", "--repo", repoArg(prior.Repository), "--state", "all", "--limit", "100", "--json", prFields); err != nil {
-		return contracts.PullRequestIdentity{}, err
+		return PRMatch{}, err
 	}
 	if len(values) == 100 {
-		return contracts.PullRequestIdentity{}, ErrAmbiguousPR
+		return PRMatch{}, ErrAmbiguousPR
 	}
 	var match *PRMatch
 	for _, value := range values {
 		candidate, err := value.identityUnmarked(prior.Repository)
 		if err != nil {
-			return contracts.PullRequestIdentity{}, err
+			return PRMatch{}, err
 		}
 		// The persisted number is an exact factory identity. A row for that
 		// number that no longer proves the old source/base is a substitution,
 		// not an opportunity to adopt a PR with a familiar branch name.
 		if candidate.Number == prior.Number {
 			if !sameRefreshContinuity(prior, candidate) || candidate.HeadOID != expected.HeadOID || !refreshMarkerPresent(value.Body, prior, expected) || value.State != "OPEN" || value.MergedAt != nil {
-				return contracts.PullRequestIdentity{}, ErrNoMatchingPR
+				return PRMatch{}, ErrNoMatchingPR
 			}
 			if match != nil {
-				return contracts.PullRequestIdentity{}, ErrAmbiguousPR
+				return PRMatch{}, ErrAmbiguousPR
 			}
 			observed := value.match(candidate)
 			match = &observed
@@ -236,13 +309,13 @@ func (c Client) RefreshFactoryPullRequestIdentity(ctx context.Context, prior, ex
 		// A second PR for this exact source/base is a foreign candidate. The
 		// list must not be used to select between it and the durable number.
 		if sameRefreshSourceAndBase(candidate, prior) {
-			return contracts.PullRequestIdentity{}, ErrAmbiguousPR
+			return PRMatch{}, ErrAmbiguousPR
 		}
 	}
 	if match == nil {
-		return contracts.PullRequestIdentity{}, ErrNoMatchingPR
+		return PRMatch{}, ErrNoMatchingPR
 	}
-	return match.Identity, nil
+	return *match, nil
 }
 func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
 	if !validIdentity(identity) || !validTitle(title) || !validBody(body) {
@@ -530,6 +603,22 @@ func (c Client) mutateExact(ctx context.Context, claim domain.ExternalEffectClai
 			return nil, ErrProcessCleanup
 		}
 		if err != nil || !sameExact(observed.Identity, identity) || observed.State != "OPEN" || observed.Merged {
+			return nil, ErrPolicyRefusal
+		}
+		return c.run(runCtx, args...)
+	})
+}
+
+func (c Client) mutateFactoryCorrectionExact(ctx context.Context, claim domain.ExternalEffectClaim, prior, expected, identity contracts.PullRequestIdentity, args ...string) ([]byte, error) {
+	if c.mutationGuard == nil {
+		return nil, ErrPolicyRefusal
+	}
+	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+		observed, err := c.refreshFactoryPullRequest(runCtx, prior, expected)
+		if errors.Is(err, ErrProcessCleanup) {
+			return nil, ErrProcessCleanup
+		}
+		if err != nil || !sameExact(observed.Identity, identity) || observed.State != "OPEN" || observed.Merged || !observed.Draft {
 			return nil, ErrPolicyRefusal
 		}
 		return c.run(runCtx, args...)

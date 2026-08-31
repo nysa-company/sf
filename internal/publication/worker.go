@@ -62,6 +62,10 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	if !ok {
 		return Result{}, ErrBoundaryUnavailable
 	}
+	outputObserver, ok := w.GitHub.(contracts.DraftPullRequestOutputObserver)
+	if !ok {
+		return Result{}, ErrBoundaryUnavailable
+	}
 	if ref.Validate() != nil || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
 		return Result{}, store.ErrStaleFence
 	}
@@ -89,7 +93,8 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 			return result, projectErr
 		}
 		liveWorktree, _, identityErr := publicationWorktree(project, existing.Worktree, existing.Candidate)
-		if identityErr != nil || w.validatePublished(ctx, observer, liveWorktree, existing.Candidate, existing.PullRequest) != nil {
+		title, body := publicationText(ticket, existing.Candidate)
+		if identityErr != nil || w.validatePublished(ctx, outputObserver, liveWorktree, existing.Candidate, existing.PullRequest, title, body) != nil {
 			if identityErr != nil {
 				return result, identityErr
 			}
@@ -146,7 +151,7 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		}
 		return result, ErrPublicationDrift
 	}
-	push, err := w.ensurePush(ctx, ticket, fence, project, candidate, worktree, gitWorktree)
+	push, err := w.ensurePush(ctx, ticket, fence, project, candidate, worktree, gitWorktree, priorPublication)
 	if err != nil {
 		return result, err
 	}
@@ -156,7 +161,7 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	if err != nil {
 		return result, err
 	}
-	if err := w.validatePublished(ctx, observer, gitWorktree, candidate, pr); err != nil {
+	if err := w.validatePublished(ctx, outputObserver, gitWorktree, candidate, pr, title, body); err != nil {
 		return result, err
 	}
 	prEffectKey := draftKey(identity, title, body)
@@ -167,14 +172,14 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	if err != nil {
 		return result, err
 	}
-	value := store.PublishedCandidateEvidence{Ref: ref, TicketVersion: ticket.Version, Fence: fence, Candidate: candidate, ConfigGeneration: ticket.ConfigGeneration, ConfigDigest: ticket.ConfigDigest, ConfigSnapshotDigest: digest(ticket.ConfigSnapshot), Worktree: worktree, RemoteBranchRef: worktree.Branch, RemoteBranchOID: candidate.Snapshot.HeadSHA, RemoteBaseOID: candidate.Snapshot.BaseSHA, PushEffect: effectEvidence(push, store.PublicationPushEffectKind), PullRequest: pr, PullRequestState: "OPEN", PullRequestDraft: true, PullRequestObservedAt: observedAt, PRCreateOrUpdateEffect: effectEvidence(prEffect, store.PublicationPRCreateEffectKind), CreatedAt: time.Now().UTC()}
+	value := store.PublishedCandidateEvidence{Ref: ref, TicketVersion: ticket.Version, Fence: fence, Candidate: candidate, ConfigGeneration: ticket.ConfigGeneration, ConfigDigest: ticket.ConfigDigest, ConfigSnapshotDigest: digest(ticket.ConfigSnapshot), Worktree: worktree, RemoteBranchRef: worktree.Branch, RemoteBranchOID: candidate.Snapshot.HeadSHA, RemoteBaseOID: candidate.Snapshot.BaseSHA, PushEffect: effectEvidence(push, store.PublicationPushEffectKind), PullRequest: pr, PullRequestState: "OPEN", PullRequestDraft: true, PullRequestObservedAt: observedAt, PRCreateOrUpdateEffect: effectEvidence(prEffect, prEffect.Kind), CreatedAt: time.Now().UTC()}
 	if err := w.Store.RecordPublishedCandidate(ctx, value); err != nil {
 		return result, err
 	}
 	// Recording the witness is durable, but it is not a substitute for a
 	// fresh live observation. Re-authenticate both effects again immediately
 	// before allowing publishing to advance.
-	if err := w.validatePublished(ctx, observer, gitWorktree, candidate, pr); err != nil {
+	if err := w.validatePublished(ctx, outputObserver, gitWorktree, candidate, pr, title, body); err != nil {
 		return result, err
 	}
 	if _, err := w.Store.TransitionPublishedCandidate(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence}); err != nil {
@@ -184,8 +189,16 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	return result, nil
 }
 
-func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domain.Fence, project store.Project, candidate store.StoredCandidate, worktree store.StoredWorktree, gitWorktree gitboundary.Worktree) (store.Effect, error) {
-	request := pushRequestDigest(ticket.Ref, project.Path, worktree, candidate)
+func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domain.Fence, project store.Project, candidate store.StoredCandidate, worktree store.StoredWorktree, gitWorktree gitboundary.Worktree, historical *store.PublishedCandidateEvidence) (store.Effect, error) {
+	expectedPrior := ""
+	if historical != nil {
+		priorWorktree, priorRepository, err := publicationWorktree(project, historical.Worktree, historical.Candidate)
+		if err != nil || priorRepository != gitWorktreeRepository(gitWorktree) || priorWorktree.Path != gitWorktree.Path || priorWorktree.Branch != gitWorktree.Branch || !sameCorrectionWorktreeIdentity(priorWorktree.Identity, gitWorktree.Identity) || historical.RemoteBranchRef != worktree.Branch || historical.RemoteBranchOID != historical.Candidate.Snapshot.HeadSHA || historical.RemoteBaseOID != historical.Candidate.Snapshot.BaseSHA || historical.Candidate.Snapshot.HeadSHA == candidate.Snapshot.HeadSHA {
+			return store.Effect{}, ErrPublicationDrift
+		}
+		expectedPrior = historical.RemoteBranchOID
+	}
+	request := pushRequestDigest(ticket.Ref, project.Path, worktree, candidate, expectedPrior)
 	intent := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence}, RequestDigest: request, Repository: project.Path, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "push", BaseRef: project.BaseRef, ExpectedBaseOID: candidate.Snapshot.BaseSHA, ExpectedHeadOID: candidate.Snapshot.HeadSHA}
 	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)
 	// execute is used both for a fresh effect and after recovery has proven
@@ -199,7 +212,7 @@ func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domai
 		if err != nil {
 			return store.Effect{}, err
 		}
-		head, err := w.Git.PushWithRequest(ctx, gitWorktree, gitboundary.PushRequest{ExpectedHead: candidate.Snapshot.HeadSHA, ExpectedPriorHead: "", MutationClaim: claim})
+		head, err := w.Git.PushWithRequest(ctx, gitWorktree, gitboundary.PushRequest{ExpectedHead: candidate.Snapshot.HeadSHA, ExpectedPriorHead: expectedPrior, MutationClaim: claim})
 		if err != nil {
 			return store.Effect{}, err
 		}
@@ -212,11 +225,14 @@ func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domai
 		if facts.Claim.Repository != project.Path || facts.Claim.Worktree != worktree.Path || facts.Claim.Branch != worktree.Branch || facts.Claim.BaseRef != project.BaseRef || facts.Claim.ExpectedBaseOID != candidate.Snapshot.BaseSHA || facts.Claim.ExpectedHeadOID != candidate.Snapshot.HeadSHA {
 			return store.Effect{}, ErrPublicationDrift
 		}
+		if facts.PriorRemoteObserved && facts.PriorRemoteOID != expectedPrior {
+			return store.Effect{}, ErrPublicationDrift
+		}
 		remote, observeErr := w.Git.ObserveRemoteBranch(ctx, gitWorktree, gitWorktree.Identity.PushOrigin, worktree.Branch)
 		if observeErr != nil {
 			return store.Effect{}, observeErr
 		}
-		if remote.OID != "" && remote.OID != candidate.Snapshot.HeadSHA {
+		if remote.OID != candidate.Snapshot.HeadSHA && remote.OID != expectedPrior {
 			return store.Effect{}, ErrRemoteCandidate
 		}
 		present := remote.OID == candidate.Snapshot.HeadSHA
@@ -358,7 +374,8 @@ func (w Worker) ensureDraft(ctx context.Context, ticket store.Ticket, fence doma
 
 func (w Worker) ensureDraftCorrection(ctx context.Context, ticket store.Ticket, fence domain.Fence, expected contracts.PullRequestIdentity, title, body string, prior contracts.PullRequestIdentity) (contracts.PullRequestIdentity, time.Time, error) {
 	refresher, ok := w.GitHub.(contracts.DraftPullRequestRefresher)
-	if !ok || prior.Number <= 0 {
+	corrector, correctionOK := w.GitHub.(contracts.DraftPullRequestCorrector)
+	if !ok || !correctionOK || prior.Number <= 0 {
 		return contracts.PullRequestIdentity{}, time.Time{}, ErrBoundaryUnavailable
 	}
 	expected.Number = prior.Number
@@ -382,26 +399,22 @@ func (w Worker) ensureDraftCorrection(ctx context.Context, ticket store.Ticket, 
 		return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
 	}
 	if effect.State == store.EffectConfirmed {
-		observed, state, draft, found, observeErr := w.GitHub.(contracts.DraftPullRequestObserver).ObserveDraftPullRequest(ctx, current)
-		if observeErr != nil || !found || !samePR(observed, current) || state != "OPEN" || !draft || effect.ObservedIdentity != store.CanonicalPublicationPRObservation(observed, state, draft) {
+		observed, state, draft, applied, observeErr := corrector.ObserveFactoryPullRequestUpdate(ctx, prior, current, title, body)
+		if observeErr != nil || !applied || !samePR(observed, current) || state != "OPEN" || !draft || effect.ObservedIdentity != store.CanonicalPublicationPRObservation(observed, state, draft) {
 			return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
 		}
 		return observed, time.Now().UTC(), nil
 	}
-	observer, ok := w.GitHub.(contracts.DraftPullRequestObserver)
-	if !ok {
-		return contracts.PullRequestIdentity{}, time.Time{}, ErrBoundaryUnavailable
-	}
 	if effect.State == store.EffectExecuting || effect.State == store.EffectUncertain {
-		observed, state, draft, found, observeErr := observer.ObserveDraftPullRequest(ctx, current)
+		observed, state, draft, applied, observeErr := corrector.ObserveFactoryPullRequestUpdate(ctx, prior, current, title, body)
 		if observeErr != nil {
 			return contracts.PullRequestIdentity{}, time.Time{}, observeErr
 		}
-		if found && (!samePR(observed, current) || state != "OPEN" || !draft) {
+		if !samePR(observed, current) || state != "OPEN" || !draft {
 			return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
 		}
-		observation := store.EffectObservation{EffectFence: effectFence(effect), Present: found}
-		if found {
+		observation := store.EffectObservation{EffectFence: effectFence(effect), Present: applied}
+		if applied {
 			observation.Identity = store.CanonicalPublicationPRObservation(observed, state, draft)
 		}
 		var reconcileErr error
@@ -413,7 +426,7 @@ func (w Worker) ensureDraftCorrection(ctx context.Context, ticket store.Ticket, 
 		if reconcileErr != nil {
 			return contracts.PullRequestIdentity{}, time.Time{}, reconcileErr
 		}
-		if found {
+		if applied {
 			return observed, time.Now().UTC(), nil
 		}
 		// Absence is now a durable semantic failure under the old claim. Replan
@@ -436,11 +449,11 @@ func (w Worker) ensureDraftCorrection(ctx context.Context, ticket store.Ticket, 
 		}
 		return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
 	}
-	if err := w.GitHub.UpdatePullRequest(ctx, claim.ExternalClaim(), current, title, body); err != nil {
+	if err := corrector.UpdateFactoryPullRequest(ctx, claim.ExternalClaim(), prior, current, title, body); err != nil {
 		return contracts.PullRequestIdentity{}, time.Time{}, err
 	}
-	observed, state, draft, found, err := observer.ObserveDraftPullRequest(ctx, current)
-	if err != nil || !found || !samePR(observed, current) || state != "OPEN" || !draft {
+	observed, state, draft, applied, err := corrector.ObserveFactoryPullRequestUpdate(ctx, prior, current, title, body)
+	if err != nil || !applied || !samePR(observed, current) || state != "OPEN" || !draft {
 		if err != nil {
 			return contracts.PullRequestIdentity{}, time.Time{}, err
 		}
@@ -482,7 +495,7 @@ func publicationWorktree(project store.Project, stored store.StoredWorktree, can
 // transition. Publication evidence authenticates the original effects, but a
 // later close, force-push, or foreign replacement is live remote truth and
 // must never be carried into waiting_ci by a replay alone.
-func (w Worker) validatePublished(ctx context.Context, observer contracts.DraftPullRequestObserver, worktree gitboundary.Worktree, candidate store.StoredCandidate, want contracts.PullRequestIdentity) error {
+func (w Worker) validatePublished(ctx context.Context, observer contracts.DraftPullRequestOutputObserver, worktree gitboundary.Worktree, candidate store.StoredCandidate, want contracts.PullRequestIdentity, title, body string) error {
 	remote, err := w.Git.ObserveRemoteBranch(ctx, worktree, worktree.Identity.PushOrigin, worktree.Branch)
 	if err != nil || remote.OID != candidate.Snapshot.HeadSHA {
 		if err != nil {
@@ -490,8 +503,8 @@ func (w Worker) validatePublished(ctx context.Context, observer contracts.DraftP
 		}
 		return ErrRemoteCandidate
 	}
-	pr, state, draft, found, err := observer.ObserveDraftPullRequest(ctx, want)
-	if err != nil || !found || state != "OPEN" || !draft || !samePR(pr, want) {
+	pr, state, draft, applied, err := observer.ObserveFactoryPullRequestOutput(ctx, want, title, body)
+	if err != nil || !applied || state != "OPEN" || !draft || !samePR(pr, want) {
 		if err != nil {
 			return err
 		}
@@ -512,8 +525,28 @@ func githubRepository(raw string) (contracts.RepositoryIdentity, bool) {
 	}
 	return contracts.RepositoryIdentity{Host: "github.com", Owner: parts[0], Name: parts[1]}, true
 }
-func pushRequestDigest(ref domain.TicketRef, repository string, worktree store.StoredWorktree, candidate store.StoredCandidate) string {
-	return "sha256:" + digest([]byte("sf.publication.push.v1\x00"+string(ref.Channel)+"\x00"+string(ref.Project)+"\x00"+string(ref.Ticket)+"\x00"+repository+"\x00"+worktree.Path+"\x00"+worktree.Branch+"\x00"+candidate.Snapshot.BaseSHA+"\x00"+candidate.Snapshot.HeadSHA))
+func gitWorktreeRepository(worktree gitboundary.Worktree) contracts.RepositoryIdentity {
+	repository, _ := githubRepository(worktree.Identity.Origin)
+	return repository
+}
+
+// sameCorrectionWorktreeIdentity retains every stable authenticated checkout
+// fact. BaseHead deliberately advances between generations: each side has
+// already been authenticated by publicationWorktree against its own candidate
+// base, so requiring equality here would reject a legitimate protected-base
+// refresh while allowing no other identity substitution.
+func sameCorrectionWorktreeIdentity(prior, current gitboundary.Identity) bool {
+	return prior.Repository == current.Repository &&
+		prior.RepositoryDev == current.RepositoryDev && prior.RepositoryIno == current.RepositoryIno &&
+		prior.Worktree == current.Worktree && prior.WorktreeDev == current.WorktreeDev && prior.WorktreeIno == current.WorktreeIno &&
+		prior.GitFile == current.GitFile && prior.GitFileDev == current.GitFileDev && prior.GitFileIno == current.GitFileIno &&
+		prior.CommonDir == current.CommonDir && prior.CommonDirDev == current.CommonDirDev && prior.CommonDirIno == current.CommonDirIno &&
+		prior.Origin == current.Origin && prior.PushOrigin == current.PushOrigin && prior.PushOriginDev == current.PushOriginDev && prior.PushOriginIno == current.PushOriginIno &&
+		prior.BaseRef == current.BaseRef && prior.HeadRef == current.HeadRef &&
+		prior.ConfigHash == current.ConfigHash && prior.HooksHash == current.HooksHash
+}
+func pushRequestDigest(ref domain.TicketRef, repository string, worktree store.StoredWorktree, candidate store.StoredCandidate, expectedPrior string) string {
+	return "sha256:" + digest([]byte("sf.publication.push.v2\x00"+string(ref.Channel)+"\x00"+string(ref.Project)+"\x00"+string(ref.Ticket)+"\x00"+repository+"\x00"+worktree.Path+"\x00"+worktree.Branch+"\x00"+candidate.Snapshot.BaseSHA+"\x00"+candidate.Snapshot.HeadSHA+"\x00"+expectedPrior))
 }
 func draftKey(identity contracts.PullRequestIdentity, title, body string) string {
 	return "github/draft-pr/v1/" + githubboundary.CanonicalDraftPullRequestRequestDigest(identity, title, body)

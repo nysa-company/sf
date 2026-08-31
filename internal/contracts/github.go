@@ -122,10 +122,28 @@ type DraftPullRequestObserver interface {
 	ObserveDraftPullRequest(context.Context, PullRequestIdentity) (identity PullRequestIdentity, state string, draft bool, found bool, err error)
 }
 
+// DraftPullRequestOutputObserver proves that the live factory PR still carries
+// the exact title and marker-bearing body bound into the durable effect
+// request. It is required before publication evidence or a state transition;
+// identity/state/draft alone cannot witness an edit's requested output.
+type DraftPullRequestOutputObserver interface {
+	ObserveFactoryPullRequestOutput(context.Context, PullRequestIdentity, string, string) (identity PullRequestIdentity, state string, draft bool, applied bool, err error)
+}
+
 // DraftPullRequestRefresher is the correction-only continuity boundary. It
 // identifies the already-owned PR by its durable number/source and returns
 // the same PR after its branch head has advanced to expected. It must refuse
 // foreign, missing, closed, or ambiguous rows.
 type DraftPullRequestRefresher interface {
 	RefreshFactoryPullRequestIdentity(context.Context, PullRequestIdentity, PullRequestIdentity) (PullRequestIdentity, error)
+}
+
+// DraftPullRequestCorrector is the correction-only mutation/recovery boundary.
+// It retains the prior marker as an ownership witness while requiring the exact
+// replacement identity and output before an edit effect may be confirmed.
+// A non-applied result is a proven absence of the requested output, never an
+// authorization to adopt a different pull request.
+type DraftPullRequestCorrector interface {
+	UpdateFactoryPullRequest(context.Context, domain.ExternalEffectClaim, PullRequestIdentity, PullRequestIdentity, string, string) error
+	ObserveFactoryPullRequestUpdate(context.Context, PullRequestIdentity, PullRequestIdentity, string, string) (identity PullRequestIdentity, state string, draft bool, applied bool, err error)
 }

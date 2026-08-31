@@ -160,6 +160,54 @@ func TestRefreshFactoryPullRequestIdentityAcceptsOldMarkerAfterHeadCorrection(t 
 	}
 }
 
+func TestUpdateFactoryPullRequestAcceptsPriorMarkerAndObservesExactOutput(t *testing.T) {
+	client, fake, identity := fixture(t)
+	prior := createDraft(t, client, identity, "before", "before body").Identity
+	expected := prior
+	expected.HeadOID = strings.Repeat("b", 40)
+	if err := fake.SetPullRequestHeadOIDForTest(prior.Number, expected.HeadOID); err != nil {
+		t.Fatal(err)
+	}
+	claim := testClaim("pr_edit", expected, "after", "after body")
+	if err := client.UpdateFactoryPullRequest(context.Background(), claim, prior, expected, "after", "after body"); err != nil {
+		t.Fatalf("correction update=%v", err)
+	}
+	got, state, draft, applied, err := client.ObserveFactoryPullRequestUpdate(context.Background(), prior, expected, "after", "after body")
+	if err != nil || !applied || state != "OPEN" || !draft || !sameExact(got, expected) {
+		t.Fatalf("correction output got=%+v state=%q draft=%v applied=%v err=%v", got, state, draft, applied, err)
+	}
+	got, state, draft, applied, err = client.ObserveFactoryPullRequestOutput(context.Background(), expected, "after", "after body")
+	if err != nil || !applied || state != "OPEN" || !draft || !sameExact(got, expected) {
+		t.Fatalf("published output got=%+v state=%q draft=%v applied=%v err=%v", got, state, draft, applied, err)
+	}
+	if err := fake.SetPullRequestTextForTest(expected.Number, "foreign title", "after body\n\n"+ownershipMarker(expected)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, applied, err = client.ObserveFactoryPullRequestOutput(context.Background(), expected, "after", "after body"); err != nil || applied {
+		t.Fatalf("foreign output applied=%v err=%v", applied, err)
+	}
+}
+
+func TestUpdateFactoryPullRequestReconcilesLostResponseWithoutSecondEdit(t *testing.T) {
+	client, fake, identity := fixture(t)
+	prior := createDraft(t, client, identity, "before", "before body").Identity
+	expected := prior
+	expected.HeadOID = strings.Repeat("b", 40)
+	if err := fake.SetPullRequestHeadOIDForTest(prior.Number, expected.HeadOID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetResponse("pr_edit", testkit.ResponseDropAfterCall); err != nil {
+		t.Fatal(err)
+	}
+	claim := testClaim("pr_edit", expected, "after", "after body")
+	if err := client.UpdateFactoryPullRequest(context.Background(), claim, prior, expected, "after", "after body"); err != nil {
+		t.Fatalf("lost correction update=%v", err)
+	}
+	if err := client.UpdateFactoryPullRequest(context.Background(), claim, prior, expected, "after", "after body"); err != nil || fake.MutationCount("pr_edit") != 1 {
+		t.Fatalf("replay err=%v mutations=%d", err, fake.MutationCount("pr_edit"))
+	}
+}
+
 func TestRefreshFactoryPullRequestIdentityRefusals(t *testing.T) {
 	prior := contracts.PullRequestIdentity{Number: 7, Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
 	expected := prior

@@ -250,6 +250,23 @@ func (f *FakeGH) SetPullRequestHeadOIDForTest(number int, oid string) error {
 	})
 }
 
+// SetPullRequestTextForTest simulates a post-effect remote edit. It is test
+// setup only; factory mutations must still use their durable effect claims.
+func (f *FakeGH) SetPullRequestTextForTest(number int, title, body string) error {
+	if number <= 0 {
+		return errors.New("testkit: pull request number is required")
+	}
+	return f.withState(func() (bool, error) {
+		for index := range f.state.PRs {
+			if f.state.PRs[index].Identity.Number == number {
+				f.state.PRs[index].Title, f.state.PRs[index].Body = title, body
+				return true, nil
+			}
+		}
+		return false, errors.New("testkit: pull request not found")
+	})
+}
+
 // OpenFakeGH loads existing durable state. It refuses an unknown schema rather
 // than silently interpreting a fixture with different semantics.
 func OpenFakeGH(path string) (*FakeGH, error) {
@@ -434,10 +451,69 @@ func (f *FakeGH) ObserveDraftPullRequest(_ context.Context, want contracts.PullR
 	return match.Identity, "OPEN", match.Draft, true, nil
 }
 
+func (f *FakeGH) ObserveFactoryPullRequestOutput(_ context.Context, want contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, string, bool, bool, error) {
+	var match PullRequest
+	count := 0
+	err := f.withState(func() (bool, error) {
+		for _, pr := range f.state.PRs {
+			if !samePRSourceAndBase(pr.Identity, want) {
+				continue
+			}
+			if !pr.Identity.FactoryOwned || !identityMatches(pr.Identity, want) {
+				return false, errors.New("fake-gh: factory pull request source identity drifted")
+			}
+			count++
+			match = pr
+		}
+		if count > 1 {
+			return false, errors.New("fake-gh: ambiguous matching pull requests")
+		}
+		return false, nil
+	})
+	if err != nil || count == 0 {
+		return contracts.PullRequestIdentity{}, "", false, false, err
+	}
+	marked := body + "\n\n" + ownershipMarkerForFake(match.Identity)
+	applied := match.Draft && match.Title == title && match.Body == marked
+	return match.Identity, "OPEN", match.Draft, applied, nil
+}
+
 // RefreshFactoryPullRequestIdentity models the production correction lookup:
 // the durable PR number and source branch stay fixed while its head advances.
 func (f *FakeGH) RefreshFactoryPullRequestIdentity(_ context.Context, prior, expected contracts.PullRequestIdentity) (contracts.PullRequestIdentity, error) {
-	var match contracts.PullRequestIdentity
+	match, err := f.refreshFactoryPullRequest(prior, expected)
+	if err != nil {
+		return contracts.PullRequestIdentity{}, err
+	}
+	return match.Identity, nil
+}
+
+func (f *FakeGH) ObserveFactoryPullRequestUpdate(_ context.Context, prior, expected contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, string, bool, bool, error) {
+	match, err := f.refreshFactoryPullRequest(prior, expected)
+	if err != nil {
+		return contracts.PullRequestIdentity{}, "", false, false, err
+	}
+	marked := body + "\n\n" + ownershipMarkerForFake(match.Identity)
+	applied := match.Draft && match.Title == title && match.Body == marked
+	return match.Identity, "OPEN", match.Draft, applied, nil
+}
+
+func (f *FakeGH) UpdateFactoryPullRequest(_ context.Context, claim domain.ExternalEffectClaim, prior, expected contracts.PullRequestIdentity, title, body string) error {
+	match, err := f.refreshFactoryPullRequest(prior, expected)
+	if err != nil {
+		return err
+	}
+	if err := validateFakeClaim(claim, "pr_edit", match.Identity, title, body); err != nil {
+		return err
+	}
+	if match.Draft && match.Title == title && match.Body == body+"\n\n"+ownershipMarkerForFake(match.Identity) {
+		return nil
+	}
+	return f.updateUnchecked(match.Identity, title, body)
+}
+
+func (f *FakeGH) refreshFactoryPullRequest(prior, expected contracts.PullRequestIdentity) (PullRequest, error) {
+	var match PullRequest
 	count := 0
 	err := f.withState(func() (bool, error) {
 		if prior.Number <= 0 || !prior.FactoryOwned || !expected.FactoryOwned || !samePRSourceAndBase(prior, expected) || prior.HeadOID == expected.HeadOID {
@@ -454,7 +530,7 @@ func (f *FakeGH) RefreshFactoryPullRequestIdentity(_ context.Context, prior, exp
 				return false, errors.New("fake-gh: correction pull request drifted")
 			}
 			count++
-			match = pr.Identity
+			match = pr
 		}
 		if count != 1 {
 			return false, errors.New("fake-gh: correction pull request missing or ambiguous")
@@ -503,6 +579,9 @@ func (f *FakeGH) createDraftUnchecked(identity contracts.PullRequestIdentity, ti
 			identity.BaseOID = f.state.BaseHeadOID
 		}
 		identity.FactoryOwned = true
+		if !strings.Contains(body, "<!-- sf:v1 ") {
+			body += "\n\n" + ownershipMarkerForFake(identity)
+		}
 		f.state.PRs = append(f.state.PRs, PullRequest{Identity: identity, Title: title, Body: body, Draft: true})
 		result, operationErr = f.finishMutationLocked("pr_create", identity)
 		return true, operationErr
