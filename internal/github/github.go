@@ -534,6 +534,19 @@ func requestDigest(operation string, identity contracts.PullRequestIdentity, val
 	return hex.EncodeToString(sum[:])
 }
 
+// CanonicalDraftPullRequestRequestDigest is the durable request binding used
+// by CreateDraftPullRequest. Publication coordinators must use this rather
+// than duplicate the adapter's private serialization.
+func CanonicalDraftPullRequestRequestDigest(identity contracts.PullRequestIdentity, title, body string) string {
+	return requestDigest("draft_pr", identity, title, body)
+}
+
+// CanonicalPullRequestUpdateRequestDigest is the durable request binding used
+// by UpdatePullRequest.
+func CanonicalPullRequestUpdateRequestDigest(identity contracts.PullRequestIdentity, title, body string) string {
+	return requestDigest("pr_edit", identity, title, body)
+}
+
 func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryIdentity) (Principal, error) {
 	if err := validRepository(repository); err != nil {
 		return Principal{}, err
