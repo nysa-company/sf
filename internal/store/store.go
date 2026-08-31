@@ -1191,8 +1191,8 @@ func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) Transition(ctx context.Context, transition Transition) (TransitionResult, error) {
-	if transition.Trigger == "operator_recover_as_guarded" && (transition.From != domain.StateBlocked || transition.To != domain.StateBuilding || transition.ResumeState != "") {
-		return TransitionResult{}, ErrEvidenceConflict
+	if transition.Trigger == "operator_recover_as_guarded" {
+		return s.TransitionRecoverAsGuarded(ctx, transition)
 	}
 	if transition.Trigger == "typed_blocker" && transition.To == domain.StateBlocked && (transition.From == domain.StatePublishing || transition.From == domain.StateWaitingCI) {
 		return s.TransitionPublishedBlock(ctx, transition)
@@ -1227,7 +1227,6 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		return TransitionResult{}, errors.New("typed blocker must target blocked state")
 	}
 	blockedCode := ""
-	guardedRecovery := transition.Trigger == "operator_recover_as_guarded"
 	if transition.Trigger == "typed_blocker" {
 		var blocker struct {
 			Code string `json:"code"`
@@ -1256,19 +1255,9 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
 			return err
 		}
-		if guardedRecovery {
-			var mode domain.MergeMode
-			var code string
-			if err := conn.QueryRowContext(ctx, `SELECT merge_mode,blocked_code FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&mode, &code); err != nil || mode != domain.MergeAutonomous || code != "autonomy_ineligible" {
-				return ErrEvidenceConflict
-			}
-		}
 		query := `UPDATE tickets SET state=?, resume_state=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`
 		args := []any{transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner}
-		if guardedRecovery {
-			query = `UPDATE tickets SET state=?, resume_state=?, merge_mode='guarded', blocked_code='', version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`
-			args = []any{transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner}
-		} else if transition.Trigger == "typed_blocker" {
+		if transition.Trigger == "typed_blocker" {
 			query = `UPDATE tickets SET state=?, resume_state=?, blocked_code=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`
 			args = []any{transition.To, nullableState(transition.ResumeState), blockedCode, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner}
 		}

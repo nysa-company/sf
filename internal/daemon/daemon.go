@@ -1611,6 +1611,15 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	// operator_retry is intentionally narrower than resume: it only follows a
 	// direct retry/correction exhaustion pause. A normal take/pause must use
 	// the inspected operator_resume path.
+	//
+	// It still changes the live runtime fence, so serialize it with take,
+	// resume, and recover. In particular, a retry must not race a runtime
+	// shutdown or a concurrent resume that could otherwise arm two workers.
+	daemon.runtimeMu.Lock()
+	defer daemon.runtimeMu.Unlock()
+	if daemon.isClosed() || daemon.runtimeStopped {
+		return daemon.failure(request, "daemon_stopping", "ticket retry is unavailable while the daemon is stopping", true)
+	}
 	var parameters controlParameters
 	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) {
 		return daemon.failure(request, "invalid_retry", "retry requires the authenticated operator and daemon channel", false)
@@ -1645,9 +1654,25 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	if err != nil || current.Version != result.TicketVersion {
 		return daemon.failure(request, "resume_state_unavailable", "retry transition could not be confirmed", true)
 	}
-	// Retry-exhaustion pauses did not traverse the stop/drain control path and
-	// therefore have no sealed runtime admission to rearm. The scheduler reads
-	// the new exact ticket fence and starts exactly one fresh attempt.
+	// Retry-exhaustion pauses normally have no sealed admission. The narrow
+	// crash window after a prior control operation is different: if Store still
+	// proves the exact control row sealed, rearm it while holding runtimeMu so
+	// one successful retry cannot admit two runtimes.
+	if state, ok := daemon.control.(RuntimeRearmStateController); ok {
+		needed, stateErr := state.RuntimeRearmNeeded(ctx, ref)
+		if stateErr != nil {
+			return daemon.failure(request, "runtime_rearm_failed", "retry state could not determine whether runtime admission is sealed", true)
+		}
+		if needed {
+			controller, ok := daemon.control.(RuntimeRearmController)
+			if !ok {
+				return daemon.failure(request, "runtime_rearm_unavailable", "retry is durably sealed until runtime admission is configured", true)
+			}
+			if err := controller.Rearm(ctx, ref); err != nil {
+				return daemon.failure(request, "runtime_rearm_failed", "retry is durably sealed until runtime admission is installed; retry after the local runtime is available", true)
+			}
+		}
+	}
 	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_" + kind, Identity: string(ref.Ticket)}, ticketView(current))
 }
 
@@ -1790,6 +1815,14 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	binary := daemon.executable()
 	argv := []string{binary, "doctor"}
 	verb := strings.TrimPrefix(request.Method, "ticket.")
+	operatorVerb := func(fallback string) string {
+		switch verb {
+		case "take", "resume", "retry", "recover", "status":
+			return verb
+		default:
+			return fallback
+		}
+	}
 	if code == "autonomous_unavailable" {
 		argv = []string{binary, "providers", "qualify", "--help"}
 	}
@@ -1820,6 +1853,25 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	if code == "invalid_logs" {
 		argv = []string{binary, "logs", "--help"}
 	}
+	// Operator control failures have a command-specific next action even when
+	// the malformed request omitted its ticket. Do not collapse them into
+	// doctor: the daemon already knows which control surface can recover.
+	switch code {
+	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_verification_changes_unadopted", "takeover_source_out_of_scope":
+		argv = []string{binary, "take", "--help"}
+	case "invalid_resume":
+		argv = []string{binary, "resume", "--help"}
+	case "invalid_retry":
+		argv = []string{binary, "retry", "--help"}
+	case "invalid_recover":
+		argv = []string{binary, "recover", "--help"}
+	case "runtime_rearm_unavailable", "runtime_rearm_failed", "resume_state_unavailable", "resume_transition_refused":
+		argv = []string{binary, operatorVerb("resume"), "--help"}
+	case "retry_state_unavailable", "retry_not_available", "retry_transition_refused", "retry_required":
+		argv = []string{binary, "retry", "--help"}
+	case "recover_mode_refused", "recover_transition_refused":
+		argv = []string{binary, "recover", "--help"}
+	}
 	if code == "invalid_control" || code == "invalid_ticket_reference" {
 		if verb != "" && verb != request.Method {
 			argv = []string{binary, verb, "--help"}
@@ -1836,8 +1888,12 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 			argv = []string{binary, "retry", request.Ticket}
 		case "takeover_inspection_failed":
 			argv = []string{binary, "take", request.Ticket}
-		case "retry_not_available", "recover_mode_refused", "recover_transition_refused":
-			argv = []string{binary, "status", request.Ticket}
+		case "runtime_rearm_unavailable", "runtime_rearm_failed", "resume_state_unavailable", "resume_transition_refused":
+			argv = []string{binary, operatorVerb("resume"), request.Ticket}
+		case "retry_state_unavailable", "retry_not_available", "retry_transition_refused":
+			argv = []string{binary, "retry", request.Ticket}
+		case "recover_mode_refused", "recover_transition_refused":
+			argv = []string{binary, "recover", request.Ticket}
 		}
 	}
 	if request.Ticket != "" {

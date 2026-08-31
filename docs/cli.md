@@ -117,11 +117,14 @@ verification-amendment flow; they are never silently routed into a source
 resume.
 
 `retry` applies only to the durable retry/correction-exhaustion pause and
-re-enters its exact stored resume state without a control rearm. `recover`
-accepts only a typed blocked ticket after a fresh drain; `--mode guarded` is
-further narrowed to the `autonomy_ineligible` blocker, atomically changes that
-ticket's durable merge mode to guarded, and starts a fresh guarded candidate
-cycle. Pause, take, and cancel invalidate the runner fence before
+re-enters its exact stored resume state. If a prior interrupted control action
+left a sealed runtime admission, retry performs its one fenced rearm before a
+new attempt can run. `recover` accepts only a typed blocked ticket after a
+fresh drain; `--mode guarded` is further narrowed to the
+`autonomy_ineligible` blocker and a frozen project configuration whose maximum
+mode is `guarded` or `autonomous` (a `manual` project is refused). It then
+atomically changes that ticket's durable merge mode to guarded and starts a
+fresh guarded candidate cycle. Pause, take, and cancel invalidate the runner fence before
 draining; capacity is released only by the final durable
 `paused`/`cancelled` transition.
 

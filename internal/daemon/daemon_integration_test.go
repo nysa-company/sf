@@ -132,6 +132,10 @@ func testDaemon(t *testing.T) (*Daemon, config.ChannelPaths, context.CancelFunc)
 }
 
 func testDaemonForChannel(t *testing.T, channel domain.Channel) (*Daemon, config.ChannelPaths, context.CancelFunc) {
+	return testDaemonForChannelWithProjectMaximum(t, channel, domain.MergeGuarded)
+}
+
+func testDaemonForChannelWithProjectMaximum(t *testing.T, channel domain.Channel, maximum domain.MergeMode) (*Daemon, config.ChannelPaths, context.CancelFunc) {
 	t.Helper()
 	root, err := os.MkdirTemp("/tmp", "sfv2-")
 	if err != nil {
@@ -148,9 +152,23 @@ func testDaemonForChannel(t *testing.T, channel domain.Channel) (*Daemon, config
 	auth := operator.Authenticator{ExpectedUID: uid, Lookup: func(got string) (operator.Account, error) {
 		return operator.Account{Username: "operator", UID: strconv.FormatUint(uint64(uid), 10)}, nil
 	}}
+	machine := config.DefaultMachineLimits()
+	projectConfig := config.DefaultProject("demo", filepath.Join(root, "repo"))
+	projectConfig.MergeMode = maximum
+	if maximum == domain.MergeAutonomous {
+		machine.AllowAutonomous = true
+	}
+	effective, err := config.Resolve(machine, projectConfig, config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
 	d, err := Start(context.Background(), Config{
 		Channel: channel, Paths: paths, StateMachinePath: stateMachine, DaemonIdentity: "integration-test-" + string(channel),
-		Projects:  []store.Project{{Channel: channel, ID: "demo", Path: filepath.Join(root, "repo"), BaseRef: "main"}},
+		Projects:  []store.Project{{Channel: channel, ID: "demo", Path: filepath.Join(root, "repo"), BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: snapshot}},
 		TicketIDs: &testIDs{}, Clock: testClock{now: time.Unix(100, 0).UTC()}, Operator: auth,
 	})
 	if err != nil {
@@ -171,15 +189,32 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				binary = "sf-dev"
 			}
 			for code, want := range map[string][]string{
-				"autonomous_unavailable":       {binary, "providers", "qualify", "--help"},
-				"runtime_activation_failed":    {binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"},
-				"runtime_already_active":       {binary, "daemon", "status"},
-				"terminal_replay_requires_new": {binary, "submit", "--help"},
-				"unknown_project":              {binary, "init", "--help"},
-				"invalid_submit":               {binary, "submit", "--help"},
-				"invalid_logs":                 {binary, "logs", "--help"},
-				"not_ready":                    {binary, "--help"},
-				"other":                        {binary, "doctor"},
+				"autonomous_unavailable":                  {binary, "providers", "qualify", "--help"},
+				"runtime_activation_failed":               {binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"},
+				"runtime_already_active":                  {binary, "daemon", "status"},
+				"terminal_replay_requires_new":            {binary, "submit", "--help"},
+				"unknown_project":                         {binary, "init", "--help"},
+				"invalid_submit":                          {binary, "submit", "--help"},
+				"invalid_logs":                            {binary, "logs", "--help"},
+				"not_ready":                               {binary, "--help"},
+				"takeover_inspection_failed":              {binary, "take", "--help"},
+				"takeover_changes_unadopted":              {binary, "take", "--help"},
+				"takeover_verification_changes_unadopted": {binary, "take", "--help"},
+				"takeover_source_out_of_scope":            {binary, "take", "--help"},
+				"invalid_resume":                          {binary, "resume", "--help"},
+				"invalid_retry":                           {binary, "retry", "--help"},
+				"invalid_recover":                         {binary, "recover", "--help"},
+				"runtime_rearm_unavailable":               {binary, "resume", "--help"},
+				"runtime_rearm_failed":                    {binary, "resume", "--help"},
+				"resume_state_unavailable":                {binary, "resume", "--help"},
+				"resume_transition_refused":               {binary, "resume", "--help"},
+				"retry_state_unavailable":                 {binary, "retry", "--help"},
+				"retry_not_available":                     {binary, "retry", "--help"},
+				"retry_transition_refused":                {binary, "retry", "--help"},
+				"retry_required":                          {binary, "retry", "--help"},
+				"recover_mode_refused":                    {binary, "recover", "--help"},
+				"recover_transition_refused":              {binary, "recover", "--help"},
+				"other":                                   {binary, "doctor"},
 			} {
 				response := d.failure(api.Request{Version: api.Version, RequestID: "failure-actions", Method: "ticket.submit"}, code, "failed", false)
 				if response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join(want, "\x00") {
@@ -205,6 +240,18 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				"takeover_source_out_of_scope":            {binary, "take", "SF-action"},
 				"takeover_inspection_failed":              {binary, "take", "SF-action"},
 				"retry_required":                          {binary, "retry", "SF-action"},
+				"invalid_resume":                          {binary, "resume", "--help"},
+				"invalid_retry":                           {binary, "retry", "--help"},
+				"invalid_recover":                         {binary, "recover", "--help"},
+				"runtime_rearm_unavailable":               {binary, "resume", "SF-action"},
+				"runtime_rearm_failed":                    {binary, "resume", "SF-action"},
+				"resume_state_unavailable":                {binary, "resume", "SF-action"},
+				"resume_transition_refused":               {binary, "resume", "SF-action"},
+				"retry_state_unavailable":                 {binary, "retry", "SF-action"},
+				"retry_not_available":                     {binary, "retry", "SF-action"},
+				"retry_transition_refused":                {binary, "retry", "SF-action"},
+				"recover_mode_refused":                    {binary, "recover", "SF-action"},
+				"recover_transition_refused":              {binary, "recover", "SF-action"},
 			} {
 				request := api.Request{Version: api.Version, RequestID: "control-actions", Method: "ticket.pause", Ticket: "SF-action"}
 				response := d.failure(request, code, "failed", false)
@@ -615,7 +662,7 @@ func TestDaemonRetryUsesOnlyARecordedRetryPause(t *testing.T) {
 
 func TestDaemonRecoverUsesTypedBlockerAndGuardedNarrowing(t *testing.T) {
 	ctx := context.Background()
-	d, _, _ := testDaemon(t)
+	d, _, _ := testDaemonForChannelWithProjectMaximum(t, domain.ChannelStable, domain.MergeGuarded)
 	started := createAndStartControlTicket(t, d, "SF-operator-recover")
 	if _, err := d.engine.Signal(ctx, contracts.SignalRequest{Ticket: started.Ref, TicketVersion: started.Version, From: domain.StatePlanning, Trigger: "typed_blocker", Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch}, Attributes: map[string]string{"no_unreconciled_external_mutation": "true"}, EventPayload: `{"code":"host_repair_required"}`}); err != nil {
 		t.Fatal(err)
