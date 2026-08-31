@@ -7,14 +7,17 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/nysa-company/sf/internal/api"
 	"github.com/nysa-company/sf/internal/config"
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/operator"
+	"github.com/nysa-company/sf/internal/providercoord"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/transport"
 )
@@ -262,6 +265,198 @@ func TestRuntimeFactoryRejectsAmbiguousOrPartialControlBundles(t *testing.T) {
 			t.Fatalf("nil runtime/control pair control=%T, want idle controller", d.control)
 		}
 	})
+}
+
+func qualificationRequest() api.Request {
+	return api.Request{Version: api.Version, RequestID: "qualify-runtime", Method: "provider.qualify", Parameters: []byte(`{"builder":"codex","reviewer":"codex"}`)}
+}
+
+func TestQualificationActivatesIdleRuntimeOnlyAfterQualifierCommits(t *testing.T) {
+	var qualified bool
+	var factoryCalls int
+	initialCoordinator := &providercoord.Coordinator{}
+	qualifiedCoordinator := &providercoord.Coordinator{}
+	started := make(chan struct{})
+	runtime := &fakeWorkflowRuntime{started: started}
+	cfg, _ := lifecycleConfig(t, func(deps RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		factoryCalls++
+		if !qualified {
+			if deps.ProviderCoordinator != initialCoordinator {
+				t.Fatalf("initial coordinator=%p, want %p", deps.ProviderCoordinator, initialCoordinator)
+			}
+			return WorkflowRuntimeComponents{}, nil
+		}
+		if deps.ProviderCoordinator != qualifiedCoordinator {
+			t.Fatalf("qualified coordinator=%p, want %p", deps.ProviderCoordinator, qualifiedCoordinator)
+		}
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
+	coordinatorCalls := 0
+	cfg.ProviderCoordinatorFactory = func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
+		coordinatorCalls++
+		if coordinatorCalls == 1 {
+			return initialCoordinator, nil
+		}
+		return qualifiedCoordinator, nil
+	}
+	cfg.ProviderQualifier = func(context.Context, *store.Store, domain.Channel, string, string) (any, error) {
+		// This assignment models the qualifier's final durable commit. The
+		// runtime factory must not run before this point.
+		qualified = true
+		return map[string]string{"durable": "qualified"}, nil
+	}
+	d, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if d.runtime != nil || factoryCalls != 1 || coordinatorCalls != 1 {
+		t.Fatalf("idle daemon runtime=%T factory=%d coordinators=%d", d.runtime, factoryCalls, coordinatorCalls)
+	}
+	response := d.qualifyProvider(context.Background(), qualificationRequest())
+	if !response.OK {
+		t.Fatalf("qualification response=%+v", response)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("qualified runtime did not start")
+	}
+	if d.runtime != runtime || d.control != runtime || d.providerCoordinator != qualifiedCoordinator {
+		t.Fatalf("installed runtime/control/coordinator=%T/%T/%p", d.runtime, d.control, d.providerCoordinator)
+	}
+	if factoryCalls != 2 || coordinatorCalls != 2 {
+		t.Fatalf("post-qualification factory=%d coordinators=%d", factoryCalls, coordinatorCalls)
+	}
+}
+
+func TestQualificationReportsCommittedActivationFailure(t *testing.T) {
+	var qualified bool
+	runtime := &fakeWorkflowRuntime{startErr: errors.New("start refused"), closed: make(chan struct{})}
+	cfg, _ := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		if !qualified {
+			return WorkflowRuntimeComponents{}, nil
+		}
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
+	cfg.ProviderCoordinatorFactory = func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
+		return &providercoord.Coordinator{}, nil
+	}
+	cfg.ProviderQualifier = func(context.Context, *store.Store, domain.Channel, string, string) (any, error) {
+		qualified = true
+		return map[string]string{"durable": "qualified"}, nil
+	}
+	d, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	response := d.qualifyProvider(context.Background(), qualificationRequest())
+	if response.OK || response.Error == nil || response.Error.Code != "runtime_activation_failed" {
+		t.Fatalf("qualification response=%+v", response)
+	}
+	if !response.Mutation.Attempted || response.Mutation.Kind != "provider.qualify" || !strings.Contains(response.Error.Message, "qualification was recorded") {
+		t.Fatalf("activation failure did not report committed qualification: %+v", response)
+	}
+	select {
+	case <-runtime.closed:
+	case <-time.After(time.Second):
+		t.Fatal("failed runtime was not closed")
+	}
+	if d.runtime != nil {
+		t.Fatalf("failed activation installed runtime %T", d.runtime)
+	}
+}
+
+func TestRequalificationDoesNotReplaceAnActiveRuntime(t *testing.T) {
+	var qualified bool
+	var factoryCalls int
+	runtime := &fakeWorkflowRuntime{closed: make(chan struct{})}
+	cfg, _ := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		factoryCalls++
+		if !qualified {
+			return WorkflowRuntimeComponents{}, nil
+		}
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
+	cfg.ProviderCoordinatorFactory = func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
+		return &providercoord.Coordinator{}, nil
+	}
+	cfg.ProviderQualifier = func(context.Context, *store.Store, domain.Channel, string, string) (any, error) {
+		qualified = true
+		return map[string]string{"durable": "qualified"}, nil
+	}
+	d, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if response := d.qualifyProvider(context.Background(), qualificationRequest()); !response.OK {
+		t.Fatalf("first qualification=%+v", response)
+	}
+	if response := d.qualifyProvider(context.Background(), qualificationRequest()); !response.OK {
+		t.Fatalf("requalification=%+v", response)
+	}
+	if factoryCalls != 2 || d.runtime != runtime || d.control != runtime {
+		t.Fatalf("requalification factory=%d runtime=%T control=%T", factoryCalls, d.runtime, d.control)
+	}
+	select {
+	case <-runtime.closed:
+		t.Fatal("requalification closed active runtime")
+	default:
+	}
+}
+
+func TestCloseWaitsForQualificationActivation(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var qualified bool
+	runtime := &fakeWorkflowRuntime{closed: make(chan struct{})}
+	cfg, _ := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		if !qualified {
+			return WorkflowRuntimeComponents{}, nil
+		}
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
+	cfg.ProviderCoordinatorFactory = func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
+		return &providercoord.Coordinator{}, nil
+	}
+	cfg.ProviderQualifier = func(context.Context, *store.Store, domain.Channel, string, string) (any, error) {
+		close(entered)
+		<-release
+		qualified = true
+		return map[string]string{"durable": "qualified"}, nil
+	}
+	d, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qualifyDone := make(chan api.Response, 1)
+	go func() { qualifyDone <- d.qualifyProvider(context.Background(), qualificationRequest()) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("qualification did not begin")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before qualification release: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if response := <-qualifyDone; !response.OK {
+		t.Fatalf("qualification response=%+v", response)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-runtime.closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not join activated runtime")
+	}
 }
 
 func TestStartupCleanupJoinsStoreAndLeaderCloseErrors(t *testing.T) {

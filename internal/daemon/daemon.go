@@ -209,15 +209,19 @@ type Daemon struct {
 	recoveryDrainer interface {
 		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
-	gitMutationDrainer       contracts.GitMutationDrainer
-	preparedCommitObserver   contracts.PreparedCommitObserver
-	repositoryCommandDrainer contracts.RepositoryCommandDrainer
-	providerCoordinator      *providercoord.Coordinator
-	providerQualifier        func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
-	runtime                  WorkflowRuntime
-	mu                       sync.Mutex
-	closed                   bool
-	serving                  bool
+	gitMutationDrainer         contracts.GitMutationDrainer
+	preparedCommitObserver     contracts.PreparedCommitObserver
+	repositoryCommandDrainer   contracts.RepositoryCommandDrainer
+	providerCoordinator        *providercoord.Coordinator
+	providerCoordinatorFactory func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error)
+	providerSupervisor         contracts.ProcessSupervisor
+	providerQualifier          func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
+	runtimeFactory             WorkflowRuntimeFactory
+	runtime                    WorkflowRuntime
+	mu                         sync.Mutex
+	closed                     bool
+	serving                    bool
+	runtimeStopped             bool
 
 	projectionMu      sync.Mutex
 	projector         events.Projector
@@ -327,7 +331,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 		preparedCommitObserver = git.PreparedCommitObserver{Runner: *configuration.GitRunner, Resolve: registeredWorktreeResolver(database)}
 	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
-		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, preparedCommitObserver: preparedCommitObserver, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinator: coordinator, providerQualifier: configuration.ProviderQualifier}
+		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, preparedCommitObserver: preparedCommitObserver, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinator: coordinator, providerCoordinatorFactory: configuration.ProviderCoordinatorFactory, providerSupervisor: configuration.ProviderSupervisor, providerQualifier: configuration.ProviderQualifier, runtimeFactory: configuration.WorkflowRuntimeFactory}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -635,6 +639,7 @@ func joinCloseError(cause error, resource string, closeFn func() error) error {
 func (daemon *Daemon) closeRuntime() error {
 	daemon.mu.Lock()
 	defer daemon.mu.Unlock()
+	daemon.runtimeStopped = true
 	if daemon.runtime == nil {
 		return nil
 	}
@@ -701,6 +706,14 @@ func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) 
 	if err := json.Unmarshal(request.Parameters, &parameters); err != nil || parameters.Builder != "codex" || parameters.Reviewer != "codex" {
 		return daemon.failure(request, "invalid_argument", "builder and reviewer must name the local Codex provider", false)
 	}
+	// Qualification changes the durable binding that a newly composed runtime
+	// would use. Serialize it with Close and controller replacement so neither
+	// a Store close nor an idle-controller drain can race activation.
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
+	if daemon.closed || daemon.runtimeStopped {
+		return daemon.failure(request, "daemon_stopping", "provider qualification is unavailable while the daemon is stopping", true)
+	}
 	value, err := daemon.providerQualifier(ctx, daemon.store, daemon.channel, parameters.Builder, parameters.Reviewer)
 	if err != nil {
 		response := daemon.failure(request, "unqualified_provider", "local Codex qualification failed without invoking a model: "+safeQualificationError(err), false)
@@ -709,7 +722,96 @@ func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) 
 		}
 		return response
 	}
+	if err := daemon.activateQualifiedRuntimeLocked(ctx); err != nil {
+		response := daemon.failure(request, "runtime_activation_failed", "provider qualification was recorded, but the local workflow runtime could not be activated; retry qualification or restart the daemon", true)
+		response.Mutation = api.Mutation{Attempted: true, Kind: "provider.qualify", Identity: string(daemon.channel), Observed: true}
+		if encoded, encodeErr := json.Marshal(value); encodeErr == nil {
+			response.Data = encoded
+		}
+		return response
+	}
 	return daemon.success(request, api.Mutation{Attempted: true, Kind: "provider.qualify", Identity: string(daemon.channel), Observed: true}, value)
+}
+
+// activateQualifiedRuntimeLocked installs the first executable local runtime
+// after a durable qualification. daemon.mu must be held. Requalification of
+// an already running daemon deliberately leaves its exact coordinator/runtime
+// pair in place: replacing it would require proving a handoff with no work in
+// flight, which this lifecycle does not yet provide.
+func (daemon *Daemon) activateQualifiedRuntimeLocked(ctx context.Context) error {
+	if daemon.runtime != nil {
+		return nil
+	}
+	if daemon.runtimeStopped || daemon.closed {
+		return errors.New("daemon runtime is stopping")
+	}
+	if daemon.providerCoordinatorFactory == nil || daemon.runtimeFactory == nil {
+		return errors.New("local workflow runtime activation is not configured")
+	}
+	coordinator, err := daemon.providerCoordinatorFactory(daemon.store, daemon.providerSupervisor)
+	if err != nil {
+		return fmt.Errorf("compose qualified provider coordinator: %w", err)
+	}
+	if coordinator == nil {
+		return errors.New("compose qualified provider coordinator: factory returned nil")
+	}
+	components, err := daemon.runtimeFactory(RuntimeDependencies{Store: daemon.store, Engine: daemon.engine, ProviderCoordinator: coordinator})
+	if err != nil {
+		if closeErr := coordinator.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+		if components.Runtime != nil {
+			if closeErr := components.Runtime.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+		}
+		return fmt.Errorf("compose qualified workflow runtime: %w", err)
+	}
+	if err := validateRuntimeComponents(components); err != nil {
+		if components.Runtime != nil {
+			err = errors.Join(err, components.Runtime.Close())
+		}
+		if closeErr := coordinator.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+		return err
+	}
+	if components.Runtime == nil {
+		if closeErr := coordinator.Close(); closeErr != nil {
+			return closeErr
+		}
+		return errors.New("qualified provider has no executable workflow runtime")
+	}
+	// The startup coordinator was intentionally idle. Retire it before the new
+	// runtime can start so a cleanup failure cannot make us report an activation
+	// failure after a real runtime is already live.
+	if daemon.providerCoordinator != nil && daemon.providerCoordinator != coordinator {
+		if err := daemon.providerCoordinator.Close(); err != nil {
+			return errors.Join(err, components.Runtime.Close(), coordinator.Close())
+		}
+	}
+	if err := components.Runtime.Start(ctx, domain.Fence{LeaderEpoch: daemon.epoch}); err != nil {
+		err = errors.Join(err, components.Runtime.Close(), coordinator.Close())
+		return fmt.Errorf("start qualified workflow runtime: %w", err)
+	}
+	daemon.runtime, daemon.control, daemon.providerCoordinator = components.Runtime, components.Controller, coordinator
+	return nil
+}
+
+func validateRuntimeComponents(components WorkflowRuntimeComponents) error {
+	if (components.Runtime == nil) != (components.Controller == nil) {
+		return errors.New("factory returned an incomplete runtime/control bundle")
+	}
+	if components.Runtime == nil {
+		return nil
+	}
+	if _, ok := components.Controller.(RuntimeRearmController); !ok {
+		return errors.New("controller does not support runtime rearm")
+	}
+	if _, ok := components.Controller.(RuntimeRetirementController); !ok {
+		return errors.New("controller does not support runtime retirement")
+	}
+	return nil
 }
 
 func safeQualificationError(err error) string {
@@ -999,6 +1101,11 @@ type controlParameters struct {
 }
 
 func (daemon *Daemon) controlTicket(ctx context.Context, request api.Request, identity domain.OperatorIdentity, intent string) api.Response {
+	// Keep one controller for the whole durable stop/drain transition. This
+	// also serializes a first qualified-runtime installation with a control
+	// request that began while the daemon still had only the idle controller.
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
 	var parameters controlParameters
 	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) {
 		return daemon.failure(request, "invalid_control", "control requires the authenticated operator and daemon channel", false)
@@ -1130,6 +1237,10 @@ func (daemon *Daemon) retireRuntimeControl(ctx context.Context, ref domain.Ticke
 }
 
 func (daemon *Daemon) resumeTicket(ctx context.Context, request api.Request, identity domain.OperatorIdentity) api.Response {
+	// See controlTicket: a rearm must use one exact runtime/control bundle and
+	// cannot interleave with its first installation after qualification.
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
 	var parameters controlParameters
 	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) {
 		return daemon.failure(request, "invalid_resume", "resume requires the authenticated operator and daemon channel", false)
