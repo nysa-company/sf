@@ -120,13 +120,14 @@ func migrationChecksum(statements []string) string {
 }
 
 type Store struct {
-	db           *sql.DB
-	commit       func(context.Context, *sql.Conn) error
-	readOnly     bool
-	worktreeRoot string
-	faultMu      sync.RWMutex
-	writeFault   func() error
-	mutations    *ExternalMutationGate
+	db             *sql.DB
+	commit         func(context.Context, *sql.Conn) error
+	readOnly       bool
+	worktreeRoot   string
+	faultMu        sync.RWMutex
+	writeFault     func() error
+	ciConsumeFault func(string) error
+	mutations      *ExternalMutationGate
 	// controlProofHook is package-test-only synchronization for proving the
 	// Store control/admission linearization.
 	controlProofHook func()
@@ -146,6 +147,25 @@ func (s *Store) injectedWriteFault() error {
 	s.faultMu.RUnlock()
 	if fault != nil {
 		return fault()
+	}
+	return nil
+}
+
+// SetCIConsumeFaultForTest injects a deterministic failure at a named point
+// in the atomic CI observation reducer. It is reserved for package tests that
+// prove budget and transition writes roll back together.
+func (s *Store) SetCIConsumeFaultForTest(fault func(string) error) {
+	s.faultMu.Lock()
+	s.ciConsumeFault = fault
+	s.faultMu.Unlock()
+}
+
+func (s *Store) injectedCIConsumeFault(stage string) error {
+	s.faultMu.RLock()
+	fault := s.ciConsumeFault
+	s.faultMu.RUnlock()
+	if fault != nil {
+		return fault(stage)
 	}
 	return nil
 }

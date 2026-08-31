@@ -101,6 +101,14 @@ func compositeForeignKey(table, target string, columns ...foreignKeyColumn) comp
 // insufficient: accepting a subset or differently ordered mapping would let a
 // valid value from another candidate, ticket, or fence satisfy the FK.
 var requiredCompositeForeignKeys = []compositeForeignKeyRequirement{
+	compositeForeignKey("ci_poll_schedules", "tickets",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "id"}),
+	compositeForeignKey("ci_poll_schedules", "publication_evidence",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"candidate_generation", "candidate_generation"}, foreignKeyColumn{"candidate_head_sha", "candidate_head_sha"}, foreignKeyColumn{"candidate_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"publication_witness_digest", "witness_digest"}),
+	compositeForeignKey("ci_poll_attempts", "ci_poll_schedules",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"candidate_generation", "candidate_generation"}, foreignKeyColumn{"candidate_head_sha", "candidate_head_sha"}, foreignKeyColumn{"candidate_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"publication_witness_digest", "publication_witness_digest"}),
+	compositeForeignKey("ci_poll_retry_epochs", "ci_poll_schedules",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"candidate_generation", "candidate_generation"}, foreignKeyColumn{"candidate_head_sha", "candidate_head_sha"}, foreignKeyColumn{"candidate_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"publication_witness_digest", "publication_witness_digest"}),
 	compositeForeignKey("ci_required_check_policies", "candidate_snapshots",
 		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"candidate_generation", "generation"}, foreignKeyColumn{"candidate_head_sha", "head_sha"}, foreignKeyColumn{"candidate_tree_sha", "tree_sha"}),
 	compositeForeignKey("ci_required_check_policies", "publication_evidence",

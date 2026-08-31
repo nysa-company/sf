@@ -87,9 +87,8 @@ type CIRequiredCheckPolicy struct {
 	authenticated            bool
 }
 
-// CorrectionBudgetAuthority is not a request to consume a budget. It is the
-// exact identity of a budget use that was authenticated and persisted by the
-// existing budget API before this transition is attempted.
+// CorrectionBudgetAuthority identifies the exact correction request the Store
+// may allocate atomically with its red CI transition.
 type CorrectionBudgetAuthority struct {
 	Ref           domain.TicketRef
 	RequestID     string
@@ -1239,19 +1238,85 @@ func (s *Store) LoadCIObservation(ctx context.Context, ref domain.TicketRef) (CI
 	return s.LoadCurrentCIObservation(ctx, ref)
 }
 
-func correctionBudgetPresent(ctx context.Context, q ciQuery, authority CorrectionBudgetAuthority, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
-	if authority.Ref != ref || authority.TicketVersion != version || authority.Fence != fence || authority.Fence.ClaimEpoch != 0 || authority.RequestID == "" || !boundedText(authority.RequestID, 300) {
-		return false, ErrBudgetExhausted
+// validateCorrectionBudgetLedger rejects any correction use that is not joined
+// to its exact red transition and repair binding. A legacy/crash orphan fails
+// closed rather than silently authorizing a repair.
+func validateCorrectionBudgetLedger(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) error {
+	var orphanCount int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses u WHERE u.channel=? AND u.project_id=? AND u.ticket_id=? AND u.kind='correction' AND NOT EXISTS (
+		SELECT 1 FROM candidate_repair_bindings b
+		JOIN ci_transition_evidence c ON c.channel=b.channel AND c.project_id=b.project_id AND c.ticket_id=b.ticket_id AND c.candidate_generation=b.predecessor_generation AND c.candidate_head_sha=b.predecessor_head_sha AND c.candidate_tree_sha=b.predecessor_tree_sha AND c.observation_classification=b.red_observation_classification AND c.observation_digest=b.red_observation_digest AND c.prior_publication_witness_digest=b.predecessor_publication_witness_digest AND c.observation_ticket_version=b.consumed_ticket_version AND c.observation_leader_epoch=b.consumed_leader_epoch AND c.observation_runner_epoch=b.consumed_runner_epoch AND c.ticket_version=b.red_transition_ticket_version AND c.transition_digest=b.red_transition_digest
+		WHERE b.channel=u.channel AND b.project_id=u.project_id AND b.ticket_id=u.ticket_id AND b.correction_budget_kind=u.kind AND b.correction_budget_request_id=u.request_id AND b.consumed_ticket_version=u.ticket_version AND b.consumed_leader_epoch=u.leader_epoch AND b.consumed_runner_epoch=u.runner_epoch
+		AND EXISTS (SELECT 1 FROM events e WHERE e.channel=u.channel AND e.project_id=u.project_id AND e.ticket_id=u.ticket_id AND e.ticket_version=u.ticket_version AND e.trigger='budget_correction' AND e.from_state='waiting_ci' AND e.to_state='waiting_ci' AND json_extract(e.payload,'$.request_id')=u.request_id)
+	)`, ref.Channel, ref.Project, ref.Ticket).Scan(&orphanCount); err != nil {
+		return normalizeBusy(ctx, err)
 	}
-	var found, sameFence int
-	err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses u JOIN ticket_counters c ON c.channel=u.channel AND c.project_id=u.project_id AND c.ticket_id=u.ticket_id AND c.kind=u.kind WHERE u.channel=? AND u.project_id=? AND u.ticket_id=? AND u.kind='correction' AND u.request_id=? AND u.ticket_version=? AND u.leader_epoch=? AND u.runner_epoch=? AND c.used>0 AND c.used<=c.limit_count AND EXISTS (SELECT 1 FROM events e WHERE e.channel=u.channel AND e.project_id=u.project_id AND e.ticket_id=u.ticket_id AND e.ticket_version=u.ticket_version AND e.trigger='budget_correction' AND json_extract(e.payload,'$.request_id')=u.request_id)`, ref.Channel, ref.Project, ref.Ticket, authority.RequestID, version, fence.LeaderEpoch, fence.RunnerEpoch).Scan(&found)
+	if orphanCount != 0 {
+		return ErrCIObservation
+	}
+	return nil
+}
+
+// consumeCorrectionBudget allocates one correction budget use inside the
+// caller's CI transaction.
+func consumeCorrectionBudget(ctx context.Context, conn *sql.Conn, authority CorrectionBudgetAuthority, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	if err := validateCorrectionBudgetLedger(ctx, conn, ref); err != nil {
+		return false, err
+	}
+	if authority.Ref != ref || authority.TicketVersion != version || authority.Fence != fence || authority.Fence.ClaimEpoch != 0 || !boundedText(authority.RequestID, 300) {
+		return false, nil
+	}
+	var used, limit int
+	err := conn.QueryRowContext(ctx, `SELECT used,limit_count FROM ticket_counters WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ref.Channel, ref.Project, ref.Ticket).Scan(&used, &limit)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO ticket_counters(channel,project_id,ticket_id,kind,used,limit_count) VALUES(?,?,?,?,0,2)`, ref.Channel, ref.Project, ref.Ticket, "correction"); err != nil {
+			return false, err
+		}
+		used, limit = 0, 2
+	} else if err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	if limit != 2 || used < 0 || used > limit {
+		return false, ErrCIObservation
+	}
+	var useCount int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ref.Channel, ref.Project, ref.Ticket).Scan(&useCount); err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	if useCount != used {
+		return false, ErrCIObservation
+	}
+	var existingVersion, existingLeader, existingRunner uint64
+	err = conn.QueryRowContext(ctx, `SELECT ticket_version,leader_epoch,runner_epoch FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND request_id=?`, ref.Channel, ref.Project, ref.Ticket, authority.RequestID).Scan(&existingVersion, &existingLeader, &existingRunner)
+	if err == nil {
+		// A durable transition with this request is replayed above. Reaching
+		// this branch means the request is an orphan or a mismatched attempt;
+		// never reuse a budget row without its exact red transition/binding.
+		if existingVersion != version || existingLeader != fence.LeaderEpoch || existingRunner != fence.RunnerEpoch {
+			return false, ErrCIObservation
+		}
+		return false, ErrCIObservation
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, normalizeBusy(ctx, err)
+	}
+	if used >= limit {
+		return false, nil
+	}
+	updated, err := conn.ExecContext(ctx, `UPDATE ticket_counters SET used=used+1 WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND used<limit_count`, ref.Channel, ref.Project, ref.Ticket)
 	if err != nil {
-		return false, normalizeBusy(ctx, err)
+		return false, err
 	}
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses u WHERE u.channel=? AND u.project_id=? AND u.ticket_id=? AND u.kind='correction' AND u.ticket_version=? AND u.leader_epoch=? AND u.runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, version, fence.LeaderEpoch, fence.RunnerEpoch).Scan(&sameFence); err != nil {
-		return false, normalizeBusy(ctx, err)
+	if count, _ := updated.RowsAffected(); count != 1 {
+		return false, ErrCIObservation
 	}
-	return found == 1 && sameFence == 1, nil
+	if _, err := conn.ExecContext(ctx, `INSERT INTO ticket_budget_uses(channel,project_id,ticket_id,kind,request_id,ticket_version,leader_epoch,runner_epoch,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, "correction", authority.RequestID, version, fence.LeaderEpoch, fence.RunnerEpoch, now()); err != nil {
+		return false, err
+	}
+	if err := evidenceEvent(ctx, conn, ref, version, "budget_correction", map[string]string{"request_id": authority.RequestID}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func ciTransitionDigest(ref domain.TicketRef, observation CIObservation, resultVersion uint64, eventID int64, eventCreated, resultingState, trigger, payload string) string {
@@ -1268,9 +1333,8 @@ func ciTransitionDigest(ref domain.TicketRef, observation CIObservation, resultV
 
 // ConsumeCIObservation atomically appends ci_transition_evidence and its
 // canonical event while advancing waiting_ci. Pending self-transitions and
-// green transitions need no budget. Red transitions require an exact,
-// separately persisted authority; otherwise the ticket is paused with the
-// normative ci_red_exhausted reason.
+// green transitions need no budget. Red transitions allocate at most one
+// correction use in this same transaction; exhaustion pauses with no new use.
 func (s *Store) ConsumeCIObservation(ctx context.Context, request CIObservationTransition) (TransitionResult, error) {
 	if request.Ref.Validate() != nil || request.ObservationDigest == "" || request.ExpectedVersion == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 {
 		return TransitionResult{}, ErrCIObservation
@@ -1286,6 +1350,9 @@ func (s *Store) ConsumeCIObservation(ctx context.Context, request CIObservationT
 		}
 		if request.ObservationDigest == "" || observation.ObservationDigest != request.ObservationDigest || observation.ObservedTicketVersion != request.ExpectedVersion || observation.ObservedFence != request.Fence {
 			return ErrStaleFence
+		}
+		if err := validateCorrectionBudgetLedger(ctx, conn, request.Ref); err != nil {
+			return err
 		}
 		var replayVersion, replayEventID, replayGeneration int64
 		var replayHead, replayTree, replayWitness string
@@ -1315,19 +1382,26 @@ func (s *Store) ConsumeCIObservation(ctx context.Context, request CIObservationT
 		observation = latest
 		resulting := domain.StateReviewing
 		trigger := "checks_green"
+		budgetAuthorized := false
 		if observation.Classification == "pending" {
 			resulting, trigger = domain.StateWaitingCI, "checks_pending"
 		} else if observation.Classification == "red" {
 			resulting, trigger = domain.StatePaused, "checks_red"
+			authority := CorrectionBudgetAuthority{}
 			if request.CorrectionBudget != nil {
-				present, budgetErr := correctionBudgetPresent(ctx, conn, *request.CorrectionBudget, request.Ref, observation.ObservedTicketVersion, observation.ObservedFence)
-				if budgetErr != nil && !errors.Is(budgetErr, ErrBudgetExhausted) {
-					// A malformed/stale authority is the exhausted branch for a
-					// known red observation. Actual SQLite failures remain fatal.
-					return budgetErr
-				}
-				if budgetErr == nil && present {
-					resulting = domain.StateBuilding
+				authority = *request.CorrectionBudget
+			}
+			var budgetErr error
+			budgetAuthorized, budgetErr = consumeCorrectionBudget(ctx, conn, authority, request.Ref, observation.ObservedTicketVersion, observation.ObservedFence)
+			if budgetErr != nil {
+				return budgetErr
+			}
+			if budgetAuthorized {
+				resulting = domain.StateBuilding
+			}
+			if budgetAuthorized {
+				if err := s.injectedCIConsumeFault("after_correction_budget"); err != nil {
+					return err
 				}
 			}
 		}

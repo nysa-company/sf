@@ -101,12 +101,9 @@ func (w CIWorker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fe
 	transition := store.CIObservationTransition{Ref: ref, ObservationDigest: stored.ObservationDigest, ExpectedVersion: ticket.Version, Fence: fence}
 	if stored.Classification == "red" {
 		requestID := "ci-red/" + strings.TrimPrefix(stored.ObservationDigest, "sha256:")
-		_, budgetErr := w.Store.ConsumeBudget(ctx, store.BudgetUse{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Kind: "correction", RequestID: requestID})
-		if budgetErr == nil {
-			transition.CorrectionBudget = &store.CorrectionBudgetAuthority{Ref: ref, RequestID: requestID, TicketVersion: ticket.Version, Fence: fence}
-		} else if !errors.Is(budgetErr, store.ErrBudgetExhausted) {
-			return result, budgetErr
-		}
+		// The Store allocates this request atomically with checks_red, repair
+		// binding, and the ticket advance. No budget mutation occurs here.
+		transition.CorrectionBudget = &store.CorrectionBudgetAuthority{Ref: ref, RequestID: requestID, TicketVersion: ticket.Version, Fence: fence}
 	}
 	transitioned, err := w.Store.ConsumeAuthenticatedCIObservation(ctx, transition)
 	if err != nil {

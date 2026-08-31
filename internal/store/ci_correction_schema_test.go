@@ -110,6 +110,22 @@ func TestCICorrectionCompositeForeignKeysAreExact(t *testing.T) {
 	}
 }
 
+func TestCIV46PollingForeignKeysAreExact(t *testing.T) {
+	database, _ := openTestStore(t)
+	defer database.Close()
+	for _, check := range []struct {
+		table, parent string
+		pairs         []foreignKeyPair
+	}{
+		{"ci_poll_schedules", "tickets", []foreignKeyPair{{"channel", "channel"}, {"project_id", "project_id"}, {"ticket_id", "id"}}},
+		{"ci_poll_schedules", "publication_evidence", []foreignKeyPair{{"candidate_generation", "candidate_generation"}, {"candidate_head_sha", "candidate_head_sha"}, {"candidate_tree_sha", "candidate_tree_sha"}, {"channel", "channel"}, {"project_id", "project_id"}, {"publication_witness_digest", "witness_digest"}, {"ticket_id", "ticket_id"}}},
+		{"ci_poll_attempts", "ci_poll_schedules", []foreignKeyPair{{"candidate_generation", "candidate_generation"}, {"candidate_head_sha", "candidate_head_sha"}, {"candidate_tree_sha", "candidate_tree_sha"}, {"channel", "channel"}, {"project_id", "project_id"}, {"publication_witness_digest", "publication_witness_digest"}, {"ticket_id", "ticket_id"}}},
+		{"ci_poll_retry_epochs", "ci_poll_schedules", []foreignKeyPair{{"candidate_generation", "candidate_generation"}, {"candidate_head_sha", "candidate_head_sha"}, {"candidate_tree_sha", "candidate_tree_sha"}, {"channel", "channel"}, {"project_id", "project_id"}, {"publication_witness_digest", "publication_witness_digest"}, {"ticket_id", "ticket_id"}}},
+	} {
+		assertExactForeignKey(t, database.db, check.table, check.parent, check.pairs...)
+	}
+}
+
 func TestCIV41CompositeForeignKeyTamperingRejectsOpenAndReadOnly(t *testing.T) {
 	ctx := context.Background()
 	for _, requirement := range requiredCompositeForeignKeys {
