@@ -691,9 +691,16 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 				return err
 			}
 			// A CI polling pause happens after effects_confirmed. It changes no
-			// external publication witness and is admitted only at this exact
-			// N+2 -> N+3 control boundary.
-			if publication.CurrentFence.RunnerEpoch != runner || publication.CurrentFence.LeaderEpoch != transition.Fence.LeaderEpoch || publication.CurrentTicketVersion > ^uint64(0)-3 || publication.CurrentTicketVersion+2 != version {
+			// external publication witness and is admitted only at the exact
+			// exhaustion/resume pair, after any authenticated pending chain.
+			if publication.CurrentTicketVersion == ^uint64(0) || publication.CurrentFence.LeaderEpoch == 0 || publication.CurrentFence.LeaderEpoch > transition.Fence.LeaderEpoch {
+				return ErrPublicationEvidence
+			}
+			pair, pairFound, pairErr := findCIPollResumePair(ctx, conn, transition.Ref, publication.CurrentTicketVersion+1, newVersion)
+			if pairErr != nil || !pairFound || pair.exhaustedVersion != version || pair.resumeVersion != newVersion {
+				return ErrPublicationEvidence
+			}
+			if pair.exhaustedVersion == 0 || validateCIRecoveryLedger(ctx, conn, transition.Ref, publication.CurrentTicketVersion+1, publication.CurrentFence.RunnerEpoch, publication.CurrentFence.LeaderEpoch, pair.exhaustedVersion-1, runner, transition.Fence.LeaderEpoch) != nil {
 				return ErrPublicationEvidence
 			}
 			if err := authenticatePublishedWaitingEvent(ctx, conn, transition.Ref, publication, publication.CurrentTicketVersion+1); err != nil {

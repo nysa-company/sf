@@ -1528,7 +1528,11 @@ func (c Client) rulesetProtection(ctx context.Context, repository contracts.Repo
 		switch rule.Type {
 		case "pull_request":
 			pullRules++
-			if !validAllowedMergeMethods(rule.Parameters["allowed_merge_methods"], method) {
+			if method == "" {
+				if !validMergeMethods(rule.Parameters["allowed_merge_methods"]) {
+					return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+				}
+			} else if !validAllowedMergeMethods(rule.Parameters["allowed_merge_methods"], method) {
 				return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 			}
 		case "required_status_checks":
@@ -1585,6 +1589,10 @@ func validAllowedMergeMethods(value any, wanted string) bool {
 	if wanted != "merge" && wanted != "squash" && wanted != "rebase" {
 		return false
 	}
+	return validMergeMethods(value) && containsMergeMethod(value, wanted)
+}
+
+func validMergeMethods(value any) bool {
 	values, ok := value.([]any)
 	if !ok || len(values) == 0 {
 		return false
@@ -1597,7 +1605,20 @@ func validAllowedMergeMethods(value any, wanted string) bool {
 		}
 		seen[method] = true
 	}
-	return seen[wanted]
+	return true
+}
+
+func containsMergeMethod(value any, wanted string) bool {
+	values, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range values {
+		if raw == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalRulesetCheck(value any) (string, bool) {

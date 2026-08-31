@@ -35,6 +35,12 @@ type ciPollRetryEpoch struct {
 	digest                                          string
 }
 
+type ciPollResumePair struct {
+	exhaustedVersion uint64
+	resumeVersion    uint64
+	resumedAt        time.Time
+}
+
 func ciPollBackoff(completed int) time.Duration {
 	if completed <= 0 {
 		return 0
@@ -144,9 +150,9 @@ func loadOrCreateCIPollSchedule(ctx context.Context, conn *sql.Conn, ref domain.
 	if err != nil {
 		return time.Time{}, time.Time{}, 0, normalizeBusy(ctx, err)
 	}
-	first, firstErr := time.Parse(time.RFC3339Nano, firstRaw)
-	deadline, deadlineErr := time.Parse(time.RFC3339Nano, deadlineRaw)
-	if firstErr != nil || deadlineErr != nil || maximum != ciPollMaxAttempts || !deadline.After(first) {
+	first, firstErr := parsePublicationTime(firstRaw)
+	deadline, deadlineErr := parsePublicationTime(deadlineRaw)
+	if firstErr != nil || deadlineErr != nil || maximum != ciPollMaxAttempts || !deadline.Equal(first.Add(ciPollDeadline)) {
 		return time.Time{}, time.Time{}, 0, ErrCIObservation
 	}
 	return first, deadline, maximum, nil
@@ -165,7 +171,7 @@ func loadCIPollAttempts(ctx context.Context, conn *sql.Conn, ref domain.TicketRe
 	if count == 0 {
 		return 0, time.Time{}, nil
 	}
-	last, err := time.Parse(time.RFC3339Nano, lastRaw)
+	last, err := parsePublicationTime(lastRaw)
 	if err != nil || !canonicalPublicationTimestamp(last) {
 		return 0, time.Time{}, ErrCIObservation
 	}
@@ -183,14 +189,70 @@ func loadCIPollRetryEpoch(ctx context.Context, conn *sql.Conn, ref domain.Ticket
 		return ciPollRetryEpoch{}, false, normalizeBusy(ctx, err)
 	}
 	var parseErr error
-	value.resumedAt, parseErr = time.Parse(time.RFC3339Nano, resumedRaw)
+	value.resumedAt, parseErr = parsePublicationTime(resumedRaw)
 	if parseErr == nil {
-		value.deadline, parseErr = time.Parse(time.RFC3339Nano, deadlineRaw)
+		value.deadline, parseErr = parsePublicationTime(deadlineRaw)
 	}
-	if parseErr != nil || !canonicalPublicationTimestamp(value.resumedAt) || !canonicalPublicationTimestamp(value.deadline) || !validCIAuthorityDigest(value.digest) {
+	if parseErr != nil || !value.deadline.Equal(value.resumedAt.Add(ciPollDeadline)) || !validCIAuthorityDigest(value.digest) {
 		return ciPollRetryEpoch{}, false, ErrCIObservation
 	}
 	return value, true, nil
+}
+
+// findCIPollResumePair locates the one initial exhaustion/resume control pair
+// for this candidate. The pair is not tied to a fixed ticket version: pending
+// observations and signed runner recovery rows may occupy arbitrary versions
+// between publication and exhaustion.
+func findCIPollResumePair(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, baselineVersion, liveVersion uint64) (ciPollResumePair, bool, error) {
+	if baselineVersion == 0 || liveVersion < baselineVersion {
+		return ciPollResumePair{}, false, nil
+	}
+	rows, err := q.QueryContext(ctx, `SELECT ticket_version,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND trigger='ci_poll_exhausted' AND from_state='waiting_ci' AND to_state='paused' ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, baselineVersion, liveVersion)
+	if err != nil {
+		return ciPollResumePair{}, false, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	var pair ciPollResumePair
+	var found bool
+	for rows.Next() {
+		var exhausted uint64
+		var payload string
+		if err := rows.Scan(&exhausted, &payload); err != nil {
+			return ciPollResumePair{}, false, err
+		}
+		var value struct {
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal([]byte(payload), &value); err != nil {
+			return ciPollResumePair{}, false, ErrCIObservation
+		}
+		if value.Code != "ci_poll_attempts_exhausted" && value.Code != "ci_poll_deadline_exhausted" {
+			continue
+		}
+		if exhausted == ^uint64(0) || exhausted+1 > liveVersion || !authenticateCIPollResume(ctx, q, ref, exhausted, exhausted+1) {
+			return ciPollResumePair{}, false, nil
+		}
+		var resumedRaw string
+		if err := q.QueryRowContext(ctx, `SELECT created_at FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_resume' AND from_state='paused' AND to_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, exhausted+1).Scan(&resumedRaw); err != nil {
+			return ciPollResumePair{}, false, normalizeBusy(ctx, err)
+		}
+		resumedAt, err := parsePublicationTime(resumedRaw)
+		if err != nil {
+			return ciPollResumePair{}, false, ErrCIObservation
+		}
+		if found {
+			return ciPollResumePair{}, false, ErrCIObservation
+		}
+		pair = ciPollResumePair{exhaustedVersion: exhausted, resumeVersion: exhausted + 1, resumedAt: resumedAt}
+		found = true
+	}
+	if err := rows.Err(); err != nil {
+		return ciPollResumePair{}, false, err
+	}
+	return pair, found, nil
 }
 
 func authorizeCIPollRetry(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, publication PublishedCandidateEvidence, attempts int, version, runner, leader uint64, at time.Time) (ciPollRetryEpoch, bool, error) {
@@ -198,42 +260,27 @@ func authorizeCIPollRetry(ctx context.Context, conn *sql.Conn, ref domain.Ticket
 		return ciPollRetryEpoch{}, false, nil
 	}
 	waitingVersion := publication.CurrentTicketVersion + 1
-	exhaustedVersion, resumeVersion := waitingVersion+1, waitingVersion+2
-	if version < resumeVersion || runner < publication.CurrentFence.RunnerEpoch || publication.CurrentFence.LeaderEpoch == 0 {
+	if version <= waitingVersion || runner < publication.CurrentFence.RunnerEpoch || publication.CurrentFence.LeaderEpoch == 0 {
 		return ciPollRetryEpoch{}, false, nil
 	}
-	var exhaustedCount, resumedCount int
-	var exhaustedPayload, resumedRaw string
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(payload),'') FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='ci_poll_exhausted' AND from_state='waiting_ci' AND to_state='paused'`, ref.Channel, ref.Project, ref.Ticket, exhaustedVersion).Scan(&exhaustedCount, &exhaustedPayload); err != nil {
-		return ciPollRetryEpoch{}, false, normalizeBusy(ctx, err)
-	}
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(created_at),'') FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_resume' AND from_state='paused' AND to_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, resumeVersion).Scan(&resumedCount, &resumedRaw); err != nil {
-		return ciPollRetryEpoch{}, false, normalizeBusy(ctx, err)
-	}
-	if exhaustedCount != 1 || resumedCount != 1 {
+	pair, authorized, err := findCIPollResumePair(ctx, conn, ref, waitingVersion, version)
+	if err != nil || !authorized {
+		if err != nil {
+			return ciPollRetryEpoch{}, false, err
+		}
 		return ciPollRetryEpoch{}, false, nil
 	}
-	var payload struct {
-		Code string `json:"code"`
+	if validationErr := validateCIRecoveryLedger(ctx, conn, ref, waitingVersion, publication.CurrentFence.RunnerEpoch, publication.CurrentFence.LeaderEpoch, version, runner, leader); validationErr != nil {
+		return ciPollRetryEpoch{}, false, nil
 	}
-	if err := json.Unmarshal([]byte(exhaustedPayload), &payload); err != nil {
+	if at.Before(pair.resumedAt) {
 		return ciPollRetryEpoch{}, false, ErrCIObservation
 	}
-	if payload.Code != "ci_poll_attempts_exhausted" && payload.Code != "ci_poll_deadline_exhausted" {
-		return ciPollRetryEpoch{}, false, nil
-	}
-	if !authenticateCIPollResume(ctx, conn, ref, exhaustedVersion, resumeVersion) || validateCIRecoveryLedger(ctx, conn, ref, waitingVersion, publication.CurrentFence.RunnerEpoch, publication.CurrentFence.LeaderEpoch, version, runner, leader) != nil {
-		return ciPollRetryEpoch{}, false, nil
-	}
-	resumedAt, err := time.Parse(time.RFC3339Nano, resumedRaw)
-	if err != nil || !canonicalPublicationTimestamp(resumedAt) || at.Before(resumedAt) {
-		return ciPollRetryEpoch{}, false, ErrCIObservation
-	}
-	deadline := resumedAt.Add(ciPollDeadline)
+	deadline := pair.resumedAt.Add(ciPollDeadline)
 	if attempts < 1 || attempts > ciPollMaxAttempts {
 		return ciPollRetryEpoch{}, false, ErrCIObservation
 	}
-	value := ciPollRetryEpoch{initialAttempts: attempts, exhaustedVersion: exhaustedVersion, resumeVersion: resumeVersion, leader: publication.CurrentFence.LeaderEpoch, runner: publication.CurrentFence.RunnerEpoch, resumedAt: resumedAt, deadline: deadline}
+	value := ciPollRetryEpoch{initialAttempts: attempts, exhaustedVersion: pair.exhaustedVersion, resumeVersion: pair.resumeVersion, leader: publication.CurrentFence.LeaderEpoch, runner: publication.CurrentFence.RunnerEpoch, resumedAt: pair.resumedAt, deadline: deadline}
 	value.digest = ciPollRetryEpochDigest(ref, publication, value.initialAttempts, value.exhaustedVersion, value.resumeVersion, value.leader, value.runner, value.resumedAt, value.deadline)
 	if _, err := conn.ExecContext(ctx, `INSERT INTO ci_poll_retry_epochs(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,publication_witness_digest,initial_attempts,exhaustion_ticket_version,resume_ticket_version,resume_leader_epoch,resume_runner_epoch,resumed_at,deadline_at,retry_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA, publication.Candidate.Snapshot.TreeSHA, publication.WitnessDigest, value.initialAttempts, value.exhaustedVersion, value.resumeVersion, value.leader, value.runner, value.resumedAt.Format(time.RFC3339Nano), value.deadline.Format(time.RFC3339Nano), value.digest); err != nil {
 		return ciPollRetryEpoch{}, false, err
@@ -329,6 +376,6 @@ func pauseCIPoll(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, vers
 }
 
 func canonicalPublicationTimestamp(at time.Time) bool {
-	_, ok := canonicalPublicationTime(at.UTC())
+	_, ok := canonicalPublicationTime(at)
 	return ok
 }

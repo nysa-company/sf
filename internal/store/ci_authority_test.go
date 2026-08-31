@@ -234,6 +234,83 @@ func TestCIPollerAuthorityPendingRestartReplaysDurableState(t *testing.T) {
 	}
 }
 
+func TestCIPollRetryEpochUsesArbitraryPendingChainAcrossRecovery(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	ctx := t.Context()
+	publication, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gh, err := testkit.NewFakeGH(t.TempDir()+"/fake-gh.json", publication.PullRequest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gh.SetAuthenticated(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := gh.InjectPullRequestForTest(testkit.PullRequest{Identity: publication.PullRequest, Draft: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gh.SetChecks(publication.PullRequest.Number, contracts.RequiredCheck{Name: "lint", ExternalID: "check-lint", State: "PENDING"}); err != nil {
+		t.Fatal(err)
+	}
+	// Several durable pending observations deliberately occupy versions between
+	// publication and exhaustion; retry authorization must discover these
+	// versions rather than assuming a fixed +2/+3 layout.
+	for pending := 0; pending < 3; pending++ {
+		if err := pollCIAuthority(ctx, db, ticket, fence, gh); err != nil {
+			t.Fatalf("pending observation %d: %v", pending+1, err)
+		}
+		ticket, err = db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence.RunnerEpoch = ticket.RunnerEpoch
+	}
+	baselineVersion := ticket.Version
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	admission, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start)
+	if err != nil || !admission.Due {
+		t.Fatalf("pending-chain first admission=%+v err=%v", admission, err)
+	}
+	next := admission.NextPoll
+	for attempt := 2; attempt <= ciPollMaxAttempts; attempt++ {
+		admission, err = db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+		if err != nil || !admission.Due || admission.Attempt != attempt {
+			t.Fatalf("pending-chain attempt %d admission=%+v err=%v", attempt, admission, err)
+		}
+		next = admission.NextPoll
+	}
+	if exhausted, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next); err != nil || !exhausted.Expired {
+		t.Fatalf("pending-chain exhaustion=%+v err=%v", exhausted, err)
+	}
+	paused, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || paused.Version != baselineVersion+1 || paused.State != domain.StatePaused {
+		t.Fatalf("pending-chain paused ticket=%+v err=%v", paused, err)
+	}
+	if _, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateWaitingCI, Trigger: "operator_resume", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatalf("pending-chain resume: %v", err)
+	}
+	// Take over after resume but before retry admission. This exercises the
+	// lost-response/recovery path with the arbitrary pending chain intact.
+	leader, err := db.AcquireLeader(ctx, ticket.Ref.Channel, "ci-poll-pending-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, ticket.Ref.Channel, leader); err != nil || changed != 1 {
+		t.Fatalf("pending-chain runner recovery changed=%d err=%v", changed, err)
+	}
+	recovered, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || recovered.Version != paused.Version+2 || recovered.RunnerEpoch != fence.RunnerEpoch+1 {
+		t.Fatalf("pending-chain recovered ticket=%+v err=%v", recovered, err)
+	}
+	retry, err := db.AdmitCIPoll(ctx, ticket.Ref, domain.Fence{LeaderEpoch: leader, RunnerEpoch: recovered.RunnerEpoch}, next)
+	if err != nil || !retry.Due || retry.Attempt != 1 {
+		t.Fatalf("pending-chain recovered retry=%+v err=%v", retry, err)
+	}
+}
+
 func TestCIPollAdmissionBackoffCapAndRestart(t *testing.T) {
 	db, ticket, fence := ciAuthorityPublishedFixture(t)
 	ctx := t.Context()
@@ -387,6 +464,27 @@ func TestCIPollAdmissionDeadlinePausesWithExplicitAction(t *testing.T) {
 	events, err := db.Events(t.Context(), ticket.Ref.Channel, 0, 100)
 	if err != nil || len(events) == 0 || events[len(events)-1].Trigger != "ci_poll_exhausted" || !strings.Contains(events[len(events)-1].Payload, `"next_action"`) {
 		t.Fatalf("CI deadline explicit next action events=%+v err=%v", events, err)
+	}
+}
+
+func TestCIPollAdmissionRejectsTamperedDeadline(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	ctx := t.Context()
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start); err != nil {
+		t.Fatal(err)
+	}
+	// Bypass the append-only trigger only to model a storage tamper. Admission
+	// must still enforce the canonical first+3h invariant.
+	if _, err := db.db.ExecContext(ctx, `DROP TRIGGER ci_poll_schedules_immutable_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ci_poll_schedules SET deadline_at=? WHERE channel=? AND project_id=? AND ticket_id=?`, start.Add(ciPollDeadline+time.Second).Format(time.RFC3339Nano), ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start.Add(time.Second)); !errors.Is(err, ErrCIObservation) {
+		t.Fatalf("tampered CI deadline accepted: %v", err)
 	}
 }
 

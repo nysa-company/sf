@@ -221,7 +221,11 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					return err
 				}
 				waitingVersion := waitingPublication.CurrentTicketVersion + 1
-				pollRetryResume := ticket.version >= waitingVersion+2 && ticket.runner == waitingPublication.CurrentFence.RunnerEpoch && authenticateCIPollResume(ctx, conn, ref, waitingVersion+1, waitingVersion+2)
+				pollPair, pollPairFound, pollPairErr := findCIPollResumePair(ctx, conn, ref, waitingVersion, ticket.version)
+				if pollPairErr != nil {
+					return pollPairErr
+				}
+				pollRetryResume := pollPairFound && pollPair.resumeVersion <= ticket.version && ticket.runner == waitingPublication.CurrentFence.RunnerEpoch
 				if pendingEvidence > 0 || pollRetryResume {
 					ciWaitingPriorLeader = waitingPublication.CurrentFence.LeaderEpoch
 					if latestFound {

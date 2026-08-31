@@ -1477,6 +1477,24 @@ func TestStrictProtectionAcceptsExactRepositoryRuleset(t *testing.T) {
 	}
 }
 
+func TestObserveCIRequiredCheckPolicyAcceptsRulesetWithoutMergeMethod(t *testing.T) {
+	client, fake, identity := fixture(t)
+	if err := fake.SetRulesetsForTest(exactRepositoryRuleset()); err != nil {
+		t.Fatal(err)
+	}
+	pr := createDraft(t, client, identity, "ruleset CI", "body")
+	if err := fake.SetChecks(pr.Identity.Number,
+		contracts.RequiredCheck{Name: "ci", ExternalID: "https://github.com/example/app/actions/runs/1", State: "SUCCESS"},
+		contracts.RequiredCheck{Name: "test-immutability", ExternalID: "https://github.com/example/app/actions/runs/2", State: "SUCCESS"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := client.ObserveCIRequiredCheckPolicy(context.Background(), pr.Identity)
+	if err != nil || len(policy.RequiredChecks) != 2 || policy.ProtectedBranchRef != "main" {
+		t.Fatalf("ruleset CI policy observation=%+v err=%v", policy, err)
+	}
+}
+
 func TestObserveCIRequiredCheckPolicyRejectsProtectionWitnessRace(t *testing.T) {
 	client, fake, identity := fixture(t)
 	if err := fake.SetRulesetsForTest(exactRepositoryRuleset()); err != nil {

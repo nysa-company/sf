@@ -625,11 +625,15 @@ func loadCICurrentPublicationAt(ctx context.Context, q ciQuery, ref domain.Ticke
 	if err := validateCIWaitingVersionEvents(ctx, q, ref, waitingVersion, string(payloadBytes), publication); err != nil {
 		return PublishedCandidateEvidence{}, ciPublicationFailure("publication waiting event")
 	}
-	pollControlVersions := uint64(0)
 	// A single exhausted-poll -> operator-resume pair consumes two ticket
 	// versions without an external CI observation. It is distinct from a
 	// pending observation and is accepted only by its exact immutable events.
-	if version >= waitingVersion+2 && authenticateCIPollResume(ctx, q, ref, waitingVersion+1, waitingVersion+2) {
+	pollPair, hasPollPair, err := findCIPollResumePair(ctx, q, ref, waitingVersion, version)
+	if err != nil {
+		return PublishedCandidateEvidence{}, err
+	}
+	pollControlVersions := uint64(0)
+	if hasPollPair {
 		pollControlVersions = 2
 	}
 	rows, err := q.QueryContext(ctx, `SELECT c.ticket_version,c.event_id,c.event_created_at,c.candidate_generation,c.candidate_head_sha,c.candidate_tree_sha,c.observation_classification,c.observation_digest,c.observation_ticket_version,c.observation_leader_epoch,c.observation_runner_epoch,c.prior_publication_witness_digest,c.prior_state,c.resulting_state,c.resulting_trigger,c.transition_digest,e.id,e.created_at,e.from_state,e.to_state,e.trigger,e.payload FROM ci_transition_evidence c JOIN events e ON e.channel=c.channel AND e.project_id=c.project_id AND e.ticket_id=c.ticket_id AND e.ticket_version=c.ticket_version AND e.id=c.event_id WHERE c.channel=? AND c.project_id=? AND c.ticket_id=? AND c.ticket_version>? ORDER BY c.ticket_version`, ref.Channel, ref.Project, ref.Ticket, waitingVersion)
@@ -637,10 +641,13 @@ func loadCICurrentPublicationAt(ctx context.Context, q ciQuery, ref domain.Ticke
 		return PublishedCandidateEvidence{}, normalizeBusy(ctx, err)
 	}
 	defer rows.Close()
-	expectedVersion := waitingVersion + 1 + pollControlVersions
+	expectedVersion := waitingVersion + 1
 	chainRunner, chainLeader := publication.CurrentFence.RunnerEpoch, publication.CurrentFence.LeaderEpoch
 	chainCount := 0
 	for rows.Next() {
+		if hasPollPair && expectedVersion == pollPair.exhaustedVersion {
+			expectedVersion = pollPair.resumeVersion + 1
+		}
 		chainCount++
 		var evidenceVersion, eventID, generation, observationVersion, observationLeader, observationRunner int64
 		var eventCreated, head, tree, classification, observationDigest, witness, priorState, resultingState, trigger, transitionDigest string
@@ -689,6 +696,9 @@ func loadCICurrentPublicationAt(ctx context.Context, q ciQuery, ref domain.Ticke
 		return PublishedCandidateEvidence{}, ErrPublicationEvidence
 	}
 	var recoveryCount int
+	if hasPollPair && (pollPair.exhaustedVersion < waitingVersion+1 || pollPair.resumeVersion > version) {
+		return PublishedCandidateEvidence{}, ciPublicationFailure("poll resume placement")
+	}
 	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, waitingVersion, version).Scan(&recoveryCount); err != nil || chainCount+recoveryCount+int(pollControlVersions) != int(version-waitingVersion) {
 		return PublishedCandidateEvidence{}, ciPublicationFailure("pending CI chain cardinality")
 	}
@@ -715,10 +725,14 @@ func validateCIRecoveryLedger(ctx context.Context, q ciQuery, ref domain.TicketR
 	}
 	defer rows.Close()
 	expectedVersion, expectedRunner, expectedLeader := baselineVersion, baselineRunner, baselineLeader
-	if liveVersion >= baselineVersion+2 && authenticateCIPollResume(ctx, q, ref, baselineVersion+1, baselineVersion+2) {
-		expectedVersion = baselineVersion + 2
+	pollPair, hasPollPair, err := findCIPollResumePair(ctx, q, ref, baselineVersion, liveVersion)
+	if err != nil {
+		return err
 	}
 	for rows.Next() {
+		if hasPollPair && expectedVersion == pollPair.exhaustedVersion {
+			expectedVersion = pollPair.resumeVersion
+		}
 		var step RunnerRecoveryLedger
 		var created string
 		if err := rows.Scan(&step.PriorTicketVersion, &step.PriorRunnerEpoch, &step.PriorLeaderEpoch, &step.TicketVersion, &step.RunnerEpoch, &step.LeaderEpoch, &step.RecoveryDigest, &created); err != nil {
@@ -731,11 +745,18 @@ func validateCIRecoveryLedger(ctx context.Context, q ciQuery, ref domain.TicketR
 		}
 		if step.PriorTicketVersion > expectedVersion {
 			var evidence, events int
-			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND resulting_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, expectedVersion, step.PriorTicketVersion).Scan(&evidence); err != nil || evidence != int(step.PriorTicketVersion-expectedVersion) {
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND resulting_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, expectedVersion, step.PriorTicketVersion).Scan(&evidence); err != nil {
 				return ciPublicationFailure("CI recovery gap evidence")
 			}
-			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, expectedVersion, step.PriorTicketVersion).Scan(&events); err != nil || events != evidence {
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, expectedVersion, step.PriorTicketVersion).Scan(&events); err != nil {
 				return ciPublicationFailure("CI recovery gap events")
+			}
+			controlCount := 0
+			if hasPollPair && pollPair.exhaustedVersion > expectedVersion && pollPair.resumeVersion <= step.PriorTicketVersion {
+				controlCount = 2
+			}
+			if evidence != int(step.PriorTicketVersion-expectedVersion)-controlCount || events != evidence+controlCount {
+				return ciPublicationFailure("CI recovery gap cardinality")
 			}
 		}
 		var events int
@@ -751,6 +772,27 @@ func validateCIRecoveryLedger(ctx context.Context, q ciQuery, ref domain.TicketR
 	// evidence may advance the ticket while retaining the current fence. The
 	// CI chain below authenticates those rows individually; this check only
 	// proves that no unaccounted version was smuggled into a recovery gap.
+	if hasPollPair && expectedVersion <= pollPair.exhaustedVersion {
+		// The control pair itself has no CI evidence rows. Any versions before
+		// exhaustion must already be accounted for by pending evidence or signed
+		// recovery rows; the pair then advances the contiguous expectation to the
+		// resumed waiting-ci version.
+		var evidence, events, recovery int
+		predecessorStart := expectedVersion + 1
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>=? AND ticket_version<? AND resulting_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, predecessorStart, pollPair.exhaustedVersion).Scan(&evidence); err != nil {
+			return ciPublicationFailure("CI poll pair predecessor evidence")
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>=? AND ticket_version<?`, ref.Channel, ref.Project, ref.Ticket, predecessorStart, pollPair.exhaustedVersion).Scan(&recovery); err != nil {
+			return ciPublicationFailure("CI poll pair predecessor recovery")
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>=? AND ticket_version<?`, ref.Channel, ref.Project, ref.Ticket, predecessorStart, pollPair.exhaustedVersion).Scan(&events); err != nil || events != evidence {
+			return ciPublicationFailure("CI poll pair predecessor events")
+		}
+		if pollPair.exhaustedVersion > predecessorStart && evidence+recovery != int(pollPair.exhaustedVersion-predecessorStart) {
+			return ciPublicationFailure("CI poll pair predecessor cardinality")
+		}
+		expectedVersion = pollPair.resumeVersion
+	}
 	if liveVersion > expectedVersion {
 		var evidence, events int
 		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND resulting_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, expectedVersion, liveVersion).Scan(&evidence); err != nil || evidence != int(liveVersion-expectedVersion) {

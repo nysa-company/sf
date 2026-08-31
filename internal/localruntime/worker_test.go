@@ -1,16 +1,40 @@
 package localruntime
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/engine"
 	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
+	"github.com/nysa-company/sf/internal/workflowworker"
 )
+
+type ciBlockEngine struct {
+	request contracts.SignalRequest
+}
+
+func (e *ciBlockEngine) Signal(_ context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	e.request = request
+	return contracts.TransitionResult{To: domain.StateBlocked, TicketVersion: request.TicketVersion + 1}, nil
+}
+
+func (e *ciBlockEngine) SignalPlan(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return contracts.TransitionResult{}, errors.New("unexpected plan signal")
+}
+func (e *ciBlockEngine) SignalVerification(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return contracts.TransitionResult{}, errors.New("unexpected verification signal")
+}
+func (e *ciBlockEngine) SignalCandidate(context.Context, contracts.SignalRequest, domain.CandidateSnapshot) (contracts.TransitionResult, error) {
+	return contracts.TransitionResult{}, errors.New("unexpected candidate signal")
+}
+
+var _ workflowworker.StateMachine = (*ciBlockEngine)(nil)
 
 func TestPrePublishingWorkerBlocksPublishingWithActionableChannelGuidance(t *testing.T) {
 	database := openStore(t)
@@ -48,6 +72,38 @@ func TestPrePublishingWorkerBlocksPublishingWithActionableChannelGuidance(t *tes
 	}
 	if json.Unmarshal([]byte(events[1].Payload), &payload) != nil || payload.NextAction != "sf-dev doctor" || payload.Guidance == "" {
 		t.Fatalf("block payload=%s", events[1].Payload)
+	}
+}
+
+func TestWaitingCIWorkerBlocksWhenObserverIsUnavailable(t *testing.T) {
+	database := openStore(t)
+	if err := database.CreateProject(t.Context(), store.Project{Channel: domain.ChannelDev, ID: "nysa", Path: "/tmp/nysa", BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-ci-observer-missing"}
+	if err := database.CreateTicket(t.Context(), store.Ticket{Ref: ref, State: domain.StateWaitingCI, SourceDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(t.Context(), ref.Channel, "ci-observer-missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &ciBlockEngine{}
+	worker := Worker{Store: database, Engine: engine, CI: CIWorker{Store: database}}
+	result, err := worker.Run(t.Context(), ref, domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil || !result.Transitioned || result.State != domain.StateBlocked {
+		t.Fatalf("missing CI observer result=%+v err=%v", result, err)
+	}
+	if engine.request.Trigger != "typed_blocker" || engine.request.From != domain.StateWaitingCI || engine.request.Attributes["no_unreconciled_external_mutation"] != "true" {
+		t.Fatalf("missing CI observer request=%+v", engine.request)
+	}
+	var payload struct {
+		Code       string `json:"code"`
+		NextAction string `json:"next_action"`
+		Guidance   string `json:"guidance"`
+	}
+	if err := json.Unmarshal([]byte(engine.request.EventPayload), &payload); err != nil || payload.Code != ciUnavailableCode || payload.NextAction != "sf-dev doctor" || payload.Guidance == "" {
+		t.Fatalf("missing CI observer payload=%q err=%v", engine.request.EventPayload, err)
 	}
 }
 
