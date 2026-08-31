@@ -93,7 +93,7 @@ func fixture(t *testing.T) (*Client, *testkit.FakeGH, contracts.PullRequestIdent
 	client := &Client{binaryPath: binary, home: filepath.Join(root, "home"), configDir: filepath.Join(root, "gh-config"), env: []string{"SF_FAKE_GH_STATE=" + state}, runner: commandRunnerFunc(runBounded), validateClaimFn: func(context.Context, domain.ExternalEffectClaim) error { return nil }, mutationGuard: fixtureGuard(), mergeIntents: intentRecorderFunc(func(context.Context, domain.MergeIntent) error { return nil }), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), verifyProtectedBranch: verifierFunc(func(_ context.Context, repository contracts.RepositoryIdentity, baseRef, mergeCommit, originalBaseOID string) (contracts.ProtectedBranchObservation, error) {
 		return contracts.ProtectedBranchObservation{Repository: repository, BaseRef: baseRef, MergeCommit: mergeCommit, OriginalBaseOID: originalBaseOID, BaseHeadOID: strings.Repeat("d", 40), Contains: true}, nil
 	})}
-	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
+	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", BaseOID: strings.Repeat("c", 40), FactoryOwned: true}
 	return client, fake, identity
 }
 
@@ -208,8 +208,31 @@ func TestUpdateFactoryPullRequestReconcilesLostResponseWithoutSecondEdit(t *test
 	}
 }
 
+func TestUpdateFactoryPullRequestPreservesBeforeStartAfterCleanAbsence(t *testing.T) {
+	client, fake, identity := fixture(t)
+	prior := createDraft(t, client, identity, "before", "before body").Identity
+	expected := prior
+	expected.HeadOID = strings.Repeat("b", 40)
+	if err := fake.SetPullRequestHeadOIDForTest(prior.Number, expected.HeadOID); err != nil {
+		t.Fatal(err)
+	}
+	// The guard documents that it never invoked the mutation callback. The
+	// post-attempt exact observation remains stale, but that is clean absence
+	// of an edit rather than a reason to upgrade a proven pre-start refusal.
+	client.mutationGuard = mutationGuardFunc(func(context.Context, domain.ExternalEffectClaim, func(context.Context) ([]byte, error)) ([]byte, error) {
+		return nil, errors.New("worker unavailable before launch")
+	})
+	claim := testClaim("pr_edit", expected, "after", "after body")
+	if err := client.UpdateFactoryPullRequest(context.Background(), claim, prior, expected, "after", "after body"); !errors.Is(err, ErrUpdateBeforeStart) {
+		t.Fatalf("clean absence reclassified before-start update: %v", err)
+	}
+	if got := fake.MutationCount("pr_edit"); got != 0 {
+		t.Fatalf("pre-start update mutated %d times", got)
+	}
+}
+
 func TestRefreshFactoryPullRequestIdentityRefusals(t *testing.T) {
-	prior := contracts.PullRequestIdentity{Number: 7, Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
+	prior := contracts.PullRequestIdentity{Number: 7, Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", BaseOID: strings.Repeat("c", 40), FactoryOwned: true}
 	expected := prior
 	expected.HeadOID = strings.Repeat("b", 40)
 	wire := func(identity contracts.PullRequestIdentity, body, state string, merged bool) map[string]any {
@@ -244,6 +267,7 @@ func TestRefreshFactoryPullRequestIdentityRefusals(t *testing.T) {
 		{"merged", prior, expected, payload(wire(expected, oldMarker, "MERGED", true)), ErrNoMatchingPR},
 		{"multiple", prior, expected, payload(wire(expected, oldMarker, "OPEN", false), wire(expected, newMarker, "OPEN", false)), ErrAmbiguousPR},
 		{"foreign-same-source", prior, expected, payload(wire(func() contracts.PullRequestIdentity { x := expected; x.Number = 8; return x }(), newMarker, "OPEN", false), wire(expected, oldMarker, "OPEN", false)), ErrAmbiguousPR},
+		{"second-open-source-different-base", prior, expected, payload(wire(expected, oldMarker, "OPEN", false), wire(func() contracts.PullRequestIdentity { x := expected; x.Number = 8; x.BaseRef = "release"; return x }(), newMarker, "OPEN", false)), ErrAmbiguousPR},
 		{"response-source-changed", prior, expected, payload(wire(func() contracts.PullRequestIdentity { x := expected; x.HeadRef = "other"; return x }(), oldMarker, "OPEN", false)), ErrNoMatchingPR},
 		{"response-base-changed", prior, expected, payload(wire(func() contracts.PullRequestIdentity { x := expected; x.BaseRef = "release"; return x }(), oldMarker, "OPEN", false)), ErrNoMatchingPR},
 		{"changed-source", prior, func() contracts.PullRequestIdentity { x := expected; x.HeadRef = "other"; return x }(), nil, ErrPolicyRefusal},
@@ -360,7 +384,7 @@ func TestStoreClaimGuardAndClientComposeExactHeadFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.env = []string{"SF_FAKE_GH_STATE=" + state}
-	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
+	identity := contracts.PullRequestIdentity{Repository: repository, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", BaseOID: strings.Repeat("c", 40), FactoryOwned: true}
 	claim := func(kind, digest string) domain.ExternalEffectClaim {
 		fence := store.EffectFence{SemanticKey: "integration/" + kind, Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}
 		if _, err := database.PlanEffect(ctx, store.EffectPlan{SemanticKey: fence.SemanticKey, Ref: ref, Kind: kind, TicketVersion: fence.TicketVersion, Fence: fence.Fence, RequestDigest: digest}); err != nil {
@@ -520,6 +544,18 @@ func TestPublicationInventoryRejectsForeignAndAmbiguousOpenSourceBase(t *testing
 			a.Number, b.Number = 7, 8
 			return []testkit.PullRequest{makePR(a, true), makePR(b, false)}
 		}, ErrPolicyRefusal},
+		{"stale owned head", func(i contracts.PullRequestIdentity) []testkit.PullRequest {
+			i.Number, i.HeadOID = 7, strings.Repeat("b", 40)
+			return []testkit.PullRequest{makePR(i, true)}
+		}, ErrPolicyRefusal},
+		{"mismatched base oid", func(i contracts.PullRequestIdentity) []testkit.PullRequest {
+			i.Number, i.BaseOID = 7, strings.Repeat("d", 40)
+			return []testkit.PullRequest{makePR(i, true)}
+		}, ErrPolicyRefusal},
+		{"different base ref", func(i contracts.PullRequestIdentity) []testkit.PullRequest {
+			i.Number, i.BaseRef = 7, "release"
+			return []testkit.PullRequest{makePR(i, true)}
+		}, ErrPolicyRefusal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client, fake, identity := fixture(t)
@@ -539,6 +575,21 @@ func TestPublicationInventoryRejectsForeignAndAmbiguousOpenSourceBase(t *testing
 				t.Fatal("foreign or ambiguous PR permitted create")
 			}
 		})
+	}
+}
+
+func TestPublicationInventoryRefusesEmptyExpectedBaseWithoutMutation(t *testing.T) {
+	client, fake, identity := fixture(t)
+	identity.BaseOID = ""
+	claim := testClaim("draft_pr", identity, "title", "body")
+	if _, _, err := client.ObservePublicationCandidate(context.Background(), identity); !errors.Is(err, ErrPolicyRefusal) {
+		t.Fatalf("empty base inventory err=%v", err)
+	}
+	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrPolicyRefusal) {
+		t.Fatalf("empty base create err=%v", err)
+	}
+	if got := fake.MutationCount("pr_create"); got != 0 {
+		t.Fatalf("empty base launched create %d times", got)
 	}
 }
 
@@ -566,6 +617,8 @@ func TestCreateUncertainNeverAttemptsNumberOnlyOrphanClose(t *testing.T) {
 		switch {
 		case len(args) >= 2 && args[0] == "pr" && args[1] == "list":
 			return []byte("[]"), nil
+		case len(args) >= 2 && args[0] == "api":
+			return []byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`), nil
 		case len(args) >= 2 && args[0] == "pr" && args[1] == "create":
 			return []byte("https://github.com/example/app/pull/999\n"), nil
 		case len(args) >= 2 && args[0] == "pr" && args[1] == "close":
@@ -600,7 +653,7 @@ func TestCreateFinalHandoffRefusesIfPRAppearsBeforeLaunch(t *testing.T) {
 		return []byte("{}"), nil
 	})
 	claim := testClaim("draft_pr", identity, "title", "body")
-	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrCreateUncertain) {
+	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrCreateBeforeStart) {
 		t.Fatalf("handoff race err=%v", err)
 	}
 	if created {
@@ -645,6 +698,32 @@ func TestCleanupUncertaintyNeverBecomesMutationSuccess(t *testing.T) {
 	client.mutationGuard = uncertainGuard
 	if err := client.MergeExactHead(context.Background(), mergeClaim, created.Identity, created.Identity.HeadOID, "merge", authorization); !errors.Is(err, ErrProcessCleanup) {
 		t.Fatalf("guarded merge cleanup uncertainty=%v", err)
+	}
+}
+
+func TestCreateAndFactoryUpdatePreserveCleanupQuarantineFatal(t *testing.T) {
+	client, fake, identity := fixture(t)
+	fatalGuard := mutationGuardFunc(func(ctx context.Context, _ domain.ExternalEffectClaim, start func(context.Context) ([]byte, error)) ([]byte, error) {
+		_, _ = start(ctx)
+		return nil, ErrCleanupQuarantineFatal
+	})
+	client.mutationGuard = fatalGuard
+	fatalCreate := identity
+	fatalCreate.HeadRef += "-fatal"
+	if _, err := client.CreateDraftPullRequest(context.Background(), testClaim("draft_pr", fatalCreate, "fatal", "fatal body"), fatalCreate, "fatal", "fatal body"); !errors.Is(err, ErrCleanupQuarantineFatal) {
+		t.Fatalf("create lost cleanup-quarantine fatal result: %v", err)
+	}
+
+	client.mutationGuard = fixtureGuard()
+	prior := createDraft(t, client, identity, "before", "before body").Identity
+	expected := prior
+	expected.HeadOID = strings.Repeat("b", 40)
+	if err := fake.SetPullRequestHeadOIDForTest(prior.Number, expected.HeadOID); err != nil {
+		t.Fatal(err)
+	}
+	client.mutationGuard = fatalGuard
+	if err := client.UpdateFactoryPullRequest(context.Background(), testClaim("pr_edit", expected, "after", "after body"), prior, expected, "after", "after body"); !errors.Is(err, ErrCleanupQuarantineFatal) {
+		t.Fatalf("factory update lost cleanup-quarantine fatal result: %v", err)
 	}
 }
 
@@ -1619,7 +1698,7 @@ func TestMergeLostResponseReconcilesFromOriginalBaseWitness(t *testing.T) {
 }
 
 func TestOfficialGHArgvGolden(t *testing.T) {
-	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", FactoryOwned: true}
+	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", BaseOID: strings.Repeat("c", 40), FactoryOwned: true}
 	created := identity
 	created.Number = 7
 	createdMap := mergeWire(created, "OPEN", "CLEAN", nil, nil)

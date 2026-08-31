@@ -142,3 +142,26 @@ func TestInvalidatedEffectPresenceIsConfirmedAndNeverRebound(t *testing.T) {
 		t.Fatalf("wrong prior claim error=%v", err)
 	}
 }
+
+func TestInvalidatedConfirmedOldFencePromotesOnlyExactPresence(t *testing.T) {
+	database, ref, _, started, prior := claimedEffectBeforeControl(t, "effect-control-confirmed-old")
+	ctx := t.Context()
+	if _, err := database.ConfirmEffect(ctx, prior, "remote@exact"); err != nil {
+		t.Fatal(err)
+	}
+	newLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "effect-control-confirmed-old-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := EffectFence{SemanticKey: prior.SemanticKey, Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: started.RunnerEpoch}}
+	promoted, err := database.ReconcileInvalidatedEffect(ctx, InvalidatedEffectObservation{Prior: EffectObservation{EffectFence: prior, Present: true, Identity: "remote@exact"}, Current: current})
+	if err != nil || promoted.State != EffectConfirmed || promoted.TicketVersion != current.TicketVersion || promoted.LeaderEpoch != current.Fence.LeaderEpoch || promoted.RunnerEpoch != current.Fence.RunnerEpoch || promoted.ClaimEpoch != prior.Fence.ClaimEpoch+1 {
+		t.Fatalf("promoted=%+v err=%v", promoted, err)
+	}
+	if _, err := database.ConfirmEffect(ctx, prior, "late-response"); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("late old confirmation=%v", err)
+	}
+	if _, err := database.ReconcileInvalidatedEffect(ctx, InvalidatedEffectObservation{Prior: EffectObservation{EffectFence: prior, Present: false}, Current: current}); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("confirmed old fence was demoted by absence: %v", err)
+	}
+}

@@ -353,11 +353,15 @@ func (s *Store) ReconcileInvalidatedEffect(ctx context.Context, observation Inva
 		if current.TicketVersion == observation.Current.TicketVersion && current.LeaderEpoch == observation.Current.Fence.LeaderEpoch && current.RunnerEpoch == observation.Current.Fence.RunnerEpoch && current.State != EffectUncertain {
 			return errors.New("invalidated effect reconciliation requires a revoked claim")
 		}
-		if current.State == target && current.ObservedIdentity == prior.Identity {
-			effect = current
-			return nil
+		// Confirmed old-fence effects are still immutable evidence of the
+		// completed request. A fresh exact observation under Current promotes
+		// that evidence, rather than leaving RecordPublishedCandidate unable to
+		// authenticate it after a runner or leader fence advance. Absence may
+		// never demote a confirmed effect.
+		if current.State == EffectConfirmed && !prior.Present {
+			return ErrStaleFence
 		}
-		if current.State != EffectExecuting && current.State != EffectUncertain {
+		if current.State != EffectExecuting && current.State != EffectUncertain && !(current.State == EffectConfirmed && prior.Present) {
 			return fmt.Errorf("cannot reconcile invalidated effect in state %q", current.State)
 		}
 		newClaimEpoch := current.ClaimEpoch
@@ -369,8 +373,12 @@ func (s *Store) ReconcileInvalidatedEffect(ctx context.Context, observation Inva
 			}
 			newTicketVersion, newLeaderEpoch, newRunnerEpoch = observation.Current.TicketVersion, observation.Current.Fence.LeaderEpoch, observation.Current.Fence.RunnerEpoch
 		}
+		allowedStates := "('executing','uncertain')"
+		if prior.Present && current.State == EffectConfirmed {
+			allowedStates = "('executing','uncertain','confirmed')"
+		}
 		updated, err := conn.ExecContext(ctx, `UPDATE effects SET state=?,observed_identity=?,ticket_version=?,leader_epoch=?,runner_epoch=?,claim_epoch=?
-			WHERE semantic_key=? AND state IN ('executing','uncertain') AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?`,
+			WHERE semantic_key=? AND state IN `+allowedStates+` AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?`,
 			target, prior.Identity, newTicketVersion, newLeaderEpoch, newRunnerEpoch, newClaimEpoch, prior.SemanticKey, prior.TicketVersion, prior.Fence.LeaderEpoch, prior.Fence.RunnerEpoch, prior.Fence.ClaimEpoch)
 		if err != nil {
 			return err

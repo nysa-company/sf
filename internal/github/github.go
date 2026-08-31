@@ -28,16 +28,21 @@ import (
 )
 
 var (
-	ErrNoMatchingPR            = errors.New("no factory-owned pull request matches identity")
-	ErrAmbiguousPR             = errors.New("multiple factory-owned pull requests match identity")
-	ErrPolicyRefusal           = errors.New("github policy refused operation")
-	ErrExternalMerged          = errors.New("pull request was merged outside the exact-head factory flow")
-	ErrChecksPending           = errors.New("required checks remain pending")
-	ErrChecksFailed            = errors.New("required checks failed or changed identity")
-	ErrApprovalInvalid         = errors.New("approval is not bound to current reviewed head")
-	ErrResponseTooLarge        = errors.New("github response exceeded bound")
-	ErrMalformedResponse       = errors.New("github response is malformed")
-	ErrCreateUncertain         = errors.New("github pull request creation is uncertain; reconcile before retrying")
+	ErrNoMatchingPR      = errors.New("no factory-owned pull request matches identity")
+	ErrAmbiguousPR       = errors.New("multiple factory-owned pull requests match identity")
+	ErrPolicyRefusal     = errors.New("github policy refused operation")
+	ErrExternalMerged    = errors.New("pull request was merged outside the exact-head factory flow")
+	ErrChecksPending     = errors.New("required checks remain pending")
+	ErrChecksFailed      = errors.New("required checks failed or changed identity")
+	ErrApprovalInvalid   = errors.New("approval is not bound to current reviewed head")
+	ErrResponseTooLarge  = errors.New("github response exceeded bound")
+	ErrMalformedResponse = errors.New("github response is malformed")
+	ErrCreateUncertain   = contracts.ErrDraftCreateUncertain
+	ErrUpdateUncertain   = contracts.ErrPullRequestUpdateUncertain
+	// These are reserved for adapters that can prove no mutation command was
+	// handed off. They are deliberately distinct from generic command errors.
+	ErrCreateBeforeStart       = contracts.ErrDraftCreateBeforeStart
+	ErrUpdateBeforeStart       = contracts.ErrPullRequestUpdateBeforeStart
 	ErrGuardedMergeUnavailable = errors.New("sf-managed guarded merge is unavailable without server-enforced strict protected-base checks; observe a manual merge instead")
 	ErrProcessCleanup          = contracts.ErrExternalCleanupUncertain
 	ErrCleanupQuarantineFatal  = contracts.ErrExternalCleanupQuarantineFatal
@@ -256,27 +261,34 @@ func (c Client) UpdateFactoryPullRequest(ctx context.Context, durable domain.Ext
 		return nil
 	}
 	_, runErr := c.mutateFactoryCorrectionExact(ctx, durable, prior, expected, current.Identity, "pr", "edit", fmt.Sprint(current.Identity.Number), "--repo", repoArg(current.Identity.Repository), "--title", title, "--body", marked)
-	if errors.Is(runErr, ErrProcessCleanup) {
+	if errors.Is(runErr, ErrProcessCleanup) || errors.Is(runErr, ErrCleanupQuarantineFatal) {
 		return runErr
 	}
 	_, _, _, applied, observeErr := c.ObserveFactoryPullRequestUpdate(ctx, prior, expected, title, body)
-	if errors.Is(observeErr, ErrProcessCleanup) {
+	if errors.Is(observeErr, ErrProcessCleanup) || errors.Is(observeErr, ErrCleanupQuarantineFatal) {
 		return observeErr
 	}
 	if observeErr == nil && applied {
 		return nil
 	}
-	if observeErr != nil {
-		return ErrPolicyRefusal
-	}
-	if runErr != nil {
+	// Once mutateFactoryCorrectionExact has entered its command handoff, neither
+	// a stale output nor a failed post-write observation proves that the edit did
+	// not happen.  Keep the effect uncertain so a later exact output witness can
+	// settle it; do not let the worker reinterpret this as semantic absence.
+	if errors.Is(runErr, ErrPolicyRefusal) || errors.Is(runErr, ErrRunnerBusy) || errors.Is(runErr, ErrUpdateBeforeStart) {
 		return runErr
 	}
-	return ErrPolicyRefusal
+	if observeErr != nil {
+		return fmt.Errorf("%w: output observation unavailable: %v", ErrUpdateUncertain, observeErr)
+	}
+	if runErr != nil {
+		return fmt.Errorf("%w: command result unavailable", ErrUpdateUncertain)
+	}
+	return fmt.Errorf("%w: requested output was not observed", ErrUpdateUncertain)
 }
 
 func (c Client) refreshFactoryPullRequest(ctx context.Context, prior, expected contracts.PullRequestIdentity) (PRMatch, error) {
-	if !validPersistedPRIdentity(prior) || !validPersistedPRIdentity(expected) || !sameRefreshContinuity(prior, expected) || prior.HeadOID == expected.HeadOID {
+	if !validPublicationPRIdentity(prior) || !validPublicationPRIdentity(expected) || !sameRefreshContinuity(prior, expected) || prior.HeadOID == expected.HeadOID {
 		return PRMatch{}, ErrPolicyRefusal
 	}
 	var values []prWire
@@ -296,7 +308,9 @@ func (c Client) refreshFactoryPullRequest(ctx context.Context, prior, expected c
 		// number that no longer proves the old source/base is a substitution,
 		// not an opportunity to adopt a PR with a familiar branch name.
 		if candidate.Number == prior.Number {
-			if !sameRefreshContinuity(prior, candidate) || candidate.HeadOID != expected.HeadOID || !refreshMarkerPresent(value.Body, prior, expected) || value.State != "OPEN" || value.MergedAt != nil {
+			// The correction may advance the head, but it must still be for the
+			// exact live protected-base witness selected for this candidate.
+			if !sameRefreshContinuity(prior, candidate) || !validOID(candidate.BaseOID) || candidate.BaseOID != expected.BaseOID || candidate.HeadOID != expected.HeadOID || !refreshMarkerPresent(value.Body, prior, expected) || value.State != "OPEN" || value.MergedAt != nil {
 				return PRMatch{}, ErrNoMatchingPR
 			}
 			if match != nil {
@@ -306,9 +320,9 @@ func (c Client) refreshFactoryPullRequest(ctx context.Context, prior, expected c
 			match = &observed
 			continue
 		}
-		// A second PR for this exact source/base is a foreign candidate. The
-		// list must not be used to select between it and the durable number.
-		if sameRefreshSourceAndBase(candidate, prior) {
+		// One factory source branch has one durable PR. A second open row is
+		// ambiguity even if it targets a different base branch.
+		if samePRSource(candidate, prior) && value.State == "OPEN" && value.MergedAt == nil {
 			return PRMatch{}, ErrAmbiguousPR
 		}
 	}
@@ -345,13 +359,13 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 	// performs one final exact absence/source observation while the mutation
 	// gate is held; a pre-handoff list result is never sufficient.
 	_, runErr := c.mutateCreateExact(ctx, durable, identity, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
-	if errors.Is(runErr, ErrProcessCleanup) {
+	if errors.Is(runErr, ErrProcessCleanup) || errors.Is(runErr, ErrCleanupQuarantineFatal) {
 		return contracts.PullRequestIdentity{}, runErr
 	}
 	// Both a delivered response and a lost response are reconciled by the same
 	// exact ownership observation; command output is never object evidence.
 	match, found, observeErr := c.ObservePublicationCandidate(ctx, identity)
-	if errors.Is(observeErr, ErrProcessCleanup) {
+	if errors.Is(observeErr, ErrProcessCleanup) || errors.Is(observeErr, ErrCleanupQuarantineFatal) {
 		return contracts.PullRequestIdentity{}, observeErr
 	}
 	if observeErr == nil && found && adoptableDraft(match) {
@@ -365,6 +379,12 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 		// exact PR is the one deterministic conflict we can safely report.
 		if found {
 			return contracts.PullRequestIdentity{}, ErrPolicyRefusal
+		}
+		// The mutation boundary proved that no command was handed off. A clean
+		// exact absence therefore remains a retryable, pre-start failure rather
+		// than being conservatively upgraded to uncertainty.
+		if errors.Is(runErr, ErrCreateBeforeStart) || errors.Is(runErr, ErrRunnerBusy) {
+			return contracts.PullRequestIdentity{}, runErr
 		}
 		if runErr != nil {
 			conflict, conflictErr := c.observeClosedPublicationConflict(ctx, identity)
@@ -524,21 +544,26 @@ func (c Client) mutateCreateExact(ctx context.Context, claim domain.ExternalEffe
 	if c.mutationGuard == nil {
 		return nil, ErrPolicyRefusal
 	}
-	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+	handedOff := false
+	output, err := c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
 		if err := c.observeSourceExact(runCtx, identity); err != nil {
-			if errors.Is(err, ErrProcessCleanup) {
-				return nil, ErrProcessCleanup
+			if errors.Is(err, ErrProcessCleanup) || errors.Is(err, ErrCleanupQuarantineFatal) {
+				return nil, err
 			}
 			return nil, ErrPolicyRefusal
 		}
 		if _, found, err := c.ObservePublicationCandidate(runCtx, identity); err != nil || found {
-			if errors.Is(err, ErrProcessCleanup) {
-				return nil, ErrProcessCleanup
+			if errors.Is(err, ErrProcessCleanup) || errors.Is(err, ErrCleanupQuarantineFatal) {
+				return nil, err
 			}
 			return nil, ErrPolicyRefusal
 		}
-		return c.run(runCtx, args...)
+		return c.runWithHandoff(runCtx, &handedOff, args...)
 	})
+	if err != nil && (!handedOff || errors.Is(err, ErrRunnerBusy)) && !errors.Is(err, ErrProcessCleanup) && !errors.Is(err, ErrCleanupQuarantineFatal) {
+		return nil, fmt.Errorf("%w: %v", ErrCreateBeforeStart, err)
+	}
+	return output, err
 }
 
 // observeSourceExact binds a create to the exact branch tip selected by the
@@ -550,8 +575,8 @@ func (c Client) observeSourceExact(ctx context.Context, identity contracts.PullR
 	path := "repos/" + identity.HeadOwner + "/" + identity.HeadRepository + "/git/ref/heads/" + identity.HeadRef
 	output, err := c.run(ctx, "api", path)
 	if err != nil {
-		if errors.Is(err, ErrProcessCleanup) {
-			return ErrProcessCleanup
+		if errors.Is(err, ErrProcessCleanup) || errors.Is(err, ErrCleanupQuarantineFatal) {
+			return err
 		}
 		return ErrPolicyRefusal
 	}
@@ -575,8 +600,8 @@ func (c Client) observeBaseExact(ctx context.Context, identity contracts.PullReq
 	path := "repos/" + identity.Repository.Owner + "/" + identity.Repository.Name + "/git/ref/heads/" + identity.BaseRef
 	output, err := c.run(ctx, "api", path)
 	if err != nil {
-		if errors.Is(err, ErrProcessCleanup) {
-			return ErrProcessCleanup
+		if errors.Is(err, ErrProcessCleanup) || errors.Is(err, ErrCleanupQuarantineFatal) {
+			return err
 		}
 		return ErrPolicyRefusal
 	}
@@ -599,8 +624,8 @@ func (c Client) mutateExact(ctx context.Context, claim domain.ExternalEffectClai
 	}
 	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
 		observed, err := c.view(runCtx, identity)
-		if errors.Is(err, ErrProcessCleanup) {
-			return nil, ErrProcessCleanup
+		if errors.Is(err, ErrProcessCleanup) || errors.Is(err, ErrCleanupQuarantineFatal) {
+			return nil, err
 		}
 		if err != nil || !sameExact(observed.Identity, identity) || observed.State != "OPEN" || observed.Merged {
 			return nil, ErrPolicyRefusal
@@ -613,16 +638,21 @@ func (c Client) mutateFactoryCorrectionExact(ctx context.Context, claim domain.E
 	if c.mutationGuard == nil {
 		return nil, ErrPolicyRefusal
 	}
-	return c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
+	handedOff := false
+	output, err := c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
 		observed, err := c.refreshFactoryPullRequest(runCtx, prior, expected)
-		if errors.Is(err, ErrProcessCleanup) {
-			return nil, ErrProcessCleanup
+		if errors.Is(err, ErrProcessCleanup) || errors.Is(err, ErrCleanupQuarantineFatal) {
+			return nil, err
 		}
 		if err != nil || !sameExact(observed.Identity, identity) || observed.State != "OPEN" || observed.Merged || !observed.Draft {
 			return nil, ErrPolicyRefusal
 		}
-		return c.run(runCtx, args...)
+		return c.runWithHandoff(runCtx, &handedOff, args...)
 	})
+	if err != nil && (!handedOff || errors.Is(err, ErrRunnerBusy)) && !errors.Is(err, ErrProcessCleanup) && !errors.Is(err, ErrCleanupQuarantineFatal) {
+		return nil, fmt.Errorf("%w: %v", ErrUpdateBeforeStart, err)
+	}
+	return output, err
 }
 
 func readyLaunchSafe(observed PRMatch, identity contracts.PullRequestIdentity) bool {
@@ -714,23 +744,54 @@ func activeLogin(hosts map[string][]authHost) (string, error) {
 // result. Head owner/repository/ref/OID/base are all compared; a branch name
 // alone can never be adopted.
 func (c Client) Observe(ctx context.Context, want contracts.PullRequestIdentity) (PRMatch, error) {
-	match, found, err := c.ObservePublicationCandidate(ctx, want)
-	if err != nil {
+	return c.observeFactoryPullRequest(ctx, want)
+}
+
+// observeFactoryPullRequest retains the generic marker-bearing lookup
+// contract. In particular, callers that only need descriptive lookup may not
+// have a protected-base OID. Publication creation/adoption must instead call
+// ObservePublicationCandidate below, which is deliberately stricter.
+func (c Client) observeFactoryPullRequest(ctx context.Context, want contracts.PullRequestIdentity) (PRMatch, error) {
+	if !validIdentity(want) {
+		return PRMatch{}, ErrPolicyRefusal
+	}
+	var values []prWire
+	if err := c.json(ctx, &values, "pr", "list", "--repo", repoArg(want.Repository), "--state", "all", "--limit", "100", "--json", prFields); err != nil {
 		return PRMatch{}, err
 	}
-	if !found {
-		return PRMatch{}, ErrNoMatchingPR
+	if len(values) == 100 {
+		return PRMatch{}, ErrAmbiguousPR
 	}
-	return match, nil
+	var matches []PRMatch
+	for _, value := range values {
+		candidate, err := value.identity(want.Repository)
+		if errors.Is(err, ErrNoMatchingPR) {
+			continue
+		}
+		if err != nil {
+			return PRMatch{}, err
+		}
+		if sameExact(candidate, want) {
+			matches = append(matches, value.match(candidate))
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return PRMatch{}, ErrNoMatchingPR
+	case 1:
+		return matches[0], nil
+	default:
+		return PRMatch{}, ErrAmbiguousPR
+	}
 }
 
 // ObservePublicationCandidate inventories the bounded pull-request list for
-// the exact source and base selected for publication.  It deliberately sees
-// unmarked PRs as well: an open human PR sharing this source/base is not
-// semantic absence and must block creation rather than permit a duplicate.
+// the exact source and base selected for publication. It deliberately sees
+// unmarked PRs as well: an open PR from this exact source branch is never
+// semantic absence, even when it targets a different base branch.
 // It returns found=false only when no open matching PR exists.
 func (c Client) ObservePublicationCandidate(ctx context.Context, want contracts.PullRequestIdentity) (PRMatch, bool, error) {
-	if !validIdentity(want) {
+	if !validPublicationIdentity(want) {
 		return PRMatch{}, false, ErrPolicyRefusal
 	}
 	var values []prWire
@@ -746,11 +807,17 @@ func (c Client) ObservePublicationCandidate(ctx context.Context, want contracts.
 		if err != nil {
 			return PRMatch{}, false, err
 		}
-		// Closed/merged rows are historical and cannot be adopted or block a
-		// new draft. Every open row sharing the exact source and base ref is
-		// nevertheless material, even if its ownership marker is absent.
-		if candidate.HeadOwner != want.HeadOwner || candidate.HeadRepository != want.HeadRepository || candidate.HeadRef != want.HeadRef || candidate.HeadOID != want.HeadOID || candidate.BaseRef != want.BaseRef || value.State != "OPEN" || value.MergedAt != nil {
+		// Closed/merged rows are historical. For each open exact source branch,
+		// classify BaseRef before HeadOID so branch reuse against a sibling base
+		// cannot be reinterpreted as absence.
+		if !samePRSource(candidate, want) || value.State != "OPEN" || value.MergedAt != nil {
 			continue
+		}
+		if candidate.BaseRef != want.BaseRef {
+			return PRMatch{}, false, ErrPolicyRefusal
+		}
+		if !validOID(candidate.BaseOID) || candidate.BaseOID != want.BaseOID || candidate.HeadOID != want.HeadOID {
+			return PRMatch{}, false, ErrPolicyRefusal
 		}
 		if !strings.Contains(value.Body, ownershipMarker(candidate)) || !sameExact(candidate, want) {
 			return PRMatch{}, false, ErrPolicyRefusal
@@ -1542,8 +1609,21 @@ func validIdentity(value contracts.PullRequestIdentity) bool {
 func validPersistedPRIdentity(value contracts.PullRequestIdentity) bool {
 	return validIdentity(value) && value.Number > 0
 }
+
+// validPublicationIdentity is intentionally narrower than validIdentity:
+// generic lookup callers may legitimately lack a base OID, but publication
+// adoption must bind the PR to the exact protected-base witness.
+func validPublicationIdentity(value contracts.PullRequestIdentity) bool {
+	return validIdentity(value) && validOID(value.BaseOID)
+}
+func validPublicationPRIdentity(value contracts.PullRequestIdentity) bool {
+	return validPublicationIdentity(value) && value.Number > 0
+}
 func sameRefreshSourceAndBase(left, right contracts.PullRequestIdentity) bool {
-	return left.Repository == right.Repository && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.BaseRef == right.BaseRef && left.FactoryOwned && right.FactoryOwned
+	return samePRSource(left, right) && left.BaseRef == right.BaseRef
+}
+func samePRSource(left, right contracts.PullRequestIdentity) bool {
+	return left.Repository == right.Repository && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.FactoryOwned && right.FactoryOwned
 }
 func sameRefreshContinuity(left, right contracts.PullRequestIdentity) bool {
 	return left.Number == right.Number && sameRefreshSourceAndBase(left, right)
@@ -1605,6 +1685,13 @@ func (c Client) json(ctx context.Context, destination any, args ...string) error
 	return nil
 }
 func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
+	return c.runWithHandoff(ctx, nil, args...)
+}
+
+// runWithHandoff flips handedOff immediately before runner invocation. This
+// keeps environment/configuration/cleanup failures provably pre-mutation while
+// treating a runner error as an uncertain post-handoff outcome.
+func (c Client) runWithHandoff(ctx context.Context, handedOff *bool, args ...string) ([]byte, error) {
 	if c.runMu != nil {
 		c.runMu.Lock()
 		defer c.runMu.Unlock()
@@ -1626,6 +1713,9 @@ func (c Client) run(ctx context.Context, args ...string) ([]byte, error) {
 		return nil, err
 	}
 	if c.runner != nil {
+		if handedOff != nil {
+			*handedOff = true
+		}
 		output, runErr := c.runner.Run(ctx, c.binary(), args, env)
 		if errors.Is(runErr, ErrRunnerBusy) {
 			return nil, runErr

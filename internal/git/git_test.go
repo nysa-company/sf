@@ -387,6 +387,82 @@ func TestPushWithRequestCorrectionRequiresExactPriorRemote(t *testing.T) {
 	}
 }
 
+func TestPushWithRequestPreStartClassificationSurvivesCleanLeaseRelease(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-push-before-start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prior, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("first")), Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Push(ctx, worktree, prior, pushClaim(worktree, prior)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("second\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("second")), Timestamp: time.Unix(2, 0), BaseRef: "main", ExpectedParent: prior, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, prior)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A valid but wrong predecessor is discovered after the writer lease was
+	// acquired, yet before a git command is handed off. A clean lease release
+	// keeps this safely retryable and retains the concrete policy diagnosis.
+	wrongPrior := strings.Repeat("d", 40)
+	_, err = runner.PushWithRequest(ctx, worktree, PushRequest{ExpectedHead: next, ExpectedPriorHead: wrongPrior, MutationClaim: pushClaim(worktree, next)})
+	if !errors.Is(err, ErrPushBeforeStart) || !errors.Is(err, ErrUnexpectedRemote) {
+		t.Fatalf("pre-start err=%v", err)
+	}
+}
+
+func TestPushWithRequestPreStartBecomesUncertainWhenLeaseReleaseFails(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-push-release-failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prior, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("first")), Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Push(ctx, worktree, prior, pushClaim(worktree, prior)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "main.txt"), []byte("second\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("second")), Timestamp: time.Unix(2, 0), BaseRef: "main", ExpectedParent: prior, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, prior)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.MutationAuthority = &releaseFailMutationAuthority{}
+	_, err = runner.PushWithRequest(ctx, worktree, PushRequest{ExpectedHead: next, ExpectedPriorHead: strings.Repeat("d", 40), MutationClaim: pushClaim(worktree, next)})
+	if !errors.Is(err, ErrPushUncertain) {
+		t.Fatalf("release failure was retryable: %v", err)
+	}
+	if !errors.Is(err, ErrUnexpectedRemote) {
+		t.Fatalf("release failure lost original classification: %v", err)
+	}
+}
+
 func TestCommitRefusesProtectedCheckpointPath(t *testing.T) {
 	ctx, runner, repository, _ := fixture(t)
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-protected")

@@ -27,9 +27,14 @@ import (
 )
 
 var (
-	ErrIdentityMismatch    = errors.New("git repository identity mismatch")
-	ErrUnsafeWorktree      = errors.New("git worktree is unsafe")
-	ErrUnexpectedRemote    = errors.New("remote branch head is unexpected")
+	ErrIdentityMismatch = errors.New("git repository identity mismatch")
+	ErrUnsafeWorktree   = errors.New("git worktree is unsafe")
+	ErrUnexpectedRemote = errors.New("remote branch head is unexpected")
+	ErrPushBeforeStart  = errors.New("git candidate push failed before mutation handoff")
+	// ErrPushUncertain means the candidate-ref push crossed the command handoff
+	// but the authenticated candidate and protected-base witnesses did not both
+	// converge. The caller must durably reconcile, never blindly replay it.
+	ErrPushUncertain       = errors.New("git candidate push is uncertain; reconcile before retrying")
 	ErrOutputBound         = errors.New("git output exceeded bound")
 	ErrWorktreeQuarantined = errors.New("created worktree could not be safely cleaned up")
 	// ErrMutationLeaseRelease means Git completed (or attempted) an effect but
@@ -368,6 +373,10 @@ func (r Runner) commandEnv(ctx context.Context, directory string, extra []string
 }
 
 func (r Runner) commandEnvExpected(ctx context.Context, directory string, expectedDev, expectedIno uint64, extra []string, args ...string) ([]byte, error) {
+	return r.commandEnvExpectedWithHandoff(ctx, directory, expectedDev, expectedIno, extra, nil, args...)
+}
+
+func (r Runner) commandEnvExpectedWithHandoff(ctx context.Context, directory string, expectedDev, expectedIno uint64, extra []string, handedOff *bool, args ...string) ([]byte, error) {
 	if directory == "" {
 		return nil, fmt.Errorf("git directory is required")
 	}
@@ -395,6 +404,9 @@ func (r Runner) commandEnvExpected(ctx context.Context, directory string, expect
 	}
 	argv = append(argv, args...)
 	if r.Run != nil {
+		if handedOff != nil {
+			*handedOff = true
+		}
 		output, err := r.Run(ctx, r.binary(), argv, env)
 		if verifyErr := pinned.verify(); verifyErr != nil {
 			return output, verifyErr
@@ -409,6 +421,9 @@ func (r Runner) commandEnvExpected(ctx context.Context, directory string, expect
 		return nil, capErr
 	}
 	defer caps.Close()
+	if handedOff != nil {
+		*handedOff = true
+	}
 	output, err := runBounded(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file, caps.gitDir.file, caps.commonDir.file})
 	if verifyErr := pinned.verify(); verifyErr != nil {
 		return output, verifyErr
@@ -2524,114 +2539,103 @@ func (r Runner) Push(ctx context.Context, worktree Worktree, expectedHead string
 }
 
 func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request PushRequest) (head string, returnedErr error) {
+	// Keep the concrete preflight cause visible to callers (notably the
+	// unexpected-remote policy result) while also classifying this as a safely
+	// retryable, pre-command exit.
+	beforeStart := func(err error) error { return errors.Join(ErrPushBeforeStart, err) }
 	if _, err := validateBranch(worktree.Branch); err != nil {
-		return "", err
+		return "", beforeStart(err)
 	}
 	if !validOID(request.ExpectedHead) || (request.ExpectedPriorHead != "" && !validOID(request.ExpectedPriorHead)) {
-		return "", fmt.Errorf("%w: invalid expected candidate head", ErrUnexpectedRemote)
+		return "", beforeStart(fmt.Errorf("%w: invalid expected candidate head", ErrUnexpectedRemote))
 	}
 	transportEnv, _, err := r.githubTransportEnvironment(worktree.Identity.PushOrigin)
 	if err != nil {
-		return "", err
+		return "", beforeStart(err)
 	}
 	lease, err := r.acquireSuppliedMutation(ctx, request.MutationClaim, contracts.GitMutationClaim{Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "push", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: request.ExpectedHead})
 	if err != nil {
-		return "", err
+		return "", beforeStart(err)
 	}
+	handedOff := false
 	defer func() {
-		returnedErr = mergeMutationLeaseRelease(returnedErr, lease)
+		if releaseErr := releaseMutationLease(lease); releaseErr != nil {
+			returnedErr = errors.Join(ErrPushUncertain, returnedErr, releaseErr)
+		}
 		if returnedErr != nil {
 			head = ""
 		}
 	}()
 	ctx = withMutationLease(ctx, lease)
 	if err := requireMutationLease(ctx, lease); err != nil {
-		return "", err
+		return "", beforeStart(err)
 	}
 	// Every publication starts from fresh observations while the repository
 	// writer is held.  The candidate observation is the exact fact persisted
 	// before the push, closing the old observe-to-writer-start race.
 	if _, err := r.provePushHead(ctx, worktree, request.ExpectedHead); err != nil {
-		return "", err
+		return "", beforeStart(err)
 	}
 	baseEnv, _, err := r.githubTransportEnvironment(worktree.Identity.Origin)
 	if err != nil {
-		return "", err
+		return "", beforeStart(err)
 	}
 	remoteBase, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
 	if err != nil || remoteBase != worktree.Identity.BaseHead {
 		if err != nil {
-			return "", err
+			return "", beforeStart(err)
 		}
-		return "", fmt.Errorf("%w: remote base moved", ErrUnexpectedRemote)
+		return "", beforeStart(fmt.Errorf("%w: remote base moved", ErrUnexpectedRemote))
 	}
 	// Use the strict observer for the candidate ref. Unlike the generic remote
 	// helper, it rejects whitespace/duplicate ls-remote output and rechecks the
 	// complete worktree + configured-origin identity after the remote command.
 	remoteObservation, err := r.ObserveRemoteBranch(ctx, worktree, worktree.Identity.PushOrigin, worktree.Branch)
 	if err != nil {
-		return "", err
+		return "", beforeStart(err)
 	}
 	remote := remoteObservation.OID
 	if remote == request.ExpectedHead {
 		return request.ExpectedHead, nil
 	}
 	if remote != request.ExpectedPriorHead {
-		return "", fmt.Errorf("%w: candidate branch does not match durable observation", ErrUnexpectedRemote)
+		return "", beforeStart(fmt.Errorf("%w: candidate branch does not match durable observation", ErrUnexpectedRemote))
 	}
 	if err := recordPushPriorRemote(ctx, lease, remote); err != nil {
-		return "", err
+		return "", beforeStart(err)
 	}
 	// Reauthenticate and prove the exact candidate immediately before push.
 	if _, err := r.provePushHead(ctx, worktree, request.ExpectedHead); err != nil {
-		return "", err
+		return "", beforeStart(err)
 	}
 	refspec := request.ExpectedHead + ":refs/heads/" + worktree.Branch
 	if worktree.Identity.PushOrigin == "" {
-		return "", fmt.Errorf("%w: authenticated push URL is missing", ErrIdentityMismatch)
+		return "", beforeStart(fmt.Errorf("%w: authenticated push URL is missing", ErrIdentityMismatch))
 	}
 	if err := requireMutationLease(ctx, lease); err != nil {
-		return "", err
+		return "", beforeStart(err)
 	}
-	if _, err := r.commandEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, transportEnv, "push", worktree.Identity.PushOrigin, refspec); err != nil {
-		// The server may have accepted the ref while the response was lost. Only
-		// reconcile success when the exact expected candidate is observed.
-		if _, proveErr := r.provePushHead(ctx, worktree, request.ExpectedHead); proveErr != nil {
-			return "", err
-		}
-		observed, observeErr := r.ObserveRemoteBranch(ctx, worktree, worktree.Identity.PushOrigin, worktree.Branch)
-		if observeErr == nil && observed.OID == request.ExpectedHead {
-			baseAfter, baseErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
-			if baseErr != nil {
-				return "", baseErr
-			}
-			if baseAfter != worktree.Identity.BaseHead {
-				return "", fmt.Errorf("%w: remote base moved during candidate publication", ErrUnexpectedRemote)
-			}
+	runErr := func() error {
+		_, err := r.commandEnvExpectedWithHandoff(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, transportEnv, &handedOff, "push", worktree.Identity.PushOrigin, refspec)
+		return err
+	}()
+	if runErr != nil && !handedOff {
+		return "", beforeStart(runErr)
+	}
+	// A response, command, or follow-up read after this handoff is not evidence
+	// that Git did not mutate. Only exact candidate+protected-base convergence
+	// is success; every other outcome remains durably uncertain.
+	if _, proveErr := r.provePushHead(ctx, worktree, request.ExpectedHead); proveErr == nil {
+		candidate, candidateErr := r.ObserveRemoteBranch(ctx, worktree, worktree.Identity.PushOrigin, worktree.Branch)
+		baseAfter, baseErr := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
+		if candidateErr == nil && baseErr == nil && candidate.OID == request.ExpectedHead && baseAfter == worktree.Identity.BaseHead {
 			return request.ExpectedHead, nil
 		}
-		return "", err
 	}
-	observed, err := r.ObserveRemoteBranch(ctx, worktree, worktree.Identity.PushOrigin, worktree.Branch)
-	if err != nil {
-		return "", err
+	if runErr != nil {
+		return "", fmt.Errorf("%w: push command result unavailable", ErrPushUncertain)
 	}
-	if observed.OID != request.ExpectedHead {
-		return "", fmt.Errorf("%w: push did not converge", ErrUnexpectedRemote)
-	}
-	// Git's ordinary candidate-ref push cannot atomically compare-and-swap a
-	// separately protected base ref. Treat this as a bounded, non-final effect:
-	// observe BaseRef again immediately after convergence and surface a stale
-	// base if it moved. Callers must invalidate publication and must not launch
-	// PR/review/merge work from this result until a fresh candidate is made.
-	remoteBaseAfter, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
-	if err != nil {
-		return "", err
-	}
-	if remoteBaseAfter != worktree.Identity.BaseHead {
-		return "", fmt.Errorf("%w: remote base moved during candidate publication", ErrUnexpectedRemote)
-	}
-	return request.ExpectedHead, nil
+	return "", fmt.Errorf("%w: exact candidate and protected-base convergence was not proved", ErrPushUncertain)
 }
 
 func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error) {

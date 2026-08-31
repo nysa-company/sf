@@ -148,20 +148,23 @@ func runDraftCorrectionFenceRecovery(t *testing.T, response testkit.ResponseMode
 		t.Fatal(err)
 	}
 	key := draftUpdateKey(current, "new", "new body")
-	request := githubboundary.CanonicalPullRequestUpdateRequestDigest(current, "new", "new body")
 	oldFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}
-	if _, err := db.PlanEffect(ctx, store.EffectPlan{SemanticKey: key, Ref: ref, Kind: store.PublicationPRUpdateEffectKind, TicketVersion: started.Version, Fence: oldFence, RequestDigest: request}); err != nil {
-		t.Fatal(err)
-	}
-	claim, err := db.ClaimEffect(ctx, store.EffectFence{SemanticKey: key, Ref: ref, TicketVersion: started.Version, Fence: oldFence})
-	if err != nil || !claim.Claimed {
-		t.Fatalf("claim=%+v err=%v", claim, err)
-	}
 	if err := fake.SetResponse("pr_edit", response); err != nil {
 		t.Fatal(err)
 	}
-	if err := fake.UpdateFactoryPullRequest(ctx, claim.ExternalClaim(), old, current, "new", "new body"); err == nil {
+	worker := Worker{Store: db, GitHub: fake}
+	if _, _, err := worker.ensureDraftCorrection(ctx, started, oldFence, current, "new", "new body", old); err == nil {
 		t.Fatal("simulated update loss unexpectedly succeeded")
+	}
+	firstEffect, err := db.Effect(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response == testkit.ResponseErrorBefore && firstEffect.State != store.EffectFailed {
+		t.Fatalf("worker did not durably fail pre-start update: %+v", firstEffect)
+	}
+	if response == testkit.ResponseDropAfterCall && firstEffect.State != store.EffectUncertain {
+		t.Fatalf("worker did not durably quarantine post-handoff update: %+v", firstEffect)
 	}
 	if got := fake.MutationCount("pr_edit"); got != beforeRecovery {
 		t.Fatalf("before recovery mutations=%d want=%d", got, beforeRecovery)
@@ -176,7 +179,6 @@ func runDraftCorrectionFenceRecovery(t *testing.T, response testkit.ResponseMode
 		t.Fatal(err)
 	}
 	newFence := domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: advanced.RunnerEpoch}
-	worker := Worker{Store: db, GitHub: fake}
 	got, _, err := worker.ensureDraftCorrection(ctx, advanced, newFence, current, "new", "new body", old)
 	if err != nil {
 		t.Fatalf("recover correction update=%v", err)
@@ -185,7 +187,7 @@ func runDraftCorrectionFenceRecovery(t *testing.T, response testkit.ResponseMode
 		t.Fatalf("recovered=%+v mutations=%d want=%d", got, fake.MutationCount("pr_edit"), afterRecovery)
 	}
 	effect, err := db.Effect(ctx, key)
-	if err != nil || effect.State != store.EffectConfirmed || effect.TicketVersion != advanced.Version || effect.LeaderEpoch != newFence.LeaderEpoch || effect.RunnerEpoch != newFence.RunnerEpoch || effect.ClaimEpoch != claim.Effect.ClaimEpoch+1 {
+	if err != nil || effect.State != store.EffectConfirmed || effect.TicketVersion != advanced.Version || effect.LeaderEpoch != newFence.LeaderEpoch || effect.RunnerEpoch != newFence.RunnerEpoch || effect.ClaimEpoch != firstEffect.ClaimEpoch+1 {
 		t.Fatalf("effect=%+v err=%v", effect, err)
 	}
 }

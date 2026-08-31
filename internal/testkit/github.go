@@ -509,14 +509,18 @@ func (f *FakeGH) UpdateFactoryPullRequest(_ context.Context, claim domain.Extern
 	if match.Draft && match.Title == title && match.Body == body+"\n\n"+ownershipMarkerForFake(match.Identity) {
 		return nil
 	}
-	return f.updateUnchecked(match.Identity, title, body)
+	err = f.updateUnchecked(match.Identity, title, body)
+	if err != nil && !errors.Is(err, contracts.ErrPullRequestUpdateBeforeStart) {
+		return fmt.Errorf("%w: fake-gh update response unavailable", contracts.ErrPullRequestUpdateUncertain)
+	}
+	return err
 }
 
 func (f *FakeGH) refreshFactoryPullRequest(prior, expected contracts.PullRequestIdentity) (PullRequest, error) {
 	var match PullRequest
 	count := 0
 	err := f.withState(func() (bool, error) {
-		if prior.Number <= 0 || !prior.FactoryOwned || !expected.FactoryOwned || !samePRSourceAndBase(prior, expected) || prior.HeadOID == expected.HeadOID {
+		if prior.Number <= 0 || !prior.FactoryOwned || !expected.FactoryOwned || !fakeOID(prior.BaseOID) || !fakeOID(expected.BaseOID) || !samePRSourceAndBase(prior, expected) || prior.HeadOID == expected.HeadOID {
 			return false, errors.New("fake-gh: invalid correction identity")
 		}
 		for _, pr := range f.state.PRs {
@@ -526,7 +530,7 @@ func (f *FakeGH) refreshFactoryPullRequest(prior, expected contracts.PullRequest
 				}
 				continue
 			}
-			if !samePRSourceAndBase(pr.Identity, prior) || pr.Identity.HeadOID != expected.HeadOID || pr.Merged || !strings.Contains(pr.Body, ownershipMarkerForFake(prior)) && !strings.Contains(pr.Body, ownershipMarkerForFake(expected)) {
+			if !samePRSourceAndBase(pr.Identity, prior) || !fakeOID(pr.Identity.BaseOID) || pr.Identity.BaseOID != expected.BaseOID || pr.Identity.HeadOID != expected.HeadOID || pr.Merged || !strings.Contains(pr.Body, ownershipMarkerForFake(prior)) && !strings.Contains(pr.Body, ownershipMarkerForFake(expected)) {
 				return false, errors.New("fake-gh: correction pull request drifted")
 			}
 			count++
@@ -544,7 +548,11 @@ func (f *FakeGH) CreateDraftPullRequest(_ context.Context, claim domain.External
 	if err := validateFakeClaim(claim, "draft_pr", identity, title, body); err != nil {
 		return contracts.PullRequestIdentity{}, err
 	}
-	return f.createDraftUnchecked(identity, title, body)
+	created, err := f.createDraftUnchecked(identity, title, body)
+	if err != nil && !errors.Is(err, contracts.ErrDraftCreateBeforeStart) {
+		return contracts.PullRequestIdentity{}, fmt.Errorf("%w: fake-gh create response unavailable", contracts.ErrDraftCreateUncertain)
+	}
+	return created, err
 }
 
 func (f *FakeGH) createDraftUnchecked(identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
@@ -569,7 +577,7 @@ func (f *FakeGH) createDraftUnchecked(identity contracts.PullRequestIdentity, ti
 			return false, err
 		} else if mode == ResponseErrorBefore {
 			f.consumeResponseLocked("pr_create")
-			return true, errors.New("fake-gh: create failed before mutation")
+			return true, fmt.Errorf("%w: fake-gh create failed before mutation", contracts.ErrDraftCreateBeforeStart)
 		}
 		if identity.Number == 0 {
 			identity.Number = f.state.NextPR
@@ -606,7 +614,7 @@ func (f *FakeGH) updateUnchecked(identity contracts.PullRequestIdentity, title, 
 			return false, err
 		} else if mode == ResponseErrorBefore {
 			f.consumeResponseLocked("pr_edit")
-			return true, errors.New("fake-gh: edit failed before mutation")
+			return true, fmt.Errorf("%w: fake-gh edit failed before mutation", contracts.ErrPullRequestUpdateBeforeStart)
 		}
 		if !strings.Contains(body, "<!-- sf:v1 ") {
 			body += "\n\n" + ownershipMarkerForFake(identity)
@@ -1274,7 +1282,10 @@ func (f *FakeGH) runList(argv []string) ([]byte, error) {
 			if repo := option(argv, "--repo"); repo != "" && repo != pr.Identity.Repository.Owner+"/"+pr.Identity.Repository.Name {
 				continue
 			}
-			results = append(results, prJSON(pr, f.state.BaseHeadOID))
+			// baseRefOid is the PR's recorded base identity, not the current
+			// protected-ref tip. Keeping the row's value visible lets strict
+			// publication inventory reject a stale/mismatched PR base witness.
+			results = append(results, prJSON(pr, pr.Identity.BaseOID))
 		}
 		return false, nil
 	})
@@ -1406,7 +1417,7 @@ func (f *FakeGH) runView(argv []string) ([]byte, error) {
 			for _, candidate := range f.state.PRs {
 				if candidate.Identity.Number == number && sameRepository(candidate.Identity.Repository, identity.Repository) {
 					pr = candidate
-					baseHeadOID = f.state.BaseHeadOID
+					baseHeadOID = candidate.Identity.BaseOID
 					return false, nil
 				}
 			}
@@ -1417,7 +1428,7 @@ func (f *FakeGH) runView(argv []string) ([]byte, error) {
 			return false, err
 		}
 		pr = f.state.PRs[index]
-		baseHeadOID = f.state.BaseHeadOID
+		baseHeadOID = pr.Identity.BaseOID
 		return false, nil
 	})
 	if err != nil {

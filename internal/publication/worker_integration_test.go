@@ -17,6 +17,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	gitboundary "github.com/nysa-company/sf/internal/git"
+	githubboundary "github.com/nysa-company/sf/internal/github"
 	"github.com/nysa-company/sf/internal/phaseartifact"
 	"github.com/nysa-company/sf/internal/publication"
 	"github.com/nysa-company/sf/internal/store"
@@ -54,22 +55,63 @@ func TestWorkerPublishesRealCandidateExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestWorkerReplansProvenAbsentPushAfterCrash(t *testing.T) {
+func TestWorkerKeepsUnprovenPushUncertainAfterLostCommandResult(t *testing.T) {
 	f := newPublicationFixture(t)
 	defer f.close()
 	f.failPushBefore = 1
 	w := publication.Worker{Store: f.db, Git: f.runner, GitHub: f.github}
-	if _, err := w.Run(f.ctx, f.ref, f.fence); err == nil {
-		t.Fatal("first push failure unexpectedly succeeded")
+	if _, err := w.Run(f.ctx, f.ref, f.fence); !errors.Is(err, gitboundary.ErrPushUncertain) {
+		t.Fatalf("first push failure=%v", err)
 	}
 	if got := f.github.MutationCount("pr_create"); got != 0 {
 		t.Fatalf("PR created after pre-push crash: %d", got)
 	}
-	if _, err := w.Run(f.ctx, f.ref, f.fence); err != nil {
+	if _, err := w.Run(f.ctx, f.ref, f.fence); err == nil {
+		t.Fatal("uncertain push was blindly replayed")
+	}
+	if f.gitPushCount != 1 || f.github.MutationCount("pr_create") != 0 {
+		t.Fatalf("uncertain recovery mutations push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
+	}
+}
+
+func TestWorkerRetriesProvenBeforeStartPushExactlyOnce(t *testing.T) {
+	f := newPublicationFixture(t)
+	defer f.close()
+	// provePushHead runs before PushWithRequest can hand the push command to
+	// the runner. The injected rev-parse failure is therefore a real adapter
+	// pre-start result, not a simulated Store transition.
+	f.failPushProofBefore = 1
+	w := publication.Worker{Store: f.db, Git: f.runner, GitHub: f.github}
+	if _, err := w.Run(f.ctx, f.ref, f.fence); !errors.Is(err, gitboundary.ErrPushBeforeStart) {
+		t.Fatalf("first pre-start push=%v", err)
+	}
+	ticket, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if f.gitPushCount != 2 || f.github.MutationCount("pr_create") != 1 {
-		t.Fatalf("recovery mutations push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
+	project, err := f.db.Project(f.ctx, f.ref.Channel, f.ref.Project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := f.db.Worktree(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := "sha256:" + digestHex([]byte("sf.publication.push.v2\x00"+string(f.ref.Channel)+"\x00"+string(f.ref.Project)+"\x00"+string(f.ref.Ticket)+"\x00"+project.Path+"\x00"+worktree.Path+"\x00"+worktree.Branch+"\x00"+f.candidate.Snapshot.BaseSHA+"\x00"+f.candidate.Snapshot.HeadSHA+"\x00"))
+	intent := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: f.ref, TicketVersion: ticket.Version, Fence: f.fence}, RequestDigest: request, Repository: project.Path, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "push", BaseRef: project.BaseRef, ExpectedBaseOID: f.candidate.Snapshot.BaseSHA, ExpectedHeadOID: f.candidate.Snapshot.HeadSHA}
+	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)
+	effect, err := f.db.Effect(f.ctx, intent.SemanticKey)
+	if err != nil || effect.State != store.EffectFailed {
+		t.Fatalf("pre-start push effect=%+v err=%v", effect, err)
+	}
+	if f.gitPushCount != 0 || f.github.MutationCount("pr_create") != 0 {
+		t.Fatalf("pre-start unexpectedly mutated push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
+	}
+	if _, err := w.Run(f.ctx, f.ref, f.fence); err != nil {
+		t.Fatalf("safe push retry=%v", err)
+	}
+	if f.gitPushCount != 1 || f.github.MutationCount("pr_create") != 1 {
+		t.Fatalf("safe retry mutations push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
 	}
 }
 
@@ -86,6 +128,25 @@ func TestWorkerReplansProvenAbsentDraftAfterCrash(t *testing.T) {
 	if f.gitPushCount != 1 || f.github.MutationCount("pr_create") != 0 {
 		t.Fatalf("first crash mutations push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
 	}
+	// This is a real Worker path, not a manually altered effect: FakeGH proved
+	// the create callback failed before launch, so the Worker must durably fail
+	// the claimed row and leave precisely one safe retry available.
+	ticket, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := f.db.Worktree(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "acme", Name: "app"}, HeadOwner: "acme", HeadRepository: "app", HeadRef: worktree.Branch, HeadOID: f.candidate.Snapshot.HeadSHA, BaseRef: "main", BaseOID: f.candidate.Snapshot.BaseSHA, FactoryOwned: true}
+	title := "sf: " + string(ticket.Ref.Ticket)
+	body := "<!-- sf:publication/v1 -->\n\nticket: " + string(ticket.Ref.Ticket) + "\ncandidate: " + f.candidate.Snapshot.HeadSHA + "\nsource: " + ticket.SourceDigest
+	key := "github/draft-pr/v1/" + githubboundary.CanonicalDraftPullRequestRequestDigest(identity, title, body)
+	effect, err := f.db.Effect(f.ctx, key)
+	if err != nil || effect.State != store.EffectFailed {
+		t.Fatalf("pre-start draft effect=%+v err=%v", effect, err)
+	}
 	if err := f.github.SetResponse("pr_create"); err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +155,27 @@ func TestWorkerReplansProvenAbsentDraftAfterCrash(t *testing.T) {
 	}
 	if f.gitPushCount != 1 || f.github.MutationCount("pr_create") != 1 {
 		t.Fatalf("recovery mutations push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
+	}
+}
+
+func TestWorkerReconcilesLostCreateWithoutBlindReplay(t *testing.T) {
+	f := newPublicationFixture(t)
+	defer f.close()
+	if err := f.github.SetResponse("pr_create", testkit.ResponseDropAfterCall); err != nil {
+		t.Fatal(err)
+	}
+	w := publication.Worker{Store: f.db, Git: f.runner, GitHub: f.github}
+	if _, err := w.Run(f.ctx, f.ref, f.fence); !errors.Is(err, githubboundary.ErrCreateUncertain) {
+		t.Fatalf("lost create err=%v", err)
+	}
+	if got := f.github.MutationCount("pr_create"); got != 1 {
+		t.Fatalf("lost create mutations=%d", got)
+	}
+	if _, err := w.Run(f.ctx, f.ref, f.fence); err != nil {
+		t.Fatalf("exact-present create reconciliation=%v", err)
+	}
+	if got := f.github.MutationCount("pr_create"); got != 1 {
+		t.Fatalf("exact-present reconciliation replayed create %d times", got)
 	}
 }
 
@@ -208,20 +290,21 @@ func (g *driftAfterOutputWitness) ObserveFactoryPullRequestOutput(ctx context.Co
 }
 
 type publicationFixture struct {
-	ctx            context.Context
-	db             *store.Store
-	ref            domain.TicketRef
-	fence          domain.Fence
-	runner         gitboundary.Runner
-	github         *testkit.FakeGH
-	candidate      store.StoredCandidate
-	gitPushCount   int
-	failPushBefore int
-	driftRemoteAt  int
-	driftRemoteOID string
-	remoteObsCount int
-	drifted        bool
-	bare           string
+	ctx                 context.Context
+	db                  *store.Store
+	ref                 domain.TicketRef
+	fence               domain.Fence
+	runner              gitboundary.Runner
+	github              *testkit.FakeGH
+	candidate           store.StoredCandidate
+	gitPushCount        int
+	failPushBefore      int
+	failPushProofBefore int
+	driftRemoteAt       int
+	driftRemoteOID      string
+	remoteObsCount      int
+	drifted             bool
+	bare                string
 }
 
 func newPublicationFixture(t *testing.T) *publicationFixture {
@@ -461,6 +544,10 @@ func newPublicationFixture(t *testing.T) *publicationFixture {
 			isBranchObservation = isBranchObservation || arg == "ls-remote"
 		}
 		joined := strings.Join(args, "\x00")
+		if f.failPushProofBefore > 0 && strings.Contains(joined, "rev-parse") {
+			f.failPushProofBefore--
+			return nil, errors.New("fixture candidate proof unavailable before push launch")
+		}
 		isBranchObservation = isBranchObservation && strings.Contains(joined, branch)
 		if isBranchObservation {
 			f.remoteObsCount++

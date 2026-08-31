@@ -56,6 +56,45 @@ type RemoteBranchObservation struct {
 	OID    string
 }
 
+// PublicationRemoteObservation is the bounded recovery witness for a
+// candidate publication. Candidate and BaseOID are both read through the
+// authenticated Git boundary; BaseOID is empty only when the protected ref is
+// unavailable and is therefore never a successful publication witness.
+type PublicationRemoteObservation struct {
+	Candidate RemoteBranchObservation
+	BaseOID   string
+}
+
+// ObservePublicationRemote proves the candidate ref and protected base remain
+// stable across a tightly bounded read sequence. It is intentionally narrower
+// than generic branch lookup so publication settlement cannot accidentally use
+// a candidate-only observation after a protected-base movement.
+func (r Runner) ObservePublicationRemote(ctx context.Context, worktree Worktree) (PublicationRemoteObservation, error) {
+	if err := ctx.Err(); err != nil {
+		return PublicationRemoteObservation{}, err
+	}
+	baseEnv, _, err := r.githubTransportEnvironment(worktree.Identity.Origin)
+	if err != nil {
+		return PublicationRemoteObservation{}, err
+	}
+	baseBefore, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
+	if err != nil {
+		return PublicationRemoteObservation{}, err
+	}
+	candidate, err := r.ObserveRemoteBranch(ctx, worktree, worktree.Identity.PushOrigin, worktree.Branch)
+	if err != nil {
+		return PublicationRemoteObservation{}, err
+	}
+	baseAfter, err := r.remoteHeadEnv(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, worktree.Identity.Origin, worktree.Identity.BaseRef, baseEnv)
+	if err != nil {
+		return PublicationRemoteObservation{}, err
+	}
+	if baseBefore != baseAfter {
+		return PublicationRemoteObservation{}, fmt.Errorf("%w: protected base moved during publication observation", ErrUnexpectedRemote)
+	}
+	return PublicationRemoteObservation{Candidate: candidate, BaseOID: baseAfter}, nil
+}
+
 // ObserveCommit authenticates the supplied worktree and then reads the
 // checked-out commit, its one parent, and its tree. In particular, roots and
 // merge commits are rejected because this observation is used where a single
