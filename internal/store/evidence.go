@@ -147,6 +147,16 @@ type OperatorDecision struct {
 	Decision        string
 }
 
+// ApplyOperatorDecision is the lifecycle authority for the two human
+// decisions.  Recording an approval in one transaction and entering merging
+// in another would leave a restart-visible authority gap; the same applies to
+// a rejection and its repair admission.  The caller supplies only the
+// authenticated peer UID and a bounded, already-redacted reason digest.
+type OperatorDecisionRequest struct {
+	OperatorDecision
+	ReasonDigest string
+}
+
 type BudgetUse struct {
 	Ref             domain.TicketRef
 	ExpectedVersion uint64
@@ -792,6 +802,98 @@ func (s *Store) RecordOperatorDecision(ctx context.Context, decision OperatorDec
 		}
 		return evidenceEvent(ctx, conn, decision.Ref, decision.ExpectedVersion, "operator_"+decision.Decision, map[string]string{"head": decision.ReviewedHead})
 	})
+}
+
+// ApplyOperatorDecision records an exact-head decision and its normative
+// transition atomically.  It deliberately re-reads both the current candidate
+// and published PR identity inside SQLite: a CLI label or historical candidate
+// can never authorize a merge after a correction has replaced the review head.
+func (s *Store) ApplyOperatorDecision(ctx context.Context, request OperatorDecisionRequest) (TransitionResult, error) {
+	decision := request.OperatorDecision
+	if err := decision.Ref.Validate(); err != nil || !validOID(decision.ReviewedHead) || decision.OperatorUID == 0 || (decision.Decision != "approved" && decision.Decision != "rejected") {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	if request.ReasonDigest != "" && !validSHA256(request.ReasonDigest) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	var result TransitionResult
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		var state domain.State
+		var mode domain.MergeMode
+		var version, runner uint64
+		if err := conn.QueryRowContext(ctx, `SELECT state,merge_mode,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket).Scan(&state, &mode, &version, &runner); err != nil {
+			return err
+		}
+		if err := s.currentFence(ctx, conn, decision.Ref.Channel, version, runner, decision.Fence); err != nil || version != decision.ExpectedVersion {
+			return ErrStaleFence
+		}
+		var head string
+		if err := conn.QueryRowContext(ctx, `SELECT head_sha FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY generation DESC LIMIT 1`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket).Scan(&head); err != nil || head != decision.ReviewedHead {
+			return ErrStaleFence
+		}
+		// Publication evidence is immutable, but it is the sole durable PR
+		// identity.  Requiring its exact source head prevents accepting a
+		// decision for a local candidate that was never the reviewed PR.
+		var prHead string
+		if err := conn.QueryRowContext(ctx, `SELECT github_head_oid FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY rowid DESC LIMIT 1`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket).Scan(&prHead); err != nil || prHead != head {
+			return ErrEvidenceConflict
+		}
+		var prior string
+		err := conn.QueryRowContext(ctx, `SELECT decision FROM approvals WHERE channel=? AND project_id=? AND ticket_id=? AND reviewed_head=? AND operator_uid=? AND invalidated=0`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket, head, decision.OperatorUID).Scan(&prior)
+		if err == nil && prior != decision.Decision {
+			return ErrEvidenceConflict
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		// A client can lose the daemon response after the transaction commits.
+		// Replaying the same authenticated decision must report the already
+		// durable outcome, never create a second decision/effect or refuse a
+		// command that the operator cannot safely classify.
+		if err == nil && prior == decision.Decision {
+			if (decision.Decision == "approved" && state == domain.StateMerging && mode == domain.MergeGuarded) ||
+				(decision.Decision == "rejected" && state == domain.StateBuilding) {
+				result.Version = version
+				return nil
+			}
+		}
+		if (decision.Decision == "approved" && (state != domain.StateWaitingApproval || mode != domain.MergeGuarded)) ||
+			(decision.Decision == "rejected" && state != domain.StateWaitingApproval && state != domain.StateWaitingManualMerge) {
+			return ErrEvidenceConflict
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO approvals(channel,project_id,ticket_id,reviewed_head,operator_uid,decision,invalidated,created_at,ticket_version) VALUES(?,?,?,?,?,?,0,?,?)`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket, head, decision.OperatorUID, decision.Decision, now(), version); err != nil {
+				return err
+			}
+		}
+		to := domain.StateMerging
+		if decision.Decision == "rejected" {
+			to = domain.StateBuilding
+		}
+		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?,resume_state=NULL,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, to, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket, state, version, runner)
+		if err != nil {
+			return err
+		}
+		if changed, _ := updated.RowsAffected(); changed != 1 {
+			return ErrStaleFence
+		}
+		payload := map[string]string{"head": head}
+		if request.ReasonDigest != "" {
+			payload["reason_digest"] = request.ReasonDigest
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket, version+1, "operator_"+decision.Decision, state, to, string(body), now())
+		if err != nil {
+			return err
+		}
+		result.Version = version + 1
+		result.EventID, _ = created.LastInsertId()
+		return nil
+	})
+	return result, err
 }
 
 func (s *Store) ConsumeBudget(ctx context.Context, use BudgetUse) (int, error) {

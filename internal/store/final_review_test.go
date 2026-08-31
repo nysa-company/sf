@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -224,6 +225,60 @@ func TestFinalReviewStoreReplayUsesCompletedAttemptWithoutSecondProviderMutation
 	}
 	if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='review_pass'`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket).Scan(&transitions); err != nil || transitions != 1 {
 		t.Fatalf("review transition count=%d err=%v", transitions, err)
+	}
+}
+
+func TestOperatorDecisionAtomicallyBindsCurrentPublishedHead(t *testing.T) {
+	fixture := finalReviewLifecycleFixture(t)
+	completeFinalReview(t, fixture)
+	if _, err := fixture.db.TransitionFinalReview(fixture.ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, From: domain.StateReviewing, To: domain.StateWaitingApproval, Trigger: "review_pass", Fence: fixture.fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := fixture.db.ApplyOperatorDecision(fixture.ctx, OperatorDecisionRequest{OperatorDecision: OperatorDecision{Ref: waiting.Ref, ExpectedVersion: waiting.Version, Fence: domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: waiting.RunnerEpoch}, ReviewedHead: fixture.candidate.Snapshot.HeadSHA, OperatorUID: 501, Decision: "approved"}})
+	if err != nil || result.Version != waiting.Version+1 {
+		t.Fatalf("approval result=%+v err=%v", result, err)
+	}
+	merged, err := fixture.db.Ticket(fixture.ctx, waiting.Ref)
+	if err != nil || merged.State != domain.StateMerging {
+		t.Fatalf("merged ticket=%+v err=%v", merged, err)
+	}
+	decisions, err := fixture.db.OperatorDecisions(fixture.ctx, waiting.Ref)
+	if err != nil || len(decisions) != 1 || decisions[0].ReviewedHead != fixture.candidate.Snapshot.HeadSHA || decisions[0].Decision != "approved" {
+		t.Fatalf("decisions=%+v err=%v", decisions, err)
+	}
+	// Simulate a lost daemon response: the same authenticated request is a
+	// read of its durable outcome, not a second approval or merge authority.
+	replayed, err := fixture.db.ApplyOperatorDecision(fixture.ctx, OperatorDecisionRequest{OperatorDecision: OperatorDecision{Ref: waiting.Ref, ExpectedVersion: merged.Version, Fence: domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: merged.RunnerEpoch}, ReviewedHead: fixture.candidate.Snapshot.HeadSHA, OperatorUID: 501, Decision: "approved"}})
+	if err != nil || replayed.Version != merged.Version {
+		t.Fatalf("replayed approval=%+v err=%v", replayed, err)
+	}
+	decisions, err = fixture.db.OperatorDecisions(fixture.ctx, waiting.Ref)
+	if err != nil || len(decisions) != 1 {
+		t.Fatalf("replayed decisions=%+v err=%v", decisions, err)
+	}
+}
+
+func TestOperatorDecisionRejectsHeadDriftWithoutMutation(t *testing.T) {
+	fixture := finalReviewLifecycleFixture(t)
+	completeFinalReview(t, fixture)
+	if _, err := fixture.db.TransitionFinalReview(fixture.ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, From: domain.StateReviewing, To: domain.StateWaitingApproval, Trigger: "review_pass", Fence: fixture.fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = fixture.db.ApplyOperatorDecision(fixture.ctx, OperatorDecisionRequest{OperatorDecision: OperatorDecision{Ref: waiting.Ref, ExpectedVersion: waiting.Version, Fence: domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: waiting.RunnerEpoch}, ReviewedHead: strings.Repeat("d", 40), OperatorUID: 501, Decision: "approved"}})
+	if !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("approval after PR head drift err=%v", err)
+	}
+	current, err := fixture.db.Ticket(fixture.ctx, waiting.Ref)
+	if err != nil || current.State != domain.StateWaitingApproval || current.Version != waiting.Version {
+		t.Fatalf("ticket after refusal=%+v err=%v", current, err)
 	}
 }
 
