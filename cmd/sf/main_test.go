@@ -127,6 +127,91 @@ func TestCompiledDevRunRetainsClaimUntilNormalDrain(t *testing.T) {
 	}
 }
 
+func TestCompiledDevCoordinatorDrainsNormalRunBeforeFinishingAttempt(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	worktree := t.TempDir()
+	raw := []byte(`{"providers":"compiled-normal"}`)
+	sum := sha256.Sum256(raw)
+	digest := fmt.Sprintf("%x", sum)
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "compiled", Path: worktree, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: raw}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "compiled-coordinator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "compiled", Ticket: "SF-compiled-normal"}
+	if err := database.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "compiled", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Minute, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := database.StartOrAdopt(ctx, ref, 1, "dev/compiled/SF-compiled-normal", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityJSON := `{"repository":"compiled"}`
+	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Path: worktree, Branch: "dev/compiled/SF-compiled-normal", IdentityJSON: []byte(identityJSON), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
+		t.Fatal(err)
+	}
+	transition, err := database.Transition(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateBuilding, Trigger: "compiled-normal", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, EventPayload: "{}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), "sf-dev")
+	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sf-dev: %v\n%s", err, output)
+	}
+	owner.Executable = binary
+	owner.SetLaunchRecorder(func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error { return nil })
+	providerIdentity := domain.ProviderIdentity{Provider: "compiled-normal", Model: "compiled-model", Family: "compiled-family", Version: "1"}
+	binaryDigest, err := owner.RegisterExecutable(providerIdentity, "/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	qual := func(run string, identity domain.ProviderIdentity, providerDigest, policyDigest string) store.ProviderQualification {
+		return store.ProviderQualification{Channel: domain.ChannelDev, RunID: run, Provider: identity, BinaryDigest: providerDigest, PolicyDigest: policyDigest, FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()}
+	}
+	builder, _, err := database.RecordProviderQualification(ctx, qual(strings.Repeat("1", 32), providerIdentity, binaryDigest, owner.PolicyDigest()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewerIdentity := domain.ProviderIdentity{Provider: "compiled-reviewer", Model: "reviewer-model", Family: "reviewer-family", Version: "1"}
+	reviewer, _, err := database.RecordProviderQualification(ctx, qual(strings.Repeat("2", 32), reviewerIdentity, strings.Repeat("d", 64), strings.Repeat("e", 64)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := database.SelectProviderSet(ctx, domain.ChannelDev, builder.ID, builder.ID, reviewer.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	provider := &compiledNormalProvider{binding: contracts.RuntimeBinding{Identity: providerIdentity, BinaryDigest: binaryDigest, PolicyDigest: owner.PolicyDigest(), FixtureDigest: strings.Repeat("c", 64), AuthDigest: strings.Repeat("d", 64)}}
+	registry := providercoord.NewRegistry()
+	if err := registry.Register(ctx, provider); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := providercoord.New(registry, map[providercoord.Role]providercoord.Route{providercoord.RoleBuilder: {Primary: provider.Name()}}, database, nil, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(ctx, providercoord.Request{Role: providercoord.RoleBuilder, ExpectedVersion: transition.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, Prompt: "compiled normal", Repository: worktree, Worktree: worktree, WorktreeIdentity: identityJSON, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}})
+	if result.Code != providercoord.Completed {
+		t.Fatalf("compiled coordinator result=%+v", result)
+	}
+	attempts, err := database.ProviderAttempts(ctx, ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "completed" {
+		t.Fatalf("normal run was not finalized after drain: attempts=%+v err=%v", attempts, err)
+	}
+}
+
 func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T) {
 	home, err := os.MkdirTemp("/tmp", "sfh-")
 	if err != nil {
@@ -515,6 +600,24 @@ func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *te
 // no provider until a configured adapter has passed qualification.
 type compiledIntegrationProvider struct {
 	binding contracts.RuntimeBinding
+}
+
+type compiledNormalProvider struct {
+	binding contracts.RuntimeBinding
+}
+
+func (p *compiledNormalProvider) Name() string { return p.binding.Identity.Provider }
+func (p *compiledNormalProvider) Probe(context.Context) (domain.ProviderIdentity, error) {
+	return p.binding.Identity, nil
+}
+func (p *compiledNormalProvider) Binding(context.Context) (contracts.RuntimeBinding, error) {
+	return p.binding, nil
+}
+func (p *compiledNormalProvider) Invocation(context.Context, contracts.PhaseInput) (contracts.Invocation, error) {
+	return contracts.Invocation{Argv: []string{"/bin/sh", "-c", "exit 0"}}, nil
+}
+func (p *compiledNormalProvider) Parse(context.Context, contracts.PhaseInput, contracts.CommandResult) (contracts.PhaseResult, error) {
+	return contracts.PhaseResult{Artifact: []byte(`{"schema":"sf.builder/v1","summary":"compiled normal","changed_files":["main.go"],"commands":[["go","test"]]}`), Provider: p.binding.Identity, UsageTrusted: true}, nil
 }
 
 func (p *compiledIntegrationProvider) Name() string { return p.binding.Identity.Provider }
