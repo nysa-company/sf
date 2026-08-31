@@ -156,6 +156,48 @@ func TestPublicationPushIntentRecoversOnlyOneAuthenticatedPush(t *testing.T) {
 	}
 }
 
+func TestPublicationPushIntentFailsClosedForUncertainDuplicateAndMalformedRows(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := gitIntentFixture(t, db, ctx, "SF-push-intent-edges")
+	intent.Operation, intent.ExpectedHeadOID = "push", strings.Repeat("b", 40)
+	intent.SemanticKey = CanonicalGitMutationSemanticKey(intent)
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "git/push", TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.MarkEffectUncertain(ctx, EffectFence{SemanticKey: claim.SemanticKey, Ref: claim.TicketRef, TicketVersion: claim.TicketVersion, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}); err != nil {
+		t.Fatal(err)
+	}
+	if facts, err := db.PublicationPushIntent(ctx, intent.Ref); err != nil || facts.Effect.State != EffectUncertain {
+		t.Fatalf("uncertain facts=%+v err=%v", facts, err)
+	}
+
+	second := intent
+	second.RequestDigest = "sha256:" + strings.Repeat("c", 64)
+	second.SemanticKey = CanonicalGitMutationSemanticKey(second)
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: second.SemanticKey, Ref: second.Ref, Kind: "git/push", TicketVersion: second.TicketVersion, Fence: second.Fence, RequestDigest: second.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.IssueGitMutationClaim(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.PublicationPushIntent(ctx, intent.Ref); !errors.Is(err, ErrGitMutationIntent) {
+		t.Fatalf("duplicate=%v", err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM git_mutation_intents WHERE semantic_key=?`, second.SemanticKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE git_mutation_intents SET expected_head_oid='bad' WHERE semantic_key=?`, intent.SemanticKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.PublicationPushIntent(ctx, intent.Ref); !errors.Is(err, ErrGitMutationIntent) {
+		t.Fatalf("malformed=%v", err)
+	}
+}
+
 func TestGitMutationLeaseReleaseIsBoundedWhenSQLiteIsBusy(t *testing.T) {
 	db, ctx := openTestStore(t)
 	intent := gitIntentFixture(t, db, ctx, "SF-git-release-busy")
