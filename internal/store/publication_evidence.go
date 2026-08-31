@@ -1716,8 +1716,14 @@ func publicationCandidateEqual(left, right StoredCandidate) bool {
 }
 
 func (s *Store) validateStoredPublicationEffect(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence, value PublicationEffectEvidence) error {
+	return validateStoredPublicationEffectQuery(ctx, s.db, ref, version, fence, value)
+}
+
+func validateStoredPublicationEffectQuery(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, version uint64, fence domain.Fence, value PublicationEffectEvidence) error {
 	var effect Effect
-	err := s.db.QueryRowContext(ctx, `SELECT channel,project_id,ticket_id,effect_kind,state,ticket_version,leader_epoch,runner_epoch,claim_epoch,request_digest,observed_identity FROM effects WHERE semantic_key=?`, value.SemanticKey).Scan(&effect.Ref.Channel, &effect.Ref.Project, &effect.Ref.Ticket, &effect.Kind, &effect.State, &effect.TicketVersion, &effect.LeaderEpoch, &effect.RunnerEpoch, &effect.ClaimEpoch, &effect.RequestDigest, &effect.ObservedIdentity)
+	err := q.QueryRowContext(ctx, `SELECT channel,project_id,ticket_id,effect_kind,state,ticket_version,leader_epoch,runner_epoch,claim_epoch,request_digest,observed_identity FROM effects WHERE semantic_key=?`, value.SemanticKey).Scan(&effect.Ref.Channel, &effect.Ref.Project, &effect.Ref.Ticket, &effect.Kind, &effect.State, &effect.TicketVersion, &effect.LeaderEpoch, &effect.RunnerEpoch, &effect.ClaimEpoch, &effect.RequestDigest, &effect.ObservedIdentity)
 	if err != nil || effect.Ref != ref || effect.Kind != value.Kind || effect.State != EffectConfirmed || effect.TicketVersion != version || effect.LeaderEpoch != fence.LeaderEpoch || effect.RunnerEpoch != fence.RunnerEpoch || effect.ClaimEpoch != value.ClaimEpoch || effect.RequestDigest != value.RequestDigest || effect.ObservedIdentity != value.ObservedIdentity {
 		return ErrPublicationEvidence
 	}
