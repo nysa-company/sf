@@ -324,6 +324,19 @@ func (s *Store) reauthenticateStoredCandidateCommand(ctx context.Context, ref do
 // holding Store's write transaction, so falling back to s.db here would both
 // miss its transactional view and risk SQLite self-contention.
 func (s *Store) reauthenticateStoredCandidateCommandFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredCandidate) error {
+	return s.reauthenticateStoredCandidateCommandAt(ctx, q, ref, stored, true)
+}
+
+// reauthenticateStoredCandidateCommandHistoricalFrom authenticates an
+// immutable Builder/candidate command at its original fence. It is reserved
+// for a completed candidate repair whose separate completion witness and
+// signed recovery ledger have already proven the old binding reaches the live
+// owner; callers must never use it as generic current-fence authority.
+func (s *Store) reauthenticateStoredCandidateCommandHistoricalFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredCandidate) error {
+	return s.reauthenticateStoredCandidateCommandAt(ctx, q, ref, stored, false)
+}
+
+func (s *Store) reauthenticateStoredCandidateCommandAt(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredCandidate, requireLiveBuilderAuthority bool) error {
 	result, found, err := loadRepositoryCommandResult(ctx, q, stored.CommandBinding.Key, true)
 	if err != nil || !found || result.Claim.TicketRef != ref || !matchingBinding(stored.CommandBinding, result) || result.Result.ExitCode != 0 || !candidatePolicyMatches(stored.Snapshot.CommandPolicyDigest, result.Claim.PolicyDigest) {
 		return ErrEvidenceConflict
@@ -332,7 +345,13 @@ func (s *Store) reauthenticateStoredCandidateCommandFrom(ctx context.Context, q 
 	// restart.  Authenticate the exact source-to-binding recovery chain instead
 	// of treating matching counters or the command witness as provider proof.
 	builder, _, err := s.loadHistoricalProviderAttemptResult(ctx, q, stored.BuilderResult)
-	if err != nil || builder.Claim.Ref != ref || builder.Claim.Phase != domain.PhaseBuild || builder.Claim.Role != "builder" || providerResultReachesFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence) != nil {
+	if err != nil || builder.Claim.Ref != ref || builder.Claim.Phase != domain.PhaseBuild || builder.Claim.Role != "builder" {
+		return ErrEvidenceConflict
+	}
+	if requireLiveBuilderAuthority && providerResultReachesFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence) != nil {
+		return ErrEvidenceConflict
+	}
+	if !requireLiveBuilderAuthority && providerResultReachesHistoricalFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence) != nil {
 		return ErrEvidenceConflict
 	}
 	var builderCreated string

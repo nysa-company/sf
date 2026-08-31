@@ -79,11 +79,24 @@ type RuntimeRearmController interface {
 	Rearm(context.Context, domain.TicketRef) error
 }
 
+// RuntimeRearmStateController lets a concrete runtime expose the sole safe
+// retry window for a resume whose durable transition committed before runtime
+// admission was installed.
+type RuntimeRearmStateController interface {
+	RuntimeRearmNeeded(context.Context, domain.TicketRef) (bool, error)
+}
+
 // RuntimeRetirementController reclaims terminal-only runtime control state.
 // It is separate from RuntimeController so an intentionally no-runtime
 // composition need not pretend to own workflow admission state.
 type RuntimeRetirementController interface {
 	Retire(context.Context, domain.TicketRef) error
+}
+
+// RuntimeTakeoverInspector is the read-only authenticated Git/worktree
+// boundary used for operator handoff and resume classification.
+type RuntimeTakeoverInspector interface {
+	InspectTakeover(context.Context, domain.TicketRef) (contracts.TakeoverInspection, error)
 }
 
 // WorkflowRuntime is the daemon lifecycle boundary for a composed workflow
@@ -768,8 +781,14 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		response = daemon.startTicket(ctx, request, identity)
 	case "ticket.pause":
 		response = daemon.controlTicket(ctx, request, identity, "pause")
+	case "ticket.take":
+		response = daemon.controlTicket(ctx, request, identity, "take")
 	case "ticket.resume":
 		response = daemon.resumeTicket(ctx, request, identity)
+	case "ticket.retry":
+		response = daemon.retryTicket(ctx, request, identity)
+	case "ticket.recover":
+		response = daemon.recoverTicket(ctx, request, identity)
 	case "ticket.cancel":
 		response = daemon.controlTicket(ctx, request, identity, "cancel")
 	case "ticket.approve":
@@ -1329,6 +1348,9 @@ func (daemon *Daemon) controlTicket(ctx context.Context, request api.Request, id
 		return daemon.controlSuccess(request, stored, intent, true)
 	}
 	if intent != "cancel" && stored.State == domain.StatePaused {
+		if intent == "take" {
+			return daemon.takeoverSuccess(ctx, request, stored, true)
+		}
 		return daemon.controlSuccess(request, stored, intent, true)
 	}
 	if err := daemon.lease.Validate(); err != nil {
@@ -1426,7 +1448,52 @@ func (daemon *Daemon) finishControl(ctx context.Context, request api.Request, st
 			return daemon.controlFailure(request, finished, intent, "runtime_retirement_failed", "terminal runtime control cleanup failed; retry cancellation without resuming the ticket", true, true)
 		}
 	}
+	if intent == "take" {
+		return daemon.takeoverSuccess(ctx, request, finished, false)
+	}
 	return daemon.controlSuccess(request, finished, intent, false)
+}
+
+// inspectTakeover is intentionally a read-only daemon boundary. A ticket
+// without a registered worktree has no editable checkout yet, so its resume
+// may take the unchanged path. Once a worktree exists, a configured runtime
+// inspector must reauthenticate it; local Store fields alone are not proof.
+func (daemon *Daemon) inspectTakeover(ctx context.Context, ref domain.TicketRef) (contracts.TakeoverInspection, error) {
+	registered, err := daemon.store.Worktree(ctx, ref)
+	if errors.Is(err, store.ErrNotFound) {
+		return contracts.TakeoverInspection{Clean: true, ChangeKind: "no_worktree"}, nil
+	}
+	if err != nil {
+		return contracts.TakeoverInspection{}, err
+	}
+	inspector, ok := daemon.control.(RuntimeTakeoverInspector)
+	if !ok {
+		return contracts.TakeoverInspection{}, errors.New("authenticated takeover inspection is unavailable")
+	}
+	inspection, err := inspector.InspectTakeover(ctx, ref)
+	if err != nil {
+		return contracts.TakeoverInspection{}, err
+	}
+	if !inspection.Registered || inspection.Path != registered.Path || inspection.Branch != registered.Branch || inspection.BaseSHA != registered.BaseSHA || inspection.Repository == "" {
+		return contracts.TakeoverInspection{}, errors.New("takeover inspection does not match the registered worktree")
+	}
+	return inspection, nil
+}
+
+func (daemon *Daemon) takeoverSuccess(ctx context.Context, request api.Request, stored store.Ticket, observed bool) api.Response {
+	inspection, err := daemon.inspectTakeover(ctx, stored.Ref)
+	if err != nil {
+		return daemon.controlFailure(request, stored, "take", "takeover_inspection_failed", "ticket is paused but its worktree identity could not be authenticated for handoff", false, true)
+	}
+	view := ticketView(stored)
+	view["control"] = "take"
+	view["takeover"] = map[string]any{
+		"registered": inspection.Registered, "path": inspection.Path, "branch": inspection.Branch,
+		"repository": inspection.Repository, "base_sha": inspection.BaseSHA, "head_sha": inspection.HeadSHA,
+		"clean": inspection.Clean, "change_kind": inspection.ChangeKind, "changed_files": inspection.ChangedFiles,
+		"source_resumable": inspection.SourceResumable,
+	}
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_take", Identity: string(stored.Ref.Ticket), Observed: observed}, view)
 }
 
 func (daemon *Daemon) retireRuntimeControl(ctx context.Context, ref domain.TicketRef) error {
@@ -1467,14 +1534,47 @@ func (daemon *Daemon) resumeTicket(ctx context.Context, request api.Request, ide
 	if err != nil {
 		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
 	}
+	transitioned := false
 	if stored.State == domain.StatePaused {
-		payload, err := json.Marshal(map[string]string{"intent": "resume", "operator": identity.Label})
+		retryable, retryableErr := daemon.store.RetryablePause(ctx, stored)
+		if retryableErr != nil {
+			return daemon.failure(request, "retry_state_unavailable", "the pause lineage could not be authenticated", true)
+		}
+		if retryable {
+			return daemon.failure(request, "retry_required", "this pause is a bounded retry/correction stop; use ticket retry to preserve its normative lineage", false)
+		}
+		inspection, inspectErr := daemon.inspectTakeover(ctx, ref)
+		if inspectErr != nil {
+			return daemon.failure(request, "takeover_inspection_failed", "the retained worktree cannot be authenticated; resume is blocked until its repository identity is repaired", false)
+		}
+		attributes := map[string]string{
+			"operator_identity_authenticated": "true", "branch_remote_identity_exact": "true", "prerequisites_green": "true",
+		}
+		switch {
+		case inspection.Clean:
+			attributes["takeover_diff_none"] = "true"
+		case inspection.SourceResumable && inspection.ChangeKind == "source_changes":
+			// This is intentionally a handoff to a fresh Builder cycle, not a
+			// direct candidate adoption. The Git boundary proved the retained
+			// checkpoint, the source paths and the untouched verification files;
+			// Builder/RecordCandidate still require new provider and repository
+			// command evidence before any candidate can be published.
+			attributes["takeover_source_diff_valid"] = "true"
+			attributes["verification_files_unchanged"] = "true"
+		default:
+			code, message := "takeover_changes_unadopted", "operator changes are retained but cannot yet enter an authenticated Builder cycle"
+			if inspection.ChangeKind == "verification_changes" {
+				code, message = "takeover_verification_changes_unadopted", "verification-owned files changed; restore verification-owned files to the authenticated baseline, then resume the ticket"
+			} else if inspection.ChangeKind == "source_out_of_scope" {
+				code, message = "takeover_source_out_of_scope", "operator changes are outside the approved Planner paths; retain them and amend the plan before resuming"
+			}
+			return daemon.failure(request, code, message, false)
+		}
+		payload, err := json.Marshal(map[string]any{"intent": "resume", "operator": identity.Label, "change_kind": inspection.ChangeKind, "changed_files": inspection.ChangedFiles})
 		if err != nil {
 			return daemon.failure(request, "internal_encoding", "resume control metadata could not be encoded", false)
 		}
-		result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, Attributes: map[string]string{
-			"operator_identity_authenticated": "true", "takeover_diff_none": "true", "branch_remote_identity_exact": "true", "prerequisites_green": "true",
-		}, EventPayload: string(payload)})
+		result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, Attributes: attributes, EventPayload: string(payload)})
 		if err != nil {
 			return daemon.failure(request, "resume_transition_refused", "ticket cannot resume from its current durable state", false)
 		}
@@ -1482,11 +1582,167 @@ func (daemon *Daemon) resumeTicket(ctx context.Context, request api.Request, ide
 		if err != nil || stored.Version != result.TicketVersion {
 			return daemon.failure(request, "resume_state_unavailable", "resume transition could not be confirmed", true)
 		}
+		transitioned = true
 	}
-	if err := controller.Rearm(ctx, ref); err != nil {
-		return daemon.failure(request, "runtime_rearm_failed", "resume is durably sealed until runtime admission is installed; retry resume after the local runtime is available", true)
+	shouldRearm := transitioned
+	if !shouldRearm {
+		if state, ok := daemon.control.(RuntimeRearmStateController); ok {
+			needed, stateErr := state.RuntimeRearmNeeded(ctx, ref)
+			if stateErr != nil {
+				return daemon.failure(request, "runtime_rearm_failed", "resume state could not determine whether runtime admission is sealed", true)
+			}
+			shouldRearm = needed
+		}
 	}
-	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_resume", Identity: string(ref.Ticket)}, ticketView(stored))
+	if shouldRearm {
+		if err := controller.Rearm(ctx, ref); err != nil {
+			return daemon.failure(request, "runtime_rearm_failed", "resume is durably sealed until runtime admission is installed; retry resume after the local runtime is available", true)
+		}
+	}
+	return daemon.success(request, api.Mutation{Attempted: transitioned, Kind: "ticket_resume", Identity: string(ref.Ticket), Observed: !transitioned}, ticketView(stored))
+}
+
+func (daemon *Daemon) retryTicket(ctx context.Context, request api.Request, identity domain.OperatorIdentity) api.Response {
+	return daemon.resumeWithTrigger(ctx, request, identity, "operator_retry", "retry")
+}
+
+type recoverParameters struct {
+	Operator string         `json:"operator"`
+	Channel  domain.Channel `json:"channel"`
+	Mode     string         `json:"mode"`
+}
+
+func (daemon *Daemon) recoverTicket(ctx context.Context, request api.Request, identity domain.OperatorIdentity) api.Response {
+	// Recovery drains and may rearm a runtime admission, so it must not race
+	// initial runtime composition or another control request.
+	daemon.runtimeMu.Lock()
+	defer daemon.runtimeMu.Unlock()
+	if daemon.isClosed() || daemon.runtimeStopped {
+		return daemon.failure(request, "daemon_stopping", "ticket recovery is unavailable while the daemon is stopping", true)
+	}
+	var parameters recoverParameters
+	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) || (parameters.Mode != "" && parameters.Mode != "guarded") {
+		return daemon.failure(request, "invalid_recover", "recover requires the authenticated operator, daemon channel, and optional guarded mode", false)
+	}
+	ref, response := daemon.ticketRefByID(ctx, request)
+	if response != nil {
+		return *response
+	}
+	stored, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	if stored.State != domain.StateBlocked {
+		return daemon.failure(request, "invalid_transition", "only a typed blocked ticket can be recovered", false)
+	}
+	if err := daemon.lease.Validate(); err != nil {
+		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	}
+	// A recovery is never just a counter transition: seal/drain before
+	// reopening so an old writer or uncertain effect cannot survive it.
+	if drained, drainErr := daemon.control.Drain(ctx, ref); drainErr != nil || !drained {
+		return daemon.controlFailure(request, stored, "recover", "blocked_process", "blocked recovery requires a completed local drain", drainErr != nil, true)
+	}
+	trigger := "operator_recover"
+	attributes := map[string]string{"operator_identity_authenticated": "true", "typed_prerequisites_satisfied": "true", "no_live_writer": "true", "runner_epoch_current": "true"}
+	if parameters.Mode == "guarded" {
+		if stored.BlockedCode != "autonomy_ineligible" {
+			return daemon.failure(request, "recover_mode_refused", "guarded recovery is only valid for an autonomy-ineligible blocker", false)
+		}
+		merged, mergeErr := daemon.control.MergeObserved(ctx, ref)
+		if mergeErr != nil || merged {
+			return daemon.failure(request, "external_state_unavailable", "merge state must be observed before guarded recovery", mergeErr != nil)
+		}
+		trigger = "operator_recover_as_guarded"
+		attributes = map[string]string{"operator_identity_authenticated": "true", "block_reason_autonomy_ineligible": "true", "project_allows_guarded": "true", "no_live_writer": "true", "merge_not_observed": "true"}
+	}
+	payload, err := json.Marshal(map[string]string{"intent": "recover", "operator": identity.Label, "mode": parameters.Mode, "blocked_code": stored.BlockedCode})
+	if err != nil {
+		return daemon.failure(request, "internal_encoding", "recovery metadata could not be encoded", false)
+	}
+	result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: trigger, Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, Attributes: attributes, EventPayload: string(payload)})
+	if err != nil {
+		return daemon.failure(request, "recover_transition_refused", "the typed blocker cannot be recovered with current prerequisites", false)
+	}
+	current, err := daemon.store.Ticket(ctx, ref)
+	if err != nil || current.Version != result.TicketVersion {
+		return daemon.failure(request, "resume_state_unavailable", "recovery transition could not be confirmed", true)
+	}
+	if controller, ok := daemon.control.(RuntimeRearmController); ok && current.State != domain.StatePublishing && current.State != domain.StateWaitingCI {
+		if err := controller.Rearm(ctx, ref); err != nil {
+			return daemon.failure(request, "runtime_rearm_failed", "recovery is durably sealed until runtime admission is installed", true)
+		}
+	}
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_recover", Identity: string(ref.Ticket)}, ticketView(current))
+}
+
+func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request, identity domain.OperatorIdentity, trigger, kind string) api.Response {
+	// operator_retry is intentionally narrower than resume: it only follows a
+	// direct retry/correction exhaustion pause. A normal take/pause must use
+	// the inspected operator_resume path.
+	//
+	// It still changes the live runtime fence, so serialize it with take,
+	// resume, and recover. In particular, a retry must not race a runtime
+	// shutdown or a concurrent resume that could otherwise arm two workers.
+	daemon.runtimeMu.Lock()
+	defer daemon.runtimeMu.Unlock()
+	if daemon.isClosed() || daemon.runtimeStopped {
+		return daemon.failure(request, "daemon_stopping", "ticket retry is unavailable while the daemon is stopping", true)
+	}
+	var parameters controlParameters
+	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) {
+		return daemon.failure(request, "invalid_retry", "retry requires the authenticated operator and daemon channel", false)
+	}
+	ref, response := daemon.ticketRefByID(ctx, request)
+	if response != nil {
+		return *response
+	}
+	stored, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	retryable, retryableErr := daemon.store.RetryablePause(ctx, stored)
+	if retryableErr != nil {
+		return daemon.failure(request, "retry_state_unavailable", "the pause lineage could not be authenticated", true)
+	}
+	if stored.State != domain.StatePaused || !retryable {
+		return daemon.failure(request, "retry_not_available", "retry is available only after a durable retry or correction exhaustion pause", false)
+	}
+	if err := daemon.lease.Validate(); err != nil {
+		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	}
+	payload, err := json.Marshal(map[string]string{"intent": kind, "operator": identity.Label})
+	if err != nil {
+		return daemon.failure(request, "internal_encoding", "retry metadata could not be encoded", false)
+	}
+	result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: trigger, Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, Attributes: map[string]string{"operator_identity_authenticated": "true", "pause_reason_retryable": "true", "typed_prerequisites_satisfied": "true", "runner_epoch_current": "true"}, EventPayload: string(payload)})
+	if err != nil {
+		return daemon.failure(request, "retry_transition_refused", "the paused ticket could not start its bounded retry", false)
+	}
+	current, err := daemon.store.Ticket(ctx, ref)
+	if err != nil || current.Version != result.TicketVersion {
+		return daemon.failure(request, "resume_state_unavailable", "retry transition could not be confirmed", true)
+	}
+	// Retry-exhaustion pauses normally have no sealed admission. The narrow
+	// crash window after a prior control operation is different: if Store still
+	// proves the exact control row sealed, rearm it while holding runtimeMu so
+	// one successful retry cannot admit two runtimes.
+	if state, ok := daemon.control.(RuntimeRearmStateController); ok {
+		needed, stateErr := state.RuntimeRearmNeeded(ctx, ref)
+		if stateErr != nil {
+			return daemon.failure(request, "runtime_rearm_failed", "retry state could not determine whether runtime admission is sealed", true)
+		}
+		if needed {
+			controller, ok := daemon.control.(RuntimeRearmController)
+			if !ok {
+				return daemon.failure(request, "runtime_rearm_unavailable", "retry is durably sealed until runtime admission is configured", true)
+			}
+			if err := controller.Rearm(ctx, ref); err != nil {
+				return daemon.failure(request, "runtime_rearm_failed", "retry is durably sealed until runtime admission is installed; retry after the local runtime is available", true)
+			}
+		}
+	}
+	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_" + kind, Identity: string(ref.Ticket)}, ticketView(current))
 }
 
 func (daemon *Daemon) ticketRefByID(ctx context.Context, request api.Request) (domain.TicketRef, *api.Response) {
@@ -1628,6 +1884,14 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	binary := daemon.executable()
 	argv := []string{binary, "doctor"}
 	verb := strings.TrimPrefix(request.Method, "ticket.")
+	operatorVerb := func(fallback string) string {
+		switch verb {
+		case "take", "resume", "retry", "recover", "status":
+			return verb
+		default:
+			return fallback
+		}
+	}
 	if code == "autonomous_unavailable" {
 		argv = []string{binary, "providers", "qualify", "--help"}
 	}
@@ -1658,9 +1922,55 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	if code == "invalid_logs" {
 		argv = []string{binary, "logs", "--help"}
 	}
+	// Operator control failures have a command-specific next action even when
+	// the malformed request omitted its ticket. Do not collapse them into
+	// doctor: the daemon already knows which control surface can recover.
+	switch code {
+	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_source_out_of_scope":
+		argv = []string{binary, "take", "--help"}
+	case "takeover_verification_changes_unadopted":
+		argv = []string{binary, operatorVerb("resume"), "--help"}
+	case "invalid_resume":
+		argv = []string{binary, "resume", "--help"}
+	case "invalid_retry":
+		argv = []string{binary, "retry", "--help"}
+	case "invalid_recover":
+		argv = []string{binary, "recover", "--help"}
+	case "runtime_rearm_unavailable", "runtime_rearm_failed", "resume_state_unavailable", "resume_transition_refused":
+		argv = []string{binary, operatorVerb("resume"), "--help"}
+	case "retry_state_unavailable", "retry_not_available", "retry_transition_refused", "retry_required":
+		argv = []string{binary, "retry", "--help"}
+	case "recover_mode_refused", "recover_transition_refused":
+		argv = []string{binary, "recover", "--help"}
+	}
 	if code == "invalid_control" || code == "invalid_ticket_reference" || code == "invalid_decision" || code == "decision_refused" || code == "approval_head_changed" {
 		if verb != "" && verb != request.Method {
 			argv = []string{binary, verb, "--help"}
+		}
+	}
+	if request.Ticket != "" {
+		switch code {
+		case "takeover_changes_unadopted", "takeover_source_out_of_scope":
+			// `take` is intentionally idempotent and prints the authenticated
+			// retained path again. It is the only safe next action for edits
+			// that have not crossed the Builder/proof authority.
+			argv = []string{binary, "take", request.Ticket}
+		case "takeover_verification_changes_unadopted":
+			// The prerequisite is deliberately manual: the daemon must not adopt
+			// verification-owned edits or invent an amendment. Once the operator
+			// restores/commits the approved files, this executable action retries
+			// the authenticated takeover inspection and resume boundary.
+			argv = []string{binary, operatorVerb("resume"), request.Ticket}
+		case "retry_required":
+			argv = []string{binary, "retry", request.Ticket}
+		case "takeover_inspection_failed":
+			argv = []string{binary, "take", request.Ticket}
+		case "runtime_rearm_unavailable", "runtime_rearm_failed", "resume_state_unavailable", "resume_transition_refused":
+			argv = []string{binary, operatorVerb("resume"), request.Ticket}
+		case "retry_state_unavailable", "retry_not_available", "retry_transition_refused":
+			argv = []string{binary, "retry", request.Ticket}
+		case "recover_mode_refused", "recover_transition_refused":
+			argv = []string{binary, "recover", request.Ticket}
 		}
 	}
 	if request.Ticket != "" {

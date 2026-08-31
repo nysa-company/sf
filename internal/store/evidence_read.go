@@ -141,9 +141,9 @@ func (s *Store) finalReviewAuthorityFrom(ctx context.Context, q candidateEvidenc
 		return FinalReviewAuthority{}, ErrStaleFence
 	}
 	var state domain.State
+	var ticketType domain.TicketType
 	var version, runner, leader uint64
 	var source string
-	var ticketType domain.TicketType
 	if err := q.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch,t.source_digest,t.ticket_type FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &leader, &source, &ticketType); err != nil || state != domain.StateReviewing || version != expectedVersion || runner != fence.RunnerEpoch || leader != fence.LeaderEpoch {
 		return FinalReviewAuthority{}, ErrStaleFence
 	}
@@ -168,49 +168,145 @@ func (s *Store) finalReviewAuthorityFrom(ctx context.Context, q candidateEvidenc
 		}
 		return FinalReviewAuthority{Candidate: candidate, Verification: verification}, nil
 	}
-	var observationID int64
-	var observedVersion, observedLeader, observedRunner, reviewVersion uint64
-	var count int
-	var requiredSetDigest string
-	err = q.QueryRowContext(ctx, `SELECT o.observation_id,o.observed_ticket_version,o.observed_leader_epoch,o.observed_runner_epoch,e.ticket_version,o.required_check_count,o.required_set_digest
-		FROM ci_transition_evidence e JOIN ci_observations o ON o.channel=e.channel AND o.project_id=e.project_id AND o.ticket_id=e.ticket_id AND o.candidate_generation=e.candidate_generation AND o.candidate_head_sha=e.candidate_head_sha AND o.candidate_tree_sha=e.candidate_tree_sha AND o.classification=e.observation_classification AND o.observation_digest=e.observation_digest AND o.observed_ticket_version=e.observation_ticket_version AND o.observed_leader_epoch=e.observation_leader_epoch AND o.observed_runner_epoch=e.observation_runner_epoch
-		WHERE e.channel=? AND e.project_id=? AND e.ticket_id=? AND e.candidate_generation=? AND e.candidate_head_sha=? AND e.candidate_tree_sha=? AND e.observation_classification='green' AND e.resulting_state='reviewing' AND e.resulting_trigger='checks_green'
-		ORDER BY e.ticket_version DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, candidate.Snapshot.Generation, candidate.Snapshot.HeadSHA, candidate.Snapshot.TreeSHA).Scan(&observationID, &observedVersion, &observedLeader, &observedRunner, &reviewVersion, &count, &requiredSetDigest)
-	if err != nil || observationID <= 0 || count <= 0 || reviewVersion == 0 || reviewVersion != observedVersion+1 || observedLeader == 0 || observedRunner == 0 || !validSHA256(requiredSetDigest) {
+	observation, checks, reviewVersion, err := finalReviewCIAuthorityFrom(ctx, q, ref, candidate)
+	if err != nil {
 		return FinalReviewAuthority{}, ErrEvidenceConflict
 	}
 	// Reviewing can survive a leader/runner recovery, but the recovery proof
 	// must begin at the exact CI-created reviewing endpoint; candidate rows
 	// themselves predate publication and cannot be used as a loose shortcut.
-	if reviewVersion != expectedVersion || observedRunner != fence.RunnerEpoch || observedLeader != fence.LeaderEpoch {
-		if err := validateRunnerRecoveryLedger(ctx, q, ref, reviewVersion, observedRunner, observedLeader, expectedVersion, fence.RunnerEpoch, fence.LeaderEpoch); err != nil {
+	if reviewVersion != expectedVersion || observation.ObservedFence.RunnerEpoch != fence.RunnerEpoch || observation.ObservedFence.LeaderEpoch != fence.LeaderEpoch {
+		if err := validateRunnerRecoveryLedger(ctx, q, ref, reviewVersion, observation.ObservedFence.RunnerEpoch, observation.ObservedFence.LeaderEpoch, expectedVersion, fence.RunnerEpoch, fence.LeaderEpoch); err != nil {
 			return FinalReviewAuthority{}, ErrStaleFence
 		}
 	}
-	rows, err := q.QueryContext(ctx, `SELECT canonical_name,external_id,normalized_state FROM ci_observation_checks WHERE observation_id=? ORDER BY canonical_name,external_id`, observationID)
+	return FinalReviewAuthority{Candidate: candidate, Verification: verification, Checks: checks}, nil
+}
+
+// finalReviewCIAuthorityFrom authenticates the complete v43 CI chain using
+// the caller's query scope. In particular, transition writes call this with
+// their active *sql.Conn: opening a second database read there could observe a
+// different snapshot or deadlock under the intentionally bounded pool.
+func finalReviewCIAuthorityFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, candidate StoredCandidate) (CIObservation, workflowprompt.ChecksIdentity, uint64, error) {
+	publication, err := loadCIPublicationBase(ctx, q, ref)
+	if err != nil || !publicationFound(publication) || publication.Candidate.Snapshot != candidate.Snapshot {
+		return CIObservation{}, workflowprompt.ChecksIdentity{}, 0, fmt.Errorf("%w: final review CI publication", ErrEvidenceConflict)
+	}
+	policy, err := scanCurrentCIPolicy(ctx, q, ref, publication)
 	if err != nil {
-		return FinalReviewAuthority{}, err
+		// A blank policy_witness_digest is the v42 compatibility default and
+		// cannot authorize final review. There is no safe reconstruction from
+		// an observation chosen before the v43 policy witness existed.
+		return CIObservation{}, workflowprompt.ChecksIdentity{}, 0, fmt.Errorf("%w: final review CI policy", ErrEvidenceConflict)
 	}
-	defer rows.Close()
-	checks := make([]workflowprompt.Check, 0, count)
-	for rows.Next() {
-		var check workflowprompt.Check
-		if err := rows.Scan(&check.Name, &check.ExternalID, &check.Status); err != nil {
-			return FinalReviewAuthority{}, err
+	observation, reviewVersion, err := finalReviewCIPendingChainFrom(ctx, q, ref, publication, policy)
+	if err != nil {
+		return CIObservation{}, workflowprompt.ChecksIdentity{}, 0, err
+	}
+	checks := make([]workflowprompt.Check, 0, len(observation.RequiredChecks))
+	for _, check := range observation.RequiredChecks {
+		if check.NormalizedState != "success" {
+			return CIObservation{}, workflowprompt.ChecksIdentity{}, 0, ErrEvidenceConflict
 		}
-		if check.Status != "success" && check.Status != "skipped" && check.Status != "neutral" {
-			return FinalReviewAuthority{}, ErrEvidenceConflict
+		checks = append(checks, workflowprompt.Check{Name: check.CanonicalName, ExternalID: check.ExternalID, Status: check.NormalizedState})
+	}
+	identity, err := workflowprompt.NewChecksIdentity(fmt.Sprintf("%d", observation.ObservationID), candidate.Snapshot.HeadSHA, checks)
+	// The CI policy digest names the server-required set (name and external
+	// ID); the reviewer prompt identity additionally includes each observed
+	// status. They are intentionally different digest domains. Exact policy
+	// equality was authenticated above by policyMatchesObservation.
+	if err != nil {
+		return CIObservation{}, workflowprompt.ChecksIdentity{}, 0, ErrEvidenceConflict
+	}
+	return observation, identity, reviewVersion, nil
+}
+
+// finalReviewCIPendingChainFrom proves the complete CI history which starts
+// at the publication-created waiting_ci endpoint and ends at exactly one
+// green transition. Pending observations are stateful authority, not a
+// dispensable prelude to green: each must be contiguous, policy-matched, and
+// bound to its exact event and digest.
+func finalReviewCIPendingChainFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, publication PublishedCandidateEvidence, policy CIRequiredCheckPolicy) (CIObservation, uint64, error) {
+	waitingVersion := publication.CurrentTicketVersion + 1
+	payload, err := json.Marshal(struct {
+		WitnessDigest    string `json:"witness_digest"`
+		WitnessCreatedAt string `json:"witness_created_at"`
+	}{publication.WitnessDigest, publication.CreatedAt.Format(time.RFC3339Nano)})
+	if err != nil {
+		return CIObservation{}, 0, fmt.Errorf("%w: final review CI publication payload", ErrEvidenceConflict)
+	}
+	var publicationEvents int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events e JOIN publication_transition_evidence p ON p.channel=e.channel AND p.project_id=e.project_id AND p.ticket_id=e.ticket_id AND p.ticket_version=e.ticket_version AND p.event_created_at=e.created_at WHERE e.channel=? AND e.project_id=? AND e.ticket_id=? AND e.ticket_version=? AND e.trigger='effects_confirmed' AND e.from_state='publishing' AND e.to_state='waiting_ci' AND e.payload=? AND p.witness_digest=? AND p.witness_created_at=?`, ref.Channel, ref.Project, ref.Ticket, waitingVersion, string(payload), publication.WitnessDigest, publication.CreatedAt.Format(time.RFC3339Nano)).Scan(&publicationEvents); err != nil || publicationEvents != 1 {
+		return CIObservation{}, 0, fmt.Errorf("%w: final review CI publication boundary", ErrEvidenceConflict)
+	}
+	if err := validateCIWaitingVersionEvents(ctx, q, ref, waitingVersion, string(payload), publication); err != nil {
+		return CIObservation{}, 0, fmt.Errorf("%w: final review CI publication event", ErrEvidenceConflict)
+	}
+	var greenCount int
+	var reviewVersion uint64
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND candidate_tree_sha=? AND observation_classification='green' AND resulting_state='reviewing' AND resulting_trigger='checks_green'`, ref.Channel, ref.Project, ref.Ticket, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA, publication.Candidate.Snapshot.TreeSHA).Scan(&greenCount, &reviewVersion); err != nil || greenCount != 1 || reviewVersion <= waitingVersion {
+		return CIObservation{}, 0, fmt.Errorf("%w: final review CI green cardinality", ErrEvidenceConflict)
+	}
+	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
+		return CIObservation{}, 0, fmt.Errorf("%w: final review CI recovery cardinality", ErrEvidenceConflict)
+	}
+	expectedRunner, expectedLeader := publication.CurrentFence.RunnerEpoch, publication.CurrentFence.LeaderEpoch
+	var green CIObservation
+	for version := waitingVersion + 1; version <= reviewVersion; version++ {
+		recovery, recovered, err := loadRunnerRecoveryAt(ctx, q, ref, version)
+		if err != nil {
+			return CIObservation{}, 0, fmt.Errorf("%w: final review CI recovery read", ErrEvidenceConflict)
 		}
-		checks = append(checks, check)
+		var transitionCount int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&transitionCount); err != nil {
+			return CIObservation{}, 0, err
+		}
+		if recovered {
+			var events int
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&events); err != nil || transitionCount != 0 || events != 0 || !validRunnerRecovery(recovery) || recovery.PriorTicketVersion != version-1 || recovery.PriorRunnerEpoch != expectedRunner || recovery.PriorLeaderEpoch != expectedLeader {
+				return CIObservation{}, 0, fmt.Errorf("%w: final review CI recovery step", ErrEvidenceConflict)
+			}
+			expectedRunner, expectedLeader = recovery.RunnerEpoch, recovery.LeaderEpoch
+			continue
+		}
+		if transitionCount != 1 {
+			return CIObservation{}, 0, fmt.Errorf("%w: final review CI transition gap", ErrEvidenceConflict)
+		}
+		var generation, eventID int64
+		var evidenceVersion, observationVersion, observationLeader, observationRunner uint64
+		var head, tree, classification, observationDigest, witness, priorState, resultingState, resultingTrigger, transitionDigest, evidenceCreated string
+		var joinedID int64
+		var eventCreated, fromState, toState, eventTrigger, eventPayload string
+		err = q.QueryRowContext(ctx, `SELECT c.ticket_version,c.event_id,c.event_created_at,c.candidate_generation,c.candidate_head_sha,c.candidate_tree_sha,c.observation_classification,c.observation_digest,c.observation_ticket_version,c.observation_leader_epoch,c.observation_runner_epoch,c.prior_publication_witness_digest,c.prior_state,c.resulting_state,c.resulting_trigger,c.transition_digest,e.id,e.created_at,e.from_state,e.to_state,e.trigger,e.payload FROM ci_transition_evidence c JOIN events e ON e.channel=c.channel AND e.project_id=c.project_id AND e.ticket_id=c.ticket_id AND e.ticket_version=c.ticket_version AND e.id=c.event_id AND e.created_at=c.event_created_at WHERE c.channel=? AND c.project_id=? AND c.ticket_id=? AND c.ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&evidenceVersion, &eventID, &evidenceCreated, &generation, &head, &tree, &classification, &observationDigest, &observationVersion, &observationLeader, &observationRunner, &witness, &priorState, &resultingState, &resultingTrigger, &transitionDigest, &joinedID, &eventCreated, &fromState, &toState, &eventTrigger, &eventPayload)
+		if err != nil || evidenceVersion != version || eventID <= 0 || eventID != joinedID || evidenceCreated != eventCreated || generation != int64(publication.Candidate.Snapshot.Generation) || head != publication.Candidate.Snapshot.HeadSHA || tree != publication.Candidate.Snapshot.TreeSHA || observationDigest == "" || observationVersion != version-1 || observationLeader != expectedLeader || observationRunner != expectedRunner || witness != publication.WitnessDigest || priorState != string(domain.StateWaitingCI) || fromState != string(domain.StateWaitingCI) {
+			return CIObservation{}, 0, fmt.Errorf("%w: final review CI transition identity", ErrEvidenceConflict)
+		}
+		observation, found, err := scanCIObservation(ctx, q, false, ref, observationDigest)
+		if err != nil || !found || !ciObservationMatchesPublication(observation, publication) || observation.ObservedTicketVersion != observationVersion || observation.ObservedFence.LeaderEpoch != observationLeader || observation.ObservedFence.RunnerEpoch != observationRunner || !policyMatchesObservation(policy, observation) || transitionDigest != ciTransitionDigest(ref, observation, version, eventID, eventCreated, resultingState, resultingTrigger, eventPayload) {
+			return CIObservation{}, 0, fmt.Errorf("%w: final review CI observation or digest", ErrEvidenceConflict)
+		}
+		switch classification {
+		case "pending":
+			if version == reviewVersion || observation.Classification != "pending" || resultingState != string(domain.StateWaitingCI) || resultingTrigger != "checks_pending" || toState != string(domain.StateWaitingCI) || eventTrigger != "checks_pending" {
+				return CIObservation{}, 0, fmt.Errorf("%w: final review CI pending transition", ErrEvidenceConflict)
+			}
+		case "green":
+			if version != reviewVersion || observation.Classification != "green" || resultingState != string(domain.StateReviewing) || resultingTrigger != "checks_green" || toState != string(domain.StateReviewing) || eventTrigger != "checks_green" {
+				return CIObservation{}, 0, fmt.Errorf("%w: final review CI green transition", ErrEvidenceConflict)
+			}
+			green = observation
+		default:
+			return CIObservation{}, 0, fmt.Errorf("%w: final review CI non-green chain transition", ErrEvidenceConflict)
+		}
 	}
-	if rows.Err() != nil || len(checks) != count {
-		return FinalReviewAuthority{}, ErrEvidenceConflict
+	if green.Ref != ref {
+		return CIObservation{}, 0, fmt.Errorf("%w: final review CI missing green endpoint", ErrEvidenceConflict)
 	}
-	identity, err := workflowprompt.NewChecksIdentity(fmt.Sprintf("%d", observationID), candidate.Snapshot.HeadSHA, checks)
-	if err != nil || identity.SetDigest != requiredSetDigest {
-		return FinalReviewAuthority{}, ErrEvidenceConflict
+	var afterGreen int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ref.Channel, ref.Project, ref.Ticket, reviewVersion).Scan(&afterGreen); err != nil || afterGreen != 0 {
+		return CIObservation{}, 0, fmt.Errorf("%w: final review CI trailing transition", ErrEvidenceConflict)
 	}
-	return FinalReviewAuthority{Candidate: candidate, Verification: verification, Checks: identity}, nil
+	return green, reviewVersion, nil
 }
 
 // ValidateCurrentCandidateForBuildTransition authenticates the exact

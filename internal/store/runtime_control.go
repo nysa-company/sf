@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/phaseartifact"
 )
 
 // TicketControlProof is one linearized control observation. It is produced
@@ -307,6 +308,200 @@ func prePublicationState(state domain.State) bool {
 	return state == domain.StatePlanning || state == domain.StateVerifying || state == domain.StateBuilding
 }
 
+// postPublicationState is the explicit allowlist for a resumed ticket whose
+// durable publication boundary has already been crossed.  Keeping this
+// separate from prePublicationState is important: RecoverAsGuarded and the
+// ordinary RearmProof must never gain a route around their pre-publication
+// evidence rules.
+func postPublicationState(state domain.State) bool {
+	switch state {
+	case domain.StatePublishing, domain.StateWaitingCI, domain.StateReviewing,
+		domain.StateWaitingApproval, domain.StateWaitingManualMerge,
+		domain.StateMerging, domain.StateReconciling:
+		return true
+	default:
+		return false
+	}
+}
+
+func runtimeRearmableState(state domain.State) bool {
+	return prePublicationState(state) || postPublicationState(state)
+}
+
+// authenticatePostPublicationState proves the immutable evidence appropriate
+// to the current phase on the same SQLite connection as the control proof.
+// It intentionally does not reconstruct a missing witness or call a reader
+// through Store (which could observe a different transaction).
+func (s *Store) authenticatePostPublicationState(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, baselineVersion uint64, baselineFence domain.Fence) error {
+	switch state {
+	case domain.StatePublishing:
+		// Publishing may legitimately be between the candidate and publication
+		// witness.  The authenticated candidate is the fresh boundary here;
+		// once publication has been recorded, its row is checked below instead.
+		candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
+		if err != nil || candidate.Fence != baselineFence {
+			return ErrControlNotDrained
+		}
+		if candidate.TicketVersion == baselineVersion {
+			return nil
+		}
+		// TransitionCandidate records the immutable candidate at the building
+		// endpoint, then the authenticated phase_pass advances the ticket into
+		// publishing.  A pause/resume proof for a publishing ticket therefore
+		// authenticates this one exact predecessor event rather than requiring an
+		// impossible candidate row at the publishing version.
+		if candidate.TicketVersion == ^uint64(0) || candidate.TicketVersion+1 != baselineVersion {
+			return ErrControlNotDrained
+		}
+		var transitions int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, ref.Channel, ref.Project, ref.Ticket, baselineVersion).Scan(&transitions); err != nil || transitions != 1 {
+			return ErrControlNotDrained
+		}
+		return nil
+	case domain.StateWaitingCI:
+		publication, err := loadCIPublicationBase(ctx, conn, ref)
+		candidate, candidateErr := s.latestCandidateFrom(ctx, conn, ref, false)
+		if err != nil || candidateErr != nil || !publicationCandidateEqual(candidate, publication.Candidate) || publication.CurrentFence != baselineFence {
+			return ErrControlNotDrained
+		}
+		// The publication witness is recorded at publishing version N; the
+		// authenticated effects_confirmed transition establishes waiting_ci at
+		// N+1.  A recovered/rebound witness may already be at the live endpoint,
+		// so accept either exact endpoint, or this one canonical transition.
+		if publication.CurrentTicketVersion != baselineVersion &&
+			(publication.CurrentTicketVersion == ^uint64(0) || publication.CurrentTicketVersion+1 != baselineVersion ||
+				authenticatePublishedWaitingEvent(ctx, conn, ref, publication, baselineVersion) != nil) {
+			return ErrControlNotDrained
+		}
+		return nil
+	case domain.StateReviewing:
+		candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
+		if err != nil {
+			return ErrControlNotDrained
+		}
+		observation, reviewVersion, err := s.authenticateHistoricalFinalReview(ctx, conn, ref, candidate)
+		if err != nil || reviewVersion != baselineVersion || observation.ObservedFence != baselineFence {
+			return ErrControlNotDrained
+		}
+		return nil
+	case domain.StateWaitingApproval, domain.StateWaitingManualMerge:
+		if err := s.authenticatePostPublicationReviewCompletion(ctx, conn, ref, state, baselineVersion, baselineFence); err != nil {
+			return ErrControlNotDrained
+		}
+		return nil
+	case domain.StateMerging, domain.StateReconciling:
+		if err := s.authenticatePostPublicationMergeState(ctx, conn, ref, baselineVersion, baselineFence); err != nil {
+			return ErrControlNotDrained
+		}
+		return nil
+	default:
+		return ErrControlNotDrained
+	}
+}
+
+func (s *Store) authenticatePostPublicationReviewCompletion(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, target domain.State, baselineVersion uint64, baselineFence domain.Fence) error {
+	publication, err := loadCIPublicationBase(ctx, conn, ref)
+	if err != nil {
+		return err
+	}
+	candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
+	if err != nil || !publicationCandidateEqual(candidate, publication.Candidate) {
+		return ErrPublicationEvidence
+	}
+	observation, reviewVersion, err := s.authenticateHistoricalFinalReview(ctx, conn, ref, candidate)
+	if err != nil {
+		return err
+	}
+	if observation.ObservedFence.LeaderEpoch != baselineFence.LeaderEpoch || observation.ObservedFence.RunnerEpoch != baselineFence.RunnerEpoch {
+		return ErrEvidenceConflict
+	}
+	var transitionCount, stateChangingCount int
+	var transitionVersion uint64
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='review_pass' AND from_state='reviewing' AND to_state=?`, ref.Channel, ref.Project, ref.Ticket, baselineVersion, target).Scan(&transitionCount, &transitionVersion, &stateChangingCount); err != nil || transitionCount != 1 || stateChangingCount != 1 || transitionVersion != baselineVersion || reviewVersion+1 != baselineVersion || baselineFence.LeaderEpoch == 0 || baselineFence.RunnerEpoch == 0 {
+		return ErrEvidenceConflict
+	}
+	var attemptID int64
+	var attempt int
+	var resultCount int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id WHERE r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase='review' AND r.role='reviewer' AND a.state='completed' AND a.outcome='completed' AND a.expected_ticket_version=? AND a.leader_epoch=? AND a.runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, reviewVersion, baselineFence.LeaderEpoch, baselineFence.RunnerEpoch).Scan(&resultCount); err != nil || resultCount != 1 {
+		return ErrEvidenceConflict
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT r.provider_attempt_id,r.attempt FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id WHERE r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase='review' AND r.role='reviewer' AND a.state='completed' AND a.outcome='completed' AND a.expected_ticket_version=? AND a.leader_epoch=? AND a.runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, reviewVersion, baselineFence.LeaderEpoch, baselineFence.RunnerEpoch).Scan(&attemptID, &attempt); err != nil {
+		return ErrEvidenceConflict
+	}
+	key := ProviderAttemptResultKey{AttemptID: attemptID, Ref: ref, Phase: domain.PhaseReview, Attempt: attempt}
+	result, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, conn, key)
+	if err != nil || parsed.Reviewer == nil || parsed.Reviewer.Decision != phaseartifact.ReviewPass || parsed.Reviewer.ReviewedHead != candidate.Snapshot.HeadSHA || parsed.Reviewer.ProofDigest != candidate.Snapshot.ProofDigest || result.Claim.ExpectedVersion != reviewVersion || providerResultReachesHistoricalFence(ctx, conn, key, result, result.Claim.ExpectedVersion, domain.Fence{LeaderEpoch: result.Claim.LeaderEpoch, RunnerEpoch: result.Claim.RunnerEpoch}) != nil {
+		return ErrEvidenceConflict
+	}
+	return nil
+}
+
+// authenticateHistoricalFinalReview is the post-publication counterpart to
+// FinalReviewAuthority. It proves the candidate's source and verification
+// chain plus the complete immutable CI chain, but deliberately evaluates them
+// at the pre-stop endpoint; a resumed ticket has a newer control version.
+func (s *Store) authenticateHistoricalFinalReview(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, candidate StoredCandidate) (CIObservation, uint64, error) {
+	var source string
+	if err := conn.QueryRowContext(ctx, `SELECT source_digest FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&source); err != nil || source != candidate.Snapshot.SourceDigest {
+		return CIObservation{}, 0, ErrEvidenceConflict
+	}
+	verification, err := s.verificationEvidenceForCandidateFrom(ctx, conn, ref)
+	if err != nil || candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest || candidate.Commit.ParentOID != verification.Checkpoint.CommitOID {
+		return CIObservation{}, 0, ErrEvidenceConflict
+	}
+	observation, _, reviewVersion, err := finalReviewCIAuthorityFrom(ctx, conn, ref, candidate)
+	if err != nil {
+		return CIObservation{}, 0, ErrEvidenceConflict
+	}
+	return observation, reviewVersion, nil
+}
+
+func (s *Store) authenticatePostPublicationMergeState(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, baselineVersion uint64, baselineFence domain.Fence) error {
+	publication, err := loadCIPublicationBase(ctx, conn, ref)
+	if err != nil {
+		return err
+	}
+	candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
+	if err != nil || !publicationCandidateEqual(candidate, publication.Candidate) {
+		return ErrPublicationEvidence
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT semantic_key FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return err
+		}
+		intent, found, err := mergeIntentFrom(ctx, conn, key)
+		if err != nil || !found || intent.Ref != ref || intent.TicketVersion != baselineVersion || intent.LeaderEpoch != baselineFence.LeaderEpoch || intent.RunnerEpoch != baselineFence.RunnerEpoch || validMergeIntent(intent) != nil {
+			return ErrEvidenceConflict
+		}
+		// A syntactically valid merge intent is not enough after a pause/resume:
+		// bind it to the exact publication witness that established the current
+		// candidate/PR.  This rejects a stale prior-generation intent even when
+		// its own immutable protection witness is internally valid.
+		pr := publication.PullRequest
+		if intent.RepositoryHost != pr.Repository.Host || intent.RepositoryOwner != pr.Repository.Owner || intent.RepositoryName != pr.Repository.Name || intent.PullRequestNumber != pr.Number || intent.HeadOID != pr.HeadOID || intent.BaseRef != pr.BaseRef || intent.OriginalBaseOID != pr.BaseOID {
+			return ErrEvidenceConflict
+		}
+		var kind, state, digest, identity string
+		var version, runner, leader, claimEpoch uint64
+		if err := conn.QueryRowContext(ctx, `SELECT effect_kind,state,request_digest,observed_identity,ticket_version,leader_epoch,runner_epoch,claim_epoch FROM effects WHERE semantic_key=?`, key).Scan(&kind, &state, &digest, &identity, &version, &leader, &runner, &claimEpoch); err != nil || kind != "merge" || (EffectState(state) != EffectConfirmed && EffectState(state) != EffectFailed) || digest != intent.RequestDigest || version != baselineVersion || leader != baselineFence.LeaderEpoch || runner != baselineFence.RunnerEpoch || claimEpoch == 0 || (EffectState(state) == EffectConfirmed && identity == "") {
+			return ErrEvidenceConflict
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil || count != 1 {
+		return ErrEvidenceConflict
+	}
+	return nil
+}
+
 // SealRuntimeControl durably closes a ticket before any runtime cancellation
 // is requested.  It intentionally performs no drain count: callers must
 // release Store's gate, join the runtime, then obtain ControlProof.
@@ -473,6 +668,209 @@ func (s *Store) RearmProof(ctx context.Context, ref domain.TicketRef, stopped Ti
 	return &RuntimeRearmCapability{ref: ref, version: proof.Ticket.Version, fence: proof.Fence, issued: true}, nil
 }
 
+// PostPublicationRearmProof is the separate authority for resuming a ticket
+// after publication has begun.  It shares the sealed/drained serialization
+// with RearmProof but has its own state and evidence allowlist; in particular,
+// it never broadens the pre-publication proof used by RecoverAsGuarded.
+func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.TicketRef, stopped Ticket) (*RuntimeRearmCapability, error) {
+	if err := ref.Validate(); err != nil || stopped.Ref != ref || stopped.Version == 0 || stopped.RunnerEpoch == 0 {
+		return nil, ErrStaleFence
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	g := s.mutations
+	if g == nil {
+		return nil, ErrStaleFence
+	}
+	if err := g.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer g.unlock()
+	proof, leader, err := s.controlProof(ctx, ref, g, func(txCtx context.Context, conn *sql.Conn, proof TicketControlProof, leader uint64) error {
+		_, latched := g.control(ref)
+		control, err := runtimeControlFrom(txCtx, conn, ref)
+		stopMatches := control.stop.version == stopped.Version && control.stop.runner == stopped.RunnerEpoch
+		if stopped.Version < ^uint64(0) && stopped.RunnerEpoch < ^uint64(0) {
+			stopMatches = stopMatches || (control.stop.version == stopped.Version+1 && control.stop.runner == stopped.RunnerEpoch+1)
+		}
+		if err != nil || control.state != "sealed" || !stopMatches {
+			return ErrStaleFence
+		}
+		if control.authority != control.stop {
+			// A prior daemon may have fenced the resumed endpoint before the
+			// rearm retry ran. The immutable resumed endpoint is stop+2; later
+			// authorities are accepted only through every signed +1/+1 ledger row
+			// from that endpoint. Never infer depth from counters alone.
+			if control.stop.version > ^uint64(0)-2 || control.stop.runner == ^uint64(0) || control.authority.version < control.stop.version+2 || control.authority.version == ^uint64(0) || control.authority.runner == ^uint64(0) || proof.Ticket.Version != control.authority.version+1 || proof.Ticket.RunnerEpoch != control.authority.runner+1 || (stopped.State != "" && proof.Ticket.State != stopped.State) {
+				return ErrStaleFence
+			}
+			if control.authority.version == control.stop.version+2 {
+				if control.authority.runner != control.stop.runner || control.authority.leader != control.stop.leader {
+					return ErrStaleFence
+				}
+			} else {
+				if control.authority.version <= control.stop.version+2 || control.authority.runner <= control.stop.runner || control.authority.leader == 0 || control.authority.leader >= leader {
+					return ErrStaleFence
+				}
+			}
+			// Authenticate the complete recovery chain from the immutable
+			// resumed endpoint through the current proof endpoint. The final
+			// row must be the exact authority predecessor; otherwise a stale
+			// authority could be paired with an unrelated future recovery.
+			if err := validateRunnerRecoveryLedger(txCtx, conn, ref, control.stop.version+2, control.stop.runner, control.stop.leader, proof.Ticket.Version, proof.Ticket.RunnerEpoch, leader); err != nil {
+				return ErrStaleFence
+			}
+			finalRecovery, found, err := loadRunnerRecoveryAt(txCtx, conn, ref, proof.Ticket.Version)
+			if err != nil || !found || finalRecovery.PriorTicketVersion != control.authority.version || finalRecovery.PriorRunnerEpoch != control.authority.runner || finalRecovery.PriorLeaderEpoch != control.authority.leader || finalRecovery.TicketVersion != proof.Ticket.Version || finalRecovery.RunnerEpoch != proof.Ticket.RunnerEpoch || finalRecovery.LeaderEpoch != leader {
+				return ErrStaleFence
+			}
+		}
+		if !latched || proof.Ticket.Version < stopped.Version || proof.Ticket.RunnerEpoch < stopped.RunnerEpoch || !postPublicationState(proof.Ticket.State) {
+			return ErrStaleFence
+		}
+		return nil
+	}, func(txCtx context.Context, conn *sql.Conn, proof TicketControlProof, _ uint64) error {
+		if !proof.Drained() || !postPublicationState(proof.Ticket.State) {
+			return ErrControlNotDrained
+		}
+		control, controlErr := runtimeControlFrom(txCtx, conn, ref)
+		if controlErr != nil {
+			return ErrControlNotDrained
+		}
+		if control.stop.version == 0 || control.stop.runner <= 1 {
+			return ErrControlNotDrained
+		}
+		baseline := stopped
+		// The durable stop row is the invalidated stopping endpoint (the
+		// operator_pause event), while the controller may still hold the ticket
+		// tuple from just before that event.  Normalize both forms to the
+		// authenticated pre-stop business-evidence endpoint.
+		baseline.Version = control.stop.version - 1
+		baseline.RunnerEpoch = control.stop.runner - 1
+		if err := authenticatePostPublicationResume(txCtx, conn, ref, baseline, proof.Ticket, control.stop); err != nil {
+			return ErrControlNotDrained
+		}
+		return s.authenticatePostPublicationState(txCtx, conn, ref, proof.Ticket.State, baseline.Version, domain.Fence{LeaderEpoch: control.stop.leader, RunnerEpoch: baseline.RunnerEpoch})
+	})
+	if err != nil {
+		return nil, err
+	}
+	g.latch(ref, mutationRevocation{version: proof.Ticket.Version, leader: leader, runner: proof.Ticket.RunnerEpoch})
+	return &RuntimeRearmCapability{ref: ref, version: proof.Ticket.Version, fence: proof.Fence, issued: true}, nil
+}
+
+// authenticatePostPublicationResume binds the resumed ticket to the exact
+// operator control triplet that followed the sealed stop.  A newer counter
+// without this three-event chain is ambiguous and cannot authorize rearm.
+func authenticatePostPublicationResume(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, stopped, current Ticket, stop mutationRevocation) error {
+	if current.Version < stopped.Version || stopped.Version > ^uint64(0)-3 || stopped.RunnerEpoch > ^uint64(0)-1 || current.Version < stopped.Version+3 || current.RunnerEpoch < stopped.RunnerEpoch+1 || stop.version != stopped.Version+1 || stop.runner != stopped.RunnerEpoch+1 || stop.leader == 0 {
+		return ErrStaleFence
+	}
+	if stopped.State == "" {
+		if err := conn.QueryRowContext(ctx, `SELECT from_state FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_pause_or_take' AND to_state='stopping'`, ref.Channel, ref.Project, ref.Ticket, stopped.Version+1).Scan(&stopped.State); err != nil {
+			return ErrStaleFence
+		}
+	}
+	checks := []struct {
+		version uint64
+		trigger string
+		from    domain.State
+		to      domain.State
+	}{
+		{stopped.Version + 1, "operator_pause_or_take", stopped.State, domain.StateStopping},
+		{stopped.Version + 2, "process_and_effects_drained", domain.StateStopping, domain.StatePaused},
+		{stopped.Version + 3, "operator_resume|operator_retry", domain.StatePaused, current.State},
+	}
+	for _, check := range checks {
+		var count, total int
+		trigger := check.trigger
+		whereTrigger := "trigger=?"
+		args := []any{ref.Channel, ref.Project, ref.Ticket, check.version, ref.Channel, ref.Project, ref.Ticket, check.version, trigger, check.from, check.to}
+		if trigger == "operator_resume|operator_retry" {
+			whereTrigger = "trigger IN ('operator_resume','operator_retry')"
+			args = []any{ref.Channel, ref.Project, ref.Ticket, check.version, ref.Channel, ref.Project, ref.Ticket, check.version, check.from, check.to}
+		}
+		query := `SELECT COUNT(*),COALESCE((SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND ` + whereTrigger + ` AND from_state=? AND to_state=?`
+		if err := conn.QueryRowContext(ctx, query, args...).Scan(&count, &total); err != nil || count != 1 || total != 1 {
+			return ErrStaleFence
+		}
+	}
+	// A daemon restart may fence the exact resumed endpoint before the retry
+	// reaches Rearm. Accept only a contiguous signed recovery chain after the
+	// +3 resume, never a bare counter jump. The recovery row itself supplies
+	// the resumed leader endpoint that the event table intentionally omits.
+	if current.Version > stopped.Version+3 {
+		recovery, found, err := loadRunnerRecoveryAt(ctx, conn, ref, stopped.Version+4)
+		if err != nil || !found || recovery.PriorTicketVersion != stopped.Version+3 || recovery.PriorRunnerEpoch != stopped.RunnerEpoch+1 || recovery.RunnerEpoch != stopped.RunnerEpoch+2 {
+			return ErrStaleFence
+		}
+		var currentLeader uint64
+		if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&currentLeader); err != nil || currentLeader == 0 {
+			return ErrStaleFence
+		}
+		if err := validateRunnerRecoveryLedger(ctx, conn, ref, stopped.Version+3, recovery.PriorRunnerEpoch, recovery.PriorLeaderEpoch, current.Version, current.RunnerEpoch, currentLeader); err != nil {
+			return ErrStaleFence
+		}
+	}
+	return nil
+}
+
+// RuntimeRearmNeeded is a read-only retry discriminator for the narrow crash
+// window after an operator-resume transition commits but before the controller
+// installs its runtime admission. It never opens admission itself. A caller
+// may retry Rearm only while the exact durable control row remains sealed;
+// armed/open rows prove an earlier rearm was already attempted. Both the
+// pre-publication and separately authenticated post-publication authorities
+// use this discriminator.
+func (s *Store) RuntimeRearmNeeded(ctx context.Context, ref domain.TicketRef) (bool, error) {
+	if s == nil || ref.Validate() != nil {
+		return false, ErrStaleFence
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	defer conn.Close()
+	control, err := runtimeControlFrom(ctx, conn, ref)
+	if err != nil {
+		return false, err
+	}
+	var state domain.State
+	if err := conn.QueryRowContext(ctx, `SELECT state FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrNotFound
+		}
+		return false, normalizeBusy(ctx, err)
+	}
+	if !runtimeRearmableState(state) || (control.state != "sealed" && control.state != "armed" && control.state != "open") {
+		return false, ErrStaleFence
+	}
+	return control.state == "sealed", nil
+}
+
+// RetryablePause authenticates the exact terminal event that put a ticket in
+// its current paused state. It is deliberately a ticket-scoped query rather
+// than a bounded event-feed scan: a quiet paused ticket must not lose its
+// retry path merely because other tickets produced many later audit events.
+func (s *Store) RetryablePause(ctx context.Context, ticket Ticket) (bool, error) {
+	if s == nil || ticket.Ref.Validate() != nil || ticket.State != domain.StatePaused || ticket.Version == 0 || ticket.ResumeState == "" {
+		return false, nil
+	}
+	var trigger string
+	err := s.db.QueryRowContext(ctx, `SELECT trigger FROM events
+		WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?
+		AND from_state=? AND to_state='paused'
+		ORDER BY id DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.Version, ticket.ResumeState).Scan(&trigger)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	return trigger == "retry_or_correction_exhausted" || trigger == "ci_red_exhausted", nil
+}
+
 // ActivateRearm is the only proof-to-runtime handoff. It holds the mutation
 // gate, consumes the opaque proof, and checks the newer durable identity.
 // It then releases the gate while the hard latch remains closed to install
@@ -610,7 +1008,7 @@ func (s *Store) openRuntimeAdmission(ctx context.Context, ref domain.TicketRef, 
 			}
 			return err
 		}
-		if !prePublicationState(state) || gotVersion != version || gotRunner != fence.RunnerEpoch || gotLeader != fence.LeaderEpoch {
+		if !runtimeRearmableState(state) || gotVersion != version || gotRunner != fence.RunnerEpoch || gotLeader != fence.LeaderEpoch {
 			return ErrStaleFence
 		}
 		updated, err := conn.ExecContext(ctx, `UPDATE runtime_ticket_controls SET state='open',updated_at=? WHERE channel=? AND project_id=? AND ticket_id=? AND state='armed' AND authority_version=? AND authority_leader_epoch=? AND authority_runner_epoch=?`, time.Now().UTC().Format(time.RFC3339Nano), ref.Channel, ref.Project, ref.Ticket, version, fence.LeaderEpoch, fence.RunnerEpoch)

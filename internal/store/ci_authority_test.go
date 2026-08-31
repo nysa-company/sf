@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
+	"github.com/nysa-company/sf/internal/testkit"
 )
 
 func ciAuthorityPublishedFixture(t *testing.T) (*Store, Ticket, domain.Fence) {
@@ -65,6 +68,538 @@ func TestCIObservationCanonicalizesAndClassifiesChecks(t *testing.T) {
 	if _, err := NormalizeCIObservationChecks([]contracts.RequiredCheck{{Name: "lint", ExternalID: "same", State: "success"}, {Name: "lint", ExternalID: "same", State: "failure"}}); !errors.Is(err, ErrCIObservation) {
 		t.Fatalf("duplicate check err=%v", err)
 	}
+	for _, state := range []string{"SKIPPED", "NEUTRAL"} {
+		checks, err := NormalizeCIObservationChecks([]contracts.RequiredCheck{{Name: "lint", ExternalID: state, State: state}})
+		if err != nil || checks[0].NormalizedState != strings.ToLower(state) {
+			t.Fatalf("terminal green state %s checks=%+v err=%v", state, checks, err)
+		}
+	}
+}
+
+// TestCIPollerAuthorityE2E exercises the production poller's Store sequence
+// against FakeGH's durable state. The localruntime worker is deliberately a
+// thin caller of these Store APIs; this fixture keeps the public candidate and
+// recovery authorities real without fabricating any evidence row.
+func TestCIPollerAuthorityE2E(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		state  string
+		setup  func(*Store, Ticket, domain.Fence)
+		want   domain.State
+		resume domain.State
+	}{
+		{name: "pending_replay", state: "PENDING", want: domain.StateWaitingCI},
+		{name: "green_reviewing", state: "SUCCESS", want: domain.StateReviewing},
+		{name: "green_skipped_reviewing", state: "SKIPPED", want: domain.StateReviewing},
+		{name: "green_neutral_reviewing", state: "NEUTRAL", want: domain.StateReviewing},
+		{name: "red_consumes_one_budget", state: "FAILURE", want: domain.StateBuilding},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, ticket, fence := ciAuthorityPublishedFixture(t)
+			defer db.Close()
+			publication, err := db.LoadPublishedCandidate(t.Context(), ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gh, err := testkit.NewFakeGH(t.TempDir()+"/fake-gh.json", publication.PullRequest.Repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := gh.SetAuthenticated(true); err != nil {
+				t.Fatal(err)
+			}
+			if err := gh.InjectPullRequestForTest(testkit.PullRequest{Identity: publication.PullRequest, Draft: true}); err != nil {
+				t.Fatal(err)
+			}
+			if err := gh.SetChecks(publication.PullRequest.Number, contracts.RequiredCheck{Name: "lint", ExternalID: "check-lint", State: test.state}); err != nil {
+				t.Fatal(err)
+			}
+			if test.setup != nil {
+				test.setup(db, ticket, fence)
+			}
+			if err := pollCIAuthority(t.Context(), db, ticket, fence, gh); err != nil {
+				t.Fatal(err)
+			}
+			current, err := db.Ticket(t.Context(), ticket.Ref)
+			if err != nil || current.State != test.want || current.ResumeState != test.resume {
+				t.Fatalf("ticket=%+v err=%v", current, err)
+			}
+			if test.name == "pending_replay" {
+				// A second bounded poll reads the durable pending chain rather than
+				// replaying an external action or reconstructing publication state.
+				if err := pollCIAuthority(t.Context(), db, current, domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}, gh); err != nil {
+					t.Fatal(err)
+				}
+				current, err = db.Ticket(t.Context(), ticket.Ref)
+				if err != nil || current.State != domain.StateWaitingCI || current.Version != ticket.Version+2 {
+					t.Fatalf("pending replay ticket=%+v err=%v", current, err)
+				}
+			}
+			if test.want == domain.StateBuilding {
+				var uses int
+				if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&uses); err != nil || uses != 1 {
+					t.Fatalf("correction uses=%d err=%v", uses, err)
+				}
+			}
+			if test.want == domain.StatePaused && current.BlockedCode != "" {
+				t.Fatalf("ci red exhaustion must use normative pause, got blocked code %q", current.BlockedCode)
+			}
+			if test.want == domain.StatePaused {
+				events, err := db.Events(t.Context(), ticket.Ref.Channel, 0, 100)
+				if err != nil || len(events) == 0 || events[len(events)-1].Trigger != "checks_red" || !strings.Contains(events[len(events)-1].Payload, `"code":"ci_red_exhausted"`) {
+					t.Fatalf("typed ci exhaustion event=%+v err=%v", events, err)
+				}
+			}
+		})
+	}
+}
+
+func TestCIPollerAuthorityPendingRestartReplaysDurableState(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	publication, err := db.LoadPublishedCandidate(t.Context(), ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghPath := filepath.Join(t.TempDir(), "fake-gh.json")
+	gh, err := testkit.NewFakeGH(ghPath, publication.PullRequest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gh.SetAuthenticated(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := gh.InjectPullRequestForTest(testkit.PullRequest{Identity: publication.PullRequest, Draft: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gh.SetChecks(publication.PullRequest.Number, contracts.RequiredCheck{Name: "lint", ExternalID: "check-lint", State: "PENDING"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pollCIAuthority(t.Context(), db, ticket, fence, gh); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.Ticket(t.Context(), ticket.Ref)
+	if err != nil || pending.State != domain.StateWaitingCI {
+		t.Fatalf("pending ticket=%+v err=%v", pending, err)
+	}
+	restartDir := t.TempDir()
+	// Backup intentionally rejects group/world-accessible parents because it
+	// may contain sealed authority rows. Go's test temp root is 0755 on macOS,
+	// so make this fixture's dedicated parent satisfy that production contract.
+	if err := os.Chmod(restartDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(restartDir, "restart.sqlite")
+	if err := db.Backup(t.Context(), databasePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(t.Context(), databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	leader, err := db.AcquireLeader(t.Context(), domain.ChannelDev, "ci-poller-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(t.Context(), domain.ChannelDev, leader); err != nil || changed != 1 {
+		t.Fatalf("pending CI signed runner recovery changed=%d err=%v", changed, err)
+	}
+	if err := db.RebindRecoveredPublishedCandidates(t.Context(), domain.ChannelDev, leader); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := db.Ticket(t.Context(), ticket.Ref)
+	if err != nil || recovered.State != domain.StateWaitingCI || recovered.RunnerEpoch == pending.RunnerEpoch {
+		t.Fatalf("recovered ticket=%+v err=%v", recovered, err)
+	}
+	restartedGH, err := testkit.OpenFakeGH(ghPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pollCIAuthority(t.Context(), db, recovered, domain.Fence{LeaderEpoch: leader, RunnerEpoch: recovered.RunnerEpoch}, restartedGH); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.Ticket(t.Context(), ticket.Ref)
+	if err != nil || current.State != domain.StateWaitingCI || current.Version != recovered.Version+1 {
+		t.Fatalf("replayed ticket=%+v err=%v", current, err)
+	}
+}
+
+func TestCIPendingChainRecoveryAcrossCardinalities(t *testing.T) {
+	for _, pendingCount := range []int{0, 1, 3} {
+		t.Run(fmt.Sprintf("pending_%d", pendingCount), func(t *testing.T) {
+			db, ticket, fence := ciAuthorityPublishedFixture(t)
+			defer db.Close()
+			publication, err := db.LoadPublishedCandidate(t.Context(), ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gh, err := testkit.NewFakeGH(t.TempDir()+"/fake-gh.json", publication.PullRequest.Repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := gh.SetAuthenticated(true); err != nil {
+				t.Fatal(err)
+			}
+			if err := gh.InjectPullRequestForTest(testkit.PullRequest{Identity: publication.PullRequest, Draft: true}); err != nil {
+				t.Fatal(err)
+			}
+			if err := gh.SetChecks(publication.PullRequest.Number, contracts.RequiredCheck{Name: "lint", ExternalID: "check-lint", State: "PENDING"}); err != nil {
+				t.Fatal(err)
+			}
+			initialVersion := ticket.Version
+			for index := 0; index < pendingCount; index++ {
+				if err := pollCIAuthority(t.Context(), db, ticket, fence, gh); err != nil {
+					t.Fatalf("pending observation %d: %v", index+1, err)
+				}
+				ticket, err = db.Ticket(t.Context(), ticket.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fence.RunnerEpoch = ticket.RunnerEpoch
+			}
+			leader, err := db.AcquireLeader(t.Context(), ticket.Ref.Channel, fmt.Sprintf("ci-pending-recovery-%d", pendingCount))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed, err := db.FenceRecoveredRunners(t.Context(), ticket.Ref.Channel, leader); err != nil || changed != 1 {
+				t.Fatalf("pending=%d recovery changed=%d err=%v", pendingCount, changed, err)
+			}
+			recovered, err := db.Ticket(t.Context(), ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.LoadPublishedCandidate(t.Context(), ticket.Ref); err != nil {
+				t.Fatalf("pending=%d recovered publication load before red consume: %v", pendingCount, err)
+			}
+			retryFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: recovered.RunnerEpoch}
+			if err := gh.SetChecks(publication.PullRequest.Number, contracts.RequiredCheck{Name: "lint", ExternalID: "check-lint", State: "FAILURE"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := pollCIAuthority(t.Context(), db, recovered, retryFence, gh); err != nil {
+				t.Fatalf("pending=%d post-recovery red observation: %v", pendingCount, err)
+			}
+			current, err := db.Ticket(t.Context(), ticket.Ref)
+			if err != nil || current.Version != initialVersion+uint64(pendingCount)+2 || current.State != domain.StateBuilding {
+				t.Fatalf("pending=%d recovered chain ticket=%+v err=%v", pendingCount, current, err)
+			}
+			var uses, bindings int
+			if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&uses); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&bindings); err != nil {
+				t.Fatal(err)
+			}
+			if uses != 1 || bindings != 1 {
+				t.Fatalf("pending=%d atomic red cardinality uses=%d bindings=%d", pendingCount, uses, bindings)
+			}
+		})
+	}
+}
+
+func TestCIPollRetryEpochUsesArbitraryPendingChainAcrossRecovery(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	ctx := t.Context()
+	publication, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gh, err := testkit.NewFakeGH(t.TempDir()+"/fake-gh.json", publication.PullRequest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gh.SetAuthenticated(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := gh.InjectPullRequestForTest(testkit.PullRequest{Identity: publication.PullRequest, Draft: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gh.SetChecks(publication.PullRequest.Number, contracts.RequiredCheck{Name: "lint", ExternalID: "check-lint", State: "PENDING"}); err != nil {
+		t.Fatal(err)
+	}
+	// Several durable pending observations deliberately occupy versions between
+	// publication and exhaustion; retry authorization must discover these
+	// versions rather than assuming a fixed +2/+3 layout.
+	for pending := 0; pending < 3; pending++ {
+		if err := pollCIAuthority(ctx, db, ticket, fence, gh); err != nil {
+			t.Fatalf("pending observation %d: %v", pending+1, err)
+		}
+		ticket, err = db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence.RunnerEpoch = ticket.RunnerEpoch
+	}
+	baselineVersion := ticket.Version
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	admission, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start)
+	if err != nil || !admission.Due {
+		t.Fatalf("pending-chain first admission=%+v err=%v", admission, err)
+	}
+	next := admission.NextPoll
+	for attempt := 2; attempt <= ciPollMaxAttempts; attempt++ {
+		admission, err = db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+		if err != nil || !admission.Due || admission.Attempt != attempt {
+			t.Fatalf("pending-chain attempt %d admission=%+v err=%v", attempt, admission, err)
+		}
+		next = admission.NextPoll
+	}
+	if exhausted, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next); err != nil || !exhausted.Expired {
+		t.Fatalf("pending-chain exhaustion=%+v err=%v", exhausted, err)
+	}
+	paused, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || paused.Version != baselineVersion+1 || paused.State != domain.StatePaused {
+		t.Fatalf("pending-chain paused ticket=%+v err=%v", paused, err)
+	}
+	if _, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateWaitingCI, Trigger: "operator_resume", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatalf("pending-chain resume: %v", err)
+	}
+	// Take over after resume but before retry admission. This exercises the
+	// lost-response/recovery path with the arbitrary pending chain intact.
+	leader, err := db.AcquireLeader(ctx, ticket.Ref.Channel, "ci-poll-pending-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, ticket.Ref.Channel, leader); err != nil || changed != 1 {
+		t.Fatalf("pending-chain runner recovery changed=%d err=%v", changed, err)
+	}
+	recovered, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || recovered.Version != paused.Version+2 || recovered.RunnerEpoch != fence.RunnerEpoch+1 {
+		t.Fatalf("pending-chain recovered ticket=%+v err=%v", recovered, err)
+	}
+	retry, err := db.AdmitCIPoll(ctx, ticket.Ref, domain.Fence{LeaderEpoch: leader, RunnerEpoch: recovered.RunnerEpoch}, next)
+	if err != nil || !retry.Due || retry.Attempt != 1 {
+		t.Fatalf("pending-chain recovered retry=%+v err=%v", retry, err)
+	}
+}
+
+func TestCIPollAdmissionBackoffCapAndRestart(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	ctx := t.Context()
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	first, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start)
+	if err != nil || !first.Due || first.Attempt != 1 || !first.NextPoll.After(start) {
+		t.Fatalf("first CI poll admission=%+v err=%v", first, err)
+	}
+	notDue, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start.Add(time.Second))
+	if err != nil || notDue.Due || notDue.Expired || !notDue.NextPoll.Equal(first.NextPoll) {
+		t.Fatalf("backoff must suppress eager scheduler tick admission=%+v err=%v", notDue, err)
+	}
+	restartDir := t.TempDir()
+	if err := os.Chmod(restartDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(restartDir, "ci-schedule.sqlite")
+	if err := db.Backup(ctx, databasePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// The durable schedule is independent of process lifetime; same leader and
+	// runner are still current because this is a direct Store restart fixture.
+	second, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, first.NextPoll)
+	if err != nil || !second.Due || second.Attempt != 2 || second.NextPoll.Sub(first.NextPoll) != ciPollBackoff(2) {
+		t.Fatalf("restarted CI backoff admission=%+v err=%v", second, err)
+	}
+	next := second.NextPoll
+	for attempt := 3; attempt <= ciPollMaxAttempts; attempt++ {
+		admission, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+		if err != nil || !admission.Due || admission.Attempt != attempt {
+			t.Fatalf("CI attempt %d admission=%+v err=%v", attempt, admission, err)
+		}
+		next = admission.NextPoll
+	}
+	exhausted, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+	if err != nil || !exhausted.Expired || exhausted.PauseCode != "ci_poll_attempts_exhausted" {
+		t.Fatalf("CI poll cap=%+v err=%v", exhausted, err)
+	}
+	paused, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || paused.State != domain.StatePaused || paused.ResumeState != domain.StateWaitingCI {
+		t.Fatalf("CI poll cap ticket=%+v err=%v", paused, err)
+	}
+	if _, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateWaitingCI, Trigger: "operator_resume", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatalf("resume one bounded CI retry window: %v", err)
+	}
+	// The resume itself is exact durable authority for epoch 2. Its attempt
+	// number restarts at one, while the immutable attempt ledger remains 1..24.
+	retry, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+	if err != nil || !retry.Due || retry.Attempt != 1 {
+		t.Fatalf("retry epoch first admission=%+v err=%v", retry, err)
+	}
+	// Simulate a caller losing the successful admission response. The durable
+	// retry-epoch insert and attempt must make the replay non-due, rather than
+	// minting a second retry epoch or a second external read authorization.
+	lostResponseReplay, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, retry.NextPoll.Add(-time.Nanosecond))
+	if err != nil || lostResponseReplay.Due || lostResponseReplay.Attempt != 0 {
+		t.Fatalf("retry epoch lost-response replay=%+v err=%v", lostResponseReplay, err)
+	}
+	var epochs, durableAttempts int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_poll_retry_epochs`).Scan(&epochs); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_poll_attempts`).Scan(&durableAttempts); err != nil || epochs != 1 || durableAttempts != ciPollMaxAttempts+1 {
+		t.Fatalf("retry epoch idempotency epochs=%d attempts=%d err=%v", epochs, durableAttempts, err)
+	}
+	next = retry.NextPoll
+	for attempt := 2; attempt <= ciPollMaxAttempts; attempt++ {
+		admission, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+		if err != nil || !admission.Due || admission.Attempt != attempt {
+			t.Fatalf("retry epoch attempt %d admission=%+v err=%v", attempt, admission, err)
+		}
+		next = admission.NextPoll
+	}
+	terminal, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+	if err != nil || !terminal.Expired || terminal.PauseCode != "ci_poll_retry_attempts_exhausted" {
+		t.Fatalf("retry terminal admission=%+v err=%v", terminal, err)
+	}
+	events, err := db.Events(ctx, ticket.Ref.Channel, 0, 100)
+	if err != nil || len(events) == 0 || !strings.Contains(events[len(events)-1].Payload, "submit a fresh ticket") {
+		t.Fatalf("retry terminal action events=%+v err=%v", events, err)
+	}
+}
+
+func TestCIPollRetryEpochSurvivesLeaderRecoveryBeforeFirstRetry(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	ctx := t.Context()
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	admission, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start)
+	if err != nil || !admission.Due {
+		t.Fatalf("first admission=%+v err=%v", admission, err)
+	}
+	next := admission.NextPoll
+	for attempt := 2; attempt <= ciPollMaxAttempts; attempt++ {
+		admission, err = db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+		if err != nil || !admission.Due {
+			t.Fatalf("initial attempt %d admission=%+v err=%v", attempt, admission, err)
+		}
+		next = admission.NextPoll
+	}
+	if exhausted, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next); err != nil || !exhausted.Expired {
+		t.Fatalf("initial exhaustion=%+v err=%v", exhausted, err)
+	}
+	paused, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateWaitingCI, Trigger: "operator_resume", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatalf("resume retry epoch: %v", err)
+	}
+	// Crash after the exact resume but before the first retry admission. The
+	// recovered runner must traverse the signed ledger and preserve the one
+	// remaining retry epoch, not reinterpret version-1 as a fresh resume.
+	leader, err := db.AcquireLeader(ctx, ticket.Ref.Channel, "ci-poll-retry-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, ticket.Ref.Channel, leader); err != nil || changed != 1 {
+		t.Fatalf("fence resumed CI poller changed=%d err=%v", changed, err)
+	}
+	recovered, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || recovered.Version != paused.Version+2 || recovered.RunnerEpoch != fence.RunnerEpoch+1 {
+		t.Fatalf("recovered resumed ticket=%+v err=%v", recovered, err)
+	}
+	retryFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: recovered.RunnerEpoch}
+	retry, err := db.AdmitCIPoll(ctx, ticket.Ref, retryFence, next)
+	if err != nil || !retry.Due || retry.Attempt != 1 {
+		t.Fatalf("recovered first retry admission=%+v err=%v", retry, err)
+	}
+}
+
+func TestCIPollAdmissionDeadlinePausesWithExplicitAction(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := db.AdmitCIPoll(t.Context(), ticket.Ref, fence, start); err != nil {
+		t.Fatal(err)
+	}
+	expired, err := db.AdmitCIPoll(t.Context(), ticket.Ref, fence, start.Add(ciPollDeadline))
+	if err != nil || !expired.Expired || expired.PauseCode != "ci_poll_deadline_exhausted" {
+		t.Fatalf("CI deadline admission=%+v err=%v", expired, err)
+	}
+	events, err := db.Events(t.Context(), ticket.Ref.Channel, 0, 100)
+	if err != nil || len(events) == 0 || events[len(events)-1].Trigger != "ci_poll_exhausted" || !strings.Contains(events[len(events)-1].Payload, `"next_action"`) {
+		t.Fatalf("CI deadline explicit next action events=%+v err=%v", events, err)
+	}
+}
+
+func TestCIPollAdmissionRejectsTamperedDeadline(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	ctx := t.Context()
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start); err != nil {
+		t.Fatal(err)
+	}
+	// Bypass the append-only trigger only to model a storage tamper. Admission
+	// must still enforce the canonical first+3h invariant.
+	if _, err := db.db.ExecContext(ctx, `DROP TRIGGER ci_poll_schedules_immutable_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ci_poll_schedules SET deadline_at=? WHERE channel=? AND project_id=? AND ticket_id=?`, start.Add(ciPollDeadline+time.Second).Format(time.RFC3339Nano), ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start.Add(time.Second)); !errors.Is(err, ErrCIObservation) {
+		t.Fatalf("tampered CI deadline accepted: %v", err)
+	}
+}
+
+func pollCIAuthority(ctx context.Context, db *Store, ticket Ticket, fence domain.Fence, gh interface {
+	contracts.CIRequiredCheckPolicyObserver
+	RequiredChecks(context.Context, contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error)
+}) error {
+	if err := db.RecordCIRequiredCheckPolicyFromObserver(ctx, ticket.Ref, gh); err != nil {
+		return fmt.Errorf("record fresh CI policy: %w", err)
+	}
+	publication, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
+	if err != nil {
+		return fmt.Errorf("load current published candidate: %w", err)
+	}
+	checks, err := gh.RequiredChecks(ctx, publication.PullRequest)
+	if err != nil {
+		return fmt.Errorf("read live required checks: %w", err)
+	}
+	normalized, err := NormalizeCIObservationChecks(checks)
+	if err != nil {
+		return fmt.Errorf("normalize required checks: %w", err)
+	}
+	classification := "green"
+	for _, check := range normalized {
+		if check.NormalizedState == "failure" || check.NormalizedState == "cancelled" {
+			classification = "red"
+			break
+		}
+		if check.NormalizedState == "pending" {
+			classification = "pending"
+		}
+	}
+	observation := CIObservation{Ref: ticket.Ref, CandidateGeneration: publication.Candidate.Snapshot.Generation, CandidateHeadSHA: publication.Candidate.Snapshot.HeadSHA, CandidateTreeSHA: publication.Candidate.Snapshot.TreeSHA, PublicationWitnessDigest: publication.WitnessDigest, PullRequest: publication.PullRequest, ObservedTicketVersion: ticket.Version, ObservedFence: fence, ObservedAt: time.Now().UTC(), RequiredChecks: normalized, Classification: classification}
+	if err := db.RecordAuthenticatedCIObservation(ctx, observation); err != nil {
+		return fmt.Errorf("record authenticated CI observation: %w", err)
+	}
+	stored, err := db.LoadCIObservation(ctx, ticket.Ref)
+	if err != nil {
+		return fmt.Errorf("load authenticated CI observation: %w", err)
+	}
+	request := CIObservationTransition{Ref: ticket.Ref, ObservationDigest: stored.ObservationDigest, ExpectedVersion: ticket.Version, Fence: fence}
+	if stored.Classification == "red" {
+		id := "ci-red/" + strings.TrimPrefix(stored.ObservationDigest, "sha256:")
+		request.CorrectionBudget = &CorrectionBudgetAuthority{Ref: ticket.Ref, RequestID: id, TicketVersion: ticket.Version, Fence: fence}
+	}
+	_, err = db.ConsumeAuthenticatedCIObservation(ctx, request)
+	if err != nil {
+		return fmt.Errorf("consume authenticated CI observation: %w", err)
+	}
+	return nil
 }
 
 func TestCIObservationRecordLoadAndRedExhaustedReplay(t *testing.T) {
@@ -155,6 +690,41 @@ func recordCIAuthorityPolicy(db *Store, ctx context.Context, publication Publish
 		AuthenticatedPrincipal: "ci-observer", RequiredChecks: observedChecks, ObservedAt: time.Now().UTC(),
 	}
 	return db.RecordCIRequiredCheckPolicyFromObserver(ctx, ticket.Ref, fakeCIAuthorityPolicyObserver{value: value})
+}
+
+func redCIConsumptionFixture(t *testing.T) (*Store, Ticket, PublishedCandidateEvidence, CIObservation) {
+	t.Helper()
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	publication, err := db.LoadPublishedCandidate(t.Context(), ticket.Ref)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	checks := []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "failure", FailingDiagnosticText: "lint failed"}}
+	if err := recordCIAuthorityPolicy(db, t.Context(), publication, ticket, []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint"}}); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	observation := ciAuthorityObservationFor(publication, ticket, fence, "red", time.Now().UTC(), checks)
+	if err := db.RecordCIObservation(t.Context(), observation); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	loaded, err := db.LoadCurrentCIObservation(t.Context(), ticket.Ref)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	return db, ticket, publication, loaded
+}
+
+func redCICorrectionAuthority(t *testing.T, ticket Ticket, observation CIObservation) CorrectionBudgetAuthority {
+	t.Helper()
+	requestID, ok := ciRedCorrectionRequestID(observation.ObservationDigest)
+	if !ok {
+		t.Fatalf("invalid red observation digest %q", observation.ObservationDigest)
+	}
+	return CorrectionBudgetAuthority{Ref: ticket.Ref, RequestID: requestID, TicketVersion: ticket.Version, Fence: observation.ObservedFence}
 }
 
 func ciAuthorityLintPolicy() []CIObservationCheck {
@@ -292,6 +862,30 @@ func TestCIObservationBindsPolicyWitnessBeforeDigest(t *testing.T) {
 	}
 }
 
+func TestCIRequiredPolicyAllowsRerunRunIdentity(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	publication, err := db.LoadPublishedCandidate(t.Context(), ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observe := func(run string) error {
+		return db.RecordCIRequiredCheckPolicyFromObserver(t.Context(), ticket.Ref, fakeCIAuthorityPolicyObserver{value: contracts.CIRequiredCheckPolicyObservation{
+			PullRequest: publication.PullRequest, ProtectedBranchRef: publication.PullRequest.BaseRef, ProtectedBranchOID: publication.PullRequest.BaseOID,
+			PolicySourceDigest: strings.Repeat("a", 64), AuthenticatedPrincipal: "ci-observer", RequiredChecks: []contracts.RequiredCheck{{Name: "lint", ExternalID: run, State: "PENDING"}}, ObservedAt: time.Now().UTC(),
+		}})
+	}
+	if err := observe("https://github.com/acme/app/actions/runs/1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := observe("https://github.com/acme/app/actions/runs/2"); err != nil {
+		t.Fatalf("same required context with rerun identity must not conflict: %v", err)
+	}
+	if _, err := db.Ticket(t.Context(), ticket.Ref); err != nil || fence.RunnerEpoch != ticket.RunnerEpoch {
+		t.Fatalf("rerun policy unexpectedly mutated ticket err=%v", err)
+	}
+}
+
 func TestCIObservationMalformedBudgetPausesRed(t *testing.T) {
 	for name, authority := range map[string]CorrectionBudgetAuthority{
 		"missing-request": {},
@@ -331,6 +925,143 @@ func TestCIObservationMalformedBudgetPausesRed(t *testing.T) {
 	}
 }
 
+func TestCIObservationAtomicBudgetRollbackBeforeTransition(t *testing.T) {
+	db, ticket, _, loaded := redCIConsumptionFixture(t)
+	defer db.Close()
+	faultErr := errors.New("injected CI transition failure")
+	db.SetCIConsumeFaultForTest(func(stage string) error {
+		if stage == "after_correction_budget" {
+			return faultErr
+		}
+		return nil
+	})
+	authority := redCICorrectionAuthority(t, ticket, loaded)
+	_, err := db.ConsumeCIObservation(t.Context(), CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority})
+	if !errors.Is(err, faultErr) {
+		t.Fatalf("faulted atomic CI consume err=%v", err)
+	}
+	var uses, transitions, bindings int
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&uses); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&transitions); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.Ticket(t.Context(), ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uses != 0 || transitions != 0 || bindings != 0 || current.State != domain.StateWaitingCI || current.Version != ticket.Version {
+		t.Fatalf("atomic rollback left durable state uses=%d transitions=%d bindings=%d ticket=%+v", uses, transitions, bindings, current)
+	}
+}
+
+func TestCIObservationAtomicBudgetCommittedLostResponseReplay(t *testing.T) {
+	db, ticket, _, loaded := redCIConsumptionFixture(t)
+	defer db.Close()
+	authority := redCICorrectionAuthority(t, ticket, loaded)
+	request := CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}
+	first, err := db.ConsumeCIObservation(t.Context(), request)
+	if err != nil {
+		t.Fatalf("atomic CI consume=%+v err=%v", first, err)
+	}
+	replay, err := db.ConsumeCIObservation(t.Context(), request)
+	if err != nil || replay != first {
+		t.Fatalf("atomic CI lost-response replay=%+v/%+v err=%v", replay, first, err)
+	}
+	var uses, budgetEvents, transitions, bindings int
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&uses); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='budget_correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&budgetEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&transitions); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	if uses != 1 || budgetEvents != 1 || transitions != 1 || bindings != 1 {
+		t.Fatalf("atomic CI replay cardinality uses=%d budgetEvents=%d transitions=%d bindings=%d", uses, budgetEvents, transitions, bindings)
+	}
+}
+
+func TestCIObservationAtomicBudgetExhaustionHasNoDanglingUse(t *testing.T) {
+	db, ticket, _, loaded := redCIConsumptionFixture(t)
+	defer db.Close()
+	// The correction limit is ticket-global. These non-CI correction uses are
+	// legitimate members of that shared budget domain, but CI-red lineage must
+	// not misclassify them as candidate-repair orphans.
+	for _, requestID := range []string{"final-review/1/one", "final-review/2/two"} {
+		if _, err := db.ConsumeBudget(t.Context(), BudgetUse{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, Kind: "correction", RequestID: requestID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	authority := redCICorrectionAuthority(t, ticket, loaded)
+	if _, err := db.ConsumeCIObservation(t.Context(), CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}); err != nil {
+		t.Fatalf("exhausted atomic CI consume err=%v", err)
+	}
+	var uses int
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&uses); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.Ticket(t.Context(), ticket.Ref)
+	if err != nil || uses != 2 || current.State != domain.StatePaused || current.ResumeState != domain.StateWaitingCI || current.Version != ticket.Version+1 {
+		t.Fatalf("exhausted atomic CI state uses=%d ticket=%+v err=%v", uses, current, err)
+	}
+	var bindings int
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	if bindings != 0 {
+		t.Fatalf("exhausted atomic CI created repair binding count=%d", bindings)
+	}
+}
+
+func TestCIObservationSharesGlobalBudgetWithNonCICorrectionDomain(t *testing.T) {
+	db, ticket, _, loaded := redCIConsumptionFixture(t)
+	defer db.Close()
+	if _, err := db.ConsumeBudget(t.Context(), BudgetUse{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, Kind: "correction", RequestID: "final-review/1/prior"}); err != nil {
+		t.Fatal(err)
+	}
+	authority := redCICorrectionAuthority(t, ticket, loaded)
+	if _, err := db.ConsumeCIObservation(t.Context(), CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}); err != nil {
+		t.Fatal(err)
+	}
+	var uses, bindings int
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&uses); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.Ticket(t.Context(), ticket.Ref)
+	if err != nil || uses != 2 || bindings != 1 || current.State != domain.StateBuilding {
+		t.Fatalf("cross-domain correction budget uses=%d bindings=%d ticket=%+v err=%v", uses, bindings, current, err)
+	}
+}
+
+func TestCIObservationRejectsWrongCorrectionBudgetDomainWithoutSpending(t *testing.T) {
+	db, ticket, _, loaded := redCIConsumptionFixture(t)
+	defer db.Close()
+	authority := CorrectionBudgetAuthority{Ref: ticket.Ref, RequestID: "final-review/not-ci", TicketVersion: ticket.Version, Fence: loaded.ObservedFence}
+	if _, err := db.ConsumeCIObservation(t.Context(), CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}); err != nil {
+		t.Fatal(err)
+	}
+	var uses int
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&uses); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.Ticket(t.Context(), ticket.Ref)
+	if err != nil || uses != 0 || current.State != domain.StatePaused || current.ResumeState != domain.StateWaitingCI {
+		t.Fatalf("wrong-domain correction authority spent budget uses=%d ticket=%+v err=%v", uses, current, err)
+	}
+}
+
 func TestCIObservationValidRepairBudgetRequiresSuccessorCompletion(t *testing.T) {
 	db, ticket, publicationFence := ciAuthorityPublishedFixture(t)
 	defer db.Close()
@@ -351,11 +1082,7 @@ func TestCIObservationValidRepairBudgetRequiresSuccessorCompletion(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	requestID := "repair-request"
-	if _, err := db.ConsumeBudget(ctx, BudgetUse{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, Kind: "correction", RequestID: requestID}); err != nil {
-		t.Fatal(err)
-	}
-	authority := CorrectionBudgetAuthority{Ref: ticket.Ref, RequestID: requestID, TicketVersion: ticket.Version, Fence: loaded.ObservedFence}
+	authority := redCICorrectionAuthority(t, ticket, loaded)
 	if _, err := db.ConsumeCIObservation(ctx, CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence, CorrectionBudget: &authority}); err != nil {
 		t.Fatal(err)
 	}
@@ -415,11 +1142,49 @@ func TestCIObservationValidRepairBudgetRequiresSuccessorCompletion(t *testing.T)
 	if _, err := db.TransitionCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: building.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: buildFence, EventPayload: "{}"}, successor); !errors.Is(err, ErrEvidenceConflict) {
 		t.Fatalf("successor published without repair completion: %v", err)
 	}
-	completion := CandidateRepairCompletion{Ref: ticket.Ref, TargetGeneration: successor.Generation, BuilderResultAttemptID: claim.ID, BuilderResultAttempt: claim.Attempt, BuilderBindingTicketVersion: building.Version, BuilderBindingFence: buildFence, FinalCandidateHeadSHA: successor.HeadSHA, FinalCandidateTreeSHA: successor.TreeSHA}
+	completion := CandidateRepairCompletion{Ref: ticket.Ref, TargetGeneration: successor.Generation, BuilderResultAttemptID: claim.ID, BuilderResultAttempt: claim.Attempt, BuilderBindingTicketVersion: building.Version, BuilderBindingFence: buildFence, FinalCandidateHeadSHA: successor.HeadSHA, FinalCandidateTreeSHA: successor.TreeSHA, CompletedAt: time.Now().UTC()}
+	tampered := completion
+	tampered.FinalCandidateTreeSHA = strings.Repeat("9", 40)
+	if err := db.RecordCandidateRepairCompletion(ctx, tampered); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("tampered repair completion=%v", err)
+	}
+	// A leader-only change cannot rebind a builder completion. The original
+	// immutable fence must have a complete signed recovery ledger.
+	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "repair-completion-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordCandidateRepairCompletion(ctx, completion); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("leader-only repair completion=%v", err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil || changed != 1 {
+		t.Fatalf("signed repair runner recovery changed=%d err=%v", changed, err)
+	}
+	recovered, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || recovered.State != domain.StateBuilding || recovered.Version <= building.Version || recovered.RunnerEpoch <= buildFence.RunnerEpoch {
+		t.Fatalf("recovered builder ticket=%+v err=%v", recovered, err)
+	}
 	if err := db.RecordCandidateRepairCompletion(ctx, completion); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.TransitionCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: building.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: buildFence, EventPayload: "{}"}, successor); err != nil {
+	if err := db.RecordCandidateRepairCompletion(ctx, completion); err != nil {
+		t.Fatalf("exact recovered completion replay=%v", err)
+	}
+	recoveredCandidate, err := db.latestCandidateFrom(ctx, db.db, ticket.Ref, false)
+	if err != nil || recoveredCandidate.Snapshot != successor || recoveredCandidate.TicketVersion != building.Version || recoveredCandidate.Fence != buildFence {
+		t.Fatalf("recovered repair candidate=%+v err=%v", recoveredCandidate, err)
+	}
+	if err := validateRunnerRecoveryLedger(ctx, db.db, ticket.Ref, building.Version, buildFence.RunnerEpoch, buildFence.LeaderEpoch, recovered.Version, recovered.RunnerEpoch, newLeader); err != nil {
+		t.Fatalf("recovered repair ledger=%v", err)
+	}
+	builderResult, _, err := db.LoadHistoricalProviderAttemptResult(ctx, recoveredCandidate.BuilderResult)
+	if err != nil || providerResultReachesHistoricalFence(ctx, db.db, recoveredCandidate.BuilderResult, builderResult, recoveredCandidate.TicketVersion, recoveredCandidate.Fence) != nil {
+		t.Fatalf("recovered repair builder authority result=%+v err=%v", builderResult, err)
+	}
+	if err := db.reauthenticateStoredCandidateCommandHistoricalFrom(ctx, db.db, ticket.Ref, recoveredCandidate); err != nil {
+		t.Fatalf("recovered repair candidate command=%v", err)
+	}
+	if _, err := db.TransitionCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: recovered.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: recovered.RunnerEpoch}, EventPayload: "{}"}, successor); err != nil {
 		t.Fatal(err)
 	}
 	var completionCount int

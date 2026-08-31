@@ -92,16 +92,41 @@ observability while the trusted incremental subscription charge is zero.
 example, `sf-dev daemon run`). Its socket-backed lifecycle commands use the
 channel-specific owner-only socket.
 
-The public Cobra surface includes every primary verb above, but the foreground
-daemon currently enables only `submit`, `start`, `status`, `show`, `logs`,
-`pause`, and `cancel`. Pause and cancel first commit the authenticated control
-intent and invalidate the runner fence, then wait for the injected runtime to
-prove writers drained; cancellation also observes external merge state before
-and after that drain. Capacity is released only with the final durable
-`paused`/`cancelled` transition. `take`, `resume`, `recover`, `retry`, approval,
-and rejection fail closed with `not_ready` until their complete worktree/effect
-evidence and workflow handlers are wired. Listing a command is therefore the
-stable CLI surface, not a claim that its lifecycle backend is enabled.
+The foreground daemon enables `take`, `resume`, `retry`, and `recover` in
+addition to the basic lifecycle commands. `take` follows the same fenced
+stop/drain authority as pause, then returns the authenticated absolute
+worktree path, branch, repository, base, and head. It never opens an editor or
+GUI. A repeated `take` is read-only and returns the same retained handoff.
+
+`resume` reauthenticates the registered worktree, branch, remotes, base, and
+filesystem identity. A clean checkout resumes its exact stored state. A
+bounded set of uncommitted source edits may instead resume into a fresh
+Builder cycle, but only when the checkout is still at the durable verification
+checkpoint, every changed path is inside the Planner's approved paths, and no
+verification-owned file changed. Those edits remain in the worktree for the
+Builder; they are not adopted directly as a candidate. The Builder must still
+produce a new result, repository-command proof, candidate, checks, and review
+before publication can continue.
+
+An operator commit with an unrecognized head, an out-of-plan edit, or a change
+to verification-owned files is preserved and refused with an actionable
+takeover blocker. The idempotent `sf take <ticket>` prints the authenticated
+handoff path again. sf never overwrites edits or treats them as Builder/proof
+authority. Verification-file changes require the separate authenticated
+verification-amendment flow; they are never silently routed into a source
+resume.
+
+`retry` applies only to the durable retry/correction-exhaustion pause and
+re-enters its exact stored resume state. If a prior interrupted control action
+left a sealed runtime admission, retry performs its one fenced rearm before a
+new attempt can run. `recover` accepts only a typed blocked ticket after a
+fresh drain; `--mode guarded` is further narrowed to the
+`autonomy_ineligible` blocker and a frozen project configuration whose maximum
+mode is `guarded` or `autonomous` (a `manual` project is refused). It then
+atomically changes that ticket's durable merge mode to guarded and starts a
+fresh guarded candidate cycle. Pause, take, and cancel invalidate the runner fence before
+draining; capacity is released only by the final durable
+`paused`/`cancelled` transition.
 
 `status` and `show` expose durable ticket/evidence metadata. Human output uses
 product labels when those fields are present; `--json` remains the versioned

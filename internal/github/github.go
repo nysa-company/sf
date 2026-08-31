@@ -464,6 +464,9 @@ func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contr
 	if err != nil {
 		return contracts.CIRequiredCheckPolicyObservation{}, err
 	}
+	if !requiredChecksMatchProtection(checks, protection) {
+		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
+	}
 	// Required-check observation is a separate GitHub read from protected
 	// branch policy. Re-sample the policy after the check list and bind both
 	// reads to the same witness; otherwise a concurrent ruleset change could
@@ -475,19 +478,20 @@ func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contr
 	if !sameProtectionWitness(protection, protectionAfter) {
 		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
 	}
-	canonical := make([]map[string]string, 0, len(checks))
-	for _, check := range checks {
-		canonical = append(canonical, map[string]string{"name": check.Name, "external_id": check.ExternalID})
+	if !requiredChecksMatchProtection(checks, protectionAfter) {
+		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
 	}
-	sort.Slice(canonical, func(i, j int) bool {
-		if canonical[i]["name"] != canonical[j]["name"] {
-			return canonical[i]["name"] < canonical[j]["name"]
-		}
-		return canonical[i]["external_id"] < canonical[j]["external_id"]
-	})
+	// A required context is stable policy identity; the run/check URL emitted by
+	// `gh pr checks --required` is deliberately per-observation identity and
+	// changes on a rerun. Never freeze that run value into the policy witness.
+	canonical := make([]string, 0, len(checks))
+	for _, check := range checks {
+		canonical = append(canonical, check.Name)
+	}
+	sort.Strings(canonical)
 	body, err := json.Marshal(struct {
 		Protection strictProtectionWitness `json:"protection"`
-		Checks     []map[string]string     `json:"checks"`
+		Checks     []string                `json:"checks"`
 	}{protection, canonical})
 	if err != nil {
 		return contracts.CIRequiredCheckPolicyObservation{}, err
@@ -498,6 +502,47 @@ func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contr
 		ProtectedBranchOID: observed.Identity.BaseOID, PolicySourceDigest: hex.EncodeToString(source[:]),
 		AuthenticatedPrincipal: principal.Login, RequiredChecks: checks, ObservedAt: time.Now().UTC(),
 	}, nil
+}
+
+// requiredChecksMatchProtection binds the live `gh pr checks --required`
+// rows to the complete status-check set configured on the exact protected
+// branch/ruleset witness. Extras or a subset are not a policy observation.
+func requiredChecksMatchProtection(checks []contracts.RequiredCheck, protection strictProtectionWitness) bool {
+	if len(protection.Checks) == 0 || len(checks) != len(protection.Checks) {
+		return false
+	}
+	want := make(map[string]bool, len(protection.Checks))
+	for _, configured := range protection.Checks {
+		parts := strings.SplitN(configured, "\x00", 2)
+		name := parts[0]
+		if protection.Kind == "classic" {
+			// Classic branch protection exposes only context names. A delimiter
+			// would be malformed here; check-run URLs remain observation facts.
+			if len(parts) != 1 {
+				return false
+			}
+		} else if protection.Kind == "ruleset" {
+			// `gh pr checks --required` exposes run URL/external identity, not a
+			// ruleset integration id. A nonzero integration requirement therefore
+			// cannot be proven by this observer and must fail closed.
+			if len(parts) != 2 || (parts[1] != "-" && parts[1] != "0") {
+				return false
+			}
+		} else {
+			return false
+		}
+		if !bounded(name, 1024) || want[name] {
+			return false
+		}
+		want[name] = true
+	}
+	for _, check := range checks {
+		if !bounded(check.Name, 1024) || !bounded(check.ExternalID, 4096) || !want[check.Name] {
+			return false
+		}
+		delete(want, check.Name)
+	}
+	return len(want) == 0
 }
 func (c Client) MarkReady(ctx context.Context, durable domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
 	observed, err := c.Observe(ctx, identity)
@@ -1113,7 +1158,7 @@ func evaluateChecks(actual []contracts.RequiredCheck, required []CheckIdentity) 
 			return ErrChecksFailed
 		}
 		seen[key] = true
-		if check.State != "SUCCESS" && check.State != "PENDING" && check.State != "QUEUED" && check.State != "IN_PROGRESS" {
+		if check.State != "SUCCESS" && check.State != "SKIPPED" && check.State != "NEUTRAL" && check.State != "PENDING" && check.State != "QUEUED" && check.State != "IN_PROGRESS" {
 			return ErrChecksFailed
 		}
 		if check.State == "PENDING" || check.State == "QUEUED" || check.State == "IN_PROGRESS" {
@@ -1191,12 +1236,13 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 						BypassForcePushAllowances struct {
 							TotalCount int `json:"totalCount"`
 						} `json:"bypassForcePushAllowances"`
+						RequiredStatusCheckContexts []string `json:"requiredStatusCheckContexts"`
 					} `json:"branchProtectionRule"`
 				} `json:"ref"`
 			} `json:"repository"`
 		} `json:"data"`
 	}
-	query := "query($owner:String!,$name:String!,$qualifiedRef:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedRef){branchProtectionRule{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}"
+	query := "query($owner:String!,$name:String!,$qualifiedRef:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedRef){branchProtectionRule{id pattern requiresStrictStatusChecks isAdminEnforced requiredStatusCheckContexts bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}"
 	if err := c.json(ctx, &response, "api", "--hostname", "github.com", "graphql", "-f", "query="+query, "-F", "owner="+repository.Owner, "-F", "name="+repository.Name, "-F", "qualifiedRef=refs/heads/"+baseRef); err != nil {
 		return strictProtectionWitness{}, err
 	}
@@ -1231,7 +1277,19 @@ func (c Client) strictProtection(ctx context.Context, repository contracts.Repos
 		if len(activeRules) == 0 && response.Data != nil && response.Data.Repository != nil && response.Data.Repository.Ref != nil && response.Data.Repository.Ref.BranchProtectionRule != nil {
 			rule := response.Data.Repository.Ref.BranchProtectionRule
 			if rule.Pattern == baseRef && rule.ID != "" && rule.RequiresStrictStatusChecks && rule.IsAdminEnforced && rule.BypassPullRequestAllowances.TotalCount == 0 && rule.BypassForcePushAllowances.TotalCount == 0 {
-				return strictProtectionWitness{Kind: "classic", ID: rule.ID, AdminEnforced: true}, nil
+				checks := append([]string(nil), rule.RequiredStatusCheckContexts...)
+				sort.Strings(checks)
+				for i, check := range checks {
+					if !bounded(check, 1024) || (i > 0 && check == checks[i-1]) {
+						return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+					}
+				}
+				witness := strictProtectionWitness{Kind: "classic", ID: rule.ID, AdminEnforced: true, Checks: checks}
+				if len(checks) > 0 {
+					digest := sha256.Sum256([]byte(strings.Join(checks, "\x00")))
+					witness.ChecksDigest = hex.EncodeToString(digest[:])
+				}
+				return witness, nil
 			}
 		}
 		return strictProtectionWitness{}, ErrGuardedMergeUnavailable
@@ -1469,7 +1527,11 @@ func (c Client) rulesetProtection(ctx context.Context, repository contracts.Repo
 		switch rule.Type {
 		case "pull_request":
 			pullRules++
-			if !validAllowedMergeMethods(rule.Parameters["allowed_merge_methods"], method) {
+			if method == "" {
+				if !validMergeMethods(rule.Parameters["allowed_merge_methods"]) {
+					return strictProtectionWitness{}, ErrGuardedMergeUnavailable
+				}
+			} else if !validAllowedMergeMethods(rule.Parameters["allowed_merge_methods"], method) {
 				return strictProtectionWitness{}, ErrGuardedMergeUnavailable
 			}
 		case "required_status_checks":
@@ -1526,6 +1588,10 @@ func validAllowedMergeMethods(value any, wanted string) bool {
 	if wanted != "merge" && wanted != "squash" && wanted != "rebase" {
 		return false
 	}
+	return validMergeMethods(value) && containsMergeMethod(value, wanted)
+}
+
+func validMergeMethods(value any) bool {
 	values, ok := value.([]any)
 	if !ok || len(values) == 0 {
 		return false
@@ -1538,7 +1604,20 @@ func validAllowedMergeMethods(value any, wanted string) bool {
 		}
 		seen[method] = true
 	}
-	return seen[wanted]
+	return true
+}
+
+func containsMergeMethod(value any, wanted string) bool {
+	values, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range values {
+		if raw == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalRulesetCheck(value any) (string, bool) {

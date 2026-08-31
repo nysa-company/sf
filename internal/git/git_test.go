@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -327,6 +328,29 @@ func TestWorktreeCommitPushAndLostResponseReconciliation(t *testing.T) {
 	}
 	if replay, err := runner.Commit(ctx, worktree, CommitRequest{EvidenceDigest: digest([]byte("candidate")), Timestamp: time.Unix(1, 0), BaseRef: "main", ExpectedParent: worktree.Identity.BaseHead, Policy: DiffPolicy{AllowedPaths: []string{"src"}}, MutationClaim: commitClaim(worktree, worktree.Identity.BaseHead)}); err != nil || replay != head {
 		t.Fatalf("commit replay=%q err=%v", replay, err)
+	}
+}
+
+func TestInspectWorktreeChangesAuthenticatesBoundedDirtySourcePaths(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-takeover")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "operator.txt"), []byte("retained source edit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := runner.InspectWorktreeChanges(ctx, worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.Head != worktree.Identity.BaseHead || !reflect.DeepEqual(observed.Paths, []string{"src/operator.txt"}) {
+		t.Fatalf("inspection=%+v", observed)
 	}
 }
 

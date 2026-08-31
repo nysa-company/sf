@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -1987,6 +1988,69 @@ func (r Runner) CleanWorktreeHead(ctx context.Context, worktree Worktree) (strin
 		return "", err
 	}
 	return head, nil
+}
+
+// WorktreeChanges is a bounded, read-only observation of uncommitted paths.
+// It is suitable for an operator handback classification only after the
+// worktree's registered identity has been reauthenticated. It is not a diff
+// policy verdict and never authorizes a commit or candidate adoption.
+type WorktreeChanges struct {
+	Head  string
+	Paths []string
+}
+
+// InspectWorktreeChanges returns the current HEAD and the union of unstaged,
+// staged, and untracked paths. The identity is checked both before and after
+// observing paths so a path replacement cannot be represented as an operator
+// edit. Renames are deliberately represented by Git's no-rename name lists.
+func (r Runner) InspectWorktreeChanges(ctx context.Context, worktree Worktree) (WorktreeChanges, error) {
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return WorktreeChanges{}, err
+	}
+	read := func(args ...string) ([]byte, error) {
+		return r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, args...)
+	}
+	unstaged, err := read("diff", "--no-renames", "--name-only", "-z")
+	if err != nil {
+		return WorktreeChanges{}, err
+	}
+	staged, err := read("diff", "--no-renames", "--cached", "--name-only", "-z")
+	if err != nil {
+		return WorktreeChanges{}, err
+	}
+	untracked, err := read("ls-files", "-o", "--exclude-standard", "-z")
+	if err != nil {
+		return WorktreeChanges{}, err
+	}
+	paths := append(splitNUL(unstaged), splitNUL(staged)...)
+	paths = append(paths, splitNUL(untracked)...)
+	seen := make(map[string]struct{}, len(paths))
+	unique := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if !validRepoPath(path) {
+			return WorktreeChanges{}, fmt.Errorf("%w: invalid changed path", ErrUnsafeWorktree)
+		}
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+		unique = append(unique, path)
+		if len(unique) > 256 {
+			return WorktreeChanges{}, fmt.Errorf("%w: too many changed paths", ErrUnsafeWorktree)
+		}
+	}
+	sort.Strings(unique)
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return WorktreeChanges{}, err
+	}
+	head, err := r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil || !validOID(head) {
+		return WorktreeChanges{}, fmt.Errorf("%w: worktree head is invalid", ErrIdentityMismatch)
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return WorktreeChanges{}, err
+	}
+	return WorktreeChanges{Head: head, Paths: unique}, nil
 }
 
 // Retain validates and returns the durable identity without removing anything.

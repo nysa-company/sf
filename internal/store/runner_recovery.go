@@ -895,6 +895,23 @@ func (s *Store) publicationRecoveryBaseline(ctx context.Context, conn *sql.Conn,
 	if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
 		return 0, false, err
 	}
+	// An operator pause/take invalidates the runner atomically at stopping,
+	// then records drained->paused and resume as two ordinary ticket events.
+	// For waiting_ci that places the resumed endpoint four versions after the
+	// publication witness (publishing->waiting_ci, stop, paused, resume) and
+	// advances the runner once. Authenticate that exact control triplet before
+	// using the witness leader as the predecessor for startup fencing.
+	if publication.CurrentTicketVersion <= ^uint64(0)-4 &&
+		publication.CurrentFence.RunnerEpoch < ^uint64(0) &&
+		publication.CurrentTicketVersion+4 == version &&
+		publication.CurrentFence.RunnerEpoch+1 == runner {
+		stopped := Ticket{Ref: ref, Version: publication.CurrentTicketVersion + 1, RunnerEpoch: publication.CurrentFence.RunnerEpoch, State: domain.StateWaitingCI}
+		current := Ticket{Ref: ref, Version: version, RunnerEpoch: runner, State: domain.StateWaitingCI}
+		stop := mutationRevocation{version: publication.CurrentTicketVersion + 2, runner: runner, leader: publication.CurrentFence.LeaderEpoch}
+		if authenticatePostPublicationResume(ctx, conn, ref, stopped, current, stop) == nil {
+			return publication.CurrentFence.LeaderEpoch, true, nil
+		}
+	}
 	// A publishing witness may be consumed by the one-version
 	// publishing->waiting_ci transition before its first recovery fence. In
 	// that case the current ticket is exactly one version beyond the witness,
@@ -920,4 +937,124 @@ func (s *Store) publicationRecoveryBaseline(ctx context.Context, conn *sql.Conn,
 		return 0, false, nil
 	}
 	return publication.CurrentFence.LeaderEpoch, true, nil
+}
+
+// postPublicationRecoveryBaseline authenticates a restart after an operator
+// pause/take has been resumed in a publication-sensitive state. The durable
+// stop row identifies the invalidated endpoint, while the three exact control
+// events identify the resumed endpoint. Business evidence is then checked at
+// the pre-stop endpoint before its leader is used as the predecessor for a
+// normal signed +1/+1 recovery row.
+func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64) (uint64, bool, error) {
+	if !postPublicationState(state) || version < 3 || runner <= 1 || newLeader == 0 {
+		return 0, false, nil
+	}
+	var controls int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&controls); err != nil {
+		return 0, false, err
+	}
+	if controls == 0 {
+		triplet, err := postPublicationControlTripletPresent(ctx, conn, ref, state, version)
+		if err != nil {
+			return 0, false, err
+		}
+		if triplet {
+			return 0, false, ErrPublicationEvidence
+		}
+		return 0, false, nil
+	}
+	control, err := runtimeControlFrom(ctx, conn, ref)
+	if err != nil {
+		return 0, false, ErrPublicationEvidence
+	}
+	if control.state != "sealed" || control.stop.version == 0 || control.stop.runner == 0 || control.stop.leader == 0 {
+		return 0, false, ErrPublicationEvidence
+	}
+	if control.authority != control.stop {
+		// ActivateRearm records the resumed live tuple as authority before the
+		// scheduler's first Begin. A crash in that narrow handoff restores the
+		// row as sealed; accept it only when the authority is exactly the current
+		// ticket identity and the original stop/resume chain still authenticates.
+		if control.authority.version == version && control.authority.runner == runner {
+			if control.authority.leader == 0 || control.authority.leader >= newLeader || control.stop.version > ^uint64(0)-2 || control.stop.runner > ^uint64(0)-1 {
+				return 0, false, ErrPublicationEvidence
+			}
+			// With no intervening recovery, authority is the resumed endpoint
+			// itself: stop+2 in the ticket stream and the original leader. When
+			// a prior startup already fenced that endpoint, authority is instead
+			// the later current tuple. Authenticate the complete signed ledger
+			// from the resumed stop endpoint to that authority; never infer it
+			// from the counter gap.
+			if version == control.stop.version+2 && runner == control.stop.runner {
+				if control.authority.leader != control.stop.leader {
+					return 0, false, ErrPublicationEvidence
+				}
+			} else {
+				if version <= control.stop.version+2 || runner <= control.stop.runner || control.authority.leader <= control.stop.leader {
+					return 0, false, ErrPublicationEvidence
+				}
+				if err := validateRunnerRecoveryLedger(ctx, conn, ref, control.stop.version+2, control.stop.runner, control.stop.leader, version, runner, control.authority.leader); err != nil {
+					return 0, false, ErrPublicationEvidence
+				}
+			}
+		} else {
+			// A valid but stale control row can remain after a later independently
+			// authenticated phase/publication transition. It must not suppress that
+			// authority, while malformed/current control gaps remain fail-closed.
+			if control.authority.version > version || control.authority.runner > runner || control.authority.leader == 0 {
+				return 0, false, ErrPublicationEvidence
+			}
+			return 0, false, nil
+		}
+	} else if control.stop.version != version-2 || control.stop.runner != runner {
+		return 0, false, ErrPublicationEvidence
+	}
+	if control.stop.version == 0 || control.stop.runner <= 1 {
+		return 0, false, ErrPublicationEvidence
+	}
+	baseline := Ticket{Ref: ref, Version: control.stop.version - 1, RunnerEpoch: control.stop.runner - 1, State: state}
+	current := Ticket{Ref: ref, Version: version, RunnerEpoch: runner, State: state}
+	if err := authenticatePostPublicationResume(ctx, conn, ref, baseline, current, control.stop); err != nil {
+		return 0, false, nil
+	}
+	if err := s.authenticatePostPublicationState(ctx, conn, ref, state, baseline.Version, domain.Fence{LeaderEpoch: control.stop.leader, RunnerEpoch: baseline.RunnerEpoch}); err != nil {
+		return 0, false, nil
+	}
+	if control.authority != control.stop {
+		return control.authority.leader, true, nil
+	}
+	return control.stop.leader, true, nil
+}
+
+func postPublicationControlTripletPresent(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version uint64) (bool, error) {
+	if !postPublicationState(state) || version < 3 {
+		return false, nil
+	}
+	checks := []struct {
+		version uint64
+		trigger string
+		from    domain.State
+		to      domain.State
+	}{
+		{version - 2, "operator_pause_or_take", state, domain.StateStopping},
+		{version - 1, "process_and_effects_drained", domain.StateStopping, domain.StatePaused},
+		{version, "operator_resume|operator_retry", domain.StatePaused, state},
+	}
+	for _, check := range checks {
+		var matching, total int
+		triggerClause := "trigger=?"
+		args := []any{ref.Channel, ref.Project, ref.Ticket, check.version, ref.Channel, ref.Project, ref.Ticket, check.version, check.trigger, check.from, check.to}
+		if check.trigger == "operator_resume|operator_retry" {
+			triggerClause = "trigger IN ('operator_resume','operator_retry')"
+			args = []any{ref.Channel, ref.Project, ref.Ticket, check.version, ref.Channel, ref.Project, ref.Ticket, check.version, check.from, check.to}
+		}
+		query := `SELECT COALESCE((SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?),0),COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND ` + triggerClause + ` AND from_state=? AND to_state=?`
+		if err := conn.QueryRowContext(ctx, query, args...).Scan(&total, &matching); err != nil {
+			return false, err
+		}
+		if total != 1 || matching != 1 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
