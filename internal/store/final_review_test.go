@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -99,6 +100,111 @@ func finalReviewLifecycleFixtureFor(t *testing.T, ticketType domain.TicketType, 
 		t.Fatalf("reviewing ticket=%+v err=%v", ticket, err)
 	}
 	return finalReviewFixture{db: db, ctx: ctx, ticket: ticket, fence: domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: ticket.RunnerEpoch}, candidate: candidate}
+}
+
+// spikeReviewLifecycleFixture intentionally does not reuse the publication
+// fixture. It drives a report-ready spike through the public Store and Engine
+// authorities only: no publication witness, CI observation, PR, or merge
+// effect is created on this path.
+func spikeReviewLifecycleFixture(t *testing.T) finalReviewFixture {
+	t.Helper()
+	db, ctx := openTestStore(t)
+	configDigest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "spike-review-lifecycle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "provider", Ticket: "SF-spike-review-lifecycle"}
+	source := sha256Digest([]byte("spike-review-source"))
+	if err := db.CreateTicket(ctx, Ticket{Ref: ref, SourceDigest: source, Type: domain.TicketSpike, MergeMode: domain.MergeManual, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := db.StartOrAdopt(ctx, ref, 1, "dev/provider/SF-spike-review-lifecycle", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := testAllocatedBranch(ref, strings.Repeat("ab", 16))
+	base := strings.Repeat("a", 40)
+	identity := []byte(strings.ReplaceAll(strings.ReplaceAll(repositoryCommandIdentity(t, "/tmp/provider", "/tmp/provider/SF-spike-review-lifecycle", branch, "main"), "git@example.test:nysa.git", "https://github.com/acme/app.git"), "/tmp/nysa-origin", "git@github.com:acme/app.git"))
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	branchKey := string(ref.Channel) + "\x00" + string(ref.Project) + "\x00" + string(ref.Ticket)
+	if _, err := db.LoadOrStoreBranchUnderFence(ctx, branchKey, branch, ticket.Version, fence); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Path: "/tmp/provider/SF-spike-review-lifecycle", Branch: branch, IdentityJSON: identity, BaseSHA: base, HeadSHA: base}); err != nil {
+		t.Fatal(err)
+	}
+	builder, reviewer := setupProviderPair(t, db, ctx)
+	launch := func(phase domain.Phase, role string, binding contracts.RuntimeBinding, raw []byte, validation phaseartifact.Validation) ProviderAttemptClaim {
+		request := supervised(t, ProviderAttemptRequest{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: phase, Role: role, Binding: binding, ConfigDigest: configDigest, Capacity: 1, At: time.Now().UTC()})
+		request.WorktreeIdentity, request.Input.WorktreeIdentity = string(identity), string(identity)
+		claim, err := db.BeginProviderAttempt(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.RecordProviderLaunch(ctx, claim, contracts.ProviderLaunch{PID: int(claim.ID), PGID: int(claim.ID), BootIdentity: "spike-review", ProcessStartIdentity: fmt.Sprintf("spike-review-%d", claim.ID), Worktree: claim.Worktree}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: raw, UsageTrusted: true, UsageUnits: 1}, validation, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		return claim
+	}
+	plan := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"report delivered"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofReport, Command: []string{"go", "test"}, Details: "report"}, Paths: []string{"docs"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"report only"}}
+	planRaw, _ := json.Marshal(plan)
+	planner := launch(domain.PhasePlanning, "planner", runtime(builder), planRaw, phaseartifact.Validation{TicketType: domain.TicketSpike})
+	planKey := ProviderAttemptResultKey{AttemptID: planner.ID, Ref: ref, Phase: domain.PhasePlanning, Attempt: planner.Attempt}
+	if _, err := db.RecordPlan(ctx, PlanArtifact{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Document: PlanDocument{Planner: &plan, ProviderResult: &planKey, Acceptance: plan.Acceptance, ProofKind: string(plan.Proof.Kind), Paths: plan.Paths, Commands: plan.Commands, Risks: plan.Risks}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionPlan(ctx, Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, _ = db.Ticket(ctx, ref)
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	planIdentity, _ := workflowprompt.NewPlanIdentity(plan)
+	verification := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: planIdentity.Digest, ProofKind: phaseartifact.ProofReport, OwnedFiles: []string{"docs"}, Command: []string{"go", "test", "./..."}, PrebuildOutcome: "report_ready", EvidenceDigest: sha256Digest([]byte("spike-review-verification"))}
+	verificationRaw, _ := json.Marshal(verification)
+	verified := launch(domain.PhaseVerification, "reviewer", runtime(reviewer), verificationRaw, phaseartifact.Validation{TicketType: domain.TicketSpike, AcceptanceDigest: planIdentity.Digest})
+	intent, _ := workflowprompt.CanonicalVerificationIntentBytes(verification)
+	proofBytes, _ := workflowprompt.CanonicalVerificationProofBytes(verification)
+	checkpoint := strings.Repeat("c", 40)
+	verificationKey := ProviderAttemptResultKey{AttemptID: verified.ID, Ref: ref, Phase: domain.PhaseVerification, Attempt: verified.Attempt}
+	command := completeEvidenceRepositoryCommand(t, db, ctx, RepositoryCommandPurposePrebuildVerification, ref, ticket.Version, fence, verificationKey, sha256Digest(intent), sha256Digest(proofBytes), "", "", 0)
+	if _, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proofBytes, OwnedFiles: verification.OwnedFiles, CheckpointID: checkpoint, ProviderResult: &verificationKey, Checkpoint: CommitObservation{CommitOID: checkpoint, ParentOID: base, TreeOID: strings.Repeat("d", 40)}, CommandResult: command}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionVerification(ctx, Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StateVerifying, To: domain.StateBuilding, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, _ = db.Ticket(ctx, ref)
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	builderRaw := []byte(`{"schema":"sf.builder/v1","summary":"spike report","changed_files":["docs/report.md"],"commands":[["go","test"]]}`)
+	built := launch(domain.PhaseBuild, "builder", runtime(builder), builderRaw, phaseartifact.Validation{TicketType: domain.TicketSpike})
+	_, parsed, err := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: built.ID, Ref: ref, Phase: domain.PhaseBuild, Attempt: built.Attempt})
+	if err != nil || parsed.Builder == nil {
+		t.Fatalf("spike builder=%+v err=%v", parsed, err)
+	}
+	builderDigest, _ := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
+	policy := sha256Digest([]byte("spike-review-policy"))
+	snapshot := domain.CandidateSnapshot{Generation: 1, BaseSHA: base, HeadSHA: strings.Repeat("e", 40), TreeSHA: strings.Repeat("f", 40), SourceDigest: source, VerificationIntentDigest: sha256Digest(intent), ProofDigest: sha256Digest(proofBytes), CommandPolicyDigest: policy, BuilderEvidenceDigest: builderDigest}
+	builtKey := ProviderAttemptResultKey{AttemptID: built.ID, Ref: ref, Phase: domain.PhaseBuild, Attempt: built.Attempt}
+	candidateCommand := completeEvidenceRepositoryCommand(t, db, ctx, RepositoryCommandPurposePostbuildCandidate, ref, ticket.Version, fence, builtKey, sha256Digest(intent), sha256Digest(proofBytes), checkpoint, "sha256:"+policy, 0)
+	if _, err := db.RecordCandidate(ctx, CandidateEvidence{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snapshot, BuilderResult: builtKey, Commit: CommitObservation{CommitOID: snapshot.HeadSHA, ParentOID: checkpoint, TreeOID: snapshot.TreeSHA}, Reason: "spike report", CommandResult: candidateCommand}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionCandidate(ctx, Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StateBuilding, To: domain.StateReviewing, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = db.Ticket(ctx, ref)
+	if err != nil || ticket.State != domain.StateReviewing {
+		t.Fatalf("spike reviewing ticket=%+v err=%v", ticket, err)
+	}
+	stored, err := db.RecoverableCandidate(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return finalReviewFixture{db: db, ctx: ctx, ticket: ticket, fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, candidate: stored}
 }
 
 func completeFinalReview(t *testing.T, fixture finalReviewFixture) ProviderAttemptClaim {
@@ -367,7 +473,12 @@ func TestFinalReviewTransitionsDeriveManualGuardedSpikeAndRejectAutonomous(t *te
 		{name: "autonomous unavailable", ticketType: domain.TicketFeature, mergeMode: domain.MergeAutonomous, to: domain.StateWaitingApproval, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fixture := finalReviewLifecycleFixtureFor(t, tc.ticketType, tc.mergeMode)
+			var fixture finalReviewFixture
+			if tc.ticketType == domain.TicketSpike {
+				fixture = spikeReviewLifecycleFixture(t)
+			} else {
+				fixture = finalReviewLifecycleFixtureFor(t, tc.ticketType, tc.mergeMode)
+			}
 			completeFinalReview(t, fixture)
 			_, err := fixture.db.TransitionFinalReview(fixture.ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, From: domain.StateReviewing, To: tc.to, Trigger: "review_pass", Fence: fixture.fence, EventPayload: `{}`})
 			if tc.wantErr {
@@ -382,6 +493,18 @@ func TestFinalReviewTransitionsDeriveManualGuardedSpikeAndRejectAutonomous(t *te
 			current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
 			if err != nil || current.State != tc.to {
 				t.Fatalf("ticket=%+v err=%v", current, err)
+			}
+			if tc.ticketType == domain.TicketSpike {
+				var publication, mergeEffects, mergeIntents int
+				if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COUNT(*) FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=?`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket).Scan(&publication); err != nil || publication != 0 {
+					t.Fatalf("spike publication rows=%d err=%v", publication, err)
+				}
+				if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND effect_kind='merge'`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket).Scan(&mergeEffects); err != nil || mergeEffects != 0 {
+					t.Fatalf("spike merge effects=%d err=%v", mergeEffects, err)
+				}
+				if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COUNT(*) FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket).Scan(&mergeIntents); err != nil || mergeIntents != 0 {
+					t.Fatalf("spike merge intents=%d err=%v", mergeIntents, err)
+				}
 			}
 		})
 	}

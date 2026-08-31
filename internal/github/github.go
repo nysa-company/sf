@@ -74,16 +74,7 @@ type Client struct {
 }
 
 type Principal struct{ Login string }
-type PRMatch struct {
-	Identity             contracts.PullRequestIdentity
-	Draft, Merged, Ready bool
-	Title, Body          string
-	MergeCommit          string
-	BaseHeadOID          string
-	State                string
-	MergeState           string
-	AutoMerge            bool
-}
+type PRMatch = contracts.PublishedPullRequestObservation
 
 // SupervisedCommandRunner is the only process capability accepted by the
 // GitHub boundary. Its Cleanup method is part of the authority contract: the

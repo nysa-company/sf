@@ -7,7 +7,6 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
-	gh "github.com/nysa-company/sf/internal/github"
 	"github.com/nysa-company/sf/internal/store"
 )
 
@@ -47,7 +46,7 @@ func (o publishedMergeObserver) MergeObserved(ctx context.Context, ref domain.Ti
 		return false, err
 	}
 	observer, ok := o.GitHub.(interface {
-		ObservePublishedPullRequest(context.Context, contracts.PullRequestIdentity) (gh.PRMatch, error)
+		ObservePublishedPullRequest(context.Context, contracts.PullRequestIdentity) (contracts.PublishedPullRequestObservation, error)
 	})
 	if !ok {
 		return false, errors.New("GitHub client does not provide authenticated published-PR observation")
@@ -65,7 +64,7 @@ func (o publishedMergeObserver) MergeObserved(ctx context.Context, ref domain.Ti
 	return observed.Merged, nil
 }
 
-func validMergeObservation(observed gh.PRMatch) bool {
+func validMergeObservation(observed contracts.PublishedPullRequestObservation) bool {
 	if observed.State != "OPEN" && observed.State != "CLOSED" && observed.State != "MERGED" {
 		return false
 	}

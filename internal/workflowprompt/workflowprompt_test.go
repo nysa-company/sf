@@ -100,6 +100,45 @@ func TestNewVerificationIdentityRejectsNonOIDCheckpoint(t *testing.T) {
 	}
 }
 
+func TestFinalReviewerAllowsOnlyReportOnlySpikeWithoutChecks(t *testing.T) {
+	ticket := testTicket()
+	ticket.Type = domain.TicketSpike
+	plan := testPlan()
+	plan.Plan.Proof.Kind = phaseartifact.ProofReport
+	plan.Plan.Proof.Details = "report evidence"
+	var err error
+	plan, err = NewPlanIdentity(plan.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verificationArtifact := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: plan.Digest, ProofKind: phaseartifact.ProofReport, OwnedFiles: []string{"internal/reminder/regression_test.go"}, Command: []string{"go", "test", "./internal/reminder"}, PrebuildOutcome: "report_ready", EvidenceDigest: testDigest}
+	intentDigest, _, err := canonicalVerificationIntent(verificationArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofDigest, _, err := canonicalVerificationProof(verificationArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := NewVerificationIdentity(verificationArtifact, intentDigest, proofDigest, testOID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := NewCandidateIdentity(testOID, testOID, testOID, testDigest, verification.IntentDigest, verification.ProofDigest, testDigest, phaseartifact.Builder{Schema: "sf.builder/v1", Summary: "spike report", ChangedFiles: []string{"internal/reminder/reminder.go"}, Commands: [][]string{{"go", "test", "./..."}}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := FinalReviewerInput{Ticket: ticket, Workspace: testWorkspace(), Plan: plan, Verification: verification, Candidate: candidate, Runtime: testRuntime()}
+	phase, err := FinalReviewer(input)
+	if err != nil || !strings.Contains(phase.Prompt, "report-only spike") || strings.Contains(phase.Prompt, `"observation_id"`) {
+		t.Fatalf("spike review prompt=%q err=%v", phase.Prompt, err)
+	}
+	input.Checks = testChecks()
+	if _, err := FinalReviewer(input); err == nil {
+		t.Fatal("spike review accepted a synthetic required-check observation")
+	}
+}
+
 func testCandidate() CandidateIdentity {
 	verification := testVerification()
 	evidence := phaseartifact.Builder{Schema: "sf.builder/v1", Summary: "implementation candidate", ChangedFiles: []string{"internal/reminder/reminder.go"}, Commands: [][]string{{"go", "test", "./..."}}}

@@ -140,41 +140,52 @@ func (w Worker) merge(ctx context.Context, ticket store.Ticket, fence domain.Fen
 	authorization := domain.MergeAuthorization{ReviewedHead: candidate.Snapshot.HeadSHA, CurrentHead: candidate.Snapshot.HeadSHA, ReviewedBaseSHA: candidate.Snapshot.BaseSHA, CurrentBaseSHA: candidate.Snapshot.BaseSHA, ReviewedBaseHeadOID: identity.BaseOID, CurrentBaseHeadOID: identity.BaseOID, Approved: true, GatesGreen: true}
 	readyDigest := githubboundary.CanonicalReadyRequestDigest(identity)
 	readyKey := "merge-ready/" + string(ticket.Ref.Channel) + "/" + string(ticket.Ref.Project) + "/" + string(ticket.Ref.Ticket) + "/" + candidate.Snapshot.HeadSHA
-	if _, err := w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: readyKey, Ref: ticket.Ref, Kind: "pr_ready", TicketVersion: ticket.Version, Fence: fence, RequestDigest: readyDigest}); err != nil {
-		return result, err
-	}
-	ready, err := w.Store.ClaimEffect(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
+	readyConfirmed, err := w.reconcileReady(ctx, ticket, fence, readyKey, identity)
 	if err != nil {
 		return result, err
 	}
-	if ready.Claimed {
-		if err := w.Publication.GitHub.MarkReady(ctx, ready.ExternalClaim(), identity); err != nil {
-			_, _ = w.Store.MarkEffectUncertain(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: ready.Effect.LeaderEpoch, RunnerEpoch: ready.Effect.RunnerEpoch, ClaimEpoch: ready.Effect.ClaimEpoch}})
+	if !readyConfirmed {
+		if _, err := w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: readyKey, Ref: ticket.Ref, Kind: "pr_ready", TicketVersion: ticket.Version, Fence: fence, RequestDigest: readyDigest}); err != nil {
 			return result, err
 		}
-		if _, err := w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: ready.Effect.LeaderEpoch, RunnerEpoch: ready.Effect.RunnerEpoch, ClaimEpoch: ready.Effect.ClaimEpoch}}, "ready/"+candidate.Snapshot.HeadSHA); err != nil {
+		ready, err := w.Store.ClaimEffect(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
+		if err != nil {
 			return result, err
+		}
+		if ready.Claimed {
+			if err := w.Publication.GitHub.MarkReady(ctx, ready.ExternalClaim(), identity); err != nil {
+				_, _ = w.Store.MarkEffectUncertain(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: ready.Effect.LeaderEpoch, RunnerEpoch: ready.Effect.RunnerEpoch, ClaimEpoch: ready.Effect.ClaimEpoch}})
+				return result, err
+			}
+			if _, err := w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: ready.Effect.LeaderEpoch, RunnerEpoch: ready.Effect.RunnerEpoch, ClaimEpoch: ready.Effect.ClaimEpoch}}, "ready/"+candidate.Snapshot.HeadSHA); err != nil {
+				return result, err
+			}
 		}
 	}
 	method := "squash"
 	mergeDigest := githubboundary.CanonicalMergeRequestDigest(identity, candidate.Snapshot.HeadSHA, method, authorization)
 	mergeKey := "merge/" + string(ticket.Ref.Channel) + "/" + string(ticket.Ref.Project) + "/" + string(ticket.Ref.Ticket) + "/" + candidate.Snapshot.HeadSHA
-	if _, err := w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: mergeKey, Ref: ticket.Ref, Kind: "merge", TicketVersion: ticket.Version, Fence: fence, RequestDigest: mergeDigest}); err != nil {
-		return result, err
-	}
-	claim, err := w.Store.ClaimEffect(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
+	mergeConfirmed, err := w.reconcileMerge(ctx, mergeKey)
 	if err != nil {
 		return result, err
 	}
-	if !claim.Claimed {
-		return result, store.ErrEffectBusy
-	}
-	if err := w.Publication.GitHub.MergeExactHead(ctx, claim.ExternalClaim(), identity, candidate.Snapshot.HeadSHA, method, authorization); err != nil {
-		_, _ = w.Store.MarkEffectUncertain(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}})
-		return result, err
-	}
-	if _, err := w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}}, "merged/"+candidate.Snapshot.HeadSHA); err != nil {
-		return result, err
+	if !mergeConfirmed {
+		if _, err := w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: mergeKey, Ref: ticket.Ref, Kind: "merge", TicketVersion: ticket.Version, Fence: fence, RequestDigest: mergeDigest}); err != nil {
+			return result, err
+		}
+		claim, err := w.Store.ClaimEffect(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
+		if err != nil {
+			return result, err
+		}
+		if claim.Claimed {
+			if err := w.Publication.GitHub.MergeExactHead(ctx, claim.ExternalClaim(), identity, candidate.Snapshot.HeadSHA, method, authorization); err != nil {
+				_, _ = w.Store.MarkEffectUncertain(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}})
+				return result, err
+			}
+			if _, err := w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}}, "merged/"+candidate.Snapshot.HeadSHA); err != nil {
+				return result, err
+			}
+		}
 	}
 	transition, err := w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: domain.StateMerging, Trigger: "merge_observed", Fence: fence, Attributes: map[string]string{"source_head_equals_reviewed_head": "true", "protected_branch_contains_merge": "true"}})
 	if err != nil {
@@ -190,6 +201,74 @@ func (w Worker) merge(ctx context.Context, ticket store.Ticket, fence domain.Fen
 	}
 	result.State, result.Version, result.Transitioned = done.State, done.Version, true
 	return result, nil
+}
+
+// reconcileReady settles only a claim that was invalidated by a recovery
+// fence. A same-fence unknown response remains uncertain and never becomes a
+// retry authorization. The all-state PR observation supplies the exact remote
+// fact needed to either confirm the old ready effect or prove its absence.
+func (w Worker) reconcileReady(ctx context.Context, ticket store.Ticket, fence domain.Fence, key string, identity contracts.PullRequestIdentity) (bool, error) {
+	effect, err := w.Store.Effect(ctx, key)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if effect.State == store.EffectConfirmed {
+		return true, nil
+	}
+	if effect.State != store.EffectExecuting && effect.State != store.EffectUncertain {
+		return false, nil
+	}
+	observer, ok := w.Publication.GitHub.(interface {
+		ObservePublishedPullRequest(context.Context, contracts.PullRequestIdentity) (contracts.PublishedPullRequestObservation, error)
+	})
+	if !ok {
+		return false, store.ErrEffectBusy
+	}
+	observed, err := observer.ObservePublishedPullRequest(ctx, identity)
+	if err != nil || !samePublishedIdentity(observed.Identity, identity) || !validMergeObservation(observed) {
+		return false, store.ErrEvidenceConflict
+	}
+	observedIdentity := ""
+	if observed.Ready {
+		observedIdentity = "ready/" + identity.HeadOID
+	}
+	_, err = w.Store.ReconcileInvalidatedEffect(ctx, store.InvalidatedEffectObservation{Prior: store.EffectObservation{EffectFence: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: effect.TicketVersion, Fence: domain.Fence{LeaderEpoch: effect.LeaderEpoch, RunnerEpoch: effect.RunnerEpoch, ClaimEpoch: effect.ClaimEpoch}}, Present: observed.Ready, Identity: observedIdentity}, Current: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence}})
+	if err != nil {
+		return false, err
+	}
+	return observed.Ready, nil
+}
+
+// reconcileMerge is the restart-only completion path for a lost exact-head
+// merge response. Store verifies the immutable merge intent and promotes the
+// uncertain old claim only after GitHub re-observes the exact protected-branch
+// merge proof; it never issues another merge call.
+func (w Worker) reconcileMerge(ctx context.Context, key string) (bool, error) {
+	effect, err := w.Store.Effect(ctx, key)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if effect.State == store.EffectConfirmed {
+		return true, nil
+	}
+	if effect.State != store.EffectUncertain {
+		return false, nil
+	}
+	observer, ok := w.Publication.GitHub.(contracts.MergeIntentObserver)
+	if !ok {
+		return false, store.ErrEffectBusy
+	}
+	recovered, err := w.Store.RecoverMergeIntent(ctx, key, observer)
+	if err != nil {
+		return false, err
+	}
+	return recovered.State == store.EffectConfirmed, nil
 }
 
 func (w Worker) blockPublishing(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {
