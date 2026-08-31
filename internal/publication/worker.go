@@ -83,6 +83,17 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		if existing.CurrentTicketVersion != ticket.Version || existing.CurrentFence != fence {
 			return result, store.ErrStaleFence
 		}
+		project, projectErr := w.Store.Project(ctx, ref.Channel, ref.Project)
+		if projectErr != nil {
+			return result, projectErr
+		}
+		liveWorktree, _, identityErr := publicationWorktree(project, existing.Worktree, existing.Candidate)
+		if identityErr != nil || w.validatePublished(ctx, observer, liveWorktree, existing.Candidate, existing.PullRequest) != nil {
+			if identityErr != nil {
+				return result, identityErr
+			}
+			return result, ErrPublicationDrift
+		}
 		if _, err := w.Store.TransitionPublishedCandidate(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence}); err != nil {
 			return result, err
 		}
@@ -130,6 +141,9 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	if err != nil {
 		return result, err
 	}
+	if err := w.validatePublished(ctx, observer, gitWorktree, candidate, pr); err != nil {
+		return result, err
+	}
 	prEffect, err := w.Store.Effect(ctx, draftKey(identity, title, body))
 	if err != nil {
 		return result, err
@@ -158,14 +172,10 @@ func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domai
 			return store.Effect{}, ErrRemoteCandidate
 		}
 		present := remote.OID == candidate.Snapshot.HeadSHA
-		// An absent branch after a launched/uncertain push is not proof that a
-		// replacement launch is safe. Keep the durable intent unresolved and
-		// surface a typed recovery refusal; only the exact remote candidate can
-		// settle this irreversible boundary automatically.
-		if !present {
-			return store.Effect{}, ErrRemoteCandidate
-		}
 		if facts.Effect.State == store.EffectConfirmed {
+			if !present {
+				return store.Effect{}, ErrRemoteCandidate
+			}
 			if facts.Effect.ObservedIdentity != store.CanonicalPublicationPushObservation(worktree.Branch, candidate.Snapshot.HeadSHA) {
 				return store.Effect{}, ErrRemoteCandidate
 			}
@@ -181,11 +191,17 @@ func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domai
 			if settleErr != nil {
 				return store.Effect{}, settleErr
 			}
+			if !present {
+				return w.ensurePush(ctx, ticket, fence, project, candidate, worktree, gitWorktree)
+			}
 			return effect, nil
 		}
 		effect, settleErr := w.Store.ReconcileInvalidatedEffect(ctx, store.InvalidatedEffectObservation{Prior: prior, Current: current})
 		if settleErr != nil {
 			return store.Effect{}, settleErr
+		}
+		if !present {
+			return w.ensurePush(ctx, ticket, fence, project, candidate, worktree, gitWorktree)
 		}
 		return effect, nil
 	} else if !errors.Is(err, store.ErrNotFound) {
@@ -238,6 +254,17 @@ func (w Worker) ensureDraft(ctx context.Context, ticket store.Ticket, fence doma
 			return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
 		}
 		return observed, time.Now().UTC(), nil
+	}
+	if !found && (effect.State == store.EffectExecuting || effect.State == store.EffectUncertain) {
+		prior := store.EffectObservation{EffectFence: effectFence(effect), Present: false}
+		if effect.TicketVersion == ticket.Version && effect.LeaderEpoch == fence.LeaderEpoch && effect.RunnerEpoch == fence.RunnerEpoch {
+			if _, err := w.Store.ObserveEffect(ctx, prior); err != nil {
+				return contracts.PullRequestIdentity{}, time.Time{}, err
+			}
+		} else if _, err := w.Store.ReconcileInvalidatedEffect(ctx, store.InvalidatedEffectObservation{Prior: prior, Current: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence}}); err != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, err
+		}
+		return w.ensureDraft(ctx, ticket, fence, observer, identity, title, body)
 	}
 	if !found {
 		claim, claimErr := w.Store.ClaimEffect(ctx, store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
@@ -302,6 +329,28 @@ func publicationWorktree(project store.Project, stored store.StoredWorktree, can
 		return gitboundary.Worktree{}, contracts.RepositoryIdentity{}, ErrPublicationDrift
 	}
 	return gitboundary.Worktree{Path: stored.Path, Branch: stored.Branch, Identity: identity}, repository, nil
+}
+
+// validatePublished is deliberately called immediately before every state
+// transition. Publication evidence authenticates the original effects, but a
+// later close, force-push, or foreign replacement is live remote truth and
+// must never be carried into waiting_ci by a replay alone.
+func (w Worker) validatePublished(ctx context.Context, observer contracts.DraftPullRequestObserver, worktree gitboundary.Worktree, candidate store.StoredCandidate, want contracts.PullRequestIdentity) error {
+	remote, err := w.Git.ObserveRemoteBranch(ctx, worktree, worktree.Identity.PushOrigin, worktree.Branch)
+	if err != nil || remote.OID != candidate.Snapshot.HeadSHA {
+		if err != nil {
+			return err
+		}
+		return ErrRemoteCandidate
+	}
+	pr, state, draft, found, err := observer.ObserveDraftPullRequest(ctx, want)
+	if err != nil || !found || state != "OPEN" || !draft || !samePR(pr, want) {
+		if err != nil {
+			return err
+		}
+		return ErrPullRequest
+	}
+	return nil
 }
 
 func githubRepository(raw string) (contracts.RepositoryIdentity, bool) {

@@ -232,9 +232,18 @@ func (s *Store) IssueGitMutationClaim(ctx context.Context, intent GitMutationInt
 		if err != nil {
 			return err
 		}
-		_, err = conn.ExecContext(ctx, `INSERT INTO git_mutation_intents(semantic_key,channel,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, intent.SemanticKey, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket, intent.RequestDigest, effect.TicketVersion, effect.LeaderEpoch, effect.RunnerEpoch, effect.ClaimEpoch, intent.Repository, intent.Worktree, intent.Branch, intent.Operation, intent.BaseRef, intent.ExpectedBaseOID, intent.ExpectedHeadOID, time.Now().UTC().Format(time.RFC3339Nano))
+		// A proven-absent effect may be planned and claimed again after recovery.
+		// The semantic Git target is immutable, but its fenced launch identity
+		// must follow the newly claimed effect; otherwise a lost response before
+		// process start would strand a safe retry forever.
+		result, err := conn.ExecContext(ctx, `INSERT INTO git_mutation_intents(semantic_key,channel,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(semantic_key) DO UPDATE SET ticket_version=excluded.ticket_version,leader_epoch=excluded.leader_epoch,runner_epoch=excluded.runner_epoch,claim_epoch=excluded.claim_epoch,created_at=excluded.created_at
+			WHERE git_mutation_intents.channel=excluded.channel AND git_mutation_intents.project_id=excluded.project_id AND git_mutation_intents.ticket_id=excluded.ticket_id AND git_mutation_intents.request_digest=excluded.request_digest AND git_mutation_intents.repository_path=excluded.repository_path AND git_mutation_intents.worktree_path=excluded.worktree_path AND git_mutation_intents.branch_ref=excluded.branch_ref AND git_mutation_intents.operation=excluded.operation AND git_mutation_intents.base_ref=excluded.base_ref AND git_mutation_intents.expected_base_oid=excluded.expected_base_oid AND git_mutation_intents.expected_head_oid=excluded.expected_head_oid`, intent.SemanticKey, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket, intent.RequestDigest, effect.TicketVersion, effect.LeaderEpoch, effect.RunnerEpoch, effect.ClaimEpoch, intent.Repository, intent.Worktree, intent.Branch, intent.Operation, intent.BaseRef, intent.ExpectedBaseOID, intent.ExpectedHeadOID, time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return ErrGitMutationIntent
 		}
 		claim = contracts.GitMutationClaim{TicketRef: intent.Ref, SemanticKey: intent.SemanticKey, RequestDigest: intent.RequestDigest, TicketVersion: effect.TicketVersion, LeaderEpoch: effect.LeaderEpoch, RunnerEpoch: effect.RunnerEpoch, ClaimEpoch: effect.ClaimEpoch, Repository: intent.Repository, Worktree: intent.Worktree, Branch: intent.Branch, Operation: intent.Operation, BaseRef: intent.BaseRef, ExpectedBaseOID: intent.ExpectedBaseOID, ExpectedHeadOID: intent.ExpectedHeadOID}
 		return nil
