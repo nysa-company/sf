@@ -98,6 +98,25 @@ func (s *Store) ValidateTicketFence(ctx context.Context, ref domain.TicketRef, v
 	})
 }
 
+// CurrentTicketFence is a read-only snapshot for a coordinator that must
+// create a child effect after a previously started effect is reconciled.  It
+// exposes no claim authority; PlanEffect/IssueGitMutationClaim still repeat
+// the exact fence inside their writes.
+func (s *Store) CurrentTicketFence(ctx context.Context, ref domain.TicketRef) (uint64, domain.Fence, error) {
+	if err := ref.Validate(); err != nil {
+		return 0, domain.Fence{}, err
+	}
+	var version, runner, leader uint64
+	err := s.db.QueryRowContext(ctx, `SELECT t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&version, &runner, &leader)
+	if err != nil {
+		return 0, domain.Fence{}, normalizeBusy(ctx, err)
+	}
+	if version == 0 || runner == 0 || leader == 0 {
+		return 0, domain.Fence{}, ErrStaleFence
+	}
+	return version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: runner}, nil
+}
+
 type EffectObservation struct {
 	EffectFence
 	Present  bool

@@ -52,6 +52,45 @@ func (s *Store) MergeIntent(ctx context.Context, semanticKey string) (domain.Mer
 	return mergeIntentFrom(ctx, s.db, semanticKey)
 }
 
+// MergeIntentForProof returns only the currently live durable merge intent
+// matching a GitHub post-merge observation.  A GitHub adapter receives no Git
+// authority; this lookup lets the root composition mint a separate fenced Git
+// proof effect from the already-recorded merge intent.
+func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, name, baseRef, originalBaseOID, mergeOID string) (domain.MergeIntent, error) {
+	if repositoryHost != "github.com" || owner == "" || name == "" || baseRef == "" || !validOID(originalBaseOID) || !validOID(mergeOID) || len(originalBaseOID) != len(mergeOID) {
+		return domain.MergeIntent{}, ErrEvidenceConflict
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT m.semantic_key FROM merge_intents m JOIN effects e ON e.semantic_key=m.semantic_key JOIN tickets t ON t.channel=m.channel AND t.project_id=m.project_id AND t.id=m.ticket_id
+		WHERE m.repository_host=? AND m.repository_owner=? AND m.repository_name=? AND m.base_ref=? AND m.original_base_oid=?
+		AND t.state='merging' AND e.effect_kind='merge' AND e.state IN ('executing','uncertain') ORDER BY m.created_at DESC`, repositoryHost, owner, name, baseRef, originalBaseOID)
+	if err != nil {
+		return domain.MergeIntent{}, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	var key string
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(&key); err != nil {
+			return domain.MergeIntent{}, err
+		}
+		count++
+		if count > 1 {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return domain.MergeIntent{}, err
+	}
+	if count != 1 {
+		return domain.MergeIntent{}, ErrNotFound
+	}
+	intent, found, err := s.MergeIntent(ctx, key)
+	if err != nil || !found || intent.OriginalBaseOID != originalBaseOID || intent.BaseRef != baseRef {
+		return domain.MergeIntent{}, ErrEvidenceConflict
+	}
+	return intent, nil
+}
+
 type mergeIntentQuerier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
