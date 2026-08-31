@@ -112,3 +112,12 @@ type GitHub interface {
 	MarkReady(context.Context, domain.ExternalEffectClaim, PullRequestIdentity) error
 	MergeExactHead(context.Context, domain.ExternalEffectClaim, PullRequestIdentity, string, string, domain.MergeAuthorization) error
 }
+
+// DraftPullRequestObserver is the recovery-only publication lookup.  It
+// inventories the exact source/base identity (including the factory ownership
+// marker) and returns the current open/draft facts needed to settle a lost PR
+// creation response.  A false result is a proven absence; implementations
+// must return an error for foreign or ambiguous candidates.
+type DraftPullRequestObserver interface {
+	ObserveDraftPullRequest(context.Context, PullRequestIdentity) (identity PullRequestIdentity, state string, draft bool, found bool, err error)
+}

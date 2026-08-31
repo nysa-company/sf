@@ -182,6 +182,17 @@ func (c Client) FindPullRequest(ctx context.Context, identity contracts.PullRequ
 	return match.Identity, true, nil
 }
 
+// ObserveDraftPullRequest is the typed recovery view used by the publication
+// coordinator.  It never adopts a merely familiar branch: ObservePublicationCandidate
+// rejects foreign and ambiguous source/base matches before returning a fact.
+func (c Client) ObserveDraftPullRequest(ctx context.Context, identity contracts.PullRequestIdentity) (contracts.PullRequestIdentity, string, bool, bool, error) {
+	match, found, err := c.ObservePublicationCandidate(ctx, identity)
+	if err != nil || !found {
+		return contracts.PullRequestIdentity{}, "", false, false, err
+	}
+	return match.Identity, match.State, match.Draft, true, nil
+}
+
 // RefreshFactoryPullRequestIdentity re-observes one already-persisted factory
 // pull request after a correction advances its source head. It is deliberately
 // a continuity check, not a branch-name lookup: both the prior identity and

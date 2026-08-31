@@ -400,6 +400,40 @@ func (f *FakeGH) FindPullRequest(_ context.Context, want contracts.PullRequestId
 	return match, found, err
 }
 
+// ObserveDraftPullRequest mirrors the production recovery contract while
+// retaining the fake's strict exact-identity matching.  A foreign matching PR
+// is a refusal, never an absence that could permit a duplicate factory PR.
+func (f *FakeGH) ObserveDraftPullRequest(_ context.Context, want contracts.PullRequestIdentity) (contracts.PullRequestIdentity, string, bool, bool, error) {
+	if !want.FactoryOwned {
+		return contracts.PullRequestIdentity{}, "", false, false, errors.New("fake-gh: factory-owned lookup is required")
+	}
+	var match PullRequest
+	count := 0
+	err := f.withState(func() (bool, error) {
+		for _, pr := range f.state.PRs {
+			if !samePRSourceAndBase(pr.Identity, want) {
+				continue
+			}
+			if !pr.Identity.FactoryOwned {
+				return false, errors.New("fake-gh: foreign pull request conflicts with the factory identity")
+			}
+			if !identityMatches(pr.Identity, want) {
+				return false, errors.New("fake-gh: factory pull request source identity drifted")
+			}
+			count++
+			match = pr
+		}
+		if count > 1 {
+			return false, errors.New("fake-gh: ambiguous matching pull requests")
+		}
+		return false, nil
+	})
+	if err != nil || count == 0 {
+		return contracts.PullRequestIdentity{}, "", false, false, err
+	}
+	return match.Identity, "OPEN", match.Draft, true, nil
+}
+
 func (f *FakeGH) CreateDraftPullRequest(_ context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, error) {
 	if err := validateFakeClaim(claim, "draft_pr", identity, title, body); err != nil {
 		return contracts.PullRequestIdentity{}, err
