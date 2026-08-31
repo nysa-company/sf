@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,12 +19,16 @@ import (
 	"github.com/nysa-company/sf/internal/cli"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
+	"github.com/nysa-company/sf/internal/daemon/runtimecontrol"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/events"
 	"github.com/nysa-company/sf/internal/leader"
 	"github.com/nysa-company/sf/internal/operator"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/transport"
+	"github.com/nysa-company/sf/internal/workflowruntime"
+	"github.com/nysa-company/sf/internal/workflowworker"
+	"github.com/nysa-company/sf/internal/worktreecoord"
 )
 
 type testIDs struct{ next int }
@@ -42,6 +47,49 @@ type testRuntimeController struct {
 	merge func(context.Context, domain.TicketRef) (bool, error)
 }
 
+type testRuntimeRetirementController struct {
+	testRuntimeController
+	retire func(context.Context, domain.TicketRef) error
+}
+
+type daemonRuntimeEnsure struct{}
+
+func (daemonRuntimeEnsure) Ensure(context.Context, worktreecoord.EnsureRequest) (store.StoredWorktree, error) {
+	return store.StoredWorktree{Path: "/tmp/daemon-runtime-worktree", State: "registered"}, nil
+}
+
+type daemonRuntimeWorker struct {
+	mu      sync.Mutex
+	calls   map[domain.TicketRef]int
+	active  map[domain.TicketRef]bool
+	entered chan domain.TicketRef
+	exited  chan domain.TicketRef
+}
+
+func newDaemonRuntimeWorker() *daemonRuntimeWorker {
+	return &daemonRuntimeWorker{calls: make(map[domain.TicketRef]int), active: make(map[domain.TicketRef]bool), entered: make(chan domain.TicketRef, 8), exited: make(chan domain.TicketRef, 8)}
+}
+
+func (worker *daemonRuntimeWorker) Run(ctx context.Context, ref domain.TicketRef, _ domain.Fence) (workflowworker.RunResult, error) {
+	worker.mu.Lock()
+	worker.calls[ref]++
+	worker.active[ref] = true
+	worker.mu.Unlock()
+	worker.entered <- ref
+	<-ctx.Done()
+	worker.mu.Lock()
+	delete(worker.active, ref)
+	worker.mu.Unlock()
+	worker.exited <- ref
+	return workflowworker.RunResult{Ref: ref}, ctx.Err()
+}
+
+func (worker *daemonRuntimeWorker) snapshot(ref domain.TicketRef) (calls int, active bool) {
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	return worker.calls[ref], worker.active[ref]
+}
+
 func (controller testRuntimeController) Drain(ctx context.Context, ref domain.TicketRef) (bool, error) {
 	if controller.drain == nil {
 		return true, nil
@@ -54,6 +102,13 @@ func (controller testRuntimeController) MergeObserved(ctx context.Context, ref d
 		return false, nil
 	}
 	return controller.merge(ctx, ref)
+}
+
+func (controller testRuntimeRetirementController) Retire(ctx context.Context, ref domain.TicketRef) error {
+	if controller.retire == nil {
+		return nil
+	}
+	return controller.retire(ctx, ref)
 }
 
 func testDaemon(t *testing.T) (*Daemon, config.ChannelPaths, context.CancelFunc) {
@@ -254,6 +309,101 @@ func daemonControl(daemon *Daemon, id domain.TicketID, intent string) api.Respon
 	})
 }
 
+func daemonResume(daemon *Daemon, id domain.TicketID) api.Response {
+	return daemon.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{
+		Version: api.Version, RequestID: "resume-" + string(id), Method: "ticket.resume",
+		Ticket: string(id), OperatorLabel: "operator",
+		Parameters: json.RawMessage(`{"channel":"` + string(daemon.channel) + `","operator":"operator"}`),
+	})
+}
+
+func TestDaemonFactoryTwoWorkerPauseDrainsOnlyTargetAndResumeRearms(t *testing.T) {
+	worker := newDaemonRuntimeWorker()
+	cfg, _ := lifecycleConfig(t, func(deps RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		runtime, err := workflowruntime.NewRuntimeWithConfig(workflowruntime.NewScheduler(
+			domain.ChannelStable,
+			workflowruntime.StoreTicketSource{Store: deps.Store},
+			daemonRuntimeEnsure{},
+			worker,
+		), workflowruntime.RuntimeConfig{Interval: time.Millisecond, Workers: 2})
+		if err != nil {
+			return WorkflowRuntimeComponents{}, err
+		}
+		controller, err := runtimecontrol.New(deps.Store, runtime.ControlBundle(), runtimecontrol.MergeObserverFunc(func(context.Context, domain.TicketRef) (bool, error) {
+			return false, nil
+		}))
+		if err != nil {
+			_ = runtime.Close()
+			return WorkflowRuntimeComponents{}, err
+		}
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: controller}, nil
+	})
+	d, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	target := createAndStartControlTicket(t, d, "SF-runtime-target")
+	sibling := createAndStartControlTicket(t, d, "SF-runtime-sibling")
+	seen := map[domain.TicketRef]bool{}
+	for len(seen) != 2 {
+		select {
+		case ref := <-worker.entered:
+			seen[ref] = true
+		case <-time.After(time.Second):
+			t.Fatalf("runtime did not start both tickets: %v", seen)
+		}
+	}
+	if !seen[target.Ref] || !seen[sibling.Ref] {
+		t.Fatalf("worker entries=%v target=%v sibling=%v", seen, target.Ref, sibling.Ref)
+	}
+	if response := daemonControl(d, target.Ref.Ticket, "pause"); !response.OK {
+		t.Fatalf("pause response=%+v", response)
+	}
+	select {
+	case exited := <-worker.exited:
+		if exited != target.Ref {
+			t.Fatalf("pause stopped sibling %v, want %v", exited, target.Ref)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pause did not join the target worker")
+	}
+	if calls, active := worker.snapshot(sibling.Ref); calls != 1 || !active {
+		t.Fatalf("sibling did not continue through target pause: calls=%d active=%v", calls, active)
+	}
+	if response := daemonResume(d, target.Ref.Ticket); !response.OK {
+		t.Fatalf("resume response=%+v", response)
+	}
+	select {
+	case ref := <-worker.entered:
+		if ref != target.Ref {
+			t.Fatalf("resume ran %v, want target %v", ref, target.Ref)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resume did not rearm and run the target")
+	}
+	if calls, active := worker.snapshot(target.Ref); calls != 2 || !active {
+		t.Fatalf("target did not restart after resume: calls=%d active=%v", calls, active)
+	}
+	if response := daemonControl(d, target.Ref.Ticket, "cancel"); !response.OK {
+		t.Fatalf("terminal cancel response=%+v error=%+v", response, response.Error)
+	}
+	select {
+	case exited := <-worker.exited:
+		if exited != target.Ref {
+			t.Fatalf("cancel stopped sibling %v, want target %v", exited, target.Ref)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal cancel did not join the rearmed target")
+	}
+	if _, err := d.store.StoppedRuntimeTicket(context.Background(), target.Ref); !errors.Is(err, store.ErrStaleFence) {
+		t.Fatalf("terminal cancel retained durable runtime control: %v", err)
+	}
+	if response := daemonControl(d, target.Ref.Ticket, "cancel"); !response.OK || !response.Mutation.Observed {
+		t.Fatalf("terminal cancel retry=%+v", response)
+	}
+}
+
 func TestDaemonPauseDrainsThenCommitsAndReplays(t *testing.T) {
 	d, _, _ := testDaemon(t)
 	started := createAndStartControlTicket(t, d, "SF-pause")
@@ -392,6 +542,36 @@ func TestDaemonCancelChecksMergeBeforeAndAfterDrain(t *testing.T) {
 			t.Fatalf("stored=%+v err=%v started=%+v", stored, err, started)
 		}
 	})
+}
+
+func TestDaemonCancellationRetriesTerminalRuntimeRetirementWithoutReopeningAdmission(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-cancel-retirement")
+	retireErr := errors.New("runtime retirement unavailable")
+	attempts := 0
+	d.control = testRuntimeRetirementController{retire: func(context.Context, domain.TicketRef) error {
+		attempts++
+		if attempts == 1 {
+			return retireErr
+		}
+		return nil
+	}}
+	response := daemonControl(d, started.Ref.Ticket, "cancel")
+	if response.OK || response.Error == nil || response.Error.Code != "runtime_retirement_failed" || !response.Error.Retryable {
+		t.Fatalf("first cancellation response=%+v", response)
+	}
+	terminal, err := d.store.Ticket(context.Background(), started.Ref)
+	if err != nil || terminal.State != domain.StateCancelled {
+		t.Fatalf("terminal cancellation was not persisted: ticket=%+v err=%v", terminal, err)
+	}
+	response = daemonControl(d, started.Ref.Ticket, "cancel")
+	if !response.OK || !response.Mutation.Observed || attempts != 2 {
+		t.Fatalf("retry response=%+v attempts=%d", response, attempts)
+	}
+	terminal, err = d.store.Ticket(context.Background(), started.Ref)
+	if err != nil || terminal.State != domain.StateCancelled || terminal.Version != started.Version+2 {
+		t.Fatalf("retirement retry changed terminal admission: ticket=%+v err=%v", terminal, err)
+	}
 }
 
 func TestDaemonControlPreconditionFailureReportsNoMutation(t *testing.T) {

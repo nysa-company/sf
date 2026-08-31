@@ -61,6 +61,15 @@ func (r *fakeWorkflowRuntime) Close() error {
 	return nil
 }
 
+func (r *fakeWorkflowRuntime) Drain(context.Context, domain.TicketRef) (bool, error) {
+	return true, nil
+}
+func (r *fakeWorkflowRuntime) MergeObserved(context.Context, domain.TicketRef) (bool, error) {
+	return false, nil
+}
+func (r *fakeWorkflowRuntime) Rearm(context.Context, domain.TicketRef) error  { return nil }
+func (r *fakeWorkflowRuntime) Retire(context.Context, domain.TicketRef) error { return nil }
+
 func lifecycleConfig(t *testing.T, factory WorkflowRuntimeFactory) (Config, config.ChannelPaths) {
 	t.Helper()
 	root, err := os.MkdirTemp("/tmp", "sf-runtime-")
@@ -89,7 +98,7 @@ func TestRuntimeFactoryRunsAfterRecoveryAndBeforeSocket(t *testing.T) {
 	var gotFence domain.Fence
 	var paths config.ChannelPaths
 	var cfg Config
-	cfg, paths = lifecycleConfig(t, func(deps RuntimeDependencies) (WorkflowRuntime, error) {
+	cfg, paths = lifecycleConfig(t, func(deps RuntimeDependencies) (WorkflowRuntimeComponents, error) {
 		factoryCalled = true
 		if deps.Store == nil || deps.Engine == nil {
 			t.Fatal("runtime dependencies were not composed")
@@ -105,7 +114,7 @@ func TestRuntimeFactoryRunsAfterRecoveryAndBeforeSocket(t *testing.T) {
 		runtime.mu.Lock()
 		runtime.fence = domain.Fence{}
 		runtime.mu.Unlock()
-		return runtimeWithFence(runtime, &gotFence), nil
+		return WorkflowRuntimeComponents{Runtime: runtimeWithFence(runtime, &gotFence), Controller: runtime}, nil
 	})
 	// runtimeWithFence only adapts observation; the returned runtime remains
 	// the exact fake implementation used by this test.
@@ -164,9 +173,17 @@ func (r *fencedFakeRuntime) Start(ctx context.Context, fence domain.Fence) error
 
 func TestRuntimeFactoryFailureLeavesNoSocketAndReleasesAuthority(t *testing.T) {
 	factoryErr := errors.New("runtime factory failed")
-	cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntime, error) { return nil, factoryErr })
+	partial := &fakeWorkflowRuntime{closed: make(chan struct{})}
+	cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		return WorkflowRuntimeComponents{Runtime: partial}, factoryErr
+	})
 	if _, err := Start(context.Background(), cfg); !errors.Is(err, factoryErr) {
 		t.Fatalf("startup error=%v, want factory error", err)
+	}
+	select {
+	case <-partial.closed:
+	case <-time.After(time.Second):
+		t.Fatal("factory-error partial runtime was not closed")
 	}
 	if _, err := os.Lstat(paths.Socket); !os.IsNotExist(err) {
 		t.Fatalf("socket exposed after factory failure: %v", err)
@@ -183,6 +200,70 @@ func TestRuntimeFactoryFailureLeavesNoSocketAndReleasesAuthority(t *testing.T) {
 	}
 }
 
+func TestRuntimeFactoryRejectsAmbiguousOrPartialControlBundles(t *testing.T) {
+	t.Run("configured controller conflicts with factory", func(t *testing.T) {
+		called := false
+		cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+			called = true
+			return WorkflowRuntimeComponents{}, nil
+		})
+		cfg.Controller = &fakeWorkflowRuntime{}
+		if _, err := Start(context.Background(), cfg); err == nil {
+			t.Fatal("factory accepted a separately configured controller")
+		}
+		if called {
+			t.Fatal("ambiguous runtime composition reached the factory")
+		}
+		if _, err := os.Lstat(paths.Socket); !os.IsNotExist(err) {
+			t.Fatalf("socket exposed for ambiguous composition: %v", err)
+		}
+	})
+
+	t.Run("runtime without controller closes partial runtime", func(t *testing.T) {
+		runtime := &fakeWorkflowRuntime{closed: make(chan struct{})}
+		cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+			return WorkflowRuntimeComponents{Runtime: runtime}, nil
+		})
+		if _, err := Start(context.Background(), cfg); err == nil {
+			t.Fatal("factory accepted a runtime without its controller")
+		}
+		select {
+		case <-runtime.closed:
+		case <-time.After(time.Second):
+			t.Fatal("partial runtime was not closed")
+		}
+		if _, err := os.Lstat(paths.Socket); !os.IsNotExist(err) {
+			t.Fatalf("socket exposed for partial composition: %v", err)
+		}
+	})
+
+	t.Run("controller without runtime", func(t *testing.T) {
+		cfg, _ := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+			return WorkflowRuntimeComponents{Controller: &fakeWorkflowRuntime{}}, nil
+		})
+		if _, err := Start(context.Background(), cfg); err == nil {
+			t.Fatal("factory accepted a controller without its runtime")
+		}
+	})
+
+	t.Run("nil pair leaves execution unavailable", func(t *testing.T) {
+		cfg, _ := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+			return WorkflowRuntimeComponents{}, nil
+		})
+		d, err := Start(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		if d.runtime != nil {
+			t.Fatal("nil runtime/control pair installed a runtime")
+		}
+		if _, idle := d.control.(idleRuntimeController); !idle {
+			t.Fatalf("nil runtime/control pair control=%T, want idle controller", d.control)
+		}
+	})
+}
+
 func TestStartupCleanupJoinsStoreAndLeaderCloseErrors(t *testing.T) {
 	cause := errors.New("factory failure")
 	storeErr := errors.New("store close failure")
@@ -196,7 +277,9 @@ func TestStartupCleanupJoinsStoreAndLeaderCloseErrors(t *testing.T) {
 
 func TestRuntimeStartFailureClosesRuntimeBeforeAuthority(t *testing.T) {
 	runtime := &fakeWorkflowRuntime{startErr: errors.New("runtime start failed"), closed: make(chan struct{})}
-	cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntime, error) { return runtime, nil })
+	cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
 	_, err := Start(context.Background(), cfg)
 	if !errors.Is(err, runtime.startErr) {
 		t.Fatalf("startup error=%v, want runtime start error", err)
@@ -215,7 +298,9 @@ func TestRuntimeUsesProcessContextAfterStartupAndStopsOnCancellation(t *testing.
 	processCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runtime := &fakeWorkflowRuntime{}
-	cfg, _ := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntime, error) { return runtime, nil })
+	cfg, _ := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
 	daemon, err := Start(processCtx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +356,9 @@ func TestRunForegroundReturnsNormalContextShutdownAndJoinedErrors(t *testing.T) 
 
 func TestDaemonServeRejectsConcurrentLifecycleWithoutStoppingRuntime(t *testing.T) {
 	runtime := &fakeWorkflowRuntime{closed: make(chan struct{})}
-	cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntime, error) { return runtime, nil })
+	cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
 	daemon, err := Start(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -314,7 +401,9 @@ func TestDaemonServeRejectsConcurrentLifecycleWithoutStoppingRuntime(t *testing.
 func TestServeReturnsRuntimeCloseFailureOnCancellation(t *testing.T) {
 	runtimeErr := errors.New("runtime close failed")
 	runtime := &fakeWorkflowRuntime{closeFn: func() error { return runtimeErr }}
-	cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntime, error) { return runtime, nil })
+	cfg, paths := lifecycleConfig(t, func(RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
+	})
 	daemon, err := Start(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -356,9 +445,9 @@ func TestDaemonCloseJoinsRuntimeBeforeStoreAndIsIdempotent(t *testing.T) {
 		}
 		return nil
 	}}
-	cfg, _ := lifecycleConfig(t, func(deps RuntimeDependencies) (WorkflowRuntime, error) {
+	cfg, _ := lifecycleConfig(t, func(deps RuntimeDependencies) (WorkflowRuntimeComponents, error) {
 		runtimeStore = deps.Store
-		return runtime, nil
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: runtime}, nil
 	})
 	daemon, err := Start(context.Background(), cfg)
 	if err != nil {

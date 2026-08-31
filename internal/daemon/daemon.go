@@ -78,6 +78,13 @@ type RuntimeRearmController interface {
 	Rearm(context.Context, domain.TicketRef) error
 }
 
+// RuntimeRetirementController reclaims terminal-only runtime control state.
+// It is separate from RuntimeController so an intentionally no-runtime
+// composition need not pretend to own workflow admission state.
+type RuntimeRetirementController interface {
+	Retire(context.Context, domain.TicketRef) error
+}
+
 // WorkflowRuntime is the daemon lifecycle boundary for a composed workflow
 // runtime. Implementations own their goroutines and must not return from
 // Close until those goroutines have stopped. The fence is supplied by the
@@ -96,9 +103,18 @@ type RuntimeDependencies struct {
 	ProviderCoordinator *providercoord.Coordinator
 }
 
+// WorkflowRuntimeComponents is the atomic execution handoff. A factory must
+// return both Runtime and Controller or neither. The Controller is built for
+// Runtime's exact control bundle; the daemon never falls back to an idle
+// controller for an executable Runtime.
+type WorkflowRuntimeComponents struct {
+	Runtime    WorkflowRuntime
+	Controller RuntimeController
+}
+
 // WorkflowRuntimeFactory is called only after durable recovery and event
 // projection have completed, and before the owner socket is exposed.
-type WorkflowRuntimeFactory func(RuntimeDependencies) (WorkflowRuntime, error)
+type WorkflowRuntimeFactory func(RuntimeDependencies) (WorkflowRuntimeComponents, error)
 
 // ErrAlreadyServing keeps the foreground lifecycle single-owner. A second
 // Serve call must not be allowed to outlive the call that joins the runtime.
@@ -167,9 +183,11 @@ type Config struct {
 	// ProviderQualifier is invoked only through this authenticated foreground
 	// daemon, after its supervisor key is current in SQLite.
 	ProviderQualifier func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
-	// WorkflowRuntimeFactory composes the execution runtime after Store,
-	// Engine, and the optional provider coordinator exist. Nil intentionally
-	// means runtime execution is unavailable for this composition.
+	// WorkflowRuntimeFactory atomically composes an executable runtime and its
+	// exact controller after Store, Engine, and the optional provider
+	// coordinator exist. Nil intentionally means runtime execution is
+	// unavailable for this composition. Controller and factory are mutually
+	// exclusive so a real runtime cannot be paired with unrelated control.
 	WorkflowRuntimeFactory WorkflowRuntimeFactory
 }
 
@@ -338,27 +356,47 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	// runtime follows the caller's process context instead of inheriting the
 	// bounded startup deadline.
 	if configuration.WorkflowRuntimeFactory != nil {
-		runtime, runtimeErr := configuration.WorkflowRuntimeFactory(RuntimeDependencies{
+		components, runtimeErr := configuration.WorkflowRuntimeFactory(RuntimeDependencies{
 			Store: database, Engine: instance.engine, ProviderCoordinator: coordinator,
 		})
 		if runtimeErr != nil {
-			if runtime != nil {
-				if closeErr := runtime.Close(); closeErr != nil {
+			if components.Runtime != nil {
+				if closeErr := components.Runtime.Close(); closeErr != nil {
 					runtimeErr = errors.Join(runtimeErr, closeErr)
 				}
 			}
 			return failStore(fmt.Errorf("compose workflow runtime: %w", runtimeErr))
 		}
-		if runtime == nil {
-			return failStore(errors.New("compose workflow runtime: factory returned nil runtime"))
-		}
-		if runtimeErr := runtime.Start(ctx, domain.Fence{LeaderEpoch: epoch}); runtimeErr != nil {
-			if closeErr := runtime.Close(); closeErr != nil {
-				runtimeErr = errors.Join(runtimeErr, closeErr)
+		if (components.Runtime == nil) != (components.Controller == nil) {
+			bundleErr := errors.New("compose workflow runtime: factory returned an incomplete runtime/control bundle")
+			if components.Runtime != nil {
+				bundleErr = errors.Join(bundleErr, components.Runtime.Close())
 			}
-			return failStore(fmt.Errorf("start workflow runtime: %w", runtimeErr))
+			return failStore(bundleErr)
 		}
-		instance.runtime = runtime
+		if components.Runtime != nil {
+			if _, ok := components.Controller.(RuntimeRearmController); !ok {
+				runtimeErr = errors.New("compose workflow runtime: controller does not support runtime rearm")
+			} else if _, ok := components.Controller.(RuntimeRetirementController); !ok {
+				runtimeErr = errors.New("compose workflow runtime: controller does not support runtime retirement")
+			}
+			if runtimeErr != nil {
+				if closeErr := components.Runtime.Close(); closeErr != nil {
+					runtimeErr = errors.Join(runtimeErr, closeErr)
+				}
+				return failStore(runtimeErr)
+			}
+			// Install the pair before starting it. Nothing can expose the socket
+			// until this exact runtime/controller composition is live.
+			instance.runtime, instance.control = components.Runtime, components.Controller
+			if runtimeErr := components.Runtime.Start(ctx, domain.Fence{LeaderEpoch: epoch}); runtimeErr != nil {
+				if closeErr := components.Runtime.Close(); closeErr != nil {
+					runtimeErr = errors.Join(runtimeErr, closeErr)
+				}
+				instance.runtime = nil
+				return failStore(fmt.Errorf("start workflow runtime: %w", runtimeErr))
+			}
+		}
 	}
 	server, err := transport.ListenWithExecutable(configuration.Paths.Socket, uint32(os.Getuid()), instance, instance.executable())
 	if err != nil {
@@ -974,6 +1012,9 @@ func (daemon *Daemon) controlTicket(ctx context.Context, request api.Request, id
 		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
 	}
 	if intent == "cancel" && stored.State == domain.StateCancelled {
+		if err := daemon.retireRuntimeControl(ctx, stored.Ref); err != nil {
+			return daemon.controlFailure(request, stored, intent, "runtime_retirement_failed", "terminal runtime control cleanup failed; retry cancellation without resuming the ticket", true, true)
+		}
 		return daemon.controlSuccess(request, stored, intent, true)
 	}
 	if intent != "cancel" && stored.State == domain.StatePaused {
@@ -1066,7 +1107,26 @@ func (daemon *Daemon) finishControl(ctx context.Context, request api.Request, st
 	if err != nil || finished.State != target || finished.Version != result.TicketVersion {
 		return daemon.controlFailure(request, stored, intent, "control_state_unavailable", "completed control state could not be confirmed", true, true)
 	}
+	if intent == "cancel" {
+		if err := daemon.retireRuntimeControl(ctx, finished.Ref); err != nil {
+			// The durable terminal transition is already committed. Retrying the
+			// same cancellation can only finish terminal cleanup; it never
+			// reopens Store admission or the runtime stop latch.
+			return daemon.controlFailure(request, finished, intent, "runtime_retirement_failed", "terminal runtime control cleanup failed; retry cancellation without resuming the ticket", true, true)
+		}
+	}
 	return daemon.controlSuccess(request, finished, intent, false)
+}
+
+func (daemon *Daemon) retireRuntimeControl(ctx context.Context, ref domain.TicketRef) error {
+	retirer, ok := daemon.control.(RuntimeRetirementController)
+	if !ok {
+		// A no-factory composition has no in-memory workflow admission state.
+		// Retaining support for its injected legacy controller is coherent as it
+		// cannot expose a real runtime behind an idle control boundary.
+		return nil
+	}
+	return retirer.Retire(ctx, ref)
 }
 
 func (daemon *Daemon) resumeTicket(ctx context.Context, request api.Request, identity domain.OperatorIdentity) api.Response {
@@ -1354,6 +1414,9 @@ func submitErrorCode(err error) string {
 func validateConfig(configuration Config) error {
 	if !configuration.Channel.Valid() || configuration.Paths.Root == "" || configuration.Paths.Database == "" || configuration.Paths.Socket == "" || configuration.DaemonIdentity == "" {
 		return errors.New("channel, paths, and daemon identity are required")
+	}
+	if configuration.WorkflowRuntimeFactory != nil && configuration.Controller != nil {
+		return errors.New("workflow runtime factory and controller must be composed as one runtime/control bundle")
 	}
 	paths := []string{configuration.Paths.Root, configuration.Paths.Database, configuration.Paths.Socket, configuration.Paths.Logs, configuration.Paths.Events, configuration.Paths.Worktrees, configuration.Paths.Backups}
 	if configuration.StateMachinePath != "" {

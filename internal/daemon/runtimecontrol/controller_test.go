@@ -364,6 +364,24 @@ func TestRetireReclaimsTerminalControllerRecordOnlyAfterStoreProof(t *testing.T)
 	if retained {
 		t.Fatal("terminal retirement leaked controller record")
 	}
+	if _, err := database.StoppedRuntimeTicket(t.Context(), ref); !errors.Is(err, store.ErrStaleFence) {
+		t.Fatalf("terminal retirement retained durable runtime control: %v", err)
+	}
+	// A fresh controller models a daemon restart. Repeating terminal cleanup
+	// must not resurrect admission or retain an in-memory stop map.
+	restarted, err := New(database, controllerBundle(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Retire(t.Context(), ref); err != nil {
+		t.Fatalf("restart terminal cleanup=%v", err)
+	}
+	restarted.mu.Lock()
+	_, retained = restarted.tickets[ref]
+	restarted.mu.Unlock()
+	if retained {
+		t.Fatal("restart retirement recreated a controller record")
+	}
 }
 
 func TestControllerSerializesOneTicketWithoutBlockingOtherTicketObserverOrRetirement(t *testing.T) {

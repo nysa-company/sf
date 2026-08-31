@@ -1431,3 +1431,44 @@ func TestOpenReadOnlyInspectsWithoutCreatingOrMutating(t *testing.T) {
 		t.Fatal("read-only store accepted a mutation")
 	}
 }
+
+func TestOpenAndReadOnlyRejectMissingRuntimeControlSchema(t *testing.T) {
+	ctx := context.Background()
+	for _, tamper := range []struct {
+		name string
+		sql  string
+	}{
+		{name: "table", sql: `DROP TABLE runtime_ticket_controls`},
+		{name: "index", sql: `DROP INDEX runtime_ticket_controls_state`},
+	} {
+		t.Run(tamper.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "runtime-control.sqlite")
+			database, err := Open(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.ExecContext(ctx, tamper.sql); err != nil {
+				_ = raw.Close()
+				t.Fatal(err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if reopened, err := Open(ctx, path); err == nil {
+				_ = reopened.Close()
+				t.Fatal("writable open accepted a tampered runtime-control schema")
+			}
+			if reopened, err := OpenReadOnly(ctx, path); err == nil {
+				_ = reopened.Close()
+				t.Fatal("read-only open accepted a tampered runtime-control schema")
+			}
+		})
+	}
+}

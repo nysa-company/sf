@@ -127,6 +127,7 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "publication_evidence", target: "tickets"},
 	{table: "publication_evidence_rebinds", target: "publication_evidence"},
 	{table: "runner_recovery_ledger", target: "tickets"},
+	{table: "runtime_ticket_controls", target: "tickets"},
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {
@@ -194,6 +195,7 @@ var requiredSchema = map[string][]string{
 	"publication_evidence_rebinds":         {"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "prior_witness_digest", "prior_ticket_version", "prior_leader_epoch", "prior_runner_epoch", "ticket_version", "leader_epoch", "runner_epoch", "rebind_digest", "created_at"},
 	"publication_transition_evidence":      {"channel", "project_id", "ticket_id", "witness_digest", "witness_created_at", "ticket_version", "event_created_at"},
 	"runner_recovery_ledger":               {"channel", "project_id", "ticket_id", "prior_ticket_version", "prior_runner_epoch", "prior_leader_epoch", "ticket_version", "runner_epoch", "leader_epoch", "recovery_digest", "created_at"},
+	"runtime_ticket_controls":              {"channel", "project_id", "ticket_id", "state", "generation", "stop_version", "stop_leader_epoch", "stop_runner_epoch", "authority_version", "authority_leader_epoch", "authority_runner_epoch", "updated_at"},
 }
 
 type indexRequirement struct {
@@ -235,6 +237,7 @@ var requiredIndexes = []indexRequirement{
 	{table: "publication_evidence_rebinds", name: "publication_evidence_rebind_digest", columns: []string{"rebind_digest"}},
 	{table: "runner_recovery_ledger", name: "runner_recovery_ledger_digest", columns: []string{"recovery_digest"}},
 	{table: "runner_recovery_ledger", name: "runner_recovery_ledger_ticket", columns: []string{"channel", "project_id", "ticket_id", "ticket_version"}, nonUnique: true},
+	{table: "runtime_ticket_controls", name: "runtime_ticket_controls_state", columns: []string{"channel", "state"}, nonUnique: true},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {
