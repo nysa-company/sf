@@ -55,6 +55,13 @@ The approved normative design is in
   ref: sf observes BaseRef before and after that bounded publication effect
   and treats any movement as stale rather than final. The build performs no
   service installation, channel-state mutation, or network operation.
+  Draft PR creation and correction edits likewise have no GitHub
+  expected-base/head OID CAS. Their fenced adapter makes final exact
+  observations immediately before dispatch, but those observations are not a
+  remote lock: refs or PR output may change before GitHub processes the
+  command. A non-exact or unavailable post-dispatch result remains a durable
+  uncertain effect and is never blindly retried; explicit exact reconciliation
+  is required before another mutation.
 
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
 one custom Go state engine over the application schema; DBOS is retained only

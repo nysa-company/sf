@@ -231,6 +231,37 @@ func TestUpdateFactoryPullRequestPreservesBeforeStartAfterCleanAbsence(t *testin
 	}
 }
 
+func TestUpdateFactoryPostHandoffHeadMoveRemainsUncertainWithoutReplay(t *testing.T) {
+	client, fake, identity := fixture(t)
+	prior := createDraft(t, client, identity, "before", "before body").Identity
+	expected := prior
+	expected.HeadOID = strings.Repeat("b", 40)
+	if err := fake.SetPullRequestHeadOIDForTest(prior.Number, expected.HeadOID); err != nil {
+		t.Fatal(err)
+	}
+	moved := false
+	client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "pr" && args[1] == "edit" {
+			moved = true
+			if err := fake.SetPullRequestHeadOIDForTest(prior.Number, strings.Repeat("d", 40)); err != nil {
+				return nil, err
+			}
+			return nil, errors.New("server result unavailable after dispatch")
+		}
+		return fake.Run(args)
+	})
+	claim := testClaim("pr_edit", expected, "after", "after body")
+	if err := client.UpdateFactoryPullRequest(context.Background(), claim, prior, expected, "after", "after body"); !errors.Is(err, ErrUpdateUncertain) {
+		t.Fatalf("post-handoff head move err=%v", err)
+	}
+	if !moved || fake.MutationCount("pr_edit") != 0 {
+		t.Fatalf("post-handoff edit moved=%v mutations=%d", moved, fake.MutationCount("pr_edit"))
+	}
+	if err := client.UpdateFactoryPullRequest(context.Background(), claim, prior, expected, "after", "after body"); err == nil || fake.MutationCount("pr_edit") != 0 {
+		t.Fatalf("unreconciled edit replay err=%v mutations=%d", err, fake.MutationCount("pr_edit"))
+	}
+}
+
 func TestRefreshFactoryPullRequestIdentityRefusals(t *testing.T) {
 	prior := contracts.PullRequestIdentity{Number: 7, Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", BaseOID: strings.Repeat("c", 40), FactoryOwned: true}
 	expected := prior
@@ -661,6 +692,31 @@ func TestCreateUncertainNeverAttemptsNumberOnlyOrphanClose(t *testing.T) {
 	}
 	if closed {
 		t.Fatal("uncertain create attempted number-only orphan close")
+	}
+}
+
+func TestCreatePostHandoffBaseMoveRemainsUncertainWithoutReplay(t *testing.T) {
+	client, fake, identity := fixture(t)
+	moved := false
+	client.runner = commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "pr" && args[1] == "create" {
+			moved = true
+			if err := fake.SetBaseHeadOIDForTest(strings.Repeat("d", 40)); err != nil {
+				return nil, err
+			}
+			return nil, errors.New("server result unavailable after dispatch")
+		}
+		return fake.Run(args)
+	})
+	claim := testClaim("draft_pr", identity, "title", "body")
+	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrCreateUncertain) {
+		t.Fatalf("post-handoff base move err=%v", err)
+	}
+	if !moved || fake.MutationCount("pr_create") != 0 {
+		t.Fatalf("post-handoff create moved=%v mutations=%d", moved, fake.MutationCount("pr_create"))
+	}
+	if _, err := client.CreateDraftPullRequest(context.Background(), claim, identity, "title", "body"); !errors.Is(err, ErrCreateBeforeStart) || fake.MutationCount("pr_create") != 0 {
+		t.Fatalf("unreconciled create replay err=%v mutations=%d", err, fake.MutationCount("pr_create"))
 	}
 }
 

@@ -355,9 +355,12 @@ func (c Client) CreateDraftPullRequest(ctx context.Context, durable domain.Exter
 		return contracts.PullRequestIdentity{}, err
 	}
 	markedBody := body + "\n\n" + ownershipMarker(identity)
-	// Creation has no GitHub-side CAS.  The durable launch handoff therefore
-	// performs one final exact absence/source observation while the mutation
-	// gate is held; a pre-handoff list result is never sufficient.
+	// Creation has no GitHub-side base/head CAS. The durable launch handoff
+	// therefore re-observes the exact base, source, and PR absence while the
+	// mutation gate is held; a pre-handoff list result is never sufficient.
+	// These are observations, not a remote lock: refs may still move before
+	// GitHub processes the command, so a non-exact or unavailable post-handoff
+	// result remains uncertain and is never blindly retried.
 	_, runErr := c.mutateCreateExact(ctx, durable, identity, "pr", "create", "--repo", repoArg(identity.Repository), "--head", identity.HeadOwner+":"+identity.HeadRef, "--base", identity.BaseRef, "--draft", "--title", title, "--body", markedBody)
 	if errors.Is(runErr, ErrProcessCleanup) || errors.Is(runErr, ErrCleanupQuarantineFatal) {
 		return contracts.PullRequestIdentity{}, runErr
@@ -546,9 +549,10 @@ func (c Client) mutateCreateExact(ctx context.Context, claim domain.ExternalEffe
 	}
 	handedOff := false
 	output, err := c.mutationGuard.RunExternalMutation(ctx, claim, func(runCtx context.Context) ([]byte, error) {
-		// GitHub has no create-side base/head CAS. Re-read the protected base
-		// inside the durable launch gate so the PR is only launched from the
-		// exact reviewed base object, alongside the source and absence witnesses.
+		// GitHub has no create-side base/head CAS. Re-read the protected base,
+		// source, and PR absence inside the durable launch gate. This proves the
+		// last pre-handoff observations matched the durable identity; it cannot
+		// prevent remote movement before GitHub processes the command.
 		if err := c.observeBaseExact(runCtx, identity, identity.BaseOID); err != nil {
 			if errors.Is(err, ErrProcessCleanup) || errors.Is(err, ErrCleanupQuarantineFatal) {
 				return nil, err
