@@ -557,12 +557,22 @@ func pollCIAuthority(ctx context.Context, db *Store, ticket Ticket, fence domain
 	contracts.CIRequiredCheckPolicyObserver
 	RequiredChecks(context.Context, contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error)
 }) error {
-	if err := db.RecordCIRequiredCheckPolicyFromObserver(ctx, ticket.Ref, gh); err != nil {
-		return fmt.Errorf("record fresh CI policy: %w", err)
-	}
 	publication, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
 	if err != nil {
 		return fmt.Errorf("load current published candidate: %w", err)
+	}
+	// FakeGH independently models the protected base tip. Most CI fixtures
+	// create a PR with a deterministic historical BaseOID, so align the fake's
+	// live protected ref to that authenticated publication before observing
+	// policy. Deliberate base-move tests use a remote without this setup path or
+	// mutate it after this point.
+	if setter, ok := gh.(interface{ SetBaseHeadOIDForTest(string) error }); ok {
+		if err := setter.SetBaseHeadOIDForTest(publication.PullRequest.BaseOID); err != nil {
+			return fmt.Errorf("align fake protected base: %w", err)
+		}
+	}
+	if err := db.RecordCIRequiredCheckPolicyFromObserver(ctx, ticket.Ref, gh); err != nil {
+		return fmt.Errorf("record fresh CI policy: %w", err)
 	}
 	checks, err := gh.RequiredChecks(ctx, publication.PullRequest)
 	if err != nil {

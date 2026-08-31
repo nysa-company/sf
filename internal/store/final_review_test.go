@@ -12,6 +12,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
+	"github.com/nysa-company/sf/internal/workflowprompt"
 )
 
 type finalReviewFixture struct {

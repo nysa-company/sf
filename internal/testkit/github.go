@@ -118,6 +118,7 @@ type FakeGHState struct {
 	AdminEnforced               bool                              `json:"admin_enforced"`
 	ActiveRulesetCount          int                               `json:"active_ruleset_count"`
 	ClassicProtection           bool                              `json:"classic_protection"`
+	RequiredStatusCheckContexts []string                          `json:"required_status_check_contexts,omitempty"`
 	Rulesets                    []FakeRuleset                     `json:"rulesets,omitempty"`
 	BypassPullRequestAllowances int                               `json:"bypass_pull_request_allowances"`
 	BypassForcePushAllowances   int                               `json:"bypass_force_push_allowances"`
@@ -179,6 +180,20 @@ func (f *FakeGH) SetBranchProtectionForTest(strict bool, bypassAllowances int) e
 	return f.withState(func() (bool, error) {
 		f.state.StrictStatusChecks = strict
 		f.state.BypassPullRequestAllowances = bypassAllowances
+		return true, nil
+	})
+}
+
+// SetRequiredStatusCheckContextsForTest configures the exact classic branch
+// protection contexts emitted by the GraphQL protection witness.
+func (f *FakeGH) SetRequiredStatusCheckContextsForTest(contexts ...string) error {
+	for _, context := range contexts {
+		if strings.TrimSpace(context) == "" {
+			return errors.New("testkit: required status context is empty")
+		}
+	}
+	return f.withState(func() (bool, error) {
+		f.state.RequiredStatusCheckContexts = append([]string(nil), contexts...)
 		return true, nil
 	})
 }
@@ -1156,6 +1171,7 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 			value := map[string]any{
 				"data": map[string]any{"repository": map[string]any{"ref": map[string]any{"branchProtectionRule": map[string]any{
 					"id": "fake-rule-main", "pattern": "main", "requiresStrictStatusChecks": snapshot.StrictStatusChecks, "isAdminEnforced": snapshot.AdminEnforced,
+					"requiredStatusCheckContexts": snapshot.RequiredStatusCheckContexts,
 					"bypassPullRequestAllowances": map[string]int{"totalCount": snapshot.BypassPullRequestAllowances}, "bypassForcePushAllowances": map[string]int{"totalCount": snapshot.BypassForcePushAllowances},
 				}}}},
 			}

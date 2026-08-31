@@ -28,7 +28,7 @@ func bindTerminalMergeEffect(t *testing.T, db *Store, fixture finalReviewFixture
 		RepositoryHost:    publication.PullRequest.Repository.Host,
 		RepositoryOwner:   publication.PullRequest.Repository.Owner,
 		RepositoryName:    publication.PullRequest.Repository.Name,
-		PullRequestNumber: publication.PullRequest.Number, HeadOID: publication.PullRequest.HeadOID,
+		PullRequestNumber: publication.PullRequest.Number, HeadOwner: publication.PullRequest.HeadOwner, HeadRepository: publication.PullRequest.HeadRepository, HeadRef: publication.PullRequest.HeadRef, HeadOID: publication.PullRequest.HeadOID,
 		BaseRef: publication.PullRequest.BaseRef, OriginalBaseOID: publication.PullRequest.BaseOID,
 		ProtectionRuleID: "post-publication-rule", StrictStatusChecks: true,
 		AdminEnforced: true, Method: "squash",
