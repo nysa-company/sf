@@ -17,6 +17,29 @@ var ErrLeaseCapacity = errors.New("lease capacity is exhausted")
 
 type phaseRecoveryBaseline struct{ version, runner, leader, currentLeader uint64 }
 
+// hasDurableCandidateRepairBaseline proves the narrow correction path where a
+// Builder completed and persisted a successor candidate before the daemon
+// could record its repair completion.  It is not a generic lifecycle bridge:
+// the immutable repair binding, successor candidate, and Builder result
+// binding must all agree on the exact old Builder fence.
+func hasDurableCandidateRepairBaseline(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, baseline phaseRecoveryBaseline) bool {
+	var count int
+	err := conn.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM candidate_repair_bindings r
+		JOIN candidate_snapshots c ON c.channel=r.channel AND c.project_id=r.project_id AND c.ticket_id=r.ticket_id AND c.generation=r.target_generation
+		JOIN candidate_result_bindings b ON b.channel=r.channel AND b.project_id=r.project_id AND b.ticket_id=r.ticket_id AND b.generation=r.target_generation
+		JOIN provider_attempts a ON a.id=b.provider_attempt_id AND a.attempt=b.provider_attempt AND a.channel=b.channel AND a.project_id=b.project_id AND a.ticket_id=b.ticket_id AND a.phase='build' AND a.role='builder' AND a.state='completed' AND a.outcome='completed'
+		WHERE r.channel=? AND r.project_id=? AND r.ticket_id=?
+		  AND c.ticket_version=? AND c.leader_epoch=? AND c.runner_epoch=?
+		  AND b.binding_ticket_version=? AND b.leader_epoch=? AND b.runner_epoch=?
+		  AND a.expected_ticket_version=? AND a.leader_epoch=? AND a.runner_epoch=?`,
+		ref.Channel, ref.Project, ref.Ticket,
+		baseline.version, baseline.leader, baseline.runner,
+		baseline.version, baseline.leader, baseline.runner,
+		baseline.version, baseline.leader, baseline.runner).Scan(&count)
+	return err == nil && count == 1
+}
+
 func recoveryProviderPhase(state domain.State) (domain.Phase, string, bool) {
 	switch state {
 	case domain.StatePlanning:
@@ -183,6 +206,34 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					return ErrPublicationEvidence
 				}
 			}
+			// AcquireLeader advances the daemon epoch before this startup fence can
+			// append a ticket-local recovery row. A waiting_ci ticket with pending
+			// evidence is therefore authenticated at its prior signed leader, not
+			// against the new daemon epoch. The complete CI chain (including any
+			// earlier runner recovery) is the only admissible predecessor.
+			ciWaitingPriorLeader := uint64(0)
+			if ticket.state == domain.StateWaitingCI {
+				var pendingEvidence int
+				if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND observation_classification='pending' AND resulting_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket).Scan(&pendingEvidence); err != nil {
+					return err
+				}
+				if pendingEvidence > 0 {
+					ciWaitingPriorLeader = latest.LeaderEpoch
+					if !found {
+						publication, publicationFound, publicationErr := loadPublicationEvidenceRow(ctx, conn, ref)
+						if publicationErr != nil || !publicationFound || loadLatestPublicationRebind(ctx, conn, &publication) != nil {
+							return ErrPublicationEvidence
+						}
+						ciWaitingPriorLeader = publication.CurrentFence.LeaderEpoch
+					}
+					if ciWaitingPriorLeader == 0 || ciWaitingPriorLeader >= leaderEpoch {
+						return ErrPublicationEvidence
+					}
+					if _, err := loadCICurrentPublicationAt(ctx, conn, ref, ciWaitingPriorLeader); err != nil {
+						return ErrPublicationEvidence
+					}
+				}
+			}
 			var recoveryCount int
 			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, channel, ticket.project, ticket.id).Scan(&recoveryCount); err != nil {
 				return err
@@ -302,7 +353,7 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 						return ErrPublicationEvidence
 					}
 					if !found && baseline.runner == 1 {
-						if err := validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version); err != nil {
+						if err := validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version); err != nil && !hasDurableCandidateRepairBaseline(ctx, conn, ref, baseline) {
 							return ErrPublicationEvidence
 						}
 					}
@@ -348,7 +399,9 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					}
 				}
 			}
-			if priorLeader == 0 && found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
+			if priorLeader == 0 && ciWaitingPriorLeader != 0 {
+				priorLeader = ciWaitingPriorLeader
+			} else if priorLeader == 0 && found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
 				priorLeader = latest.LeaderEpoch
 			} else if priorLeader == 0 && ticket.state == domain.StateBuilding {
 				// Verification may have committed and transitioned the ticket to

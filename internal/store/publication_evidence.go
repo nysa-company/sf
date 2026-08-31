@@ -1491,6 +1491,18 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 		return PublishedCandidateEvidence{}, err
 	}
 	waitingReplay := ticket.State == domain.StateWaitingCI
+	// A pending CI observation is a real, authenticated same-state transition.
+	// The generic publication reader predates that chain and deliberately
+	// rejects additional events at the publication->waiting_ci version.  Prefer
+	// the CI-specific reader when it can prove the entire live chain; retain the
+	// generic paths below for non-CI waiting-state recoveries.
+	ciWaitingReplay := false
+	if waitingReplay {
+		if current, ciErr := loadCICurrentPublication(ctx, s.db, ref); ciErr == nil {
+			value = current
+			ciWaitingReplay = true
+		}
+	}
 	semanticPublishingReplay := false
 	semanticWaitingReplay := false
 	blockedPublishingReplay := false
@@ -1508,7 +1520,10 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 			return PublishedCandidateEvidence{}, ErrPublicationEvidence
 		}
 	}
-	if waitingReplay {
+	if ciWaitingReplay {
+		// loadCICurrentPublication already authenticated the complete pending
+		// chain and any signed runner-recovery rows to the live leader.
+	} else if waitingReplay {
 		waitingVersion := value.CurrentTicketVersion + 1
 		if value.CurrentTicketVersion == ^uint64(0) || ticket.Version < waitingVersion || ticket.RunnerEpoch < value.CurrentFence.RunnerEpoch {
 			return PublishedCandidateEvidence{}, ErrPublicationEvidence
@@ -1543,7 +1558,7 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 	if err := s.db.QueryRowContext(ctx, `SELECT base_ref FROM projects WHERE channel=? AND id=?`, ref.Channel, ref.Project).Scan(&projectBaseRef); err != nil || projectBaseRef != value.PullRequest.BaseRef {
 		return PublishedCandidateEvidence{}, ErrPublicationEvidence
 	}
-	if waitingReplay {
+	if waitingReplay && !ciWaitingReplay {
 		payload, err := json.Marshal(struct {
 			WitnessDigest    string `json:"witness_digest"`
 			WitnessCreatedAt string `json:"witness_created_at"`
@@ -1566,7 +1581,10 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 	if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&leader); err != nil {
 		return PublishedCandidateEvidence{}, ErrStaleFence
 	}
-	if waitingReplay {
+	if ciWaitingReplay {
+		// loadCICurrentPublication already authenticated the complete pending
+		// chain and any signed runner-recovery rows to the live leader.
+	} else if waitingReplay {
 		baselineVersion, baselineRunner, baselineLeader := waitingVersion, value.CurrentFence.RunnerEpoch, value.CurrentFence.LeaderEpoch
 		if waitingPairRecovery {
 			baselineVersion += 2
@@ -1583,7 +1601,7 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 	} else if !blockedPublishingReplay && !semanticPublishingReplay && leader != value.CurrentFence.LeaderEpoch {
 		return PublishedCandidateEvidence{}, ErrStaleFence
 	}
-	if waitingReplay && !semanticWaitingReplay && !blockedWaitingReplay {
+	if waitingReplay && !ciWaitingReplay && !semanticWaitingReplay && !blockedWaitingReplay {
 		baselineVersion, baselineRunner, baselineLeader := waitingVersion, value.CurrentFence.RunnerEpoch, value.CurrentFence.LeaderEpoch
 		if waitingPairRecovery {
 			baselineVersion += 2

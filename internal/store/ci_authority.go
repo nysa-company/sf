@@ -152,6 +152,10 @@ func canonicalCIState(value string) (string, bool) {
 		return "pending", true
 	case "success":
 		return "success", true
+	case "skipped":
+		return "skipped", true
+	case "neutral":
+		return "neutral", true
 	case "failure", "failed", "error", "timed_out", "timed-out", "action_required":
 		return "failure", true
 	case "cancelled", "canceled", "cancelled_failure":
@@ -561,6 +565,14 @@ func (s *Store) authenticateCurrentCIObservation(ctx context.Context, q ciQuery,
 // leader/runner fence; every such advance must be an exact contiguous,
 // authenticated checks_pending evidence row.
 func loadCICurrentPublication(ctx context.Context, q ciQuery, ref domain.TicketRef) (PublishedCandidateEvidence, error) {
+	return loadCICurrentPublicationAt(ctx, q, ref, 0)
+}
+
+// loadCICurrentPublicationAt validates the complete CI chain at a particular
+// ticket-local leader when nonzero. Startup fencing uses that form after the
+// daemon leader has advanced but before it appends the next signed recovery
+// row; ordinary readers pass zero and require the durable daemon leader.
+func loadCICurrentPublicationAt(ctx context.Context, q ciQuery, ref domain.TicketRef, ticketLeader uint64) (PublishedCandidateEvidence, error) {
 	publication, err := loadCIPublicationBase(ctx, q, ref)
 	if err != nil {
 		return PublishedCandidateEvidence{}, err
@@ -569,6 +581,9 @@ func loadCICurrentPublication(ctx context.Context, q ciQuery, ref domain.TicketR
 	var version, runner, leader uint64
 	if err := q.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &leader); err != nil {
 		return PublishedCandidateEvidence{}, normalizeBusy(ctx, err)
+	}
+	if ticketLeader != 0 {
+		leader = ticketLeader
 	}
 	if state != string(domain.StateWaitingCI) || runner < publication.CurrentFence.RunnerEpoch || (runner == publication.CurrentFence.RunnerEpoch && leader != publication.CurrentFence.LeaderEpoch) {
 		return PublishedCandidateEvidence{}, ErrPublicationEvidence
@@ -1108,7 +1123,16 @@ func (s *Store) RecordCandidateRepairCompletion(ctx context.Context, input Candi
 	}
 	return s.ciWrite(ctx, input.Ref, func(conn *sql.Conn) error {
 		if err := s.assertTicketFence(ctx, conn, input.Ref, input.BuilderBindingTicketVersion, input.BuilderBindingFence); err != nil {
-			return err
+			// Builder completion may be durable before a daemon crash. The
+			// successor binding remains immutable at its original builder fence,
+			// but a signed runner-recovery ledger may prove the exact current
+			// building owner derived from it. Do not accept a leader-only or
+			// caller-reconstructed rebind.
+			var state string
+			var version, runner, leader uint64
+			if scanErr := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, input.Ref.Channel, input.Ref.Project, input.Ref.Ticket).Scan(&state, &version, &runner, &leader); scanErr != nil || state != string(domain.StateBuilding) || version <= input.BuilderBindingTicketVersion || runner <= input.BuilderBindingFence.RunnerEpoch || validateRunnerRecoveryLedger(ctx, conn, input.Ref, input.BuilderBindingTicketVersion, input.BuilderBindingFence.RunnerEpoch, input.BuilderBindingFence.LeaderEpoch, version, runner, leader) != nil {
+				return err
+			}
 		}
 		var predecessor uint64
 		if err := conn.QueryRowContext(ctx, `SELECT predecessor_generation FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, input.Ref.Channel, input.Ref.Project, input.Ref.Ticket, input.TargetGeneration).Scan(&predecessor); err != nil {

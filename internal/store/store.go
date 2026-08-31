@@ -1483,25 +1483,47 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 				return ErrEvidenceConflict
 			}
 		}
-		// Re-authenticate on the transaction connection.  A separate pooled
-		// connection can observe a different snapshot (or block behind this
-		// write), turning an otherwise valid same-fence candidate into a false
-		// evidence conflict.  The transaction-scoped reader also keeps the
-		// candidate proof and ticket fence in one authenticated snapshot.
-		authenticated, err := s.latestCandidateFrom(ctx, conn, transition.Ref, true)
-		if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != version || authenticated.Fence != transition.Fence || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {
-			return ErrEvidenceConflict
-		}
 		var attemptID int64
 		var attempt, actualAttempt int
+		var bindingVersion, bindingLeader, bindingRunner uint64
 		var parent string
 		var phase, role, state, outcome string
-		if err := conn.QueryRowContext(ctx, `SELECT b.provider_attempt_id,b.provider_attempt,b.commit_parent_oid,r.phase,a.role,a.state,a.outcome
+		bindingQuery := `SELECT b.provider_attempt_id,b.provider_attempt,b.binding_ticket_version,b.leader_epoch,b.runner_epoch,b.commit_parent_oid,r.phase,a.role,a.state,a.outcome
 			FROM candidate_result_bindings b JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id JOIN provider_attempts a ON a.id=r.provider_attempt_id
-			WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.generation=? AND b.binding_ticket_version=? AND b.leader_epoch=? AND b.runner_epoch=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, version, transition.Fence.LeaderEpoch, transition.Fence.RunnerEpoch).Scan(&attemptID, &attempt, &parent, &phase, &role, &state, &outcome); err != nil || attemptID <= 0 || attempt <= 0 || phase != "build" || role != "builder" || state != "completed" || outcome != "completed" || !validOID(parent) {
+			WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.generation=?`
+		bindingArgs := []any{transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation}
+		if repairPending == 0 {
+			bindingQuery += ` AND b.binding_ticket_version=? AND b.leader_epoch=? AND b.runner_epoch=?`
+			bindingArgs = append(bindingArgs, version, transition.Fence.LeaderEpoch, transition.Fence.RunnerEpoch)
+		}
+		if err := conn.QueryRowContext(ctx, bindingQuery, bindingArgs...).Scan(&attemptID, &attempt, &bindingVersion, &bindingLeader, &bindingRunner, &parent, &phase, &role, &state, &outcome); err != nil || attemptID <= 0 || attempt <= 0 || phase != "build" || role != "builder" || state != "completed" || outcome != "completed" || !validOID(parent) {
 			return ErrEvidenceConflict
 		}
 		if err := conn.QueryRowContext(ctx, `SELECT attempt FROM provider_attempts WHERE id=?`, attemptID).Scan(&actualAttempt); err != nil || actualAttempt != attempt {
+			return ErrEvidenceConflict
+		}
+		if repairPending > 0 {
+			// A repaired candidate remains bound to its original Builder fence.
+			// It may cross a restart only through this immutable completion and a
+			// contiguous signed runner-recovery ledger.
+			var completionAttemptID int64
+			var completionAttempt int
+			var completionVersion, completionLeader, completionRunner uint64
+			if err := conn.QueryRowContext(ctx, `SELECT builder_result_attempt_id,builder_result_attempt,builder_binding_ticket_version,builder_binding_leader_epoch,builder_binding_runner_epoch
+				FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=? AND final_candidate_head_sha=? AND final_candidate_tree_sha=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, candidate.HeadSHA, candidate.TreeSHA).Scan(&completionAttemptID, &completionAttempt, &completionVersion, &completionLeader, &completionRunner); err != nil || completionAttemptID != attemptID || completionAttempt != attempt || completionVersion != bindingVersion || completionLeader != bindingLeader || completionRunner != bindingRunner || validateRunnerRecoveryLedger(ctx, conn, transition.Ref, bindingVersion, bindingRunner, bindingLeader, version, runner, transition.Fence.LeaderEpoch) != nil {
+				return ErrEvidenceConflict
+			}
+		} else if bindingVersion != version || bindingLeader != transition.Fence.LeaderEpoch || bindingRunner != transition.Fence.RunnerEpoch {
+			return ErrEvidenceConflict
+		}
+		// Re-authenticate on the transaction connection. A repaired candidate is
+		// the one narrow historical-fence case: its completion+ledger above bind
+		// it to the recovered owner without relaxing normal candidates.
+		authenticated, err := s.latestCandidateFrom(ctx, conn, transition.Ref, repairPending == 0)
+		if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != bindingVersion || authenticated.Fence.LeaderEpoch != bindingLeader || authenticated.Fence.RunnerEpoch != bindingRunner || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {
+			return ErrEvidenceConflict
+		}
+		if repairPending > 0 && s.reauthenticateStoredCandidateCommandHistoricalFrom(ctx, conn, transition.Ref, authenticated) != nil {
 			return ErrEvidenceConflict
 		}
 		if err := assertNewestBoundResult(ctx, conn, transition.Ref, domain.PhaseBuild, "builder", ProviderAttemptResultKey{AttemptID: attemptID, Ref: transition.Ref, Phase: domain.PhaseBuild, Attempt: attempt}); err != nil {

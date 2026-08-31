@@ -172,7 +172,7 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 			if clientErr != nil {
 				return daemon.WorkflowRuntimeComponents{}, fmt.Errorf("compose GitHub client: %w", errors.Join(clientErr, gh.Close()))
 			}
-			runtimeWorker = Worker{Store: dependencies.Store, Engine: dependencies.Engine, Workflow: worker, Publication: publication.Worker{Store: dependencies.Store, Git: gitRunner, GitHub: githubClient}, PublicationEnabled: true}
+			runtimeWorker = Worker{Store: dependencies.Store, Engine: dependencies.Engine, Workflow: worker, Publication: publication.Worker{Store: dependencies.Store, Git: gitRunner, GitHub: githubClient}, CI: CIWorker{Store: dependencies.Store, Observer: githubClient}, PublicationEnabled: true}
 			mergeObserver = publishedMergeObserver{Store: dependencies.Store, GitHub: githubClient}
 		}
 		scheduler := workflowruntime.NewScheduler(

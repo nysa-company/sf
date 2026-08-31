@@ -653,6 +653,32 @@ func (f *FakeGH) RequiredChecks(_ context.Context, identity contracts.PullReques
 	return checks, err
 }
 
+// ObserveCIRequiredCheckPolicy supplies the same authenticated, read-only
+// policy/check boundary used by the production poller. The fake's durable
+// state is intentionally the source of truth so restart tests do not rely on
+// an in-memory test-only policy.
+func (f *FakeGH) ObserveCIRequiredCheckPolicy(_ context.Context, identity contracts.PullRequestIdentity) (contracts.CIRequiredCheckPolicyObservation, error) {
+	var result contracts.CIRequiredCheckPolicyObservation
+	err := f.withState(func() (bool, error) {
+		index, err := f.findLocked(identity)
+		if err != nil {
+			return false, err
+		}
+		pr := f.state.PRs[index].Identity
+		if !identityMatches(pr, identity) || pr.BaseOID == "" {
+			return false, errors.New("fake-gh: pull request identity drifted")
+		}
+		checks := append([]contracts.RequiredCheck(nil), f.state.Checks[pr.Number]...)
+		result = contracts.CIRequiredCheckPolicyObservation{
+			PullRequest: pr, ProtectedBranchRef: pr.BaseRef, ProtectedBranchOID: pr.BaseOID,
+			PolicySourceDigest: strings.Repeat("a", 64), AuthenticatedPrincipal: "fake-gh",
+			RequiredChecks: checks, ObservedAt: time.Now().UTC(),
+		}
+		return false, nil
+	})
+	return result, err
+}
+
 func (f *FakeGH) MarkReady(_ context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity) error {
 	if err := validateFakeClaim(claim, "pr_ready", identity); err != nil {
 		return err

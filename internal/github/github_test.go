@@ -2063,7 +2063,7 @@ func TestOfficialMergeArgvGoldenAndProof(t *testing.T) {
 		t.Fatalf("guarded merge verified=%v err=%v", verified, err)
 	}
 	queue := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{position}}}}", "-F", "owner=example", "-F", "name=app", "-F", "number=7"}
-	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$qualifiedRef:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedRef){branchProtectionRule{id pattern requiresStrictStatusChecks isAdminEnforced bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app", "-F", "qualifiedRef=refs/heads/main"}
+	protection := []string{"api", "--hostname", "github.com", "graphql", "-f", "query=query($owner:String!,$name:String!,$qualifiedRef:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedRef){branchProtectionRule{id pattern requiresStrictStatusChecks isAdminEnforced requiredStatusCheckContexts bypassPullRequestAllowances(first:1){totalCount} bypassForcePushAllowances(first:1){totalCount}}}}}", "-F", "owner=example", "-F", "name=app", "-F", "qualifiedRef=refs/heads/main"}
 	rules := []string{"api", "--hostname", "github.com", "--method", "GET", "repos/example/app/rules/branches/main?per_page=100&page=1"}
 	rulesetAudit := []string{"api", "--hostname", "github.com", "--method", "GET", "repos/example/app/rulesets?includes_parents=true&targets=branch&per_page=100&page=1"}
 	view := []string{"pr", "view", "7", "--repo", "example/app", "--json", prFields}
@@ -2110,6 +2110,16 @@ func TestChecksAllowExtrasButFailureDominatesPending(t *testing.T) {
 	actual[1].State = "FAILURE"
 	if err := evaluateChecks(actual, []CheckIdentity{{Name: "required", ExternalID: "one"}}); !errors.Is(err, ErrChecksFailed) {
 		t.Fatalf("failure precedence=%v", err)
+	}
+}
+
+func TestRequiredChecksMatchProtectionRequiresExactConfiguredSet(t *testing.T) {
+	protection := strictProtectionWitness{Checks: []string{"lint\x00-", "unit\x001"}}
+	if !requiredChecksMatchProtection([]contracts.RequiredCheck{{Name: "unit", ExternalID: "run-1"}, {Name: "lint", ExternalID: "run-2"}}, protection) {
+		t.Fatal("exact configured check set was refused")
+	}
+	if requiredChecksMatchProtection([]contracts.RequiredCheck{{Name: "lint", ExternalID: "run-2"}}, protection) || requiredChecksMatchProtection([]contracts.RequiredCheck{{Name: "lint", ExternalID: "run-2"}, {Name: "unit", ExternalID: "run-1"}, {Name: "extra", ExternalID: "run-3"}}, protection) {
+		t.Fatal("subset or extra check set was accepted")
 	}
 }
 

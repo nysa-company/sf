@@ -26,6 +26,7 @@ type Worker struct {
 	Engine      workflowworker.StateMachine
 	Workflow    workflowworker.Worker
 	Publication pub.Worker
+	CI          CIWorker
 	// PublicationEnabled is explicit so a pre-publishing composition cannot
 	// accidentally treat a zero publication worker as a successful phase.
 	PublicationEnabled bool
@@ -65,10 +66,14 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 			Transitioned: result.Transitioned,
 			Replayed:     result.Replayed,
 		}, err
+	case domain.StateWaitingCI:
+		if w.CI.Observer == nil {
+			return workflowworker.RunResult{Ref: ref, State: ticket.State, Version: ticket.Version}, nil
+		}
+		return w.CI.Run(ctx, ref, fence)
 	default:
-		// waiting_ci and all control/terminal states are inert. The scheduler
-		// normally filters them, but keeping this dispatch boundary inert makes
-		// direct calls safe as well.
+		// Control and terminal states are inert. The scheduler normally filters
+		// them, but keeping this dispatch boundary inert makes direct calls safe.
 		return workflowworker.RunResult{Ref: ref, State: ticket.State, Version: ticket.Version}, nil
 	}
 }
