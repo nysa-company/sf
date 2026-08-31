@@ -120,7 +120,10 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	if err != nil {
 		return result, err
 	}
-	candidate, err := w.Store.LatestCandidate(ctx, ref)
+	// Publication starts after building has advanced the ticket fence. Load the
+	// immutable candidate through the recovery-qualified reader; LatestCandidate
+	// intentionally rejects that historical build fence once publishing begins.
+	candidate, err := w.Store.RecoverableCandidate(ctx, ref)
 	if err != nil {
 		return result, err
 	}
