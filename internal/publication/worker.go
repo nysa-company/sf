@@ -119,7 +119,11 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	if err != nil {
 		return result, err
 	}
-	if candidate.TicketVersion+1 != ticket.Version || candidate.Fence.LeaderEpoch != fence.LeaderEpoch || candidate.Fence.RunnerEpoch != fence.RunnerEpoch || candidate.Snapshot.SourceDigest != ticket.SourceDigest || worktree.TicketVersion != ticket.Version || worktree.Fence != fence {
+	// A worktree registration is anchored to the version at which it was
+	// allocated and remains valid across the planning, verification, and build
+	// transitions.  The candidate is the publication-phase version witness; do
+	// not require the registration's original TicketVersion to equal it.
+	if candidate.TicketVersion+1 != ticket.Version || candidate.Fence.LeaderEpoch != fence.LeaderEpoch || candidate.Fence.RunnerEpoch != fence.RunnerEpoch || candidate.Snapshot.SourceDigest != ticket.SourceDigest {
 		return result, ErrPublicationDrift
 	}
 	if err := w.GitHub.AuthStatus(ctx); err != nil {
@@ -152,6 +156,12 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	if err := w.Store.RecordPublishedCandidate(ctx, value); err != nil {
 		return result, err
 	}
+	// Recording the witness is durable, but it is not a substitute for a
+	// fresh live observation. Re-authenticate both effects again immediately
+	// before allowing publishing to advance.
+	if err := w.validatePublished(ctx, observer, gitWorktree, candidate, pr); err != nil {
+		return result, err
+	}
 	if _, err := w.Store.TransitionPublishedCandidate(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence}); err != nil {
 		return result, err
 	}
@@ -160,6 +170,29 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 }
 
 func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domain.Fence, project store.Project, candidate store.StoredCandidate, worktree store.StoredWorktree, gitWorktree gitboundary.Worktree) (store.Effect, error) {
+	request := pushRequestDigest(ticket.Ref, project.Path, worktree, candidate)
+	intent := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence}, RequestDigest: request, Repository: project.Path, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "push", BaseRef: project.BaseRef, ExpectedBaseOID: candidate.Snapshot.BaseSHA, ExpectedHeadOID: candidate.Snapshot.HeadSHA}
+	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)
+	// execute is used both for a fresh effect and after recovery has proven
+	// absence.  Recovery deliberately replans the failed effect before claiming
+	// it; reusing the old failed claim would leave the Worker stranded.
+	execute := func() (store.Effect, error) {
+		if _, err := w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: intent.SemanticKey, Ref: ticket.Ref, Kind: "git/push", TicketVersion: ticket.Version, Fence: fence, RequestDigest: request}); err != nil {
+			return store.Effect{}, err
+		}
+		claim, err := w.Store.IssueGitMutationClaim(ctx, intent)
+		if err != nil {
+			return store.Effect{}, err
+		}
+		head, err := w.Git.PushWithRequest(ctx, gitWorktree, gitboundary.PushRequest{ExpectedHead: candidate.Snapshot.HeadSHA, ExpectedPriorHead: "", MutationClaim: claim})
+		if err != nil {
+			return store.Effect{}, err
+		}
+		if head != candidate.Snapshot.HeadSHA {
+			return store.Effect{}, ErrRemoteCandidate
+		}
+		return w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: intent.SemanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}, store.CanonicalPublicationPushObservation(worktree.Branch, head))
+	}
 	if facts, err := w.Store.PublicationPushIntent(ctx, ticket.Ref); err == nil {
 		if facts.Claim.Repository != project.Path || facts.Claim.Worktree != worktree.Path || facts.Claim.Branch != worktree.Branch || facts.Claim.BaseRef != project.BaseRef || facts.Claim.ExpectedBaseOID != candidate.Snapshot.BaseSHA || facts.Claim.ExpectedHeadOID != candidate.Snapshot.HeadSHA {
 			return store.Effect{}, ErrPublicationDrift
@@ -192,7 +225,7 @@ func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domai
 				return store.Effect{}, settleErr
 			}
 			if !present {
-				return w.ensurePush(ctx, ticket, fence, project, candidate, worktree, gitWorktree)
+				return execute()
 			}
 			return effect, nil
 		}
@@ -201,30 +234,13 @@ func (w Worker) ensurePush(ctx context.Context, ticket store.Ticket, fence domai
 			return store.Effect{}, settleErr
 		}
 		if !present {
-			return w.ensurePush(ctx, ticket, fence, project, candidate, worktree, gitWorktree)
+			return execute()
 		}
 		return effect, nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return store.Effect{}, err
 	}
-	request := pushRequestDigest(ticket.Ref, project.Path, worktree, candidate)
-	intent := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence}, RequestDigest: request, Repository: project.Path, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "push", BaseRef: project.BaseRef, ExpectedBaseOID: candidate.Snapshot.BaseSHA, ExpectedHeadOID: candidate.Snapshot.HeadSHA}
-	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)
-	if _, err := w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: intent.SemanticKey, Ref: ticket.Ref, Kind: "git/push", TicketVersion: ticket.Version, Fence: fence, RequestDigest: request}); err != nil {
-		return store.Effect{}, err
-	}
-	claim, err := w.Store.IssueGitMutationClaim(ctx, intent)
-	if err != nil {
-		return store.Effect{}, err
-	}
-	head, err := w.Git.PushWithRequest(ctx, gitWorktree, gitboundary.PushRequest{ExpectedHead: candidate.Snapshot.HeadSHA, ExpectedPriorHead: "", MutationClaim: claim})
-	if err != nil {
-		return store.Effect{}, err
-	}
-	if head != candidate.Snapshot.HeadSHA {
-		return store.Effect{}, ErrRemoteCandidate
-	}
-	return w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: intent.SemanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}, store.CanonicalPublicationPushObservation(worktree.Branch, head))
+	return execute()
 }
 
 func (w Worker) ensureDraft(ctx context.Context, ticket store.Ticket, fence domain.Fence, observer contracts.DraftPullRequestObserver, identity contracts.PullRequestIdentity, title, body string) (contracts.PullRequestIdentity, time.Time, error) {
@@ -264,7 +280,13 @@ func (w Worker) ensureDraft(ctx context.Context, ticket store.Ticket, fence doma
 		} else if _, err := w.Store.ReconcileInvalidatedEffect(ctx, store.InvalidatedEffectObservation{Prior: prior, Current: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence}}); err != nil {
 			return contracts.PullRequestIdentity{}, time.Time{}, err
 		}
-		return w.ensureDraft(ctx, ticket, fence, observer, identity, title, body)
+		// Proven absence settles the old launch as failed. Re-plan the same
+		// immutable request before claiming it again; a direct ClaimEffect on the
+		// old failed row would strand recovery on an invalidated effect.
+		effect, err = w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: key, Ref: ticket.Ref, Kind: "draft_pr", TicketVersion: ticket.Version, Fence: fence, RequestDigest: request})
+		if err != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, err
+		}
 	}
 	if !found {
 		claim, claimErr := w.Store.ClaimEffect(ctx, store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
