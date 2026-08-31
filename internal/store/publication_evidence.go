@@ -454,25 +454,34 @@ func (s *Store) TransitionPublishedBlock(ctx context.Context, transition Transit
 			return err
 		}
 		publication, found, err := loadPublicationEvidenceRow(ctx, conn, transition.Ref)
-		if err != nil || !found {
+		if err != nil {
 			return ErrPublicationEvidence
 		}
-		if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
-			return err
-		}
-		if publication.CurrentFence.RunnerEpoch != runner || publication.CurrentFence.LeaderEpoch != transition.Fence.LeaderEpoch {
-			return ErrPublicationEvidence
-		}
-		if state == domain.StatePublishing {
-			if version != publication.CurrentTicketVersion {
-				return ErrPublicationEvidence
+		if !found {
+			// A local runtime may discover its publication capability is absent
+			// before it has planned any public effect. It may only fail closed
+			// when this transaction proves that no external identity exists.
+			if err := validatePublicationBlock(ctx, conn, transition.Ref); err != nil {
+				return err
 			}
 		} else {
-			if publication.CurrentTicketVersion == ^uint64(0) || version != publication.CurrentTicketVersion+1 {
+			if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
+				return err
+			}
+			if publication.CurrentFence.RunnerEpoch != runner || publication.CurrentFence.LeaderEpoch != transition.Fence.LeaderEpoch {
 				return ErrPublicationEvidence
 			}
-			if err := authenticatePublishedWaitingEvent(ctx, conn, transition.Ref, publication, version); err != nil {
-				return err
+			if state == domain.StatePublishing {
+				if version != publication.CurrentTicketVersion {
+					return ErrPublicationEvidence
+				}
+			} else {
+				if publication.CurrentTicketVersion == ^uint64(0) || version != publication.CurrentTicketVersion+1 {
+					return ErrPublicationEvidence
+				}
+				if err := authenticatePublishedWaitingEvent(ctx, conn, transition.Ref, publication, version); err != nil {
+					return err
+				}
 			}
 		}
 		if version == ^uint64(0) {
@@ -936,8 +945,16 @@ func (s *Store) TransitionPublishedCandidate(ctx context.Context, transition Tra
 		if err := checkPublicationEffect(ctx, conn, transition.Ref, value.TicketVersion, value.Fence, value.PRCreateOrUpdateEffect); err != nil {
 			return err
 		}
+		buildVersion := value.Candidate.TicketVersion + 1
+		if value.TicketVersion == value.Candidate.TicketVersion+2 {
+			if err := authenticateRunnerRecoveryStep(ctx, conn, transition.Ref, buildVersion, value.Candidate.Fence, value.TicketVersion, value.Fence); err != nil {
+				return ErrPublicationEvidence
+			}
+		} else if value.TicketVersion != buildVersion {
+			return ErrPublicationEvidence
+		}
 		var buildEvents int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing' AND created_at=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, value.TicketVersion, value.BuildTransitionCreatedAt.Format(time.RFC3339Nano)).Scan(&buildEvents); err != nil || buildEvents != 1 {
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing' AND created_at=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, buildVersion, value.BuildTransitionCreatedAt.Format(time.RFC3339Nano)).Scan(&buildEvents); err != nil || buildEvents != 1 {
 			return ErrPublicationEvidence
 		}
 		payloadBytes, err := json.Marshal(struct {
@@ -1075,6 +1092,29 @@ func (s *Store) validateCandidateOnlyPublishingRecovery(ctx context.Context, ref
 		return ErrPublicationEvidence
 	}
 	return nil
+}
+
+// AuthenticatePublishingRecovery proves that the immutable candidate supplied
+// by a recovered local runtime is exactly the Store's current candidate and
+// reaches the caller's live publishing fence. It is an authentication check,
+// not a rebinding operation: every authority input is reloaded from SQLite.
+func (s *Store) AuthenticatePublishingRecovery(ctx context.Context, ref domain.TicketRef, candidate StoredCandidate, version uint64, fence domain.Fence) error {
+	if ref.Validate() != nil || version == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || fence.ClaimEpoch != 0 {
+		return ErrPublicationEvidence
+	}
+	live, err := s.Ticket(ctx, ref)
+	if err != nil || live.State != domain.StatePublishing || live.Version != version || live.RunnerEpoch != fence.RunnerEpoch {
+		return ErrPublicationEvidence
+	}
+	var leader uint64
+	if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&leader); err != nil || leader != fence.LeaderEpoch {
+		return ErrPublicationEvidence
+	}
+	durable, err := s.RecoverableCandidate(ctx, ref)
+	if err != nil || durable != candidate {
+		return ErrPublicationEvidence
+	}
+	return s.validateCandidateOnlyPublishingRecovery(ctx, ref, version, fence)
 }
 
 // RebindPublishedCandidate records one controlled runner/leader recovery for

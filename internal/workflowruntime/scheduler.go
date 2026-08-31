@@ -102,7 +102,12 @@ type Scheduler struct {
 	Tickets   TicketSource
 	Worktrees WorktreeEnsurer
 	Worker    Worker
-	admission *admission
+	// AdmitPublishing records whether the publication worker is configured. A
+	// false value still admits a publishing ticket exactly once so the worker
+	// can durably block it with an actionable operator reason; it must not be
+	// filtered into an invisible forever-waiting state.
+	AdmitPublishing bool
+	admission       *admission
 }
 
 func NewScheduler(channel domain.Channel, tickets TicketSource, worktrees WorktreeEnsurer, worker Worker) *Scheduler {
@@ -110,7 +115,7 @@ func NewScheduler(channel domain.Channel, tickets TicketSource, worktrees Worktr
 }
 
 func newScheduler(channel domain.Channel, tickets TicketSource, worktrees WorktreeEnsurer, worker Worker, admission *admission) *Scheduler {
-	return &Scheduler{Channel: channel, Tickets: tickets, Worktrees: worktrees, Worker: worker, admission: admission}
+	return &Scheduler{Channel: channel, Tickets: tickets, Worktrees: worktrees, Worker: worker, AdmitPublishing: true, admission: admission}
 }
 
 func (s Scheduler) validate() error {
@@ -157,7 +162,7 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 	})
 	var lastBenign *TickResult
 	for _, ticket := range tickets {
-		if ticket.Ref.Channel != s.Channel || !activeState(ticket.State) {
+		if ticket.Ref.Channel != s.Channel || !s.activeState(ticket.State) {
 			continue
 		}
 		// Runner epochs are ticket-scoped. Preserve the one leader snapshot,
@@ -183,10 +188,24 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 			end()
 			return classify(currentErr, candidateFence, ticket.Ref)
 		}
-		if current.State != ticket.State || current.Version != ticket.Version || current.RunnerEpoch != ticket.RunnerEpoch || !activeState(current.State) {
+		if current.State != ticket.State || current.Version != ticket.Version || current.RunnerEpoch != ticket.RunnerEpoch || !s.activeState(current.State) {
 			end()
 			lastBenign = &TickResult{Outcome: OutcomeStale, Ref: ticket.Ref, Ticket: current, Fence: candidateFence, Err: ErrStale}
 			continue
+		}
+		if ticket.State == domain.StatePublishing && !s.AdmitPublishing {
+			// The explicit pre-publishing composition must block before it asks
+			// for a worktree. This keeps a missing local checkout from stranding
+			// an already-publishing ticket outside the publication capability.
+			workerResult, workerErr := s.Worker.Run(runCtx, ticket.Ref, candidateFence)
+			end()
+			result.Worker = workerResult
+			if workerErr != nil {
+				result.Outcome, result.Err = classifyWorker(workerErr)
+				return result
+			}
+			result.Outcome = OutcomeInvoked
+			return result
 		}
 		worktree, ensureErr := s.Worktrees.Ensure(runCtx, worktreecoord.EnsureRequest{Ref: ticket.Ref, Version: ticket.Version, Fence: candidateFence})
 		if ensureErr != nil {
@@ -218,8 +237,13 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 	return TickResult{Outcome: OutcomeIdle, Fence: fence}
 }
 
-func activeState(state domain.State) bool {
-	return state == domain.StatePlanning || state == domain.StateVerifying || state == domain.StateBuilding
+func (s Scheduler) activeState(state domain.State) bool {
+	// Publishing is an active, single-shot boundary: publication.Worker owns
+	// its durable effect replay and the publishing -> waiting_ci transition,
+	// while a pre-publishing runtime uses the same admission to durably block.
+	// waiting_ci is intentionally absent. It is a passive observation state and
+	// must never cause a scheduler retry or external command.
+	return state == domain.StatePlanning || state == domain.StateVerifying || state == domain.StateBuilding || state == domain.StatePublishing
 }
 
 func classify(err error, fence domain.Fence, ref domain.TicketRef) TickResult {

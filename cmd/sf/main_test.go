@@ -35,6 +35,33 @@ func bindSupervisorTestInput(t *testing.T, request *contracts.DrainRequest) cont
 	return input
 }
 
+func TestCompiledDevDoctorBypassesGHPreflight(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "sf-dev")
+	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sf-dev: %v\n%s", err, output)
+	}
+	home := t.TempDir()
+	path := t.TempDir()
+	command := exec.Command(binary, "doctor", "--json")
+	command.Env = []string{"HOME=" + home, "PATH=" + path}
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatal("doctor unexpectedly passed on an empty host")
+	}
+	// Direct diagnostics must run their own actionable checks even when the
+	// daemon-only gh capability probe cannot succeed. In particular, the
+	// preflight error must never replace the typed doctor response.
+	text := string(output)
+	if !strings.Contains(text, `"doctor_failed"`) || !strings.Contains(text, `"github_auth"`) {
+		t.Fatalf("doctor did not report typed gh guidance: %s", text)
+	}
+	if strings.Contains(text, "GitHub capability preflight failed safely") {
+		t.Fatalf("daemon gh preflight blocked direct doctor: %s", text)
+	}
+}
+
 func TestCompiledDevGateRestartDrainsRecordedGroupBeforeCallerContinues(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "sf-dev")
 	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")

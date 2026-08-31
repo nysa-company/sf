@@ -3,6 +3,8 @@ package git
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"os/exec"
@@ -1095,12 +1097,19 @@ func slicesContainPrefix(values []string, prefix string) bool {
 
 func TestGitHubHTTPSTransportUsesOnlyPackagedCredentialBridge(t *testing.T) {
 	root := t.TempDir()
+	ghPath := filepath.Join(root, "gh")
+	ghBytes := []byte("staged gh fixture")
+	if err := os.WriteFile(ghPath, ghBytes, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ghSum := sha256.Sum256(ghBytes)
 	var gotArgv, gotEnv []string
 	runner := Runner{
 		Binary:             "/usr/bin/git",
 		Home:               filepath.Join(root, "home"),
 		CredentialHelper:   filepath.Join(root, "sf-git-credential"),
-		GHBinary:           filepath.Join(root, "gh"),
+		GHBinary:           ghPath,
+		GHBinaryDigest:     "sha256:" + hex.EncodeToString(ghSum[:]),
 		GHConfigDir:        filepath.Join(root, "gh-config"),
 		TestLocalTransport: true,
 		Run: func(_ context.Context, _ string, argv, environment []string) ([]byte, error) {

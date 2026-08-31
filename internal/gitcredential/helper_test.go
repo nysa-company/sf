@@ -3,6 +3,8 @@ package gitcredential
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -39,7 +41,7 @@ func TestRunDelegatesOnlyCanonicalGet(t *testing.T) {
 	if err := os.Mkdir(config, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	environment := map[string]string{"SF_GIT_HTTPS_REPOSITORY": "nysa-company/nysa-app", "SF_GIT_GH_BINARY": gh, "SF_GIT_GH_CONFIG_DIR": config}
+	environment := map[string]string{"SF_GIT_HTTPS_REPOSITORY": "nysa-company/nysa-app", "SF_GIT_GH_BINARY": gh, "SF_GIT_GH_BINARY_DIGEST": fileDigest(gh), "SF_GIT_GH_CONFIG_DIR": config}
 	lookup := func(key string) (string, bool) { value, ok := environment[key]; return value, ok }
 	runner := &recordingRunner{}
 	var output bytes.Buffer
@@ -67,7 +69,7 @@ func TestRunRefusesOtherHostsRepositoriesAndOversizedInput(t *testing.T) {
 	if err := os.Mkdir(config, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	environment := map[string]string{"SF_GIT_HTTPS_REPOSITORY": "nysa-company/nysa-app", "SF_GIT_GH_BINARY": gh, "SF_GIT_GH_CONFIG_DIR": config}
+	environment := map[string]string{"SF_GIT_HTTPS_REPOSITORY": "nysa-company/nysa-app", "SF_GIT_GH_BINARY": gh, "SF_GIT_GH_BINARY_DIGEST": fileDigest(gh), "SF_GIT_GH_CONFIG_DIR": config}
 	lookup := func(key string) (string, bool) { value, ok := environment[key]; return value, ok }
 	for _, request := range []string{
 		"protocol=https\nhost=evil.example\npath=nysa-company/nysa-app.git\n\n",
@@ -84,6 +86,12 @@ func TestRunRefusesOtherHostsRepositoriesAndOversizedInput(t *testing.T) {
 	}
 }
 
+func fileDigest(path string) string {
+	data, _ := os.ReadFile(path)
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 func TestRunStoreAndEraseNeverPersistOrEchoCredential(t *testing.T) {
 	environment := map[string]string{"SF_GIT_HTTPS_REPOSITORY": "nysa-company/nysa-app"}
 	lookup := func(key string) (string, bool) { value, ok := environment[key]; return value, ok }
@@ -96,6 +104,28 @@ func TestRunStoreAndEraseNeverPersistOrEchoCredential(t *testing.T) {
 		}
 		if runner.runs != 0 || output.Len() != 0 {
 			t.Fatalf("%s persisted or echoed a credential", operation)
+		}
+	}
+}
+
+func TestRunRefusesUnboundGHSnapshot(t *testing.T) {
+	root := t.TempDir()
+	gh := filepath.Join(root, "gh")
+	if err := os.WriteFile(gh, []byte("fixture"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(root, "config")
+	if err := os.Mkdir(config, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	request := "protocol=https\nhost=github.com\npath=owner/repo.git\n\n"
+	for _, digest := range []string{"", "sha256:" + strings.Repeat("0", 64)} {
+		environment := map[string]string{"SF_GIT_HTTPS_REPOSITORY": "owner/repo", "SF_GIT_GH_BINARY": gh, "SF_GIT_GH_BINARY_DIGEST": digest, "SF_GIT_GH_CONFIG_DIR": config}
+		lookup := func(key string) (string, bool) { value, ok := environment[key]; return value, ok }
+		runner := &recordingRunner{}
+		var output bytes.Buffer
+		if err := Run(context.Background(), []string{"get"}, strings.NewReader(request), &output, lookup, runner); err == nil || runner.runs != 0 {
+			t.Fatalf("unbound gh snapshot accepted: digest=%q runs=%d err=%v", digest, runner.runs, err)
 		}
 	}
 }

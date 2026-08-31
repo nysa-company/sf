@@ -23,6 +23,13 @@ type Core struct {
 	GitExec    string
 }
 
+// Publication contains the channel-specific credential bridge. It is
+// resolved separately from Core so ordinary workflow composition remains
+// remote-free until an explicit publication runtime is assembled.
+type Publication struct {
+	CredentialHelper string
+}
+
 // CurrentCore resolves the currently running executable and its exact
 // channel-matched Git gate. The returned paths are canonical and absolute.
 func CurrentCore(channel domain.Channel) (Core, error) {
@@ -57,6 +64,49 @@ func ResolveCore(channel domain.Channel, executable string) (Core, error) {
 		return Core{}, fmt.Errorf("%w: helper escaped executable bundle", ErrUnsafeBundle)
 	}
 	return Core{Executable: primary, GitExec: helper}, nil
+}
+
+// CurrentPublication resolves the credential bridge beside the running
+// channel executable. No credentials are read, copied, or created here.
+func CurrentPublication(channel domain.Channel) (Publication, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return Publication{}, fmt.Errorf("%w: locate primary executable", ErrUnsafeBundle)
+	}
+	return ResolvePublication(channel, executable)
+}
+
+// ResolvePublication authenticates only the exact channel-matched packaged
+// credential helper. It requires the same trusted bundle directory and leaf
+// metadata as ResolveCore, and rejects a cross-channel or escaped helper.
+func ResolvePublication(channel domain.Channel, executable string) (Publication, error) {
+	primaryName, _, err := names(channel)
+	if err != nil {
+		return Publication{}, err
+	}
+	helperName := credentialName(channel)
+	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable || filepath.Base(executable) != primaryName {
+		return Publication{}, fmt.Errorf("%w: primary executable does not match channel", ErrUnsafeBundle)
+	}
+	primary, err := authenticate(executable)
+	if err != nil {
+		return Publication{}, fmt.Errorf("%w: primary executable", err)
+	}
+	helper, err := authenticate(filepath.Join(filepath.Dir(primary), helperName))
+	if err != nil {
+		return Publication{}, fmt.Errorf("%w: Git credential helper", err)
+	}
+	if filepath.Dir(primary) != filepath.Dir(helper) || filepath.Base(helper) != helperName {
+		return Publication{}, fmt.Errorf("%w: credential helper escaped executable bundle", ErrUnsafeBundle)
+	}
+	return Publication{CredentialHelper: helper}, nil
+}
+
+func credentialName(channel domain.Channel) string {
+	if channel == domain.ChannelDev {
+		return "sf-git-credential-dev"
+	}
+	return "sf-git-credential"
 }
 
 func names(channel domain.Channel) (string, string, error) {

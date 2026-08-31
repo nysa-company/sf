@@ -847,6 +847,85 @@ func (c Client) ObservePublicationCandidate(ctx context.Context, want contracts.
 	}
 }
 
+// ObservePublishedPullRequest is the all-state observation boundary used
+// after publication. It is intentionally separate from
+// ObservePublicationCandidate, whose open-draft semantics skip merged and
+// closed rows. The durable PR number and source identity are exact, while
+// BaseOID is deliberately not compared because GitHub may advance the base
+// ref as part of merging the PR.
+func (c Client) ObservePublishedPullRequest(ctx context.Context, want contracts.PullRequestIdentity) (PRMatch, error) {
+	if !validPersistedPRIdentity(want) {
+		return PRMatch{}, ErrPolicyRefusal
+	}
+	var values []prWire
+	if err := c.json(ctx, &values, "pr", "list", "--repo", repoArg(want.Repository), "--state", "all", "--limit", "100", "--json", prFields); err != nil {
+		return PRMatch{}, err
+	}
+	if len(values) == 100 {
+		return PRMatch{}, ErrAmbiguousPR
+	}
+	var found *PRMatch
+	for _, value := range values {
+		candidate, err := value.identityUnmarked(want.Repository)
+		if err != nil {
+			return PRMatch{}, err
+		}
+		if !samePublishedSource(candidate, want) {
+			continue
+		}
+		// A second PR for the exact durable source is not safe to classify by
+		// branch familiarity. Refuse it even when only one row has the durable
+		// number.
+		if candidate.Number != want.Number {
+			return PRMatch{}, ErrAmbiguousPR
+		}
+		if !strings.Contains(value.Body, ownershipMarker(candidate)) {
+			return PRMatch{}, ErrNoMatchingPR
+		}
+		if value.State != "OPEN" && value.State != "CLOSED" && value.State != "MERGED" {
+			return PRMatch{}, ErrMalformedResponse
+		}
+		if !validOID(candidate.BaseOID) {
+			return PRMatch{}, ErrMalformedResponse
+		}
+		mergedByTimestamp := value.MergedAt != nil
+		mergedByState := value.State == "MERGED"
+		if mergedByTimestamp != mergedByState {
+			// GitHub's all-state witness must agree on both independent merge
+			// signals. Treating a contradictory row as merged could allow a
+			// closed, unmerged PR to bypass the durable BaseOID binding.
+			return PRMatch{}, ErrMalformedResponse
+		}
+		if value.MergedAt != nil {
+			if _, err := time.Parse(time.RFC3339, *value.MergedAt); err != nil {
+				return PRMatch{}, ErrMalformedResponse
+			}
+		}
+		if mergedByState && (value.Draft || value.MergeCommit == nil || !validOID(value.MergeCommit.OID)) {
+			// A merged PR cannot remain a draft, and merge completion must carry
+			// a concrete commit witness. Do not downgrade an impossible row to an
+			// unmerged result during cancellation.
+			return PRMatch{}, ErrMalformedResponse
+		}
+		if !mergedByState && (!validOID(candidate.BaseOID) || candidate.BaseOID != want.BaseOID) {
+			// An open or closed-unmerged PR is still bound to the exact base
+			// witness that was published. Base movement is permitted only once
+			// GitHub has independently marked this exact PR merged.
+			return PRMatch{}, ErrNoMatchingPR
+		}
+		observed := value.match(candidate)
+		observed.Merged = mergedByState
+		if found != nil {
+			return PRMatch{}, ErrAmbiguousPR
+		}
+		found = &observed
+	}
+	if found == nil {
+		return PRMatch{}, ErrNoMatchingPR
+	}
+	return *found, nil
+}
+
 // observeClosedPublicationConflict is intentionally separate from
 // ObservePublicationCandidate: closed rows are historical for inventory, but
 // a closed PR with the exact source/head is a deterministic create conflict
@@ -1637,6 +1716,9 @@ func sameRefreshSourceAndBase(left, right contracts.PullRequestIdentity) bool {
 }
 func samePRSource(left, right contracts.PullRequestIdentity) bool {
 	return left.Repository == right.Repository && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.FactoryOwned && right.FactoryOwned
+}
+func samePublishedSource(left, right contracts.PullRequestIdentity) bool {
+	return samePRSource(left, right) && left.HeadOID == right.HeadOID && left.BaseRef == right.BaseRef
 }
 func sameRefreshContinuity(left, right contracts.PullRequestIdentity) bool {
 	return left.Number == right.Number && sameRefreshSourceAndBase(left, right)

@@ -94,6 +94,39 @@ func TestSchedulerDoesNotRunSecondPhaseAndBusyIsBenign(t *testing.T) {
 	}
 }
 
+func TestSchedulerAdmitsPublishingExactlyOnceAndLeavesWaitingCIInert(t *testing.T) {
+	publishing := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "publishing"}, domain.StatePublishing)
+	waiting := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "b", Ticket: "waiting"}, domain.StateWaitingCI)
+	ensurer := &fakeEnsure{}
+	worker := &fakeWorker{}
+	scheduler := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{waiting, publishing}}, ensurer, worker)
+	fence := domain.Fence{LeaderEpoch: 9}
+	first := scheduler.Tick(context.Background(), fence)
+	if first.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != publishing.Ref {
+		t.Fatalf("first result=%+v calls=%v", first, worker.calls)
+	}
+	if len(ensurer.calls) != 1 || ensurer.calls[0].Ref != publishing.Ref {
+		t.Fatalf("first ensure calls=%v", ensurer.calls)
+	}
+	idle := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{waiting}}, &fakeEnsure{}, &fakeWorker{})
+	result := idle.Tick(context.Background(), fence)
+	if result.Outcome != OutcomeIdle {
+		t.Fatalf("waiting_ci result=%+v", result)
+	}
+}
+
+func TestSchedulerPrePublishingAdmissionInvokesBlockerWithoutWorktree(t *testing.T) {
+	publishing := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "publishing"}, domain.StatePublishing)
+	ensurer := &fakeEnsure{}
+	worker := &fakeWorker{}
+	scheduler := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{publishing}}, ensurer, worker)
+	scheduler.AdmitPublishing = false
+	result := scheduler.Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || len(ensurer.calls) != 0 {
+		t.Fatalf("pre-publishing result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
 func TestSchedulerBindsEachTicketRunnerEpochToTheSameLeader(t *testing.T) {
 	first := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "first"}, domain.StatePlanning)
 	first.RunnerEpoch = 3

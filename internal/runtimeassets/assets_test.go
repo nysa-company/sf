@@ -123,6 +123,42 @@ func TestResolveCoreRejectsUnsafeExecutableFacts(t *testing.T) {
 	})
 }
 
+func TestResolvePublicationUsesExactChannelCredentialHelper(t *testing.T) {
+	for _, test := range []struct {
+		channel domain.Channel
+		primary string
+		helper  string
+	}{
+		{domain.ChannelStable, "sf", "sf-git-credential"},
+		{domain.ChannelDev, "sf-dev", "sf-git-credential-dev"},
+	} {
+		t.Run(string(test.channel), func(t *testing.T) {
+			root := privateDirectory(t)
+			primary := executable(t, root, test.primary, 0o700)
+			executable(t, root, test.helper, 0o700)
+			got, err := ResolvePublication(test.channel, primary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, _ := filepath.EvalSymlinks(filepath.Join(root, test.helper))
+			if got.CredentialHelper != want {
+				t.Fatalf("credential helper=%q want %q", got.CredentialHelper, want)
+			}
+			if err := os.Rename(filepath.Join(root, test.helper), filepath.Join(root, test.helper+".saved")); err != nil {
+				t.Fatal(err)
+			}
+			foreign := "sf-git-credential"
+			if test.channel == domain.ChannelStable {
+				foreign = "sf-git-credential-dev"
+			}
+			executable(t, root, foreign, 0o700)
+			if _, err := ResolvePublication(test.channel, primary); !errors.Is(err, ErrUnsafeBundle) {
+				t.Fatalf("foreign helper err=%v", err)
+			}
+		})
+	}
+}
+
 func privateDirectory(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

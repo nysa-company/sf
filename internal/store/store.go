@@ -55,6 +55,7 @@ var (
 	ErrRepositoryCommandLease  = errors.New("repository command lease is unavailable or stale")
 	ErrRepositoryCommandResult = errors.New("repository command result is missing, malformed, or conflicts with durable evidence")
 	ErrPublicationEvidence     = errors.New("publication evidence is missing, malformed, stale, or conflicts with durable evidence")
+	ErrPublicationBlockUnsafe  = errors.New("publication blocker requires publication and merge effects to be reconciled")
 )
 
 const schemaVersion = 42
@@ -1202,12 +1203,15 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
 		return TransitionResult{}, errors.New("transition event payload must be bounded JSON")
 	}
+	if transition.Trigger == "typed_blocker" && transition.To != domain.StateBlocked {
+		return TransitionResult{}, errors.New("typed blocker must target blocked state")
+	}
 	blockedCode := ""
-	if transition.To == domain.StateBlocked && transition.Trigger == "typed_blocker" {
+	if transition.Trigger == "typed_blocker" {
 		var blocker struct {
 			Code string `json:"code"`
 		}
-		if json.Unmarshal([]byte(transition.EventPayload), &blocker) != nil || blocker.Code == "" || !boundedText(blocker.Code, 128) {
+		if json.Unmarshal([]byte(transition.EventPayload), &blocker) != nil || !validBlockedCode(blocker.Code) {
 			return TransitionResult{}, ErrEvidenceConflict
 		}
 		blockedCode = blocker.Code
@@ -1231,7 +1235,13 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
 			return err
 		}
-		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?, resume_state=?, blocked_code=CASE WHEN ?<>'' THEN ? WHEN state='blocked' THEN '' ELSE blocked_code END, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), blockedCode, blockedCode, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
+		query := `UPDATE tickets SET state=?, resume_state=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`
+		args := []any{transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner}
+		if transition.Trigger == "typed_blocker" {
+			query = `UPDATE tickets SET state=?, resume_state=?, blocked_code=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`
+			args = []any{transition.To, nullableState(transition.ResumeState), blockedCode, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner}
+		}
+		updated, err := conn.ExecContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}
@@ -1260,6 +1270,36 @@ func publicationSensitiveTransition(from, to domain.State) bool {
 	// continuation. All other publication exits must go through a dedicated
 	// evidence-bearing boundary.
 	return to != domain.StateStopping && to != domain.StateCancelling
+}
+
+func validBlockedCode(value string) bool {
+	if value == "" || len(value) > 100 || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, character := range value {
+		if character != '-' && character != '_' && !(character >= 'a' && character <= 'z') && !(character >= '0' && character <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// validatePublicationBlock proves that the ticket has not crossed any
+// external publication or merge boundary before a runtime-availability
+// blocker exits publishing. It runs inside the same fenced write as the
+// transition; the caller's claim alone is not authority.
+func validatePublicationBlock(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) error {
+	var effects, intents int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND effect_kind NOT IN ('git/create-worktree','git/commit','repository_command')`, ref.Channel, ref.Project, ref.Ticket).Scan(&effects); err != nil {
+		return err
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&intents); err != nil {
+		return err
+	}
+	if effects != 0 || intents != 0 {
+		return ErrPublicationBlockUnsafe
+	}
+	return nil
 }
 
 // TransitionPlan consumes the current planner binding in the same SQLite write

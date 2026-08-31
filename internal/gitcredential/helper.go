@@ -7,6 +7,8 @@ package gitcredential
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -67,6 +69,10 @@ func Run(ctx context.Context, args []string, input io.Reader, output io.Writer, 
 	}
 	gh, ok := lookup("SF_GIT_GH_BINARY")
 	if !ok || !trustedExecutable(gh) {
+		return ErrRefused
+	}
+	digest, ok := lookup("SF_GIT_GH_BINARY_DIGEST")
+	if !ok || !validDigest(digest) || executableDigest(gh) != digest {
 		return ErrRefused
 	}
 	configDir, ok := lookup("SF_GIT_GH_CONFIG_DIR")
@@ -135,6 +141,24 @@ func trustedExecutable(path string) bool {
 		return false
 	}
 	return true
+}
+
+func executableDigest(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func validDigest(value string) bool {
+	if len(value) != len("sha256:")+sha256.Size*2 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	encoded := strings.TrimPrefix(value, "sha256:")
+	decoded, err := hex.DecodeString(encoded)
+	return err == nil && len(decoded) == sha256.Size && strings.ToLower(encoded) == encoded
 }
 
 func trustedDirectory(path string) bool {

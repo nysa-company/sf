@@ -357,6 +357,81 @@ func TestRefreshFactoryPullRequestIdentityRefusals(t *testing.T) {
 	})
 }
 
+func TestObservePublishedPullRequestAcceptsMergedBaseMovementAndRejectsIdentityDrift(t *testing.T) {
+	identity := contracts.PullRequestIdentity{Number: 7, Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", BaseOID: strings.Repeat("c", 40), FactoryOwned: true}
+	wire := func(value contracts.PullRequestIdentity, marker string, state string, merged bool) []byte {
+		body := marker
+		var mergeCommit any
+		if merged {
+			mergeCommit = map[string]string{"oid": strings.Repeat("e", 40)}
+		}
+		payload := map[string]any{"number": value.Number, "title": "title", "body": body,
+			"headRepositoryOwner": map[string]string{"login": value.HeadOwner}, "headRepository": map[string]string{"nameWithOwner": value.HeadOwner + "/" + value.HeadRepository},
+			"headRefName": value.HeadRef, "headRefOid": value.HeadOID, "baseRefName": value.BaseRef, "baseRefOid": strings.Repeat("d", 40), "isDraft": false,
+			"mergedAt": map[bool]any{true: "2026-01-01T00:00:00Z", false: nil}[merged], "mergeCommit": mergeCommit, "state": state, "mergeStateStatus": "CLEAN", "autoMergeRequest": nil}
+		encoded, _ := json.Marshal([]map[string]any{payload})
+		return encoded
+	}
+	mergedResponse := wire(identity, ownershipMarker(identity), "MERGED", true)
+	var calls [][]string
+	got, err := refreshTestClient(t, mergedResponse, &calls).ObservePublishedPullRequest(context.Background(), identity)
+	if err != nil || !got.Merged || got.State != "MERGED" || got.Draft || got.Identity.BaseOID == identity.BaseOID {
+		t.Fatalf("merged observation=%+v err=%v", got, err)
+	}
+	for _, state := range []string{"OPEN", "CLOSED"} {
+		var calls [][]string
+		if _, err := refreshTestClient(t, wire(identity, ownershipMarker(identity), state, false), &calls).ObservePublishedPullRequest(context.Background(), identity); !errors.Is(err, ErrNoMatchingPR) {
+			t.Fatalf("unmerged %s BaseOID drift err=%v", state, err)
+		}
+	}
+	for _, malformed := range []struct {
+		name   string
+		state  string
+		merged bool
+	}{
+		{name: "merged state without timestamp", state: "MERGED"},
+		{name: "timestamp without merged state", state: "CLOSED", merged: true},
+		{name: "malformed merged timestamp", state: "MERGED", merged: true},
+	} {
+		t.Run(malformed.name, func(t *testing.T) {
+			var calls [][]string
+			response := wire(identity, ownershipMarker(identity), malformed.state, malformed.merged)
+			if malformed.name == "malformed merged timestamp" {
+				response = []byte(strings.Replace(string(response), "2026-01-01T00:00:00Z", "not-a-timestamp", 1))
+			}
+			if _, err := refreshTestClient(t, response, &calls).ObservePublishedPullRequest(context.Background(), identity); !errors.Is(err, ErrMalformedResponse) {
+				t.Fatalf("inconsistent merge witness err=%v", err)
+			}
+		})
+	}
+	var malformedBaseCalls [][]string
+	malformedBase := []byte(strings.Replace(string(mergedResponse), "\"baseRefOid\":\"dddddddddddddddddddddddddddddddddddddddd\"", "\"baseRefOid\":\"not-an-oid\"", 1))
+	if _, err := refreshTestClient(t, malformedBase, &malformedBaseCalls).ObservePublishedPullRequest(context.Background(), identity); !errors.Is(err, ErrMalformedResponse) {
+		t.Fatalf("malformed merged BaseOID err=%v", err)
+	}
+	for name, wrong := range map[string]contracts.PullRequestIdentity{
+		"wrong-number": func() contracts.PullRequestIdentity { value := identity; value.Number = 8; return value }(),
+		"wrong-source": func() contracts.PullRequestIdentity { value := identity; value.HeadRef = "foreign"; return value }(),
+		"wrong-base":   func() contracts.PullRequestIdentity { value := identity; value.BaseRef = "release"; return value }(),
+		"wrong-head": func() contracts.PullRequestIdentity {
+			value := identity
+			value.HeadOID = strings.Repeat("b", 40)
+			return value
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var calls [][]string
+			if _, err := refreshTestClient(t, wire(wrong, ownershipMarker(wrong), "MERGED", true), &calls).ObservePublishedPullRequest(context.Background(), identity); err == nil {
+				t.Fatalf("wrong identity err=%v", err)
+			}
+		})
+	}
+	var callsMarker [][]string
+	if _, err := refreshTestClient(t, wire(identity, "<!-- foreign -->", "MERGED", true), &callsMarker).ObservePublishedPullRequest(context.Background(), identity); !errors.Is(err, ErrNoMatchingPR) {
+		t.Fatalf("wrong marker err=%v", err)
+	}
+}
+
 func refreshTestClient(t *testing.T, response []byte, calls *[][]string) *Client {
 	t.Helper()
 	return &Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {

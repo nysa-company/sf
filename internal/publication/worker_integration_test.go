@@ -3,6 +3,7 @@ package publication_test
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,14 +16,19 @@ import (
 
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
+	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/domain"
 	gitboundary "github.com/nysa-company/sf/internal/git"
 	githubboundary "github.com/nysa-company/sf/internal/github"
+	"github.com/nysa-company/sf/internal/localruntime"
 	"github.com/nysa-company/sf/internal/phaseartifact"
 	"github.com/nysa-company/sf/internal/publication"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/testkit"
 	"github.com/nysa-company/sf/internal/workflowprompt"
+	"github.com/nysa-company/sf/internal/workflowruntime"
+	"github.com/nysa-company/sf/internal/workflowworker"
+	"github.com/nysa-company/sf/internal/worktreecoord"
 )
 
 func TestWorkerPublishesRealCandidateExactlyOnce(t *testing.T) {
@@ -53,6 +59,112 @@ func TestWorkerPublishesRealCandidateExactlyOnce(t *testing.T) {
 	if f.github.MutationCount("pr_create") != 1 || f.gitPushCount != 1 {
 		t.Fatalf("replay mutated push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
 	}
+}
+
+func TestRecoveredPublishingRuntimePublishesAfterPrePublicationCrash(t *testing.T) {
+	f := newPublicationFixture(t)
+	defer f.close()
+
+	// Simulate the process dying immediately after the durable
+	// building->publishing transition, before either public effect or witness
+	// exists. Reopen the backed-up Store through daemon.Start so AcquireLeader
+	// and the complete daemon.Recover path run before the runtime tick.
+	home, err := os.MkdirTemp("/tmp", "sf-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	paths, err := config.PathsFor(home, domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Backup(f.ctx, paths.Database); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := daemon.Start(f.ctx, daemon.Config{Channel: domain.ChannelDev, Paths: paths, DaemonIdentity: "publication-crash-restart"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	restarted, err := store.Open(f.ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db = restarted
+	f.runner.MutationAuthority = restarted
+	ticket, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := f.db.Worktree(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := f.db.RecoverableCandidate(f.ctx, f.ref)
+	if err != nil {
+		t.Fatalf("recoverable candidate: %v", err)
+	}
+	if err := f.db.AuthenticatePublishingRecovery(f.ctx, f.ref, candidate, ticket.Version, domain.Fence{LeaderEpoch: owner.Epoch(), RunnerEpoch: ticket.RunnerEpoch}); err != nil {
+		t.Fatalf("publishing recovery chain: %v candidate=%+v ticket=%+v", err, candidate, ticket)
+	}
+	ledgerDB, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledgerDB.Close()
+	var priorVersion, priorRunner, priorLeader, recoveredVersion, recoveredRunner, recoveredLeader uint64
+	var recoveryDigest, createdAt string
+	if err := ledgerDB.QueryRowContext(f.ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY ticket_version DESC LIMIT 1`, f.ref.Channel, f.ref.Project, f.ref.Ticket).Scan(&priorVersion, &priorRunner, &priorLeader, &recoveredVersion, &recoveredRunner, &recoveredLeader, &recoveryDigest, &createdAt); err != nil {
+		t.Fatalf("recovery ledger: %v", err)
+	}
+	if priorVersion != candidate.TicketVersion+1 || priorRunner != candidate.Fence.RunnerEpoch || priorLeader != candidate.Fence.LeaderEpoch || recoveredVersion != ticket.Version || recoveredRunner != ticket.RunnerEpoch || recoveredLeader != owner.Epoch() || recoveryDigest == "" || createdAt == "" {
+		t.Fatalf("recovery ledger tuple=(%d,%d,%d)->(%d,%d,%d) digest=%q created=%q candidate=%+v ticket=%+v leader=%d", priorVersion, priorRunner, priorLeader, recoveredVersion, recoveredRunner, recoveredLeader, recoveryDigest, createdAt, candidate, ticket, owner.Epoch())
+	}
+	runtimeWorker := localruntime.Worker{
+		Store:              f.db,
+		Publication:        publication.Worker{Store: f.db, Git: f.runner, GitHub: f.github},
+		PublicationEnabled: true,
+	}
+	captured := &capturingRuntimeWorker{worker: runtimeWorker}
+	scheduler := workflowruntime.NewScheduler(
+		f.ref.Channel,
+		workflowruntime.StoreTicketSource{Store: f.db},
+		staticWorktreeEnsurer{worktree: worktree},
+		captured,
+	)
+	scheduler.AdmitPublishing = true
+	tick := scheduler.Tick(f.ctx, domain.Fence{LeaderEpoch: owner.Epoch(), RunnerEpoch: ticket.RunnerEpoch})
+	if tick.Outcome != workflowruntime.OutcomeInvoked || tick.Worker.State != domain.StateWaitingCI || !tick.Worker.Transitioned {
+		t.Fatalf("recovered publication outcome=%s worker=%+v worker_err=%v tick_err=%v", tick.Outcome, tick.Worker, captured.err, tick.Err)
+	}
+	if f.gitPushCount != 1 || f.github.MutationCount("pr_create") != 1 {
+		t.Fatalf("recovered publication mutations push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
+	}
+}
+
+type capturingRuntimeWorker struct {
+	worker localruntime.Worker
+	err    error
+}
+
+func (w *capturingRuntimeWorker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fence) (workflowworker.RunResult, error) {
+	result, err := w.worker.Run(ctx, ref, fence)
+	w.err = err
+	return result, err
+}
+
+type staticWorktreeEnsurer struct {
+	worktree store.StoredWorktree
+}
+
+func (e staticWorktreeEnsurer) Ensure(context.Context, worktreecoord.EnsureRequest) (store.StoredWorktree, error) {
+	return e.worktree, nil
 }
 
 func TestWorkerKeepsUnprovenPushUncertainAfterLostCommandResult(t *testing.T) {
@@ -464,6 +576,13 @@ func newPublicationFixture(t *testing.T) *publicationFixture {
 	runner := newFixtureRunner(t, bare)
 	runner.CredentialHelper = filepath.Join(runner.Home, "sf-git-credential")
 	runner.GHBinary = filepath.Join(runner.Home, "gh")
+	ghBytes := []byte("fixture gh")
+	if err := os.WriteFile(runner.GHBinary, ghBytes, 0o700); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	ghDigest := sha256.Sum256(ghBytes)
+	runner.GHBinaryDigest = "sha256:" + hex.EncodeToString(ghDigest[:])
 	runner.GHConfigDir = filepath.Join(runner.Home, "gh-config")
 	runner.MutationAuthority = db
 	identity, err := runner.Snapshot(ctx, worktree, "main")
@@ -653,6 +772,9 @@ func (f *publicationFixture) close() {
 func newFixtureRunner(t *testing.T, bare string) gitboundary.Runner {
 	t.Helper()
 	home := filepath.Join(t.TempDir(), "home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	r := gitboundary.Runner{Binary: "/usr/bin/git", Home: home, TestLocalTransport: true}
 	r.Run = func(ctx context.Context, binary string, args []string, env []string) ([]byte, error) {
 		for i := range args {

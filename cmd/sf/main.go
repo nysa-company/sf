@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/nysa-company/sf/internal/cli"
 	"github.com/nysa-company/sf/internal/codexprovider"
@@ -15,6 +17,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/ghrunner"
 	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/localruntime"
 	"github.com/nysa-company/sf/internal/processsupervisor"
@@ -138,6 +141,10 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	runDaemon := func(runCtx context.Context) error {
+		ownerHome, ghBinary, ghConfigDir, prePublishingOnly, err := publicationCapability(home, channel)
+		if err != nil {
+			return err
+		}
 		supervisor, err := processsupervisor.New(nil)
 		if err != nil {
 			return err
@@ -157,12 +164,84 @@ func main() {
 				return codexprovider.QualifyLocalPair(qualifyCtx, database, value, builder, reviewer, supervisor)
 			},
 			WorkflowRuntimeFactory: localruntime.Factory(localruntime.Config{
-				Channel: channel,
-				GitHome: filepath.Join(filepath.Dir(paths.Socket), "git-home"),
-				Workers: 2,
+				Channel:           channel,
+				GitHome:           filepath.Join(filepath.Dir(paths.Socket), "git-home"),
+				OwnerHome:         ownerHome,
+				GHConfigDir:       ghConfigDir,
+				GHBinary:          ghBinary,
+				GHAuthenticated:   !prePublishingOnly,
+				PrePublishingOnly: prePublishingOnly,
+				Workers:           2,
 			}),
 		})
 		return errors.Join(runErr, supervisor.Close())
 	}
 	os.Exit(cli.ExecuteWithDaemon(ctx, os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}, runDaemon))
+}
+
+func existingDirectory(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir()
+}
+
+// publicationCapability is intentionally evaluated only when daemon/run is
+// requested. Direct commands such as doctor, version, and init must remain
+// usable on a host without gh or GitHub authentication.
+func publicationCapability(home string, channel domain.Channel) (ownerHome, ghBinary, ghConfigDir string, prePublishingOnly bool, err error) {
+	ghBinary = ""
+	if resolved, lookErr := exec.LookPath("gh"); lookErr == nil {
+		ghBinary = resolved
+	}
+	ghConfigDir = filepath.Join(home, ".config", "gh")
+	prePublishingOnly = home == "" || ghBinary == "" || !existingDirectory(ghConfigDir)
+	if !prePublishingOnly {
+		var authenticated bool
+		authenticated, err = githubAuthenticated(ghBinary, home, ghConfigDir)
+		if err != nil {
+			return "", "", "", false, fmt.Errorf("GitHub capability preflight failed safely; run sf-%s doctor, install/repair gh, and authenticate GitHub: %w", channel, err)
+		}
+		prePublishingOnly = !authenticated
+	}
+	ownerHome = home
+	if prePublishingOnly {
+		// Qualification and local planning remain available when publication's
+		// explicit gh/auth capability is absent. The runtime disables publishing
+		// admission, rather than repeatedly reporting provider requalification.
+		ownerHome, ghBinary, ghConfigDir = "", "", ""
+	}
+	return ownerHome, ghBinary, ghConfigDir, prePublishingOnly, nil
+}
+
+// githubAuthenticated is a read-only local capability probe. Its output is
+// discarded and it never invokes login or writes the gh config. A missing or
+// inactive login selects the explicit pre-publishing runtime so qualification
+// can continue without admitting a ticket that would strand at publishing.
+func githubAuthenticated(binary, home, configDir string) (bool, error) {
+	runner, err := ghrunner.New(binary)
+	if err != nil {
+		return false, err
+	}
+	env := []string{
+		"HOME=" + home,
+		"GH_CONFIG_DIR=" + configDir,
+		"GH_PROMPT_DISABLED=1",
+		"GIT_TERMINAL_PROMPT=0",
+		"NO_COLOR=1",
+		"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, runErr := runner.Run(ctx, runner.Path(), []string{"auth", "status", "--active", "--hostname", "github.com"}, env)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cleanupCancel()
+	proof, cleanupErr := runner.Cleanup(cleanupCtx)
+	closeErr := runner.Close()
+	if cleanupErr != nil || !proof.Drained || proof.Quarantined || closeErr != nil {
+		cause := errors.Join(cleanupErr, closeErr)
+		if cause == nil {
+			cause = errors.New("invalid drain proof")
+		}
+		return false, fmt.Errorf("supervised gh auth cleanup was not proven: %w", cause)
+	}
+	return runErr == nil, nil
 }

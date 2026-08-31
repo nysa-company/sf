@@ -142,8 +142,17 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	// allocated and remains valid across the planning, verification, and build
 	// transitions.  The candidate is the publication-phase version witness; do
 	// not require the registration's original TicketVersion to equal it.
-	if candidate.TicketVersion+1 != ticket.Version || candidate.Fence.LeaderEpoch != fence.LeaderEpoch || candidate.Fence.RunnerEpoch != fence.RunnerEpoch || candidate.Snapshot.SourceDigest != ticket.SourceDigest {
+	if candidate.Snapshot.SourceDigest != ticket.SourceDigest {
 		return result, ErrPublicationDrift
+	}
+	if candidate.TicketVersion+1 != ticket.Version || candidate.Fence != fence {
+		// A crash after building->publishing leaves the immutable candidate at
+		// its source endpoint while daemon recovery advances the live fence once.
+		// The publication witness keeps that immutable source identity and Store
+		// verifies the exact transition plus runner ledger before admitting it.
+		if candidate.TicketVersion+2 != ticket.Version || w.Store.AuthenticatePublishingRecovery(ctx, ref, candidate, ticket.Version, fence) != nil {
+			return result, ErrPublicationDrift
+		}
 	}
 	if err := w.GitHub.AuthStatus(ctx); err != nil {
 		return result, err
@@ -177,7 +186,7 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	}
 	value := store.PublishedCandidateEvidence{Ref: ref, TicketVersion: ticket.Version, Fence: fence, Candidate: candidate, ConfigGeneration: ticket.ConfigGeneration, ConfigDigest: ticket.ConfigDigest, ConfigSnapshotDigest: digest(ticket.ConfigSnapshot), Worktree: worktree, RemoteBranchRef: worktree.Branch, RemoteBranchOID: candidate.Snapshot.HeadSHA, RemoteBaseOID: candidate.Snapshot.BaseSHA, PushEffect: effectEvidence(push, store.PublicationPushEffectKind), PullRequest: pr, PullRequestState: "OPEN", PullRequestDraft: true, PullRequestObservedAt: observedAt, PRCreateOrUpdateEffect: effectEvidence(prEffect, prEffect.Kind), CreatedAt: time.Now().UTC()}
 	if err := w.Store.RecordPublishedCandidate(ctx, value); err != nil {
-		return result, err
+		return result, fmt.Errorf("record published candidate: %w", err)
 	}
 	// Recording the witness is durable, but it is not a substitute for a
 	// fresh live observation. Re-authenticate both effects again immediately
@@ -186,7 +195,7 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		return result, err
 	}
 	if _, err := w.Store.TransitionPublishedCandidate(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence}); err != nil {
-		return result, err
+		return result, fmt.Errorf("transition published candidate: %w", err)
 	}
 	result.State, result.Version, result.Transitioned = domain.StateWaitingCI, ticket.Version+1, true
 	return result, nil

@@ -90,6 +90,15 @@ type Runner struct {
 	closed           bool
 }
 
+// CredentialCapability is the only GH executable capability that may be
+// handed to the Git credential bridge. Path is the private constructor-time
+// snapshot, and Digest binds helper execution to the bytes authenticated by
+// this Runner rather than to the caller's configured executable path.
+type CredentialCapability struct {
+	Path   string
+	Digest string
+}
+
 var _ github.SupervisedCommandRunner = (*Runner)(nil)
 
 // New authenticates executable immediately and binds its canonical path and
@@ -129,6 +138,25 @@ func (r *Runner) Path() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.canonical
+}
+
+// CredentialCapability returns a live, digest-checked snapshot capability.
+// It is intentionally unavailable after Close so a credential helper cannot
+// retain a path whose owning runtime has already been torn down.
+func (r *Runner) CredentialCapability() (CredentialCapability, error) {
+	if r == nil {
+		return CredentialCapability{}, ErrRunnerClosed
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.snapshotPath == "" || r.digest == "" {
+		return CredentialCapability{}, ErrRunnerClosed
+	}
+	digest, err := authenticateSnapshot(r.snapshotPath)
+	if err != nil || digest != r.digest {
+		return CredentialCapability{}, ErrExecutableChanged
+	}
+	return CredentialCapability{Path: r.snapshotPath, Digest: "sha256:" + r.digest}, nil
 }
 
 // Close removes the private executable snapshot after all runs have been
@@ -260,8 +288,8 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 
 	binaryCanonical, binaryErr := filepath.EvalSymlinks(binary)
 	if binaryErr != nil || binaryCanonical != r.canonical {
+		r.markPrelaunchLocked()
 		r.mu.Unlock()
-		r.markPrelaunch()
 		return nil, ErrInvalidExecutable
 	}
 	// Re-authenticate as the final pre-start operation. This catches target
@@ -269,8 +297,8 @@ func (r *Runner) Run(ctx context.Context, binary string, args, env []string) ([]
 	_, current, digest, err := authenticate(r.requested)
 	snapshotDigest, snapshotErr := authenticateSnapshot(r.snapshotPath)
 	if err != nil || current != r.canonical || digest != r.digest || snapshotErr != nil || snapshotDigest != r.digest {
+		r.markPrelaunchLocked()
 		r.mu.Unlock()
-		r.markPrelaunch()
 		return nil, ErrExecutableChanged
 	}
 	// Revalidate the canonical environment immediately before Start as well;

@@ -170,6 +170,49 @@ func TestRefusalsAndConcurrent(t *testing.T) {
 	}
 }
 
+func TestPrelaunchFailurePublishesCleanupBeforeUnlock(t *testing.T) {
+	old := validatedEnvironmentFn
+	defer func() { validatedEnvironmentFn = old }()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	validatedEnvironmentFn = func(env []string) ([]string, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return validatedEnvironment(env)
+	}
+	runner, err := New(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := runnerEnvironment(t)
+	runDone := make(chan error, 1)
+	go func() {
+		_, runErr := runner.Run(context.Background(), filepath.Join(t.TempDir(), "missing-gh"), helperArgs("ok"), env)
+		runDone <- runErr
+	}()
+	<-entered
+	cleanupDone := make(chan struct {
+		proof github.CleanupProof
+		err   error
+	}, 1)
+	go func() {
+		proof, cleanupErr := runner.Cleanup(context.Background())
+		cleanupDone <- struct {
+			proof github.CleanupProof
+			err   error
+		}{proof: proof, err: cleanupErr}
+	}()
+	close(release)
+	if !errors.Is(<-runDone, ErrInvalidExecutable) {
+		t.Fatal("invalid prelaunch executable was not rejected")
+	}
+	cleanup := <-cleanupDone
+	if cleanup.err != nil || !cleanup.proof.Drained || cleanup.proof.Quarantined {
+		t.Fatalf("prelaunch cleanup proof=%+v err=%v", cleanup.proof, cleanup.err)
+	}
+}
+
 func TestSecondEnvironmentValidationFailureHasDefiniteCleanup(t *testing.T) {
 	old := validatedEnvironmentFn
 	defer func() { validatedEnvironmentFn = old }()
