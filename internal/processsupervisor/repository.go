@@ -67,13 +67,17 @@ func (s RepositoryCommandSupervisor) Preflight(spec contracts.CommandSpec) error
 	if !repositoryCommandPlatformAvailable(runtime.GOOS) {
 		return ErrUnclear
 	}
-	if len(spec.Argv) > 0 && filepath.Base(spec.Argv[0]) == "npm" {
-		return ErrSubprocessRecipeUnsupported
-	}
-	if len(spec.Argv) == 0 || filepath.Base(spec.Argv[0]) != "go" {
+	if len(spec.Argv) == 0 {
 		return ErrUnclear
 	}
-	return nil
+	switch filepath.Base(spec.Argv[0]) {
+	case "go", "node":
+		return nil
+	case "npm":
+		return ErrSubprocessRecipeUnsupported
+	default:
+		return ErrUnclear
+	}
 }
 
 var ErrSubprocessRecipeUnsupported = errors.New("repository npm recipe requires operator or CI takeover")
@@ -81,6 +85,9 @@ var ErrSubprocessRecipeUnsupported = errors.New("repository npm recipe requires 
 func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.RepositoryCommandClaim, spec contracts.CommandSpec, policy executionpolicy.CommandSnapshot, lease contracts.RepositoryCommandLease) (contracts.CommandResult, error) {
 	if err := s.Preflight(spec); err != nil {
 		return contracts.CommandResult{}, err
+	}
+	if filepath.Base(spec.Argv[0]) == "node" {
+		return s.runNode(ctx, claim, spec, policy, lease)
 	}
 	if lease == nil || spec.Profile != contracts.ProfileGuarded || len(spec.Argv) == 0 || spec.Directory != claim.Worktree || spec.Timeout <= 0 || spec.Timeout > 45*time.Minute || s.SoftDrain > 30*time.Second || s.HardDrain > 30*time.Second || policy.Authorize(spec.Argv) != nil || policy.Digest() != claim.PolicyDigest {
 		return contracts.CommandResult{}, ErrUnclear
@@ -440,6 +447,9 @@ func authenticateRepositorySourceExecutable(path string) error {
 // It intentionally shares Supervisor.Run's resolver and source checks so a
 // caller cannot prepare a claim using a broader PATH-based interpretation.
 func RepositoryExecutableIdentity(name string) (string, string, error) {
+	if filepath.Base(name) == "node" {
+		return node22Identity(name)
+	}
 	resolved, err := resolveFixedExecutable(name)
 	if err != nil {
 		return "", "", err
@@ -498,6 +508,10 @@ func approvedRepositoryGoExecutables() []string {
 
 // RepositoryExecutableDigest binds the approved executable file to the claim.
 func RepositoryExecutableDigest(path string) (string, error) {
+	if filepath.Base(path) == "node" {
+		_, digest, err := RepositoryExecutableIdentity(path)
+		return digest, err
+	}
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", err

@@ -74,16 +74,20 @@ Autonomous mode additionally requires the exact provider and repository-command
 executor to pass an OS-enforced macOS profile. Docker and Colima are deferred,
 not hidden fallbacks.
 
-The local guarded repository-command executor is intentionally narrow: its only
-Go recipe is `go test ./...`, with no caller flags, CGO, downloads, module
-updates, overlays, compiler/linker selection, or output paths. It accepts only
-a dependency-free module or a checked-in compatible vendor closure; it never
-uses an ambient module cache or network. npm/Node commands are not locally
-executable in v1: ADR 0002 cannot prove their complete process tree has drained
-after setsid or double-fork behavior. SF itself and Nysa remain CI/operator
-takeover work until they meet this vendored Go-only contract; this boundary is
-uncomposed infrastructure, not a production workflow. Autonomous execution
-remains unavailable.
+The local guarded repository-command executor is intentionally narrow. Its Go
+recipe is `go test ./...`, with no caller flags, CGO, downloads, module updates,
+overlays, compiler/linker selection, or output paths. It accepts only a
+dependency-free module or a checked-in compatible vendor closure. A separate
+dependency-free Node 22 recipe supports only source `node --test`: a bounded
+regular `package.json`, no dependency/workspace declarations, `node_modules`,
+native addons, or symlinks, and at least one official JavaScript/CJS/MJS test
+discovery file. sf resolves code-owned Node paths, stages an authenticated
+private Mach-O dylib closure, and applies a Node-specific Seatbelt plus Node
+permissions before executing that staged copy. npm, package scripts,
+dependency-bearing Node projects, and TypeScript remain credential-free CI or
+operator takeover; no Docker or Colima prerequisite is introduced. SF itself
+and Nysa remain CI/operator takeover work until they meet one of these exact
+contracts. Autonomous execution remains unavailable.
 This is a local guarded baseline, not evidence that ADR 0002's autonomous
 capability has changed.
 

@@ -150,3 +150,50 @@ func TestRepositoryStrictSandboxDeniesSeparateWorktreeAndHostWrites(t *testing.T
 		}
 	}
 }
+
+func TestRepositoryNodeSandboxUsesPrivateStagedClosure(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("repository command product boundary is macOS")
+	}
+	if os.Getenv("SF_REPOSITORY_NODE_SANDBOX_HELPER") == "1" {
+		staged, worktree, closure := os.Getenv("SF_REPOSITORY_NODE_STAGED"), os.Getenv("SF_REPOSITORY_NODE_WORKTREE_TEST"), os.Getenv("SF_REPOSITORY_NODE_CLOSURE_TEST")
+		profile, err := RepositoryNodeSandboxProfile(worktree, closure, staged)
+		if err != nil || ApplyRepositoryTestSandbox(profile) != nil {
+			t.Fatal("initialize Node Seatbelt")
+		}
+		if err := syscall.Exec(staged, []string{staged, "--version"}, os.Environ()); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if _, err := os.Stat("/opt/homebrew/bin/node"); err != nil {
+		t.Skip("Homebrew Node is unavailable")
+	}
+	resolved, err := resolveFixedNodeExecutable("node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure, err := nodeClosureFor(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := nodeClosureIdentity(closure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, library, cleanup, err := stageNodeClosure(closure, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	worktree, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRepositoryNodeSandboxUsesPrivateStagedClosure$")
+	cmd.Env = append(os.Environ(), "PATH=/usr/bin:/bin", "DYLD_LIBRARY_PATH="+library, "HOME=/var/empty", "TMPDIR=/var/empty", "SF_REPOSITORY_NODE_SANDBOX_HELPER=1", "SF_REPOSITORY_NODE_STAGED="+staged, "SF_REPOSITORY_NODE_WORKTREE_TEST="+worktree, "SF_REPOSITORY_NODE_CLOSURE_TEST="+filepath.Dir(library))
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(out)), "v22.") {
+		t.Fatalf("staged closure could not start without original Homebrew paths: %v: %s", err, out)
+	}
+}

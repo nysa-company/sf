@@ -157,3 +157,31 @@ func RepositoryTestSandboxProfile(repository, executable string) (string, error)
 	}
 	return repositoryStrictSandboxProfileFor(paths)
 }
+
+// RepositoryNodeSandboxProfile confines the single staged Node binary. The
+// Node permission model is defense in depth; Seatbelt remains the network and
+// process boundary. Unlike the Go driver path, no source toolchain, HOME, or
+// temporary writable directory is granted.
+func RepositoryNodeSandboxProfile(worktree, closureRoot, executable string) (string, error) {
+	if !repositorySandboxAvailable(worktree) || !cleanAbsolute(worktree) || !cleanAbsolute(closureRoot) || !cleanAbsolute(executable) {
+		return "", ErrUnclear
+	}
+	profile := "(version 1)\n(deny default)\n" +
+		"(allow file-read* (literal \"/\"))\n" +
+		"(allow file-read* (subpath \"/System\"))\n" +
+		"(allow file-read* (subpath \"/usr/lib\"))\n" +
+		"(allow file-read* (subpath \"/usr/share\"))\n" +
+		"(allow file-read* (subpath \"/Library/Apple\"))\n" +
+		"(allow file-read* (subpath \"/dev\"))\n" +
+		"(allow mach-lookup)\n(allow sysctl-read)\n" +
+		"(allow file-read* (subpath " + seatbeltString(worktree) + "))\n" +
+		"(allow file-read* (subpath " + seatbeltString(closureRoot) + "))\n" +
+		"(deny file-write*)\n(deny network*)\n(deny process-fork)\n(deny process-exec)\n" +
+		"(allow process-exec (literal " + seatbeltString(executable) + "))\n"
+	for _, path := range []string{worktree, closureRoot, executable} {
+		for _, ancestor := range seatbeltAncestors(path) {
+			profile += "(allow file-read* (literal " + seatbeltString(ancestor) + "))\n"
+		}
+	}
+	return profile, nil
+}

@@ -89,6 +89,10 @@ func TestRepositoryCommandPolicy(t *testing.T) {
 		allowed bool
 	}{
 		{[]string{"go", "test", "./..."}, true},
+		{[]string{"node", "--test"}, true},
+		{[]string{"node", "--test", "test/smoke.test.js"}, false},
+		{[]string{"node", "--permission", "--test"}, false},
+		{[]string{"node", "script.js"}, false},
 		{[]string{"go", "vet", "./..."}, false},
 		{[]string{"go", "build", "./..."}, false},
 		{[]string{"go", "list", "./..."}, false},

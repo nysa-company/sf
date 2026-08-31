@@ -55,6 +55,26 @@ func TestLoadProjectAutoDetectsGoRepository(t *testing.T) {
 	}
 }
 
+func TestLoadProjectAutoDetectsDependencyFreeNode22Recipe(t *testing.T) {
+	repository := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repository, "test"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "package.json"), []byte(`{"name":"proof"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "test", "smoke.test.mjs"), []byte(`import test from "node:test"; test("ok", () => {});`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	effective, _, _, err := LoadProject(repository, "node-project", DefaultMachineLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := effective.Commands.Verify.Argv; len(got) != 2 || got[0] != "node" || got[1] != "--test" {
+		t.Fatalf("node argv=%q", got)
+	}
+}
+
 func TestLoadProjectGoDetectionRequiresBoundedLocalClosure(t *testing.T) {
 	tests := map[string]struct {
 		goMod  string

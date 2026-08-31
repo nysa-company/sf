@@ -56,6 +56,19 @@ func TestPrebuildEvidenceRequestCanBeIssuedBeforeCheckpointExists(t *testing.T) 
 	}
 }
 
+func TestNodeClosureDigestIsAcceptedByCanonicalEvidence(t *testing.T) {
+	request := evidenceRequestFixture(RepositoryCommandPurposePrebuildVerification)
+	request.ExecutablePath = "/opt/homebrew/Cellar/node@22/22.23.2/bin/node"
+	request.ExecutableDigest = "node22-closure-v1:sha256:" + strings.Repeat("a", 64)
+	if _, _, err := CanonicalRepositoryCommandEvidenceRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	request.ExecutableDigest = "sha256:" + strings.Repeat("a", 64)
+	if _, _, err := CanonicalRepositoryCommandEvidenceRequest(request); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("plain Node digest accepted: %v", err)
+	}
+}
+
 func TestEvidenceRequestRefusesCrossAttemptTicketAndRevisionReuse(t *testing.T) {
 	request := evidenceRequestFixture(RepositoryCommandPurposePrebuildVerification)
 	_, digest, err := CanonicalRepositoryCommandEvidenceRequest(request)

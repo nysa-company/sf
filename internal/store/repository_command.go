@@ -54,7 +54,7 @@ const repositoryCommandProcessGroupLimit = 64
 const repositoryCommandProcessGroupByteLimit = 64 << 10
 
 func validRepositoryCommandIntent(i RepositoryCommandIntent) bool {
-	return i.Ref.Validate() == nil && i.SemanticKey != "" && validClaimDigest(i.RequestDigest) && i.TicketVersion > 0 && i.Fence.LeaderEpoch > 0 && i.Fence.RunnerEpoch > 0 && validStorePath(i.Repository) && validStorePath(i.Worktree) && validRepositoryWorktreeIdentity(i.WorktreeIdentity, i.Repository, i.Worktree, i.Branch, i.BaseRef, i.BaseSHA) && validClaimDigest(i.CommandDigest) && validClaimDigest(i.SpecDigest) && validClaimDigest(i.PolicyDigest) && validStorePath(i.ExecutablePath) && validClaimDigest(i.ExecutableDigest)
+	return i.Ref.Validate() == nil && i.SemanticKey != "" && validClaimDigest(i.RequestDigest) && i.TicketVersion > 0 && i.Fence.LeaderEpoch > 0 && i.Fence.RunnerEpoch > 0 && validStorePath(i.Repository) && validStorePath(i.Worktree) && validRepositoryWorktreeIdentity(i.WorktreeIdentity, i.Repository, i.Worktree, i.Branch, i.BaseRef, i.BaseSHA) && validClaimDigest(i.CommandDigest) && validClaimDigest(i.SpecDigest) && validClaimDigest(i.PolicyDigest) && validStorePath(i.ExecutablePath) && validRepositoryExecutableDigest(i.ExecutablePath, i.ExecutableDigest)
 }
 
 func (s *Store) IssueRepositoryCommandClaim(ctx context.Context, intent RepositoryCommandIntent) (contracts.RepositoryCommandClaim, error) {
@@ -676,7 +676,22 @@ func repositoryCommandIntentMatches(ctx context.Context, c *sql.Conn, claim cont
 }
 
 func validRepositoryCommandClaim(c contracts.RepositoryCommandClaim) bool {
-	return c.TicketRef.Validate() == nil && c.SemanticKey != "" && validClaimDigest(c.RequestDigest) && c.TicketVersion > 0 && c.LeaderEpoch > 0 && c.RunnerEpoch > 0 && c.ClaimEpoch > 0 && validStorePath(c.Repository) && validStorePath(c.Worktree) && validRepositoryWorktreeIdentity(c.WorktreeIdentity, c.Repository, c.Worktree, c.Branch, c.BaseRef, c.BaseSHA) && validClaimDigest(c.CommandDigest) && validClaimDigest(c.SpecDigest) && validClaimDigest(c.PolicyDigest) && validStorePath(c.ExecutablePath) && validClaimDigest(c.ExecutableDigest)
+	return c.TicketRef.Validate() == nil && c.SemanticKey != "" && validClaimDigest(c.RequestDigest) && c.TicketVersion > 0 && c.LeaderEpoch > 0 && c.RunnerEpoch > 0 && c.ClaimEpoch > 0 && validStorePath(c.Repository) && validStorePath(c.Worktree) && validRepositoryWorktreeIdentity(c.WorktreeIdentity, c.Repository, c.Worktree, c.Branch, c.BaseRef, c.BaseSHA) && validClaimDigest(c.CommandDigest) && validClaimDigest(c.SpecDigest) && validClaimDigest(c.PolicyDigest) && validStorePath(c.ExecutablePath) && validRepositoryExecutableDigest(c.ExecutablePath, c.ExecutableDigest)
+}
+
+// Node's closure identity is not a generic claim digest. Only a resolved node
+// executable may carry the domain-tagged form; every other existing recipe
+// retains the ordinary SHA-256 executable-file binding.
+func validRepositoryExecutableDigest(path, digest string) bool {
+	if filepath.Base(path) != "node" {
+		return validClaimDigest(digest)
+	}
+	const prefix = "node22-closure-v1:sha256:"
+	if !strings.HasPrefix(digest, prefix) {
+		return false
+	}
+	value := strings.TrimPrefix(digest, prefix)
+	return len(value) == 64 && validClaimDigest("sha256:"+value)
 }
 
 // validRepositoryWorktreeIdentity rejects the historic opaque JSON blob.  The

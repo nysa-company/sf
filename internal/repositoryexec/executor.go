@@ -47,7 +47,8 @@ func CommandDigest(argv []string) (string, error) {
 }
 
 func ExecutableDigest(path string) (string, error) {
-	return processsupervisor.RepositoryExecutableDigest(path)
+	_, digest, err := processsupervisor.RepositoryExecutableIdentity(path)
+	return digest, err
 }
 
 // SpecDigest binds every launch-affecting field. Stdin is hashed by the

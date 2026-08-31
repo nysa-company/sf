@@ -166,9 +166,9 @@ type RepositoryCommandLease interface {
 }
 
 // RepositoryCommandGroupRecorder durably records an exact Go-test process
-// group before its launch gate is opened. v1 admits only the guarded,
-// dependency-closed `go test ./...` recipe; production fails closed when this
-// Go-only containment handshake is unavailable.
+// group before its launch gate is opened. The separate dependency-free Node
+// 22 recipe does not use a test-wrapper group: its Seatbelt forbids fork/exec
+// after the single fd-gated staged Node launch.
 type RepositoryCommandGroupRecorder interface {
 	RecordRepositoryCommandProcessGroup(context.Context, RepositoryCommandLaunch) error
 }

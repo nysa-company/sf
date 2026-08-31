@@ -581,3 +581,40 @@ func TestRepositoryCommandRejectsOversizedTrackedGroupBeforePersistence(t *testi
 		t.Fatalf("oversized tracked group persisted: %v", err)
 	}
 }
+
+func TestRepositoryExecutableDigestDomainValidation(t *testing.T) {
+	plain := "sha256:" + strings.Repeat("a", 64)
+	node := "node22-closure-v1:sha256:" + strings.Repeat("b", 64)
+	if !validRepositoryExecutableDigest("/usr/local/go/bin/go", plain) {
+		t.Fatal("ordinary Go executable digest rejected")
+	}
+	if !validRepositoryExecutableDigest("/opt/homebrew/Cellar/node/22/bin/node", node) {
+		t.Fatal("Node closure identity rejected")
+	}
+	if validRepositoryExecutableDigest("/opt/homebrew/Cellar/node/22/bin/node", plain) {
+		t.Fatal("plain digest accepted for Node")
+	}
+	if validRepositoryExecutableDigest("/usr/local/go/bin/go", node) {
+		t.Fatal("Node closure identity accepted for Go")
+	}
+}
+
+func TestNodeClosureDigestIssuesAcquiresAndCompletesRepositoryCommand(t *testing.T) {
+	db, ctx := openTestStore(t)
+	intent := repositoryCommandIntentFixture(t, db, ctx, "node-closure")
+	intent.ExecutablePath = "/opt/homebrew/Cellar/node@22/22.23.2/bin/node"
+	intent.ExecutableDigest = "node22-closure-v1:sha256:" + strings.Repeat("c", 64)
+	claim, err := db.IssueRepositoryCommandClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeDrainedRepositoryCommand(t, db, ctx, lease, claim, contracts.CommandResult{ExitCode: 0})
+	result, err := db.LoadRepositoryCommandResult(ctx, contracts.RepositoryCommandResultKey{SemanticKey: claim.SemanticKey, ClaimEpoch: claim.ClaimEpoch})
+	if err != nil || result.Claim.ExecutableDigest != intent.ExecutableDigest {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}

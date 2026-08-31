@@ -14,6 +14,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/goclosure"
+	"github.com/nysa-company/sf/internal/nodeclosure"
 )
 
 const MaxFileBytes = 64 * 1024
@@ -218,7 +219,11 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 		return Commands{Verify: command, Review: command}, nil
 	}
 	if packageJSON {
-		return Commands{}, detectionError("package.json/npm is not a locally executable v1 repository-command recipe; use operator or credential-free CI takeover instead of local commands")
+		if err := nodeclosure.Validate(repository); err != nil {
+			return Commands{}, detectionError("package.json is not the bounded dependency-free Node 22 local verification recipe; npm/dependency-bearing projects require operator or credential-free CI takeover")
+		}
+		command := Command{Argv: []string{"node", "--test"}}
+		return Commands{Verify: command, Review: command}, nil
 	}
 	return Commands{}, detectionError("repository type is unsupported; add explicit commands to .sf/config.toml")
 }

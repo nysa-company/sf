@@ -182,9 +182,22 @@ func EvaluateRepositoryCommand(argv []string) CommandDecision {
 	switch executable {
 	case "go":
 		return evaluateGoVerification(argv)
+	case "node":
+		return evaluateNodeVerification(argv)
 	default:
-		return deny("repository_command_not_allowlisted", "only the exact guarded Go test verification recipe is eligible")
+		return deny("repository_command_not_allowlisted", "only the exact guarded Go or dependency-free Node 22 test verification recipes are eligible")
 	}
+}
+
+// evaluateNodeVerification is intentionally a single source argv. The
+// supervisor adds its fixed Node 22 hardening flags after Store has bound this
+// immutable recipe. Scripts, flags, npm, and shell wrappers are never source
+// authority.
+func evaluateNodeVerification(argv []string) CommandDecision {
+	if len(argv) != 2 || argv[1] != "--test" {
+		return deny("node_recipe_forbidden", "only the exact dependency-free Node 22 recipe `node --test` is eligible; flags, scripts, npm, and wrappers require operator takeover")
+	}
+	return CommandDecision{Allowed: true, Code: "allowed_node_test_recipe", Reason: "exact dependency-free Node 22 test recipe"}
 }
 
 // evaluateGoVerification is intentionally a recipe, not a flag denylist.  The

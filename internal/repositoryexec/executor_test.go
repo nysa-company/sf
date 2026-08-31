@@ -150,6 +150,28 @@ func TestNPMRecipeNeverAcquiresRepositoryLease(t *testing.T) {
 	}
 }
 
+func TestNodeRecipeIsTheOnlyNonGoRepositoryPolicyAlternative(t *testing.T) {
+	if _, err := executionpolicy.NewCommandSnapshot([]string{"node", "--test"}); err != nil {
+		t.Fatalf("exact Node recipe rejected: %v", err)
+	}
+	if _, err := executionpolicy.NewCommandSnapshot([]string{"node", "--test", "test/smoke.test.js"}); err == nil {
+		t.Fatal("Node flags/paths were admitted")
+	}
+	if err := (processsupervisor.RepositoryCommandSupervisor{}).Preflight(contracts.CommandSpec{Argv: []string{"node", "--test"}, Profile: contracts.ProfileGuarded}); runtime.GOOS == "darwin" && err != nil {
+		t.Fatalf("Darwin Node preflight refused exact recipe: %v", err)
+	}
+}
+
+func TestExecutableDigestUsesNodeClosureIdentity(t *testing.T) {
+	if _, err := os.Stat("/opt/homebrew/bin/node"); err != nil {
+		t.Skip("Homebrew Node is unavailable")
+	}
+	got, err := ExecutableDigest("node")
+	if err != nil || !strings.HasPrefix(got, "node22-closure-v1:") {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+}
+
 func TestCanceledObservedCommandNeverCompletesRepositoryEvidence(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

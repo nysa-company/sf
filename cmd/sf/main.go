@@ -57,6 +57,36 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) >= 3 && os.Args[1] == "__repository_node_command_gate" {
+		// FD 3 carries durable Store authority and FD 4 is the authenticated
+		// worktree. This gate is deliberately separate from Go's test-wrapper
+		// gate: Node itself is the only executable after Seatbelt starts.
+		gate := os.NewFile(uintptr(3), "repository-node-launch-gate")
+		if gate == nil {
+			os.Exit(125)
+		}
+		var one [1]byte
+		if _, err := gate.Read(one[:]); err != nil {
+			os.Exit(125)
+		}
+		if err := syscall.Fchdir(4); err != nil {
+			os.Exit(125)
+		}
+		target, err := filepath.EvalSymlinks(os.Args[2])
+		if err != nil {
+			os.Exit(125)
+		}
+		profile, err := processsupervisor.RepositoryNodeSandboxProfile(os.Getenv("SF_REPOSITORY_NODE_WORKTREE"), os.Getenv("SF_REPOSITORY_NODE_CLOSURE"), target)
+		if err != nil || processsupervisor.ApplyRepositoryTestSandbox(profile) != nil {
+			os.Exit(125)
+		}
+		syscall.CloseOnExec(3)
+		syscall.CloseOnExec(4)
+		if err := syscall.Exec(target, append([]string{target}, os.Args[3:]...), os.Environ()); err != nil {
+			os.Exit(126)
+		}
+		return
+	}
 	if len(os.Args) >= 3 && os.Args[1] == "__repository_command_test_gate" {
 		// Go's trusted driver invokes this wrapper for every test binary. Make
 		// the binary its own process-group leader before the strict Seatbelt
