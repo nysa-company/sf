@@ -49,6 +49,21 @@ func (w CIWorker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fe
 	if fence.LeaderEpoch == 0 || fence.RunnerEpoch != ticket.RunnerEpoch {
 		return result, store.ErrStaleFence
 	}
+	now := time.Now
+	if w.Now != nil {
+		now = w.Now
+	}
+	admission, err := w.Store.AdmitCIPoll(ctx, ref, fence, now().UTC())
+	if err != nil {
+		return result, err
+	}
+	if !admission.Due {
+		current, ticketErr := w.Store.Ticket(ctx, ref)
+		if ticketErr != nil {
+			return result, ticketErr
+		}
+		return workflowworker.RunResult{Ref: ref, State: current.State, Version: current.Version}, nil
+	}
 
 	// The required set is server-defined. Persist it before accepting current
 	// states so the Store can reject a changed, omitted, or injected set.
@@ -62,10 +77,6 @@ func (w CIWorker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fe
 	checks, err := w.Observer.RequiredChecks(ctx, publication.PullRequest)
 	if err != nil {
 		return result, err
-	}
-	now := time.Now
-	if w.Now != nil {
-		now = w.Now
 	}
 	observation := store.CIObservation{
 		Ref:                      ref,

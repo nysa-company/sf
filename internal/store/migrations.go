@@ -1096,3 +1096,58 @@ var migrationV43 = []string{
 		OR (o.classification='pending' AND (EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state IN ('failure','cancelled')) OR NOT EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state='pending')))
 		OR (o.classification='green' AND EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state<>'success')))) BEGIN SELECT RAISE(ABORT,'ci observation check reducer mismatch'); END`,
 }
+
+// v44 preserves final-review repair boundaries. It is retained here because
+// this lane starts before the integrated v44/v45 schema baseline; integration
+// resolves the identical history before applying v46 below.
+var migrationV44 = []string{
+	`CREATE TABLE final_review_repair_boundaries (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		target_state TEXT NOT NULL CHECK(target_state IN ('verifying','building')),
+		transition_ticket_version INTEGER NOT NULL CHECK(transition_ticket_version > 0),
+		reviewer_attempt_id INTEGER NOT NULL CHECK(reviewer_attempt_id > 0), reviewer_attempt INTEGER NOT NULL CHECK(reviewer_attempt > 0), reviewer_typed_sha256 TEXT NOT NULL CHECK(length(reviewer_typed_sha256)=64),
+		prior_verification_revision INTEGER NOT NULL CHECK(prior_verification_revision > 0), amendment_reason TEXT NOT NULL CHECK(length(amendment_reason) BETWEEN 1 AND 2000), requester TEXT NOT NULL CHECK(length(requester) BETWEEN 1 AND 200),
+		correction_budget_kind TEXT NOT NULL CHECK(correction_budget_kind='correction'), correction_budget_request_id TEXT NOT NULL CHECK(length(correction_budget_request_id) BETWEEN 1 AND 300),
+		consumed_ticket_version INTEGER NOT NULL CHECK(consumed_ticket_version > 0), consumed_leader_epoch INTEGER NOT NULL CHECK(consumed_leader_epoch > 0), consumed_runner_epoch INTEGER NOT NULL CHECK(consumed_runner_epoch > 0),
+		created_at TEXT NOT NULL CHECK(length(created_at) BETWEEN 1 AND 128),
+		PRIMARY KEY(channel,project_id,ticket_id,transition_ticket_version),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(channel,project_id,ticket_id,correction_budget_kind,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch) REFERENCES ticket_budget_uses(channel,project_id,ticket_id,kind,request_id,ticket_version,leader_epoch,runner_epoch),
+		CHECK(transition_ticket_version=consumed_ticket_version+1)
+	)`,
+	`CREATE INDEX final_review_repair_boundaries_target ON final_review_repair_boundaries(channel,project_id,ticket_id,target_state,transition_ticket_version DESC)`,
+	`CREATE UNIQUE INDEX final_review_repair_boundaries_reviewer ON final_review_repair_boundaries(channel,project_id,ticket_id,reviewer_attempt_id,reviewer_attempt,transition_ticket_version)`,
+	`CREATE TRIGGER final_review_repair_boundaries_immutable_update BEFORE UPDATE ON final_review_repair_boundaries BEGIN SELECT RAISE(ABORT,'final review repair boundary is immutable'); END`,
+	`CREATE TRIGGER final_review_repair_boundaries_immutable_delete BEFORE DELETE ON final_review_repair_boundaries BEGIN SELECT RAISE(ABORT,'final review repair boundary is append-only'); END`,
+}
+
+var migrationV45 = []string{
+	`UPDATE tickets SET state='blocked',resume_state=NULL,blocked_code='legacy_runner_start_authority_unverifiable',version=version+1 WHERE state='planning' AND version=2 AND runner_epoch=1 AND NOT EXISTS(SELECT 1 FROM runner_start_authorities r WHERE r.channel=tickets.channel AND r.project_id=tickets.project_id AND r.ticket_id=tickets.id)`,
+	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,id,version,'typed_blocker','planning','blocked','{"code":"legacy_runner_start_authority_unverifiable","reason":"planning ticket predates immutable runner-start authority","next_action":"submit a fresh ticket; this legacy ticket cannot be resumed safely"}',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tickets WHERE state='blocked' AND resume_state IS NULL AND blocked_code='legacy_runner_start_authority_unverifiable'`,
+}
+
+// v46 bounds durable CI polling and aligns the SQL reducer with canonical
+// terminal-green skipped/neutral check states. v43's checksum is immutable.
+var migrationV46 = []string{
+	`CREATE TABLE ci_poll_schedules (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		candidate_generation INTEGER NOT NULL CHECK(candidate_generation > 0), candidate_head_sha TEXT NOT NULL CHECK(length(candidate_head_sha) BETWEEN 1 AND 128), candidate_tree_sha TEXT NOT NULL CHECK(length(candidate_tree_sha) BETWEEN 1 AND 128), publication_witness_digest TEXT NOT NULL CHECK(length(publication_witness_digest)=71),
+		first_polled_at TEXT NOT NULL CHECK(length(first_polled_at) BETWEEN 1 AND 128), deadline_at TEXT NOT NULL CHECK(length(deadline_at) BETWEEN 1 AND 128), max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 64),
+		PRIMARY KEY(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,publication_witness_digest),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,publication_witness_digest) REFERENCES publication_evidence(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,witness_digest)
+	)`,
+	`CREATE TABLE ci_poll_attempts (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		candidate_generation INTEGER NOT NULL, candidate_head_sha TEXT NOT NULL, candidate_tree_sha TEXT NOT NULL, publication_witness_digest TEXT NOT NULL,
+		attempt INTEGER NOT NULL CHECK(attempt BETWEEN 1 AND 64), polled_at TEXT NOT NULL CHECK(length(polled_at) BETWEEN 1 AND 128),
+		PRIMARY KEY(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,publication_witness_digest,attempt),
+		FOREIGN KEY(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,publication_witness_digest) REFERENCES ci_poll_schedules(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,publication_witness_digest)
+	)`,
+	`CREATE TRIGGER ci_poll_schedules_immutable_update BEFORE UPDATE ON ci_poll_schedules BEGIN SELECT RAISE(ABORT,'ci poll schedule is immutable'); END`,
+	`CREATE TRIGGER ci_poll_schedules_immutable_delete BEFORE DELETE ON ci_poll_schedules BEGIN SELECT RAISE(ABORT,'ci poll schedules are append-only'); END`,
+	`CREATE TRIGGER ci_poll_attempts_immutable_update BEFORE UPDATE ON ci_poll_attempts BEGIN SELECT RAISE(ABORT,'ci poll attempt is immutable'); END`,
+	`CREATE TRIGGER ci_poll_attempts_immutable_delete BEFORE DELETE ON ci_poll_attempts BEGIN SELECT RAISE(ABORT,'ci poll attempts are append-only'); END`,
+	`DROP TRIGGER ci_transition_evidence_requires_checks`,
+	`CREATE TRIGGER ci_transition_evidence_requires_checks BEFORE INSERT ON ci_transition_evidence WHEN EXISTS(SELECT 1 FROM ci_observations o WHERE o.channel=NEW.channel AND o.project_id=NEW.project_id AND o.ticket_id=NEW.ticket_id AND o.candidate_generation=NEW.candidate_generation AND o.candidate_head_sha=NEW.candidate_head_sha AND o.candidate_tree_sha=NEW.candidate_tree_sha AND o.classification=NEW.observation_classification AND o.observation_digest=NEW.observation_digest AND o.observed_ticket_version=NEW.observation_ticket_version AND o.observed_leader_epoch=NEW.observation_leader_epoch AND o.observed_runner_epoch=NEW.observation_runner_epoch AND (o.required_check_count<>(SELECT COUNT(*) FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest) OR (o.classification='red' AND NOT EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state IN ('failure','cancelled'))) OR (o.classification='pending' AND (EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state IN ('failure','cancelled')) OR NOT EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state='pending'))) OR (o.classification='green' AND EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state NOT IN ('success','skipped','neutral'))))) BEGIN SELECT RAISE(ABORT,'ci observation check reducer mismatch'); END`,
+}

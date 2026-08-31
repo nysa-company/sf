@@ -154,7 +154,7 @@ func TestPublicationV37FailsClosedForPopulatedLegacyPublish(t *testing.T) {
 			t.Fatalf("legacy publication %s blocker event count=%d err=%v", legacy.id, eventCount, err)
 		}
 	}
-	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v036-to-v043-*.sqlite"))
+	files, err := filepath.Glob(filepath.Join(backups, fmt.Sprintf("sf-schema-v036-to-v%03d-*.sqlite", schemaVersion)))
 	if err != nil || len(files) != 1 {
 		t.Fatalf("v36 populated backup files=%v err=%v", files, err)
 	}
@@ -202,7 +202,7 @@ func TestPublicationV37ToV38DispositionForPopulatedRows(t *testing.T) {
 			t.Fatalf("%s disposition=%s/%s/%s/v%d want=%s/%s/%s/v%d", want.id, state, resume, code, version, want.state, want.resume, want.code, want.version)
 		}
 	}
-	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v037-to-v043-*.sqlite"))
+	files, err := filepath.Glob(filepath.Join(backups, fmt.Sprintf("sf-schema-v037-to-v%03d-*.sqlite", schemaVersion)))
 	if err != nil || len(files) != 1 {
 		t.Fatalf("v37 backup files=%v err=%v", files, err)
 	}
@@ -1003,6 +1003,12 @@ func testMigration(version int) []string {
 		return migrationV42
 	case 43:
 		return migrationV43
+	case 44:
+		return migrationV44
+	case 45:
+		return migrationV45
+	case 46:
+		return migrationV46
 	default:
 		return nil
 	}

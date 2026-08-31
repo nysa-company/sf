@@ -238,41 +238,36 @@ func canonicalCIRequiredSetDigest(checks []CIObservationCheck) string {
 	return ciDigest(body)
 }
 
+// canonicalCIPolicySetDigest deliberately contains only protected-branch
+// context names. A check run's URL/external id changes on rerun and belongs to
+// the immutable observation, never the policy identity.
+func canonicalCIPolicySetDigest(checks []CIObservationCheck) string {
+	names := make([]string, len(checks))
+	for i, check := range checks {
+		names[i] = check.CanonicalName
+	}
+	body, _ := json.Marshal(names)
+	return ciDigest(body)
+}
+
 func canonicalCIPolicyChecks(checks []CIObservationCheck) ([]CIObservationCheck, error) {
 	if len(checks) == 0 || len(checks) > maxCIChecks {
 		return nil, ErrCIObservation
 	}
 	out := make([]CIObservationCheck, len(checks))
-	seen := make(map[string]struct{}, len(checks))
 	seenNames := make(map[string]struct{}, len(checks))
-	seenIDs := make(map[string]struct{}, len(checks))
 	for i, check := range checks {
 		name, ok := canonicalCIText(check.CanonicalName, 255)
-		external, extOK := canonicalCIText(check.ExternalID, 255)
-		if !ok || !extOK || name == "" || external == "" {
-			return nil, ErrCIObservation
-		}
-		key := name + "\x00" + external
-		if _, exists := seen[key]; exists {
+		if !ok || name == "" {
 			return nil, ErrCIObservation
 		}
 		if _, exists := seenNames[name]; exists {
 			return nil, ErrCIObservation
 		}
-		if _, exists := seenIDs[external]; exists {
-			return nil, ErrCIObservation
-		}
-		seen[key] = struct{}{}
 		seenNames[name] = struct{}{}
-		seenIDs[external] = struct{}{}
-		out[i] = CIObservationCheck{CanonicalName: name, ExternalID: external}
+		out[i] = CIObservationCheck{CanonicalName: name}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CanonicalName == out[j].CanonicalName {
-			return out[i].ExternalID < out[j].ExternalID
-		}
-		return out[i].CanonicalName < out[j].CanonicalName
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i].CanonicalName < out[j].CanonicalName })
 	return out, nil
 }
 
@@ -294,7 +289,7 @@ func canonicalCIPolicy(value CIRequiredCheckPolicy) (CIRequiredCheckPolicy, erro
 	if len(canonicalCIPolicyJSON(checks)) > maxCIDiagnosticJSON {
 		return CIRequiredCheckPolicy{}, ErrCIObservation
 	}
-	digest := canonicalCIRequiredSetDigest(checks)
+	digest := canonicalCIPolicySetDigest(checks)
 	if value.RequiredSetDigest != "" && value.RequiredSetDigest != digest {
 		return CIRequiredCheckPolicy{}, ErrCIObservation
 	}
@@ -837,7 +832,7 @@ func canonicalCIPolicyJSON(checks []CIObservationCheck) string {
 	}
 	items := make([]identity, len(checks))
 	for i, check := range checks {
-		items[i] = identity{check.CanonicalName, check.ExternalID}
+		items[i] = identity{check.CanonicalName, ""}
 	}
 	body, _ := json.Marshal(items)
 	return string(body)
@@ -884,11 +879,11 @@ func scanCurrentCIPolicy(ctx context.Context, q ciQuery, ref domain.TicketRef, p
 }
 
 func policyMatchesObservation(policy CIRequiredCheckPolicy, observation CIObservation) bool {
-	if policy.Ref != observation.Ref || policy.CandidateGeneration != observation.CandidateGeneration || policy.CandidateHeadSHA != observation.CandidateHeadSHA || policy.CandidateTreeSHA != observation.CandidateTreeSHA || policy.PublicationWitnessDigest != observation.PublicationWitnessDigest || policy.PolicyWitnessDigest != observation.PolicyWitnessDigest || policy.RequiredSetDigest != observation.RequiredSetDigest || len(policy.RequiredChecks) != len(observation.RequiredChecks) {
+	if policy.Ref != observation.Ref || policy.CandidateGeneration != observation.CandidateGeneration || policy.CandidateHeadSHA != observation.CandidateHeadSHA || policy.CandidateTreeSHA != observation.CandidateTreeSHA || policy.PublicationWitnessDigest != observation.PublicationWitnessDigest || policy.PolicyWitnessDigest != observation.PolicyWitnessDigest || len(policy.RequiredChecks) != len(observation.RequiredChecks) {
 		return false
 	}
 	for i := range policy.RequiredChecks {
-		if policy.RequiredChecks[i].CanonicalName != observation.RequiredChecks[i].CanonicalName || policy.RequiredChecks[i].ExternalID != observation.RequiredChecks[i].ExternalID {
+		if policy.RequiredChecks[i].CanonicalName != observation.RequiredChecks[i].CanonicalName {
 			return false
 		}
 	}

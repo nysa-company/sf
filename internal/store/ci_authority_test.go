@@ -90,6 +90,8 @@ func TestCIPollerAuthorityE2E(t *testing.T) {
 	}{
 		{name: "pending_replay", state: "PENDING", want: domain.StateWaitingCI},
 		{name: "green_reviewing", state: "SUCCESS", want: domain.StateReviewing},
+		{name: "green_skipped_reviewing", state: "SKIPPED", want: domain.StateReviewing},
+		{name: "green_neutral_reviewing", state: "NEUTRAL", want: domain.StateReviewing},
 		{name: "red_consumes_one_budget", state: "FAILURE", want: domain.StateBuilding},
 		{name: "red_exhausted_pauses", state: "FAILURE", setup: func(db *Store, ticket Ticket, fence domain.Fence) {
 			for _, id := range []string{"prior-one", "prior-two"} {
@@ -229,6 +231,75 @@ func TestCIPollerAuthorityPendingRestartReplaysDurableState(t *testing.T) {
 	current, err := db.Ticket(t.Context(), ticket.Ref)
 	if err != nil || current.State != domain.StateWaitingCI || current.Version != recovered.Version+1 {
 		t.Fatalf("replayed ticket=%+v err=%v", current, err)
+	}
+}
+
+func TestCIPollAdmissionBackoffCapAndRestart(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	ctx := t.Context()
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	first, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start)
+	if err != nil || !first.Due || first.Attempt != 1 || !first.NextPoll.After(start) {
+		t.Fatalf("first CI poll admission=%+v err=%v", first, err)
+	}
+	notDue, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, start.Add(time.Second))
+	if err != nil || notDue.Due || notDue.Expired || !notDue.NextPoll.Equal(first.NextPoll) {
+		t.Fatalf("backoff must suppress eager scheduler tick admission=%+v err=%v", notDue, err)
+	}
+	restartDir := t.TempDir()
+	if err := os.Chmod(restartDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(restartDir, "ci-schedule.sqlite")
+	if err := db.Backup(ctx, databasePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// The durable schedule is independent of process lifetime; same leader and
+	// runner are still current because this is a direct Store restart fixture.
+	second, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, first.NextPoll)
+	if err != nil || !second.Due || second.Attempt != 2 || second.NextPoll.Sub(first.NextPoll) != ciPollBackoff(2) {
+		t.Fatalf("restarted CI backoff admission=%+v err=%v", second, err)
+	}
+	next := second.NextPoll
+	for attempt := 3; attempt <= ciPollMaxAttempts; attempt++ {
+		admission, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+		if err != nil || !admission.Due || admission.Attempt != attempt {
+			t.Fatalf("CI attempt %d admission=%+v err=%v", attempt, admission, err)
+		}
+		next = admission.NextPoll
+	}
+	exhausted, err := db.AdmitCIPoll(ctx, ticket.Ref, fence, next)
+	if err != nil || !exhausted.Expired || exhausted.PauseCode != "ci_poll_attempts_exhausted" {
+		t.Fatalf("CI poll cap=%+v err=%v", exhausted, err)
+	}
+	paused, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || paused.State != domain.StatePaused || paused.ResumeState != domain.StateWaitingCI {
+		t.Fatalf("CI poll cap ticket=%+v err=%v", paused, err)
+	}
+}
+
+func TestCIPollAdmissionDeadlinePausesWithExplicitAction(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := db.AdmitCIPoll(t.Context(), ticket.Ref, fence, start); err != nil {
+		t.Fatal(err)
+	}
+	expired, err := db.AdmitCIPoll(t.Context(), ticket.Ref, fence, start.Add(ciPollDeadline))
+	if err != nil || !expired.Expired || expired.PauseCode != "ci_poll_deadline_exhausted" {
+		t.Fatalf("CI deadline admission=%+v err=%v", expired, err)
+	}
+	events, err := db.Events(t.Context(), ticket.Ref.Channel, 0, 100)
+	if err != nil || len(events) == 0 || events[len(events)-1].Trigger != "ci_poll_exhausted" || !strings.Contains(events[len(events)-1].Payload, `"next_action"`) {
+		t.Fatalf("CI deadline explicit next action events=%+v err=%v", events, err)
 	}
 }
 
@@ -507,6 +578,30 @@ func TestCIObservationBindsPolicyWitnessBeforeDigest(t *testing.T) {
 	tampered.ObservationDigest = strings.Repeat("f", 64)
 	if err := db.RecordCIObservation(ctx, tampered); !errors.Is(err, ErrCIObservation) {
 		t.Fatalf("tampered observation digest accepted: %v", err)
+	}
+}
+
+func TestCIRequiredPolicyAllowsRerunRunIdentity(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	publication, err := db.LoadPublishedCandidate(t.Context(), ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observe := func(run string) error {
+		return db.RecordCIRequiredCheckPolicyFromObserver(t.Context(), ticket.Ref, fakeCIAuthorityPolicyObserver{value: contracts.CIRequiredCheckPolicyObservation{
+			PullRequest: publication.PullRequest, ProtectedBranchRef: publication.PullRequest.BaseRef, ProtectedBranchOID: publication.PullRequest.BaseOID,
+			PolicySourceDigest: strings.Repeat("a", 64), AuthenticatedPrincipal: "ci-observer", RequiredChecks: []contracts.RequiredCheck{{Name: "lint", ExternalID: run, State: "PENDING"}}, ObservedAt: time.Now().UTC(),
+		}})
+	}
+	if err := observe("https://github.com/acme/app/actions/runs/1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := observe("https://github.com/acme/app/actions/runs/2"); err != nil {
+		t.Fatalf("same required context with rerun identity must not conflict: %v", err)
+	}
+	if _, err := db.Ticket(t.Context(), ticket.Ref); err != nil || fence.RunnerEpoch != ticket.RunnerEpoch {
+		t.Fatalf("rerun policy unexpectedly mutated ticket err=%v", err)
 	}
 }
 

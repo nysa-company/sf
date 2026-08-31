@@ -490,19 +490,17 @@ func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contr
 	if !requiredChecksMatchProtection(checks, protectionAfter) {
 		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
 	}
-	canonical := make([]map[string]string, 0, len(checks))
+	// A required context is stable policy identity; the run/check URL emitted by
+	// `gh pr checks --required` is deliberately per-observation identity and
+	// changes on a rerun. Never freeze that run value into the policy witness.
+	canonical := make([]string, 0, len(checks))
 	for _, check := range checks {
-		canonical = append(canonical, map[string]string{"name": check.Name, "external_id": check.ExternalID})
+		canonical = append(canonical, check.Name)
 	}
-	sort.Slice(canonical, func(i, j int) bool {
-		if canonical[i]["name"] != canonical[j]["name"] {
-			return canonical[i]["name"] < canonical[j]["name"]
-		}
-		return canonical[i]["external_id"] < canonical[j]["external_id"]
-	})
+	sort.Strings(canonical)
 	body, err := json.Marshal(struct {
 		Protection strictProtectionWitness `json:"protection"`
-		Checks     []map[string]string     `json:"checks"`
+		Checks     []string                `json:"checks"`
 	}{protection, canonical})
 	if err != nil {
 		return contracts.CIRequiredCheckPolicyObservation{}, err
@@ -524,7 +522,14 @@ func requiredChecksMatchProtection(checks []contracts.RequiredCheck, protection 
 	}
 	want := make(map[string]bool, len(protection.Checks))
 	for _, configured := range protection.Checks {
-		name := strings.SplitN(configured, "\x00", 2)[0]
+		parts := strings.SplitN(configured, "\x00", 2)
+		name := parts[0]
+		// `gh pr checks --required` exposes run URL/external identity, not a
+		// ruleset integration id. A nonzero integration requirement therefore
+		// cannot be proven by this observer and must fail closed.
+		if len(parts) != 2 || (parts[1] != "-" && parts[1] != "0") {
+			return false
+		}
 		if !bounded(name, 1024) || want[name] {
 			return false
 		}

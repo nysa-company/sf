@@ -28,7 +28,7 @@ func TestCICorrectionV41SchemaIsAppendOnlyAndValidated(t *testing.T) {
 	if version != schemaVersion || len(migrationChecksums) != schemaVersion {
 		t.Fatalf("schema version/checksum history=%d/%d", version, len(migrationChecksums))
 	}
-	for _, table := range []string{"ci_required_check_policies", "ci_observations", "ci_observation_checks", "ci_transition_evidence", "candidate_repair_bindings", "candidate_repair_completions"} {
+	for _, table := range []string{"ci_required_check_policies", "ci_observations", "ci_observation_checks", "ci_transition_evidence", "candidate_repair_bindings", "candidate_repair_completions", "ci_poll_schedules", "ci_poll_attempts"} {
 		var count int
 		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("required table %s count=%d err=%v", table, count, err)
@@ -645,7 +645,7 @@ func TestCIV41RowsSurviveV42V43MigrationAndRemainImmutable(t *testing.T) {
 		t.Fatalf("v41 authority rows lost during v42/v43 migration: observations=%d checks=%d evidence=%d bindings=%d completions=%d", observations, checks, evidence, bindings, completions)
 	}
 	var version int
-	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 43 {
+	if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != schemaVersion {
 		t.Fatalf("migrated schema=%d err=%v", version, err)
 	}
 	if _, err := database.db.ExecContext(ctx, `UPDATE ci_observations SET diagnostic_text='tampered' WHERE observation_id=1`); err == nil {

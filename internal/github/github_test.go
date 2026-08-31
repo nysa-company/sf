@@ -2114,12 +2114,19 @@ func TestChecksAllowExtrasButFailureDominatesPending(t *testing.T) {
 }
 
 func TestRequiredChecksMatchProtectionRequiresExactConfiguredSet(t *testing.T) {
-	protection := strictProtectionWitness{Checks: []string{"lint\x00-", "unit\x001"}}
+	protection := strictProtectionWitness{Checks: []string{"lint\x00-", "unit\x00-"}}
 	if !requiredChecksMatchProtection([]contracts.RequiredCheck{{Name: "unit", ExternalID: "run-1"}, {Name: "lint", ExternalID: "run-2"}}, protection) {
 		t.Fatal("exact configured check set was refused")
 	}
 	if requiredChecksMatchProtection([]contracts.RequiredCheck{{Name: "lint", ExternalID: "run-2"}}, protection) || requiredChecksMatchProtection([]contracts.RequiredCheck{{Name: "lint", ExternalID: "run-2"}, {Name: "unit", ExternalID: "run-1"}, {Name: "extra", ExternalID: "run-3"}}, protection) {
 		t.Fatal("subset or extra check set was accepted")
+	}
+}
+
+func TestRequiredChecksMatchProtectionRejectsUnprovableRulesetIntegration(t *testing.T) {
+	protection := strictProtectionWitness{Kind: "ruleset", Checks: []string{"unit\x0042"}}
+	if requiredChecksMatchProtection([]contracts.RequiredCheck{{Name: "unit", ExternalID: "https://github.com/acme/app/actions/runs/9"}}, protection) {
+		t.Fatal("ruleset integration requirement was accepted from an unrelated run URL")
 	}
 }
 
