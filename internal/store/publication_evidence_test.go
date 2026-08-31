@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -190,7 +191,7 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	if _, err := db.RecordCandidate(ctx, CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snapshot, BuilderResult: builtKey, Commit: CommitObservation{CommitOID: snapshot.HeadSHA, ParentOID: checkpoint, TreeOID: snapshot.TreeSHA}, Reason: "publication", CommandResult: candidateCommand}); err != nil {
 		t.Fatal(err)
 	}
-	stored, err := db.LatestCandidate(ctx, ticket.Ref)
+	stored, err := db.RecoverableCandidate(ctx, ticket.Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,13 +202,518 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	return db, ctx, ticket, fence
 }
 
+func TestCandidateOnlyPublishingRecoveryWithoutPublicationWitness(t *testing.T) {
+	db, ctx, ticket, _ := publicationLifecycleFixture(t)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "candidate-only-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err != nil || changed != 1 {
+		t.Fatalf("candidate-only fence changed=%d err=%v", changed, err)
+	}
+	if err := db.RebindRecoveredPublishedCandidates(ctx, domain.ChannelDev, leader); err != nil {
+		t.Fatalf("candidate-only startup rebind=%v", err)
+	}
+	if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("candidate-only recovery manufactured publication evidence: %v", err)
+	}
+	current, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || current.State != domain.StatePublishing {
+		t.Fatalf("candidate-only ticket=%+v err=%v", current, err)
+	}
+}
+
+func recordFixturePublication(t *testing.T, db *Store, ctx context.Context, ticket Ticket, fence domain.Fence) {
+	t.Helper()
+	worktree, err := db.Worktree(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := db.RecoverableCandidate(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "acme", Name: "app"}, Number: 42, HeadOwner: "acme", HeadRepository: "app", HeadRef: worktree.Branch, HeadOID: candidate.Snapshot.HeadSHA, BaseRef: "main", BaseOID: candidate.Snapshot.BaseSHA, FactoryOwned: true}
+	value := PublishedCandidateEvidence{Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence, Candidate: candidate, ConfigGeneration: ticket.ConfigGeneration, ConfigDigest: ticket.ConfigDigest, ConfigSnapshotDigest: sha256Digest(ticket.ConfigSnapshot), Worktree: worktree, RemoteBranchRef: worktree.Branch, RemoteBranchOID: candidate.Snapshot.HeadSHA, RemoteBaseOID: candidate.Snapshot.BaseSHA, PullRequest: pr, PullRequestState: "OPEN", PullRequestDraft: true, PullRequestObservedAt: time.Now().UTC(), CreatedAt: time.Now().UTC()}
+	value.PushEffect = PublicationEffectEvidence{SemanticKey: "fixture-push-" + string(ticket.Ref.Ticket), Kind: PublicationPushEffectKind, RequestDigest: strings.Repeat("1", 64), ClaimEpoch: 1, ObservedIdentity: CanonicalPublicationPushObservation(value.RemoteBranchRef, value.RemoteBranchOID)}
+	value.PRCreateOrUpdateEffect = PublicationEffectEvidence{SemanticKey: "fixture-pr-" + string(ticket.Ref.Ticket), Kind: PublicationPRCreateEffectKind, RequestDigest: "sha256:" + strings.Repeat("2", 64), ClaimEpoch: 1, ObservedIdentity: CanonicalPublicationPRObservation(pr, "OPEN", true)}
+	for _, effect := range []PublicationEffectEvidence{value.PushEffect, value.PRCreateOrUpdateEffect} {
+		if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: effect.SemanticKey, Ref: ticket.Ref, Kind: effect.Kind, TicketVersion: ticket.Version, Fence: fence, RequestDigest: effect.RequestDigest}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := db.ClaimEffect(ctx, EffectFence{SemanticKey: effect.SemanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ConfirmEffect(ctx, EffectFence{SemanticKey: effect.SemanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}}, effect.ObservedIdentity); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.RecordPublishedCandidate(ctx, value); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPausedPublishingResumeToWaitingCIAuthenticatesControlLineage(t *testing.T) {
+	db, ctx, ticket, fence := publicationLifecycleFixture(t)
+	recordFixturePublication(t, db, ctx, ticket, fence)
+	current, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionPublishedCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	current, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitingFence := domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
+	stopping, err := db.TransitionAndInvalidateRunner(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StateWaitingCI, To: domain.StateStopping, ResumeState: domain.StateWaitingCI, Trigger: "operator_pause_or_take", Fence: waitingFence, EventPayload: `{}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused, err := db.CompleteControlTransition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: stopping.Version, From: domain.StateStopping, To: domain.StatePaused, ResumeState: domain.StateWaitingCI, Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch + 1}, EventPayload: `{}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateWaitingCI, Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch + 1}, EventPayload: `{}`})
+	if err != nil || resumed.EventID == 0 {
+		t.Fatalf("waiting-ci resume=%+v err=%v", resumed, err)
+	}
+	loaded, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
+	if err != nil || loaded.CurrentTicketVersion != ticket.Version {
+		t.Fatalf("waiting-ci publication=%+v err=%v", loaded, err)
+	}
+}
+
+func TestWaitingCIPublicationReaderRequiresFenceAfterLeaderAcquisition(t *testing.T) {
+	db, ctx, ticket, fence := publicationLifecycleFixture(t)
+	recordFixturePublication(t, db, ctx, ticket, fence)
+	if _, err := db.TransitionPublishedCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "waiting-ci-leader-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("waiting-ci publication read survived leader-only takeover: %v", err)
+	}
+	if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil {
+		t.Fatalf("waiting-ci fence=%v", err)
+	}
+	if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
+		t.Fatalf("fenced waiting-ci publication read=%v", err)
+	}
+	current, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || current.Version != waiting.Version+1 || current.RunnerEpoch != waiting.RunnerEpoch+1 {
+		t.Fatalf("waiting-ci fence did not append exact recovery: current=%+v waiting=%+v err=%v", current, waiting, err)
+	}
+}
+
+func TestSemanticPublishingPauseResumeAuthenticatesExactPair(t *testing.T) {
+	db, ctx, ticket, fence := publicationLifecycleFixture(t)
+	recordFixturePublication(t, db, ctx, ticket, fence)
+	paused, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StatePaused, ResumeState: domain.StatePublishing, Trigger: "retry_or_correction_exhausted", Fence: fence, EventPayload: `{"reason":"retry_budget"}`})
+	if err != nil {
+		t.Fatalf("semantic publishing pause=%v", err)
+	}
+	resumed, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StatePublishing, Trigger: "operator_retry", Fence: fence, EventPayload: `{}`})
+	if err != nil || resumed.EventID == 0 {
+		t.Fatalf("semantic publishing resume=%+v err=%v", resumed, err)
+	}
+	loaded, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
+	if err != nil || loaded.CurrentTicketVersion != ticket.Version {
+		t.Fatalf("semantic publishing publication=%+v err=%v", loaded, err)
+	}
+	var rebinds int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&rebinds); err != nil || rebinds != 0 {
+		t.Fatalf("semantic pause minted publication rebinds=%d err=%v", rebinds, err)
+	}
+}
+
+func TestSemanticWaitingCIPauseResumeAuthenticatesExactPair(t *testing.T) {
+	db, ctx, ticket, fence := publicationLifecycleFixture(t)
+	recordFixturePublication(t, db, ctx, ticket, fence)
+	if _, err := db.TransitionPublishedCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: waiting.Version, From: domain.StateWaitingCI, To: domain.StatePaused, ResumeState: domain.StateWaitingCI, Trigger: "retry_or_correction_exhausted", Fence: fence, EventPayload: `{"reason":"ci_red_exhausted"}`})
+	if err != nil {
+		t.Fatalf("semantic waiting-ci pause=%v", err)
+	}
+	resumed, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateWaitingCI, Trigger: "operator_resume", Fence: fence, EventPayload: `{}`})
+	if err != nil || resumed.EventID == 0 {
+		t.Fatalf("semantic waiting-ci resume=%+v err=%v", resumed, err)
+	}
+	loaded, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
+	if err != nil || loaded.CurrentTicketVersion != ticket.Version {
+		t.Fatalf("semantic waiting-ci publication=%+v err=%v", loaded, err)
+	}
+	mutantDir := t.TempDir()
+	if err := os.Chmod(mutantDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mutantPath := mutantDir + "/semantic-waiting-runner-bump.sqlite"
+	if err := db.Backup(ctx, mutantPath); err != nil {
+		t.Fatal(err)
+	}
+	mutant, err := Open(ctx, mutantPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutant.db.ExecContext(ctx, `UPDATE tickets SET runner_epoch=runner_epoch+1 WHERE channel=? AND project_id=? AND id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		mutant.Close()
+		t.Fatal(err)
+	}
+	if _, err := mutant.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
+		mutant.Close()
+		t.Fatal("semantic waiting-ci replay accepted an unexplained runner bump")
+	}
+	mutant.Close()
+}
+
+func TestBlockedPublishingRecoverRequiresTypedBlockerAndRebindsPublication(t *testing.T) {
+	db, ctx, ticket, fence := publicationLifecycleFixture(t)
+	recordFixturePublication(t, db, ctx, ticket, fence)
+	current, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateBlocked, ResumeState: domain.StatePublishing, Trigger: "typed_blocker", Fence: fence, EventPayload: `{"code":"publication_retry_required"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedVersion := blocked.Version
+	resumed, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: blockedVersion, From: domain.StateBlocked, To: domain.StatePublishing, Trigger: "operator_recover", Fence: fence, EventPayload: `{}`})
+	if err != nil || resumed.EventID == 0 {
+		t.Fatalf("blocked publication recover=%+v err=%v", resumed, err)
+	}
+	loaded, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
+	if err != nil || loaded.CurrentTicketVersion != ticket.Version {
+		t.Fatalf("recovered publication=%+v err=%v", loaded, err)
+	}
+}
+
+func TestBlockedWaitingCIRecoverAuthenticatesExactPair(t *testing.T) {
+	db, ctx, ticket, fence := publicationLifecycleFixture(t)
+	recordFixturePublication(t, db, ctx, ticket, fence)
+	if _, err := db.TransitionPublishedCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: waiting.Version, From: domain.StateWaitingCI, To: domain.StateBlocked, ResumeState: domain.StateWaitingCI, Trigger: "typed_blocker", Fence: fence, EventPayload: `{"code":"ci_retry_required"}`})
+	if err != nil {
+		t.Fatalf("waiting-ci block=%v", err)
+	}
+	resumed, err := db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: blocked.Version, From: domain.StateBlocked, To: domain.StateWaitingCI, Trigger: "operator_recover", Fence: fence, EventPayload: `{}`})
+	if err != nil || resumed.EventID == 0 {
+		t.Fatalf("waiting-ci recover=%+v err=%v", resumed, err)
+	}
+	if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
+		t.Fatalf("waiting-ci recovered publication=%v", err)
+	}
+
+	mutantDir := t.TempDir()
+	if err := os.Chmod(mutantDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mutantPath := mutantDir + "/blocked-waiting-runner-bump.sqlite"
+	if err := db.Backup(ctx, mutantPath); err != nil {
+		t.Fatal(err)
+	}
+	mutant, err := Open(ctx, mutantPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutant.db.ExecContext(ctx, `UPDATE tickets SET runner_epoch=runner_epoch+1 WHERE channel=? AND project_id=? AND id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		mutant.Close()
+		t.Fatal(err)
+	}
+	if _, err := mutant.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
+		mutant.Close()
+		t.Fatal("blocked waiting-ci replay accepted an unexplained runner bump")
+	}
+	mutant.Close()
+
+	tamperDir := t.TempDir()
+	if err := os.Chmod(tamperDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tamperPath := tamperDir + "/blocked-waiting-payload.sqlite"
+	if err := db.Backup(ctx, tamperPath); err != nil {
+		t.Fatal(err)
+	}
+	tamper, err := Open(ctx, tamperPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tamper.db.ExecContext(ctx, `UPDATE events SET payload='{"code":"tampered"}' WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='typed_blocker'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		tamper.Close()
+		t.Fatal(err)
+	}
+	if _, err := tamper.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
+		tamper.Close()
+		t.Fatal("blocked waiting-ci replay accepted tampered blocker lineage")
+	}
+	tamper.Close()
+}
+
+func TestPublishingResumeTakeoverRequiresRecoveryRebind(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		blocked bool
+		pauseTo domain.State
+		trigger string
+		payload string
+		resume  string
+	}{
+		{name: "typed-blocker", blocked: true},
+		{name: "semantic-pause", pauseTo: domain.StatePaused, trigger: "retry_or_correction_exhausted", payload: `{"reason":"retry_budget"}`, resume: "operator_retry"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, ctx, ticket, fence := publicationLifecycleFixture(t)
+			recordFixturePublication(t, db, ctx, ticket, fence)
+			current, err := db.Ticket(ctx, ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.blocked {
+				blocked, transitionErr := db.TransitionPublishedBlock(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: domain.StateBlocked, ResumeState: domain.StatePublishing, Trigger: "typed_blocker", Fence: fence, EventPayload: `{"code":"publication_retry_required"}`})
+				if transitionErr != nil {
+					t.Fatal(transitionErr)
+				}
+				_, err = db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: blocked.Version, From: domain.StateBlocked, To: domain.StatePublishing, Trigger: "operator_recover", Fence: fence, EventPayload: `{}`})
+			} else {
+				paused, transitionErr := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: current.Version, From: domain.StatePublishing, To: tc.pauseTo, ResumeState: domain.StatePublishing, Trigger: tc.trigger, Fence: fence, EventPayload: tc.payload})
+				if transitionErr != nil {
+					t.Fatal(transitionErr)
+				}
+				_, err = db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StatePublishing, Trigger: tc.resume, Fence: fence, EventPayload: `{}`})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, err = db.Ticket(ctx, ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "publishing-resume-takeover-"+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); !errors.Is(err, ErrStaleFence) {
+				t.Fatalf("pre-fence publishing resume accepted: %v", err)
+			}
+			if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil || changed != 1 {
+				t.Fatalf("publishing resume fence changed=%d err=%v", changed, err)
+			}
+			fenced, err := db.Ticket(ctx, ticket.Ref)
+			if err != nil || fenced.Version != current.Version+1 || fenced.RunnerEpoch != current.RunnerEpoch+1 {
+				t.Fatalf("publishing resume recovery=%+v prior=%+v err=%v", fenced, current, err)
+			}
+			if err := db.RebindRecoveredPublishedCandidates(ctx, domain.ChannelDev, newLeader); err != nil {
+				t.Fatalf("publishing resume rebind=%v", err)
+			}
+			if err := db.RebindPublishedCandidate(ctx, ticket.Ref, fenced.Version, domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: fenced.RunnerEpoch}); err != nil {
+				t.Fatalf("publishing resume lost-response rebind=%v", err)
+			}
+			if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
+				t.Fatalf("publishing resume post-fence load=%v", err)
+			}
+		})
+	}
+}
+
+func TestWaitingCIResumeTakeoverUsesResumedEndpointRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		blocked bool
+		trigger string
+		payload string
+		resume  string
+	}{
+		{name: "typed-blocker", blocked: true},
+		{name: "semantic-pause", trigger: "ci_red_exhausted", payload: `{"reason":"ci_red_exhausted"}`, resume: "operator_resume"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, ctx, ticket, fence := publicationLifecycleFixture(t)
+			recordFixturePublication(t, db, ctx, ticket, fence)
+			_, err := db.TransitionPublishedCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence, EventPayload: `{}`})
+			if err != nil {
+				t.Fatal(err)
+			}
+			waiting, err := db.Ticket(ctx, ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.blocked {
+				blocked, transitionErr := db.TransitionPublishedBlock(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: waiting.Version, From: domain.StateWaitingCI, To: domain.StateBlocked, ResumeState: domain.StateWaitingCI, Trigger: "typed_blocker", Fence: fence, EventPayload: `{"code":"ci_retry_required"}`})
+				if transitionErr != nil {
+					t.Fatal(transitionErr)
+				}
+				_, err = db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: blocked.Version, From: domain.StateBlocked, To: domain.StateWaitingCI, Trigger: "operator_recover", Fence: fence, EventPayload: `{}`})
+			} else {
+				paused, transitionErr := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: waiting.Version, From: domain.StateWaitingCI, To: domain.StatePaused, ResumeState: domain.StateWaitingCI, Trigger: tc.trigger, Fence: fence, EventPayload: tc.payload})
+				if transitionErr != nil {
+					t.Fatal(transitionErr)
+				}
+				_, err = db.TransitionPublishedResume(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateWaitingCI, Trigger: tc.resume, Fence: fence, EventPayload: `{}`})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			resumed, err := db.Ticket(ctx, ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "waiting-resume-takeover-"+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); !errors.Is(err, ErrStaleFence) {
+				t.Fatalf("pre-fence waiting resume accepted: %v", err)
+			}
+			if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil || changed != 1 {
+				t.Fatalf("waiting resume fence changed=%d err=%v", changed, err)
+			}
+			fenced, err := db.Ticket(ctx, ticket.Ref)
+			if err != nil || fenced.Version != resumed.Version+1 || fenced.RunnerEpoch != resumed.RunnerEpoch+1 {
+				t.Fatalf("waiting resume recovery=%+v prior=%+v err=%v", fenced, resumed, err)
+			}
+			if err := db.RebindRecoveredPublishedCandidates(ctx, domain.ChannelDev, newLeader); err != nil {
+				t.Fatalf("waiting resume rebind/load=%v", err)
+			}
+			if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
+				t.Fatalf("waiting resume post-fence load=%v", err)
+			}
+		})
+	}
+}
+
+func TestLatestCandidateRejectsLeaderOnlyTakeover(t *testing.T) {
+	db, ctx, ticket, fence := publicationLifecycleFixture(t)
+	candidate, err := db.RecoverableCandidate(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture advances through the publication boundary. Put the isolated
+	// current-reader check back at the candidate's authenticated build endpoint;
+	// the only subsequent change is daemon leadership.
+	if _, err := db.db.ExecContext(ctx, `UPDATE tickets SET state='building',version=?,runner_epoch=? WHERE channel=? AND project_id=? AND id=?`, candidate.TicketVersion, candidate.Fence.RunnerEpoch, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.LatestCandidate(ctx, ticket.Ref); err != nil {
+		t.Fatalf("current candidate before takeover=%v", err)
+	}
+	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "latest-candidate-leader-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = fence
+	if _, err := db.LatestCandidate(ctx, ticket.Ref); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("latest candidate survived leader-only takeover: %v", err)
+	}
+	if newLeader == 0 {
+		t.Fatal("leader acquisition returned zero")
+	}
+}
+
+func TestBuilderPublishingRecoveryRebindsOnlyTheLatestCandidate(t *testing.T) {
+	db, ctx, ticket, _ := publicationLifecycleFixture(t)
+	candidate, err := db.RecoverableCandidate(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "builder-publishing-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err != nil || changed != 1 {
+		t.Fatalf("fence publishing candidate changed=%d err=%v", changed, err)
+	}
+	live, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: live.RunnerEpoch}
+	reusable, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: live.Version, Fence: fence})
+	if err != nil || !reusable.Recovered || reusable.Key != candidate.BuilderResult {
+		t.Fatalf("reusable builder=%+v err=%v", reusable, err)
+	}
+	if _, err := db.RecordCandidate(ctx, CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: live.Version, Fence: fence, Snapshot: candidate.Snapshot, BuilderResult: candidate.BuilderResult, Commit: candidate.Commit, Reason: "recover builder before publish", CommandResult: candidate.CommandBinding.Key}); err != nil {
+		t.Fatalf("rebind candidate=%v", err)
+	}
+	newGeneration := candidate
+	newGeneration.Snapshot.Generation++
+	if _, err := db.RecordCandidate(ctx, CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: live.Version, Fence: fence, Snapshot: newGeneration.Snapshot, BuilderResult: newGeneration.BuilderResult, Commit: newGeneration.Commit, Reason: "must not mint during publish", CommandResult: newGeneration.CommandBinding.Key}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("publishing accepted a new candidate generation: %v", err)
+	}
+	current, err := db.LatestCandidate(ctx, ticket.Ref)
+	if err != nil || current.Snapshot.Generation != candidate.Snapshot.Generation || current.BuilderResult != candidate.BuilderResult || current.TicketVersion != live.Version || current.Fence != fence {
+		t.Fatalf("current candidate=%+v err=%v", current, err)
+	}
+
+	t.Run("wrong builder role is not bridged", func(t *testing.T) {
+		result, _, err := db.LoadHistoricalProviderAttemptResult(ctx, candidate.BuilderResult)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result.Claim.Role = "reviewer"
+		if err := providerResultReachesFence(ctx, db.db, candidate.BuilderResult, result, live.Version, fence); !errors.Is(err, ErrStaleFence) {
+			t.Fatalf("wrong-role bridge accepted: %v", err)
+		}
+	})
+
+	t.Run("wrong transition is not bridged", func(t *testing.T) {
+		other, otherCtx, otherTicket, _ := publicationLifecycleFixture(t)
+		otherCandidate, err := other.RecoverableCandidate(otherCtx, otherTicket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		otherLeader, err := other.AcquireLeader(otherCtx, domain.ChannelDev, "builder-publishing-wrong-transition")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := other.FenceRecoveredRunners(otherCtx, domain.ChannelDev, otherLeader); err != nil {
+			t.Fatal(err)
+		}
+		otherLive, err := other.Ticket(otherCtx, otherTicket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := other.db.ExecContext(otherCtx, `UPDATE events SET to_state='reviewing' WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, otherTicket.Ref.Channel, otherTicket.Ref.Project, otherTicket.Ref.Ticket, otherLive.Version-1); err != nil {
+			t.Fatal(err)
+		}
+		result, _, err := other.LoadHistoricalProviderAttemptResult(otherCtx, otherCandidate.BuilderResult)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := providerResultReachesFence(otherCtx, other.db, otherCandidate.BuilderResult, result, otherLive.Version, domain.Fence{LeaderEpoch: otherLeader, RunnerEpoch: otherLive.RunnerEpoch}); !errors.Is(err, ErrStaleFence) {
+			t.Fatalf("wrong-transition bridge accepted: %v", err)
+		}
+	})
+}
+
 func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 	db, ctx, ticket, fence := publicationLifecycleFixture(t)
 	worktree, err := db.Worktree(ctx, ticket.Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidate, err := db.LatestCandidate(ctx, ticket.Ref)
+	candidate, err := db.RecoverableCandidate(ctx, ticket.Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,9 +1098,9 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 			t.Fatalf("waiting_ci recovery %d=%v", recovery, err)
 		}
 	}
-	// A direct runner invalidation has no recovery-ledger proof. Startup
-	// fencing remains available after that control gap, but publication replay
-	// must fail closed rather than treating the counters as recovery evidence.
+	// A direct runner invalidation has no recovery-ledger or runtime-control
+	// proof. Neither startup fencing nor publication replay may treat its bare
+	// counter advance as an authenticated predecessor.
 	invalidated, err := Open(ctx, waitingBase)
 	if err != nil {
 		t.Fatal(err)
@@ -609,9 +1115,29 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		invalidated.Close()
 		t.Fatal(err)
 	}
-	if _, err := invalidated.FenceRecoveredRunners(ctx, domain.ChannelDev, invalidLeader); err != nil {
+	invalidatedBeforeFence, err := invalidated.Ticket(ctx, ticket.Ref)
+	if err != nil {
 		invalidated.Close()
-		t.Fatalf("fencing after control invalidation=%v", err)
+		t.Fatal(err)
+	}
+	var invalidatedLedgerRows int
+	if err := invalidated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&invalidatedLedgerRows); err != nil {
+		invalidated.Close()
+		t.Fatal(err)
+	}
+	if _, err := invalidated.FenceRecoveredRunners(ctx, domain.ChannelDev, invalidLeader); !errors.Is(err, ErrPublicationEvidence) {
+		invalidated.Close()
+		t.Fatalf("bare control invalidation fence=%v", err)
+	}
+	invalidatedAfterFence, err := invalidated.Ticket(ctx, ticket.Ref)
+	if err != nil || invalidatedAfterFence.Version != invalidatedBeforeFence.Version || invalidatedAfterFence.RunnerEpoch != invalidatedBeforeFence.RunnerEpoch {
+		invalidated.Close()
+		t.Fatalf("bare control invalidation fence mutated ticket before=%+v after=%+v err=%v", invalidatedBeforeFence, invalidatedAfterFence, err)
+	}
+	var invalidatedLedgerRowsAfter int
+	if err := invalidated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&invalidatedLedgerRowsAfter); err != nil || invalidatedLedgerRowsAfter != invalidatedLedgerRows {
+		invalidated.Close()
+		t.Fatalf("bare control invalidation ledger rows=%d want=%d err=%v", invalidatedLedgerRowsAfter, invalidatedLedgerRows, err)
 	}
 	if _, err := invalidated.LoadPublishedCandidate(ctx, ticket.Ref); err == nil {
 		invalidated.Close()

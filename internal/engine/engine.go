@@ -85,6 +85,9 @@ func (e *Engine) transition(ctx context.Context, request contracts.TransitionReq
 	if transition.ResumeState == "$from" {
 		resume = request.From
 	}
+	if transition.ResumeState == "$resume_state" {
+		resume = ticket.ResumeState
+	}
 	if transition.ResumeState == "$stored" {
 		resume = ticket.ResumeState
 	}
@@ -101,6 +104,8 @@ func (e *Engine) transition(ctx context.Context, request contracts.TransitionReq
 		result, err = e.store.CompleteControlTransition(ctx, persisted)
 	} else if strings.HasPrefix(transition.PhaseDisposition, "invalidate_runner_epoch") {
 		result, err = e.store.TransitionAndInvalidateRunner(ctx, persisted)
+	} else if ((persisted.From == domain.StatePaused && (persisted.Trigger == "operator_resume" || persisted.Trigger == "operator_retry")) || (persisted.From == domain.StateBlocked && persisted.Trigger == "operator_recover")) && (persisted.To == domain.StatePublishing || persisted.To == domain.StateWaitingCI) {
+		result, err = e.store.TransitionPublishedResume(ctx, persisted)
 	} else {
 		result, err = persist(ctx, persisted)
 	}

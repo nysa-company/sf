@@ -122,6 +122,9 @@ func (s *Store) LoadCurrentProviderAttemptResult(ctx context.Context, key Provid
 	if err := s.AssertTicketFence(ctx, key.Ref, expected, fence); err != nil {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, err
 	}
+	if err := validateRunnerRecoveryAuthority(ctx, s.db, key.Ref, expected, fence); err != nil {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+	}
 	return result, parsed, nil
 }
 
@@ -201,18 +204,19 @@ func (s *Store) ValidateFinalReviewEvidence(ctx context.Context, ref domain.Tick
 }
 
 type rowQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 func validateFinalReviewEvidence(ctx context.Context, query rowQueryer, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, expectedHead, expectedProof string) error {
 	var head, proof, intent, source, ticketSource string
-	var ticketVersion, runner, candidateRunner uint64
+	var ticketVersion, runner, candidateVersion, candidateLeader, candidateRunner uint64
 	var verificationIntent, verificationProof sql.NullString
-	if err := query.QueryRowContext(ctx, `SELECT c.head_sha,c.proof_digest,c.verification_intent_digest,c.source_digest,t.version,t.runner_epoch,c.runner_epoch,t.source_digest,v.intent_digest,v.proof_digest
+	if err := query.QueryRowContext(ctx, `SELECT c.head_sha,c.proof_digest,c.verification_intent_digest,c.source_digest,c.ticket_version,c.leader_epoch,c.runner_epoch,t.version,t.runner_epoch,t.source_digest,v.intent_digest,v.proof_digest
 		FROM candidate_snapshots c
 		JOIN tickets t ON t.channel=c.channel AND t.project_id=c.project_id AND t.id=c.ticket_id
 		LEFT JOIN verifications v ON v.channel=c.channel AND v.project_id=c.project_id AND v.ticket_id=c.ticket_id
-		WHERE c.channel=? AND c.project_id=? AND c.ticket_id=? ORDER BY c.generation DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket).Scan(&head, &proof, &intent, &source, &ticketVersion, &runner, &candidateRunner, &ticketSource, &verificationIntent, &verificationProof); err != nil {
+		WHERE c.channel=? AND c.project_id=? AND c.ticket_id=? ORDER BY c.generation DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket).Scan(&head, &proof, &intent, &source, &candidateVersion, &candidateLeader, &candidateRunner, &ticketVersion, &runner, &ticketSource, &verificationIntent, &verificationProof); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrEvidenceConflict
 		}
@@ -222,8 +226,16 @@ func validateFinalReviewEvidence(ctx context.Context, query rowQueryer, ref doma
 	if err := query.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&leader); err != nil {
 		return normalizeBusy(ctx, err)
 	}
-	if leader != fence.LeaderEpoch || head != expectedHead || proof != expectedProof || ticketVersion > expectedVersion || candidateRunner != fence.RunnerEpoch || runner != fence.RunnerEpoch || source != ticketSource || !verificationIntent.Valid || !verificationProof.Valid || intent != verificationIntent.String || proof != verificationProof.String {
+	if leader != fence.LeaderEpoch || head != expectedHead || proof != expectedProof || candidateVersion > expectedVersion || ticketVersion > expectedVersion || runner != fence.RunnerEpoch || source != ticketSource || candidateLeader == 0 || candidateRunner == 0 || !verificationIntent.Valid || !verificationProof.Valid || intent != verificationIntent.String || proof != verificationProof.String {
 		return ErrEvidenceConflict
+	}
+	if candidateRunner != runner || candidateLeader != leader {
+		// Start at the exact candidate endpoint. Picking an arbitrary later
+		// ledger predecessor would leave candidate->bridge unproved and could
+		// silently skip an unauthenticated runner/leader gap.
+		if validateRunnerRecoveryLedger(ctx, query, ref, candidateVersion, candidateRunner, candidateLeader, expectedVersion, runner, leader) != nil {
+			return ErrEvidenceConflict
+		}
 	}
 	return nil
 }
@@ -765,6 +777,9 @@ func (s *Store) LoadProviderAttemptResult(ctx context.Context, claim ProviderAtt
 	if claim.ID <= 0 || claim.ExpectedVersion != expected || claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
 	}
+	if err := validateRunnerRecoveryAuthority(ctx, s.db, claim.Ref, expected, fence); err != nil {
+		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+	}
 	var out ProviderAttemptResult
 	var c ProviderAttemptClaim
 	var attemptState, attemptOutcome, phaseState, phaseOutcome string
@@ -809,13 +824,20 @@ func (s *Store) LoadProviderAttemptResult(ctx context.Context, claim ProviderAtt
 // against provider_attempts, provider_attempt_inputs, and phase_runs, but does
 // not require those original fences to still be current.
 func (s *Store) LoadHistoricalProviderAttemptResult(ctx context.Context, key ProviderAttemptResultKey) (ProviderAttemptResult, phaseartifact.Parsed, error) {
+	return s.loadHistoricalProviderAttemptResult(ctx, s.db, key)
+}
+
+// loadHistoricalProviderAttemptResult authenticates immutable provider output
+// through the caller's connection. Recovery fencing invokes it inside an
+// IMMEDIATE write transaction, so it must not open a second DB connection.
+func (s *Store) loadHistoricalProviderAttemptResult(ctx context.Context, query rowQueryer, key ProviderAttemptResultKey) (ProviderAttemptResult, phaseartifact.Parsed, error) {
 	if key.AttemptID <= 0 || key.Ref.Validate() != nil || key.Phase == "" || key.Attempt <= 0 {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
 	}
 	var out ProviderAttemptResult
 	var c ProviderAttemptClaim
 	var attemptState, attemptOutcome, phaseState, phaseOutcome string
-	err := s.db.QueryRowContext(ctx, `SELECT r.provider_attempt_id,r.channel,r.project_id,r.ticket_id,r.phase,r.role,r.attempt,r.provider,r.model,r.family,r.provider_version,r.request_digest,r.leader_epoch,r.runner_epoch,r.expected_ticket_version,r.repository_path,r.worktree_path,r.worktree_identity,r.base_sha,r.raw_artifact,r.raw_sha256,r.typed_artifact,r.typed_sha256,r.validation,r.validation_sha256,r.transcript_sha256,a.auth_mode,i.canonical_input,a.state,a.outcome,p.state,p.outcome FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id AND a.channel=r.channel AND a.project_id=r.project_id AND a.ticket_id=r.ticket_id AND a.phase=r.phase AND a.role=r.role AND a.attempt=r.attempt AND a.provider=r.provider AND a.model=r.model AND a.family=r.family AND a.version=r.provider_version AND a.leader_epoch=r.leader_epoch AND a.runner_epoch=r.runner_epoch AND a.expected_ticket_version=r.expected_ticket_version AND a.repository_path=r.repository_path AND a.worktree_path=r.worktree_path AND a.worktree_identity=r.worktree_identity AND a.base_sha=r.base_sha JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id AND i.request_digest=r.request_digest JOIN phase_runs p ON p.channel=r.channel AND p.project_id=r.project_id AND p.ticket_id=r.ticket_id AND p.phase=r.phase AND p.attempt=r.attempt AND p.provider=r.provider AND p.model=r.model AND p.family=r.family AND p.provider_version=r.provider_version AND p.leader_epoch=r.leader_epoch AND p.runner_epoch=r.runner_epoch AND p.expected_ticket_version=r.expected_ticket_version AND p.worktree_identity=r.worktree_identity AND p.base_sha=r.base_sha WHERE r.provider_attempt_id=? AND r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase=? AND r.attempt=?`, key.AttemptID, key.Ref.Channel, key.Ref.Project, key.Ref.Ticket, key.Phase, key.Attempt).Scan(&out.AttemptID, &c.Ref.Channel, &c.Ref.Project, &c.Ref.Ticket, &c.Phase, &c.Role, &c.Attempt, &c.Binding.Identity.Provider, &c.Binding.Identity.Model, &c.Binding.Identity.Family, &c.Binding.Identity.Version, &c.RequestDigest, &c.LeaderEpoch, &c.RunnerEpoch, &c.ExpectedVersion, &c.Repository, &c.Worktree, &c.WorktreeIdentity, &c.BaseSHA, &out.RawArtifact, &out.RawSHA256, &out.TypedArtifact, &out.TypedSHA256, &out.Validation, &out.ValidationSHA256, &out.TranscriptSHA256, &c.Binding.AuthMode, &c.RequestPayload, &attemptState, &attemptOutcome, &phaseState, &phaseOutcome)
+	err := query.QueryRowContext(ctx, `SELECT r.provider_attempt_id,r.channel,r.project_id,r.ticket_id,r.phase,r.role,r.attempt,r.provider,r.model,r.family,r.provider_version,r.request_digest,r.leader_epoch,r.runner_epoch,r.expected_ticket_version,r.repository_path,r.worktree_path,r.worktree_identity,r.base_sha,r.raw_artifact,r.raw_sha256,r.typed_artifact,r.typed_sha256,r.validation,r.validation_sha256,r.transcript_sha256,a.auth_mode,i.canonical_input,a.state,a.outcome,p.state,p.outcome FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id AND a.channel=r.channel AND a.project_id=r.project_id AND a.ticket_id=r.ticket_id AND a.phase=r.phase AND a.role=r.role AND a.attempt=r.attempt AND a.provider=r.provider AND a.model=r.model AND a.family=r.family AND a.version=r.provider_version AND a.leader_epoch=r.leader_epoch AND a.runner_epoch=r.runner_epoch AND a.expected_ticket_version=r.expected_ticket_version AND a.repository_path=r.repository_path AND a.worktree_path=r.worktree_path AND a.worktree_identity=r.worktree_identity AND a.base_sha=r.base_sha JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id AND i.request_digest=r.request_digest JOIN phase_runs p ON p.channel=r.channel AND p.project_id=r.project_id AND p.ticket_id=r.ticket_id AND p.phase=r.phase AND p.attempt=r.attempt AND p.provider=r.provider AND p.model=r.model AND p.family=r.family AND p.provider_version=r.provider_version AND p.leader_epoch=r.leader_epoch AND p.runner_epoch=r.runner_epoch AND p.expected_ticket_version=r.expected_ticket_version AND p.worktree_identity=r.worktree_identity AND p.base_sha=r.base_sha WHERE r.provider_attempt_id=? AND r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase=? AND r.attempt=?`, key.AttemptID, key.Ref.Channel, key.Ref.Project, key.Ref.Ticket, key.Phase, key.Attempt).Scan(&out.AttemptID, &c.Ref.Channel, &c.Ref.Project, &c.Ref.Ticket, &c.Phase, &c.Role, &c.Attempt, &c.Binding.Identity.Provider, &c.Binding.Identity.Model, &c.Binding.Identity.Family, &c.Binding.Identity.Version, &c.RequestDigest, &c.LeaderEpoch, &c.RunnerEpoch, &c.ExpectedVersion, &c.Repository, &c.Worktree, &c.WorktreeIdentity, &c.BaseSHA, &out.RawArtifact, &out.RawSHA256, &out.TypedArtifact, &out.TypedSHA256, &out.Validation, &out.ValidationSHA256, &out.TranscriptSHA256, &c.Binding.AuthMode, &c.RequestPayload, &attemptState, &attemptOutcome, &phaseState, &phaseOutcome)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrNotFound
@@ -823,7 +845,7 @@ func (s *Store) LoadHistoricalProviderAttemptResult(ctx context.Context, key Pro
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, normalizeBusy(ctx, err)
 	}
 	c.ID = out.AttemptID
-	source, sourceErr := loadAuthenticatedProviderAttemptClaim(ctx, s.db, out.AttemptID)
+	source, sourceErr := loadAuthenticatedProviderAttemptClaim(ctx, query, out.AttemptID)
 	if sourceErr != nil || !resultClaimMatchesSource(c, source) {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
 	}
@@ -862,14 +884,31 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if liveErr != nil {
 		return LatestReusableProviderAttemptResult{}, liveErr
 	}
-	if (request.Phase == domain.PhaseBuild && liveBefore.State != domain.StateBuilding) || (request.Phase == domain.PhaseVerification && liveBefore.State != domain.StateVerifying) {
+	verificationBuildingRecovery := request.Phase == domain.PhaseVerification && liveBefore.State == domain.StateBuilding
+	builderPublishingRecovery := request.Phase == domain.PhaseBuild && liveBefore.State == domain.StatePublishing
+	if verificationBuildingRecovery {
+		var candidates int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=?`, request.Ref.Channel, request.Ref.Project, request.Ref.Ticket).Scan(&candidates); err != nil || candidates != 0 {
+			return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
+		}
+	}
+	if builderPublishingRecovery {
+		// Review-repair loops may leave multiple immutable generations. Recovery
+		// is limited to the latest one, and RecordCandidate later requires the
+		// reusable Builder key to equal that generation's binding.
+		if _, err := s.RecoverableCandidate(ctx, request.Ref); err != nil {
+			return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
+		}
+	}
+	if (request.Phase == domain.PhaseBuild && liveBefore.State != domain.StateBuilding && !builderPublishingRecovery) || (request.Phase == domain.PhaseVerification && liveBefore.State != domain.StateVerifying && !verificationBuildingRecovery) {
 		return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
 	}
 	var key ProviderAttemptResultKey
 	var resultID sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `SELECT r.provider_attempt_id,a.attempt
 		FROM provider_attempts a LEFT JOIN provider_attempt_results r ON r.provider_attempt_id=a.id
-		WHERE a.channel=? AND a.project_id=? AND a.ticket_id=? AND a.phase=? AND a.role=? AND a.finished_at IS NOT NULL
+		WHERE a.channel=? AND a.project_id=? AND a.ticket_id=? AND a.phase=? AND a.role=?
+		AND a.state='completed' AND a.outcome='completed' AND a.finished_at IS NOT NULL AND a.finished_at <> ''
 		ORDER BY a.attempt DESC,a.id DESC LIMIT 1`, request.Ref.Channel, request.Ref.Project, request.Ref.Ticket, request.Phase, request.Role).Scan(&resultID, &key.Attempt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return LatestReusableProviderAttemptResult{}, ErrNotFound
@@ -905,6 +944,9 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if live.Version != request.ExpectedVersion || live.RunnerEpoch != request.Fence.RunnerEpoch || liveLeader != request.Fence.LeaderEpoch {
 		return LatestReusableProviderAttemptResult{}, ErrStaleFence
 	}
+	if err := validateRunnerRecoveryAuthority(ctx, s.db, request.Ref, request.ExpectedVersion, request.Fence); err != nil {
+		return LatestReusableProviderAttemptResult{}, ErrStaleFence
+	}
 	current := historical.Claim.ExpectedVersion == request.ExpectedVersion && historical.Claim.RunnerEpoch == request.Fence.RunnerEpoch && historical.Claim.LeaderEpoch == request.Fence.LeaderEpoch
 	result := LatestReusableProviderAttemptResult{Key: key, Result: historical, Parsed: parsed}
 	if current {
@@ -914,8 +956,11 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 		}
 		result.Result, result.Parsed = currentResult, currentParsed
 	} else {
-		allowedState := (request.Phase == domain.PhasePlanning && live.State == domain.StatePlanning) || (request.Phase == domain.PhaseVerification && live.State == domain.StateVerifying) || (request.Phase == domain.PhaseBuild && live.State == domain.StateBuilding) || (request.Phase == domain.PhaseReview && live.State == domain.StateReviewing)
-		if !allowedState || live.Version <= historical.Claim.ExpectedVersion || live.RunnerEpoch <= historical.Claim.RunnerEpoch || live.Version-historical.Claim.ExpectedVersion != live.RunnerEpoch-historical.Claim.RunnerEpoch {
+		allowedState := (request.Phase == domain.PhasePlanning && live.State == domain.StatePlanning) || (request.Phase == domain.PhaseVerification && (live.State == domain.StateVerifying || (live.State == domain.StateBuilding && verificationBuildingRecovery))) || (request.Phase == domain.PhaseBuild && (live.State == domain.StateBuilding || (live.State == domain.StatePublishing && builderPublishingRecovery))) || (request.Phase == domain.PhaseReview && live.State == domain.StateReviewing)
+		if !allowedState {
+			return LatestReusableProviderAttemptResult{}, ErrStaleFence
+		}
+		if err := s.ProviderResultReachesFence(ctx, key, request.ExpectedVersion, request.Fence); err != nil {
 			return LatestReusableProviderAttemptResult{}, ErrStaleFence
 		}
 		result.Recovered = true
@@ -946,7 +991,7 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if err != nil || result.Parsed.Reviewer == nil || validation.ExpectedReviewedHead == "" || validation.ExpectedProofDigest == "" {
 		return LatestReusableProviderAttemptResult{}, ErrProviderAttempt
 	}
-	candidate, err := s.LatestCandidate(ctx, request.Ref)
+	candidate, err := s.RecoverableCandidate(ctx, request.Ref)
 	if err != nil || candidate.Snapshot.HeadSHA != validation.ExpectedReviewedHead || candidate.Snapshot.ProofDigest != validation.ExpectedProofDigest || result.Parsed.Reviewer.ReviewedHead != validation.ExpectedReviewedHead || result.Parsed.Reviewer.ProofDigest != validation.ExpectedProofDigest {
 		return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
 	}

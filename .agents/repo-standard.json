@@ -29,7 +29,7 @@
       ".github/workflows/repository-baseline.yml": "9a93935282a4f3c3cdd2674ca96ef74f0fac3a29929a60e2ba424263ae4d9197",
       "docs/git-flow.md": "3aff2ae40cda90c1180f381a28fe4c3e164e3748be9bf9b258256955865b0108",
       "scripts/repo-check": "9199bc24c6dd518fecf5affc17f58bc144d910bef9d49027643db308f8ec9c27",
-      "scripts/secret-scan": "ebe73581c238ad4c32319f057dbdd5e982ff7547f65a8e96cdf7fe995ecbb4ab"
+      "scripts/secret-scan": "0bf9f81596f5ba281f341c84725d4e354461ed938db892db62109cfe28064ab0"
     }
   },
   "profile": "toolkit",

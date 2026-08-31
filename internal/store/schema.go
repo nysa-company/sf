@@ -327,7 +327,6 @@ var requiredSchema = map[string][]string{
 	"publication_evidence_rebinds":         {"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "prior_witness_digest", "prior_ticket_version", "prior_leader_epoch", "prior_runner_epoch", "ticket_version", "leader_epoch", "runner_epoch", "rebind_digest", "created_at"},
 	"publication_transition_evidence":      {"channel", "project_id", "ticket_id", "witness_digest", "witness_created_at", "ticket_version", "event_created_at"},
 	"runner_recovery_ledger":               {"channel", "project_id", "ticket_id", "prior_ticket_version", "prior_runner_epoch", "prior_leader_epoch", "ticket_version", "runner_epoch", "leader_epoch", "recovery_digest", "created_at"},
-	"runner_start_authorities":             {"channel", "project_id", "ticket_id", "start_ticket_version", "runner_epoch", "leader_epoch", "workflow_id", "workflow_digest", "created_at", "authority_digest"},
 	"runtime_ticket_controls":              {"channel", "project_id", "ticket_id", "state", "generation", "stop_version", "stop_leader_epoch", "stop_runner_epoch", "authority_version", "authority_leader_epoch", "authority_runner_epoch", "updated_at"},
 	"ci_observations":                      {"observation_id", "channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "publication_witness_digest", "policy_witness_digest", "pr_host", "pr_owner", "pr_repo", "pr_number", "pr_head_owner", "pr_head_repo", "pr_head_ref", "pr_head_oid", "pr_base_ref", "pr_base_oid", "pr_factory_owned", "pr_open", "pr_draft", "observed_ticket_version", "observed_leader_epoch", "observed_runner_epoch", "observed_at", "required_set_digest", "required_check_count", "classification", "diagnostic_digest", "diagnostic_text", "diagnostic_json", "observation_digest"},
 	"ci_required_check_policies":           {"policy_id", "channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "publication_witness_digest", "protected_branch_ref", "protected_branch_oid", "policy_source_digest", "authenticated_principal", "policy_witness_digest", "required_set_digest", "required_check_count", "required_checks_json", "created_at"},
@@ -335,6 +334,7 @@ var requiredSchema = map[string][]string{
 	"ci_transition_evidence":               {"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "ticket_version", "event_id", "event_created_at", "observation_classification", "observation_digest", "observation_ticket_version", "observation_leader_epoch", "observation_runner_epoch", "prior_publication_witness_digest", "prior_state", "resulting_state", "resulting_trigger", "transition_digest", "created_at"},
 	"candidate_repair_bindings":            {"channel", "project_id", "ticket_id", "target_generation", "predecessor_generation", "predecessor_head_sha", "predecessor_tree_sha", "predecessor_publication_witness_digest", "pr_host", "pr_owner", "pr_repo", "pr_number", "branch_ref", "remote_head_oid", "base_ref", "remote_base_oid", "red_observation_digest", "red_observation_classification", "red_transition_ticket_version", "red_transition_digest", "correction_budget_kind", "correction_budget_request_id", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "repair_context_digest", "created_at"},
 	"candidate_repair_completions":         {"channel", "project_id", "ticket_id", "target_generation", "builder_result_attempt_id", "builder_result_attempt", "builder_result_phase", "builder_result_role", "builder_binding_ticket_version", "builder_binding_leader_epoch", "builder_binding_runner_epoch", "final_candidate_head_sha", "final_candidate_tree_sha", "completion_digest", "completed_at"},
+	"runner_start_authorities":             {"channel", "project_id", "ticket_id", "start_ticket_version", "runner_epoch", "leader_epoch", "workflow_id", "workflow_digest", "created_at", "authority_digest"},
 }
 
 type indexRequirement struct {
@@ -376,8 +376,6 @@ var requiredIndexes = []indexRequirement{
 	{table: "publication_evidence_rebinds", name: "publication_evidence_rebind_digest", columns: []string{"rebind_digest"}},
 	{table: "runner_recovery_ledger", name: "runner_recovery_ledger_digest", columns: []string{"recovery_digest"}},
 	{table: "runner_recovery_ledger", name: "runner_recovery_ledger_ticket", columns: []string{"channel", "project_id", "ticket_id", "ticket_version"}, nonUnique: true},
-	{table: "runner_start_authorities", name: "runner_start_authority_digest", columns: []string{"authority_digest"}},
-	{table: "runner_start_authorities", name: "runner_start_authority_ticket", columns: []string{"channel", "project_id", "ticket_id"}, nonUnique: true},
 	{table: "runtime_ticket_controls", name: "runtime_ticket_controls_state", columns: []string{"channel", "state"}, nonUnique: true},
 	{table: "candidate_snapshots", name: "candidate_snapshot_generation_head", columns: []string{"channel", "project_id", "ticket_id", "generation", "head_sha"}},
 	{table: "candidate_snapshots", name: "candidate_snapshot_generation_head_tree", columns: []string{"channel", "project_id", "ticket_id", "generation", "head_sha", "tree_sha"}},
@@ -410,6 +408,8 @@ var requiredIndexes = []indexRequirement{
 	{table: "candidate_repair_bindings", name: "candidate_repair_bindings_predecessor_lineage", columns: []string{"channel", "project_id", "ticket_id", "predecessor_generation", "predecessor_head_sha", "predecessor_tree_sha"}, nonUnique: true},
 	{table: "candidate_repair_bindings", name: "candidate_repair_bindings_context_digest", columns: []string{"repair_context_digest"}},
 	{table: "candidate_repair_completions", name: "candidate_repair_completions_digest", columns: []string{"completion_digest"}},
+	{table: "runner_start_authorities", name: "runner_start_authority_digest", columns: []string{"authority_digest"}},
+	{table: "runner_start_authorities", name: "runner_start_authority_ticket", columns: []string{"channel", "project_id", "ticket_id"}, nonUnique: true},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {

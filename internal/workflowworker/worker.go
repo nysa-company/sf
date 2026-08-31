@@ -5,6 +5,7 @@
 package workflowworker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -35,7 +36,9 @@ type Evidence interface {
 	Ticket(context.Context, domain.TicketRef) (store.Ticket, error)
 	Plan(context.Context, domain.TicketRef) (store.StoredPlan, error)
 	CurrentVerification(context.Context, domain.TicketRef) (store.StoredVerification, error)
+	RecoverableVerification(context.Context, domain.TicketRef) (store.StoredVerification, error)
 	LatestCandidate(context.Context, domain.TicketRef) (store.StoredCandidate, error)
+	RecoverableCandidate(context.Context, domain.TicketRef) (store.StoredCandidate, error)
 	ValidateCurrentCandidateForBuildTransition(context.Context, domain.TicketRef, uint64, domain.Fence) (store.StoredCandidate, error)
 	Worktree(context.Context, domain.TicketRef) (store.StoredWorktree, error)
 	AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error
@@ -68,6 +71,9 @@ type PhaseRequest struct {
 	Plan         *store.StoredPlan
 	Verification *store.StoredVerification
 	Candidate    *store.StoredCandidate
+	// RecoveryVerification is an immutable checkpoint/command witness.  When
+	// present, a materializer must observe it; it must not execute or commit.
+	RecoveryVerification *store.StoredVerification
 }
 
 // PhaseResult carries only an immutable Store key and independently observed
@@ -330,33 +336,41 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 		return false, false, err
 	}
 	verification, err := w.Evidence.CurrentVerification(ctx, ticket.Ref)
+	if errors.Is(err, store.ErrEvidenceConflict) {
+		// CurrentVerification deliberately refuses an old binding once a later
+		// recovery row exists. The immutable tuple below is only input to
+		// RecordVerification; the Store re-authenticates it at this live fence.
+		verification, err = w.Evidence.RecoverableVerification(ctx, ticket.Ref)
+	}
 	if err == nil {
 		if verification.TicketVersion != ticket.Version || verification.Fence != fence {
 			// A completed reviewer result survives runner-fence recovery, but its
 			// old binding is not itself transition authority. Re-select the exact
-			// newest reusable result under the live fence, re-materialize its Git
-			// checkpoint, and let RecordVerification append a live binding.
+			// newest reusable result under the live fence and let RecordVerification
+			// append the Store-authenticated live binding.
 			reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence})
 			if reuseErr != nil || !reusable.Recovered || reusable.Key != verification.ProviderResult {
 				return false, false, ErrStaleEvidence
 			}
-			artifact, parseErr := canonicalVerification(reusable.Parsed)
-			if parseErr != nil {
-				return false, true, parseErr
-			}
-			replayRequest, requestErr := w.request(ctx, ticket, fence, domain.PhaseVerification, &plan, nil, nil)
-			if requestErr != nil {
-				return false, true, requestErr
-			}
-			if err := w.persistVerification(ctx, ticket, fence, replayRequest, planIdentity, artifact, reusable.Key); err != nil {
+			if err := w.rebindStoredVerification(ctx, ticket, fence, verification, reusable); err != nil {
 				return false, true, err
 			}
 			verification, err = w.Evidence.CurrentVerification(ctx, ticket.Ref)
 			if err != nil || verification.TicketVersion != ticket.Version || verification.Fence != fence {
 				return false, true, ErrStaleEvidence
 			}
+			// Store has authenticated the immutable provider, checkpoint, and
+			// command evidence under this exact binding. A recovery rebind is
+			// observation-only: do not touch Git or repository boundaries again.
+			if _, err := w.storedVerificationIdentity(ctx, ticket, planIdentity, verification, fence, false); err != nil {
+				return false, true, err
+			}
+			if err := w.signalVerification(ctx, ticket, fence); err != nil {
+				return false, true, err
+			}
+			return true, true, nil
 		}
-		if _, err := w.storedVerificationIdentity(ctx, ticket, planIdentity, verification, fence); err != nil {
+		if _, err := w.storedVerificationIdentity(ctx, ticket, planIdentity, verification, fence, true); err != nil {
 			return false, false, err
 		}
 		if err := w.signalVerification(ctx, ticket, fence); err != nil {
@@ -441,27 +455,67 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 	}
 	verification, err := w.Evidence.CurrentVerification(ctx, ticket.Ref)
 	if err != nil {
-		return false, false, err
+		if errors.Is(err, store.ErrEvidenceConflict) {
+			// Candidate-first recovery remains observation-only. A candidate that
+			// exists may legitimately outlive the historical reviewer binding it
+			// names, so its Store-authenticated Builder binding is the live
+			// authority and must be replayed before considering review recovery.
+			if _, candidateErr := w.Evidence.RecoverableCandidate(ctx, ticket.Ref); candidateErr == nil {
+				candidate, recoverErr := w.rebindRecoveredCandidate(ctx, ticket, fence)
+				if recoverErr != nil {
+					return false, true, recoverErr
+				}
+				if signalErr := w.signalCandidate(ctx, ticket, fence, candidate.Snapshot); signalErr != nil {
+					return false, true, signalErr
+				}
+				return true, true, nil
+			} else if !errors.Is(candidateErr, store.ErrNotFound) {
+				return false, false, candidateErr
+			}
+			// The verification→building signal can commit before Builder creates a
+			// candidate. After a restart, the immutable reviewer binding is stale
+			// at the new fence. Rebind only that exact reusable result through
+			// RecordVerification, which re-authenticates its checkpoint and frozen
+			// command witness without re-running either boundary.
+			recoverable, recoverErr := w.Evidence.RecoverableVerification(ctx, ticket.Ref)
+			if recoverErr != nil {
+				return false, false, recoverErr
+			}
+			reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence})
+			if reuseErr != nil || !reusable.Recovered || reusable.Key != recoverable.ProviderResult {
+				return false, false, ErrStaleEvidence
+			}
+			if rebindErr := w.rebindStoredVerification(ctx, ticket, fence, recoverable, reusable); rebindErr != nil {
+				return false, true, rebindErr
+			}
+			verification, err = w.Evidence.CurrentVerification(ctx, ticket.Ref)
+			if err != nil || verification.TicketVersion != ticket.Version || verification.Fence != fence {
+				return false, true, ErrStaleEvidence
+			}
+		}
+		if err != nil {
+			return false, false, err
+		}
 	}
-	verificationIdentity, err := w.storedVerificationIdentity(ctx, ticket, planIdentity, verification, fence)
+	verificationIdentity, err := w.storedVerificationIdentity(ctx, ticket, planIdentity, verification, fence, true)
 	if err != nil {
 		return false, false, err
 	}
 	candidate, err := w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
 	if err == nil {
-		if err := w.authenticateStoredCandidate(ctx, ticket, fence, planIdentity, verificationIdentity, candidate); err != nil {
-			return false, true, err
-		}
+		// ValidateCurrentCandidateForBuildTransition has reloaded and
+		// authenticated immutable Store evidence under the live fence. Do not
+		// invoke a materializer, Git observer, or command boundary after rebind.
 		if err := w.signalCandidate(ctx, ticket, fence, candidate.Snapshot); err != nil {
 			return false, true, err
 		}
 		return true, true, nil
 	}
-	if errors.Is(err, store.ErrStaleFence) {
+	if errors.Is(err, store.ErrStaleFence) || errors.Is(err, store.ErrEvidenceConflict) {
 		// A candidate snapshot is immutable provenance.  Rebind an old snapshot
 		// only from the exact newest recovered Builder result, after the injected
 		// materializer and authenticator have re-proved the live Git boundary.
-		old, oldErr := w.Evidence.LatestCandidate(ctx, ticket.Ref)
+		old, oldErr := w.Evidence.RecoverableCandidate(ctx, ticket.Ref)
 		if oldErr != nil {
 			return false, false, err
 		}
@@ -469,20 +523,16 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 		if reuseErr != nil || !reusable.Recovered || reusable.Key != old.BuilderResult {
 			return false, false, ErrStaleEvidence
 		}
-		builder, parseErr := canonicalBuilder(reusable.Parsed)
-		if parseErr != nil {
-			return false, true, parseErr
-		}
-		if err := w.persistCandidate(ctx, ticket, fence, PhaseRequest{}, planIdentity, verificationIdentity, verification, &old, builder, reusable.Key); err != nil {
+		if err := w.rebindStoredCandidate(ctx, ticket, fence, old, reusable); err != nil {
 			return false, true, err
 		}
 		candidate, err = w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
 		if err != nil {
 			return false, true, err
 		}
-		if err := w.authenticateStoredCandidate(ctx, ticket, fence, planIdentity, verificationIdentity, candidate); err != nil {
-			return false, true, err
-		}
+		// RecordCandidate plus the Store reload above prove the exact immutable
+		// Builder/command chain. This recovered path must not re-materialize or
+		// re-observe the candidate boundary before signaling it.
 		if err := w.signalCandidate(ctx, ticket, fence, candidate.Snapshot); err != nil {
 			return false, true, err
 		}
@@ -558,6 +608,21 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 		return false, false, err
 	}
 	return true, false, nil
+}
+
+func (w Worker) rebindRecoveredCandidate(ctx context.Context, ticket store.Ticket, fence domain.Fence) (store.StoredCandidate, error) {
+	old, err := w.Evidence.RecoverableCandidate(ctx, ticket.Ref)
+	if err != nil {
+		return store.StoredCandidate{}, err
+	}
+	reusable, err := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: ticket.Version, Fence: fence})
+	if err != nil || !reusable.Recovered || reusable.Key != old.BuilderResult {
+		return store.StoredCandidate{}, ErrStaleEvidence
+	}
+	if err := w.rebindStoredCandidate(ctx, ticket, fence, old, reusable); err != nil {
+		return store.StoredCandidate{}, err
+	}
+	return w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
 }
 
 func (w Worker) request(ctx context.Context, ticket store.Ticket, fence domain.Fence, phase domain.Phase, plan *store.StoredPlan, verification *store.StoredVerification, candidate *store.StoredCandidate) (PhaseRequest, error) {
@@ -640,7 +705,7 @@ func (w Worker) storedPlanIdentity(ctx context.Context, ticket store.Ticket, pla
 	return identity, nil
 }
 
-func (w Worker) storedVerificationIdentity(ctx context.Context, ticket store.Ticket, plan workflowprompt.PlanIdentity, verification store.StoredVerification, fence domain.Fence) (workflowprompt.VerificationIdentity, error) {
+func (w Worker) storedVerificationIdentity(ctx context.Context, ticket store.Ticket, plan workflowprompt.PlanIdentity, verification store.StoredVerification, fence domain.Fence, observeCheckpoint bool) (workflowprompt.VerificationIdentity, error) {
 	if verification.ProviderResult.AttemptID == 0 || verification.ProviderResult.Phase != domain.PhaseVerification || verification.Checkpoint.CommitOID != verification.Revision.CheckpointID || verification.Checkpoint.ParentOID == "" || verification.Checkpoint.TreeOID == "" {
 		return workflowprompt.VerificationIdentity{}, ErrStaleEvidence
 	}
@@ -661,7 +726,7 @@ func (w Worker) storedVerificationIdentity(ctx context.Context, ticket store.Tic
 	// parent to this checkpoint, and candidate authentication re-observes the
 	// live head; requiring checkpoint HEAD equality here would reject a valid
 	// post-build replay.
-	if ticket.State != domain.StateBuilding {
+	if observeCheckpoint && ticket.State != domain.StateBuilding {
 		if w.Checkpoint == nil {
 			return workflowprompt.VerificationIdentity{}, ErrCheckpointRequired
 		}
@@ -674,6 +739,43 @@ func (w Worker) storedVerificationIdentity(ctx context.Context, ticket store.Tic
 		}
 	}
 	return identity, nil
+}
+
+// rebindStoredVerification appends only the provider-to-live-fence binding for
+// an already durable verification.  Its repository-command and checkpoint
+// witnesses are immutable observations, so recovery must not run either one
+// again merely to cross a daemon restart.
+func (w Worker) rebindStoredVerification(ctx context.Context, ticket store.Ticket, fence domain.Fence, stored store.StoredVerification, reusable store.LatestReusableProviderAttemptResult) error {
+	artifact, err := canonicalVerification(reusable.Parsed)
+	if err != nil {
+		return err
+	}
+	intent, err := canonicalVerificationIntent(artifact)
+	if err != nil {
+		return err
+	}
+	proof, err := canonicalVerificationProof(artifact)
+	if err != nil || !bytes.Equal(intent, stored.Intent) || !bytes.Equal(proof, stored.Proof) || !reflect.DeepEqual(artifact.OwnedFiles, stored.Revision.OwnedFiles) || stored.Checkpoint.CommitOID != stored.Revision.CheckpointID {
+		return ErrStaleEvidence
+	}
+	_, err = w.Evidence.RecordVerification(ctx, store.VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: artifact.OwnedFiles, CheckpointID: stored.Revision.CheckpointID, ProviderResult: &reusable.Key, Checkpoint: stored.Checkpoint, CommandResult: stored.CommandBinding.Key})
+	return err
+}
+
+// rebindStoredCandidate is the equivalent append-only recovery path for a
+// durable candidate.  It deliberately reuses the recorded commit and command
+// witnesses instead of calling a materializer, command executor, or provider.
+func (w Worker) rebindStoredCandidate(ctx context.Context, ticket store.Ticket, fence domain.Fence, stored store.StoredCandidate, reusable store.LatestReusableProviderAttemptResult) error {
+	builder, err := canonicalBuilder(reusable.Parsed)
+	if err != nil {
+		return err
+	}
+	digest, err := phaseartifact.BuilderEvidenceDigest(builder)
+	if err != nil || digest != stored.Snapshot.BuilderEvidenceDigest || stored.Commit.CommitOID != stored.Snapshot.HeadSHA || stored.Commit.TreeOID != stored.Snapshot.TreeSHA {
+		return ErrStaleEvidence
+	}
+	_, err = w.Evidence.RecordCandidate(ctx, store.CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: stored.Snapshot, BuilderResult: reusable.Key, Commit: stored.Commit, Reason: "recovered immutable candidate evidence", CommandResult: stored.CommandBinding.Key})
+	return err
 }
 
 func (w Worker) persistVerification(ctx context.Context, ticket store.Ticket, fence domain.Fence, request PhaseRequest, plan workflowprompt.PlanIdentity, artifact phaseartifact.Verification, key store.ProviderAttemptResultKey) error {

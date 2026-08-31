@@ -167,6 +167,35 @@ func TestVerificationAndCandidateTransitionsConsumeNewestSameFenceResult(t *test
 	if e != nil {
 		t.Fatal(e)
 	}
+	var commandsBeforeVerificationReplay int
+	if e = db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_results WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&commandsBeforeVerificationReplay); e != nil {
+		t.Fatal(e)
+	}
+	// A restart after durable reviewer evidence must be able to reuse the
+	// original provider, repository-command, and checkpoint witnesses under
+	// the recovered fence without issuing any new external work.
+	leader, e = db.AcquireLeader(ctx, domain.ChannelDev, "phase-newest-restart")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); e != nil {
+		t.Fatal(e)
+	}
+	ticket, e = db.Ticket(ctx, ticket.Ref)
+	if e != nil {
+		t.Fatal(e)
+	}
+	fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	if _, e = db.RecordVerification(ctx, vr(r2)); e != nil {
+		t.Fatalf("post-restart verification replay=%v", e)
+	}
+	var commandsAfterVerificationReplay, verificationBindings int
+	if e = db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_results WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&commandsAfterVerificationReplay); e != nil {
+		t.Fatal(e)
+	}
+	if e = db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM verification_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, rev.Revision).Scan(&verificationBindings); e != nil || commandsAfterVerificationReplay != commandsBeforeVerificationReplay || verificationBindings != 2 {
+		t.Fatalf("verification replay commands=%d/%d bindings=%d err=%v", commandsBeforeVerificationReplay, commandsAfterVerificationReplay, verificationBindings, e)
+	}
 	if _, e = db.TransitionVerification(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateVerifying, To: domain.StateBuilding, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); e != nil {
 		t.Fatal(e)
 	}
@@ -193,6 +222,32 @@ func TestVerificationAndCandidateTransitionsConsumeNewestSameFenceResult(t *test
 	before := eventCount(t, db, ctx, ticket.Ref)
 	if _, e = db.RecordCandidate(ctx, ce(b2)); e != nil {
 		t.Fatal(e)
+	}
+	var commandsBeforeCandidateReplay int
+	if e = db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_results WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&commandsBeforeCandidateReplay); e != nil {
+		t.Fatal(e)
+	}
+	leader, e = db.AcquireLeader(ctx, domain.ChannelDev, "phase-newest-candidate-restart")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); e != nil {
+		t.Fatal(e)
+	}
+	ticket, e = db.Ticket(ctx, ticket.Ref)
+	if e != nil {
+		t.Fatal(e)
+	}
+	fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	if _, e = db.RecordCandidate(ctx, ce(b2)); e != nil {
+		t.Fatalf("post-restart candidate replay=%v", e)
+	}
+	var commandsAfterCandidateReplay, candidateBindings int
+	if e = db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_results WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&commandsAfterCandidateReplay); e != nil {
+		t.Fatal(e)
+	}
+	if e = db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND generation=1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&candidateBindings); e != nil || commandsAfterCandidateReplay != commandsBeforeCandidateReplay || candidateBindings != 2 {
+		t.Fatalf("candidate replay commands=%d/%d bindings=%d err=%v", commandsBeforeCandidateReplay, commandsAfterCandidateReplay, candidateBindings, e)
 	}
 	stored, e := db.LatestCandidate(ctx, ticket.Ref)
 	if e != nil {
@@ -707,8 +762,10 @@ func TestHistoricalProviderResultSurvivesTransitionAndLeaderRestart(t *testing.T
 		t.Fatal(err)
 	}
 	currentFence := domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: advanced.RunnerEpoch}
-	if reused, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: advanced.Version, Fence: currentFence}); err != nil || !reused.Recovered || reused.Parsed.Planner == nil {
-		t.Fatalf("recovered reusable=%+v err=%v", reused, err)
+	// A direct control invalidation is deliberately not a recovery proof. It
+	// cannot lend its counters to a historical provider result.
+	if _, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: advanced.Version, Fence: currentFence}); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("control-gap reusable=%v", err)
 	}
 	if _, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: ticket.Version, Fence: fence}); !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("stale reuse request=%v", err)
@@ -739,73 +796,301 @@ func TestHistoricalProviderResultSurvivesTransitionAndLeaderRestart(t *testing.T
 	}
 }
 
-func TestLatestReusableReviewerExactAndRestartRecovery(t *testing.T) {
+// TestGenericPhaseRunnerRecoveryLedger makes the phase-neutral runner ledger
+// prove the two recovery shapes a provider result can encounter. In
+// particular, the first restart has no provider predecessor, so it must use
+// the exact registered worktree leader as its nonzero predecessor. Once the
+// provider completes under that recovered fence, every later restart must
+// chain from the recovered leader before the result is reusable.
+func TestGenericPhaseRunnerRecoveryLedger(t *testing.T) {
+	newPlanningTicket := func(t *testing.T, id, owner string) (*Store, context.Context, string, Ticket, ProviderQualification, domain.Fence) {
+		t.Helper()
+		db, ctx := openTestStore(t)
+		digest := setupProviderProject(t, db, ctx)
+		leader, err := db.AcquireLeader(ctx, domain.ChannelDev, owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, id, leader), leader, domain.StatePlanning)
+		planner, _ := setupProviderPair(t, db, ctx)
+		return db, ctx, digest, ticket, planner, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	}
+	completePlanner := func(t *testing.T, db *Store, ctx context.Context, digest string, ticket Ticket, fence domain.Fence, planner ProviderQualification) ProviderAttemptResultKey {
+		t.Helper()
+		claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"proof"},"paths":["main.go"],"commands":[["go","test"]],"risks":["risk"]}`), UsageTrusted: true, UsageUnits: 1}
+		if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: ticket.Type}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		return ProviderAttemptResultKey{AttemptID: claim.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: claim.Attempt}
+	}
+
+	t.Run("first recovery without a provider uses worktree leader and later chains", func(t *testing.T) {
+		db, ctx, digest, ticket, planner, initialFence := newPlanningTicket(t, "SF-generic-first-worktree", "generic-first-worktree")
+		firstLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "generic-first-zero-restart")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, firstLeader); err != nil {
+			t.Fatal(err)
+		}
+		first, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstStep, found, err := loadLatestRunnerRecovery(ctx, db.db, ticket.Ref)
+		if err != nil || !found || firstStep.PriorLeaderEpoch != initialFence.LeaderEpoch || firstStep.PriorLeaderEpoch == 0 || firstStep.TicketVersion != first.Version || firstStep.RunnerEpoch != first.RunnerEpoch || firstStep.LeaderEpoch != firstLeader || !validRunnerRecovery(firstStep) {
+			t.Fatalf("first recovery=%+v found=%v ticket=%+v err=%v", firstStep, found, first, err)
+		}
+		firstFence := domain.Fence{LeaderEpoch: firstLeader, RunnerEpoch: first.RunnerEpoch}
+		key := completePlanner(t, db, ctx, digest, first, firstFence, planner)
+
+		secondLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "generic-first-zero-restart-again")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, secondLeader); err != nil {
+			t.Fatal(err)
+		}
+		second, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondStep, found, err := loadLatestRunnerRecovery(ctx, db.db, ticket.Ref)
+		if err != nil || !found || secondStep.PriorLeaderEpoch != firstLeader || secondStep.PriorTicketVersion != first.Version || secondStep.PriorRunnerEpoch != first.RunnerEpoch || secondStep.TicketVersion != second.Version || secondStep.RunnerEpoch != second.RunnerEpoch || secondStep.LeaderEpoch != secondLeader || !validRunnerRecovery(secondStep) {
+			t.Fatalf("second recovery=%+v found=%v ticket=%+v err=%v", secondStep, found, second, err)
+		}
+		reused, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: second.Version, Fence: domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: second.RunnerEpoch}})
+		if err != nil || !reused.Recovered || reused.Key != key || reused.Parsed.Planner == nil {
+			t.Fatalf("reused=%+v err=%v", reused, err)
+		}
+	})
+
+	t.Run("completed provider before first recovery is exactly reusable", func(t *testing.T) {
+		db, ctx, digest, ticket, planner, fence := newPlanningTicket(t, "SF-generic-exact", "generic-exact")
+		key := completePlanner(t, db, ctx, digest, ticket, fence, planner)
+		leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "generic-exact-restart")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err != nil {
+			t.Fatal(err)
+		}
+		live, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		step, found, err := loadLatestRunnerRecovery(ctx, db.db, ticket.Ref)
+		if err != nil || !found || step.PriorLeaderEpoch != fence.LeaderEpoch || step.PriorTicketVersion != ticket.Version || step.PriorRunnerEpoch != ticket.RunnerEpoch || !validRunnerRecovery(step) {
+			t.Fatalf("recovery=%+v found=%v err=%v", step, found, err)
+		}
+		reused, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: live.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: live.RunnerEpoch}})
+		if err != nil || !reused.Recovered || reused.Key != key || reused.Parsed.Planner == nil {
+			t.Fatalf("reused=%+v err=%v", reused, err)
+		}
+	})
+
+	t.Run("whole-ticket cap blocks reusable and current provider readers", func(t *testing.T) {
+		db, ctx, digest, ticket, planner, fence := newPlanningTicket(t, "SF-generic-cap-current-readers", "generic-cap-current-readers")
+		key := completePlanner(t, db, ctx, digest, ticket, fence, planner)
+		result, _, err := db.LoadHistoricalProviderAttemptResult(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		priorVersion, priorRunner, priorLeader := ticket.Version, ticket.RunnerEpoch, fence.LeaderEpoch
+		for i := 0; i < 65; i++ {
+			step := RunnerRecoveryLedger{Ref: ticket.Ref, PriorTicketVersion: priorVersion, PriorRunnerEpoch: priorRunner, PriorLeaderEpoch: priorLeader, TicketVersion: priorVersion + 1, RunnerEpoch: priorRunner + 1, LeaderEpoch: priorLeader + 1, CreatedAt: time.Date(2026, 8, 30, 19, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Second)}
+			step.RecoveryDigest = runnerRecoveryDigest(step)
+			if _, err := db.db.ExecContext(ctx, `INSERT INTO runner_recovery_ledger(channel,project_id,ticket_id,prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch, step.TicketVersion, step.RunnerEpoch, step.LeaderEpoch, step.RecoveryDigest, step.CreatedAt.Format(time.RFC3339Nano)); err != nil {
+				t.Fatal(err)
+			}
+			priorVersion, priorRunner, priorLeader = step.TicketVersion, step.RunnerEpoch, step.LeaderEpoch
+		}
+		request := LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: ticket.Version, Fence: fence}
+		if _, err := db.LatestReusableProviderAttempt(ctx, request); !errors.Is(err, ErrStaleFence) {
+			t.Fatalf("reusable current-fence fast path accepted capped ledger: %v", err)
+		}
+		if _, _, err := db.LoadCurrentProviderAttemptResult(ctx, key, ticket.Version, fence); !errors.Is(err, ErrStaleFence) {
+			t.Fatalf("current result reader accepted capped ledger: %v", err)
+		}
+		if _, _, err := db.LoadProviderAttemptResult(ctx, result.Claim, ticket.Version, fence); !errors.Is(err, ErrStaleFence) {
+			t.Fatalf("claim result reader accepted capped ledger: %v", err)
+		}
+	})
+}
+
+func TestGenericPhaseRecoveryRefusesMalformedNewestResultAndControlGap(t *testing.T) {
+	newPlanningTicket := func(t *testing.T, id string) (*Store, context.Context, string, Ticket, ProviderQualification, domain.Fence) {
+		t.Helper()
+		db, ctx := openTestStore(t)
+		digest := setupProviderProject(t, db, ctx)
+		leader, err := db.AcquireLeader(ctx, domain.ChannelDev, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, id, leader), leader, domain.StatePlanning)
+		planner, _ := setupProviderPair(t, db, ctx)
+		return db, ctx, digest, ticket, planner, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	}
+	complete := func(t *testing.T, db *Store, ctx context.Context, digest string, ticket Ticket, fence domain.Fence, planner ProviderQualification) ProviderAttemptClaim {
+		t.Helper()
+		claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"proof"},"paths":["main.go"],"commands":[["go","test"]],"risks":["risk"]}`), UsageTrusted: true, UsageUnits: 1}
+		if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: ticket.Type}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		return claim
+	}
+
+	t.Run("does not fall back from malformed newest completion", func(t *testing.T) {
+		db, ctx, digest, ticket, planner, fence := newPlanningTicket(t, "SF-generic-malformed")
+		older := complete(t, db, ctx, digest, ticket, fence, planner)
+		// The normal admission path correctly refuses a second same-fence
+		// completion. Model a pre-existing terminal row that was repaired back
+		// to completed after a later attempt had begun; recovery must still
+		// inspect the newer result first rather than silently choosing older.
+		if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempts SET state='failed',outcome='failed' WHERE id=?`, older.ID); err != nil {
+			t.Fatal(err)
+		}
+		newest := complete(t, db, ctx, digest, ticket, fence, planner)
+		if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempts SET state='completed',outcome='completed' WHERE id=?`, older.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.db.ExecContext(ctx, `DROP TRIGGER provider_attempt_results_immutable_update`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempt_results SET typed_artifact='{}' WHERE provider_attempt_id=?`, newest.ID); err != nil {
+			t.Fatal(err)
+		}
+		leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "generic-malformed-restart")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); !errors.Is(err, ErrPublicationEvidence) {
+			t.Fatalf("malformed newest recovery=%v", err)
+		}
+		unchanged, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil || unchanged.Version != ticket.Version || unchanged.RunnerEpoch != ticket.RunnerEpoch {
+			t.Fatalf("malformed recovery mutated ticket=%+v original=%+v err=%v", unchanged, ticket, err)
+		}
+	})
+
+	t.Run("rejects a same-phase control gap without a signed ledger", func(t *testing.T) {
+		db, ctx, digest, ticket, planner, fence := newPlanningTicket(t, "SF-generic-control-gap")
+		_ = complete(t, db, ctx, digest, ticket, fence, planner)
+		advanced, err := db.InvalidateRunner(ctx, ticket.Ref, ticket.Version, fence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "generic-control-gap-restart")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); !errors.Is(err, ErrPublicationEvidence) {
+			t.Fatalf("control gap recovery=%v", err)
+		}
+		live, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil || live.Version != advanced.Version || live.RunnerEpoch != advanced.RunnerEpoch {
+			t.Fatalf("control gap recovery mutated ticket=%+v advanced=%+v err=%v", live, advanced, err)
+		}
+	})
+}
+
+func TestGenericPhaseRecoveryRefusesNewestResultlessCompletion(t *testing.T) {
+	db, ctx := func() (*Store, context.Context) {
+		db, ctx := openTestStore(t)
+		digest := setupProviderProject(t, db, ctx)
+		leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "resultless-newest")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-resultless-newest", leader), leader, domain.StatePlanning)
+		planner, _ := setupProviderPair(t, db, ctx)
+		fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+		finish := func(success bool) ProviderAttemptClaim {
+			claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if success {
+				raw := contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"proof"},"paths":["main.go"],"commands":[["go","test"]],"risks":["risk"]}`), UsageTrusted: true, UsageUnits: 1}
+				if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: ticket.Type}, time.Now().UTC()); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "failed", 1, time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			return claim
+		}
+		older := finish(true)
+		if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempts SET state='failed',outcome='failed' WHERE id=?`, older.ID); err != nil {
+			t.Fatal(err)
+		}
+		newest := finish(false)
+		// A completed-success attempt with no immutable result is tampering,
+		// unlike an ordinary failed retry. The newest successful tuple must fail
+		// closed rather than letting recovery fall back to older evidence.
+		if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempts SET state='completed',outcome='completed' WHERE id=?`, newest.ID); err != nil {
+			t.Fatal(err)
+		}
+		return db, ctx
+	}()
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "resultless-newest-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("resultless newest recovery accepted: %v", err)
+	}
+}
+
+func TestGenericPhaseRecoveryIgnoresNewestFailedAttemptForBaseline(t *testing.T) {
 	db, ctx := openTestStore(t)
 	digest := setupProviderProject(t, db, ctx)
-	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "reviewer-reuse")
-	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-reviewer-reuse", leader), leader, domain.StateBuilding)
-	builder, reviewer := setupProviderPair(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "failed-newest-baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-failed-newest-baseline", leader), leader, domain.StatePlanning)
+	planner, _ := setupProviderPair(t, db, ctx)
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
-	bclaim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	braw := contracts.PhaseResult{Provider: bclaim.Binding.Identity, Artifact: []byte(`{"schema":"sf.builder/v1","summary":"done","changed_files":["main.go"],"commands":[["go","test"]]}`), UsageTrusted: true, UsageUnits: 1}
-	if _, err := db.CompleteProviderAttemptSuccess(ctx, bclaim, proof(t, bclaim), ticket.Version, fence, braw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC()); err != nil {
+	raw := contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"proof"},"paths":["main.go"],"commands":[["go","test"]],"risks":["risk"]}`), UsageTrusted: true, UsageUnits: 1}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: ticket.Type}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	_, parsed, err := db.LoadHistoricalProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: bclaim.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: bclaim.Attempt})
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempts SET state='failed',outcome='failed' WHERE id=?`, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// This test's historical reviewer-reuse assertion no longer creates a
-	// candidate from a bare verification projection; dedicated v36 coverage
-	// supplies both bound command observations.
-	if parsed.Builder != nil {
-		return
-	}
-	source := sha256Digest([]byte("review-source"))
-	if _, err := db.db.ExecContext(ctx, `UPDATE tickets SET source_digest=? WHERE channel=? AND project_id=? AND id=?`, source, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+	if err := db.FinishProviderAttempt(ctx, failed, proof(t, failed), ticket.Version, fence, "failed", "failed", 1, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	rev, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: []byte("intent"), Proof: []byte("proof"), OwnedFiles: []string{"verify.go"}, CheckpointID: strings.Repeat("d", 40)})
+	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "failed-newest-baseline-restart")
 	if err != nil {
 		t.Fatal(err)
 	}
-	bd, _ := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
-	snap := domain.CandidateSnapshot{BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), TreeSHA: strings.Repeat("c", 40), SourceDigest: source, VerificationIntentDigest: rev.IntentDigest, ProofDigest: rev.ProofDigest, CommandPolicyDigest: sha256Digest([]byte("policy")), BuilderEvidenceDigest: bd}
-	ce := CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snap, BuilderResult: ProviderAttemptResultKey{AttemptID: bclaim.ID, Ref: ticket.Ref, Phase: domain.PhaseBuild, Attempt: bclaim.Attempt}, Commit: CommitObservation{CommitOID: snap.HeadSHA, ParentOID: strings.Repeat("d", 40), TreeOID: snap.TreeSHA}, Reason: "candidate"}
-	if _, err := db.RecordCandidate(ctx, ce); err != nil {
-		t.Fatal(err)
+	if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil {
+		t.Fatalf("ordinary failed retry blocked recovery: %v", err)
 	}
-	ticket = providerState(t, db, ctx, ticket, leader, domain.StateReviewing)
-	fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
-	rclaim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseReview, Role: "reviewer", Binding: runtime(reviewer), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(), ExpectedHead: snap.HeadSHA, ExpectedProof: snap.ProofDigest}))
+	live, err := db.Ticket(ctx, ticket.Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rraw := contracts.PhaseResult{Provider: rclaim.Binding.Identity, Artifact: []byte(`{"schema":"sf.reviewer/v1","decision":"pass","findings":[],"reviewed_head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","proof_digest":"` + snap.ProofDigest + `"}`), UsageTrusted: true, UsageUnits: 1}
-	if _, err := db.CompleteProviderAttemptSuccess(ctx, rclaim, proof(t, rclaim), ticket.Version, fence, rraw, phaseartifact.Validation{TicketType: domain.TicketFeature, ExpectedReviewedHead: snap.HeadSHA, ExpectedProofDigest: snap.ProofDigest}, time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
-	request := LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseReview, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence}
-	if got, err := db.LatestReusableProviderAttempt(ctx, request); err != nil || got.Recovered || got.Parsed.Reviewer == nil {
-		t.Fatalf("exact reviewer=%+v err=%v", got, err)
-	}
-	advanced, err := db.InvalidateRunner(ctx, ticket.Ref, ticket.Version, fence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	leader, _ = db.AcquireLeader(ctx, domain.ChannelDev, "reviewer-restart")
-	request.ExpectedVersion, request.Fence = advanced.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: advanced.RunnerEpoch}
-	if got, err := db.LatestReusableProviderAttempt(ctx, request); err != nil || !got.Recovered {
-		t.Fatalf("recovered reviewer=%+v err=%v", got, err)
-	}
-	if _, err := db.RecordVerification(ctx, VerificationArtifact{Ref: ticket.Ref, ExpectedVersion: advanced.Version, Fence: request.Fence, Intent: []byte("intent-two"), Proof: []byte("proof-two"), OwnedFiles: []string{"verify.go"}, CheckpointID: strings.Repeat("e", 40), AmendsRevision: rev.Revision, Reason: "changed", Requester: "test"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.LatestReusableProviderAttempt(ctx, request); !errors.Is(err, ErrEvidenceConflict) {
-		t.Fatalf("stale review proof accepted=%v", err)
+	if _, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhasePlanning, Role: "planner", ExpectedVersion: live.Version, Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: live.RunnerEpoch}}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed newest attempt allowed stale reuse: %v", err)
 	}
 }
 
@@ -1151,6 +1436,9 @@ func runtime(q ProviderQualification) contracts.RuntimeBinding {
 func providerState(t *testing.T, db *Store, ctx context.Context, ticket Ticket, leader uint64, state domain.State) Ticket {
 	t.Helper()
 	from := ticket.State
+	if from == state {
+		return ticket
+	}
 	result, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: from, To: state, Trigger: "test_phase", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, EventPayload: "{}"})
 	if err != nil {
 		t.Fatal(err)

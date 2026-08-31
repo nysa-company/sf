@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -148,6 +149,24 @@ func TestPhaseRunnerStoreLifecyclePreservesHistoricalPredecessors(t *testing.T) 
 
 	building, buildFence := lineageRecover(t, db, supervisor, ref, "building")
 	coordinator.bindings = lineageQualifications(t, db, supervisor, buildFence.LeaderEpoch, "building")
+	if _, err := db.CurrentVerification(ctx, ref); !errors.Is(err, store.ErrEvidenceConflict) {
+		t.Fatalf("strict verification accepted pre-recovery binding: %v", err)
+	}
+	recoverable, err := db.RecoverableVerification(ctx, ref)
+	if err != nil {
+		t.Fatalf("recoverable verification: %v", err)
+	}
+	reusable, err := db.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: building.Version, Fence: buildFence})
+	if err != nil || !reusable.Recovered || reusable.Key != recoverable.ProviderResult {
+		t.Fatalf("reusable verification=%+v err=%v", reusable, err)
+	}
+	if _, err := db.RecordVerification(ctx, store.VerificationArtifact{Ref: ref, ExpectedVersion: building.Version, Fence: buildFence, Intent: recoverable.Intent, Proof: recoverable.Proof, OwnedFiles: recoverable.Revision.OwnedFiles, CheckpointID: recoverable.Revision.CheckpointID, ProviderResult: &reusable.Key, Checkpoint: recoverable.Checkpoint, CommandResult: recoverable.CommandBinding.Key, AmendsRevision: recoverable.Revision.Amends, Reason: recoverable.AmendmentReason, Requester: recoverable.Requester}); err != nil {
+		t.Fatalf("rebind verification: %v", err)
+	}
+	verification, err = db.CurrentVerification(ctx, ref)
+	if err != nil || verification.TicketVersion != building.Version || verification.Fence != buildFence {
+		t.Fatalf("rebound verification=%+v err=%v", verification, err)
+	}
 	worktree, err = db.Worktree(ctx, ref)
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +182,7 @@ func TestPhaseRunnerStoreLifecyclePreservesHistoricalPredecessors(t *testing.T) 
 	if _, _, err := db.LoadHistoricalProviderAttemptResult(ctx, buildResult.ProviderResult); err != nil {
 		t.Fatalf("historical builder: %v", err)
 	}
-	if planningFence == verificationFence || verificationFence == buildFence || !(started.Version < verifying.Version && verifying.Version < building.Version) || plan.TicketVersion != started.Version || verification.TicketVersion != verifying.Version || worktree.TicketVersion != started.Version {
+	if planningFence == verificationFence || verificationFence == buildFence || !(started.Version < verifying.Version && verifying.Version < building.Version) || plan.TicketVersion != started.Version || verification.TicketVersion != building.Version || verification.Fence != buildFence || worktree.TicketVersion != started.Version {
 		t.Fatalf("lineage versions/fences plan=%+v verification=%+v tickets=%d/%d/%d fences=%+v/%+v/%+v worktree=%+v", plan, verification, started.Version, verifying.Version, building.Version, planningFence, verificationFence, buildFence, worktree)
 	}
 	if coordinator.calls[providercoord.RolePlanner] != 1 || coordinator.calls[providercoord.RoleReviewer] != 1 || coordinator.calls[providercoord.RoleBuilder] != 1 {

@@ -1177,6 +1177,15 @@ func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) Transition(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if transition.Trigger == "typed_blocker" && transition.To == domain.StateBlocked && (transition.From == domain.StatePublishing || transition.From == domain.StateWaitingCI) {
+		return s.TransitionPublishedBlock(ctx, transition)
+	}
+	// Publication retries that exhaust their bounded budget are an authenticated
+	// pause, not a generic publication exit.  Keep the witness as the source of
+	// truth so the subsequent operator resume can prove this exact pause.
+	if semanticPublicationPauseTransition(transition) {
+		return s.TransitionPublishedPause(ctx, transition)
+	}
 	// Publication is a separate trust boundary. A caller must not be able to
 	// advance publishing based only on a ticket counter and arbitrary payload.
 	if publicationSensitiveTransition(transition.From, transition.To) {
@@ -1197,6 +1206,16 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
 		return TransitionResult{}, errors.New("transition event payload must be bounded JSON")
 	}
+	blockedCode := ""
+	if transition.To == domain.StateBlocked && transition.Trigger == "typed_blocker" {
+		var blocker struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal([]byte(transition.EventPayload), &blocker) != nil || blocker.Code == "" || !boundedText(blocker.Code, 128) {
+			return TransitionResult{}, ErrEvidenceConflict
+		}
+		blockedCode = blocker.Code
+	}
 	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
 		return TransitionResult{}, err
 	}
@@ -1216,7 +1235,7 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
 			return err
 		}
-		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?, resume_state=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
+		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?, resume_state=?, blocked_code=CASE WHEN ?<>'' THEN ? WHEN state='blocked' THEN '' ELSE blocked_code END, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), blockedCode, blockedCode, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
 		if err != nil {
 			return err
 		}
@@ -1305,8 +1324,8 @@ func (s *Store) TransitionVerification(ctx context.Context, transition Transitio
 		if err := assertNewestBoundResult(ctx, conn, transition.Ref, domain.PhaseVerification, "reviewer", ProviderAttemptResultKey{AttemptID: id, Ref: transition.Ref, Phase: domain.PhaseVerification, Attempt: attempt}); err != nil {
 			return err
 		}
-		stored, err := s.CurrentVerification(ctx, transition.Ref)
-		if err != nil || stored.Revision.Revision == 0 || stored.Revision.CheckpointID != revisionCheckpoint || stored.ProviderResult.AttemptID != id || stored.ProviderResult.Attempt != attempt || stored.TicketVersion != version || stored.Fence != transition.Fence || stored.CommandBinding.TicketVersion != version || stored.CommandBinding.LeaderEpoch != transition.Fence.LeaderEpoch || stored.CommandBinding.RunnerEpoch != transition.Fence.RunnerEpoch {
+		stored, err := s.currentVerificationFrom(ctx, conn, transition.Ref)
+		if err != nil || stored.Revision.Revision == 0 || stored.Revision.CheckpointID != revisionCheckpoint || stored.ProviderResult.AttemptID != id || stored.ProviderResult.Attempt != attempt || stored.TicketVersion != version || stored.Fence != transition.Fence {
 			return ErrEvidenceConflict
 		}
 		return nil
@@ -1374,11 +1393,9 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 	if len(transition.EventPayload) > maxEvidenceJSON || !json.Valid([]byte(transition.EventPayload)) {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
-	// A failed repair-gated transition must not drain and revoke the very
-	// builder fence needed to record its missing completion. Keep the durable
-	// check inside the write transaction below as the race-safe authority; this
-	// read-only preflight only prevents a known-missing completion from causing
-	// an unrelated revocation side effect.
+	// A repair-gated transition must not revoke the builder fence before its
+	// missing successor completion can be recorded. The same check is repeated
+	// inside the write transaction below for race-safe authority.
 	var repairPending int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation).Scan(&repairPending); err != nil {
 		return TransitionResult{}, err

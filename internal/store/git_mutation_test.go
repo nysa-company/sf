@@ -39,7 +39,7 @@ func unplannedGitIntentFixture(t *testing.T, db *Store, ctx context.Context, tic
 	}
 	intent := GitMutationIntent{EffectFence: EffectFence{Ref: ref, TicketVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}}, RequestDigest: gitDigest("a"), Repository: "/tmp/nysa", Worktree: "/tmp/nysa/" + ticketID, Branch: "sf/dev/aaaaaaaa/aaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Operation: "commit", BaseRef: "main", ExpectedBaseOID: strings.Repeat("a", 40), ExpectedHeadOID: strings.Repeat("a", 40)}
 	intent.SemanticKey = CanonicalGitMutationSemanticKey(intent)
-	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: intent.Fence, Path: intent.Worktree, Branch: intent.Branch, IdentityJSON: []byte(`{"repository":"/tmp/nysa"}`), BaseSHA: intent.ExpectedBaseOID, HeadSHA: intent.ExpectedHeadOID}); err != nil {
+	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: intent.Fence, Path: intent.Worktree, Branch: intent.Branch, IdentityJSON: []byte(repositoryCommandIdentity(t, intent.Repository, intent.Worktree, intent.Branch, intent.BaseRef)), BaseSHA: intent.ExpectedBaseOID, HeadSHA: intent.ExpectedHeadOID}); err != nil {
 		t.Fatal(err)
 	}
 	return intent

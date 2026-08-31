@@ -268,13 +268,32 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	if _, err := worker.Run(ctx, ref, fence); err != nil {
 		t.Fatalf("candidate replay: %+v", err)
 	}
-	candidateAfter, err := db.LatestCandidate(ctx, ref)
+	liveAfterCandidateSignal, err := db.Ticket(ctx, ref)
+	if err != nil || liveAfterCandidateSignal.State != domain.StatePublishing {
+		t.Fatalf("candidate signal ticket=%+v err=%v", liveAfterCandidateSignal, err)
+	}
+	if err := db.ProviderResultReachesFence(ctx, candidateBefore.BuilderResult, liveAfterCandidateSignal.Version, domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: liveAfterCandidateSignal.RunnerEpoch}); err != nil {
+		t.Fatalf("builder result did not cross the normal build-publish bridge: %v", err)
+	}
+	if _, err := db.RecoverableCandidate(ctx, ref); err != nil {
+		t.Fatalf("immutable candidate was not readable after build-publish: %v", err)
+	}
+	if _, err := db.LoadRepositoryCommandResult(ctx, candidateBefore.CommandBinding.Key); err != nil {
+		t.Fatalf("candidate command evidence was not readable after build-publish: %v", err)
+	}
+	if _, err := db.LatestCandidate(ctx, ref); !errors.Is(err, store.ErrStaleFence) {
+		t.Fatalf("current candidate reader accepted pre-rebind publishing evidence: %v", err)
+	}
+	candidateAfter, err := db.RecoverableCandidate(ctx, ref)
 	if err != nil || candidateAfter.Commit != candidateBefore.Commit || candidateAfter.CommandBinding.Key != candidateBefore.CommandBinding.Key {
 		t.Fatalf("candidate replay changed evidence before=%+v after=%+v err=%v", candidateBefore, candidateAfter, err)
 	}
-	verificationAfter, err := db.CurrentVerification(ctx, ref)
+	if _, err := db.CurrentVerification(ctx, ref); !errors.Is(err, store.ErrEvidenceConflict) {
+		t.Fatalf("strict verification remained current after publishing: %v", err)
+	}
+	verificationAfter, err := db.RecoverableVerification(ctx, ref)
 	if err != nil || verificationAfter.Checkpoint != verificationBefore.Checkpoint || verificationAfter.CommandBinding.Key != verificationBefore.CommandBinding.Key {
-		t.Fatalf("candidate replay changed checkpoint evidence before=%+v after=%+v err=%v", verificationBefore, verificationAfter, err)
+		t.Fatalf("candidate replay changed recoverable checkpoint evidence before=%+v after=%+v err=%v", verificationBefore, verificationAfter, err)
 	}
 	candidateCommandAfter, err := db.LoadRepositoryCommandResult(ctx, candidateAfter.CommandBinding.Key)
 	if err != nil || candidateCommandAfter.Key != candidateCommandBefore.Key || candidateCommandAfter.ResultDigest != candidateCommandBefore.ResultDigest {

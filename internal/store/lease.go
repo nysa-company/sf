@@ -15,6 +15,91 @@ import (
 
 var ErrLeaseCapacity = errors.New("lease capacity is exhausted")
 
+type phaseRecoveryBaseline struct{ version, runner, leader, currentLeader uint64 }
+
+func recoveryProviderPhase(state domain.State) (domain.Phase, string, bool) {
+	switch state {
+	case domain.StatePlanning:
+		return domain.PhasePlanning, "planner", true
+	case domain.StateVerifying:
+		return domain.PhaseVerification, "reviewer", true
+	case domain.StateBuilding:
+		return domain.PhaseBuild, "builder", true
+	default:
+		return "", "", false
+	}
+}
+
+// loadActiveProviderEndpoint authenticates the exact provider claim that was
+// still running when the daemon died. It is a narrow recovery predecessor for
+// the no-result crash window; counters, events, and older worktree rows cannot
+// substitute for this immutable claim/binding.
+func loadActiveProviderEndpoint(ctx context.Context, q rowQueryer, ref domain.TicketRef, phase domain.Phase, role string, version, runner, newLeader uint64) (uint64, bool, error) {
+	if ref.Validate() != nil || phase == "" || role == "" || version == 0 || runner == 0 || newLeader == 0 {
+		return 0, false, ErrPublicationEvidence
+	}
+	rows, err := q.QueryContext(ctx, `SELECT id FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND role=? AND expected_ticket_version=? AND runner_epoch=? AND leader_epoch>0 AND leader_epoch<? AND state IN ('active','quarantined') ORDER BY id`, ref.Channel, ref.Project, ref.Ticket, phase, role, version, runner, newLeader)
+	if err != nil {
+		return 0, false, err
+	}
+	defer rows.Close()
+	var id int64
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(&id); err != nil {
+			return 0, false, err
+		}
+		count++
+		if count > 1 {
+			return 0, false, ErrPublicationEvidence
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, false, err
+	}
+	if count == 0 {
+		return 0, false, nil
+	}
+	claim, err := loadAuthenticatedProviderAttemptClaim(ctx, q, id)
+	if err != nil || claim.Ref != ref || claim.Phase != phase || claim.Role != role || claim.ExpectedVersion != version || claim.RunnerEpoch != runner || claim.LeaderEpoch == 0 || claim.LeaderEpoch >= newLeader {
+		return 0, false, ErrPublicationEvidence
+	}
+	return claim.LeaderEpoch, true, nil
+}
+
+// loadPhaseRecoveryBaseline intentionally reads the newest completed source
+// claim.  A later malformed completion must not be skipped by adopting an
+// older result.
+func (s *Store) loadPhaseRecoveryBaseline(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, phase domain.Phase, role string) (phaseRecoveryBaseline, bool, error) {
+	var b phaseRecoveryBaseline
+	var attempt int
+	var resultID sql.NullInt64
+	err := conn.QueryRowContext(ctx, `SELECT r.provider_attempt_id,a.attempt
+		FROM provider_attempts a LEFT JOIN provider_attempt_results r ON r.provider_attempt_id=a.id
+		WHERE a.channel=? AND a.project_id=? AND a.ticket_id=? AND a.phase=? AND a.role=?
+		AND a.state='completed' AND a.outcome='completed' AND a.finished_at IS NOT NULL AND a.finished_at <> ''
+		ORDER BY a.attempt DESC,a.id DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, phase, role).Scan(&resultID, &attempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return phaseRecoveryBaseline{}, false, nil
+	}
+	if err != nil {
+		return phaseRecoveryBaseline{}, false, err
+	}
+	// The newest terminal attempt is authoritative even when its immutable
+	// result row is missing. Never hide a resultless/tampered completion by
+	// falling back to an older successful attempt.
+	if !resultID.Valid {
+		return phaseRecoveryBaseline{}, false, ErrPublicationEvidence
+	}
+	resultKey := ProviderAttemptResultKey{AttemptID: resultID.Int64, Ref: ref, Phase: phase, Attempt: attempt}
+	result, _, err := s.loadHistoricalProviderAttemptResult(ctx, conn, resultKey)
+	if err != nil || result.Claim.Role != role || result.Claim.Ref != ref || result.Claim.Phase != phase {
+		return phaseRecoveryBaseline{}, false, ErrPublicationEvidence
+	}
+	b.version, b.runner, b.leader, b.currentLeader = result.Claim.ExpectedVersion, result.Claim.RunnerEpoch, result.Claim.LeaderEpoch, result.Claim.LeaderEpoch
+	return b, true, nil
+}
+
 // ErrLeaseAdoption keeps capacity held when the ownership of an invalidated
 // lease cannot be proven safe to transfer to a replacement runner.
 var ErrLeaseAdoption = errors.New("invalidated leases cannot be adopted")
@@ -77,18 +162,11 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				if latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner && latest.LeaderEpoch == leaderEpoch {
 					continue // lost-response replay under the same leader
 				}
-				// A control invalidation may advance the ticket without writing a
-				// recovery row, but only its sealed runtime-control authority may
-				// authenticate that one-version gap. Counter arithmetic alone must
-				// not let a forged ticket update bridge the recovery ledger.
+				// A direct control invalidation may advance the ticket without writing
+				// a recovery row. It is not an authenticated predecessor for startup
+				// fencing; do not mint a zero-prior or bridged recovery row from it.
 				if latest.TicketVersion > ticket.version || latest.RunnerEpoch > ticket.runner || leaderEpoch <= latest.LeaderEpoch {
 					return ErrStaleFence
-				}
-				if latest.TicketVersion+1 == ticket.version && latest.RunnerEpoch+1 == ticket.runner && ticket.state != domain.StateWaitingCI {
-					var controlVersion, controlRunner, controlLeader uint64
-					if err := conn.QueryRowContext(ctx, `SELECT authority_version,authority_runner_epoch,authority_leader_epoch FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=? AND state='sealed'`, channel, ticket.project, ticket.id).Scan(&controlVersion, &controlRunner, &controlLeader); err != nil || controlVersion != ticket.version || controlRunner != ticket.runner || controlLeader != latest.LeaderEpoch {
-						return ErrPublicationEvidence
-					}
 				}
 			}
 			// Runner recovery is also an append-only, bounded authority. Its cap
@@ -117,54 +195,247 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 			// limit, so check it before changing either ticket counters or the
 			// runner ledger. The surrounding Store write rolls back every ticket
 			// in this startup pass if one is capped.
+			priorLeader := uint64(0)
 			if ticket.state == domain.StatePublishing {
-				publication, found, err := loadPublicationEvidenceRow(ctx, conn, ref)
-				if err != nil || !found {
+				publication, publicationFound, err := loadPublicationEvidenceRow(ctx, conn, ref)
+				if err != nil {
 					return ErrPublicationEvidence
 				}
-				if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil || publication.CurrentTicketVersion != ticket.version || publication.CurrentFence.RunnerEpoch != ticket.runner {
-					return ErrPublicationEvidence
-				}
-				var rebinds int
-				if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=?`, channel, ticket.project, ticket.id, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA).Scan(&rebinds); err != nil {
-					return err
-				}
-				if rebinds >= 64 {
-					return ErrPublicationEvidence
+				if publicationFound {
+					if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil || publication.CurrentFence.RunnerEpoch != ticket.runner {
+						return ErrPublicationEvidence
+					}
+					if publication.CurrentTicketVersion != ticket.version {
+						pair := ticket.version == publication.CurrentTicketVersion+2 &&
+							ticket.runner == publication.CurrentFence.RunnerEpoch &&
+							(authenticateBlockedPublicationResume(ctx, conn, ref, publication.CurrentTicketVersion+1, ticket.version, domain.StatePublishing, domain.StatePublishing) == nil ||
+								authenticateSemanticPublicationResume(ctx, conn, ref, publication.CurrentTicketVersion+1, ticket.version, domain.StatePublishing) == nil)
+						if !pair || publication.CurrentFence.LeaderEpoch == 0 || publication.CurrentFence.LeaderEpoch >= leaderEpoch {
+							return ErrPublicationEvidence
+						}
+						priorLeader = publication.CurrentFence.LeaderEpoch
+					} else {
+						priorLeader = publication.CurrentFence.LeaderEpoch
+					}
+					var rebinds int
+					if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence_rebinds WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=?`, channel, ticket.project, ticket.id, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA).Scan(&rebinds); err != nil {
+						return err
+					}
+					if rebinds >= 64 {
+						return ErrPublicationEvidence
+					}
+				} else if found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
+					priorLeader = latest.LeaderEpoch
+				} else {
+					// A candidate can be durable before the build->publishing
+					// signal, while publication evidence is intentionally absent
+					// until the external boundary runs. Authenticate that exact
+					// candidate and transition as the first recovery predecessor.
+					candidate, candidateErr := s.latestCandidateFrom(ctx, conn, ref, false)
+					if candidateErr != nil || candidate.TicketVersion == ^uint64(0) || candidate.TicketVersion >= ticket.version {
+						return ErrPublicationEvidence
+					}
+					var transitions int
+					if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, channel, ticket.project, ticket.id, candidate.TicketVersion+1).Scan(&transitions); err != nil || transitions != 1 {
+						return ErrPublicationEvidence
+					}
+					priorLeader = candidate.Fence.LeaderEpoch
+					exactLatest := found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner
+					if exactLatest {
+						priorLeader = latest.LeaderEpoch
+					}
+					if controlLeader, controlFound, controlErr := loadRuntimeControlEndpointLeader(ctx, conn, ref, ticket.version, ticket.runner); controlErr != nil {
+						return controlErr
+					} else if controlFound {
+						priorLeader = controlLeader
+					} else if !exactLatest && (ticket.version != candidate.TicketVersion+1 || ticket.runner != candidate.Fence.RunnerEpoch) {
+						return ErrPublicationEvidence
+					}
+					if priorLeader == 0 || priorLeader >= leaderEpoch {
+						return ErrPublicationEvidence
+					}
+					if !found && candidate.Fence.RunnerEpoch == 1 {
+						if err := validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version); err != nil {
+							return ErrPublicationEvidence
+						}
+					}
+					// This is a startup-only pre-fence proof.  The builder result
+					// must reach the exact old endpoint, never the new daemon leader:
+					// the signed recovery row below is what transfers authority.
+					provider, _, providerErr := s.loadHistoricalProviderAttemptResult(ctx, conn, candidate.BuilderResult)
+					if providerErr != nil || provider.Claim.ExpectedVersion != candidate.TicketVersion || provider.Claim.RunnerEpoch != candidate.Fence.RunnerEpoch || provider.Claim.LeaderEpoch != candidate.Fence.LeaderEpoch || provider.Claim.Ref != ref || provider.Claim.Phase != domain.PhaseBuild || provider.Claim.Role != "builder" || providerResultReachesHistoricalFence(ctx, conn, candidate.BuilderResult, provider, ticket.version, domain.Fence{LeaderEpoch: priorLeader, RunnerEpoch: ticket.runner}) != nil {
+						return ErrPublicationEvidence
+					}
 				}
 			}
-			priorLeader := uint64(0)
-			if found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
+			if phase, role, ok := recoveryProviderPhase(ticket.state); ok {
+				baseline, baselineFound, baselineErr := s.loadPhaseRecoveryBaseline(ctx, conn, ref, phase, role)
+				if baselineErr != nil {
+					return ErrPublicationEvidence
+				}
+				if baselineFound && found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
+					baseline.currentLeader = latest.LeaderEpoch
+				}
+				if baselineFound {
+					// The recovery row being appended starts from the authenticated
+					// pre-fence endpoint, not the provider claim's original leader.
+					// Prefer an exact prior ledger row, then the durable control
+					// authority created by pause/take + resume; only the first recovery
+					// falls back to the provider claim's source leader.
+					exactLatest := found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner
+					priorLeader = baseline.currentLeader
+					if exactLatest {
+						priorLeader = latest.LeaderEpoch
+					}
+					if controlLeader, controlFound, controlErr := loadRuntimeControlEndpointLeader(ctx, conn, ref, ticket.version, ticket.runner); controlErr != nil {
+						return controlErr
+					} else if controlFound {
+						priorLeader = controlLeader
+					} else if !exactLatest && (ticket.version != baseline.version || ticket.runner != baseline.runner) && !(ticket.version == baseline.version+1 && ticket.runner == baseline.runner) {
+						// More than the single authenticated phase bridge means a
+						// pause/take or other control advance occurred. Without its
+						// durable endpoint, the source leader is not an authority for
+						// this live fence.
+						return ErrPublicationEvidence
+					}
+					if priorLeader == 0 || priorLeader >= leaderEpoch {
+						return ErrPublicationEvidence
+					}
+					if !found && baseline.runner == 1 {
+						if err := validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version); err != nil {
+							return ErrPublicationEvidence
+						}
+					}
+					// Authenticate the source claim to the exact pre-fence endpoint.
+					// Passing leaderEpoch here would let a generic provider reader
+					// bless an unrecorded leader-only takeover.
+					if err := validateRunnerRecoveryLedger(ctx, conn, ref, baseline.version, baseline.runner, baseline.leader, ticket.version, ticket.runner, priorLeader); err != nil {
+						return ErrPublicationEvidence
+					}
+				} else if ticket.state == domain.StateVerifying {
+					// Planning may have been consumed by the exact planning->verifying
+					// transition before the first reviewer claim was issued. That is a
+					// narrow predecessor: the completed Planner source, one canonical
+					// phase_pass endpoint, and any prior signed recovery rows must all
+					// reach this pre-fence ticket identity.
+					planning, planningFound, planningErr := s.loadPhaseRecoveryBaseline(ctx, conn, ref, domain.PhasePlanning, "planner")
+					if planningErr != nil {
+						return ErrPublicationEvidence
+					}
+					if planningFound && !(found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner) {
+						var transitions int
+						if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='planning' AND to_state='verifying'`, channel, ticket.project, ticket.id, ticket.version).Scan(&transitions); err != nil || transitions != 1 {
+							return ErrPublicationEvidence
+						}
+						exactSource := ticket.version == planning.version+1 && ticket.runner == planning.runner
+						exactLatest := found && latest.TicketVersion+1 == ticket.version && latest.RunnerEpoch == ticket.runner
+						if !exactSource && !exactLatest {
+							return ErrPublicationEvidence
+						}
+						priorLeader = planning.currentLeader
+						if exactLatest {
+							priorLeader = latest.LeaderEpoch
+						}
+						if priorLeader == 0 || priorLeader >= leaderEpoch {
+							return ErrPublicationEvidence
+						}
+						if !found && planning.runner == 1 && validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version) != nil {
+							return ErrPublicationEvidence
+						}
+						if err := validateRunnerRecoveryLedger(ctx, conn, ref, planning.version, planning.runner, planning.leader, ticket.version, ticket.runner, priorLeader); err != nil {
+							return ErrPublicationEvidence
+						}
+					}
+				}
+			}
+			if priorLeader == 0 && found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
 				priorLeader = latest.LeaderEpoch
-			} else if found && latest.TicketVersion+1 == ticket.version && latest.RunnerEpoch+1 == ticket.runner {
-				priorLeader = latest.LeaderEpoch
-			} else if publication, ok, err := s.publicationRecoveryBaseline(ctx, conn, ref, ticket.version, ticket.runner); err != nil {
-				return err
-			} else if ok {
-				priorLeader = publication
+			} else if priorLeader == 0 && ticket.state == domain.StateBuilding {
+				// Verification may have committed and transitioned the ticket to
+				// Building before Builder started. Preserve that reviewer leader as
+				// the first recovery predecessor only when the one intervening
+				// verification->building event is exact; this is the durable bridge
+				// consumed by the candidate-less building recovery path.
+				verification, verificationFound, verificationErr := s.loadPhaseRecoveryBaseline(ctx, conn, ref, domain.PhaseVerification, "reviewer")
+				if verificationErr != nil {
+					return ErrPublicationEvidence
+				}
+				if verificationFound {
+					var transitions int
+					if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='verifying' AND to_state='building'`, channel, ticket.project, ticket.id, ticket.version).Scan(&transitions); err != nil || transitions != 1 || verification.version+1 != ticket.version || verification.runner != ticket.runner {
+						return ErrPublicationEvidence
+					}
+					exactLatest := found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner
+					priorLeader = verification.currentLeader
+					if exactLatest {
+						priorLeader = latest.LeaderEpoch
+					}
+					if controlLeader, controlFound, controlErr := loadRuntimeControlEndpointLeader(ctx, conn, ref, ticket.version, ticket.runner); controlErr != nil {
+						return controlErr
+					} else if controlFound {
+						priorLeader = controlLeader
+					} else if !exactLatest && (ticket.version != verification.version+1 || ticket.runner != verification.runner) {
+						return ErrPublicationEvidence
+					}
+					if priorLeader == 0 || priorLeader >= leaderEpoch {
+						return ErrPublicationEvidence
+					}
+					if err := validateRunnerRecoveryLedger(ctx, conn, ref, verification.version, verification.runner, verification.leader, ticket.version, ticket.runner, priorLeader); err != nil {
+						return ErrPublicationEvidence
+					}
+				}
+			} else if priorLeader == 0 && found {
+				// Non-phase states (including final review) have no dedicated
+				// baseline, but may still cross a complete pause/take handoff.
+				if controlLeader, controlFound, controlErr := loadRuntimeControlEndpointLeader(ctx, conn, ref, ticket.version, ticket.runner); controlErr != nil {
+					return controlErr
+				} else if controlFound && validateRunnerControlAdvance(ctx, conn, ref, latest.TicketVersion, latest.RunnerEpoch, latest.LeaderEpoch, ticket.version, ticket.runner, controlLeader) == nil {
+					priorLeader = controlLeader
+				} else if publication, ok, publicationErr := s.publicationRecoveryBaseline(ctx, conn, ref, ticket.version, ticket.runner); publicationErr != nil {
+					return publicationErr
+				} else if ok {
+					priorLeader = publication
+				}
+			} else if priorLeader == 0 {
+				publication, ok, err := s.publicationRecoveryBaseline(ctx, conn, ref, ticket.version, ticket.runner)
+				if err != nil {
+					return err
+				} else if ok {
+					priorLeader = publication
+				}
 			}
 			if priorLeader == 0 {
-				provider, providerFound, providerErr := providerRecoveryBaseline(ctx, conn, ref, ticket.state, ticket.version, ticket.runner)
-				if providerErr != nil {
-					return providerErr
-				}
-				if providerFound {
-					if provider >= leaderEpoch {
-						return ErrPublicationEvidence
+				if phase, role, ok := recoveryProviderPhase(ticket.state); ok {
+					activeLeader, activeFound, activeErr := loadActiveProviderEndpoint(ctx, conn, ref, phase, role, ticket.version, ticket.runner, leaderEpoch)
+					if activeErr != nil {
+						return activeErr
 					}
-					priorLeader = provider
+					if activeFound {
+						priorLeader = activeLeader
+					}
 				}
 			}
-			if priorLeader == 0 && !found && ticket.state == domain.StatePlanning && ticket.version == 2 && ticket.runner == 1 {
-				startAuthority, authorityFound, authorityErr := loadRunnerStartAuthority(ctx, conn, ref, ticket.version, ticket.runner)
-				if authorityErr != nil {
-					return authorityErr
-				}
-				if authorityFound {
-					if startAuthority.LeaderEpoch >= leaderEpoch || validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version) != nil {
-						return ErrPublicationEvidence
+			if priorLeader == 0 {
+				// A daemon can die after the atomic queued->planning start and
+				// before asynchronous worktree registration. The dedicated start
+				// authority is the only predecessor allowed in that crash window.
+				if !found && ticket.state == domain.StatePlanning && ticket.version == 2 && ticket.runner == 1 {
+					startAuthority, startAuthorityFound, startAuthorityErr := loadRunnerStartAuthority(ctx, conn, ref, ticket.version, ticket.runner)
+					if startAuthorityErr != nil {
+						return startAuthorityErr
+					} else if startAuthorityFound {
+						if startAuthority.LeaderEpoch >= leaderEpoch || validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version) != nil {
+							return ErrPublicationEvidence
+						}
+						priorLeader = startAuthority.LeaderEpoch
 					}
-					priorLeader = startAuthority.LeaderEpoch
+				}
+			}
+			if priorLeader == 0 {
+				if worktreeLeader, worktreeFound, worktreeErr := loadRegisteredWorktreeEndpoint(ctx, conn, ref, ticket.version, ticket.runner); worktreeErr != nil {
+					return worktreeErr
+				} else if worktreeFound && worktreeLeader < leaderEpoch {
+					priorLeader = worktreeLeader
 				}
 			}
 			if priorLeader == 0 {

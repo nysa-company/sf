@@ -1050,6 +1050,24 @@ var migrationV41 = []string{
 	`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,id,version,'typed_blocker','waiting_ci','blocked','{"code":"legacy_ci_observation_unverifiable","reason":"CI observation predates authenticated v41 evidence","next_action":"reconcile CI externally or start a fresh ticket"}',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tickets WHERE state='blocked' AND blocked_code='legacy_ci_observation_unverifiable' AND resume_state='waiting_ci'`,
 }
 
+// v42 records the exact source endpoint created by a real queued->planning
+// admission. Unlike an audit event, this is one immutable physical row per
+// ticket, with a digest over every authority-bearing field.
+var migrationV42 = []string{
+	`CREATE TABLE runner_start_authorities (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		start_ticket_version INTEGER NOT NULL CHECK(start_ticket_version=2), runner_epoch INTEGER NOT NULL CHECK(runner_epoch=1), leader_epoch INTEGER NOT NULL CHECK(leader_epoch>0),
+		workflow_id TEXT NOT NULL, workflow_digest TEXT NOT NULL CHECK(length(workflow_digest)=71), created_at TEXT NOT NULL,
+		authority_digest TEXT NOT NULL CHECK(length(authority_digest)=71),
+		PRIMARY KEY(channel,project_id,ticket_id), UNIQUE(authority_digest),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
+	)`,
+	`CREATE UNIQUE INDEX runner_start_authority_digest ON runner_start_authorities(authority_digest)`,
+	`CREATE INDEX runner_start_authority_ticket ON runner_start_authorities(channel,project_id,ticket_id)`,
+	`CREATE TRIGGER runner_start_authorities_immutable_update BEFORE UPDATE ON runner_start_authorities BEGIN SELECT RAISE(ABORT,'runner start authority is immutable'); END`,
+	`CREATE TRIGGER runner_start_authorities_immutable_delete BEFORE DELETE ON runner_start_authorities BEGIN SELECT RAISE(ABORT,'runner start authority is append-only'); END`,
+}
+
 // v43 persists the server/policy-defined required check set separately from
 // observations. A CI observation may only classify after it proves exact
 // equality with this immutable witness; callers cannot select a convenient
@@ -1074,23 +1092,7 @@ var migrationV43 = []string{
 	`CREATE TRIGGER ci_required_check_policies_immutable_update BEFORE UPDATE ON ci_required_check_policies BEGIN SELECT RAISE(ABORT,'CI required check policy is immutable'); END`,
 	`CREATE TRIGGER ci_required_check_policies_immutable_delete BEFORE DELETE ON ci_required_check_policies BEGIN SELECT RAISE(ABORT,'CI required check policy is append-only'); END`,
 	`DROP TRIGGER ci_transition_evidence_requires_checks`,
-	`CREATE TRIGGER ci_transition_evidence_requires_checks BEFORE INSERT ON ci_transition_evidence WHEN EXISTS(SELECT 1 FROM ci_observations o WHERE o.channel=NEW.channel AND o.project_id=NEW.project_id AND o.ticket_id=NEW.ticket_id AND o.candidate_generation=NEW.candidate_generation AND o.candidate_head_sha=NEW.candidate_head_sha AND o.candidate_tree_sha=NEW.candidate_tree_sha AND o.classification=NEW.observation_classification AND o.observation_digest=NEW.observation_digest AND o.observed_ticket_version=NEW.observation_ticket_version AND o.observed_leader_epoch=NEW.observation_leader_epoch AND o.observed_runner_epoch=NEW.observation_runner_epoch AND (o.required_check_count<>(SELECT COUNT(*) FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest) OR (o.classification='red' AND NOT EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state IN ('failure','cancelled'))) OR (o.classification='pending' AND (EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state IN ('failure','cancelled')) OR NOT EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state='pending'))) OR (o.classification='green' AND EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state<>'success')))) BEGIN SELECT RAISE(ABORT,'ci observation check reducer mismatch'); END`,
-}
-
-// v42 records the exact source endpoint created by a real queued->planning
-// admission. Unlike an audit event, this is one immutable physical row per
-// ticket, with a digest over every authority-bearing field.
-var migrationV42 = []string{
-	`CREATE TABLE runner_start_authorities (
-		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
-		start_ticket_version INTEGER NOT NULL CHECK(start_ticket_version=2), runner_epoch INTEGER NOT NULL CHECK(runner_epoch=1), leader_epoch INTEGER NOT NULL CHECK(leader_epoch>0),
-		workflow_id TEXT NOT NULL, workflow_digest TEXT NOT NULL CHECK(length(workflow_digest)=71), created_at TEXT NOT NULL,
-		authority_digest TEXT NOT NULL CHECK(length(authority_digest)=71),
-		PRIMARY KEY(channel,project_id,ticket_id), UNIQUE(authority_digest),
-		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id)
-	)`,
-	`CREATE UNIQUE INDEX runner_start_authority_digest ON runner_start_authorities(authority_digest)`,
-	`CREATE INDEX runner_start_authority_ticket ON runner_start_authorities(channel,project_id,ticket_id)`,
-	`CREATE TRIGGER runner_start_authorities_immutable_update BEFORE UPDATE ON runner_start_authorities BEGIN SELECT RAISE(ABORT,'runner start authority is immutable'); END`,
-	`CREATE TRIGGER runner_start_authorities_immutable_delete BEFORE DELETE ON runner_start_authorities BEGIN SELECT RAISE(ABORT,'runner start authority is append-only'); END`,
+	`CREATE TRIGGER ci_transition_evidence_requires_checks BEFORE INSERT ON ci_transition_evidence WHEN EXISTS(SELECT 1 FROM ci_observations o WHERE o.channel=NEW.channel AND o.project_id=NEW.project_id AND o.ticket_id=NEW.ticket_id AND o.candidate_generation=NEW.candidate_generation AND o.candidate_head_sha=NEW.candidate_head_sha AND o.candidate_tree_sha=NEW.candidate_tree_sha AND o.classification=NEW.observation_classification AND o.observation_digest=NEW.observation_digest AND o.observed_ticket_version=NEW.observation_ticket_version AND o.observed_leader_epoch=NEW.observation_leader_epoch AND o.observed_runner_epoch=NEW.observation_runner_epoch AND (o.required_check_count<>(SELECT COUNT(*) FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest) OR (o.classification='red' AND NOT EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state IN ('failure','cancelled')))
+		OR (o.classification='pending' AND (EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state IN ('failure','cancelled')) OR NOT EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state='pending')))
+		OR (o.classification='green' AND EXISTS(SELECT 1 FROM ci_observation_checks c WHERE c.observation_id=o.observation_id AND c.observation_digest=o.observation_digest AND c.normalized_state<>'success')))) BEGIN SELECT RAISE(ABORT,'ci observation check reducer mismatch'); END`,
 }

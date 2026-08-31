@@ -235,6 +235,137 @@ func TestWorkerPlanningRecoveryRebindsOnlyExactRecoveredPlanResult(t *testing.T)
 	})
 }
 
+func TestWorkerRecoveredVerificationAndCandidateRebindAreObservationOnly(t *testing.T) {
+	fixture := newRealPlanningRecoveryFixture(t)
+	defer fixture.db.Close()
+
+	// Crash after each durable Store write, then cross a real runner fence.
+	if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil {
+		t.Fatal("expected injected planner response loss")
+	}
+	fixture.recover(t)
+	if result, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err != nil || result.State != domain.StateVerifying {
+		t.Fatalf("plan recovery=%+v err=%v", result, err)
+	}
+
+	runtime := fixture.worker.Engine.(*realFaultEngine)
+	checkpoint := fixture.worker.Checkpoint.(*realCheckpoint)
+	candidateBoundary := fixture.worker.Candidate.(*realCandidate)
+	runtime.failVerificationSignal = true
+	if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil || !strings.Contains(err.Error(), "injected crash after verification evidence") {
+		t.Fatalf("verification response loss=%v", err)
+	}
+	checkpointMaterializations, checkpointAuthentications, checkpointCommands := checkpoint.materializations, checkpoint.authentications, checkpoint.commandEvidences
+	providerCalls := fixture.runner.calls[domain.PhaseVerification]
+	assertVerificationNoBoundary := func(restart string) {
+		t.Helper()
+		if checkpoint.materializations != checkpointMaterializations || checkpoint.authentications != checkpointAuthentications || checkpoint.commandEvidences != checkpointCommands || fixture.runner.calls[domain.PhaseVerification] != providerCalls {
+			t.Fatalf("verification %s observed a boundary: checkpoint=%+v provider=%d/%d", restart, checkpoint, fixture.runner.calls[domain.PhaseVerification], providerCalls)
+		}
+	}
+	fixture.recover(t)
+	runtime.failVerificationSignal = true
+	if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil || !strings.Contains(err.Error(), "injected crash after verification evidence") {
+		t.Fatalf("first verification rebind signal loss=%v", err)
+	}
+	assertVerificationNoBoundary("first restart")
+	fixture.recover(t)
+	if result, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err != nil || result.State != domain.StateBuilding || !result.Replayed {
+		t.Fatalf("second verification rebind=%+v err=%v", result, err)
+	}
+	assertVerificationNoBoundary("second restart")
+
+	runtime.failCandidateSignal = true
+	if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil || !strings.Contains(err.Error(), "injected crash after candidate evidence") {
+		t.Fatalf("candidate response loss=%v", err)
+	}
+	candidateMaterializations, candidateAuthentications, candidateCommands := candidateBoundary.materializations, candidateBoundary.authentications, candidateBoundary.commandEvidences
+	providerCalls = fixture.runner.calls[domain.PhaseBuild]
+	assertCandidateNoBoundary := func(restart string) {
+		t.Helper()
+		if candidateBoundary.materializations != candidateMaterializations || candidateBoundary.authentications != candidateAuthentications || candidateBoundary.commandEvidences != candidateCommands || fixture.runner.calls[domain.PhaseBuild] != providerCalls {
+			t.Fatalf("candidate %s observed a boundary: candidate=%+v provider=%d/%d", restart, candidateBoundary, fixture.runner.calls[domain.PhaseBuild], providerCalls)
+		}
+	}
+	fixture.recover(t)
+	ticket, err := fixture.db.Ticket(fixture.ctx, fixture.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reusable, err := fixture.db.LatestReusableProviderAttempt(fixture.ctx, store.LatestReusableProviderAttemptRequest{Ref: fixture.ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: ticket.Version, Fence: fixture.fence})
+	if err != nil || !reusable.Recovered {
+		t.Fatalf("candidate provider recovery authority=%+v err=%v", reusable, err)
+	}
+	runtime.failCandidateSignal = true
+	if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil || !strings.Contains(err.Error(), "injected crash after candidate evidence") {
+		t.Fatalf("first candidate rebind signal loss=%v", err)
+	}
+	assertCandidateNoBoundary("first restart")
+	fixture.recover(t)
+	if result, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err != nil || result.State != domain.StatePublishing || !result.Replayed {
+		t.Fatalf("second candidate rebind=%+v err=%v", result, err)
+	}
+	assertCandidateNoBoundary("second restart")
+}
+
+func TestWorkerRebindsVerificationAfterBuildingRecoveryBeforeBuilder(t *testing.T) {
+	fixture := newRealPlanningRecoveryFixture(t)
+	defer fixture.db.Close()
+
+	if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil {
+		t.Fatal("expected injected planner response loss")
+	}
+	fixture.recover(t)
+	if result, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err != nil || result.State != domain.StateVerifying {
+		t.Fatalf("plan recovery=%+v err=%v", result, err)
+	}
+	if result, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err != nil || result.State != domain.StateBuilding {
+		t.Fatalf("verification transition=%+v err=%v", result, err)
+	}
+
+	checkpoint := fixture.worker.Checkpoint.(*realCheckpoint)
+	verificationMaterializations, verificationAuthentications, verificationCommands := checkpoint.materializations, checkpoint.authentications, checkpoint.commandEvidences
+	if fixture.runner.calls[domain.PhaseVerification] != 1 || fixture.runner.calls[domain.PhaseBuild] != 0 {
+		t.Fatalf("unexpected pre-crash calls=%+v", fixture.runner.calls)
+	}
+	// Model the daemon dying after verification->building committed, before the
+	// first Builder call. The restart advances the runner fence and makes the
+	// reviewer binding historical while no candidate exists yet.
+	fixture.recover(t)
+	ticket, err := fixture.db.Ticket(fixture.ctx, fixture.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := fixture.db.RecoverableVerification(fixture.ctx, fixture.ref)
+	if err != nil {
+		t.Fatalf("recoverable verification=%v", err)
+	}
+	if reusable, err := fixture.db.LatestReusableProviderAttempt(fixture.ctx, store.LatestReusableProviderAttemptRequest{Ref: fixture.ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fixture.fence}); err != nil || !reusable.Recovered || reusable.Key != stored.ProviderResult {
+		t.Fatalf("reviewer recovery authority key=%+v recovered=%v stored=%+v ticket=%+v fence=%+v err=%v", reusable.Key, reusable.Recovered, stored.ProviderResult, ticket, fixture.fence, err)
+	}
+	faults := &realFaultEvidence{Evidence: fixture.db, failVerificationAfter: true}
+	fixture.worker.Evidence = faults
+	if _, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err == nil || !strings.Contains(err.Error(), "injected crash after verification rebind") {
+		t.Fatalf("verification rebind response loss=%v", err)
+	}
+	if fixture.runner.calls[domain.PhaseVerification] != 1 || fixture.runner.calls[domain.PhaseBuild] != 0 || checkpoint.materializations != verificationMaterializations || checkpoint.authentications != verificationAuthentications || checkpoint.commandEvidences != verificationCommands {
+		t.Fatalf("first pre-builder restart crossed a review boundary: calls=%+v checkpoint=%+v", fixture.runner.calls, checkpoint)
+	}
+	if _, err := fixture.db.RecoverableCandidate(fixture.ctx, fixture.ref); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("candidate unexpectedly exists before Builder: %v", err)
+	}
+
+	// A second restart before candidate creation must reuse the now-live
+	// verification binding, then invoke Builder exactly once.
+	fixture.recover(t)
+	if result, err := fixture.worker.Run(fixture.ctx, fixture.ref, fixture.fence); err != nil || result.State != domain.StatePublishing || result.Replayed {
+		t.Fatalf("building recovery=%+v err=%v", result, err)
+	}
+	if fixture.runner.calls[domain.PhaseVerification] != 1 || fixture.runner.calls[domain.PhaseBuild] != 1 || checkpoint.materializations != verificationMaterializations || checkpoint.authentications != verificationAuthentications || checkpoint.commandEvidences != verificationCommands {
+		t.Fatalf("building recovery reran verification boundary: calls=%+v checkpoint=%+v", fixture.runner.calls, checkpoint)
+	}
+}
+
 // A reviewer completion can be returned by providercoord's Begin-time reuse
 // path after another runner already completed it.  Worker consumes only the
 // immutable key, so model the lost response here: the first runner has
@@ -270,9 +401,12 @@ func TestWorkerPersistsAndTransitionsReusedReviewerResult(t *testing.T) {
 	if err != nil || !result.Transitioned || !result.Replayed || result.State != domain.StateBuilding {
 		t.Fatalf("reviewer reuse transition=%+v err=%v", result, err)
 	}
+	// The ordinary verifying->building handoff retains the same runner and
+	// leader. It is intentionally current until a later recovery fence is
+	// appended; only then must callers use RecoverableVerification to rebind it.
 	verification, err := fixture.db.CurrentVerification(fixture.ctx, fixture.ref)
 	if err != nil || verification.ProviderResult != reusable.Key || verification.TicketVersion != ticket.Version || verification.Fence != fixture.fence {
-		t.Fatalf("verification=%+v reusable=%+v err=%v", verification, reusable, err)
+		t.Fatalf("current verification=%+v reusable=%+v err=%v", verification, reusable, err)
 	}
 	if fixture.runner.calls[domain.PhaseVerification] != 1 {
 		t.Fatalf("reviewer reran after reusable result: calls=%d", fixture.runner.calls[domain.PhaseVerification])
@@ -343,7 +477,7 @@ func newRealPlanningRecoveryFixture(t *testing.T) *realPlanningRecoveryFixture {
 	machine := engine.New(db, spec)
 	runtime := &realFaultEngine{StateMachine: machine, failPlanSignal: true}
 	checkpoint := &realCheckpoint{db: db, withCommand: true}
-	candidate := &realCandidate{}
+	candidate := &realCandidate{db: db, withCommand: true}
 	return &realPlanningRecoveryFixture{ctx: ctx, db: db, ref: ref, fence: fence, worker: Worker{Evidence: db, Engine: runtime, Runner: runner, Checkpoint: checkpoint, Candidate: candidate, CheckpointMaterializer: checkpoint, CandidateMaterializer: candidate}, runner: runner, machine: machine}
 }
 
@@ -371,7 +505,7 @@ func (f *realPlanningRecoveryFixture) recover(t *testing.T) {
 
 type realFaultEvidence struct {
 	Evidence
-	failVerification, failCandidate bool
+	failVerification, failVerificationAfter, failCandidate bool
 }
 
 func (e *realFaultEvidence) RecordVerification(ctx context.Context, value store.VerificationArtifact) (store.VerificationRevision, error) {
@@ -379,7 +513,15 @@ func (e *realFaultEvidence) RecordVerification(ctx context.Context, value store.
 		e.failVerification = false
 		return store.VerificationRevision{}, fmt.Errorf("injected crash after verification materialization")
 	}
-	return e.Evidence.RecordVerification(ctx, value)
+	revision, err := e.Evidence.RecordVerification(ctx, value)
+	if err != nil {
+		return store.VerificationRevision{}, err
+	}
+	if e.failVerificationAfter {
+		e.failVerificationAfter = false
+		return store.VerificationRevision{}, fmt.Errorf("injected crash after verification rebind")
+	}
+	return revision, nil
 }
 func (e *realFaultEvidence) RecordCandidate(ctx context.Context, value store.CandidateEvidence) ([]store.InvalidationReceipt, error) {
 	if e.failCandidate {
@@ -530,22 +672,22 @@ func realVerificationCommandEvidence(ctx context.Context, db *store.Store, reque
 	}
 	command := store.RepositoryCommandIntent{EffectFence: store.EffectFence{SemanticKey: semantic, Ref: request.Ticket.Ref, TicketVersion: request.Ticket.Version, Fence: request.Fence}, RequestDigest: requestDigest, Repository: project.Path, Worktree: request.Worktree.Path, WorktreeIdentity: string(request.Worktree.IdentityJSON), Branch: request.Worktree.Branch, BaseRef: project.BaseRef, BaseSHA: request.Worktree.BaseSHA, CommandDigest: commandDigest, SpecDigest: spec, PolicyDigest: policy, ExecutablePath: "/usr/bin/true", ExecutableDigest: executable}
 	if _, err := db.PlanEffect(ctx, store.EffectPlan{SemanticKey: semantic, Ref: request.Ticket.Ref, Kind: "repository_command", TicketVersion: request.Ticket.Version, Fence: request.Fence, RequestDigest: requestDigest}); err != nil {
-		return contracts.RepositoryCommandResultKey{}, err
+		return contracts.RepositoryCommandResultKey{}, fmt.Errorf("plan candidate command: %w", err)
 	}
 	claim, err := db.IssueRepositoryCommandClaim(ctx, command)
 	if err != nil {
-		return contracts.RepositoryCommandResultKey{}, err
+		return contracts.RepositoryCommandResultKey{}, fmt.Errorf("issue candidate command: %w", err)
 	}
 	lease, err := db.AcquireRepositoryCommand(ctx, claim)
 	if err != nil {
-		return contracts.RepositoryCommandResultKey{}, err
+		return contracts.RepositoryCommandResultKey{}, fmt.Errorf("acquire candidate command: %w", err)
 	}
 	launch := contracts.RepositoryCommandLaunch{PID: 654, PGID: 654, BootIdentity: "worker", ProcessStartIdentity: "worker-verification"}
 	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
-		return contracts.RepositoryCommandResultKey{}, err
+		return contracts.RepositoryCommandResultKey{}, fmt.Errorf("record candidate launch: %w", err)
 	}
 	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
-		return contracts.RepositoryCommandResultKey{}, err
+		return contracts.RepositoryCommandResultKey{}, fmt.Errorf("finish candidate launch: %w", err)
 	}
 	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 1, Duration: time.Millisecond, Observed: true, ObservedAt: time.Now().UTC()}); err != nil {
 		return contracts.RepositoryCommandResultKey{}, err
@@ -557,15 +699,16 @@ func realVerificationCommandEvidence(ctx context.Context, db *store.Store, reque
 }
 
 type realCheckpoint struct {
-	db                                *store.Store
-	withCommand                       bool
-	materializations, authentications int
+	db                                                  *store.Store
+	withCommand                                         bool
+	materializations, authentications, commandEvidences int
 }
 
 func (r *realCheckpoint) MaterializeVerificationCheckpoint(ctx context.Context, request PhaseRequest, artifact phaseartifact.Verification, key store.ProviderAttemptResultKey) (VerificationCheckpoint, error) {
 	r.materializations++
 	checkpoint := VerificationCheckpoint{ID: realOID("c"), Commit: store.CommitObservation{CommitOID: realOID("c"), ParentOID: realOID("a"), TreeOID: realOID("d")}}
 	if r.withCommand {
+		r.commandEvidences++
 		command, err := realVerificationCommandEvidence(ctx, r.db, request, artifact, key)
 		if err != nil {
 			return VerificationCheckpoint{}, err
@@ -579,15 +722,79 @@ func (r *realCheckpoint) AuthenticateVerificationCheckpoint(context.Context, Pha
 	return nil
 }
 
-type realCandidate struct{ materializations, authentications int }
+type realCandidate struct {
+	db                                                  *store.Store
+	withCommand                                         bool
+	materializations, authentications, commandEvidences int
+}
 
-func (r *realCandidate) MaterializeCandidate(context.Context, PhaseRequest, workflowprompt.PlanIdentity, workflowprompt.VerificationIdentity, phaseartifact.Builder, store.ProviderAttemptResultKey) (CandidateWitness, error) {
+func (r *realCandidate) MaterializeCandidate(ctx context.Context, request PhaseRequest, _ workflowprompt.PlanIdentity, _ workflowprompt.VerificationIdentity, _ phaseartifact.Builder, key store.ProviderAttemptResultKey) (CandidateWitness, error) {
 	r.materializations++
-	return CandidateWitness{Commit: store.CommitObservation{CommitOID: realOID("e"), ParentOID: realOID("c"), TreeOID: realOID("f")}, CommandPolicyDigest: realDigest("policy"), Reason: "real"}, nil
+	witness := CandidateWitness{Commit: store.CommitObservation{CommitOID: realOID("e"), ParentOID: realOID("c"), TreeOID: realOID("f")}, CommandPolicyDigest: realDigest("candidate-policy"), Reason: "real"}
+	if r.withCommand {
+		r.commandEvidences++
+		command, err := realCandidateCommandEvidence(ctx, r.db, request, key, witness.CommandPolicyDigest)
+		if err != nil {
+			return CandidateWitness{}, err
+		}
+		witness.CommandResult = command
+	}
+	return witness, nil
 }
 func (r *realCandidate) AuthenticateCandidate(context.Context, PhaseRequest, workflowprompt.PlanIdentity, workflowprompt.VerificationIdentity, phaseartifact.Builder, CandidateWitness) error {
 	r.authentications++
 	return nil
+}
+
+func realCandidateCommandEvidence(ctx context.Context, db *store.Store, request PhaseRequest, provider store.ProviderAttemptResultKey, policy string) (contracts.RepositoryCommandResultKey, error) {
+	if db == nil || request.Verification == nil {
+		return contracts.RepositoryCommandResultKey{}, errors.New("candidate command evidence requires Store verification")
+	}
+	project, err := db.Project(ctx, request.Ticket.Ref.Channel, request.Ticket.Ref.Project)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	argv, err := json.Marshal([]string{"go", "test", "./..."})
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	commandDigest := "sha256:" + realDigest(string(argv))
+	spec, executable := "sha256:"+strings.Repeat("2", 64), "sha256:"+strings.Repeat("3", 64)
+	evidenceRequest := store.RepositoryCommandEvidenceRequest{Purpose: store.RepositoryCommandPurposePostbuildCandidate, Ref: request.Ticket.Ref, TicketVersion: request.Ticket.Version, LeaderEpoch: request.Fence.LeaderEpoch, RunnerEpoch: request.Fence.RunnerEpoch, ProviderResult: provider, VerificationIntentDigest: request.Verification.Revision.IntentDigest, ProofDigest: request.Verification.Revision.ProofDigest, CheckpointID: request.Verification.Revision.CheckpointID, ConfigCommandDigest: commandDigest, Worktree: request.Worktree.Path, WorktreeIdentity: string(request.Worktree.IdentityJSON), BaseSHA: request.Worktree.BaseSHA, PolicyDigest: "sha256:" + policy, SpecDigest: spec, ExecutablePath: "/usr/bin/true", ExecutableDigest: executable}
+	_, requestDigest, err := store.CanonicalRepositoryCommandEvidenceRequest(evidenceRequest)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	semantic, err := store.RepositoryCommandEvidenceSemanticKey(evidenceRequest)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	command := store.RepositoryCommandIntent{EffectFence: store.EffectFence{SemanticKey: semantic, Ref: request.Ticket.Ref, TicketVersion: request.Ticket.Version, Fence: request.Fence}, RequestDigest: requestDigest, Repository: project.Path, Worktree: request.Worktree.Path, WorktreeIdentity: string(request.Worktree.IdentityJSON), Branch: request.Worktree.Branch, BaseRef: project.BaseRef, BaseSHA: request.Worktree.BaseSHA, CommandDigest: commandDigest, SpecDigest: spec, PolicyDigest: "sha256:" + policy, ExecutablePath: "/usr/bin/true", ExecutableDigest: executable}
+	if _, err := db.PlanEffect(ctx, store.EffectPlan{SemanticKey: semantic, Ref: request.Ticket.Ref, Kind: "repository_command", TicketVersion: request.Ticket.Version, Fence: request.Fence, RequestDigest: requestDigest}); err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	claim, err := db.IssueRepositoryCommandClaim(ctx, command)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	lease, err := db.AcquireRepositoryCommand(ctx, claim)
+	if err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	launch := contracts.RepositoryCommandLaunch{PID: 655, PGID: 655, BootIdentity: "worker", ProcessStartIdentity: "worker-candidate"}
+	if err := lease.RecordRepositoryCommandLaunch(ctx, launch); err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	if err := lease.FinishRepositoryCommandLaunch(ctx, launch); err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	if err := db.CompleteRepositoryCommand(ctx, claim, contracts.CommandResult{ExitCode: 0, Duration: time.Millisecond, Observed: true, ObservedAt: time.Now().UTC()}); err != nil {
+		return contracts.RepositoryCommandResultKey{}, fmt.Errorf("complete candidate command: %w", err)
+	}
+	if err := lease.Release(); err != nil {
+		return contracts.RepositoryCommandResultKey{}, err
+	}
+	return contracts.RepositoryCommandResultKey{SemanticKey: claim.SemanticKey, ClaimEpoch: claim.ClaimEpoch}, nil
 }
 func realOID(v string) string    { return strings.Repeat(v, 40) }
 func realDigest(v string) string { s := sha256.Sum256([]byte(v)); return hex.EncodeToString(s[:]) }

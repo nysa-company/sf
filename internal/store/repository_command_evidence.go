@@ -12,6 +12,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
+	"github.com/nysa-company/sf/internal/workflowprompt"
 )
 
 const (
@@ -155,7 +156,7 @@ func authenticateVerificationCommandEvidence(ctx context.Context, conn *sql.Conn
 		return RepositoryCommandResult{}, RepositoryCommandResultBinding{}, ErrEvidenceConflict
 	}
 	result, found, err := loadRepositoryCommandResult(ctx, conn, artifact.CommandResult, true)
-	if err != nil || !found || result.Claim.TicketRef != artifact.Ref || result.Claim.TicketVersion != artifact.ExpectedVersion || result.Claim.LeaderEpoch != artifact.Fence.LeaderEpoch || result.Claim.RunnerEpoch != artifact.Fence.RunnerEpoch || result.Claim.Worktree != worktree || result.Claim.WorktreeIdentity != identity || result.Claim.BaseSHA != base || result.Claim.CommandDigest != commandDigest {
+	if err != nil || !found || result.Claim.TicketRef != artifact.Ref || result.Claim.Worktree != worktree || result.Claim.WorktreeIdentity != identity || result.Claim.BaseSHA != base || result.Claim.CommandDigest != commandDigest {
 		return RepositoryCommandResult{}, RepositoryCommandResultBinding{}, ErrEvidenceConflict
 	}
 	if err := expectedVerificationExit(verify.PrebuildOutcome, result.Result.ExitCode); err != nil {
@@ -169,7 +170,8 @@ func authenticateVerificationCommandEvidence(ctx context.Context, conn *sql.Conn
 	// identity therefore binds the provider attempt and proof projections but
 	// deliberately has no checkpoint component. RecordVerification separately
 	// binds the later checkpoint to that same immutable provider artifact.
-	request := commandEvidenceRequest(RepositoryCommandPurposePrebuildVerification, artifact.Ref, artifact.ExpectedVersion, artifact.Fence, *artifact.ProviderResult, sha256Digest(artifact.Intent), sha256Digest(artifact.Proof), "", commandDigest, result)
+	sourceFence := domain.Fence{LeaderEpoch: result.Claim.LeaderEpoch, RunnerEpoch: result.Claim.RunnerEpoch}
+	request := commandEvidenceRequest(RepositoryCommandPurposePrebuildVerification, artifact.Ref, result.Claim.TicketVersion, sourceFence, *artifact.ProviderResult, sha256Digest(artifact.Intent), sha256Digest(artifact.Proof), "", commandDigest, result)
 	if err := assertCommandEvidenceRequest(request, result); err != nil {
 		return RepositoryCommandResult{}, RepositoryCommandResultBinding{}, err
 	}
@@ -180,7 +182,7 @@ func ensureVerificationCommandBinding(ctx context.Context, conn *sql.Conn, ref d
 	var stored RepositoryCommandResultBinding
 	err := conn.QueryRowContext(ctx, `SELECT binding_ticket_version,leader_epoch,runner_epoch,semantic_key,claim_epoch,command_digest,spec_digest,policy_digest,executable_path,executable_digest,expected_outcome FROM verification_command_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, ref.Channel, ref.Project, ref.Ticket, revision).Scan(&stored.TicketVersion, &stored.LeaderEpoch, &stored.RunnerEpoch, &stored.Key.SemanticKey, &stored.Key.ClaimEpoch, &stored.CommandDigest, &stored.SpecDigest, &stored.PolicyDigest, &stored.ExecutablePath, &stored.ExecutableDigest, &stored.ExpectedOutcome)
 	if err == nil {
-		if stored == binding {
+		if stored.Key == binding.Key && stored.CommandDigest == binding.CommandDigest && stored.SpecDigest == binding.SpecDigest && stored.PolicyDigest == binding.PolicyDigest && stored.ExecutablePath == binding.ExecutablePath && stored.ExecutableDigest == binding.ExecutableDigest && stored.ExpectedOutcome == binding.ExpectedOutcome {
 			return nil
 		}
 		return ErrEvidenceConflict
@@ -206,27 +208,36 @@ func loadVerificationCommandBinding(ctx context.Context, q repositoryResultQueri
 }
 
 func (s *Store) reauthenticateStoredVerificationCommand(ctx context.Context, ref domain.TicketRef, stored StoredVerification) error {
-	result, err := s.LoadRepositoryCommandResult(ctx, stored.CommandBinding.Key)
-	if err != nil || result.Claim.TicketRef != ref || !matchingBinding(stored.CommandBinding, result) || stored.CommandBinding.TicketVersion != stored.TicketVersion || stored.CommandBinding.LeaderEpoch != stored.Fence.LeaderEpoch || stored.CommandBinding.RunnerEpoch != stored.Fence.RunnerEpoch {
+	return s.reauthenticateStoredVerificationCommandFrom(ctx, s.db, ref, stored)
+}
+
+// reauthenticateStoredVerificationCommandFrom mirrors the strict public
+// verification reader under one caller-owned connection. TransitionVerification
+// uses it while writing its phase transition, so no witness may be reloaded
+// through s.db between its exact-fence checks and the commit.
+func (s *Store) reauthenticateStoredVerificationCommandFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredVerification) error {
+	result, found, err := loadRepositoryCommandResult(ctx, q, stored.CommandBinding.Key, true)
+	if err != nil || !found || result.Claim.TicketRef != ref || !matchingBinding(stored.CommandBinding, result) {
 		return ErrEvidenceConflict
 	}
-	provider, parsed, err := s.LoadHistoricalProviderAttemptResult(ctx, stored.ProviderResult)
-	if err != nil || parsed.Verify == nil || provider.Claim.Ref != ref || provider.Claim.ExpectedVersion != stored.TicketVersion || provider.Claim.LeaderEpoch != stored.Fence.LeaderEpoch || provider.Claim.RunnerEpoch != stored.Fence.RunnerEpoch {
+	provider, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, q, stored.ProviderResult)
+	if err != nil || parsed.Verify == nil || provider.Claim.Ref != ref || providerResultReachesFence(ctx, q, stored.ProviderResult, provider, stored.TicketVersion, stored.Fence) != nil {
 		return ErrEvidenceConflict
 	}
 	var providerCreated string
-	if err := s.db.QueryRowContext(ctx, `SELECT created_at FROM provider_attempt_results WHERE provider_attempt_id=?`, stored.ProviderResult.AttemptID).Scan(&providerCreated); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT created_at FROM provider_attempt_results WHERE provider_attempt_id=?`, stored.ProviderResult.AttemptID).Scan(&providerCreated); err != nil {
 		return ErrEvidenceConflict
 	}
 	created, err := time.Parse(time.RFC3339Nano, providerCreated)
 	if err != nil || result.Result.ObservedAt.Before(created) {
 		return ErrEvidenceConflict
 	}
-	ticket, err := s.Ticket(ctx, ref)
-	if err != nil {
+	var configDigest string
+	var configSnapshot []byte
+	if err := q.QueryRowContext(ctx, `SELECT config_digest,config_snapshot_bytes FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&configDigest, &configSnapshot); err != nil {
 		return ErrEvidenceConflict
 	}
-	argv, err := frozenVerifyArgv(ticket.ConfigSnapshot, ticket.ConfigDigest)
+	argv, err := frozenVerifyArgv(configSnapshot, configDigest)
 	if err != nil || !equalStringSlices(argv, parsed.Verify.Command) {
 		return ErrEvidenceConflict
 	}
@@ -234,11 +245,11 @@ func (s *Store) reauthenticateStoredVerificationCommand(ctx context.Context, ref
 	if err != nil || commandDigest != result.Claim.CommandDigest || expectedVerificationExit(parsed.Verify.PrebuildOutcome, result.Result.ExitCode) != nil || stored.CommandBinding.ExpectedOutcome != parsed.Verify.PrebuildOutcome {
 		return ErrEvidenceConflict
 	}
-	worktree, err := s.Worktree(ctx, ref)
-	if err != nil || result.Claim.Worktree != worktree.Path || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || result.Claim.BaseSHA != worktree.BaseSHA || result.Claim.BaseSHA != provider.Claim.BaseSHA || result.Claim.Worktree != provider.Claim.Worktree || result.Claim.WorktreeIdentity != provider.Claim.WorktreeIdentity {
+	var worktreePath, worktreeIdentity, worktreeBase string
+	if err := q.QueryRowContext(ctx, `SELECT path,identity_json,base_sha FROM worktrees WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&worktreePath, &worktreeIdentity, &worktreeBase); err != nil || !boundedText(worktreePath, 1_000) || !validJSON([]byte(worktreeIdentity)) || !validOID(worktreeBase) || result.Claim.Worktree != worktreePath || result.Claim.WorktreeIdentity != worktreeIdentity || result.Claim.BaseSHA != worktreeBase || result.Claim.BaseSHA != provider.Claim.BaseSHA || result.Claim.Worktree != provider.Claim.Worktree || result.Claim.WorktreeIdentity != provider.Claim.WorktreeIdentity {
 		return ErrEvidenceConflict
 	}
-	request := commandEvidenceRequest(RepositoryCommandPurposePrebuildVerification, ref, stored.TicketVersion, stored.Fence, stored.ProviderResult, stored.Revision.IntentDigest, stored.Revision.ProofDigest, "", commandDigest, result)
+	request := commandEvidenceRequest(RepositoryCommandPurposePrebuildVerification, ref, result.Claim.TicketVersion, domain.Fence{LeaderEpoch: result.Claim.LeaderEpoch, RunnerEpoch: result.Claim.RunnerEpoch}, stored.ProviderResult, stored.Revision.IntentDigest, stored.Revision.ProofDigest, "", commandDigest, result)
 	return assertCommandEvidenceRequest(request, result)
 }
 
@@ -261,14 +272,14 @@ func authenticateCandidateCommandEvidence(ctx context.Context, conn *sql.Conn, e
 		return RepositoryCommandResult{}, RepositoryCommandResultBinding{}, ErrEvidenceConflict
 	}
 	result, found, err := loadRepositoryCommandResult(ctx, conn, evidence.CommandResult, true)
-	if err != nil || !found || result.Result.ExitCode != 0 || result.Claim.TicketRef != evidence.Ref || result.Claim.TicketVersion != evidence.ExpectedVersion || result.Claim.LeaderEpoch != evidence.Fence.LeaderEpoch || result.Claim.RunnerEpoch != evidence.Fence.RunnerEpoch || result.Claim.Worktree != worktree || result.Claim.WorktreeIdentity != identity || result.Claim.BaseSHA != base || result.Claim.CommandDigest != commandDigest || !candidatePolicyMatches(evidence.Snapshot.CommandPolicyDigest, result.Claim.PolicyDigest) {
+	if err != nil || !found || result.Result.ExitCode != 0 || result.Claim.TicketRef != evidence.Ref || result.Claim.Worktree != worktree || result.Claim.WorktreeIdentity != identity || result.Claim.BaseSHA != base || result.Claim.CommandDigest != commandDigest || !candidatePolicyMatches(evidence.Snapshot.CommandPolicyDigest, result.Claim.PolicyDigest) {
 		return RepositoryCommandResult{}, RepositoryCommandResultBinding{}, ErrEvidenceConflict
 	}
 	finished, err := time.Parse(time.RFC3339Nano, providerFinished)
 	if err != nil || result.Result.ObservedAt.Before(finished) {
 		return RepositoryCommandResult{}, RepositoryCommandResultBinding{}, ErrEvidenceConflict
 	}
-	request := commandEvidenceRequest(RepositoryCommandPurposePostbuildCandidate, evidence.Ref, evidence.ExpectedVersion, evidence.Fence, evidence.BuilderResult, intent, proof, checkpoint, commandDigest, result)
+	request := commandEvidenceRequest(RepositoryCommandPurposePostbuildCandidate, evidence.Ref, result.Claim.TicketVersion, domain.Fence{LeaderEpoch: result.Claim.LeaderEpoch, RunnerEpoch: result.Claim.RunnerEpoch}, evidence.BuilderResult, intent, proof, checkpoint, commandDigest, result)
 	if err := assertCommandEvidenceRequest(request, result); err != nil {
 		return RepositoryCommandResult{}, RepositoryCommandResultBinding{}, err
 	}
@@ -279,7 +290,7 @@ func ensureCandidateCommandBinding(ctx context.Context, conn *sql.Conn, ref doma
 	var stored RepositoryCommandResultBinding
 	err := conn.QueryRowContext(ctx, `SELECT binding_ticket_version,leader_epoch,runner_epoch,semantic_key,claim_epoch,command_digest,spec_digest,policy_digest,executable_path,executable_digest FROM candidate_command_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND generation=?`, ref.Channel, ref.Project, ref.Ticket, generation).Scan(&stored.TicketVersion, &stored.LeaderEpoch, &stored.RunnerEpoch, &stored.Key.SemanticKey, &stored.Key.ClaimEpoch, &stored.CommandDigest, &stored.SpecDigest, &stored.PolicyDigest, &stored.ExecutablePath, &stored.ExecutableDigest)
 	if err == nil {
-		if stored == binding {
+		if stored.Key == binding.Key && stored.CommandDigest == binding.CommandDigest && stored.SpecDigest == binding.SpecDigest && stored.PolicyDigest == binding.PolicyDigest && stored.ExecutablePath == binding.ExecutablePath && stored.ExecutableDigest == binding.ExecutableDigest {
 			return nil
 		}
 		return ErrEvidenceConflict
@@ -305,31 +316,51 @@ func loadCandidateCommandBinding(ctx context.Context, q repositoryResultQuerier,
 }
 
 func (s *Store) reauthenticateStoredCandidateCommand(ctx context.Context, ref domain.TicketRef, stored StoredCandidate) error {
-	result, err := s.LoadRepositoryCommandResult(ctx, stored.CommandBinding.Key)
-	if err != nil || result.Claim.TicketRef != ref || !matchingBinding(stored.CommandBinding, result) || stored.CommandBinding.TicketVersion != stored.TicketVersion || stored.CommandBinding.LeaderEpoch != stored.Fence.LeaderEpoch || stored.CommandBinding.RunnerEpoch != stored.Fence.RunnerEpoch || result.Result.ExitCode != 0 || !candidatePolicyMatches(stored.Snapshot.CommandPolicyDigest, result.Claim.PolicyDigest) {
+	return s.reauthenticateStoredCandidateCommandFrom(ctx, s.db, ref, stored)
+}
+
+// reauthenticateStoredCandidateCommandFrom keeps every immutable candidate
+// witness on the caller's connection. TransitionCandidate invokes this while
+// holding Store's write transaction, so falling back to s.db here would both
+// miss its transactional view and risk SQLite self-contention.
+func (s *Store) reauthenticateStoredCandidateCommandFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredCandidate) error {
+	result, found, err := loadRepositoryCommandResult(ctx, q, stored.CommandBinding.Key, true)
+	if err != nil || !found || result.Claim.TicketRef != ref || !matchingBinding(stored.CommandBinding, result) || result.Result.ExitCode != 0 || !candidatePolicyMatches(stored.Snapshot.CommandPolicyDigest, result.Claim.PolicyDigest) {
+		return ErrEvidenceConflict
+	}
+	// The provider source may predate this append-only candidate binding after a
+	// restart.  Authenticate the exact source-to-binding recovery chain instead
+	// of treating matching counters or the command witness as provider proof.
+	builder, _, err := s.loadHistoricalProviderAttemptResult(ctx, q, stored.BuilderResult)
+	if err != nil || builder.Claim.Ref != ref || builder.Claim.Phase != domain.PhaseBuild || builder.Claim.Role != "builder" || providerResultReachesFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence) != nil {
 		return ErrEvidenceConflict
 	}
 	var builderCreated string
-	if err := s.db.QueryRowContext(ctx, `SELECT created_at FROM provider_attempt_results WHERE provider_attempt_id=?`, stored.BuilderResult.AttemptID).Scan(&builderCreated); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT created_at FROM provider_attempt_results WHERE provider_attempt_id=?`, stored.BuilderResult.AttemptID).Scan(&builderCreated); err != nil {
 		return ErrEvidenceConflict
 	}
 	created, err := time.Parse(time.RFC3339Nano, builderCreated)
 	if err != nil || result.Result.ObservedAt.Before(created) {
 		return ErrEvidenceConflict
 	}
-	verification, err := s.CurrentVerification(ctx, ref)
+	// Candidate recovery consumes a verification revision that necessarily
+	// predates the Builder result. Read that immutable revision directly rather
+	// than asking CurrentVerification to re-walk the reviewer's old recovery
+	// chain through the candidate's later live fence.
+	verification, err := s.verificationEvidenceForCandidateFrom(ctx, q, ref)
 	if err != nil || stored.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || stored.Snapshot.ProofDigest != verification.Revision.ProofDigest || stored.Commit.ParentOID != verification.Checkpoint.CommitOID {
 		return ErrEvidenceConflict
 	}
-	worktree, err := s.Worktree(ctx, ref)
-	if err != nil || stored.Snapshot.BaseSHA != worktree.BaseSHA || result.Claim.Worktree != worktree.Path || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || result.Claim.BaseSHA != worktree.BaseSHA {
+	var worktreePath, worktreeIdentity, worktreeBase string
+	if err := q.QueryRowContext(ctx, `SELECT path,identity_json,base_sha FROM worktrees WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&worktreePath, &worktreeIdentity, &worktreeBase); err != nil || !boundedText(worktreePath, 1_000) || !validJSON([]byte(worktreeIdentity)) || !validOID(worktreeBase) || stored.Snapshot.BaseSHA != worktreeBase || result.Claim.Worktree != worktreePath || result.Claim.WorktreeIdentity != worktreeIdentity || result.Claim.BaseSHA != worktreeBase {
 		return ErrEvidenceConflict
 	}
-	ticket, err := s.Ticket(ctx, ref)
-	if err != nil {
+	var configDigest string
+	var configSnapshot []byte
+	if err := q.QueryRowContext(ctx, `SELECT config_digest,config_snapshot_bytes FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&configDigest, &configSnapshot); err != nil {
 		return ErrEvidenceConflict
 	}
-	argv, err := frozenVerifyArgv(ticket.ConfigSnapshot, ticket.ConfigDigest)
+	argv, err := frozenVerifyArgv(configSnapshot, configDigest)
 	if err != nil {
 		return ErrEvidenceConflict
 	}
@@ -337,8 +368,55 @@ func (s *Store) reauthenticateStoredCandidateCommand(ctx context.Context, ref do
 	if err != nil || commandDigest != result.Claim.CommandDigest {
 		return ErrEvidenceConflict
 	}
-	request := commandEvidenceRequest(RepositoryCommandPurposePostbuildCandidate, ref, stored.TicketVersion, stored.Fence, stored.BuilderResult, stored.Snapshot.VerificationIntentDigest, stored.Snapshot.ProofDigest, verification.Revision.CheckpointID, commandDigest, result)
+	request := commandEvidenceRequest(RepositoryCommandPurposePostbuildCandidate, ref, result.Claim.TicketVersion, domain.Fence{LeaderEpoch: result.Claim.LeaderEpoch, RunnerEpoch: result.Claim.RunnerEpoch}, stored.BuilderResult, stored.Snapshot.VerificationIntentDigest, stored.Snapshot.ProofDigest, verification.Revision.CheckpointID, commandDigest, result)
 	return assertCommandEvidenceRequest(request, result)
+}
+
+// verificationEvidenceForCandidate authenticates the immutable verification
+// revision a candidate names. It deliberately does not turn the historical
+// reviewer result into current-fence authority: the candidate's own Builder
+// binding performs that live-fence proof.
+func (s *Store) verificationEvidenceForCandidate(ctx context.Context, ref domain.TicketRef) (StoredVerification, error) {
+	return s.verificationEvidenceForCandidateFrom(ctx, s.db, ref)
+}
+
+func (s *Store) verificationEvidenceForCandidateFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef) (StoredVerification, error) {
+	var stored StoredVerification
+	var owned string
+	err := q.QueryRowContext(ctx, `SELECT r.revision,r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id
+		FROM verifications v JOIN verification_revisions r
+		ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision
+		WHERE v.channel=? AND v.project_id=? AND v.ticket_id=?
+		AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`, ref.Channel, ref.Project, ref.Ticket).Scan(
+		&stored.Revision.Revision, &stored.Revision.IntentDigest, &stored.Intent, &stored.Revision.ProofDigest, &stored.Proof, &owned, &stored.Revision.CheckpointID,
+	)
+	if err != nil || stored.Revision.Revision == 0 || sha256Digest(stored.Intent) != stored.Revision.IntentDigest || sha256Digest(stored.Proof) != stored.Revision.ProofDigest || json.Unmarshal([]byte(owned), &stored.Revision.OwnedFiles) != nil || validOwnedFiles(stored.Revision.OwnedFiles) != nil || !validOID(stored.Revision.CheckpointID) {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	err = q.QueryRowContext(ctx, `SELECT binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid
+		FROM verification_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?
+		ORDER BY binding_ticket_version DESC,leader_epoch DESC,runner_epoch DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, stored.Revision.Revision).Scan(
+		&stored.TicketVersion, &stored.Fence.LeaderEpoch, &stored.Fence.RunnerEpoch, &stored.ProviderResult.AttemptID, &stored.ProviderResult.Attempt, &stored.Checkpoint.CommitOID, &stored.Checkpoint.ParentOID, &stored.Checkpoint.TreeOID,
+	)
+	if err != nil || stored.TicketVersion == 0 || stored.Fence.LeaderEpoch == 0 || stored.Fence.RunnerEpoch == 0 || stored.ProviderResult.AttemptID == 0 || stored.ProviderResult.Attempt <= 0 || stored.Checkpoint.CommitOID != stored.Revision.CheckpointID || !validOID(stored.Checkpoint.ParentOID) || !validOID(stored.Checkpoint.TreeOID) {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	stored.ProviderResult.Ref, stored.ProviderResult.Phase = ref, domain.PhaseVerification
+	binding, err := loadVerificationCommandBinding(ctx, q, ref, stored.Revision.Revision)
+	if err != nil {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	stored.CommandBinding = binding
+	provider, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, q, stored.ProviderResult)
+	if err != nil || provider.Claim.Ref != ref || provider.Claim.Phase != domain.PhaseVerification || provider.Claim.Role != "reviewer" || parsed.Verify == nil {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	intent, intentErr := workflowprompt.CanonicalVerificationIntentBytes(*parsed.Verify)
+	proof, proofErr := workflowprompt.CanonicalVerificationProofBytes(*parsed.Verify)
+	if intentErr != nil || proofErr != nil || sha256Digest(intent) != stored.Revision.IntentDigest || sha256Digest(proof) != stored.Revision.ProofDigest || binding.ExpectedOutcome != parsed.Verify.PrebuildOutcome {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	return stored, nil
 }
 
 // commandResultIsExact is retained as a small testable assertion for paths

@@ -16,6 +16,19 @@ import (
 	"github.com/nysa-company/sf/internal/store"
 )
 
+func daemonRecoveryWorktreeIdentity(repository, worktree, branch, baseRef, baseSHA string) []byte {
+	identity, _ := json.Marshal(git.Identity{
+		Repository: repository, RepositoryDev: 1, RepositoryIno: 2,
+		Worktree: worktree, WorktreeDev: 3, WorktreeIno: 4,
+		GitFile: "gitdir: " + filepath.Join(worktree, ".git"), GitFileDev: 5, GitFileIno: 6,
+		CommonDir: filepath.Join(repository, ".git"), CommonDirDev: 7, CommonDirIno: 8,
+		Origin: "git@example.test:nysa.git", PushOrigin: "git@example.test:nysa.git",
+		BaseRef: baseRef, BaseHead: baseSHA, HeadRef: branch,
+		ConfigHash: strings.Repeat("b", 64), HooksHash: strings.Repeat("c", 64),
+	})
+	return identity
+}
+
 type preparedCommitObserverFunc func(context.Context, contracts.GitMutationClaim) (contracts.PreparedCommitObservation, error)
 
 func (f preparedCommitObserverFunc) ObservePreparedCommit(ctx context.Context, claim contracts.GitMutationClaim) (contracts.PreparedCommitObservation, error) {
@@ -50,10 +63,7 @@ func seedPreparedCommit(t *testing.T, daemon *Daemon, ticketID domain.TicketID) 
 	tree := strings.Repeat("c", 40)
 	path := filepath.Join(daemon.paths.Worktrees, "demo", string(ticketID))
 	branch := fmt.Sprintf("sf/%s/aaaaaaaa/aaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", daemon.channel)
-	identity, err := json.Marshal(git.Identity{Repository: project.Path, Worktree: path, BaseRef: project.BaseRef, BaseHead: base, HeadRef: branch})
-	if err != nil {
-		t.Fatal(err)
-	}
+	identity := daemonRecoveryWorktreeIdentity(project.Path, path, branch, project.BaseRef, base)
 	if err := daemon.store.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: started.RunnerEpoch}, Path: path, Branch: branch, IdentityJSON: identity, BaseSHA: base, HeadSHA: base}); err != nil {
 		t.Fatal(err)
 	}
