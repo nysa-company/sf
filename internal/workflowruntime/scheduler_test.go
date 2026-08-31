@@ -22,6 +22,16 @@ type currentFakeTickets struct {
 	current store.Ticket
 }
 
+type mergeReadyFakeTickets struct {
+	fakeTickets
+	ready bool
+	err   error
+}
+
+func (f mergeReadyFakeTickets) MergeReconciliationReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+	return f.ready, f.err
+}
+
 func (f currentFakeTickets) Ticket(context.Context, domain.TicketRef) (store.Ticket, error) {
 	return f.current, nil
 }
@@ -157,6 +167,17 @@ func TestSchedulerReconcilesObservedMergeWithoutWorktree(t *testing.T) {
 	result := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{reconciling}}, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
 	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != reconciling.Ref || len(ensurer.calls) != 0 {
 		t.Fatalf("reconciling result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
+func TestSchedulerReconcilesSettledMergeWithoutUnavailableWorktree(t *testing.T) {
+	merging := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "settled-merge"}, domain.StateMerging)
+	ensurer := &fakeEnsure{err: store.ErrNotFound}
+	worker := &fakeWorker{}
+	source := mergeReadyFakeTickets{fakeTickets: fakeTickets{tickets: []store.Ticket{merging}}, ready: true}
+	result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != merging.Ref || len(ensurer.calls) != 0 {
+		t.Fatalf("settled merge result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
 	}
 }
 

@@ -52,6 +52,92 @@ func (s *Store) MergeIntent(ctx context.Context, semanticKey string) (domain.Mer
 	return mergeIntentFrom(ctx, s.db, semanticKey)
 }
 
+// MergeReconciliationReady proves that a merging ticket can make progress
+// without opening its local checkout.  This is intentionally narrower than a
+// generic "merge exists" lookup: the merge intent and both settled effects
+// must be the unique, current, guarded operation for the ticket, and no other
+// effect may still require external work.  Callers may use the result only to
+// skip worktree preparation; the worker repeats its normal evidence checks.
+func (s *Store) MergeReconciliationReady(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	if s == nil || ref.Validate() != nil || version == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return false, nil
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
+
+	var state string
+	var mergeMode string
+	var currentVersion, currentRunner, currentLeader uint64
+	if err := conn.QueryRowContext(ctx, `SELECT t.state,t.merge_mode,t.version,t.runner_epoch,d.leader_epoch
+		FROM tickets t JOIN daemon_instances d ON d.channel=t.channel
+		WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).
+		Scan(&state, &mergeMode, &currentVersion, &currentRunner, &currentLeader); err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, normalizeBusy(ctx, err)
+	}
+	if domain.State(state) != domain.StateMerging || domain.MergeMode(mergeMode) != domain.MergeGuarded || currentVersion != version || currentRunner != fence.RunnerEpoch || currentLeader != fence.LeaderEpoch {
+		return false, nil
+	}
+
+	rows, err := conn.QueryContext(ctx, `SELECT semantic_key FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY semantic_key`, ref.Channel, ref.Project, ref.Ticket)
+	if err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	var key string
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(&key); err != nil {
+			_ = rows.Close()
+			return false, err
+		}
+		count++
+		if count > 1 {
+			_ = rows.Close()
+			return false, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return false, err
+	}
+	if err := rows.Close(); err != nil || count != 1 {
+		return false, err
+	}
+
+	intent, found, err := mergeIntentFrom(ctx, conn, key)
+	if err != nil || !found || intent.Ref != ref || intent.SemanticKey != key || intent.TicketVersion != version || intent.LeaderEpoch != fence.LeaderEpoch || intent.RunnerEpoch != fence.RunnerEpoch || validMergeIntent(intent) != nil {
+		return false, nil
+	}
+	effect, err := effectFrom(ctx, conn, key)
+	if err != nil || effect.Ref != ref || effect.Kind != "merge" || effect.State != EffectConfirmed || effect.TicketVersion != version || effect.LeaderEpoch != fence.LeaderEpoch || effect.RunnerEpoch != fence.RunnerEpoch || effect.ClaimEpoch == 0 || effect.RequestDigest != intent.RequestDigest || effect.ObservedIdentity == "" {
+		return false, nil
+	}
+
+	// A confirmed merge is only a read-only continuation when the exact ready
+	// effect for the same source head is settled as well.  Derive its key from
+	// the authenticated intent rather than accepting an arbitrary pr_ready row.
+	readyKey := "merge-ready/" + string(ref.Channel) + "/" + string(ref.Project) + "/" + string(ref.Ticket) + "/" + intent.HeadOID
+	ready, err := effectFrom(ctx, conn, readyKey)
+	if err != nil || ready.Ref != ref || ready.Kind != "pr_ready" || ready.State != EffectConfirmed || ready.TicketVersion != version || ready.LeaderEpoch != fence.LeaderEpoch || ready.RunnerEpoch != fence.RunnerEpoch || ready.ClaimEpoch == 0 || ready.ObservedIdentity == "" {
+		return false, nil
+	}
+
+	var unresolved int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('planned','executing','uncertain')`, ref.Channel, ref.Project, ref.Ticket).Scan(&unresolved); err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	return unresolved == 0, nil
+}
+
 // MergeIntentForProof returns only the currently live durable merge intent
 // matching a GitHub post-merge observation.  A GitHub adapter receives no Git
 // authority; this lookup lets the root composition mint a separate fenced Git
@@ -107,8 +193,7 @@ func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, 
 			return domain.MergeIntent{}, ErrEvidenceConflict
 		}
 		reconciling := normalRecoveryEndpoint{version: confirmed.version + 1, runner: confirmed.runner, leader: confirmed.leader}
-		var events, stateChanges int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='merge_observed' AND from_state='merging' AND to_state='reconciling'`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket, reconciling.version).Scan(&events, &stateChanges); err != nil || events != 1 || stateChanges != 1 {
+		if err := canonicalGuardedMergeObservation(ctx, conn, intent.Ref, reconciling.version); err != nil {
 			return domain.MergeIntent{}, ErrEvidenceConflict
 		}
 		var version, runner, leader uint64

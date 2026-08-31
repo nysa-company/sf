@@ -405,7 +405,7 @@ func (s *Store) authenticatePostPublicationState(ctx context.Context, conn *sql.
 			}
 			return nil
 		}
-		if mergeMode != domain.MergeGuarded || s.authenticatePostPublicationMergeState(ctx, conn, ref, baselineVersion, baselineFence) != nil {
+		if mergeMode != domain.MergeGuarded || s.authenticatePostPublicationGuardedReconcile(ctx, conn, ref, baselineVersion, baselineFence) != nil {
 			return ErrControlNotDrained
 		}
 		return nil
@@ -537,6 +537,27 @@ func (s *Store) authenticatePostPublicationMergeState(ctx context.Context, conn 
 	}
 	if err := rows.Err(); err != nil || count != 1 {
 		return ErrEvidenceConflict
+	}
+	return nil
+}
+
+// authenticatePostPublicationGuardedReconcile proves the actual guarded
+// merging -> reconciling handoff before following only signed recovery rows to
+// the sealed endpoint. A reconciling ticket is one state version newer than
+// the confirmed merge intent/effect, so treating it as a merging endpoint
+// would either reject every real recovery or weaken the intent binding.
+func (s *Store) authenticatePostPublicationGuardedReconcile(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, baselineVersion uint64, baselineFence domain.Fence) error {
+	confirmed, err := s.confirmedMergeRecoveryEndpoint(ctx, conn, ref)
+	if err != nil || confirmed.version == ^uint64(0) {
+		return ErrPublicationEvidence
+	}
+	reconciling := normalRecoveryEndpoint{version: confirmed.version + 1, runner: confirmed.runner, leader: confirmed.leader}
+	if err := canonicalGuardedMergeObservation(ctx, conn, ref, reconciling.version); err != nil {
+		return ErrPublicationEvidence
+	}
+	leader, err := normalRecoveryLeaderAt(ctx, conn, ref, reconciling, baselineVersion, baselineFence.RunnerEpoch)
+	if err != nil || leader != baselineFence.LeaderEpoch {
+		return ErrPublicationEvidence
 	}
 	return nil
 }

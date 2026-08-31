@@ -33,6 +33,14 @@ type TicketSource interface {
 	Ticket(context.Context, domain.TicketRef) (store.Ticket, error)
 }
 
+// MergeReconciliationReadiness is optional so read-only test sources and
+// alternate adapters do not need to expose Store internals. A true result is
+// an authority proof, not permission to skip worker checks; a false result or
+// an error must retain the normal worktree path.
+type MergeReconciliationReadiness interface {
+	MergeReconciliationReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error)
+}
+
 // StoreTicketSource adapts Store.Tickets without exposing SQL to the runtime.
 type StoreTicketSource struct {
 	Store *store.Store
@@ -55,6 +63,13 @@ func (s StoreTicketSource) Ticket(ctx context.Context, ref domain.TicketRef) (st
 		return store.Ticket{}, ErrInvalidScheduler
 	}
 	return s.Store.Ticket(ctx, ref)
+}
+
+func (s StoreTicketSource) MergeReconciliationReady(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	if s.Store == nil {
+		return false, ErrInvalidScheduler
+	}
+	return s.Store.MergeReconciliationReady(ctx, ref, version, fence)
 }
 
 // WorktreeEnsurer is compatible with worktreecoord.Coordinator. Keeping the
@@ -234,6 +249,26 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 			}
 			result.Outcome = OutcomeInvoked
 			return result
+		}
+		if ticket.State == domain.StateMerging {
+			// A confirmed, fully settled merge can be advanced by Store/localruntime
+			// using only durable evidence and external read-only observations. The
+			// optional proof is deliberately fail-open to worktree setup: if this
+			// adapter cannot prove the exact operation, preserve the normal path.
+			if readiness, ok := s.Tickets.(MergeReconciliationReadiness); ok {
+				ready, readinessErr := readiness.MergeReconciliationReady(runCtx, ticket.Ref, ticket.Version, candidateFence)
+				if readinessErr == nil && ready {
+					workerResult, workerErr := s.Worker.Run(runCtx, ticket.Ref, candidateFence)
+					end()
+					result.Worker = workerResult
+					if workerErr != nil {
+						result.Outcome, result.Err = classifyWorker(workerErr)
+						return result
+					}
+					result.Outcome = OutcomeInvoked
+					return result
+				}
+			}
 		}
 		worktree, ensureErr := s.Worktrees.Ensure(runCtx, worktreecoord.EnsureRequest{Ref: ticket.Ref, Version: ticket.Version, Fence: candidateFence})
 		if ensureErr != nil {

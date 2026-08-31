@@ -1111,8 +1111,7 @@ func (s *Store) normalPostPublicationRecoveryPredecessor(ctx context.Context, co
 			return 0, false, ErrPublicationEvidence
 		}
 		reconciling := normalRecoveryEndpoint{version: baseline.version + 1, runner: baseline.runner, leader: baseline.leader}
-		var transitions, stateChanges int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='merge_observed' AND from_state='merging' AND to_state='reconciling'`, ref.Channel, ref.Project, ref.Ticket, reconciling.version).Scan(&transitions, &stateChanges); err != nil || transitions != 1 || stateChanges != 1 {
+		if err := canonicalGuardedMergeObservation(ctx, conn, ref, reconciling.version); err != nil {
 			return 0, false, ErrPublicationEvidence
 		}
 		current.leader, err = normalRecoveryLeaderAt(ctx, conn, ref, reconciling, version, runner)
@@ -1132,6 +1131,22 @@ type normalRecoveryEndpoint struct {
 	version uint64
 	runner  uint64
 	leader  uint64
+}
+
+// canonicalGuardedMergeObservation proves the sole state-changing event at a
+// reconciling version is the default-payload guarded merging handoff. Events
+// have audit entries as well as transitions, so filtering first by the desired
+// row is insufficient: a second state change at the same version must fail
+// closed instead of being silently ignored.
+func canonicalGuardedMergeObservation(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, reconcilingVersion uint64) error {
+	if reconcilingVersion == 0 {
+		return ErrPublicationEvidence
+	}
+	var exactEvents, stateChanges int
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN trigger='merge_observed' AND from_state='merging' AND to_state='reconciling' AND payload='{}' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, reconcilingVersion).Scan(&exactEvents, &stateChanges); err != nil || exactEvents != 1 || stateChanges != 1 {
+		return ErrPublicationEvidence
+	}
+	return nil
 }
 
 func (s *Store) finalReviewRecoveryEndpoint(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State) (normalRecoveryEndpoint, error) {

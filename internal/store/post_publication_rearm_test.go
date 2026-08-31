@@ -7,6 +7,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/statemachine"
 )
 
 func bindTerminalMergeEffect(t *testing.T, db *Store, fixture finalReviewFixture, ticket Ticket, fence domain.Fence, semanticKey string) {
@@ -228,29 +229,75 @@ func TestPostPublicationRearmProofRejectsUnboundMergeState(t *testing.T) {
 func TestPostPublicationRearmProofAuthenticatesMergingAndReconciling(t *testing.T) {
 	for _, target := range []domain.State{domain.StateMerging, domain.StateReconciling} {
 		t.Run(string(target), func(t *testing.T) {
-			fixture := finalReviewLifecycleFixture(t)
+			fixture, current, fence := preparePostPublicationRearmState(t, target)
 			defer fixture.db.Close()
-			completeFinalReview(t, fixture)
-			current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
-			if err != nil {
-				t.Fatal(err)
-			}
-			fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
-			if target != domain.StateWaitingApproval {
-				if _, err := fixture.db.Transition(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: current.Version, From: current.State, To: target, Trigger: "merge_start", Fence: fence, EventPayload: `{}`}); err != nil {
-					t.Fatalf("transition to %s: %v", target, err)
-				}
-				current, err = fixture.db.Ticket(fixture.ctx, current.Ref)
-				if err != nil {
-					t.Fatal(err)
-				}
-				fence.RunnerEpoch = current.RunnerEpoch
-			}
-			bindTerminalMergeEffect(t, fixture.db, fixture, current, fence, "merge/rearm/"+string(target))
 			stopped, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fence, target)
 			capability, err := fixture.db.PostPublicationRearmProof(t.Context(), resumed.Ref, stopped)
 			if err != nil || capability == nil {
 				t.Fatalf("state=%s capability=%v err=%v", target, capability, err)
+			}
+		})
+	}
+}
+
+func TestGuardedReconcilingAuthoritiesRejectNonCanonicalMergeObservation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Store, Ticket)
+	}{
+		{
+			name: "payload",
+			mutate: func(db *Store, ticket Ticket) {
+				if _, err := db.db.ExecContext(t.Context(), `UPDATE events SET payload='{"unexpected":true}' WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='merge_observed' AND from_state='merging' AND to_state='reconciling'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.Version); err != nil {
+					t.Fatalf("tamper guarded merge payload: %v", err)
+				}
+			},
+		},
+		{
+			name: "second state transition",
+			mutate: func(db *Store, ticket Ticket) {
+				if _, err := db.db.ExecContext(t.Context(), `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,'reconciling','blocked','{}',?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.Version, "tampered_transition", now()); err != nil {
+					t.Fatalf("append alternate guarded transition: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture, current, fence := preparePostPublicationRearmState(t, domain.StateReconciling)
+			intent, found, err := fixture.db.MergeIntent(fixture.ctx, "merge/rearm/armed/reconciling")
+			if err != nil || !found {
+				fixture.db.Close()
+				t.Fatalf("load guarded merge intent found=%v err=%v", found, err)
+			}
+			tc.mutate(fixture.db, current)
+			if _, err := fixture.db.MergeIntentForProof(fixture.ctx, intent.RepositoryHost, intent.RepositoryOwner, intent.RepositoryName, intent.BaseRef, intent.OriginalBaseOID, strings.Repeat("d", len(intent.HeadOID))); !errors.Is(err, ErrEvidenceConflict) {
+				fixture.db.Close()
+				t.Fatalf("noncanonical guarded merge observation exposed proof intent: %v", err)
+			}
+			stopped, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fence, domain.StateReconciling)
+			if _, err := fixture.db.PostPublicationRearmProof(fixture.ctx, resumed.Ref, stopped); !errors.Is(err, ErrControlNotDrained) {
+				fixture.db.Close()
+				t.Fatalf("noncanonical guarded merge observation rearmed: %v", err)
+			}
+			var path string
+			if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+				fixture.db.Close()
+				t.Fatalf("database path=%q err=%v", path, err)
+			}
+			if err := fixture.db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := Open(fixture.ctx, path)
+			if err != nil {
+				t.Fatalf("reopen store: %v", err)
+			}
+			defer reopened.Close()
+			leader, err := reopened.AcquireLeader(fixture.ctx, domain.ChannelDev, "tampered-guarded-reconciling-"+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reopened.FenceRecoveredRunners(fixture.ctx, domain.ChannelDev, leader); !errors.Is(err, ErrPublicationEvidence) {
+				t.Fatalf("noncanonical guarded merge observation recovered: %v", err)
 			}
 		})
 	}
@@ -326,42 +373,7 @@ func TestPostPublicationRearmProofAfterRestartAcrossStates(t *testing.T) {
 		domain.StateReconciling,
 	} {
 		t.Run(string(target), func(t *testing.T) {
-			mergeMode := domain.MergeGuarded
-			if target == domain.StateWaitingManualMerge {
-				mergeMode = domain.MergeManual
-			}
-			fixture := finalReviewLifecycleFixtureFor(t, domain.TicketFeature, mergeMode)
-			if target != domain.StateReviewing {
-				completeFinalReview(t, fixture)
-				current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
-				if err != nil {
-					t.Fatal(err)
-				}
-				fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
-				to := domain.StateWaitingApproval
-				if target == domain.StateWaitingManualMerge {
-					to = domain.StateWaitingManualMerge
-				}
-				if _, err := fixture.db.TransitionFinalReview(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateReviewing, To: to, Trigger: "review_pass", Fence: fence, EventPayload: `{}`}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
-			if err != nil {
-				t.Fatal(err)
-			}
-			fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
-			if target == domain.StateMerging || target == domain.StateReconciling {
-				if _, err := fixture.db.Transition(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: current.Version, From: current.State, To: target, Trigger: "merge_start", Fence: fence, EventPayload: `{}`}); err != nil {
-					t.Fatalf("transition to %s: %v", target, err)
-				}
-				current, err = fixture.db.Ticket(fixture.ctx, current.Ref)
-				if err != nil {
-					t.Fatal(err)
-				}
-				fence.RunnerEpoch = current.RunnerEpoch
-				bindTerminalMergeEffect(t, fixture.db, fixture, current, fence, "merge/rearm/restart/"+string(target))
-			}
+			fixture, current, fence := preparePostPublicationRearmState(t, target)
 			_, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fence, target)
 
 			var path string
@@ -431,15 +443,44 @@ func preparePostPublicationRearmState(t *testing.T, target domain.State) (finalR
 	}
 	fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
 	if target == domain.StateMerging || target == domain.StateReconciling {
-		if _, err := fixture.db.Transition(fixture.ctx, Transition{Ref: current.Ref, ExpectedVersion: current.Version, From: current.State, To: target, Trigger: "merge_start", Fence: fence, EventPayload: `{}`}); err != nil {
-			t.Fatalf("transition to %s: %v", target, err)
+		if current.State != domain.StateWaitingApproval {
+			t.Fatalf("guarded merge setup expected waiting_approval for %s, got %s", target, current.State)
+		}
+		if _, err := fixture.db.ApplyOperatorDecision(fixture.ctx, OperatorDecisionRequest{OperatorDecision: OperatorDecision{
+			Ref: current.Ref, ExpectedVersion: current.Version, Fence: fence,
+			ReviewedHead: fixture.candidate.Snapshot.HeadSHA, OperatorUID: 501, Decision: "approved",
+		}}); err != nil {
+			t.Fatalf("approve guarded merge: %v", err)
 		}
 		current, err = fixture.db.Ticket(fixture.ctx, current.Ref)
-		if err != nil {
-			t.Fatal(err)
+		if err != nil || current.State != domain.StateMerging {
+			t.Fatalf("guarded merging ticket=%+v err=%v", current, err)
 		}
-		fence.RunnerEpoch = current.RunnerEpoch
+		fence = domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
 		bindTerminalMergeEffect(t, fixture.db, fixture, current, fence, "merge/rearm/armed/"+string(target))
+		if target == domain.StateReconciling {
+			spec, err := statemachine.LoadEmbeddedApproved()
+			if err != nil {
+				t.Fatalf("load normative state machine: %v", err)
+			}
+			if transition, err := spec.Select(string(domain.StateMerging), "merge_observed", map[string]bool{
+				"source_head_equals_reviewed_head": true,
+				"protected_branch_contains_merge":  true,
+			}); err != nil || transition.To != string(domain.StateReconciling) {
+				t.Fatalf("select normative guarded merge observation transition=%+v err=%v", transition, err)
+			}
+			if _, err := fixture.db.Transition(fixture.ctx, Transition{
+				Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
+				To: domain.StateReconciling, Trigger: "merge_observed", Fence: fence, EventPayload: `{}`,
+			}); err != nil {
+				t.Fatalf("record guarded merge observation: %v", err)
+			}
+			current, err = fixture.db.Ticket(fixture.ctx, current.Ref)
+			if err != nil || current.State != domain.StateReconciling {
+				t.Fatalf("guarded reconciling ticket=%+v err=%v", current, err)
+			}
+			fence = domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: current.RunnerEpoch}
+		}
 	}
 	return fixture, current, fence
 }
