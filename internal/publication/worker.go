@@ -106,7 +106,7 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		// unverifiable row remains a hard publication blocker.
 		prior, historyErr := w.Store.LoadHistoricalPublishedCandidate(ctx, ref)
 		if historyErr != nil {
-			return result, err
+			return result, historyErr
 		}
 		priorPublication = &prior
 	}
@@ -394,15 +394,34 @@ func (w Worker) ensureDraftCorrection(ctx context.Context, ticket store.Ticket, 
 	}
 	if effect.State == store.EffectExecuting || effect.State == store.EffectUncertain {
 		observed, state, draft, found, observeErr := observer.ObserveDraftPullRequest(ctx, current)
-		if observeErr == nil && found && samePR(observed, current) && state == "OPEN" && draft {
-			confirmed, confirmErr := w.Store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: effect.LeaderEpoch, RunnerEpoch: effect.RunnerEpoch, ClaimEpoch: effect.ClaimEpoch}}, store.CanonicalPublicationPRObservation(observed, state, draft))
-			if confirmErr != nil {
-				return contracts.PullRequestIdentity{}, time.Time{}, confirmErr
-			}
-			_ = confirmed
+		if observeErr != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, observeErr
+		}
+		if found && (!samePR(observed, current) || state != "OPEN" || !draft) {
+			return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
+		}
+		observation := store.EffectObservation{EffectFence: effectFence(effect), Present: found}
+		if found {
+			observation.Identity = store.CanonicalPublicationPRObservation(observed, state, draft)
+		}
+		var reconcileErr error
+		if effect.TicketVersion == ticket.Version && effect.LeaderEpoch == fence.LeaderEpoch && effect.RunnerEpoch == fence.RunnerEpoch {
+			effect, reconcileErr = w.Store.ObserveEffect(ctx, observation)
+		} else {
+			effect, reconcileErr = w.Store.ReconcileInvalidatedEffect(ctx, store.InvalidatedEffectObservation{Prior: observation, Current: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence}})
+		}
+		if reconcileErr != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, reconcileErr
+		}
+		if found {
 			return observed, time.Now().UTC(), nil
 		}
-		return contracts.PullRequestIdentity{}, time.Time{}, ErrPullRequest
+		// Absence is now a durable semantic failure under the old claim. Replan
+		// under the live ticket/leader fence before attempting the update again.
+		effect, err = w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: key, Ref: ticket.Ref, Kind: store.PublicationPRUpdateEffectKind, TicketVersion: ticket.Version, Fence: fence, RequestDigest: request})
+		if err != nil {
+			return contracts.PullRequestIdentity{}, time.Time{}, err
+		}
 	}
 	if effect.TicketVersion != ticket.Version || effect.LeaderEpoch != fence.LeaderEpoch || effect.RunnerEpoch != fence.RunnerEpoch {
 		effect, err = w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: key, Ref: ticket.Ref, Kind: store.PublicationPRUpdateEffectKind, TicketVersion: ticket.Version, Fence: fence, RequestDigest: request})
@@ -504,7 +523,7 @@ func draftUpdateKey(identity contracts.PullRequestIdentity, title, body string) 
 }
 func digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 func samePR(left, right contracts.PullRequestIdentity) bool {
-	return left.Repository == right.Repository && left.Number > 0 && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.HeadOID == right.HeadOID && left.BaseRef == right.BaseRef && left.BaseOID == right.BaseOID && left.FactoryOwned && right.FactoryOwned
+	return left.Repository == right.Repository && left.Number > 0 && (right.Number == 0 || left.Number == right.Number) && left.HeadOwner == right.HeadOwner && left.HeadRepository == right.HeadRepository && left.HeadRef == right.HeadRef && left.HeadOID == right.HeadOID && left.BaseRef == right.BaseRef && left.BaseOID == right.BaseOID && left.FactoryOwned && right.FactoryOwned
 }
 func publicationText(ticket store.Ticket, candidate store.StoredCandidate) (string, string) {
 	return "sf: " + string(ticket.Ref.Ticket), "<!-- sf:publication/v1 -->\n\nticket: " + string(ticket.Ref.Ticket) + "\ncandidate: " + candidate.Snapshot.HeadSHA + "\nsource: " + ticket.SourceDigest

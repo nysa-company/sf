@@ -529,6 +529,9 @@ func (f *FakeGH) updateUnchecked(identity contracts.PullRequestIdentity, title, 
 			f.consumeResponseLocked("pr_edit")
 			return true, errors.New("fake-gh: edit failed before mutation")
 		}
+		if !strings.Contains(body, "<!-- sf:v1 ") {
+			body += "\n\n" + ownershipMarkerForFake(identity)
+		}
 		f.state.PRs[index].Title, f.state.PRs[index].Body = title, body
 		f.recordMutationLocked("pr_edit", identity)
 		return true, f.finishErrorLocked("pr_edit")
