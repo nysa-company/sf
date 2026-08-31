@@ -1214,6 +1214,9 @@ func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) Transition(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if transition.Trigger == "operator_recover_as_guarded" {
+		return s.TransitionRecoverAsGuarded(ctx, transition)
+	}
 	if transition.Trigger == "typed_blocker" && transition.To == domain.StateBlocked && (transition.From == domain.StatePublishing || transition.From == domain.StateWaitingCI) {
 		return s.TransitionPublishedBlock(ctx, transition)
 	}

@@ -31,13 +31,13 @@ func exitCode(response api.Response) ExitCode {
 		return ExitInternal
 	}
 	switch response.Error.Code {
-	case "invalid_command", "invalid_request", "invalid_ticket", "invalid_argument", "invalid_repository", "invalid_configuration", "invalid_control", "invalid_ticket_reference", "invalid_submit", "invalid_logs", "wrong_channel", "ticket_not_found":
+	case "invalid_command", "invalid_request", "invalid_ticket", "invalid_argument", "invalid_repository", "invalid_configuration", "invalid_control", "invalid_ticket_reference", "invalid_submit", "invalid_logs", "wrong_channel", "ticket_not_found", "invalid_resume", "invalid_retry", "invalid_recover":
 		return ExitInput
-	case "operator_action_required", "operator_identity_required", "provider_auth_missing", "provider_unavailable", "auth_login_failed", "blocked_process", "uncertain_effect", "external_merge_observed", "invalid_transition", "control_drain_failed", "control_completion_failed", "not_configured", "not_ready", "doctor_not_configured", "doctor_failed", "project_conflict", "init_failed", "unknown_project", "doctor_required", "start_refused", "submit_refused", "terminal_replay_requires_new", "runtime_activation_failed", "runtime_already_active":
+	case "operator_action_required", "operator_identity_required", "provider_auth_missing", "provider_unavailable", "auth_login_failed", "blocked_process", "uncertain_effect", "external_merge_observed", "invalid_transition", "control_drain_failed", "control_completion_failed", "not_configured", "not_ready", "doctor_not_configured", "doctor_failed", "project_conflict", "init_failed", "unknown_project", "doctor_required", "start_refused", "submit_refused", "terminal_replay_requires_new", "runtime_activation_failed", "runtime_already_active", "runtime_rearm_unavailable", "retry_required", "retry_not_available", "retry_transition_refused", "recover_mode_refused", "recover_transition_refused", "resume_transition_refused":
 		return ExitAction
-	case "daemon_unavailable", "daemon_stopping", "provider_waiting", "checks_pending", "store_busy", "projection_unavailable", "external_state_unavailable", "control_state_unavailable", "evidence_unavailable", "logs_unavailable", "status_unavailable", "capacity_unavailable", "leader_lost", "ticket_id_unavailable":
+	case "daemon_unavailable", "daemon_stopping", "provider_waiting", "checks_pending", "store_busy", "projection_unavailable", "external_state_unavailable", "control_state_unavailable", "evidence_unavailable", "logs_unavailable", "status_unavailable", "capacity_unavailable", "leader_lost", "ticket_id_unavailable", "runtime_rearm_failed", "resume_state_unavailable", "retry_state_unavailable":
 		return ExitWait
-	case "policy_refusal", "safety_blocked", "unqualified_provider", "evidence_conflict", "autonomous_unavailable":
+	case "policy_refusal", "safety_blocked", "unqualified_provider", "evidence_conflict", "autonomous_unavailable", "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_verification_changes_unadopted", "takeover_source_out_of_scope":
 		return ExitPolicy
 	case "protocol_incompatible", "version_mismatch", "schema_mismatch":
 		return ExitCompatibility

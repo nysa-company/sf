@@ -52,6 +52,22 @@ type testRuntimeRetirementController struct {
 	retire func(context.Context, domain.TicketRef) error
 }
 
+type takeoverRuntimeController struct {
+	testRuntimeController
+	inspection contracts.TakeoverInspection
+	inspectErr error
+	rearms     int
+}
+
+func (controller *takeoverRuntimeController) InspectTakeover(context.Context, domain.TicketRef) (contracts.TakeoverInspection, error) {
+	return controller.inspection, controller.inspectErr
+}
+
+func (controller *takeoverRuntimeController) Rearm(context.Context, domain.TicketRef) error {
+	controller.rearms++
+	return nil
+}
+
 type daemonRuntimeEnsure struct{}
 
 func (daemonRuntimeEnsure) Ensure(context.Context, worktreecoord.EnsureRequest) (store.StoredWorktree, error) {
@@ -116,6 +132,10 @@ func testDaemon(t *testing.T) (*Daemon, config.ChannelPaths, context.CancelFunc)
 }
 
 func testDaemonForChannel(t *testing.T, channel domain.Channel) (*Daemon, config.ChannelPaths, context.CancelFunc) {
+	return testDaemonForChannelWithProjectMaximum(t, channel, domain.MergeGuarded)
+}
+
+func testDaemonForChannelWithProjectMaximum(t *testing.T, channel domain.Channel, maximum domain.MergeMode) (*Daemon, config.ChannelPaths, context.CancelFunc) {
 	t.Helper()
 	root, err := os.MkdirTemp("/tmp", "sfv2-")
 	if err != nil {
@@ -132,9 +152,23 @@ func testDaemonForChannel(t *testing.T, channel domain.Channel) (*Daemon, config
 	auth := operator.Authenticator{ExpectedUID: uid, Lookup: func(got string) (operator.Account, error) {
 		return operator.Account{Username: "operator", UID: strconv.FormatUint(uint64(uid), 10)}, nil
 	}}
+	machine := config.DefaultMachineLimits()
+	projectConfig := config.DefaultProject("demo", filepath.Join(root, "repo"))
+	projectConfig.MergeMode = maximum
+	if maximum == domain.MergeAutonomous {
+		machine.AllowAutonomous = true
+	}
+	effective, err := config.Resolve(machine, projectConfig, config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
 	d, err := Start(context.Background(), Config{
 		Channel: channel, Paths: paths, StateMachinePath: stateMachine, DaemonIdentity: "integration-test-" + string(channel),
-		Projects:  []store.Project{{Channel: channel, ID: "demo", Path: filepath.Join(root, "repo"), BaseRef: "main"}},
+		Projects:  []store.Project{{Channel: channel, ID: "demo", Path: filepath.Join(root, "repo"), BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: snapshot}},
 		TicketIDs: &testIDs{}, Clock: testClock{now: time.Unix(100, 0).UTC()}, Operator: auth,
 	})
 	if err != nil {
@@ -155,15 +189,32 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				binary = "sf-dev"
 			}
 			for code, want := range map[string][]string{
-				"autonomous_unavailable":       {binary, "providers", "qualify", "--help"},
-				"runtime_activation_failed":    {binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"},
-				"runtime_already_active":       {binary, "daemon", "status"},
-				"terminal_replay_requires_new": {binary, "submit", "--help"},
-				"unknown_project":              {binary, "init", "--help"},
-				"invalid_submit":               {binary, "submit", "--help"},
-				"invalid_logs":                 {binary, "logs", "--help"},
-				"not_ready":                    {binary, "--help"},
-				"other":                        {binary, "doctor"},
+				"autonomous_unavailable":                  {binary, "providers", "qualify", "--help"},
+				"runtime_activation_failed":               {binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"},
+				"runtime_already_active":                  {binary, "daemon", "status"},
+				"terminal_replay_requires_new":            {binary, "submit", "--help"},
+				"unknown_project":                         {binary, "init", "--help"},
+				"invalid_submit":                          {binary, "submit", "--help"},
+				"invalid_logs":                            {binary, "logs", "--help"},
+				"not_ready":                               {binary, "--help"},
+				"takeover_inspection_failed":              {binary, "take", "--help"},
+				"takeover_changes_unadopted":              {binary, "take", "--help"},
+				"takeover_verification_changes_unadopted": {binary, "resume", "--help"},
+				"takeover_source_out_of_scope":            {binary, "take", "--help"},
+				"invalid_resume":                          {binary, "resume", "--help"},
+				"invalid_retry":                           {binary, "retry", "--help"},
+				"invalid_recover":                         {binary, "recover", "--help"},
+				"runtime_rearm_unavailable":               {binary, "resume", "--help"},
+				"runtime_rearm_failed":                    {binary, "resume", "--help"},
+				"resume_state_unavailable":                {binary, "resume", "--help"},
+				"resume_transition_refused":               {binary, "resume", "--help"},
+				"retry_state_unavailable":                 {binary, "retry", "--help"},
+				"retry_not_available":                     {binary, "retry", "--help"},
+				"retry_transition_refused":                {binary, "retry", "--help"},
+				"retry_required":                          {binary, "retry", "--help"},
+				"recover_mode_refused":                    {binary, "recover", "--help"},
+				"recover_transition_refused":              {binary, "recover", "--help"},
+				"other":                                   {binary, "doctor"},
 			} {
 				response := d.failure(api.Request{Version: api.Version, RequestID: "failure-actions", Method: "ticket.submit"}, code, "failed", false)
 				if response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join(want, "\x00") {
@@ -177,13 +228,30 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				}
 			}
 			for code, want := range map[string][]string{
-				"invalid_control":            {binary, "pause", "--help"},
-				"invalid_ticket_reference":   {binary, "pause", "--help"},
-				"invalid_transition":         {binary, "status", "SF-action"},
-				"external_merge_observed":    {binary, "status", "SF-action"},
-				"external_state_unavailable": {binary, "status", "SF-action"},
-				"blocked_process":            {binary, "status", "SF-action"},
-				"uncertain_effect":           {binary, "status", "SF-action"},
+				"invalid_control":                         {binary, "pause", "--help"},
+				"invalid_ticket_reference":                {binary, "pause", "--help"},
+				"invalid_transition":                      {binary, "status", "SF-action"},
+				"external_merge_observed":                 {binary, "status", "SF-action"},
+				"external_state_unavailable":              {binary, "status", "SF-action"},
+				"blocked_process":                         {binary, "status", "SF-action"},
+				"uncertain_effect":                        {binary, "status", "SF-action"},
+				"takeover_changes_unadopted":              {binary, "take", "SF-action"},
+				"takeover_verification_changes_unadopted": {binary, "resume", "SF-action"},
+				"takeover_source_out_of_scope":            {binary, "take", "SF-action"},
+				"takeover_inspection_failed":              {binary, "take", "SF-action"},
+				"retry_required":                          {binary, "retry", "SF-action"},
+				"invalid_resume":                          {binary, "resume", "--help"},
+				"invalid_retry":                           {binary, "retry", "--help"},
+				"invalid_recover":                         {binary, "recover", "--help"},
+				"runtime_rearm_unavailable":               {binary, "resume", "SF-action"},
+				"runtime_rearm_failed":                    {binary, "resume", "SF-action"},
+				"resume_state_unavailable":                {binary, "resume", "SF-action"},
+				"resume_transition_refused":               {binary, "resume", "SF-action"},
+				"retry_state_unavailable":                 {binary, "retry", "SF-action"},
+				"retry_not_available":                     {binary, "retry", "SF-action"},
+				"retry_transition_refused":                {binary, "retry", "SF-action"},
+				"recover_mode_refused":                    {binary, "recover", "SF-action"},
+				"recover_transition_refused":              {binary, "recover", "SF-action"},
 			} {
 				request := api.Request{Version: api.Version, RequestID: "control-actions", Method: "ticket.pause", Ticket: "SF-action"}
 				response := d.failure(request, code, "failed", false)
@@ -446,6 +514,186 @@ func TestDaemonPauseDrainsThenCommitsAndReplays(t *testing.T) {
 	replay := daemonControl(d, started.Ref.Ticket, "pause")
 	if !replay.OK || !replay.Mutation.Observed || drains != 1 {
 		t.Fatalf("replay=%+v drains=%d", replay, drains)
+	}
+}
+
+func TestDaemonTakeReturnsAuthenticatedWorktreeAndResumeRearmsExactlyOnce(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-take-handoff")
+	project, err := d.store.Project(context.Background(), d.channel, started.Ref.Project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := strings.Repeat("a", 40)
+	path := filepath.Join(d.paths.Worktrees, "demo", string(started.Ref.Ticket))
+	branch := "sf/stable/aaaaaaaa/aaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if err := d.store.RegisterWorktree(context.Background(), store.WorktreeRegistration{Ref: started.Ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch}, Path: path, Branch: branch, IdentityJSON: daemonRecoveryWorktreeIdentity(project.Path, path, branch, project.BaseRef, base), BaseSHA: base, HeadSHA: base}); err != nil {
+		t.Fatal(err)
+	}
+	control := &takeoverRuntimeController{inspection: contracts.TakeoverInspection{Registered: true, Path: path, Branch: branch, Repository: project.Path, BaseSHA: base, HeadSHA: base, Clean: true, ChangeKind: "none"}}
+	d.control = control
+	taken := daemonControl(d, started.Ref.Ticket, "take")
+	if !taken.OK || taken.Mutation.Kind != "ticket_take" {
+		t.Fatalf("take response=%+v", taken)
+	}
+	var body struct {
+		Takeover contracts.TakeoverInspection `json:"takeover"`
+	}
+	if err := json.Unmarshal(taken.Data, &body); err != nil || body.Takeover.Path != path || body.Takeover.Branch != branch || !body.Takeover.Clean {
+		t.Fatalf("take body=%s parsed=%+v err=%v", taken.Data, body, err)
+	}
+	events, err := d.store.Events(context.Background(), d.channel, 0, 100)
+	if err != nil || !strings.Contains(events[len(events)-2].Payload, `"intent":"take"`) {
+		t.Fatalf("take events=%+v err=%v", events, err)
+	}
+	resumed := daemonResume(d, started.Ref.Ticket)
+	if !resumed.OK || resumed.Mutation.Observed || control.rearms != 1 {
+		t.Fatalf("resume=%+v rearms=%d", resumed, control.rearms)
+	}
+	replay := daemonResume(d, started.Ref.Ticket)
+	if !replay.OK || !replay.Mutation.Observed || control.rearms != 1 {
+		t.Fatalf("resume replay=%+v rearms=%d", replay, control.rearms)
+	}
+}
+
+func TestDaemonOperatorControlsRejectWrongChannelAndOperator(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-operator-controls-auth")
+	wrongChannel := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{
+		Version: api.Version, RequestID: "take-wrong-channel", Method: "ticket.take", Ticket: string(started.Ref.Ticket), OperatorLabel: "operator",
+		Parameters: json.RawMessage(`{"channel":"dev","operator":"operator"}`),
+	})
+	if wrongChannel.OK || wrongChannel.Error == nil || wrongChannel.Error.Code != "invalid_control" {
+		t.Fatalf("wrong channel=%+v", wrongChannel)
+	}
+	wrongOperator := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{
+		Version: api.Version, RequestID: "take-wrong-operator", Method: "ticket.take", Ticket: string(started.Ref.Ticket), OperatorLabel: "intruder",
+		Parameters: json.RawMessage(`{"channel":"stable","operator":"intruder"}`),
+	})
+	if wrongOperator.OK || wrongOperator.Error == nil || wrongOperator.Error.Code != "operator_identity_required" {
+		t.Fatalf("wrong operator=%+v", wrongOperator)
+	}
+}
+
+func TestDaemonResumeRefusesUnadoptedTakeoverChanges(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-take-dirty")
+	project, err := d.store.Project(context.Background(), d.channel, started.Ref.Project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := strings.Repeat("a", 40)
+	path := filepath.Join(d.paths.Worktrees, "demo", string(started.Ref.Ticket))
+	branch := "sf/stable/bbbbbbbb/bbbbbbbb-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if err := d.store.RegisterWorktree(context.Background(), store.WorktreeRegistration{Ref: started.Ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch}, Path: path, Branch: branch, IdentityJSON: daemonRecoveryWorktreeIdentity(project.Path, path, branch, project.BaseRef, base), BaseSHA: base, HeadSHA: base}); err != nil {
+		t.Fatal(err)
+	}
+	control := &takeoverRuntimeController{inspection: contracts.TakeoverInspection{Registered: true, Path: path, Branch: branch, Repository: project.Path, BaseSHA: base, ChangeKind: "dirty"}}
+	d.control = control
+	if response := daemonControl(d, started.Ref.Ticket, "take"); !response.OK {
+		t.Fatalf("take=%+v", response)
+	}
+	response := daemonResume(d, started.Ref.Ticket)
+	if response.OK || response.Error == nil || response.Error.Code != "takeover_changes_unadopted" || control.rearms != 0 {
+		t.Fatalf("dirty resume=%+v rearms=%d", response, control.rearms)
+	}
+}
+
+func TestDaemonResumeSourceChangesStartsFreshBuilderCycle(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-take-source")
+	project, err := d.store.Project(context.Background(), d.channel, started.Ref.Project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := strings.Repeat("c", 40)
+	path := filepath.Join(d.paths.Worktrees, "demo", string(started.Ref.Ticket))
+	branch := "sf/stable/cccccccc/cccccccc-cccccccccccccccccccccccccccccccc"
+	if err := d.store.RegisterWorktree(context.Background(), store.WorktreeRegistration{Ref: started.Ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch}, Path: path, Branch: branch, IdentityJSON: daemonRecoveryWorktreeIdentity(project.Path, path, branch, project.BaseRef, base), BaseSHA: base, HeadSHA: base}); err != nil {
+		t.Fatal(err)
+	}
+	control := &takeoverRuntimeController{inspection: contracts.TakeoverInspection{
+		Registered: true, Path: path, Branch: branch, Repository: project.Path, BaseSHA: base, HeadSHA: base,
+		ChangeKind: "source_changes", ChangedFiles: []string{"src/feature.go"}, SourceResumable: true,
+	}}
+	d.control = control
+	if response := daemonControl(d, started.Ref.Ticket, "take"); !response.OK {
+		t.Fatalf("take=%+v", response)
+	}
+	response := daemonResume(d, started.Ref.Ticket)
+	if !response.OK || response.Mutation.Observed || control.rearms != 1 {
+		t.Fatalf("source resume=%+v rearms=%d", response, control.rearms)
+	}
+	current, err := d.store.Ticket(context.Background(), started.Ref)
+	if err != nil || current.State != domain.StateBuilding {
+		t.Fatalf("source resume ticket=%+v err=%v", current, err)
+	}
+	// The resume merely routes retained edits to Builder. It cannot mint a
+	// candidate: Store still insists on a completed Builder result and its
+	// repository-command proof before RecordCandidate can proceed.
+	if _, err := d.store.RecordCandidate(context.Background(), store.CandidateEvidence{Ref: started.Ref, ExpectedVersion: current.Version, Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: current.RunnerEpoch}, Reason: "operator source edits"}); err == nil {
+		t.Fatal("source resume minted a candidate without Builder evidence")
+	}
+}
+
+func TestDaemonRetryUsesOnlyARecordedRetryPause(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-operator-retry")
+	if _, err := d.engine.Signal(context.Background(), contracts.SignalRequest{Ticket: started.Ref, TicketVersion: started.Version, From: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch}, EventPayload: `{"reason":"fixture"}`}); err != nil {
+		t.Fatal(err)
+	}
+	response := daemonControl(d, started.Ref.Ticket, "retry")
+	if !response.OK || response.Mutation.Kind != "ticket_retry" {
+		t.Fatalf("retry response=%+v", response)
+	}
+	current, err := d.store.Ticket(context.Background(), started.Ref)
+	if err != nil || current.State != domain.StatePlanning || current.ResumeState != "" {
+		t.Fatalf("retried=%+v err=%v", current, err)
+	}
+	// A normal handoff pause has a different durable predecessor and cannot be
+	// smuggled through the retry trigger.
+	if response := daemonControl(d, started.Ref.Ticket, "take"); !response.OK {
+		t.Fatalf("take=%+v", response)
+	}
+	if response := daemonControl(d, started.Ref.Ticket, "retry"); response.OK || response.Error == nil || response.Error.Code != "retry_not_available" {
+		t.Fatalf("retry after take=%+v", response)
+	}
+}
+
+func TestDaemonRecoverUsesTypedBlockerAndGuardedNarrowing(t *testing.T) {
+	ctx := context.Background()
+	d, _, _ := testDaemonForChannelWithProjectMaximum(t, domain.ChannelStable, domain.MergeGuarded)
+	started := createAndStartControlTicket(t, d, "SF-operator-recover")
+	if _, err := d.engine.Signal(ctx, contracts.SignalRequest{Ticket: started.Ref, TicketVersion: started.Version, From: domain.StatePlanning, Trigger: "typed_blocker", Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch}, Attributes: map[string]string{"no_unreconciled_external_mutation": "true"}, EventPayload: `{"code":"host_repair_required"}`}); err != nil {
+		t.Fatal(err)
+	}
+	response := d.Handle(ctx, transport.Peer{UID: uint32(os.Getuid())}, api.Request{Version: api.Version, RequestID: "recover", Method: "ticket.recover", Ticket: string(started.Ref.Ticket), OperatorLabel: "operator", Parameters: json.RawMessage(`{"channel":"stable","operator":"operator"}`)})
+	if !response.OK || response.Mutation.Kind != "ticket_recover" {
+		t.Fatalf("recover=%+v", response)
+	}
+
+	ref := domain.TicketRef{Channel: d.channel, Project: "demo", Ticket: "SF-guarded-recover"}
+	if err := d.store.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "guarded-recover", Type: domain.TicketBug, MergeMode: domain.MergeAutonomous}); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := d.store.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedGuarded, err := d.store.StartOrAdopt(ctx, ref, queued.Version, "guarded-recover", domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: queued.RunnerEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.engine.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: startedGuarded.Version, From: domain.StatePlanning, Trigger: "typed_blocker", Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: startedGuarded.RunnerEpoch}, Attributes: map[string]string{"no_unreconciled_external_mutation": "true"}, EventPayload: `{"code":"autonomy_ineligible"}`}); err != nil {
+		t.Fatal(err)
+	}
+	guarded := d.Handle(ctx, transport.Peer{UID: uint32(os.Getuid())}, api.Request{Version: api.Version, RequestID: "recover-guarded", Method: "ticket.recover", Ticket: string(ref.Ticket), OperatorLabel: "operator", Parameters: json.RawMessage(`{"channel":"stable","operator":"operator","mode":"guarded"}`)})
+	if !guarded.OK {
+		t.Fatalf("guarded recovery=%+v", guarded)
+	}
+	current, err := d.store.Ticket(ctx, ref)
+	if err != nil || current.State != domain.StateBuilding || current.MergeMode != domain.MergeGuarded {
+		t.Fatalf("guarded current=%+v err=%v", current, err)
 	}
 }
 

@@ -198,7 +198,7 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 			return daemon.WorkflowRuntimeComponents{}, fmt.Errorf("compose workflow runtime: %w", err)
 		}
 		managed := &managedRuntime{runtime: runtime, gh: gh}
-		controller, err := runtimecontrol.New(dependencies.Store, runtime.ControlBundle(), mergeObserver)
+		controller, err := runtimecontrol.New(dependencies.Store, runtime.ControlBundle(), mergeObserver, gitRunner)
 		if err != nil {
 			return daemon.WorkflowRuntimeComponents{}, fmt.Errorf("compose runtime controller: %w", errors.Join(err, managed.Close()))
 		}
