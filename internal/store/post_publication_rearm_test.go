@@ -240,6 +240,45 @@ func TestPostPublicationRearmProofAuthenticatesMergingAndReconciling(t *testing.
 	}
 }
 
+func TestTransitionGuardedMergeObservedRejectsMissingAuthorityAndNonCanonicalPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*Store, Ticket)
+		payload string
+	}{
+		{
+			name: "missing merge intent",
+			mutate: func(db *Store, ticket Ticket) {
+				if _, err := db.db.ExecContext(t.Context(), `DELETE FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+					t.Fatalf("delete merge intent: %v", err)
+				}
+			},
+			payload: "{}",
+		},
+		{
+			name:    "noncanonical payload",
+			mutate:  func(*Store, Ticket) {},
+			payload: `{"forged":true}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
+			defer fixture.db.Close()
+			tc.mutate(fixture.db, current)
+			if _, err := fixture.db.TransitionGuardedMergeObserved(fixture.ctx, Transition{
+				Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
+				To: domain.StateReconciling, Trigger: "merge_observed", Fence: fence, EventPayload: tc.payload,
+			}); !errors.Is(err, ErrEvidenceConflict) {
+				t.Fatalf("guarded merge observation accepted %s: %v", tc.name, err)
+			}
+			stored, err := fixture.db.Ticket(fixture.ctx, current.Ref)
+			if err != nil || stored.State != domain.StateMerging || stored.Version != current.Version {
+				t.Fatalf("failed guarded observation mutated ticket=%+v err=%v", stored, err)
+			}
+		})
+	}
+}
+
 func TestGuardedReconcilingAuthoritiesRejectNonCanonicalMergeObservation(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -470,6 +509,12 @@ func preparePostPublicationRearmState(t *testing.T, target domain.State) (finalR
 				t.Fatalf("select normative guarded merge observation transition=%+v err=%v", transition, err)
 			}
 			if _, err := fixture.db.Transition(fixture.ctx, Transition{
+				Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
+				To: domain.StateReconciling, Trigger: "merge_observed", Fence: fence, EventPayload: `{}`,
+			}); !errors.Is(err, ErrEvidenceConflict) {
+				t.Fatalf("generic guarded merge observation bypass=%v", err)
+			}
+			if _, err := fixture.db.TransitionGuardedMergeObserved(fixture.ctx, Transition{
 				Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
 				To: domain.StateReconciling, Trigger: "merge_observed", Fence: fence, EventPayload: `{}`,
 			}); err != nil {

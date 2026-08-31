@@ -1220,6 +1220,9 @@ func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) Transition(ctx context.Context, transition Transition) (TransitionResult, error) {
+	if guardedMergeObservationTransition(transition) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
 	if transition.Trigger == "operator_recover_as_guarded" {
 		return s.TransitionRecoverAsGuarded(ctx, transition)
 	}
@@ -1306,6 +1309,10 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		return nil
 	})
 	return result, err
+}
+
+func guardedMergeObservationTransition(transition Transition) bool {
+	return transition.From == domain.StateMerging && transition.To == domain.StateReconciling && transition.Trigger == "merge_observed"
 }
 
 func publicationSensitiveTransition(from, to domain.State) bool {

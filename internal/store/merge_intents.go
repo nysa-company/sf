@@ -88,37 +88,19 @@ func (s *Store) MergeReconciliationReady(ctx context.Context, ref domain.TicketR
 		return false, nil
 	}
 
-	rows, err := conn.QueryContext(ctx, `SELECT semantic_key FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY semantic_key`, ref.Channel, ref.Project, ref.Ticket)
-	if err != nil {
-		return false, normalizeBusy(ctx, err)
-	}
-	var key string
-	count := 0
-	for rows.Next() {
-		if err := rows.Scan(&key); err != nil {
-			_ = rows.Close()
-			return false, err
-		}
-		count++
-		if count > 1 {
-			_ = rows.Close()
-			return false, nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return false, err
-	}
-	if err := rows.Close(); err != nil || count != 1 {
-		return false, err
-	}
-
-	intent, found, err := mergeIntentFrom(ctx, conn, key)
-	if err != nil || !found || intent.Ref != ref || intent.SemanticKey != key || intent.TicketVersion != version || intent.LeaderEpoch != fence.LeaderEpoch || intent.RunnerEpoch != fence.RunnerEpoch || validMergeIntent(intent) != nil {
+	intent, found, err := singleRecoveryMergeIntent(ctx, conn, ref)
+	if err != nil || !found || intent.TicketVersion != version || intent.LeaderEpoch != fence.LeaderEpoch || intent.RunnerEpoch != fence.RunnerEpoch {
 		return false, nil
 	}
-	effect, err := effectFrom(ctx, conn, key)
-	if err != nil || effect.Ref != ref || effect.Kind != "merge" || effect.State != EffectConfirmed || effect.TicketVersion != version || effect.LeaderEpoch != fence.LeaderEpoch || effect.RunnerEpoch != fence.RunnerEpoch || effect.ClaimEpoch == 0 || effect.RequestDigest != intent.RequestDigest || effect.ObservedIdentity == "" {
+	// Reuse the same strict publication/approval/recovery authority as merge
+	// replay. A synthetic intent or a PR/head/base drift must never turn this
+	// optimization into an uncredentialed read-only path.
+	endpoint, err := s.confirmedMergeRecoveryEndpoint(ctx, conn, ref)
+	if err != nil || endpoint.version != version || endpoint.runner != fence.RunnerEpoch || endpoint.leader != fence.LeaderEpoch {
+		return false, nil
+	}
+	effect, err := effectFrom(ctx, conn, intent.SemanticKey)
+	if err != nil || effect.Ref != ref || effect.SemanticKey != intent.SemanticKey || effect.Kind != "merge" || effect.State != EffectConfirmed || effect.TicketVersion != version || effect.LeaderEpoch != fence.LeaderEpoch || effect.RunnerEpoch != fence.RunnerEpoch || effect.ClaimEpoch == 0 || effect.ClaimEpoch != intent.ClaimEpoch || effect.RequestDigest != intent.RequestDigest || effect.ObservedIdentity == "" {
 		return false, nil
 	}
 
