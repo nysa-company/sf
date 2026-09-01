@@ -31,6 +31,7 @@ var (
 type TicketSource interface {
 	ListTickets(context.Context, domain.Channel) ([]store.Ticket, error)
 	Ticket(context.Context, domain.TicketRef) (store.Ticket, error)
+	RuntimeAdmissionReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error)
 }
 
 // MergeReconciliationReadiness is optional so read-only test sources and
@@ -70,6 +71,13 @@ func (s StoreTicketSource) MergeReconciliationReady(ctx context.Context, ref dom
 		return false, ErrInvalidScheduler
 	}
 	return s.Store.MergeReconciliationReady(ctx, ref, version, fence)
+}
+
+func (s StoreTicketSource) RuntimeAdmissionReady(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	if s.Store == nil {
+		return false, ErrInvalidScheduler
+	}
+	return s.Store.RuntimeAdmissionReady(ctx, ref, version, fence)
 }
 
 // WorktreeEnsurer is compatible with worktreecoord.Coordinator. Keeping the
@@ -208,6 +216,16 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 			lastBenign = &TickResult{Outcome: OutcomeStale, Ref: ticket.Ref, Ticket: current, Fence: candidateFence, Err: ErrStale}
 			continue
 		}
+		ready, readinessErr := s.Tickets.RuntimeAdmissionReady(runCtx, ticket.Ref, ticket.Version, candidateFence)
+		if readinessErr != nil {
+			end()
+			return classify(readinessErr, candidateFence, ticket.Ref)
+		}
+		if !ready {
+			end()
+			lastBenign = &TickResult{Outcome: OutcomeCanceled, Ref: ticket.Ref, Ticket: current, Fence: candidateFence, Err: ErrCanceled}
+			continue
+		}
 		if ticket.State == domain.StatePublishing && !s.AdmitPublishing {
 			// The explicit pre-publishing composition must block before it asks
 			// for a worktree. This keeps a missing local checkout from stranding
@@ -313,6 +331,8 @@ func classify(err error, fence domain.Fence, ref domain.TicketRef) TickResult {
 	result := TickResult{Ref: ref, Fence: fence, Err: ErrReadiness}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		result.Outcome, result.Err = OutcomeCanceled, ErrCanceled
+	} else if errors.Is(err, store.ErrStaleFence) {
+		result.Outcome, result.Err = OutcomeStale, ErrStale
 	} else if errors.Is(err, store.ErrBusy) {
 		result.Outcome, result.Err = OutcomeBusy, ErrBusy
 	}

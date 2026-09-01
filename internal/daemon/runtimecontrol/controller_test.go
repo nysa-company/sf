@@ -26,6 +26,9 @@ func (controlTickets) ListTickets(context.Context, domain.Channel) ([]store.Tick
 func (controlTickets) Ticket(context.Context, domain.TicketRef) (store.Ticket, error) {
 	return store.Ticket{}, store.ErrNotFound
 }
+func (controlTickets) RuntimeAdmissionReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+	return true, nil
+}
 
 type controlEnsure struct{}
 

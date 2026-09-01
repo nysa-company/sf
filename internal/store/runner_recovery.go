@@ -946,7 +946,7 @@ func (s *Store) publicationRecoveryBaseline(ctx context.Context, conn *sql.Conn,
 // the pre-stop endpoint before its leader is used as the predecessor for a
 // normal signed +1/+1 recovery row.
 func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64) (uint64, bool, error) {
-	if !postPublicationState(state) || version < 3 || runner <= 1 || newLeader == 0 {
+	if !postPublicationState(state) || version < 2 || runner == 0 || newLeader == 0 {
 		return 0, false, nil
 	}
 	var controls int
@@ -954,6 +954,9 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 		return 0, false, err
 	}
 	if controls == 0 {
+		if version < 3 || runner <= 1 {
+			return 0, false, nil
+		}
 		triplet, err := postPublicationControlTripletPresent(ctx, conn, ref, state, version)
 		if err != nil {
 			return 0, false, err
@@ -966,6 +969,52 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 	control, err := runtimeControlFrom(ctx, conn, ref)
 	if err != nil {
 		return 0, false, ErrPublicationEvidence
+	}
+	if semanticMergeRetryControl(control) {
+		current := Ticket{Ref: ref, State: state, Version: version, RunnerEpoch: runner}
+		priorLeader, semanticErr := s.authenticatePostPublicationSemanticRetryPreFence(ctx, conn, ref, control, current)
+		if semanticErr != nil || priorLeader == 0 || priorLeader >= newLeader {
+			return 0, false, ErrPublicationEvidence
+		}
+		return priorLeader, true, nil
+	}
+	if state == domain.StateReconciling && controlledMergeReconcileShape(control) {
+		current := Ticket{Ref: ref, State: state, Version: version, RunnerEpoch: runner}
+		endpointLeader := uint64(0)
+		switch {
+		case version == control.authority.version && runner == control.authority.runner:
+			endpointLeader = control.authority.leader
+		default:
+			recovery, found, recoveryErr := loadRunnerRecoveryAt(ctx, conn, ref, version)
+			if recoveryErr != nil || !found || !validRunnerRecovery(recovery) || recovery.TicketVersion != version || recovery.RunnerEpoch != runner {
+				return 0, false, ErrPublicationEvidence
+			}
+			endpointLeader = recovery.LeaderEpoch
+		}
+		if endpointLeader == 0 || endpointLeader >= newLeader || s.authenticateControlledMergeToReconcile(ctx, conn, ref, control, current, endpointLeader) != nil {
+			return 0, false, ErrPublicationEvidence
+		}
+		return endpointLeader, true, nil
+	}
+	if state == domain.StateReconciling && semanticMergeReconcileShape(control) {
+		current := Ticket{Ref: ref, State: state, Version: version, RunnerEpoch: runner}
+		endpointLeader := uint64(0)
+		switch {
+		case version == control.authority.version && runner == control.authority.runner:
+			endpointLeader = control.authority.leader
+		default:
+			recovery, found, recoveryErr := loadRunnerRecoveryAt(ctx, conn, ref, version)
+			if recoveryErr != nil || !found || !validRunnerRecovery(recovery) || recovery.TicketVersion != version || recovery.RunnerEpoch != runner {
+				return 0, false, ErrPublicationEvidence
+			}
+			endpointLeader = recovery.LeaderEpoch
+		}
+		if endpointLeader != 0 && endpointLeader < newLeader && s.authenticateSemanticMergeToReconcile(ctx, conn, ref, control, current, endpointLeader) == nil {
+			return endpointLeader, true, nil
+		}
+	}
+	if version < 3 || runner <= 1 {
+		return 0, false, nil
 	}
 	if control.state != "sealed" || control.stop.version == 0 || control.stop.runner == 0 || control.stop.leader == 0 {
 		return 0, false, ErrPublicationEvidence
@@ -1014,16 +1063,23 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 	}
 	baseline := Ticket{Ref: ref, Version: control.stop.version - 1, RunnerEpoch: control.stop.runner - 1, State: state}
 	current := Ticket{Ref: ref, Version: version, RunnerEpoch: runner, State: state}
-	if err := authenticatePostPublicationResume(ctx, conn, ref, baseline, current, control.stop); err != nil {
+	currentLeader := control.stop.leader
+	if control.authority != control.stop {
+		currentLeader = control.authority.leader
+	}
+	if state == domain.StateMerging || state == domain.StateReconciling {
+		prior := normalRecoveryEndpoint{version: baseline.Version, runner: baseline.RunnerEpoch, leader: control.stop.leader}
+		resumed := normalRecoveryEndpoint{version: current.Version, runner: current.RunnerEpoch, leader: currentLeader}
+		if err := authenticateCurrentPostPublicationEndpointBridge(ctx, conn, ref, state, prior, resumed); err != nil {
+			return 0, false, nil
+		}
+	} else if err := authenticatePostPublicationResume(ctx, conn, ref, baseline, current, control.stop); err != nil {
 		return 0, false, nil
 	}
 	if err := s.authenticatePostPublicationState(ctx, conn, ref, state, baseline.Version, domain.Fence{LeaderEpoch: control.stop.leader, RunnerEpoch: baseline.RunnerEpoch}); err != nil {
 		return 0, false, nil
 	}
-	if control.authority != control.stop {
-		return control.authority.leader, true, nil
-	}
-	return control.stop.leader, true, nil
+	return currentLeader, true, nil
 }
 
 // normalPostPublicationRecoveryPredecessor is the no-control restart bridge
@@ -1091,7 +1147,10 @@ func (s *Store) normalPostPublicationRecoveryPredecessor(ctx context.Context, co
 			}
 			reconciling := normalRecoveryEndpoint{version: manual.CurrentTicketVersion + 1, runner: manual.CurrentFence.RunnerEpoch, leader: manual.CurrentFence.LeaderEpoch}
 			var events, stateChanges int
-			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='external_merge_observed' AND from_state='waiting_manual_merge' AND to_state='reconciling' AND payload=?`, ref.Channel, ref.Project, ref.Ticket, reconciling.version, manualMergeObservationEventPayload(manual.ObservationDigest)).Scan(&events, &stateChanges); err != nil || events != 1 || stateChanges != 1 {
+			if err := conn.QueryRowContext(ctx, `SELECT
+				COALESCE(SUM(CASE WHEN trigger='external_merge_observed' AND from_state='waiting_manual_merge' AND to_state='reconciling' AND payload=? THEN 1 ELSE 0 END),0),
+				COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0)
+				FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, manualMergeObservationEventPayload(manual.ObservationDigest), ref.Channel, ref.Project, ref.Ticket, reconciling.version).Scan(&events, &stateChanges); err != nil || events != 1 || stateChanges != 1 {
 				return 0, false, ErrPublicationEvidence
 			}
 			current.leader, err = normalRecoveryLeaderAt(ctx, conn, ref, reconciling, version, runner)
@@ -1195,6 +1254,10 @@ func (s *Store) approvalRecoveryEndpoint(ctx context.Context, conn *sql.Conn, re
 	var payload string
 	var events, stateChanges int
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0),COALESCE(MAX(payload),'') FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_approved' AND from_state='waiting_approval' AND to_state='merging'`, ref.Channel, ref.Project, ref.Ticket, approvalVersion+1).Scan(&events, &stateChanges, &payload); err != nil || events != 1 || stateChanges != 1 {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	var totalStateChanges int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, approvalVersion+1).Scan(&totalStateChanges); err != nil || totalStateChanges != 1 {
 		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
 	var approved map[string]string
@@ -1377,14 +1440,26 @@ func (s *Store) authenticateMergingRecoveryEffect(ctx context.Context, conn *sql
 	case EffectConfirmed, EffectFailed:
 		effectEndpoint := normalRecoveryEndpoint{version: effect.TicketVersion, runner: effect.RunnerEpoch, leader: effect.LeaderEpoch}
 		leader, err := normalRecoveryLeaderAt(ctx, conn, ref, intentEndpoint, effectEndpoint.version, effectEndpoint.runner)
-		if err != nil || leader != effectEndpoint.leader || effectEndpoint.version < intentEndpoint.version || effectEndpoint.version > current.version || effectEndpoint.runner > current.runner {
+		normal := err == nil && leader == effectEndpoint.leader && validRecoveredMergeClaimAdvance(intent, effectEndpoint, effect.ClaimEpoch)
+		promotedAncestor := false
+		if !normal && effect.State == EffectConfirmed {
+			if effectEndpoint.version > current.version || effectEndpoint.runner > current.runner {
+				normal = s.authenticatePromotedConfirmedMergeEffect(ctx, conn, ref, intent, effect, current) == nil
+				promotedAncestor = normal
+			} else {
+				normal = s.authenticatePromotedConfirmedMergeEffect(ctx, conn, ref, intent, effect) == nil
+			}
+		}
+		if !normal || effectEndpoint.version < intentEndpoint.version || (!promotedAncestor && (effectEndpoint.version > current.version || effectEndpoint.runner > current.runner)) {
 			return ErrPublicationEvidence
 		}
-		delta := effectEndpoint.version - intentEndpoint.version
-		if intent.ClaimEpoch > ^uint64(0)-delta || effect.ClaimEpoch < intent.ClaimEpoch+delta || effect.LeaderEpoch < intent.LeaderEpoch || effect.ClaimEpoch-intent.ClaimEpoch > effect.LeaderEpoch-intent.LeaderEpoch || (effect.State == EffectConfirmed && effect.ObservedIdentity == "") || (effect.State == EffectFailed && effect.ObservedIdentity != "") {
+		if (effect.State == EffectConfirmed && effect.ObservedIdentity == "") || (effect.State == EffectFailed && effect.ObservedIdentity != "") {
 			return ErrPublicationEvidence
 		}
-		if currentLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, effectEndpoint, current.version, current.runner); err != nil || currentLeader != current.leader {
+		if promotedAncestor {
+			return nil
+		}
+		if err := authenticatePostPublicationEndpointBridge(ctx, conn, ref, domain.StateMerging, effectEndpoint, current); err != nil {
 			return ErrPublicationEvidence
 		}
 	default:
@@ -1413,14 +1488,382 @@ func (s *Store) confirmedMergeRecoveryEndpoint(ctx context.Context, conn *sql.Co
 	}
 	effectEndpoint := normalRecoveryEndpoint{version: effect.TicketVersion, runner: effect.RunnerEpoch, leader: effect.LeaderEpoch}
 	leader, err = normalRecoveryLeaderAt(ctx, conn, ref, intentEndpoint, effectEndpoint.version, effectEndpoint.runner)
-	if err != nil || leader != effectEndpoint.leader {
-		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	if err == nil && leader == effectEndpoint.leader && validRecoveredMergeClaimAdvance(intent, effectEndpoint, effect.ClaimEpoch) {
+		return effectEndpoint, nil
 	}
-	delta := effectEndpoint.version - intentEndpoint.version
-	if intent.ClaimEpoch > ^uint64(0)-delta || effect.ClaimEpoch < intent.ClaimEpoch+delta || effect.LeaderEpoch < intent.LeaderEpoch || effect.ClaimEpoch-intent.ClaimEpoch > effect.LeaderEpoch-intent.LeaderEpoch {
+	if err := s.authenticatePromotedConfirmedMergeEffect(ctx, conn, ref, intent, effect); err != nil {
 		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
 	return effectEndpoint, nil
+}
+
+func validRecoveredMergeClaimAdvance(intent domain.MergeIntent, endpoint normalRecoveryEndpoint, claimEpoch uint64) bool {
+	if endpoint.version < intent.TicketVersion || endpoint.runner < intent.RunnerEpoch || endpoint.leader < intent.LeaderEpoch {
+		return false
+	}
+	delta := endpoint.version - intent.TicketVersion
+	return intent.ClaimEpoch <= ^uint64(0)-delta && claimEpoch >= intent.ClaimEpoch+delta && claimEpoch-intent.ClaimEpoch <= endpoint.leader-intent.LeaderEpoch
+}
+
+// authenticatePromotedConfirmedMergeEffect walks the bounded append-only
+// audit chain produced when an already-confirmed merge is independently
+// re-observed after one or more pause/resume cycles. Each hop must bind the
+// exact prior/current fences and be explained by either ordinary +1/+1 runner
+// recovery, the guarded operator control triplet, or the semantic retry pair.
+func (s *Store) authenticatePromotedConfirmedMergeEffect(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, intent domain.MergeIntent, effect Effect, required ...normalRecoveryEndpoint) error {
+	if effect.State != EffectConfirmed || effect.ObservedIdentity == "" || effect.ClaimEpoch <= intent.ClaimEpoch {
+		return ErrPublicationEvidence
+	}
+	var intentCreatedRaw string
+	if err := conn.QueryRowContext(ctx, `SELECT created_at FROM merge_intents WHERE semantic_key=?`, intent.SemanticKey).Scan(&intentCreatedRaw); err != nil {
+		return ErrPublicationEvidence
+	}
+	intentCreated, err := parseRunnerRecoveryTime(intentCreatedRaw)
+	if err != nil {
+		return ErrPublicationEvidence
+	}
+	type promotion struct {
+		version uint64
+		created time.Time
+		value   invalidatedEffectReconciliationPayload
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT ticket_version,from_state,to_state,payload,created_at FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='invalidated_effect_reconciled' ORDER BY id`, ref.Channel, ref.Project, ref.Ticket)
+	if err != nil {
+		return err
+	}
+	var promotions []promotion
+	for rows.Next() {
+		var step promotion
+		var from, to domain.State
+		var raw string
+		var createdRaw string
+		if err := rows.Scan(&step.version, &from, &to, &raw, &createdRaw); err != nil {
+			rows.Close()
+			return err
+		}
+		step.created, err = parseRunnerRecoveryTime(createdRaw)
+		if err != nil {
+			rows.Close()
+			return ErrPublicationEvidence
+		}
+		var value invalidatedEffectReconciliationPayload
+		if len(raw) == 0 || len(raw) > maxEvidenceJSON || json.Unmarshal([]byte(raw), &value) != nil {
+			rows.Close()
+			return ErrPublicationEvidence
+		}
+		canonical, err := json.Marshal(value)
+		if err != nil || string(canonical) != raw {
+			rows.Close()
+			return ErrPublicationEvidence
+		}
+		if value.SemanticKey == intent.SemanticKey {
+			if from != domain.StateMerging || to != domain.StateMerging {
+				rows.Close()
+				return ErrPublicationEvidence
+			}
+			if !value.Present {
+				// The same deterministic key may have one safely retired
+				// pre-handoff claim before the immutable merge intent is issued.
+				// Authenticate that historical absence independently and exclude
+				// it from the later confirmed-promotion chain. An absence at or
+				// after intent creation, or one overlapping its claim epoch, is a
+				// contradiction and remains fail-closed.
+				if value.ObservedIdentity != "" || value.PriorTicketVersion == 0 || value.PriorLeaderEpoch == 0 || value.PriorRunnerEpoch == 0 || value.PriorClaimEpoch == 0 || value.CurrentTicket != step.version || value.CurrentLeader == 0 || value.CurrentRunner == 0 || value.CurrentClaim != value.PriorClaimEpoch || value.CurrentTicket != intent.TicketVersion || value.CurrentRunner != intent.RunnerEpoch || value.CurrentLeader != intent.LeaderEpoch || value.CurrentClaim == ^uint64(0) || value.CurrentClaim+1 != intent.ClaimEpoch || value.PriorTicketVersion == ^uint64(0) || value.PriorTicketVersion+1 != value.CurrentTicket || value.PriorRunnerEpoch == ^uint64(0) || value.PriorRunnerEpoch+1 != value.CurrentRunner || value.PriorLeaderEpoch != value.CurrentLeader || !step.created.Before(intentCreated) {
+					rows.Close()
+					return ErrPublicationEvidence
+				}
+				recovery, found, err := loadRunnerRecoveryAt(ctx, conn, ref, value.CurrentTicket)
+				if err != nil || !found || recovery.PriorTicketVersion != value.PriorTicketVersion || recovery.PriorRunnerEpoch != value.PriorRunnerEpoch || recovery.TicketVersion != value.CurrentTicket || recovery.RunnerEpoch != value.CurrentRunner || recovery.LeaderEpoch != value.CurrentLeader || !validRunnerRecovery(recovery) {
+					rows.Close()
+					return ErrPublicationEvidence
+				}
+				continue
+			}
+			if !step.created.After(intentCreated) {
+				rows.Close()
+				return ErrPublicationEvidence
+			}
+			step.value = value
+			promotions = append(promotions, step)
+			if len(promotions) > 64 {
+				rows.Close()
+				return ErrPublicationEvidence
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(promotions) == 0 {
+		return ErrPublicationEvidence
+	}
+
+	intentEndpoint := normalRecoveryEndpoint{version: intent.TicketVersion, runner: intent.RunnerEpoch, leader: intent.LeaderEpoch}
+	var previous normalRecoveryEndpoint
+	var previousClaim uint64
+	requiredFound := len(required) == 0 || required[0] == intentEndpoint
+	for index, step := range promotions {
+		value := step.value
+		if !value.Present || value.PriorTicketVersion == 0 || value.PriorLeaderEpoch == 0 || value.PriorRunnerEpoch == 0 || value.PriorClaimEpoch == 0 || value.PriorClaimEpoch == ^uint64(0) || value.CurrentClaim != value.PriorClaimEpoch+1 || value.CurrentTicket != step.version || value.CurrentTicket == 0 || value.CurrentLeader == 0 || value.CurrentRunner == 0 || value.ObservedIdentity == "" || value.ObservedIdentity != effect.ObservedIdentity {
+			return ErrPublicationEvidence
+		}
+		prior := normalRecoveryEndpoint{version: value.PriorTicketVersion, runner: value.PriorRunnerEpoch, leader: value.PriorLeaderEpoch}
+		current := normalRecoveryEndpoint{version: value.CurrentTicket, runner: value.CurrentRunner, leader: value.CurrentLeader}
+		if index == 0 {
+			leader, err := normalRecoveryLeaderAt(ctx, conn, ref, intentEndpoint, prior.version, prior.runner)
+			if err != nil || leader != prior.leader || !validRecoveredMergeClaimAdvance(intent, prior, value.PriorClaimEpoch) {
+				return ErrPublicationEvidence
+			}
+		} else if prior != previous || value.PriorClaimEpoch != previousClaim {
+			return ErrPublicationEvidence
+		}
+		if err := authenticateMergePromotionBridge(ctx, conn, ref, prior, current); err != nil {
+			return ErrPublicationEvidence
+		}
+		if len(required) > 0 {
+			checkpoint := required[0]
+			if checkpoint == prior || checkpoint == current {
+				requiredFound = true
+			} else if checkpoint.version > prior.version && checkpoint.version < current.version &&
+				validatePostPublicationEndpointAdvance(ctx, conn, ref, domain.StateMerging, prior, checkpoint) == nil &&
+				validatePostPublicationEndpointAdvance(ctx, conn, ref, domain.StateMerging, checkpoint, current) == nil {
+				// A single promotion can span more than one authenticated
+				// pause/recovery segment. A later crash fences from the latest
+				// durable stop endpoint, which may sit inside that hop; prove
+				// both bounded halves rather than requiring an artificial
+				// intermediate promotion event.
+				requiredFound = true
+			}
+		}
+		previous, previousClaim = current, value.CurrentClaim
+	}
+	last := promotions[len(promotions)-1].value
+	if !requiredFound || previous.version != effect.TicketVersion || previous.runner != effect.RunnerEpoch || previous.leader != effect.LeaderEpoch || previousClaim != effect.ClaimEpoch || last.ObservedIdentity != effect.ObservedIdentity {
+		return ErrPublicationEvidence
+	}
+	return nil
+}
+
+func authenticateMergePromotionBridge(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, prior, current normalRecoveryEndpoint) error {
+	return authenticatePostPublicationEndpointBridge(ctx, conn, ref, domain.StateMerging, prior, current)
+}
+
+func authenticatePostPublicationEndpointBridge(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, prior, current normalRecoveryEndpoint) error {
+	if (state != domain.StateMerging && state != domain.StateReconciling && state != domain.StateWaitingManualMerge) || prior.version == 0 || prior.runner == 0 || prior.leader == 0 || current.version < prior.version || current.runner < prior.runner || current.leader < prior.leader {
+		return ErrPublicationEvidence
+	}
+	return validatePostPublicationEndpointAdvance(ctx, conn, ref, state, prior, current)
+}
+
+func authenticateCurrentPostPublicationEndpointBridge(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, prior, current normalRecoveryEndpoint) error {
+	if err := authenticatePostPublicationEndpointBridge(ctx, conn, ref, state, prior, current); err != nil {
+		return err
+	}
+	var future int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ref.Channel, ref.Project, ref.Ticket, current.version).Scan(&future); err != nil || future != 0 {
+		return ErrPublicationEvidence
+	}
+	return nil
+}
+
+func currentPostPublicationLeader(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, current Ticket) (uint64, error) {
+	if current.Ref != ref || !postPublicationState(current.State) || current.Version == 0 || current.RunnerEpoch == 0 {
+		return 0, ErrPublicationEvidence
+	}
+	var state domain.State
+	var version, runner, leader uint64
+	if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &leader); err != nil || state != current.State || version != current.Version || runner != current.RunnerEpoch || leader == 0 {
+		return 0, ErrPublicationEvidence
+	}
+	return leader, nil
+}
+
+// validatePostPublicationEndpointAdvance authenticates a bounded same-state
+// lineage through any interleaving of signed +1/+1 daemon recoveries, exact
+// operator pause/drain/resume triplets, and (for guarded merging/reconciling)
+// exact retry-exhaustion/retry pairs. It is deliberately separate from the
+// generic runner helpers: phase transitions cannot carry publication/merge
+// authority, and a counter gap without one of these rows must fail closed.
+func validatePostPublicationEndpointAdvance(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, source, target normalRecoveryEndpoint) error {
+	if ref.Validate() != nil || (state != domain.StateMerging && state != domain.StateReconciling && state != domain.StateWaitingManualMerge) || source.version == 0 || source.runner == 0 || source.leader == 0 || target.version < source.version || target.runner < source.runner || target.leader < source.leader || target.version-source.version > 64 {
+		return ErrPublicationEvidence
+	}
+	if source == target {
+		return nil
+	}
+	if err := validateRunnerRecoveryCardinality(ctx, conn, ref); err != nil {
+		return err
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, source.version, target.version)
+	if err != nil {
+		return err
+	}
+	var recoveries []RunnerRecoveryLedger
+	for rows.Next() {
+		var step RunnerRecoveryLedger
+		var createdAt string
+		if err := rows.Scan(&step.PriorTicketVersion, &step.PriorRunnerEpoch, &step.PriorLeaderEpoch, &step.TicketVersion, &step.RunnerEpoch, &step.LeaderEpoch, &step.RecoveryDigest, &createdAt); err != nil {
+			rows.Close()
+			return err
+		}
+		step.Ref = ref
+		step.CreatedAt, err = parseRunnerRecoveryTime(createdAt)
+		if err != nil || !validRunnerRecovery(step) {
+			rows.Close()
+			return ErrPublicationEvidence
+		}
+		recoveries = append(recoveries, step)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	expected := source
+	var previousCreated time.Time
+	for _, step := range recoveries {
+		predecessor := normalRecoveryEndpoint{version: step.PriorTicketVersion, runner: step.PriorRunnerEpoch, leader: step.PriorLeaderEpoch}
+		if err := validatePostPublicationControlAdvance(ctx, conn, ref, state, expected, predecessor); err != nil {
+			return ErrPublicationEvidence
+		}
+		if !previousCreated.IsZero() && !step.CreatedAt.After(previousCreated) {
+			return ErrPublicationEvidence
+		}
+		var transitions int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, step.TicketVersion).Scan(&transitions); err != nil || transitions != 0 {
+			return ErrPublicationEvidence
+		}
+		expected = normalRecoveryEndpoint{version: step.TicketVersion, runner: step.RunnerEpoch, leader: step.LeaderEpoch}
+		previousCreated = step.CreatedAt
+	}
+	return validatePostPublicationControlAdvance(ctx, conn, ref, state, expected, target)
+}
+
+func validatePostPublicationControlAdvance(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, source, target normalRecoveryEndpoint) error {
+	if source.version == 0 || source.runner == 0 || source.leader == 0 || target.version < source.version || target.runner < source.runner || target.leader < source.leader {
+		return ErrPublicationEvidence
+	}
+	if source.version == target.version {
+		if source.runner != target.runner || source.leader != target.leader {
+			return ErrPublicationEvidence
+		}
+		return nil
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT ticket_version,trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND from_state<>to_state ORDER BY ticket_version,id`, ref.Channel, ref.Project, ref.Ticket, source.version, target.version)
+	if err != nil {
+		return err
+	}
+	type transition struct {
+		version uint64
+		trigger string
+		from    domain.State
+		to      domain.State
+		payload string
+	}
+	var transitions []transition
+	for rows.Next() {
+		var value transition
+		if err := rows.Scan(&value.version, &value.trigger, &value.from, &value.to, &value.payload); err != nil {
+			rows.Close()
+			return err
+		}
+		if len(value.payload) == 0 || len(value.payload) > maxEvidenceJSON || !json.Valid([]byte(value.payload)) {
+			rows.Close()
+			return ErrPublicationEvidence
+		}
+		transitions = append(transitions, value)
+		if len(transitions) > 64 {
+			rows.Close()
+			return ErrPublicationEvidence
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(transitions) == 0 {
+		return ErrPublicationEvidence
+	}
+
+	expectedVersion, expectedRunner := source.version, source.runner
+	for index := 0; index < len(transitions); {
+		first := transitions[index]
+		if first.version != expectedVersion+1 || first.from != state {
+			return ErrPublicationEvidence
+		}
+		switch {
+		case first.trigger == "operator_pause_or_take" && first.to == domain.StateStopping:
+			if index+2 >= len(transitions) || expectedVersion > ^uint64(0)-3 || expectedRunner == ^uint64(0) {
+				return ErrPublicationEvidence
+			}
+			drained, resumed := transitions[index+1], transitions[index+2]
+			if drained.version != expectedVersion+2 || drained.trigger != "process_and_effects_drained" || drained.from != domain.StateStopping || drained.to != domain.StatePaused || resumed.version != expectedVersion+3 || resumed.trigger != "operator_resume" || resumed.from != domain.StatePaused || resumed.to != state {
+				return ErrPublicationEvidence
+			}
+			expectedVersion += 3
+			expectedRunner++
+			index += 3
+		case (state == domain.StateMerging || state == domain.StateReconciling) && first.trigger == "retry_or_correction_exhausted" && first.to == domain.StatePaused:
+			if index+1 >= len(transitions) || expectedVersion > ^uint64(0)-2 {
+				return ErrPublicationEvidence
+			}
+			resumed := transitions[index+1]
+			if resumed.version != expectedVersion+2 || resumed.trigger != "operator_retry" || resumed.from != domain.StatePaused || resumed.to != state {
+				return ErrPublicationEvidence
+			}
+			expectedVersion += 2
+			index += 2
+		default:
+			return ErrPublicationEvidence
+		}
+	}
+	if expectedVersion != target.version || expectedRunner != target.runner {
+		return ErrPublicationEvidence
+	}
+	// Paused tickets are intentionally not fenced. An authenticated operator
+	// may therefore resume under a newer daemon leader; the exact control
+	// sequence is the durable authority for that monotonic handoff. A leader
+	// change without at least one control sequence was rejected above.
+	return nil
+}
+
+func exactStateChangeEvent(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, version uint64, trigger string, from, to domain.State) error {
+	var matching, stateChanges int
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN trigger=? AND from_state=? AND to_state=? THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, trigger, from, to, ref.Channel, ref.Project, ref.Ticket, version).Scan(&matching, &stateChanges); err != nil || matching != 1 || stateChanges != 1 {
+		return ErrPublicationEvidence
+	}
+	return nil
+}
+
+func noRunnerRecoveryRows(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, afterVersion, throughVersion uint64) error {
+	var count int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, afterVersion, throughVersion).Scan(&count); err != nil || count != 0 {
+		return ErrPublicationEvidence
+	}
+	return nil
+}
+
+func promotionBridgeLeader(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, resumed, current normalRecoveryEndpoint) (uint64, error) {
+	if current.version < resumed.version || current.runner < resumed.runner || current.version-resumed.version != current.runner-resumed.runner {
+		return 0, ErrPublicationEvidence
+	}
+	if current.version == resumed.version {
+		resumed.leader = current.leader
+		return resumed.leader, nil
+	}
+	first, found, err := loadRunnerRecoveryAt(ctx, conn, ref, resumed.version+1)
+	if err != nil || !found || first.PriorTicketVersion != resumed.version || first.PriorRunnerEpoch != resumed.runner || first.PriorLeaderEpoch == 0 {
+		return 0, ErrPublicationEvidence
+	}
+	resumed.leader = first.PriorLeaderEpoch
+	if err := validateRunnerRecoveryLedger(ctx, conn, ref, resumed.version, resumed.runner, resumed.leader, current.version, current.runner, current.leader); err != nil {
+		return 0, ErrPublicationEvidence
+	}
+	return resumed.leader, nil
 }
 
 func postPublicationControlTripletPresent(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version uint64) (bool, error) {

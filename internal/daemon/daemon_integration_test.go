@@ -59,6 +59,16 @@ type takeoverRuntimeController struct {
 	rearms     int
 }
 
+type retryRuntimeController struct {
+	testRuntimeController
+	needed    bool
+	stateErr  error
+	replay    store.GuardedMergeRetryReplayState
+	replayErr error
+	rearmErr  error
+	rearms    int
+}
+
 func (controller *takeoverRuntimeController) InspectTakeover(context.Context, domain.TicketRef) (contracts.TakeoverInspection, error) {
 	return controller.inspection, controller.inspectErr
 }
@@ -66,6 +76,19 @@ func (controller *takeoverRuntimeController) InspectTakeover(context.Context, do
 func (controller *takeoverRuntimeController) Rearm(context.Context, domain.TicketRef) error {
 	controller.rearms++
 	return nil
+}
+
+func (controller *retryRuntimeController) Rearm(context.Context, domain.TicketRef) error {
+	controller.rearms++
+	return controller.rearmErr
+}
+
+func (controller *retryRuntimeController) RuntimeRearmNeeded(context.Context, domain.TicketRef) (bool, error) {
+	return controller.needed, controller.stateErr
+}
+
+func (controller *retryRuntimeController) GuardedMergeRetryReplay(context.Context, domain.TicketRef) (store.GuardedMergeRetryReplayState, error) {
+	return controller.replay, controller.replayErr
 }
 
 type daemonRuntimeEnsure struct{}
@@ -170,6 +193,7 @@ func testDaemonForChannelWithProjectMaximum(t *testing.T, channel domain.Channel
 		Channel: channel, Paths: paths, StateMachinePath: stateMachine, DaemonIdentity: "integration-test-" + string(channel),
 		Projects:  []store.Project{{Channel: channel, ID: "demo", Path: filepath.Join(root, "repo"), BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: snapshot}},
 		TicketIDs: &testIDs{}, Clock: testClock{now: time.Unix(100, 0).UTC()}, Operator: auth,
+		StartupTimeout: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -658,6 +682,87 @@ func TestDaemonRetryUsesOnlyARecordedRetryPause(t *testing.T) {
 	if response := daemonControl(d, started.Ref.Ticket, "retry"); response.OK || response.Error == nil || response.Error.Code != "retry_not_available" {
 		t.Fatalf("retry after take=%+v", response)
 	}
+}
+
+func TestDaemonGuardedMergeRetryDrainsBeforeAuthorityAndReplaysCommittedRearm(t *testing.T) {
+	t.Run("missing merge authority remains paused after drain", func(t *testing.T) {
+		d, _, _ := testDaemon(t)
+		ref := domain.TicketRef{Channel: d.channel, Project: "demo", Ticket: "SF-merge-retry-drain"}
+		if err := d.store.CreateTicket(t.Context(), store.Ticket{Ref: ref, SourceDigest: "merge-retry", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, State: domain.StateMerging}); err != nil {
+			t.Fatal(err)
+		}
+		merging, err := d.store.Ticket(t.Context(), ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.engine.Signal(t.Context(), contracts.SignalRequest{Ticket: ref, TicketVersion: merging.Version, From: domain.StateMerging, Trigger: "retry_or_correction_exhausted", Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: merging.RunnerEpoch}, EventPayload: `{"reason":"fixture"}`}); err != nil {
+			t.Fatal(err)
+		}
+		var drains int
+		controller := &retryRuntimeController{testRuntimeController: testRuntimeController{drain: func(context.Context, domain.TicketRef) (bool, error) {
+			drains++
+			return true, nil
+		}}}
+		d.control = controller
+		response := daemonControl(d, ref.Ticket, "retry")
+		if response.OK || response.Error == nil || response.Error.Code != "retry_transition_refused" || drains != 1 || controller.rearms != 0 {
+			t.Fatalf("unbound guarded retry response=%+v drains=%d rearms=%d", response, drains, controller.rearms)
+		}
+		paused, err := d.store.Ticket(t.Context(), ref)
+		if err != nil || paused.State != domain.StatePaused || paused.ResumeState != domain.StateMerging || paused.Version != merging.Version+1 {
+			t.Fatalf("rejected guarded retry mutated ticket=%+v err=%v", paused, err)
+		}
+	})
+
+	t.Run("committed sealed retry replays rearm without transition", func(t *testing.T) {
+		d, _, _ := testDaemon(t)
+		ref := domain.TicketRef{Channel: d.channel, Project: "demo", Ticket: "SF-merge-retry-rearm"}
+		if err := d.store.CreateTicket(t.Context(), store.Ticket{Ref: ref, SourceDigest: "merge-retry", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, State: domain.StateMerging}); err != nil {
+			t.Fatal(err)
+		}
+		before, err := d.store.Events(t.Context(), d.channel, 0, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		controller := &retryRuntimeController{replay: store.GuardedMergeRetryNeedsRearm}
+		d.control = controller
+		response := daemonControl(d, ref.Ticket, "retry")
+		if !response.OK || response.Mutation.Attempted || !response.Mutation.Observed || response.Mutation.Kind != "ticket_retry" || controller.rearms != 1 {
+			t.Fatalf("committed retry replay=%+v rearms=%d", response, controller.rearms)
+		}
+		after, err := d.store.Events(t.Context(), d.channel, 0, 10)
+		if err != nil || len(after) != len(before) {
+			t.Fatalf("rearm replay events before=%d after=%d err=%v", len(before), len(after), err)
+		}
+	})
+
+	t.Run("already rearmed retry is observed without another rearm", func(t *testing.T) {
+		d, _, _ := testDaemon(t)
+		ref := domain.TicketRef{Channel: d.channel, Project: "demo", Ticket: "SF-merge-retry-observed"}
+		if err := d.store.CreateTicket(t.Context(), store.Ticket{Ref: ref, SourceDigest: "merge-retry", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, State: domain.StateMerging}); err != nil {
+			t.Fatal(err)
+		}
+		controller := &retryRuntimeController{replay: store.GuardedMergeRetryAlreadyRearmed}
+		d.control = controller
+		response := daemonControl(d, ref.Ticket, "retry")
+		if !response.OK || response.Mutation.Attempted || !response.Mutation.Observed || controller.rearms != 0 {
+			t.Fatalf("already rearmed retry=%+v rearms=%d", response, controller.rearms)
+		}
+	})
+
+	t.Run("unrelated sealed runtime is not a retry replay", func(t *testing.T) {
+		d, _, _ := testDaemon(t)
+		ref := domain.TicketRef{Channel: d.channel, Project: "demo", Ticket: "SF-merge-retry-unrelated"}
+		if err := d.store.CreateTicket(t.Context(), store.Ticket{Ref: ref, SourceDigest: "merge-retry", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, State: domain.StateMerging}); err != nil {
+			t.Fatal(err)
+		}
+		controller := &retryRuntimeController{replay: store.GuardedMergeRetryNotReplay}
+		d.control = controller
+		response := daemonControl(d, ref.Ticket, "retry")
+		if response.OK || response.Error == nil || response.Error.Code != "retry_not_available" || controller.rearms != 0 {
+			t.Fatalf("unrelated sealed retry=%+v rearms=%d", response, controller.rearms)
+		}
+	})
 }
 
 func TestDaemonRecoverUsesTypedBlockerAndGuardedNarrowing(t *testing.T) {

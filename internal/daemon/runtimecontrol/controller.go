@@ -288,6 +288,15 @@ func (c *Controller) RuntimeRearmNeeded(ctx context.Context, ref domain.TicketRe
 	return c.store.RuntimeRearmNeeded(ctx, ref)
 }
 
+// GuardedMergeRetryReplay exposes only Store's authenticated semantic retry
+// classification. It cannot turn an arbitrary sealed control into a retry.
+func (c *Controller) GuardedMergeRetryReplay(ctx context.Context, ref domain.TicketRef) (store.GuardedMergeRetryReplayState, error) {
+	if c == nil || c.store == nil {
+		return store.GuardedMergeRetryNotReplay, errors.New("runtime controller is not configured")
+	}
+	return c.store.GuardedMergeRetryReplay(ctx, ref)
+}
+
 // Retire clears a terminal ticket's in-memory stop record only after Store's
 // linearized terminal proof.  This bounds long-lived controller/runtime maps
 // without creating any route back to admission.

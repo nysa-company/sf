@@ -181,3 +181,42 @@ func TestProductionSchedulerDispatchesReviewingTicketToWorkflowWorker(t *testing
 		t.Fatalf("reviewing scheduler dispatch=%+v worktree_calls=%d", result, ensurer.calls)
 	}
 }
+
+func TestDirectWorkerRefusesSealedRuntimeAdmissionAcrossStates(t *testing.T) {
+	states := []domain.State{
+		domain.StatePlanning,
+		domain.StateVerifying,
+		domain.StateBuilding,
+		domain.StateReviewing,
+		domain.StatePublishing,
+		domain.StateWaitingCI,
+		domain.StateWaitingApproval,
+		domain.StateWaitingManualMerge,
+		domain.StateMerging,
+		domain.StateReconciling,
+	}
+	for _, state := range states {
+		t.Run(string(state), func(t *testing.T) {
+			database := openStore(t)
+			if err := database.CreateProject(t.Context(), store.Project{Channel: domain.ChannelDev, ID: "nysa", Path: "/tmp/nysa", BaseRef: "main"}); err != nil {
+				t.Fatal(err)
+			}
+			ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: domain.TicketID("SF-sealed-" + string(state))}
+			if err := database.CreateTicket(t.Context(), store.Ticket{Ref: ref, State: state, SourceDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			leader, err := database.AcquireLeader(t.Context(), ref.Channel, "sealed-direct-worker")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := database.SealRuntimeControl(t.Context(), ref); err != nil {
+				t.Fatal(err)
+			}
+			worker := Worker{Store: database, PublicationEnabled: true}
+			result, err := worker.Run(t.Context(), ref, domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+			if !errors.Is(err, store.ErrStaleFence) || result.State != state || result.Version != 1 {
+				t.Fatalf("sealed %s direct worker result=%+v err=%v", state, result, err)
+			}
+		})
+	}
+}

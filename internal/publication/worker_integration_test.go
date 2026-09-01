@@ -319,13 +319,107 @@ func TestGuardedApprovalMergeRecoversLostProofResponse(t *testing.T) {
 	f.runner.MutationAuthority = restarted
 	restartedClient := newStoreBackedFakeGHClient(t, f, mergeproof.Coordinator{Store: restarted, Git: f.runner}, advanceFixtureMain)
 	restartedWorker := localruntime.NewWorker(restarted, workflowworker.Worker{}, publication.Worker{Store: restarted, Git: f.runner, GitHub: restartedClient})
-	restartedWorker.Engine = &failReconcileOnceEngine{StateMachine: engine.New(restarted, spec)}
+	restartedWorker.Engine = &failMergeObservedOnceEngine{StateMachine: engine.New(restarted, spec)}
 	if _, err := restartedWorker.Run(f.ctx, f.ref, domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: recovered.RunnerEpoch}); err == nil {
-		t.Fatal("post-merge reconcile crash was not injected")
+		t.Fatal("post-merge observation crash was not injected")
 	}
 	stranded, err := restarted.Ticket(f.ctx, f.ref)
+	if err != nil || stranded.State != domain.StateMerging {
+		t.Fatalf("post-proof stranded ticket=%+v err=%v", stranded, err)
+	}
+	confirmedBeforePause, err := restarted.Effect(f.ctx, mergeKey)
+	if err != nil || confirmedBeforePause.State != store.EffectConfirmed || confirmedBeforePause.TicketVersion != stranded.Version || confirmedBeforePause.LeaderEpoch != secondLeader || confirmedBeforePause.RunnerEpoch != stranded.RunnerEpoch {
+		t.Fatalf("confirmed pre-pause merge effect=%+v err=%v", confirmedBeforePause, err)
+	}
+	if got := f.github.MutationCount("pr_merge"); got != 1 || proofFetches != 1 {
+		t.Fatalf("post-proof crash replayed external mutation merge_calls=%d proof_fetches=%d", got, proofFetches)
+	}
+
+	// Pause and rearm after the merge and child protected-ref proof are already
+	// confirmed. The next worker must re-observe the immutable merge intent,
+	// reuse the child proof, and promote the parent effect to the resumed fence
+	// without a second hosted merge or Git fetch.
+	controlProof, err := restarted.ControlProof(f.ctx, f.ref)
+	if err != nil || !controlProof.Drained() {
+		t.Fatalf("pre-pause control proof=%+v err=%v", controlProof, err)
+	}
+	stopping, err := restarted.TransitionAndInvalidateRunner(f.ctx, store.Transition{
+		Ref: f.ref, ExpectedVersion: stranded.Version, From: domain.StateMerging, To: domain.StateStopping,
+		ResumeState: domain.StateMerging, Trigger: "operator_pause_or_take",
+		Fence: domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: stranded.RunnerEpoch}, EventPayload: `{"intent":"pause"}`,
+	})
+	if err != nil {
+		t.Fatalf("pause confirmed merge: %v", err)
+	}
+	pausedResult, err := restarted.CompleteControlTransition(f.ctx, store.Transition{
+		Ref: f.ref, ExpectedVersion: stopping.Version, From: domain.StateStopping, To: domain.StatePaused,
+		ResumeState: domain.StateMerging, Trigger: "process_and_effects_drained",
+		Fence: domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: stranded.RunnerEpoch + 1}, EventPayload: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("complete confirmed merge pause: %v", err)
+	}
+	if _, err := engine.New(restarted, spec).Signal(f.ctx, contracts.SignalRequest{
+		Ticket: f.ref, TicketVersion: pausedResult.Version, From: domain.StatePaused, Trigger: "operator_resume",
+		Fence: domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: stranded.RunnerEpoch + 1},
+		Attributes: map[string]string{
+			"operator_identity_authenticated": "true", "takeover_diff_none": "true",
+			"branch_remote_identity_exact": "true", "prerequisites_green": "true",
+		},
+		EventPayload: `{}`,
+	}); err != nil {
+		t.Fatalf("resume confirmed merge: %v", err)
+	}
+	resumed, err := restarted.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := restarted.PostPublicationRearmProof(f.ctx, f.ref, controlProof.Ticket)
+	if err != nil {
+		t.Fatalf("prove confirmed merge rearm: %v", err)
+	}
+	var admission *store.RuntimeAdmissionCapability
+	if err := restarted.ActivateRearm(f.ctx, capability, func(value *store.RuntimeAdmissionCapability) error {
+		if _, _, _, ok := value.ConsumeRuntimeAdmission(); !ok {
+			return errors.New("fixture: runtime admission was not consumable")
+		}
+		admission = value
+		return nil
+	}); err != nil || admission == nil {
+		t.Fatalf("activate confirmed merge rearm admission=%v err=%v", admission, err)
+	}
+	if err := admission.OpenStoreAdmission(f.ctx); err != nil {
+		t.Fatalf("open confirmed merge rearm: %v", err)
+	}
+
+	restartedWorker.Engine = &failMergeObservedOnceEngine{StateMachine: engine.New(restarted, spec)}
+	resumedFence := domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: resumed.RunnerEpoch}
+	if _, err := restartedWorker.Run(f.ctx, f.ref, resumedFence); err == nil {
+		t.Fatal("post-rearm merge observation crash was not injected")
+	}
+	promoted, err := restarted.Effect(f.ctx, mergeKey)
+	if err != nil || promoted.State != store.EffectConfirmed || promoted.TicketVersion != resumed.Version || promoted.LeaderEpoch != secondLeader || promoted.RunnerEpoch != resumed.RunnerEpoch || promoted.ClaimEpoch != confirmedBeforePause.ClaimEpoch+1 {
+		t.Fatalf("promoted post-rearm merge effect=%+v prior=%+v err=%v", promoted, confirmedBeforePause, err)
+	}
+	promotedIntent, found, err := restarted.MergeIntent(f.ctx, mergeKey)
+	if err != nil || !found {
+		t.Fatalf("promoted merge intent found=%v err=%v", found, err)
+	}
+	if _, err := restarted.MergeIntentForProof(f.ctx, promotedIntent.RepositoryHost, promotedIntent.RepositoryOwner, promotedIntent.RepositoryName, promotedIntent.BaseRef, promotedIntent.OriginalBaseOID, promotedIntent.HeadOID); err != nil {
+		t.Fatalf("promoted merge proof authority: %v", err)
+	}
+	if got := f.github.MutationCount("pr_merge"); got != 1 || proofFetches != 1 {
+		t.Fatalf("post-rearm promotion replayed external mutation merge_calls=%d proof_fetches=%d", got, proofFetches)
+	}
+
+	restartedWorker.Engine = &failReconcileOnceEngine{StateMachine: engine.New(restarted, spec)}
+	_, reconcileCrashErr := restartedWorker.Run(f.ctx, f.ref, resumedFence)
+	if reconcileCrashErr == nil {
+		t.Fatal("post-merge reconcile crash was not injected")
+	}
+	stranded, err = restarted.Ticket(f.ctx, f.ref)
 	if err != nil || stranded.State != domain.StateReconciling {
-		t.Fatalf("post-merge stranded ticket=%+v err=%v", stranded, err)
+		t.Fatalf("post-merge stranded ticket=%+v load_err=%v run_err=%v", stranded, err, reconcileCrashErr)
 	}
 	if got := f.github.MutationCount("pr_merge"); got != 1 || proofFetches != 1 {
 		t.Fatalf("post-merge crash replayed external mutation merge_calls=%d proof_fetches=%d", got, proofFetches)
@@ -352,6 +446,27 @@ func TestGuardedApprovalMergeRecoversLostProofResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	recoveredStopped, err := restarted.StoppedRuntimeTicket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatalf("load post-merge recovered stop: %v", err)
+	}
+	recoveredCapability, err := restarted.PostPublicationRearmProof(f.ctx, f.ref, recoveredStopped)
+	if err != nil {
+		t.Fatalf("prove post-merge recovered rearm: %v", err)
+	}
+	var recoveredAdmission *store.RuntimeAdmissionCapability
+	if err := restarted.ActivateRearm(f.ctx, recoveredCapability, func(value *store.RuntimeAdmissionCapability) error {
+		if _, _, _, ok := value.ConsumeRuntimeAdmission(); !ok {
+			return errors.New("fixture: recovered runtime admission was not consumable")
+		}
+		recoveredAdmission = value
+		return nil
+	}); err != nil || recoveredAdmission == nil {
+		t.Fatalf("activate post-merge recovered admission=%v err=%v", recoveredAdmission, err)
+	}
+	if err := recoveredAdmission.OpenStoreAdmission(f.ctx); err != nil {
+		t.Fatalf("open post-merge recovered admission: %v", err)
+	}
 	f.runner.MutationAuthority = restarted
 	restartedClient = newStoreBackedFakeGHClient(t, f, mergeproof.Coordinator{Store: restarted, Git: f.runner}, advanceFixtureMain)
 	restartedWorker = localruntime.NewWorker(restarted, workflowworker.Worker{}, publication.Worker{Store: restarted, Git: f.runner, GitHub: restartedClient})
@@ -372,6 +487,19 @@ func TestGuardedApprovalMergeRecoversLostProofResponse(t *testing.T) {
 type failReconcileOnceEngine struct {
 	workflowworker.StateMachine
 	failed bool
+}
+
+type failMergeObservedOnceEngine struct {
+	workflowworker.StateMachine
+	failed bool
+}
+
+func (e *failMergeObservedOnceEngine) Signal(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if request.From == domain.StateMerging && request.Trigger == "merge_observed" && !e.failed {
+		e.failed = true
+		return contracts.TransitionResult{}, errors.New("fixture: crash before merge_observed")
+	}
+	return e.StateMachine.Signal(ctx, request)
 }
 
 func (e *failReconcileOnceEngine) Signal(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {

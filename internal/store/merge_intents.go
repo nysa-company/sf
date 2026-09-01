@@ -135,7 +135,7 @@ func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, 
 	defer conn.Close()
 	rows, err := conn.QueryContext(ctx, `SELECT m.semantic_key,t.state FROM merge_intents m JOIN effects e ON e.semantic_key=m.semantic_key JOIN tickets t ON t.channel=m.channel AND t.project_id=m.project_id AND t.id=m.ticket_id
 		WHERE m.repository_host=? AND m.repository_owner=? AND m.repository_name=? AND m.base_ref=? AND m.original_base_oid=?
-		AND e.effect_kind='merge' AND ((t.state='merging' AND e.state IN ('executing','uncertain')) OR (t.state='reconciling' AND e.state='confirmed')) ORDER BY m.created_at DESC`, repositoryHost, owner, name, baseRef, originalBaseOID)
+		AND e.effect_kind='merge' AND ((t.state='merging' AND e.state IN ('executing','uncertain','confirmed')) OR (t.state='reconciling' AND e.state='confirmed')) ORDER BY m.created_at DESC`, repositoryHost, owner, name, baseRef, originalBaseOID)
 	if err != nil {
 		return domain.MergeIntent{}, normalizeBusy(ctx, err)
 	}
@@ -165,6 +165,38 @@ func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, 
 	if err != nil || !found || intent.OriginalBaseOID != originalBaseOID || intent.BaseRef != baseRef {
 		return domain.MergeIntent{}, ErrEvidenceConflict
 	}
+	if state == domain.StateMerging {
+		effect, err := effectFrom(ctx, conn, intent.SemanticKey)
+		if err != nil {
+			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+		if effect.State == EffectConfirmed {
+			confirmed, err := s.confirmedMergeRecoveryEndpoint(ctx, conn, intent.Ref)
+			if err != nil || confirmed.version != effect.TicketVersion || confirmed.runner != effect.RunnerEpoch || confirmed.leader != effect.LeaderEpoch {
+				return domain.MergeIntent{}, ErrEvidenceConflict
+			}
+			var live normalRecoveryEndpoint
+			var liveState domain.State
+			if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&liveState, &live.version, &live.runner, &live.leader); err != nil || liveState != domain.StateMerging {
+				return domain.MergeIntent{}, ErrEvidenceConflict
+			}
+			var controls int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&controls); err != nil || controls > 1 {
+				return domain.MergeIntent{}, ErrEvidenceConflict
+			}
+			if controls == 1 {
+				control, err := runtimeControlFrom(ctx, conn, intent.Ref)
+				if err != nil || control.state != "open" || control.authority.version != live.version || control.authority.runner != live.runner || control.authority.leader != live.leader {
+					return domain.MergeIntent{}, ErrEvidenceConflict
+				}
+			} else if live != confirmed {
+				return domain.MergeIntent{}, ErrEvidenceConflict
+			}
+			if authenticateCurrentPostPublicationEndpointBridge(ctx, conn, intent.Ref, domain.StateMerging, confirmed, live) != nil {
+				return domain.MergeIntent{}, ErrEvidenceConflict
+			}
+		}
+	}
 	if state == domain.StateReconciling {
 		// Reconciling is recovery-only: the parent merge and child protected-ref
 		// proof have already completed. Authenticate the immutable confirmed
@@ -183,7 +215,17 @@ func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, 
 		if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&liveState, &version, &runner, &leader); err != nil || liveState != domain.StateReconciling {
 			return domain.MergeIntent{}, ErrEvidenceConflict
 		}
-		if currentLeader, err := normalRecoveryLeaderAt(ctx, conn, intent.Ref, reconciling, version, runner); err != nil || currentLeader != leader {
+		current := normalRecoveryEndpoint{version: version, runner: runner, leader: leader}
+		if current != reconciling {
+			currentLeader, normalErr := normalRecoveryLeaderAt(ctx, conn, intent.Ref, reconciling, version, runner)
+			if normalErr != nil || currentLeader != leader {
+				control, controlErr := runtimeControlFrom(ctx, conn, intent.Ref)
+				if controlErr != nil || control.state != "open" || control.authority.version != current.version || control.authority.runner != current.runner || control.authority.leader != current.leader {
+					return domain.MergeIntent{}, ErrEvidenceConflict
+				}
+			}
+		}
+		if authenticateCurrentPostPublicationEndpointBridge(ctx, conn, intent.Ref, domain.StateReconciling, reconciling, current) != nil {
 			return domain.MergeIntent{}, ErrEvidenceConflict
 		}
 	}

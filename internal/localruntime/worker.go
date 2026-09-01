@@ -53,6 +53,13 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	if err != nil {
 		return workflowworker.RunResult{Ref: ref}, err
 	}
+	ready, err := w.Store.RuntimeAdmissionReady(ctx, ref, ticket.Version, fence)
+	if err != nil {
+		return workflowworker.RunResult{Ref: ref, State: ticket.State, Version: ticket.Version}, err
+	}
+	if !ready {
+		return workflowworker.RunResult{Ref: ref, State: ticket.State, Version: ticket.Version}, store.ErrStaleFence
+	}
 	switch ticket.State {
 	case domain.StatePlanning, domain.StateVerifying, domain.StateBuilding, domain.StateReviewing:
 		return w.Workflow.Run(ctx, ref, fence)
@@ -268,7 +275,55 @@ func (w Worker) reconcileMerge(ctx context.Context, ticket store.Ticket, fence d
 		return false, err
 	}
 	if effect.State == store.EffectConfirmed {
-		return true, nil
+		if effect.TicketVersion == ticket.Version && effect.LeaderEpoch == fence.LeaderEpoch && effect.RunnerEpoch == fence.RunnerEpoch {
+			return true, nil
+		}
+		// Reconciling performs its own exact MergeIntent observation below. The
+		// Store proof reader authenticates the original merge_observed handoff and
+		// any later pause/resume chain, so this path never promotes the parent
+		// effect or launches a second merge.
+		if ticket.State == domain.StateReconciling {
+			return true, nil
+		}
+		observer, ok := w.Publication.GitHub.(contracts.MergeIntentObserver)
+		if !ok {
+			return false, store.ErrEffectBusy
+		}
+		intent, found, err := w.Store.MergeIntent(ctx, key)
+		if err != nil {
+			return false, err
+		}
+		if !found || intent.SemanticKey != effect.SemanticKey || intent.Ref != effect.Ref || effect.Ref != ticket.Ref || effect.Kind != "merge" || intent.RequestDigest != effect.RequestDigest || effect.TicketVersion < intent.TicketVersion || effect.LeaderEpoch < intent.LeaderEpoch || effect.RunnerEpoch < intent.RunnerEpoch || effect.ClaimEpoch < intent.ClaimEpoch {
+			return false, store.ErrEvidenceConflict
+		}
+		identity, err := observer.ObserveMergeIntent(ctx, intent)
+		if err != nil {
+			return false, err
+		}
+		if identity == "" {
+			return false, store.ErrEvidenceConflict
+		}
+		promoted, err := w.Store.ReconcileInvalidatedEffect(ctx, store.InvalidatedEffectObservation{
+			Prior: store.EffectObservation{
+				EffectFence: store.EffectFence{
+					SemanticKey:   key,
+					Ref:           ticket.Ref,
+					TicketVersion: effect.TicketVersion,
+					Fence: domain.Fence{
+						LeaderEpoch: effect.LeaderEpoch,
+						RunnerEpoch: effect.RunnerEpoch,
+						ClaimEpoch:  effect.ClaimEpoch,
+					},
+				},
+				Present:  true,
+				Identity: identity,
+			},
+			Current: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence},
+		})
+		if err != nil {
+			return false, err
+		}
+		return promoted.State == store.EffectConfirmed, nil
 	}
 	if effect.State != store.EffectUncertain {
 		return false, nil

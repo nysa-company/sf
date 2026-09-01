@@ -86,6 +86,14 @@ type RuntimeRearmStateController interface {
 	RuntimeRearmNeeded(context.Context, domain.TicketRef) (bool, error)
 }
 
+// RuntimeMergeRetryReplayController proves that an already-active merge or
+// reconciliation ticket is the exact durable result of a prior semantic operator_retry. It is
+// deliberately separate from RuntimeRearmStateController: an unrelated
+// sealed pause/resume must never be replayed by the retry command.
+type RuntimeMergeRetryReplayController interface {
+	GuardedMergeRetryReplay(context.Context, domain.TicketRef) (store.GuardedMergeRetryReplayState, error)
+}
+
 // RuntimeRetirementController reclaims terminal-only runtime control state.
 // It is separate from RuntimeController so an intentionally no-runtime
 // composition need not pretend to own workflow admission state.
@@ -1070,6 +1078,9 @@ func (daemon *Daemon) show(ctx context.Context, request api.Request, identity do
 	if err != nil {
 		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
 	}
+	if err := daemon.lease.Validate(); err != nil {
+		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	}
 	view := ticketDetail(stored)
 	evidence, err := daemon.evidenceView(ctx, stored.Ref)
 	if err != nil {
@@ -1701,15 +1712,62 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	if err != nil {
 		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
 	}
+	if err := daemon.lease.Validate(); err != nil {
+		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	}
+	// A response can be lost after the authenticated retry transition commits
+	// but before runtime admission is installed.  In that state the durable
+	// control remains sealed and the ticket is already active, so replay must
+	// finish the handoff rather than attempting a second lifecycle transition.
+	if stored.State != domain.StatePaused {
+		if replay, ok := daemon.control.(RuntimeMergeRetryReplayController); ok {
+			state, stateErr := replay.GuardedMergeRetryReplay(ctx, ref)
+			if stateErr != nil && !errors.Is(stateErr, store.ErrStaleFence) {
+				return daemon.failure(request, "runtime_rearm_failed", "retry state could not authenticate the committed merge retry", true)
+			}
+			if stateErr == nil && state == store.GuardedMergeRetryNeedsRearm {
+				controller, ok := daemon.control.(RuntimeRearmController)
+				if !ok {
+					return daemon.failure(request, "runtime_rearm_unavailable", "retry is durably sealed until runtime admission is configured", true)
+				}
+				if err := controller.Rearm(ctx, ref); err != nil {
+					return daemon.failure(request, "runtime_rearm_failed", "retry is durably sealed until runtime admission is installed; retry after the local runtime is available", true)
+				}
+				state = store.GuardedMergeRetryAlreadyRearmed
+			}
+			if stateErr == nil && state == store.GuardedMergeRetryAlreadyRearmed {
+				current, currentErr := daemon.store.Ticket(ctx, ref)
+				if currentErr != nil {
+					return daemon.failure(request, "resume_state_unavailable", "retry state could not be confirmed after runtime admission", true)
+				}
+				return daemon.success(request, api.Mutation{Attempted: false, Kind: "ticket_" + kind, Identity: string(ref.Ticket), Observed: true}, ticketView(current))
+			}
+		}
+		return daemon.failure(request, "retry_not_available", "retry is available only after a durable retry or correction exhaustion pause", false)
+	}
 	retryable, retryableErr := daemon.store.RetryablePause(ctx, stored)
 	if retryableErr != nil {
 		return daemon.failure(request, "retry_state_unavailable", "the pause lineage could not be authenticated", true)
 	}
-	if stored.State != domain.StatePaused || !retryable {
+	if !retryable {
 		return daemon.failure(request, "retry_not_available", "retry is available only after a durable retry or correction exhaustion pause", false)
 	}
-	if err := daemon.lease.Validate(); err != nil {
-		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+	// Merge/reconciliation retry is a post-publication mutation boundary. Stop the
+	// in-memory admission before Store seals and advances the ticket so the
+	// subsequent opaque rearm token has an exact stopped runtime to authorize.
+	// Other semantic retries retain their existing no-control fast path.
+	requiresGuardedMergeRearm := stored.ResumeState == domain.StateMerging || stored.ResumeState == domain.StateReconciling
+	var mergeRearm RuntimeRearmController
+	if requiresGuardedMergeRearm {
+		var ok bool
+		mergeRearm, ok = daemon.control.(RuntimeRearmController)
+		if !ok {
+			return daemon.failure(request, "runtime_rearm_unavailable", "post-publication retry requires the local runtime rearm authority", true)
+		}
+		drained, drainErr := daemon.control.Drain(ctx, ref)
+		if drainErr != nil || !drained {
+			return daemon.controlFailure(request, stored, kind, "blocked_process", "post-publication retry requires a completed local drain", drainErr != nil, true)
+		}
 	}
 	payload, err := json.Marshal(map[string]string{"intent": kind, "operator": identity.Label})
 	if err != nil {
@@ -1722,6 +1780,12 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	current, err := daemon.store.Ticket(ctx, ref)
 	if err != nil || current.Version != result.TicketVersion {
 		return daemon.failure(request, "resume_state_unavailable", "retry transition could not be confirmed", true)
+	}
+	if requiresGuardedMergeRearm {
+		if err := mergeRearm.Rearm(ctx, ref); err != nil {
+			return daemon.failure(request, "runtime_rearm_failed", "retry is durably sealed until runtime admission is installed; retry after the local runtime is available", true)
+		}
+		return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_" + kind, Identity: string(ref.Ticket)}, ticketView(current))
 	}
 	// Retry-exhaustion pauses normally have no sealed admission. The narrow
 	// crash window after a prior control operation is different: if Store still

@@ -53,4 +53,29 @@ func TestManualMergeObservationAuthorityIsAtomicAndFailsClosedOnTamper(t *testin
 	if err := fixture.db.ValidateManualMergeObservation(fixture.ctx, waiting.Ref, tampered); !errors.Is(err, ErrPublicationEvidence) {
 		t.Fatalf("tampered observation err=%v", err)
 	}
+	if _, err := fixture.db.db.ExecContext(fixture.ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, waiting.Ref.Channel, waiting.Ref.Project, waiting.Ref.Ticket, current.Version, "tampered_competing_transition", domain.StateReconciling, domain.StateBlocked, `{}`, now()); err != nil {
+		t.Fatalf("append competing manual transition: %v", err)
+	}
+	if err := fixture.db.ValidateManualMergeObservation(fixture.ctx, waiting.Ref, NewManualMergeObservation(publication, observed)); !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("manual observation accepted competing state transition: %v", err)
+	}
+	var path string
+	if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+		t.Fatalf("database path=%q err=%v", path, err)
+	}
+	if err := fixture.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(fixture.ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	leader, err := reopened.AcquireLeader(fixture.ctx, waiting.Ref.Channel, "manual-conflicting-transition")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := reopened.FenceRecoveredRunners(fixture.ctx, waiting.Ref.Channel, leader); changed != 0 || !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("manual conflict recovery changed=%d err=%v", changed, err)
+	}
 }

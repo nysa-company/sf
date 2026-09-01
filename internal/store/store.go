@@ -1318,12 +1318,13 @@ func guardedMergeObservationTransition(transition Transition) bool {
 	return transition.From == domain.StateMerging && transition.To == domain.StateReconciling && transition.Trigger == "merge_observed"
 }
 
-// StateMerging is entered through ApplyOperatorDecision for guarded tickets.
-// The only generic path retained here is the authenticated paused -> merging
-// resume/retry used after the sealed post-publication control triplet; all
-// other direct entries would bypass the exact-head approval authority.
+// Merging and resumed reconciling are post-publication authority boundaries.
+// Generic lifecycle persistence never has enough evidence to establish the
+// exact merge/manual observation plus runtime admission lineage they require.
 func genericMergeEntryTransition(transition Transition) bool {
-	return transition.To == domain.StateMerging && !(transition.From == domain.StatePaused && (transition.Trigger == "operator_resume" || transition.Trigger == "operator_retry"))
+	return transition.To == domain.StateMerging ||
+		(transition.From == domain.StatePaused && transition.To == domain.StateReconciling &&
+			(transition.Trigger == "operator_resume" || transition.Trigger == "operator_retry"))
 }
 
 func publicationSensitiveTransition(from, to domain.State) bool {

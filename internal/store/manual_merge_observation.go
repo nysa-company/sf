@@ -179,12 +179,31 @@ func (s *Store) RecordManualMergeObservation(ctx context.Context, transition Tra
 		if err != nil || endpoint.version > version || endpoint.runner > runner {
 			return fmt.Errorf("%w: final review endpoint", ErrPublicationEvidence)
 		}
-		leader, err := normalRecoveryLeaderAt(ctx, conn, transition.Ref, endpoint, version, runner)
-		if err != nil || leader != transition.Fence.LeaderEpoch {
+		currentEndpoint := normalRecoveryEndpoint{version: version, runner: runner, leader: transition.Fence.LeaderEpoch}
+		if err := authenticateCurrentPostPublicationEndpointBridge(ctx, conn, transition.Ref, domain.StateWaitingManualMerge, endpoint, currentEndpoint); err != nil {
 			return fmt.Errorf("%w: manual merge endpoint", ErrStaleFence)
 		}
 		if err := s.authenticateManualMergePublication(ctx, conn, value); err != nil {
 			return err
+		}
+		// Preserve an already-open runtime admission across this authenticated
+		// waiting_manual_merge -> reconciling handoff. The active scheduler still
+		// owns the predecessor token; advancing durable authority atomically lets
+		// a later Store-first controller seal prove and join that exact successor.
+		control, controlErr := runtimeControlFrom(ctx, conn, transition.Ref)
+		if controlErr == nil {
+			if control.state != "open" || control.authority.version != version || control.authority.runner != runner || control.authority.leader != transition.Fence.LeaderEpoch || version == ^uint64(0) {
+				return ErrPublicationEvidence
+			}
+			updated, err := conn.ExecContext(ctx, `UPDATE runtime_ticket_controls SET authority_version=?,updated_at=? WHERE channel=? AND project_id=? AND ticket_id=? AND state='open' AND generation=? AND authority_version=? AND authority_leader_epoch=? AND authority_runner_epoch=?`, version+1, time.Now().UTC().Format(time.RFC3339Nano), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, control.generation, version, transition.Fence.LeaderEpoch, runner)
+			if err != nil {
+				return err
+			}
+			if changed, _ := updated.RowsAffected(); changed != 1 {
+				return ErrStaleFence
+			}
+		} else if !errors.Is(controlErr, ErrStaleFence) {
+			return controlErr
 		}
 
 		_, err = conn.ExecContext(ctx, `INSERT INTO manual_merge_observations(channel,project_id,ticket_id,current_ticket_version,current_leader_epoch,current_runner_epoch,candidate_generation,candidate_head_sha,candidate_base_sha,candidate_tree_sha,publication_witness_digest,publication_host,publication_owner,publication_name,publication_pr_number,publication_head_owner,publication_head_repository,publication_head_ref,publication_head_oid,publication_base_ref,publication_base_oid,publication_factory_owned,observed_host,observed_owner,observed_name,observed_pr_number,observed_head_owner,observed_head_repository,observed_head_ref,observed_head_oid,observed_base_ref,observed_base_oid,observed_factory_owned,merge_commit,observed_protected_base,observation_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?) ON CONFLICT(channel,project_id,ticket_id,candidate_generation,candidate_head_sha) DO NOTHING`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, value.CurrentTicketVersion, value.CurrentFence.LeaderEpoch, value.CurrentFence.RunnerEpoch, value.CandidateGeneration, value.CandidateHeadSHA, value.CandidateBaseSHA, value.CandidateTreeSHA, value.PublicationWitnessDigest, value.Publication.Repository.Host, value.Publication.Repository.Owner, value.Publication.Repository.Name, value.Publication.Number, value.Publication.HeadOwner, value.Publication.HeadRepository, value.Publication.HeadRef, value.Publication.HeadOID, value.Publication.BaseRef, value.Publication.BaseOID, boolInt(value.Publication.FactoryOwned), value.Observed.Identity.Repository.Host, value.Observed.Identity.Repository.Owner, value.Observed.Identity.Repository.Name, value.Observed.Identity.Number, value.Observed.Identity.HeadOwner, value.Observed.Identity.HeadRepository, value.Observed.Identity.HeadRef, value.Observed.Identity.HeadOID, value.Observed.Identity.BaseRef, value.Observed.Identity.BaseOID, boolInt(value.Observed.Identity.FactoryOwned), value.MergeCommit, value.ObservedProtectedBase, value.ObservationDigest, time.Now().UTC().Format(time.RFC3339Nano))
@@ -290,16 +309,20 @@ func (s *Store) ValidateManualMergeObservation(ctx context.Context, ref domain.T
 	if err != nil {
 		return normalizeBusy(ctx, err)
 	}
-	leader, err := normalRecoveryLeaderAt(ctx, conn, ref, endpoint, ticket.Version, ticket.RunnerEpoch)
+	current := normalRecoveryEndpoint{version: ticket.Version, runner: ticket.RunnerEpoch, leader: baselineLeader}
+	err = authenticateCurrentPostPublicationEndpointBridge(ctx, conn, ref, domain.StateReconciling, endpoint, current)
 	_ = conn.Close()
-	if err != nil || leader != baselineLeader {
+	if err != nil {
 		return ErrPublicationEvidence
 	}
-	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='external_merge_observed' AND from_state='waiting_manual_merge' AND to_state='reconciling' AND payload=?`, ref.Channel, ref.Project, ref.Ticket, stored.CurrentTicketVersion+1, manualMergeObservationEventPayload(stored.ObservationDigest)).Scan(&count); err != nil {
+	var count, stateChanges int
+	if err := s.db.QueryRowContext(ctx, `SELECT
+		COALESCE(SUM(CASE WHEN trigger='external_merge_observed' AND from_state='waiting_manual_merge' AND to_state='reconciling' AND payload=? THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0)
+		FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, manualMergeObservationEventPayload(stored.ObservationDigest), ref.Channel, ref.Project, ref.Ticket, stored.CurrentTicketVersion+1).Scan(&count, &stateChanges); err != nil {
 		return normalizeBusy(ctx, err)
 	}
-	if count != 1 {
+	if count != 1 || stateChanges != 1 {
 		return ErrPublicationEvidence
 	}
 	return nil

@@ -28,8 +28,18 @@ type mergeReadyFakeTickets struct {
 	err   error
 }
 
+type runtimeReadyMergeTickets struct {
+	mergeReadyFakeTickets
+	runtimeReady bool
+	runtimeErr   error
+}
+
 func (f mergeReadyFakeTickets) MergeReconciliationReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
 	return f.ready, f.err
+}
+
+func (f runtimeReadyMergeTickets) RuntimeAdmissionReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+	return f.runtimeReady, f.runtimeErr
 }
 
 func (f currentFakeTickets) Ticket(context.Context, domain.TicketRef) (store.Ticket, error) {
@@ -47,6 +57,10 @@ func (f fakeTickets) Ticket(_ context.Context, ref domain.TicketRef) (store.Tick
 		}
 	}
 	return store.Ticket{}, store.ErrNotFound
+}
+
+func (f fakeTickets) RuntimeAdmissionReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+	return true, nil
 }
 
 type fakeEnsure struct {
@@ -178,6 +192,55 @@ func TestSchedulerReconcilesSettledMergeWithoutUnavailableWorktree(t *testing.T)
 	result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
 	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != merging.Ref || len(ensurer.calls) != 0 {
 		t.Fatalf("settled merge result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
+func TestSchedulerNeverConsumesSealedMergeBeforeRuntimeRearm(t *testing.T) {
+	merging := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "sealed-merge"}, domain.StateMerging)
+	ensurer := &fakeEnsure{}
+	worker := &fakeWorker{}
+	source := runtimeReadyMergeTickets{
+		mergeReadyFakeTickets: mergeReadyFakeTickets{fakeTickets: fakeTickets{tickets: []store.Ticket{merging}}, ready: true},
+		runtimeReady:          false,
+	}
+	result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeCanceled || !errors.Is(result.Err, ErrCanceled) || len(worker.calls) != 0 || len(ensurer.calls) != 0 {
+		t.Fatalf("sealed merge crossed runtime admission: result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+
+	source.runtimeReady = true
+	result = NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != merging.Ref || len(ensurer.calls) != 0 {
+		t.Fatalf("opened merge did not reconcile: result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
+func TestSchedulerNeverConsumesSealedRuntimeAcrossActiveStates(t *testing.T) {
+	states := []domain.State{
+		domain.StatePlanning,
+		domain.StateVerifying,
+		domain.StateBuilding,
+		domain.StateReviewing,
+		domain.StatePublishing,
+		domain.StateWaitingCI,
+		domain.StateWaitingManualMerge,
+		domain.StateMerging,
+		domain.StateReconciling,
+	}
+	for _, state := range states {
+		t.Run(string(state), func(t *testing.T) {
+			candidate := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: domain.TicketID("sealed-" + string(state))}, state)
+			ensurer := &fakeEnsure{}
+			worker := &fakeWorker{}
+			source := runtimeReadyMergeTickets{
+				mergeReadyFakeTickets: mergeReadyFakeTickets{fakeTickets: fakeTickets{tickets: []store.Ticket{candidate}}, ready: true},
+				runtimeReady:          false,
+			}
+			result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+			if result.Outcome != OutcomeCanceled || !errors.Is(result.Err, ErrCanceled) || len(worker.calls) != 0 || len(ensurer.calls) != 0 {
+				t.Fatalf("sealed %s crossed runtime admission: result=%+v worker=%v ensure=%v", state, result, worker.calls, ensurer.calls)
+			}
+		})
 	}
 }
 

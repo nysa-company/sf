@@ -87,6 +87,7 @@ func lifecycleConfig(t *testing.T, factory WorkflowRuntimeFactory) (Config, conf
 	uid := uint32(os.Getuid())
 	return Config{
 		Channel: domain.ChannelStable, Paths: paths, DaemonIdentity: "runtime-lifecycle-" + strconv.Itoa(os.Getpid()),
+		StartupTimeout: 30 * time.Second,
 		Operator: operator.Authenticator{ExpectedUID: uid, Lookup: func(string) (operator.Account, error) {
 			return operator.Account{Username: "operator", UID: strconv.FormatUint(uint64(uid), 10)}, nil
 		}},
