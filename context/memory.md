@@ -18,7 +18,9 @@
   Reviewer still authors verification before the Builder changes product code.
 - Canonical GitHub HTTPS transport uses a packaged credential-protocol bridge
   to `gh auth git-credential`; sf neither requests a displayed token nor stores
-  one. Runtime composition remains part of the production workflow milestone.
+  one. The production local runtime now composes planning, test authorship,
+  building, review, publication, approval, manual observation, and guarded
+  merge/reconciliation through durable Store authorities.
 - `sf init` now performs native-only canonical repository registration. Stable
   and dev configuration generations are stored in separate SQLite databases,
   and tickets snapshot exact canonical configuration bytes at start.
@@ -27,6 +29,11 @@
   under a freshly observed exact strict-status protected rule with no
   pull-request or force-push bypass allowance; otherwise manual
   merge observation remains the safe path.
+- `sf` and `sf-dev` are channel-isolated local binaries backed by separate
+  SQLite databases. The foreground daemon, friendly CLI, operator pause/take/
+  resume controls, test-before-build workflow, draft PR lifecycle, human
+  approval/manual merge observation, and guarded automatic merge path are
+  implemented and covered by crash/restart and race tests.
 
 ## Log
 
@@ -89,3 +96,19 @@ passes the original base witness to protected-branch reconciliation. The
 durable fake GitHub direct interface validates exact effect claims and merge
 authorization; the command shim remains only the remote protocol exercised by
 the real client.
+
+### 2026-08-31 — Local v1 implementation gates complete
+
+The local-only factory now runs the approved verification-before-build workflow
+through one Go daemon and one SQLite authority per stable/dev channel. Manual
+merge observation and guarded human-approved automatic merge both recover
+across lost responses, daemon leadership changes, runner fencing, operator
+pause/take/resume, and post-merge reconciliation without replaying mutations.
+Generic Store transitions cannot manufacture guarded merge observations or
+enter guarded merging outside the dedicated approval/control boundaries.
+
+The final local gate includes the complete normal and race suites, `go vet`,
+repository/secret/artifact/docs checks, stable/dev release builds, and compiled
+foreground-daemon/client smokes. The project still has no remote and has not
+mutated Nysa; autonomous merge remains ineligible under the native-profile
+verdict and requires a separate future authorization and containment design.
