@@ -206,10 +206,49 @@ func TestSchemasAreStrictBoundedJSONAndMatchArtifacts(t *testing.T) {
 func strictObjects(value any) error {
 	switch value := value.(type) {
 	case map[string]any:
+		for _, unsupported := range []string{"allOf", "if", "then", "else", "not", "oneOf"} {
+			if _, ok := value[unsupported]; ok {
+				return errors.New("provider schema contains unsupported " + unsupported)
+			}
+		}
+		if _, ok := value["const"]; ok {
+			if _, hasType := value["type"]; !hasType {
+				return errors.New("const schema property missing explicit type")
+			}
+		}
+		if pattern, ok := value["pattern"].(string); ok && strings.Contains(pattern, "(?") {
+			return errors.New("provider schema contains regex lookaround")
+		}
 		if value["type"] == "object" && value["additionalProperties"] != false {
 			return errors.New("strict object missing additionalProperties=false")
 		}
-		for _, child := range value {
+		if properties, ok := value["properties"].(map[string]any); ok {
+			required := map[string]bool{}
+			if items, ok := value["required"].([]any); ok {
+				for _, item := range items {
+					if name, ok := item.(string); ok {
+						required[name] = true
+					}
+				}
+			}
+			for name, child := range properties {
+				if !required[name] {
+					return errors.New("object property missing from required")
+				}
+				if name == "rollback_command" || name == "characterization_ref" || name == "repair_owner" || name == "amendment_request" {
+					if !schemaTypeIncludesNull(child) {
+						return errors.New("optional provider property is not nullable")
+					}
+				}
+				if err := strictObjects(child); err != nil {
+					return err
+				}
+			}
+		}
+		for key, child := range value {
+			if key == "properties" {
+				continue
+			}
 			if err := strictObjects(child); err != nil {
 				return err
 			}
@@ -222,6 +261,23 @@ func strictObjects(value any) error {
 		}
 	}
 	return nil
+}
+
+func schemaTypeIncludesNull(value any) bool {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	types, ok := object["type"].([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range types {
+		if item == "null" {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPromptsAreDeterministicAndRoleBound(t *testing.T) {

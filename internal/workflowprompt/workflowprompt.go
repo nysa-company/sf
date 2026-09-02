@@ -1108,7 +1108,114 @@ var builderSchema = []byte(`{"$schema":"https://json-schema.org/draft/2020-12/sc
 
 var reviewerSchema = []byte(`{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"sf.reviewer/v1","type":"object","additionalProperties":false,"required":["schema","decision","findings","reviewed_head","proof_digest"],"properties":{"schema":{"const":"sf.reviewer/v1"},"decision":{"type":"string","enum":["pass","repair","needs_operator"]},"repair_owner":{"type":"string","enum":["builder","reviewer","operator"]},"findings":{"type":"array","maxItems":50,"items":{"type":"string","minLength":1,"maxLength":4096}},"reviewed_head":{"oneOf":[{"type":"string","pattern":"^[0-9a-f]{40}$"},{"type":"string","pattern":"^[0-9a-f]{64}$"}]},"proof_digest":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"}}}`)
 
-func copySchema(schema []byte) []byte { return append([]byte(nil), schema...) }
+func copySchema(schema []byte) []byte {
+	var value any
+	if err := json.Unmarshal(schema, &value); err != nil {
+		return append([]byte(nil), schema...)
+	}
+	normalizeProviderSchema(value, "")
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return append([]byte(nil), schema...)
+	}
+	return encoded
+}
+
+// normalizeProviderSchema reduces the durable artifact schema to the strict
+// subset accepted by the provider structured-output endpoint. Conditional
+// rules are intentionally not sent to the provider: phaseartifact performs
+// those semantic checks after the response is received, at the authority
+// boundary. This function is also the single normalization path for all roles.
+func normalizeProviderSchema(value any, propertyName string) {
+	switch value := value.(type) {
+	case []any:
+		for _, child := range value {
+			normalizeProviderSchema(child, propertyName)
+		}
+	case map[string]any:
+		if propertyName == "reviewed_head" {
+			// The provider rejects oneOf. Both accepted forms are hexadecimal
+			// object IDs, so use one bounded pattern instead.
+			if _, ok := value["oneOf"]; ok {
+				delete(value, "oneOf")
+				value["type"] = "string"
+				value["pattern"] = "^[0-9a-f]{40}([0-9a-f]{24})?$"
+			}
+		}
+		if propertyName == "rollback_command" || propertyName == "characterization_ref" {
+			makeNullable(value)
+		}
+		if propertyName == "repair_owner" {
+			makeNullable(value)
+			if enum, ok := value["enum"].([]any); ok {
+				hasNull := false
+				for _, item := range enum {
+					if item == nil {
+						hasNull = true
+						break
+					}
+				}
+				if !hasNull {
+					value["enum"] = append(enum, nil)
+				}
+			}
+		}
+		if _, ok := value["const"].(string); ok {
+			if _, hasType := value["type"]; !hasType {
+				value["type"] = "string"
+			}
+		}
+		if pattern, ok := value["pattern"].(string); ok && strings.Contains(pattern, "(?") {
+			// Path safety is enforced by phaseartifact after provider output;
+			// strict provider regexes do not support this lookaround syntax.
+			delete(value, "pattern")
+		}
+		for _, key := range []string{"allOf", "if", "then", "else", "not", "oneOf"} {
+			delete(value, key)
+		}
+		if properties, ok := value["properties"].(map[string]any); ok {
+			if _, ok := value["additionalProperties"]; !ok {
+				value["additionalProperties"] = false
+			}
+			required := make([]any, 0, len(properties))
+			seen := make(map[string]bool, len(properties))
+			if existing, ok := value["required"].([]any); ok {
+				for _, item := range existing {
+					name, ok := item.(string)
+					if ok && !seen[name] {
+						required = append(required, name)
+						seen[name] = true
+					}
+				}
+			}
+			missing := make([]string, 0, len(properties))
+			for name := range properties {
+				if !seen[name] {
+					missing = append(missing, name)
+				}
+			}
+			sort.Strings(missing)
+			for _, name := range missing {
+				required = append(required, name)
+			}
+			value["required"] = required
+			for name, child := range properties {
+				normalizeProviderSchema(child, name)
+			}
+		}
+		for key, child := range value {
+			if key != "properties" {
+				normalizeProviderSchema(child, propertyName)
+			}
+		}
+	}
+}
+
+func makeNullable(value map[string]any) {
+	if kind, ok := value["type"].(string); ok {
+		value["type"] = []any{kind, "null"}
+	}
+}
 
 func PlannerSchema() []byte      { return copySchema(plannerSchema) }
 func VerificationSchema() []byte { return withRules(verificationSchema, verificationRules) }
@@ -1129,7 +1236,7 @@ func withRules(base, rules []byte) []byte {
 	if err != nil {
 		return copySchema(base)
 	}
-	return encoded
+	return copySchema(encoded)
 }
 
 // ValidateSchemas is useful to startup checks and tests. It validates syntax
