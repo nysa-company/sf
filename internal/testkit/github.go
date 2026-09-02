@@ -1,18 +1,21 @@
 package testkit
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
@@ -373,9 +376,11 @@ type FakeGH struct {
 	mu    sync.Mutex
 	path  string
 	state FakeGHState
+	bare  string
 }
 
 var _ contracts.GitHub = (*FakeGH)(nil)
+var _ contracts.ExternalMergeObserver = (*FakeGH)(nil)
 
 func (f *FakeGH) Snapshot() FakeGHState {
 	var snapshot FakeGHState
@@ -557,6 +562,49 @@ func (f *FakeGH) ObservePublishedPullRequest(_ context.Context, want contracts.P
 			state = "MERGED"
 			// Production gh reports the current protected-base OID after merge,
 			// which may differ from the publication-time base witness.
+			identity.BaseOID = f.state.BaseHeadOID
+			baseHead = f.state.BaseHeadOID
+		}
+		result = contracts.PublishedPullRequestObservation{Identity: identity, Draft: match.Draft, Merged: match.Merged, Ready: match.Ready, Title: match.Title, Body: match.Body, MergeCommit: match.MergeCommit, BaseHeadOID: baseHead, State: state}
+		return false, nil
+	})
+	return result, err
+}
+
+// ObserveExternalMerge mirrors the production sibling observer: publication
+// source ownership and base identity stay exact, while a post-publication
+// source-head advance is retained in the observation.
+func (f *FakeGH) ObserveExternalMerge(_ context.Context, want contracts.PullRequestIdentity) (contracts.PublishedPullRequestObservation, error) {
+	var result contracts.PublishedPullRequestObservation
+	err := f.withState(func() (bool, error) {
+		var match *PullRequest
+		for index := range f.state.PRs {
+			candidate := &f.state.PRs[index]
+			if !samePRSourceAndBase(candidate.Identity, want) {
+				continue
+			}
+			if candidate.Identity.Number != want.Number {
+				return false, errors.New("fake-gh: external merge pull request number drifted")
+			}
+			if !candidate.Identity.FactoryOwned || (!strings.Contains(candidate.Body, ownershipMarkerForFake(want)) && !strings.Contains(candidate.Body, ownershipMarkerForFake(candidate.Identity))) {
+				return false, errors.New("fake-gh: external merge pull request ownership drifted")
+			}
+			if match != nil {
+				return false, errors.New("fake-gh: ambiguous external merge pull requests")
+			}
+			match = candidate
+		}
+		if match == nil {
+			return false, errors.New("fake-gh: external merge pull request not found")
+		}
+		if !match.Merged && match.Identity.BaseOID != want.BaseOID {
+			return false, errors.New("fake-gh: unmerged external pull request base drifted")
+		}
+		state := "OPEN"
+		identity := match.Identity
+		baseHead := identity.BaseOID
+		if match.Merged {
+			state = "MERGED"
 			identity.BaseOID = f.state.BaseHeadOID
 			baseHead = f.state.BaseHeadOID
 		}
@@ -1161,6 +1209,12 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 		return nil, err
 	}
 	if len(argv) >= 2 && argv[0] == "auth" && argv[1] == "status" {
+		if hasExactActiveAuthStatus(argv) {
+			if err := f.AuthStatus(context.Background()); err != nil {
+				return nil, err
+			}
+			return []byte("github.com\n"), nil
+		}
 		if option(argv, "--json") != "" {
 			if err := f.AuthStatus(context.Background()); err != nil {
 				return nil, err
@@ -1262,6 +1316,206 @@ func (f *FakeGH) Run(argv []string) ([]byte, error) {
 	return nil, errors.New("fake-gh: unsupported invocation")
 }
 
+// AdvanceBareRefFromMarker is a fixture-only bridge for compiled end-to-end
+// runs. Only a private marker in GH_CONFIG_DIR can opt a fake hosted merge
+// into updating a local bare repository. The normal in-process fake has no
+// local transport side effect.
+func (f *FakeGH) AdvanceBareRefFromMarker(configDir string) error {
+	bare, found, err := fakeBareFromMarker(configDir)
+	if err != nil || !found {
+		return err
+	}
+	return advanceFakeBareRef(bare, f)
+}
+
+// UseBareRepositoryFromMarker lets the fake GitHub API answer the exact
+// pre-PR source-ref observation from the same private remote used by compiled
+// end-to-end fixtures. Missing markers remain a no-op for ordinary tests.
+func (f *FakeGH) UseBareRepositoryFromMarker(configDir string) error {
+	bare, found, err := fakeBareFromMarker(configDir)
+	if err != nil || !found {
+		return err
+	}
+	return f.UseBareRepositoryForTest(bare)
+}
+
+// UseBareRepositoryForTest configures only a read-through source-ref witness;
+// all hosted mutation state remains in FakeGH's durable JSON document.
+func (f *FakeGH) UseBareRepositoryForTest(bare string) error {
+	if err := validateFakeBare(bare); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	f.bare = bare
+	f.mu.Unlock()
+	return nil
+}
+
+func fakeBareFromMarker(configDir string) (string, bool, error) {
+	if configDir == "" || !filepath.IsAbs(configDir) || filepath.Clean(configDir) != configDir || configDir == string(filepath.Separator) {
+		return "", false, errors.New("fake-gh: invalid GH_CONFIG_DIR")
+	}
+	marker := filepath.Join(configDir, "sf-fake-gh-bare")
+	info, markerErr := os.Lstat(marker)
+	if errors.Is(markerErr, fs.ErrNotExist) {
+		// The bare bridge is optional. Ordinary fake-gh invocations do not need
+		// to materialize GH_CONFIG_DIR merely to prove that no marker exists.
+		return "", false, nil
+	}
+	if markerErr != nil {
+		return "", false, markerErr
+	}
+	canonical, err := filepath.EvalSymlinks(configDir)
+	if err != nil || canonical != configDir {
+		return "", false, errors.New("fake-gh: GH_CONFIG_DIR must be canonical")
+	}
+	configInfo, err := os.Lstat(configDir)
+	if err != nil || configInfo.Mode()&os.ModeSymlink != 0 || !configInfo.IsDir() || configInfo.Mode().Perm()&0o077 != 0 || !fakeOwned(configInfo) {
+		return "", false, errors.New("fake-gh: GH_CONFIG_DIR is unsafe")
+	}
+	if info.Mode()&os.ModeSymlink == 0 && info.IsDir() {
+		// Accept the marker as the bare directory itself as well as the
+		// preferred private file containing its path. This keeps the fixture
+		// convenient for callers that already stage a uniquely named bare.
+		return marker, true, nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || !fakeOwned(info) || !fakeSingleLink(info) {
+		return "", false, errors.New("fake-gh: bare marker is unsafe")
+	}
+	if info.Size() == 0 || info.Size() > 4096 {
+		return "", false, errors.New("fake-gh: bare marker is bounded and required")
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		return "", false, err
+	}
+	bare := strings.TrimSpace(string(data))
+	if err := validateFakeBare(bare); err != nil {
+		return "", false, err
+	}
+	return bare, true, nil
+}
+
+func advanceFakeBareRef(bare string, f *FakeGH) error {
+	if err := validateFakeBare(bare); err != nil {
+		return err
+	}
+	snapshot := f.Snapshot()
+	if !fakeOID(snapshot.MergeCommitOID) {
+		return errors.New("fake-gh: configured merge commit is invalid")
+	}
+	baseRef := snapshot.BaseRef
+	if baseRef == "" { // tolerate durable fixture state written before BaseRef.
+		baseRef = "main"
+	}
+	if baseRef != "main" {
+		return errors.New("fake-gh: compiled bare bridge only supports the fixture main branch")
+	}
+	// The wrapper calls this reconciliation even when the subprocess response
+	// is lost.  Advance the bare ref only when the durable hosted state proves
+	// that the mutation itself committed; an error-before-mutation must leave
+	// the protected branch untouched.
+	committed := snapshot.BaseHeadOID == snapshot.MergeCommitOID
+	if committed {
+		committed = false
+		for _, pr := range snapshot.PRs {
+			if pr.Merged && pr.MergeCommit == snapshot.MergeCommitOID && pr.Identity.BaseRef == baseRef {
+				committed = true
+				break
+			}
+		}
+	}
+	if !committed {
+		return nil
+	}
+	ref := filepath.Join(bare, "refs", "heads", "main")
+	if err := validateFakeRefPath(ref); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(ref), ".sf-fake-gh-main-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(snapshot.MergeCommitOID + "\n"); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, ref)
+}
+
+func fakeOwned(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && (stat.Uid == uint32(os.Getuid()) || stat.Uid == 0)
+}
+
+func fakeSingleLink(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Nlink == 1
+}
+
+func validateFakeBare(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == string(filepath.Separator) {
+		return errors.New("fake-gh: bare path must be absolute and non-root")
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil || canonical != path {
+		return errors.New("fake-gh: bare path must be canonical")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 || !fakeOwned(info) {
+		return errors.New("fake-gh: bare path is unsafe")
+	}
+	for _, name := range []string{"HEAD", "objects", "refs"} {
+		entry, entryErr := os.Lstat(filepath.Join(path, name))
+		if entryErr != nil {
+			return fmt.Errorf("fake-gh: bare %s is unsafe", name)
+		}
+		regularUnsafe := name == "HEAD" && (!entry.Mode().IsRegular() || !fakeSingleLink(entry))
+		directoryUnsafe := name != "HEAD" && !entry.IsDir()
+		if entry.Mode()&os.ModeSymlink != 0 || regularUnsafe || directoryUnsafe || !fakeOwned(entry) {
+			return fmt.Errorf("fake-gh: bare %s is unsafe", name)
+		}
+	}
+	return nil
+}
+
+func validateFakeRefPath(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errors.New("fake-gh: bare ref path is invalid")
+	}
+	refParent := filepath.Dir(path)
+	for current := refParent; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || !fakeOwned(info) {
+			return errors.New("fake-gh: bare ref parent is unsafe")
+		}
+		if current == filepath.Dir(filepath.Dir(filepath.Dir(path))) {
+			break
+		}
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !fakeOwned(info) || !fakeSingleLink(info) {
+			return errors.New("fake-gh: existing bare ref is unsafe")
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func (f *FakeGH) runSourceRef(argv []string) ([]byte, error) {
 	const marker = "/git/ref/heads/"
 	path := argv[1]
@@ -1279,6 +1533,7 @@ func (f *FakeGH) runSourceRef(argv []string) ([]byte, error) {
 	}
 	ref := sourceRef
 	sha := strings.Repeat("a", 40)
+	foundPR := false
 	snapshot := f.Snapshot()
 	baseRef := snapshot.BaseRef
 	if baseRef == "" { // tolerate test state written before BaseRef was added.
@@ -1290,10 +1545,97 @@ func (f *FakeGH) runSourceRef(argv []string) ([]byte, error) {
 	for _, pr := range snapshot.PRs {
 		if pr.Identity.HeadOwner == sourceOwner && pr.Identity.HeadRepository == sourceRepo && pr.Identity.HeadRef == ref {
 			sha = pr.Identity.HeadOID
+			foundPR = true
 			break
 		}
 	}
+	if !foundPR && sourceOwner == snapshot.Repository.Owner && sourceRepo == snapshot.Repository.Name {
+		f.mu.Lock()
+		bare := f.bare
+		f.mu.Unlock()
+		if bare != "" {
+			observed, found, err := readFakeBareRef(bare, ref)
+			if err != nil {
+				return nil, err
+			}
+			if found {
+				sha = observed
+			}
+		}
+	}
 	return json.Marshal(map[string]any{"object": map[string]string{"sha": sha}})
+}
+
+func readFakeBareRef(bare, ref string) (string, bool, error) {
+	if err := validateFakeBare(bare); err != nil {
+		return "", false, err
+	}
+	if ref == "" || len(ref) > 512 || filepath.IsAbs(ref) || filepath.Clean(ref) != ref || strings.Contains(ref, "..") || strings.ContainsAny(ref, "\\\x00\r\n\t ") {
+		return "", false, errors.New("fake-gh: source ref is unsafe")
+	}
+	path := filepath.Join(bare, "refs", "heads", ref)
+	root := filepath.Join(bare, "refs", "heads") + string(filepath.Separator)
+	if !strings.HasPrefix(path, root) || validateFakeRefPath(path) != nil {
+		return "", false, errors.New("fake-gh: source ref escaped private bare repository")
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return readFakePackedRef(bare, "refs/heads/"+ref)
+	}
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || !fakeOwned(info) || !fakeSingleLink(info) || info.Size() <= 0 || info.Size() > 128 {
+		return "", false, errors.New("fake-gh: source ref file is unsafe")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, err
+	}
+	oid := strings.TrimSpace(string(data))
+	if !fakeOID(oid) {
+		return "", false, errors.New("fake-gh: source ref OID is invalid")
+	}
+	return oid, true, nil
+}
+
+func readFakePackedRef(bare, wantRef string) (string, bool, error) {
+	path := filepath.Join(bare, "packed-refs")
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || !fakeOwned(info) || !fakeSingleLink(info) || info.Size() <= 0 || info.Size() > 4<<20 {
+		return "", false, errors.New("fake-gh: packed refs file is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", false, err
+	}
+	defer func() { _ = file.Close() }()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm()&0o022 != 0 || !fakeOwned(opened) || !fakeSingleLink(opened) {
+		return "", false, errors.New("fake-gh: packed refs file changed while opening")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, 4<<20+1))
+	if err != nil || len(data) == 0 || len(data) > 4<<20 || bytes.IndexByte(data, 0) >= 0 {
+		return "", false, errors.New("fake-gh: packed refs file is malformed")
+	}
+	found := ""
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSuffix(raw, "\r")
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "^") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 || !fakeOID(fields[0]) || !strings.HasPrefix(fields[1], "refs/") {
+			return "", false, errors.New("fake-gh: packed refs file is malformed")
+		}
+		if fields[1] == wantRef {
+			if found != "" {
+				return "", false, errors.New("fake-gh: packed source ref is ambiguous")
+			}
+			found = fields[0]
+		}
+	}
+	return found, found != "", nil
 }
 
 // validateOfficialArgv deliberately accepts only the public gh CLI grammar
@@ -1327,6 +1669,10 @@ func validateOfficialArgv(argv []string) error {
 			return fmt.Errorf("fake-gh: incomplete %s", key)
 		}
 	case "auth status":
+		if hasExactActiveAuthStatus(argv) {
+			allowed["--active"], allowed["--hostname"] = true, true
+			break
+		}
 		allowed["--json"] = true
 		if err := require("--json", "hosts"); err != nil {
 			return err
@@ -1414,6 +1760,10 @@ func validateOfficialArgv(argv []string) error {
 		}
 	}
 	return nil
+}
+
+func hasExactActiveAuthStatus(argv []string) bool {
+	return len(argv) == 5 && argv[0] == "auth" && argv[1] == "status" && argv[2] == "--active" && argv[3] == "--hostname" && argv[4] == "github.com"
 }
 
 func hasFlag(argv []string, wanted string) bool {

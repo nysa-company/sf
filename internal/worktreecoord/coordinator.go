@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
@@ -162,6 +163,219 @@ func (c Coordinator) Ensure(ctx context.Context, request EnsureRequest) (store.S
 		return c.postClaimFailure(request, project, path, claim, err)
 	}
 	return registered, nil
+}
+
+// AuthenticateOperatorSourceResume is the deliberately narrow counterpart to
+// Ensure for one clean operator source commit. It re-proves the registered
+// filesystem identity, exact one-parent commit, immutable path/status set,
+// frozen remote refs, and current Store proof before Scheduler may launch a
+// fresh Reviewer or admits Builder only after that fresh checkpoint has been
+// independently reauthenticated.
+func (c Coordinator) AuthenticateOperatorSourceResume(ctx context.Context, request EnsureRequest, proof store.OperatorSourceResumeProof) (store.StoredWorktree, error) {
+	if c.Store == nil || request.Ref.Validate() != nil || request.Version == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 || request.Fence.ClaimEpoch != 0 || proof.Ref != request.Ref || proof.Version != request.Version || proof.Fence != request.Fence {
+		return store.StoredWorktree{}, fmt.Errorf("%w: complete source-resume proof is required", ErrAuthentication)
+	}
+	// Reload the Store proof before touching the filesystem. It both prevents a
+	// caller from inventing a struct and establishes the exact durable inputs
+	// which the physical observation must match.
+	current, found, err := c.Store.OperatorSourceResumeProof(ctx, request.Ref, request.Version, request.Fence)
+	if err != nil || !found || !sameOperatorSourceResumeProof(current, proof) {
+		if err != nil {
+			return store.StoredWorktree{}, err
+		}
+		return store.StoredWorktree{}, fmt.Errorf("%w: source-resume proof is stale or absent", ErrAuthentication)
+	}
+	project, err := c.Store.Project(ctx, request.Ref.Channel, request.Ref.Project)
+	if err != nil {
+		return store.StoredWorktree{}, err
+	}
+	expectedPath, err := c.Store.TicketWorktreePath(request.Ref)
+	if err != nil {
+		return store.StoredWorktree{}, err
+	}
+	registered, err := c.Store.Worktree(ctx, request.Ref)
+	if err != nil {
+		return store.StoredWorktree{}, err
+	}
+	if !sameStoredWorktree(registered, proof.Worktree) || registered.Path != expectedPath || registered.State != "registered" {
+		return store.StoredWorktree{}, fmt.Errorf("%w: registered worktree drifted from source-resume proof", ErrAuthentication)
+	}
+	worktree, identity, err := decodeWorktree(registered.Path, registered.Branch, registered.IdentityJSON)
+	if err != nil || !sameIdentityJSON(registered.IdentityJSON, identity) || identity.Repository != project.Path || identity.BaseRef != project.BaseRef || identity.BaseHead != registered.BaseSHA {
+		return store.StoredWorktree{}, fmt.Errorf("%w: registered identity does not bind source-resume proof: %v", ErrAuthentication, err)
+	}
+	ticket, err := c.Store.Ticket(ctx, request.Ref)
+	if err != nil || (ticket.State != domain.StateVerifying && ticket.State != domain.StateBuilding) || ticket.Version != request.Version || ticket.RunnerEpoch != request.Fence.RunnerEpoch {
+		if err != nil {
+			return store.StoredWorktree{}, err
+		}
+		return store.StoredWorktree{}, fmt.Errorf("%w: source-resume ticket is no longer at the requested admission fence", ErrAuthentication)
+	}
+	switch ticket.State {
+	case domain.StateVerifying:
+		observed, observeErr := c.Git.ObserveOperatorSourceCommit(ctx, worktree, proof.Verification.Checkpoint.CommitOID)
+		if observeErr == nil {
+			paths := sourceCommitPaths(observed)
+			if !sameOperatorSourceCommit(observed, proof.SourceCommit) || !sourceResumePathsAllowed(paths, proof.Plan.Document.Paths, proof.Verification.Revision.OwnedFiles) {
+				return store.StoredWorktree{}, fmt.Errorf("%w: source-resume checkout no longer matches its authenticated commit and paths", ErrAuthentication)
+			}
+		} else {
+			// A fresh Reviewer checkpoint may have crossed Git's update-ref boundary
+			// immediately before the process died.  Admit only Store's one exact
+			// prepared child F of source S; any ordinary dirty or foreign HEAD still
+			// fails the normal source-commit contract above.
+			prepared, preparedFound, preparedErr := c.Store.OperatorSourceResumePreparedCheckpoint(ctx, request.Ref, request.Version, request.Fence)
+			if preparedErr != nil || !preparedFound {
+				if preparedErr != nil {
+					return store.StoredWorktree{}, preparedErr
+				}
+				return store.StoredWorktree{}, fmt.Errorf("%w: source-resume worktree no longer authenticates: %v", ErrAuthentication, observeErr)
+			}
+			head, headErr := c.Git.CleanWorktreeHead(ctx, worktree)
+			commit, commitErr := c.Git.ObserveCommit(ctx, worktree)
+			if headErr != nil || commitErr != nil || head != prepared.CommitOID || commit.CommitOID != prepared.CommitOID || commit.ParentOID != prepared.ParentOID || commit.TreeOID != prepared.TreeOID {
+				return store.StoredWorktree{}, fmt.Errorf("%w: prepared source-resume checkpoint drifted: head=%v commit=%v", ErrAuthentication, headErr, commitErr)
+			}
+		}
+	case domain.StateBuilding:
+		// The fresh verifier checkpoints a clean child F of the retained source
+		// commit S.  Re-running the source-commit observer here would require
+		// HEAD=S and strand Builder.  Instead bind HEAD=F, F.parent=S, and the
+		// exact fresh verification record written at the immediately preceding
+		// verifying endpoint.
+		fresh, freshErr := c.Store.CurrentVerification(ctx, request.Ref)
+		if freshErr != nil {
+			// A runner recovery deliberately makes the immutable fresh Reviewer
+			// row historical. RecoverableVerification is admissible here only
+			// because Store's source-resume proof re-authenticates its path to the
+			// requested live fence below.
+			fresh, freshErr = c.Store.RecoverableVerification(ctx, request.Ref)
+		}
+		if freshErr != nil || fresh.TicketVersion >= request.Version || fresh.Revision.Revision == proof.Verification.Revision.Revision || fresh.Checkpoint.CommitOID == "" || fresh.Checkpoint.CommitOID != fresh.Revision.CheckpointID || fresh.Checkpoint.ParentOID != proof.SourceCommit.CommitOID {
+			if freshErr != nil {
+				return store.StoredWorktree{}, freshErr
+			}
+			return store.StoredWorktree{}, fmt.Errorf("%w: fresh verification is not bound to this Builder admission", ErrAuthentication)
+		}
+		head, headErr := c.Git.CleanWorktreeHead(ctx, worktree)
+		if headErr != nil {
+			return store.StoredWorktree{}, fmt.Errorf("%w: Builder worktree head is not the fresh verification checkpoint: %v", ErrAuthentication, headErr)
+		}
+		commit, commitErr := c.Git.ObserveCommit(ctx, worktree)
+		if head == fresh.Checkpoint.CommitOID {
+			if commitErr != nil || commit.CommitOID != fresh.Checkpoint.CommitOID || commit.ParentOID != proof.SourceCommit.CommitOID || commit.TreeOID != fresh.Checkpoint.TreeOID {
+				return store.StoredWorktree{}, fmt.Errorf("%w: fresh verification checkpoint changed before Builder admission: %v", ErrAuthentication, commitErr)
+			}
+		} else {
+			// Builder may have prepared candidate G and crashed before its
+			// RecordCandidate append. Only Store's exact Builder/command-bound
+			// child of fresh F can cross this admission boundary.
+			prepared, preparedFound, preparedErr := c.Store.OperatorSourceResumePreparedCandidate(ctx, request.Ref, request.Version, request.Fence)
+			if preparedErr != nil || !preparedFound || head != prepared.CommitOID || commitErr != nil || commit.CommitOID != prepared.CommitOID || commit.ParentOID != prepared.ParentOID || commit.TreeOID != prepared.TreeOID || commit.ParentOID != fresh.Checkpoint.CommitOID {
+				if preparedErr != nil {
+					return store.StoredWorktree{}, preparedErr
+				}
+				return store.StoredWorktree{}, fmt.Errorf("%w: Builder worktree head is neither fresh checkpoint nor authenticated prepared candidate", ErrAuthentication)
+			}
+		}
+		finalHead, finalErr := c.Git.CleanWorktreeHead(ctx, worktree)
+		if finalErr != nil || finalHead != commit.CommitOID {
+			return store.StoredWorktree{}, fmt.Errorf("%w: Builder worktree changed during fresh checkpoint observation: %v", ErrAuthentication, finalErr)
+		}
+	default:
+		return store.StoredWorktree{}, fmt.Errorf("%w: source-resume only admits verifying or building", ErrAuthentication)
+	}
+	remote, err := c.Git.ObservePublicationRemote(ctx, worktree)
+	if err != nil {
+		return store.StoredWorktree{}, fmt.Errorf("%w: source-resume remote state is unavailable: %v", ErrAuthentication, err)
+	}
+	currentRemote := store.TakeoverRemoteBaseline{Registered: true, WorktreePath: registered.Path, WorktreeBranch: registered.Branch, WorktreeIdentity: takeoverWorktreeIdentityDigest(registered.IdentityJSON), CandidatePresent: remote.Candidate.OID != "", CandidateOID: remote.Candidate.OID, BaseOID: remote.BaseOID}
+	if currentRemote != proof.Remote {
+		return store.StoredWorktree{}, fmt.Errorf("%w: source-resume candidate branch or protected base changed after take", ErrAuthentication)
+	}
+	// Git observers check identity before and after each observation;
+	// now repeat Store proof/fence after that external boundary. A control or
+	// leader change cannot race this exception into a Builder launch.
+	current, found, err = c.Store.OperatorSourceResumeProof(ctx, request.Ref, request.Version, request.Fence)
+	if err != nil || !found || !sameOperatorSourceResumeProof(current, proof) {
+		if err != nil {
+			return store.StoredWorktree{}, err
+		}
+		return store.StoredWorktree{}, fmt.Errorf("%w: source-resume proof changed during inspection", ErrAuthentication)
+	}
+	if err := c.Store.ValidateTicketFence(ctx, request.Ref, request.Version, request.Fence); err != nil {
+		return store.StoredWorktree{}, err
+	}
+	return registered, nil
+}
+
+func sameOperatorSourceResumeProof(left, right store.OperatorSourceResumeProof) bool {
+	return left.Ref == right.Ref && left.Version == right.Version && left.Fence == right.Fence && sameStoredWorktree(left.Worktree, right.Worktree) && left.Operator == right.Operator && sameOperatorSourceCommit(left.SourceCommit, right.SourceCommit) && left.Remote == right.Remote && left.Verification.Revision.Revision == right.Verification.Revision.Revision && left.Verification.Revision.IntentDigest == right.Verification.Revision.IntentDigest && left.Verification.Revision.ProofDigest == right.Verification.Revision.ProofDigest && equalPaths(left.Verification.Revision.OwnedFiles, right.Verification.Revision.OwnedFiles) && left.Verification.Checkpoint == right.Verification.Checkpoint && left.Verification.TicketVersion == right.Verification.TicketVersion && left.Verification.Fence == right.Verification.Fence && left.Plan.Digest == right.Plan.Digest && equalPaths(left.Plan.Document.Paths, right.Plan.Document.Paths)
+}
+
+func sameOperatorSourceCommit(left, right contracts.OperatorSourceCommit) bool {
+	if left.CommitOID != right.CommitOID || left.ParentOID != right.ParentOID || left.TreeOID != right.TreeOID || len(left.Changes) != len(right.Changes) {
+		return false
+	}
+	for index := range left.Changes {
+		if left.Changes[index] != right.Changes[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func sourceCommitPaths(value contracts.OperatorSourceCommit) []string {
+	paths := make([]string, 0, len(value.Changes))
+	for _, change := range value.Changes {
+		paths = append(paths, change.Path)
+	}
+	return paths
+}
+
+func sameStoredWorktree(left, right store.StoredWorktree) bool {
+	return left.Path == right.Path && left.Branch == right.Branch && left.State == right.State && bytes.Equal(left.IdentityJSON, right.IdentityJSON) && left.BaseSHA == right.BaseSHA && left.HeadSHA == right.HeadSHA && left.TicketVersion == right.TicketVersion && left.Fence == right.Fence
+}
+
+func equalPaths(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func sourceResumePathsAllowed(changed, allowed, owned []string) bool {
+	if len(changed) == 0 || len(allowed) == 0 {
+		return false
+	}
+	for _, path := range changed {
+		within := false
+		for _, prefix := range allowed {
+			if sourceResumePathMatches(path, prefix) {
+				within = true
+				break
+			}
+		}
+		if !within {
+			return false
+		}
+		for _, protected := range owned {
+			if sourceResumePathMatches(path, protected) || sourceResumePathMatches(protected, path) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sourceResumePathMatches(path, prefix string) bool {
+	prefix = strings.Trim(prefix, "/")
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
 // preRunnerClaimFailure handles a failure after the durable claim but before
@@ -363,6 +577,14 @@ func ensureDigest(ref domain.TicketRef, repository, path, branch, baseRef, base 
 		_, _ = hash.Write([]byte{0})
 	}
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+// takeoverWorktreeIdentityDigest shares Store's canonical evidence format:
+// lowercase SHA-256 hex without an algorithm prefix. The source-resume proof
+// compares this value byte-for-byte with the take-time durable baseline.
+func takeoverWorktreeIdentityDigest(identity []byte) string {
+	sum := sha256.Sum256(identity)
+	return hex.EncodeToString(sum[:])
 }
 
 func decodeWorktree(path, branch string, raw []byte) (git.Worktree, git.Identity, error) {

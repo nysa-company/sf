@@ -6,6 +6,7 @@ package runtimecontrol
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,7 +79,7 @@ func (c *Controller) InspectTakeover(ctx context.Context, ref domain.TicketRef) 
 	}
 	registered, err := c.store.Worktree(ctx, ref)
 	if errors.Is(err, store.ErrNotFound) {
-		return contracts.TakeoverInspection{Clean: true, ChangeKind: "no_worktree"}, nil
+		return contracts.TakeoverInspection{Clean: true, ChangeKind: "no_worktree", RemoteIdentityExact: true}, nil
 	}
 	if err != nil || c.git == nil || registered.State != "registered" {
 		if err != nil {
@@ -95,35 +96,86 @@ func (c *Controller) InspectTakeover(ctx context.Context, ref domain.TicketRef) 
 		return contracts.TakeoverInspection{}, errors.New("registered worktree identity is not canonical")
 	}
 	worktree := git.Worktree{Path: registered.Path, Branch: registered.Branch, Identity: identity}
-	inspection := contracts.TakeoverInspection{Registered: true, Path: registered.Path, Branch: registered.Branch, Repository: identity.Repository, BaseSHA: identity.BaseHead}
+	inspection := contracts.TakeoverInspection{Registered: true, Path: registered.Path, Branch: registered.Branch, Repository: identity.Repository, Origin: identity.Origin, PushOrigin: identity.PushOrigin, BaseSHA: identity.BaseHead}
 	changes, err := c.git.InspectWorktreeChanges(ctx, worktree)
 	if err != nil {
 		return contracts.TakeoverInspection{}, err
 	}
 	inspection.HeadSHA = changes.Head
+	remote, err := c.git.ObservePublicationRemote(ctx, worktree)
+	if err != nil || remote.BaseOID == "" {
+		if err == nil {
+			err = errors.New("protected remote base is unavailable")
+		}
+		return contracts.TakeoverInspection{}, err
+	}
+	inspection.RemoteCandidatePresent = remote.Candidate.OID != ""
+	inspection.RemoteCandidateSHA = remote.Candidate.OID
+	inspection.RemoteBaseSHA = remote.BaseOID
+	inspection.RemoteIdentityExact = remote.BaseOID == identity.BaseHead
 	// The registration head is valid before a checkpoint exists. A candidate
 	// head is valid after it has been recorded. During building, the current
 	// verification checkpoint is the only head from which a dirty source diff
 	// can safely be handed back to the Builder.
 	allowedHeads := map[string]struct{}{registered.HeadSHA: {}}
-	if candidate, candidateErr := c.store.RecoverableCandidate(ctx, ref); candidateErr == nil {
+	candidate, candidateErr := c.store.RecoverableCandidate(ctx, ref)
+	if candidateErr == nil {
 		allowedHeads[candidate.Snapshot.HeadSHA] = struct{}{}
 	} else if !errors.Is(candidateErr, store.ErrNotFound) {
 		return contracts.TakeoverInspection{}, candidateErr
 	}
+	if remote.Candidate.OID != "" && (candidateErr != nil || remote.Candidate.OID != candidate.Snapshot.HeadSHA) {
+		inspection.RemoteIdentityExact = false
+	}
 	verification, verificationErr := c.store.RecoverableVerification(ctx, ref)
 	if verificationErr == nil {
 		allowedHeads[verification.Checkpoint.CommitOID] = struct{}{}
+		inspection.RetainedProofDigest = verification.Revision.ProofDigest
+		inspection.RetainedPolicyDigest = verification.CommandBinding.PolicyDigest
+		inspection.RetainedVersion = verification.TicketVersion
+		inspection.RetainedLeaderEpoch = verification.Fence.LeaderEpoch
+		inspection.RetainedRunnerEpoch = verification.Fence.RunnerEpoch
 	} else if !errors.Is(verificationErr, store.ErrNotFound) {
 		return contracts.TakeoverInspection{}, verificationErr
 	}
-	if _, allowed := allowedHeads[changes.Head]; !allowed {
-		inspection.ChangeKind = "unadopted_commit"
-		return inspection, nil
+	ticket, ticketErr := c.store.Ticket(ctx, ref)
+	if ticketErr != nil {
+		return contracts.TakeoverInspection{}, ticketErr
+	}
+	if ticket.State == domain.StatePaused {
+		if baseline, baselineErr := c.store.OperatorTakeRemoteBaseline(ctx, ref, ticket.Version); baselineErr == nil {
+			inspection.RemoteIdentityExact = inspection.RemoteIdentityExact && sameRemoteBaseline(baseline, currentTakeoverRemoteBaseline(registered, remote))
+		}
 	}
 	if len(changes.Paths) == 0 {
 		inspection.Clean = true
-		inspection.ChangeKind = "none"
+		if _, allowed := allowedHeads[changes.Head]; allowed {
+			inspection.ChangeKind = "none"
+			return inspection, nil
+		}
+		if verificationErr != nil {
+			inspection.ChangeKind = "unadopted_commit"
+			return inspection, nil
+		}
+		source, sourceErr := c.git.ObserveOperatorSourceCommit(ctx, worktree, verification.Checkpoint.CommitOID)
+		if sourceErr != nil {
+			inspection.ChangeKind = "unadopted_commit"
+			return inspection, nil
+		}
+		paths := sourceCommitPaths(source)
+		inspection.ChangedFiles = paths
+		if touchesOwnedFiles(paths, verification.Revision.OwnedFiles) {
+			inspection.ChangeKind = "verification_changes"
+			return inspection, nil
+		}
+		plan, planErr := c.store.Plan(ctx, ref)
+		if planErr != nil || !allWithinPlan(paths, plan.Document.Planner.Paths) {
+			inspection.ChangeKind = "source_out_of_scope"
+			return inspection, nil
+		}
+		inspection.ChangeKind = "source_commit"
+		inspection.SourceResumable = true
+		inspection.SourceCommit = source
 		return inspection, nil
 	}
 	inspection.ChangedFiles = changes.Paths
@@ -140,10 +192,24 @@ func (c *Controller) InspectTakeover(ctx context.Context, ref domain.TicketRef) 
 		inspection.ChangeKind = "source_out_of_scope"
 		return inspection, nil
 	}
-	inspection.ChangeKind = "source_changes"
-	inspection.SourceResumable = true
+	inspection.ChangeKind = "source_commit_required"
 	return inspection, nil
 }
+
+func sourceCommitPaths(value contracts.OperatorSourceCommit) []string {
+	paths := make([]string, 0, len(value.Changes))
+	for _, change := range value.Changes {
+		paths = append(paths, change.Path)
+	}
+	return paths
+}
+
+func currentTakeoverRemoteBaseline(worktree store.StoredWorktree, remote git.PublicationRemoteObservation) store.TakeoverRemoteBaseline {
+	digest := sha256.Sum256(worktree.IdentityJSON)
+	return store.TakeoverRemoteBaseline{Registered: true, WorktreePath: worktree.Path, WorktreeBranch: worktree.Branch, WorktreeIdentity: fmt.Sprintf("%x", digest[:]), CandidatePresent: remote.Candidate.OID != "", CandidateOID: remote.Candidate.OID, BaseOID: remote.BaseOID}
+}
+
+func sameRemoteBaseline(left, right store.TakeoverRemoteBaseline) bool { return left == right }
 
 func takeoverPathMatches(path, prefix string) bool {
 	prefix = strings.Trim(prefix, "/")

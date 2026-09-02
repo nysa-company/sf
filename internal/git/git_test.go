@@ -354,6 +354,38 @@ func TestInspectWorktreeChangesAuthenticatesBoundedDirtySourcePaths(t *testing.T
 	}
 }
 
+func TestObserveOperatorSourceCommitRequiresCleanExactSingleParentDelta(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-source-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "worktree")
+	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := worktree.Identity.BaseHead
+	if err := os.WriteFile(filepath.Join(path, "src", "operator.txt"), []byte("operator source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rawGit(t, path, "add", "--", "src/operator.txt")
+	rawGit(t, path, "commit", "-m", "operator source")
+	observed, err := runner.ObserveOperatorSourceCommit(ctx, worktree, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.ParentOID != parent || observed.CommitOID == parent || observed.TreeOID == "" || !reflect.DeepEqual(observed.Changes, []contracts.OperatorSourceChange{{Status: "A", Path: "src/operator.txt"}}) {
+		t.Fatalf("operator commit=%+v parent=%s", observed, parent)
+	}
+	if err := os.WriteFile(filepath.Join(path, "src", "operator.txt"), []byte("dirty again\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.ObserveOperatorSourceCommit(ctx, worktree, parent); !errors.Is(err, ErrUnsafeWorktree) {
+		t.Fatalf("dirty operator commit err=%v", err)
+	}
+}
+
 func TestPushWithRequestCorrectionRequiresExactPriorRemote(t *testing.T) {
 	ctx, runner, repository, remote := fixture(t)
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-correction-push")

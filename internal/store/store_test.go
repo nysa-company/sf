@@ -247,6 +247,90 @@ func TestFencedSubmitOnlyPermitsNormativeNoneToQueued(t *testing.T) {
 	}
 }
 
+func TestFencedSubmitDerivesControlsFromFrozenProjectPolicy(t *testing.T) {
+	database, ctx := openTestStore(t)
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "daemon-submit-policy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := func(id domain.ProjectID, mode domain.MergeMode, timeout time.Duration, cost int64) {
+		t.Helper()
+		project := config.DefaultProject(string(id), "/tmp/"+string(id))
+		project.MergeMode = mode
+		project.TicketTimeout = timeout
+		if project.PhaseTimeout > project.TicketTimeout {
+			project.PhaseTimeout = project.TicketTimeout
+		}
+		project.MaxTicketCostMicroUSD = cost
+		effective, err := config.Resolve(config.DefaultMachineLimits(), project, config.TicketOverride{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot, digest, err := config.Snapshot(effective)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := database.CreateProject(ctx, Project{Channel: domain.ChannelDev, ID: id, Path: project.Repository, BaseRef: project.BaseBranch, ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: snapshot}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	submission := func(project domain.ProjectID, id domain.TicketID, mode domain.MergeMode, timeout time.Duration, cost int64) Ticket {
+		t.Helper()
+		source := []byte("# " + string(id) + "\n\nPolicy is durable.\n")
+		sum := sha256.Sum256(source)
+		return Ticket{Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: project, Ticket: id}, Source: source, SourceDigest: fmt.Sprintf("%x", sum[:]), Type: domain.TicketBug, MergeMode: mode, MaxDuration: timeout, MaxCostMicroUSD: cost}
+	}
+	register("manual", domain.MergeManual, 2*time.Hour, 25_000_000)
+	if _, _, err := database.SubmitTicketFenced(ctx, submission("manual", "SF-manual-guarded", domain.MergeGuarded, 0, 0), false, leader); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("guarded override of manual project err=%v", err)
+	}
+	if tickets, err := database.Tickets(ctx, domain.ChannelDev, "manual", 10); err != nil || len(tickets) != 0 {
+		t.Fatalf("rejected manual-project override persisted tickets=%+v err=%v", tickets, err)
+	}
+	created, fresh, err := database.SubmitTicketFenced(ctx, submission("manual", "SF-manual-default", domain.MergeManual, 0, 0), false, leader)
+	if err != nil || !fresh || created.MergeMode != domain.MergeManual || created.MaxDuration != 2*time.Hour || created.MaxCostMicroUSD != 25_000_000 {
+		t.Fatalf("manual effective admission=%+v fresh=%v err=%v", created, fresh, err)
+	}
+	register("guarded", domain.MergeGuarded, 2*time.Hour, 25_000_000)
+	if created, fresh, err := database.SubmitTicketFenced(ctx, submission("guarded", "SF-guarded-manual", domain.MergeManual, 0, 0), false, leader); err != nil || !fresh || created.MergeMode != domain.MergeManual {
+		t.Fatalf("manual override of guarded project=%+v fresh=%v err=%v", created, fresh, err)
+	}
+	register("tight", domain.MergeGuarded, 30*time.Minute, 5_000_000)
+	for name, input := range map[string]Ticket{
+		"duration": submission("tight", "SF-tight-duration", domain.MergeGuarded, 31*time.Minute, 0),
+		"cost":     submission("tight", "SF-tight-cost", domain.MergeGuarded, 0, 5_000_001),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := database.SubmitTicketFenced(ctx, input, false, leader); !errors.Is(err, ErrEvidenceConflict) {
+				t.Fatalf("policy ceiling err=%v", err)
+			}
+		})
+	}
+	malformed := []byte(`{"machine":`)
+	malformedDigest := sha256.Sum256(malformed)
+	if err := database.CreateProject(ctx, Project{Channel: domain.ChannelDev, ID: "malformed", Path: "/tmp/malformed", BaseRef: "main", ConfigGeneration: 1, ConfigDigest: fmt.Sprintf("%x", malformedDigest[:]), ConfigSnapshot: malformed}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := database.SubmitTicketFenced(ctx, submission("malformed", "SF-malformed", domain.MergeGuarded, 0, 0), false, leader); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("malformed frozen policy err=%v", err)
+	}
+	project := config.DefaultProject("other", "/tmp/other")
+	effective, err := config.Resolve(config.DefaultMachineLimits(), project, config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateProject(ctx, Project{Channel: domain.ChannelDev, ID: "mismatch", Path: "/tmp/mismatch", BaseRef: "main", ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: snapshot}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := database.SubmitTicketFenced(ctx, submission("mismatch", "SF-mismatch", domain.MergeGuarded, 0, 0), false, leader); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("mismatched frozen project identity err=%v", err)
+	}
+}
+
 func TestMigrationAndActiveTicketConstraint(t *testing.T) {
 	database, ctx := openTestStore(t)
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-1"}
@@ -478,6 +562,7 @@ func TestValidMergeIntentRulesetWitnessRoundTripAndTamper(t *testing.T) {
 	if err := database.RecordMergeIntent(ctx, intent); err != nil {
 		t.Fatal(err)
 	}
+	dropMergeIntentImmutability(t, database)
 	stored, found, err := database.MergeIntent(ctx, intent.SemanticKey)
 	if err != nil || !found || stored != intent {
 		t.Fatalf("ruleset round trip=%+v found=%v err=%v", stored, found, err)

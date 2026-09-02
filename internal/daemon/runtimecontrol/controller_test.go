@@ -2,7 +2,9 @@ package runtimecontrol
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -11,12 +13,23 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/engine"
+	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/workflowruntime"
 	"github.com/nysa-company/sf/internal/workflowworker"
 	"github.com/nysa-company/sf/internal/worktreecoord"
 )
+
+func TestCurrentTakeoverRemoteBaselineUsesCanonicalStoreDigest(t *testing.T) {
+	identity := []byte(`{"worktree":"/tmp/worktree"}`)
+	digest := sha256.Sum256(identity)
+	remote := git.PublicationRemoteObservation{BaseOID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	baseline := currentTakeoverRemoteBaseline(store.StoredWorktree{Path: "/tmp/worktree", Branch: "sf/dev/project/ticket", IdentityJSON: identity}, remote)
+	if baseline.WorktreeIdentity != fmt.Sprintf("%x", digest[:]) || len(baseline.WorktreeIdentity) != 64 {
+		t.Fatalf("takeover identity digest=%q, want canonical 64-byte hex", baseline.WorktreeIdentity)
+	}
+}
 
 type controlTickets struct{}
 

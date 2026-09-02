@@ -4,32 +4,46 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   baseline:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # v1's production execution and compiled acceptance boundary is macOS.
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: macos-14
+    # make test-all has a 90-minute local bound; leave setup/teardown headroom.
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: scripts/repo-check
-      - name: Scan secrets
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |-
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            scripts/secret-scan --base "$BASE_SHA" --head "$HEAD_SHA"
-          else
-            scripts/secret-scan
-          fi
       - run: scripts/artifact-check --base origin/main
-      - run: |-
-          go test ./...
+      - run: make test-all
+
+  credential-free-local-acceptance:
+    # This is credential-free local evidence, not stable-promotion approval.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: make test-all

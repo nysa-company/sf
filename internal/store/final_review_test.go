@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -338,6 +339,96 @@ func TestReviewRepairAndOperatorEscalationConsumeExactStoredReviewerResult(t *te
 	}
 }
 
+func TestTransitionReviewRepairRejectsNonCanonicalPayloadWithoutMutation(t *testing.T) {
+	fixture := finalReviewLifecycleFixture(t)
+	defer fixture.db.Close()
+	completeFinalReviewWith(t, fixture, phaseartifact.ReviewRepair, "builder")
+
+	before, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeEvents, err := fixture.db.Events(fixture.ctx, before.Ref.Channel, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeBudget int
+	if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COALESCE((SELECT used FROM ticket_counters WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'),0)`, before.Ref.Channel, before.Ref.Project, before.Ref.Ticket).Scan(&beforeBudget); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fixture.db.TransitionReviewRepair(fixture.ctx, Transition{
+		Ref: before.Ref, ExpectedVersion: before.Version, From: domain.StateReviewing,
+		To: domain.StateBuilding, Trigger: "review_repair", Fence: fixture.fence,
+		EventPayload: `{"unexpected":true}`,
+	})
+	if !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("noncanonical review repair payload err=%v, want evidence conflict", err)
+	}
+
+	after, err := fixture.db.Ticket(fixture.ctx, before.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterEvents, err := fixture.db.Events(fixture.ctx, before.Ref.Channel, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var afterBudget int
+	if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COALESCE((SELECT used FROM ticket_counters WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'),0)`, before.Ref.Channel, before.Ref.Project, before.Ref.Ticket).Scan(&afterBudget); err != nil {
+		t.Fatal(err)
+	}
+	if after.State != before.State || after.Version != before.Version || afterBudget != beforeBudget || len(afterEvents) != len(beforeEvents) {
+		t.Fatalf("noncanonical review repair payload mutated ticket/events/budget: before=%+v after=%+v before_events=%d after_events=%d before_budget=%d after_budget=%d", before, after, len(beforeEvents), len(afterEvents), beforeBudget, afterBudget)
+	}
+}
+
+func TestGenericTransitionCannotForgeReviewRepair(t *testing.T) {
+	for _, target := range []domain.State{domain.StateBuilding, domain.StateVerifying} {
+		t.Run(string(target), func(t *testing.T) {
+			fixture := finalReviewLifecycleFixture(t)
+			before, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeEvents, err := fixture.db.Events(fixture.ctx, before.Ref.Channel, 0, 1_000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var beforeBudget, beforeBoundaries int
+			if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COALESCE((SELECT used FROM ticket_counters WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'),0)`, before.Ref.Channel, before.Ref.Project, before.Ref.Ticket).Scan(&beforeBudget); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COUNT(*) FROM final_review_repair_boundaries WHERE channel=? AND project_id=? AND ticket_id=?`, before.Ref.Channel, before.Ref.Project, before.Ref.Ticket).Scan(&beforeBoundaries); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := fixture.db.Transition(fixture.ctx, Transition{Ref: before.Ref, ExpectedVersion: before.Version, From: domain.StateReviewing, To: target, Trigger: "review_repair", Fence: fixture.fence, EventPayload: `{}`}); !errors.Is(err, ErrEvidenceConflict) {
+				t.Fatalf("generic reviewing->%s review repair err=%v, want evidence conflict", target, err)
+			}
+
+			after, err := fixture.db.Ticket(fixture.ctx, before.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			afterEvents, err := fixture.db.Events(fixture.ctx, before.Ref.Channel, 0, 1_000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var afterBudget, afterBoundaries int
+			if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COALESCE((SELECT used FROM ticket_counters WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'),0)`, before.Ref.Channel, before.Ref.Project, before.Ref.Ticket).Scan(&afterBudget); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COUNT(*) FROM final_review_repair_boundaries WHERE channel=? AND project_id=? AND ticket_id=?`, before.Ref.Channel, before.Ref.Project, before.Ref.Ticket).Scan(&afterBoundaries); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(after, before) || len(afterEvents) != len(beforeEvents) || afterBudget != beforeBudget || afterBoundaries != beforeBoundaries {
+				t.Fatalf("generic reviewing->%s review repair mutated ticket/events/budget/boundaries: before=%+v after=%+v events=%d/%d budget=%d/%d boundaries=%d/%d", target, before, after, len(beforeEvents), len(afterEvents), beforeBudget, afterBudget, beforeBoundaries, afterBoundaries)
+			}
+		})
+	}
+}
+
 func TestFinalReviewStoreReplayUsesCompletedAttemptWithoutSecondProviderMutation(t *testing.T) {
 	fixture := finalReviewLifecycleFixture(t)
 	claim := completeFinalReview(t, fixture)
@@ -442,6 +533,69 @@ func TestFinalReviewStoreRecoveryRebindsExactResultOnce(t *testing.T) {
 	}
 }
 
+func TestReviewRepairAmendmentRejectsCompetingTransitionEvent(t *testing.T) {
+	fixture := finalReviewLifecycleFixture(t)
+	completeFinalReviewWith(t, fixture, phaseartifact.ReviewRepair, "reviewer")
+	if _, err := fixture.db.TransitionReviewRepair(fixture.ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, From: domain.StateReviewing, To: domain.StateVerifying, Trigger: "review_repair", Fence: fixture.fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.db.ExecContext(fixture.ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,from_state,to_state,trigger,payload,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket, current.Version, domain.StateReviewing, domain.StateBuilding, "forged_competing_transition", "{}", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := fixture.db.db.Conn(fixture.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, found, loadErr := fixture.db.reviewRepairVerificationAmendment(fixture.ctx, conn, current.Ref, current.Version, fixture.fence)
+	closeErr := conn.Close()
+	if !errors.Is(loadErr, ErrEvidenceConflict) || found || closeErr != nil {
+		t.Fatalf("competing repair event accepted: found=%v load=%v close=%v", found, loadErr, closeErr)
+	}
+}
+
+func TestReviewRepairAmendmentRejectsRetargetedBudgetRequest(t *testing.T) {
+	fixture := finalReviewLifecycleFixture(t)
+	completeFinalReviewWith(t, fixture, phaseartifact.ReviewRepair, "reviewer")
+	if _, err := fixture.db.TransitionReviewRepair(fixture.ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, From: domain.StateReviewing, To: domain.StateVerifying, Trigger: "review_repair", Fence: fixture.fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var consumedVersion, consumedLeader, consumedRunner uint64
+	if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch
+		FROM final_review_repair_boundaries WHERE channel=? AND project_id=? AND ticket_id=? AND target_state='verifying' AND transition_ticket_version=?`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket, current.Version).Scan(&consumedVersion, &consumedLeader, &consumedRunner); err != nil {
+		t.Fatal(err)
+	}
+	const unrelatedRequestID = "unrelated-final-review-budget"
+	if _, err := fixture.db.db.ExecContext(fixture.ctx, `INSERT INTO ticket_budget_uses(channel,project_id,ticket_id,kind,request_id,ticket_version,leader_epoch,runner_epoch,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket, "correction", unrelatedRequestID, consumedVersion, consumedLeader, consumedRunner, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.db.ExecContext(fixture.ctx, `DROP TRIGGER final_review_repair_boundaries_immutable_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE final_review_repair_boundaries SET correction_budget_request_id=?
+		WHERE channel=? AND project_id=? AND ticket_id=? AND target_state='verifying' AND transition_ticket_version=?`, unrelatedRequestID, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket, current.Version); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := fixture.db.db.Conn(fixture.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, found, loadErr := fixture.db.reviewRepairVerificationAmendment(fixture.ctx, conn, current.Ref, current.Version, fixture.fence)
+	closeErr := conn.Close()
+	if !errors.Is(loadErr, ErrEvidenceConflict) || found || closeErr != nil {
+		t.Fatalf("retargeted repair budget accepted: found=%v load=%v close=%v", found, loadErr, closeErr)
+	}
+}
+
 func TestReviewRepairBoundaryBridgesStartupBeforeFreshTargetClaim(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -454,6 +608,10 @@ func TestReviewRepairBoundaryBridgesStartupBeforeFreshTargetClaim(t *testing.T) 
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := finalReviewLifecycleFixture(t)
+			prior, err := fixture.db.RecoverableVerification(fixture.ctx, fixture.ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
 			completeFinalReviewWith(t, fixture, phaseartifact.ReviewRepair, tc.owner)
 			to := domain.StateBuilding
 			if tc.owner == "reviewer" {
@@ -477,6 +635,17 @@ func TestReviewRepairBoundaryBridgesStartupBeforeFreshTargetClaim(t *testing.T) 
 			}
 			if _, err := fixture.db.LatestReusableProviderAttempt(fixture.ctx, LatestReusableProviderAttemptRequest{Ref: live.Ref, Phase: tc.phase, Role: tc.role, ExpectedVersion: live.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: live.RunnerEpoch}}); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("recovered repair reused old %s result: %v", tc.phase, err)
+			}
+			if tc.owner == "reviewer" {
+				conn, err := fixture.db.db.Conn(fixture.ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				amendment, found, loadErr := fixture.db.reviewRepairVerificationAmendment(fixture.ctx, conn, live.Ref, live.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: live.RunnerEpoch})
+				closeErr := conn.Close()
+				if loadErr != nil || closeErr != nil || !found || amendment.PriorRevision != prior.Revision.Revision || amendment.Reason != "fix exact finding" || amendment.Requester != "final-reviewer" {
+					t.Fatalf("recovered reviewer repair amendment=%+v found=%v load=%v close=%v", amendment, found, loadErr, closeErr)
+				}
 			}
 		})
 	}
@@ -503,6 +672,14 @@ func TestFinalReviewTransitionsDeriveManualGuardedSpikeAndRejectAutonomous(t *te
 				fixture = finalReviewLifecycleFixtureFor(t, tc.ticketType, tc.mergeMode)
 			}
 			completeFinalReview(t, fixture)
+			if tc.ticketType == domain.TicketSpike {
+				if _, err := fixture.db.AcquireLeases(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence, []LeaseRequest{
+					{Scope: "global", Resource: "machine", Capacity: 1},
+					{Scope: "project", Resource: string(fixture.ticket.Ref.Project), Capacity: 1},
+				}, time.Now().UTC()); err != nil {
+					t.Fatal(err)
+				}
+			}
 			_, err := fixture.db.TransitionFinalReview(fixture.ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, From: domain.StateReviewing, To: tc.to, Trigger: "review_pass", Fence: fixture.fence, EventPayload: `{}`})
 			if tc.wantErr {
 				if !errors.Is(err, ErrEvidenceConflict) {
@@ -518,6 +695,9 @@ func TestFinalReviewTransitionsDeriveManualGuardedSpikeAndRejectAutonomous(t *te
 				t.Fatalf("ticket=%+v err=%v", current, err)
 			}
 			if tc.ticketType == domain.TicketSpike {
+				if leases, err := fixture.db.Leases(fixture.ctx, domain.ChannelDev); err != nil || len(leases) != 0 {
+					t.Fatalf("spike terminal transition retained capacity=%+v err=%v", leases, err)
+				}
 				var publication, mergeEffects, mergeIntents int
 				if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT COUNT(*) FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=?`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket).Scan(&publication); err != nil || publication != 0 {
 					t.Fatalf("spike publication rows=%d err=%v", publication, err)

@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -89,7 +91,7 @@ func (s *Store) MergeReconciliationReady(ctx context.Context, ref domain.TicketR
 	}
 
 	intent, found, err := singleRecoveryMergeIntent(ctx, conn, ref)
-	if err != nil || !found || intent.TicketVersion != version || intent.LeaderEpoch != fence.LeaderEpoch || intent.RunnerEpoch != fence.RunnerEpoch {
+	if err != nil || !found || intent.TicketVersion != version || intent.LeaderEpoch != fence.LeaderEpoch || intent.RunnerEpoch != fence.RunnerEpoch || validMergeIntentForProof(intent) != nil {
 		return false, nil
 	}
 	// Reuse the same strict publication/approval/recovery authority as merge
@@ -99,8 +101,15 @@ func (s *Store) MergeReconciliationReady(ctx context.Context, ref domain.TicketR
 	if err != nil || endpoint.version != version || endpoint.runner != fence.RunnerEpoch || endpoint.leader != fence.LeaderEpoch {
 		return false, nil
 	}
+	observation, observed, err := guardedMergeObservationFrom(ctx, conn, intent.SemanticKey)
+	if err != nil || !observed || !guardedMergeObservationMatchesIntent(observation, intent) {
+		return false, nil
+	}
+	if guardedMergeProtectedRefFetchMatches(ctx, conn, intent, observation.MergeOID, endpoint) != nil {
+		return false, nil
+	}
 	effect, err := effectFrom(ctx, conn, intent.SemanticKey)
-	if err != nil || effect.Ref != ref || effect.SemanticKey != intent.SemanticKey || effect.Kind != "merge" || effect.State != EffectConfirmed || effect.TicketVersion != version || effect.LeaderEpoch != fence.LeaderEpoch || effect.RunnerEpoch != fence.RunnerEpoch || effect.ClaimEpoch == 0 || effect.ClaimEpoch != intent.ClaimEpoch || effect.RequestDigest != intent.RequestDigest || effect.ObservedIdentity == "" {
+	if err != nil || effect.Ref != ref || effect.SemanticKey != intent.SemanticKey || effect.Kind != "merge" || effect.State != EffectConfirmed || effect.TicketVersion != version || effect.LeaderEpoch != fence.LeaderEpoch || effect.RunnerEpoch != fence.RunnerEpoch || effect.ClaimEpoch == 0 || effect.ClaimEpoch != intent.ClaimEpoch || effect.RequestDigest != intent.RequestDigest || !guardedMergeParentEffectIdentityMatches(observation, intent, effect.ObservedIdentity) {
 		return false, nil
 	}
 
@@ -109,7 +118,7 @@ func (s *Store) MergeReconciliationReady(ctx context.Context, ref domain.TicketR
 	// the authenticated intent rather than accepting an arbitrary pr_ready row.
 	readyKey := "merge-ready/" + string(ref.Channel) + "/" + string(ref.Project) + "/" + string(ref.Ticket) + "/" + intent.HeadOID
 	ready, err := effectFrom(ctx, conn, readyKey)
-	if err != nil || ready.Ref != ref || ready.Kind != "pr_ready" || ready.State != EffectConfirmed || ready.TicketVersion != version || ready.LeaderEpoch != fence.LeaderEpoch || ready.RunnerEpoch != fence.RunnerEpoch || ready.ClaimEpoch == 0 || ready.ObservedIdentity == "" {
+	if err != nil || ready.Ref != ref || ready.SemanticKey != readyKey || ready.Kind != "pr_ready" || ready.State != EffectConfirmed || ready.TicketVersion != version || ready.LeaderEpoch != fence.LeaderEpoch || ready.RunnerEpoch != fence.RunnerEpoch || ready.ClaimEpoch == 0 || ready.RequestDigest != canonicalReadyRequestDigest(intent) || ready.ObservedIdentity != "ready/"+intent.HeadOID {
 		return false, nil
 	}
 
@@ -121,9 +130,10 @@ func (s *Store) MergeReconciliationReady(ctx context.Context, ref domain.TicketR
 }
 
 // MergeIntentForProof returns only the currently live durable merge intent
-// matching a GitHub post-merge observation.  A GitHub adapter receives no Git
-// authority; this lookup lets the root composition mint a separate fenced Git
-// proof effect from the already-recorded merge intent.
+// matching a sealed exact GitHub post-merge observation. A GitHub adapter
+// receives no Git authority; this lookup lets the root composition mint a
+// separate fenced Git proof effect only after the source PR identity and its
+// observed post-merge commit have been bound together durably.
 func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, name, baseRef, originalBaseOID, mergeOID string) (domain.MergeIntent, error) {
 	if repositoryHost != "github.com" || owner == "" || name == "" || baseRef == "" || !validOID(originalBaseOID) || !validOID(mergeOID) || len(originalBaseOID) != len(mergeOID) {
 		return domain.MergeIntent{}, ErrEvidenceConflict
@@ -133,9 +143,9 @@ func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, 
 		return domain.MergeIntent{}, normalizeBusy(ctx, err)
 	}
 	defer conn.Close()
-	rows, err := conn.QueryContext(ctx, `SELECT m.semantic_key,t.state FROM merge_intents m JOIN effects e ON e.semantic_key=m.semantic_key JOIN tickets t ON t.channel=m.channel AND t.project_id=m.project_id AND t.id=m.ticket_id
-		WHERE m.repository_host=? AND m.repository_owner=? AND m.repository_name=? AND m.base_ref=? AND m.original_base_oid=?
-		AND e.effect_kind='merge' AND ((t.state='merging' AND e.state IN ('executing','uncertain','confirmed')) OR (t.state='reconciling' AND e.state='confirmed')) ORDER BY m.created_at DESC`, repositoryHost, owner, name, baseRef, originalBaseOID)
+	rows, err := conn.QueryContext(ctx, `SELECT m.semantic_key,t.state FROM guarded_merge_observations o JOIN merge_intents m ON m.semantic_key=o.semantic_key JOIN effects e ON e.semantic_key=m.semantic_key JOIN tickets t ON t.channel=m.channel AND t.project_id=m.project_id AND t.id=m.ticket_id
+		WHERE o.repository_host=? AND o.repository_owner=? AND o.repository_name=? AND o.base_ref=? AND o.original_base_oid=? AND o.merge_oid=?
+		AND e.effect_kind='merge' AND ((t.state='merging' AND e.state IN ('executing','uncertain','confirmed')) OR (t.state='reconciling' AND e.state='confirmed')) ORDER BY m.created_at DESC`, repositoryHost, owner, name, baseRef, originalBaseOID, mergeOID)
 	if err != nil {
 		return domain.MergeIntent{}, normalizeBusy(ctx, err)
 	}
@@ -159,41 +169,66 @@ func (s *Store) MergeIntentForProof(ctx context.Context, repositoryHost, owner, 
 		return domain.MergeIntent{}, err
 	}
 	if count != 1 {
-		return domain.MergeIntent{}, ErrNotFound
+		// Proof lookup is an authority boundary, not a convenience lookup. An
+		// absent (or ambiguous) post-merge observation must fail as conflicting
+		// evidence rather than invite a caller to infer a descendant witness.
+		return domain.MergeIntent{}, fmt.Errorf("%w: merge proof observation cardinality", ErrEvidenceConflict)
 	}
 	intent, found, err := mergeIntentFrom(ctx, conn, key)
-	if err != nil || !found || intent.OriginalBaseOID != originalBaseOID || intent.BaseRef != baseRef {
-		return domain.MergeIntent{}, ErrEvidenceConflict
+	observation, observed, observationErr := guardedMergeObservationFrom(ctx, conn, key)
+	if err != nil || !found || observationErr != nil || !observed || intent.OriginalBaseOID != originalBaseOID || intent.BaseRef != baseRef || observation.MergeOID != mergeOID || !guardedMergeObservationMatchesIntent(observation, intent) || validMergeIntentForProof(intent) != nil {
+		return domain.MergeIntent{}, fmt.Errorf("%w: merge proof intent or observation mismatch", ErrEvidenceConflict)
 	}
 	if state == domain.StateMerging {
 		effect, err := effectFrom(ctx, conn, intent.SemanticKey)
-		if err != nil {
+		if err != nil || effect.Ref != intent.Ref || effect.SemanticKey != intent.SemanticKey || effect.Kind != "merge" || effect.RequestDigest != intent.RequestDigest {
 			return domain.MergeIntent{}, ErrEvidenceConflict
+		}
+		exactLaunch := effect.TicketVersion == intent.TicketVersion && effect.LeaderEpoch == intent.LeaderEpoch && effect.RunnerEpoch == intent.RunnerEpoch && effect.ClaimEpoch == intent.ClaimEpoch
+		if !exactLaunch && effect.State != EffectConfirmed {
+			// GitHub can apply the merge after the command handoff but before its
+			// exact merged-PR observation is recorded. A restart makes the parent
+			// effect uncertain under a new leader and fences the ticket. The
+			// observation writer has already authenticated that narrow recovery
+			// shape; the immediately following protected-ref proof must accept the
+			// same historical intent, never a generic promoted effect.
+			if effect.State != EffectUncertain {
+				return domain.MergeIntent{}, ErrEvidenceConflict
+			}
+			var current normalRecoveryEndpoint
+			var liveState domain.State
+			if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&liveState, &current.version, &current.runner, &current.leader); err != nil || liveState != domain.StateMerging {
+				return domain.MergeIntent{}, ErrEvidenceConflict
+			}
+			approval, err := s.approvalRecoveryEndpoint(ctx, conn, intent.Ref)
+			if err != nil || s.authenticateMergingRecoveryEffect(ctx, conn, intent.Ref, approval, current, current.leader, intent) != nil {
+				return domain.MergeIntent{}, ErrEvidenceConflict
+			}
 		}
 		if effect.State == EffectConfirmed {
 			confirmed, err := s.confirmedMergeRecoveryEndpoint(ctx, conn, intent.Ref)
 			if err != nil || confirmed.version != effect.TicketVersion || confirmed.runner != effect.RunnerEpoch || confirmed.leader != effect.LeaderEpoch {
-				return domain.MergeIntent{}, ErrEvidenceConflict
+				return domain.MergeIntent{}, fmt.Errorf("%w: confirmed merge endpoint mismatch", ErrEvidenceConflict)
 			}
 			var live normalRecoveryEndpoint
 			var liveState domain.State
 			if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&liveState, &live.version, &live.runner, &live.leader); err != nil || liveState != domain.StateMerging {
-				return domain.MergeIntent{}, ErrEvidenceConflict
+				return domain.MergeIntent{}, fmt.Errorf("%w: live merge endpoint unavailable", ErrEvidenceConflict)
 			}
 			var controls int
 			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).Scan(&controls); err != nil || controls > 1 {
-				return domain.MergeIntent{}, ErrEvidenceConflict
+				return domain.MergeIntent{}, fmt.Errorf("%w: runtime control cardinality", ErrEvidenceConflict)
 			}
 			if controls == 1 {
 				control, err := runtimeControlFrom(ctx, conn, intent.Ref)
 				if err != nil || control.state != "open" || control.authority.version != live.version || control.authority.runner != live.runner || control.authority.leader != live.leader {
-					return domain.MergeIntent{}, ErrEvidenceConflict
+					return domain.MergeIntent{}, fmt.Errorf("%w: runtime control does not authorize live merge endpoint", ErrEvidenceConflict)
 				}
 			} else if live != confirmed {
-				return domain.MergeIntent{}, ErrEvidenceConflict
+				return domain.MergeIntent{}, fmt.Errorf("%w: live merge endpoint has no runtime control", ErrEvidenceConflict)
 			}
 			if authenticateCurrentPostPublicationEndpointBridge(ctx, conn, intent.Ref, domain.StateMerging, confirmed, live) != nil {
-				return domain.MergeIntent{}, ErrEvidenceConflict
+				return domain.MergeIntent{}, fmt.Errorf("%w: merge endpoint control lineage", ErrEvidenceConflict)
 			}
 		}
 	}
@@ -278,4 +313,35 @@ func validMergeIntent(intent domain.MergeIntent) error {
 		return fmt.Errorf("invalid merge intent")
 	}
 	return intent.ValidateProtectionWitness()
+}
+
+// validMergeIntentForProof is stricter than the write-time shape check. A
+// merge proof may use only an intent whose request digest binds the exact PR
+// source identity, source head, protected base, method, and all four exact
+// base-authorization facts. Without this check a tampered or legacy arbitrary
+// digest could authorize a protected-ref proof for a different source PR while
+// the repository/base tuple still matched.
+func validMergeIntentForProof(intent domain.MergeIntent) error {
+	if err := validMergeIntent(intent); err != nil {
+		return err
+	}
+	if !validOID(intent.HeadOID) || !validOID(intent.OriginalBaseOID) || intent.RequestDigest != canonicalMergeRequestDigest(intent) {
+		return fmt.Errorf("merge intent request digest does not bind source identity")
+	}
+	return nil
+}
+
+func canonicalMergeRequestDigest(intent domain.MergeIntent) string {
+	input := "merge\x00" + intent.RepositoryOwner + "/" + intent.RepositoryName + "\x00" + intent.HeadOwner + "\x00" + intent.HeadRepository + "\x00" + intent.HeadRef + "\x00" + intent.HeadOID + "\x00" + intent.BaseRef + "\x00" + intent.OriginalBaseOID
+	for _, value := range []string{intent.HeadOID, intent.Method, intent.OriginalBaseOID, intent.OriginalBaseOID, intent.OriginalBaseOID, intent.OriginalBaseOID} {
+		input += "\x00" + value
+	}
+	sum := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(sum[:])
+}
+
+func canonicalReadyRequestDigest(intent domain.MergeIntent) string {
+	input := "pr_ready\x00" + intent.RepositoryOwner + "/" + intent.RepositoryName + "\x00" + intent.HeadOwner + "\x00" + intent.HeadRepository + "\x00" + intent.HeadRef + "\x00" + intent.HeadOID + "\x00" + intent.BaseRef + "\x00" + intent.OriginalBaseOID
+	sum := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(sum[:])
 }

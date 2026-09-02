@@ -339,11 +339,22 @@ func (r Runner) commandExpected(ctx context.Context, directory string, expectedD
 		return nil, fmt.Errorf("%w: command directory identity changed", ErrIdentityMismatch)
 	}
 	gitDirectory := directory
+	commandArguments := args
 	if r.Run == nil {
 		gitDirectory = "."
+		// The sf_e2e transport seam is deliberately applied to the raw,
+		// code-owned operation arguments. Production Git prefixes every command
+		// with its fixed -C/-c hardening options, which must remain outside the
+		// exact push/ls-remote/fetch matcher. Replace only on the direct-exec
+		// path; injected Run adapters continue to observe the canonical HTTPS
+		// argv unchanged.
+		commandArguments, err = rewriteE2ERemoteArgv(args)
+		if err != nil {
+			return nil, err
+		}
 	}
-	argv := r.commandArgs(gitDirectory, args...)
-	argv = append(argv, args...)
+	argv := r.commandArgs(gitDirectory, commandArguments...)
+	argv = append(argv, commandArguments...)
 	if r.Run != nil {
 		output, err := r.Run(ctx, r.binary(), argv, env)
 		if verifyErr := pinned.verify(); verifyErr != nil {
@@ -399,14 +410,22 @@ func (r Runner) commandEnvExpectedWithHandoff(ctx context.Context, directory str
 		return nil, fmt.Errorf("%w: command directory identity changed", ErrIdentityMismatch)
 	}
 	gitDirectory := directory
+	commandArguments := args
 	if r.Run == nil {
 		gitDirectory = "."
+		// Keep the tagged local transport bridge scoped to the raw operation
+		// suffix. See commandExpected for why the fixed Git hardening prefix is
+		// intentionally constructed only after this exact rewrite.
+		commandArguments, err = rewriteE2ERemoteArgv(args)
+		if err != nil {
+			return nil, err
+		}
 	}
-	argv := r.commandArgs(gitDirectory, args...)
+	argv := r.commandArgs(gitDirectory, commandArguments...)
 	if helper := credentialHelperFromEnvironment(extra); helper != "" {
 		argv = append(argv, "-c", "credential.useHttpPath=true", "-c", "credential.helper="+helper)
 	}
-	argv = append(argv, args...)
+	argv = append(argv, commandArguments...)
 	if r.Run != nil {
 		if handedOff != nil {
 			*handedOff = true

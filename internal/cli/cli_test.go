@@ -33,6 +33,18 @@ func TestPrimaryCommandsAndSecondarySetupCommandsExist(t *testing.T) {
 	}
 }
 
+func TestRootHelpUsesTheSelectedChannelBinary(t *testing.T) {
+	for _, test := range []struct {
+		channel domain.Channel
+		want    string
+	}{{domain.ChannelStable, "sf"}, {domain.ChannelDev, "sf-dev"}} {
+		command := (&app{out: &bytes.Buffer{}, errOut: &bytes.Buffer{}, channel: test.channel, ctx: context.Background()}).command()
+		if command.Use != test.want {
+			t.Fatalf("channel=%s use=%q, want %q", test.channel, command.Use, test.want)
+		}
+	}
+}
+
 func TestLifecycleCommandUsesSocketClientAndChannelIdentity(t *testing.T) {
 	var got api.Request
 	client := fakeClient(func(_ context.Context, request api.Request) (api.Response, error) {
@@ -347,6 +359,8 @@ func TestHumanRendererProjectsKnownTicketAndLogShapes(t *testing.T) {
 	}{
 		{name: "ticket", data: `{"channel":"dev","project":"nysa","ticket":"SF-1","state":"waiting_approval","merge_mode":"guarded"}`, want: []string{"SF-1", "Channel: dev", "State: waiting_approval", "Merge mode: guarded"}},
 		{name: "detail", data: `{"channel":"stable","project":"nysa","ticket":"SF-2","state":"done","title":"Fix reminders","problem":"A bounded problem.","acceptance":["one"]}`, want: []string{"SF-2  Fix reminders", "Problem: A bounded problem.", "Acceptance: 1 item(s)"}},
+		{name: "takeover", data: `{"channel":"dev","project":"nysa","ticket":"SF-4","state":"paused","resume_state":"building","takeover":{"registered":true,"path":"/private/tmp/SF-4","branch":"sf/SF-4","repository":"/private/tmp/repo","base_sha":"base","head_sha":"head","clean":true,"change_kind":"none","changed_files":[],"source_resumable":false}}`, want: []string{"SF-4", "State: paused", "Resume state: building", "Takeover worktree: /private/tmp/SF-4", "Branch: sf/SF-4", "Repository: /private/tmp/repo", "Local base: base", "Local head: head", "Change kind: none"}},
+		{name: "early_takeover", data: `{"channel":"dev","project":"nysa","ticket":"SF-5","state":"paused","resume_state":"planning","takeover":{"registered":false,"path":"","clean":true,"change_kind":"no_worktree","changed_files":[],"source_resumable":false},"next_action":{"code":"resume","argv":["sf-dev","resume","SF-5"]}}`, want: []string{"SF-5", "State: paused", "Resume state: planning", "Takeover worktree: not created yet", "Next: sf-dev resume SF-5"}},
 		{name: "logs", data: `{"channel":"dev","ticket":"SF-3","events":[{"id":4,"from":"planning","to":"verifying"}]}`, want: []string{"Logs: SF-3", "#4 planning -> verifying"}},
 	}
 	for _, test := range tests {
@@ -360,6 +374,9 @@ func TestHumanRendererProjectsKnownTicketAndLogShapes(t *testing.T) {
 				if !strings.Contains(output.String(), want) {
 					t.Fatalf("output=%q missing %q", output.String(), want)
 				}
+			}
+			if test.name == "early_takeover" && strings.Count(output.String(), "Next:") != 1 {
+				t.Fatalf("early takeover output has duplicate next actions: %q", output.String())
 			}
 		})
 	}

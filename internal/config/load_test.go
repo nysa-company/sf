@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/nysapure"
 )
 
 func TestLoadProjectDefaultsWithoutRepositoryFile(t *testing.T) {
@@ -72,6 +73,162 @@ func TestLoadProjectAutoDetectsDependencyFreeNode22Recipe(t *testing.T) {
 	}
 	if got := effective.Commands.Verify.Argv; len(got) != 2 || got[0] != "node" || got[1] != "--test" {
 		t.Fatalf("node argv=%q", got)
+	}
+}
+
+func TestLoadProjectAcceptsConfiguredNysaPureTypedRecipe(t *testing.T) {
+	repository := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repository, ".sf"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "package.json"), []byte(`{"name":"workspace","workspaces":["apps/*"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := "[commands]\nverify = [\"node\", \"--sf-nysa-api-pure-v1\", \"apps/api/tests/retrieval-fusion.test.ts\"]\nreview = [\"node\", \"--sf-nysa-api-pure-v1\", \"apps/api/tests/retrieval-fusion.test.ts\"]\n"
+	if err := os.WriteFile(filepath.Join(repository, ".sf", "config.toml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	effective, _, _, err := LoadProject(repository, "nysa", DefaultMachineLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := effective.Commands.Verify.Argv; len(got) != 3 || got[1] != "--sf-nysa-api-pure-v1" || got[2] != "apps/api/tests/retrieval-fusion.test.ts" {
+		t.Fatalf("argv=%q", got)
+	}
+}
+
+func TestEnsureNysaPureConfigBootstrapsAndDoesNotOverwrite(t *testing.T) {
+	repository := t.TempDir()
+	entrypoint := filepath.Join(repository, "apps", "api", "tests", "retrieval-fusion.test.ts")
+	if err := os.MkdirAll(filepath.Dir(entrypoint), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entrypoint, []byte("import test from 'node:test'; test('proof', () => {});\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	testPath := "apps/api/tests/retrieval-fusion.test.ts"
+	created, err := EnsureNysaPureConfig(repository, NysaPureAPIV1Profile, testPath)
+	if err != nil || !created {
+		t.Fatalf("created=%v err=%v", created, err)
+	}
+	effective, _, _, err := LoadProject(repository, "nysa", DefaultMachineLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"node", nysapure.RecipeFlag, testPath}
+	if !sameStrings(effective.Commands.Verify.Argv, want) || !sameStrings(effective.Commands.Review.Argv, want) {
+		t.Fatalf("commands verify=%q review=%q", effective.Commands.Verify.Argv, effective.Commands.Review.Argv)
+	}
+	if effective.PhaseTimeout != time.Minute {
+		t.Fatalf("fresh %s profile phase timeout=%s, want %s", NysaPureAPIV1Profile, effective.PhaseTimeout, time.Minute)
+	}
+	created, err = EnsureNysaPureConfig(repository, NysaPureAPIV1Profile, testPath)
+	if err != nil || created {
+		t.Fatalf("matching replay created=%v err=%v", created, err)
+	}
+	if _, err := EnsureNysaPureConfig(repository, NysaPureAPIV1Profile, "apps/api/tests/other.test.ts"); err == nil {
+		t.Fatal("different entrypoint should not overwrite existing configuration")
+	}
+}
+
+func TestEnsureNysaPureConfigRejectsProfileAndPathAmbiguity(t *testing.T) {
+	repository := t.TempDir()
+	if _, err := EnsureNysaPureConfig(repository, "", "apps/api/tests/proof.test.ts"); err == nil {
+		t.Fatal("test path without profile should be refused")
+	}
+	if _, err := EnsureNysaPureConfig(repository, "unknown", "apps/api/tests/proof.test.ts"); err == nil {
+		t.Fatal("unknown profile should be refused")
+	}
+}
+
+func TestNysaPureBootstrapLockSerializesAndRollsBackOnlyItsInstall(t *testing.T) {
+	repository := t.TempDir()
+	testPath := "apps/api/tests/kernel.test.ts"
+	entrypoint := filepath.Join(repository, filepath.FromSlash(testPath))
+	if err := os.MkdirAll(filepath.Dir(entrypoint), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entrypoint, []byte("import test from 'node:test'; test('proof', () => {});\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := PrepareNysaPureConfig(repository, NysaPureAPIV1Profile, testPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	secondResult := make(chan struct {
+		plan NysaPureConfigPlan
+		err  error
+	}, 1)
+	go func() {
+		plan, err := PrepareNysaPureConfig(repository, NysaPureAPIV1Profile, testPath)
+		secondResult <- struct {
+			plan NysaPureConfigPlan
+			err  error
+		}{plan, err}
+	}()
+	select {
+	case result := <-secondResult:
+		if result.err == nil {
+			_ = result.plan.Close()
+		}
+		t.Fatal("concurrent initializer bypassed .sf advisory lock")
+	case <-time.After(25 * time.Millisecond):
+	}
+	created, err := first.Install()
+	if err != nil || !created || first.ValidateUnchanged() != nil {
+		t.Fatalf("install created=%v err=%v", created, err)
+	}
+	if err := first.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(repository, ".sf", "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("rollback left config: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-secondResult:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		defer result.plan.Close()
+		if result.plan.Existing {
+			t.Fatal("rolled-back config was observed by concurrent initializer")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent initializer did not resume after lock release")
+	}
+}
+
+func TestNysaConfigPostLinkIdentityFailureRetainsOnlyTrackedRollbackAuthority(t *testing.T) {
+	repository := t.TempDir()
+	lock, err := acquireNysaConfigLock(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	configPath := filepath.Join(repository, ".sf", "config.toml")
+	afterNysaConfigLink = func() {
+		if err := os.Remove(configPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, []byte("foreign = true\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { afterNysaConfigLink = nil }()
+	installed, err := lock.install([]byte("[commands]\nverify=[]\nreview=[]\n"))
+	if err == nil || installed == nil {
+		t.Fatalf("post-link replacement installed=%v err=%v", installed, err)
+	}
+	if err := lock.rollback(installed); err == nil {
+		t.Fatal("rollback removed a replacement config")
+	}
+	data, readErr := os.ReadFile(configPath)
+	if readErr != nil || string(data) != "foreign = true\n" {
+		t.Fatalf("replacement config data=%q err=%v", data, readErr)
 	}
 }
 

@@ -275,7 +275,7 @@
     },
     {
       "id": "external_merge_verified",
-      "from": ["queued", "planning", "verifying", "building", "publishing", "waiting_ci", "reviewing", "waiting_approval", "waiting_manual_merge", "merging", "reconciling", "stopping", "cancelling", "paused", "blocked"],
+      "from": ["waiting_manual_merge"],
       "trigger": "external_merge_observed",
       "guards": ["merged_pr_identity_exact", "merged_source_head_equals_reviewed_head", "required_checks_green", "mode_completion_policy_satisfied"],
       "to": "reconciling",
@@ -285,7 +285,7 @@
     },
     {
       "id": "external_merge_unverified",
-      "from": ["queued", "planning", "verifying", "building", "publishing", "waiting_ci", "reviewing", "waiting_approval", "waiting_manual_merge", "merging", "reconciling", "stopping", "cancelling", "paused", "blocked"],
+      "from": ["waiting_approval", "waiting_manual_merge"],
       "trigger": "external_merge_observed",
       "guards": ["merge_exists", "verified_external_completion_guards_not_all_satisfied"],
       "to": "external_merged",
@@ -390,11 +390,11 @@
       "id": "resume_source_changes",
       "from": ["paused"],
       "trigger": "operator_resume",
-      "guards": ["operator_identity_authenticated", "takeover_source_diff_valid", "verification_files_unchanged", "branch_remote_identity_exact"],
-      "to": "building",
-      "phase_disposition": "adopt_operator_checkpoint_start_proof",
+      "guards": ["operator_identity_authenticated", "takeover_source_commit_valid", "verification_files_unchanged", "branch_remote_identity_exact"],
+      "to": "verifying",
+      "phase_disposition": "start_fresh_verification",
       "allowed_effects": [],
-      "invalidates": ["candidate"]
+      "invalidates": ["candidate", "proof"]
     },
     {
       "id": "resume_proof_changes",

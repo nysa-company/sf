@@ -608,3 +608,12 @@ func TestEnsureExcludesActiveRepositoryCommandWriter(t *testing.T) {
 		t.Fatalf("blocked ensure created %s: %v", path, err)
 	}
 }
+
+func TestTakeoverWorktreeIdentityDigestUsesStoreCanonicalForm(t *testing.T) {
+	identity := []byte(`{"repository":"/tmp/repository","worktree":"/tmp/worktree"}`)
+	sum := sha256.Sum256(identity)
+	want := hex.EncodeToString(sum[:])
+	if got := takeoverWorktreeIdentityDigest(identity); got != want || len(got) != 64 || strings.HasPrefix(got, "sha256:") {
+		t.Fatalf("takeover identity digest=%q, want canonical Store digest %q", got, want)
+	}
+}

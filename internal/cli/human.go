@@ -85,6 +85,11 @@ func renderTicket(writer io.Writer, ticket map[string]any, evidence any, context
 			return err
 		}
 	}
+	if takeover, ok := context["takeover"].(map[string]any); ok {
+		if err := renderTakeover(writer, takeover); err != nil {
+			return err
+		}
+	}
 	if title != "" {
 		if problem := stringField(ticket, "problem"); problem != "" {
 			if _, err := fmt.Fprintf(writer, "Problem: %s\n", problem); err != nil {
@@ -105,6 +110,59 @@ func renderTicket(writer io.Writer, ticket map[string]any, evidence any, context
 	if evidenceMap, ok := evidence.(map[string]any); ok {
 		if err := renderEvidence(writer, evidenceMap); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func renderTakeover(writer io.Writer, takeover map[string]any) error {
+	// An absolute path is intentionally displayed only in the authenticated
+	// `take` response. Ordinary status evidence omits it; the purpose of this
+	// handoff view is to give the operator one directly usable checkout.
+	if !boolField(takeover, "registered") || stringField(takeover, "path") == "" {
+		if _, err := io.WriteString(writer, "Takeover worktree: not created yet\n"); err != nil {
+			return err
+		}
+		return nil
+	}
+	if _, err := fmt.Fprintf(writer, "Takeover worktree: %s\n", stringField(takeover, "path")); err != nil {
+		return err
+	}
+	for _, field := range []struct{ label, key string }{
+		{"Branch", "branch"}, {"Repository", "repository"}, {"Origin", "origin"}, {"Push origin", "push_origin"},
+		{"Local base", "base_sha"}, {"Local head", "head_sha"}, {"Remote base", "remote_base_sha"}, {"Remote candidate", "remote_candidate_sha"},
+		{"Change kind", "change_kind"}, {"Retained proof", "retained_proof_digest"}, {"Retained policy", "retained_policy_digest"},
+		{"Retained version", "retained_version"}, {"Retained leader", "retained_leader_epoch"}, {"Retained runner", "retained_runner_epoch"},
+	} {
+		if text := displayField(takeover, field.key); text != "" {
+			if _, err := fmt.Fprintf(writer, "%s: %s\n", field.label, text); err != nil {
+				return err
+			}
+		}
+	}
+	if stringField(takeover, "remote_candidate_sha") == "" {
+		if _, err := io.WriteString(writer, "Remote candidate: absent\n"); err != nil {
+			return err
+		}
+	}
+	remoteIdentity := "changed"
+	if boolField(takeover, "remote_identity_exact") {
+		remoteIdentity = "exact"
+	}
+	if _, err := fmt.Fprintf(writer, "Remote identity: %s\n", remoteIdentity); err != nil {
+		return err
+	}
+	if changed, ok := takeover["changed_files"].([]any); ok && len(changed) > 0 {
+		files := make([]string, 0, len(changed))
+		for _, value := range changed {
+			if text, ok := value.(string); ok && text != "" {
+				files = append(files, text)
+			}
+		}
+		if len(files) > 0 {
+			if _, err := fmt.Fprintf(writer, "Changed files: %s\n", strings.Join(files, ", ")); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

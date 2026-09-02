@@ -39,6 +39,9 @@ type publishedObserverFake struct {
 func (f publishedObserverFake) ObservePublishedPullRequest(context.Context, contracts.PullRequestIdentity) (gh.PRMatch, error) {
 	return f.match, f.err
 }
+func (f publishedObserverFake) ObserveExternalMerge(context.Context, contracts.PullRequestIdentity) (gh.PRMatch, error) {
+	return f.match, f.err
+}
 func (publishedObserverFake) AuthStatus(context.Context) error { return nil }
 func (publishedObserverFake) Repository(context.Context, contracts.RepositoryIdentity) (contracts.RepositoryIdentity, error) {
 	return contracts.RepositoryIdentity{}, errors.New("unused")
@@ -130,5 +133,17 @@ func TestPublishedMergeObserverRejectsWrongObservedIdentity(t *testing.T) {
 	merged, err := (publishedMergeObserver{Store: storeFake, GitHub: publishedObserverFake{match: gh.PRMatch{Identity: wrong, State: "MERGED", Merged: true}}}).MergeObserved(context.Background(), ref)
 	if err == nil || merged {
 		t.Fatalf("wrong identity merged=%v err=%v", merged, err)
+	}
+}
+
+func TestPublishedMergeObserverExternalAllowsSourceHeadDrift(t *testing.T) {
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "app", Ticket: "SF-1"}
+	want := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "acme", Name: "app"}, Number: 7, HeadOwner: "acme", HeadRepository: "app", HeadRef: "sf/dev/app/SF-1", HeadOID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", BaseRef: "main", BaseOID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", FactoryOwned: true}
+	observed := want
+	observed.HeadOID = "cccccccccccccccccccccccccccccccccccccccc"
+	storeFake := &historicalStoreFake{evidence: store.PublishedCandidateEvidence{Ref: ref, PullRequest: want}}
+	value, err := (publishedMergeObserver{Store: storeFake, GitHub: publishedObserverFake{match: gh.PRMatch{Identity: observed, State: "MERGED", Merged: true, MergeCommit: "dddddddddddddddddddddddddddddddddddddddd", BaseHeadOID: want.BaseOID}}}).ObserveExternal(context.Background(), ref)
+	if err != nil || !value.Observed.Merged || value.Observed.Identity.HeadOID != observed.HeadOID {
+		t.Fatalf("external observation=%+v err=%v", value, err)
 	}
 }

@@ -90,6 +90,9 @@ func TestRepositoryCommandPolicy(t *testing.T) {
 	}{
 		{[]string{"go", "test", "./..."}, true},
 		{[]string{"node", "--test"}, true},
+		{[]string{"node", "--sf-nysa-api-pure-v1", "apps/api/tests/retrieval-fusion.test.ts"}, true},
+		{[]string{"node", "--sf-nysa-api-pure-v1", "../apps/api/tests/retrieval-fusion.test.ts"}, false},
+		{[]string{"node", "--sf-nysa-api-pure-v1", "apps/api/tests/retrieval-fusion.ts"}, false},
 		{[]string{"node", "--test", "test/smoke.test.js"}, false},
 		{[]string{"node", "--permission", "--test"}, false},
 		{[]string{"node", "script.js"}, false},

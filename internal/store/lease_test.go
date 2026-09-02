@@ -129,6 +129,94 @@ func TestLeaseCapacityIsBoundedUnderConcurrency(t *testing.T) {
 	}
 }
 
+func TestTerminalTransitionAtomicallyReleasesCapacityForNextTicket(t *testing.T) {
+	database, ctx := openTestStore(t)
+	first := createLeaseTicket(t, database, 20)
+	second := createLeaseTicket(t, database, 21)
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "terminal-capacity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := database.Ticket(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := []LeaseRequest{
+		{Scope: "global", Resource: "machine", Capacity: 1},
+		{Scope: "project", Resource: "nysa", Capacity: 1},
+	}
+	started, _, err := database.StartWithOwnership(ctx, first, queued.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: queued.RunnerEpoch}, "dev/nysa/SF-lease-20/planning", requests, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondQueued, err := database.Ticket(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := database.StartWithOwnership(ctx, second, secondQueued.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: secondQueued.RunnerEpoch}, "dev/nysa/SF-lease-21/planning", requests, time.Now().UTC()); !errors.Is(err, ErrLeaseCapacity) {
+		t.Fatalf("occupied terminal fixture did not consume capacity: %v", err)
+	}
+	if _, err := database.Transition(ctx, Transition{
+		Ref: first, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateDone,
+		Trigger: "test_terminal", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if leases, err := database.Leases(ctx, domain.ChannelDev); err != nil || len(leases) != 0 {
+		t.Fatalf("terminal transition retained capacity leases=%+v err=%v", leases, err)
+	}
+	if _, _, err := database.StartWithOwnership(ctx, second, secondQueued.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: secondQueued.RunnerEpoch}, "dev/nysa/SF-lease-21/planning", requests, time.Now().UTC()); err != nil {
+		t.Fatalf("terminal capacity was not available to the next ticket: %v", err)
+	}
+}
+
+func TestTerminalTransitionRollsBackWithActiveProviderWriter(t *testing.T) {
+	database, ctx := openTestStore(t)
+	first := createLeaseTicket(t, database, 22)
+	second := createLeaseTicket(t, database, 23)
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "terminal-capacity-provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := database.Ticket(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := []LeaseRequest{
+		{Scope: "global", Resource: "machine", Capacity: 1},
+		{Scope: "project", Resource: "nysa", Capacity: 1},
+	}
+	started, _, err := database.StartWithOwnership(ctx, first, queued.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: queued.RunnerEpoch}, "dev/nysa/SF-lease-22/planning", requests, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.ExecContext(ctx, `INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,usage_units,started_at,launch_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, first.Channel, first.Project, first.Ticket, "planning", 1, "test", "model", "family", "v1", "running", "planner", "active", 0, time.Now().UTC().Format(time.RFC3339Nano), "launching"); err != nil {
+		t.Fatal(err)
+	}
+	before := started
+	if _, err := database.Transition(ctx, Transition{
+		Ref: first, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateDone,
+		Trigger: "test_terminal", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: `{}`,
+	}); !errors.Is(err, ErrControlNotDrained) {
+		t.Fatalf("terminal transition accepted an active provider writer: %v", err)
+	}
+	after, err := database.Ticket(ctx, first)
+	if err != nil || after.State != before.State || after.Version != before.Version || after.RunnerEpoch != before.RunnerEpoch {
+		t.Fatalf("failed terminal transition did not roll back ticket: before=%+v after=%+v err=%v", before, after, err)
+	}
+	leases, err := database.Leases(ctx, domain.ChannelDev)
+	if err != nil || len(leases) != 2 {
+		t.Fatalf("failed terminal transition released capacity=%+v err=%v", leases, err)
+	}
+	secondQueued, err := database.Ticket(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := database.StartWithOwnership(ctx, second, secondQueued.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: secondQueued.RunnerEpoch}, "dev/nysa/SF-lease-23/planning", requests, time.Now().UTC()); !errors.Is(err, ErrLeaseCapacity) {
+		t.Fatalf("failed terminal transaction made capacity observable: %v", err)
+	}
+}
+
 func TestFenceRecoveredRunnersRollsBackAllTicketsAtGlobalLedgerCap(t *testing.T) {
 	database, ctx := openTestStore(t)
 	setupProviderProject(t, database, ctx)

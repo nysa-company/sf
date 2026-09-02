@@ -114,6 +114,7 @@ const (
 )
 
 var _ contracts.GitHub = (*Client)(nil)
+var _ contracts.ExternalMergeObserver = (*Client)(nil)
 
 // NewClient composes a caller-supplied protected-branch verifier with the
 // durable mutation and quarantine authorities. Daemon wiring remains outside
@@ -601,7 +602,8 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	if err != nil {
 		return err
 	}
-	if err := c.mergeIntents.RecordMergeIntent(ctx, domain.MergeIntent{Ref: durable.Ref, SemanticKey: durable.SemanticKey, RequestDigest: durable.RequestDigest, TicketVersion: durable.TicketVersion, LeaderEpoch: durable.LeaderEpoch, RunnerEpoch: durable.RunnerEpoch, ClaimEpoch: durable.ClaimEpoch, RepositoryHost: identity.Repository.Host, RepositoryOwner: identity.Repository.Owner, RepositoryName: identity.Repository.Name, PullRequestNumber: identity.Number, HeadOwner: identity.HeadOwner, HeadRepository: identity.HeadRepository, HeadRef: identity.HeadRef, HeadOID: headOID, BaseRef: identity.BaseRef, OriginalBaseOID: baseOID, ProtectionRuleID: protection.ID, ProtectionKind: protection.Kind, ProtectionChecksDigest: protection.ChecksDigest, StrictStatusChecks: true, AdminEnforced: protection.AdminEnforced, ActiveRulesetCount: uint32(protection.ActiveRulesetCount), Method: method}); err != nil {
+	intent := domain.MergeIntent{Ref: durable.Ref, SemanticKey: durable.SemanticKey, RequestDigest: durable.RequestDigest, TicketVersion: durable.TicketVersion, LeaderEpoch: durable.LeaderEpoch, RunnerEpoch: durable.RunnerEpoch, ClaimEpoch: durable.ClaimEpoch, RepositoryHost: identity.Repository.Host, RepositoryOwner: identity.Repository.Owner, RepositoryName: identity.Repository.Name, PullRequestNumber: identity.Number, HeadOwner: identity.HeadOwner, HeadRepository: identity.HeadRepository, HeadRef: identity.HeadRef, HeadOID: headOID, BaseRef: identity.BaseRef, OriginalBaseOID: baseOID, ProtectionRuleID: protection.ID, ProtectionKind: protection.Kind, ProtectionChecksDigest: protection.ChecksDigest, StrictStatusChecks: true, AdminEnforced: protection.AdminEnforced, ActiveRulesetCount: uint32(protection.ActiveRulesetCount), Method: method}
+	if err := c.mergeIntents.RecordMergeIntent(ctx, intent); err != nil {
 		return err
 	}
 	args := []string{"pr", "merge", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--match-head-commit", headOID, "--" + method}
@@ -625,7 +627,7 @@ func (c Client) MergeExactHead(ctx context.Context, durable domain.ExternalEffec
 	}
 	// A gh response can be lost after the server applies the expected-head
 	// mutation. Reconcile both delivered and unavailable command responses.
-	return c.reconcileStrictMerge(ctx, identity, headOID, baseOID)
+	return c.reconcileStrictMerge(ctx, identity, headOID, baseOID, intent)
 }
 
 func (c Client) validateClaim(ctx context.Context, claim domain.ExternalEffectClaim, identity contracts.PullRequestIdentity, requiredKind, digest string) error {
@@ -1011,6 +1013,73 @@ func (c Client) ObservePublishedPullRequest(ctx context.Context, want contracts.
 			// An open or closed-unmerged PR is still bound to the exact base
 			// witness that was published. Base movement is permitted only once
 			// GitHub has independently marked this exact PR merged.
+			return PRMatch{}, ErrNoMatchingPR
+		}
+		observed := value.match(candidate)
+		observed.Merged = mergedByState
+		if found != nil {
+			return PRMatch{}, ErrAmbiguousPR
+		}
+		found = &observed
+	}
+	if found == nil {
+		return PRMatch{}, ErrNoMatchingPR
+	}
+	return *found, nil
+}
+
+// ObserveExternalMerge is the sibling recovery boundary for a PR that may
+// have advanced its source head after publication. It keeps the durable PR
+// number, source owner/repository/ref, base ref, and factory marker exact;
+// only the observed source OID is allowed to differ. This is intentionally
+// separate from ObservePublishedPullRequest, whose exact-head contract is
+// retained for verified manual completion and cancellation compatibility.
+func (c Client) ObserveExternalMerge(ctx context.Context, want contracts.PullRequestIdentity) (PRMatch, error) {
+	if !validPersistedPRIdentity(want) {
+		return PRMatch{}, ErrPolicyRefusal
+	}
+	var values []prWire
+	if err := c.json(ctx, &values, "pr", "list", "--repo", repoArg(want.Repository), "--state", "all", "--limit", "100", "--json", prFields); err != nil {
+		return PRMatch{}, err
+	}
+	if len(values) == 100 {
+		return PRMatch{}, ErrAmbiguousPR
+	}
+	var found *PRMatch
+	for _, value := range values {
+		candidate, err := value.identityUnmarked(want.Repository)
+		if err != nil {
+			return PRMatch{}, err
+		}
+		if candidate.HeadOwner != want.HeadOwner || candidate.HeadRepository != want.HeadRepository || candidate.HeadRef != want.HeadRef || candidate.BaseRef != want.BaseRef || !candidate.FactoryOwned {
+			continue
+		}
+		if candidate.Number != want.Number {
+			return PRMatch{}, ErrAmbiguousPR
+		}
+		if !strings.Contains(value.Body, ownershipMarker(want)) && !strings.Contains(value.Body, ownershipMarker(candidate)) {
+			return PRMatch{}, ErrNoMatchingPR
+		}
+		if value.State != "OPEN" && value.State != "CLOSED" && value.State != "MERGED" {
+			return PRMatch{}, ErrMalformedResponse
+		}
+		if !validOID(candidate.BaseOID) {
+			return PRMatch{}, ErrMalformedResponse
+		}
+		mergedByTimestamp := value.MergedAt != nil
+		mergedByState := value.State == "MERGED"
+		if mergedByTimestamp != mergedByState {
+			return PRMatch{}, ErrMalformedResponse
+		}
+		if value.MergedAt != nil {
+			if _, err := time.Parse(time.RFC3339, *value.MergedAt); err != nil {
+				return PRMatch{}, ErrMalformedResponse
+			}
+		}
+		if mergedByState && (value.Draft || value.MergeCommit == nil || !validOID(value.MergeCommit.OID)) {
+			return PRMatch{}, ErrMalformedResponse
+		}
+		if !mergedByState && candidate.BaseOID != want.BaseOID {
 			return PRMatch{}, ErrNoMatchingPR
 		}
 		observed := value.match(candidate)
@@ -1649,7 +1718,7 @@ func containsCheck(values []string, wanted string) bool {
 	return false
 }
 
-func (c Client) reconcileStrictMerge(ctx context.Context, identity contracts.PullRequestIdentity, headOID, originalBaseOID string) error {
+func (c Client) reconcileStrictMerge(ctx context.Context, identity contracts.PullRequestIdentity, headOID, originalBaseOID string, intent domain.MergeIntent) error {
 	observed, err := c.viewNumber(ctx, identity.Repository, identity.Number)
 	if err != nil {
 		return err
@@ -1657,9 +1726,21 @@ func (c Client) reconcileStrictMerge(ctx context.Context, identity contracts.Pul
 	if !observed.Merged || !sameMergeIdentity(observed.Identity, identity) || observed.Identity.HeadOID != headOID || observed.State != "MERGED" || observed.MergeCommit == "" || c.verifyProtectedBranch == nil {
 		return ErrPolicyRefusal
 	}
+	// This record is the durable boundary between the exact merged-PR response
+	// and the separate Git protected-branch proof.  Do not let the proof lookup
+	// infer authority from a descendant commit or a repository/base tuple.
+	if c.mergeIntents == nil {
+		return ErrPolicyRefusal
+	}
+	if err := c.mergeIntents.RecordGuardedMergeObservation(ctx, intent, contracts.PublishedPullRequestObservation{
+		Identity: observed.Identity, Merged: observed.Merged, Draft: observed.Draft,
+		MergeCommit: observed.MergeCommit, BaseHeadOID: observed.BaseHeadOID, State: observed.State,
+	}); err != nil {
+		return fmt.Errorf("record guarded merge observation: %w", err)
+	}
 	proof, err := c.verifyProtectedBranch.VerifyProtectedBranch(ctx, identity.Repository, identity.BaseRef, observed.MergeCommit, originalBaseOID)
 	if err != nil {
-		return err
+		return fmt.Errorf("verify guarded merge protected branch: %w", err)
 	}
 	if proof.Repository != identity.Repository || proof.BaseRef != identity.BaseRef || proof.MergeCommit != observed.MergeCommit || proof.OriginalBaseOID != originalBaseOID || !validOID(proof.BaseHeadOID) || !proof.Contains {
 		return ErrPolicyRefusal
@@ -1679,7 +1760,7 @@ func (c Client) ObserveMergeIntent(ctx context.Context, intent domain.MergeInten
 	if err != nil || !observed.Merged || !sameMergeIdentity(observed.Identity, identity) || observed.Identity.HeadOID != intent.HeadOID || observed.Identity.BaseRef != intent.BaseRef || observed.MergeCommit == "" {
 		return "", ErrExternalMerged
 	}
-	if err := c.reconcileStrictMerge(ctx, observed.Identity, intent.HeadOID, intent.OriginalBaseOID); err != nil {
+	if err := c.reconcileStrictMerge(ctx, observed.Identity, intent.HeadOID, intent.OriginalBaseOID, intent); err != nil {
 		return "", err
 	}
 	return identity.Repository.Owner + "/" + identity.Repository.Name + "@" + observed.MergeCommit, nil

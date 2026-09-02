@@ -26,6 +26,11 @@ type PhaseEvidence interface {
 	Worktree(context.Context, domain.TicketRef) (store.StoredWorktree, error)
 	Plan(context.Context, domain.TicketRef) (store.StoredPlan, error)
 	CurrentVerification(context.Context, domain.TicketRef) (store.StoredVerification, error)
+	RecoverableVerification(context.Context, domain.TicketRef) (store.StoredVerification, error)
+	LatestReusableProviderAttempt(context.Context, store.LatestReusableProviderAttemptRequest) (store.LatestReusableProviderAttemptResult, error)
+	OperatorSourceResumeRequiresFreshVerification(context.Context, domain.TicketRef, uint64) (bool, error)
+	OperatorSourceResumeProof(context.Context, domain.TicketRef, uint64, domain.Fence) (store.OperatorSourceResumeProof, bool, error)
+	PendingVerificationAmendment(context.Context, domain.TicketRef, uint64, domain.Fence) (store.VerificationAmendment, error)
 	FinalReviewAuthority(context.Context, domain.TicketRef, uint64, domain.Fence) (store.FinalReviewAuthority, error)
 	AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error
 	LoadCurrentProviderAttemptResult(context.Context, store.ProviderAttemptResultKey, uint64, domain.Fence) (store.ProviderAttemptResult, phaseartifact.Parsed, error)
@@ -114,12 +119,70 @@ func (r PhaseRunner) verification(ctx context.Context, request workflowworker.Ph
 	if err != nil {
 		return workflowworker.PhaseResult{}, err
 	}
-	if verification, readErr := r.Store.CurrentVerification(ctx, request.Ticket.Ref); readErr == nil || !errors.Is(readErr, store.ErrNotFound) {
-		// A verifier is only launched before a verification is recorded. If a
-		// concurrent worker has already recorded one, this request is no longer
-		// an admission to launch a new predecessor result.
-		_ = verification
-		return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+	freshSource, err := r.Store.OperatorSourceResumeRequiresFreshVerification(ctx, request.Ticket.Ref, request.Ticket.Version)
+	if err != nil {
+		return workflowworker.PhaseResult{}, err
+	}
+	var sourceProof store.OperatorSourceResumeProof
+	if freshSource {
+		var found bool
+		sourceProof, found, err = r.Store.OperatorSourceResumeProof(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+		if err != nil || !found || sourceProof.Verification.Revision.Revision == 0 || sourceProof.Verification.TicketVersion >= request.Ticket.Version {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
+	}
+	if request.Amendment == nil {
+		// The amendment is a Store-owned mode switch, not an optional prompt
+		// decoration. A direct PhaseRunner caller must not bypass a pending
+		// Builder request simply by omitting its projection from PhaseRequest.
+		if _, amendmentErr := r.Store.PendingVerificationAmendment(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence); amendmentErr == nil {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		} else if !errors.Is(amendmentErr, store.ErrNotFound) {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
+		verification, readErr := r.Store.CurrentVerification(ctx, request.Ticket.Ref)
+		if freshSource && errors.Is(readErr, store.ErrEvidenceConflict) {
+			verification, readErr = r.Store.RecoverableVerification(ctx, request.Ticket.Ref)
+		}
+		if readErr != nil && !errors.Is(readErr, store.ErrNotFound) {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
+		if readErr == nil && (!freshSource || verification.Revision.Revision != sourceProof.Verification.Revision.Revision) {
+			// A verifier is only launched before a verification is recorded.  A
+			// source resume retains one historical revision only to authenticate the
+			// checkout.  Any distinct fresh durable revision must be rebound by
+			// Worker, never re-run by this provider boundary.
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
+		if freshSource {
+			reusable, reusableErr := r.Store.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: request.Ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: request.Ticket.Version, Fence: request.Fence})
+			if reusableErr == nil && reusable.Key != sourceProof.Verification.ProviderResult {
+				// The Reviewer has already returned, but checkpoint materialization
+				// has not yet been durably recorded. Worker owns that one-time write.
+				return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+			}
+			if reusableErr != nil && !errors.Is(reusableErr, store.ErrNotFound) {
+				return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+			}
+		}
+	}
+	if request.Amendment != nil {
+		stored, amendmentErr := r.Store.PendingVerificationAmendment(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+		if amendmentErr != nil || !reflect.DeepEqual(stored, *request.Amendment) {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
+		// A completed amendment Reviewer can survive a daemon recovery with its
+		// original fence. Reuse only one that descends from this request's
+		// Builder->verifying endpoint; LatestReusable proves the recovery ledger
+		// to the live fence. In particular, an earlier ordinary verification result
+		// is not amendment authority and does not suppress the required review.
+		if reusable, reusableErr := r.Store.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: request.Ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: request.Ticket.Version, Fence: request.Fence}); reusableErr == nil {
+			if stored.TransitionTicketVersion != 0 && reusable.Result.Claim.ExpectedVersion >= stored.TransitionTicketVersion {
+				return workflowworker.PhaseResult{ProviderResult: reusable.Key}, nil
+			}
+		} else if !errors.Is(reusableErr, store.ErrNotFound) {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
 	}
 	_, identity, err := r.planIdentity(ctx, request, project, worktree)
 	if err != nil {
@@ -130,11 +193,19 @@ func (r PhaseRunner) verification(ctx context.Context, request workflowworker.Ph
 		Workspace: phaseWorkspace(project, worktree, identity.Plan.Paths),
 		Plan:      identity,
 		Runtime:   phaseRuntime(effective.PhaseTimeout),
+		Amendment: amendmentPrompt(request.Amendment),
 	})
 	if err != nil {
 		return workflowworker.PhaseResult{}, ErrConfigSnapshotInvalid
 	}
 	return r.run(ctx, request, project, worktree, providercoord.RoleReviewer, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: identity.Digest})
+}
+
+func amendmentPrompt(value *store.VerificationAmendment) *workflowprompt.AmendmentReview {
+	if value == nil {
+		return nil
+	}
+	return &workflowprompt.AmendmentReview{PriorProofDigest: value.Prior.ProofDigest, ProposedDigest: value.ProposedDigest, ProposedCommand: append([]string(nil), value.ProposedCommand...), Reason: value.Reason, Requester: value.Requester}
 }
 
 func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequest) (workflowworker.PhaseResult, error) {
@@ -163,8 +234,9 @@ func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequ
 	if err != nil {
 		return workflowworker.PhaseResult{}, ErrConfigSnapshotInvalid
 	}
-	// ApprovedAmendmentDigest remains empty by design. Any attempt to modify a
-	// protected verification path therefore fails in phaseartifact validation.
+	// A protected verification change is admissible only as a bounded Builder
+	// amendment request. The Store records and charges that request before a
+	// fresh independent Reviewer may accept the exact proposed proof.
 	return r.run(ctx, request, project, worktree, providercoord.RoleBuilder, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ProtectedVerification: append([]string(nil), verification.OwnedFiles...)})
 }
 

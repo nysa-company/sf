@@ -55,8 +55,12 @@ func newApp(client Client, out, errOut io.Writer) *app {
 }
 
 func (a *app) command() *cobra.Command {
+	use := "sf"
+	if a.channel == domain.ChannelDev {
+		use = "sf-dev"
+	}
 	root := &cobra.Command{
-		Use:           "sf",
+		Use:           use,
 		Short:         "safe local software factory",
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -455,12 +459,14 @@ func (a *app) authCommand() *cobra.Command {
 }
 
 func (a *app) initCommand() *cobra.Command {
-	var project, repo string
-	command := &cobra.Command{Use: "init --project <name> --repo <path>", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		return a.emit(RunInit(cmd.Context(), InitRequest{Channel: a.channel, Project: project, Repo: repo}))
+	var project, repo, profile, testPath string
+	command := &cobra.Command{Use: "init --project <name> --repo <path> [--profile <name> --test <path>]", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		return a.emit(RunInit(cmd.Context(), InitRequest{Channel: a.channel, Project: project, Repo: repo, Profile: profile, TestPath: testPath}))
 	}}
 	command.Flags().StringVar(&project, "project", "", "project name")
 	command.Flags().StringVar(&repo, "repo", "", "trusted repository path")
+	command.Flags().StringVar(&profile, "profile", "", "explicit project profile (for example nysa-api-pure-v1)")
+	command.Flags().StringVar(&testPath, "test", "", "repository-relative .test.ts entrypoint for the selected profile")
 	_ = command.MarkFlagRequired("project")
 	_ = command.MarkFlagRequired("repo")
 	return command

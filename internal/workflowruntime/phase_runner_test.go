@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,11 @@ type phaseStore struct {
 	plan      store.StoredPlan
 	verify    store.StoredVerification
 	hasVerify bool
+	reusable  *store.LatestReusableProviderAttemptResult
+	fresh     bool
+	proof     store.OperatorSourceResumeProof
+	proofOK   bool
+	amendment *store.VerificationAmendment
 	final     *store.FinalReviewAuthority
 	results   map[int64]store.ProviderAttemptResult
 	parsed    map[int64]phaseartifact.Parsed
@@ -46,6 +52,27 @@ func (s *phaseStore) CurrentVerification(context.Context, domain.TicketRef) (sto
 		return store.StoredVerification{}, store.ErrNotFound
 	}
 	return s.verify, nil
+}
+func (s *phaseStore) RecoverableVerification(ctx context.Context, ref domain.TicketRef) (store.StoredVerification, error) {
+	return s.CurrentVerification(ctx, ref)
+}
+func (s *phaseStore) LatestReusableProviderAttempt(context.Context, store.LatestReusableProviderAttemptRequest) (store.LatestReusableProviderAttemptResult, error) {
+	if s.reusable == nil {
+		return store.LatestReusableProviderAttemptResult{}, store.ErrNotFound
+	}
+	return *s.reusable, nil
+}
+func (s *phaseStore) OperatorSourceResumeRequiresFreshVerification(context.Context, domain.TicketRef, uint64) (bool, error) {
+	return s.fresh, nil
+}
+func (s *phaseStore) OperatorSourceResumeProof(context.Context, domain.TicketRef, uint64, domain.Fence) (store.OperatorSourceResumeProof, bool, error) {
+	return s.proof, s.proofOK, nil
+}
+func (s *phaseStore) PendingVerificationAmendment(context.Context, domain.TicketRef, uint64, domain.Fence) (store.VerificationAmendment, error) {
+	if s.amendment == nil {
+		return store.VerificationAmendment{}, store.ErrNotFound
+	}
+	return *s.amendment, nil
 }
 func (s *phaseStore) FinalReviewAuthority(context.Context, domain.TicketRef, uint64, domain.Fence) (store.FinalReviewAuthority, error) {
 	if s.final != nil {
@@ -165,6 +192,73 @@ func TestPhaseRunnerVerificationUsesStoredPlannerWitness(t *testing.T) {
 	}
 	if coordinator.request.Role != providercoord.RoleReviewer || coordinator.request.Input.Phase != domain.PhaseVerification || !reflect.DeepEqual(coordinator.request.Input.AllowedPaths, plan.Plan.Paths) || !reflect.DeepEqual(coordinator.request.Validation, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest}) {
 		t.Fatalf("request=%+v", coordinator.request)
+	}
+}
+
+func TestPhaseRunnerVerificationCannotBypassPendingAmendment(t *testing.T) {
+	request, evidence, coordinator, _, _ := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying
+	evidence.ticket = request.Ticket
+	request.Plan = &evidence.plan
+	evidence.hasVerify = false
+	evidence.amendment = &store.VerificationAmendment{Prior: store.VerificationRevision{Revision: 1, ProofDigest: strings.Repeat("a", 64)}, ProposedDigest: strings.Repeat("b", 64), ProposedCommand: []string{"go", "test"}, Reason: "replace proof", Requester: "builder"}
+	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); !errors.Is(err, ErrProviderResultInvalid) {
+		t.Fatalf("pending amendment bypass err=%v", err)
+	}
+	if coordinator.calls != 0 {
+		t.Fatalf("pending amendment launched reviewer: calls=%d", coordinator.calls)
+	}
+}
+
+func TestPhaseRunnerReplaysRecoveredAmendmentReviewer(t *testing.T) {
+	request, evidence, coordinator, _, _ := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying
+	request.Ticket.Version, request.Ticket.RunnerEpoch = 4, 8
+	request.Fence = domain.Fence{LeaderEpoch: 11, RunnerEpoch: 8}
+	request.Worktree.TicketVersion, request.Worktree.Fence = request.Ticket.Version, request.Fence
+	evidence.ticket, evidence.worktree = request.Ticket, request.Worktree
+	request.Plan = &evidence.plan
+	evidence.hasVerify = false
+	amendment := store.VerificationAmendment{TransitionTicketVersion: 4, ConsumedVersion: 3, Prior: store.VerificationRevision{Revision: 1, ProofDigest: strings.Repeat("a", 64)}, ProposedDigest: strings.Repeat("b", 64), ProposedCommand: []string{"go", "test"}, Reason: "replace proof", Requester: "builder"}
+	request.Amendment, evidence.amendment = &amendment, &amendment
+	key := store.ProviderAttemptResultKey{AttemptID: 13, Ref: request.Ticket.Ref, Phase: domain.PhaseVerification, Attempt: 2}
+	result := phaseProviderResult(key, request, providercoord.RoleReviewer)
+	result.Claim.LeaderEpoch--
+	evidence.reusable = &store.LatestReusableProviderAttemptResult{Key: key, Result: result, Parsed: phaseartifact.Parsed{Phase: domain.PhaseVerification, Provider: result.Claim.Binding.Identity, Verify: evidence.parsed[12].Verify}, Recovered: true}
+
+	out, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request)
+	if err != nil || out.ProviderResult != key {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+	if coordinator.calls != 0 {
+		t.Fatalf("recovered amendment reviewer launched again: calls=%d", coordinator.calls)
+	}
+}
+
+func TestPhaseRunnerSourceResumeNeverRerunsFreshDurableVerification(t *testing.T) {
+	request, evidence, coordinator, _, _ := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying
+	request.Ticket.Version, request.Ticket.RunnerEpoch = 6, 8
+	request.Fence = domain.Fence{LeaderEpoch: 11, RunnerEpoch: 8}
+	request.Worktree.TicketVersion, request.Worktree.Fence = request.Ticket.Version, request.Fence
+	evidence.ticket, evidence.worktree = request.Ticket, request.Worktree
+	request.Plan = &evidence.plan
+	retained := evidence.verify
+	retained.Revision.Revision = 1
+	retained.TicketVersion = 4
+	retained.Fence = domain.Fence{LeaderEpoch: 9, RunnerEpoch: 7}
+	evidence.verify.Revision.Revision = 2 // fresh result already materialized before recovery
+	evidence.verify.TicketVersion = 5
+	evidence.verify.Fence = domain.Fence{LeaderEpoch: 10, RunnerEpoch: 8}
+	evidence.fresh = true
+	evidence.proof = store.OperatorSourceResumeProof{Ref: request.Ticket.Ref, Version: request.Ticket.Version, Fence: request.Fence, Verification: retained}
+	evidence.proofOK = true
+
+	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); !errors.Is(err, ErrProviderResultInvalid) {
+		t.Fatalf("fresh durable source review launched again: %v", err)
+	}
+	if coordinator.calls != 0 {
+		t.Fatalf("fresh durable source review invoked provider: calls=%d", coordinator.calls)
 	}
 }
 

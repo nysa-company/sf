@@ -195,10 +195,41 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	if leases, leaseErr := db.ActiveRepositoryCommandLeases(ctx, domain.ChannelDev); leaseErr != nil || len(leases) != 0 {
 		t.Fatalf("canceled checkpoint left repository-command leases=%+v err=%v", leases, leaseErr)
 	}
+	// Commit has already crossed update-ref when the first observation response
+	// is lost. The materializer must preserve the immutable prepared tuple as
+	// uncertain; the next same-fence call can observe that exact child and
+	// confirm it without issuing a second commit.
+	postCommitObservationLoss := errors.New("injected post-commit observation loss")
+	failingMaterializer = materializer
+	failingMaterializer.BeforePreparedCommitObservation = func() error { return postCommitObservationLoss }
+	worker.Checkpoint = failingMaterializer
+	worker.CheckpointMaterializer = failingMaterializer
+	commitCountBeforeObservationRecovery := rawMaterializerGit(t, worktree, "rev-list", "--count", "HEAD")
+	if _, err := worker.Run(ctx, ref, fence); !errors.Is(err, postCommitObservationLoss) {
+		t.Fatalf("post-commit observation loss err=%v", err)
+	}
+	uncertain, err := db.ReconcileEffects(ctx, domain.ChannelDev, leader)
+	if err != nil || len(uncertain) != 1 || uncertain[0].Kind != "git/commit" || uncertain[0].State != store.EffectUncertain {
+		t.Fatalf("post-commit uncertain effects=%+v err=%v", uncertain, err)
+	}
+	facts, err := db.GitMutationIntentFacts(ctx, uncertain[0].SemanticKey)
+	if err != nil || facts.Effect != uncertain[0] || facts.PreparedCommitOID == "" || facts.PreparedTreeOID == "" {
+		t.Fatalf("post-commit prepared facts=%+v err=%v", facts, err)
+	}
+	if got := rawMaterializerGit(t, worktree, "rev-list", "--count", "HEAD"); got == commitCountBeforeObservationRecovery {
+		t.Fatalf("post-commit observation loss did not make a commit: before=%q after=%q", commitCountBeforeObservationRecovery, got)
+	}
 	worker.Checkpoint = materializer
 	worker.CheckpointMaterializer = materializer
 	if _, err := worker.Run(ctx, ref, fence); err == nil {
 		t.Fatal("expected injected response loss after checkpoint evidence")
+	}
+	confirmed, err := db.Effect(ctx, facts.Claim.SemanticKey)
+	if err != nil || confirmed.State != store.EffectConfirmed || confirmed.ObservedIdentity != facts.PreparedCommitOID {
+		t.Fatalf("same-process prepared commit recovery=%+v err=%v", confirmed, err)
+	}
+	if got := rawMaterializerGit(t, worktree, "rev-list", "--count", "HEAD"); got != "2" {
+		t.Fatalf("same-process recovery issued a second commit: count=%q", got)
 	}
 	if _, err := worker.Run(ctx, ref, fence); err != nil {
 		t.Fatalf("verification replay: %v", err)
@@ -313,6 +344,262 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	}
 	if got := rawMaterializerGit(t, worktree, "show", "--format=%s", "--no-patch", "HEAD"); got == "" {
 		t.Fatal("candidate commit was not observed")
+	}
+}
+
+// TestRepositoryMaterializerRealSourceResumePreparedObservationLoss exercises
+// the source-resume-specific G witness.  In particular, the first call loses
+// the response after update-ref, while the next call must authenticate that
+// exact uncertain tuple and replay it without another Builder, command, or
+// Git mutation.
+func TestRepositoryMaterializerRealSourceResumePreparedObservationLoss(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("guarded repository command execution is Darwin-only")
+	}
+	ctx := context.Background()
+	repository, worktree, base := newMaterializerGitFixture(t)
+	helper := filepath.Join(t.TempDir(), "sf-git-exec")
+	sfBinary := filepath.Join(t.TempDir(), "sf")
+	for _, command := range []struct {
+		name string
+		path string
+	}{
+		{name: "git helper", path: "./cmd/sf-git-exec"},
+		{name: "sf gate", path: "./cmd/sf"},
+	} {
+		build := exec.Command("go", "build", "-o", map[string]string{"git helper": helper, "sf gate": sfBinary}[command.name], command.path)
+		build.Dir = repoRoot(t)
+		if output, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("build %s: %v: %s", command.name, err, output)
+		}
+	}
+	runner := git.Runner{Home: filepath.Join(t.TempDir(), "git-home"), ExecHelper: helper, TestLocalTransport: true}
+	if err := os.MkdirAll(runner.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := runner.Snapshot(ctx, worktree, "main")
+	if err != nil {
+		t.Fatalf("snapshot worktree: %v", err)
+	}
+	base = identity.BaseHead
+
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("source-resume", repository), config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, configDigest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "source-resume", Path: repository, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: configDigest, ConfigSnapshot: snapshot}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "source-resume", Ticket: "SF-source-resume-materializer"}
+	source := []byte("source resume materializer")
+	sourceSum := sha256.Sum256(source)
+	if err := db.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: hex.EncodeToString(sourceSum[:]), Source: source, Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "source-resume-materializer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "sf/dev/0123456789abcdef/01234567-0123456789abcdef"
+	started, err := db.StartOrAdopt(ctx, ref, 1, branch, domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}
+	identityJSON, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: fence, Path: worktree, Branch: branch, IdentityJSON: identityJSON, BaseSHA: base, HeadSHA: base}); err != nil {
+		t.Fatal(err)
+	}
+
+	providerScript := writeMaterializerProvider(t)
+	builderAuth := writeMaterializerAuthHome(t)
+	reviewerAuth := writeMaterializerAuthHome(t)
+	providerSupervisor, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerSupervisor.Executable = sfBinary
+	if err := db.SetRecoveryAuthority(ctx, domain.ChannelDev, leader, providerSupervisor.PublicKey()); err != nil {
+		t.Fatal(err)
+	}
+	builderAdapter, err := codexprovider.New(codexprovider.Config{Route: "codex-builder", Executable: providerScript, AuthHome: builderAuth, Model: "gpt-5.6-luna"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewerAdapter, err := codexprovider.New(codexprovider.Config{Route: "codex-reviewer", Executable: providerScript, AuthHome: reviewerAuth, Model: "gpt-5.5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builderBinding, err := builderAdapter.Binding(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewerBinding, err := reviewerAdapter.Binding(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := materializerAttestedQualification(t, db, providerSupervisor, builderBinding, "33333333333333333333333333333333")
+	reviewer := materializerAttestedQualification(t, db, providerSupervisor, reviewerBinding, "44444444444444444444444444444444")
+	if _, _, err := db.SelectProviderSet(ctx, domain.ChannelDev, builder.ID, builder.ID, reviewer.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := providerSupervisor.RegisterRuntime(builderBinding, providerScript, builderAuth); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := providerSupervisor.RegisterRuntime(reviewerBinding, providerScript, reviewerAuth); err != nil {
+		t.Fatal(err)
+	}
+	registry := providercoord.NewRegistry()
+	if err := registry.Register(ctx, builderAdapter); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(ctx, reviewerAdapter); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := providercoord.New(registry, map[providercoord.Role]providercoord.Route{
+		providercoord.RolePlanner:  {Primary: builderAdapter.Name()},
+		providercoord.RoleBuilder:  {Primary: builderAdapter.Name()},
+		providercoord.RoleReviewer: {Primary: reviewerAdapter.Name()},
+	}, db, nil, providerSupervisor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providers := workflowruntime.NewPhaseRunner(db, coordinator)
+	baseEngine, err := statemachine.LoadEmbeddedApproved()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := engine.New(db, baseEngine)
+	supervisor := processsupervisor.RepositoryCommandSupervisor{Executable: sfBinary, GitRunner: runner, SoftDrain: time.Second, HardDrain: time.Second}
+	materializer := workflowruntime.RepositoryMaterializer{Store: db, Git: git.Runner{Home: runner.Home, ExecHelper: helper, TestLocalTransport: true, MutationAuthority: db}, Executor: repositoryexec.Executor{Authority: db, Supervisor: supervisor}}
+	worker := workflowworker.Worker{Evidence: db, Engine: state, Runner: providers, Checkpoint: materializer, Candidate: materializer, CheckpointMaterializer: materializer, CandidateMaterializer: materializer}
+
+	if _, err := worker.Run(ctx, ref, fence); err != nil {
+		t.Fatalf("planning: %v", err)
+	}
+	if _, err := worker.Run(ctx, ref, fence); err != nil {
+		t.Fatalf("initial verification: %v", err)
+	}
+	retained, err := db.CurrentVerification(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	building, err := db.Ticket(ctx, ref)
+	if err != nil || building.State != domain.StateBuilding {
+		t.Fatalf("initial building ticket=%+v err=%v", building, err)
+	}
+	_, err = db.TransitionAndInvalidateRunner(ctx, store.Transition{Ref: ref, ExpectedVersion: building.Version, From: domain.StateBuilding, To: domain.StateStopping, ResumeState: domain.StateBuilding, Trigger: "operator_pause_or_take", Fence: fence, EventPayload: `{"intent":"take","operator":"operator","operator_uid":501}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := db.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := store.TakeoverRemoteBaseline{Registered: true, WorktreePath: worktree, WorktreeBranch: branch, WorktreeIdentity: materializerDigest(string(identityJSON)), CandidatePresent: false, BaseOID: base}
+	drain, err := json.Marshal(map[string]any{"drained": true, "intent": "take", "remote": baseline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CompleteControlTransition(ctx, store.Transition{Ref: ref, ExpectedVersion: stopped.Version, From: domain.StateStopping, To: domain.StatePaused, ResumeState: domain.StateBuilding, Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopped.RunnerEpoch}, EventPayload: string(drain)}); err != nil {
+		t.Fatal(err)
+	}
+	paused, err := db.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "go.mod"), []byte("module example.test\n\n// operator source\n\ngo 1.23\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runMaterializerGit(t, worktree, "add", "--", "go.mod")
+	runMaterializerGit(t, worktree, "commit", "-m", "operator source")
+	sourceCommit, err := runner.ObserveOperatorSourceCommit(ctx, git.Worktree{Path: worktree, Branch: branch, Identity: identity}, retained.Checkpoint.CommitOID)
+	if err != nil {
+		t.Fatalf("observe operator source: %v", err)
+	}
+	if _, err := db.TransitionOperatorSourceResume(ctx, store.OperatorSourceResume{Ref: ref, ExpectedVersion: paused.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: paused.RunnerEpoch}, Operator: "operator", SourceCommit: sourceCommit, Remote: baseline}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := db.Ticket(ctx, ref)
+	if err != nil || resumed.State != domain.StateVerifying {
+		t.Fatalf("resumed ticket=%+v err=%v", resumed, err)
+	}
+	if capability, err := db.RearmProof(ctx, ref, stopped); err != nil {
+		t.Fatalf("rearm proof: %v", err)
+	} else if err := db.ActivateRearm(ctx, capability, func(admission *store.RuntimeAdmissionCapability) error {
+		if _, _, _, ok := admission.ConsumeRuntimeAdmission(); !ok {
+			return errors.New("runtime admission was not issued")
+		}
+		return admission.OpenStoreAdmission(ctx)
+	}); err != nil {
+		t.Fatalf("activate rearm: %v", err)
+	}
+	resumeFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: resumed.RunnerEpoch}
+	if _, err := worker.Run(ctx, ref, resumeFence); err != nil {
+		t.Fatalf("fresh source-resume verification: %v", err)
+	}
+	if ticket, err := db.Ticket(ctx, ref); err != nil || ticket.State != domain.StateBuilding {
+		t.Fatalf("post-resume building ticket=%+v err=%v", ticket, err)
+	}
+	commitCountBeforeLoss := rawMaterializerGit(t, worktree, "rev-list", "--count", "HEAD")
+	loss := errors.New("injected source-resume G post-commit observation loss")
+	failing := materializer
+	failing.BeforePreparedCommitObservation = func() error { return loss }
+	worker.Checkpoint = failing
+	worker.CheckpointMaterializer = failing
+	worker.Candidate = failing
+	worker.CandidateMaterializer = failing
+	if _, err := worker.Run(ctx, ref, resumeFence); !errors.Is(err, loss) {
+		t.Fatalf("source-resume G observation loss err=%v", err)
+	}
+	uncertain, err := db.ReconcileEffects(ctx, domain.ChannelDev, leader)
+	if err != nil || len(uncertain) != 1 || uncertain[0].Kind != "git/commit" || uncertain[0].State != store.EffectUncertain {
+		t.Fatalf("source-resume uncertain effects=%+v err=%v", uncertain, err)
+	}
+	facts, err := db.GitMutationIntentFacts(ctx, uncertain[0].SemanticKey)
+	if err != nil || facts.Effect != uncertain[0] || facts.PreparedCommitOID == "" || facts.PreparedTreeOID == "" {
+		t.Fatalf("source-resume prepared facts=%+v err=%v", facts, err)
+	}
+	commitCountAfterLoss := rawMaterializerGit(t, worktree, "rev-list", "--count", "HEAD")
+	if commitCountAfterLoss == commitCountBeforeLoss {
+		t.Fatalf("source-resume G did not cross update-ref: before=%q after=%q", commitCountBeforeLoss, commitCountAfterLoss)
+	}
+	attemptsAfterLoss, err := db.ProviderAttempts(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.Checkpoint = materializer
+	worker.CheckpointMaterializer = materializer
+	worker.Candidate = materializer
+	worker.CandidateMaterializer = materializer
+	if _, err := worker.Run(ctx, ref, resumeFence); err != nil {
+		t.Fatalf("source-resume G witness replay: %v", err)
+	}
+	if got := rawMaterializerGit(t, worktree, "rev-list", "--count", "HEAD"); got != commitCountAfterLoss {
+		t.Fatalf("source-resume recovery issued another Git commit: before=%q after=%q", commitCountAfterLoss, got)
+	}
+	attemptsAfterRecovery, err := db.ProviderAttempts(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attemptsAfterRecovery) != len(attemptsAfterLoss) {
+		t.Fatalf("source-resume recovery reran a provider: before=%d after=%d", len(attemptsAfterLoss), len(attemptsAfterRecovery))
+	}
+	confirmed, err := db.Effect(ctx, facts.Claim.SemanticKey)
+	if err != nil || confirmed.State != store.EffectConfirmed || confirmed.ObservedIdentity != facts.PreparedCommitOID {
+		t.Fatalf("source-resume G effect=%+v err=%v", confirmed, err)
 	}
 }
 
@@ -492,7 +779,11 @@ if [ "$model" = 'gpt-5.5' ] || printf '%s' "$prompt" | grep -qi 'independent pre
 	plan=${prompt#*PLAN=}
 	plan=${plan%%WORKSPACE=*}
 	digest=$(printf '%s' "$plan" | grep -Eo '"digest":"[0-9a-f]+"' | grep -Eo '[0-9a-f]{64}' | head -1 || true)
-  printf '%s\n' '{"schema":"sf.verification/v1","acceptance_digest":"'"$digest"'","proof_kind":"acceptance","owned_files":["proof.txt"],"command":["go","test","./..."],"prebuild_outcome":"red","evidence_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' > "$last"
+	evidence=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+	case "$(cat go.mod 2>/dev/null || true)" in
+	  *"operator source"*) evidence=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+	esac
+	  printf '%s\n' '{"schema":"sf.verification/v1","acceptance_digest":"'"$digest"'","proof_kind":"acceptance","owned_files":["proof.txt"],"command":["go","test","./..."],"prebuild_outcome":"red","evidence_digest":"'"$evidence"'"}' > "$last"
 elif printf '%s' "$prompt" | grep -qi 'builder'; then
   printf '%s\n' 'package example
 
@@ -502,7 +793,7 @@ func TestFeature(t *testing.T) {}
 ' > tracked_test.go
   printf '%s\n' '{"schema":"sf.builder/v1","summary":"real mutation","changed_files":["tracked_test.go"],"commands":[["go","test","./..."]]}' > "$last"
 else
-  printf '%s\n' '{"schema":"sf.planner/v1","acceptance":["real materializer"],"proof":{"kind":"acceptance","command":["go","test","./..."],"details":"real"},"paths":["proof.txt","tracked_test.go"],"commands":[["go","test","./..."]],"risks":["none"]}' > "$last"
+	printf '%s\n' '{"schema":"sf.planner/v1","acceptance":["real materializer"],"proof":{"kind":"acceptance","command":["go","test","./..."],"details":"real"},"paths":["go.mod","proof.txt","tracked_test.go"],"commands":[["go","test","./..."]],"risks":["none"]}' > "$last"
 fi
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}'
 `

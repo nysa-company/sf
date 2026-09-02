@@ -161,45 +161,12 @@ func (s *Store) CompleteControlTransition(ctx context.Context, transition Transi
 		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
 			return err
 		}
-		var unreconciled int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('executing','uncertain')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&unreconciled); err != nil {
+		if err := releaseTerminalCapacity(ctx, conn, transition.Ref); err != nil {
 			return err
-		}
-		if unreconciled != 0 {
-			return ErrControlNotDrained
-		}
-		// Provider claims carry their own supervisor proof and recovery
-		// identity. Control completion cannot safely infer that proof from a
-		// ticket-level drain, so leave the phase, claim, and provider lease
-		// intact until the coordinator finalizes the exact claim (or recovery
-		// proves it drained).
-		var providerClaims int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempts
-			WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`,
-			transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&providerClaims); err != nil {
-			return err
-		}
-		if providerClaims != 0 {
-			return ErrControlNotDrained
-		}
-		// A durable repository-command lease is an independent process witness.
-		// Its effect may already hold a terminal result while the command group
-		// or a quarantined recovery row still blocks repository writers.
-		var repositoryCommands int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases
-			WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`,
-			transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&repositoryCommands); err != nil {
-			return err
-		}
-		if repositoryCommands != 0 {
-			return ErrControlNotDrained
 		}
 		at := time.Now().UTC().Format(time.RFC3339Nano)
 		if _, err := conn.ExecContext(ctx, `UPDATE phase_runs SET state='cancelled',completed_at=COALESCE(completed_at,?),outcome='cancelled'
 			WHERE channel=? AND project_id=? AND ticket_id=? AND state='active'`, at, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket); err != nil {
-			return err
-		}
-		if _, err := conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND project_id=? AND ticket_id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `UPDATE workflow_owners SET state=? WHERE channel=? AND project_id=? AND ticket_id=?`, transition.To, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket); err != nil {

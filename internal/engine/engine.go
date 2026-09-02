@@ -5,6 +5,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -53,10 +54,81 @@ func (e *Engine) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expecte
 }
 
 func (e *Engine) Transition(ctx context.Context, request contracts.TransitionRequest) (contracts.TransitionResult, error) {
+	// External merge observations are evidence-bearing boundaries, not generic
+	// state-machine transitions. Dedicated Store paths authenticate manual and
+	// guarded observations before changing durable lifecycle state.
+	if request.Trigger == "external_merge_observed" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	// The source_changes branch is deliberately not a generic state-machine
+	// persistence path. Its event binds a sealed operator-take lineage to the
+	// immutable plan, verification checkpoint, and registered worktree; only
+	// SignalOperatorSourceResume may mint it.
+	if genericOperatorSourceResume(request) {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	if genericVerificationAmendmentTransition(request.Trigger) {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
 	if request.Trigger == "phase_pass" && (request.From == domain.StatePlanning || request.From == domain.StateVerifying || request.From == domain.StateBuilding) {
 		return contracts.TransitionResult{}, store.ErrEvidenceConflict
 	}
 	return e.transition(ctx, request, e.store.Transition)
+}
+
+// genericVerificationAmendmentTransition rejects every generic entry to the
+// Builder/Reviewer amendment boundary. Each trigger carries Store-authenticated
+// authority that the generic state-machine persistence path cannot construct.
+func genericVerificationAmendmentTransition(trigger string) bool {
+	switch trigger {
+	case "verification_amendment_requested", "amendment_accepted", "amendment_rejected", "review_repair":
+		return true
+	default:
+		return false
+	}
+}
+
+func genericOperatorSourceResume(request contracts.TransitionRequest) bool {
+	if request.From != domain.StatePaused || request.Trigger != "operator_resume" {
+		return false
+	}
+	if request.Attributes["takeover_source_commit_valid"] == "true" || request.Attributes["takeover_source_diff_valid"] == "true" || request.Attributes["verification_files_unchanged"] == "true" {
+		return true
+	}
+	var payload struct {
+		ChangeKind string `json:"change_kind"`
+	}
+	return json.Unmarshal([]byte(request.EventPayload), &payload) == nil && (payload.ChangeKind == "source_commit" || payload.ChangeKind == "source_changes")
+}
+
+// SignalOperatorSourceResume is the sole Engine entry point for a retained,
+// source-only operator diff. Store independently authenticates the complete
+// control/evidence lineage and builds the durable event payload itself.
+func (e *Engine) SignalOperatorSourceResume(ctx context.Context, request store.OperatorSourceResume) (contracts.TransitionResult, error) {
+	if request.Ref.Validate() != nil || request.ExpectedVersion == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 || request.Fence.ClaimEpoch != 0 {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	transition, err := e.spec.Select(string(domain.StatePaused), "operator_resume", map[string]bool{
+		"operator_identity_authenticated": true,
+		"takeover_source_commit_valid":    true,
+		"verification_files_unchanged":    true,
+		"branch_remote_identity_exact":    true,
+	})
+	if err != nil || transition.ID != "resume_source_changes" || transition.To != string(domain.StateVerifying) {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	ticket, err := e.store.Ticket(ctx, request.Ref)
+	if err != nil {
+		return contracts.TransitionResult{}, err
+	}
+	if ticket.State != domain.StatePaused || ticket.Version != request.ExpectedVersion {
+		return contracts.TransitionResult{}, store.ErrStaleFence
+	}
+	result, err := e.store.TransitionOperatorSourceResume(ctx, request)
+	if err != nil {
+		return contracts.TransitionResult{}, err
+	}
+	return contracts.TransitionResult{To: domain.StateVerifying, TicketVersion: result.Version, Invalidated: invalidations(e.spec, transition.Invalidates), EventID: fmt.Sprint(result.EventID)}, nil
 }
 
 func (e *Engine) transition(ctx context.Context, request contracts.TransitionRequest, persist func(context.Context, store.Transition) (store.TransitionResult, error)) (contracts.TransitionResult, error) {
@@ -161,6 +233,55 @@ func (e *Engine) SignalVerification(ctx context.Context, request contracts.Signa
 		return contracts.TransitionResult{}, store.ErrEvidenceConflict
 	}
 	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: request.Trigger, Fence: request.Fence, Attributes: map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}, EventPayload: request.EventPayload}, e.store.TransitionVerification)
+}
+
+// SignalVerificationAmendment is the only lifecycle entry for a Builder
+// request to replace protected pre-build verification. Store binds the request
+// and the fresh Reviewer decision; caller attributes are only the normative
+// selector inputs.
+func (e *Engine) SignalVerificationAmendment(ctx context.Context, request contracts.SignalRequest, decision store.VerificationAmendmentDecision, key store.ProviderAttemptResultKey) (contracts.TransitionResult, error) {
+	if request.From != domain.StateVerifying || key.Ref != request.Ticket || key.Phase != domain.PhaseVerification {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	var trigger string
+	var persist func(context.Context, store.Transition) (store.TransitionResult, error)
+	switch decision {
+	case store.VerificationAmendmentAccepted:
+		trigger = "amendment_accepted"
+		persist = func(ctx context.Context, transition store.Transition) (store.TransitionResult, error) {
+			return e.store.TransitionVerificationAmendmentAccepted(ctx, transition, key)
+		}
+	case store.VerificationAmendmentRejected:
+		trigger = "amendment_rejected"
+		persist = func(ctx context.Context, transition store.Transition) (store.TransitionResult, error) {
+			return e.store.TransitionVerificationAmendmentRejected(ctx, transition, key)
+		}
+	default:
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: trigger, Fence: request.Fence, Attributes: map[string]string{"fresh_reviewer": "true", "old_and_new_digest_bound": "true", "correction_available": "true", "original_verification_intent_current": "true"}, EventPayload: request.EventPayload}, persist)
+}
+
+// SignalVerificationAmendmentRequest consumes a completed Builder request in
+// the same lifecycle transaction as building -> verifying.
+func (e *Engine) SignalVerificationAmendmentRequest(ctx context.Context, request contracts.SignalRequest, key store.ProviderAttemptResultKey) (contracts.TransitionResult, error) {
+	if request.From != domain.StateBuilding || key.Ref != request.Ticket || key.Phase != domain.PhaseBuild {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: "verification_amendment_requested", Fence: request.Fence, Attributes: map[string]string{"amendment_request_valid": "true", "correction_available": "true"}, EventPayload: request.EventPayload}, func(ctx context.Context, transition store.Transition) (store.TransitionResult, error) {
+		return e.store.TransitionVerificationAmendmentRequest(ctx, transition, key)
+	})
+}
+
+// SignalVerificationAmendmentBlocked is the typed fail-closed exit for a
+// malformed Builder request or Reviewer response. It deliberately does not
+// reinterpret the response as a rejection: only the original proof is a
+// valid rejection, and only the Builder-bound proposed proof is acceptance.
+func (e *Engine) SignalVerificationAmendmentBlocked(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if request.From != domain.StateBuilding && request.From != domain.StateVerifying {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: "typed_blocker", Fence: request.Fence, Attributes: map[string]string{"no_unreconciled_external_mutation": "true"}, EventPayload: `{"code":"verification_amendment_invalid"}`}, e.store.Transition)
 }
 
 // SignalCandidate consumes the exact candidate in the same SQLite write as

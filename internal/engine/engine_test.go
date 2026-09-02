@@ -2,9 +2,11 @@ package engine
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/nysa-company/sf/internal/contracts"
@@ -12,6 +14,39 @@ import (
 	"github.com/nysa-company/sf/internal/statemachine"
 	"github.com/nysa-company/sf/internal/store"
 )
+
+type amendmentAuthorityCounts struct {
+	budgets, requests, revisions, bindings int
+}
+
+func TestGenericExternalMergeObservationRejectedByEngine(t *testing.T) {
+	runtime := &Engine{}
+	_, err := runtime.Transition(t.Context(), contracts.TransitionRequest{Trigger: "external_merge_observed"})
+	if !errors.Is(err, store.ErrEvidenceConflict) {
+		t.Fatalf("generic external merge observation err=%v, want evidence conflict", err)
+	}
+}
+
+func snapshotAmendmentAuthorityCounts(t *testing.T, databasePath string, ref domain.TicketRef) amendmentAuthorityCounts {
+	t.Helper()
+	database, err := sql.Open("sqlite", databasePath+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	counts := amendmentAuthorityCounts{}
+	for table, target := range map[string]*int{
+		"ticket_budget_uses":              &counts.budgets,
+		"verification_amendment_requests": &counts.requests,
+		"verification_revisions":          &counts.revisions,
+		"verification_result_bindings":    &counts.bindings,
+	} {
+		if err := database.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM `+table+` WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return counts
+}
 
 func TestTransitionUsesNormativeStateMachineAndFencedStore(t *testing.T) {
 	ctx := context.Background()
@@ -67,6 +102,76 @@ func TestTransitionUsesNormativeStateMachineAndFencedStore(t *testing.T) {
 	}
 }
 
+func TestGenericTransitionCannotForgeVerificationAmendmentOrReviewRepair(t *testing.T) {
+	ctx := t.Context()
+	databasePath := filepath.Join(t.TempDir(), "amendment.sqlite")
+	database, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "nysa", Path: "/tmp/nysa", BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-engine-amendment"}
+	if err := database.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "digest", Type: domain.TicketBug, MergeMode: domain.MergeGuarded}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "amendment-engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := statemachine.LoadEmbeddedApproved()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := New(database, spec)
+	beforeTicket, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeEvents, err := database.Events(ctx, domain.ChannelDev, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeRevisions, err := database.VerificationRevisions(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCounts := snapshotAmendmentAuthorityCounts(t, databasePath, ref)
+	for _, tc := range []struct {
+		trigger string
+		from    domain.State
+		to      domain.State
+	}{
+		{trigger: "verification_amendment_requested", from: domain.StateBuilding, to: domain.StateVerifying},
+		{trigger: "amendment_accepted", from: domain.StateVerifying, to: domain.StateBuilding},
+		{trigger: "amendment_rejected", from: domain.StateVerifying, to: domain.StateBuilding},
+		{trigger: "review_repair", from: domain.StateReviewing, to: domain.StateBuilding},
+		{trigger: "review_repair", from: domain.StateReviewing, to: domain.StateVerifying},
+	} {
+		if _, err := runtime.Transition(ctx, contracts.TransitionRequest{Ticket: ref, TicketVersion: beforeTicket.Version, From: tc.from, Trigger: tc.trigger, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: beforeTicket.RunnerEpoch}, Attributes: map[string]string{"amendment_request_valid": "true", "fresh_reviewer": "true", "old_and_new_digest_bound": "true", "correction_available": "true", "original_verification_intent_current": "true"}, EventPayload: "{}"}); !errors.Is(err, store.ErrEvidenceConflict) {
+			t.Fatalf("generic %s transition=%v, want evidence conflict", tc.trigger, err)
+		}
+		afterTicket, err := database.Ticket(ctx, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		afterEvents, err := database.Events(ctx, domain.ChannelDev, 0, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		afterRevisions, err := database.VerificationRevisions(ctx, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		afterCounts := snapshotAmendmentAuthorityCounts(t, databasePath, ref)
+		if !reflect.DeepEqual(afterTicket, beforeTicket) || !reflect.DeepEqual(afterEvents, beforeEvents) || !reflect.DeepEqual(afterRevisions, beforeRevisions) || afterCounts != beforeCounts {
+			t.Fatalf("generic %s mutated ticket, events, budget, or evidence", tc.trigger)
+		}
+	}
+}
+
 func TestControlDispositionInvalidatesRunnerAtomically(t *testing.T) {
 	ctx := context.Background()
 	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "control.sqlite"))
@@ -111,6 +216,39 @@ func TestControlDispositionInvalidatesRunnerAtomically(t *testing.T) {
 	}
 	if after.State != domain.StateStopping || after.ResumeState != domain.StatePlanning || after.RunnerEpoch != started.RunnerEpoch+1 || after.Version != result.TicketVersion {
 		t.Fatalf("after=%+v result=%+v", after, result)
+	}
+}
+
+func TestGenericSignalCannotForgeOperatorSourceResume(t *testing.T) {
+	ctx := t.Context()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "source-resume.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "nysa", Path: "/tmp/nysa", BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-forged-source-resume"}
+	if err := database.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "digest", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, State: domain.StatePaused, ResumeState: domain.StateBuilding}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "source-resume-engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := statemachine.LoadEmbeddedApproved()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := New(database, spec)
+	_, err = runtime.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: ticket.Version, From: domain.StatePaused, Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Attributes: map[string]string{"operator_identity_authenticated": "true", "takeover_source_diff_valid": "true", "verification_files_unchanged": "true", "branch_remote_identity_exact": "true"}, EventPayload: `{"intent":"resume","change_kind":"source_changes"}`})
+	if !errors.Is(err, store.ErrEvidenceConflict) {
+		t.Fatalf("generic source resume=%v, want evidence conflict", err)
 	}
 }
 

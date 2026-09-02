@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
 	_ "modernc.org/sqlite"
@@ -60,7 +61,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 48
+const schemaVersion = 50
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -111,6 +112,8 @@ var migrationChecksums = map[int]string{
 	46: migrationChecksum(migrationV46),
 	47: migrationChecksum(migrationV47),
 	48: migrationChecksum(migrationV48),
+	49: migrationChecksum(migrationV49),
+	50: migrationChecksum(migrationV50),
 }
 
 func migrationChecksum(statements []string) string {
@@ -486,6 +489,10 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV47
 			} else if version == 48 {
 				statements = migrationV48
+			} else if version == 49 {
+				statements = migrationV49
+			} else if version == 50 {
+				statements = migrationV50
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -776,9 +783,14 @@ func (s *Store) submitTicket(ctx context.Context, ticket Ticket, allowNew bool, 
 				return ErrStaleFence
 			}
 		}
+		resolved, err := resolveSubmittedTicketPolicy(ctx, conn, ticket)
+		if err != nil {
+			return err
+		}
+		ticket = resolved
 		var existingID domain.TicketID
 		var existingState domain.State
-		err := conn.QueryRowContext(ctx, `SELECT id, state FROM tickets WHERE channel=? AND project_id=? AND source_digest=? ORDER BY rowid DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.SourceDigest).Scan(&existingID, &existingState)
+		err = conn.QueryRowContext(ctx, `SELECT id, state FROM tickets WHERE channel=? AND project_id=? AND source_digest=? ORDER BY rowid DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.SourceDigest).Scan(&existingID, &existingState)
 		if err == nil {
 			existingRef = domain.TicketRef{Channel: ticket.Ref.Channel, Project: ticket.Ref.Project, Ticket: existingID}
 			if !existingState.Terminal() {
@@ -802,6 +814,43 @@ func (s *Store) submitTicket(ctx context.Context, ticket Ticket, allowNew bool, 
 	}
 	result, err := s.Ticket(ctx, existingRef)
 	return result, created, err
+}
+
+// resolveSubmittedTicketPolicy makes ticket-level controls a derived value of
+// the immutable project configuration registered in this same transaction.
+// Callers can request only stricter controls; no daemon preflight may widen
+// the durable admission boundary.
+func resolveSubmittedTicketPolicy(ctx context.Context, conn *sql.Conn, ticket Ticket) (Ticket, error) {
+	project := Project{Channel: ticket.Ref.Channel, ID: ticket.Ref.Project}
+	err := conn.QueryRowContext(ctx, `SELECT p.canonical_path,p.base_ref,p.current_config_generation,
+		COALESCE(c.digest, ''),COALESCE(c.snapshot_bytes, X'')
+		FROM projects p LEFT JOIN project_configurations c
+		ON c.channel=p.channel AND c.project_id=p.id AND c.generation=p.current_config_generation
+		WHERE p.channel=? AND p.id=?`, ticket.Ref.Channel, ticket.Ref.Project).Scan(
+		&project.Path, &project.BaseRef, &project.ConfigGeneration, &project.ConfigDigest, &project.ConfigSnapshot,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Ticket{}, ErrNotFound
+	}
+	if err != nil {
+		return Ticket{}, err
+	}
+	frozen, err := config.DecodeSnapshot(project.ConfigSnapshot, project.ConfigDigest)
+	if err != nil || frozen.Name != string(project.ID) || frozen.Repository != project.Path || frozen.BaseBranch != project.BaseRef {
+		return Ticket{}, ErrEvidenceConflict
+	}
+	effective, err := config.Resolve(frozen.Machine, frozen.Project, config.TicketOverride{
+		MergeMode:       ticket.MergeMode,
+		TicketTimeout:   ticket.MaxDuration,
+		MaxCostMicroUSD: ticket.MaxCostMicroUSD,
+	})
+	if err != nil {
+		return Ticket{}, ErrEvidenceConflict
+	}
+	ticket.MergeMode = effective.MergeMode
+	ticket.MaxDuration = effective.TicketTimeout
+	ticket.MaxCostMicroUSD = effective.MaxTicketCostMicroUSD
+	return ticket, nil
 }
 
 func validateTicketInput(ticket Ticket) error {
@@ -1220,7 +1269,18 @@ func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) Transition(ctx context.Context, transition Transition) (TransitionResult, error) {
+	// External merge observations carry publication and merge authority that
+	// generic lifecycle persistence cannot construct. Manual observations must
+	// use RecordManualMergeObservation; guarded observations use the distinct
+	// merge_observed boundary. Reject the shared trigger before any drain or
+	// database work so no caller can advance either protected merge state.
+	if transition.Trigger == "external_merge_observed" {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
 	if genericMergeEntryTransition(transition) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	if genericVerificationAmendmentTransition(transition.Trigger) {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
 	if guardedMergeObservationTransition(transition) {
@@ -1302,6 +1362,11 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		}
 		if count, _ := updated.RowsAffected(); count != 1 {
 			return ErrStaleFence
+		}
+		if transition.To.Terminal() {
+			if err := releaseTerminalCapacity(ctx, conn, transition.Ref); err != nil {
+				return err
+			}
 		}
 		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, transition.Trigger, transition.From, transition.To, transition.EventPayload, time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
@@ -1478,7 +1543,7 @@ func (s *Store) TransitionFinalReview(ctx context.Context, transition Transition
 // TransitionReviewRepair consumes an exact Reviewer repair result and its
 // durable correction budget in the same transaction as the lifecycle move.
 func (s *Store) TransitionReviewRepair(ctx context.Context, transition Transition) (TransitionResult, error) {
-	if transition.From != domain.StateReviewing || transition.Trigger != "review_repair" || (transition.To != domain.StateBuilding && transition.To != domain.StateVerifying) {
+	if transition.From != domain.StateReviewing || transition.Trigger != "review_repair" || transition.EventPayload != "{}" || (transition.To != domain.StateBuilding && transition.To != domain.StateVerifying) {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
 	return s.transitionWithEvidence(ctx, transition, func(ctx context.Context, conn *sql.Conn, version, runner uint64) error {
@@ -1536,6 +1601,18 @@ func (s *Store) finalReviewerResult(ctx context.Context, conn *sql.Conn, ref dom
 	return authority, result, *parsed.Reviewer, nil
 }
 
+// genericVerificationAmendmentTransition rejects lifecycle triggers whose
+// durable request, bounded budget, or exact Reviewer decision can be created
+// only by their dedicated Store boundaries.
+func genericVerificationAmendmentTransition(trigger string) bool {
+	switch trigger {
+	case "verification_amendment_requested", "amendment_accepted", "amendment_rejected", "review_repair":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Store) transitionWithEvidence(ctx context.Context, transition Transition, check func(context.Context, *sql.Conn, uint64, uint64) error) (TransitionResult, error) {
 	if transition.Ref.Validate() != nil || !transition.To.Valid() || !transition.From.Valid() || transition.Trigger == "" {
 		return TransitionResult{}, ErrEvidenceConflict
@@ -1575,12 +1652,25 @@ func (s *Store) transitionWithEvidence(ctx context.Context, transition Transitio
 		if err := check(ctx, conn, version, runner); err != nil {
 			return err
 		}
+		// A source-only or post-takeover runtime may already have an open
+		// admission authority. Carry that authority over every evidence-backed
+		// lifecycle transition in the same SQLite transaction as the ticket
+		// update; otherwise a fresh scheduler can observe a stale authority and
+		// either run without the proof endpoint or strand the resumed workflow.
+		if err := advanceOpenRuntimeAuthority(ctx, conn, transition.Ref, version, transition.Fence); err != nil {
+			return err
+		}
 		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?,resume_state=?,blocked_code=CASE WHEN ?<>'' THEN ? WHEN state='blocked' THEN '' ELSE blocked_code END,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), blockedCode, blockedCode, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
 		if err != nil {
 			return err
 		}
 		if n, _ := updated.RowsAffected(); n != 1 {
 			return ErrStaleFence
+		}
+		if transition.To.Terminal() {
+			if err := releaseTerminalCapacity(ctx, conn, transition.Ref); err != nil {
+				return err
+			}
 		}
 		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, transition.Trigger, transition.From, transition.To, transition.EventPayload, time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
@@ -1717,6 +1807,14 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 		}
 		if source != candidate.SourceDigest || base != candidate.BaseSHA || intent != candidate.VerificationIntentDigest || proof != candidate.ProofDigest {
 			return ErrEvidenceConflict
+		}
+		// Candidate publication is an evidence-backed lifecycle transition just
+		// like plan, verification, and final review. Carry an already-open
+		// runtime admission to the publishing/reviewing endpoint in this same
+		// transaction so a crash cannot leave the durable authority one version
+		// behind the ticket it admitted.
+		if err := advanceOpenRuntimeAuthority(ctx, conn, transition.Ref, version, transition.Fence); err != nil {
+			return err
 		}
 		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?,resume_state=?,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state='building' AND version=? AND runner_epoch=?`, transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version, runner)
 		if err != nil {

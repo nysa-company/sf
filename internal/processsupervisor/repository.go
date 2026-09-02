@@ -24,6 +24,7 @@ import (
 	"github.com/nysa-company/sf/internal/executionpolicy"
 	gitboundary "github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/goclosure"
+	"github.com/nysa-company/sf/internal/nysapure"
 )
 
 const repositoryOutputLimit = 64 << 10
@@ -470,6 +471,26 @@ func RepositoryExecutableIdentity(name string) (string, string, error) {
 		return "", "", err
 	}
 	return resolved, digest, nil
+}
+
+// RepositoryCommandExecutableIdentity binds the complete typed command
+// runtime. The ordinary recipes bind their sole executable; nysa_api_pure_v1
+// additionally binds the factory-owned ESM resolver that Node will load.
+func RepositoryCommandExecutableIdentity(argv []string) (string, string, error) {
+	if len(argv) == 0 {
+		return "", "", exec.ErrNotFound
+	}
+	path, digest, err := RepositoryExecutableIdentity(argv[0])
+	if err != nil {
+		return "", "", err
+	}
+	if len(argv) == 3 && argv[0] == "node" && argv[1] == nysapure.RecipeFlag && nysapure.ValidTestPath(argv[2]) {
+		digest, err = nysaPureRuntimeIdentity(digest)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	return path, digest, nil
 }
 
 func resolveFixedExecutable(name string) (string, error) {

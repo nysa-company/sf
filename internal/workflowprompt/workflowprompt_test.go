@@ -235,7 +235,7 @@ func TestPromptsAreDeterministicAndRoleBound(t *testing.T) {
 	}{
 		{"planner", func() (contracts.PhaseInput, error) { return Planner(PlannerInput{ticket, workspace, runtime}) }, []string{"read-only", "Planner", "workflow states"}},
 		{"verification", func() (contracts.PhaseInput, error) {
-			return Verification(VerificationInput{ticket, workspace, plan, runtime})
+			return Verification(VerificationInput{ticket, workspace, plan, runtime, nil})
 		}, []string{"writes the tests or proof", "red", "missing", "baseline", "canonical_artifact"}},
 		{"builder", func() (contracts.PhaseInput, error) {
 			return Builder(BuilderInput{ticket, workspace, plan, verification, runtime})

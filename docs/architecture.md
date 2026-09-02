@@ -35,9 +35,10 @@ The approved normative design is in
   port-443 SSH path uses the packaged `sf-ssh` helper, a pinned GitHub host-key
   asset, and an explicitly supplied SSH agent socket. `make build` packages
   these helpers with `bin/github_known_hosts` and `bin/sf-git-exec`.
-  The transport boundary is implemented and hermetically tested; the real
-  workflow worker must still supply the absolute helper and gh configuration
-  paths before HTTPS publication becomes reachable in production.
+  The transport boundary and local production composition are implemented and
+  hermetically tested. The local runtime supplies the absolute helper and gh
+  configuration paths only after the explicit authenticated publication
+  preflight; otherwise publication remains unavailable.
   `sf-git-exec` performs an fd-pinned `fchdir` and confirms the
   live worktree `.git` pointer, linked-worktree gitdir, and common directory
   against inherited descriptors immediately before Git exec. Every Git
@@ -48,9 +49,10 @@ The approved normative design is in
   `GIT_DIR` (and this host also rejects it as an executable path), so this is a
   trusted-repository boundary rather than a claim to isolate a malicious
   concurrent same-UID process. Production rejects local origins; they exist
-  only under the explicit hermetic test transport. The SQLite supervisor is
-  the pending production implementation of this claim/lease contract; until
-  it is wired, Git mutations fail closed.
+  only under the explicit hermetic test transport. Store-backed mutation claims
+  and repository-command leases are the wired production authority for this
+  contract. They are issued and checked by the local runtime before Git
+  mutation; missing or stale authority still fails closed.
   An ordinary candidate-ref push has no server-side CAS for a separate base
   ref: sf observes BaseRef before and after that bounded publication effect
   and treats any movement as stale rather than final. The build performs no
@@ -77,9 +79,9 @@ before build to author verification and again fresh after the candidate and CI
 checks exist.
 
 Manual and guarded modes use an explicit trusted-provider/repository baseline.
-Autonomous mode additionally requires the exact provider and repository-command
-executor to pass an OS-enforced macOS profile. Docker and Colima are deferred,
-not hidden fallbacks.
+Autonomous selection and merge are unavailable in v1 pending the guarded pilot
+and a stronger native execution-profile proof. Docker and Colima are not
+required and are never hidden fallbacks or silently installed.
 
 The local guarded repository-command executor is intentionally narrow. Its Go
 recipe is `go test ./...`, with no caller flags, CGO, downloads, module updates,
@@ -92,9 +94,15 @@ discovery file. sf resolves code-owned Node paths, stages an authenticated
 private Mach-O dylib closure, and applies a Node-specific Seatbelt plus Node
 permissions before executing that staged copy. npm, package scripts,
 dependency-bearing Node projects, and TypeScript remain credential-free CI or
-operator takeover; no Docker or Colima prerequisite is introduced. SF itself
-and Nysa remain CI/operator takeover work until they meet one of these exact
-contracts. Autonomous execution remains unavailable.
+operator takeover, except the configured `nysa_api_pure_v1` recipe. That
+recipe admits one ticket-bound canonical `.test.ts` entrypoint, a minimal
+allowlist of `node:test` and `node:assert` builtins, and confined relative
+`.js`-to-`.ts` resolution through a
+factory-owned loader whose digest is part of the command identity. It uses no
+npm, package imports, `node_modules`, network, subprocesses, or writes and is
+bounded to 60 seconds; a missing confined implementation is permitted only for
+the expected prebuild-red proof. No Docker or Colima prerequisite is introduced.
+Autonomous execution remains unavailable.
 This is a local guarded baseline, not evidence that ADR 0002's autonomous
 capability has changed.
 

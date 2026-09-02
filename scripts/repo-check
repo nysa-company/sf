@@ -378,11 +378,11 @@ def validate(root: Path) -> Check:
             for path in workflow_dir.glob(pattern)
         ] if workflow_dir.is_dir() else []
         check.require(bool(workflows), "github_ci enabled but no GitHub Actions workflow exists")
-        required_tokens = ["fetch-depth: 0", "scripts/repo-check", "scripts/secret-scan"]
-        if isinstance(verify, str) and verify.strip() and PLACEHOLDER_VERIFY.search(verify) is None:
-            required_tokens.append(verify)
-        if enabled(features, "artifact_check"):
-            required_tokens.append("scripts/artifact-check")
+        # `make test-all` is the documented complete, credential-free local
+        # acceptance surface. It invokes the declared verification command and
+        # every baseline static/repository check, so CI and local acceptance do
+        # not drift by requiring duplicated workflow steps.
+        required_tokens = ["fetch-depth: 0", "make test-all"]
         compliant = []
         for path in workflows:
             workflow_text = path.read_text(encoding="utf-8", errors="replace")
@@ -390,7 +390,7 @@ def validate(root: Path) -> Check:
                 compliant.append(path)
         check.require(
             bool(compliant),
-            "one GitHub Actions workflow must contain full-history checkout and every required check",
+            "one GitHub Actions workflow must contain full-history checkout and make test-all",
         )
 
     scoped = manifest.get("scoped_agents", [])

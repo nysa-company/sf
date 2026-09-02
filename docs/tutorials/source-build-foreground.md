@@ -27,19 +27,32 @@ make build-dev
 
 ./bin/sf-dev auth status
 ./bin/sf-dev auth login github
-./bin/sf-dev auth login cursor
-./bin/sf-dev auth login claude
+./bin/sf-dev auth login codex
 
 ./bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app
 ```
 
-`init` reads an optional `.sf/config.toml` but does not create or modify that
-file. It canonicalizes the Git worktree root, verifies the configured local
-base branch, creates only the dev channel's owner-only state directory, and
-records a durable configuration generation. Running the exact command again
-is an idempotent observation. A different repository or changed configuration
-under the same project name is refused rather than silently replacing the
-registration.
+`init` reads an optional `.sf/config.toml` but the normal form does not create
+or modify that file. It canonicalizes the Git worktree root, verifies the
+configured local base branch, creates only the dev channel's owner-only state
+directory, and records a durable configuration generation. Running the exact
+command again is an idempotent observation. A different repository or changed
+configuration under the same project name is refused rather than silently
+replacing the registration.
+
+For the dependency-bearing Nysa monorepo, explicitly select the bounded pure
+API test recipe. This is the only `init` form that may create the missing
+project config, and it never overwrites an existing file:
+
+```text
+./bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app \
+  --profile nysa-api-pure-v1 \
+  --test apps/api/tests/retrieval-fusion.test.ts
+```
+
+The selected entrypoint and its relative `.js`-to-`.ts` closure are validated
+before the config is installed. The resulting command uses no npm, package
+scripts, network, or `node_modules`.
 
 `auth login` starts the official interactive login flow in your terminal. It
 does not send a displayed token to the daemon. `auth status` reports only a
@@ -54,8 +67,8 @@ cd /absolute/path/to/sf-source
 ./bin/sf-dev daemon run
 ```
 
-Return to the first terminal and qualify the exact beta pair, then run the
-read-only diagnostic:
+Return to the first terminal and qualify the two Codex-backed logical roles,
+then run the read-only diagnostic:
 
 ```text
 cd /absolute/path/to/sf-source

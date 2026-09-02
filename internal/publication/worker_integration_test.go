@@ -359,7 +359,7 @@ func TestGuardedApprovalMergeRecoversLostProofResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("complete confirmed merge pause: %v", err)
 	}
-	if _, err := engine.New(restarted, spec).Signal(f.ctx, contracts.SignalRequest{
+	resumeResult, err := engine.New(restarted, spec).Signal(f.ctx, contracts.SignalRequest{
 		Ticket: f.ref, TicketVersion: pausedResult.Version, From: domain.StatePaused, Trigger: "operator_resume",
 		Fence: domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: stranded.RunnerEpoch + 1},
 		Attributes: map[string]string{
@@ -367,12 +367,13 @@ func TestGuardedApprovalMergeRecoversLostProofResponse(t *testing.T) {
 			"branch_remote_identity_exact": "true", "prerequisites_green": "true",
 		},
 		EventPayload: `{}`,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("resume confirmed merge: %v", err)
 	}
 	resumed, err := restarted.Ticket(f.ctx, f.ref)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || resumeResult.To != domain.StateMerging || resumeResult.TicketVersion != pausedResult.Version+1 || resumeResult.EventID == "" || resumed.State != domain.StateMerging || resumed.Version != resumeResult.TicketVersion || resumed.ResumeState != "" || resumed.RunnerEpoch != stranded.RunnerEpoch+1 {
+		t.Fatalf("resume confirmed merge result=%+v ticket=%+v err=%v", resumeResult, resumed, err)
 	}
 	capability, err := restarted.PostPublicationRearmProof(f.ctx, f.ref, controlProof.Ticket)
 	if err != nil {
@@ -392,10 +393,65 @@ func TestGuardedApprovalMergeRecoversLostProofResponse(t *testing.T) {
 		t.Fatalf("open confirmed merge rearm: %v", err)
 	}
 
+	mergeRetryPausedResult, err := restarted.Transition(f.ctx, store.Transition{
+		Ref: f.ref, ExpectedVersion: resumed.Version, From: domain.StateMerging, To: domain.StatePaused,
+		ResumeState: domain.StateMerging, Trigger: "retry_or_correction_exhausted",
+		Fence: domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: resumed.RunnerEpoch}, EventPayload: `{"reason":"retry_budget"}`,
+	})
+	if err != nil {
+		t.Fatalf("pause confirmed merge for retry: %v", err)
+	}
+	mergeRetryPaused, err := restarted.Ticket(f.ctx, f.ref)
+	if err != nil || mergeRetryPaused.State != domain.StatePaused || mergeRetryPaused.Version != mergeRetryPausedResult.Version || mergeRetryPaused.ResumeState != domain.StateMerging || mergeRetryPaused.RunnerEpoch != resumed.RunnerEpoch {
+		t.Fatalf("paused confirmed merge for retry ticket=%+v result=%+v err=%v", mergeRetryPaused, mergeRetryPausedResult, err)
+	}
+	mergeRetryResult, err := engine.New(restarted, spec).Signal(f.ctx, contracts.SignalRequest{
+		Ticket: f.ref, TicketVersion: mergeRetryPaused.Version, From: domain.StatePaused, Trigger: "operator_retry",
+		Fence: domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: mergeRetryPaused.RunnerEpoch},
+		Attributes: map[string]string{
+			"operator_identity_authenticated": "true", "pause_reason_retryable": "true",
+			"typed_prerequisites_satisfied": "true", "runner_epoch_current": "true",
+		},
+		EventPayload: `{"intent":"retry"}`,
+	})
+	if err != nil {
+		t.Fatalf("retry confirmed merge: %v", err)
+	}
+	resumed, err = restarted.Ticket(f.ctx, f.ref)
+	if err != nil || mergeRetryResult.To != domain.StateMerging || mergeRetryResult.TicketVersion != mergeRetryPaused.Version+1 || mergeRetryResult.EventID == "" || resumed.State != domain.StateMerging || resumed.Version != mergeRetryResult.TicketVersion || resumed.ResumeState != "" || resumed.RunnerEpoch != mergeRetryPaused.RunnerEpoch {
+		t.Fatalf("retry confirmed merge result=%+v ticket=%+v err=%v", mergeRetryResult, resumed, err)
+	}
+	if needed, err := restarted.RuntimeRearmNeeded(f.ctx, f.ref); err != nil || !needed {
+		t.Fatalf("retry confirmed merge rearm needed=%v err=%v", needed, err)
+	}
+	mergeRetryStopped, err := restarted.StoppedRuntimeTicket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatalf("load confirmed merge retry stop: %v", err)
+	}
+	mergeRetryCapability, err := restarted.PostPublicationRearmProof(f.ctx, f.ref, mergeRetryStopped)
+	if err != nil {
+		t.Fatalf("prove confirmed merge retry rearm: %v", err)
+	}
+	var mergeRetryAdmission *store.RuntimeAdmissionCapability
+	if err := restarted.ActivateRearm(f.ctx, mergeRetryCapability, func(value *store.RuntimeAdmissionCapability) error {
+		if _, _, _, ok := value.ConsumeRuntimeAdmission(); !ok {
+			return errors.New("fixture: merge retry runtime admission was not consumable")
+		}
+		mergeRetryAdmission = value
+		return nil
+	}); err != nil || mergeRetryAdmission == nil {
+		t.Fatalf("activate confirmed merge retry admission=%v err=%v", mergeRetryAdmission, err)
+	}
+	if err := mergeRetryAdmission.OpenStoreAdmission(f.ctx); err != nil {
+		t.Fatalf("open confirmed merge retry rearm: %v", err)
+	}
+
 	restartedWorker.Engine = &failMergeObservedOnceEngine{StateMachine: engine.New(restarted, spec)}
 	resumedFence := domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: resumed.RunnerEpoch}
 	if _, err := restartedWorker.Run(f.ctx, f.ref, resumedFence); err == nil {
 		t.Fatal("post-rearm merge observation crash was not injected")
+	} else if err.Error() != "fixture: crash before merge_observed" {
+		t.Fatalf("post-rearm merge recovery failed before observation injection: %v", err)
 	}
 	promoted, err := restarted.Effect(f.ctx, mergeKey)
 	if err != nil || promoted.State != store.EffectConfirmed || promoted.TicketVersion != resumed.Version || promoted.LeaderEpoch != secondLeader || promoted.RunnerEpoch != resumed.RunnerEpoch || promoted.ClaimEpoch != confirmedBeforePause.ClaimEpoch+1 {
@@ -405,7 +461,11 @@ func TestGuardedApprovalMergeRecoversLostProofResponse(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("promoted merge intent found=%v err=%v", found, err)
 	}
-	if _, err := restarted.MergeIntentForProof(f.ctx, promotedIntent.RepositoryHost, promotedIntent.RepositoryOwner, promotedIntent.RepositoryName, promotedIntent.BaseRef, promotedIntent.OriginalBaseOID, promotedIntent.HeadOID); err != nil {
+	_, mergeOID, found := strings.Cut(promoted.ObservedIdentity, "@")
+	if !found || mergeOID == "" {
+		t.Fatalf("promoted merge observation identity=%q", promoted.ObservedIdentity)
+	}
+	if _, err := restarted.MergeIntentForProof(f.ctx, promotedIntent.RepositoryHost, promotedIntent.RepositoryOwner, promotedIntent.RepositoryName, promotedIntent.BaseRef, promotedIntent.OriginalBaseOID, mergeOID); err != nil {
 		t.Fatalf("promoted merge proof authority: %v", err)
 	}
 	if got := f.github.MutationCount("pr_merge"); got != 1 || proofFetches != 1 {
@@ -424,6 +484,115 @@ func TestGuardedApprovalMergeRecoversLostProofResponse(t *testing.T) {
 	if got := f.github.MutationCount("pr_merge"); got != 1 || proofFetches != 1 {
 		t.Fatalf("post-merge crash replayed external mutation merge_calls=%d proof_fetches=%d", got, proofFetches)
 	}
+
+	for _, tc := range []struct {
+		name    string
+		trigger string
+		control bool
+	}{
+		{name: "operator_resume", trigger: "operator_resume", control: true},
+		{name: "operator_retry", trigger: "operator_retry"},
+	} {
+		t.Run("engine reconciling "+tc.name, func(t *testing.T) {
+			current, err := restarted.Ticket(f.ctx, f.ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fence := domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: current.RunnerEpoch}
+			var pausedResult store.TransitionResult
+			var stopped store.Ticket
+			if tc.control {
+				controlProof, err := restarted.ControlProof(f.ctx, f.ref)
+				if err != nil || !controlProof.Drained() {
+					t.Fatalf("pre-reconcile control proof=%+v err=%v", controlProof, err)
+				}
+				stopping, err := restarted.TransitionAndInvalidateRunner(f.ctx, store.Transition{
+					Ref: f.ref, ExpectedVersion: current.Version, From: domain.StateReconciling, To: domain.StateStopping,
+					ResumeState: domain.StateReconciling, Trigger: "operator_pause_or_take",
+					Fence: fence, EventPayload: `{"intent":"pause"}`,
+				})
+				if err != nil {
+					t.Fatalf("pause reconciling: %v", err)
+				}
+				pausedResult, err = restarted.CompleteControlTransition(f.ctx, store.Transition{
+					Ref: f.ref, ExpectedVersion: stopping.Version, From: domain.StateStopping, To: domain.StatePaused,
+					ResumeState: domain.StateReconciling, Trigger: "process_and_effects_drained",
+					Fence: domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: current.RunnerEpoch + 1}, EventPayload: `{}`,
+				})
+				if err != nil {
+					t.Fatalf("complete reconciling pause: %v", err)
+				}
+				stopped = controlProof.Ticket
+			} else {
+				pausedResult, err = restarted.Transition(f.ctx, store.Transition{
+					Ref: f.ref, ExpectedVersion: current.Version, From: domain.StateReconciling, To: domain.StatePaused,
+					ResumeState: domain.StateReconciling, Trigger: "retry_or_correction_exhausted",
+					Fence: fence, EventPayload: `{"reason":"retry_budget"}`,
+				})
+				if err != nil {
+					t.Fatalf("pause reconciling for retry: %v", err)
+				}
+			}
+			paused, err := restarted.Ticket(f.ctx, f.ref)
+			if err != nil || paused.State != domain.StatePaused || paused.Version != pausedResult.Version || paused.ResumeState != domain.StateReconciling {
+				t.Fatalf("paused reconciling ticket=%+v result=%+v err=%v", paused, pausedResult, err)
+			}
+
+			attributes := map[string]string{
+				"operator_identity_authenticated": "true",
+			}
+			eventPayload := `{}`
+			if tc.control {
+				attributes["takeover_diff_none"] = "true"
+				attributes["branch_remote_identity_exact"] = "true"
+				attributes["prerequisites_green"] = "true"
+			} else {
+				attributes["pause_reason_retryable"] = "true"
+				attributes["typed_prerequisites_satisfied"] = "true"
+				attributes["runner_epoch_current"] = "true"
+				eventPayload = `{"intent":"retry"}`
+			}
+			result, err := engine.New(restarted, spec).Signal(f.ctx, contracts.SignalRequest{
+				Ticket: f.ref, TicketVersion: paused.Version, From: domain.StatePaused, Trigger: tc.trigger,
+				Fence:      domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: paused.RunnerEpoch},
+				Attributes: attributes, EventPayload: eventPayload,
+			})
+			if err != nil {
+				t.Fatalf("reconcile %s: %v", tc.trigger, err)
+			}
+			resumed, err := restarted.Ticket(f.ctx, f.ref)
+			if err != nil || result.To != domain.StateReconciling || result.TicketVersion != paused.Version+1 || result.EventID == "" || resumed.State != domain.StateReconciling || resumed.Version != result.TicketVersion || resumed.ResumeState != "" || resumed.RunnerEpoch != paused.RunnerEpoch {
+				t.Fatalf("reconcile %s result=%+v ticket=%+v err=%v", tc.trigger, result, resumed, err)
+			}
+			if !tc.control {
+				if needed, err := restarted.RuntimeRearmNeeded(f.ctx, f.ref); err != nil || !needed {
+					t.Fatalf("reconcile retry rearm needed=%v err=%v", needed, err)
+				}
+				stopped, err = restarted.StoppedRuntimeTicket(f.ctx, f.ref)
+				if err != nil {
+					t.Fatalf("load reconciling retry stop: %v", err)
+				}
+			}
+			capability, err := restarted.PostPublicationRearmProof(f.ctx, f.ref, stopped)
+			if err != nil {
+				t.Fatalf("prove reconciling %s rearm: %v", tc.trigger, err)
+			}
+			var admission *store.RuntimeAdmissionCapability
+			if err := restarted.ActivateRearm(f.ctx, capability, func(value *store.RuntimeAdmissionCapability) error {
+				if _, _, _, ok := value.ConsumeRuntimeAdmission(); !ok {
+					return errors.New("fixture: reconciling runtime admission was not consumable")
+				}
+				admission = value
+				return nil
+			}); err != nil || admission == nil {
+				t.Fatalf("activate reconciling %s admission=%v err=%v", tc.trigger, admission, err)
+			}
+			if err := admission.OpenStoreAdmission(f.ctx); err != nil {
+				t.Fatalf("open reconciling %s rearm: %v", tc.trigger, err)
+			}
+		})
+	}
+
 	if err := restarted.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -17,6 +17,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/nysapure"
 )
 
 var (
@@ -189,15 +190,18 @@ func EvaluateRepositoryCommand(argv []string) CommandDecision {
 	}
 }
 
-// evaluateNodeVerification is intentionally a single source argv. The
-// supervisor adds its fixed Node 22 hardening flags after Store has bound this
-// immutable recipe. Scripts, flags, npm, and shell wrappers are never source
-// authority.
+// evaluateNodeVerification is intentionally a small set of source argv
+// recipes. The supervisor adds all Node flags and the factory-owned loader
+// after Store has bound the immutable recipe. Scripts, npm, and shell wrappers
+// are never source authority.
 func evaluateNodeVerification(argv []string) CommandDecision {
-	if len(argv) != 2 || argv[1] != "--test" {
-		return deny("node_recipe_forbidden", "only the exact dependency-free Node 22 recipe `node --test` is eligible; flags, scripts, npm, and wrappers require operator takeover")
+	if len(argv) == 2 && argv[1] == "--test" {
+		return CommandDecision{Allowed: true, Code: "allowed_node_test_recipe", Reason: "exact dependency-free Node 22 test recipe"}
 	}
-	return CommandDecision{Allowed: true, Code: "allowed_node_test_recipe", Reason: "exact dependency-free Node 22 test recipe"}
+	if len(argv) == 3 && argv[1] == nysapure.RecipeFlag && nysapure.ValidTestPath(argv[2]) {
+		return CommandDecision{Allowed: true, Code: "allowed_nysa_api_pure_v1_recipe", Reason: "exact nysa_api_pure_v1 TypeScript test recipe"}
+	}
+	return deny("node_recipe_forbidden", "only `node --test` or `node --sf-nysa-api-pure-v1 <canonical .test.ts>` is eligible; npm, flags, scripts, and wrappers require operator takeover")
 }
 
 // evaluateGoVerification is intentionally a recipe, not a flag denylist.  The

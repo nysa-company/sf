@@ -3,9 +3,11 @@ package workflowruntime
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/workflowworker"
@@ -34,12 +36,29 @@ type runtimeReadyMergeTickets struct {
 	runtimeErr   error
 }
 
+type sourceResumeProofTickets struct {
+	fakeTickets
+	proof    store.OperatorSourceResumeProof
+	found    bool
+	err      error
+	fresh    bool
+	freshErr error
+}
+
 func (f mergeReadyFakeTickets) MergeReconciliationReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
 	return f.ready, f.err
 }
 
 func (f runtimeReadyMergeTickets) RuntimeAdmissionReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
 	return f.runtimeReady, f.runtimeErr
+}
+
+func (f sourceResumeProofTickets) OperatorSourceResumeProof(context.Context, domain.TicketRef, uint64, domain.Fence) (store.OperatorSourceResumeProof, bool, error) {
+	return f.proof, f.found, f.err
+}
+
+func (f sourceResumeProofTickets) OperatorSourceResumeRequiresFreshVerification(context.Context, domain.TicketRef, uint64) (bool, error) {
+	return f.fresh, f.freshErr
 }
 
 func (f currentFakeTickets) Ticket(context.Context, domain.TicketRef) (store.Ticket, error) {
@@ -66,6 +85,34 @@ func (f fakeTickets) RuntimeAdmissionReady(context.Context, domain.TicketRef, ui
 type fakeEnsure struct {
 	calls []worktreecoord.EnsureRequest
 	err   error
+}
+
+type fakeSourceResumeEnsure struct {
+	fakeEnsure
+	proofCalls  []store.OperatorSourceResumeProof
+	proofResult store.StoredWorktree
+	proofErr    error
+}
+
+type blockingSourceResumeEnsure struct {
+	fakeSourceResumeEnsure
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (f *fakeSourceResumeEnsure) AuthenticateOperatorSourceResume(_ context.Context, _ worktreecoord.EnsureRequest, proof store.OperatorSourceResumeProof) (store.StoredWorktree, error) {
+	f.proofCalls = append(f.proofCalls, proof)
+	if f.proofErr != nil {
+		return store.StoredWorktree{}, f.proofErr
+	}
+	return f.proofResult, nil
+}
+
+func (f *blockingSourceResumeEnsure) AuthenticateOperatorSourceResume(_ context.Context, _ worktreecoord.EnsureRequest, proof store.OperatorSourceResumeProof) (store.StoredWorktree, error) {
+	f.proofCalls = append(f.proofCalls, proof)
+	close(f.entered)
+	<-f.release
+	return f.proofResult, nil
 }
 
 func (f *fakeEnsure) Ensure(_ context.Context, request worktreecoord.EnsureRequest) (store.StoredWorktree, error) {
@@ -174,6 +221,16 @@ func TestSchedulerObservesManualMergeWithoutWorktree(t *testing.T) {
 	}
 }
 
+func TestSchedulerObservesExternalMergeWhileWaitingApprovalWithoutWorktree(t *testing.T) {
+	waiting := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "approval"}, domain.StateWaitingApproval)
+	ensurer := &fakeEnsure{err: store.ErrNotFound}
+	worker := &fakeWorker{}
+	result := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{waiting}}, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != waiting.Ref || len(ensurer.calls) != 0 {
+		t.Fatalf("waiting approval result=%+v worker=%v ensures=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
 func TestSchedulerReconcilesObservedMergeWithoutWorktree(t *testing.T) {
 	reconciling := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "reconciling"}, domain.StateReconciling)
 	ensurer := &fakeEnsure{err: store.ErrNotFound}
@@ -192,6 +249,105 @@ func TestSchedulerReconcilesSettledMergeWithoutUnavailableWorktree(t *testing.T)
 	result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
 	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != merging.Ref || len(ensurer.calls) != 0 {
 		t.Fatalf("settled merge result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
+func TestSchedulerRunsAuthenticatedOperatorSourceResumeWithoutPristineEnsure(t *testing.T) {
+	building := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "operator-source-resume"}, domain.StateBuilding)
+	proof := store.OperatorSourceResumeProof{Ref: building.Ref, Version: building.Version, Fence: domain.Fence{LeaderEpoch: 9, RunnerEpoch: building.RunnerEpoch}, SourceCommit: contracts.OperatorSourceCommit{CommitOID: strings.Repeat("a", 40), ParentOID: strings.Repeat("b", 40), TreeOID: strings.Repeat("c", 40), Changes: []contracts.OperatorSourceChange{{Status: "M", Path: "internal/feature.go"}}}}
+	ensurer := &fakeSourceResumeEnsure{fakeEnsure: fakeEnsure{err: worktreecoord.ErrQuarantined}, proofResult: store.StoredWorktree{Path: "/tmp/source", State: "registered"}}
+	worker := &fakeWorker{}
+	source := sourceResumeProofTickets{fakeTickets: fakeTickets{tickets: []store.Ticket{building}}, proof: proof, found: true}
+	result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeInvoked || len(worker.calls) != 1 || worker.calls[0] != building.Ref || len(ensurer.calls) != 0 || len(ensurer.proofCalls) != 1 || result.Worktree.Path != ensurer.proofResult.Path || result.Worktree.State != ensurer.proofResult.State {
+		t.Fatalf("authenticated source resume=%+v worker=%v ensure=%v proof=%v", result, worker.calls, ensurer.calls, ensurer.proofCalls)
+	}
+}
+
+func TestSchedulerRetainsPristineEnsureWhenOperatorSourceResumeIsNotProven(t *testing.T) {
+	building := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "unproven-source-resume"}, domain.StateBuilding)
+	for _, value := range []struct {
+		name  string
+		found bool
+	}{
+		{name: "proof absent"},
+	} {
+		t.Run(value.name, func(t *testing.T) {
+			ensurer := &fakeEnsure{err: worktreecoord.ErrInProgress}
+			worker := &fakeWorker{}
+			source := sourceResumeProofTickets{fakeTickets: fakeTickets{tickets: []store.Ticket{building}}, found: value.found}
+			result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+			if result.Outcome != OutcomeInProgress || !errors.Is(result.Err, ErrInProgress) || len(worker.calls) != 0 || len(ensurer.calls) != 1 {
+				t.Fatalf("unproven source resume=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+			}
+		})
+	}
+}
+
+func TestSchedulerNeverFallsBackToPristineEnsureWhenSourceFreshnessNeedsProof(t *testing.T) {
+	verifying := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "fresh-source-proof-missing"}, domain.StateVerifying)
+	ensurer := &fakeEnsure{err: worktreecoord.ErrInProgress}
+	worker := &fakeWorker{}
+	source := sourceResumeProofTickets{fakeTickets: fakeTickets{tickets: []store.Ticket{verifying}}, fresh: true}
+	result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeReadiness || !errors.Is(result.Err, ErrReadiness) || len(worker.calls) != 0 || len(ensurer.calls) != 0 {
+		t.Fatalf("missing required source proof fell back to Ensure: result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
+func TestSchedulerFailsClosedWhenOperatorSourceResumeProofErrors(t *testing.T) {
+	building := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "source-proof-error"}, domain.StateBuilding)
+	ensurer := &fakeEnsure{err: worktreecoord.ErrInProgress}
+	worker := &fakeWorker{}
+	source := sourceResumeProofTickets{fakeTickets: fakeTickets{tickets: []store.Ticket{building}}, err: store.ErrBusy}
+	result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeBusy || len(worker.calls) != 0 || len(ensurer.calls) != 0 {
+		t.Fatalf("proof error bypassed source handoff safety: result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
+func TestSchedulerDoesNotInvokeWorkerWhenSourceResumeAuthenticationIsStopped(t *testing.T) {
+	building := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "source-resume-stop"}, domain.StateBuilding)
+	proof := store.OperatorSourceResumeProof{Ref: building.Ref, Version: building.Version, Fence: domain.Fence{LeaderEpoch: 9, RunnerEpoch: building.RunnerEpoch}, SourceCommit: contracts.OperatorSourceCommit{CommitOID: strings.Repeat("a", 40), ParentOID: strings.Repeat("b", 40), TreeOID: strings.Repeat("c", 40), Changes: []contracts.OperatorSourceChange{{Status: "M", Path: "internal/feature.go"}}}}
+	ensurer := &blockingSourceResumeEnsure{
+		fakeSourceResumeEnsure: fakeSourceResumeEnsure{proofResult: store.StoredWorktree{Path: "/tmp/source", State: "registered"}},
+		entered:                make(chan struct{}),
+		release:                make(chan struct{}),
+	}
+	worker := &fakeWorker{}
+	scheduler := NewScheduler(domain.ChannelDev, sourceResumeProofTickets{fakeTickets: fakeTickets{tickets: []store.Ticket{building}}, proof: proof, found: true}, ensurer, worker)
+	stopped := make(chan struct{})
+	scheduler.admission.afterStop = func() { close(stopped) }
+	resultCh := make(chan TickResult, 1)
+	go func() { resultCh <- scheduler.Tick(context.Background(), domain.Fence{LeaderEpoch: 9}) }()
+	select {
+	case <-ensurer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("source-resume authenticator was not invoked")
+	}
+	stopCh := make(chan error, 1)
+	go func() { stopCh <- scheduler.admission.Stop(context.Background(), building.Ref) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not cancel source-resume authentication")
+	}
+	close(ensurer.release)
+	select {
+	case err := <-stopCh:
+		if err != nil {
+			t.Fatalf("stop=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stop did not join source-resume authentication")
+	}
+	select {
+	case result := <-resultCh:
+		if result.Outcome != OutcomeCanceled || !errors.Is(result.Err, ErrCanceled) || len(worker.calls) != 0 || len(ensurer.calls) != 0 {
+			t.Fatalf("stopped source resume invoked work: result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("scheduler tick did not return after source-resume stop")
 	}
 }
 
@@ -223,6 +379,7 @@ func TestSchedulerNeverConsumesSealedRuntimeAcrossActiveStates(t *testing.T) {
 		domain.StateReviewing,
 		domain.StatePublishing,
 		domain.StateWaitingCI,
+		domain.StateWaitingApproval,
 		domain.StateWaitingManualMerge,
 		domain.StateMerging,
 		domain.StateReconciling,

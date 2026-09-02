@@ -24,6 +24,7 @@ import (
 	"github.com/nysa-company/sf/internal/executionpolicy"
 	gitboundary "github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/goclosure"
+	"github.com/nysa-company/sf/internal/nysapure"
 )
 
 func TestRepositoryCommandRejectsCustomExecutableNamedGo(t *testing.T) {
@@ -523,6 +524,96 @@ test('permission and seatbelt proof', async () => {
 	}
 	if atomic.LoadInt32(&connections) != 0 {
 		t.Fatalf("Seatbelt allowed %d localhost connections", connections)
+	}
+}
+
+// This is the production composition proof for the typed Nysa profile: the
+// exact three-argv command is policy-bound, its loader-inclusive runtime
+// identity is claimed, and the compiled fd/Seatbelt gate stages both Node and
+// the factory-owned resolver before running a .js-to-.ts test closure.
+func TestRepositoryCommandRunsNysaPureTypeScriptThroughGate(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("repository command product boundary is macOS")
+	}
+	if _, err := resolveFixedNodeExecutable("node"); err != nil {
+		t.Skip("no approved Node executable is available")
+	}
+	repo := t.TempDir()
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, argv := range [][]string{{"git", "init"}, {"git", "checkout", "-b", "main"}, {"git", "config", "user.email", "sf@example.test"}, {"git", "config", "user.name", "SF"}, {"git", "remote", "add", "origin", "ssh://git@ssh.github.com:443/example/repository.git"}} {
+		mustRepositoryCommand(t, repo, argv...)
+	}
+	files := map[string]string{
+		"apps/api/tests/kernel.test.ts": `import test from 'node:test'; import { value } from '../src/kernel.js'; test('pure', () => { if (value !== 7) throw new Error('bad'); });`,
+		"apps/api/src/kernel.ts":        `export const value: number = 7;`,
+	}
+	for relative, data := range files {
+		path := filepath.Join(repo, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustRepositoryCommand(t, repo, "git", "add", ".")
+	mustRepositoryCommand(t, repo, "git", "commit", "-m", "initial")
+	worktree := filepath.Join(t.TempDir(), "worktree")
+	mustRepositoryCommand(t, repo, "git", "worktree", "add", "-b", "ticket/nysa-pure", worktree)
+	helper := filepath.Join(t.TempDir(), "sf-git-exec")
+	buildHelper := exec.Command("go", "build", "-o", helper, "./cmd/sf-git-exec")
+	buildHelper.Dir = root
+	if out, err := buildHelper.CombinedOutput(); err != nil {
+		t.Fatalf("build Git helper: %v: %s", err, out)
+	}
+	gitHome := filepath.Join(t.TempDir(), "git-home")
+	if err := os.Mkdir(gitHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := gitboundary.Runner{Binary: "/usr/bin/git", ExecHelper: helper, Home: gitHome}
+	identity, err := runner.Snapshot(context.Background(), worktree, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree = identity.Worktree
+	identityRaw, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := contracts.CommandSpec{Argv: []string{"node", nysapure.RecipeFlag, "apps/api/tests/kernel.test.ts"}, Directory: worktree, Timeout: 60 * time.Second, Profile: contracts.ProfileGuarded}
+	policy, err := executionpolicy.NewCommandSnapshot(spec.Argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodePath, nodeDigest, err := RepositoryCommandExecutableIdentity(spec.Argv)
+	if err != nil || !strings.HasPrefix(nodeDigest, "nysa-api-pure-v1:sha256:") {
+		t.Fatalf("Nysa runtime identity path=%q digest=%q err=%v", nodePath, nodeDigest, err)
+	}
+	argv, _ := json.Marshal(spec.Argv)
+	argvSum := sha256.Sum256(argv)
+	empty := sha256.Sum256(nil)
+	specBytes, _ := json.Marshal(struct {
+		Argv        []string
+		Directory   string
+		Timeout     int64
+		Profile     contracts.ExecutionProfile
+		StdinDigest string
+	}{spec.Argv, spec.Directory, spec.Timeout.Nanoseconds(), spec.Profile, "sha256:" + hex.EncodeToString(empty[:])})
+	specSum := sha256.Sum256(specBytes)
+	claim := contracts.RepositoryCommandClaim{TicketRef: domain.TicketRef{Channel: domain.ChannelDev, Project: "proof", Ticket: "nysa-pure"}, SemanticKey: "repository-command/nysa-pure", RequestDigest: "sha256:" + strings.Repeat("a", 64), TicketVersion: 1, LeaderEpoch: 1, RunnerEpoch: 1, ClaimEpoch: 1, Repository: identity.Repository, Worktree: worktree, WorktreeIdentity: string(identityRaw), Branch: identity.HeadRef, BaseRef: identity.BaseRef, BaseSHA: identity.BaseHead, CommandDigest: "sha256:" + hex.EncodeToString(argvSum[:]), SpecDigest: "sha256:" + hex.EncodeToString(specSum[:]), PolicyDigest: policy.Digest(), ExecutablePath: nodePath, ExecutableDigest: nodeDigest}
+	sf := filepath.Join(t.TempDir(), "sf")
+	build := exec.Command("go", "build", "-o", sf, "./cmd/sf")
+	build.Dir = root
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sf gate: %v: %s", err, out)
+	}
+	lease := &repositoryTestLease{}
+	result, err := (RepositoryCommandSupervisor{Executable: sf, GitRunner: runner, SoftDrain: time.Second, HardDrain: time.Second}).Run(context.Background(), claim, spec, policy, lease)
+	if err != nil || !result.Observed || result.ExitCode != 0 || !lease.launchFinished() || lease.groupCount() != 0 {
+		t.Fatalf("Nysa pure result=%+v err=%v lifecycle=%+v groups=%d", result, err, lease.launch, lease.groupCount())
 	}
 }
 

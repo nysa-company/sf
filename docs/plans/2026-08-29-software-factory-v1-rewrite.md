@@ -1,6 +1,6 @@
 # Software Factory v1 replacement
 
-Status: Approved; local implementation in progress
+Status: Approved; release-candidate hardening and validation in progress
 
 Plan owner: Sofia, with Codex as plan author
 
@@ -13,17 +13,21 @@ Related artifacts:
 - [Normative state machine](2026-08-29-software-factory-v1-state-machine.json)
 - [Implementation tasks](2026-08-29-software-factory-v1-tasks.jsonl)
 
+The implementation-task JSONL is the original execution backlog. Historical
+Cursor/Claude, LaunchAgent, and autonomous items in that backlog are not v1
+product claims; this plan and the current verification plan are authoritative.
+
 ## Outcome
 
 Software Factory v1 is a local, operator-friendly service that turns one
 Markdown ticket into a reviewed GitHub pull request and, according to the
-selected merge mode, either waits for Sofia or merges the exact reviewed
-commit.
+selected merge mode, either waits for Sofia to merge externally or requests an
+exact reviewed-head merge after her approval.
 
 The shortest successful path is:
 
 ~~~text
-sf submit ticket.md --repo /path/to/nysa
+sf submit ticket.md --project nysa
 sf start SF-123
 
 ticket
@@ -33,13 +37,16 @@ ticket
   -> verified implementation commit
   -> draft pull request
   -> fresh independent review + GitHub checks
-  -> human approval or autonomous exact-head merge
+  -> human external merge or approval followed by guarded exact-head merge
   -> merged-state reconciliation
   -> done
 ~~~
 
-At any point, Sofia can see what is happening, pause safely, stop the current
-agent, enter the worktree, make changes, and return control to the factory.
+At any active or waiting workflow point, Sofia can see what is happening,
+pause safely, stop the current agent, enter the worktree when one exists, make
+changes, and return control to the factory. A queued ticket is controlled with
+`start`; a typed blocked ticket remains fail-closed and is controlled with
+`status` and `recover`, never by bypassing its recovery prerequisite.
 Every stopped state must name the cause and print one exact next action or one
 typed host prerequisite followed by the recovery command. The CLI never invents
 a retry when disk, authentication, filesystem ownership, or a live escaped
@@ -51,27 +58,30 @@ process must be repaired first.
 
 - Sofia building Nysa on a trusted local macOS machine.
 - Trusted repositories explicitly registered by the operator.
-- macOS open-source contributors who want the same local GitHub workflow and
-  accept the trusted-repository threat model.
 - Feature, bug, refactor, infrastructure/configuration, documentation, and
   non-merging spike tickets.
 
+Broader open-source contributor support follows the Nysa pilot; it is not a v1
+release claim.
+
 ### v1 includes
 
-- A friendly sf CLI and local background daemon.
+- A friendly sf CLI and foreground local daemon.
 - Local Markdown tickets; GitHub Issues are not required.
 - Per-ticket Git worktrees.
 - Planner, Builder, and Reviewer logical roles.
 - A pre-build verification invocation of Reviewer and a fresh post-build
   review invocation.
-- Cursor-first provider execution with configured Claude and Codex fallback.
+- Codex execution for both logical Builder and Reviewer roles. Cursor, Claude,
+  and provider fallback selection are future work.
 - SQLite as the single application-state authority.
-- DBOS Go as the preferred durable workflow runtime, conditional on a one-day
-  proof gate.
+- The selected custom Go state engine over SQLite; DBOS remains only as a
+  rejected, reproducible proof spike.
 - GitHub pull requests and merge through the official gh CLI.
-- Manual, guarded, and autonomous merge modes.
+- Manual external merge observation and guarded automatic merge after human
+  approval.
 - Bounded concurrency, defaulting to two active tickets.
-- Stable and development installations that cannot share state.
+- Separate stable and development channel builds and state roots.
 - Crash recovery from the last durable phase.
 - Time and optional cost ceilings.
 
@@ -129,8 +139,7 @@ make build-dev
 
 ./bin/sf-dev auth status
 ./bin/sf-dev auth login github       # delegates interactively to gh
-./bin/sf-dev auth login cursor       # delegates to the installed provider
-./bin/sf-dev auth login claude       # or codex for independent review
+./bin/sf-dev auth login codex        # delegates to the installed provider
 
 ./bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app
 
@@ -138,7 +147,7 @@ make build-dev
 ./bin/sf-dev daemon run
 
 # Back in the first terminal:
-./bin/sf-dev providers qualify --builder cursor --reviewer claude
+./bin/sf-dev providers qualify --builder codex --reviewer codex
 ./bin/sf-dev doctor --repo /absolute/path/to/nysa-app
 
 ./bin/sf-dev submit ./tickets/fix-duplicate-reminders.md \
@@ -158,17 +167,24 @@ auth status and doctor report only provider, account label when safely
 available, credential state, and remediation; they never print credential
 bytes.
 
-The guarded beta pair is Cursor as Builder and Claude as the independent
-Reviewer. Codex is the first later fallback. Doctor prints the selected pair,
-their actual inference families, authentication state, and qualification
-level. A project may change the pair only within the supported-version and
-independence rules.
+The v1 provider is Codex for both the Builder and Reviewer logical roles.
+Separate invocations and Store-bound evidence preserve role boundaries; v1
+does not claim independent provider families. Doctor prints the configured
+provider, authentication state, and qualification level. Cursor, Claude, and
+cross-provider fallback remain post-v1 work.
 
-The stable tutorial replaces make build-dev with the exact checksummed release
-installation command selected and tested before the first public release; the
-plan does not publish a placeholder command. The complete path
-from an already installed/authenticated machine to a submitted, visible ticket
-has a five-minute documentation-test budget, excluding model runtime.
+The stable tutorial must replace `make build-dev` with the exact checksummed
+release-installation command selected and tested before the first public
+release; this plan does not publish a placeholder command. Until then, local
+v1 acceptance is credential-free and proves only the documented local gates;
+it is not real-provider qualification, disposable-GitHub qualification, or a
+stable-promotion decision. Those are manual release gates: provider
+qualification uses an isolated Codex fixture with no GitHub mutation, and the
+separately authorized disposable non-production GitHub guarded flow precedes
+the ten-ticket guarded Nysa pilot. `update` and `rollback` currently fail
+closed, so no CLI promotion command is implied. The complete path from an
+already installed/authenticated machine to a submitted, visible ticket has a
+five-minute documentation-test budget, excluding model runtime.
 
 ## Why replacement is the correct boundary
 
@@ -254,7 +270,7 @@ behaviors and failure fixtures, not a runtime dependency.
         +----------+-----------+--------------------+
         |                      |                    |
   durable workflow       scheduler/limits     operator control
-  DBOS or fallback       global/repo/provider pause/take/resume
+  custom Go engine       global/repo/provider pause/take/resume
         |
   +-----+---------+----------------+------------------+
   |               |                |                  |
@@ -263,7 +279,7 @@ Planner       Reviewer verify    Builder          Reviewer final
   +---------------+-------+--------+------------------+
                           |
                     provider runner
-                    Cursor/Claude/Codex
+                    Codex (v1)
                           |
                 disposable ticket worktree
                           |
@@ -300,9 +316,9 @@ The daemon owns:
 - Event projection and log redaction.
 - Recovery after restart.
 
-On macOS, a user LaunchAgent runs each installed channel. The same binary
-supports a foreground daemon command for development and tests. No root
-privileges or system service are required.
+On macOS, the operator launches the selected channel's daemon in the
+foreground. No root privileges or system service are required; LaunchAgent and
+other background-service packaging remain post-v1 work.
 
 Each channel has exactly one leader:
 
@@ -322,9 +338,11 @@ late results from a superseded runner from being interpreted as current.
 
 #### Durable workflow engine
 
-The preferred engine is DBOS Go using the same SQLite database as the
-application. DBOS documents local SQLite configuration, recovery from the last
-completed workflow step, workflow communication, and transactions that combine
+The custom Go state engine over the application SQLite schema is selected for
+v1. The DBOS Go spike was run as a bounded design check and rejected for the
+local contention/recovery contract; it is not a v1 production dependency.
+DBOS documents local SQLite configuration, recovery from the last completed
+workflow step, workflow communication, and transactions that combine
 application writes with workflow checkpoints:
 
 - [SQLite configuration](https://docs.dbos.dev/golang/reference/configuration)
@@ -332,9 +350,9 @@ application writes with workflow checkpoints:
 - [Application data source](https://docs.dbos.dev/golang/reference/datasources)
 - [Messages and events](https://docs.dbos.dev/golang/tutorials/workflow-communication)
 
-DBOS steps are at-least-once. It therefore does not remove the need to reconcile
-Git, provider, or GitHub effects. It removes custom checkpoint, wakeup, and
-workflow-versioning machinery only if the proof gate passes.
+DBOS steps are at-least-once. The rejected spike therefore does not remove the
+need to reconcile Git, provider, or GitHub effects; the selected custom engine
+owns those checkpoints and reconciliations in v1.
 
 ##### One-day DBOS proof gate
 
@@ -363,11 +381,10 @@ The spike passes only if one small Go program proves all of the following:
     reconciliation/re-enqueue using a stable workflow ID; an irreconcilable
     observation becomes a typed blocked state.
 
-If any critical criterion fails in one working day, the decision is final for
-v1: implement a small explicit Go state engine over the same schema. The
-workflow-facing application interface remains the same, so the rest of the
-plan does not depend on DBOS types. Only the selected engine is implemented
-beyond the proof; v1 does not carry two production runtimes.
+The spike failed its SQLite contention requirement. The decision is final for
+v1: implement and use a small explicit Go state engine over the same schema.
+The workflow-facing application interface remains the same, so the rest of the
+plan does not depend on DBOS types. v1 carries one production runtime, not two.
 
 #### SQLite
 
@@ -403,14 +420,12 @@ PhaseResult:
 There is no dynamic portfolio language. Defaults are code-owned and
 configuration may override them:
 
-- Planner and Builder prefer Cursor.
-- Claude and Codex are ordered fallbacks.
-- Verification and final review use a different model family from Builder
-  whenever available.
-- One primary attempt and one configured fallback attempt are allowed for a
-  phase; then the ticket pauses.
-- Autonomous merge is unavailable when independent verification/review cannot
-  be established.
+- Planner, Builder, verification, and final review use separately qualified
+  Codex invocations for their logical roles.
+- Provider selection and cross-provider fallback are post-v1 work.
+- Bounded retries are controlled by the phase policy; exhausted work pauses or
+  blocks with a typed next action.
+- Autonomous no-human merge is post-v1.
 
 The provider runner creates a dedicated process group, gives it a minimal
 environment, streams structured output through a redactor, and enforces soft
@@ -423,7 +438,7 @@ Provider authentication is adapter-specific and allowlisted:
 - auth login launches the official interactive login in the operator's
   terminal; the daemon never accepts a pasted token.
 - Before a paid phase, the adapter checks authentication in the same
-  LaunchAgent/foreground environment that will run the task.
+  foreground environment that will run the task.
 - Each attempt receives an isolated temporary provider home containing only
   the minimum validated authentication material that provider supports.
 - Provider authentication may reach that provider. GitHub credentials, product
@@ -472,10 +487,12 @@ For each ticket:
    provider home, a scrubbed environment, and provider-specific restrictions.
 4. Every enabled provider meets the guarded baseline: isolated authentication,
    scrubbed environment, provider restrictions, process supervision, immutable
-   Git identity, and hostile-fixture qualification. This baseline protects
-   factory integrity but, because the provider and repository run as the same
-   macOS user, it is not advertised as containment against arbitrary hostile
-   same-UID code.
+   Git identity, and bounded local guarded qualification probes. This baseline
+   protects factory integrity but, because the provider and repository run as
+   the same macOS user, it is not advertised as containment against arbitrary
+   hostile same-UID code. Real-provider hostile-fixture evidence is a separate
+   manual stable-promotion gate and is not produced by `providers qualify` or
+   `make test-all`.
 5. Repository test/verification commands run in a separate credential-free
    baseline executor. Their argv and command-policy digest
    are snapshotted from registered configuration before the ticket starts.
@@ -526,8 +543,8 @@ and regression-tested. Cursor allow/deny rules alone are not an OS boundary.
 The spike attempts parent/home/Keychain/SSH/GitHub reads, .git writes, arbitrary
 network, changed-command exfiltration, setsid/double-fork, and launchd escape.
 If no candidate passes, guarded development continues but autonomous mode is
-disabled and Phase 5 stops for an explicit product decision; Docker/Colima is
-not silently introduced.
+disabled and the post-v1 autonomous roadmap stops for an explicit product
+decision; Docker/Colima is not silently introduced.
 
 The hostile fixture attempts a parent/home/Keychain write/read, symlink escape,
 secret read, network command, changed test-script exfiltration, background
@@ -687,7 +704,7 @@ queued -> planning -> verifying -> building -> publishing
                                                  v
                                              reviewing
                                           /      |       \
-                                    manual    guarded    autonomous
+                                    manual    guarded    post-v1
                                       |          |           |
                           waiting_manual_merge   |      merging or blocked
                                                  v           |
@@ -830,8 +847,8 @@ Normative constraints include:
 Concurrent insert/update tests must prove each constraint rather than relying
 only on application checks.
 
-DBOS system tables may share the same SQLite file. They are implementation
-state, not a second product authority. Provider transcripts and large command
+The rejected DBOS spike used separate implementation tables; v1 has no DBOS
+system tables or second workflow authority. Provider transcripts and large command
 logs are bounded files addressed by digest from phase_runs; they are not stored
 as large SQLite blobs.
 
@@ -883,7 +900,7 @@ The mode is selected by project default and may be narrowed per ticket.
 - sf requests the configured immediate exact-head merge after approval. It
   never uses admin bypass, GitHub --auto, or a merge queue.
 
-### autonomous
+### Post-v1 autonomous (not available in v1)
 
 - sf merges automatically only when verification, independent final review,
   required GitHub checks, branch protection, budget, safety qualification, and
@@ -899,8 +916,11 @@ The mode is selected by project default and may be narrowed per ticket.
 - Autonomous implementation is integrated only after the guarded walking
   skeleton and guarded pilot pass.
 
-The project may disable autonomous mode completely. A ticket may choose a more
-conservative mode but cannot exceed the project's maximum automation.
+Autonomous mode is deliberately unavailable in v1 because the tested native
+execution profile is not eligible. A later release may enable it only after the
+guarded pilot and a stronger OS-enforced containment proof. A v1 ticket may
+choose manual or guarded mode but cannot exceed the project's maximum
+automation.
 
 ## Friendly CLI
 
@@ -959,7 +979,7 @@ Mode-aware command validity:
 | --- | --- | --- | --- | --- |
 | waiting_manual_merge/manual | invalid | valid, returns to Builder | valid | expected |
 | waiting_approval/guarded | valid | valid | valid | observed; mismatch is external_merged |
-| autonomous and all gates green | not requested | operator pause must win before merge effect | only before merge effect begins | unexpected but observed |
+| post-v1 autonomous and all gates green | not requested | operator pause must win before merge effect | only before merge effect begins | unexpected but observed |
 | blocked, any mode | invalid | invalid unless the blocker names it | valid only after process/effect safety | never treated as approval |
 | merging/reconciling | invalid | invalid | request waits for effect reconciliation | observed exactly |
 
@@ -1015,13 +1035,13 @@ Normative response envelope:
   "schema": "sf.response/v1",
   "ok": false,
   "code": "provider_auth_missing",
-  "message": "Cursor authentication is unavailable in the dev daemon environment.",
+  "message": "Codex authentication is unavailable in the dev daemon environment.",
   "channel": "dev",
   "project": "nysa",
   "ticket": "SF-...",
   "mutation": {"performed": false, "summary": "No phase or external effect started."},
   "next_action": {
-    "argv": ["sf-dev", "auth", "login", "cursor"],
+    "argv": ["sf-dev", "auth", "login", "codex"],
     "preconditions": [],
     "mutates": "provider credential store only"
   }
@@ -1084,28 +1104,31 @@ macOS channel roots:
   backups/
 ~~~
 
-The sf and sf-dev binaries have different application identifiers, LaunchAgent
-labels, roots, sockets, databases, worktrees, logs, and backups. A channel is
-part of every internal identity and effect key.
+The sf and sf-dev binaries have different application identifiers, roots,
+sockets, databases, worktrees, logs, and backups. A channel is part of every
+internal identity and effect key. Both are foreground local daemons in v1;
+LaunchAgent labels and service installation are deferred.
 
 ## Versions, promotion, and rollback
 
 - Use SemVer releases and ordinary GitHub release artifacts.
-- sf remains on its explicitly installed stable version until Sofia upgrades
-  it.
+- `make build VERSION=<semver>` creates a local stable-channel candidate; it
+  does not install or promote that candidate.
 - sf-dev may run an arbitrary development commit without touching stable
   state.
+- Stable promotion, update, and rollback are explicit later gates; the current
+  CLI reserves update/rollback and returns `not_configured`.
 - There is no per-product sealed release or qualification generation.
-- Release CI runs unit, race, integration, crash, security-fixture, upgrade,
-  and stable/dev isolation suites.
+- Release validation must run unit, race, integration, crash,
+  security-fixture, upgrade, and stable/dev isolation suites, including a
+  simultaneous-daemon isolation acceptance test.
 - A disposable local GitHub test repository proves the complete guarded path
   before a release candidate is promoted.
-- Promotion installs an already-built, checksummed candidate as stable; it
-  never copies the dev database.
-- Database migration creates a backup before changing stable.
-- Rollback restores the previous binary and, only when required, its matching
-  database backup. Incompatible active workflows produce a clear refusal
-  rather than partial recovery.
+- A future promotion operation must install an already-built, checksummed
+  candidate as stable and never copy the dev database.
+- A future rollback operation must bind the previous binary to its matching
+  database backup and refuse incompatible active workflows rather than perform
+  partial recovery.
 - Nysa chooses stability by continuing to invoke sf. Factory development uses
   sf-dev.
 
@@ -1161,15 +1184,16 @@ to success without observation.
 
 The factory is ready for stable Nysa use only after:
 
-1. The DBOS proof gate passes or the fallback decision is recorded.
+1. The DBOS proof decision is recorded and the custom Go engine passes its
+   equivalent recovery gates.
 2. Every deterministic and integration gate in the verification plan passes.
 3. Ten consecutive representative Nysa tickets reach their intended terminal
    state without database edits, worktree surgery, or controller-code repair.
 4. The set includes at least two bugs, two features, one refactor, one
    infrastructure/configuration change, one documentation change, one paused
    takeover, and one two-ticket concurrency run.
-5. Guarded approval and autonomous merge each complete on an exact reviewed
-   head.
+5. Manual external merge observation and guarded automatic merge after human
+   approval each complete on an exact reviewed head.
 6. A forced crash is injected in planning, provider execution, push, PR
    creation, and merge reconciliation without duplicate effects.
 7. sf take yields a usable worktree and instructions within 30 seconds after a
@@ -1182,14 +1206,15 @@ The factory is ready for stable Nysa use only after:
 
 ## Implementation strategy
 
-Implementation starts only after this plan is approved. The new repository is
-created locally first; no remote is created or pushed until the repository name
-and open-source metadata are approved.
+Implementation began after this plan was approved. The repository remains
+local; no remote is created or pushed until the repository name and open-source
+metadata are approved.
 
 ### Phase 0 — risk spikes and contracts
 
 - Create the Go module, architecture decision records, and interface skeletons.
-- Run the one-day DBOS proof.
+- Record the completed one-day DBOS proof and the selected custom-engine
+  fallback.
 - Run the bounded native execution-profile capability proof. Its failure
   disables autonomy, not the guarded walking skeleton.
 - Freeze the public ticket, normative state-machine, provider, effect-fencing,
@@ -1238,28 +1263,30 @@ Exit: a disposable GitHub repository completes the guarded path and takeover
 using a foreground dev daemon. This is the first usable beta and a hard review
 checkpoint before adding providers or autonomy.
 
-### Phase 4 — resilience, full provider set, and channels
+### Phase 4 — resilience and channels
 
 - Complete daemon/effect crash recovery, schema upgrade/rollback, and all
   supported blocked-state recovery.
-- Add the remaining Cursor/Claude/Codex adapters and one configured fallback;
-  disable any provider that fails qualification.
+- Qualify the exact Codex runtime used by both logical roles; additional
+  providers and configured fallback remain post-v1.
 - Implement bounded two-ticket concurrency and one-refresh conflict behavior.
-- Package separate sf/sf-dev identities, roots, foreground mode, LaunchAgents,
-  promotion, backup, and rollback.
+- Validate separate sf/sf-dev identities, roots, foreground mode, and release
+  candidate artifacts. Service installation, promotion, update, and rollback
+  remain explicit later gates.
 
 Exit: every normative transition and supported fault has a deterministic test,
 and stable/dev isolation is proven.
 
-### Phase 5 — autonomous merge and Nysa promotion
+### Post-v1 roadmap — autonomous merge and Nysa promotion
 
 - After the independent architecture, DX, and adversarial reviews, run ten
   representative Nysa tickets in guarded mode.
-- Only after that guarded gate, integrate autonomous mode for exact
+- Only after that guarded gate, a later release may integrate autonomous mode
+  for exact
   provider/command profiles that passed the stronger OS-enforced eligibility
   proof.
-- Qualify autonomous merge in the disposable GitHub repository, then promote
-  the stable release with Sofia's approval.
+- Qualify autonomous merge in the disposable GitHub repository, then consider
+  a later stable promotion with Sofia's approval.
 - Enabling autonomous mode on even one Nysa ticket remains a separate explicit
   post-qualification approval; it is not implied by plan or release approval.
 
@@ -1336,19 +1363,16 @@ coordinator. Agent labels describe intended model tier, not permanent people.
 
 ## Documentation deliverables
 
-The new repository ships:
+The current repository ships:
 
-- README: install and first ticket tutorial.
-- docs/concepts.md: phases, roles, verification-first, merge modes.
+- README: repository overview and local build/test entry points.
+- docs/tutorials/source-build-foreground.md: first local Nysa ticket tutorial.
 - docs/cli.md: commands, JSON, exit codes, examples.
-- docs/config.md: machine and project configuration.
-- docs/providers.md: authentication, supported versions, qualification.
-- docs/recovery.md: pause, takeover, crash, ambiguous effects.
-- docs/security.md: trusted-repository boundary and deferred containers.
+- docs/configuration.md: machine and project configuration.
 - docs/releases.md: stable/dev promotion and rollback.
-- CONTRIBUTING.md and AGENTS.md.
-- Architecture decision records for Go, workflow engine, SQLite, GitHub-bound
-  scope, native isolation, and legacy clean cut.
+- AGENTS.md.
+- Architecture decision records for the workflow engine and native execution
+  profile.
 
 ## Open taste decisions that do not block local implementation
 
@@ -1367,7 +1391,7 @@ None changes the v1 state machine or implementation boundaries.
 | Risk | Mitigation |
 | --- | --- |
 | DBOS Go behavior does not satisfy local recovery needs | One-day proof gate and frozen custom fallback |
-| Cursor restriction is weaker than other providers | Hostile qualification, trusted repos only, fail closed autonomous eligibility |
+| Trusted-provider controls are not hostile same-UID containment | Native-profile qualification, trusted repositories only, no autonomous v1 claim |
 | SQLite contention at two tickets | Short transactions, WAL, no long locks, race/load test |
 | External effect duplicates after crash | Unique effect keys and read-before-retry reconciliation |
 | Agent weakens acceptance to make tests pass | Separate verification invocation and explicit amendment approval |
@@ -1418,7 +1442,7 @@ Review verdict: GO for Sofia's approval
 
 Architecture status: load-bearing decisions resolved and independently challenged
 
-Implementation status: not started
+Implementation status: release-candidate hardening and validation in progress
 
 Plan author: root Codex agent; analysis delegated to Terra/Luna agents
 
@@ -1429,17 +1453,19 @@ Plan author: root Codex agent; analysis delegated to Terra/Luna agents
 | Independent operator/DX | 2 | GO | First run, provider pair, identity, takeover, and channel UX verified |
 | Independent adversarial safety | 3 | GO | Guarded trust boundary, native autonomy proof, Git/process/network invariants verified |
 
-Resolved architecture: new Go repository and blank state; local daemon and
+Resolved architecture: new Go repository and blank state; foreground local daemon and
 Markdown tickets; Planner/Builder/Reviewer with independent verification before
-build; SQLite authority; DBOS behind a bounded proof and one selected fallback;
+build; SQLite authority with the selected custom Go state engine;
 GitHub through gh; stable/dev isolation; bounded concurrency two; manual and
-guarded first; autonomous exact-head mode only after the guarded Nysa pilot and
-the native execution-profile proof. Docker and Colima remain deferred.
+guarded automatic merge after human approval; autonomous exact-head mode is
+post-v1 pending the guarded Nysa pilot and native execution-profile proof.
+Docker and Colima remain unnecessary.
 
 Artifact validation: 62 unique tasks, no missing dependencies, no cycles, no
 phase/wave inversions, valid JSON/JSONL, and no unknown state references.
 
-VERDICT: ENG REVIEW CLEARED — ready for Sofia's plan approval; user approval is
-the only prerequisite to begin Phase 0.
+VERDICT: ENG REVIEW CLEARED — implementation is in release-candidate
+hardening and validation. Remaining release gates are verification evidence,
+not plan approval.
 
 NO UNRESOLVED DECISIONS

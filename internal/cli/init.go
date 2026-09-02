@@ -19,25 +19,31 @@ import (
 )
 
 type InitRequest struct {
-	Channel domain.Channel
-	Project string
-	Repo    string
-	Home    string
-	Paths   config.ChannelPaths
+	Channel  domain.Channel
+	Project  string
+	Repo     string
+	Home     string
+	Paths    config.ChannelPaths
+	Profile  string
+	TestPath string
 }
 
 type initResult struct {
-	Channel      domain.Channel   `json:"channel"`
-	Project      string           `json:"project"`
-	Repository   string           `json:"repository"`
-	BaseBranch   string           `json:"base_branch"`
-	MergeMode    domain.MergeMode `json:"merge_mode"`
-	ConfigDigest string           `json:"config_digest"`
-	Created      bool             `json:"created"`
+	Channel       domain.Channel   `json:"channel"`
+	Project       string           `json:"project"`
+	Repository    string           `json:"repository"`
+	BaseBranch    string           `json:"base_branch"`
+	MergeMode     domain.MergeMode `json:"merge_mode"`
+	ConfigDigest  string           `json:"config_digest"`
+	Profile       string           `json:"profile,omitempty"`
+	TestPath      string           `json:"test_path,omitempty"`
+	ConfigCreated bool             `json:"config_created,omitempty"`
+	Created       bool             `json:"created"`
 }
 
 // RunInit is the direct local setup path. It never contacts the daemon or a
-// remote and never writes into the registered repository.
+// remote. The explicit profile form may create the requested repository
+// configuration; all other setup remains owner-local.
 func RunInit(ctx context.Context, request InitRequest) api.Response {
 	binary := binaryForChannel(request.Channel)
 	initHelp := []string{binary, "init", "--help"}
@@ -69,7 +75,19 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 	if err != nil {
 		return initFailure("invalid_configuration", err.Error(), initHelp, false)
 	}
-	effective, snapshot, digest, err := config.LoadProject(repository, request.Project, machine)
+	configPlan, err := config.PrepareNysaPureConfig(repository, request.Profile, request.TestPath)
+	if err != nil {
+		return initFailure("invalid_configuration", err.Error(), initHelp, false)
+	}
+	defer configPlan.Close()
+	var effective config.Effective
+	var snapshot []byte
+	var digest string
+	if len(configPlan.Encoded) > 0 && !configPlan.Existing {
+		effective, snapshot, digest, err = config.LoadProjectWithCommands(repository, request.Project, machine, configPlan.Commands)
+	} else {
+		effective, snapshot, digest, err = config.LoadProject(repository, request.Project, machine)
+	}
 	if err != nil {
 		next := initHelp
 		if errors.Is(err, config.ErrCommandDetection) {
@@ -85,6 +103,36 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 		return initFailure("init_failed", "local state could not be opened", []string{binary, "doctor"}, true)
 	}
 	defer database.Close()
+	configCreated, err := configPlan.Install()
+	if err != nil {
+		if configCreated {
+			_ = configPlan.Rollback()
+		}
+		return initFailure("init_failed", "profile configuration could not be installed: "+err.Error(), []string{binary, "init", "--project", request.Project, "--repo", repository}, true)
+	}
+	registrationConfirmed := false
+	defer func() {
+		if configCreated && !registrationConfirmed {
+			_ = configPlan.Rollback()
+		}
+	}()
+	if err := configPlan.ValidateUnchanged(); err != nil {
+		return initFailure("init_failed", "profile configuration changed during initialization; registration was not committed: "+err.Error(), []string{binary, "init", "--project", request.Project, "--repo", repository}, true)
+	}
+	if request.Profile != "" {
+		// Re-read the authoritative project document while the profile's
+		// canonical .sf lock is still held. The bytes registered below therefore
+		// describe the same config admission that Install/ValidateUnchanged just
+		// authenticated.
+		if len(configPlan.Encoded) > 0 && !configPlan.Existing {
+			effective, snapshot, digest, err = configPlan.LoadLockedProject(request.Project, machine, &configPlan.Commands)
+		} else {
+			effective, snapshot, digest, err = configPlan.LoadLockedProject(request.Project, machine, nil)
+		}
+		if err != nil {
+			return initFailure("invalid_configuration", "profile configuration could not be re-read under initialization lock: "+err.Error(), initHelp, true)
+		}
+	}
 	created, err := database.RegisterProject(ctx, store.Project{
 		Channel: request.Channel, ID: domain.ProjectID(request.Project), Path: repository, BaseRef: effective.BaseBranch,
 		ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: snapshot,
@@ -98,7 +146,8 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 		}
 		return initFailure("init_failed", "project registration was not committed", []string{binary, "doctor"}, true)
 	}
-	data, err := json.Marshal(initResult{Channel: request.Channel, Project: request.Project, Repository: repository, BaseBranch: effective.BaseBranch, MergeMode: effective.MergeMode, ConfigDigest: digest, Created: created})
+	registrationConfirmed = true
+	data, err := json.Marshal(initResult{Channel: request.Channel, Project: request.Project, Repository: repository, BaseBranch: effective.BaseBranch, MergeMode: effective.MergeMode, ConfigDigest: digest, Profile: request.Profile, TestPath: request.TestPath, ConfigCreated: configCreated, Created: created})
 	if err != nil {
 		return initFailure("init_failed", "registration succeeded but its response could not be encoded", []string{binary, "doctor"}, true)
 	}

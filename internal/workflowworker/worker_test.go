@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/nysa-company/sf/internal/contracts"
@@ -19,18 +20,82 @@ var testRef = domain.TicketRef{Channel: domain.ChannelDev, Project: "sf", Ticket
 var testFence = domain.Fence{LeaderEpoch: 7, RunnerEpoch: 1}
 
 type fakeEvidence struct {
-	ticket          store.Ticket
-	plan            store.StoredPlan
-	verification    store.StoredVerification
-	candidate       store.StoredCandidate
-	hasPlan         bool
-	hasVerify       bool
-	hasCandidate    bool
-	budget          int
-	plans           int
-	verifications   int
-	candidates      int
-	providerResults map[int64]phaseartifact.Parsed
+	ticket             store.Ticket
+	plan               store.StoredPlan
+	verification       store.StoredVerification
+	candidate          store.StoredCandidate
+	hasPlan            bool
+	hasVerify          bool
+	hasCandidate       bool
+	budget             int
+	plans              int
+	verifications      int
+	amendment          *store.VerificationAmendment
+	amendmentDecision  store.VerificationAmendmentDecision
+	amendmentErr       error
+	reusableHistorical bool
+	reusableRecovered  bool
+	recoveredVersion   bool
+	candidates         int
+	providerResults    map[int64]phaseartifact.Parsed
+}
+
+// sourceResumeEvidence keeps the retained reviewer projection available for
+// source-commit authentication while exposing the exact resume proof that
+// lets Worker distinguish it from a freshly completed reviewer result.
+type sourceResumeEvidence struct {
+	*fakeEvidence
+	proof store.OperatorSourceResumeProof
+}
+
+func (f *sourceResumeEvidence) OperatorSourceResumeRequiresFreshVerification(context.Context, domain.TicketRef, uint64) (bool, error) {
+	return true, nil
+}
+
+func (f *sourceResumeEvidence) OperatorSourceResumeProof(context.Context, domain.TicketRef, uint64, domain.Fence) (store.OperatorSourceResumeProof, bool, error) {
+	return f.proof, true, nil
+}
+
+// Plan supplies the same immutable Planner/provider binding that Store's
+// source-resume projection retains.  These focused Worker tests exercise the
+// source-specific Reviewer selection, so their prior hand-written plan shell
+// must not bypass the production storedPlanIdentity authentication.
+func (f *sourceResumeEvidence) Plan(ctx context.Context, ref domain.TicketRef) (store.StoredPlan, error) {
+	plan, err := f.fakeEvidence.Plan(ctx, ref)
+	if err != nil || (plan.Document.Planner != nil && plan.Document.ProviderResult != nil && plan.Digest != "") {
+		return plan, err
+	}
+	out := plannerOutput(false)
+	if f.providerResults == nil {
+		f.providerResults = map[int64]phaseartifact.Parsed{}
+	}
+	f.providerResults[out.result.ProviderResult.AttemptID] = out.parsed
+	plan.Document = store.PlanDocument{
+		Planner:        out.parsed.Planner,
+		ProviderResult: &out.result.ProviderResult,
+		Acceptance:     out.parsed.Planner.Acceptance,
+		ProofKind:      string(out.parsed.Planner.Proof.Kind),
+		Paths:          out.parsed.Planner.Paths,
+		Commands:       out.parsed.Planner.Commands,
+		Risks:          out.parsed.Planner.Risks,
+	}
+	plan.Digest = "source-resume-plan"
+	plan.TicketVersion = f.ticket.Version
+	plan.Fence = testFence
+	f.plan = plan
+	return plan, nil
+}
+
+func (f *sourceResumeEvidence) RecordVerification(ctx context.Context, artifact store.VerificationArtifact) (store.VerificationRevision, error) {
+	revision, err := f.fakeEvidence.RecordVerification(ctx, artifact)
+	if err != nil {
+		return store.VerificationRevision{}, err
+	}
+	if revision.Revision <= f.proof.Verification.Revision.Revision {
+		revision.Revision = f.proof.Verification.Revision.Revision + 1
+		f.verification.Revision.Revision = revision.Revision
+	}
+	return revision, nil
 }
 
 func (f *fakeEvidence) Ticket(context.Context, domain.TicketRef) (store.Ticket, error) {
@@ -97,6 +162,9 @@ func (f *fakeEvidence) LoadCurrentProviderAttemptResult(_ context.Context, key s
 func (f *fakeEvidence) LoadHistoricalProviderAttemptResult(ctx context.Context, key store.ProviderAttemptResultKey) (store.ProviderAttemptResult, phaseartifact.Parsed, error) {
 	return f.LoadCurrentProviderAttemptResult(ctx, key, f.ticket.Version, testFence)
 }
+func (f *fakeEvidence) ProviderResultReachesFence(context.Context, store.ProviderAttemptResultKey, uint64, domain.Fence) error {
+	return nil
+}
 func (f *fakeEvidence) LatestReusableProviderAttempt(_ context.Context, request store.LatestReusableProviderAttemptRequest) (store.LatestReusableProviderAttemptResult, error) {
 	for id, p := range f.providerResults {
 		if p.Phase == request.Phase {
@@ -109,7 +177,21 @@ func (f *fakeEvidence) LatestReusableProviderAttempt(_ context.Context, request 
 				copy.AcceptanceDigest = identity.Digest
 				p.Verify = &copy
 			}
-			return store.LatestReusableProviderAttemptResult{Key: store.ProviderAttemptResultKey{AttemptID: id, Ref: testRef, Phase: request.Phase, Attempt: 1}, Parsed: p}, nil
+			key := store.ProviderAttemptResultKey{AttemptID: id, Ref: testRef, Phase: request.Phase, Attempt: 1}
+			result, _, err := f.LoadCurrentProviderAttemptResult(context.Background(), key, request.ExpectedVersion, request.Fence)
+			if err != nil {
+				return store.LatestReusableProviderAttemptResult{}, err
+			}
+			if f.reusableHistorical {
+				result.Claim.ExpectedVersion = request.ExpectedVersion - 1
+			}
+			if f.reusableRecovered {
+				result.Claim.LeaderEpoch--
+			}
+			if f.recoveredVersion {
+				result.Claim.ExpectedVersion--
+			}
+			return store.LatestReusableProviderAttemptResult{Key: key, Result: result, Parsed: p, Recovered: f.reusableRecovered}, nil
 		}
 	}
 	return store.LatestReusableProviderAttemptResult{}, store.ErrNotFound
@@ -133,6 +215,24 @@ func (f *fakeEvidence) RecordCandidate(_ context.Context, a store.CandidateEvide
 	f.candidate = store.StoredCandidate{Snapshot: a.Snapshot, TicketVersion: a.ExpectedVersion, Fence: a.Fence}
 	return nil, nil
 }
+func (f *fakeEvidence) PendingVerificationAmendment(_ context.Context, _ domain.TicketRef, _ uint64, _ domain.Fence) (store.VerificationAmendment, error) {
+	if f.amendment == nil {
+		return store.VerificationAmendment{}, store.ErrNotFound
+	}
+	return *f.amendment, nil
+}
+func (f *fakeEvidence) VerificationAmendmentDecision(_ context.Context, _ domain.TicketRef, _ uint64, _ domain.Fence, _ store.ProviderAttemptResultKey) (store.VerificationAmendmentDecision, error) {
+	if f.amendmentErr != nil {
+		return "", f.amendmentErr
+	}
+	if f.amendment == nil {
+		return "", store.ErrNotFound
+	}
+	if f.amendmentDecision != "" {
+		return f.amendmentDecision, nil
+	}
+	return store.VerificationAmendmentAccepted, nil
+}
 func (f *fakeEvidence) ConsumeBudget(context.Context, store.BudgetUse) (int, error) {
 	if f.budget >= 2 {
 		return f.budget, store.ErrBudgetExhausted
@@ -145,6 +245,7 @@ type fakeEngine struct {
 	state   *store.Ticket
 	last    contracts.SignalRequest
 	stale   bool
+	err     error
 	signals int
 }
 
@@ -182,12 +283,31 @@ func (e *fakeEngine) SignalPlan(ctx context.Context, req contracts.SignalRequest
 func (e *fakeEngine) SignalVerification(ctx context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
 	return e.Signal(ctx, req)
 }
+func (e *fakeEngine) SignalVerificationAmendment(ctx context.Context, req contracts.SignalRequest, decision store.VerificationAmendmentDecision, _ store.ProviderAttemptResultKey) (contracts.TransitionResult, error) {
+	if decision == store.VerificationAmendmentAccepted {
+		req.Trigger = "amendment_accepted"
+	} else {
+		req.Trigger = "amendment_rejected"
+	}
+	return e.Signal(ctx, req)
+}
+func (e *fakeEngine) SignalVerificationAmendmentRequest(ctx context.Context, req contracts.SignalRequest, _ store.ProviderAttemptResultKey) (contracts.TransitionResult, error) {
+	req.Trigger = "verification_amendment_requested"
+	return e.Signal(ctx, req)
+}
+func (e *fakeEngine) SignalVerificationAmendmentBlocked(ctx context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
+	req.Trigger = "typed_blocker"
+	return e.Signal(ctx, req)
+}
 
 func (e *fakeEngine) Signal(_ context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
 	e.signals++
 	e.last = req
 	if e.stale {
 		return contracts.TransitionResult{}, store.ErrStaleFence
+	}
+	if e.err != nil {
+		return contracts.TransitionResult{}, e.err
 	}
 	if req.Fence != testFence {
 		return contracts.TransitionResult{}, store.ErrStaleFence
@@ -224,6 +344,8 @@ func (e *fakeEngine) Signal(_ context.Context, req contracts.SignalRequest) (con
 		e.state.State = domain.StatePaused
 	case "verification_amendment_requested":
 		e.state.State = domain.StateVerifying
+	case "amendment_accepted", "amendment_rejected":
+		e.state.State = domain.StateBuilding
 	case "retry_or_correction_exhausted":
 		e.state.State = domain.StatePaused
 	}
@@ -292,7 +414,7 @@ func verificationOutput() fakePhase {
 func builderOutput(amend bool) fakePhase {
 	b := &phaseartifact.Builder{Schema: "sf.builder/v1", Summary: "implemented", ChangedFiles: []string{"internal/foo.go"}, Commands: [][]string{{"go", "test", "./..."}}}
 	if amend {
-		b.AmendmentRequest = &phaseartifact.AmendmentRequest{OldProofDigest: digest, ProposedDigest: digest, Reason: "proof needs clarification"}
+		b.AmendmentRequest = &phaseartifact.AmendmentRequest{OldProofDigest: digest, ProposedDigest: strings.Repeat("b", 64), ProposedCommand: []string{"go", "test", "./..."}, Reason: "proof needs clarification"}
 	}
 	return fakePhase{parsed: phaseartifact.Parsed{Phase: domain.PhaseBuild, Provider: provider(), Builder: b}, result: PhaseResult{ProviderResult: store.ProviderAttemptResultKey{AttemptID: 3, Ref: testRef, Phase: domain.PhaseBuild, Attempt: 1}}}
 }
@@ -469,11 +591,175 @@ func TestVerificationPassAndBuilderAmendmentAndPass(t *testing.T) {
 	builder := &fakeRunner{outputs: []fakePhase{builderOutput(true)}}
 	builder.evidence = e
 	w.Runner = builder
-	if _, err := w.Run(context.Background(), testRef, testFence); !errors.Is(err, ErrAmendmentUnsupported) {
+	if _, err := w.Run(context.Background(), testRef, testFence); err != nil {
 		t.Fatalf("amend err=%v", err)
 	}
-	if eng.state.State != domain.StatePaused || e.budget != 0 {
+	if eng.state.State != domain.StateVerifying || e.budget != 0 {
 		t.Fatalf("amend state=%s budget=%d", eng.state.State, e.budget)
+	}
+}
+
+func TestSourceResumeMaterializesFreshReusableReviewerAfterResultBeforeRecord(t *testing.T) {
+	base := &fakeEvidence{hasPlan: true, plan: store.StoredPlan{Document: store.PlanDocument{Acceptance: []string{"accept"}, ProofKind: "regression", Paths: []string{"internal"}, Commands: [][]string{{"go", "test", "./..."}}}}, hasVerify: true, providerResults: map[int64]phaseartifact.Parsed{2: verificationOutput().parsed}}
+	base.ticket = ticket(domain.StateVerifying)
+	base.ticket.Version = 2
+	// This is the retained old revision.  It must not be replayed, but its
+	// presence also must not hide the completed reviewer result below.
+	base.verification = store.StoredVerification{Revision: store.VerificationRevision{Revision: 1}, TicketVersion: 1, Fence: testFence}
+	evidence := &sourceResumeEvidence{fakeEvidence: base, proof: store.OperatorSourceResumeProof{Ref: testRef, Version: 2, Fence: testFence, Verification: base.verification}}
+	engine := &fakeEngine{state: &base.ticket}
+	worker := Worker{Evidence: evidence, Engine: engine, Checkpoint: fakeCheckpoint{}, CheckpointMaterializer: fakeCheckpointMaterializer{}}
+	result, err := worker.Run(context.Background(), testRef, testFence)
+	if err != nil || !result.Transitioned || !result.Replayed || engine.state.State != domain.StateBuilding || base.verifications != 1 {
+		t.Fatalf("result=%+v err=%v state=%s records=%d", result, err, engine.state.State, base.verifications)
+	}
+}
+
+func TestSourceResumeLaunchesFreshReviewerAfterCrashBeforeReviewerClaim(t *testing.T) {
+	retainedKey := store.ProviderAttemptResultKey{AttemptID: 1, Ref: testRef, Phase: domain.PhaseVerification, Attempt: 1}
+	base := &fakeEvidence{hasPlan: true, plan: store.StoredPlan{Document: store.PlanDocument{Acceptance: []string{"accept"}, ProofKind: "regression", Paths: []string{"internal"}, Commands: [][]string{{"go", "test", "./..."}}}}, providerResults: map[int64]phaseartifact.Parsed{retainedKey.AttemptID: verificationOutput().parsed}}
+	base.ticket = ticket(domain.StateVerifying)
+	base.ticket.Version = 2
+	retained := store.StoredVerification{Revision: store.VerificationRevision{Revision: 1}, TicketVersion: 1, Fence: testFence, ProviderResult: retainedKey}
+	evidence := &sourceResumeEvidence{fakeEvidence: base, proof: store.OperatorSourceResumeProof{Ref: testRef, Version: 2, Fence: testFence, Verification: retained}}
+	engine := &fakeEngine{state: &base.ticket}
+	runner := &fakeRunner{evidence: base}
+	worker := Worker{Evidence: evidence, Engine: engine, Runner: runner, Checkpoint: fakeCheckpoint{}, CheckpointMaterializer: fakeCheckpointMaterializer{}}
+
+	if _, err := worker.Run(context.Background(), testRef, testFence); err == nil || !strings.Contains(err.Error(), "no scripted output") {
+		t.Fatalf("pre-claim crash=%v", err)
+	}
+	if len(runner.requests) != 1 || base.verifications != 0 {
+		t.Fatalf("pre-claim crash recorded unexpected evidence: calls=%d records=%d", len(runner.requests), base.verifications)
+	}
+
+	runner.outputs = []fakePhase{verificationOutput()}
+	result, err := worker.Run(context.Background(), testRef, testFence)
+	if err != nil || !result.Transitioned || result.Replayed || len(runner.requests) != 2 || base.verifications != 1 || engine.state.State != domain.StateBuilding {
+		t.Fatalf("fresh reviewer after pre-claim crash=%+v err=%v calls=%d records=%d state=%s", result, err, len(runner.requests), base.verifications, engine.state.State)
+	}
+}
+
+func TestSourceResumeDoesNotRerunFreshReviewerAfterRecordBeforeTransitionCrash(t *testing.T) {
+	base := &fakeEvidence{hasPlan: true, plan: store.StoredPlan{Document: store.PlanDocument{Acceptance: []string{"accept"}, ProofKind: "regression", Paths: []string{"internal"}, Commands: [][]string{{"go", "test", "./..."}}}}}
+	base.ticket = ticket(domain.StateVerifying)
+	base.ticket.Version = 2
+	retained := store.StoredVerification{Revision: store.VerificationRevision{Revision: 1}, TicketVersion: 1, Fence: testFence}
+	evidence := &sourceResumeEvidence{fakeEvidence: base, proof: store.OperatorSourceResumeProof{Ref: testRef, Version: 2, Fence: testFence, Verification: retained}}
+	engine := &fakeEngine{state: &base.ticket, err: errors.New("crash after RecordVerification")}
+	runner := &fakeRunner{outputs: []fakePhase{verificationOutput()}, evidence: base}
+	worker := Worker{Evidence: evidence, Engine: engine, Runner: runner, Checkpoint: fakeCheckpoint{}, CheckpointMaterializer: fakeCheckpointMaterializer{}}
+
+	if _, err := worker.Run(context.Background(), testRef, testFence); err == nil || !strings.Contains(err.Error(), "crash after RecordVerification") {
+		t.Fatalf("first source-resume record/transition crash=%v", err)
+	}
+	if len(runner.requests) != 1 || base.verifications != 1 || !base.hasVerify || base.verification.Revision.Revision != 2 {
+		t.Fatalf("fresh verification was not recorded once: calls=%d records=%d verification=%+v", len(runner.requests), base.verifications, base.verification)
+	}
+
+	engine.err = nil
+	result, err := worker.Run(context.Background(), testRef, testFence)
+	if err != nil || !result.Transitioned || !result.Replayed || len(runner.requests) != 1 || base.verifications != 1 || engine.state.State != domain.StateBuilding {
+		t.Fatalf("source-resume transition replay=%+v err=%v calls=%d records=%d state=%s", result, err, len(runner.requests), base.verifications, engine.state.State)
+	}
+}
+
+func TestVerificationAmendmentReplaysExactCurrentReviewerResult(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		decision    store.VerificationAmendmentDecision
+		decisionErr error
+		wantVerify  int
+		wantState   domain.State
+	}{
+		{name: "accepted", decision: store.VerificationAmendmentAccepted, wantVerify: 1, wantState: domain.StateBuilding},
+		{name: "rejected", decision: store.VerificationAmendmentRejected, wantVerify: 0, wantState: domain.StateBuilding},
+		{name: "third digest blocks", decisionErr: store.ErrEvidenceConflict, wantVerify: 0, wantState: domain.StateBlocked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			evidence := &fakeEvidence{hasPlan: true, amendment: &store.VerificationAmendment{TransitionTicketVersion: 1, Prior: store.VerificationRevision{Revision: 1, ProofDigest: digest}, ProposedDigest: strings.Repeat("b", 64), ProposedCommand: []string{"go", "test", "./..."}, Reason: "replace the proof", Requester: "builder"}, amendmentDecision: tc.decision, amendmentErr: tc.decisionErr, providerResults: map[int64]phaseartifact.Parsed{2: verificationOutput().parsed}}
+			engine := &fakeEngine{}
+			runner := &fakeRunner{}
+			worker := newWorker(domain.StateVerifying, runner, evidence, engine)
+			worker.Checkpoint = fakeCheckpoint{}
+			got, err := worker.Run(context.Background(), testRef, testFence)
+			if err != nil || !got.Transitioned || !got.Replayed || len(runner.requests) != 0 || evidence.verifications != tc.wantVerify || engine.state.State != tc.wantState {
+				t.Fatalf("run=%+v err=%v calls=%d verifications=%d state=%s", got, err, len(runner.requests), evidence.verifications, engine.state.State)
+			}
+		})
+	}
+}
+
+func TestVerificationAmendmentReplaysRecoveredReviewerWithoutThirdInvocation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		decision   store.VerificationAmendmentDecision
+		wantVerify int
+	}{
+		{name: "accepted before transition", decision: store.VerificationAmendmentAccepted, wantVerify: 1},
+		{name: "rejected before transition", decision: store.VerificationAmendmentRejected, wantVerify: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			evidence := &fakeEvidence{
+				hasPlan:           true,
+				reusableRecovered: true,
+				recoveredVersion:  true,
+				amendment: &store.VerificationAmendment{
+					TransitionTicketVersion: 1,
+					ConsumedVersion:         0,
+					Prior:                   store.VerificationRevision{Revision: 1, ProofDigest: digest},
+					ProposedDigest:          strings.Repeat("b", 64),
+					ProposedCommand:         []string{"go", "test", "./..."},
+					Reason:                  "replace the proof",
+					Requester:               "builder",
+				},
+				amendmentDecision: tc.decision,
+				providerResults:   map[int64]phaseartifact.Parsed{2: verificationOutput().parsed},
+			}
+			engine := &fakeEngine{}
+			runner := &fakeRunner{}
+			worker := newWorker(domain.StateVerifying, runner, evidence, engine)
+			// Simulate a recovery ledger hop after the amendment Reviewer completed:
+			// the result belongs to the immutable request endpoint (v1), while the
+			// live decision runs at v2. Replaying it must not launch a third Reviewer.
+			evidence.ticket.Version = 2
+			worker.Checkpoint = fakeCheckpoint{}
+
+			got, err := worker.Run(context.Background(), testRef, testFence)
+			if err != nil || !got.Transitioned || !got.Replayed || len(runner.requests) != 0 || evidence.verifications != tc.wantVerify || engine.state.State != domain.StateBuilding {
+				t.Fatalf("recovered amendment replay=%+v err=%v calls=%d verifications=%d state=%s", got, err, len(runner.requests), evidence.verifications, engine.state.State)
+			}
+		})
+	}
+}
+
+func TestVerificationAmendmentIgnoresHistoricalReviewerResultAndLaunchesFresh(t *testing.T) {
+	// The pre-amendment Reviewer is still the newest completed result until the
+	// independent amendment Reviewer starts. It must not be mistaken for the
+	// amendment decision, even though Store can authenticate it across the
+	// recovery/version bridge.
+	evidence := &fakeEvidence{
+		hasPlan: true,
+		amendment: &store.VerificationAmendment{
+			TransitionTicketVersion: 1,
+			Prior:                   store.VerificationRevision{Revision: 1, ProofDigest: digest},
+			ProposedDigest:          strings.Repeat("b", 64),
+			ProposedCommand:         []string{"go", "test", "./..."},
+			Reason:                  "replace the proof",
+			Requester:               "builder",
+		},
+		reusableHistorical: true,
+		providerResults: map[int64]phaseartifact.Parsed{
+			8: verificationOutput().parsed,
+		},
+	}
+	engine := &fakeEngine{}
+	runner := &fakeRunner{outputs: []fakePhase{verificationOutput()}}
+	worker := newWorker(domain.StateVerifying, runner, evidence, engine)
+	worker.Checkpoint = fakeCheckpoint{}
+	got, err := worker.Run(context.Background(), testRef, testFence)
+	if err != nil || !got.Transitioned || got.Replayed || len(runner.requests) != 1 || evidence.verifications != 1 || engine.state.State != domain.StateBuilding {
+		t.Fatalf("historical amendment result was reused: run=%+v err=%v calls=%d verifications=%d state=%s", got, err, len(runner.requests), evidence.verifications, engine.state.State)
 	}
 }
 

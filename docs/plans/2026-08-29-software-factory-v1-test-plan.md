@@ -1,6 +1,6 @@
 # Software Factory v1 verification plan
 
-Status: Approved verification companion; local implementation in progress
+Status: Approved verification companion; release-candidate hardening and validation in progress
 
 Applies to: the new Go repository
 Goal: prove that the simple factory delivers tickets without duplicate effects,
@@ -34,7 +34,7 @@ unit/integration loop.
                     +--------------+--------------+
                     |                             |
             disposable GitHub E2E          provider qualification
-                    |                       Cursor/Claude/Codex
+                    |                         Codex (v1)
                     +--------------+--------------+
                                    |
                          local integration suite
@@ -97,8 +97,7 @@ reproducible at the lowest useful layer before a fix is accepted.
 ### Nysa pilot
 
 - Selected real Nysa tickets.
-- Guarded mode initially.
-- Autonomous mode enabled only after the plan's pilot gate passes.
+- Guarded mode only for v1; autonomous mode is a post-v1 roadmap item.
 - No changes to Nysa factory configuration without separate approval.
 
 ## Required commands
@@ -113,13 +112,28 @@ make test-integration # local daemon/Git/fake-gh suite
 make test-crash       # deterministic crash matrix
 make test-security    # hostile fixture and redaction tests
 make test-upgrade     # schema/workflow/channel compatibility
-make test-all         # every credential-free required gate
-make qualify-providers
-make qualify-github
+make test-all         # bounded credential-free local acceptance gate
 ~~~
 
 Equivalent raw Go commands remain documented. CI uses the wrappers to keep
 local and hosted behavior identical.
+
+Provider and disposable-GitHub qualification are deliberately not exposed as
+no-argument Make targets in the local beta. They require explicit provider
+identities/authentication and, for GitHub, a separately authorized disposable
+repository. They remain manual stable-promotion gates; `make test-all` never
+contacts a live provider, GitHub repository, or Nysa. The secret-scan step may
+make one bounded, checksum-verified download of the pinned Gitleaks v8.30.1
+release from public GitHub when its ignored local cache is absent; set
+`GITLEAKS_BIN` or pre-populate `.context/tools/gitleaks/8.30.1/` for a fully
+offline run. The download is capped at 32 MiB, has a hard 30-second end-to-end
+deadline, and fails closed.
+
+The current local gate intentionally covers only implemented credential-free
+checks. This repository has no license scanner or 1,000-ticket/100-repetition
+randomized stress harness, so `make test-all` does not claim either result.
+License evidence and the randomized stress suite are future promotion gates and
+must be completed and retained before stable promotion.
 
 ## Unit and package contracts
 
@@ -166,16 +180,18 @@ Property checks:
 - attempt counters are monotonic.
 - correction and provider-fallback counts cannot exceed policy.
 - approval always names the current reviewed SHA.
-- autonomous merge requires every independent gate.
+- any future autonomous merge requires every independent gate.
 - waiting_approval exists only when every nonapproval gate is green.
 - blocked never accepts approve.
 - stopping/cancelling cannot complete before effects and writers drain.
 - external_merged cannot be reported as verified done.
 - Spike review-pass guards are mutually exclusive with every merge-mode
   review-pass guard.
-- An external merge observed from any nonterminal state reaches reconciled done
-  only when that mode's full completion policy is satisfied; otherwise it
-  reaches external_merged.
+- An external merge observed from either supported post-publication wait state
+  reaches reconciled done only when manual mode's full completion policy is
+  satisfied; a changed manual head or any merge while guarded approval is still
+  pending reaches external_merged. Control states fail closed and require the
+  documented resume or recovery path before this classification is consumed.
 
 ### Planning and verification schemas
 
@@ -262,7 +278,7 @@ The custom fallback must pass the identical behavior suite.
 
 ## Native execution-profile proof
 
-Before autonomous mode is implemented, a bounded macOS spike records the exact
+Before any post-v1 autonomous mode is implemented, a bounded macOS spike records the exact
 provider-native sandbox or macOS enforcement primitive, executable, profile,
 entitlements/arguments, child-inheritance behavior, and supported OS/provider
 versions. The proof independently runs provider and repository-command probes
@@ -278,7 +294,7 @@ for:
 - setsid, double-fork, and launchd/background-service escape.
 
 Failure does not block the guarded trusted-repository beta. It records
-autonomous_eligible=false and prevents Phase 5 autonomous work until Sofia
+autonomous_eligible=false and prevents post-v1 autonomous work until Sofia
 approves a different boundary; it must not install Docker or Colima implicitly.
 
 ## Effects and crash matrix
@@ -400,10 +416,10 @@ Contract rules:
 - Unknown fields are tolerated only when semantics remain unambiguous.
 - A changed supported gh version runs the complete contract suite.
 
-The real GitHub qualification repeats the guarded and autonomous happy paths,
-stale-head refusal, red required check, and lost-read retry against the
-disposable repository. It also proves that a repository requiring a merge queue
-is rejected for sf-managed merge and remains usable only in manual mode.
+The real GitHub qualification repeats the guarded happy path, stale-head
+refusal, red required check, and lost-read retry against the disposable
+repository. It also proves that a repository requiring a merge queue is
+rejected for sf-managed merge and remains usable only in manual mode.
 
 ## Provider and process tests
 
@@ -443,6 +459,10 @@ Assert:
 - Same-family verification blocks autonomous merge.
 
 ### Hostile provider qualification fixture
+
+This is a manual stable-promotion gate. It is distinct from the bounded local
+probes run by `providers qualify` and from the fake, credential-free fixtures
+run by `make test-all`.
 
 Run the same repository prompt-injection fixture through every real provider:
 
@@ -514,7 +534,7 @@ Required scenario matrix:
 - Any head change invalidates approval.
 - sf merges only after the approval and current checks.
 
-### Autonomous
+### Post-v1 autonomous (not part of the v1 release gate)
 
 - All gates green causes exact-head merge.
 - Same-family review, policy exception, budget override, unqualified provider,
@@ -588,7 +608,7 @@ Run under the Go race detector and a deterministic scheduler fixture:
   sibling.
 - Stable and dev capacity are independent.
 
-Stress:
+Future promotion stress gate (not included in `make test-all`):
 
 - At least 1,000 fake tickets through state-only workflows.
 - At least 100 two-ticket integration repetitions with randomized crash points.
@@ -636,7 +656,7 @@ Golden tests cover:
 - Exit codes.
 - Log follow interruption.
 - Daemon unavailable, version mismatch, and corrupt database guidance.
-- Missing/expired provider auth in the actual foreground/LaunchAgent
+- Missing/expired provider auth in the actual foreground
   environment.
 - Project/ticket/channel disambiguation and channel-scoped ticket IDs; the same
   generated ID may exist independently in stable and dev.
@@ -704,12 +724,15 @@ Every pull request:
 - Local integration suite.
 - Credential-free crash matrix.
 - Security/redaction suite.
-- License and secret scan.
+- Secret scan.
+- License scan is a future promotion gate; no scanner is currently claimed by
+  `make test-all`.
 
 Main/release candidate:
 
 - Full race suite.
-- Full randomized crash/concurrency suite.
+- Full randomized crash/concurrency suite (future promotion gate; not claimed
+  by `make test-all` until its harness exists).
 - Upgrade/rollback matrix.
 - Stable/dev isolation.
 - Binary packaging smoke on supported macOS architectures.
@@ -721,11 +744,10 @@ Manual release qualification:
 - One takeover.
 - One injected daemon crash after a remote mutation.
 
-The guarded foreground beta must pass before remaining providers, LaunchAgent
-polish, or autonomous mode integrate. Autonomous qualification is a later
-manual gate and runs only with autonomous_eligible execution profiles. Stable
-Nysa promotion additionally requires the ten-ticket guarded pilot and the
-separately approved autonomous test described in the formal plan.
+The guarded foreground beta must pass before stable v1 promotion. Additional
+providers, any service-manager packaging, and autonomous qualification are
+post-v1 work. Stable Nysa promotion requires the ten-ticket guarded pilot and
+the disposable guarded GitHub test; it does not require autonomous merge.
 
 ## Evidence retained
 

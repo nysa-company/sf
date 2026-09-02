@@ -68,9 +68,10 @@ type Verification struct {
 }
 
 type AmendmentRequest struct {
-	OldProofDigest string `json:"old_proof_digest"`
-	ProposedDigest string `json:"proposed_digest"`
-	Reason         string `json:"reason"`
+	OldProofDigest  string   `json:"old_proof_digest"`
+	ProposedDigest  string   `json:"proposed_digest"`
+	ProposedCommand []string `json:"proposed_command"`
+	Reason          string   `json:"reason"`
 }
 
 type Builder struct {
@@ -486,18 +487,35 @@ func validateBuilder(value *Builder, validation Validation) error {
 	if err != nil {
 		return fmt.Errorf("protected verification files: %w", err)
 	}
-	if intersects(changed, protected) {
-		if value.AmendmentRequest == nil {
-			return errors.New("builder changed protected verification without an amendment request")
-		}
-		if value.AmendmentRequest.OldProofDigest == "" || value.AmendmentRequest.ProposedDigest == "" || strings.TrimSpace(value.AmendmentRequest.Reason) == "" {
+	protectedChanged := intersects(changed, protected)
+	if protectedChanged && value.AmendmentRequest == nil {
+		return errors.New("builder changed protected verification without an amendment request")
+	}
+	if !protectedChanged && value.AmendmentRequest != nil {
+		return errors.New("verification amendment request requires a protected verification change")
+	}
+	if value.AmendmentRequest != nil {
+		request := value.AmendmentRequest
+		if !lowerSHA256(request.OldProofDigest) || !lowerSHA256(request.ProposedDigest) || request.OldProofDigest == request.ProposedDigest || strings.TrimSpace(request.Reason) == "" || argv("verification amendment proposed command", request.ProposedCommand) != nil {
 			return errors.New("verification amendment request is incomplete")
 		}
-		if validation.ApprovedAmendmentDigest == "" || value.AmendmentRequest.ProposedDigest != validation.ApprovedAmendmentDigest {
+		// A Builder request is not an approval. The Store records it before a
+		// fresh Reviewer may create a replacement checkpoint. When this field is
+		// non-empty it is an additional exact replay check, never a way to skip
+		// that Store authority.
+		if validation.ApprovedAmendmentDigest != "" && request.ProposedDigest != validation.ApprovedAmendmentDigest {
 			return errors.New("verification amendment is not freshly approved")
 		}
 	}
 	return nil
+}
+
+func lowerSHA256(value string) bool {
+	if len(value) != 64 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func validateReviewer(value *Reviewer, validation Validation) error {

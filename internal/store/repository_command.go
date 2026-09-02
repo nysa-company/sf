@@ -686,6 +686,11 @@ func validRepositoryExecutableDigest(path, digest string) bool {
 	if filepath.Base(path) != "node" {
 		return validClaimDigest(digest)
 	}
+	const nysaPrefix = "nysa-api-pure-v1:sha256:"
+	if strings.HasPrefix(digest, nysaPrefix) {
+		value := strings.TrimPrefix(digest, nysaPrefix)
+		return len(value) == 64 && validClaimDigest("sha256:"+value)
+	}
 	const prefix = "node22-closure-v1:sha256:"
 	if !strings.HasPrefix(digest, prefix) {
 		return false

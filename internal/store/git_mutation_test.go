@@ -268,6 +268,87 @@ func TestPublicationPushIntentReclaimsOnlyProvenAbsentImmutableTarget(t *testing
 	}
 }
 
+// TestReclaimProtectedRefFetchAfterRestart promotes the proof's effect and
+// immutable Git intent together only after the normal signed post-publication
+// restart lineage has advanced the merging ticket by +1/+1. The test begins
+// with the durable uncertainty left by an interrupted verifier; the fetch is
+// a deterministic private local proof ref, never a protected-branch mutation.
+func TestReclaimProtectedRefFetchAfterRestart(t *testing.T) {
+	fixture, current, _ := preparePostPublicationRearmState(t, domain.StateMerging)
+	publication, err := fixture.db.LoadHistoricalPublishedCandidate(fixture.ctx, current.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := fixture.db.MergeIntentForProof(fixture.ctx,
+		publication.PullRequest.Repository.Host,
+		publication.PullRequest.Repository.Owner,
+		publication.PullRequest.Repository.Name,
+		publication.PullRequest.BaseRef,
+		publication.PullRequest.BaseOID,
+		publication.PullRequest.HeadOID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := fixture.db.GuardedMergeProtectedRefFetchIntent(fixture.ctx, intent, intent.HeadOID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := fixture.db.GitMutationIntentFacts(fixture.ctx, proof.Intent.SemanticKey)
+	if err != nil || before.Effect.State != EffectConfirmed {
+		t.Fatalf("settled protected proof=%+v err=%v", before, err)
+	}
+	// Simulate the independently-durable result of an interrupted verifier.
+	// The coordinator regression covers this write under a cancelled context;
+	// this test starts exactly at the subsequent process-restart boundary.
+	if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE effects SET state='uncertain',observed_identity='' WHERE semantic_key=? AND state='confirmed'`, proof.Intent.SemanticKey); err != nil {
+		t.Fatal(err)
+	}
+	var path string
+	if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+		t.Fatalf("database path=%q err=%v", path, err)
+	}
+	if err := fixture.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	leader, err := reopened.AcquireLeader(t.Context(), domain.ChannelDev, "protected-proof-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.ReconcileEffects(t.Context(), domain.ChannelDev, leader); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := reopened.FenceRecoveredRunners(t.Context(), domain.ChannelDev, leader); err != nil || changed != 1 {
+		t.Fatalf("restart fence changed=%d err=%v", changed, err)
+	}
+	afterRestart, err := reopened.Ticket(t.Context(), current.Ref)
+	if err != nil || afterRestart.Version != current.Version+1 || afterRestart.RunnerEpoch != current.RunnerEpoch+1 || afterRestart.State != domain.StateMerging {
+		t.Fatalf("restart ticket=%+v prior=%+v err=%v", afterRestart, current, err)
+	}
+	proof.Intent.TicketVersion = afterRestart.Version
+	proof.Intent.Fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: afterRestart.RunnerEpoch}
+	reclaimed, err := reopened.ReclaimProtectedRefFetch(t.Context(), proof.Intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed.SemanticKey != before.Claim.SemanticKey || reclaimed.RequestDigest != before.Claim.RequestDigest ||
+		reclaimed.Repository != before.Claim.Repository || reclaimed.Worktree != before.Claim.Worktree || reclaimed.Branch != before.Claim.Branch ||
+		reclaimed.Operation != "protected-ref-fetch" || reclaimed.BaseRef != before.Claim.BaseRef ||
+		reclaimed.ExpectedBaseOID != before.Claim.ExpectedBaseOID || reclaimed.ExpectedHeadOID != before.Claim.ExpectedHeadOID ||
+		reclaimed.TicketVersion != afterRestart.Version || reclaimed.LeaderEpoch != leader || reclaimed.RunnerEpoch != afterRestart.RunnerEpoch ||
+		reclaimed.ClaimEpoch != before.Effect.ClaimEpoch+2 {
+		t.Fatalf("restart reclaim first=%+v reclaimed=%+v", before.Claim, reclaimed)
+	}
+	after, err := reopened.GitMutationIntentFacts(t.Context(), proof.Intent.SemanticKey)
+	if err != nil || after.Claim != reclaimed || after.Effect.State != EffectExecuting || after.Effect.TicketVersion != afterRestart.Version || after.Effect.LeaderEpoch != leader || after.Effect.RunnerEpoch != afterRestart.RunnerEpoch {
+		t.Fatalf("reclaimed durable facts=%+v err=%v", after, err)
+	}
+}
+
 func TestGitMutationLeaseReleaseIsBoundedWhenSQLiteIsBusy(t *testing.T) {
 	db, ctx := openTestStore(t)
 	intent := gitIntentFixture(t, db, ctx, "SF-git-release-busy")

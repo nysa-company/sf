@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,10 +24,13 @@ import (
 	"github.com/nysa-company/sf/internal/daemon/runtimecontrol"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/events"
+	gitboundary "github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/leader"
 	"github.com/nysa-company/sf/internal/operator"
+	"github.com/nysa-company/sf/internal/phaseartifact"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/transport"
+	"github.com/nysa-company/sf/internal/workflowprompt"
 	"github.com/nysa-company/sf/internal/workflowruntime"
 	"github.com/nysa-company/sf/internal/workflowworker"
 	"github.com/nysa-company/sf/internal/worktreecoord"
@@ -101,6 +106,7 @@ type daemonRuntimeWorker struct {
 	mu      sync.Mutex
 	calls   map[domain.TicketRef]int
 	active  map[domain.TicketRef]bool
+	onExit  func(domain.TicketRef)
 	entered chan domain.TicketRef
 	exited  chan domain.TicketRef
 }
@@ -118,7 +124,11 @@ func (worker *daemonRuntimeWorker) Run(ctx context.Context, ref domain.TicketRef
 	<-ctx.Done()
 	worker.mu.Lock()
 	delete(worker.active, ref)
+	onExit := worker.onExit
 	worker.mu.Unlock()
+	if onExit != nil {
+		onExit(ref)
+	}
 	worker.exited <- ref
 	return workflowworker.RunResult{Ref: ref}, ctx.Err()
 }
@@ -127,6 +137,408 @@ func (worker *daemonRuntimeWorker) snapshot(ref domain.TicketRef) (calls int, ac
 	worker.mu.Lock()
 	defer worker.mu.Unlock()
 	return worker.calls[ref], worker.active[ref]
+}
+
+func (worker *daemonRuntimeWorker) setOnExit(onExit func(domain.TicketRef)) {
+	worker.mu.Lock()
+	worker.onExit = onExit
+	worker.mu.Unlock()
+}
+
+type daemonCIPolicyObserver struct {
+	observation contracts.CIRequiredCheckPolicyObservation
+}
+
+func (o daemonCIPolicyObserver) ObserveCIRequiredCheckPolicy(context.Context, contracts.PullRequestIdentity) (contracts.CIRequiredCheckPolicyObservation, error) {
+	return o.observation, nil
+}
+
+var daemonFixtureCommandPID int64 = 20_000
+
+func daemonFixtureDigest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func daemonFixtureIdentity(t *testing.T, repository, worktree, branch, base string) []byte {
+	t.Helper()
+	value, err := json.Marshal(gitboundary.Identity{
+		Repository: repository, RepositoryDev: 1, RepositoryIno: 2,
+		Worktree: worktree, WorktreeDev: 3, WorktreeIno: 4,
+		GitFile: "gitdir: " + worktree + "/.git", GitFileDev: 5, GitFileIno: 6,
+		CommonDir: repository + "/.git", CommonDirDev: 7, CommonDirIno: 8,
+		Origin: "https://github.com/acme/app.git", PushOrigin: "git@github.com:acme/app.git", PushOriginDev: 9, PushOriginIno: 10,
+		BaseRef: base, BaseHead: strings.Repeat("a", 40), HeadRef: branch,
+		ConfigHash: strings.Repeat("b", 64), HooksHash: strings.Repeat("c", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func daemonFixtureQualification(channel domain.Channel, runID, provider, family string) store.ProviderQualification {
+	return store.ProviderQualification{
+		Channel: channel, RunID: runID,
+		Provider:     domain.ProviderIdentity{Provider: provider, Model: provider + "-model", Family: family, Version: "1.0.0"},
+		BinaryDigest: strings.Repeat("a", 64), PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64),
+		Profile: store.QualificationGuarded, CreatedAt: time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC),
+	}
+}
+
+func daemonFixtureBinding(q store.ProviderQualification) contracts.RuntimeBinding {
+	return contracts.RuntimeBinding{Identity: q.Provider, BinaryDigest: q.BinaryDigest, PolicyDigest: q.PolicyDigest, FixtureDigest: q.FixtureDigest, AuthDigest: daemonFixtureDigest("auth:" + q.Provider.Provider)}
+}
+
+func daemonFixtureDrainProof(t *testing.T, signer *contracts.DrainSigner, claim store.ProviderAttemptClaim) contracts.DrainProof {
+	t.Helper()
+	proof, err := signer.ProveDrained(contracts.DrainRequest{
+		ClaimID: claim.ID, Identity: claim.Binding.Identity, Ref: claim.Ref, Phase: claim.Phase, Role: claim.Role, Attempt: claim.Attempt,
+		LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ExpectedVersion: claim.ExpectedVersion, LeaseKey: claim.LeaseKey,
+		BindingDigest: claim.BindingDigest, BinaryDigest: claim.Binding.BinaryDigest, PolicyDigest: claim.Binding.PolicyDigest,
+		AuthDigest: claim.Binding.AuthDigest, AuthMode: claim.Binding.AuthMode, Repository: claim.Repository, Worktree: claim.Worktree,
+		WorktreeIdentity: claim.WorktreeIdentity, BaseSHA: claim.BaseSHA, RequestDigest: claim.RequestDigest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return proof
+}
+
+func daemonFixtureCompleteCommand(t *testing.T, database *store.Store, ref domain.TicketRef, version uint64, fence domain.Fence, purpose string, provider store.ProviderAttemptResultKey, intent, proof, checkpoint, policy string) contracts.RepositoryCommandResultKey {
+	t.Helper()
+	project, err := database.Project(t.Context(), ref.Channel, ref.Project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := database.Worktree(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := database.Ticket(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err := config.DecodeSnapshot(ticket.ConfigSnapshot, ticket.ConfigDigest)
+	if err != nil || effective.Commands.Verify.Validate("verify") != nil {
+		t.Fatalf("decode fixture verify command: %v", err)
+	}
+	argv, err := json.Marshal(effective.Commands.Verify.Argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandDigest := "sha256:" + daemonFixtureDigest(string(argv))
+	if policy == "" {
+		policy = "sha256:" + strings.Repeat("1", 64)
+	}
+	request := store.RepositoryCommandEvidenceRequest{
+		Purpose: purpose, Ref: ref, TicketVersion: version, LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch, ProviderResult: provider,
+		VerificationIntentDigest: intent, ProofDigest: proof, CheckpointID: checkpoint, ConfigCommandDigest: commandDigest,
+		Worktree: worktree.Path, WorktreeIdentity: string(worktree.IdentityJSON), BaseSHA: worktree.BaseSHA, PolicyDigest: policy,
+		SpecDigest: "sha256:" + strings.Repeat("2", 64), ExecutablePath: "/usr/bin/true", ExecutableDigest: "sha256:" + strings.Repeat("3", 64),
+	}
+	if purpose == store.RepositoryCommandPurposePrebuildVerification {
+		request.CheckpointID = ""
+	}
+	_, requestDigest, err := store.CanonicalRepositoryCommandEvidenceRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	semantic, err := store.RepositoryCommandEvidenceSemanticKey(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := store.RepositoryCommandIntent{
+		EffectFence: store.EffectFence{SemanticKey: semantic, Ref: ref, TicketVersion: version, Fence: fence}, RequestDigest: requestDigest,
+		Repository: project.Path, Worktree: worktree.Path, WorktreeIdentity: string(worktree.IdentityJSON), Branch: worktree.Branch, BaseRef: project.BaseRef, BaseSHA: worktree.BaseSHA,
+		CommandDigest: commandDigest, SpecDigest: request.SpecDigest, PolicyDigest: policy, ExecutablePath: request.ExecutablePath, ExecutableDigest: request.ExecutableDigest,
+	}
+	if _, err := database.PlanEffect(t.Context(), store.EffectPlan{SemanticKey: semantic, Ref: ref, Kind: "repository_command", TicketVersion: version, Fence: fence, RequestDigest: requestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := database.IssueRepositoryCommandClaim(t.Context(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := database.AcquireRepositoryCommand(t.Context(), claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := int(atomic.AddInt64(&daemonFixtureCommandPID, 1))
+	launch := contracts.RepositoryCommandLaunch{PID: pid, PGID: pid, BootIdentity: "fixture", ProcessStartIdentity: fmt.Sprintf("fixture-%d", pid)}
+	if err := lease.RecordRepositoryCommandLaunch(t.Context(), launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.FinishRepositoryCommandLaunch(t.Context(), launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CompleteRepositoryCommand(t.Context(), claim, contracts.CommandResult{ExitCode: map[string]int{store.RepositoryCommandPurposePrebuildVerification: 1, store.RepositoryCommandPurposePostbuildCandidate: 0}[purpose], Duration: time.Millisecond, Observed: true, ObservedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	return contracts.RepositoryCommandResultKey{SemanticKey: claim.SemanticKey, ClaimEpoch: claim.ClaimEpoch}
+}
+
+// prepareDaemonGuardedMergeRetry creates the minimum complete public-Store
+// provenance required for a guarded operator retry. It never invokes a GitHub,
+// Git, or provider adapter: the immutable observations are explicit fixtures.
+func prepareDaemonGuardedMergeRetry(t *testing.T, daemon *Daemon, ticketID domain.TicketID) store.Ticket {
+	t.Helper()
+	ctx := t.Context()
+	ref := domain.TicketRef{Channel: daemon.channel, Project: "demo", Ticket: ticketID}
+	project, err := daemon.store.Project(ctx, ref.Channel, ref.Project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.store.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: daemonFixtureDigest("source:" + string(ticketID)), Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = daemon.store.StartOrAdopt(ctx, ref, ticket.Version, "guarded-merge-retry-fixture", domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: ticket.RunnerEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "sf/" + string(ref.Channel) + "/" + daemonFixtureDigest(string(ref.Project))[:16] + "/" + daemonFixtureDigest(string(ref.Ticket))[:16] + "-" + strings.Repeat("b", 32)
+	base := strings.Repeat("a", 40)
+	worktreePath := filepath.Join(project.Path, string(ticketID))
+	identity := daemonFixtureIdentity(t, project.Path, worktreePath, branch, project.BaseRef)
+	fence := domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: ticket.RunnerEpoch}
+	branchKey := string(ref.Channel) + "\x00" + string(ref.Project) + "\x00" + string(ref.Ticket)
+	if _, err := daemon.store.LoadOrStoreBranchUnderFence(ctx, branchKey, branch, ticket.Version, fence); err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.store.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Path: worktreePath, Branch: branch, IdentityJSON: identity, BaseSHA: base, HeadSHA: base}); err != nil {
+		t.Fatal(err)
+	}
+	builder, _, err := daemon.store.RecordProviderQualification(ctx, daemonFixtureQualification(daemon.channel, strings.Repeat("a", 32), "cursor", "cursor-family"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer, _, err := daemon.store.RecordProviderQualification(ctx, daemonFixtureQualification(daemon.channel, strings.Repeat("b", 32), "claude", "claude-family"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := daemon.store.SelectProviderPair(ctx, daemon.channel, builder.ID, reviewer.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	signer, err := contracts.NewDrainSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch := func(phase domain.Phase, role string, binding contracts.RuntimeBinding, raw []byte, validation phaseartifact.Validation, expectedHead, expectedProof string) store.ProviderAttemptClaim {
+		request := store.ProviderAttemptRequest{
+			Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: phase, Role: role, Binding: binding, ConfigDigest: ticket.ConfigDigest, Capacity: 1, At: time.Now().UTC(),
+			ExpectedHead: expectedHead, ExpectedProof: expectedProof, Repository: project.Path, Worktree: worktreePath, WorktreeIdentity: string(identity), BaseSHA: base, SupervisorKey: signer.PublicKey(),
+			Input: contracts.PhaseInput{Ticket: ref, Phase: phase, LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch, ExpectedVersion: ticket.Version, Prompt: "guarded merge fixture", Repository: project.Path, Worktree: worktreePath, WorktreeIdentity: string(identity), BaseSHA: base, AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)},
+		}
+		claim, err := daemon.store.BeginProviderAttempt(ctx, request)
+		if err != nil {
+			t.Fatalf("begin %s/%s: %v", phase, role, err)
+		}
+		if err := daemon.store.RecordProviderLaunch(ctx, claim, contracts.ProviderLaunch{PID: int(claim.ID), PGID: int(claim.ID), BootIdentity: "fixture", ProcessStartIdentity: fmt.Sprintf("fixture-%d", claim.ID), Worktree: claim.Worktree}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := daemon.store.CompleteProviderAttemptSuccess(ctx, claim, daemonFixtureDrainProof(t, signer, claim), ticket.Version, fence, contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: raw, UsageTrusted: true, UsageUnits: 1}, validation, time.Now().UTC()); err != nil {
+			t.Fatalf("complete %s/%s: %v", phase, role, err)
+		}
+		return claim
+	}
+	plan := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"fixture acceptance"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofAcceptance, Command: []string{"go", "test"}, Details: "fixture proof"}, Paths: []string{"internal"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"fixture"}}
+	planRaw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := launch(domain.PhasePlanning, "planner", daemonFixtureBinding(builder), planRaw, phaseartifact.Validation{TicketType: ticket.Type}, "", "")
+	planKey := store.ProviderAttemptResultKey{AttemptID: planner.ID, Ref: ref, Phase: domain.PhasePlanning, Attempt: planner.Attempt}
+	if _, err := daemon.store.RecordPlan(ctx, store.PlanArtifact{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Document: store.PlanDocument{Planner: &plan, ProviderResult: &planKey, Acceptance: plan.Acceptance, ProofKind: string(plan.Proof.Kind), Paths: plan.Paths, Commands: plan.Commands, Risks: plan.Risks}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := daemon.store.TransitionPlan(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	planIdentity, err := workflowprompt.NewPlanIdentity(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: planIdentity.Digest, ProofKind: phaseartifact.ProofAcceptance, OwnedFiles: []string{"internal"}, Command: []string{"go", "test", "./..."}, PrebuildOutcome: "red", EvidenceDigest: daemonFixtureDigest("verification")}
+	verificationRaw, err := json.Marshal(verification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified := launch(domain.PhaseVerification, "reviewer", daemonFixtureBinding(reviewer), verificationRaw, phaseartifact.Validation{TicketType: ticket.Type, AcceptanceDigest: planIdentity.Digest}, "", "")
+	intent, err := workflowprompt.CanonicalVerificationIntentBytes(verification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := workflowprompt.CanonicalVerificationProofBytes(verification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := strings.Repeat("c", 40)
+	verificationKey := store.ProviderAttemptResultKey{AttemptID: verified.ID, Ref: ref, Phase: domain.PhaseVerification, Attempt: verified.Attempt}
+	verificationCommand := daemonFixtureCompleteCommand(t, daemon.store, ref, ticket.Version, fence, store.RepositoryCommandPurposePrebuildVerification, verificationKey, daemonFixtureDigest(string(intent)), daemonFixtureDigest(string(proof)), "", "")
+	if _, err := daemon.store.RecordVerification(ctx, store.VerificationArtifact{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: verification.OwnedFiles, CheckpointID: checkpoint, ProviderResult: &verificationKey, Checkpoint: store.CommitObservation{CommitOID: checkpoint, ParentOID: base, TreeOID: strings.Repeat("d", 40)}, CommandResult: verificationCommand}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := daemon.store.TransitionVerification(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StateVerifying, To: domain.StateBuilding, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	builderRaw := []byte(`{"schema":"sf.builder/v1","summary":"fixture","changed_files":["internal/x.go"],"commands":[["go","test"]]}`)
+	built := launch(domain.PhaseBuild, "builder", daemonFixtureBinding(builder), builderRaw, phaseartifact.Validation{TicketType: ticket.Type}, "", "")
+	builtKey := store.ProviderAttemptResultKey{AttemptID: built.ID, Ref: ref, Phase: domain.PhaseBuild, Attempt: built.Attempt}
+	_, parsed, err := daemon.store.LoadHistoricalProviderAttemptResult(ctx, builtKey)
+	if err != nil || parsed.Builder == nil {
+		t.Fatalf("load fixture builder result: %v", err)
+	}
+	builderDigest, err := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := daemonFixtureDigest("candidate-policy")
+	snapshot := domain.CandidateSnapshot{Generation: 1, BaseSHA: base, HeadSHA: strings.Repeat("e", 40), TreeSHA: strings.Repeat("f", 40), SourceDigest: daemonFixtureDigest("source:" + string(ticketID)), VerificationIntentDigest: daemonFixtureDigest(string(intent)), ProofDigest: daemonFixtureDigest(string(proof)), CommandPolicyDigest: policy, BuilderEvidenceDigest: builderDigest}
+	candidateCommand := daemonFixtureCompleteCommand(t, daemon.store, ref, ticket.Version, fence, store.RepositoryCommandPurposePostbuildCandidate, builtKey, snapshot.VerificationIntentDigest, snapshot.ProofDigest, checkpoint, "sha256:"+policy)
+	if _, err := daemon.store.RecordCandidate(ctx, store.CandidateEvidence{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Snapshot: snapshot, BuilderResult: builtKey, Commit: store.CommitObservation{CommitOID: snapshot.HeadSHA, ParentOID: checkpoint, TreeOID: snapshot.TreeSHA}, Reason: "fixture", CommandResult: candidateCommand}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := daemon.store.TransitionCandidate(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := daemon.store.RecoverableCandidate(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := daemon.store.Worktree(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "acme", Name: "app"}, Number: 42, HeadOwner: "acme", HeadRepository: "app", HeadRef: worktree.Branch, HeadOID: candidate.Snapshot.HeadSHA, BaseRef: project.BaseRef, BaseOID: candidate.Snapshot.BaseSHA, FactoryOwned: true}
+	publication := store.PublishedCandidateEvidence{Ref: ref, TicketVersion: ticket.Version, Fence: fence, Candidate: candidate, ConfigGeneration: ticket.ConfigGeneration, ConfigDigest: ticket.ConfigDigest, ConfigSnapshotDigest: daemonFixtureDigest(string(ticket.ConfigSnapshot)), Worktree: worktree, RemoteBranchRef: worktree.Branch, RemoteBranchOID: candidate.Snapshot.HeadSHA, RemoteBaseOID: candidate.Snapshot.BaseSHA, PullRequest: pr, PullRequestState: "OPEN", PullRequestDraft: true, PullRequestObservedAt: time.Now().UTC(), CreatedAt: time.Now().UTC()}
+	publication.PushEffect = store.PublicationEffectEvidence{SemanticKey: "fixture-push-" + string(ticketID), Kind: store.PublicationPushEffectKind, RequestDigest: strings.Repeat("1", 64), ClaimEpoch: 1, ObservedIdentity: store.CanonicalPublicationPushObservation(publication.RemoteBranchRef, publication.RemoteBranchOID)}
+	publication.PRCreateOrUpdateEffect = store.PublicationEffectEvidence{SemanticKey: "fixture-pr-" + string(ticketID), Kind: store.PublicationPRCreateEffectKind, RequestDigest: "sha256:" + strings.Repeat("2", 64), ClaimEpoch: 1, ObservedIdentity: store.CanonicalPublicationPRObservation(pr, "OPEN", true)}
+	for _, effect := range []store.PublicationEffectEvidence{publication.PushEffect, publication.PRCreateOrUpdateEffect} {
+		if _, err := daemon.store.PlanEffect(ctx, store.EffectPlan{SemanticKey: effect.SemanticKey, Ref: ref, Kind: effect.Kind, TicketVersion: ticket.Version, Fence: fence, RequestDigest: effect.RequestDigest}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := daemon.store.ClaimEffect(ctx, store.EffectFence{SemanticKey: effect.SemanticKey, Ref: ref, TicketVersion: ticket.Version, Fence: fence})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := daemon.store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: effect.SemanticKey, Ref: ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}}, effect.ObservedIdentity); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := daemon.store.RecordPublishedCandidate(ctx, publication); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := daemon.store.TransitionPublishedCandidate(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	published, err := daemon.store.LoadPublishedCandidate(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyObserver := daemonCIPolicyObserver{observation: contracts.CIRequiredCheckPolicyObservation{PullRequest: pr, ProtectedBranchRef: pr.BaseRef, ProtectedBranchOID: pr.BaseOID, PolicySourceDigest: strings.Repeat("a", 64), AuthenticatedPrincipal: "fixture", RequiredChecks: []contracts.RequiredCheck{{Name: "unit", ExternalID: "run-1", State: "success"}}, ObservedAt: time.Now().UTC()}}
+	if err := daemon.store.RecordCIRequiredCheckPolicyFromObserver(ctx, ref, policyObserver); err != nil {
+		t.Fatal(err)
+	}
+	observation := store.CIObservation{Ref: ref, CandidateGeneration: candidate.Snapshot.Generation, CandidateHeadSHA: candidate.Snapshot.HeadSHA, CandidateTreeSHA: candidate.Snapshot.TreeSHA, PublicationWitnessDigest: published.WitnessDigest, PullRequest: pr, ObservedTicketVersion: ticket.Version, ObservedFence: fence, ObservedAt: time.Now().UTC(), RequiredChecks: []store.CIObservationCheck{{CanonicalName: "unit", ExternalID: "run-1", NormalizedState: "success"}}, Classification: "green"}
+	if err := daemon.store.RecordCIObservation(ctx, observation); err != nil {
+		t.Fatal(err)
+	}
+	observation, err = daemon.store.LoadCurrentCIObservation(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := daemon.store.ConsumeCIObservation(ctx, store.CIObservationTransition{Ref: ref, ObservationDigest: observation.ObservationDigest, ExpectedVersion: ticket.Version, Fence: fence}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	reviewed := launch(domain.PhaseReview, "reviewer", daemonFixtureBinding(reviewer), []byte(fmt.Sprintf(`{"schema":"sf.reviewer/v1","decision":"pass","repair_owner":"","findings":[],"reviewed_head":"%s","proof_digest":"%s"}`, candidate.Snapshot.HeadSHA, candidate.Snapshot.ProofDigest)), phaseartifact.Validation{TicketType: ticket.Type, ExpectedReviewedHead: candidate.Snapshot.HeadSHA, ExpectedProofDigest: candidate.Snapshot.ProofDigest}, candidate.Snapshot.HeadSHA, candidate.Snapshot.ProofDigest)
+	if reviewed.ID == 0 {
+		t.Fatal("final review did not create a provider attempt")
+	}
+	if _, err := daemon.store.TransitionFinalReview(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StateReviewing, To: domain.StateWaitingApproval, Trigger: "review_pass", Fence: fence, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	if _, err := daemon.store.ApplyOperatorDecision(ctx, store.OperatorDecisionRequest{OperatorDecision: store.OperatorDecision{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, ReviewedHead: candidate.Snapshot.HeadSHA, OperatorUID: 501, Decision: "approved"}}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = daemon.store.Ticket(ctx, ref)
+	if err != nil || ticket.State != domain.StateMerging {
+		t.Fatalf("guarded merge fixture=%+v err=%v", ticket, err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	publication, err = daemon.store.LoadHistoricalPublishedCandidate(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := publication.PullRequest.HeadOID
+	readyKey := "merge-ready/" + string(ref.Channel) + "/" + string(ref.Project) + "/" + string(ref.Ticket) + "/" + head
+	if _, err := daemon.store.PlanEffect(ctx, store.EffectPlan{SemanticKey: readyKey, Ref: ref, Kind: "pr_ready", TicketVersion: ticket.Version, Fence: fence, RequestDigest: "fixture-ready-request"}); err != nil {
+		t.Fatal(err)
+	}
+	readyClaim, err := daemon.store.ClaimEffect(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ref, TicketVersion: ticket.Version, Fence: fence})
+	if err != nil || !readyClaim.Claimed {
+		t.Fatalf("fixture pr-ready claim=%+v err=%v", readyClaim, err)
+	}
+	if _, err := daemon.store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: readyKey, Ref: ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: readyClaim.Effect.LeaderEpoch, RunnerEpoch: readyClaim.Effect.RunnerEpoch, ClaimEpoch: readyClaim.Effect.ClaimEpoch}}, "ready/"+head); err != nil {
+		t.Fatal(err)
+	}
+	mergeKey := "merge/" + string(ref.Channel) + "/" + string(ref.Project) + "/" + string(ref.Ticket) + "/" + head
+	if _, err := daemon.store.PlanEffect(ctx, store.EffectPlan{SemanticKey: mergeKey, Ref: ref, Kind: "merge", TicketVersion: ticket.Version, Fence: fence, RequestDigest: "fixture-merge-request"}); err != nil {
+		t.Fatal(err)
+	}
+	mergeClaim, err := daemon.store.ClaimEffect(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ref, TicketVersion: ticket.Version, Fence: fence})
+	if err != nil || !mergeClaim.Claimed {
+		t.Fatalf("fixture merge claim=%+v err=%v", mergeClaim, err)
+	}
+	if err := daemon.store.RecordMergeIntent(ctx, domain.MergeIntent{
+		Ref: ref, SemanticKey: mergeKey, RequestDigest: mergeClaim.Effect.RequestDigest,
+		TicketVersion: ticket.Version, LeaderEpoch: mergeClaim.Effect.LeaderEpoch, RunnerEpoch: mergeClaim.Effect.RunnerEpoch, ClaimEpoch: mergeClaim.Effect.ClaimEpoch,
+		RepositoryHost: publication.PullRequest.Repository.Host, RepositoryOwner: publication.PullRequest.Repository.Owner, RepositoryName: publication.PullRequest.Repository.Name,
+		PullRequestNumber: publication.PullRequest.Number, HeadOwner: publication.PullRequest.HeadOwner, HeadRepository: publication.PullRequest.HeadRepository,
+		HeadRef: publication.PullRequest.HeadRef, HeadOID: publication.PullRequest.HeadOID, BaseRef: publication.PullRequest.BaseRef, OriginalBaseOID: publication.PullRequest.BaseOID,
+		ProtectionRuleID: "fixture-main", StrictStatusChecks: true, AdminEnforced: true, Method: "squash",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := daemon.store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: mergeClaim.Effect.LeaderEpoch, RunnerEpoch: mergeClaim.Effect.RunnerEpoch, ClaimEpoch: mergeClaim.Effect.ClaimEpoch}}, "merged/"+head); err != nil {
+		t.Fatal(err)
+	}
+	return ticket
 }
 
 func (controller testRuntimeController) Drain(ctx context.Context, ref domain.TicketRef) (bool, error) {
@@ -213,12 +625,13 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				binary = "sf-dev"
 			}
 			for code, want := range map[string][]string{
-				"autonomous_unavailable":                  {binary, "providers", "qualify", "--help"},
+				"autonomous_unavailable":                  {binary, "submit", "--help"},
 				"runtime_activation_failed":               {binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"},
 				"runtime_already_active":                  {binary, "daemon", "status"},
 				"terminal_replay_requires_new":            {binary, "submit", "--help"},
 				"unknown_project":                         {binary, "init", "--help"},
 				"invalid_submit":                          {binary, "submit", "--help"},
+				"ticket_policy_refused":                   {binary, "submit", "--help"},
 				"invalid_logs":                            {binary, "logs", "--help"},
 				"not_ready":                               {binary, "--help"},
 				"takeover_inspection_failed":              {binary, "take", "--help"},
@@ -532,7 +945,7 @@ func TestDaemonPauseDrainsThenCommitsAndReplays(t *testing.T) {
 	if intentEvent.Trigger != "operator_pause_or_take" || !strings.Contains(intentEvent.Payload, `"intent":"pause"`) || !strings.Contains(intentEvent.Payload, `"operator":"operator"`) || !strings.Contains(intentEvent.Payload, `"operator_uid":`) {
 		t.Fatalf("control intent event=%+v", intentEvent)
 	}
-	if drainedEvent := events[len(events)-1]; drainedEvent.Trigger != "process_and_effects_drained" || drainedEvent.Payload != `{"drained":true,"intent":"pause"}` {
+	if drainedEvent := events[len(events)-1]; drainedEvent.Trigger != "process_and_effects_drained" || drainedEvent.Payload != `{"drained":true,"intent":"pause","remote":{"registered":false,"candidate_present":false}}` {
 		t.Fatalf("drained event=%+v", drainedEvent)
 	}
 	replay := daemonControl(d, started.Ref.Ticket, "pause")
@@ -554,7 +967,7 @@ func TestDaemonTakeReturnsAuthenticatedWorktreeAndResumeRearmsExactlyOnce(t *tes
 	if err := d.store.RegisterWorktree(context.Background(), store.WorktreeRegistration{Ref: started.Ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch}, Path: path, Branch: branch, IdentityJSON: daemonRecoveryWorktreeIdentity(project.Path, path, branch, project.BaseRef, base), BaseSHA: base, HeadSHA: base}); err != nil {
 		t.Fatal(err)
 	}
-	control := &takeoverRuntimeController{inspection: contracts.TakeoverInspection{Registered: true, Path: path, Branch: branch, Repository: project.Path, BaseSHA: base, HeadSHA: base, Clean: true, ChangeKind: "none"}}
+	control := &takeoverRuntimeController{inspection: contracts.TakeoverInspection{Registered: true, Path: path, Branch: branch, Repository: project.Path, BaseSHA: base, HeadSHA: base, Clean: true, ChangeKind: "none", RemoteBaseSHA: base, RemoteIdentityExact: true}}
 	d.control = control
 	taken := daemonControl(d, started.Ref.Ticket, "take")
 	if !taken.OK || taken.Mutation.Kind != "ticket_take" {
@@ -577,6 +990,32 @@ func TestDaemonTakeReturnsAuthenticatedWorktreeAndResumeRearmsExactlyOnce(t *tes
 	replay := daemonResume(d, started.Ref.Ticket)
 	if !replay.OK || !replay.Mutation.Observed || control.rearms != 1 {
 		t.Fatalf("resume replay=%+v rearms=%d", replay, control.rearms)
+	}
+}
+
+func TestDaemonEarlyTakeReportsPausedWithoutInventingWorktree(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-take-before-worktree")
+	d.control = testRuntimeController{drain: func(context.Context, domain.TicketRef) (bool, error) { return true, nil }}
+
+	taken := daemonControl(d, started.Ref.Ticket, "take")
+	if !taken.OK || !taken.Mutation.Attempted || taken.Mutation.Observed || taken.Mutation.Kind != "ticket_take" {
+		t.Fatalf("early take response=%+v", taken)
+	}
+	var body struct {
+		State       domain.State `json:"state"`
+		ResumeState domain.State `json:"resume_state"`
+		Takeover    struct {
+			Registered      bool     `json:"registered"`
+			Path            string   `json:"path"`
+			Clean           bool     `json:"clean"`
+			ChangeKind      string   `json:"change_kind"`
+			ChangedFiles    []string `json:"changed_files"`
+			SourceResumable bool     `json:"source_resumable"`
+		} `json:"takeover"`
+	}
+	if err := json.Unmarshal(taken.Data, &body); err != nil || body.State != domain.StatePaused || body.ResumeState != domain.StatePlanning || body.Takeover.Registered || body.Takeover.Path != "" || !body.Takeover.Clean || body.Takeover.ChangeKind != "no_worktree" || len(body.Takeover.ChangedFiles) != 0 || body.Takeover.SourceResumable {
+		t.Fatalf("early take body=%s parsed=%+v err=%v", taken.Data, body, err)
 	}
 }
 
@@ -612,7 +1051,7 @@ func TestDaemonResumeRefusesUnadoptedTakeoverChanges(t *testing.T) {
 	if err := d.store.RegisterWorktree(context.Background(), store.WorktreeRegistration{Ref: started.Ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: started.RunnerEpoch}, Path: path, Branch: branch, IdentityJSON: daemonRecoveryWorktreeIdentity(project.Path, path, branch, project.BaseRef, base), BaseSHA: base, HeadSHA: base}); err != nil {
 		t.Fatal(err)
 	}
-	control := &takeoverRuntimeController{inspection: contracts.TakeoverInspection{Registered: true, Path: path, Branch: branch, Repository: project.Path, BaseSHA: base, ChangeKind: "dirty"}}
+	control := &takeoverRuntimeController{inspection: contracts.TakeoverInspection{Registered: true, Path: path, Branch: branch, Repository: project.Path, BaseSHA: base, RemoteBaseSHA: base, RemoteIdentityExact: true, ChangeKind: "dirty"}}
 	d.control = control
 	if response := daemonControl(d, started.Ref.Ticket, "take"); !response.OK {
 		t.Fatalf("take=%+v", response)
@@ -623,7 +1062,7 @@ func TestDaemonResumeRefusesUnadoptedTakeoverChanges(t *testing.T) {
 	}
 }
 
-func TestDaemonResumeSourceChangesStartsFreshBuilderCycle(t *testing.T) {
+func TestDaemonResumeSourceChangesRequiresAuthenticatedEvidence(t *testing.T) {
 	d, _, _ := testDaemon(t)
 	started := createAndStartControlTicket(t, d, "SF-take-source")
 	project, err := d.store.Project(context.Background(), d.channel, started.Ref.Project)
@@ -638,25 +1077,24 @@ func TestDaemonResumeSourceChangesStartsFreshBuilderCycle(t *testing.T) {
 	}
 	control := &takeoverRuntimeController{inspection: contracts.TakeoverInspection{
 		Registered: true, Path: path, Branch: branch, Repository: project.Path, BaseSHA: base, HeadSHA: base,
-		ChangeKind: "source_changes", ChangedFiles: []string{"src/feature.go"}, SourceResumable: true,
+		Clean: true, ChangeKind: "source_commit", ChangedFiles: []string{"src/feature.go"}, SourceResumable: true, RemoteBaseSHA: base, RemoteIdentityExact: true,
+		SourceCommit: contracts.OperatorSourceCommit{CommitOID: strings.Repeat("d", 40), ParentOID: base, TreeOID: strings.Repeat("e", 40), Changes: []contracts.OperatorSourceChange{{Status: "M", Path: "src/feature.go"}}},
 	}}
 	d.control = control
 	if response := daemonControl(d, started.Ref.Ticket, "take"); !response.OK {
 		t.Fatalf("take=%+v", response)
 	}
 	response := daemonResume(d, started.Ref.Ticket)
-	if !response.OK || response.Mutation.Observed || control.rearms != 1 {
-		t.Fatalf("source resume=%+v rearms=%d", response, control.rearms)
+	// This fixture deliberately has no authenticated plan or verification
+	// checkpoint. A source-changes resume must retain the paused ticket rather
+	// than minting a Builder cycle from inspection data alone. The compiled
+	// takeover test covers the real evidence-backed positive path.
+	if response.OK || response.Error == nil || response.Error.Code != "resume_transition_refused" || control.rearms != 0 {
+		t.Fatalf("unauthenticated source resume=%+v error=%+v next=%+v rearms=%d", response, response.Error, response.NextAction, control.rearms)
 	}
 	current, err := d.store.Ticket(context.Background(), started.Ref)
-	if err != nil || current.State != domain.StateBuilding {
+	if err != nil || current.State != domain.StatePaused || current.ResumeState != domain.StatePlanning {
 		t.Fatalf("source resume ticket=%+v err=%v", current, err)
-	}
-	// The resume merely routes retained edits to Builder. It cannot mint a
-	// candidate: Store still insists on a completed Builder result and its
-	// repository-command proof before RecordCandidate can proceed.
-	if _, err := d.store.RecordCandidate(context.Background(), store.CandidateEvidence{Ref: started.Ref, ExpectedVersion: current.Version, Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: current.RunnerEpoch}, Reason: "operator source edits"}); err == nil {
-		t.Fatal("source resume minted a candidate without Builder evidence")
 	}
 }
 
@@ -763,6 +1201,164 @@ func TestDaemonGuardedMergeRetryDrainsBeforeAuthorityAndReplaysCommittedRearm(t 
 			t.Fatalf("unrelated sealed retry=%+v rearms=%d", response, controller.rearms)
 		}
 	})
+}
+
+func TestDaemonGuardedMergeRetryUsesRealControllerProofAndSchedulerAdmission(t *testing.T) {
+	worker := newDaemonRuntimeWorker()
+	var scheduler *workflowruntime.Scheduler
+	cfg, _ := lifecycleConfig(t, func(deps RuntimeDependencies) (WorkflowRuntimeComponents, error) {
+		scheduler = workflowruntime.NewScheduler(domain.ChannelStable, workflowruntime.StoreTicketSource{Store: deps.Store}, daemonRuntimeEnsure{}, worker)
+		runtime, err := workflowruntime.NewRuntimeWithConfig(scheduler, workflowruntime.RuntimeConfig{Interval: time.Hour, Workers: 1})
+		if err != nil {
+			return WorkflowRuntimeComponents{}, err
+		}
+		controller, err := runtimecontrol.New(deps.Store, runtime.ControlBundle(), runtimecontrol.MergeObserverFunc(func(context.Context, domain.TicketRef) (bool, error) {
+			return false, nil
+		}))
+		if err != nil {
+			_ = runtime.Close()
+			return WorkflowRuntimeComponents{}, err
+		}
+		return WorkflowRuntimeComponents{Runtime: runtime, Controller: controller}, nil
+	})
+	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("demo", cfg.Projects[0].Path), config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Projects[0].ConfigGeneration = 1
+	cfg.Projects[0].ConfigDigest = digest
+	cfg.Projects[0].ConfigSnapshot = snapshot
+	d, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if scheduler == nil {
+		t.Fatal("runtime factory did not expose its real scheduler")
+	}
+	merging := prepareDaemonGuardedMergeRetry(t, d, "SF-real-guarded-retry")
+	stateAtDrain := make(chan domain.State, 1)
+	worker.setOnExit(func(ref domain.TicketRef) {
+		if ref != merging.Ref {
+			return
+		}
+		current, err := d.store.Ticket(context.Background(), ref)
+		if err != nil {
+			t.Errorf("read ticket while proving drain: %v", err)
+			return
+		}
+		stateAtDrain <- current.State
+	})
+	firstTick := make(chan workflowruntime.TickResult, 1)
+	go func() { firstTick <- scheduler.Tick(t.Context(), domain.Fence{LeaderEpoch: d.epoch}) }()
+	select {
+	case entered := <-worker.entered:
+		if entered != merging.Ref {
+			t.Fatalf("first admission entered %v, want %v", entered, merging.Ref)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("guarded merge did not enter the real scheduler")
+	}
+	if _, err := d.engine.Signal(t.Context(), contracts.SignalRequest{
+		Ticket: merging.Ref, TicketVersion: merging.Version, From: domain.StateMerging, Trigger: "retry_or_correction_exhausted",
+		Fence: domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: merging.RunnerEpoch}, EventPayload: `{"reason":"fixture"}`,
+	}); err != nil {
+		t.Fatalf("record guarded merge retry exhaustion: %v", err)
+	}
+	paused, err := d.store.Ticket(t.Context(), merging.Ref)
+	if err != nil || paused.State != domain.StatePaused || paused.ResumeState != domain.StateMerging {
+		t.Fatalf("semantic retry pause=%+v err=%v", paused, err)
+	}
+	if calls, active := worker.snapshot(merging.Ref); calls != 1 || !active {
+		t.Fatalf("semantic retry pause unexpectedly stopped the worker: calls=%d active=%v", calls, active)
+	}
+	replay, err := d.store.GuardedMergeRetryReplay(t.Context(), merging.Ref)
+	if err != nil || replay != store.GuardedMergeRetryNotReplay {
+		t.Fatalf("paused retry replay=%v err=%v", replay, err)
+	}
+	response := daemonControl(d, merging.Ref.Ticket, "retry")
+	if !response.OK || response.Mutation.Observed {
+		t.Fatalf("guarded retry response: ok=%v mutation=%+v error=%+v data=%s next_action=%+v", response.OK, response.Mutation, response.Error, response.Data, response.NextAction)
+	}
+	select {
+	case state := <-stateAtDrain:
+		if state != domain.StatePaused {
+			t.Fatalf("worker drain did not complete before operator retry commit: saw state %s", state)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not prove its drain")
+	}
+	select {
+	case exited := <-worker.exited:
+		if exited != merging.Ref {
+			t.Fatalf("retry drain exited %v, want %v", exited, merging.Ref)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry drain did not join the real scheduler worker")
+	}
+	select {
+	case result := <-firstTick:
+		if result.Outcome != workflowruntime.OutcomeCanceled {
+			t.Fatalf("drained scheduler tick=%+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("drained scheduler tick did not return")
+	}
+	retried, err := d.store.Ticket(t.Context(), merging.Ref)
+	if err != nil || retried.State != domain.StateMerging || retried.ResumeState != "" {
+		t.Fatalf("retried guarded merge=%+v err=%v", retried, err)
+	}
+	replay, err = d.store.GuardedMergeRetryReplay(t.Context(), merging.Ref)
+	if err != nil || replay != store.GuardedMergeRetryAlreadyRearmed {
+		t.Fatalf("activated retry replay=%v err=%v", replay, err)
+	}
+	ready, err := d.store.RuntimeAdmissionReady(t.Context(), merging.Ref, retried.Version, domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: retried.RunnerEpoch})
+	if err != nil || ready {
+		t.Fatalf("armed retry was admitted before scheduler begin: ready=%v err=%v", ready, err)
+	}
+	runCtx, cancelRun := context.WithCancel(t.Context())
+	secondTick := make(chan workflowruntime.TickResult, 1)
+	go func() { secondTick <- scheduler.Tick(runCtx, domain.Fence{LeaderEpoch: d.epoch}) }()
+	select {
+	case entered := <-worker.entered:
+		if entered != merging.Ref {
+			t.Fatalf("rearmed admission entered %v, want %v", entered, merging.Ref)
+		}
+	case <-time.After(time.Second):
+		cancelRun()
+		t.Fatal("rearmed ticket was not admitted by the real scheduler")
+	}
+	ready, err = d.store.RuntimeAdmissionReady(t.Context(), merging.Ref, retried.Version, domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: retried.RunnerEpoch})
+	if err != nil || !ready {
+		cancelRun()
+		t.Fatalf("scheduler begin did not open durable admission: ready=%v err=%v", ready, err)
+	}
+	duplicate := scheduler.Tick(t.Context(), domain.Fence{LeaderEpoch: d.epoch})
+	if duplicate.Outcome != workflowruntime.OutcomeCanceled {
+		cancelRun()
+		t.Fatalf("active rearmed ticket was admitted twice: %+v", duplicate)
+	}
+	cancelRun()
+	select {
+	case exited := <-worker.exited:
+		if exited != merging.Ref {
+			t.Fatalf("rearmed cancellation exited %v, want %v", exited, merging.Ref)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rearmed scheduler worker did not stop")
+	}
+	select {
+	case result := <-secondTick:
+		if result.Outcome != workflowruntime.OutcomeCanceled {
+			t.Fatalf("rearmed scheduler result=%+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rearmed scheduler tick did not return")
+	}
 }
 
 func TestDaemonRecoverUsesTypedBlockerAndGuardedNarrowing(t *testing.T) {
@@ -1028,12 +1624,44 @@ func TestSubmitRefusesAutonomousWorkflowBeforeAdmission(t *testing.T) {
 	source := "---\nmerge: autonomous\n---\n# Autonomous\n\nDo not start this workflow.\n\n## Acceptance\n- It is refused before admission\n"
 	request := api.Request{Version: api.Version, RequestID: "autonomous-refusal", Method: "ticket.submit", Parameters: []byte(`{"channel":"dev","project":"demo","source":` + strconv.Quote(source) + `}`)}
 	response := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, request)
-	if response.OK || response.Error == nil || response.Error.Code != "autonomy_blocked" || response.Mutation.Attempted {
+	if response.OK || response.Error == nil || response.Error.Code != "autonomous_unavailable" || response.Mutation.Attempted || response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join([]string{"sf-dev", "submit", "--help"}, "\x00") {
 		t.Fatalf("autonomous submission response=%+v", response)
 	}
 	tickets, err := d.store.Tickets(context.Background(), domain.ChannelDev, "demo", 10)
 	if err != nil || len(tickets) != 0 {
 		t.Fatalf("autonomous submission persisted tickets=%+v err=%v", tickets, err)
+	}
+}
+
+func TestSubmitResolvesOmittedMergeModeAgainstFrozenProjectPolicy(t *testing.T) {
+	submit := func(t *testing.T, daemon *Daemon, source, requestID string) api.Response {
+		t.Helper()
+		return daemon.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{
+			Version: api.Version, RequestID: requestID, Method: "ticket.submit",
+			Parameters: []byte(`{"channel":"dev","project":"demo","source":` + strconv.Quote(source) + `}`),
+		})
+	}
+	manual, _, _ := testDaemonForChannelWithProjectMaximum(t, domain.ChannelDev, domain.MergeManual)
+	omitted := submit(t, manual, "# Inherit manual\n\nThe project policy is the default.\n", "manual-omitted")
+	if !omitted.OK {
+		t.Fatalf("manual omitted response=%+v", omitted)
+	}
+	manualTickets, err := manual.store.Tickets(context.Background(), domain.ChannelDev, "demo", 10)
+	if err != nil || len(manualTickets) != 1 || manualTickets[0].MergeMode != domain.MergeManual {
+		t.Fatalf("manual omitted ticket=%+v err=%v", manualTickets, err)
+	}
+	explicitGuarded := submit(t, manual, "---\nmerge: guarded\n---\n# Reject wider mode\n\nThe project is manual.\n", "manual-guarded")
+	if explicitGuarded.OK || explicitGuarded.Error == nil || explicitGuarded.Error.Code != "ticket_policy_refused" || explicitGuarded.NextAction == nil || strings.Join(explicitGuarded.NextAction.Argv, "\x00") != strings.Join([]string{"sf-dev", "submit", "--help"}, "\x00") {
+		t.Fatalf("manual guarded override response=%+v", explicitGuarded)
+	}
+	guarded, _, _ := testDaemonForChannelWithProjectMaximum(t, domain.ChannelDev, domain.MergeGuarded)
+	manualOverride := submit(t, guarded, "---\nmerge: manual\n---\n# Narrow merge\n\nManual is stricter.\n", "guarded-manual")
+	if !manualOverride.OK {
+		t.Fatalf("guarded manual response=%+v", manualOverride)
+	}
+	guardedTickets, err := guarded.store.Tickets(context.Background(), domain.ChannelDev, "demo", 10)
+	if err != nil || len(guardedTickets) != 1 || guardedTickets[0].MergeMode != domain.MergeManual {
+		t.Fatalf("guarded manual ticket=%+v err=%v", guardedTickets, err)
 	}
 }
 

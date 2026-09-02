@@ -56,6 +56,9 @@ type intentRecorderFunc func(context.Context, domain.MergeIntent) error
 func (f intentRecorderFunc) RecordMergeIntent(ctx context.Context, intent domain.MergeIntent) error {
 	return f(ctx, intent)
 }
+func (f intentRecorderFunc) RecordGuardedMergeObservation(context.Context, domain.MergeIntent, contracts.PublishedPullRequestObservation) error {
+	return nil
+}
 
 type cleanupQuarantinerFunc func(context.Context) error
 
@@ -429,6 +432,28 @@ func TestObservePublishedPullRequestAcceptsMergedBaseMovementAndRejectsIdentityD
 	var callsMarker [][]string
 	if _, err := refreshTestClient(t, wire(identity, "<!-- foreign -->", "MERGED", true), &callsMarker).ObservePublishedPullRequest(context.Background(), identity); !errors.Is(err, ErrNoMatchingPR) {
 		t.Fatalf("wrong marker err=%v", err)
+	}
+}
+
+func TestObserveExternalMergeAcceptsPostPublicationHeadDriftOnlyWithHistoricalMarker(t *testing.T) {
+	want := contracts.PullRequestIdentity{Number: 7, Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/example/SF-44-random", HeadOID: strings.Repeat("a", 40), BaseRef: "main", BaseOID: strings.Repeat("c", 40), FactoryOwned: true}
+	observed := want
+	observed.HeadOID = strings.Repeat("b", 40)
+	payload := map[string]any{"number": observed.Number, "title": "title", "body": ownershipMarker(want),
+		"headRepositoryOwner": map[string]string{"login": observed.HeadOwner}, "headRepository": map[string]string{"nameWithOwner": observed.HeadOwner + "/" + observed.HeadRepository},
+		"headRefName": observed.HeadRef, "headRefOid": observed.HeadOID, "baseRefName": observed.BaseRef, "baseRefOid": strings.Repeat("d", 40), "isDraft": false,
+		"mergedAt": "2026-01-01T00:00:00Z", "mergeCommit": map[string]string{"oid": strings.Repeat("e", 40)}, "state": "MERGED", "mergeStateStatus": "CLEAN", "autoMergeRequest": nil}
+	response, _ := json.Marshal([]map[string]any{payload})
+	var calls [][]string
+	got, err := refreshTestClient(t, response, &calls).ObserveExternalMerge(context.Background(), want)
+	if err != nil || !got.Merged || got.Identity.HeadOID != observed.HeadOID || got.Identity.Number != want.Number {
+		t.Fatalf("external merge observation=%+v err=%v", got, err)
+	}
+	var markerCalls [][]string
+	payload["body"] = "<!-- foreign -->"
+	response, _ = json.Marshal([]map[string]any{payload})
+	if _, err := refreshTestClient(t, response, &markerCalls).ObserveExternalMerge(context.Background(), want); !errors.Is(err, ErrNoMatchingPR) {
+		t.Fatalf("missing historical marker err=%v", err)
 	}
 }
 

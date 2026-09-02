@@ -327,11 +327,24 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			cancel()
 			finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			finishErr := c.store.FailProviderAttemptBeforeLaunch(finishCtx, claim, r.ExpectedVersion, r.Fence, c.clock.Now())
+			retiredForControl := false
+			if errors.Is(finishErr, store.ErrStaleFence) {
+				// Operator control commits its ticket/runner revocation before it
+				// cancels the runtime.  If that revocation wins this race, the
+				// ordinary old-fence terminal path must fail.  Retire only the
+				// exact still-unlaunched claim under Store's sealed-control proof;
+				// never reinterpret the adapter error as current-fence evidence.
+				finishErr = c.store.RetireUnlaunchedProviderAttemptAfterControlInvalidation(finishCtx, claim, c.clock.Now())
+				retiredForControl = finishErr == nil
+			}
 			finishCancel()
-			receipts = append(receipts, Receipt{Attempt: claim.Attempt, Provider: binding.Identity, ErrorCode: "provider_invocation_failed"})
+			receipts = append(receipts, Receipt{AttemptID: claim.ID, Attempt: claim.Attempt, Provider: binding.Identity, ErrorCode: "provider_invocation_failed"})
 			if finishErr != nil {
 				c.markPersistenceFailure(finishErr)
 				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: true}
+			}
+			if retiredForControl || ctx.Err() != nil {
+				return Result{Code: Canceled, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
 			continue
 		}
@@ -400,6 +413,24 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		}
 		finishCancel()
 		if finishErr != nil {
+			if errors.Is(finishErr, store.ErrStaleFence) {
+				// A successful/error provider response that arrives after the
+				// operator revoked this runner is not completion evidence.  The
+				// signed drain proof authorizes only cancellation of the exact old
+				// attempt and release of its exact provider lease.  This also
+				// covers the narrow race where the provider returns before the
+				// cancellation becomes visible through ctx.Err().
+				retireCtx, retireCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				retireErr := c.store.RetireProviderAttemptAfterControlInvalidation(retireCtx, claim, drain, c.clock.Now())
+				retireCancel()
+				if retireErr == nil {
+					receipts[len(receipts)-1].ErrorCode = "provider_control_revoked"
+					receipts[len(receipts)-1].UsageUnits = 0
+					receipts[len(receipts)-1].TokenUsage = 0
+					return Result{Code: Canceled, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+				}
+				finishErr = retireErr
+			}
 			if errors.Is(finishErr, store.ErrBudgetExhausted) {
 				quarantineCtx, quarantineCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				budgetErr := c.store.FailProviderAttemptBudget(quarantineCtx, claim, drain, r.ExpectedVersion, r.Fence, c.clock.Now())

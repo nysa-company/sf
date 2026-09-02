@@ -2,7 +2,10 @@ package mergeproof
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,8 +25,122 @@ import (
 // instance must prove the existing immutable Store/Git binding and never issue
 // another protected-ref mutation claim.
 func TestVerifyProtectedBranchReusesConfirmedProofAfterLostResponse(t *testing.T) {
+	fixture := newMergeProofCoordinatorFixture(t)
+	first, err := (Coordinator{Store: fixture.database, Git: fixture.runner}).VerifyProtectedBranch(fixture.ctx, fixture.repositoryID, "main", fixture.mergeCommit, fixture.originalBase)
+	if err != nil || !first.Contains {
+		t.Fatalf("first proof=%+v err=%v", first, err)
+	}
+	// A new coordinator models a restart after the proof commit but before the
+	// GitHub caller received it. The durable proof must be reused exactly.
+	second, err := (Coordinator{Store: fixture.database, Git: fixture.runner}).VerifyProtectedBranch(fixture.ctx, fixture.repositoryID, "main", fixture.mergeCommit, fixture.originalBase)
+	if err != nil || second != first {
+		t.Fatalf("replayed proof=%+v first=%+v err=%v", second, first, err)
+	}
+	proof, err := fixture.database.GuardedMergeProtectedRefFetchIntent(fixture.ctx, fixture.intent, fixture.mergeCommit)
+	if err != nil || proof.Origin != fixture.identity.Origin {
+		t.Fatalf("durable protected proof intent=%+v err=%v", proof, err)
+	}
+	proofEffect, err := fixture.database.Effect(fixture.ctx, proof.Intent.SemanticKey)
+	if err != nil || proofEffect.State != store.EffectConfirmed {
+		t.Fatalf("durable proof=%+v err=%v", proofEffect, err)
+	}
+	if got := gitOutput(t, fixture.repository, "ls-remote", fixture.remote, "refs/heads/main"); !strings.Contains(got, fixture.mergeCommit) {
+		t.Fatalf("protected ref changed unexpectedly: %q", got)
+	}
+}
+
+// TestVerifyProtectedBranchReclaimsUncertainProofAfterInterruptedVerifier
+// proves the boundary that used to strand the child as executing: the runner
+// has crossed the Store lease boundary, loses its response, and the verifier
+// context is cancelled.  The independent uncertainty write must survive that
+// cancellation before the exact deterministic proof can be reissued.
+func TestVerifyProtectedBranchReclaimsUncertainProofAfterInterruptedVerifier(t *testing.T) {
+	fixture := newMergeProofCoordinatorFixture(t)
+	ctx, cancel := context.WithCancel(fixture.ctx)
+	runner := &interruptedProtectedProofRunner{database: fixture.database, identity: fixture.identity, interrupt: cancel}
+	coordinator := Coordinator{Store: fixture.database, Git: runner}
+	if _, err := coordinator.VerifyProtectedBranch(ctx, fixture.repositoryID, "main", fixture.mergeCommit, fixture.originalBase); !errors.Is(err, errProtectedProofInterrupted) {
+		t.Fatalf("interrupted verifier=%v", err)
+	}
+	proof, err := fixture.database.GuardedMergeProtectedRefFetchIntent(fixture.ctx, fixture.intent, fixture.mergeCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncertain, err := fixture.database.Effect(fixture.ctx, proof.Intent.SemanticKey)
+	if err != nil || uncertain.State != store.EffectUncertain {
+		t.Fatalf("interrupted proof effect=%+v err=%v", uncertain, err)
+	}
+	if len(runner.claims) != 1 {
+		t.Fatalf("first verifier calls=%d", len(runner.claims))
+	}
+	second, err := coordinator.VerifyProtectedBranch(fixture.ctx, fixture.repositoryID, "main", fixture.mergeCommit, fixture.originalBase)
+	if err != nil || !second.Contains {
+		t.Fatalf("reclaimed proof=%+v err=%v", second, err)
+	}
+	if len(runner.claims) != 2 {
+		t.Fatalf("verifier calls=%d", len(runner.claims))
+	}
+	firstClaim, secondClaim := runner.claims[0], runner.claims[1]
+	if firstClaim.SemanticKey != secondClaim.SemanticKey || firstClaim.RequestDigest != secondClaim.RequestDigest ||
+		firstClaim.Repository != secondClaim.Repository || firstClaim.Worktree != secondClaim.Worktree || firstClaim.Branch != secondClaim.Branch ||
+		firstClaim.Operation != "protected-ref-fetch" || secondClaim.Operation != "protected-ref-fetch" ||
+		firstClaim.BaseRef != secondClaim.BaseRef || firstClaim.ExpectedBaseOID != secondClaim.ExpectedBaseOID || firstClaim.ExpectedHeadOID != secondClaim.ExpectedHeadOID ||
+		secondClaim.ClaimEpoch != firstClaim.ClaimEpoch+1 {
+		t.Fatalf("proof reclaim changed immutable binding first=%+v second=%+v", firstClaim, secondClaim)
+	}
+	confirmed, err := fixture.database.Effect(fixture.ctx, proof.Intent.SemanticKey)
+	if err != nil || confirmed.State != store.EffectConfirmed {
+		t.Fatalf("reclaimed proof effect=%+v err=%v", confirmed, err)
+	}
+}
+
+var errProtectedProofInterrupted = errors.New("protected proof verifier interrupted")
+
+type interruptedProtectedProofRunner struct {
+	database  *store.Store
+	identity  git.Identity
+	claims    []contracts.GitMutationClaim
+	interrupt func()
+}
+
+func (r *interruptedProtectedProofRunner) Snapshot(context.Context, string, string) (git.Identity, error) {
+	return r.identity, nil
+}
+
+func (r *interruptedProtectedProofRunner) VerifyProtectedBranch(ctx context.Context, witness contracts.ProtectedBranchWitness) error {
+	lease, err := r.database.AcquireGitMutation(ctx, witness.MutationClaim)
+	if err != nil {
+		return err
+	}
+	r.claims = append(r.claims, witness.MutationClaim)
+	if err := lease.Release(); err != nil {
+		return err
+	}
+	if r.interrupt != nil {
+		r.interrupt()
+		r.interrupt = nil
+		return errProtectedProofInterrupted
+	}
+	return nil
+}
+
+type mergeProofCoordinatorFixture struct {
+	ctx          context.Context
+	database     *store.Store
+	runner       git.Runner
+	repository   string
+	remote       string
+	repositoryID contracts.RepositoryIdentity
+	identity     git.Identity
+	intent       domain.MergeIntent
+	originalBase string
+	mergeCommit  string
+}
+
+func newMergeProofCoordinatorFixture(t *testing.T) mergeProofCoordinatorFixture {
+	t.Helper()
 	ctx := context.Background()
-	repository, worktree, remote, originalBase, mergeCommit := mergeProofRepository(t)
+	repository, worktree, remote, originalBase, sourceHead, mergeCommit := mergeProofRepository(t)
 	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "sf.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -60,41 +177,56 @@ func TestVerifyProtectedBranchReusesConfirmedProofAfterLostResponse(t *testing.T
 		t.Fatal(err)
 	}
 	mergeKey := "merge/dev/app/SF-mergeproof"
-	if _, err := database.PlanEffect(ctx, store.EffectPlan{SemanticKey: mergeKey, Ref: ref, Kind: "merge", TicketVersion: version, Fence: fence, RequestDigest: "merge-request"}); err != nil {
+	intent := domain.MergeIntent{Ref: ref, SemanticKey: mergeKey, TicketVersion: version, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 17, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/app/SF-mergeproof", HeadOID: sourceHead, BaseRef: "main", OriginalBaseOID: originalBase, ProtectionRuleID: "strict", ProtectionKind: "classic", StrictStatusChecks: true, AdminEnforced: true, Method: "squash"}
+	intent.RequestDigest = mergeRequestDigestForTest(intent)
+	if _, err := database.PlanEffect(ctx, store.EffectPlan{SemanticKey: mergeKey, Ref: ref, Kind: "merge", TicketVersion: version, Fence: fence, RequestDigest: intent.RequestDigest}); err != nil {
 		t.Fatal(err)
 	}
 	mergeClaim, err := database.ClaimEffect(ctx, store.EffectFence{SemanticKey: mergeKey, Ref: ref, TicketVersion: version, Fence: fence})
 	if err != nil || !mergeClaim.Claimed {
 		t.Fatalf("merge claim=%+v err=%v", mergeClaim, err)
 	}
-	intent := domain.MergeIntent{Ref: ref, SemanticKey: mergeKey, RequestDigest: "merge-request", TicketVersion: version, LeaderEpoch: leader, RunnerEpoch: fence.RunnerEpoch, ClaimEpoch: mergeClaim.Effect.ClaimEpoch, RepositoryHost: "github.com", RepositoryOwner: "example", RepositoryName: "app", PullRequestNumber: 17, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/app/SF-mergeproof", HeadOID: mergeCommit, BaseRef: "main", OriginalBaseOID: originalBase, ProtectionRuleID: "strict", StrictStatusChecks: true, AdminEnforced: true, Method: "squash"}
+	intent.LeaderEpoch = leader
+	intent.RunnerEpoch = fence.RunnerEpoch
+	intent.ClaimEpoch = mergeClaim.Effect.ClaimEpoch
 	if err := database.RecordMergeIntent(ctx, intent); err != nil {
 		t.Fatal(err)
 	}
-	coordinator := Coordinator{Store: database, Git: runner}
 	repositoryID := contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}
-	first, err := coordinator.VerifyProtectedBranch(ctx, repositoryID, "main", mergeCommit, originalBase)
-	if err != nil || !first.Contains {
-		t.Fatalf("first proof=%+v err=%v", first, err)
+	mergedIdentity := contracts.PullRequestIdentity{Repository: repositoryID, Number: 17, HeadOwner: "example", HeadRepository: "app", HeadRef: "sf/dev/app/SF-mergeproof", HeadOID: sourceHead, BaseRef: "main", BaseOID: mergeCommit, FactoryOwned: true}
+	wrongSource := mergedIdentity
+	wrongSource.HeadOID = mergeCommit
+	wrongObservation := contracts.PublishedPullRequestObservation{Identity: wrongSource, State: "MERGED", Merged: true, MergeCommit: mergeCommit, BaseHeadOID: wrongSource.BaseOID}
+	if err := database.RecordGuardedMergeObservation(ctx, intent, wrongObservation); !errors.Is(err, store.ErrEvidenceConflict) {
+		t.Fatalf("post-merge observation accepted a substituted source head: %v", err)
 	}
-	// A new coordinator models a restart after the proof commit but before the
-	// GitHub caller received it. The durable proof must be reused exactly.
-	second, err := (Coordinator{Store: database, Git: runner}).VerifyProtectedBranch(ctx, repositoryID, "main", mergeCommit, originalBase)
-	if err != nil || second != first {
-		t.Fatalf("replayed proof=%+v first=%+v err=%v", second, first, err)
+	mergedObservation := contracts.PublishedPullRequestObservation{Identity: mergedIdentity, State: "MERGED", Merged: true, MergeCommit: mergeCommit, BaseHeadOID: mergedIdentity.BaseOID}
+	if err := database.RecordGuardedMergeObservation(ctx, intent, mergedObservation); err != nil {
+		t.Fatal(err)
 	}
-	proofEffect, err := database.Effect(ctx, store.CanonicalGitMutationSemanticKey(store.GitMutationIntent{EffectFence: store.EffectFence{Ref: ref}, RequestDigest: proofRequestDigest(intent.SemanticKey, "main", originalBase, mergeCommit, identity.Origin), Repository: repository, Worktree: worktree, Branch: "proof", Operation: "protected-ref-fetch", BaseRef: "main", ExpectedBaseOID: originalBase, ExpectedHeadOID: mergeCommit}))
-	if err != nil || proofEffect.State != store.EffectConfirmed {
-		t.Fatalf("durable proof=%+v err=%v", proofEffect, err)
+	selected, err := database.MergeIntentForProof(ctx, repositoryID.Host, repositoryID.Owner, repositoryID.Name, "main", originalBase, mergeCommit)
+	if err != nil || selected != intent {
+		t.Fatalf("select exact guarded merge intent=%+v want=%+v err=%v", selected, intent, err)
 	}
-	if got := gitOutput(t, repository, "ls-remote", remote, "refs/heads/main"); !strings.Contains(got, mergeCommit) {
-		t.Fatalf("protected ref changed unexpectedly: %q", got)
+	if _, err := database.GuardedMergeProtectedRefFetchIntent(ctx, intent, mergeCommit); err != nil {
+		t.Fatalf("derive exact protected-ref proof intent: %v", err)
 	}
+	if _, err := database.MergeIntentForProof(ctx, repositoryID.Host, repositoryID.Owner, repositoryID.Name, "main", originalBase, sourceHead); err == nil {
+		t.Fatal("source head selected a protected proof without its exact observed merge commit")
+	}
+	return mergeProofCoordinatorFixture{ctx: ctx, database: database, runner: runner, repository: repository, remote: remote, repositoryID: repositoryID, identity: identity, intent: intent, originalBase: originalBase, mergeCommit: mergeCommit}
 }
 
-func proofRequestDigest(values ...string) string { return digest(values...) }
+func mergeRequestDigestForTest(intent domain.MergeIntent) string {
+	input := "merge\x00" + intent.RepositoryOwner + "/" + intent.RepositoryName + "\x00" + intent.HeadOwner + "\x00" + intent.HeadRepository + "\x00" + intent.HeadRef + "\x00" + intent.HeadOID + "\x00" + intent.BaseRef + "\x00" + intent.OriginalBaseOID
+	for _, value := range []string{intent.HeadOID, intent.Method, intent.OriginalBaseOID, intent.OriginalBaseOID, intent.OriginalBaseOID, intent.OriginalBaseOID} {
+		input += "\x00" + value
+	}
+	sum := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(sum[:])
+}
 
-func mergeProofRepository(t *testing.T) (repository, worktree, remote, originalBase, mergeCommit string) {
+func mergeProofRepository(t *testing.T) (repository, worktree, remote, originalBase, sourceHead, mergeCommit string) {
 	t.Helper()
 	root := t.TempDir()
 	repository, remote = filepath.Join(root, "repo"), filepath.Join(root, "remote.git")
@@ -116,16 +248,34 @@ func mergeProofRepository(t *testing.T) (repository, worktree, remote, originalB
 	}
 	gitRun(t, repository, "add", "README.md")
 	gitRun(t, repository, "commit", "-m", "feature")
+	sourceHead = strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD^{commit}"))
 	gitRun(t, repository, "checkout", "main")
-	gitRun(t, repository, "merge", "--ff-only", "feature")
+	if err := os.WriteFile(filepath.Join(repository, "MAIN.md"), []byte("main advance\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repository, "add", "MAIN.md")
+	gitRun(t, repository, "commit", "-m", "main advance")
+	gitRun(t, repository, "merge", "--no-ff", "feature", "-m", "merge feature")
 	gitRun(t, repository, "push", "origin", "main")
 	mergeCommit = strings.TrimSpace(gitOutput(t, repository, "rev-parse", "main^{commit}"))
+	if mergeCommit == sourceHead {
+		t.Fatal("fixture must model a post-merge commit distinct from the source head")
+	}
+	// Preserve the factory's authenticated local protected-base snapshot while
+	// leaving the simulated GitHub remote advanced to the post-merge commit.
+	// The proof boundary must learn that advance only through its bounded
+	// protected-ref fetch, not through a pre-updated local main ref.
+	gitRun(t, repository, "checkout", "--detach", originalBase)
+	gitRun(t, repository, "branch", "-f", "main", originalBase)
 	worktree = filepath.Join(root, "proof-worktree")
-	gitRun(t, repository, "worktree", "add", "-b", "proof", worktree, "main")
+	// The factory worktree remains bound to the reviewed protected-base
+	// snapshot. The remote protected ref advances independently after GitHub
+	// merges; mergeproof fetches that ref into its private proof namespace.
+	gitRun(t, repository, "worktree", "add", "-b", "proof", worktree, originalBase)
 	repository, _ = filepath.EvalSymlinks(repository)
 	worktree, _ = filepath.EvalSymlinks(worktree)
 	remote, _ = filepath.EvalSymlinks(remote)
-	return repository, worktree, remote, originalBase, mergeCommit
+	return repository, worktree, remote, originalBase, sourceHead, mergeCommit
 }
 
 func gitRun(t *testing.T, directory string, args ...string) {

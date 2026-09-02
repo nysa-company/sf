@@ -136,7 +136,7 @@ func resultBinding(result RepositoryCommandResult, expectedOutcome string) Repos
 // worktree context on the caller's transaction, then authenticates the
 // immutable result against the command the ticket froze at submission. The
 // provider's command is compared only as an untrusted declaration.
-func authenticateVerificationCommandEvidence(ctx context.Context, conn *sql.Conn, artifact VerificationArtifact, verify *phaseartifact.Verification) (RepositoryCommandResult, RepositoryCommandResultBinding, error) {
+func authenticateVerificationCommandEvidence(ctx context.Context, conn repositoryResultQuerier, artifact VerificationArtifact, verify *phaseartifact.Verification) (RepositoryCommandResult, RepositoryCommandResultBinding, error) {
 	if verify == nil || artifact.CommandResult.SemanticKey == "" || artifact.CommandResult.ClaimEpoch == 0 {
 		return RepositoryCommandResult{}, RepositoryCommandResultBinding{}, ErrEvidenceConflict
 	}
@@ -216,12 +216,52 @@ func (s *Store) reauthenticateStoredVerificationCommand(ctx context.Context, ref
 // uses it while writing its phase transition, so no witness may be reloaded
 // through s.db between its exact-fence checks and the commit.
 func (s *Store) reauthenticateStoredVerificationCommandFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredVerification) error {
+	return s.reauthenticateStoredVerificationCommandAt(ctx, q, ref, stored, true)
+}
+
+// reauthenticateStoredVerificationCommandHistoricalFrom verifies the immutable
+// command/provider tuple at its recorded binding. The caller must separately
+// authenticate that binding to the live ticket (for example through the exact
+// accepted-or-rejected amendment boundary).
+func (s *Store) reauthenticateStoredVerificationCommandHistoricalFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredVerification) error {
+	return s.reauthenticateStoredVerificationCommandAt(ctx, q, ref, stored, false)
+}
+
+func (s *Store) reauthenticateStoredVerificationCommandAt(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredVerification, requireLiveProviderAuthority bool) error {
 	result, found, err := loadRepositoryCommandResult(ctx, q, stored.CommandBinding.Key, true)
 	if err != nil || !found || result.Claim.TicketRef != ref || !matchingBinding(stored.CommandBinding, result) {
 		return ErrEvidenceConflict
 	}
 	provider, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, q, stored.ProviderResult)
-	if err != nil || parsed.Verify == nil || provider.Claim.Ref != ref || providerResultReachesFence(ctx, q, stored.ProviderResult, provider, stored.TicketVersion, stored.Fence) != nil {
+	if err != nil || parsed.Verify == nil || provider.Claim.Ref != ref {
+		return ErrEvidenceConflict
+	}
+	if requireLiveProviderAuthority {
+		if providerResultReachesFence(ctx, q, stored.ProviderResult, provider, stored.TicketVersion, stored.Fence) != nil {
+			conn, ok := q.(*sql.Conn)
+			if !ok {
+				return ErrEvidenceConflict
+			}
+			artifact := VerificationArtifact{
+				Ref:             ref,
+				ExpectedVersion: stored.TicketVersion,
+				Fence:           stored.Fence,
+				Intent:          stored.Intent,
+				Proof:           stored.Proof,
+				OwnedFiles:      append([]string(nil), stored.Revision.OwnedFiles...),
+				CheckpointID:    stored.Revision.CheckpointID,
+				ProviderResult:  &stored.ProviderResult,
+				Checkpoint:      stored.Checkpoint,
+				CommandResult:   stored.CommandBinding.Key,
+				AmendsRevision:  stored.Revision.Amends,
+				Reason:          stored.AmendmentReason,
+				Requester:       stored.Requester,
+			}
+			if s.authenticateOperatorSourceResumeVerificationBinding(ctx, conn, artifact, provider) != nil {
+				return ErrEvidenceConflict
+			}
+		}
+	} else if validateRunnerRecoveryLedgerPrefix(ctx, q, ref, provider.Claim.ExpectedVersion, provider.Claim.RunnerEpoch, provider.Claim.LeaderEpoch, stored.TicketVersion, stored.Fence.RunnerEpoch, stored.Fence.LeaderEpoch) != nil {
 		return ErrEvidenceConflict
 	}
 	var providerCreated string
@@ -253,7 +293,7 @@ func (s *Store) reauthenticateStoredVerificationCommandFrom(ctx context.Context,
 	return assertCommandEvidenceRequest(request, result)
 }
 
-func authenticateCandidateCommandEvidence(ctx context.Context, conn *sql.Conn, evidence CandidateEvidence, builderResult ProviderAttemptResult, intent, proof, checkpoint string) (RepositoryCommandResult, RepositoryCommandResultBinding, error) {
+func authenticateCandidateCommandEvidence(ctx context.Context, conn repositoryResultQuerier, evidence CandidateEvidence, builderResult ProviderAttemptResult, intent, proof, checkpoint string) (RepositoryCommandResult, RepositoryCommandResultBinding, error) {
 	if evidence.CommandResult.SemanticKey == "" || evidence.CommandResult.ClaimEpoch == 0 {
 		return RepositoryCommandResult{}, RepositoryCommandResultBinding{}, ErrEvidenceConflict
 	}
@@ -349,7 +389,22 @@ func (s *Store) reauthenticateStoredCandidateCommandAt(ctx context.Context, q ca
 		return ErrEvidenceConflict
 	}
 	if requireLiveBuilderAuthority && providerResultReachesFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence) != nil {
-		return ErrEvidenceConflict
+		// A source-only operator handoff starts a separately authenticated
+		// recovery lineage. RecordCandidate admits that lineage only through its
+		// complete prepared-candidate witness; the strict current reader must
+		// revalidate that exact witness rather than treating the historical
+		// Builder claim as ordinary provider authority or suffix-only proof.
+		var witness OperatorSourceResumePreparedCandidateWitness
+		var found bool
+		var witnessErr error
+		if conn, ok := q.(*sql.Conn); ok {
+			witness, found, witnessErr = s.operatorSourceResumePreparedCandidateWitnessFrom(ctx, conn, ref, stored.TicketVersion, stored.Fence, false)
+		} else {
+			witness, found, witnessErr = s.OperatorSourceResumePreparedCandidateWitness(ctx, ref, stored.TicketVersion, stored.Fence)
+		}
+		if witnessErr != nil || !found || witness.Ref != ref || witness.Version != stored.TicketVersion || witness.Fence != stored.Fence || witness.Builder != stored.BuilderResult || witness.Command.Key != stored.CommandBinding.Key || witness.Command.Claim.PolicyDigest != stored.CommandBinding.PolicyDigest || !candidatePolicyMatches(stored.Snapshot.CommandPolicyDigest, witness.Command.Claim.PolicyDigest) || witness.Commit != stored.Commit || witness.Commit.CommitOID != stored.Snapshot.HeadSHA || witness.Commit.TreeOID != stored.Snapshot.TreeSHA || witness.Source.Worktree.BaseSHA != stored.Snapshot.BaseSHA || witness.Verification.Revision.IntentDigest != stored.Snapshot.VerificationIntentDigest || witness.Verification.Revision.ProofDigest != stored.Snapshot.ProofDigest || witness.Verification.Revision.CheckpointID != stored.Commit.ParentOID || witness.Verification.Checkpoint.CommitOID != stored.Commit.ParentOID {
+			return ErrEvidenceConflict
+		}
 	}
 	if !requireLiveBuilderAuthority && providerResultReachesHistoricalFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence) != nil {
 		return ErrEvidenceConflict

@@ -229,7 +229,9 @@ func (s *Store) RecordPlan(ctx context.Context, artifact PlanArtifact) (string, 
 	return digest, err
 }
 
-func assertNewestBoundResult(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, phase domain.Phase, role string, key ProviderAttemptResultKey) error {
+func assertNewestBoundResult(ctx context.Context, conn interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, phase domain.Phase, role string, key ProviderAttemptResultKey) error {
 	var id int64
 	var attempt int
 	err := conn.QueryRowContext(ctx, `SELECT r.provider_attempt_id,a.attempt FROM provider_attempts a LEFT JOIN provider_attempt_results r ON r.provider_attempt_id=a.id WHERE a.channel=? AND a.project_id=? AND a.ticket_id=? AND a.phase=? AND a.role=? AND a.finished_at IS NOT NULL ORDER BY a.attempt DESC,a.id DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, phase, role).Scan(&id, &attempt)
@@ -268,23 +270,77 @@ type reviewRepairAmendment struct {
 }
 
 // reviewRepairVerificationAmendment exposes only the Store-authenticated
-// amendment context created by a reviewer-owned final-review repair. It never
-// trusts a Worker-provided reason or lets a builder repair alter verification.
-func reviewRepairVerificationAmendment(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, version uint64) (reviewRepairAmendment, bool, error) {
+// amendment context created by the newest reviewer-owned final-review repair
+// that reaches this Verifying endpoint. The immutable repair transition may
+// predate a daemon recovery or an exact pause/resume control sequence, so the
+// source row is rehydrated and its complete signed lineage is authenticated to
+// the live fence. It never trusts a Worker-provided reason or lets an older
+// repair shadow a live Builder amendment.
+func (s *Store) reviewRepairVerificationAmendment(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, version uint64, fence domain.Fence) (reviewRepairAmendment, bool, error) {
 	var result reviewRepairAmendment
-	var transitionVersion uint64
+	var transitionVersion, consumedVersion, consumedLeader, consumedRunner uint64
+	var reviewerID int64
+	var reviewerAttempt int
+	var reviewerTyped, budgetRequest string
 	var state domain.State
-	err := conn.QueryRowContext(ctx, `SELECT b.prior_verification_revision,b.amendment_reason,b.requester,b.transition_ticket_version,t.state
+	err := conn.QueryRowContext(ctx, `SELECT b.prior_verification_revision,b.amendment_reason,b.requester,b.transition_ticket_version,
+		b.reviewer_attempt_id,b.reviewer_attempt,b.reviewer_typed_sha256,b.correction_budget_request_id,
+		b.consumed_ticket_version,b.consumed_leader_epoch,b.consumed_runner_epoch,t.state
 		FROM final_review_repair_boundaries b JOIN tickets t ON t.channel=b.channel AND t.project_id=b.project_id AND t.id=b.ticket_id
 		WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.target_state='verifying' AND b.transition_ticket_version<=?
-		ORDER BY b.transition_ticket_version DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&result.PriorRevision, &result.Reason, &result.Requester, &transitionVersion, &state)
+		ORDER BY b.transition_ticket_version DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, version).Scan(
+		&result.PriorRevision, &result.Reason, &result.Requester, &transitionVersion,
+		&reviewerID, &reviewerAttempt, &reviewerTyped, &budgetRequest,
+		&consumedVersion, &consumedLeader, &consumedRunner, &state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return reviewRepairAmendment{}, false, nil
 	}
 	if err != nil {
 		return reviewRepairAmendment{}, false, err
 	}
-	if state != domain.StateVerifying || transitionVersion == 0 || transitionVersion > version || result.PriorRevision == 0 || !boundedText(result.Reason, 2_000) || !boundedText(result.Requester, 200) {
+	if state != domain.StateVerifying || transitionVersion == 0 || consumedVersion+1 != transitionVersion || transitionVersion > version ||
+		consumedLeader == 0 || consumedRunner == 0 || reviewerID <= 0 || reviewerAttempt <= 0 || !validSHA256(reviewerTyped) ||
+		result.PriorRevision == 0 || !boundedText(result.Reason, 2_000) || result.Requester != "final-reviewer" || !boundedText(budgetRequest, 300) {
+		return reviewRepairAmendment{}, false, ErrEvidenceConflict
+	}
+	reviewerKey := ProviderAttemptResultKey{AttemptID: reviewerID, Ref: ref, Phase: domain.PhaseReview, Attempt: reviewerAttempt}
+	reviewerResult, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, conn, reviewerKey)
+	if err != nil || reviewerResult.TypedSHA256 != reviewerTyped || reviewerResult.Claim.Ref != ref || reviewerResult.Claim.Phase != domain.PhaseReview || reviewerResult.Claim.Role != "reviewer" || parsed.Reviewer == nil || parsed.Reviewer.Decision != phaseartifact.ReviewRepair || parsed.Reviewer.RepairOwner != "reviewer" || strings.Join(parsed.Reviewer.Findings, "\n") != result.Reason || providerResultReachesFenceAt(ctx, conn, reviewerKey, reviewerResult, consumedVersion, domain.Fence{LeaderEpoch: consumedLeader, RunnerEpoch: consumedRunner}, false) != nil {
+		return reviewRepairAmendment{}, false, ErrEvidenceConflict
+	}
+	if budgetRequest != fmt.Sprintf("final-review/%d/%s", reviewerID, reviewerTyped) {
+		return reviewRepairAmendment{}, false, ErrEvidenceConflict
+	}
+	var budgets, transitions, unrelated int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses
+		WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND request_id=?
+		AND ticket_version=? AND leader_epoch=? AND runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, budgetRequest, consumedVersion, consumedLeader, consumedRunner).Scan(&budgets); err != nil || budgets != 1 {
+		return reviewRepairAmendment{}, false, ErrEvidenceConflict
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events
+		WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?
+		AND trigger='review_repair' AND from_state='reviewing' AND to_state='verifying' AND payload='{}'`, ref.Channel, ref.Project, ref.Ticket, transitionVersion).Scan(&transitions); err != nil || transitions != 1 {
+		return reviewRepairAmendment{}, false, ErrEvidenceConflict
+	}
+	var stateChanges int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events
+		WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, transitionVersion).Scan(&stateChanges); err != nil || stateChanges != 1 {
+		return reviewRepairAmendment{}, false, ErrEvidenceConflict
+	}
+	// A later phase/amendment transition denotes a different Verifying episode.
+	// Permit only the exact operator-control triplet that the recovery ledger
+	// itself authenticates; every other state change makes this repair stale.
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events
+		WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?
+		AND ticket_version<=? AND from_state<>to_state
+		AND trigger NOT IN ('operator_pause_or_take','process_and_effects_drained','operator_resume','operator_retry')`, ref.Channel, ref.Project, ref.Ticket, transitionVersion, version).Scan(&unrelated); err != nil || unrelated != 0 {
+		return reviewRepairAmendment{}, false, ErrEvidenceConflict
+	}
+	if transitionVersion == version {
+		if fence.LeaderEpoch != consumedLeader || fence.RunnerEpoch != consumedRunner {
+			return reviewRepairAmendment{}, false, ErrEvidenceConflict
+		}
+	} else if validateRunnerRecoveryLedger(ctx, conn, ref, transitionVersion, consumedRunner, consumedLeader, version, fence.RunnerEpoch, fence.LeaderEpoch) != nil {
 		return reviewRepairAmendment{}, false, ErrEvidenceConflict
 	}
 	return result, true, nil
@@ -313,7 +369,19 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		if result.Claim.ExpectedVersion != artifact.ExpectedVersion || result.Claim.LeaderEpoch != artifact.Fence.LeaderEpoch || result.Claim.RunnerEpoch != artifact.Fence.RunnerEpoch {
 			reusable, reuseErr := s.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: artifact.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: artifact.ExpectedVersion, Fence: artifact.Fence})
 			if reuseErr != nil || !reusable.Recovered || reusable.Key != *artifact.ProviderResult {
-				return VerificationRevision{}, ErrEvidenceConflict
+				// A prepared source-resume checkpoint is intentionally recovered by
+				// its Store-owned source/command/Git proof rather than the generic
+				// provider lifecycle. Authenticate that complete boundary before the
+				// write; ensureVerificationBinding repeats it on the write connection.
+				conn, connErr := s.db.Conn(ctx)
+				if connErr != nil {
+					return VerificationRevision{}, normalizeBusy(ctx, connErr)
+				}
+				sourceErr := s.authenticateOperatorSourceResumeVerificationBinding(ctx, conn, artifact, result)
+				closeErr := conn.Close()
+				if sourceErr != nil || closeErr != nil {
+					return VerificationRevision{}, ErrEvidenceConflict
+				}
 			}
 		}
 		intent, intentErr := workflowprompt.CanonicalVerificationIntentBytes(*parsed.Verify)
@@ -352,52 +420,178 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		if err := conn.QueryRowContext(ctx, `SELECT current_revision FROM verifications WHERE channel=? AND project_id=? AND ticket_id=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket).Scan(&current); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if artifact.AmendsRevision == 0 {
-			amendment, found, amendmentErr := reviewRepairVerificationAmendment(ctx, conn, artifact.Ref, artifact.ExpectedVersion)
-			if amendmentErr != nil {
-				return amendmentErr
+		// A live Builder amendment is the sole authority for this Verifying
+		// episode. Load it before considering historical final-review repair
+		// metadata so an older repair cannot shadow the current request.
+		pendingAmendment, pendingErr := s.loadPendingVerificationAmendmentAtFence(ctx, conn, artifact.Ref, artifact.ExpectedVersion, artifact.Fence)
+		if pendingErr != nil && !errors.Is(pendingErr, ErrNotFound) {
+			return pendingErr
+		}
+		pendingFound := pendingErr == nil
+		// Amendment metadata is a projection of an authenticated Store boundary,
+		// never a caller-provided switch.  Keep accepting exact replays that carry
+		// the projection, but reject a forged AmendsRevision/reason/requester
+		// before it can reach the append path below.
+		callerAmendmentAuthorized := false
+		callerAmendmentDigest := ""
+		var callerAmendmentCommand []string
+		if artifact.AmendsRevision > 0 {
+			if pendingFound {
+				if pendingAmendment.Prior.Revision == artifact.AmendsRevision && pendingAmendment.Reason == artifact.Reason && pendingAmendment.Requester == artifact.Requester {
+					// Caller-supplied projection is safe only for the exact accepted
+					// amendment Reviewer. This rules out a rejected result, a Builder-
+					// family result, and a pre-amendment Reviewer even if its text happens
+					// to resemble current request metadata.
+					decision, decisionErr := s.verificationAmendmentDecisionFrom(ctx, conn, pendingAmendment, artifact.Ref, artifact.ExpectedVersion, artifact.Fence, *artifact.ProviderResult)
+					if decisionErr != nil || decision != VerificationAmendmentAccepted {
+						return ErrEvidenceConflict
+					}
+					callerAmendmentAuthorized = true
+					callerAmendmentDigest = pendingAmendment.ProposedDigest
+					callerAmendmentCommand = pendingAmendment.ProposedCommand
+				}
+			} else {
+				repair, repairFound, repairErr := s.reviewRepairVerificationAmendment(ctx, conn, artifact.Ref, artifact.ExpectedVersion, artifact.Fence)
+				if repairErr != nil {
+					return repairErr
+				}
+				if repairFound && repair.PriorRevision == artifact.AmendsRevision && repair.Reason == artifact.Reason && repair.Requester == artifact.Requester {
+					callerAmendmentAuthorized = true
+				}
 			}
-			if found {
-				artifact.AmendsRevision, artifact.Reason, artifact.Requester = amendment.PriorRevision, amendment.Reason, amendment.Requester
-				result.Amends = amendment.PriorRevision
-				if current == amendment.PriorRevision {
-					// First persistence of the newly reviewed verification below.
-				} else if current > amendment.PriorRevision {
-					// A crash may occur after the amended revision is durable but
-					// before the phase transition. A recovered exact provider result
-					// must append only its live binding, never try to create a second
-					// amendment revision or reject the boundary-derived metadata.
+			if !callerAmendmentAuthorized || callerAmendmentDigest != "" && (callerAmendmentDigest != proofDigest || !equalStringSlices(providerVerify.Command, callerAmendmentCommand)) {
+				return ErrEvidenceConflict
+			}
+		}
+		if artifact.AmendsRevision == 0 {
+			// A source-only operator takeover deliberately invalidates the retained
+			// verification and requires an independently reviewed checkpoint before
+			// Builder can resume. Project the amendment metadata from that exact
+			// Store-owned source endpoint; callers cannot opt into this path.
+			sourceProof, sourceFound, sourceErr := s.operatorSourceResumeProofFrom(ctx, conn, artifact.Ref, artifact.ExpectedVersion, artifact.Fence)
+			if sourceErr != nil {
+				return sourceErr
+			}
+			if sourceFound {
+				const sourceReason = "operator source commit requires fresh verification"
+				prior := sourceProof.Verification.Revision.Revision
+				if prior == 0 || current < prior || !boundedText(sourceProof.Operator, 200) || artifact.Checkpoint.ParentOID != sourceProof.SourceCommit.CommitOID || s.authenticateOperatorSourceResumeVerificationBinding(ctx, conn, artifact, provider) != nil {
+					return ErrEvidenceConflict
+				}
+				artifact.AmendsRevision, artifact.Reason, artifact.Requester = prior, sourceReason, sourceProof.Operator
+				result.Amends = prior
+				if current > prior {
+					// Lost response after the fresh source verification was appended:
+					// authenticate the exact immutable revision, then add only the live
+					// recovered bindings.
 					var storedAmends uint64
 					var storedReason, storedRequester, storedIntent, storedProof, storedCheckpoint string
 					if err := conn.QueryRowContext(ctx, `SELECT COALESCE(amends_revision,0),amendment_reason,requester,intent_digest,proof_digest,checkpoint_id FROM verification_revisions WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current).Scan(&storedAmends, &storedReason, &storedRequester, &storedIntent, &storedProof, &storedCheckpoint); err != nil {
 						return err
 					}
-					if storedAmends != amendment.PriorRevision || storedReason != amendment.Reason || storedRequester != amendment.Requester || storedIntent != intentDigest || storedProof != proofDigest || storedCheckpoint != artifact.CheckpointID {
+					if storedAmends != prior || storedReason != sourceReason || storedRequester != sourceProof.Operator || storedIntent != intentDigest || storedProof != proofDigest || storedCheckpoint != artifact.CheckpointID {
 						return ErrEvidenceConflict
 					}
 					result.Revision = current
-					if err := ensureVerificationBinding(ctx, conn, artifact, current, provider); err != nil {
+					if err := s.ensureVerificationBinding(ctx, conn, artifact, current, provider); err != nil {
 						return err
 					}
 					return ensureVerificationCommandBinding(ctx, conn, artifact.Ref, current, commandBinding)
-				} else {
-					return ErrEvidenceConflict
+				}
+			}
+		}
+		if artifact.AmendsRevision == 0 {
+			historicalRepairFound := false
+			if !pendingFound {
+				amendment, found, amendmentErr := s.reviewRepairVerificationAmendment(ctx, conn, artifact.Ref, artifact.ExpectedVersion, artifact.Fence)
+				if amendmentErr != nil {
+					return amendmentErr
+				}
+				historicalRepairFound = found
+				if found {
+					artifact.AmendsRevision, artifact.Reason, artifact.Requester = amendment.PriorRevision, amendment.Reason, amendment.Requester
+					result.Amends = amendment.PriorRevision
+					if current == amendment.PriorRevision {
+						// First persistence of the newly reviewed verification below.
+					} else if current > amendment.PriorRevision {
+						// A crash may occur after the amended revision is durable but
+						// before the phase transition. A recovered exact provider result
+						// must append only its live binding, never try to create a second
+						// amendment revision or reject the boundary-derived metadata.
+						var storedAmends uint64
+						var storedReason, storedRequester, storedIntent, storedProof, storedCheckpoint string
+						if err := conn.QueryRowContext(ctx, `SELECT COALESCE(amends_revision,0),amendment_reason,requester,intent_digest,proof_digest,checkpoint_id FROM verification_revisions WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current).Scan(&storedAmends, &storedReason, &storedRequester, &storedIntent, &storedProof, &storedCheckpoint); err != nil {
+							return err
+						}
+						if storedAmends != amendment.PriorRevision || storedReason != amendment.Reason || storedRequester != amendment.Requester || storedIntent != intentDigest || storedProof != proofDigest || storedCheckpoint != artifact.CheckpointID {
+							return ErrEvidenceConflict
+						}
+						result.Revision = current
+						if err := s.ensureVerificationBinding(ctx, conn, artifact, current, provider); err != nil {
+							return err
+						}
+						return ensureVerificationCommandBinding(ctx, conn, artifact.Ref, current, commandBinding)
+					} else {
+						return ErrEvidenceConflict
+					}
+				}
+			}
+			if !historicalRepairFound {
+				if builderAmendment, builderFound, builderErr := s.builderVerificationAmendmentForRecord(ctx, conn, artifact, provider, providerVerify, proofDigest); builderErr != nil {
+					return builderErr
+				} else if builderFound {
+					artifact.AmendsRevision, artifact.Reason, artifact.Requester = builderAmendment.Prior.Revision, builderAmendment.Reason, builderAmendment.Requester
+					result.Amends = builderAmendment.Prior.Revision
+					if current == builderAmendment.Prior.Revision {
+						// The first independently reviewed amended checkpoint is appended below.
+					} else if current > builderAmendment.Prior.Revision {
+						var storedAmends uint64
+						var storedReason, storedRequester, storedIntent, storedProof, storedCheckpoint string
+						if err := conn.QueryRowContext(ctx, `SELECT COALESCE(amends_revision,0),amendment_reason,requester,intent_digest,proof_digest,checkpoint_id FROM verification_revisions WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current).Scan(&storedAmends, &storedReason, &storedRequester, &storedIntent, &storedProof, &storedCheckpoint); err != nil {
+							return err
+						}
+						if storedAmends != builderAmendment.Prior.Revision || storedReason != builderAmendment.Reason || storedRequester != builderAmendment.Requester || storedIntent != intentDigest || storedProof != proofDigest || storedCheckpoint != artifact.CheckpointID {
+							return ErrEvidenceConflict
+						}
+						result.Revision = current
+						if err := s.ensureVerificationBinding(ctx, conn, artifact, current, provider); err != nil {
+							return err
+						}
+						return ensureVerificationCommandBinding(ctx, conn, artifact.Ref, current, commandBinding)
+					} else {
+						return ErrEvidenceConflict
+					}
 				}
 			}
 		}
 		if current > 0 {
-			var oldIntent string
-			if err := conn.QueryRowContext(ctx, `SELECT intent_digest FROM verification_revisions WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current).Scan(&oldIntent); err != nil {
+			var oldIntent, oldProof string
+			if err := conn.QueryRowContext(ctx, `SELECT intent_digest,proof_digest FROM verification_revisions WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current).Scan(&oldIntent, &oldProof); err != nil {
 				return err
 			}
+			if artifact.AmendsRevision > 0 && callerAmendmentAuthorized && current > artifact.AmendsRevision {
+				var storedAmends uint64
+				var storedReason, storedRequester, storedIntent, storedProof, storedCheckpoint string
+				if err := conn.QueryRowContext(ctx, `SELECT COALESCE(amends_revision,0),amendment_reason,requester,intent_digest,proof_digest,checkpoint_id FROM verification_revisions WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current).Scan(&storedAmends, &storedReason, &storedRequester, &storedIntent, &storedProof, &storedCheckpoint); err != nil {
+					return err
+				}
+				if storedAmends != artifact.AmendsRevision || storedReason != artifact.Reason || storedRequester != artifact.Requester || storedIntent != intentDigest || storedProof != proofDigest || storedCheckpoint != artifact.CheckpointID {
+					return ErrEvidenceConflict
+				}
+				result.Revision = current
+				if err := s.ensureVerificationBinding(ctx, conn, artifact, current, provider); err != nil {
+					return err
+				}
+				return ensureVerificationCommandBinding(ctx, conn, artifact.Ref, current, commandBinding)
+			}
 			if artifact.AmendsRevision == 0 {
-				var oldProof, oldCheckpoint string
-				if err := conn.QueryRowContext(ctx, `SELECT proof_digest, checkpoint_id FROM verification_revisions WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current).Scan(&oldProof, &oldCheckpoint); err != nil {
+				var oldCheckpoint string
+				if err := conn.QueryRowContext(ctx, `SELECT checkpoint_id FROM verification_revisions WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`, artifact.Ref.Channel, artifact.Ref.Project, artifact.Ref.Ticket, current).Scan(&oldCheckpoint); err != nil {
 					return err
 				}
 				if oldIntent == intentDigest && oldProof == proofDigest && oldCheckpoint == artifact.CheckpointID {
 					result.Revision = current
-					if err := ensureVerificationBinding(ctx, conn, artifact, current, provider); err != nil {
+					if err := s.ensureVerificationBinding(ctx, conn, artifact, current, provider); err != nil {
 						return err
 					}
 					if err := ensureVerificationCommandBinding(ctx, conn, artifact.Ref, current, commandBinding); err != nil {
@@ -407,7 +601,10 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 				}
 				return ErrEvidenceConflict
 			}
-			if artifact.AmendsRevision != current || oldIntent == intentDigest {
+			// An authenticated amendment may intentionally preserve the verification
+			// intent while replacing its independently reviewed proof. Refuse only a
+			// true no-op or a request that does not amend the current revision.
+			if artifact.AmendsRevision != current || oldIntent == intentDigest && oldProof == proofDigest {
 				return ErrEvidenceConflict
 			}
 		} else if artifact.AmendsRevision != 0 {
@@ -419,7 +616,7 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 		if err != nil {
 			return err
 		}
-		if err := ensureVerificationBinding(ctx, conn, artifact, result.Revision, provider); err != nil {
+		if err := s.ensureVerificationBinding(ctx, conn, artifact, result.Revision, provider); err != nil {
 			return err
 		}
 		if err := ensureVerificationCommandBinding(ctx, conn, artifact.Ref, result.Revision, commandBinding); err != nil {
@@ -438,13 +635,21 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 	return result, err
 }
 
-func ensureVerificationBinding(ctx context.Context, conn *sql.Conn, artifact VerificationArtifact, revision uint64, provider ProviderAttemptResult) error {
+func (s *Store) ensureVerificationBinding(ctx context.Context, conn *sql.Conn, artifact VerificationArtifact, revision uint64, provider ProviderAttemptResult) error {
 	if artifact.ProviderResult == nil {
 		return nil
 	}
 	key := *artifact.ProviderResult
 	if err := providerResultReachesFence(ctx, conn, key, provider, artifact.ExpectedVersion, artifact.Fence); err != nil {
-		return ErrEvidenceConflict
+		// Source-resume's prepared-checkpoint boundary is a deliberately narrow
+		// alternative to the ordinary provider recovery validator.  It proves the
+		// same Reviewer result, prepared commit, and source endpoint, so a first
+		// recovery row cannot be mistaken for a fresh initial lifecycle.  Never
+		// relax provider authority globally: the fallback is self-authenticating
+		// and only available for this exact Store-owned source-resume proof.
+		if sourceErr := s.authenticateOperatorSourceResumeVerificationBinding(ctx, conn, artifact, provider); sourceErr != nil {
+			return ErrEvidenceConflict
+		}
 	}
 	var id int64
 	var attempt int
@@ -484,12 +689,27 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 	if builder.Claim.ExpectedVersion != evidence.ExpectedVersion || builder.Claim.LeaderEpoch != evidence.Fence.LeaderEpoch || builder.Claim.RunnerEpoch != evidence.Fence.RunnerEpoch {
 		reusable, reuseErr := s.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: evidence.Ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: evidence.ExpectedVersion, Fence: evidence.Fence})
 		if reuseErr != nil || !reusable.Recovered || reusable.Key != evidence.BuilderResult {
-			return nil, ErrEvidenceConflict
+			witness, found, witnessErr := s.OperatorSourceResumePreparedCandidateWitness(ctx, evidence.Ref, evidence.ExpectedVersion, evidence.Fence)
+			if witnessErr != nil || !found || witness.Ref != evidence.Ref || witness.Version != evidence.ExpectedVersion || witness.Fence != evidence.Fence || witness.Builder != evidence.BuilderResult || witness.Command.Key != evidence.CommandResult || witness.Commit != evidence.Commit || witness.Commit.CommitOID != evidence.Snapshot.HeadSHA || witness.Commit.TreeOID != evidence.Snapshot.TreeSHA || witness.Source.Worktree.BaseSHA != evidence.Snapshot.BaseSHA || witness.Verification.Revision.IntentDigest != evidence.Snapshot.VerificationIntentDigest || witness.Verification.Revision.ProofDigest != evidence.Snapshot.ProofDigest || strings.TrimPrefix(witness.Command.Claim.PolicyDigest, "sha256:") != evidence.Snapshot.CommandPolicyDigest {
+				return nil, ErrEvidenceConflict
+			}
 		}
 	}
 	builderDigest, err := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
 	if err != nil || builderDigest != evidence.Snapshot.BuilderEvidenceDigest {
 		return nil, ErrEvidenceConflict
+	}
+	// A source-resume candidate may only be recorded after its prepared G has
+	// been confirmed. The recoverable witness is materializer-only; this Store
+	// authority boundary must use the strict witness and bind it to the exact
+	// candidate evidence being recorded.
+	if _, sourceFound, sourceErr := s.OperatorSourceResumeProof(ctx, evidence.Ref, evidence.ExpectedVersion, evidence.Fence); sourceErr != nil {
+		return nil, ErrEvidenceConflict
+	} else if sourceFound {
+		prepared, preparedFound, preparedErr := s.OperatorSourceResumePreparedCandidateWitness(ctx, evidence.Ref, evidence.ExpectedVersion, evidence.Fence)
+		if preparedErr != nil || !preparedFound || prepared.Ref != evidence.Ref || prepared.Version != evidence.ExpectedVersion || prepared.Fence != evidence.Fence || prepared.Builder != evidence.BuilderResult || prepared.Command.Key != evidence.CommandResult || prepared.Commit != evidence.Commit || prepared.Source.Worktree.BaseSHA != evidence.Snapshot.BaseSHA || prepared.Verification.Revision.IntentDigest != evidence.Snapshot.VerificationIntentDigest || prepared.Verification.Revision.ProofDigest != evidence.Snapshot.ProofDigest || strings.TrimPrefix(prepared.Command.Claim.PolicyDigest, "sha256:") != evidence.Snapshot.CommandPolicyDigest {
+			return nil, ErrEvidenceConflict
+		}
 	}
 	receipts := make([]InvalidationReceipt, 0, 4)
 	err = s.write(ctx, func(conn *sql.Conn) error {
@@ -573,7 +793,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			candidate := evidence.Snapshot
 			candidate.Generation = current
 			if existing == candidate {
-				if err := ensureCandidateBinding(ctx, conn, evidence, current, builder); err != nil {
+				if err := s.ensureCandidateBinding(ctx, conn, evidence, current, builder); err != nil {
 					return err
 				}
 				return ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding)
@@ -591,7 +811,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			if err != nil || existing != evidence.Snapshot {
 				return ErrEvidenceConflict
 			}
-			if err := ensureCandidateBinding(ctx, conn, evidence, current, builder); err != nil {
+			if err := s.ensureCandidateBinding(ctx, conn, evidence, current, builder); err != nil {
 				return err
 			}
 			return ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding)
@@ -610,7 +830,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if err != nil {
 			return err
 		}
-		if err := ensureCandidateBinding(ctx, conn, evidence, evidence.Snapshot.Generation, builder); err != nil {
+		if err := s.ensureCandidateBinding(ctx, conn, evidence, evidence.Snapshot.Generation, builder); err != nil {
 			return err
 		}
 		if err := ensureCandidateCommandBinding(ctx, conn, evidence.Ref, evidence.Snapshot.Generation, commandBinding); err != nil {
@@ -631,9 +851,11 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 	return receipts, err
 }
 
-func ensureCandidateBinding(ctx context.Context, conn *sql.Conn, evidence CandidateEvidence, generation uint64, provider ProviderAttemptResult) error {
+func (s *Store) ensureCandidateBinding(ctx context.Context, conn *sql.Conn, evidence CandidateEvidence, generation uint64, provider ProviderAttemptResult) error {
 	if err := providerResultReachesFence(ctx, conn, evidence.BuilderResult, provider, evidence.ExpectedVersion, evidence.Fence); err != nil {
-		return ErrEvidenceConflict
+		if sourceErr := s.operatorSourceResumeProviderResultReachesFence(ctx, conn, evidence.Ref, evidence.BuilderResult, provider, evidence.ExpectedVersion, evidence.Fence); sourceErr != nil {
+			return ErrEvidenceConflict
+		}
 	}
 	var id int64
 	var attempt int
@@ -887,6 +1109,13 @@ func (s *Store) ApplyOperatorDecision(ctx context.Context, request OperatorDecis
 		}
 		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket, version+1, "operator_"+decision.Decision, state, to, string(body), now())
 		if err != nil {
+			return err
+		}
+		// A resumed ticket may have an open runtime admission. Carry that exact
+		// same-runner authority across the atomic decision so a crash after the
+		// state transition, but before the first merge/build effect, remains
+		// recoverable. A sealed or stale admission rolls the whole decision back.
+		if err := advanceOpenRuntimeAuthority(ctx, conn, decision.Ref, version, decision.Fence); err != nil {
 			return err
 		}
 		result.Version = version + 1

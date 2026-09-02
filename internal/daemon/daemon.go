@@ -1036,14 +1036,22 @@ func (daemon *Daemon) submit(ctx context.Context, request api.Request, _ domain.
 	if err != nil {
 		return daemon.failure(request, "invalid_ticket", "ticket source does not meet the local ticket format", false)
 	}
-	if _, err := daemon.store.Project(ctx, daemon.channel, domain.ProjectID(parameters.Project)); err != nil {
+	project, err := daemon.store.Project(ctx, daemon.channel, domain.ProjectID(parameters.Project))
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return daemon.failure(request, "unknown_project", "ticket project is not registered", false)
 		}
 		return daemon.failure(request, submitErrorCode(err), "ticket project registration could not be read", errors.Is(err, store.ErrBusy))
 	}
-	if parsed.MergeMode == domain.MergeAutonomous {
-		return daemon.failure(request, "autonomy_blocked", "autonomous workflows are unsupported until a separately approved native profile and pilot are qualified", false)
+	if parsed.MergeModeExplicit && parsed.MergeMode == domain.MergeAutonomous {
+		return daemon.failure(request, "autonomous_unavailable", "autonomous workflows are unavailable in v1; choose guarded or manual merge mode and resubmit the ticket", false)
+	}
+	effective, err := resolveSubmissionPolicy(project, parsed)
+	if err != nil {
+		return daemon.failure(request, "ticket_policy_refused", "ticket overrides exceed the registered project policy", false)
+	}
+	if effective.MergeMode == domain.MergeAutonomous {
+		return daemon.failure(request, "autonomous_unavailable", "autonomous workflows are unavailable in v1; choose guarded or manual merge mode and resubmit the ticket", false)
 	}
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
@@ -1053,14 +1061,29 @@ func (daemon *Daemon) submit(ctx context.Context, request api.Request, _ domain.
 		return daemon.failure(request, "ticket_id_unavailable", "could not allocate a ticket identity", true)
 	}
 	record := store.Ticket{Ref: domain.TicketRef{Channel: daemon.channel, Project: domain.ProjectID(parameters.Project), Ticket: id},
-		SourceDigest: parsed.Digest, Type: parsed.Type, MergeMode: parsed.MergeMode, Title: parsed.Title, Problem: parsed.Problem,
+		SourceDigest: parsed.Digest, Type: parsed.Type, MergeMode: effective.MergeMode, Title: parsed.Title, Problem: parsed.Problem,
 		Acceptance: parsed.Acceptance, Source: parsed.Source, Priority: parsed.Priority, CreatedAt: daemon.clock.Now().UTC(),
-		MaxDuration: parsed.MaxDuration, MaxCostMicroUSD: parsed.MaxCostMicroUSD}
+		MaxDuration: effective.TicketTimeout, MaxCostMicroUSD: effective.MaxTicketCostMicroUSD}
 	stored, created, err := daemon.store.SubmitTicketFenced(ctx, record, parameters.New, daemon.epoch)
 	if err != nil {
 		return daemon.failure(request, submitErrorCode(err), "ticket submission was not accepted", errors.Is(err, store.ErrBusy))
 	}
 	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_submit", Identity: string(stored.Ref.Ticket), Observed: !created}, ticketView(stored))
+}
+
+func resolveSubmissionPolicy(project store.Project, parsed ticket.Parsed) (config.Effective, error) {
+	frozen, err := config.DecodeSnapshot(project.ConfigSnapshot, project.ConfigDigest)
+	if err != nil {
+		return config.Effective{}, fmt.Errorf("decode registered configuration: %w", err)
+	}
+	if frozen.Name != string(project.ID) || frozen.Repository != project.Path || frozen.BaseBranch != project.BaseRef {
+		return config.Effective{}, errors.New("registered configuration does not match project identity")
+	}
+	override := config.TicketOverride{TicketTimeout: parsed.MaxDuration, MaxCostMicroUSD: parsed.MaxCostMicroUSD}
+	if parsed.MergeModeExplicit {
+		override.MergeMode = parsed.MergeMode
+	}
+	return config.Resolve(frozen.Machine, frozen.Project, override)
 }
 
 type ticketParameters struct {
@@ -1434,11 +1457,35 @@ func (daemon *Daemon) finishControl(ctx context.Context, request api.Request, st
 	if intent == "cancel" {
 		target = domain.StateCancelled
 	}
+	eventPayload := `{"drained":true,"intent":"` + intent + `"}`
+	if intent == "take" || intent == "pause" {
+		inspection, inspectErr := daemon.inspectTakeover(ctx, stored.Ref)
+		if inspectErr != nil {
+			return daemon.controlFailure(request, stored, intent, "takeover_inspection_failed", "the runtime is drained but the local and remote worktree identity could not be captured for handoff", true, true)
+		}
+		baseline := store.TakeoverRemoteBaseline{
+			Registered: inspection.Registered, WorktreePath: inspection.Path, WorktreeBranch: inspection.Branch,
+			CandidatePresent: inspection.RemoteCandidatePresent, CandidateOID: inspection.RemoteCandidateSHA, BaseOID: inspection.RemoteBaseSHA,
+		}
+		if inspection.Registered {
+			registered, readErr := daemon.store.Worktree(ctx, stored.Ref)
+			if readErr != nil {
+				return daemon.controlFailure(request, stored, intent, "takeover_inspection_failed", "the registered worktree changed while the remote handoff baseline was captured", true, true)
+			}
+			digest := sha256.Sum256(registered.IdentityJSON)
+			baseline.WorktreeIdentity = hex.EncodeToString(digest[:])
+		}
+		encoded, encodeErr := json.Marshal(map[string]any{"drained": true, "intent": intent, "remote": baseline})
+		if encodeErr != nil {
+			return daemon.failure(request, "internal_encoding", "takeover remote evidence could not be encoded", false)
+		}
+		eventPayload = string(encoded)
+	}
 	result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{
 		Ticket: stored.Ref, TicketVersion: stored.Version, From: stored.State, Trigger: "process_and_effects_drained",
 		Fence:        domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch},
 		Attributes:   map[string]string{"no_live_writer": "true", "no_unreconciled_mutation": "true"},
-		EventPayload: `{"drained":true,"intent":"` + intent + `"}`,
+		EventPayload: eventPayload,
 	})
 	if err != nil {
 		code, message := "control_completion_failed", "drained control state could not be committed"
@@ -1472,7 +1519,7 @@ func (daemon *Daemon) finishControl(ctx context.Context, request api.Request, st
 func (daemon *Daemon) inspectTakeover(ctx context.Context, ref domain.TicketRef) (contracts.TakeoverInspection, error) {
 	registered, err := daemon.store.Worktree(ctx, ref)
 	if errors.Is(err, store.ErrNotFound) {
-		return contracts.TakeoverInspection{Clean: true, ChangeKind: "no_worktree"}, nil
+		return contracts.TakeoverInspection{Clean: true, ChangeKind: "no_worktree", RemoteIdentityExact: true}, nil
 	}
 	if err != nil {
 		return contracts.TakeoverInspection{}, err
@@ -1500,10 +1547,15 @@ func (daemon *Daemon) takeoverSuccess(ctx context.Context, request api.Request, 
 	view["control"] = "take"
 	view["takeover"] = map[string]any{
 		"registered": inspection.Registered, "path": inspection.Path, "branch": inspection.Branch,
-		"repository": inspection.Repository, "base_sha": inspection.BaseSHA, "head_sha": inspection.HeadSHA,
+		"repository": inspection.Repository, "origin": inspection.Origin, "push_origin": inspection.PushOrigin, "base_sha": inspection.BaseSHA, "head_sha": inspection.HeadSHA,
 		"clean": inspection.Clean, "change_kind": inspection.ChangeKind, "changed_files": inspection.ChangedFiles,
-		"source_resumable": inspection.SourceResumable,
+		"source_resumable": inspection.SourceResumable, "source_commit": inspection.SourceCommit,
+		"remote_candidate_present": inspection.RemoteCandidatePresent, "remote_candidate_sha": inspection.RemoteCandidateSHA,
+		"remote_base_sha": inspection.RemoteBaseSHA, "remote_identity_exact": inspection.RemoteIdentityExact,
+		"retained_proof_digest": inspection.RetainedProofDigest, "retained_policy_digest": inspection.RetainedPolicyDigest,
+		"retained_version": inspection.RetainedVersion, "retained_leader_epoch": inspection.RetainedLeaderEpoch, "retained_runner_epoch": inspection.RetainedRunnerEpoch,
 	}
+	view["next_action"] = domain.NextAction{Code: "takeover_resume", Argv: []string{daemon.executable(), "resume", string(stored.Ref.Ticket)}}
 	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_take", Identity: string(stored.Ref.Ticket), Observed: observed}, view)
 }
 
@@ -1559,33 +1611,46 @@ func (daemon *Daemon) resumeTicket(ctx context.Context, request api.Request, ide
 			return daemon.failure(request, "takeover_inspection_failed", "the retained worktree cannot be authenticated; resume is blocked until its repository identity is repaired", false)
 		}
 		attributes := map[string]string{
-			"operator_identity_authenticated": "true", "branch_remote_identity_exact": "true", "prerequisites_green": "true",
+			"operator_identity_authenticated": "true", "prerequisites_green": "true",
 		}
+		sourceResume := false
 		switch {
+		case !inspection.RemoteIdentityExact:
+			return daemon.failure(request, "takeover_remote_drift", "the candidate branch or protected base changed after take; sf retained the paused worktree and started no provider", false)
+		case inspection.SourceResumable && inspection.Clean && inspection.ChangeKind == "source_commit":
+			attributes["takeover_source_commit_valid"] = "true"
+			attributes["verification_files_unchanged"] = "true"
+			attributes["branch_remote_identity_exact"] = "true"
+			sourceResume = true
 		case inspection.Clean:
 			attributes["takeover_diff_none"] = "true"
-		case inspection.SourceResumable && inspection.ChangeKind == "source_changes":
-			// This is intentionally a handoff to a fresh Builder cycle, not a
-			// direct candidate adoption. The Git boundary proved the retained
-			// checkpoint, the source paths and the untouched verification files;
-			// Builder/RecordCandidate still require new provider and repository
-			// command evidence before any candidate can be published.
-			attributes["takeover_source_diff_valid"] = "true"
-			attributes["verification_files_unchanged"] = "true"
+			attributes["branch_remote_identity_exact"] = "true"
 		default:
 			code, message := "takeover_changes_unadopted", "operator changes are retained but cannot yet enter an authenticated Builder cycle"
-			if inspection.ChangeKind == "verification_changes" {
+			if inspection.ChangeKind == "source_commit_required" {
+				code, message = "source_commit_required", "operator source edits are retained but cannot execute directly; create one clean commit on this branch, then resume so sf can authenticate it and run a fresh Reviewer"
+			} else if inspection.ChangeKind == "verification_changes" {
 				code, message = "takeover_verification_changes_unadopted", "verification-owned files changed; restore verification-owned files to the authenticated baseline, then resume the ticket"
 			} else if inspection.ChangeKind == "source_out_of_scope" {
 				code, message = "takeover_source_out_of_scope", "operator changes are outside the approved Planner paths; retain them and amend the plan before resuming"
 			}
 			return daemon.failure(request, code, message, false)
 		}
-		payload, err := json.Marshal(map[string]any{"intent": "resume", "operator": identity.Label, "change_kind": inspection.ChangeKind, "changed_files": inspection.ChangedFiles})
-		if err != nil {
-			return daemon.failure(request, "internal_encoding", "resume control metadata could not be encoded", false)
+		fence := domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}
+		var result contracts.TransitionResult
+		if sourceResume {
+			baseline, baselineErr := daemon.store.OperatorTakeRemoteBaseline(ctx, ref, stored.Version)
+			if baselineErr != nil {
+				return daemon.failure(request, "takeover_remote_evidence_unavailable", "the take-time remote baseline is missing or malformed; sf retained the paused worktree and started no provider", false)
+			}
+			result, err = daemon.engine.SignalOperatorSourceResume(ctx, store.OperatorSourceResume{Ref: ref, ExpectedVersion: stored.Version, Fence: fence, Operator: identity.Label, SourceCommit: inspection.SourceCommit, Remote: baseline})
+		} else {
+			payload, encodeErr := json.Marshal(map[string]any{"intent": "resume", "operator": identity.Label, "change_kind": inspection.ChangeKind, "changed_files": inspection.ChangedFiles})
+			if encodeErr != nil {
+				return daemon.failure(request, "internal_encoding", "resume control metadata could not be encoded", false)
+			}
+			result, err = daemon.engine.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: "operator_resume", Fence: fence, Attributes: attributes, EventPayload: string(payload)})
 		}
-		result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, Attributes: attributes, EventPayload: string(payload)})
 		if err != nil {
 			return daemon.failure(request, "resume_transition_refused", "ticket cannot resume from its current durable state", false)
 		}
@@ -1957,7 +2022,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 		}
 	}
 	if code == "autonomous_unavailable" {
-		argv = []string{binary, "providers", "qualify", "--help"}
+		argv = []string{binary, "submit", "--help"}
 	}
 	if code == "unqualified_provider" {
 		argv = []string{binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"}
@@ -1983,6 +2048,9 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	if code == "invalid_submit" {
 		argv = []string{binary, "submit", "--help"}
 	}
+	if code == "ticket_policy_refused" {
+		argv = []string{binary, "submit", "--help"}
+	}
 	if code == "invalid_logs" {
 		argv = []string{binary, "logs", "--help"}
 	}
@@ -1990,8 +2058,10 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	// the malformed request omitted its ticket. Do not collapse them into
 	// doctor: the daemon already knows which control surface can recover.
 	switch code {
-	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_source_out_of_scope":
+	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 		argv = []string{binary, "take", "--help"}
+	case "source_commit_required":
+		argv = []string{binary, operatorVerb("resume"), "--help"}
 	case "takeover_verification_changes_unadopted":
 		argv = []string{binary, operatorVerb("resume"), "--help"}
 	case "invalid_resume":
@@ -2014,11 +2084,13 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	}
 	if request.Ticket != "" {
 		switch code {
-		case "takeover_changes_unadopted", "takeover_source_out_of_scope":
+		case "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 			// `take` is intentionally idempotent and prints the authenticated
 			// retained path again. It is the only safe next action for edits
 			// that have not crossed the Builder/proof authority.
 			argv = []string{binary, "take", request.Ticket}
+		case "source_commit_required":
+			argv = []string{binary, operatorVerb("resume"), request.Ticket}
 		case "takeover_verification_changes_unadopted":
 			// The prerequisite is deliberately manual: the daemon must not adopt
 			// verification-owned edits or invent an amendment. Once the operator

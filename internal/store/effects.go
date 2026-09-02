@@ -94,7 +94,7 @@ func (s *Store) ValidateTicketFence(ctx context.Context, ref domain.TicketRef, v
 		return ErrStaleFence
 	}
 	return s.write(ctx, func(conn *sql.Conn) error {
-		return s.assertTicketFence(ctx, conn, ref, version, fence)
+		return s.assertCurrentTicketFence(ctx, conn, ref, version, fence)
 	})
 }
 
@@ -515,14 +515,19 @@ func (s *Store) assertTicketFence(ctx context.Context, conn *sql.Conn, ref domai
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	var state domain.State
 	var version, runner uint64
-	if err := conn.QueryRowContext(ctx, `SELECT version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&version, &runner); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT state,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return err
 	}
-	if version != expectedVersion {
+	// This is the shared mutation-admission fence. A terminal ticket may still
+	// be observed and reconciled through assertCurrentTicketFence, but it can
+	// never create, rebind, or launch another external writer after its
+	// capacity has been released to a different ticket.
+	if state.Terminal() || version != expectedVersion {
 		return ErrStaleFence
 	}
 	return s.currentFence(ctx, conn, ref.Channel, version, runner, fence)

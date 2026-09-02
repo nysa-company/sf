@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	githubboundary "github.com/nysa-company/sf/internal/github"
@@ -82,6 +83,8 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		return w.reconcile(ctx, ticket, fence)
 	case domain.StateWaitingManualMerge:
 		return w.observeManualMerge(ctx, ticket, fence)
+	case domain.StateWaitingApproval:
+		return w.observeExternalMerge(ctx, ticket, fence)
 	case domain.StateWaitingCI:
 		if w.CI.Observer == nil {
 			return w.blockCI(ctx, ticket, fence)
@@ -94,33 +97,78 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	}
 }
 
-// observeManualMerge is intentionally read-only.  Manual mode never marks a
-// PR ready or asks GitHub to merge; it only advances after the authenticated
-// published-PR observer proves the reviewed source head was externally merged.
+// observeManualMerge is intentionally read-only. Manual mode never marks a
+// PR ready or asks GitHub to merge; it only records an authenticated external
+// merge. Exact source-head observations retain the verified reconciliation
+// path, while a changed source head becomes external_merged.
 func (w Worker) observeManualMerge(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {
 	result := workflowworker.RunResult{Ref: ticket.Ref, State: ticket.State, Version: ticket.Version, Phase: domain.PhaseReconcile}
 	if !w.PublicationEnabled || w.Engine == nil || w.Publication.GitHub == nil {
 		return result, ErrPublishingUnavailable
 	}
 	observer := publishedMergeObserver{Store: w.Store, GitHub: w.Publication.GitHub}
-	observation, err := observer.Observe(ctx, ticket.Ref)
+	observation, err := observer.ObserveExternal(ctx, ticket.Ref)
 	if err != nil {
 		return result, fmt.Errorf("observe manual merge: %w", err)
 	}
 	if !observation.Observed.Merged {
 		return result, nil
 	}
-	observation, err = w.Store.BindManualMergeObservation(ctx, ticket.Ref, observation, fence)
+	observation, err = w.Store.BindExternalMergeObservation(ctx, ticket.Ref, observation, fence)
 	if err != nil {
 		return result, fmt.Errorf("bind manual merge observation: %w", err)
 	}
-	transition, err := w.Store.RecordManualMergeObservation(ctx, store.Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateWaitingManualMerge, To: domain.StateReconciling, Trigger: "external_merge_observed", Fence: fence}, observation)
+	to := domain.StateExternalMerged
+	if observation.Observed.Identity.HeadOID == observation.Publication.HeadOID {
+		to = domain.StateReconciling
+	}
+	transition, err := w.Store.RecordExternalMergeObservation(ctx, store.Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateWaitingManualMerge, To: to, Trigger: "external_merge_observed", Fence: fence}, observation)
 	if err != nil {
 		return result, fmt.Errorf("record manual merge observation: %w", err)
+	}
+	if to == domain.StateExternalMerged {
+		current, err := w.Store.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			return result, err
+		}
+		result.State, result.Version, result.Transitioned = current.State, current.Version, true
+		return result, nil
 	}
 	_, err = w.Engine.Signal(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: transition.Version, From: domain.StateReconciling, Trigger: "reconcile_pass", Fence: fence, Attributes: map[string]string{"terminal_remote_truth_exact": "true"}})
 	if err != nil {
 		return result, err
+	}
+	current, err := w.Store.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		return result, err
+	}
+	result.State, result.Version, result.Transitioned = current.State, current.Version, true
+	return result, nil
+}
+
+// observeExternalMerge handles guarded approval without a checkout or remote
+// mutation. A merged PR is accepted only through the typed observer and the
+// evidence-bearing Store boundary, which classifies it as external_merged.
+func (w Worker) observeExternalMerge(ctx context.Context, ticket store.Ticket, fence domain.Fence) (workflowworker.RunResult, error) {
+	result := workflowworker.RunResult{Ref: ticket.Ref, State: ticket.State, Version: ticket.Version, Phase: domain.PhaseReconcile}
+	if !w.PublicationEnabled || w.Engine == nil || w.Publication.GitHub == nil {
+		return result, ErrPublishingUnavailable
+	}
+	observer := publishedMergeObserver{Store: w.Store, GitHub: w.Publication.GitHub}
+	observation, err := observer.ObserveExternal(ctx, ticket.Ref)
+	if err != nil {
+		return result, fmt.Errorf("observe external merge: %w", err)
+	}
+	if !observation.Observed.Merged {
+		return result, nil
+	}
+	observation, err = w.Store.BindExternalMergeObservation(ctx, ticket.Ref, observation, fence)
+	if err != nil {
+		return result, fmt.Errorf("bind external merge observation: %w", err)
+	}
+	_, err = w.Store.RecordExternalMergeObservation(ctx, store.Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateWaitingApproval, To: domain.StateExternalMerged, Trigger: "external_merge_observed", Fence: fence}, observation)
+	if err != nil {
+		return result, fmt.Errorf("record external merge observation: %w", err)
 	}
 	current, err := w.Store.Ticket(ctx, ticket.Ref)
 	if err != nil {
@@ -135,18 +183,25 @@ func (w Worker) merge(ctx context.Context, ticket store.Ticket, fence domain.Fen
 	if !w.PublicationEnabled || w.Publication.Store == nil || w.Publication.GitHub == nil || w.Engine == nil || ticket.MergeMode != domain.MergeGuarded {
 		return result, ErrPublishingUnavailable
 	}
-	candidate, err := w.Store.RecoverableCandidate(ctx, ticket.Ref)
+	method, err := frozenMergeMethod(ticket)
 	if err != nil {
 		return result, err
 	}
+	candidate, err := w.Store.RecoverableCandidate(ctx, ticket.Ref)
+	if err != nil {
+		return result, fmt.Errorf("load recoverable merge candidate: %w", err)
+	}
 	published, err := w.Store.LoadHistoricalPublishedCandidate(ctx, ticket.Ref)
-	if err != nil || published.PullRequest.HeadOID != candidate.Snapshot.HeadSHA {
+	if err != nil {
+		return result, fmt.Errorf("load historical published candidate: %w", err)
+	}
+	if published.PullRequest.HeadOID != candidate.Snapshot.HeadSHA {
 		return result, store.ErrEvidenceConflict
 	}
 	approved := false
 	decisions, err := w.Store.OperatorDecisions(ctx, ticket.Ref)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("load guarded merge decisions: %w", err)
 	}
 	for _, decision := range decisions {
 		if decision.Decision == "approved" && !decision.Invalidated && decision.ReviewedHead == candidate.Snapshot.HeadSHA {
@@ -162,7 +217,7 @@ func (w Worker) merge(ctx context.Context, ticket store.Ticket, fence domain.Fen
 	readyKey := "merge-ready/" + string(ticket.Ref.Channel) + "/" + string(ticket.Ref.Project) + "/" + string(ticket.Ref.Ticket) + "/" + candidate.Snapshot.HeadSHA
 	readyConfirmed, err := w.reconcileReady(ctx, ticket, fence, readyKey, identity)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("reconcile ready effect: %w", err)
 	}
 	if !readyConfirmed {
 		if _, err := w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: readyKey, Ref: ticket.Ref, Kind: "pr_ready", TicketVersion: ticket.Version, Fence: fence, RequestDigest: readyDigest}); err != nil {
@@ -182,12 +237,11 @@ func (w Worker) merge(ctx context.Context, ticket store.Ticket, fence domain.Fen
 			}
 		}
 	}
-	method := "squash"
 	mergeDigest := githubboundary.CanonicalMergeRequestDigest(identity, candidate.Snapshot.HeadSHA, method, authorization)
 	mergeKey := "merge/" + string(ticket.Ref.Channel) + "/" + string(ticket.Ref.Project) + "/" + string(ticket.Ref.Ticket) + "/" + candidate.Snapshot.HeadSHA
 	mergeConfirmed, err := w.reconcileMerge(ctx, ticket, fence, mergeKey)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("reconcile merge effect: %w", err)
 	}
 	if !mergeConfirmed {
 		if _, err := w.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: mergeKey, Ref: ticket.Ref, Kind: "merge", TicketVersion: ticket.Version, Fence: fence, RequestDigest: mergeDigest}); err != nil {
@@ -223,6 +277,18 @@ func (w Worker) merge(ctx context.Context, ticket store.Ticket, fence domain.Fen
 	return result, nil
 }
 
+// frozenMergeMethod reads the project authority retained on the ticket rather
+// than consulting a mutable repository configuration or choosing a runtime
+// default. The exact value is included in the durable merge-effect digest and
+// subsequently rechecked by the GitHub boundary.
+func frozenMergeMethod(ticket store.Ticket) (string, error) {
+	effective, err := config.DecodeSnapshot(ticket.ConfigSnapshot, ticket.ConfigDigest)
+	if err != nil {
+		return "", fmt.Errorf("frozen merge configuration: %w", err)
+	}
+	return effective.MergeMethod, nil
+}
+
 // reconcileReady settles only a claim that was invalidated by a recovery
 // fence. A same-fence unknown response remains uncertain and never becomes a
 // retry authorization. The all-state PR observation supplies the exact remote
@@ -235,8 +301,39 @@ func (w Worker) reconcileReady(ctx context.Context, ticket store.Ticket, fence d
 	if err != nil {
 		return false, err
 	}
+	expectedIdentity := "ready/" + identity.HeadOID
+	expectedDigest := githubboundary.CanonicalReadyRequestDigest(identity)
+	if effect.Ref != ticket.Ref || effect.SemanticKey != key || effect.Kind != "pr_ready" || effect.RequestDigest != expectedDigest {
+		return false, store.ErrEvidenceConflict
+	}
 	if effect.State == store.EffectConfirmed {
-		return true, nil
+		if effect.ClaimEpoch == 0 || effect.ObservedIdentity != expectedIdentity {
+			return false, store.ErrEvidenceConflict
+		}
+		if effect.TicketVersion == ticket.Version && effect.LeaderEpoch == fence.LeaderEpoch && effect.RunnerEpoch == fence.RunnerEpoch {
+			return true, nil
+		}
+		// A confirmed ready mutation is immutable evidence, but its original
+		// runner may have been revoked by a restart or operator handoff. Promote
+		// that exact evidence under the current fenced endpoint; never treat a
+		// merely confirmed row with a different binding as current authority.
+		promoted, promoteErr := w.Store.ReconcileInvalidatedEffect(ctx, store.InvalidatedEffectObservation{
+			Prior: store.EffectObservation{
+				EffectFence: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: effect.TicketVersion, Fence: domain.Fence{LeaderEpoch: effect.LeaderEpoch, RunnerEpoch: effect.RunnerEpoch, ClaimEpoch: effect.ClaimEpoch}},
+				Present:     true, Identity: expectedIdentity,
+			},
+			Current: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence},
+		})
+		if promoteErr != nil {
+			return false, promoteErr
+		}
+		return promoted.State == store.EffectConfirmed && promoted.TicketVersion == ticket.Version && promoted.LeaderEpoch == fence.LeaderEpoch && promoted.RunnerEpoch == fence.RunnerEpoch, nil
+	}
+	if (effect.State == store.EffectExecuting || effect.State == store.EffectUncertain) && effect.ClaimEpoch == 0 {
+		return false, store.ErrEvidenceConflict
+	}
+	if effect.ObservedIdentity != "" {
+		return false, store.ErrEvidenceConflict
 	}
 	if effect.State != store.EffectExecuting && effect.State != store.EffectUncertain {
 		return false, nil
@@ -253,7 +350,7 @@ func (w Worker) reconcileReady(ctx context.Context, ticket store.Ticket, fence d
 	}
 	observedIdentity := ""
 	if observed.Ready {
-		observedIdentity = "ready/" + identity.HeadOID
+		observedIdentity = expectedIdentity
 	}
 	_, err = w.Store.ReconcileInvalidatedEffect(ctx, store.InvalidatedEffectObservation{Prior: store.EffectObservation{EffectFence: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: effect.TicketVersion, Fence: domain.Fence{LeaderEpoch: effect.LeaderEpoch, RunnerEpoch: effect.RunnerEpoch, ClaimEpoch: effect.ClaimEpoch}}, Present: observed.Ready, Identity: observedIdentity}, Current: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence}})
 	if err != nil {
@@ -291,14 +388,14 @@ func (w Worker) reconcileMerge(ctx context.Context, ticket store.Ticket, fence d
 		}
 		intent, found, err := w.Store.MergeIntent(ctx, key)
 		if err != nil {
-			return false, err
+			return false, fmt.Errorf("load confirmed merge intent: %w", err)
 		}
 		if !found || intent.SemanticKey != effect.SemanticKey || intent.Ref != effect.Ref || effect.Ref != ticket.Ref || effect.Kind != "merge" || intent.RequestDigest != effect.RequestDigest || effect.TicketVersion < intent.TicketVersion || effect.LeaderEpoch < intent.LeaderEpoch || effect.RunnerEpoch < intent.RunnerEpoch || effect.ClaimEpoch < intent.ClaimEpoch {
 			return false, store.ErrEvidenceConflict
 		}
 		identity, err := observer.ObserveMergeIntent(ctx, intent)
 		if err != nil {
-			return false, err
+			return false, fmt.Errorf("observe confirmed merge intent: %w", err)
 		}
 		if identity == "" {
 			return false, store.ErrEvidenceConflict
@@ -321,7 +418,7 @@ func (w Worker) reconcileMerge(ctx context.Context, ticket store.Ticket, fence d
 			Current: store.EffectFence{SemanticKey: key, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence},
 		})
 		if err != nil {
-			return false, err
+			return false, fmt.Errorf("promote confirmed merge effect: %w", err)
 		}
 		return promoted.State == store.EffectConfirmed, nil
 	}

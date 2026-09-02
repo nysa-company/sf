@@ -34,6 +34,13 @@ type script struct {
 }
 
 func main() {
+	if isCodexInvocation(os.Args[1:]) {
+		if err := runCodexInvocation(os.Args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, "fake-provider:", err)
+			os.Exit(2)
+		}
+		return
+	}
 	behavior := flag.String("behavior", "valid", "valid,partial,malformed,hang,progress,secret,forbidden")
 	scriptPath := flag.String("script", os.Getenv("SF_FAKE_PROVIDER_SCRIPT"), "optional JSON script")
 	phase := flag.String("phase", os.Getenv("SF_FAKE_PROVIDER_PHASE"), "script step to run")

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/nysapure"
 )
 
 type Command struct {
@@ -32,6 +33,9 @@ func (c Command) Validate(name string) error {
 		if total > 16*1024 {
 			return fmt.Errorf("command %s exceeds the argv size limit", name)
 		}
+	}
+	if len(c.Argv) >= 2 && c.Argv[0] == "node" && c.Argv[1] == nysapure.RecipeFlag && (len(c.Argv) != 3 || !nysapure.ValidTestPath(c.Argv[2])) {
+		return fmt.Errorf("command %s has an invalid nysa_api_pure_v1 test path", name)
 	}
 	return nil
 }

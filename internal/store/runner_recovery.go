@@ -113,15 +113,27 @@ func validateRunnerRecoveryLedger(ctx context.Context, q interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, ref domain.TicketRef, baselineVersion, baselineRunner, baselineLeader, liveVersion, liveRunner, liveLeader uint64) error {
+	var future int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ref.Channel, ref.Project, ref.Ticket, liveVersion).Scan(&future); err != nil || future != 0 {
+		return ErrPublicationEvidence
+	}
+	return validateRunnerRecoveryLedgerPrefix(ctx, q, ref, baselineVersion, baselineRunner, baselineLeader, liveVersion, liveRunner, liveLeader)
+}
+
+// validateRunnerRecoveryLedgerPrefix authenticates a bounded historical
+// segment. Callers must independently authenticate every later segment; the
+// ordinary validator above deliberately refuses any future row instead.
+func validateRunnerRecoveryLedgerPrefix(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, baselineVersion, baselineRunner, baselineLeader, liveVersion, liveRunner, liveLeader uint64) error {
 	if baselineVersion == 0 || baselineRunner == 0 || baselineLeader == 0 || liveVersion == 0 || liveRunner == 0 || liveLeader == 0 {
 		return ErrPublicationEvidence
 	}
 	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
 		return err
 	}
-	// A future row remains ticket authority. It cannot be ignored merely
-	// because this caller is authenticating an earlier live fence.
-	rows, err := q.QueryContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, baselineVersion)
+	rows, err := q.QueryContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, baselineVersion, liveVersion)
 	if err != nil {
 		return err
 	}
@@ -151,7 +163,7 @@ func validateRunnerRecoveryLedger(ctx context.Context, q interface {
 	}
 	rows.Close()
 	for _, step := range steps {
-		if step.TicketVersion > liveVersion || !validRunnerRecovery(step) || step.PriorTicketVersion < expectedVersion || step.PriorRunnerEpoch < expectedRunner || step.PriorLeaderEpoch < expectedLeader {
+		if !validRunnerRecovery(step) || step.PriorTicketVersion < expectedVersion || step.PriorRunnerEpoch < expectedRunner || step.PriorLeaderEpoch < expectedLeader {
 			return ErrPublicationEvidence
 		}
 		// A complete operator pause/take may advance the ticket version and
@@ -160,7 +172,7 @@ func validateRunnerRecoveryLedger(ctx context.Context, q interface {
 		// counter gap without its stopping/drained/resume event triplet remains
 		// invalid.
 		if err := validateRunnerControlAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch); err != nil {
-			if err := validateRunnerPhaseChain(ctx, q, ref, expectedVersion, expectedRunner, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil {
+			if err := validateRunnerPhaseChain(ctx, q, ref, expectedVersion, expectedRunner, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil {
 				return ErrPublicationEvidence
 			}
 		}
@@ -177,7 +189,7 @@ func validateRunnerRecoveryLedger(ctx context.Context, q interface {
 		expectedVersion, expectedRunner, expectedLeader = step.TicketVersion, step.RunnerEpoch, step.LeaderEpoch
 	}
 	if validateRunnerControlAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) != nil {
-		if err := validateRunnerPhaseAdvance(ctx, q, ref, expectedVersion, expectedRunner, liveVersion, liveRunner); err != nil {
+		if err := validateRunnerPhaseAdvance(ctx, q, ref, expectedVersion, expectedRunner, liveVersion, liveRunner); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) != nil {
 			return ErrPublicationEvidence
 		}
 	}
@@ -569,7 +581,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// Several ordinary phase completions may occur under one runner before
 			// the next daemon recovery. The chain is accepted only when every
 			// intervening event is a contiguous canonical lifecycle phase_pass.
-			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil {
+			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil {
 				return ErrPublicationEvidence
 			}
 		}
@@ -586,7 +598,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// A normal phase transition may follow the latest recovery row without
 			// changing the runner. It is current phase authority, not a control
 			// handoff; require the exact canonical phase event.
-			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, liveVersion, liveFence.RunnerEpoch); err != nil {
+			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, liveVersion, liveFence.RunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) != nil {
 				return ErrPublicationEvidence
 			}
 		}
@@ -655,7 +667,7 @@ func validateInitialLifecycleAdvance(ctx context.Context, q interface {
 		if from != prior {
 			return ErrPublicationEvidence
 		}
-		if !validInitialLifecycleTransition(trigger, from, to) {
+		if !validInitialLifecycleTransition(trigger, from, to) && !validInitialVerificationAmendmentRequest(ctx, q, ref, version, trigger, from, to, payload) && !validInitialVerificationAmendmentDecision(ctx, q, ref, version, trigger, from, to, payload) {
 			return ErrPublicationEvidence
 		}
 		if trigger == "checks_green" {
@@ -673,6 +685,46 @@ func validateInitialLifecycleAdvance(ctx context.Context, q interface {
 		return ErrPublicationEvidence
 	}
 	return nil
+}
+
+// validInitialVerificationAmendmentRequest admits the one Builder -> Reviewer
+// lifecycle edge which is deliberately not a generic phase_pass.  It is used
+// only while establishing the first startup-recovery predecessor: the event
+// projection alone is never authority.  Rehydrate the immutable Store request
+// at this exact transition version so a forged event, a missing correction
+// budget, or a retargeted Builder result cannot bootstrap a recovery row.
+func validInitialVerificationAmendmentRequest(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, version uint64, trigger string, from, to domain.State, payload string) bool {
+	return validInitialVerificationAmendmentRequestAtFence(ctx, q, ref, 0, domain.Fence{}, version, trigger, from, to, payload)
+}
+
+// validInitialVerificationAmendmentRequestAtFence additionally binds the
+// immutable request row to the exact recovery segment that is being bridged.
+// Without this comparison, a well-formed request could be paired with an
+// unrelated starting fence merely because its event exists at the expected
+// ticket version.
+func validInitialVerificationAmendmentRequestAtFence(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, consumedVersion uint64, consumedFence domain.Fence, version uint64, trigger string, from, to domain.State, payload string) bool {
+	if version == 0 || trigger != "verification_amendment_requested" || from != domain.StateBuilding || to != domain.StateVerifying || payload != "{}" {
+		return false
+	}
+	// loadVerificationAmendment performs the source/result/typed-artifact,
+	// prior-revision, command, and exact correction-budget checks at the
+	// immutable consumed endpoint.  It intentionally uses the row's persisted
+	// fence rather than a caller-supplied live fence.
+	var rowConsumedVersion, consumedLeader, consumedRunner uint64
+	if q.QueryRowContext(ctx, `SELECT consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch FROM verification_amendment_requests WHERE channel=? AND project_id=? AND ticket_id=? AND transition_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&rowConsumedVersion, &consumedLeader, &consumedRunner) != nil || rowConsumedVersion+1 != version || consumedLeader == 0 || consumedRunner == 0 {
+		return false
+	}
+	if consumedVersion != 0 && (rowConsumedVersion != consumedVersion || consumedFence.LeaderEpoch == 0 || consumedFence.RunnerEpoch == 0 || consumedLeader != consumedFence.LeaderEpoch || consumedRunner != consumedFence.RunnerEpoch) {
+		return false
+	}
+	amendment, err := (&Store{}).loadVerificationAmendment(ctx, q, ref, version, domain.Fence{LeaderEpoch: consumedLeader, RunnerEpoch: consumedRunner})
+	return err == nil && amendment.TransitionTicketVersion == version && amendment.ConsumedVersion+1 == version && amendment.Fence.LeaderEpoch == consumedLeader && amendment.Fence.RunnerEpoch == consumedRunner
 }
 
 // validInitialLifecycleTransition is deliberately narrower than the generic
@@ -776,11 +828,22 @@ func (s *Store) ProviderResultReachesFence(ctx context.Context, key ProviderAtte
 	if err := s.AssertTicketFence(ctx, key.Ref, expected, fence); err != nil {
 		return err
 	}
-	if err := validateRunnerRecoveryAuthority(ctx, s.db, key.Ref, expected, fence); err != nil {
-		return ErrStaleFence
+	if result.Claim.Phase != domain.PhaseReview {
+		if err := validateRunnerRecoveryAuthority(ctx, s.db, key.Ref, expected, fence); err != nil {
+			return ErrStaleFence
+		}
 	}
 	if err := providerResultReachesFence(ctx, s.db, key, result, expected, fence); err != nil {
 		return ErrStaleFence
+	}
+	if result.Claim.Phase == domain.PhaseReview {
+		// Review authority is not a generic phase bridge: it starts at the
+		// authenticated green-CI reviewing endpoint and may cross only the exact
+		// post-publication control/recovery lineage. This also audits recovery rows
+		// that predate the reviewer claim.
+		if _, err := s.FinalReviewAuthority(ctx, key.Ref, expected, fence); err != nil {
+			return ErrStaleFence
+		}
 	}
 	return nil
 }
@@ -816,13 +879,28 @@ func providerResultReachesFenceAt(ctx context.Context, q interface {
 	if key.Ref != claim.Ref || key.Phase != claim.Phase || key.AttemptID != claim.ID || key.Attempt != claim.Attempt || !providerRoleMatchesPhase(claim.Phase, claim.Role) || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
 		return ErrStaleFence
 	}
-	if requireLiveAuthority {
+	if requireLiveAuthority && claim.Phase != domain.PhaseReview {
 		if err := validateRunnerRecoveryAuthority(ctx, q, key.Ref, expected, fence); err != nil {
 			return ErrStaleFence
 		}
 	}
 	if claim.ExpectedVersion == expected && claim.RunnerEpoch == fence.RunnerEpoch && claim.LeaderEpoch == fence.LeaderEpoch {
 		return nil
+	}
+	// Verification amendments use decision-specific triggers rather than the
+	// ordinary phase_pass bridge. Authenticate that exact request/Reviewer/
+	// decision tuple before considering any generic recovery arithmetic.
+	if claim.Phase == domain.PhaseVerification && claim.Role == "reviewer" && claim.ExpectedVersion < expected {
+		boundary, boundaryErr := loadVerificationAmendmentBoundary(ctx, q, key.Ref, expected, fence)
+		if boundaryErr == nil {
+			if boundary.Reviewer != key {
+				return ErrStaleFence
+			}
+			return nil
+		}
+		if !errors.Is(boundaryErr, ErrNotFound) {
+			return ErrStaleFence
+		}
 	}
 	if err := validateRunnerRecoveryLedger(ctx, q, key.Ref, claim.ExpectedVersion, claim.RunnerEpoch, claim.LeaderEpoch, expected, fence.RunnerEpoch, fence.LeaderEpoch); err == nil {
 		return nil
@@ -1013,6 +1091,47 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 			return endpointLeader, true, nil
 		}
 	}
+	if state == domain.StateMerging && controlledApprovalMergeShape(control) {
+		// Crash after an exact approval and before the first merge intent/effect.
+		// The open authority was advanced atomically to the approval successor;
+		// restoreRuntimeControls sealed it on reopen. Authenticate that complete
+		// approval lineage before minting the first signed recovery row.
+		if version != control.authority.version || runner != control.authority.runner || control.authority.leader == 0 || control.authority.leader >= newLeader {
+			return 0, false, ErrPublicationEvidence
+		}
+		current := Ticket{Ref: ref, State: state, Version: version, RunnerEpoch: runner}
+		if s.authenticateControlledApprovalToMerging(ctx, conn, ref, control, current, control.authority.leader) != nil {
+			return 0, false, ErrPublicationEvidence
+		}
+		return control.authority.leader, true, nil
+	}
+	// A manual external-merge observation is an authenticated same-runner
+	// waiting_manual_merge -> reconciling successor. A runtime that was rearmed
+	// at the waiting endpoint advances its open authority atomically with that
+	// observation, so validate that direct endpoint here. Guarded reconciling
+	// with the same sealed/current counters is instead a normal pause/resume of
+	// an already-reconciling ticket; it must continue into the generic exact
+	// control-triplet and guarded-merge proof below.
+	if state == domain.StateReconciling && control.state == "sealed" &&
+		control.authority.version == version && control.authority.runner == runner {
+		var mergeMode domain.MergeMode
+		if err := conn.QueryRowContext(ctx, `SELECT merge_mode FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&mergeMode); err != nil {
+			return 0, false, ErrPublicationEvidence
+		}
+		switch mergeMode {
+		case domain.MergeManual:
+			origin, err := s.reconcilingRecoveryEndpoint(ctx, conn, ref)
+			if err != nil || origin.version != version || origin.runner != runner || origin.leader != control.authority.leader || origin.leader == 0 || origin.leader >= newLeader {
+				return 0, false, ErrPublicationEvidence
+			}
+			return origin.leader, true, nil
+		case domain.MergeGuarded:
+			// Continue below: authenticate the exact pause/drain/resume triplet
+			// and the immutable guarded reconciling origin at the pre-stop fence.
+		default:
+			return 0, false, ErrPublicationEvidence
+		}
+	}
 	if version < 3 || runner <= 1 {
 		return 0, false, nil
 	}
@@ -1071,13 +1190,18 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 		prior := normalRecoveryEndpoint{version: baseline.Version, runner: baseline.RunnerEpoch, leader: control.stop.leader}
 		resumed := normalRecoveryEndpoint{version: current.Version, runner: current.RunnerEpoch, leader: currentLeader}
 		if err := authenticateCurrentPostPublicationEndpointBridge(ctx, conn, ref, state, prior, resumed); err != nil {
-			return 0, false, nil
+			// Once a sealed control row and a post-publication mutation
+			// endpoint are present, malformed or contradictory evidence is
+			// not an ordinary "not this baseline" miss. Falling through to
+			// a weaker publication/provider fallback could mint a recovery
+			// row without authenticating the mutation lineage.
+			return 0, false, ErrPublicationEvidence
 		}
 	} else if err := authenticatePostPublicationResume(ctx, conn, ref, baseline, current, control.stop); err != nil {
-		return 0, false, nil
+		return 0, false, ErrPublicationEvidence
 	}
 	if err := s.authenticatePostPublicationState(ctx, conn, ref, state, baseline.Version, domain.Fence{LeaderEpoch: control.stop.leader, RunnerEpoch: baseline.RunnerEpoch}); err != nil {
-		return 0, false, nil
+		return 0, false, ErrPublicationEvidence
 	}
 	return currentLeader, true, nil
 }
@@ -1212,16 +1336,26 @@ func (s *Store) finalReviewRecoveryEndpoint(ctx context.Context, conn *sql.Conn,
 	if state != domain.StateWaitingApproval && state != domain.StateWaitingManualMerge {
 		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
-	candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
+	// This reader is also used after the ticket has entered merging or
+	// reconciling, so it must derive the immutable completion endpoint rather
+	// than assuming the requested waiting state is still live.
+	var completionVersion uint64
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(ticket_version),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='review_pass' AND from_state='reviewing' AND to_state=?`, ref.Channel, ref.Project, ref.Ticket, state).Scan(&completionVersion); err != nil || completionVersion == 0 {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	// A correction can legitimately produce an earlier review_pass for an
+	// invalidated candidate.  The latest pass is the only candidate for the
+	// current publication, but its ticket version must still contain exactly
+	// one state-changing review_pass rather than an ambiguous audit bundle.
+	var matching, stateChanges int
+	if err := conn.QueryRowContext(ctx, `SELECT
+		COALESCE(SUM(CASE WHEN trigger='review_pass' AND from_state='reviewing' AND to_state=? THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0)
+		FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, state, ref.Channel, ref.Project, ref.Ticket, completionVersion).Scan(&matching, &stateChanges); err != nil || matching != 1 || stateChanges != 1 {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	endpoint, err := s.reviewCompletionRecoveryEndpoint(ctx, conn, ref, state, completionVersion)
 	if err != nil {
-		return normalRecoveryEndpoint{}, ErrPublicationEvidence
-	}
-	observation, reviewVersion, err := s.authenticateHistoricalFinalReview(ctx, conn, ref, candidate)
-	if err != nil || reviewVersion == ^uint64(0) || observation.ObservedFence.LeaderEpoch == 0 || observation.ObservedFence.RunnerEpoch == 0 {
-		return normalRecoveryEndpoint{}, ErrPublicationEvidence
-	}
-	endpoint := normalRecoveryEndpoint{version: reviewVersion + 1, runner: observation.ObservedFence.RunnerEpoch, leader: observation.ObservedFence.LeaderEpoch}
-	if err := s.authenticatePostPublicationReviewCompletion(ctx, conn, ref, state, endpoint.version, domain.Fence{LeaderEpoch: endpoint.leader, RunnerEpoch: endpoint.runner}); err != nil {
 		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
 	return endpoint, nil
@@ -1241,14 +1375,101 @@ func (s *Store) approvalRecoveryEndpoint(ctx context.Context, conn *sql.Conn, re
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0) FROM approvals WHERE channel=? AND project_id=? AND ticket_id=? AND reviewed_head=? AND decision='approved' AND invalidated=0`, ref.Channel, ref.Project, ref.Ticket, candidate.Snapshot.HeadSHA).Scan(&approvals, &approvalVersion); err != nil || approvals != 1 || approvalVersion == 0 {
 		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
-	if approvalVersion < waiting.version || approvalVersion-waiting.version > 64 || waiting.runner > ^uint64(0)-(approvalVersion-waiting.version) {
+	if approvalVersion < waiting.version || approvalVersion-waiting.version > 64 || approvalVersion == ^uint64(0) {
 		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
-	preApprovalLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, waiting, approvalVersion, waiting.runner+(approvalVersion-waiting.version))
-	if err != nil {
+	// The waiting_approval endpoint can be historical by the time a merge
+	// observation/reconciliation asks for it.  Collect only independently
+	// authenticated endpoint witnesses, then require them to agree.  In
+	// particular, never derive a leader from a version delta: pause/resume
+	// events deliberately do not contain one.
+	candidates := make([]normalRecoveryEndpoint, 0, 4)
+	appendCandidate := func(value normalRecoveryEndpoint) error {
+		if value.version != approvalVersion || value.runner == 0 || value.leader == 0 {
+			return ErrPublicationEvidence
+		}
+		if err := validatePostPublicationEndpointAdvance(ctx, conn, ref, domain.StateWaitingApproval, waiting, value); err != nil {
+			return ErrPublicationEvidence
+		}
+		for _, existing := range candidates {
+			if existing == value {
+				return nil
+			}
+		}
+		candidates = append(candidates, value)
+		return nil
+	}
+	if approvalVersion == waiting.version {
+		if err := appendCandidate(waiting); err != nil {
+			return normalRecoveryEndpoint{}, err
+		}
+	}
+	// Do not use the live daemon leader as a historical endpoint witness.  A
+	// leader takeover can occur before its signed recovery row exists; that
+	// leader is precisely what this proof must not trust.  The waiting
+	// endpoint, runtime control authority, signed recovery, and merge intent
+	// below are all immutable/counter-bound witnesses instead.
+	intent, foundIntent, intentErr := singleRecoveryMergeIntent(ctx, conn, ref)
+	if intentErr != nil {
 		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
-	if approvalVersion == ^uint64(0) {
+	if foundIntent {
+		if approvalVersion == ^uint64(0) || intent.TicketVersion <= approvalVersion {
+			return normalRecoveryEndpoint{}, ErrPublicationEvidence
+		}
+		// Only an intent at the direct merging successor can witness the
+		// historical approval endpoint. A newer intent is downstream evidence
+		// (for example after a signed daemon recovery) and is authenticated later
+		// by authenticateMergingRecoveryEffect; it must not make the older
+		// approval baseline ambiguous.
+		if intent.TicketVersion == approvalVersion+1 {
+			if err := appendCandidate(normalRecoveryEndpoint{version: approvalVersion, runner: intent.RunnerEpoch, leader: intent.LeaderEpoch}); err != nil {
+				return normalRecoveryEndpoint{}, err
+			}
+		}
+	}
+	control, controlErr := runtimeControlFrom(ctx, conn, ref)
+	if controlErr != nil && !errors.Is(controlErr, ErrStaleFence) {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	if controlErr == nil && control.authority.version == approvalVersion {
+		if (control.state != "open" && control.state != "sealed") || control.authority.runner == 0 || control.authority.leader == 0 {
+			return normalRecoveryEndpoint{}, ErrPublicationEvidence
+		}
+		if err := appendCandidate(normalRecoveryEndpoint{version: control.authority.version, runner: control.authority.runner, leader: control.authority.leader}); err != nil {
+			return normalRecoveryEndpoint{}, err
+		}
+	}
+	// A pause/take stores the stopping endpoint (pre-stop version +1) and the
+	// incremented runner. After drained + resume/retry, the historical waiting
+	// endpoint is therefore stop.version+2. This remains available after the
+	// open authority advances through approval and a later daemon recovery.
+	// appendCandidate independently authenticates the exact control triplet.
+	if controlErr == nil && control.stop.version <= ^uint64(0)-2 && control.stop.version+2 == approvalVersion {
+		if (control.state != "open" && control.state != "sealed") || control.stop.runner == 0 || control.stop.leader == 0 {
+			return normalRecoveryEndpoint{}, ErrPublicationEvidence
+		}
+		if err := appendCandidate(normalRecoveryEndpoint{version: approvalVersion, runner: control.stop.runner, leader: control.stop.leader}); err != nil {
+			return normalRecoveryEndpoint{}, err
+		}
+	}
+	recovery, foundRecovery, recoveryErr := loadRunnerRecoveryAt(ctx, conn, ref, approvalVersion)
+	if recoveryErr != nil {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	if foundRecovery {
+		if !validRunnerRecovery(recovery) || recovery.TicketVersion != approvalVersion {
+			return normalRecoveryEndpoint{}, ErrPublicationEvidence
+		}
+		if err := appendCandidate(normalRecoveryEndpoint{version: recovery.TicketVersion, runner: recovery.RunnerEpoch, leader: recovery.LeaderEpoch}); err != nil {
+			return normalRecoveryEndpoint{}, err
+		}
+	}
+	if len(candidates) != 1 {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
+	}
+	preApproval := candidates[0]
+	if preApproval.version != approvalVersion {
 		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
 	var payload string
@@ -1268,7 +1489,7 @@ func (s *Store) approvalRecoveryEndpoint(ctx context.Context, conn *sql.Conn, re
 	if err != nil || string(canonical) != payload || len(approved) > 2 {
 		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
-	return normalRecoveryEndpoint{version: approvalVersion + 1, runner: waiting.runner + (approvalVersion - waiting.version), leader: preApprovalLeader}, nil
+	return normalRecoveryEndpoint{version: approvalVersion + 1, runner: preApproval.runner, leader: preApproval.leader}, nil
 }
 
 // normalRecoveryLeaderAt authenticates a historical endpoint through only
@@ -1430,10 +1651,16 @@ func (s *Store) authenticateMergingRecoveryEffect(ctx context.Context, conn *sql
 			return ErrPublicationEvidence
 		}
 		delta := current.version - intent.TicketVersion
-		if delta != current.runner-intent.RunnerEpoch || delta == ^uint64(0) || intent.ClaimEpoch > ^uint64(0)-delta-1 {
+		if delta != current.runner-intent.RunnerEpoch || intent.ClaimEpoch > ^uint64(0)-delta {
 			return ErrPublicationEvidence
 		}
-		minimumClaim := intent.ClaimEpoch + delta + 1
+		// ReconcileEffects revokes the external claimant once per leader change.
+		// FenceRecoveredRunners then advances the ticket/runner; that fence does
+		// not claim the effect a second time. The first complete recovery is
+		// therefore intent+1, not intent+2. Interrupted recovery attempts may
+		// add further claim epochs, bounded below by the ticket delta and above
+		// by the authenticated leader delta.
+		minimumClaim := intent.ClaimEpoch + delta
 		if effect.ClaimEpoch < minimumClaim || newLeader <= intent.LeaderEpoch || effect.ClaimEpoch-intent.ClaimEpoch > newLeader-intent.LeaderEpoch {
 			return ErrPublicationEvidence
 		}
@@ -1650,19 +1877,19 @@ func authenticateMergePromotionBridge(ctx context.Context, conn *sql.Conn, ref d
 	return authenticatePostPublicationEndpointBridge(ctx, conn, ref, domain.StateMerging, prior, current)
 }
 
-func authenticatePostPublicationEndpointBridge(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, prior, current normalRecoveryEndpoint) error {
-	if (state != domain.StateMerging && state != domain.StateReconciling && state != domain.StateWaitingManualMerge) || prior.version == 0 || prior.runner == 0 || prior.leader == 0 || current.version < prior.version || current.runner < prior.runner || current.leader < prior.leader {
+func authenticatePostPublicationEndpointBridge(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, state domain.State, prior, current normalRecoveryEndpoint) error {
+	if (state != domain.StateReviewing && state != domain.StateWaitingApproval && state != domain.StateWaitingManualMerge && state != domain.StateMerging && state != domain.StateReconciling) || prior.version == 0 || prior.runner == 0 || prior.leader == 0 || current.version < prior.version || current.runner < prior.runner || current.leader < prior.leader {
 		return ErrPublicationEvidence
 	}
-	return validatePostPublicationEndpointAdvance(ctx, conn, ref, state, prior, current)
+	return validatePostPublicationEndpointAdvance(ctx, q, ref, state, prior, current)
 }
 
-func authenticateCurrentPostPublicationEndpointBridge(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, prior, current normalRecoveryEndpoint) error {
-	if err := authenticatePostPublicationEndpointBridge(ctx, conn, ref, state, prior, current); err != nil {
+func authenticateCurrentPostPublicationEndpointBridge(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, state domain.State, prior, current normalRecoveryEndpoint) error {
+	if err := authenticatePostPublicationEndpointBridge(ctx, q, ref, state, prior, current); err != nil {
 		return err
 	}
 	var future int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ref.Channel, ref.Project, ref.Ticket, current.version).Scan(&future); err != nil || future != 0 {
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ref.Channel, ref.Project, ref.Ticket, current.version).Scan(&future); err != nil || future != 0 {
 		return ErrPublicationEvidence
 	}
 	return nil
@@ -1686,17 +1913,17 @@ func currentPostPublicationLeader(ctx context.Context, conn *sql.Conn, ref domai
 // exact retry-exhaustion/retry pairs. It is deliberately separate from the
 // generic runner helpers: phase transitions cannot carry publication/merge
 // authority, and a counter gap without one of these rows must fail closed.
-func validatePostPublicationEndpointAdvance(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, source, target normalRecoveryEndpoint) error {
-	if ref.Validate() != nil || (state != domain.StateMerging && state != domain.StateReconciling && state != domain.StateWaitingManualMerge) || source.version == 0 || source.runner == 0 || source.leader == 0 || target.version < source.version || target.runner < source.runner || target.leader < source.leader || target.version-source.version > 64 {
+func validatePostPublicationEndpointAdvance(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, state domain.State, source, target normalRecoveryEndpoint) error {
+	if ref.Validate() != nil || (state != domain.StateReviewing && state != domain.StateWaitingApproval && state != domain.StateWaitingManualMerge && state != domain.StateMerging && state != domain.StateReconciling) || source.version == 0 || source.runner == 0 || source.leader == 0 || target.version < source.version || target.runner < source.runner || target.leader < source.leader || target.version-source.version > 64 {
 		return ErrPublicationEvidence
 	}
 	if source == target {
 		return nil
 	}
-	if err := validateRunnerRecoveryCardinality(ctx, conn, ref); err != nil {
+	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
 		return err
 	}
-	rows, err := conn.QueryContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, source.version, target.version)
+	rows, err := q.QueryContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, source.version, target.version)
 	if err != nil {
 		return err
 	}
@@ -1726,23 +1953,23 @@ func validatePostPublicationEndpointAdvance(ctx context.Context, conn *sql.Conn,
 	var previousCreated time.Time
 	for _, step := range recoveries {
 		predecessor := normalRecoveryEndpoint{version: step.PriorTicketVersion, runner: step.PriorRunnerEpoch, leader: step.PriorLeaderEpoch}
-		if err := validatePostPublicationControlAdvance(ctx, conn, ref, state, expected, predecessor); err != nil {
+		if err := validatePostPublicationControlAdvance(ctx, q, ref, state, expected, predecessor); err != nil {
 			return ErrPublicationEvidence
 		}
 		if !previousCreated.IsZero() && !step.CreatedAt.After(previousCreated) {
 			return ErrPublicationEvidence
 		}
 		var transitions int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, step.TicketVersion).Scan(&transitions); err != nil || transitions != 0 {
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, step.TicketVersion).Scan(&transitions); err != nil || transitions != 0 {
 			return ErrPublicationEvidence
 		}
 		expected = normalRecoveryEndpoint{version: step.TicketVersion, runner: step.RunnerEpoch, leader: step.LeaderEpoch}
 		previousCreated = step.CreatedAt
 	}
-	return validatePostPublicationControlAdvance(ctx, conn, ref, state, expected, target)
+	return validatePostPublicationControlAdvance(ctx, q, ref, state, expected, target)
 }
 
-func validatePostPublicationControlAdvance(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, source, target normalRecoveryEndpoint) error {
+func validatePostPublicationControlAdvance(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, state domain.State, source, target normalRecoveryEndpoint) error {
 	if source.version == 0 || source.runner == 0 || source.leader == 0 || target.version < source.version || target.runner < source.runner || target.leader < source.leader {
 		return ErrPublicationEvidence
 	}
@@ -1752,7 +1979,7 @@ func validatePostPublicationControlAdvance(ctx context.Context, conn *sql.Conn, 
 		}
 		return nil
 	}
-	rows, err := conn.QueryContext(ctx, `SELECT ticket_version,trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND from_state<>to_state ORDER BY ticket_version,id`, ref.Channel, ref.Project, ref.Ticket, source.version, target.version)
+	rows, err := q.QueryContext(ctx, `SELECT ticket_version,trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND from_state<>to_state ORDER BY ticket_version,id`, ref.Channel, ref.Project, ref.Ticket, source.version, target.version)
 	if err != nil {
 		return err
 	}
@@ -1801,7 +2028,12 @@ func validatePostPublicationControlAdvance(ctx context.Context, conn *sql.Conn, 
 				return ErrPublicationEvidence
 			}
 			drained, resumed := transitions[index+1], transitions[index+2]
-			if drained.version != expectedVersion+2 || drained.trigger != "process_and_effects_drained" || drained.from != domain.StateStopping || drained.to != domain.StatePaused || resumed.version != expectedVersion+3 || resumed.trigger != "operator_resume" || resumed.from != domain.StatePaused || resumed.to != state {
+			// Both explicit resume and retry are valid ways to leave a sealed
+			// pause/take control sequence.  authenticatePostPublicationResume
+			// already enforces the same documented parity for rearm; keeping this
+			// lineage reader narrower would strand a reviewing or approval ticket
+			// that resumed with operator_retry.
+			if drained.version != expectedVersion+2 || drained.trigger != "process_and_effects_drained" || drained.from != domain.StateStopping || drained.to != domain.StatePaused || resumed.version != expectedVersion+3 || (resumed.trigger != "operator_resume" && resumed.trigger != "operator_retry") || resumed.from != domain.StatePaused || resumed.to != state {
 				return ErrPublicationEvidence
 			}
 			expectedVersion += 3

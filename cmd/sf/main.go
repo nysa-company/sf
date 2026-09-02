@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -62,8 +63,10 @@ func main() {
 	}
 	if len(os.Args) >= 3 && os.Args[1] == "__repository_node_command_gate" {
 		// FD 3 carries durable Store authority and FD 4 is the authenticated
-		// worktree. This gate is deliberately separate from Go's test-wrapper
-		// gate: Node itself is the only executable after Seatbelt starts.
+		// launch root: the worktree for the ordinary recipe or the private staged
+		// TypeScript closure for nysa_api_pure_v1. This gate is deliberately
+		// separate from Go's test-wrapper gate: Node itself is the only executable
+		// after Seatbelt starts.
 		gate := os.NewFile(uintptr(3), "repository-node-launch-gate")
 		if gate == nil {
 			os.Exit(125)
@@ -79,8 +82,22 @@ func main() {
 		if err != nil {
 			os.Exit(125)
 		}
-		profile, err := processsupervisor.RepositoryNodeSandboxProfile(os.Getenv("SF_REPOSITORY_NODE_WORKTREE"), os.Getenv("SF_REPOSITORY_NODE_CLOSURE"), target)
-		if err != nil || processsupervisor.ApplyRepositoryTestSandbox(profile) != nil {
+		worktree, closure := os.Getenv("SF_REPOSITORY_NODE_WORKTREE"), os.Getenv("SF_REPOSITORY_NODE_CLOSURE")
+		var profile string
+		var profileErr error
+		if rawFiles := os.Getenv("SF_REPOSITORY_NODE_FILES"); rawFiles != "" {
+			var files []string
+			if err := json.Unmarshal([]byte(rawFiles), &files); err != nil {
+				os.Exit(125)
+			}
+			if files == nil {
+				os.Exit(125)
+			}
+			profile, profileErr = processsupervisor.RepositoryNodeSandboxProfileForFiles(worktree, closure, target, files)
+		} else {
+			profile, profileErr = processsupervisor.RepositoryNodeSandboxProfile(worktree, closure, target)
+		}
+		if profileErr != nil || processsupervisor.ApplyRepositoryTestSandbox(profile) != nil {
 			os.Exit(125)
 		}
 		syscall.CloseOnExec(3)

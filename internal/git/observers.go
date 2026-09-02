@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/nysa-company/sf/internal/contracts"
@@ -15,6 +16,72 @@ type CommitObservation struct {
 	CommitOID string
 	ParentOID string
 	TreeOID   string
+}
+
+// ObserveOperatorSourceCommit authenticates a clean, single-parent commit
+// whose parent is the retained verification checkpoint. It returns the exact
+// tree and canonical A/M/D path set; callers still apply Planner and
+// verification-ownership policy to that immutable observation.
+func (r Runner) ObserveOperatorSourceCommit(ctx context.Context, worktree Worktree, expectedParent string) (contracts.OperatorSourceCommit, error) {
+	if !validOID(expectedParent) {
+		return contracts.OperatorSourceCommit{}, fmt.Errorf("%w: retained verification parent is invalid", ErrIdentityMismatch)
+	}
+	head, err := r.CleanWorktreeHead(ctx, worktree)
+	if err != nil {
+		return contracts.OperatorSourceCommit{}, err
+	}
+	commit, err := r.ObserveCommit(ctx, worktree)
+	if err != nil {
+		return contracts.OperatorSourceCommit{}, err
+	}
+	if commit.CommitOID != head || commit.ParentOID != expectedParent || commit.CommitOID == expectedParent {
+		return contracts.OperatorSourceCommit{}, fmt.Errorf("%w: operator commit is not the exact one-parent successor of the verification checkpoint", ErrUnexpectedRemote)
+	}
+	raw, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno,
+		"diff", "--no-renames", "--name-status", "-z", expectedParent, commit.CommitOID)
+	if err != nil {
+		return contracts.OperatorSourceCommit{}, err
+	}
+	parts := splitNUL(raw)
+	if len(parts) == 0 || len(parts)%2 != 0 || len(parts)/2 > 256 {
+		return contracts.OperatorSourceCommit{}, fmt.Errorf("%w: operator commit requires a bounded nonempty A/M/D delta", ErrUnsafeWorktree)
+	}
+	changes := make([]contracts.OperatorSourceChange, 0, len(parts)/2)
+	paths := make([]string, 0, len(parts)/2)
+	seen := make(map[string]struct{}, len(parts)/2)
+	for index := 0; index < len(parts); index += 2 {
+		status, path := parts[index], parts[index+1]
+		if status != "A" && status != "M" && status != "D" {
+			return contracts.OperatorSourceCommit{}, fmt.Errorf("%w: operator commit contains unsupported status %q", ErrUnsafeWorktree, status)
+		}
+		if !validRepoPath(path) {
+			return contracts.OperatorSourceCommit{}, fmt.Errorf("%w: operator commit contains an invalid path", ErrUnsafeWorktree)
+		}
+		if _, duplicate := seen[path]; duplicate {
+			return contracts.OperatorSourceCommit{}, fmt.Errorf("%w: operator commit contains a duplicate path", ErrUnsafeWorktree)
+		}
+		seen[path] = struct{}{}
+		changes = append(changes, contracts.OperatorSourceChange{Status: status, Path: path})
+		paths = append(paths, path)
+	}
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+	sort.Strings(paths)
+	policy := DiffPolicy{AllowedPaths: paths, ExpectedHead: expectedParent}
+	if err := r.validateImmutableTree(ctx, worktree.Path, expectedParent, commit.TreeOID, policy); err != nil {
+		return contracts.OperatorSourceCommit{}, err
+	}
+	if err := validateSpecialFiles(worktree.Path); err != nil {
+		return contracts.OperatorSourceCommit{}, err
+	}
+	finalHead, err := r.CleanWorktreeHead(ctx, worktree)
+	if err != nil || finalHead != commit.CommitOID {
+		return contracts.OperatorSourceCommit{}, fmt.Errorf("%w: operator commit or worktree changed during observation", ErrUnexpectedRemote)
+	}
+	finalCommit, err := r.ObserveCommit(ctx, worktree)
+	if err != nil || finalCommit != commit {
+		return contracts.OperatorSourceCommit{}, fmt.Errorf("%w: operator commit identity changed during observation", ErrUnexpectedRemote)
+	}
+	return contracts.OperatorSourceCommit{CommitOID: commit.CommitOID, ParentOID: commit.ParentOID, TreeOID: commit.TreeOID, Changes: changes}, nil
 }
 
 // RegisteredWorktreeResolver supplies an already registered, authenticated

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/nysa-company/sf/internal/contracts"
+	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/workflowprompt"
@@ -26,6 +28,32 @@ func TestRepositoryMaterializerMissingStoreFailsClosed(t *testing.T) {
 	}
 	if err := materializer.AuthenticateCandidate(context.Background(), request, workflowprompt.PlanIdentity{}, workflowprompt.VerificationIdentity{}, phaseartifact.Builder{}, workflowworker.CandidateWitness{}); !errors.Is(err, ErrRepositoryMaterialization) {
 		t.Fatalf("candidate authenticator error=%v", err)
+	}
+}
+
+func TestVerificationAmendmentCheckpointDigestIgnoresRecoveryFence(t *testing.T) {
+	amendment := &store.VerificationAmendment{
+		TransitionTicketVersion: 7,
+		ConsumedVersion:         6,
+		Fence:                   domain.Fence{LeaderEpoch: 11, RunnerEpoch: 4},
+		Prior:                   store.VerificationRevision{Revision: 2, IntentDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ProofDigest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", CheckpointID: "cccccccccccccccccccccccccccccccccccccccc"},
+		BuilderResult:           store.ProviderAttemptResultKey{AttemptID: 3, Ref: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "SF-1"}, Phase: domain.PhaseBuild, Attempt: 1},
+		BuilderTypedSHA256:      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ProposedDigest:          "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+		ProposedCommand:         []string{"go", "test", "./..."},
+		Reason:                  "replace protected proof",
+		Requester:               "builder",
+		BudgetRequestID:         "verification-amendment/3/digest",
+	}
+	request := workflowworker.PhaseRequest{Ticket: store.Ticket{Ref: amendment.BuilderResult.Ref, Version: 7, RunnerEpoch: 4}, Fence: amendment.Fence, Worktree: store.StoredWorktree{Path: "/worktree", Branch: "dev/p/SF-1", IdentityJSON: []byte(`{"repository":"/repo"}`), BaseSHA: "ffffffffffffffffffffffffffffffffffffffff"}, Amendment: amendment}
+	provider := store.ProviderAttemptResultKey{AttemptID: 4, Ref: request.Ticket.Ref, Phase: domain.PhaseVerification, Attempt: 2}
+	command := contracts.RepositoryCommandResultKey{SemanticKey: "command", ClaimEpoch: 1}
+	artifact := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ProofKind: phaseartifact.ProofAcceptance, OwnedFiles: []string{"internal"}, Command: []string{"go", "test", "./..."}, PrebuildOutcome: "red", EvidenceDigest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	stable := verificationAmendmentCheckpointCommitDigest(request, provider, command, "result", artifact)
+	request.Ticket.Version, request.Ticket.RunnerEpoch = 9, 6
+	request.Fence = domain.Fence{LeaderEpoch: 13, RunnerEpoch: 6}
+	if recovered := verificationAmendmentCheckpointCommitDigest(request, provider, command, "result", artifact); recovered != stable {
+		t.Fatalf("recovery changed amendment checkpoint digest: %q != %q", recovered, stable)
 	}
 }
 

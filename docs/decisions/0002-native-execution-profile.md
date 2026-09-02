@@ -85,8 +85,9 @@ discovery file plus successful execution of the fixed `node --test` recipe, not
 source parsing of test bodies. No discovered files refuses rather than turning
 local verification into an empty invocation.
 
-The implementation resolves only code-owned Node paths, authenticates major
-22, copies the complete non-system Mach-O closure to an owner-only stage, and
+The implementation resolves only the supported Homebrew Node entrypoints
+(`/opt/homebrew/bin/node` or `/usr/local/bin/node`), authenticates Node
+`>=22.8.0 <23`, copies the complete non-system Mach-O closure to an owner-only stage, and
 binds a canonical closure digest to the durable command claim. The Node gate
 uses the staged binary with `DYLD_LIBRARY_PATH`; its Seatbelt profile permits
 only the worktree, private closure, and necessary system reads while denying
@@ -95,3 +96,32 @@ flags are defense in depth. npm, package scripts, dependencies, and TypeScript
 remain durable GitHub CI or operator takeover. Docker and Colima are not a
 prerequisite for this recipe, and this does not change the ADR's negative
 autonomous eligibility verdict.
+
+## Guarded `nysa_api_pure_v1` TypeScript compatibility slice
+
+Nysa has one deliberately small local exception for a pure API-kernel test. It
+is selected only by the immutable argv form
+`node --sf-nysa-api-pure-v1 <canonical-relative.test.ts>`; the test path is
+stored in the project/ticket configuration, not inferred from package scripts
+or a workspace. The command is bounded to 60 seconds.
+
+sf validates the selected test and its static closure through the authenticated
+worktree FD immediately before launch. It permits only the minimal
+`node:test`/`node:assert` builtin allowlist and relative `.js` imports that map
+to a confined same-path `.ts` file. Bare
+packages, `node_modules`, dynamic import/require, URL or extensionless
+resolution, JSX, symlinks, and path escapes refuse. A missing confined
+implementation is permitted only as the expected prebuild-red condition; it
+is not replaced, compiled by another tool, or treated as a pass.
+
+The resolver is factory-owned source staged beside the private Node runtime.
+The exact FD-read TypeScript closure is separately copied into a private
+per-launch stage from canonical path, inode, size, and SHA-256 evidence. The
+stage is sealed read-only and carries the matching manifest; the resolver
+checks that manifest before loading every source file. Its digest
+is combined with the Node Mach-O closure identity in the durable command claim,
+so changing either runtime artifact invalidates a frozen ticket. Node remains
+under the existing no-network/no-write/no-fork/no-exec Seatbelt and Node
+permission boundary. This permits pure unit kernels such as
+`apps/api/tests/retrieval-fusion.test.ts`; database/API integration and the
+rest of the npm workspace remain credential-free CI or operator takeover.

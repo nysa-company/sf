@@ -2,11 +2,14 @@ package localruntime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/engine"
@@ -39,6 +42,15 @@ func (e *ciBlockEngine) SignalPlan(context.Context, contracts.SignalRequest) (co
 func (e *ciBlockEngine) SignalVerification(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error) {
 	return contracts.TransitionResult{}, errors.New("unexpected verification signal")
 }
+func (e *ciBlockEngine) SignalVerificationAmendment(context.Context, contracts.SignalRequest, store.VerificationAmendmentDecision, store.ProviderAttemptResultKey) (contracts.TransitionResult, error) {
+	return contracts.TransitionResult{}, errors.New("unexpected verification amendment signal")
+}
+func (e *ciBlockEngine) SignalVerificationAmendmentRequest(context.Context, contracts.SignalRequest, store.ProviderAttemptResultKey) (contracts.TransitionResult, error) {
+	return contracts.TransitionResult{}, errors.New("unexpected verification amendment request signal")
+}
+func (e *ciBlockEngine) SignalVerificationAmendmentBlocked(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return e.Signal(ctx, request)
+}
 func (e *ciBlockEngine) SignalCandidate(context.Context, contracts.SignalRequest, domain.CandidateSnapshot) (contracts.TransitionResult, error) {
 	return contracts.TransitionResult{}, errors.New("unexpected candidate signal")
 }
@@ -53,6 +65,53 @@ func (e *ciBlockEngine) SignalFinalReviewNeedsOperator(context.Context, contract
 }
 
 var _ workflowworker.StateMachine = (*ciBlockEngine)(nil)
+
+func TestFrozenMergeMethodUsesTicketConfiguration(t *testing.T) {
+	for _, method := range []string{"merge", "squash", "rebase"} {
+		t.Run(method, func(t *testing.T) {
+			project := config.DefaultProject("nysa", "/tmp/nysa")
+			project.MergeMethod = method
+			effective, err := config.Resolve(config.DefaultMachineLimits(), project, config.TicketOverride{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, digest, err := config.Snapshot(effective)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := frozenMergeMethod(store.Ticket{ConfigSnapshot: snapshot, ConfigDigest: digest})
+			if err != nil || got != method {
+				t.Fatalf("frozen merge method=%q err=%v, want %q", got, err, method)
+			}
+		})
+	}
+}
+
+func TestFrozenMergeMethodRejectsMalformedOrDriftedSnapshot(t *testing.T) {
+	project := config.DefaultProject("nysa", "/tmp/nysa")
+	effective, err := config.Resolve(config.DefaultMachineLimits(), project, config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drifted := append([]byte(nil), snapshot...)
+	drifted[len(drifted)-1] ^= 1
+	malformed := []byte(`{"project":`)
+	malformedDigest := sha256.Sum256(malformed)
+	for name, ticket := range map[string]store.Ticket{
+		"drifted":   {ConfigSnapshot: drifted, ConfigDigest: digest},
+		"malformed": {ConfigSnapshot: malformed, ConfigDigest: hex.EncodeToString(malformedDigest[:])},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := frozenMergeMethod(ticket); err == nil || got != "" {
+				t.Fatalf("frozen merge method=%q err=%v, want rejection", got, err)
+			}
+		})
+	}
+}
 
 func TestPrePublishingWorkerBlocksPublishingWithActionableChannelGuidance(t *testing.T) {
 	database := openStore(t)

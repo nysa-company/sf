@@ -68,6 +68,59 @@ func TestConfirmPreparedCommitAuthenticatesCurrentPreparedTupleAndIsIdempotent(t
 	}
 }
 
+func TestConfirmPreparedCommitSettlesOnlyExactUncertainPreparedTuple(t *testing.T) {
+	for name, observation := range map[string]func(GitMutationIntent, string, string) contracts.PreparedCommitObservation{
+		"exact": func(intent GitMutationIntent, commit, tree string) contracts.PreparedCommitObservation {
+			return contracts.PreparedCommitObservation{CommitOID: commit, ParentOID: intent.ExpectedHeadOID, TreeOID: tree}
+		},
+		"mismatched tree": func(intent GitMutationIntent, commit, _ string) contracts.PreparedCommitObservation {
+			return contracts.PreparedCommitObservation{CommitOID: commit, ParentOID: intent.ExpectedHeadOID, TreeOID: strings.Repeat("d", 40)}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			intent := gitIntentFixture(t, db, ctx, "SF-prepared-uncertain-"+strings.ReplaceAll(name, " ", "-"))
+			claim, err := db.IssueGitMutationClaim(ctx, intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := db.AcquireGitMutation(ctx, claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			commit, tree := strings.Repeat("b", 40), strings.Repeat("c", 40)
+			if err := lease.(contracts.GitMutationRecoveryFactsLease).RecordPreparedCommit(ctx, commit, tree); err != nil {
+				t.Fatal(err)
+			}
+			if err := lease.Release(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.MarkEffectUncertain(ctx, EffectFence{SemanticKey: claim.SemanticKey, Ref: claim.TicketRef, TicketVersion: claim.TicketVersion, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}); err != nil {
+				t.Fatal(err)
+			}
+			before, err := db.Effect(ctx, claim.SemanticKey)
+			if err != nil || before.State != EffectUncertain {
+				t.Fatalf("uncertain effect=%+v err=%v", before, err)
+			}
+
+			confirmed, err := db.ConfirmPreparedCommit(ctx, claim, observation(intent, commit, tree))
+			if name == "exact" {
+				if err != nil || confirmed.State != EffectConfirmed || confirmed.ObservedIdentity != commit {
+					t.Fatalf("confirmed=%+v err=%v", confirmed, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrGitMutationIntent) {
+				t.Fatalf("mismatch err=%v", err)
+			}
+			after, readErr := db.Effect(ctx, claim.SemanticKey)
+			if readErr != nil || after != before {
+				t.Fatalf("mismatch changed uncertain effect: before=%+v after=%+v err=%v", before, after, readErr)
+			}
+		})
+	}
+}
+
 func TestConfirmPreparedCommitRefusesActiveLeaseAndMismatch(t *testing.T) {
 	db, ctx := openTestStore(t)
 	intent := gitIntentFixture(t, db, ctx, "SF-prepared-normal-reject")

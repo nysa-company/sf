@@ -17,7 +17,7 @@ func TestParseMinimalTicket(t *testing.T) {
 	if parsed.Title != "Fix reminders" || parsed.Problem != "Users receive duplicates." {
 		t.Fatalf("unexpected ticket: %+v", parsed)
 	}
-	if parsed.Type != domain.TicketFeature || parsed.MergeMode != domain.MergeGuarded {
+	if parsed.Type != domain.TicketFeature || parsed.MergeMode != domain.MergeGuarded || parsed.MergeModeExplicit {
 		t.Fatalf("unexpected defaults: %+v", parsed)
 	}
 	if string(parsed.Source) != source || len(parsed.Digest) != 64 {
@@ -31,7 +31,7 @@ func TestParseStrictFrontMatter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if parsed.Type != domain.TicketBug || parsed.MergeMode != domain.MergeManual || parsed.Priority != "high" || parsed.MaxDuration.String() != "1h30m0s" || parsed.MaxCostMicroUSD != 20_125_000 {
+	if parsed.Type != domain.TicketBug || parsed.MergeMode != domain.MergeManual || !parsed.MergeModeExplicit || parsed.Priority != "high" || parsed.MaxDuration.String() != "1h30m0s" || parsed.MaxCostMicroUSD != 20_125_000 {
 		t.Fatalf("unexpected front matter: %+v", parsed)
 	}
 }

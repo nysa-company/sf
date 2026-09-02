@@ -251,6 +251,109 @@ func (s *Store) IssueGitMutationClaim(ctx context.Context, intent GitMutationInt
 	return claim, err
 }
 
+// ReclaimProtectedRefFetch reissues only the exact protected-ref proof after
+// its prior child claim became uncertain. The fetch writes one deterministic,
+// private local proof ref; it never changes the remote protected branch. A
+// replacement is therefore safe only after the Store proves the immutable
+// original claim reaches the current merging endpoint through the signed
+// post-publication recovery/control lineage. The Git runner must still acquire
+// its exclusive Store lease before it can materialize that proof ref.
+//
+// This deliberately does not generalize uncertain Git mutation recovery.
+// Commit, push, and worktree effects have operation-specific observation rules
+// and must not be retried through this narrow idempotent-proof path.
+func (s *Store) ReclaimProtectedRefFetch(ctx context.Context, intent GitMutationIntent) (contracts.GitMutationClaim, error) {
+	if s == nil || !validGitIntent(intent) || intent.Operation != "protected-ref-fetch" {
+		return contracts.GitMutationClaim{}, ErrGitMutationIntent
+	}
+	var claim contracts.GitMutationClaim
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		var state domain.State
+		var version, runner, leader uint64
+		if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch
+			FROM tickets t JOIN daemon_instances d ON d.channel=t.channel
+			WHERE t.channel=? AND t.project_id=? AND t.id=?`, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket).
+			Scan(&state, &version, &runner, &leader); err != nil {
+			return err
+		}
+		if state != domain.StateMerging || version != intent.TicketVersion || runner != intent.Fence.RunnerEpoch || leader != intent.Fence.LeaderEpoch {
+			return ErrStaleFence
+		}
+		if err := s.assertTicketFence(ctx, conn, intent.Ref, intent.TicketVersion, intent.Fence); err != nil {
+			return err
+		}
+		facts, err := gitMutationIntentFactsFrom(ctx, conn, intent.SemanticKey)
+		if err != nil || !sameGitMutationBinding(intent, facts.Claim) || facts.Effect.Ref != intent.Ref || facts.Effect.Kind != "git/protected-ref-fetch" || facts.Effect.RequestDigest != intent.RequestDigest {
+			return ErrGitMutationIntent
+		}
+		// ReconcileEffects moves a revoked child to the current leader and
+		// increments its effect claim epoch. Its immutable Git intent remains
+		// the original launch witness until this successful replacement.
+		if facts.Effect.State != EffectUncertain || facts.Effect.ObservedIdentity != "" ||
+			facts.Effect.TicketVersion != facts.Claim.TicketVersion || facts.Effect.RunnerEpoch != facts.Claim.RunnerEpoch ||
+			facts.Effect.LeaderEpoch != intent.Fence.LeaderEpoch || facts.Effect.ClaimEpoch < facts.Claim.ClaimEpoch {
+			return ErrStaleFence
+		}
+		prior := normalRecoveryEndpoint{version: facts.Claim.TicketVersion, runner: facts.Claim.RunnerEpoch, leader: facts.Claim.LeaderEpoch}
+		current := normalRecoveryEndpoint{version: intent.TicketVersion, runner: intent.Fence.RunnerEpoch, leader: intent.Fence.LeaderEpoch}
+		if err := authenticateCurrentPostPublicationEndpointBridge(ctx, conn, intent.Ref, domain.StateMerging, prior, current); err != nil {
+			return ErrStaleFence
+		}
+		// An active or quarantined lease is a durable no-writer exclusion. Do
+		// not replace an uncertain proof until startup or the original runner
+		// has conclusively released that exact repository lease.
+		if err := repositoryHasGitWriter(ctx, conn, intent.Repository); err != nil {
+			return err
+		}
+		if facts.Effect.ClaimEpoch == ^uint64(0) {
+			return ErrStaleFence
+		}
+		claimEpoch := facts.Effect.ClaimEpoch + 1
+		updated, err := conn.ExecContext(ctx, `UPDATE effects
+			SET state='executing',ticket_version=?,leader_epoch=?,runner_epoch=?,claim_epoch=?,observed_identity=''
+			WHERE semantic_key=? AND state='uncertain' AND channel=? AND project_id=? AND ticket_id=?
+			AND effect_kind='git/protected-ref-fetch' AND request_digest=?
+			AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=? AND observed_identity=''`,
+			intent.TicketVersion, intent.Fence.LeaderEpoch, intent.Fence.RunnerEpoch, claimEpoch,
+			intent.SemanticKey, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket, intent.RequestDigest,
+			facts.Effect.TicketVersion, facts.Effect.LeaderEpoch, facts.Effect.RunnerEpoch, facts.Effect.ClaimEpoch)
+		if err != nil {
+			return err
+		}
+		if changed, _ := updated.RowsAffected(); changed != 1 {
+			return ErrStaleFence
+		}
+		updated, err = conn.ExecContext(ctx, `UPDATE git_mutation_intents
+			SET ticket_version=?,leader_epoch=?,runner_epoch=?,claim_epoch=?,created_at=?
+			WHERE semantic_key=? AND channel=? AND project_id=? AND ticket_id=? AND request_digest=?
+			AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?
+			AND repository_path=? AND worktree_path=? AND branch_ref=? AND operation='protected-ref-fetch'
+			AND base_ref=? AND expected_base_oid=? AND expected_head_oid=?`,
+			intent.TicketVersion, intent.Fence.LeaderEpoch, intent.Fence.RunnerEpoch, claimEpoch, time.Now().UTC().Format(time.RFC3339Nano),
+			intent.SemanticKey, intent.Ref.Channel, intent.Ref.Project, intent.Ref.Ticket, intent.RequestDigest,
+			facts.Claim.TicketVersion, facts.Claim.LeaderEpoch, facts.Claim.RunnerEpoch, facts.Claim.ClaimEpoch,
+			intent.Repository, intent.Worktree, intent.Branch, intent.BaseRef, intent.ExpectedBaseOID, intent.ExpectedHeadOID)
+		if err != nil {
+			return err
+		}
+		if changed, _ := updated.RowsAffected(); changed != 1 {
+			return ErrGitMutationIntent
+		}
+		claim = contracts.GitMutationClaim{TicketRef: intent.Ref, SemanticKey: intent.SemanticKey, RequestDigest: intent.RequestDigest,
+			TicketVersion: intent.TicketVersion, LeaderEpoch: intent.Fence.LeaderEpoch, RunnerEpoch: intent.Fence.RunnerEpoch, ClaimEpoch: claimEpoch,
+			Repository: intent.Repository, Worktree: intent.Worktree, Branch: intent.Branch, Operation: intent.Operation,
+			BaseRef: intent.BaseRef, ExpectedBaseOID: intent.ExpectedBaseOID, ExpectedHeadOID: intent.ExpectedHeadOID}
+		return nil
+	})
+	return claim, err
+}
+
+func sameGitMutationBinding(intent GitMutationIntent, claim contracts.GitMutationClaim) bool {
+	return claim.TicketRef == intent.Ref && claim.SemanticKey == intent.SemanticKey && claim.RequestDigest == intent.RequestDigest &&
+		claim.Repository == intent.Repository && claim.Worktree == intent.Worktree && claim.Branch == intent.Branch &&
+		claim.Operation == intent.Operation && claim.BaseRef == intent.BaseRef && claim.ExpectedBaseOID == intent.ExpectedBaseOID && claim.ExpectedHeadOID == intent.ExpectedHeadOID
+}
+
 // AcquireGitMutation implements contracts.GitMutationAuthority.  It admits a
 // claim only when every caller field equals the immutable intent and its exact
 // effect remains executing under the current ticket fence.

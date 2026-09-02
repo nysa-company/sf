@@ -30,5 +30,6 @@ stable=$($scratch/stable/sf version --json)
 printf '%s' "$stable" | grep -F '"version":"1.2.3"' >/dev/null || fail "stable version was not embedded"
 printf '%s' "$stable" | grep -F '"commit":"'"$commit"'"' >/dev/null || fail "stable commit was not embedded"
 printf '%s' "$stable" | grep -F '"channel":"stable"' >/dev/null || fail "stable channel was not embedded"
+printf '%s' "$stable" | grep -F '"protocol":"sf.local/v1"' >/dev/null || fail "stable protocol was not reported"
 
 echo "release-build-smoke: PASS"

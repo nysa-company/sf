@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nysa-company/sf/internal/api"
@@ -49,6 +50,40 @@ func TestRunInitRegistersCanonicalProjectInSelectedChannelOnly(t *testing.T) {
 	}
 	if err := json.Unmarshal(replay.Data, &result); err != nil || result.Created {
 		t.Fatalf("replay result=%+v err=%v", result, err)
+	}
+}
+
+func TestRunInitBootstrapsExplicitNysaPureProfile(t *testing.T) {
+	repository := initializedRepository(t)
+	testPath := "apps/api/tests/retrieval-fusion.test.ts"
+	entrypoint := filepath.Join(repository, filepath.FromSlash(testPath))
+	if err := os.MkdirAll(filepath.Dir(entrypoint), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entrypoint, []byte("import test from 'node:test'; test('proof', () => {});\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	response := RunInit(context.Background(), InitRequest{
+		Channel: domain.ChannelDev, Project: "nysa", Repo: repository, Home: home,
+		Profile: config.NysaPureAPIV1Profile, TestPath: testPath,
+	})
+	if !response.OK {
+		t.Fatalf("response=%+v", response)
+	}
+	var result initResult
+	if err := json.Unmarshal(response.Data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Profile != config.NysaPureAPIV1Profile || result.TestPath != testPath || !result.ConfigCreated {
+		t.Fatalf("result=%+v", result)
+	}
+	data, err := os.ReadFile(filepath.Join(repository, ".sf", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `phase_timeout = '60s'`) || !strings.Contains(string(data), "--sf-nysa-api-pure-v1") || !strings.Contains(string(data), testPath) {
+		t.Fatalf("config=%q", data)
 	}
 }
 

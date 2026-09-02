@@ -5,6 +5,12 @@ commands never open SQLite or mutate workflow state in the CLI. The stable
 binary uses the `stable` channel; a development build uses `dev`, so the two
 channels have separate sockets and roots.
 
+In v1, `sf` can observe a manual external merge or request a guarded
+exact-head merge after a human approves the reviewed head. Autonomous ticket
+selection and merge are deliberately unavailable pending a stronger native
+containment proof and guarded pilot. Docker and Colima are not required and
+are never installed silently.
+
 ## Primary verbs
 
 ```text
@@ -63,9 +69,17 @@ operation because a passing result must carry the current supervisor's
 signature. `init` is implemented: it validates an
 absolute Git worktree root and its configured base branch, reads optional
 strict `.sf/config.toml`, creates only the selected channel's owner-only local
-state, and idempotently registers the canonical repository in SQLite. It never
-writes into the repository or contacts a remote. See
+state, and idempotently registers the canonical repository in SQLite. The
+normal form never writes into the repository or contacts a remote. An explicit
+`--profile nysa-api-pure-v1 --test <repo-relative .test.ts>` form safely creates
+the missing `.sf/config.toml` for one selected bounded pure-kernel test; it
+never overwrites an existing config. See
 [`configuration.md`](configuration.md).
+
+The pure TypeScript recipe requires Node `>=22.8.0 <23` from the supported
+Homebrew entrypoint for the host: `/opt/homebrew/bin/node` on Apple Silicon or
+`/usr/local/bin/node` on Intel. sf authenticates and stages the resolved
+runtime; it does not trust `PATH`, NVM, or another ambient Node installation.
 
 Doctor performs read-only checks for the
 channel root, socket, disk space, Git/gh executables, and an optional
@@ -96,25 +110,35 @@ The foreground daemon enables `take`, `resume`, `retry`, and `recover` in
 addition to the basic lifecycle commands. `take` follows the same fenced
 stop/drain authority as pause, then returns the authenticated absolute
 worktree path, branch, repository, base, and head. It never opens an editor or
-GUI. A repeated `take` is read-only and returns the same retained handoff.
+GUI. If an active ticket is stopped before a worktree exists, the human view
+says so and prints the channel-correct `resume` command instead of inventing a
+path. A repeated `take` is read-only and returns the same retained handoff.
 
-`resume` reauthenticates the registered worktree, branch, remotes, base, and
-filesystem identity. A clean checkout resumes its exact stored state. A
-bounded set of uncommitted source edits may instead resume into a fresh
-Builder cycle, but only when the checkout is still at the durable verification
-checkpoint, every changed path is inside the Planner's approved paths, and no
-verification-owned file changed. Those edits remain in the worktree for the
-Builder; they are not adopted directly as a candidate. The Builder must still
-produce a new result, repository-command proof, candidate, checks, and review
-before publication can continue.
+`resume` reauthenticates the registered worktree, branch, remote candidate,
+protected base, and filesystem identity. A clean checkout at an existing
+factory checkpoint resumes its exact stored state. Uncommitted operator source
+edits are retained but refused with `source_commit_required`: the operator
+must create one clean commit on the displayed ticket branch first. sf then
+accepts that commit only when its single parent is the retained verification
+checkpoint, its complete A/M/D path set is inside the Planner's approved
+scope, it changes no verification-owned path, and the candidate/base remote
+tuple is byte-for-byte unchanged from the post-drain take observation.
 
-An operator commit with an unrecognized head, an out-of-plan edit, or a change
-to verification-owned files is preserved and refused with an actionable
-takeover blocker. The idempotent `sf take <ticket>` prints the authenticated
-handoff path again. sf never overwrites edits or treats them as Builder/proof
-authority. Verification-file changes require the separate authenticated
-verification-amendment flow; they are never silently routed into a source
-resume.
+An accepted operator commit resumes into a fresh Reviewer verification, never
+directly into Builder. The new verification checkpoint must parent the
+operator commit and may change only verification-owned files; the operator
+source paths are protected from Reviewer mutation. Builder runs only after
+that fresh checkpoint and must still produce new provider, repository-command,
+candidate, checks, and final-review evidence before publication.
+
+A merge commit, a commit with the wrong parent, an out-of-plan edit, a remote
+ref change, or a change to verification-owned files is preserved and refused
+with an actionable takeover blocker. The idempotent `sf take <ticket>` prints
+the absolute path, branch, local and remote heads, retained proof/policy
+digests, and the channel-correct next action. sf never overwrites edits or
+treats them as Builder/proof authority. Verification-file changes require the
+separate authenticated verification-amendment flow; they are never silently
+routed into a source resume.
 
 `retry` applies only to the durable retry/correction-exhaustion pause and
 re-enters its exact stored resume state. If a prior interrupted control action
@@ -124,9 +148,10 @@ fresh drain; `--mode guarded` is further narrowed to the
 `autonomy_ineligible` blocker and a frozen project configuration whose maximum
 mode is `guarded` or `autonomous` (a `manual` project is refused). It then
 atomically changes that ticket's durable merge mode to guarded and starts a
-fresh guarded candidate cycle. Pause, take, and cancel invalidate the runner fence before
-draining; capacity is released only by the final durable
-`paused`/`cancelled` transition.
+fresh guarded candidate cycle. Pause, take, and cancel invalidate the runner
+fence before draining. Capacity is released only by a final durable `paused`,
+`cancelled`, or terminal workflow transition after Store proves that provider,
+repository-command, Git-mutation, and uncertain-effect writers are gone.
 
 `status` and `show` expose durable ticket/evidence metadata. Human output uses
 product labels when those fields are present; `--json` remains the versioned

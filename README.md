@@ -2,11 +2,14 @@
 
 `sf` is a local, operator-controlled software factory. It turns a Markdown
 ticket into a planned, independently verified implementation and a reviewed
-GitHub pull request, then follows the configured manual, guarded, or autonomous
-exact-head merge policy.
+GitHub pull request. v1 supports manual external merge observation and a
+guarded exact-head merge requested only after a human approves the reviewed
+head.
 
 The first implementation target is Sofia building Nysa on a trusted macOS
-machine. Docker and Colima are not required.
+machine. Docker and Colima are not required and are never silently installed.
+Autonomous selection or merge is deliberately unavailable in v1 pending a
+stronger native containment proof and a guarded pilot.
 
 ## Development
 
@@ -16,7 +19,11 @@ provider CLIs.
 ```sh
 make build-dev
 ./bin/sf-dev version
-go test ./...
+make test
+# Explicit compiled macOS process-boundary acceptance.
+make test-compiled
+# Before landing: race, recovery, security, upgrade, and compiled E2E gates.
+make test-all
 ```
 
 `make build-dev` embeds the development channel and exact source commit.

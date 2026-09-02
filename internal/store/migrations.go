@@ -1202,3 +1202,57 @@ var migrationV48 = []string{
 	`CREATE TRIGGER manual_merge_observations_immutable_update BEFORE UPDATE ON manual_merge_observations BEGIN SELECT RAISE(ABORT,'manual merge observation is immutable'); END`,
 	`CREATE TRIGGER manual_merge_observations_immutable_delete BEFORE DELETE ON manual_merge_observations BEGIN SELECT RAISE(ABORT,'manual merge observation is append-only'); END`,
 }
+
+// v49 records the Builder's request to change the pre-build verification as
+// an immutable, independently reviewable authority.  Existing building rows
+// cannot honestly be reconstructed as amendment requests, so no legacy row is
+// backfilled.
+var migrationV49 = []string{
+	`CREATE TABLE verification_amendment_requests (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		transition_ticket_version INTEGER NOT NULL CHECK(transition_ticket_version > 1),
+		prior_verification_revision INTEGER NOT NULL CHECK(prior_verification_revision > 0), prior_intent_digest TEXT NOT NULL CHECK(length(prior_intent_digest)=64), prior_proof_digest TEXT NOT NULL CHECK(length(prior_proof_digest)=64), prior_checkpoint_id TEXT NOT NULL CHECK(length(prior_checkpoint_id) BETWEEN 40 AND 64),
+		builder_attempt_id INTEGER NOT NULL CHECK(builder_attempt_id > 0), builder_attempt INTEGER NOT NULL CHECK(builder_attempt > 0), builder_result_phase TEXT NOT NULL CHECK(builder_result_phase='build'), builder_result_role TEXT NOT NULL CHECK(builder_result_role='builder'), builder_typed_sha256 TEXT NOT NULL CHECK(length(builder_typed_sha256)=64),
+		proposed_digest TEXT NOT NULL CHECK(length(proposed_digest)=64), proposed_command_json TEXT NOT NULL CHECK(length(proposed_command_json) BETWEEN 3 AND 16384 AND json_valid(proposed_command_json)=1), amendment_reason TEXT NOT NULL CHECK(length(amendment_reason) BETWEEN 1 AND 2000), requester TEXT NOT NULL CHECK(length(requester) BETWEEN 1 AND 200),
+		consumed_ticket_version INTEGER NOT NULL CHECK(consumed_ticket_version+1=transition_ticket_version), consumed_leader_epoch INTEGER NOT NULL CHECK(consumed_leader_epoch > 0), consumed_runner_epoch INTEGER NOT NULL CHECK(consumed_runner_epoch > 0),
+		correction_budget_kind TEXT NOT NULL CHECK(correction_budget_kind='correction'), correction_budget_request_id TEXT NOT NULL CHECK(length(correction_budget_request_id) BETWEEN 1 AND 300), created_at TEXT NOT NULL CHECK(length(created_at) BETWEEN 1 AND 128),
+		PRIMARY KEY(channel,project_id,ticket_id,transition_ticket_version),
+		UNIQUE(channel,project_id,ticket_id,builder_attempt_id),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(channel,project_id,ticket_id,prior_verification_revision) REFERENCES verification_revisions(channel,project_id,ticket_id,revision),
+		FOREIGN KEY(channel,project_id,ticket_id,builder_result_phase,builder_result_role,builder_attempt,builder_attempt_id) REFERENCES provider_attempts(channel,project_id,ticket_id,phase,role,attempt,id),
+		FOREIGN KEY(channel,project_id,ticket_id,builder_result_phase,builder_result_role,builder_attempt,builder_attempt_id) REFERENCES provider_attempt_results(channel,project_id,ticket_id,phase,role,attempt,provider_attempt_id),
+		FOREIGN KEY(channel,project_id,ticket_id,correction_budget_kind,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch) REFERENCES ticket_budget_uses(channel,project_id,ticket_id,kind,request_id,ticket_version,leader_epoch,runner_epoch)
+	)`,
+	`CREATE INDEX verification_amendment_requests_ticket ON verification_amendment_requests(channel,project_id,ticket_id,transition_ticket_version DESC)`,
+	`CREATE TRIGGER verification_amendment_requests_immutable_update BEFORE UPDATE ON verification_amendment_requests BEGIN SELECT RAISE(ABORT,'verification amendment request is immutable'); END`,
+	`CREATE TRIGGER verification_amendment_requests_immutable_delete BEFORE DELETE ON verification_amendment_requests BEGIN SELECT RAISE(ABORT,'verification amendment request is append-only'); END`,
+}
+
+// v50 seals GitHub's exact guarded post-merge PR observation before the
+// independent protected-ref proof can be issued. The source HeadOID and the
+// protected-branch MergeOID are separate immutable facts (which may be equal
+// for a fast-forward or rebase merge); legacy merge rows
+// have no such observation and therefore fail closed for proof replay.
+var migrationV50 = []string{
+	`CREATE TABLE guarded_merge_observations (
+		semantic_key TEXT PRIMARY KEY,
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		request_digest TEXT NOT NULL CHECK(length(request_digest)=64), ticket_version INTEGER NOT NULL CHECK(ticket_version>0), leader_epoch INTEGER NOT NULL CHECK(leader_epoch>0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch>0), claim_epoch INTEGER NOT NULL CHECK(claim_epoch>0),
+		repository_host TEXT NOT NULL CHECK(repository_host='github.com'), repository_owner TEXT NOT NULL CHECK(length(repository_owner) BETWEEN 1 AND 128), repository_name TEXT NOT NULL CHECK(length(repository_name) BETWEEN 1 AND 128), pull_request_number INTEGER NOT NULL CHECK(pull_request_number>0),
+		head_owner TEXT NOT NULL CHECK(length(head_owner) BETWEEN 1 AND 128), head_repository TEXT NOT NULL CHECK(length(head_repository) BETWEEN 1 AND 128), head_ref TEXT NOT NULL CHECK(length(head_ref) BETWEEN 1 AND 300), head_oid TEXT NOT NULL CHECK(length(head_oid) IN (40,64)), base_ref TEXT NOT NULL CHECK(length(base_ref) BETWEEN 1 AND 255), original_base_oid TEXT NOT NULL CHECK(length(original_base_oid) IN (40,64)), merge_oid TEXT NOT NULL CHECK(length(merge_oid) IN (40,64)),
+		observed_state TEXT NOT NULL CHECK(observed_state='MERGED'), observed_merged INTEGER NOT NULL CHECK(observed_merged=1), observed_draft INTEGER NOT NULL CHECK(observed_draft=0), observed_factory_owned INTEGER NOT NULL CHECK(observed_factory_owned=1), observed_merge_commit TEXT NOT NULL CHECK(length(observed_merge_commit) IN (40,64)), observed_base_oid TEXT NOT NULL CHECK(length(observed_base_oid) IN (40,64)), observed_base_head_oid TEXT NOT NULL CHECK(length(observed_base_head_oid) IN (40,64)),
+		protection_rule_id TEXT NOT NULL CHECK(length(protection_rule_id) BETWEEN 1 AND 256), protection_kind TEXT NOT NULL CHECK(length(protection_kind) <= 64), protection_checks_digest TEXT NOT NULL CHECK(length(protection_checks_digest) <= 128), strict_status_checks INTEGER NOT NULL CHECK(strict_status_checks=1), admin_enforced INTEGER NOT NULL CHECK(admin_enforced=1), active_ruleset_count INTEGER NOT NULL CHECK(active_ruleset_count>=0), method TEXT NOT NULL CHECK(method IN ('merge','squash','rebase')),
+		observation_digest TEXT NOT NULL UNIQUE CHECK(length(observation_digest)=64), created_at TEXT NOT NULL CHECK(length(created_at) BETWEEN 1 AND 128),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(semantic_key) REFERENCES merge_intents(semantic_key),
+		FOREIGN KEY(semantic_key) REFERENCES effects(semantic_key)
+	)`,
+	`CREATE INDEX guarded_merge_observations_ticket ON guarded_merge_observations(channel,project_id,ticket_id,created_at)`,
+	`CREATE TRIGGER guarded_merge_observations_immutable_update BEFORE UPDATE ON guarded_merge_observations BEGIN SELECT RAISE(ABORT,'guarded merge observation is immutable'); END`,
+	`CREATE TRIGGER guarded_merge_observations_immutable_delete BEFORE DELETE ON guarded_merge_observations BEGIN SELECT RAISE(ABORT,'guarded merge observation is append-only'); END`,
+	`CREATE TRIGGER merge_intents_immutable_update BEFORE UPDATE ON merge_intents BEGIN SELECT RAISE(ABORT,'merge intent is immutable'); END`,
+	`CREATE TRIGGER merge_intents_immutable_delete BEFORE DELETE ON merge_intents BEGIN SELECT RAISE(ABORT,'merge intent is append-only'); END`,
+	`CREATE TRIGGER verification_revisions_immutable_update BEFORE UPDATE ON verification_revisions BEGIN SELECT RAISE(ABORT,'verification revision is immutable'); END`,
+	`CREATE TRIGGER verification_revisions_immutable_delete BEFORE DELETE ON verification_revisions BEGIN SELECT RAISE(ABORT,'verification revision is append-only'); END`,
+}

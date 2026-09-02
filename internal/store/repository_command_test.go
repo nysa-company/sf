@@ -585,17 +585,24 @@ func TestRepositoryCommandRejectsOversizedTrackedGroupBeforePersistence(t *testi
 func TestRepositoryExecutableDigestDomainValidation(t *testing.T) {
 	plain := "sha256:" + strings.Repeat("a", 64)
 	node := "node22-closure-v1:sha256:" + strings.Repeat("b", 64)
+	nysa := "nysa-api-pure-v1:sha256:" + strings.Repeat("c", 64)
 	if !validRepositoryExecutableDigest("/usr/local/go/bin/go", plain) {
 		t.Fatal("ordinary Go executable digest rejected")
 	}
 	if !validRepositoryExecutableDigest("/opt/homebrew/Cellar/node/22/bin/node", node) {
 		t.Fatal("Node closure identity rejected")
 	}
+	if !validRepositoryExecutableDigest("/opt/homebrew/Cellar/node/22/bin/node", nysa) {
+		t.Fatal("Nysa pure Node runtime identity rejected")
+	}
 	if validRepositoryExecutableDigest("/opt/homebrew/Cellar/node/22/bin/node", plain) {
 		t.Fatal("plain digest accepted for Node")
 	}
 	if validRepositoryExecutableDigest("/usr/local/go/bin/go", node) {
 		t.Fatal("Node closure identity accepted for Go")
+	}
+	if validRepositoryExecutableDigest("/usr/local/go/bin/go", nysa) {
+		t.Fatal("Nysa runtime identity accepted for Go")
 	}
 }
 

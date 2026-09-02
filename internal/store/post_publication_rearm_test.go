@@ -17,30 +17,57 @@ func bindTerminalMergeEffect(t *testing.T, db *Store, fixture finalReviewFixture
 	if err != nil || !found {
 		t.Fatalf("merge publication found=%v err=%v", found, err)
 	}
-	requestDigest := "merge-request-" + semanticKey
-	if _, err := db.PlanEffect(fixture.ctx, EffectPlan{SemanticKey: semanticKey, Ref: ticket.Ref, Kind: "merge", TicketVersion: ticket.Version, Fence: fence, RequestDigest: requestDigest}); err != nil {
+	intent := domain.MergeIntent{
+		Ref: ticket.Ref, SemanticKey: semanticKey, TicketVersion: ticket.Version,
+		RepositoryHost:    publication.PullRequest.Repository.Host,
+		RepositoryOwner:   publication.PullRequest.Repository.Owner,
+		RepositoryName:    publication.PullRequest.Repository.Name,
+		PullRequestNumber: publication.PullRequest.Number, HeadOwner: publication.PullRequest.HeadOwner, HeadRepository: publication.PullRequest.HeadRepository, HeadRef: publication.PullRequest.HeadRef, HeadOID: publication.PullRequest.HeadOID,
+		BaseRef: publication.PullRequest.BaseRef, OriginalBaseOID: publication.PullRequest.BaseOID,
+		ProtectionRuleID: "post-publication-rule", ProtectionKind: "classic", StrictStatusChecks: true,
+		AdminEnforced: true, Method: "squash",
+	}
+	intent.RequestDigest = canonicalMergeRequestDigest(intent)
+	if _, err := db.PlanEffect(fixture.ctx, EffectPlan{SemanticKey: semanticKey, Ref: ticket.Ref, Kind: "merge", TicketVersion: ticket.Version, Fence: fence, RequestDigest: intent.RequestDigest}); err != nil {
 		t.Fatalf("plan terminal merge effect: %v", err)
 	}
 	claim, err := db.ClaimEffect(fixture.ctx, EffectFence{SemanticKey: semanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
 	if err != nil || !claim.Claimed {
 		t.Fatalf("claim terminal merge effect=%+v err=%v", claim, err)
 	}
-	intent := domain.MergeIntent{
-		Ref: ticket.Ref, SemanticKey: semanticKey, RequestDigest: requestDigest,
-		TicketVersion: ticket.Version, LeaderEpoch: claim.Effect.LeaderEpoch,
-		RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch,
-		RepositoryHost:    publication.PullRequest.Repository.Host,
-		RepositoryOwner:   publication.PullRequest.Repository.Owner,
-		RepositoryName:    publication.PullRequest.Repository.Name,
-		PullRequestNumber: publication.PullRequest.Number, HeadOwner: publication.PullRequest.HeadOwner, HeadRepository: publication.PullRequest.HeadRepository, HeadRef: publication.PullRequest.HeadRef, HeadOID: publication.PullRequest.HeadOID,
-		BaseRef: publication.PullRequest.BaseRef, OriginalBaseOID: publication.PullRequest.BaseOID,
-		ProtectionRuleID: "post-publication-rule", StrictStatusChecks: true,
-		AdminEnforced: true, Method: "squash",
-	}
+	intent.TicketVersion = claim.Effect.TicketVersion
+	intent.LeaderEpoch = claim.Effect.LeaderEpoch
+	intent.RunnerEpoch = claim.Effect.RunnerEpoch
+	intent.ClaimEpoch = claim.Effect.ClaimEpoch
 	if err := db.RecordMergeIntent(fixture.ctx, intent); err != nil {
 		t.Fatalf("record terminal merge intent: %v", err)
 	}
-	if _, err := db.ConfirmEffect(fixture.ctx, EffectFence{SemanticKey: semanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}}, "merge-observed"); err != nil {
+	// A fast-forward/rebase result may have the same protected-branch OID as
+	// the reviewed source. The observation still stores both immutable fields
+	// independently; this fixture intentionally exercises that valid shape.
+	if err := db.RecordGuardedMergeObservation(fixture.ctx, intent, guardedMergedObservation(publication.PullRequest, intent.HeadOID)); err != nil {
+		t.Fatalf("record terminal guarded merge observation: %v", err)
+	}
+	// Guarded reconciliation is authorized only after the separate Store-issued
+	// protected-ref fetch proves the observed merge object on the protected
+	// base. Keep the fixture's ordering identical to mergeproof.Coordinator:
+	// observation, child Git proof, then parent merge confirmation.
+	proof, err := db.GuardedMergeProtectedRefFetchIntent(fixture.ctx, intent, intent.HeadOID)
+	if err != nil {
+		t.Fatalf("derive terminal protected-ref proof: %v", err)
+	}
+	proof.Intent.TicketVersion, proof.Intent.Fence = ticket.Version, fence
+	if _, err := db.PlanEffect(fixture.ctx, EffectPlan{SemanticKey: proof.Intent.SemanticKey, Ref: ticket.Ref, Kind: "git/protected-ref-fetch", TicketVersion: ticket.Version, Fence: fence, RequestDigest: proof.Intent.RequestDigest}); err != nil {
+		t.Fatalf("plan terminal protected-ref proof: %v", err)
+	}
+	proofClaim, err := db.IssueGitMutationClaim(fixture.ctx, proof.Intent)
+	if err != nil {
+		t.Fatalf("issue terminal protected-ref proof: %v", err)
+	}
+	if _, err := db.ConfirmEffect(fixture.ctx, EffectFence{SemanticKey: proofClaim.SemanticKey, Ref: proofClaim.TicketRef, TicketVersion: proofClaim.TicketVersion, Fence: domain.Fence{LeaderEpoch: proofClaim.LeaderEpoch, RunnerEpoch: proofClaim.RunnerEpoch, ClaimEpoch: proofClaim.ClaimEpoch}}, intent.BaseRef+"@"+intent.HeadOID); err != nil {
+		t.Fatalf("confirm terminal protected-ref proof: %v", err)
+	}
+	if _, err := db.ConfirmEffect(fixture.ctx, EffectFence{SemanticKey: semanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}}, "merged/"+intent.HeadOID); err != nil {
 		t.Fatalf("confirm terminal merge effect: %v", err)
 	}
 }
@@ -88,10 +115,27 @@ func postPublicationPauseAt(t *testing.T, db *Store, ticket Ticket, fence domain
 
 func postPublicationPauseResumeAt(t *testing.T, db *Store, ticket Ticket, fence domain.Fence, target domain.State) (Ticket, Ticket) {
 	t.Helper()
+	return postPublicationPauseContinueAt(t, db, ticket, fence, target, "operator_resume")
+}
+
+// postPublicationPauseRetryAt exercises the state-machine's documented
+// paused -> $resume_state retry path.  It is intentionally shared with the
+// ordinary resume helper so a control-lineage regression cannot hide behind a
+// test-only event shape.
+func postPublicationPauseRetryAt(t *testing.T, db *Store, ticket Ticket, fence domain.Fence, target domain.State) (Ticket, Ticket) {
+	t.Helper()
+	return postPublicationPauseContinueAt(t, db, ticket, fence, target, "operator_retry")
+}
+
+func postPublicationPauseContinueAt(t *testing.T, db *Store, ticket Ticket, fence domain.Fence, target domain.State, trigger string) (Ticket, Ticket) {
+	t.Helper()
+	if trigger != "operator_resume" && trigger != "operator_retry" {
+		t.Fatalf("invalid post-publication continuation trigger %q", trigger)
+	}
 	ctx := t.Context()
 	stopped, paused := postPublicationPauseAt(t, db, ticket, fence)
 	var err error
-	resume := Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: target, Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: ticket.RunnerEpoch + 1}, EventPayload: `{}`}
+	resume := Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: target, Trigger: trigger, Fence: domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: ticket.RunnerEpoch + 1}, EventPayload: `{}`}
 	var resumed TransitionResult
 	switch target {
 	case domain.StatePublishing, domain.StateWaitingCI:
@@ -574,6 +618,9 @@ func TestTransitionGuardedMergeResumeRejectsTamperedAuthorityBeforeCommit(t *tes
 			fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
 			defer fixture.db.Close()
 			_, paused := postPublicationPauseAt(t, fixture.db, current, fence)
+			if tc.name != "approval removed" {
+				dropMergeIntentImmutability(t, fixture.db)
+			}
 			tc.mutate(fixture.db, fixture, paused)
 			if _, err := fixture.db.TransitionGuardedMergeResume(fixture.ctx, Transition{
 				Ref: paused.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused,
@@ -735,7 +782,8 @@ func TestPostPublicationReconcilingResumeAuthenticatesBeforeCommit(t *testing.T)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fixture.db.db.ExecContext(fixture.ctx, `DELETE FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket); err != nil {
+		dropMergeIntentImmutability(t, fixture.db)
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE merge_intents SET request_digest=? WHERE channel=? AND project_id=? AND ticket_id=?`, strings.Repeat("0", 64), current.Ref.Channel, current.Ref.Project, current.Ref.Ticket); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := fixture.db.TransitionPostPublicationReconcileResume(fixture.ctx, Transition{
@@ -1419,6 +1467,9 @@ func TestPostPublicationRearmProofRejectsMergingWithoutApprovalOrExactClaim(t *t
 			fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
 			defer fixture.db.Close()
 			stopped, resumed := postPublicationPauseResumeAt(t, fixture.db, current, fence, domain.StateMerging)
+			if tc.name != "approval removed" {
+				dropMergeIntentImmutability(t, fixture.db)
+			}
 			tc.mutate(fixture.db, fixture, resumed)
 			if _, err := fixture.db.PostPublicationRearmProof(fixture.ctx, resumed.Ref, stopped); !errors.Is(err, ErrControlNotDrained) {
 				t.Fatalf("%s merging rearmed: %v", tc.name, err)
@@ -1465,6 +1516,15 @@ func TestTransitionGuardedMergeObservedRejectsMissingAuthorityAndNonCanonicalPay
 		t.Run(tc.name, func(t *testing.T) {
 			fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
 			defer fixture.db.Close()
+			if tc.name == "missing merge intent" {
+				dropMergeIntentImmutability(t, fixture.db)
+				if _, err := fixture.db.db.ExecContext(fixture.ctx, `DROP TRIGGER guarded_merge_observations_immutable_delete`); err != nil {
+					t.Fatalf("drop guarded observation immutability: %v", err)
+				}
+				if _, err := fixture.db.db.ExecContext(fixture.ctx, `DELETE FROM guarded_merge_observations WHERE channel=? AND project_id=? AND ticket_id=?`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket); err != nil {
+					t.Fatalf("delete guarded merge observation: %v", err)
+				}
+			}
 			tc.mutate(fixture.db, current)
 			if _, err := fixture.db.TransitionGuardedMergeObserved(fixture.ctx, Transition{
 				Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
@@ -1478,6 +1538,151 @@ func TestTransitionGuardedMergeObservedRejectsMissingAuthorityAndNonCanonicalPay
 			}
 		})
 	}
+}
+
+func TestTransitionGuardedMergeObservedRequiresSealedExactObservation(t *testing.T) {
+	t.Run("missing observation refuses confirmed intent and effect", func(t *testing.T) {
+		fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
+		defer fixture.db.Close()
+
+		intent, found, err := fixture.db.MergeIntent(fixture.ctx, "merge/rearm/armed/merging")
+		if err != nil || !found {
+			t.Fatalf("merge intent found=%v err=%v", found, err)
+		}
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `DROP TRIGGER guarded_merge_observations_immutable_delete`); err != nil {
+			t.Fatalf("drop guarded observation immutability: %v", err)
+		}
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `DELETE FROM guarded_merge_observations WHERE semantic_key=?`, intent.SemanticKey); err != nil {
+			t.Fatalf("delete sealed guarded observation: %v", err)
+		}
+		transition := Transition{
+			Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
+			To: domain.StateReconciling, Trigger: "merge_observed", Fence: fence, EventPayload: `{}`,
+		}
+		if _, err := fixture.db.TransitionGuardedMergeObserved(fixture.ctx, transition); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("confirmed merge intent/effect without sealed observation transitioned: %v", err)
+		}
+		stored, err := fixture.db.Ticket(fixture.ctx, current.Ref)
+		if err != nil || stored.State != domain.StateMerging || stored.Version != current.Version {
+			t.Fatalf("missing sealed observation changed ticket=%+v err=%v", stored, err)
+		}
+	})
+
+	t.Run("confirmed effect identity must name reviewed head", func(t *testing.T) {
+		fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
+		defer fixture.db.Close()
+
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE effects SET observed_identity='merged/ffffffffffffffffffffffffffffffffffffffff' WHERE semantic_key='merge/rearm/armed/merging'`); err != nil {
+			t.Fatalf("tamper confirmed merge identity: %v", err)
+		}
+		if _, err := fixture.db.TransitionGuardedMergeObserved(fixture.ctx, Transition{
+			Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
+			To: domain.StateReconciling, Trigger: "merge_observed", Fence: fence, EventPayload: `{}`,
+		}); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("wrong confirmed merge identity transitioned: %v", err)
+		}
+		stored, err := fixture.db.Ticket(fixture.ctx, current.Ref)
+		if err != nil || stored.State != domain.StateMerging || stored.Version != current.Version {
+			t.Fatalf("wrong confirmed identity changed ticket=%+v err=%v", stored, err)
+		}
+	})
+
+	t.Run("missing protected-ref proof refuses sealed merge observation", func(t *testing.T) {
+		fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
+		defer fixture.db.Close()
+
+		intent, found, err := fixture.db.MergeIntent(fixture.ctx, "merge/rearm/armed/merging")
+		if err != nil || !found {
+			t.Fatalf("merge intent found=%v err=%v", found, err)
+		}
+		proof, err := fixture.db.GuardedMergeProtectedRefFetchIntent(fixture.ctx, intent, intent.HeadOID)
+		if err != nil {
+			t.Fatalf("derive protected-ref proof: %v", err)
+		}
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `DELETE FROM git_mutation_intents WHERE semantic_key=?`, proof.Intent.SemanticKey); err != nil {
+			t.Fatalf("delete protected-ref claim: %v", err)
+		}
+		if _, err := fixture.db.TransitionGuardedMergeObserved(fixture.ctx, Transition{
+			Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
+			To: domain.StateReconciling, Trigger: "merge_observed", Fence: fence, EventPayload: `{}`,
+		}); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("missing protected-ref proof transitioned: %v", err)
+		}
+		stored, err := fixture.db.Ticket(fixture.ctx, current.Ref)
+		if err != nil || stored.State != domain.StateMerging || stored.Version != current.Version {
+			t.Fatalf("missing protected-ref proof changed ticket=%+v err=%v", stored, err)
+		}
+	})
+
+	t.Run("tampered protected-ref proof refuses sealed merge observation", func(t *testing.T) {
+		fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
+		defer fixture.db.Close()
+
+		intent, found, err := fixture.db.MergeIntent(fixture.ctx, "merge/rearm/armed/merging")
+		if err != nil || !found {
+			t.Fatalf("merge intent found=%v err=%v", found, err)
+		}
+		proof, err := fixture.db.GuardedMergeProtectedRefFetchIntent(fixture.ctx, intent, intent.HeadOID)
+		if err != nil {
+			t.Fatalf("derive protected-ref proof: %v", err)
+		}
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE effects SET observed_identity='main@ffffffffffffffffffffffffffffffffffffffff' WHERE semantic_key=?`, proof.Intent.SemanticKey); err != nil {
+			t.Fatalf("tamper protected-ref observation: %v", err)
+		}
+		if _, err := fixture.db.TransitionGuardedMergeObserved(fixture.ctx, Transition{
+			Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
+			To: domain.StateReconciling, Trigger: "merge_observed", Fence: fence, EventPayload: `{}`,
+		}); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("tampered protected-ref proof transitioned: %v", err)
+		}
+		stored, err := fixture.db.Ticket(fixture.ctx, current.Ref)
+		if err != nil || stored.State != domain.StateMerging || stored.Version != current.Version {
+			t.Fatalf("tampered protected-ref proof changed ticket=%+v err=%v", stored, err)
+		}
+	})
+
+	t.Run("tampered protected-ref claim refuses sealed merge observation", func(t *testing.T) {
+		fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
+		defer fixture.db.Close()
+
+		intent, found, err := fixture.db.MergeIntent(fixture.ctx, "merge/rearm/armed/merging")
+		if err != nil || !found {
+			t.Fatalf("merge intent found=%v err=%v", found, err)
+		}
+		proof, err := fixture.db.GuardedMergeProtectedRefFetchIntent(fixture.ctx, intent, intent.HeadOID)
+		if err != nil {
+			t.Fatalf("derive protected-ref proof: %v", err)
+		}
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE git_mutation_intents SET expected_head_oid=? WHERE semantic_key=?`, strings.Repeat("f", len(intent.HeadOID)), proof.Intent.SemanticKey); err != nil {
+			t.Fatalf("tamper protected-ref claim: %v", err)
+		}
+		if _, err := fixture.db.TransitionGuardedMergeObserved(fixture.ctx, Transition{
+			Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
+			To: domain.StateReconciling, Trigger: "merge_observed", Fence: fence, EventPayload: `{}`,
+		}); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("tampered protected-ref claim transitioned: %v", err)
+		}
+		stored, err := fixture.db.Ticket(fixture.ctx, current.Ref)
+		if err != nil || stored.State != domain.StateMerging || stored.Version != current.Version {
+			t.Fatalf("tampered protected-ref claim changed ticket=%+v err=%v", stored, err)
+		}
+	})
+
+	t.Run("exact sealed merged observation succeeds", func(t *testing.T) {
+		fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
+		defer fixture.db.Close()
+
+		if _, err := fixture.db.TransitionGuardedMergeObserved(fixture.ctx, Transition{
+			Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
+			To: domain.StateReconciling, Trigger: "merge_observed", Fence: fence, EventPayload: `{}`,
+		}); err != nil {
+			t.Fatalf("exact sealed guarded observation did not transition: %v", err)
+		}
+		stored, err := fixture.db.Ticket(fixture.ctx, current.Ref)
+		if err != nil || stored.State != domain.StateReconciling || stored.Version != current.Version+1 {
+			t.Fatalf("exact sealed observation successor=%+v err=%v", stored, err)
+		}
+	})
 }
 
 func TestGuardedReconcilingAuthoritiesRejectNonCanonicalMergeObservation(t *testing.T) {

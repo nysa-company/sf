@@ -678,7 +678,17 @@ func TestProductionForegroundDaemonServesAnotherCLIClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := database.CreateProject(context.Background(), store.Project{Channel: domain.ChannelStable, ID: "demo", Path: t.TempDir(), BaseRef: "main"}); err != nil {
+	repository := t.TempDir()
+	projectConfig := config.DefaultProject("demo", repository)
+	effective, err := config.Resolve(config.DefaultMachineLimits(), projectConfig, config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateProject(context.Background(), store.Project{Channel: domain.ChannelStable, ID: "demo", Path: repository, BaseRef: projectConfig.BaseBranch, ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: snapshot}); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.Close(); err != nil {
@@ -809,7 +819,12 @@ exit 98
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("dev daemon did not create socket: %s", daemonOutput.String())
+			// exec.Wait also joins the goroutine copying child output into the
+			// buffer. Stop and wait before reading it, otherwise a startup
+			// failure races this diagnostic with os/exec's writer.
+			_ = foreground.Process.Signal(os.Interrupt)
+			waitErr := foreground.Wait()
+			t.Fatalf("dev daemon did not create socket: wait=%v output=%s", waitErr, daemonOutput.String())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

@@ -78,6 +78,46 @@ func (o publishedMergeObserver) Observe(ctx context.Context, ref domain.TicketRe
 	return store.NewManualMergeObservation(evidence, observed), nil
 }
 
+// ObserveExternal is the typed sibling used by active waiting states. It
+// retains publication evidence and all merged/base facts, but permits the
+// source head in GitHub's current observation to differ from the published
+// head. The Store decides whether that difference is an unverified terminal
+// outcome or the existing exact manual-reconciliation path.
+func (o publishedMergeObserver) ObserveExternal(ctx context.Context, ref domain.TicketRef) (store.ExternalMergeObservation, error) {
+	if o.Store == nil || o.GitHub == nil {
+		return store.ExternalMergeObservation{}, errors.New("published merge observer is not configured")
+	}
+	prePublication, err := o.Store.MergeObservationPrePublication(ctx, ref)
+	if err != nil {
+		return store.ExternalMergeObservation{}, err
+	}
+	evidence, err := o.Store.LoadHistoricalPublishedCandidate(ctx, ref)
+	if errors.Is(err, store.ErrNotFound) {
+		if prePublication {
+			return store.ExternalMergeObservation{}, nil
+		}
+		return store.ExternalMergeObservation{}, store.ErrPublicationEvidence
+	}
+	if err != nil {
+		return store.ExternalMergeObservation{}, err
+	}
+	observer, ok := o.GitHub.(contracts.ExternalMergeObserver)
+	if !ok {
+		return store.ExternalMergeObservation{}, errors.New("GitHub client does not provide authenticated external-merge observation")
+	}
+	observed, err := observer.ObserveExternalMerge(ctx, evidence.PullRequest)
+	if err != nil {
+		return store.ExternalMergeObservation{}, err
+	}
+	if !validMergeObservation(observed) {
+		return store.ExternalMergeObservation{}, errors.New("external pull request merge observation is malformed")
+	}
+	if !observed.Merged {
+		return store.ExternalMergeObservation{}, nil
+	}
+	return store.NewManualMergeObservation(evidence, observed), nil
+}
+
 func validMergeObservation(observed contracts.PublishedPullRequestObservation) bool {
 	if observed.State != "OPEN" && observed.State != "CLOSED" && observed.State != "MERGED" {
 		return false

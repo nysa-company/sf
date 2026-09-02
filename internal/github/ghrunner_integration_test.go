@@ -39,6 +39,9 @@ func (integrationVerifier) VerifyProtectedBranch(context.Context, contracts.Repo
 type integrationIntents struct{}
 
 func (integrationIntents) RecordMergeIntent(context.Context, domain.MergeIntent) error { return nil }
+func (integrationIntents) RecordGuardedMergeObservation(context.Context, domain.MergeIntent, contracts.PublishedPullRequestObservation) error {
+	return nil
+}
 
 type integrationSerialRunner struct {
 	mu       sync.Mutex

@@ -334,11 +334,26 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					// publication witness exists. Authenticate that exact stop/resume
 					// chain and pre-stop candidate here; otherwise the ordinary
 					// candidate-only path below would reject the resumed counter gap.
-					if postLeader, postFound, postErr := s.postPublicationRecoveryBaseline(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); postErr != nil {
-						return postErr
-					} else if postFound {
-						priorLeader = postLeader
-					} else {
+					// A source-only takeover begins in Building and resumes into
+					// Verifying. It can later cross fresh verification/build and become
+					// candidate-only Publishing before an external witness exists. That
+					// is not a post-publication control triplet: authenticate its exact
+					// immutable source lineage, then let the candidate-only fallback
+					// below prove the candidate and build->publishing transition. Any
+					// unrelated pre-publication control remains subject to the normal
+					// post-publication baseline and fails closed.
+					_, sourceFound, sourceErr := s.operatorSourceResumeEndpointFrom(ctx, conn, ref)
+					if sourceErr != nil {
+						return ErrPublicationEvidence
+					}
+					if !sourceFound {
+						if postLeader, postFound, postErr := s.postPublicationRecoveryBaseline(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); postErr != nil {
+							return postErr
+						} else if postFound {
+							priorLeader = postLeader
+						}
+					}
+					if priorLeader == 0 {
 						// A candidate can be durable before the build->publishing
 						// signal, while publication evidence is intentionally absent
 						// until the external boundary runs. Authenticate that exact
@@ -375,7 +390,15 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 						// must reach the exact old endpoint, never the new daemon leader:
 						// the signed recovery row below is what transfers authority.
 						provider, _, providerErr := s.loadHistoricalProviderAttemptResult(ctx, conn, candidate.BuilderResult)
-						if providerErr != nil || provider.Claim.ExpectedVersion != candidate.TicketVersion || provider.Claim.RunnerEpoch != candidate.Fence.RunnerEpoch || provider.Claim.LeaderEpoch != candidate.Fence.LeaderEpoch || provider.Claim.Ref != ref || provider.Claim.Phase != domain.PhaseBuild || provider.Claim.Role != "builder" || providerResultReachesHistoricalFence(ctx, conn, candidate.BuilderResult, provider, ticket.version, domain.Fence{LeaderEpoch: priorLeader, RunnerEpoch: ticket.runner}) != nil {
+						if providerErr != nil || provider.Claim.Ref != ref || provider.Claim.Phase != domain.PhaseBuild || provider.Claim.Role != "builder" {
+							return ErrPublicationEvidence
+						}
+						predecessorFence := domain.Fence{LeaderEpoch: priorLeader, RunnerEpoch: ticket.runner}
+						if provider.Claim.ExpectedVersion == candidate.TicketVersion && provider.Claim.RunnerEpoch == candidate.Fence.RunnerEpoch && provider.Claim.LeaderEpoch == candidate.Fence.LeaderEpoch {
+							if providerResultReachesHistoricalFence(ctx, conn, candidate.BuilderResult, provider, ticket.version, predecessorFence) != nil {
+								return ErrPublicationEvidence
+							}
+						} else if s.operatorSourceResumeCandidateOnlyPublishingRecovery(ctx, conn, ref, candidate, provider, ticket.version, predecessorFence) != nil {
 							return ErrPublicationEvidence
 						}
 					}
@@ -385,6 +408,25 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				return repairErr
 			} else if repairFound {
 				priorLeader = repairLeader
+			}
+			// A source-only takeover deliberately enters Verifying before the fresh
+			// Reviewer exists.  Its prior reviewer is immutable historical input,
+			// not a recovery predecessor: authenticate the sealed source-resume
+			// endpoint first so generic phase/worktree fallbacks cannot bypass the
+			// required fresh verification after a daemon restart.
+			if priorLeader == 0 {
+				if sourceLeader, sourceFound, sourceErr := s.operatorSourceResumeRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner); sourceErr != nil {
+					return ErrPublicationEvidence
+				} else if sourceFound {
+					priorLeader = sourceLeader
+				}
+			}
+			if priorLeader == 0 {
+				if amendmentLeader, amendmentFound, amendmentErr := verificationAmendmentRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); amendmentErr != nil {
+					return amendmentErr
+				} else if amendmentFound {
+					priorLeader = amendmentLeader
+				}
 			}
 			if phase, role, ok := recoveryProviderPhase(ticket.state); ok {
 				baseline, baselineFound, baselineErr := s.loadPhaseRecoveryBaseline(ctx, conn, ref, phase, role)
@@ -420,7 +462,12 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 						return ErrPublicationEvidence
 					}
 					if !found && baseline.runner == 1 {
-						if err := validateInitialLifecycleAdvance(ctx, conn, ref, ticket.version); err != nil && !hasDurableCandidateRepairBaseline(ctx, conn, ref, baseline) {
+						// Bootstrap only through the immutable provider claim's
+						// own endpoint. Any later pause/resume or phase bridge is
+						// authenticated separately by the source-to-ticket ledger
+						// check below; folding it into the initial lifecycle would
+						// reject valid post-result operator control.
+						if err := validateInitialLifecycleAdvance(ctx, conn, ref, baseline.version); err != nil && !hasDurableCandidateRepairBaseline(ctx, conn, ref, baseline) {
 							return ErrPublicationEvidence
 						}
 					}
@@ -819,6 +866,33 @@ func (s *Store) ReleaseLeases(ctx context.Context, ref domain.TicketRef, expecte
 		return nil
 	})
 	return released, err
+}
+
+// releaseTerminalCapacity is the single transaction-scoped authority for
+// retiring a terminal ticket's admission leases. A lifecycle transition may
+// call it only from the same write that commits a terminal state. The durable
+// writer rows are rechecked here so a caller cannot infer process drain from a
+// terminal target or from an already-settled effect alone.
+func releaseTerminalCapacity(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) error {
+	counts := []struct {
+		query string
+		value int
+	}{
+		{query: `SELECT COUNT(*) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`},
+		{query: `SELECT COUNT(*) FROM repository_command_leases WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`},
+		{query: `SELECT COUNT(*) FROM git_mutation_leases WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`},
+		{query: `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('executing','uncertain')`},
+	}
+	for index := range counts {
+		if err := conn.QueryRowContext(ctx, counts[index].query, ref.Channel, ref.Project, ref.Ticket).Scan(&counts[index].value); err != nil {
+			return err
+		}
+		if counts[index].value != 0 {
+			return ErrControlNotDrained
+		}
+	}
+	_, err := conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket)
+	return err
 }
 
 // StaleLeases is a leader-fenced startup observation. Runner invalidation alone

@@ -147,12 +147,6 @@ func (s *Store) finalReviewAuthorityFrom(ctx context.Context, q candidateEvidenc
 	if err := q.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch,t.source_digest,t.ticket_type FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &leader, &source, &ticketType); err != nil || state != domain.StateReviewing || version != expectedVersion || runner != fence.RunnerEpoch || leader != fence.LeaderEpoch {
 		return FinalReviewAuthority{}, ErrStaleFence
 	}
-	// Audit the complete ledger even when the candidate's green CI transition
-	// happens to be at the live fence. A forged future recovery row must make
-	// the reviewing authority fail closed rather than being ignored as unused.
-	if err := validateRunnerRecoveryAuthority(ctx, q, ref, expectedVersion, fence); err != nil {
-		return FinalReviewAuthority{}, ErrStaleFence
-	}
 	candidate, err := s.latestCandidateFrom(ctx, q, ref, false)
 	if err != nil || candidate.Snapshot.SourceDigest != source {
 		return FinalReviewAuthority{}, ErrEvidenceConflict
@@ -172,11 +166,25 @@ func (s *Store) finalReviewAuthorityFrom(ctx context.Context, q candidateEvidenc
 	if err != nil {
 		return FinalReviewAuthority{}, ErrEvidenceConflict
 	}
+	// This is a current-fence reader. The CI and post-publication proofs below
+	// authenticate every recovery through expectedVersion; a later row would
+	// be contradictory durable authority and must not be ignored.
+	var futureRecoveries int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ref.Channel, ref.Project, ref.Ticket, expectedVersion).Scan(&futureRecoveries); err != nil || futureRecoveries != 0 {
+		return FinalReviewAuthority{}, ErrStaleFence
+	}
 	// Reviewing can survive a leader/runner recovery, but the recovery proof
 	// must begin at the exact CI-created reviewing endpoint; candidate rows
 	// themselves predate publication and cannot be used as a loose shortcut.
 	if reviewVersion != expectedVersion || observation.ObservedFence.RunnerEpoch != fence.RunnerEpoch || observation.ObservedFence.LeaderEpoch != fence.LeaderEpoch {
-		if err := validateRunnerRecoveryLedger(ctx, q, ref, reviewVersion, observation.ObservedFence.RunnerEpoch, observation.ObservedFence.LeaderEpoch, expectedVersion, fence.RunnerEpoch, fence.LeaderEpoch); err != nil {
+		// A final review may continue after an authenticated operator
+		// pause/drain/resume. That exact control triplet advances three ticket
+		// versions but only one runner epoch, so the phase-only recovery ledger
+		// is deliberately insufficient here. The post-publication bridge accepts
+		// only that triplet (and signed recovery rows), never a bare gap.
+		if err := validatePostPublicationEndpointAdvance(ctx, q, ref, domain.StateReviewing,
+			normalRecoveryEndpoint{version: reviewVersion, runner: observation.ObservedFence.RunnerEpoch, leader: observation.ObservedFence.LeaderEpoch},
+			normalRecoveryEndpoint{version: expectedVersion, runner: fence.RunnerEpoch, leader: fence.LeaderEpoch}); err != nil {
 			return FinalReviewAuthority{}, ErrStaleFence
 		}
 	}
@@ -472,6 +480,7 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 		return StoredVerification{}, ErrEvidenceConflict
 	}
 	exact := ticketVersion == result.TicketVersion && ticketRunner == result.Fence.RunnerEpoch && leader == result.Fence.LeaderEpoch
+	amendmentAuthenticated := false
 	if !exact {
 		boundaryPhase := domain.PhaseVerification
 		if ticketState == domain.StateBuilding {
@@ -495,6 +504,32 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 			exact = true
 		}
 	}
+	if !exact && ticketState == domain.StateBuilding {
+		// Amendment decisions are an authenticated verification boundary, but
+		// they intentionally do not use the generic phase_pass trigger.  Prove
+		// the exact request, fresh Reviewer decision, decision trigger, and
+		// resulting revision before accepting the live Building fence.
+		amendment, amendmentErr := loadVerificationAmendmentBoundary(ctx, q, ref, ticketVersion, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticketRunner})
+		if amendmentErr == nil {
+			switch amendment.Decision {
+			case VerificationAmendmentAccepted:
+				if result.ProviderResult != amendment.Reviewer {
+					return StoredVerification{}, fmt.Errorf("verification amendment reviewer binding: %w", ErrEvidenceConflict)
+				}
+			case VerificationAmendmentRejected:
+				historical, _, historicalErr := s.loadHistoricalProviderAttemptResult(ctx, q, result.ProviderResult)
+				if historicalErr != nil || verificationResultReachesAmendmentRequest(ctx, q, result.ProviderResult, historical, amendment.Amendment) != nil {
+					return StoredVerification{}, fmt.Errorf("verification rejected amendment source: %w", ErrEvidenceConflict)
+				}
+			default:
+				return StoredVerification{}, ErrEvidenceConflict
+			}
+			exact = true
+			amendmentAuthenticated = true
+		} else if !errors.Is(amendmentErr, ErrNotFound) {
+			return StoredVerification{}, fmt.Errorf("verification amendment boundary: %w", amendmentErr)
+		}
+	}
 	if !exact {
 		var transitions int
 		if ticketVersion != result.TicketVersion+1 || ticketRunner != result.Fence.RunnerEpoch || leader != result.Fence.LeaderEpoch || q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='verifying' AND to_state='building'`, ref.Channel, ref.Project, ref.Ticket, ticketVersion).Scan(&transitions) != nil || transitions != 1 {
@@ -503,11 +538,25 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 	}
 	binding, err := loadVerificationCommandBinding(ctx, q, ref, result.Revision.Revision)
 	if err != nil {
-		return StoredVerification{}, ErrEvidenceConflict
+		return StoredVerification{}, fmt.Errorf("verification command binding: %w", ErrEvidenceConflict)
 	}
 	result.CommandBinding = binding
-	if err := s.reauthenticateStoredVerificationCommandFrom(ctx, q, ref, result); err != nil {
-		return StoredVerification{}, ErrEvidenceConflict
+	var commandErr error
+	if amendmentAuthenticated {
+		commandErr = s.reauthenticateStoredVerificationCommandHistoricalFrom(ctx, q, ref, result)
+	} else {
+		commandErr = s.reauthenticateStoredVerificationCommandFrom(ctx, q, ref, result)
+	}
+	if commandErr != nil {
+		return StoredVerification{}, fmt.Errorf("verification command reauthentication: %w", ErrEvidenceConflict)
+	}
+	if amendmentAuthenticated {
+		// The amendment boundary and signed recovery suffix are themselves the
+		// live binding for this decision-specific transition. Project that exact
+		// current endpoint while retaining the immutable provider/command witnesses
+		// at the fences where they were recorded.
+		result.TicketVersion = ticketVersion
+		result.Fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticketRunner}
 	}
 	// Events are human/audit projections only. Provider, checkpoint, and
 	// repository-command authority come from constrained immutable bindings.

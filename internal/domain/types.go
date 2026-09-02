@@ -229,20 +229,33 @@ type MergeIntent struct {
 // classic rule from a repository ruleset.
 func (intent MergeIntent) ValidateProtectionWitness() error {
 	if intent.ActiveRulesetCount == 0 {
-		if (intent.ProtectionKind == "" || intent.ProtectionKind == "classic") && intent.ProtectionChecksDigest == "" {
+		if intent.ProtectionKind == "" && intent.ProtectionChecksDigest == "" {
+			return nil
+		}
+		// Empty classic digests remain valid for rows written before the checks
+		// digest was persisted. Current GitHub observations bind the exact
+		// required-context set with a canonical SHA-256 digest.
+		if intent.ProtectionKind == "classic" && (intent.ProtectionChecksDigest == "" || validProtectionChecksDigest(intent.ProtectionChecksDigest)) {
 			return nil
 		}
 		return fmt.Errorf("invalid classic protection witness")
 	}
-	if intent.ActiveRulesetCount != 1 || intent.ProtectionKind != "ruleset" || len(intent.ProtectionChecksDigest) != 64 {
+	if intent.ActiveRulesetCount != 1 || intent.ProtectionKind != "ruleset" || !validProtectionChecksDigest(intent.ProtectionChecksDigest) {
 		return fmt.Errorf("invalid ruleset protection witness")
 	}
-	for _, value := range intent.ProtectionChecksDigest {
+	return nil
+}
+
+func validProtectionChecksDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, value := range value {
 		if !(value >= '0' && value <= '9' || value >= 'a' && value <= 'f') {
-			return fmt.Errorf("invalid ruleset protection checks digest")
+			return false
 		}
 	}
-	return nil
+	return true
 }
 
 type ProviderIdentity struct {

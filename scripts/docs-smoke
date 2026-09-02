@@ -19,8 +19,7 @@ for required in \
 	'make build-dev' \
 	'./bin/sf-dev auth status' \
 	'./bin/sf-dev auth login github' \
-	'./bin/sf-dev auth login cursor' \
-	'./bin/sf-dev auth login claude' \
+	'./bin/sf-dev auth login codex' \
 	'./bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app' \
 	'./bin/sf-dev daemon run' \
 	'./bin/sf-dev providers qualify --builder codex --reviewer codex' \

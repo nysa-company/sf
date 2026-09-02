@@ -42,6 +42,22 @@ type MergeReconciliationReadiness interface {
 	MergeReconciliationReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error)
 }
 
+// OperatorSourceResumeProofSource loads the typed Store proof for one exact
+// source takeover handback. It is necessary but insufficient: Worktrees must also
+// implement OperatorSourceResumeAuthenticator and physically reauthenticate
+// the checkout before Scheduler can invoke Worker.
+type OperatorSourceResumeProofSource interface {
+	OperatorSourceResumeProof(context.Context, domain.TicketRef, uint64, domain.Fence) (store.OperatorSourceResumeProof, bool, error)
+}
+
+// OperatorSourceResumeFreshnessSource identifies an active source-resume
+// verification endpoint before its physical proof is loaded.  If freshness is
+// required, Scheduler must never fall back to pristine Ensure: that would
+// discard the authenticated operator checkout after a restart.
+type OperatorSourceResumeFreshnessSource interface {
+	OperatorSourceResumeRequiresFreshVerification(context.Context, domain.TicketRef, uint64) (bool, error)
+}
+
 // StoreTicketSource adapts Store.Tickets without exposing SQL to the runtime.
 type StoreTicketSource struct {
 	Store *store.Store
@@ -73,6 +89,20 @@ func (s StoreTicketSource) MergeReconciliationReady(ctx context.Context, ref dom
 	return s.Store.MergeReconciliationReady(ctx, ref, version, fence)
 }
 
+func (s StoreTicketSource) OperatorSourceResumeProof(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (store.OperatorSourceResumeProof, bool, error) {
+	if s.Store == nil {
+		return store.OperatorSourceResumeProof{}, false, ErrInvalidScheduler
+	}
+	return s.Store.OperatorSourceResumeProof(ctx, ref, version, fence)
+}
+
+func (s StoreTicketSource) OperatorSourceResumeRequiresFreshVerification(ctx context.Context, ref domain.TicketRef, version uint64) (bool, error) {
+	if s.Store == nil {
+		return false, ErrInvalidScheduler
+	}
+	return s.Store.OperatorSourceResumeRequiresFreshVerification(ctx, ref, version)
+}
+
 func (s StoreTicketSource) RuntimeAdmissionReady(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
 	if s.Store == nil {
 		return false, ErrInvalidScheduler
@@ -85,6 +115,13 @@ func (s StoreTicketSource) RuntimeAdmissionReady(ctx context.Context, ref domain
 // identity fields while still permitting deterministic fakes in tests.
 type WorktreeEnsurer interface {
 	Ensure(context.Context, worktreecoord.EnsureRequest) (store.StoredWorktree, error)
+}
+
+// OperatorSourceResumeAuthenticator is intentionally separate from Ensure.
+// Its implementation may accept only the source-resume proof's exact dirty
+// path set; it cannot weaken the normal pristine worktree contract.
+type OperatorSourceResumeAuthenticator interface {
+	AuthenticateOperatorSourceResume(context.Context, worktreecoord.EnsureRequest, store.OperatorSourceResumeProof) (store.StoredWorktree, error)
 }
 
 type Worker interface {
@@ -240,7 +277,7 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 			result.Outcome = OutcomeInvoked
 			return result
 		}
-		if ticket.State == domain.StateWaitingManualMerge || ticket.State == domain.StateReconciling {
+		if ticket.State == domain.StateWaitingApproval || ticket.State == domain.StateWaitingManualMerge || ticket.State == domain.StateReconciling {
 			// Manual merge observation and guarded/manual reconciliation are
 			// read-only GitHub observations. They
 			// must not be held hostage by an unavailable local checkout, because
@@ -288,6 +325,66 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 				}
 			}
 		}
+		if ticket.State == domain.StateVerifying || ticket.State == domain.StateBuilding {
+			freshSource := false
+			if freshness, ok := s.Tickets.(OperatorSourceResumeFreshnessSource); ok {
+				fresh, freshnessErr := freshness.OperatorSourceResumeRequiresFreshVerification(runCtx, ticket.Ref, ticket.Version)
+				if freshnessErr != nil {
+					end()
+					return classify(freshnessErr, candidateFence, ticket.Ref)
+				}
+				freshSource = fresh
+			}
+			// A Store proof alone cannot authorize a dirty worktree. The optional
+			// coordinator path re-observes its physical identity, checkpoint head,
+			// and exact path set before this Scheduler reaches Worker.
+			if source, ok := s.Tickets.(OperatorSourceResumeProofSource); ok {
+				proof, found, proofErr := source.OperatorSourceResumeProof(runCtx, ticket.Ref, ticket.Version, candidateFence)
+				if proofErr != nil {
+					end()
+					return classify(proofErr, candidateFence, ticket.Ref)
+				}
+				if freshSource && !found {
+					end()
+					return TickResult{Outcome: OutcomeReadiness, Ref: ticket.Ref, Ticket: ticket, Fence: candidateFence, Err: ErrReadiness}
+				}
+				if found {
+					authenticator, supported := s.Worktrees.(OperatorSourceResumeAuthenticator)
+					if !supported {
+						end()
+						return TickResult{Outcome: OutcomeReadiness, Ref: ticket.Ref, Ticket: ticket, Fence: candidateFence, Err: ErrReadiness}
+					}
+					worktree, authErr := authenticator.AuthenticateOperatorSourceResume(runCtx, worktreecoord.EnsureRequest{Ref: ticket.Ref, Version: ticket.Version, Fence: candidateFence}, proof)
+					if authErr != nil {
+						end()
+						result.Outcome, result.Err = classifyEnsure(authErr)
+						return result
+					}
+					// Stop seals and cancels a registered activity while the
+					// coordinator is reauthenticating the physical checkout. Never
+					// cross from that external boundary into Worker after cancellation,
+					// even if an authenticator returns a successful observation late.
+					if runCtx.Err() != nil {
+						end()
+						result.Outcome, result.Err = OutcomeCanceled, ErrCanceled
+						return result
+					}
+					result.Worktree = worktree
+					workerResult, workerErr := s.Worker.Run(runCtx, ticket.Ref, candidateFence)
+					end()
+					result.Worker = workerResult
+					if workerErr != nil {
+						result.Outcome, result.Err = classifyWorker(workerErr)
+						return result
+					}
+					result.Outcome = OutcomeInvoked
+					return result
+				}
+			} else if freshSource {
+				end()
+				return TickResult{Outcome: OutcomeReadiness, Ref: ticket.Ref, Ticket: ticket, Fence: candidateFence, Err: ErrReadiness}
+			}
+		}
 		worktree, ensureErr := s.Worktrees.Ensure(runCtx, worktreecoord.EnsureRequest{Ref: ticket.Ref, Version: ticket.Version, Fence: candidateFence})
 		if ensureErr != nil {
 			end()
@@ -324,7 +421,7 @@ func (s Scheduler) activeState(state domain.State) bool {
 	// while a pre-publishing runtime uses the same admission to durably block.
 	// waiting_ci is a bounded, read-only observation state. It must not create
 	// a worktree or launch a provider, but one scheduler tick may poll it.
-	return state == domain.StatePlanning || state == domain.StateVerifying || state == domain.StateBuilding || state == domain.StatePublishing || state == domain.StateWaitingCI || state == domain.StateReviewing || state == domain.StateWaitingManualMerge || state == domain.StateMerging || state == domain.StateReconciling
+	return state == domain.StatePlanning || state == domain.StateVerifying || state == domain.StateBuilding || state == domain.StatePublishing || state == domain.StateWaitingCI || state == domain.StateReviewing || state == domain.StateWaitingApproval || state == domain.StateWaitingManualMerge || state == domain.StateMerging || state == domain.StateReconciling
 }
 
 func classify(err error, fence domain.Fence, ref domain.TicketRef) TickResult {
@@ -367,6 +464,7 @@ func classifyWorker(err error) (Outcome, error) {
 // Compile-time documentation that the concrete coordinator remains usable by
 // this package. No daemon wiring is performed here.
 var _ WorktreeEnsurer = worktreecoord.Coordinator{}
+var _ OperatorSourceResumeAuthenticator = worktreecoord.Coordinator{}
 
 func (r TickResult) String() string {
 	if r.Err == nil {

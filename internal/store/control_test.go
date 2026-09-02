@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/phaseartifact"
 )
 
 func TestTransitionAndInvalidateRunnerIsAtomicAndFenced(t *testing.T) {
@@ -211,6 +213,75 @@ func TestCompleteControlTransitionPreservesActiveProviderClaim(t *testing.T) {
 	leases, err := db.Leases(ctx, domain.ChannelDev)
 	if err != nil || len(leases) != 1 {
 		t.Fatalf("provider lease changed: %+v err=%v", leases, err)
+	}
+}
+
+func TestDrainedProviderControlInvalidationCancelsExactAttemptAndAdmitsRetry(t *testing.T) {
+	db, ctx, leader, ticket, claim := providerControlFixture(t)
+	oldFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	if err := db.RecordProviderLaunch(ctx, claim, contracts.ProviderLaunch{PID: 4242, PGID: 4242, BootIdentity: "boot-provider-control", ProcessStartIdentity: "start-provider-control", Worktree: claim.Worktree}); err != nil {
+		t.Fatal(err)
+	}
+	control, stopping := stopProviderControl(t, db, ctx, leader, ticket)
+	raw := contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: []byte(`{"schema":"sf.builder/v1","summary":"late output","changed_files":["main.go"],"commands":[["go","test","./..."]]}`), UsageTrusted: true, UsageUnits: 1}
+	validation := phaseartifact.Validation{TicketType: ticket.Type}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, oldFence, raw, validation, time.Now().UTC()); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("revoked provider output was admitted: %v", err)
+	}
+	if err := db.RetireProviderAttemptAfterControlInvalidation(ctx, claim, proof(t, claim), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, oldFence, raw, validation, time.Now().UTC()); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("late completion for retired claim was admitted: %v", err)
+	}
+	var results int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&results); err != nil || results != 0 {
+		t.Fatalf("revoked output result count=%d err=%v", results, err)
+	}
+	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "cancelled" || attempts[0].Outcome != "cancelled" || attempts[0].UsageUnits != 0 {
+		t.Fatalf("retired provider attempt=%+v err=%v", attempts, err)
+	}
+	phases, err := db.PhaseAttempts(ctx, ticket.Ref)
+	if err != nil || len(phases) != 1 || phases[0].State != "cancelled" || phases[0].Outcome != "cancelled" {
+		t.Fatalf("retired phase=%+v err=%v", phases, err)
+	}
+	active, err := db.ActiveProviderAttempts(ctx, ticket.Ref.Channel)
+	if err != nil || len(active) != 0 {
+		t.Fatalf("active provider attempts=%+v err=%v", active, err)
+	}
+	leases, err := db.Leases(ctx, ticket.Ref.Channel)
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("provider lease survived retirement=%+v err=%v", leases, err)
+	}
+	pausedResult, err := db.CompleteControlTransition(ctx, Transition{
+		Ref: stopping.Ref, ExpectedVersion: control.Version, From: domain.StateStopping, To: domain.StatePaused,
+		ResumeState: ticket.State, Trigger: "process_and_effects_drained",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || paused.State != domain.StatePaused || paused.Version != pausedResult.Version {
+		t.Fatalf("paused ticket=%+v result=%+v err=%v", paused, pausedResult, err)
+	}
+	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateBuilding, Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: paused.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openExactRuntimeAdmission(t, db, ticket.Ref)
+	second, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{
+		Ref: resumed.Ref, ExpectedVersion: resumed.Version,
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: resumed.RunnerEpoch},
+		Phase: claim.Phase, Role: claim.Role, Binding: claim.Binding,
+		ConfigDigest: resumed.ConfigDigest, Capacity: 1, At: time.Now().UTC(),
+	}))
+	if err != nil || second.Attempt != 2 {
+		t.Fatalf("second attempt=%+v err=%v", second, err)
 	}
 }
 

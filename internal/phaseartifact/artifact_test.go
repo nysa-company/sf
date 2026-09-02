@@ -90,8 +90,8 @@ func TestBuilderCannotSilentlyChangeProtectedVerification(t *testing.T) {
 	if _, err := Parse(domain.PhaseBuild, result(t, value), validation); err == nil {
 		t.Fatal("protected proof edit accepted without amendment")
 	}
-	value.AmendmentRequest = &AmendmentRequest{OldProofDigest: "old", ProposedDigest: "new", Reason: "fixture assertion wrong"}
-	validation.ApprovedAmendmentDigest = "new"
+	value.AmendmentRequest = &AmendmentRequest{OldProofDigest: strings.Repeat("a", 64), ProposedDigest: strings.Repeat("b", 64), ProposedCommand: []string{"go", "test", "./..."}, Reason: "fixture assertion wrong"}
+	validation.ApprovedAmendmentDigest = strings.Repeat("b", 64)
 	if _, err := Parse(domain.PhaseBuild, result(t, value), validation); err != nil {
 		t.Fatal(err)
 	}

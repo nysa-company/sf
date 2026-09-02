@@ -83,6 +83,15 @@ type PublishedPullRequestObserver interface {
 	ObservePublishedPullRequest(context.Context, PullRequestIdentity) (PublishedPullRequestObservation, error)
 }
 
+// ExternalMergeObserver is the explicit read-only boundary for an externally
+// merged published PR. Unlike PublishedPullRequestObserver, it may return a
+// PR whose source head moved after publication so Store can classify that
+// merge as the terminal unverified external_merged outcome. Repository, PR
+// number, source ownership, base ref, and the factory marker remain exact.
+type ExternalMergeObserver interface {
+	ObserveExternalMerge(context.Context, PullRequestIdentity) (PublishedPullRequestObservation, error)
+}
+
 // MergeBranchVerifier is implemented by a merge-proof coordinator after it
 // arranges a freshly authorized protected-ref fetch and proves that the
 // observed merge is reachable from a protected branch whose merge started at
@@ -117,6 +126,12 @@ type ExternalMutationGuard interface {
 // intent can be reconciled after a crash or a lost response.
 type MergeIntentRecorder interface {
 	RecordMergeIntent(context.Context, domain.MergeIntent) error
+	// RecordGuardedMergeObservation seals the exact GitHub merged-PR response
+	// before a protected-branch proof may be issued. The Store validates and
+	// persists the merged state, source identity, post-merge base observations,
+	// and merge commit; the source head in the intent remains distinct from the
+	// post-merge commit in this response.
+	RecordGuardedMergeObservation(context.Context, domain.MergeIntent, PublishedPullRequestObservation) error
 }
 
 // MergeIntentObserver performs restart reconciliation from the complete

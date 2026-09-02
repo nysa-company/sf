@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Run one command with a portable, process-group timeout."""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import signal
+import subprocess
+import sys
+
+
+def parse_timeout(value: str) -> float:
+    units = {"s": 1.0, "m": 60.0, "h": 3600.0}
+    suffix = value[-1:].lower()
+    if suffix not in units:
+        raise argparse.ArgumentTypeError("timeout must end in s, m, or h")
+    try:
+        amount = float(value[:-1])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("timeout must be numeric") from exc
+    seconds = amount * units[suffix]
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("timeout must be positive and finite")
+    return seconds
+
+
+class TerminationRequested(Exception):
+    """Raised in the main thread when the wrapper receives a termination signal."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+
+
+def request_termination(signum: int, _frame: object) -> None:
+    raise TerminationRequested(signum)
+
+
+def terminate_process_group(
+    process: subprocess.Popen[bytes], grace_seconds: float = 10.0
+) -> bool:
+    """Stop one child group with finite TERM and KILL waits.
+
+    SIGINT and SIGTERM are ignored while cleanup is underway so a repeated
+    cancellation cannot abandon the child process group after this wrapper has
+    created its own session for it.
+    """
+    previous_handlers = {
+        signum: signal.signal(signum, signal.SIG_IGN)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+        try:
+            process.wait(timeout=grace_seconds)
+            return True
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return True
+            try:
+                process.wait(timeout=grace_seconds)
+                return True
+            except subprocess.TimeoutExpired:
+                return False
+    finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--timeout", type=parse_timeout, required=True)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if not args.command or args.command[0] != "--":
+        parser.error("command must follow --")
+    command = args.command[1:]
+    if not command:
+        parser.error("command must include an executable after --")
+
+    process = subprocess.Popen(command, start_new_session=True)
+    previous_handlers = {
+        signum: signal.signal(signum, request_termination)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        return process.wait(timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        print(
+            f"bounded command timed out after {args.timeout:g}s: {' '.join(command)}",
+            file=sys.stderr,
+        )
+        if not terminate_process_group(process):
+            print("bounded command did not exit after TERM/KILL cleanup", file=sys.stderr)
+        return 124
+    except TerminationRequested as exc:
+        print(
+            f"bounded command interrupted by {signal.Signals(exc.signum).name}: {' '.join(command)}",
+            file=sys.stderr,
+        )
+        if not terminate_process_group(process):
+            print("bounded command did not exit after TERM/KILL cleanup", file=sys.stderr)
+        return 128 + exc.signum
+    finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

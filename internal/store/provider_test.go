@@ -546,9 +546,16 @@ func TestCompleteProviderAttemptSuccessPersistsAndReparses(t *testing.T) {
 	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("premature result count=%d err=%v", count, err)
 	}
+	if _, _, err := db.LoadProviderAttemptResult(ctx, claim, ticket.Version, fence); !errors.Is(err, ErrProviderAttempt) {
+		t.Fatalf("absent result lookup=%v", err)
+	}
 	stored, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
+	}
+	replayed, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, raw, phaseartifact.Validation{TicketType: domain.TicketFeature}, time.Now().UTC())
+	if err != nil || !sameProviderAttemptResult(replayed, stored) {
+		t.Fatalf("exact replay=%+v stored=%+v err=%v", replayed, stored, err)
 	}
 	loaded, parsed, err := db.LoadProviderAttemptResult(ctx, claim, ticket.Version, fence)
 	if err != nil || parsed.Builder == nil || loaded.RawSHA256 != stored.RawSHA256 || loaded.Claim.BindingDigest != claim.BindingDigest || loaded.Claim.LeaseKey != claim.LeaseKey || !bytes.Equal(loaded.Claim.SupervisorKey, claim.SupervisorKey) || loaded.Claim.Input.RequestDigest != claim.Input.RequestDigest {
@@ -1282,7 +1289,7 @@ func setupProviderProject(t *testing.T, db *Store, ctx context.Context) string {
 func setupProviderTicket(t *testing.T, db *Store, ctx context.Context, id string, leader uint64) Ticket {
 	t.Helper()
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "provider", Ticket: domain.TicketID(id)}
-	if err := db.CreateTicket(ctx, Ticket{Ref: ref, SourceDigest: "digest-" + id, Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+	if err := db.CreateTicket(ctx, Ticket{Ref: ref, SourceDigest: sha256Digest([]byte("digest-" + id)), Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
 		t.Fatal(err)
 	}
 	started, err := db.StartOrAdopt(ctx, ref, 1, "dev/provider/"+id, domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})

@@ -18,16 +18,20 @@ import (
 const MaxSourceBytes = 1 << 20
 
 type Parsed struct {
-	Title           string
-	Problem         string
-	Acceptance      []string
-	Type            domain.TicketType
-	MergeMode       domain.MergeMode
-	Priority        string
-	MaxDuration     time.Duration
-	MaxCostMicroUSD int64
-	Source          []byte
-	Digest          string
+	Title      string
+	Problem    string
+	Acceptance []string
+	Type       domain.TicketType
+	MergeMode  domain.MergeMode
+	// MergeModeExplicit distinguishes an omitted merge front-matter value from
+	// the parser's guarded compatibility default. Submission resolves omitted
+	// values against the registered project's frozen policy.
+	MergeModeExplicit bool
+	Priority          string
+	MaxDuration       time.Duration
+	MaxCostMicroUSD   int64
+	Source            []byte
+	Digest            string
 }
 
 func Parse(reader io.Reader) (Parsed, error) {
@@ -147,6 +151,7 @@ func parseFrontMatter(lines []string, parsed *Parsed) (int, error) {
 			if !parsed.MergeMode.Valid() {
 				return 0, fmt.Errorf("invalid merge mode %q", value)
 			}
+			parsed.MergeModeExplicit = true
 		case "priority":
 			switch value {
 			case "low", "normal", "high":

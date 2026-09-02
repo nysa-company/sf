@@ -18,22 +18,27 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/executionpolicy"
 	"github.com/nysa-company/sf/internal/nodeclosure"
+	"github.com/nysa-company/sf/internal/nysapure"
 )
 
 const (
-	nodeClosureVersion         = "node22-closure-v1"
-	nodeClosureEntries         = 128
-	nodeClosureBytes     int64 = 256 << 20
-	nodeClosureFileBytes int64 = 64 << 20
-	nodeClosureDepth           = 16
-	nodeClosureStageTime       = 15 * time.Second
+	nodeClosureVersion             = "node22-closure-v1"
+	nodeClosureEntries             = 128
+	nodeClosureBytes         int64 = 256 << 20
+	nodeClosureFileBytes     int64 = 64 << 20
+	nodeClosureDepth               = 16
+	nodeClosureStageTime           = 15 * time.Second
+	stagedNodeRecoveryWindow       = 30 * time.Second
+	stagedNodeRecoveryPoll         = 250 * time.Millisecond
 )
 
 type nodeClosureEntry struct {
@@ -244,16 +249,27 @@ func nodeClosureIdentity(c nodeClosure) (string, error) {
 	return nodeClosureVersion + ":sha256:" + hex.EncodeToString(s[:]), nil
 }
 
-// stageNodeClosure copies every executable dependency to an owner-only
-// directory and verifies each staged byte stream against the canonical claim.
+// stageNodeClosure copies every executable dependency into writable private
+// directories, then seals the entire runtime closure before returning it.
 func stageNodeClosure(source nodeClosure, want string) (node, library string, cleanup func(), err error) {
+	node, library, _, cleanup, err = stageNodeClosureWithLoader(source, want, false)
+	return node, library, cleanup, err
+}
+
+// stageNysaPureNodeClosure installs the factory loader before the shared
+// closure is sealed. A launch can consequently never reopen lib to add it.
+func stageNysaPureNodeClosure(source nodeClosure, want string) (node, library, loader string, cleanup func(), err error) {
+	return stageNodeClosureWithLoader(source, want, true)
+}
+
+func stageNodeClosureWithLoader(source nodeClosure, want string, withLoader bool) (node, library, loader string, cleanup func(), err error) {
 	identity, err := nodeClosureIdentity(source)
 	if err != nil || identity != want {
-		return "", "", nil, ErrUnclear
+		return "", "", "", nil, ErrUnclear
 	}
 	base, err := os.MkdirTemp("", "sf-node22-closure-")
 	if err != nil {
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
 	// Seatbelt matches macOS's /private/var spelling. Use the canonical path
 	// for the stage, DYLD path, and profile so an alias cannot make the exact
@@ -262,52 +278,123 @@ func stageNodeClosure(source nodeClosure, want string) (node, library string, cl
 	base, err = filepath.EvalSymlinks(base)
 	if err != nil {
 		_ = os.RemoveAll(created)
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
 	if err := os.Chmod(base, 0o700); err != nil {
 		_ = os.RemoveAll(base)
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
-	cleanup = func() { _ = os.RemoveAll(base) }
+	cleanup = func() { removeSealedNodeStage(base) }
 	bin, lib := filepath.Join(base, "bin"), filepath.Join(base, "lib")
 	if err := os.Mkdir(bin, 0o700); err != nil {
 		cleanup()
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
 	if err := os.Mkdir(lib, 0o700); err != nil {
 		cleanup()
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
 	deadline := time.Now().Add(nodeClosureStageTime)
 	copied := int64(0)
 	if err := copyNodeClosureFile(source.Executable, filepath.Join(bin, "node"), source.Digest, source.Size, &copied, deadline); err != nil {
 		cleanup()
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
 	for _, entry := range source.Entries {
 		if err := copyNodeClosureFile(entry.Path, filepath.Join(lib, entry.Leaf), entry.Digest, entry.Size, &copied, deadline); err != nil {
 			cleanup()
-			return "", "", nil, err
+			return "", "", "", nil, err
 		}
 	}
 	node = filepath.Join(bin, "node")
 	if copied != source.Bytes || copied > nodeClosureBytes {
 		cleanup()
-		return "", "", nil, ErrUnclear
+		return "", "", "", nil, ErrUnclear
 	}
-	if err := verifyStagedNodeClosure(source, node, lib); err != nil {
+	if withLoader {
+		loader, err = stageNysaPureLoader(lib)
+		if err != nil {
+			cleanup()
+			return "", "", "", nil, err
+		}
+	}
+	if err := sealNodeClosureStage(base, bin, lib, node, loader, source); err != nil {
 		cleanup()
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
-	return node, lib, cleanup, nil
+	return node, lib, loader, cleanup, nil
 }
 
 func verifyStagedNodeClosure(source nodeClosure, node, library string) error {
+	base := filepath.Dir(filepath.Dir(node))
+	if filepath.Dir(node) != filepath.Join(base, "bin") || library != filepath.Join(base, "lib") || !sealedNodeDirectory(base) || !sealedNodeDirectory(filepath.Dir(node)) || !sealedNodeDirectory(library) {
+		return ErrUnclear
+	}
+	if !sealedNodeFile(node) {
+		return ErrUnclear
+	}
 	if got, err := executableFileDigest(node); err != nil || got != source.Digest {
 		return ErrUnclear
 	}
 	for _, entry := range source.Entries {
-		if got, err := executableFileDigest(filepath.Join(library, entry.Leaf)); err != nil || got != entry.Digest {
+		path := filepath.Join(library, entry.Leaf)
+		if !sealedNodeFile(path) {
+			return ErrUnclear
+		}
+		if got, err := executableFileDigest(path); err != nil || got != entry.Digest {
+			return ErrUnclear
+		}
+	}
+	return nil
+}
+
+func sealedNodeDirectory(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() && info.Mode().Perm() == 0o500 && trustedOwner(info)
+}
+
+func sealedNodeFile(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() && info.Mode().Perm() == 0o500 && trustedOwner(info)
+}
+
+func removeSealedNodeStage(root string) {
+	if !cleanAbsolute(root) {
+		return
+	}
+	_ = filepath.WalkDir(root, func(current string, entry os.DirEntry, err error) error {
+		if err == nil && entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
+			_ = os.Chmod(current, 0o700)
+		}
+		return nil
+	})
+	_ = os.RemoveAll(root)
+}
+
+func sealNodeClosureStage(base, bin, library, node, loader string, source nodeClosure) error {
+	paths := []string{node}
+	for _, entry := range source.Entries {
+		paths = append(paths, filepath.Join(library, entry.Leaf))
+	}
+	if loader != "" {
+		paths = append(paths, loader)
+	}
+	for _, path := range paths {
+		if err := os.Chmod(path, 0o500); err != nil || !sealedNodeFile(path) {
+			return ErrUnclear
+		}
+	}
+	for _, directory := range []string{bin, library, base} {
+		if err := os.Chmod(directory, 0o500); err != nil || !sealedNodeDirectory(directory) {
+			return ErrUnclear
+		}
+	}
+	if err := verifyStagedNodeClosure(source, node, library); err != nil {
+		return err
+	}
+	if loader != "" {
+		data, err := os.ReadFile(loader)
+		if err != nil || !nysapure.EqualLoaderSource(data) {
 			return ErrUnclear
 		}
 	}
@@ -331,7 +418,7 @@ func copyNodeClosureFile(source, target, want string, wantSize int64, copied *in
 	if err != nil || !os.SameFile(info, opened) || info.Size() != wantSize || info.Size() > nodeClosureFileBytes || copied == nil || info.Size() > nodeClosureBytes-*copied {
 		return ErrUnclear
 	}
-	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o500)
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -342,7 +429,7 @@ func copyNodeClosureFile(source, target, want string, wantSize int64, copied *in
 		return ErrUnclear
 	}
 	staged, err := secureNodeSource(target)
-	if err != nil || staged.Mode().Perm()&0o077 != 0 {
+	if err != nil || staged.Mode().Perm() != 0o600 {
 		return ErrUnclear
 	}
 	got, err := executableFileDigest(target)
@@ -353,13 +440,44 @@ func copyNodeClosureFile(source, target, want string, wantSize int64, copied *in
 	return nil
 }
 
+// node22VersionUsable accepts the exact Node 22 release family required by
+// the recipe. Node's experimental test isolation flag was added in 22.8.0;
+// accepting an earlier v22 would defer that compatibility failure until the
+// gated child is launched.
+func node22VersionUsable(version string) bool {
+	version = strings.TrimSpace(version)
+	if !strings.HasPrefix(version, "v") {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(version, "v"), ".")
+	if len(parts) != 3 {
+		return false
+	}
+	parsePart := func(part string) (int, bool) {
+		if part == "" || (len(part) > 1 && part[0] == '0') {
+			return 0, false
+		}
+		for index := range part {
+			if part[index] < '0' || part[index] > '9' {
+				return 0, false
+			}
+		}
+		parsed, err := strconv.Atoi(part)
+		return parsed, err == nil
+	}
+	major, validMajor := parsePart(parts[0])
+	minor, validMinor := parsePart(parts[1])
+	patch, validPatch := parsePart(parts[2])
+	return validMajor && validMinor && validPatch && major == 22 && (minor > 8 || (minor == 8 && patch >= 0))
+}
+
 func probeStagedNode22(path, library string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "--version")
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "DYLD_LIBRARY_PATH=" + library, "HOME=/var/empty", "TMPDIR=/var/empty"}
 	out, err := cmd.Output()
-	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(out)), "v22.") {
+	if err != nil || !node22VersionUsable(string(out)) {
 		return ErrUnclear
 	}
 	return nil
@@ -389,15 +507,218 @@ func node22Identity(name string) (string, string, error) {
 	return path, identity, nil
 }
 
+// nysaPureRuntimeIdentity binds the staged Node closure and the factory-owned
+// resolver. A frozen command therefore cannot silently start using a changed
+// TypeScript resolution policy merely because the selected Node binary stayed
+// the same.
+func nysaPureRuntimeIdentity(nodeIdentity string) (string, error) {
+	if !strings.HasPrefix(nodeIdentity, nodeClosureVersion+":sha256:") {
+		return "", ErrUnclear
+	}
+	data, err := json.Marshal(struct {
+		Version, Node, Loader string
+	}{"nysa-api-pure-v1", nodeIdentity, nysapure.LoaderIdentity()})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return "nysa-api-pure-v1:sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func stageNysaPureLoader(directory string) (string, error) {
+	if !cleanAbsolute(directory) {
+		return "", ErrUnclear
+	}
+	path := filepath.Join(directory, "nysa_api_pure_loader.mjs")
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o500)
+	if err != nil {
+		return "", err
+	}
+	_, writeErr := io.WriteString(file, nysapure.LoaderSource)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		_ = os.Remove(path)
+		return "", ErrUnclear
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o500 || !trustedOwner(info) {
+		return "", ErrUnclear
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !nysapure.EqualLoaderSource(data) {
+		return "", ErrUnclear
+	}
+	return path, nil
+}
+
+func nodeRecipeValidate(worktree string, argv []string, pure bool) error {
+	if pure {
+		if len(argv) != 3 || !nysapure.ValidTestPath(argv[2]) {
+			return ErrUnclear
+		}
+		return nysapure.Validate(worktree, argv[2])
+	}
+	return nodeclosure.Validate(worktree)
+}
+
+func nodeRecipeValidateDirectoryFD(rootFD int, argv []string, pure bool) ([]nysapure.SourceFile, error) {
+	if pure {
+		if len(argv) != 3 || !nysapure.ValidTestPath(argv[2]) {
+			return nil, ErrUnclear
+		}
+		return nysapure.ValidateDirectoryFDSources(rootFD, argv[2])
+	}
+	return nil, nodeclosure.ValidateDirectoryFD(rootFD)
+}
+
+func sameStringList(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func nodeLaunchFlags(pure bool, loader, testPath, worktree, closureRoot string) []string {
+	// Node's test runner must traverse the launch root to resolve a relative
+	// test path. In the pure recipe this is the private sealed source stage,
+	// which contains exactly the authenticated closure rather than the mutable
+	// worktree. Seatbelt still grants only the individual staged source files.
+	flags := []string{"--permission", "--allow-fs-read=" + worktree}
+	flags = append(flags, "--allow-fs-read="+closureRoot, "--no-addons", "--experimental-test-isolation=none", "--test-concurrency=1", "--no-experimental-fetch", "--no-experimental-websocket", "--no-experimental-sqlite", "--no-global-search-paths")
+	if pure {
+		// Node's permission model runs an experimental loader in a worker. The
+		// worker permission is narrowly paired with Seatbelt's process-fork and
+		// process-exec denials at the repository gate.
+		flags = append(flags, "--allow-worker", "--experimental-transform-types", "--experimental-loader", loader, "--test", testPath)
+	} else {
+		flags = append(flags, "--no-experimental-strip-types", "--test")
+	}
+	return flags
+}
+
+func nodePureSourceReadFlags(flags, files []string) ([]string, error) {
+	if len(flags) < 2 || flags[len(flags)-2] != "--test" || flags[len(flags)-1] == "" {
+		return nil, ErrUnclear
+	}
+	tail := append([]string(nil), flags[len(flags)-2:]...)
+	result := append([]string(nil), flags[:len(flags)-2]...)
+	for _, file := range files {
+		if !cleanAbsolute(file) {
+			return nil, ErrUnclear
+		}
+		result = append(result, "--allow-fs-read="+file)
+	}
+	return append(result, tail...), nil
+}
+
+// stagedNodeArtifacts owns every private path granted to the one staged Node
+// process. It intentionally has one close transition: source and runtime are
+// released together, only after the recorded launch is durably finished.
+type stagedNodeArtifacts struct {
+	runtime, source func()
+	once            sync.Once
+}
+
+func (a *stagedNodeArtifacts) Close() {
+	if a == nil {
+		return
+	}
+	a.once.Do(func() {
+		if a.source != nil {
+			a.source()
+		}
+		if a.runtime != nil {
+			a.runtime()
+		}
+	})
+}
+
+// repositoryLaunchFinisher shares one durable Finish attempt between the
+// normal wait path and bounded recovery. A returned error is deliberately
+// memoized: retrying an uncertain persistence result could create a second
+// transition after a store commit that the first caller failed to observe.
+type repositoryLaunchFinisher struct {
+	once sync.Once
+	run  func(context.Context) error
+	err  error
+}
+
+func (f *repositoryLaunchFinisher) Finish(ctx context.Context) error {
+	if f == nil || f.run == nil {
+		return ErrUnclear
+	}
+	f.once.Do(func() {
+		f.err = f.run(ctx)
+	})
+	return f.err
+}
+
+// drainStagedNodeLifecycle has one bounded recovery owner for a recorded
+// launch. A failed Finish is not retried by a second stage finisher: it is
+// quarantined, then both stages are released only after identity-pinned
+// disappearance has already proved that no process can still use them.
+func (s RepositoryCommandSupervisor) drainStagedNodeLifecycle(launch contracts.RepositoryCommandLaunch, lease contracts.RepositoryCommandLease, artifacts *stagedNodeArtifacts, finish func(context.Context) error) {
+	if artifacts == nil || lease == nil || finish == nil || launch.PID <= 0 || launch.PGID <= 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), stagedNodeRecoveryWindow)
+		defer cancel()
+		settleStagedNodeArtifacts(ctx, stagedNodeRecoveryPoll, func() error {
+			return s.ensureGone(launch, false)
+		}, finish, lease.Quarantine, artifacts)
+	}()
+}
+
+// settleStagedNodeArtifacts performs a single Finish transition. It is kept
+// dependency-injected so regressions can prove that a failed finish is
+// quarantined and cannot consume a second artifact cleanup path.
+func settleStagedNodeArtifacts(ctx context.Context, poll time.Duration, gone func() error, finish func(context.Context) error, quarantine func() error, artifacts *stagedNodeArtifacts) {
+	if ctx == nil || gone == nil || finish == nil || quarantine == nil || artifacts == nil || poll <= 0 {
+		return
+	}
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	for {
+		if gone() == nil {
+			finishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := finish(finishCtx)
+			cancel()
+			if err != nil {
+				_ = quarantine()
+			}
+			// A successful gone proof makes the private paths inert even when the
+			// Store transition could not be persisted. Quarantine retains the
+			// authority evidence; retaining executable/source files would not.
+			artifacts.Close()
+			return
+		}
+		select {
+		case <-ctx.Done():
+			_ = quarantine()
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // runNode uses the same durable Store lease and fd-pinned worktree as Go, but
 // never inserts Node test wrappers. Seatbelt denies network and
 // process-fork/exec; Node's own permissions/flags add child, worker, write,
 // and addon defense in depth.
 func (s RepositoryCommandSupervisor) runNode(ctx context.Context, claim contracts.RepositoryCommandClaim, spec contracts.CommandSpec, policy executionpolicy.CommandSnapshot, lease contracts.RepositoryCommandLease) (contracts.CommandResult, error) {
-	if lease == nil || spec.Profile != contracts.ProfileGuarded || len(spec.Argv) != 2 || spec.Argv[0] != "node" || spec.Argv[1] != "--test" || spec.Directory != claim.Worktree || spec.Timeout <= 0 || spec.Timeout > 45*time.Minute || s.SoftDrain > 30*time.Second || s.HardDrain > 30*time.Second || policy.Authorize(spec.Argv) != nil || policy.Digest() != claim.PolicyDigest {
+	pure := len(spec.Argv) == 3 && spec.Argv[0] == "node" && spec.Argv[1] == nysapure.RecipeFlag && nysapure.ValidTestPath(spec.Argv[2])
+	normal := len(spec.Argv) == 2 && spec.Argv[0] == "node" && spec.Argv[1] == "--test"
+	if lease == nil || spec.Profile != contracts.ProfileGuarded || (!normal && !pure) || spec.Directory != claim.Worktree || spec.Timeout <= 0 || (pure && spec.Timeout > 60*time.Second) || (!pure && spec.Timeout > 45*time.Minute) || s.SoftDrain > 30*time.Second || s.HardDrain > 30*time.Second || policy.Authorize(spec.Argv) != nil || policy.Digest() != claim.PolicyDigest {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	if err := nodeclosure.Validate(spec.Directory); err != nil {
+	if err := nodeRecipeValidate(spec.Directory, spec.Argv, pure); err != nil {
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	argvBytes, err := json.Marshal(spec.Argv)
@@ -431,15 +752,43 @@ func (s RepositoryCommandSupervisor) runNode(ctx context.Context, claim contract
 	if err != nil {
 		return contracts.CommandResult{}, err
 	}
-	identity, err := nodeClosureIdentity(closure)
-	if err != nil || claim.ExecutablePath != resolved || claim.ExecutableDigest != identity {
+	closureIdentity, err := nodeClosureIdentity(closure)
+	claimIdentity := closureIdentity
+	if pure && err == nil {
+		claimIdentity, err = nysaPureRuntimeIdentity(closureIdentity)
+	}
+	if err != nil || claim.ExecutablePath != resolved || claim.ExecutableDigest != claimIdentity {
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	staged, library, cleanup, err := stageNodeClosure(closure, identity)
+	var staged, library, loader string
+	var cleanup func()
+	if pure {
+		staged, library, loader, cleanup, err = stageNysaPureNodeClosure(closure, closureIdentity)
+	} else {
+		staged, library, cleanup, err = stageNodeClosure(closure, closureIdentity)
+	}
 	if err != nil {
 		return contracts.CommandResult{}, err
 	}
-	defer cleanup()
+	artifacts := &stagedNodeArtifacts{runtime: cleanup}
+	stageStarted, stageReleased := false, false
+	var launch contracts.RepositoryCommandLaunch
+	launchRecorded := false
+	finisher := &repositoryLaunchFinisher{run: func(_ context.Context) error {
+		finishCtx, finishCancel := repositoryLeasePersistenceContext()
+		defer finishCancel()
+		return lease.FinishRepositoryCommandLaunch(finishCtx, launch)
+	}}
+	defer func() {
+		if !stageStarted || stageReleased || !launchRecorded {
+			artifacts.Close()
+			return
+		}
+		// One recovery owner guards both source and runtime. It releases them
+		// only after identity-pinned disappearance, and quarantines a failed
+		// durable Finish without another consumer racing that transition.
+		s.drainStagedNodeLifecycle(launch, lease, artifacts, finisher.Finish)
+	}()
 	if err := probeStagedNode22(staged, library); err != nil {
 		return contracts.CommandResult{}, err
 	}
@@ -482,8 +831,49 @@ func (s RepositoryCommandSupervisor) runNode(ctx context.Context, claim contract
 	if err != nil {
 		return contracts.CommandResult{}, err
 	}
-	flags := []string{"--permission", "--allow-fs-read=" + claim.Worktree, "--allow-fs-read=" + filepath.Dir(library), "--no-addons", "--experimental-test-isolation=none", "--test-concurrency=1", "--no-experimental-fetch", "--no-experimental-websocket", "--no-experimental-sqlite", "--no-experimental-strip-types", "--no-global-search-paths", "--test"}
-	env = append(env, "DYLD_LIBRARY_PATH="+library, "OPENSSL_CONF=/dev/null", "SF_REPOSITORY_NODE_WORKTREE="+claim.Worktree, "SF_REPOSITORY_NODE_CLOSURE="+filepath.Dir(library))
+	closureSources, err := nodeRecipeValidateDirectoryFD(int(worktreeFD.Fd()), spec.Argv, pure)
+	if err != nil {
+		return contracts.CommandResult{}, ErrUnclear
+	}
+	var sourceStage *nysapure.SourceStage
+	if pure {
+		sourceStage, err = nysapure.StageDirectoryFD(int(worktreeFD.Fd()), spec.Argv[2], closureSources)
+		if err != nil {
+			return contracts.CommandResult{}, ErrUnclear
+		}
+		artifacts.source = sourceStage.Close
+	}
+	testPath := ""
+	if pure {
+		testPath = spec.Argv[2]
+	}
+	launchRoot := claim.Worktree
+	if pure {
+		launchRoot = sourceStage.Root
+	}
+	flags := nodeLaunchFlags(pure, loader, testPath, launchRoot, filepath.Dir(library))
+	env = append(env, "DYLD_LIBRARY_PATH="+library, "OPENSSL_CONF=/dev/null", "SF_REPOSITORY_NODE_WORKTREE="+launchRoot, "SF_REPOSITORY_NODE_CLOSURE="+filepath.Dir(library))
+	if pure {
+		env = append(env, "SF_NYSA_API_PURE_ROOT="+sourceStage.Root, "SF_NYSA_API_PURE_MANIFEST="+string(sourceStage.Manifest), "SF_NYSA_API_PURE_MANIFEST_DIGEST="+sourceStage.ManifestDigest)
+		allowed := append([]string(nil), sourceStage.Files...)
+		flags, err = nodePureSourceReadFlags(flags, allowed)
+		if err != nil {
+			return contracts.CommandResult{}, ErrUnclear
+		}
+		encoded, encodeErr := json.Marshal(allowed)
+		if encodeErr != nil {
+			return contracts.CommandResult{}, ErrUnclear
+		}
+		env = append(env, "SF_REPOSITORY_NODE_FILES="+string(encoded))
+	}
+	launchFD := worktreeFD
+	if pure {
+		launchFD, err = os.Open(sourceStage.Root)
+		if err != nil {
+			return contracts.CommandResult{}, err
+		}
+		defer launchFD.Close()
+	}
 	gateRead, gateWrite, err := os.Pipe()
 	if err != nil {
 		return contracts.CommandResult{}, err
@@ -494,7 +884,7 @@ func (s RepositoryCommandSupervisor) runNode(ctx context.Context, claim contract
 	cmd.WaitDelay = s.drainHard()
 	cmd.Dir = string(filepath.Separator)
 	cmd.Env = env
-	cmd.ExtraFiles = []*os.File{gateRead, worktreeFD}
+	cmd.ExtraFiles = []*os.File{gateRead, launchFD}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr repositoryBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -503,10 +893,11 @@ func (s RepositoryCommandSupervisor) runNode(ctx context.Context, claim contract
 		_ = gateRead.Close()
 		return contracts.CommandResult{}, err
 	}
+	stageStarted = true
 	_ = gateRead.Close()
 	startID, e1 := processStartIdentity(cmd.Process.Pid)
 	bootID, e2 := hostBootIdentity()
-	launch := contracts.RepositoryCommandLaunch{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootID, ProcessStartIdentity: startID}
+	launch = contracts.RepositoryCommandLaunch{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootID, ProcessStartIdentity: startID}
 	if e1 != nil || e2 != nil || lease.RecordRepositoryCommandLaunch(ctx, launch) != nil {
 		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
@@ -514,18 +905,17 @@ func (s RepositoryCommandSupervisor) runNode(ctx context.Context, claim contract
 		_ = lease.Quarantine()
 		return contracts.CommandResult{}, ErrUnclear
 	}
+	launchRecorded = true
 	if err := lease.Check(ctx); err != nil {
 		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
 		_ = lease.Quarantine()
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	// Config admission used a path before the durable command lease existed.
-	// Repeat it from the authenticated worktree directory descriptor after the
-	// final Git reauthentication and immediately before opening the launch gate,
-	// so a pathname replacement cannot redirect the source closure Node receives
-	// after Fchdir.
-	if err := nodeclosure.ValidateDirectoryFD(int(worktreeFD.Fd())); err != nil {
+	// Pure source admission has already copied the FD-authenticated closure to
+	// an owner-only immutable stage. The gate receives that stage descriptor,
+	// never the mutable worktree descriptor.
+	if pure && sourceStage.Validate() != nil {
 		_ = signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
 		_ = lease.Quarantine()
@@ -566,12 +956,12 @@ func (s RepositoryCommandSupervisor) runNode(ctx context.Context, claim contract
 		_ = lease.Quarantine()
 		return contracts.CommandResult{}, fmt.Errorf("repository ensure gone: %w", err)
 	}
-	finishCtx, finishCancel := repositoryLeasePersistenceContext()
-	finishErr := lease.FinishRepositoryCommandLaunch(finishCtx, launch)
-	finishCancel()
+	finishErr := finisher.Finish(ctx)
 	if finishErr != nil {
 		return contracts.CommandResult{}, ErrUnclear
 	}
+	stageReleased = true
+	artifacts.Close()
 	if stdout.overflow || stderr.overflow {
 		return contracts.CommandResult{}, errors.New("repository command output exceeds limit")
 	}

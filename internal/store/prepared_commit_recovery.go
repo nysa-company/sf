@@ -81,7 +81,11 @@ func (s *Store) ConfirmPreparedCommit(ctx context.Context, claim contracts.GitMu
 			result = facts.Effect
 			return nil
 		}
-		if facts.Effect.State != EffectExecuting {
+		// An interrupted materializer marks a prepared commit uncertain rather
+		// than retrying the visible update-ref. A same-process retry may settle
+		// that exact tuple only while the original ticket/fence/claim remains
+		// current; every check below is shared with the executing normal path.
+		if facts.Effect.State != EffectExecuting && facts.Effect.State != EffectUncertain {
 			return ErrStaleFence
 		}
 		if err := s.assertTicketFence(ctx, conn, claim.TicketRef, claim.TicketVersion, domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}); err != nil {
@@ -100,7 +104,7 @@ func (s *Store) ConfirmPreparedCommit(ctx context.Context, claim contracts.GitMu
 		if err := repositoryHasGitWriter(ctx, conn, claim.Repository); err != nil {
 			return err
 		}
-		updated, err := conn.ExecContext(ctx, `UPDATE effects SET state='confirmed',observed_identity=? WHERE semantic_key=? AND state='executing' AND channel=? AND project_id=? AND ticket_id=? AND request_digest=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?`, observation.CommitOID, claim.SemanticKey, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch)
+		updated, err := conn.ExecContext(ctx, `UPDATE effects SET state='confirmed',observed_identity=? WHERE semantic_key=? AND state IN ('executing','uncertain') AND channel=? AND project_id=? AND ticket_id=? AND request_digest=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?`, observation.CommitOID, claim.SemanticKey, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch)
 		if err != nil {
 			return err
 		}

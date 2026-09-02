@@ -450,6 +450,64 @@ func TestCompletionPersistenceFailureDoesNotExposeProviderResultKey(t *testing.T
 	}
 }
 
+func TestControlInvalidationAfterDrainCancelsOldAttemptWithoutFatalLatch(t *testing.T) {
+	supervisor := &faultAfterDrainSupervisor{Supervisor: testkit.NewSupervisor()}
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, supervisor)
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
+	var control store.TransitionResult
+	var controlErr error
+	supervisor.onDrain = func() {
+		control, controlErr = database.TransitionAndInvalidateRunner(context.Background(), store.Transition{
+			Ref: ref, ExpectedVersion: request.ExpectedVersion, From: domain.StatePlanning, To: domain.StateStopping,
+			ResumeState: domain.StatePlanning, Trigger: "operator_pause_or_take", Fence: request.Fence, EventPayload: `{"intent":"take"}`,
+		})
+	}
+
+	result := coordinator.Run(context.Background(), request)
+	if controlErr != nil {
+		t.Fatal(controlErr)
+	}
+	if result.Code != Canceled || !result.NeedsOperator || result.PersistenceFailure || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
+		t.Fatalf("revoked completion result=%+v", result)
+	}
+	if len(result.Attempts) != 1 || result.Attempts[0].ErrorCode != "provider_control_revoked" || result.Attempts[0].UsageUnits != 0 {
+		t.Fatalf("revoked completion receipt=%+v", result.Attempts)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "cancelled" || attempts[0].Outcome != "cancelled" || attempts[0].UsageUnits != 0 {
+		t.Fatalf("retired attempts=%+v err=%v", attempts, err)
+	}
+	active, err := database.ActiveProviderAttempts(context.Background(), ref.Channel)
+	if err != nil || len(active) != 0 {
+		t.Fatalf("active attempts=%+v err=%v", active, err)
+	}
+	leases, err := database.Leases(context.Background(), ref.Channel)
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("provider leases=%+v err=%v", leases, err)
+	}
+	proof, err := database.ControlProof(context.Background(), ref)
+	if err != nil || !proof.Drained() {
+		t.Fatalf("control proof=%+v err=%v", proof, err)
+	}
+	stopping, err := database.Ticket(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CompleteControlTransition(context.Background(), store.Transition{
+		Ref: ref, ExpectedVersion: control.Version, From: domain.StateStopping, To: domain.StatePaused,
+		ResumeState: domain.StatePlanning, Trigger: "process_and_effects_drained",
+		Fence: domain.Fence{LeaderEpoch: request.Fence.LeaderEpoch, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The coordinator did not latch the expected old-fence refusal as a
+	// persistence fault. A later current-fence run remains admissible once the
+	// runtime control boundary is explicitly rearmed.
+	if err := coordinator.persistenceFailure(); err != nil {
+		t.Fatalf("control retirement latched coordinator: %v", err)
+	}
+}
+
 func TestCanceledResultDoesNotExposeProviderResultKey(t *testing.T) {
 	database, request, coordinator, ref, _ := newCoordinatorFixture(t, testkit.NewSupervisor())
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)

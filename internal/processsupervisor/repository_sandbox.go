@@ -163,8 +163,38 @@ func RepositoryTestSandboxProfile(repository, executable string) (string, error)
 // process boundary. Unlike the Go driver path, no source toolchain, HOME, or
 // temporary writable directory is granted.
 func RepositoryNodeSandboxProfile(worktree, closureRoot, executable string) (string, error) {
+	return repositoryNodeSandboxProfile(worktree, closureRoot, executable, nil)
+}
+
+// RepositoryNodeSandboxProfileForFiles is the pure-recipe variant. The
+// authenticated closure is passed as exact regular files, so a test cannot
+// use the worktree read grant to discover or execute dependency-bearing
+// node_modules content.
+func RepositoryNodeSandboxProfileForFiles(worktree, closureRoot, executable string, files []string) (string, error) {
+	return repositoryNodeSandboxProfile(worktree, closureRoot, executable, files)
+}
+
+func repositoryNodeSandboxProfile(worktree, closureRoot, executable string, files []string) (string, error) {
 	if !repositorySandboxAvailable(worktree) || !cleanAbsolute(worktree) || !cleanAbsolute(closureRoot) || !cleanAbsolute(executable) {
 		return "", ErrUnclear
+	}
+	if files != nil {
+		if len(files) == 0 {
+			return "", ErrUnclear
+		}
+		for _, file := range files {
+			if !cleanAbsolute(file) || !strings.HasPrefix(file, worktree+string(filepath.Separator)) {
+				return "", ErrUnclear
+			}
+			info, err := os.Lstat(file)
+			if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+				return "", ErrUnclear
+			}
+		}
+	}
+	worktreeRead := "(allow file-read* (subpath " + seatbeltString(worktree) + "))\n"
+	if files != nil {
+		worktreeRead = "(allow file-read* (literal " + seatbeltString(worktree) + "))\n"
 	}
 	profile := "(version 1)\n(deny default)\n" +
 		"(allow file-read* (literal \"/\"))\n" +
@@ -174,13 +204,21 @@ func RepositoryNodeSandboxProfile(worktree, closureRoot, executable string) (str
 		"(allow file-read* (subpath \"/Library/Apple\"))\n" +
 		"(allow file-read* (subpath \"/dev\"))\n" +
 		"(allow mach-lookup)\n(allow sysctl-read)\n" +
-		"(allow file-read* (subpath " + seatbeltString(worktree) + "))\n" +
+		worktreeRead +
 		"(allow file-read* (subpath " + seatbeltString(closureRoot) + "))\n" +
 		"(deny file-write*)\n(deny network*)\n(deny process-fork)\n(deny process-exec)\n" +
 		"(allow process-exec (literal " + seatbeltString(executable) + "))\n"
 	for _, path := range []string{worktree, closureRoot, executable} {
 		for _, ancestor := range seatbeltAncestors(path) {
 			profile += "(allow file-read* (literal " + seatbeltString(ancestor) + "))\n"
+		}
+	}
+	if files != nil {
+		for _, file := range files {
+			profile += "(allow file-read* (literal " + seatbeltString(file) + "))\n"
+			for _, ancestor := range seatbeltAncestors(file) {
+				profile += "(allow file-read* (literal " + seatbeltString(ancestor) + "))\n"
+			}
 		}
 	}
 	return profile, nil

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/nysa-company/sf/internal/domain"
@@ -32,6 +34,105 @@ func TestApprovedSpecMatchesDomain(t *testing.T) {
 	}
 	if got, want := len(spec.Transitions), 44; got != want {
 		t.Fatalf("transitions=%d want=%d", got, want)
+	}
+}
+
+func TestApprovedSpecExpandsEveryTransitionAndForbiddenComplement(t *testing.T) {
+	spec := loadApprovedSpec(t)
+	states := []string{"none"}
+	for _, state := range domain.AllStates() {
+		states = append(states, string(state))
+	}
+	sort.Strings(states)
+
+	triggerSet := make(map[string]struct{})
+	byPair := make(map[string][]Transition)
+	for _, transition := range spec.Transitions {
+		triggerSet[transition.Trigger] = struct{}{}
+		for _, from := range transition.From {
+			key := from + "\x00" + transition.Trigger
+			byPair[key] = append(byPair[key], transition)
+		}
+	}
+	triggers := make([]string, 0, len(triggerSet))
+	for trigger := range triggerSet {
+		triggers = append(triggers, trigger)
+	}
+	sort.Strings(triggers)
+
+	for _, from := range states {
+		for _, trigger := range triggers {
+			from, trigger := from, trigger
+			t.Run(from+"/"+trigger, func(t *testing.T) {
+				candidates := byPair[from+"\x00"+trigger]
+				if len(candidates) == 0 {
+					if _, err := spec.Select(from, trigger, nil); !errors.Is(err, ErrNoTransition) {
+						t.Fatalf("forbidden complement selected transition: %v", err)
+					}
+					return
+				}
+
+				guardSet := make(map[string]struct{})
+				for _, candidate := range candidates {
+					for _, guard := range candidate.Guards {
+						guardSet[guard] = struct{}{}
+					}
+				}
+				guardNames := make([]string, 0, len(guardSet))
+				for guard := range guardSet {
+					guardNames = append(guardNames, guard)
+				}
+				sort.Strings(guardNames)
+				if len(guardNames) > 20 {
+					t.Fatalf("guard complement is unexpectedly large: %d", len(guardNames))
+				}
+
+				selected := make(map[string]bool, len(candidates))
+				for mask := 0; mask < 1<<len(guardNames); mask++ {
+					guards := make(map[string]bool, len(guardNames))
+					for index, guard := range guardNames {
+						guards[guard] = mask&(1<<index) != 0
+					}
+					var expected []Transition
+					for _, candidate := range candidates {
+						matches := true
+						for _, guard := range candidate.Guards {
+							if !guards[guard] {
+								matches = false
+								break
+							}
+						}
+						if matches {
+							expected = append(expected, candidate)
+						}
+					}
+					got, err := spec.Select(from, trigger, guards)
+					switch len(expected) {
+					case 0:
+						if !errors.Is(err, ErrNoTransition) {
+							t.Fatalf("mask=%d selected forbidden transition %+v: %v", mask, got, err)
+						}
+					case 1:
+						if err != nil {
+							t.Fatalf("mask=%d select %s: %v", mask, expected[0].ID, err)
+						}
+						if !reflect.DeepEqual(got, expected[0]) {
+							t.Fatalf("mask=%d selected transition mismatch\ngot:  %+v\nwant: %+v", mask, got, expected[0])
+						}
+						selected[got.ID] = true
+					default:
+						if !errors.Is(err, ErrAmbiguousTransition) {
+							t.Fatalf("mask=%d must fail ambiguous, got %+v err=%v", mask, got, err)
+						}
+					}
+				}
+				for _, candidate := range candidates {
+					if !selected[candidate.ID] {
+						t.Fatalf("transition %s has no unambiguous guard assignment", candidate.ID)
+					}
+				}
+			})
+		}
 	}
 }
 

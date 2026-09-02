@@ -44,11 +44,29 @@ type Evidence interface {
 	AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error
 	LoadCurrentProviderAttemptResult(context.Context, store.ProviderAttemptResultKey, uint64, domain.Fence) (store.ProviderAttemptResult, phaseartifact.Parsed, error)
 	LoadHistoricalProviderAttemptResult(context.Context, store.ProviderAttemptResultKey) (store.ProviderAttemptResult, phaseartifact.Parsed, error)
+	ProviderResultReachesFence(context.Context, store.ProviderAttemptResultKey, uint64, domain.Fence) error
 	LatestReusableProviderAttempt(context.Context, store.LatestReusableProviderAttemptRequest) (store.LatestReusableProviderAttemptResult, error)
 	RecordPlan(context.Context, store.PlanArtifact) (string, error)
 	RecordVerification(context.Context, store.VerificationArtifact) (store.VerificationRevision, error)
 	RecordCandidate(context.Context, store.CandidateEvidence) ([]store.InvalidationReceipt, error)
 	ConsumeBudget(context.Context, store.BudgetUse) (int, error)
+	PendingVerificationAmendment(context.Context, domain.TicketRef, uint64, domain.Fence) (store.VerificationAmendment, error)
+	VerificationAmendmentDecision(context.Context, domain.TicketRef, uint64, domain.Fence, store.ProviderAttemptResultKey) (store.VerificationAmendmentDecision, error)
+}
+
+// FreshVerificationSource marks the durable first state of a source-only
+// takeover. The old reviewer checkpoint remains useful for authenticating the
+// edited checkout, but it must never be replayed as the new verification.
+type FreshVerificationSource interface {
+	OperatorSourceResumeRequiresFreshVerification(context.Context, domain.TicketRef, uint64) (bool, error)
+}
+
+// OperatorSourceResumeProofSource supplies the retained source revision for a
+// source-only resume.  The Worker uses it only to exclude that one historical
+// review revision: a new reviewer result already bound to the resumed ticket
+// and fence remains safe to replay after a response-loss crash.
+type OperatorSourceResumeProofSource interface {
+	OperatorSourceResumeProof(context.Context, domain.TicketRef, uint64, domain.Fence) (store.OperatorSourceResumeProof, bool, error)
 }
 
 // StateMachine is the narrow Engine surface. Signals must be implemented by
@@ -57,6 +75,9 @@ type StateMachine interface {
 	Signal(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 	SignalPlan(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 	SignalVerification(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
+	SignalVerificationAmendment(context.Context, contracts.SignalRequest, store.VerificationAmendmentDecision, store.ProviderAttemptResultKey) (contracts.TransitionResult, error)
+	SignalVerificationAmendmentRequest(context.Context, contracts.SignalRequest, store.ProviderAttemptResultKey) (contracts.TransitionResult, error)
+	SignalVerificationAmendmentBlocked(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 	SignalCandidate(context.Context, contracts.SignalRequest, domain.CandidateSnapshot) (contracts.TransitionResult, error)
 	SignalFinalReview(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 	SignalFinalReviewRepair(context.Context, contracts.SignalRequest, string) (contracts.TransitionResult, error)
@@ -77,6 +98,9 @@ type PhaseRequest struct {
 	// RecoveryVerification is an immutable checkpoint/command witness.  When
 	// present, a materializer must observe it; it must not execute or commit.
 	RecoveryVerification *store.StoredVerification
+	// Amendment is present only for the fresh independent Reviewer that decides
+	// a Store-bound Builder request. It is never provider-supplied authority.
+	Amendment *store.VerificationAmendment
 }
 
 // PhaseResult carries only an immutable Store key and independently observed
@@ -414,12 +438,51 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 	if err != nil {
 		return false, false, err
 	}
+	if amendment, amendmentErr := w.Evidence.PendingVerificationAmendment(ctx, ticket.Ref, ticket.Version, fence); amendmentErr == nil {
+		return w.verifyingAmendment(ctx, ticket, fence, plan, planIdentity, amendment)
+	} else if !errors.Is(amendmentErr, store.ErrNotFound) {
+		return false, false, amendmentErr
+	}
+	freshSource := false
+	if source, ok := w.Evidence.(FreshVerificationSource); ok {
+		freshSource, err = source.OperatorSourceResumeRequiresFreshVerification(ctx, ticket.Ref, ticket.Version)
+		if err != nil {
+			return false, false, err
+		}
+	}
+	var sourceProof store.OperatorSourceResumeProof
+	var retainedRevision uint64
+	if freshSource {
+		source, ok := w.Evidence.(OperatorSourceResumeProofSource)
+		if !ok {
+			return false, false, ErrStaleEvidence
+		}
+		proof, found, proofErr := source.OperatorSourceResumeProof(ctx, ticket.Ref, ticket.Version, fence)
+		if proofErr != nil || !found || proof.Verification.Revision.Revision == 0 || proof.Verification.TicketVersion >= ticket.Version {
+			return false, false, ErrStaleEvidence
+		}
+		sourceProof = proof
+		retainedRevision = proof.Verification.Revision.Revision
+	}
 	verification, err := w.Evidence.CurrentVerification(ctx, ticket.Ref)
-	if errors.Is(err, store.ErrEvidenceConflict) {
+	if freshSource && errors.Is(err, store.ErrEvidenceConflict) {
+		// A resumed verification may have crossed one or more daemon recovery
+		// fences.  The strict reader deliberately refuses that historical binding;
+		// RecoverableVerification is the Store-authenticated projection used only
+		// to rebind a distinct fresh revision below.
+		verification, err = w.Evidence.RecoverableVerification(ctx, ticket.Ref)
+	} else if errors.Is(err, store.ErrEvidenceConflict) {
 		// CurrentVerification deliberately refuses an old binding once a later
 		// recovery row exists. The immutable tuple below is only input to
 		// RecordVerification; the Store re-authenticates it at this live fence.
 		verification, err = w.Evidence.RecoverableVerification(ctx, ticket.Ref)
+	}
+	if err == nil {
+		if freshSource && verification.Revision.Revision == retainedRevision {
+			// The retained source reviewer authenticates the operator checkout, but
+			// can never satisfy the required independent post-resume review.
+			verification, err = store.StoredVerification{}, store.ErrNotFound
+		}
 	}
 	if err == nil {
 		if verification.TicketVersion != ticket.Version || verification.Fence != fence {
@@ -428,7 +491,7 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 			// newest reusable result under the live fence and let RecordVerification
 			// append the Store-authenticated live binding.
 			reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence})
-			if reuseErr != nil || !reusable.Recovered || reusable.Key != verification.ProviderResult {
+			if reuseErr != nil || !reusable.Recovered || reusable.Key != verification.ProviderResult || freshSource && reusable.Key == sourceProof.Verification.ProviderResult {
 				return false, false, ErrStaleEvidence
 			}
 			if err := w.rebindStoredVerification(ctx, ticket, fence, verification, reusable); err != nil {
@@ -460,7 +523,7 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 	if !errors.Is(err, store.ErrNotFound) {
 		return false, false, err
 	}
-	if reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence}); reuseErr == nil {
+	if reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence}); reuseErr == nil && (!freshSource || reusable.Key != sourceProof.Verification.ProviderResult) {
 		artifact, parseErr := canonicalVerification(reusable.Parsed)
 		if parseErr != nil {
 			return false, true, parseErr
@@ -476,6 +539,10 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 			return false, true, err
 		}
 		return true, true, nil
+	} else if reuseErr == nil {
+		// The only reusable Reviewer is the retained pre-resume source review.
+		// It authenticates the checkout but is deliberately not transition
+		// authority; fall through and launch the one required fresh Reviewer.
 	} else if !errors.Is(reuseErr, store.ErrNotFound) {
 		return false, false, reuseErr
 	}
@@ -521,6 +588,132 @@ func (w Worker) verifying(ctx context.Context, ticket store.Ticket, fence domain
 		return false, false, err
 	}
 	return true, false, nil
+}
+
+// verifyingAmendment requires one fresh independent Reviewer decision, but a
+// completed result at the authenticated amendment endpoint is replayed after
+// response loss rather than paying for a third reviewer invocation.
+func (w Worker) verifyingAmendment(ctx context.Context, ticket store.Ticket, fence domain.Fence, plan store.StoredPlan, planIdentity workflowprompt.PlanIdentity, amendment store.VerificationAmendment) (bool, bool, error) {
+	// RecordVerification commits the accepted revision before the lifecycle
+	// decision. If the process dies in that interval, the durable current
+	// revision is already the amendment's exact result. Reuse its binding and
+	// finish the decision directly; rematerializing here could rerun the
+	// checkpoint path (and, under a changed fence, create a second mutation).
+	if current, currentErr := w.Evidence.CurrentVerification(ctx, ticket.Ref); currentErr == nil && current.Revision.Amends == amendment.Prior.Revision && current.Revision.ProofDigest == amendment.ProposedDigest && current.AmendmentReason == amendment.Reason && current.Requester == amendment.Requester && current.ProviderResult.AttemptID > 0 {
+		decision, decisionErr := w.Evidence.VerificationAmendmentDecision(ctx, ticket.Ref, ticket.Version, fence, current.ProviderResult)
+		if decisionErr != nil {
+			return false, false, decisionErr
+		}
+		if decision != store.VerificationAmendmentAccepted {
+			return false, false, ErrStaleEvidence
+		}
+		if err := w.signalVerificationAmendment(ctx, ticket, fence, decision, current.ProviderResult); err != nil {
+			return false, false, err
+		}
+		return true, false, nil
+	} else if currentErr != nil && !errors.Is(currentErr, store.ErrNotFound) && !errors.Is(currentErr, store.ErrEvidenceConflict) {
+		return false, false, currentErr
+	}
+	if reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence}); reuseErr == nil {
+		// The ordinary reusable selector can return the prior verification
+		// Reviewer across a recovery bridge. That result is historical input, not
+		// the independent decision for this amendment. Only a result descended
+		// from the amendment endpoint may be replayed; LatestReusable has already
+		// authenticated its runner-recovery chain to the live fence. Otherwise
+		// continue to launch the one required fresh Reviewer below.
+		if amendment.TransitionTicketVersion != 0 && reusable.Result.Claim.ExpectedVersion >= amendment.TransitionTicketVersion {
+			return w.resolveVerificationAmendment(ctx, ticket, fence, plan, planIdentity, amendment, reusable.Key, reusable.Result, reusable.Parsed, true)
+		}
+	} else if !errors.Is(reuseErr, store.ErrNotFound) {
+		return false, false, reuseErr
+	}
+	if w.Runner == nil {
+		return false, false, ErrNoPhaseRunner
+	}
+	request, err := w.request(ctx, ticket, fence, domain.PhaseVerification, &plan, nil, nil)
+	if err != nil {
+		return false, false, err
+	}
+	request.Amendment = &amendment
+	if err := w.Evidence.AssertTicketFence(ctx, ticket.Ref, ticket.Version, fence); err != nil {
+		return false, false, err
+	}
+	out, err := w.Runner.Run(ctx, request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, false, fmt.Errorf("%w: %v", ErrCanceled, ctx.Err())
+		}
+		return false, false, err
+	}
+	result, parsed, err := w.Evidence.LoadCurrentProviderAttemptResult(ctx, out.ProviderResult, ticket.Version, fence)
+	if err != nil && out.ProviderResult.Ref == ticket.Ref && out.ProviderResult.Phase == domain.PhaseVerification {
+		// A completed amendment Reviewer can win the narrow race between the
+		// first reusable lookup above and PhaseRunner admission. PhaseRunner then
+		// returns its recovered key instead of launching another process. Reload
+		// only the exact newest recovered key; the Store proves its recovery chain
+		// again when classifying the amendment decision.
+		if reusable, reuseErr := w.Evidence.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: ticket.Version, Fence: fence}); reuseErr == nil && reusable.Recovered && reusable.Key == out.ProviderResult && amendment.TransitionTicketVersion != 0 && reusable.Result.Claim.ExpectedVersion >= amendment.TransitionTicketVersion {
+			return w.resolveVerificationAmendment(ctx, ticket, fence, plan, planIdentity, amendment, reusable.Key, reusable.Result, reusable.Parsed, true)
+		}
+	}
+	if err != nil || out.ProviderResult.Ref != ticket.Ref || out.ProviderResult.Phase != domain.PhaseVerification || result.Claim.Role != "reviewer" || result.Claim.ID != out.ProviderResult.AttemptID || result.Claim.Attempt != out.ProviderResult.Attempt {
+		return false, false, ErrStaleEvidence
+	}
+	return w.resolveVerificationAmendment(ctx, ticket, fence, plan, planIdentity, amendment, out.ProviderResult, result, parsed, false)
+}
+
+func (w Worker) resolveVerificationAmendment(ctx context.Context, ticket store.Ticket, fence domain.Fence, plan store.StoredPlan, planIdentity workflowprompt.PlanIdentity, amendment store.VerificationAmendment, key store.ProviderAttemptResultKey, result store.ProviderAttemptResult, parsed phaseartifact.Parsed, replayed bool) (bool, bool, error) {
+	// A completed amendment Reviewer may have been launched after the immutable
+	// request endpoint but before a later runner recovery.  The Store proves the
+	// request-to-Reviewer and Reviewer-to-live-fence chains below; Worker must
+	// not replace that proof with an exact-current-version assumption.
+	if key.Ref != ticket.Ref || key.Phase != domain.PhaseVerification || key.AttemptID <= 0 || key.Attempt <= 0 || result.Claim.Role != "reviewer" || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || amendment.TransitionTicketVersion == 0 || result.Claim.ExpectedVersion < amendment.TransitionTicketVersion || result.Claim.ExpectedVersion > ticket.Version {
+		return false, replayed, ErrStaleEvidence
+	}
+	if !replayed && (result.Claim.LeaderEpoch != fence.LeaderEpoch || result.Claim.RunnerEpoch != fence.RunnerEpoch) {
+		return false, replayed, ErrStaleEvidence
+	}
+	if replayed {
+		// The immutable result itself retains its completed fence. Replaying it
+		// requires the Store to prove every signed recovery hop to this live
+		// worker fence; neither the worker nor a PhaseRunner can infer that from
+		// counters alone.
+		if err := w.Evidence.ProviderResultReachesFence(ctx, key, ticket.Version, fence); err != nil {
+			return false, replayed, ErrStaleEvidence
+		}
+	}
+	artifact, err := canonicalVerification(parsed)
+	if err != nil {
+		return w.blockInvalidVerificationAmendment(ctx, ticket, fence, replayed, err)
+	}
+	decision, err := w.Evidence.VerificationAmendmentDecision(ctx, ticket.Ref, ticket.Version, fence, key)
+	if err != nil {
+		if errors.Is(err, store.ErrEvidenceConflict) || errors.Is(err, store.ErrProviderPairRefused) {
+			return w.blockInvalidVerificationAmendment(ctx, ticket, fence, replayed, err)
+		}
+		return false, replayed, err
+	}
+	request, err := w.request(ctx, ticket, fence, domain.PhaseVerification, &plan, nil, nil)
+	if err != nil {
+		return false, replayed, err
+	}
+	request.Amendment = &amendment
+	if decision == store.VerificationAmendmentAccepted {
+		if err := w.persistVerification(ctx, ticket, fence, request, planIdentity, artifact, key); err != nil {
+			return false, replayed, err
+		}
+	}
+	if err := w.signalVerificationAmendment(ctx, ticket, fence, decision, key); err != nil {
+		return false, replayed, err
+	}
+	return true, replayed, nil
+}
+
+func (w Worker) blockInvalidVerificationAmendment(ctx context.Context, ticket store.Ticket, fence domain.Fence, replayed bool, cause error) (bool, bool, error) {
+	if _, err := w.Engine.SignalVerificationAmendmentBlocked(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Fence: fence}); err != nil {
+		return false, replayed, fmt.Errorf("%w: %v", cause, err)
+	}
+	return true, replayed, nil
 }
 
 func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.Fence) (bool, bool, error) {
@@ -632,10 +825,13 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 			return false, true, parseErr
 		}
 		if builder.AmendmentRequest != nil {
-			if err := w.signalPayload(ctx, ticket, fence, "retry_or_correction_exhausted", nil, `{"reason":"amendment_unsupported"}`); err != nil {
+			if err := w.signalVerificationAmendmentRequest(ctx, ticket, fence, reusable.Key); err != nil {
+				if errors.Is(err, store.ErrEvidenceConflict) || errors.Is(err, store.ErrProviderPairRefused) {
+					return w.blockInvalidVerificationAmendment(ctx, ticket, fence, true, err)
+				}
 				return false, true, err
 			}
-			return false, true, ErrAmendmentUnsupported
+			return true, true, nil
 		}
 		if err := w.persistCandidate(ctx, ticket, fence, PhaseRequest{}, planIdentity, verificationIdentity, verification, nil, builder, reusable.Key); err != nil {
 			return false, true, err
@@ -677,10 +873,13 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 		return false, false, err
 	}
 	if builder.AmendmentRequest != nil {
-		if err := w.signalPayload(ctx, ticket, fence, "retry_or_correction_exhausted", nil, `{"reason":"amendment_unsupported"}`); err != nil {
+		if err := w.signalVerificationAmendmentRequest(ctx, ticket, fence, out.ProviderResult); err != nil {
+			if errors.Is(err, store.ErrEvidenceConflict) || errors.Is(err, store.ErrProviderPairRefused) {
+				return w.blockInvalidVerificationAmendment(ctx, ticket, fence, false, err)
+			}
 			return false, false, err
 		}
-		return false, false, ErrAmendmentUnsupported
+		return true, false, nil
 	}
 	if err := w.persistCandidate(ctx, ticket, fence, request, planIdentity, verificationIdentity, verification, nil, builder, out.ProviderResult); err != nil {
 		return false, false, err
@@ -736,6 +935,22 @@ func (w Worker) signalVerification(ctx context.Context, ticket store.Ticket, fen
 		return store.ErrStaleFence
 	}
 	_, err := w.Engine.SignalVerification(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: "phase_pass", Fence: fence, Attributes: map[string]string{"independent_intent_valid": "true", "prebuild_proof_valid": "true", "verification_checkpoint_committed": "true"}, EventPayload: "{}"})
+	return err
+}
+
+func (w Worker) signalVerificationAmendmentRequest(ctx context.Context, ticket store.Ticket, fence domain.Fence, key store.ProviderAttemptResultKey) error {
+	if fence.RunnerEpoch != ticket.RunnerEpoch {
+		return store.ErrStaleFence
+	}
+	_, err := w.Engine.SignalVerificationAmendmentRequest(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Fence: fence, EventPayload: "{}"}, key)
+	return err
+}
+
+func (w Worker) signalVerificationAmendment(ctx context.Context, ticket store.Ticket, fence domain.Fence, decision store.VerificationAmendmentDecision, key store.ProviderAttemptResultKey) error {
+	if fence.RunnerEpoch != ticket.RunnerEpoch {
+		return store.ErrStaleFence
+	}
+	_, err := w.Engine.SignalVerificationAmendment(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Fence: fence, EventPayload: "{}"}, decision, key)
 	return err
 }
 func (w Worker) signalPayload(ctx context.Context, ticket store.Ticket, fence domain.Fence, trigger string, attributes map[string]string, payload string) error {
