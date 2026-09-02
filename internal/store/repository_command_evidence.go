@@ -464,6 +464,14 @@ func (s *Store) verificationEvidenceForCandidateFrom(ctx context.Context, q cand
 		AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`, ref.Channel, ref.Project, ref.Ticket).Scan(
 		&stored.Revision.Revision, &stored.Revision.IntentDigest, &stored.Intent, &stored.Revision.ProofDigest, &stored.Proof, &owned, &stored.Revision.CheckpointID,
 	)
+	if errors.Is(err, sql.ErrNoRows) {
+		var exists int
+		existsErr := q.QueryRowContext(ctx, `SELECT 1 FROM verifications WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&exists)
+		if errors.Is(existsErr, sql.ErrNoRows) {
+			return StoredVerification{}, ErrNotFound
+		}
+		return StoredVerification{}, ErrEvidenceConflict
+	}
 	if err != nil || stored.Revision.Revision == 0 || sha256Digest(stored.Intent) != stored.Revision.IntentDigest || sha256Digest(stored.Proof) != stored.Revision.ProofDigest || json.Unmarshal([]byte(owned), &stored.Revision.OwnedFiles) != nil || validOwnedFiles(stored.Revision.OwnedFiles) != nil || !validOID(stored.Revision.CheckpointID) {
 		return StoredVerification{}, ErrEvidenceConflict
 	}

@@ -3,9 +3,13 @@ package runtimecontrol
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +32,81 @@ func TestCurrentTakeoverRemoteBaselineUsesCanonicalStoreDigest(t *testing.T) {
 	baseline := currentTakeoverRemoteBaseline(store.StoredWorktree{Path: "/tmp/worktree", Branch: "sf/dev/project/ticket", IdentityJSON: identity}, remote)
 	if baseline.WorktreeIdentity != fmt.Sprintf("%x", digest[:]) || len(baseline.WorktreeIdentity) != 64 {
 		t.Fatalf("takeover identity digest=%q, want canonical 64-byte hex", baseline.WorktreeIdentity)
+	}
+}
+
+func TestInspectTakeoverClassifiesDirtyWorktreeWithoutVerificationAsUnadoptedChanges(t *testing.T) {
+	database, ref, leader, started := controllerFixture(t)
+	ctx := t.Context()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(root, "repository")
+	remote := filepath.Join(root, "origin.git")
+	worktreePath := filepath.Join(root, "worktree")
+	branch := "sf/dev/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef"
+	runGit := func(directory string, args ...string) {
+		t.Helper()
+		command := exec.Command("git", append([]string{"-C", directory}, args...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+		}
+	}
+	if err := os.MkdirAll(repository, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGit(root, "init", "--bare", remote)
+	runGit(repository, "init", "-b", "main")
+	runGit(repository, "config", "user.name", "fixture")
+	runGit(repository, "config", "user.email", "fixture@example.test")
+	if err := os.WriteFile(filepath.Join(repository, "tracked.txt"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(repository, "add", "tracked.txt")
+	runGit(repository, "commit", "-m", "base")
+	runGit(repository, "remote", "add", "origin", remote)
+	runGit(repository, "push", "origin", "main:refs/heads/main")
+	runGit(repository, "worktree", "add", "-b", branch, worktreePath, "main")
+	worktreePath, err = filepath.EvalSymlinks(worktreePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner := git.Runner{
+		Binary:             "/usr/bin/git",
+		Home:               filepath.Join(root, "git-home"),
+		TestLocalTransport: true,
+		Run: func(ctx context.Context, binary string, argv, env []string) ([]byte, error) {
+			command := exec.CommandContext(ctx, binary, argv...)
+			command.Env = env
+			return command.Output()
+		},
+	}
+	identity, err := runner.Snapshot(ctx, worktreePath, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityJSON, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Path: worktreePath, Branch: branch, IdentityJSON: identityJSON, BaseSHA: identity.BaseHead, HeadSHA: identity.BaseHead}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "operator.txt"), []byte("retained edit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := New(database, controllerBundle(t), nil, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := controller.InspectTakeover(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Clean || inspection.ChangeKind != "unadopted_changes" || len(inspection.ChangedFiles) != 1 || inspection.ChangedFiles[0] != "operator.txt" {
+		t.Fatalf("inspection=%+v", inspection)
 	}
 }
 
