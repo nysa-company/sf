@@ -1,6 +1,7 @@
 package providercoord
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -17,6 +18,33 @@ import (
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/testkit"
 )
+
+func TestReusedInputMatchesExactLegacyPhaseInput(t *testing.T) {
+	input := contracts.PhaseInput{
+		Ticket: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "SF-legacy-reuse"}, Phase: domain.PhasePlanning,
+		Attempt: 1, LeaderEpoch: 4, RunnerEpoch: 1, ExpectedVersion: 2, Prompt: "plan", Repository: "/repo", Worktree: "/repo/.sf/worktree", WorktreeIdentity: "identity", BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Provider: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "openai", Version: "1"}, AuthMode: "chatgpt_subscription", Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`),
+	}
+	payload, _, err := contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := bytes.TrimSuffix(payload, []byte(`,"Repair":null}`))
+	if len(legacy) == len(payload) {
+		t.Fatalf("current payload has no v53 repair suffix: %s", payload)
+	}
+	legacy = append(append([]byte(nil), legacy...), '}')
+	sum := sha256.Sum256(legacy)
+	digest := fmt.Sprintf("%x", sum)
+	decoded, err := contracts.DecodeCanonicalPhaseInput(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ProviderAttemptClaim{Attempt: 1, Binding: contracts.RuntimeBinding{Identity: input.Provider, AuthMode: input.AuthMode}, LeaderEpoch: 4, RunnerEpoch: 1, ExpectedVersion: 2, Input: decoded, RequestDigest: digest, RequestPayload: legacy}
+	input.Provider, input.AuthMode, input.Attempt, input.LeaderEpoch, input.RunnerEpoch, input.ExpectedVersion = domain.ProviderIdentity{}, "", 0, 0, 0, 0
+	if !reusedInputMatches(Request{Input: input}, claim) {
+		t.Fatal("logical request did not reuse exact legacy claim input")
+	}
+}
 
 func TestMalformedOutputIsIndeterminateAndNeverRepairsOrPersistsSecrets(t *testing.T) {
 	ctx := context.Background()

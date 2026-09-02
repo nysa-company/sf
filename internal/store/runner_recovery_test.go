@@ -1,8 +1,10 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -11,6 +13,88 @@ import (
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
 )
+
+func TestFenceRecoveredRunnersAcceptsExactLegacyPlannerInputBeforeReviewer(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "legacy-planner-input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-legacy-planner-input", leader), leader, domain.StatePlanning)
+	planner, reviewer := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	planning, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plannerDocument := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"works"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofAcceptance, Command: []string{"go", "test"}, Details: "proof"}, Paths: []string{"main.go"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"risk"}}
+	plannerArtifact, err := json.Marshal(plannerDocument)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := contracts.PhaseResult{Provider: planning.Binding.Identity, Artifact: plannerArtifact, UsageTrusted: true, UsageUnits: 1}
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, planning, proof(t, planning), ticket.Version, fence, plan, phaseartifact.Validation{TicketType: ticket.Type}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	planKey := ProviderAttemptResultKey{AttemptID: planning.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: planning.Attempt}
+	if _, err := db.RecordPlan(ctx, PlanArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Document: PlanDocument{Planner: &plannerDocument, ProviderResult: &planKey, Acceptance: plannerDocument.Acceptance, ProofKind: string(plannerDocument.Proof.Kind), Paths: plannerDocument.Paths, Commands: plannerDocument.Commands, Risks: plannerDocument.Risks}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate an immutable provider_attempt_inputs row written by v52: its
+	// exact canonical bytes predate the trailing v53 Repair field. This is a
+	// migration fixture, not a production row rewrite.
+	legacy := bytes.TrimSuffix(planning.RequestPayload, []byte(`,"Repair":null}`))
+	if len(legacy) == len(planning.RequestPayload) || len(legacy) == 0 {
+		t.Fatalf("unexpected current planner payload: %s", planning.RequestPayload)
+	}
+	legacy = append(append([]byte(nil), legacy...), '}')
+	legacyDigest := sha256Digest(legacy)
+	if _, err := db.db.ExecContext(ctx, `DROP TRIGGER provider_attempt_inputs_immutable_update; DROP TRIGGER provider_attempt_results_immutable_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempt_inputs SET request_digest=?,canonical_input=? WHERE provider_attempt_id=?`, legacyDigest, legacy, planning.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempt_results SET request_digest=? WHERE provider_attempt_id=?`, legacyDigest, planning.ID); err != nil {
+		t.Fatal(err)
+	}
+	planning.RequestDigest = legacyDigest
+	planning.RequestPayload = legacy
+	if historical, _, err := db.LoadHistoricalProviderAttemptResult(ctx, planKey); err != nil || historical.Claim.RequestDigest != legacyDigest || !contracts.PhaseInputDigestMatches(historical.Claim.Input, legacyDigest) {
+		t.Fatalf("legacy planner historical load=%+v err=%v", historical.Claim, err)
+	}
+
+	verified, err := db.TransitionPlan(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.Version != verified.Version || ticket.State != domain.StateVerifying {
+		t.Fatalf("verified ticket=%+v transition=%+v err=%v", ticket, verified, err)
+	}
+	reviewFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	review, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: reviewFence, Phase: domain.PhaseVerification, Role: "reviewer", Binding: runtime(reviewer), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishProviderAttempt(ctx, review, proof(t, review), ticket.Version, reviewFence, "failed", "invalid_artifact", 0, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "legacy-planner-input-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil || changed != 1 {
+		t.Fatalf("legacy planner recovery changed=%d err=%v", changed, err)
+	}
+	current, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || current.State != domain.StateVerifying || current.RunnerEpoch != ticket.RunnerEpoch+1 {
+		t.Fatalf("recovered ticket=%+v err=%v", current, err)
+	}
+}
 
 func TestRunnerStartAuthorityIsCanonicalImmutableAndUnique(t *testing.T) {
 	newStarted := func(t *testing.T, id string) (*Store, context.Context, Ticket, uint64) {

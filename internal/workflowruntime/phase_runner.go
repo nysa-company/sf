@@ -447,12 +447,11 @@ func matchesLaunchInput(claim store.ProviderAttemptClaim, key store.ProviderAtte
 		return false
 	}
 	input.Timeout = claim.Input.Timeout
-	payload, digest, err := contracts.CanonicalPhaseInput(input)
+	payload, digest, err := contracts.CanonicalPhaseInput(claim.Input)
 	if err != nil {
 		return false
 	}
-	input.RequestDigest = digest
-	return digest == claim.RequestDigest && bytes.Equal(payload, claim.RequestPayload) && reflect.DeepEqual(input, claim.Input)
+	return digest == claim.RequestDigest && bytes.Equal(payload, claim.RequestPayload) && contracts.PhaseInputMatchesAuthenticatedClaim(input, claim.Input, claim.RequestDigest)
 }
 
 func parsedForPhase(parsed phaseartifact.Parsed, phase domain.Phase) bool {

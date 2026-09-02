@@ -1,8 +1,11 @@
 package workflowruntime
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -16,6 +19,35 @@ import (
 	"github.com/nysa-company/sf/internal/workflowprompt"
 	"github.com/nysa-company/sf/internal/workflowworker"
 )
+
+func TestMatchesLaunchInputAcceptsExactLegacyPhaseInput(t *testing.T) {
+	input := contracts.PhaseInput{
+		Ticket: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "SF-legacy-launch"}, Phase: domain.PhaseVerification,
+		Attempt: 1, LeaderEpoch: 5, RunnerEpoch: 1, ExpectedVersion: 3, Prompt: "verify", Repository: "/repo", Worktree: "/repo/.sf/worktree", WorktreeIdentity: "identity", BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Provider: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "openai", Version: "1"}, AuthMode: "chatgpt_subscription", Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`),
+	}
+	payload, _, err := contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := bytes.TrimSuffix(payload, []byte(`,"Repair":null}`))
+	if len(legacy) == len(payload) {
+		t.Fatalf("current payload has no v53 repair suffix: %s", payload)
+	}
+	legacy = append(append([]byte(nil), legacy...), '}')
+	sum := sha256.Sum256(legacy)
+	digest := fmt.Sprintf("%x", sum)
+	decoded, err := contracts.DecodeCanonicalPhaseInput(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ProviderAttemptClaim{ID: 9, Ref: input.Ticket, Phase: input.Phase, Role: string(providercoord.RoleReviewer), Attempt: 1, Binding: contracts.RuntimeBinding{Identity: input.Provider, AuthMode: input.AuthMode}, LeaderEpoch: 5, RunnerEpoch: 1, ExpectedVersion: 3, Repository: input.Repository, Worktree: input.Worktree, WorktreeIdentity: input.WorktreeIdentity, BaseSHA: input.BaseSHA, Input: decoded, RequestDigest: digest, RequestPayload: legacy}
+	key := store.ProviderAttemptResultKey{AttemptID: claim.ID, Ref: input.Ticket, Phase: input.Phase, Attempt: claim.Attempt}
+	input.Provider, input.AuthMode, input.Attempt, input.LeaderEpoch, input.RunnerEpoch, input.ExpectedVersion = domain.ProviderIdentity{}, "", 0, 0, 0, 0
+	input.Timeout = 2 * time.Minute
+	if !matchesLaunchInput(claim, key, input) {
+		t.Fatal("logical phase request did not match exact legacy launch input")
+	}
+}
 
 type phaseStore struct {
 	project   store.Project

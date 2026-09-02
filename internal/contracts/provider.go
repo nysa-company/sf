@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -56,6 +57,65 @@ type PhaseInput struct {
 	// phase entry. It carries only opaque attempt/input identifiers: never the
 	// previous artifact, transcript, prompt, or credentials.
 	Repair *ProviderRepairContext
+
+	// legacyCanonicalPayload is set only by DecodeCanonicalPhaseInput after it
+	// has proved that persisted pre-v53 bytes are the exact old canonical
+	// representation. It is deliberately private: new proposals must always
+	// serialize with the current v53 shape, including Repair:null when no
+	// repair applies.
+	legacyCanonicalPayload []byte
+}
+
+// phaseInputV52 is the exact pre-v53 canonical wire shape. Keep its field
+// order in lock-step with PhaseInput through RequestDigest; PhaseInput.Repair
+// was appended in v53 without omitempty.
+type phaseInputV52 struct {
+	Ticket           domain.TicketRef
+	Phase            domain.Phase
+	Attempt          int
+	LeaderEpoch      uint64
+	RunnerEpoch      uint64
+	ExpectedVersion  uint64
+	Prompt           string
+	Repository       string
+	Worktree         string
+	WorktreeIdentity string
+	BaseSHA          string
+	AllowedPaths     []string
+	Provider         domain.ProviderIdentity
+	AuthMode         string
+	Timeout          time.Duration
+	Profile          ExecutionProfile
+	Schema           []byte
+	RequestDigest    string
+}
+
+func phaseInputV52Value(input PhaseInput) phaseInputV52 {
+	return phaseInputV52{
+		Ticket:           input.Ticket,
+		Phase:            input.Phase,
+		Attempt:          input.Attempt,
+		LeaderEpoch:      input.LeaderEpoch,
+		RunnerEpoch:      input.RunnerEpoch,
+		ExpectedVersion:  input.ExpectedVersion,
+		Prompt:           input.Prompt,
+		Repository:       input.Repository,
+		Worktree:         input.Worktree,
+		WorktreeIdentity: input.WorktreeIdentity,
+		BaseSHA:          input.BaseSHA,
+		AllowedPaths:     input.AllowedPaths,
+		Provider:         input.Provider,
+		AuthMode:         input.AuthMode,
+		Timeout:          input.Timeout,
+		Profile:          input.Profile,
+		Schema:           input.Schema,
+		RequestDigest:    input.RequestDigest,
+	}
+}
+
+func canonicalPhaseInputV52(input PhaseInput) ([]byte, error) {
+	input.RequestDigest = ""
+	return json.Marshal(phaseInputV52Value(input))
 }
 
 // ProviderRepairContext is deliberately small. Its source input digest lets
@@ -81,6 +141,17 @@ func ValidProviderRepairContext(value *ProviderRepairContext) bool {
 // lets the store issue a digest without trusting the coordinator or adapter
 // to serialize the request the same way.
 func CanonicalPhaseInput(input PhaseInput) ([]byte, string, error) {
+	if input.legacyCanonicalPayload != nil {
+		if input.Repair != nil {
+			return nil, "", errors.New("legacy phase input cannot carry repair context")
+		}
+		legacy, err := canonicalPhaseInputV52(input)
+		if err != nil || string(legacy) != string(input.legacyCanonicalPayload) {
+			return nil, "", errors.New("legacy phase input no longer matches authenticated payload")
+		}
+		sum := sha256.Sum256(legacy)
+		return append([]byte(nil), legacy...), hex.EncodeToString(sum[:]), nil
+	}
 	input.RequestDigest = ""
 	payload, err := json.Marshal(input)
 	if err != nil {
@@ -95,15 +166,53 @@ func PhaseInputDigestMatches(input PhaseInput, digest string) bool {
 	return err == nil && len(digest) == 64 && actual == digest
 }
 
+// PhaseInputMatchesAuthenticatedClaim compares a caller's reconstructed launch
+// input with a decoded durable claim. The claim may carry the private marker
+// for an exact pre-v53 canonical payload; callers cannot and must not copy
+// that marker. First authenticate the claim's own serialized format and
+// digest, then compare the public logical fields with request digests cleared.
+// New inputs always take the v53 branch in CanonicalPhaseInput.
+func PhaseInputMatchesAuthenticatedClaim(proposed, claim PhaseInput, digest string) bool {
+	if len(digest) != 64 {
+		return false
+	}
+	_, actual, err := CanonicalPhaseInput(claim)
+	if err != nil || actual != digest {
+		return false
+	}
+	proposed.RequestDigest = ""
+	proposed.legacyCanonicalPayload = nil
+	claim.RequestDigest = ""
+	claim.legacyCanonicalPayload = nil
+	return reflect.DeepEqual(proposed, claim)
+}
+
 func DecodeCanonicalPhaseInput(payload []byte) (PhaseInput, error) {
 	var input PhaseInput
 	if err := json.Unmarshal(payload, &input); err != nil {
 		return PhaseInput{}, err
 	}
 	canonical, _, err := CanonicalPhaseInput(input)
-	if err != nil || string(canonical) != string(payload) {
+	if err == nil && string(canonical) == string(payload) {
+		return input, nil
+	}
+	// v53 appended Repair without omitempty. A database created by an earlier
+	// binary has exact pre-v53 canonical bytes and their SHA-256 digest. Accept
+	// only that one historical shape: no Repair member at all, nil Repair after
+	// decode, and a byte-for-byte match to an explicitly marshalled v52 value.
+	// Never normalize or rewrite those durable bytes.
+	var fields map[string]json.RawMessage
+	if input.Repair != nil || json.Unmarshal(payload, &fields) != nil {
 		return PhaseInput{}, errors.New("phase input is not canonical")
 	}
+	if _, hasRepair := fields["Repair"]; hasRepair {
+		return PhaseInput{}, errors.New("phase input is not canonical")
+	}
+	legacy, legacyErr := canonicalPhaseInputV52(input)
+	if legacyErr != nil || string(legacy) != string(payload) {
+		return PhaseInput{}, errors.New("phase input is not canonical")
+	}
+	input.legacyCanonicalPayload = append([]byte(nil), legacy...)
 	return input, nil
 }
 

@@ -656,8 +656,7 @@ func reusedInputMatches(request Request, claim store.ProviderAttemptClaim) bool 
 		return false
 	}
 	input.Timeout = claim.Input.Timeout
-	_, digest, err := contracts.CanonicalPhaseInput(input)
-	return err == nil && digest == claim.RequestDigest && contracts.PhaseInputDigestMatches(claim.Input, claim.RequestDigest)
+	return contracts.PhaseInputMatchesAuthenticatedClaim(input, claim.Input, claim.RequestDigest)
 }
 
 // bindClaimToInput is the last coordinator-side authentication point before
@@ -690,8 +689,7 @@ func bindClaimToInput(input *contracts.PhaseInput, claim store.ProviderAttemptCl
 		expected.ExpectedVersion = claim.ExpectedVersion
 	}
 	expected.Repair = claim.Input.Repair
-	_, expectedDigest, err := contracts.CanonicalPhaseInput(expected)
-	if err != nil || expectedDigest != claim.RequestDigest {
+	if !contracts.PhaseInputMatchesAuthenticatedClaim(expected, claim.Input, claim.RequestDigest) {
 		return false
 	}
 	*input = claim.Input
