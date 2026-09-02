@@ -497,6 +497,59 @@ func prePublicationRecoveredStoppingPauseOrigin(ctx context.Context, q interface
 	return ErrPublicationEvidence
 }
 
+func noLifecycleStateChangeAt(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, version uint64) error {
+	var count int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&count); err != nil || count != 0 {
+		return ErrPublicationEvidence
+	}
+	return nil
+}
+
+// recoveredCancellationBaseline follows a resealed cancelling endpoint back
+// through only contiguous signed restart rows. The exact operator_cancel
+// event remains the sole lifecycle authority at the baseline; every recovery
+// endpoint must be free of lifecycle events.
+func recoveredCancellationBaseline(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, sealed mutationRevocation) (mutationRevocation, stateChangeEvent, bool, error) {
+	latest, found, err := loadRunnerRecoveryAt(ctx, q, ref, sealed.version)
+	if err != nil || !found || !validRunnerRecovery(latest) || latest.TicketVersion != sealed.version || latest.RunnerEpoch != sealed.runner || latest.LeaderEpoch != sealed.leader {
+		return mutationRevocation{}, stateChangeEvent{}, false, ErrPublicationEvidence
+	}
+	originalSealed := sealed
+	for depth := 0; depth < 64; depth++ {
+		if !validRunnerRecovery(latest) || latest.TicketVersion != sealed.version || latest.RunnerEpoch != sealed.runner || latest.LeaderEpoch != sealed.leader || noLifecycleStateChangeAt(ctx, q, ref, latest.TicketVersion) != nil {
+			return mutationRevocation{}, stateChangeEvent{}, false, ErrPublicationEvidence
+		}
+		baseline := mutationRevocation{version: latest.PriorTicketVersion, runner: latest.PriorRunnerEpoch, leader: latest.PriorLeaderEpoch}
+		event, eventErr := loadOnlyStateChangeEvent(ctx, q, ref, baseline.version)
+		if eventErr == nil {
+			if event.trigger != "operator_cancel" || event.to != domain.StateCancelling || !runnerInvalidatingCancelSource(event.from) {
+				return mutationRevocation{}, stateChangeEvent{}, false, ErrPublicationEvidence
+			}
+			if _, recoveryFound, recoveryErr := loadRunnerRecoveryAt(ctx, q, ref, baseline.version); recoveryErr != nil || recoveryFound {
+				return mutationRevocation{}, stateChangeEvent{}, false, ErrPublicationEvidence
+			}
+			if err := validateRunnerRecoveryLedgerPrefix(ctx, q, ref, baseline.version, baseline.runner, baseline.leader, originalSealed.version, originalSealed.runner, originalSealed.leader); err != nil {
+				return mutationRevocation{}, stateChangeEvent{}, false, ErrPublicationEvidence
+			}
+			return baseline, event, true, nil
+		}
+		if noLifecycleStateChangeAt(ctx, q, ref, baseline.version) != nil {
+			return mutationRevocation{}, stateChangeEvent{}, false, ErrPublicationEvidence
+		}
+		next, nextFound, nextErr := loadRunnerRecoveryAt(ctx, q, ref, baseline.version)
+		if nextErr != nil || !nextFound {
+			return mutationRevocation{}, stateChangeEvent{}, false, ErrPublicationEvidence
+		}
+		sealed, latest = baseline, next
+	}
+	return mutationRevocation{}, stateChangeEvent{}, false, ErrPublicationEvidence
+}
+
 // exactCancellationControlPredecessor authenticates the Store-owned atomic
 // operator-cancel endpoint before startup appends a new runner-recovery row.
 // It does not decide whether the origin was pre-publication; publication-aware
@@ -581,19 +634,28 @@ func prePublicationCancellationProof(ctx context.Context, q interface {
 	if state != "sealed" || stop != authority || authority.leader == 0 || authority.version == 0 || authority.runner == 0 || authority.version > currentVersion || authority.runner > currentRunner {
 		return false, nil
 	}
-	event, err := loadOnlyStateChangeEvent(ctx, q, ref, authority.version)
-	if err != nil || event.trigger != "operator_cancel" || event.to != domain.StateCancelling || !runnerInvalidatingCancelSource(event.from) {
-		return false, nil
-	}
-	if _, found, recoveryErr := loadRunnerRecoveryAt(ctx, q, ref, authority.version); recoveryErr != nil || found {
-		return false, nil
+	cancelAuthority := authority
+	event, eventErr := loadOnlyStateChangeEvent(ctx, q, ref, authority.version)
+	if eventErr == nil {
+		if event.trigger != "operator_cancel" || event.to != domain.StateCancelling || !runnerInvalidatingCancelSource(event.from) {
+			return false, nil
+		}
+		if _, found, recoveryErr := loadRunnerRecoveryAt(ctx, q, ref, authority.version); recoveryErr != nil || found {
+			return false, nil
+		}
+	} else {
+		var found bool
+		cancelAuthority, event, found, err = recoveredCancellationBaseline(ctx, q, ref, authority)
+		if err != nil || !found {
+			return false, nil
+		}
 	}
 	originAuthenticated := false
-	if event.from == domain.StatePaused && authority.version > 1 && authority.runner > 1 {
-		originAuthenticated = prePublicationRecoveredStoppingPauseOrigin(ctx, q, ref, authority.version-1, authority.runner-1) == nil
+	if event.from == domain.StatePaused && cancelAuthority.version > 1 && cancelAuthority.runner > 1 {
+		originAuthenticated = prePublicationRecoveredStoppingPauseOrigin(ctx, q, ref, cancelAuthority.version-1, cancelAuthority.runner-1) == nil
 	}
 	if !originAuthenticated {
-		if err := prePublicationControlOriginAt(ctx, q, ref, authority.version-1, event.from, 0); err != nil {
+		if err := prePublicationControlOriginAt(ctx, q, ref, cancelAuthority.version-1, event.from, 0); err != nil {
 			return false, nil
 		}
 	}

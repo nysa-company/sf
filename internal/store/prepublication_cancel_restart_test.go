@@ -450,17 +450,50 @@ func TestMergeObservationPrePublicationAcceptsCancelledRecoveredStoppingLineage(
 	if err != nil || !pre {
 		t.Fatalf("cancelled recovered stopping classified pre-publication=%v err=%v ticket=%+v", pre, err, fixture.cancelling)
 	}
-	leader, err := fixture.database.AcquireLeader(t.Context(), fixture.ref.Channel, "cancel-after-stopping-recovery")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if changed, err := fixture.database.FenceRecoveredRunners(t.Context(), fixture.ref.Channel, leader); err != nil || changed != 1 {
-		t.Fatalf("cancel recovery changed=%d err=%v", changed, err)
-	}
+	fixture = resealRecoveredStoppingCancellation(t, fixture)
 	pre, err = fixture.database.MergeObservationPrePublication(t.Context(), fixture.ref)
 	if err != nil || !pre {
 		t.Fatalf("recovered cancellation classified pre-publication=%v err=%v", pre, err)
 	}
+	var cancelEvents int
+	if err := fixture.database.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='operator_cancel'`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket).Scan(&cancelEvents); err != nil || cancelEvents != 1 {
+		t.Fatalf("operator_cancel events=%d err=%v", cancelEvents, err)
+	}
+}
+
+// resealRecoveredStoppingCancellation reproduces Drain's post-recovery
+// SealRuntimeControl then ControlProof sequence. Two restart rows move the
+// durable authority past the one operator_cancel event without adding any
+// publication or merge evidence.
+func resealRecoveredStoppingCancellation(t *testing.T, fixture recoveredStoppingCancellationFixture) recoveredStoppingCancellationFixture {
+	t.Helper()
+	for index := 0; index < 2; index++ {
+		leader, err := fixture.database.AcquireLeader(t.Context(), fixture.ref.Channel, "resealed-cancel-recovery")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := fixture.database.FenceRecoveredRunners(t.Context(), fixture.ref.Channel, leader); err != nil || changed != 1 {
+			t.Fatalf("resealed cancel recovery changed=%d err=%v", changed, err)
+		}
+		fixture.leader = leader
+	}
+	if err := fixture.database.SealRuntimeControl(t.Context(), fixture.ref); err != nil {
+		t.Fatalf("reseal recovered cancellation: %v", err)
+	}
+	proof, err := fixture.database.ControlProof(t.Context(), fixture.ref)
+	if err != nil {
+		t.Fatalf("recovered cancellation control proof: %v", err)
+	}
+	if proof.PublicationOrMergeEffects != 0 || proof.MergeIntents != 0 || proof.OutstandingPublicationOrMergeEffects != 0 || proof.OutstandingMergeIntents != 0 {
+		t.Fatalf("recovered cancellation publication/merge evidence=%+v", proof)
+	}
+	fixture.cancelling = databaseTicket(t, fixture.database, t.Context(), fixture.ref)
+	return fixture
+}
+
+func resealedRecoveredStoppingCancellation(t *testing.T) recoveredStoppingCancellationFixture {
+	t.Helper()
+	return resealRecoveredStoppingCancellation(t, recoveredStoppingCancellation(t))
 }
 
 func insertRecoveredStoppingForgery(t *testing.T, fixture recoveredStoppingCancellationFixture, value RunnerRecoveryLedger) {
@@ -470,6 +503,102 @@ func insertRecoveredStoppingForgery(t *testing.T, fixture recoveredStoppingCance
 	value.RecoveryDigest = runnerRecoveryDigest(value)
 	if _, err := fixture.database.db.ExecContext(t.Context(), `INSERT INTO runner_recovery_ledger(channel,project_id,ticket_id,prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, value.PriorTicketVersion, value.PriorRunnerEpoch, value.PriorLeaderEpoch, value.TicketVersion, value.RunnerEpoch, value.LeaderEpoch, value.RecoveryDigest, value.CreatedAt.Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func recoveredCancellationCurrentLedger(t *testing.T, fixture recoveredStoppingCancellationFixture) RunnerRecoveryLedger {
+	t.Helper()
+	value, found, err := loadRunnerRecoveryAt(t.Context(), fixture.database.db, fixture.ref, fixture.cancelling.Version)
+	if err != nil || !found {
+		t.Fatalf("load resealed cancellation recovery found=%v err=%v", found, err)
+	}
+	return value
+}
+
+func TestMergeObservationPrePublicationRejectsTamperedResealedCancellationRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, recoveredStoppingCancellationFixture)
+	}{
+		{
+			name: "missing-current-recovery",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `DROP TRIGGER runner_recovery_ledger_immutable_delete`); err != nil {
+					t.Fatal(err)
+				}
+				changed, err := fixture.database.db.ExecContext(t.Context(), `DELETE FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.cancelling.Version)
+				if err != nil {
+					t.Fatalf("delete resealed cancellation recovery: %v", err)
+				}
+				if count, _ := changed.RowsAffected(); count != 1 {
+					t.Fatalf("delete resealed cancellation recovery count=%d", count)
+				}
+			},
+		},
+		{
+			name: "endpoint-leader-mismatch",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `DROP TRIGGER runner_recovery_ledger_immutable_update`); err != nil {
+					t.Fatal(err)
+				}
+				changed, err := fixture.database.db.ExecContext(t.Context(), `UPDATE runner_recovery_ledger SET leader_epoch=leader_epoch+1 WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.cancelling.Version)
+				if err != nil {
+					t.Fatalf("modify resealed cancellation recovery: %v", err)
+				}
+				if count, _ := changed.RowsAffected(); count != 1 {
+					t.Fatalf("modify resealed cancellation recovery count=%d", count)
+				}
+			},
+		},
+		{
+			name: "broken-recovery-chain",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `DROP TRIGGER runner_recovery_ledger_immutable_delete`); err != nil {
+					t.Fatal(err)
+				}
+				changed, err := fixture.database.db.ExecContext(t.Context(), `DELETE FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.cancelling.Version-1)
+				if err != nil {
+					t.Fatalf("delete linked cancellation recovery: %v", err)
+				}
+				if count, _ := changed.RowsAffected(); count != 1 {
+					t.Fatalf("delete linked cancellation recovery count=%d", count)
+				}
+			},
+		},
+		{
+			name: "lifecycle-event-at-current-recovery-endpoint",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.cancelling.Version, "forged_recovery_state", domain.StateCancelling, domain.StatePaused, `{}`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "recovery-at-original-cancel-baseline",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				current := recoveredCancellationCurrentLedger(t, fixture)
+				prior, found, err := loadRunnerRecoveryAt(t.Context(), fixture.database.db, fixture.ref, current.PriorTicketVersion)
+				if err != nil || !found {
+					t.Fatalf("load original cancellation recovery found=%v err=%v", found, err)
+				}
+				insertRecoveredStoppingForgery(t, fixture, RunnerRecoveryLedger{
+					PriorTicketVersion: prior.PriorTicketVersion - 1,
+					PriorRunnerEpoch:   prior.PriorRunnerEpoch - 1,
+					PriorLeaderEpoch:   prior.PriorLeaderEpoch,
+					TicketVersion:      prior.PriorTicketVersion,
+					RunnerEpoch:        prior.PriorRunnerEpoch,
+					LeaderEpoch:        prior.PriorLeaderEpoch + 1,
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := resealedRecoveredStoppingCancellation(t)
+			tc.mutate(t, fixture)
+			if pre, err := fixture.database.MergeObservationPrePublication(t.Context(), fixture.ref); err != nil || pre {
+				t.Fatalf("tampered resealed cancellation classified pre-publication=%v err=%v", pre, err)
+			}
+		})
 	}
 }
 
