@@ -314,6 +314,20 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					priorLeader = control.leader
 				}
 			}
+			if ticket.state == domain.StateStopping {
+				if found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
+					priorLeader = latest.LeaderEpoch
+				} else {
+					control, controlFound, controlErr := exactStoppingControlPredecessor(ctx, conn, ref, ticket.version, ticket.runner)
+					if controlErr != nil || !controlFound {
+						return ErrPublicationEvidence
+					}
+					if control.leader >= leaderEpoch {
+						return ErrPublicationEvidence
+					}
+					priorLeader = control.leader
+				}
+			}
 			if ticket.state == domain.StatePublishing {
 				publication, publicationFound, err := loadPublicationEvidenceRow(ctx, conn, ref)
 				if err != nil {

@@ -4,9 +4,260 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/phaseartifact"
 )
+
+func TestStoppingRecoveryWithFailedVerificationAttemptWithoutArtifact(t *testing.T) {
+	database, ctx := openTestStore(t)
+	digest := setupProviderProject(t, database, ctx)
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "stopping-failed-verification")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, database, ctx, "SF-stopping-failed-verification", leader)
+	planner, reviewer := setupProviderPair(t, database, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	planning, err := database.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence,
+		Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner),
+		ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plannerDocument := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"works"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofAcceptance, Command: []string{"go", "test"}, Details: "proof"}, Paths: []string{"main.go"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"risk"}}
+	planRaw := []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"proof"},"paths":["main.go"],"commands":[["go","test"]],"risks":["risk"]}`)
+	if _, err := database.CompleteProviderAttemptSuccess(ctx, planning, proof(t, planning), ticket.Version, fence, contracts.PhaseResult{Provider: planning.Binding.Identity, Artifact: planRaw, UsageTrusted: true, UsageUnits: 1}, phaseartifact.Validation{TicketType: ticket.Type}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	planKey := ProviderAttemptResultKey{AttemptID: planning.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: planning.Attempt}
+	if _, err := database.RecordPlan(ctx, PlanArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Document: PlanDocument{Planner: &plannerDocument, ProviderResult: &planKey, Acceptance: plannerDocument.Acceptance, ProofKind: string(plannerDocument.Proof.Kind), Paths: plannerDocument.Paths, Commands: plannerDocument.Commands, Risks: plannerDocument.Risks}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.TransitionPlan(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = database.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.State != domain.StateVerifying || ticket.Version != 3 || ticket.RunnerEpoch != 1 {
+		t.Fatalf("verification entry=%+v err=%v", ticket, err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	claim, err := database.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence,
+		Phase: domain.PhaseVerification, Role: "reviewer", Binding: runtime(reviewer),
+		ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "invalid_artifact", 1, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var attemptState, outcome, launchState string
+	if err := database.db.QueryRowContext(ctx, `SELECT state,outcome,launch_state FROM provider_attempts WHERE id=?`, claim.ID).Scan(&attemptState, &outcome, &launchState); err != nil || attemptState != "failed" || outcome != "invalid_artifact" || launchState != "drained" {
+		t.Fatalf("failed verifier state=%s/%s/%s err=%v", attemptState, outcome, launchState, err)
+	}
+	var artifacts int
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&artifacts); err != nil || artifacts != 0 {
+		t.Fatalf("failed verifier artifacts=%d err=%v", artifacts, err)
+	}
+	secondLeader, err := database.AcquireLeader(ctx, ticket.Ref.Channel, "stopping-failed-verification-pre-stop-first-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := database.FenceRecoveredRunners(ctx, ticket.Ref.Channel, secondLeader); err != nil || changed != 1 {
+		t.Fatalf("first pre-stop recovery changed=%d err=%v", changed, err)
+	}
+	ticket, err = database.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.State != domain.StateVerifying || ticket.Version != 4 || ticket.RunnerEpoch != 2 {
+		t.Fatalf("first pre-stop recovery ticket=%+v err=%v", ticket, err)
+	}
+	thirdLeader, err := database.AcquireLeader(ctx, ticket.Ref.Channel, "stopping-failed-verification-pre-stop-second-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := database.FenceRecoveredRunners(ctx, ticket.Ref.Channel, thirdLeader); err != nil || changed != 1 {
+		t.Fatalf("second pre-stop recovery changed=%d err=%v", changed, err)
+	}
+	ticket, err = database.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.State != domain.StateVerifying || ticket.Version != 5 || ticket.RunnerEpoch != 3 {
+		t.Fatalf("second pre-stop recovery ticket=%+v err=%v", ticket, err)
+	}
+	fence = domain.Fence{LeaderEpoch: thirdLeader, RunnerEpoch: ticket.RunnerEpoch}
+
+	stoppedResult, err := database.TransitionAndInvalidateRunner(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateVerifying,
+		To: domain.StateStopping, ResumeState: domain.StateVerifying,
+		Trigger: "operator_pause_or_take", Fence: fence, EventPayload: `{"intent":"take"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopping, err := database.Ticket(ctx, ticket.Ref)
+	if err != nil || stopping.State != domain.StateStopping || stopping.Version != stoppedResult.Version || stopping.RunnerEpoch != ticket.RunnerEpoch+1 {
+		t.Fatalf("stopping=%+v result=%+v err=%v", stopping, stoppedResult, err)
+	}
+
+	var sequence int
+	var name, path string
+	if err := database.db.QueryRowContext(ctx, `PRAGMA database_list`).Scan(&sequence, &name, &path); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	fourthLeader, err := reopened.AcquireLeader(ctx, ticket.Ref.Channel, "stopping-failed-verification-post-stop-first-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := reopened.FenceRecoveredRunners(ctx, ticket.Ref.Channel, fourthLeader); err != nil || changed != 1 {
+		t.Fatalf("first stopping recovery changed=%d err=%v", changed, err)
+	}
+	firstRecovered, err := reopened.Ticket(ctx, ticket.Ref)
+	if err != nil || firstRecovered.State != domain.StateStopping || firstRecovered.Version != stopping.Version+1 || firstRecovered.RunnerEpoch != stopping.RunnerEpoch+1 {
+		t.Fatalf("first recovered=%+v stopping=%+v err=%v", firstRecovered, stopping, err)
+	}
+	var priorVersion, priorRunner, priorLeader, recoveredVersion, recoveredRunner, recoveredLeader uint64
+	if err := reopened.db.QueryRowContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY ticket_version DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&priorVersion, &priorRunner, &priorLeader, &recoveredVersion, &recoveredRunner, &recoveredLeader); err != nil || priorVersion != stopping.Version || priorRunner != stopping.RunnerEpoch || priorLeader != thirdLeader || recoveredVersion != firstRecovered.Version || recoveredRunner != firstRecovered.RunnerEpoch || recoveredLeader != fourthLeader {
+		t.Fatalf("first stopping recovery ledger prior=%d/%d/%d recovered=%d/%d/%d err=%v", priorVersion, priorRunner, priorLeader, recoveredVersion, recoveredRunner, recoveredLeader, err)
+	}
+
+	fifthLeader, err := reopened.AcquireLeader(ctx, ticket.Ref.Channel, "stopping-failed-verification-post-stop-second-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := reopened.FenceRecoveredRunners(ctx, ticket.Ref.Channel, fifthLeader); err != nil || changed != 1 {
+		t.Fatalf("second stopping recovery changed=%d err=%v", changed, err)
+	}
+	secondRecovered, err := reopened.Ticket(ctx, ticket.Ref)
+	if err != nil || secondRecovered.State != domain.StateStopping || secondRecovered.Version != firstRecovered.Version+1 || secondRecovered.RunnerEpoch != firstRecovered.RunnerEpoch+1 {
+		t.Fatalf("second recovered=%+v first=%+v err=%v", secondRecovered, firstRecovered, err)
+	}
+	if err := reopened.db.QueryRowContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY ticket_version DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&priorVersion, &priorRunner, &priorLeader, &recoveredVersion, &recoveredRunner, &recoveredLeader); err != nil || priorVersion != firstRecovered.Version || priorRunner != firstRecovered.RunnerEpoch || priorLeader != fourthLeader || recoveredVersion != secondRecovered.Version || recoveredRunner != secondRecovered.RunnerEpoch || recoveredLeader != fifthLeader {
+		t.Fatalf("second stopping recovery ledger prior=%d/%d/%d recovered=%d/%d/%d err=%v", priorVersion, priorRunner, priorLeader, recoveredVersion, recoveredRunner, recoveredLeader, err)
+	}
+	if _, err := reopened.CompleteControlTransition(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: secondRecovered.Version, From: domain.StateStopping,
+		To: domain.StatePaused, ResumeState: domain.StateVerifying,
+		Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: fifthLeader, RunnerEpoch: secondRecovered.RunnerEpoch}, EventPayload: `{"drained":true}`,
+	}); err != nil {
+		t.Fatalf("complete recovered stopping control: %v", err)
+	}
+	paused, err := reopened.Ticket(ctx, ticket.Ref)
+	if err != nil || paused.State != domain.StatePaused || paused.ResumeState != domain.StateVerifying || paused.Version != secondRecovered.Version+1 || paused.RunnerEpoch != secondRecovered.RunnerEpoch {
+		t.Fatalf("paused=%+v recovered=%+v err=%v", paused, secondRecovered, err)
+	}
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&artifacts); err != nil || artifacts != 0 {
+		t.Fatalf("recovery fabricated verifier artifact count=%d err=%v", artifacts, err)
+	}
+	var stops int
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='operator_pause_or_take' AND from_state='verifying' AND to_state='stopping'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&stops); err != nil || stops != 1 {
+		t.Fatalf("operator pause/take event count=%d err=%v", stops, err)
+	}
+}
+
+func TestStoppingRecoveryRejectsTamperedControlEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, *Store, Ticket)
+	}{
+		{
+			name: "missing-control",
+			mutate: func(t *testing.T, database *Store, stopping Ticket) {
+				if _, err := database.db.ExecContext(t.Context(), `DELETE FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, stopping.Ref.Channel, stopping.Ref.Project, stopping.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "opened-control",
+			mutate: func(t *testing.T, database *Store, stopping Ticket) {
+				if _, err := database.db.ExecContext(t.Context(), `UPDATE runtime_ticket_controls SET state='open' WHERE channel=? AND project_id=? AND ticket_id=?`, stopping.Ref.Channel, stopping.Ref.Project, stopping.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "mismatched-authority",
+			mutate: func(t *testing.T, database *Store, stopping Ticket) {
+				if _, err := database.db.ExecContext(t.Context(), `UPDATE runtime_ticket_controls SET authority_runner_epoch=authority_runner_epoch+1 WHERE channel=? AND project_id=? AND ticket_id=?`, stopping.Ref.Channel, stopping.Ref.Project, stopping.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "duplicate-state-change",
+			mutate: func(t *testing.T, database *Store, stopping Ticket) {
+				if _, err := database.db.ExecContext(t.Context(), `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, stopping.Ref.Channel, stopping.Ref.Project, stopping.Ref.Ticket, stopping.Version, "typed_blocker", domain.StatePlanning, domain.StateBlocked, `{}`, "2026-09-02T00:00:00Z"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, ref, leader, started := runtimeControlTicket(t)
+			_, err := database.TransitionAndInvalidateRunner(t.Context(), Transition{
+				Ref: ref, ExpectedVersion: started.Version, From: started.State,
+				To: domain.StateStopping, ResumeState: started.State, Trigger: "operator_pause_or_take",
+				Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: `{}`,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stopping, err := database.Ticket(t.Context(), ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(t, database, stopping)
+			newLeader, err := database.AcquireLeader(t.Context(), ref.Channel, "stopping-tampered-"+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.FenceRecoveredRunners(t.Context(), ref.Channel, newLeader); !errors.Is(err, ErrPublicationEvidence) {
+				t.Fatalf("tampered stopping control startup fence err=%v, want publication evidence", err)
+			}
+		})
+	}
+}
+
+func TestStoppingRecoveryRejectsMismatchedResumeState(t *testing.T) {
+	database, ref, leader, started := runtimeControlTicket(t)
+	_, err := database.TransitionAndInvalidateRunner(t.Context(), Transition{
+		Ref: ref, ExpectedVersion: started.Version, From: started.State,
+		To: domain.StateStopping, ResumeState: started.State, Trigger: "operator_pause_or_take",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: `{}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stoppingTicket, err := database.Ticket(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.ExecContext(t.Context(), `UPDATE tickets SET resume_state=? WHERE channel=? AND project_id=? AND id=?`, domain.StateBuilding, ref.Channel, ref.Project, ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	newLeader, err := database.AcquireLeader(t.Context(), ref.Channel, "stopping-resume-tampered-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.FenceRecoveredRunners(t.Context(), ref.Channel, newLeader); !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("resume-tampered stopping control startup fence err=%v, want publication evidence", err)
+	}
+	if current, err := database.Ticket(t.Context(), ref); err != nil || current.Version != stoppingTicket.Version || current.RunnerEpoch != stoppingTicket.RunnerEpoch {
+		t.Fatalf("tampered stopping ticket advanced=%+v stopping=%+v err=%v", current, stoppingTicket, err)
+	}
+}
 
 // Cancellation is still a pre-publication disposition.  In particular, a
 // merge observer must not turn an operator cancellation into a proof request

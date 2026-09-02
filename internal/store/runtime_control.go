@@ -474,6 +474,41 @@ func exactCancellationControlPredecessor(ctx context.Context, q interface {
 	return authority, true, nil
 }
 
+// exactStoppingControlPredecessor authenticates the Store-owned atomic
+// operator-pause/take endpoint before startup appends a new runner-recovery
+// row. The sealed control tuple--not provider-result availability--is its
+// authority in the crash window before process_and_effects_drained commits;
+// startup recovery handles any still-active provider process claim separately.
+func exactStoppingControlPredecessor(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, version, runner uint64) (mutationRevocation, bool, error) {
+	var state string
+	var ticketState domain.State
+	var resume sql.NullString
+	var ticketVersion, ticketRunner uint64
+	var stop, authority mutationRevocation
+	err := q.QueryRowContext(ctx, `SELECT c.state,c.stop_version,c.stop_leader_epoch,c.stop_runner_epoch,c.authority_version,c.authority_leader_epoch,c.authority_runner_epoch,
+		t.state,t.resume_state,t.version,t.runner_epoch
+		FROM runtime_ticket_controls c JOIN tickets t ON t.channel=c.channel AND t.project_id=c.project_id AND t.id=c.ticket_id
+		WHERE c.channel=? AND c.project_id=? AND c.ticket_id=?`,
+		ref.Channel, ref.Project, ref.Ticket).Scan(&state, &stop.version, &stop.leader, &stop.runner, &authority.version, &authority.leader, &authority.runner,
+		&ticketState, &resume, &ticketVersion, &ticketRunner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return mutationRevocation{}, false, nil
+	}
+	if err != nil {
+		return mutationRevocation{}, false, err
+	}
+	if state != "sealed" || ticketState != domain.StateStopping || ticketVersion != version || ticketRunner != runner || stop != authority || authority.version != version || authority.runner != runner || authority.leader == 0 {
+		return mutationRevocation{}, false, nil
+	}
+	event, err := loadOnlyStateChangeEvent(ctx, q, ref, version)
+	if err != nil || event.trigger != "operator_pause_or_take" || event.to != domain.StateStopping || !resume.Valid || domain.State(resume.String) != event.from || !validRunnerInvalidatingControlTransition(Transition{From: event.from, To: event.to, ResumeState: event.from, Trigger: event.trigger}) {
+		return mutationRevocation{}, false, ErrPublicationEvidence
+	}
+	return authority, true, nil
+}
+
 // prePublicationCancellationProof follows the durable control endpoint
 // through any signed startup recovery rows and proves that the exact state
 // cancelled by the operator was still on the pre-publication side.
