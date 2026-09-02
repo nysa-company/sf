@@ -1437,6 +1437,12 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	if transition.Trigger == "base_or_candidate_head_changed" {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
+	// The ticket-wide time/cost ceiling is immutable and non-retryable. Route
+	// its reserved blocker code through the Store-owned proof before generic
+	// typed blockers can persist caller-supplied metadata.
+	if ticketBudgetExhaustionTransition(transition) {
+		return s.transitionTicketBudgetExhausted(ctx, transition)
+	}
 	// These provider transitions carry attempt-window proof and must enter via
 	// TransitionProviderExhausted / TransitionProviderRetry, never generic
 	// lifecycle persistence.
@@ -1533,6 +1539,9 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		if persistedBlockedCode == "legacy_provider_phase_entry_unverifiable" && (transition.Trigger == "operator_resume" || transition.Trigger == "operator_recover") {
 			return ErrEvidenceConflict
 		}
+		if persistedBlockedCode == ticketBudgetExhaustedCode && transition.Trigger == "operator_recover" {
+			return ErrBudgetExhausted
+		}
 		if transition.Trigger == "operator_resume" && actual == domain.StatePaused && providerStateForPhaseTransition(transition.To) {
 			if !storedResume.Valid || domain.State(storedResume.String) != transition.To {
 				return ErrEvidenceConflict
@@ -1617,6 +1626,154 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		}
 		result.Version = version + 1
 		result.EventID, _ = created.LastInsertId()
+		return nil
+	})
+	return result, err
+}
+
+const (
+	ticketBudgetExhaustedCode   = "ticket_budget_exhausted"
+	ticketBudgetExhaustedSchema = "sf.ticket-budget-exhausted/v1"
+)
+
+type ticketBudgetExhaustionPayload struct {
+	Schema          string       `json:"schema"`
+	Code            string       `json:"code"`
+	Phase           domain.Phase `json:"phase"`
+	Reason          string       `json:"reason"`
+	CreatedAt       string       `json:"created_at"`
+	Deadline        string       `json:"deadline"`
+	MaxCostMicroUSD int64        `json:"max_cost_micro_usd"`
+	SpentMicroUSD   int64        `json:"spent_micro_usd"`
+	NextAction      string       `json:"next_action"`
+}
+
+func ticketBudgetExhaustionTransition(transition Transition) bool {
+	if transition.Trigger != "typed_blocker" {
+		return false
+	}
+	var payload struct {
+		Code string `json:"code"`
+	}
+	return json.Unmarshal([]byte(transition.EventPayload), &payload) == nil && payload.Code == ticketBudgetExhaustedCode
+}
+
+// transitionTicketBudgetExhausted is the only lifecycle authority for the
+// immutable ticket-wide deadline/cost ceiling. Caller JSON selects the
+// boundary but supplies no budget facts; Store reconstructs and persists the
+// canonical proof while holding the current ticket fence.
+func (s *Store) transitionTicketBudgetExhausted(ctx context.Context, transition Transition) (TransitionResult, error) {
+	phase, ok := providerPhaseForState(transition.From)
+	if !ok || transition.To != domain.StateBlocked || transition.ResumeState != transition.From || transition.Trigger != "typed_blocker" || transition.Ref.Validate() != nil || transition.ExpectedVersion == 0 || transition.Fence.LeaderEpoch == 0 || transition.Fence.RunnerEpoch == 0 {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
+		return TransitionResult{}, err
+	}
+	observedAt := time.Now().UTC()
+	var result TransitionResult
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		var actual domain.State
+		var version, runner uint64
+		var created string
+		var maxDuration, maxCost int64
+		if err := conn.QueryRowContext(ctx, `SELECT state,version,runner_epoch,created_at,max_duration_ns,max_cost_micro_usd FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&actual, &version, &runner, &created, &maxDuration, &maxCost); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if actual != transition.From || version != transition.ExpectedVersion {
+			return ErrStaleFence
+		}
+		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
+			return err
+		}
+		entry, err := loadCurrentProviderPhaseEntry(ctx, conn, transition.Ref, phase, version, runner, transition.Fence.LeaderEpoch)
+		if err != nil {
+			return err
+		}
+		if err := validateProviderPhaseEntryBindings(ctx, conn, transition.Ref, entry); err != nil {
+			return err
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, created)
+		if err != nil || maxDuration <= 0 || maxCost <= 0 {
+			return ErrEvidenceConflict
+		}
+		deadline := createdAt.Add(time.Duration(maxDuration))
+		var spent int64
+		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(usage_units),0) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&spent); err != nil {
+			return err
+		}
+		var budgetRejected, reusable, activeAttempts, activeRuns, providerLeases, gitWriters, commandWriters, unresolvedEffects int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries pe
+			JOIN provider_attempts a ON a.id=pe.provider_attempt_id
+			JOIN phase_runs r ON r.channel=pe.channel AND r.project_id=pe.project_id AND r.ticket_id=pe.ticket_id AND r.phase=pe.phase AND r.attempt=pe.attempt
+			WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=?
+			AND a.state='failed' AND a.outcome='budget_exhausted' AND a.launch_state='drained'
+			AND r.state='failed' AND r.outcome='budget_exhausted'`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, phase, entry.Version).Scan(&budgetRejected); err != nil {
+			return err
+		}
+		if budgetRejected > 1 {
+			return ErrEvidenceConflict
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries pe JOIN provider_attempt_results r ON r.provider_attempt_id=pe.provider_attempt_id WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, phase, entry.Version).Scan(&reusable); err != nil {
+			return err
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&activeAttempts); err != nil {
+			return err
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM phase_runs WHERE channel=? AND project_id=? AND ticket_id=? AND state='active'`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&activeRuns); err != nil {
+			return err
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases WHERE channel=? AND project_id=? AND ticket_id=? AND scope='provider'`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&providerLeases); err != nil {
+			return err
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM git_mutation_leases WHERE channel=? AND project_id=? AND ticket_id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&gitWriters); err != nil {
+			return err
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&commandWriters); err != nil {
+			return err
+		}
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('executing','uncertain')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&unresolvedEffects); err != nil {
+			return err
+		}
+		if reusable != 0 || activeAttempts != 0 || activeRuns != 0 || providerLeases != 0 || gitWriters != 0 || commandWriters != 0 || unresolvedEffects != 0 {
+			return ErrEvidenceConflict
+		}
+		reason := ""
+		switch {
+		case !observedAt.Before(deadline):
+			reason = "ticket_duration_exhausted"
+		case spent >= maxCost:
+			reason = "ticket_cost_exhausted"
+		case budgetRejected == 1:
+			reason = "provider_budget_rejected"
+		default:
+			return ErrEvidenceConflict
+		}
+		payload, err := json.Marshal(ticketBudgetExhaustionPayload{
+			Schema: ticketBudgetExhaustedSchema, Code: ticketBudgetExhaustedCode,
+			Phase: phase, Reason: reason, CreatedAt: createdAt.UTC().Format(time.RFC3339Nano),
+			Deadline: deadline.UTC().Format(time.RFC3339Nano), MaxCostMicroUSD: maxCost,
+			SpentMicroUSD: spent, NextAction: "cancel this ticket and submit a fresh ticket",
+		})
+		if err != nil || len(payload) > maxEvidenceJSON {
+			return ErrEvidenceConflict
+		}
+		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state='blocked',resume_state=?,blocked_code=?,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.From, ticketBudgetExhaustedCode, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
+		if err != nil {
+			return err
+		}
+		if changed, _ := updated.RowsAffected(); changed != 1 {
+			return ErrStaleFence
+		}
+		createdEvent, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, "typed_blocker", transition.From, domain.StateBlocked, string(payload), observedAt.Format(time.RFC3339Nano))
+		if err != nil {
+			return err
+		}
+		result.Version = version + 1
+		result.EventID, _ = createdEvent.LastInsertId()
 		return nil
 	})
 	return result, err

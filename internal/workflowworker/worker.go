@@ -31,6 +31,10 @@ var (
 	// ticket time/cost budget: Worker converts only this attempt-window limit
 	// through Store's authenticated provider-exhaustion pause boundary.
 	ErrProviderAttemptExhausted = errors.New("workflow provider attempt window is exhausted")
+	// ErrTicketBudgetExhausted is the immutable ticket-wide time/cost ceiling.
+	// It is never retryable: Worker asks Store to prove and block it so the
+	// operator can cancel and submit a fresh ticket without widening policy.
+	ErrTicketBudgetExhausted = errors.New("workflow ticket time or cost budget is exhausted")
 )
 
 // Evidence is the deliberately small Store surface needed by the walking
@@ -229,6 +233,23 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	if err != nil {
 		if errors.Is(err, ErrProviderAttemptExhausted) {
 			_, signalErr := w.Engine.SignalProviderExhausted(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: "retry_or_correction_exhausted", Fence: fence})
+			if signalErr != nil {
+				return result, signalErr
+			}
+			current, readErr := w.Evidence.Ticket(ctx, ref)
+			if readErr != nil {
+				return result, readErr
+			}
+			result.State, result.Version, result.Transitioned = current.State, current.Version, true
+			return result, nil
+		}
+		if errors.Is(err, ErrTicketBudgetExhausted) {
+			_, signalErr := w.Engine.Signal(ctx, contracts.SignalRequest{
+				Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State,
+				Trigger: "typed_blocker", Fence: fence,
+				Attributes:   map[string]string{"no_unreconciled_external_mutation": "true"},
+				EventPayload: `{"code":"ticket_budget_exhausted"}`,
+			})
 			if signalErr != nil {
 				return result, signalErr
 			}

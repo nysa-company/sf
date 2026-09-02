@@ -1105,6 +1105,9 @@ func (daemon *Daemon) show(ctx context.Context, request api.Request, identity do
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
 	}
 	view := ticketDetail(stored)
+	if action, ok := daemon.ticketBudgetNextAction(stored); ok {
+		view["next_action"] = action
+	}
 	evidence, err := daemon.evidenceView(ctx, stored.Ref)
 	if err != nil {
 		return daemon.failure(request, evidenceErrorCode(err), "durable workflow evidence could not be authenticated", errors.Is(err, store.ErrBusy))
@@ -1691,6 +1694,9 @@ func (daemon *Daemon) recoverTicket(ctx context.Context, request api.Request, id
 	if stored.BlockedCode == "legacy_provider_phase_entry_unverifiable" {
 		return daemon.failure(request, "legacy_provider_entry_unverifiable", "this pre-v51 provider ticket cannot safely resume; cancel it and submit a fresh ticket", false)
 	}
+	if stored.BlockedCode == "ticket_budget_exhausted" {
+		return daemon.failure(request, "ticket_budget_exhausted", "ticket time/cost budget is immutable and exhausted; cancel it, then submit a fresh ticket", false)
+	}
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
 	}
@@ -2000,7 +2006,11 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, id
 		if err != nil {
 			return daemon.failure(request, evidenceErrorCode(err), "durable workflow evidence could not be authenticated", errors.Is(err, store.ErrBusy))
 		}
-		return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "current_version": stored.Version, "operator": operatorView(identity), "ticket": ticketView(stored), "evidence": evidence})
+		view := map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "current_version": stored.Version, "operator": operatorView(identity), "ticket": ticketView(stored), "evidence": evidence}
+		if action, ok := daemon.ticketBudgetNextAction(stored); ok {
+			view["next_action"] = action
+		}
+		return daemon.success(request, api.Mutation{}, view)
 	}
 	items, err := daemon.store.Tickets(ctx, daemon.channel, domain.ProjectID(parameters.Project), 1000)
 	if err != nil {
@@ -2008,7 +2018,11 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, id
 	}
 	views := make([]map[string]any, 0, len(items))
 	for _, item := range items {
-		views = append(views, ticketView(item))
+		view := ticketView(item)
+		if action, ok := daemon.ticketBudgetNextAction(item); ok {
+			view["next_action"] = action
+		}
+		views = append(views, view)
 	}
 	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "leader_epoch": daemon.epoch, "operator": operatorView(identity), "tickets": views})
 }
@@ -2079,6 +2093,8 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	switch code {
 	case "legacy_provider_entry_unverifiable":
 		argv = []string{binary, "cancel", "--help"}
+	case "ticket_budget_exhausted":
+		argv = []string{binary, "cancel", "--help"}
 	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 		argv = []string{binary, "take", "--help"}
 	case "source_commit_required":
@@ -2106,6 +2122,8 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	if request.Ticket != "" {
 		switch code {
 		case "legacy_provider_entry_unverifiable":
+			argv = []string{binary, "cancel", request.Ticket}
+		case "ticket_budget_exhausted":
 			argv = []string{binary, "cancel", request.Ticket}
 		case "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 			// `take` is intentionally idempotent and prints the authenticated
@@ -2152,6 +2170,13 @@ func (daemon *Daemon) executable() string {
 		return "sf-dev"
 	}
 	return "sf"
+}
+
+func (daemon *Daemon) ticketBudgetNextAction(value store.Ticket) (domain.NextAction, bool) {
+	if value.BlockedCode != "ticket_budget_exhausted" || value.Ref.Ticket == "" {
+		return domain.NextAction{}, false
+	}
+	return domain.NextAction{Code: "ticket_budget_exhausted", Argv: []string{daemon.executable(), "cancel", string(value.Ref.Ticket)}}, true
 }
 
 func ticketView(value store.Ticket) map[string]any {

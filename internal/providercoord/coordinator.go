@@ -289,6 +289,9 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest, Repository: r.Input.Repository, Worktree: r.Input.Worktree, WorktreeIdentity: r.Input.WorktreeIdentity, BaseSHA: r.Input.BaseSHA, SupervisorKey: c.supervisor.PublicKey(), Input: claimInput})
 		if err != nil {
 			cancel()
+			if errors.Is(err, store.ErrBudgetExhausted) {
+				return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			}
 			if errors.Is(err, store.ErrProviderAttemptReusable) {
 				key, reusable, reuseErr := c.store.ReuseCurrentCompletedProviderAttempt(ctx, r.Input.Ticket, r.Input.Phase, string(r.Role), r.ExpectedVersion, r.Fence)
 				if reuseErr == nil && reusable {
@@ -382,6 +385,10 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			state, outcome = "cancelled", "cancelled"
 		}
 		valid := !cancelled && runErr == nil && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0
+		trustedUsage := int64(0)
+		if raw.UsageTrusted && raw.UsageUnits >= 0 {
+			trustedUsage = raw.UsageUnits
+		}
 		var parsed phaseartifact.Parsed
 		if valid {
 			parsed, err = phaseartifact.Parse(input.Phase, raw, r.Validation)
@@ -395,7 +402,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 				outcome = "invalid_artifact"
 			}
 		}
-		receipt := Receipt{AttemptID: claim.ID, Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), UsageUnits: max(raw.UsageUnits, 0)}
+		receipt := Receipt{AttemptID: claim.ID, Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), UsageUnits: trustedUsage}
 		if raw.TokenUsageTrusted {
 			receipt.TokenUsage = max(raw.TokenUsage, 0)
 		}
@@ -408,12 +415,13 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		}
 		receipts = append(receipts, receipt)
 		finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		finishedAt := c.clock.Now()
 		var finishErr error
 		var durableResult store.ProviderAttemptResult
 		if state == "completed" {
-			durableResult, finishErr = c.store.CompleteProviderAttemptSuccess(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, raw, r.Validation, c.clock.Now())
+			durableResult, finishErr = c.store.CompleteProviderAttemptSuccess(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, raw, r.Validation, finishedAt)
 		} else {
-			finishErr = c.store.FinishProviderAttempt(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, state, outcome, max(raw.UsageUnits, 0), c.clock.Now())
+			finishErr = c.store.FinishProviderAttempt(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, state, outcome, trustedUsage, finishedAt)
 		}
 		finishCancel()
 		if finishErr != nil {
@@ -437,7 +445,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			}
 			if errors.Is(finishErr, store.ErrBudgetExhausted) {
 				quarantineCtx, quarantineCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				budgetErr := c.store.FailProviderAttemptBudget(quarantineCtx, claim, drain, r.ExpectedVersion, r.Fence, c.clock.Now())
+				budgetErr := c.store.FailProviderAttemptBudget(quarantineCtx, claim, drain, r.ExpectedVersion, r.Fence, trustedUsage, finishedAt)
 				quarantineCancel()
 				if budgetErr != nil {
 					c.markPersistenceFailure(budgetErr)
@@ -448,18 +456,18 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			c.markPersistenceFailure(finishErr)
 			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: true}
 		}
-		spent += max(raw.UsageUnits, 0)
+		spent += trustedUsage
 		if !raw.UsageTrusted {
 			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 		if cancelled {
 			return Result{Code: Canceled, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
-		if spent >= ticket.MaxCostMicroUSD {
-			return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
-		}
 		if state == "completed" {
 			return Result{Code: Completed, Parsed: &parsed, ProviderResult: store.ProviderAttemptResultKey{AttemptID: durableResult.AttemptID, Ref: durableResult.Claim.Ref, Phase: durableResult.Claim.Phase, Attempt: durableResult.Claim.Attempt}, Attempts: receipts, CostUsed: spent}
+		}
+		if spent >= ticket.MaxCostMicroUSD {
+			return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 	}
 	return Result{Code: Failed, Attempts: receipts, NeedsOperator: true, CostUsed: spent}

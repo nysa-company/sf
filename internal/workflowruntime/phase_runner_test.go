@@ -195,6 +195,21 @@ func TestPhaseRunnerVerificationUsesStoredPlannerWitness(t *testing.T) {
 	}
 }
 
+func TestPhaseRunnerPreservesTicketBudgetExhaustionAsNonRetryable(t *testing.T) {
+	request, evidence, coordinator, _, _ := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying
+	evidence.ticket = request.Ticket
+	coordinator.result = providercoord.Result{Code: providercoord.BudgetExhausted, NeedsOperator: true}
+
+	_, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).run(
+		context.Background(), request, evidence.project, evidence.worktree,
+		providercoord.RoleReviewer, contracts.PhaseInput{}, phaseartifact.Validation{},
+	)
+	if !errors.Is(err, workflowworker.ErrTicketBudgetExhausted) || errors.Is(err, workflowworker.ErrProviderAttemptExhausted) {
+		t.Fatalf("ticket budget outcome=%v", err)
+	}
+}
+
 func TestPhaseRunnerVerificationCannotBypassPendingAmendment(t *testing.T) {
 	request, evidence, coordinator, _, _ := phaseFixture(t)
 	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying

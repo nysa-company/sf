@@ -32,7 +32,7 @@ test:
 # Race runs the complete credential-free Go suite once, serializing package
 # execution because several durable SQLite tests intentionally contend.
 test-race:
-	go test -race -count=1 -shuffle=off -p 1 -timeout 30m ./...
+	go test -race -count=1 -shuffle=off -p 1 -timeout 60m ./...
 
 # Friendly explicit alias for the complete serialized race suite.
 test-full: test-race

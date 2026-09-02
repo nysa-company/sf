@@ -1828,6 +1828,9 @@ func TestProviderFinishRejectsUsageBeyondTicketCeiling(t *testing.T) {
 	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "failed", ticket.MaxCostMicroUSD+1, time.Now().UTC()); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("overspend finish=%v", err)
 	}
+	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "failed", 1, ticket.CreatedAt.Add(ticket.MaxDuration)); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("exact-deadline finish=%v", err)
+	}
 	if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "failed", 1, ticket.CreatedAt.Add(ticket.MaxDuration).Add(time.Nanosecond)); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("late finish=%v", err)
 	}
@@ -2016,11 +2019,14 @@ func TestFailProviderAttemptBudgetMarksLaunchDrained(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FailProviderAttemptBudget(ctx, claim, proof(t, claim), ticket.Version, fence, time.Now().UTC()); err != nil {
+	if err := db.FailProviderAttemptBudget(ctx, claim, proof(t, claim), ticket.Version, fence, ticket.MaxCostMicroUSD-1, time.Now().UTC()); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("under-budget result was accepted as budget exhaustion: %v", err)
+	}
+	if err := db.FailProviderAttemptBudget(ctx, claim, proof(t, claim), ticket.Version, fence, ticket.MaxCostMicroUSD+1, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
-	if err != nil || len(attempts) != 1 || attempts[0].State != "failed" || attempts[0].Outcome != "budget_exhausted" {
+	if err != nil || len(attempts) != 1 || attempts[0].State != "failed" || attempts[0].Outcome != "budget_exhausted" || attempts[0].UsageUnits != ticket.MaxCostMicroUSD {
 		t.Fatalf("budget attempt=%+v err=%v", attempts, err)
 	}
 	var launchState string
@@ -2030,6 +2036,77 @@ func TestFailProviderAttemptBudgetMarksLaunchDrained(t *testing.T) {
 	leases, err := db.Leases(ctx, domain.ChannelDev)
 	if err != nil || len(leases) != 0 {
 		t.Fatalf("budget provider lease=%+v err=%v", leases, err)
+	}
+	if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhaseBuild,
+		Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(),
+	})); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("budget-rejected attempt admitted another provider: %v", err)
+	}
+}
+
+func TestTicketBudgetExhaustionIsStoreAuthenticatedAndNonRecoverable(t *testing.T) {
+	db, ctx := openTestStore(t)
+	setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "ticket-budget-block")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unexpired := setupProviderTicket(t, db, ctx, "SF-ticket-budget-unexpired", leader)
+	unexpiredFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: unexpired.RunnerEpoch}
+	forged := Transition{Ref: unexpired.Ref, ExpectedVersion: unexpired.Version, From: domain.StatePlanning, To: domain.StateBlocked, ResumeState: domain.StatePlanning, Trigger: "typed_blocker", Fence: unexpiredFence, EventPayload: `{"code":"ticket_budget_exhausted","reason":"caller-forged"}`}
+	if _, err := db.Transition(ctx, forged); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("unexpired ticket accepted forged budget blocker: %v", err)
+	}
+
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "provider", Ticket: "SF-ticket-budget-expired"}
+	if err := db.CreateTicket(ctx, Ticket{Ref: ref, SourceDigest: sha256Digest([]byte("expired-budget")), Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC().Add(-24 * time.Hour), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	expired, err := db.StartOrAdopt(ctx, ref, 1, "dev/provider/SF-ticket-budget-expired", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/provider/SF-ticket-budget-expired"
+	branch := "dev/provider/SF-ticket-budget-expired"
+	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: expired.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: expired.RunnerEpoch}, Path: worktree, Branch: branch, IdentityJSON: []byte(repositoryCommandIdentity(t, "/tmp/provider", worktree, branch, "main")), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
+		t.Fatal(err)
+	}
+	expiredFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: expired.RunnerEpoch}
+	blocked, err := db.Transition(ctx, Transition{Ref: ref, ExpectedVersion: expired.Version, From: domain.StatePlanning, To: domain.StateBlocked, ResumeState: domain.StatePlanning, Trigger: "typed_blocker", Fence: expiredFence, EventPayload: `{"code":"ticket_budget_exhausted","reason":"caller-data-must-not-survive"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.Ticket(ctx, ref)
+	if err != nil || current.State != domain.StateBlocked || current.ResumeState != domain.StatePlanning || current.BlockedCode != "ticket_budget_exhausted" || current.Version != blocked.Version {
+		t.Fatalf("blocked ticket=%+v err=%v", current, err)
+	}
+	events, err := db.Events(ctx, domain.ChannelDev, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Schema     string       `json:"schema"`
+		Code       string       `json:"code"`
+		Phase      domain.Phase `json:"phase"`
+		Reason     string       `json:"reason"`
+		NextAction string       `json:"next_action"`
+	}
+	found := 0
+	for _, event := range events {
+		if event.Ref == ref && event.Trigger == "typed_blocker" && event.From == domain.StatePlanning && event.To == domain.StateBlocked {
+			found++
+			if json.Unmarshal([]byte(event.Payload), &payload) != nil {
+				t.Fatalf("invalid canonical payload=%q", event.Payload)
+			}
+		}
+	}
+	if found != 1 || payload.Schema != "sf.ticket-budget-exhausted/v1" || payload.Code != "ticket_budget_exhausted" || payload.Phase != domain.PhasePlanning || payload.Reason == "caller-data-must-not-survive" || payload.NextAction == "" {
+		t.Fatalf("budget events=%d payload=%+v", found, payload)
+	}
+	if _, err := db.Transition(ctx, Transition{Ref: ref, ExpectedVersion: current.Version, From: domain.StateBlocked, To: domain.StatePlanning, Trigger: "operator_recover", Fence: expiredFence, EventPayload: `{}`}); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("immutable budget blocker recovered: %v", err)
 	}
 }
 

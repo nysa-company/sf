@@ -51,6 +51,11 @@ func renderTickets(writer io.Writer, parent map[string]any, values []any) error 
 		if _, err := fmt.Fprintf(writer, "- %s  %s\n", stringField(item, "ticket"), stringField(item, "state")); err != nil {
 			return err
 		}
+		if action, ok := item["next_action"].(map[string]any); ok {
+			if err := renderAction(writer, "  Next", action); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

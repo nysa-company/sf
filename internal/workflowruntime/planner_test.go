@@ -221,8 +221,8 @@ func TestPlannerRunnerOnlyMapsAttemptWindowExhaustionToProviderPause(t *testing.
 	request, evidence, coordinator := plannerFixture(t)
 	runner := PlannerRunner{Store: evidence, Coordinator: coordinator}
 	coordinator.result = providercoord.Result{Code: providercoord.BudgetExhausted, NeedsOperator: true}
-	if _, err := runner.RunArtifact(context.Background(), request); !errors.Is(err, ErrPlannerNotReady) {
-		t.Fatalf("ticket time/cost budget mapped to provider exhaustion: %v", err)
+	if _, err := runner.RunArtifact(context.Background(), request); !errors.Is(err, workflowworker.ErrTicketBudgetExhausted) || errors.Is(err, workflowworker.ErrProviderAttemptExhausted) {
+		t.Fatalf("ticket time/cost budget lost its distinct outcome: %v", err)
 	}
 	coordinator.result = providercoord.Result{Code: providercoord.AttemptExhausted, NeedsOperator: true}
 	if _, err := runner.RunArtifact(context.Background(), request); !errors.Is(err, workflowworker.ErrProviderAttemptExhausted) {

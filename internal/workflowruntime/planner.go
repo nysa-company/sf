@@ -144,6 +144,9 @@ func (r PlannerRunner) RunArtifact(ctx context.Context, request workflowworker.P
 		if coordResult.Code == providercoord.AttemptExhausted {
 			return PlannerResult{}, workflowworker.ErrProviderAttemptExhausted
 		}
+		if coordResult.Code == providercoord.BudgetExhausted {
+			return PlannerResult{}, workflowworker.ErrTicketBudgetExhausted
+		}
 		return PlannerResult{}, ErrPlannerNotReady
 	}
 	key := coordResult.ProviderResult

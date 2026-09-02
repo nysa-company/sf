@@ -369,6 +369,18 @@ type aliasedProvider struct{ *testkit.ScriptedProvider }
 
 func (p *aliasedProvider) Name() string { return "claude" }
 
+type untrustedUsageProvider struct {
+	*testkit.ScriptedProvider
+	usage int64
+}
+
+func (p *untrustedUsageProvider) Parse(ctx context.Context, input contracts.PhaseInput, result contracts.CommandResult) (contracts.PhaseResult, error) {
+	raw, err := p.ScriptedProvider.Parse(ctx, input, result)
+	raw.UsageTrusted = false
+	raw.UsageUnits = p.usage
+	return raw, err
+}
+
 type undrainedProvider struct {
 	*testkit.ScriptedProvider
 	drained bool
@@ -528,6 +540,76 @@ func TestBudgetExhaustionDoesNotExposeProviderResultKey(t *testing.T) {
 	result := coordinator.Run(context.Background(), request)
 	if result.Code != BudgetExhausted || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
 		t.Fatalf("budget result=%+v", result)
+	}
+}
+
+func TestUntrustedUsageCannotChargeOrExhaustTicketBudget(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
+	coordinator.registry.providers["cursor"] = &untrustedUsageProvider{ScriptedProvider: primary, usage: 10_000}
+	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != NeedsOperator || result.CostUsed != 0 || result.ProviderResult != (store.ProviderAttemptResultKey{}) || len(result.Attempts) != 1 || result.Attempts[0].UsageUnits != 0 {
+		t.Fatalf("untrusted usage result=%+v", result)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 1 || attempts[0].UsageUnits != 0 || attempts[0].Outcome == "budget_exhausted" {
+		t.Fatalf("untrusted usage attempts=%+v err=%v", attempts, err)
+	}
+	ticket, err := database.Ticket(context.Background(), ref)
+	if err != nil || ticket.State != domain.StatePlanning || ticket.BlockedCode != "" {
+		t.Fatalf("untrusted usage blocked ticket=%+v err=%v", ticket, err)
+	}
+}
+
+func TestExactCostCeilingConsumesCompletedResultBeforeBlockingLaterPhase(t *testing.T) {
+	_, request, coordinator, _, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact(), UsageUnits: 100}}
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != Completed || result.ProviderResult.AttemptID <= 0 || result.CostUsed != 100 {
+		t.Fatalf("exact-ceiling result=%+v", result)
+	}
+}
+
+type providerSequenceClock struct {
+	values []time.Time
+	next   int
+}
+
+func (clock *providerSequenceClock) Now() time.Time {
+	if len(clock.values) == 0 {
+		return time.Time{}
+	}
+	index := clock.next
+	if index >= len(clock.values) {
+		index = len(clock.values) - 1
+	} else {
+		clock.next++
+	}
+	return clock.values[index]
+}
+
+func TestCoordinatorMapsStoreDeadlineRaceToTicketBudgetExhausted(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	ticket, err := database.Ticket(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	coordinator.clock = &providerSequenceClock{values: []time.Time{
+		ticket.CreatedAt.Add(ticket.MaxDuration - time.Second),
+		ticket.CreatedAt.Add(ticket.MaxDuration + time.Nanosecond),
+	}}
+	callsBefore := len(primary.CallsSnapshot())
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != BudgetExhausted || !result.NeedsOperator || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
+		t.Fatalf("deadline-race result=%+v", result)
+	}
+	if callsAfter := len(primary.CallsSnapshot()); callsAfter != callsBefore {
+		t.Fatalf("provider invoked across deadline race: before=%d after=%d", callsBefore, callsAfter)
 	}
 }
 

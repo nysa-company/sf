@@ -492,13 +492,26 @@ func TestPlannerPassAndQuestions(t *testing.T) {
 	}
 }
 
-func TestProviderBudgetExhaustionPausesThroughTypedEngineBoundary(t *testing.T) {
+func TestProviderAttemptWindowExhaustionPausesThroughTypedEngineBoundary(t *testing.T) {
 	evidence := &fakeEvidence{}
 	engine := &fakeEngine{}
 	worker := newWorker(domain.StatePlanning, &fakeRunner{err: ErrProviderAttemptExhausted}, evidence, engine)
 	got, err := worker.Run(context.Background(), testRef, testFence)
 	if err != nil || !got.Transitioned || got.State != domain.StatePaused || engine.last.Trigger != "retry_or_correction_exhausted" || engine.signals != 1 {
 		t.Fatalf("run=%+v err=%v signal=%+v calls=%d", got, err, engine.last, engine.signals)
+	}
+}
+
+func TestTicketBudgetExhaustionBlocksOnceAndCannotBecomeProviderRetry(t *testing.T) {
+	evidence := &fakeEvidence{}
+	engine := &fakeEngine{}
+	worker := newWorker(domain.StatePlanning, &fakeRunner{err: ErrTicketBudgetExhausted}, evidence, engine)
+	got, err := worker.Run(context.Background(), testRef, testFence)
+	if err != nil || !got.Transitioned || got.State != domain.StateBlocked || engine.last.Trigger != "typed_blocker" || !strings.Contains(engine.last.EventPayload, `"code":"ticket_budget_exhausted"`) || engine.signals != 1 {
+		t.Fatalf("run=%+v err=%v signal=%+v calls=%d", got, err, engine.last, engine.signals)
+	}
+	if replay, replayErr := worker.Run(context.Background(), testRef, testFence); replayErr != nil || replay.Transitioned || replay.State != domain.StateBlocked || engine.signals != 1 {
+		t.Fatalf("blocked replay=%+v err=%v signals=%d", replay, replayErr, engine.signals)
 	}
 }
 

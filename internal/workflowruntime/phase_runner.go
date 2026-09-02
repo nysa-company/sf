@@ -386,6 +386,9 @@ func (r PhaseRunner) run(ctx context.Context, request workflowworker.PhaseReques
 		if result.Code == providercoord.AttemptExhausted {
 			return workflowworker.PhaseResult{}, workflowworker.ErrProviderAttemptExhausted
 		}
+		if result.Code == providercoord.BudgetExhausted {
+			return workflowworker.PhaseResult{}, workflowworker.ErrTicketBudgetExhausted
+		}
 		return workflowworker.PhaseResult{}, ErrPlannerNotReady
 	}
 	key := result.ProviderResult

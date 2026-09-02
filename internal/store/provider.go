@@ -451,6 +451,32 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		} else if reusable {
 			return ErrProviderAttemptReusable
 		}
+		entry, err := loadCurrentProviderPhaseEntry(ctx, conn, r.Ref, r.Phase, version, runner, r.Fence.LeaderEpoch)
+		if err != nil {
+			return err
+		}
+		if err := validateProviderPhaseEntryBindings(ctx, conn, r.Ref, entry); err != nil {
+			return err
+		}
+		// A Store-authenticated budget rejection is terminal for this immutable
+		// ticket/phase entry.  In particular, a daemon crash after the drained
+		// rejection but before the ticket blocker is recorded must not admit a
+		// second paid provider run.
+		var budgetRejected int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries pe
+			JOIN provider_attempts a ON a.id=pe.provider_attempt_id
+			JOIN phase_runs pr ON pr.channel=pe.channel AND pr.project_id=pe.project_id AND pr.ticket_id=pe.ticket_id AND pr.phase=pe.phase AND pr.attempt=pe.attempt
+			WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=?
+			AND a.state='failed' AND a.outcome='budget_exhausted' AND a.launch_state='drained'
+			AND pr.state='failed' AND pr.outcome='budget_exhausted'`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, entry.Version).Scan(&budgetRejected); err != nil {
+			return err
+		}
+		if budgetRejected > 1 {
+			return ErrEvidenceConflict
+		}
+		if budgetRejected == 1 {
+			return ErrBudgetExhausted
+		}
 		// Provider admission is one side of the repository writer exclusion.
 		// It is checked in this same IMMEDIATE transaction as the eventual
 		// provider-attempt insert, so a Git writer cannot
@@ -501,13 +527,6 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		}
 		if active != 0 {
 			return ErrProviderAttempt
-		}
-		entry, err := loadCurrentProviderPhaseEntry(ctx, conn, r.Ref, r.Phase, version, runner, r.Fence.LeaderEpoch)
-		if err != nil {
-			return err
-		}
-		if err := validateProviderPhaseEntryBindings(ctx, conn, r.Ref, entry); err != nil {
-			return err
 		}
 		var entryRuns, prior int
 		if err = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND entry_ticket_version=?`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, entry.Version).Scan(&entryRuns); err != nil {
@@ -828,7 +847,7 @@ func (s *Store) finishProviderAttempt(ctx context.Context, claim ProviderAttempt
 		if err != nil {
 			return err
 		}
-		if maxDuration <= 0 || finished.After(createdAt.Add(time.Duration(maxDuration))) {
+		if maxDuration <= 0 || !finished.Before(createdAt.Add(time.Duration(maxDuration))) {
 			return ErrBudgetExhausted
 		}
 		if result != nil {
@@ -1297,12 +1316,13 @@ func (s *Store) QuarantineProviderAttempt(ctx context.Context, claim ProviderAtt
 	})
 }
 
-// FailProviderAttemptBudget closes a drained attempt without recording usage
-// beyond the ticket ceiling. It is used when a provider reports more units
-// than remain; the ticket is blocked for operator reconciliation rather than
-// releasing a still-active claim.
-func (s *Store) FailProviderAttemptBudget(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, at time.Time) error {
-	if claim.ID <= 0 || claim.ExpectedVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ExpectedVersion != expected || claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch || at.IsZero() {
+// FailProviderAttemptBudget closes a drained attempt after Store proves that
+// the trusted reported usage exceeds the remaining ticket cost or that the
+// result arrived at/after the immutable ticket deadline.  Usage is charged up
+// to the configured ceiling, and the durable budget_exhausted outcome blocks
+// any later provider admission even across a crash before lifecycle blocking.
+func (s *Store) FailProviderAttemptBudget(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, rejectedUsage int64, at time.Time) error {
+	if claim.ID <= 0 || claim.ExpectedVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || claim.ExpectedVersion != expected || claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch || rejectedUsage < 0 || at.IsZero() {
 		return ErrProviderAttempt
 	}
 	if !contracts.VerifyDrainProof(claim.SupervisorKey, drainRequestForClaim(claim), proof) {
@@ -1310,7 +1330,9 @@ func (s *Store) FailProviderAttemptBudget(ctx context.Context, claim ProviderAtt
 	}
 	return s.write(ctx, func(conn *sql.Conn) error {
 		var version, runner uint64
-		if err := conn.QueryRowContext(ctx, `SELECT version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&version, &runner); err != nil {
+		var created string
+		var maxDuration, maxCost int64
+		if err := conn.QueryRowContext(ctx, `SELECT version,runner_epoch,created_at,max_duration_ns,max_cost_micro_usd FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&version, &runner, &created, &maxDuration, &maxCost); err != nil {
 			return err
 		}
 		if version != expected {
@@ -1319,7 +1341,31 @@ func (s *Store) FailProviderAttemptBudget(ctx context.Context, claim ProviderAtt
 		if err := s.currentFence(ctx, conn, claim.Ref.Channel, version, runner, fence); err != nil {
 			return err
 		}
-		result, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='failed',outcome='budget_exhausted',usage_units=0,finished_at=?,launch_state='drained' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND state='active'`, at.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion)
+		persisted, err := loadAuthenticatedProviderAttemptClaim(ctx, conn, claim.ID)
+		if err != nil || !sameImmutableProviderAttemptClaim(claim, persisted) {
+			return ErrProviderAttempt
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, created)
+		if err != nil || maxDuration <= 0 || maxCost <= 0 {
+			return ErrEvidenceConflict
+		}
+		var spent int64
+		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(usage_units),0) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? AND id<>?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.ID).Scan(&spent); err != nil {
+			return err
+		}
+		remaining := maxCost - spent
+		deadlineRejected := !at.Before(createdAt.Add(time.Duration(maxDuration)))
+		costRejected := remaining <= 0 || rejectedUsage > remaining
+		if !deadlineRejected && !costRejected {
+			return ErrEvidenceConflict
+		}
+		chargedUsage := rejectedUsage
+		if remaining <= 0 {
+			chargedUsage = 0
+		} else if chargedUsage > remaining {
+			chargedUsage = remaining
+		}
+		result, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='failed',outcome='budget_exhausted',usage_units=?,finished_at=?,launch_state='drained' WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=? AND provider_lease_key=? AND state='active'`, chargedUsage, at.UTC().Format(time.RFC3339Nano), claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest, claim.LeaseKey)
 		if err != nil {
 			return err
 		}

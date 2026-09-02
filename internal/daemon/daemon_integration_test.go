@@ -629,6 +629,7 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				"runtime_activation_failed":               {binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"},
 				"runtime_already_active":                  {binary, "daemon", "status"},
 				"terminal_replay_requires_new":            {binary, "submit", "--help"},
+				"ticket_budget_exhausted":                 {binary, "cancel", "--help"},
 				"unknown_project":                         {binary, "init", "--help"},
 				"invalid_submit":                          {binary, "submit", "--help"},
 				"ticket_policy_refused":                   {binary, "submit", "--help"},
@@ -689,6 +690,7 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				"retry_transition_refused":                {binary, "retry", "SF-action"},
 				"recover_mode_refused":                    {binary, "recover", "SF-action"},
 				"recover_transition_refused":              {binary, "recover", "SF-action"},
+				"ticket_budget_exhausted":                 {binary, "cancel", "SF-action"},
 			} {
 				request := api.Request{Version: api.Version, RequestID: "control-actions", Method: "ticket.pause", Ticket: "SF-action"}
 				response := d.failure(request, code, "failed", false)
@@ -1566,6 +1568,37 @@ func TestDaemonRecoverUsesTypedBlockerAndGuardedNarrowing(t *testing.T) {
 		t.Fatalf("legacy recovery=%+v drains=%d", legacyResponse, legacyDrains)
 	}
 
+	// Store owns creation of this blocker; this direct fixture isolates the
+	// daemon's recovery policy and proves it refuses before any runtime drain.
+	budgetDaemon, budgetPaths, _ := testDaemonForChannelWithProjectMaximum(t, domain.ChannelStable, domain.MergeGuarded)
+	budget := createAndStartControlTicket(t, budgetDaemon, "SF-ticket-budget-recover")
+	writer, err := sql.Open("sqlite", budgetPaths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := writer.ExecContext(ctx, `UPDATE tickets SET state='blocked',resume_state='planning',blocked_code='ticket_budget_exhausted',version=version+1 WHERE channel='stable' AND project_id='demo' AND id=? AND state='planning' AND version=?`, budget.Ref.Ticket, budget.Version)
+	if err != nil {
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	if changed, _ := updated.RowsAffected(); changed != 1 {
+		_ = writer.Close()
+		t.Fatalf("budget fixture rows=%d", changed)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var budgetDrains int
+	budgetDaemon.control = testRuntimeController{drain: func(context.Context, domain.TicketRef) (bool, error) {
+		budgetDrains++
+		return true, nil
+	}}
+	budgetResponse := daemonControl(budgetDaemon, budget.Ref.Ticket, "recover")
+	currentBudget, currentErr := budgetDaemon.store.Ticket(ctx, budget.Ref)
+	if budgetResponse.OK || budgetResponse.Error == nil || budgetResponse.Error.Code != "ticket_budget_exhausted" || budgetResponse.NextAction == nil || strings.Join(budgetResponse.NextAction.Argv, " ") != "sf cancel SF-ticket-budget-recover" || budgetDrains != 0 || currentErr != nil || currentBudget.State != domain.StateBlocked || currentBudget.Version != budget.Version+1 {
+		t.Fatalf("budget recovery=%+v drains=%d ticket=%+v err=%v", budgetResponse, budgetDrains, currentBudget, currentErr)
+	}
+
 	ref := domain.TicketRef{Channel: d.channel, Project: "demo", Ticket: "SF-guarded-recover"}
 	if err := d.store.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "guarded-recover", Type: domain.TicketBug, MergeMode: domain.MergeAutonomous}); err != nil {
 		t.Fatal(err)
@@ -1729,7 +1762,7 @@ func TestDaemonControlPreconditionFailureReportsNoMutation(t *testing.T) {
 }
 
 func TestDaemonShowAndStatusExposeBoundedAuthenticatedEvidence(t *testing.T) {
-	d, _, _ := testDaemon(t)
+	d, paths, _ := testDaemon(t)
 	started := createAndStartControlTicket(t, d, "SF-evidence-view")
 	digest, err := d.store.RecordPlan(context.Background(), store.PlanArtifact{
 		Ref: started.Ref, ExpectedVersion: started.Version,
@@ -1755,6 +1788,28 @@ func TestDaemonShowAndStatusExposeBoundedAuthenticatedEvidence(t *testing.T) {
 	})
 	if !status.OK || !strings.Contains(string(status.Data), `"runner_epoch":`) || !strings.Contains(string(status.Data), `"phase_attempts":[]`) || !strings.Contains(string(status.Data), `"merge_mode":"guarded"`) {
 		t.Fatalf("status=%+v data=%s", status, status.Data)
+	}
+
+	budget := createAndStartControlTicket(t, d, "SF-budget-action-view")
+	writer, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.ExecContext(context.Background(), `UPDATE tickets SET state='blocked',resume_state='planning',blocked_code='ticket_budget_exhausted',version=version+1 WHERE channel='stable' AND project_id='demo' AND id=? AND version=?`, budget.Ref.Ticket, budget.Version); err != nil {
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for method, parameters := range map[string]json.RawMessage{
+		"ticket.show":   json.RawMessage(`{"channel":"stable","project":"demo","ticket":"SF-budget-action-view"}`),
+		"ticket.status": json.RawMessage(`{"channel":"stable","project":"","watch":false}`),
+	} {
+		response := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{Version: api.Version, RequestID: method + "-budget", Method: method, Ticket: string(budget.Ref.Ticket), OperatorLabel: "operator", Parameters: parameters})
+		if !response.OK || !strings.Contains(string(response.Data), `"next_action":{"code":"ticket_budget_exhausted","argv":["sf","cancel","SF-budget-action-view"]}`) {
+			t.Fatalf("%s budget action response=%+v data=%s", method, response, response.Data)
+		}
 	}
 }
 
