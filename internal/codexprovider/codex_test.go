@@ -31,6 +31,17 @@ type fakeProbe struct {
 	calls         [][]string
 }
 
+type routedProbe struct {
+	executable string
+	arguments  []string
+}
+
+func (r *routedProbe) Probe(_ context.Context, executable string, arguments, _ []string, _ int) (auth.ProbeResult, error) {
+	r.executable = executable
+	r.arguments = append([]string(nil), arguments...)
+	return auth.ProbeResult{}, nil
+}
+
 func (f *fakeProbe) Probe(ctx context.Context, _ string, arguments, _ []string, _ int) (auth.ProbeResult, error) {
 	f.calls = append(f.calls, append([]string(nil), arguments...))
 	if f.err != nil {
@@ -115,6 +126,29 @@ func TestInstalledCodexExecGuardedConfigParsesWithoutModel(t *testing.T) {
 			output = output[:1024]
 		}
 		t.Fatalf("guarded Codex exec configuration did not parse (no model call): %v: %s", runErr, output)
+	}
+}
+
+func TestOuterQualificationRunnerDoesNotNestCodexSandbox(t *testing.T) {
+	authHome := privateDir(t, "auth")
+	base := &routedProbe{}
+	runner, err := newOuterQualificationRunner(base, authHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(privateDir(t, "bin"), "codex")
+	sandboxArgs := []string{"sandbox", "--permission-profile", "sf-guarded", "--", "/usr/bin/true"}
+	if _, err := runner.Probe(context.Background(), executable, sandboxArgs, probeEnvironment(), maxProbeOutput); err != nil {
+		t.Fatal(err)
+	}
+	if base.executable != executable || !reflect.DeepEqual(base.arguments, sandboxArgs) {
+		t.Fatalf("sandbox probe was nested: executable=%q arguments=%v", base.executable, base.arguments)
+	}
+	if _, err := runner.Probe(context.Background(), executable, []string{"exec", "--help"}, probeEnvironment(), maxProbeOutput); err != nil {
+		t.Fatal(err)
+	}
+	if base.executable != "/usr/bin/sandbox-exec" || len(base.arguments) < 4 || base.arguments[0] != "-p" || base.arguments[2] != executable || base.arguments[3] != "exec" {
+		t.Fatalf("configuration probe lost its outer profile: executable=%q arguments=%v", base.executable, base.arguments)
 	}
 }
 

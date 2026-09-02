@@ -601,6 +601,18 @@ func (r outerQualificationRunner) Probe(ctx context.Context, executable string, 
 	if len(arguments) == 2 && arguments[0] == "login" && arguments[1] == "status" {
 		return r.base.Probe(ctx, executable, arguments, environment, limit)
 	}
+	// `codex sandbox` applies its own Seatbelt profile to the requested local
+	// command. macOS does not permit that inner profile to be applied when the
+	// Codex process is already running under sandbox-exec, so wrapping this
+	// exact subcommand makes every real hostile-fixture probe fail with EPERM
+	// before the requested command starts. Run these no-model probes directly:
+	// their success criteria independently verify read/write/network and
+	// credential isolation under the exact Codex-owned profile. Other probes
+	// remain inside the outer profile so configuration parsing cannot gain
+	// network, write, or credential-home authority.
+	if len(arguments) > 0 && arguments[0] == "sandbox" {
+		return r.base.Probe(ctx, executable, arguments, environment, limit)
+	}
 	args := append([]string{"-p", r.profile, executable}, arguments...)
 	return r.base.Probe(ctx, "/usr/bin/sandbox-exec", args, environment, limit)
 }
