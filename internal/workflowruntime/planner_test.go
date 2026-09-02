@@ -228,6 +228,18 @@ func TestPlannerRunnerOnlyMapsAttemptWindowExhaustionToProviderPause(t *testing.
 	if _, err := runner.RunArtifact(context.Background(), request); !errors.Is(err, workflowworker.ErrProviderAttemptExhausted) {
 		t.Fatalf("attempt window did not retain typed exhaustion: %v", err)
 	}
+	for _, test := range []struct {
+		outcome providercoord.Outcome
+		want    error
+	}{
+		{providercoord.ResultIndeterminate, workflowworker.ErrProviderResultIndeterminate},
+		{providercoord.RepairUnavailable, workflowworker.ErrProviderRepairUnavailable},
+	} {
+		coordinator.result = providercoord.Result{Code: test.outcome, NeedsOperator: true}
+		if _, err := runner.RunArtifact(context.Background(), request); !errors.Is(err, test.want) {
+			t.Fatalf("outcome %s lost typed blocker: %v", test.outcome, err)
+		}
+	}
 }
 
 func TestPlannerRunnerAcceptsCoordinatorNarrowedTimeout(t *testing.T) {
@@ -246,6 +258,31 @@ func TestPlannerRunnerAcceptsCoordinatorNarrowedTimeout(t *testing.T) {
 	}
 	if _, err := (PlannerRunner{Store: evidence, Coordinator: coordinator}).RunArtifact(context.Background(), request); err != nil {
 		t.Fatalf("narrowed timeout rejected: %v", err)
+	}
+}
+
+func TestPlannerRunnerAuthenticatesSuccessfulStoreOwnedRepair(t *testing.T) {
+	request, evidence, coordinator := plannerFixture(t)
+	coordinator.result.ProviderResult.Attempt = 2
+	evidence.result.Claim.Attempt = 2
+	repair := &contracts.ProviderRepairContext{PriorAttempt: 1, PriorRequestDigest: strings.Repeat("d", 64)}
+	bind := coordinator.onRun
+	coordinator.onRun = func(input providercoord.Request) {
+		bind(input)
+		stored := evidence.result
+		stored.Claim.Input.Attempt = 2
+		stored.Claim.Input.Repair = repair
+		payload, digest, err := contracts.CanonicalPhaseInput(stored.Claim.Input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored.Claim.Input.RequestDigest, stored.Claim.RequestDigest, stored.Claim.RequestPayload = digest, digest, payload
+		evidence.result = stored
+	}
+
+	result, err := (PlannerRunner{Store: evidence, Coordinator: coordinator}).RunArtifact(context.Background(), request)
+	if err != nil || result.Key.Attempt != 2 {
+		t.Fatalf("successful repair result=%+v err=%v", result, err)
 	}
 }
 

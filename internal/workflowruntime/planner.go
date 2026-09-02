@@ -147,6 +147,12 @@ func (r PlannerRunner) RunArtifact(ctx context.Context, request workflowworker.P
 		if coordResult.Code == providercoord.BudgetExhausted {
 			return PlannerResult{}, workflowworker.ErrTicketBudgetExhausted
 		}
+		switch coordResult.Code {
+		case providercoord.ResultIndeterminate:
+			return PlannerResult{}, workflowworker.ErrProviderResultIndeterminate
+		case providercoord.RepairUnavailable:
+			return PlannerResult{}, workflowworker.ErrProviderRepairUnavailable
+		}
 		return PlannerResult{}, ErrPlannerNotReady
 	}
 	key := coordResult.ProviderResult

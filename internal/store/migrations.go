@@ -1315,3 +1315,18 @@ var migrationV52 = []string{
 	                       AND generation=NEW.current_config_generation))
 	BEGIN SELECT RAISE(ABORT,'project configuration generation must advance one step to an existing generation'); END`,
 }
+
+// v53 preserves a terminal provider result whose durable content cannot be
+// established.  This is deliberately distinct from invalid_artifact: no
+// result row exists, so Store-owned blocker authority must stop the ticket
+// rather than admitting a repair or another provider route.
+var migrationV53 = []string{
+	`DROP TRIGGER IF EXISTS provider_attempt_state_outcome_insert`,
+	`DROP TRIGGER IF EXISTS provider_attempt_state_outcome_update`,
+	`DROP TRIGGER IF EXISTS phase_run_state_outcome_insert`,
+	`DROP TRIGGER IF EXISTS phase_run_state_outcome_update`,
+	`CREATE TRIGGER provider_attempt_state_outcome_insert BEFORE INSERT ON provider_attempts WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome='completed') OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='quarantined' AND NEW.outcome IN ('undrained','undrained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable','invocation_failed','result_indeterminate'))) BEGIN SELECT RAISE(ABORT,'invalid provider state/outcome'); END`,
+	`CREATE TRIGGER provider_attempt_state_outcome_update BEFORE UPDATE OF state,outcome ON provider_attempts WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome='completed') OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='quarantined' AND NEW.outcome IN ('undrained','undrained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable','invocation_failed','result_indeterminate'))) BEGIN SELECT RAISE(ABORT,'invalid provider state/outcome'); END`,
+	`CREATE TRIGGER phase_run_state_outcome_insert BEFORE INSERT ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome IN ('completed','passed')) OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable','invocation_failed','result_indeterminate'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
+	`CREATE TRIGGER phase_run_state_outcome_update BEFORE UPDATE OF state,outcome ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome IN ('completed','passed')) OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable','invocation_failed','result_indeterminate'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
+}

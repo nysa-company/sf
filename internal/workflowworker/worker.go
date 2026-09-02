@@ -31,6 +31,12 @@ var (
 	// ticket time/cost budget: Worker converts only this attempt-window limit
 	// through Store's authenticated provider-exhaustion pause boundary.
 	ErrProviderAttemptExhausted = errors.New("workflow provider attempt window is exhausted")
+	// These outcomes are fail-closed operator boundaries, not retry budgets.
+	// The coordinator has already drained and durably finalized any provider
+	// attempt before returning them; Worker records one typed blocker so the
+	// scheduler cannot spin or inherit unaudited local changes.
+	ErrProviderResultIndeterminate = errors.New("workflow provider result is indeterminate")
+	ErrProviderRepairUnavailable   = errors.New("workflow provider repair binding is unavailable")
 	// ErrTicketBudgetExhausted is the immutable ticket-wide time/cost ceiling.
 	// It is never retryable: Worker asks Store to prove and block it so the
 	// operator can cancel and submit a fresh ticket without widening policy.
@@ -249,6 +255,30 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 				Trigger: "typed_blocker", Fence: fence,
 				Attributes:   map[string]string{"no_unreconciled_external_mutation": "true"},
 				EventPayload: `{"code":"ticket_budget_exhausted"}`,
+			})
+			if signalErr != nil {
+				return result, signalErr
+			}
+			current, readErr := w.Evidence.Ticket(ctx, ref)
+			if readErr != nil {
+				return result, readErr
+			}
+			result.State, result.Version, result.Transitioned = current.State, current.Version, true
+			return result, nil
+		}
+		blockCode := ""
+		switch {
+		case errors.Is(err, ErrProviderResultIndeterminate):
+			blockCode = "provider_result_indeterminate"
+		case errors.Is(err, ErrProviderRepairUnavailable):
+			blockCode = "provider_repair_unavailable"
+		}
+		if blockCode != "" {
+			_, signalErr := w.Engine.Signal(ctx, contracts.SignalRequest{
+				Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State,
+				Trigger: "typed_blocker", Fence: fence,
+				Attributes:   map[string]string{"no_unreconciled_external_mutation": "true"},
+				EventPayload: fmt.Sprintf(`{"code":%q}`, blockCode),
 			})
 			if signalErr != nil {
 				return result, signalErr

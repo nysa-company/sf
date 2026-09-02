@@ -188,15 +188,27 @@ func TestCodexParseRejectsMalformedOversizedAndNonzeroOutput(t *testing.T) {
 	if err != nil || string(result.Artifact) != `{"schema":"sf.builder/v1"}` || !result.UsageTrusted || result.UsageUnits != 0 || !result.TokenUsageTrusted || result.TokenUsage != 20 || result.TokenInputTokens != 12 || result.TokenCachedTokens != 3 || result.TokenCacheWriteTokens != 2 || result.TokenOutputTokens != 8 || result.TokenReasoningTokens != 5 || strings.Contains(result.Transcript, "keep-out") {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	for _, command := range []contracts.CommandResult{
-		{ExitCode: 1, Stdout: valid},
-		{ExitCode: 0, Stdout: []byte("not-json\n")},
-		{ExitCode: 0, Stdout: []byte(`{"type":"item.completed","item":{"type":"agent_message","text":"not json"}}` + "\n")},
-		{ExitCode: 0, Stdout: valid, StdoutTruncated: true},
-		{ExitCode: 0, Stdout: []byte(strings.Repeat("x", maxJSONL+1))},
+	for _, bad := range []struct {
+		name    string
+		command contracts.CommandResult
+		outcome string
+	}{
+		{name: "nonzero exit", command: contracts.CommandResult{ExitCode: 1, Stdout: valid}, outcome: contracts.PhaseResultIndeterminate},
+		{name: "missing artifact", command: contracts.CommandResult{ExitCode: 0, Stdout: valid}, outcome: contracts.PhaseResultInvalidArtifact},
+		{name: "malformed jsonl", command: contracts.CommandResult{ExitCode: 0, Stdout: []byte("not-json\n"), OutputLastMessage: []byte(`{}`)}, outcome: contracts.PhaseResultIndeterminate},
+		{name: "incomplete jsonl", command: contracts.CommandResult{ExitCode: 0, Stdout: []byte(`{"type":"item.completed","item":{"type":"agent_message","text":"not json"}}` + "\n"), OutputLastMessage: []byte(`{}`)}, outcome: contracts.PhaseResultIndeterminate},
+		{name: "truncated stdout", command: contracts.CommandResult{ExitCode: 0, Stdout: valid, StdoutTruncated: true, OutputLastMessage: []byte(`{}`)}, outcome: contracts.PhaseResultIndeterminate},
+		{name: "truncated stderr", command: contracts.CommandResult{ExitCode: 0, Stdout: valid, Stderr: []byte("progress"), StderrTruncated: true, OutputLastMessage: []byte(`{}`)}, outcome: contracts.PhaseResultIndeterminate},
+		{name: "oversized stdout", command: contracts.CommandResult{ExitCode: 0, Stdout: []byte(strings.Repeat("x", maxJSONL+1)), OutputLastMessage: []byte(`{}`)}, outcome: contracts.PhaseResultIndeterminate},
+		{name: "truncated final artifact", command: contracts.CommandResult{ExitCode: 0, Stdout: valid, OutputLastMessage: []byte(`{}`), OutputLastMessageTruncated: true}, outcome: contracts.PhaseResultInvalidArtifact},
+		{name: "oversized final artifact", command: contracts.CommandResult{ExitCode: 0, Stdout: valid, OutputLastMessage: []byte(strings.Repeat("x", 1<<20+1))}, outcome: contracts.PhaseResultInvalidArtifact},
 	} {
-		if _, err := adapter.Parse(context.Background(), input, command); err == nil {
-			t.Fatalf("accepted bad result=%+v", command)
+		invalid, err := adapter.Parse(context.Background(), input, bad.command)
+		if err == nil {
+			t.Fatalf("accepted bad result %s=%+v", bad.name, bad.command)
+		}
+		if invalid.Outcome != bad.outcome || invalid.Provider != identity || !invalid.UsageTrusted || invalid.UsageUnits != 0 {
+			t.Fatalf("bad result %s classification/result=%+v err=%v", bad.name, invalid, err)
 		}
 	}
 	for name, malformed := range map[string][]byte{
@@ -207,8 +219,12 @@ func TestCodexParseRejectsMalformedOversizedAndNonzeroOutput(t *testing.T) {
 		"failed turn":              []byte(`{"type":"turn.failed","error":{"message":"no"}}` + "\n"),
 		"unknown terminal failure": []byte(`{"type":"future.failed","error":{}}` + "\n"),
 	} {
-		if _, err := adapter.Parse(context.Background(), input, contracts.CommandResult{ExitCode: 0, Stdout: malformed, OutputLastMessage: []byte(`{}`)}); err == nil {
+		invalid, err := adapter.Parse(context.Background(), input, contracts.CommandResult{ExitCode: 0, Stdout: malformed, OutputLastMessage: []byte(`{}`)})
+		if err == nil {
 			t.Fatalf("accepted malformed JSONL %s", name)
+		}
+		if invalid.Outcome != contracts.PhaseResultIndeterminate || invalid.Provider != identity || !invalid.UsageTrusted || invalid.UsageUnits != 0 {
+			t.Fatalf("malformed JSONL %s lost trusted zero-cost identity: result=%+v err=%v", name, invalid, err)
 		}
 	}
 	cancelled, cancel := context.WithCancel(context.Background())

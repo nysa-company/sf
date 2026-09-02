@@ -505,13 +505,39 @@ func TestProviderAttemptWindowExhaustionPausesThroughTypedEngineBoundary(t *test
 func TestTicketBudgetExhaustionBlocksOnceAndCannotBecomeProviderRetry(t *testing.T) {
 	evidence := &fakeEvidence{}
 	engine := &fakeEngine{}
-	worker := newWorker(domain.StatePlanning, &fakeRunner{err: ErrTicketBudgetExhausted}, evidence, engine)
+	runner := &fakeRunner{err: ErrTicketBudgetExhausted}
+	worker := newWorker(domain.StatePlanning, runner, evidence, engine)
 	got, err := worker.Run(context.Background(), testRef, testFence)
 	if err != nil || !got.Transitioned || got.State != domain.StateBlocked || engine.last.Trigger != "typed_blocker" || !strings.Contains(engine.last.EventPayload, `"code":"ticket_budget_exhausted"`) || engine.signals != 1 {
 		t.Fatalf("run=%+v err=%v signal=%+v calls=%d", got, err, engine.last, engine.signals)
 	}
-	if replay, replayErr := worker.Run(context.Background(), testRef, testFence); replayErr != nil || replay.Transitioned || replay.State != domain.StateBlocked || engine.signals != 1 {
-		t.Fatalf("blocked replay=%+v err=%v signals=%d", replay, replayErr, engine.signals)
+	if replay, replayErr := worker.Run(context.Background(), testRef, testFence); replayErr != nil || replay.Transitioned || replay.State != domain.StateBlocked || engine.signals != 1 || len(runner.requests) != 1 {
+		t.Fatalf("blocked replay=%+v err=%v signals=%d phase_calls=%d", replay, replayErr, engine.signals, len(runner.requests))
+	}
+}
+
+func TestProviderSafetyOutcomesBlockOnceWithExecutableRecoveryReason(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"result indeterminate", ErrProviderResultIndeterminate, "provider_result_indeterminate"},
+		{"repair unavailable", ErrProviderRepairUnavailable, "provider_repair_unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := &fakeEvidence{}
+			engine := &fakeEngine{}
+			runner := &fakeRunner{err: test.err}
+			worker := newWorker(domain.StatePlanning, runner, evidence, engine)
+			got, err := worker.Run(context.Background(), testRef, testFence)
+			if err != nil || !got.Transitioned || got.State != domain.StateBlocked || engine.last.Trigger != "typed_blocker" || !strings.Contains(engine.last.EventPayload, `"code":"`+test.code+`"`) || engine.signals != 1 {
+				t.Fatalf("run=%+v err=%v signal=%+v calls=%d", got, err, engine.last, engine.signals)
+			}
+			if replay, replayErr := worker.Run(context.Background(), testRef, testFence); replayErr != nil || replay.Transitioned || replay.State != domain.StateBlocked || engine.signals != 1 || len(runner.requests) != 1 {
+				t.Fatalf("blocked replay=%+v err=%v signals=%d phase_calls=%d", replay, replayErr, engine.signals, len(runner.requests))
+			}
+		})
 	}
 }
 

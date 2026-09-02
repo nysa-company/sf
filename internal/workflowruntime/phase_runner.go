@@ -389,6 +389,12 @@ func (r PhaseRunner) run(ctx context.Context, request workflowworker.PhaseReques
 		if result.Code == providercoord.BudgetExhausted {
 			return workflowworker.PhaseResult{}, workflowworker.ErrTicketBudgetExhausted
 		}
+		switch result.Code {
+		case providercoord.ResultIndeterminate:
+			return workflowworker.PhaseResult{}, workflowworker.ErrProviderResultIndeterminate
+		case providercoord.RepairUnavailable:
+			return workflowworker.PhaseResult{}, workflowworker.ErrProviderRepairUnavailable
+		}
 		return workflowworker.PhaseResult{}, ErrPlannerNotReady
 	}
 	key := result.ProviderResult
@@ -430,6 +436,10 @@ func matchesLaunchInput(claim store.ProviderAttemptClaim, key store.ProviderAtte
 	input.LeaderEpoch = claim.LeaderEpoch
 	input.RunnerEpoch = claim.RunnerEpoch
 	input.ExpectedVersion = claim.ExpectedVersion
+	// Repair is Store-owned launch context. The caller submits the same logical
+	// phase request, while the immutable claim carries the exact prior-attempt
+	// binding that made this one bounded repair admissible.
+	input.Repair = claim.Input.Repair
 	// Coordinator may constrain a launch to the ticket's remaining duration.
 	// That is the sole permitted post-prompt difference; all other launch
 	// input fields remain byte-for-byte bound by the canonical request digest.

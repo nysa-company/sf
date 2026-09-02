@@ -1599,6 +1599,38 @@ func TestDaemonRecoverUsesTypedBlockerAndGuardedNarrowing(t *testing.T) {
 		t.Fatalf("budget recovery=%+v drains=%d ticket=%+v err=%v", budgetResponse, budgetDrains, currentBudget, currentErr)
 	}
 
+	for _, blocker := range []string{"provider_result_indeterminate", "provider_repair_unavailable"} {
+		blockerDaemon, blockerPaths, _ := testDaemonForChannelWithProjectMaximum(t, domain.ChannelStable, domain.MergeGuarded)
+		blocked := createAndStartControlTicket(t, blockerDaemon, domain.TicketID("SF-"+blocker+"-recover"))
+		writer, err := sql.Open("sqlite", blockerPaths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		updated, err := writer.ExecContext(ctx, `UPDATE tickets SET state='blocked',resume_state='planning',blocked_code=?,version=version+1 WHERE channel='stable' AND project_id='demo' AND id=? AND state='planning' AND version=?`, blocker, blocked.Ref.Ticket, blocked.Version)
+		if err != nil {
+			_ = writer.Close()
+			t.Fatal(err)
+		}
+		if changed, _ := updated.RowsAffected(); changed != 1 {
+			_ = writer.Close()
+			t.Fatalf("%s fixture rows=%d", blocker, changed)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		var drains int
+		blockerDaemon.control = testRuntimeController{drain: func(context.Context, domain.TicketRef) (bool, error) {
+			drains++
+			return true, nil
+		}}
+		response := daemonControl(blockerDaemon, blocked.Ref.Ticket, "recover")
+		current, currentErr := blockerDaemon.store.Ticket(ctx, blocked.Ref)
+		wantAction := "sf cancel " + string(blocked.Ref.Ticket)
+		if response.OK || response.Error == nil || response.Error.Code != blocker || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != wantAction || drains != 0 || currentErr != nil || current.State != domain.StateBlocked || current.Version != blocked.Version+1 {
+			t.Fatalf("%s recovery=%+v drains=%d ticket=%+v err=%v", blocker, response, drains, current, currentErr)
+		}
+	}
+
 	ref := domain.TicketRef{Channel: d.channel, Project: "demo", Ticket: "SF-guarded-recover"}
 	if err := d.store.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "guarded-recover", Type: domain.TicketBug, MergeMode: domain.MergeAutonomous}); err != nil {
 		t.Fatal(err)
@@ -1809,6 +1841,36 @@ func TestDaemonShowAndStatusExposeBoundedAuthenticatedEvidence(t *testing.T) {
 		response := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{Version: api.Version, RequestID: method + "-budget", Method: method, Ticket: string(budget.Ref.Ticket), OperatorLabel: "operator", Parameters: parameters})
 		if !response.OK || !strings.Contains(string(response.Data), `"next_action":{"code":"ticket_budget_exhausted","argv":["sf","cancel","SF-budget-action-view"]}`) {
 			t.Fatalf("%s budget action response=%+v data=%s", method, response, response.Data)
+		}
+	}
+}
+
+func TestDaemonNonrecoverableBlockersExposeDevCancelAction(t *testing.T) {
+	d, paths, _ := testDaemonForChannelWithProjectMaximum(t, domain.ChannelDev, domain.MergeGuarded)
+	blocked := createAndStartControlTicket(t, d, "SF-dev-blocker-action")
+	writer, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+
+	for _, code := range []string{"ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable"} {
+		if _, err := writer.ExecContext(context.Background(), `UPDATE tickets SET state='blocked',resume_state='planning',blocked_code=?,version=version+1 WHERE channel='dev' AND project_id='demo' AND id=?`, code, blocked.Ref.Ticket); err != nil {
+			t.Fatal(err)
+		}
+		want := `"next_action":{"code":"` + code + `","argv":["sf-dev","cancel","` + string(blocked.Ref.Ticket) + `"]}`
+		for method, parameters := range map[string]json.RawMessage{
+			"ticket.show":   json.RawMessage(`{"channel":"dev","project":"demo","ticket":"SF-dev-blocker-action"}`),
+			"ticket.status": json.RawMessage(`{"channel":"dev","project":"demo","watch":false}`),
+		} {
+			response := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{Version: api.Version, RequestID: method + "-" + code, Method: method, Ticket: string(blocked.Ref.Ticket), OperatorLabel: "operator", Parameters: parameters})
+			if !response.OK || !strings.Contains(string(response.Data), want) {
+				t.Fatalf("%s %s response=%+v data=%s", method, code, response, response.Data)
+			}
+		}
+		list := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{Version: api.Version, RequestID: "ticket-list-" + code, Method: "ticket.status", OperatorLabel: "operator", Parameters: json.RawMessage(`{"channel":"dev","project":"demo","watch":false}`)})
+		if !list.OK || !strings.Contains(string(list.Data), want) {
+			t.Fatalf("list %s response=%+v data=%s", code, list, list.Data)
 		}
 	}
 }

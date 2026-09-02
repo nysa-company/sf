@@ -38,7 +38,7 @@ const (
 	maxProbeOutput    = 16 << 10
 	maxJSONL          = 64 << 10
 	maxEvents         = 256
-	repairInstruction = "\n\nRepair instruction: a prior attempt by this same provider for this exact phase entry was fully drained after its final artifact failed validation. Retry the task and return only a final artifact that strictly satisfies the supplied output schema. Do not quote, reproduce, or rely on prior artifact content."
+	repairInstruction = "\n\nRepair instruction: a prior attempt by this same provider for this exact phase entry was fully drained after its final artifact failed validation. Existing worktree changes may be partial work retained from that attempt. Inspect all current changes, correct or replace them, and return one complete schema-valid result whose changed and owned files account for every retained phase change. Do not quote, reproduce, or rely on prior artifact content."
 )
 
 var (
@@ -390,19 +390,27 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	if err := ctx.Err(); err != nil {
 		return contracts.PhaseResult{}, err
 	}
-	if result.StdoutTruncated || result.StderrTruncated || result.OutputLastMessageTruncated || len(result.Stdout) > maxJSONL || len(result.Stderr) > maxJSONL || len(result.OutputLastMessage) > 1<<20 {
-		return contracts.PhaseResult{}, ErrOutputTooLarge
+	// The selected ChatGPT subscription route has a known zero incremental
+	// monetary charge even when the provider result is not interpretable. Keep
+	// that trusted zero on every bounded terminal classification; token usage is
+	// never trusted unless the complete JSONL protocol was parsed.
+	indeterminate := contracts.PhaseResult{Outcome: contracts.PhaseResultIndeterminate, Provider: input.Provider, UsageTrusted: input.AuthMode == authModeChatGPTSubscription, UsageUnits: 0}
+	if result.StdoutTruncated || result.StderrTruncated || len(result.Stdout) > maxJSONL || len(result.Stderr) > maxJSONL {
+		return indeterminate, ErrOutputTooLarge
 	}
 	if result.ExitCode != 0 {
-		return contracts.PhaseResult{}, fmt.Errorf("codex exec exited %d", result.ExitCode)
+		return indeterminate, fmt.Errorf("codex exec exited %d", result.ExitCode)
 	}
 	transcript, usage, usageTrusted, usageDetail, err := parseJSONL(result.Stdout, result.Stderr)
 	if err != nil {
-		return contracts.PhaseResult{}, err
+		return indeterminate, err
 	}
 	artifact := bytes.TrimSpace(result.OutputLastMessage)
-	if len(artifact) == 0 || !json.Valid(artifact) || len(artifact) > 1<<20 {
-		return contracts.PhaseResult{}, ErrNoFinalArtifact
+	// A clean exit and valid completed JSONL establish that this is a provider
+	// artifact failure, including an absent, truncated, malformed, or oversized
+	// final message. It is the only adapter outcome eligible for repair.
+	if result.OutputLastMessageTruncated || len(artifact) == 0 || !json.Valid(artifact) || len(artifact) > 1<<20 {
+		return contracts.PhaseResult{Outcome: contracts.PhaseResultInvalidArtifact, Transcript: transcript, Provider: input.Provider, UsageTrusted: input.AuthMode == authModeChatGPTSubscription, UsageUnits: 0}, ErrNoFinalArtifact
 	}
 	if input.AuthMode != authModeChatGPTSubscription {
 		return contracts.PhaseResult{}, ErrUnsupportedAuthMode
@@ -410,7 +418,7 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	// This route has been admitted only for the exact ChatGPT subscription
 	// status. Its incremental API charge is therefore known to be zero; token
 	// counters remain observability only and never become monetary usage.
-	return contracts.PhaseResult{Outcome: "completed", Artifact: artifact, Transcript: transcript, Provider: input.Provider, UsageTrusted: true, UsageUnits: 0, TokenUsageTrusted: usageTrusted, TokenUsage: usage, TokenInputTokens: usageDetail.input, TokenCachedTokens: usageDetail.cached, TokenCacheWriteTokens: usageDetail.cacheWrite, TokenOutputTokens: usageDetail.output, TokenReasoningTokens: usageDetail.reasoning}, nil
+	return contracts.PhaseResult{Outcome: contracts.PhaseResultCompleted, Artifact: artifact, Transcript: transcript, Provider: input.Provider, UsageTrusted: true, UsageUnits: 0, TokenUsageTrusted: usageTrusted, TokenUsage: usage, TokenInputTokens: usageDetail.input, TokenCachedTokens: usageDetail.cached, TokenCacheWriteTokens: usageDetail.cacheWrite, TokenOutputTokens: usageDetail.output, TokenReasoningTokens: usageDetail.reasoning}, nil
 }
 
 const authModeChatGPTSubscription = "chatgpt_subscription"

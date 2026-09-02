@@ -65,6 +65,10 @@ func (s *Store) validateSchema(ctx context.Context) error {
 		}
 	}
 	for _, trigger := range []string{
+		"provider_attempt_state_outcome_insert",
+		"provider_attempt_state_outcome_update",
+		"phase_run_state_outcome_insert",
+		"phase_run_state_outcome_update",
 		"provider_attempt_results_immutable_update",
 		"provider_attempt_results_immutable_delete",
 		"plan_result_bindings_immutable_update",

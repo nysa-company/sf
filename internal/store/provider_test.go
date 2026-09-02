@@ -1243,6 +1243,10 @@ func TestBeginProviderAttemptDerivesBoundedRepairContextAfterDrainedInvalidArtif
 	if err := db.FinishProviderAttempt(ctx, first, proof(t, first), ticket.Version, fence, "failed", "invalid_artifact", 1, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
+	pending, found, err := db.PendingProviderRepair(ctx, ticket.Ref, domain.PhasePlanning, "planner", ticket.Version, fence)
+	if err != nil || !found || pending.ID != first.ID || pending.Binding != first.Binding {
+		t.Fatalf("pending repair=%+v found=%v err=%v", pending, found, err)
+	}
 	second, err := db.BeginProviderAttempt(ctx, request)
 	if err != nil {
 		t.Fatal(err)

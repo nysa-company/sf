@@ -362,6 +362,191 @@ type providerRetryAttemptPair struct {
 	Reason   string
 }
 
+type providerAttemptEndpoint struct {
+	version, runner, leader uint64
+}
+
+// validateProviderAttemptEndpointAdvance is the deliberately non-recursive
+// bridge between two attempts in one retained phase window. It consumes only
+// signed runner-recovery rows, exact pause/take -> drain -> resume triplets,
+// and exact provider typed-blocker -> operator-recover pairs. In particular,
+// it never calls the general recovery validator, whose provider-retry-gap
+// branch would make this pair validator recursive and could admit a semantic
+// retry as a repair bridge.
+func validateProviderAttemptEndpointAdvance(ctx context.Context, q rowQueryer, ref domain.TicketRef, phase domain.Phase, source, target providerAttemptEndpoint) error {
+	if ref.Validate() != nil || !validProviderPhase(phase) || source.version == 0 || source.runner == 0 || source.leader == 0 || target.version < source.version || target.runner < source.runner || target.leader < source.leader {
+		return ErrEvidenceConflict
+	}
+	if source == target {
+		return nil
+	}
+	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
+		return ErrEvidenceConflict
+	}
+	rows, err := q.QueryContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at
+		FROM runner_recovery_ledger
+		WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?
+		ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, source.version, target.version)
+	if err != nil {
+		return err
+	}
+	var recoveries []RunnerRecoveryLedger
+	for rows.Next() {
+		var step RunnerRecoveryLedger
+		var createdAt string
+		if err := rows.Scan(&step.PriorTicketVersion, &step.PriorRunnerEpoch, &step.PriorLeaderEpoch, &step.TicketVersion, &step.RunnerEpoch, &step.LeaderEpoch, &step.RecoveryDigest, &createdAt); err != nil {
+			rows.Close()
+			return err
+		}
+		created, parseErr := parseRunnerRecoveryTime(createdAt)
+		if parseErr != nil {
+			rows.Close()
+			return ErrEvidenceConflict
+		}
+		step.Ref, step.CreatedAt = ref, created
+		recoveries = append(recoveries, step)
+		if len(recoveries) > 64 {
+			rows.Close()
+			return ErrEvidenceConflict
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	current := source
+	for _, step := range recoveries {
+		prior := providerAttemptEndpoint{version: step.PriorTicketVersion, runner: step.PriorRunnerEpoch, leader: step.PriorLeaderEpoch}
+		if err := validateProviderAttemptControlBlockAdvance(ctx, q, ref, phase, current, prior); err != nil {
+			return ErrEvidenceConflict
+		}
+		if !validRunnerRecovery(step) || step.PriorTicketVersion != prior.version || step.PriorRunnerEpoch != prior.runner || step.PriorLeaderEpoch != prior.leader {
+			return ErrEvidenceConflict
+		}
+		var stateChanges int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, step.TicketVersion).Scan(&stateChanges); err != nil || stateChanges != 0 {
+			return ErrEvidenceConflict
+		}
+		current = providerAttemptEndpoint{version: step.TicketVersion, runner: step.RunnerEpoch, leader: step.LeaderEpoch}
+	}
+	if err := validateProviderAttemptControlBlockAdvance(ctx, q, ref, phase, current, target); err != nil {
+		return ErrEvidenceConflict
+	}
+	return nil
+}
+
+// validateProviderAttemptControlBlockAdvance proves only the non-ledger
+// components retained by a provider phase entry. It intentionally rejects
+// phase passes, retry epochs, amendment/publication bridges, and arbitrary
+// state changes instead of delegating to a broader recovery validator.
+func validateProviderAttemptControlBlockAdvance(ctx context.Context, q rowQueryer, ref domain.TicketRef, phase domain.Phase, source, target providerAttemptEndpoint) error {
+	if source.version == 0 || source.runner == 0 || source.leader == 0 || target.version < source.version || target.runner < source.runner || target.leader < source.leader {
+		return ErrEvidenceConflict
+	}
+	if source == target {
+		return nil
+	}
+	state := providerStateForPhase(phase)
+	if state == "" || target.version == source.version {
+		return ErrEvidenceConflict
+	}
+	type stateChange struct {
+		version uint64
+		trigger string
+		from    domain.State
+		to      domain.State
+		payload string
+	}
+	rows, err := q.QueryContext(ctx, `SELECT ticket_version,trigger,from_state,to_state,payload
+		FROM events
+		WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND from_state<>to_state
+		ORDER BY ticket_version,id`, ref.Channel, ref.Project, ref.Ticket, source.version, target.version)
+	if err != nil {
+		return err
+	}
+	var changes []stateChange
+	for rows.Next() {
+		var change stateChange
+		if err := rows.Scan(&change.version, &change.trigger, &change.from, &change.to, &change.payload); err != nil {
+			rows.Close()
+			return err
+		}
+		if !change.from.Valid() || !change.to.Valid() || len(change.payload) == 0 || len(change.payload) > maxEvidenceJSON || !json.Valid([]byte(change.payload)) {
+			rows.Close()
+			return ErrEvidenceConflict
+		}
+		changes = append(changes, change)
+		if len(changes) > 64 {
+			rows.Close()
+			return ErrEvidenceConflict
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(changes) == 0 {
+		return ErrEvidenceConflict
+	}
+
+	currentVersion, currentRunner := source.version, source.runner
+	usedControl := false
+	for index := 0; index < len(changes); {
+		first := changes[index]
+		if first.version != currentVersion+1 || first.from != state {
+			return ErrEvidenceConflict
+		}
+		switch {
+		case first.trigger == "operator_pause_or_take" && first.to == domain.StateStopping:
+			if index+2 >= len(changes) || currentVersion > ^uint64(0)-3 || currentRunner == ^uint64(0) {
+				return ErrEvidenceConflict
+			}
+			drained, resumed := changes[index+1], changes[index+2]
+			if drained.version != currentVersion+2 || drained.trigger != "process_and_effects_drained" || drained.from != domain.StateStopping || drained.to != domain.StatePaused || resumed.version != currentVersion+3 || resumed.trigger != "operator_resume" || resumed.from != domain.StatePaused || resumed.to != state {
+				return ErrEvidenceConflict
+			}
+			currentVersion += 3
+			currentRunner++
+			usedControl = true
+			index += 3
+		case first.trigger == "typed_blocker" && first.to == domain.StateBlocked:
+			if index+1 >= len(changes) || currentVersion > ^uint64(0)-2 || len(first.payload) > maxEvidenceJSON {
+				return ErrEvidenceConflict
+			}
+			var blocker struct {
+				Code string `json:"code"`
+			}
+			if json.Unmarshal([]byte(first.payload), &blocker) != nil || !validBlockedCode(blocker.Code) || blocker.Code == "legacy_provider_phase_entry_unverifiable" || nonRecoverableProviderBlockerCode(blocker.Code) {
+				return ErrEvidenceConflict
+			}
+			recovered := changes[index+1]
+			if recovered.version != currentVersion+2 || recovered.trigger != "operator_recover" || recovered.from != domain.StateBlocked || recovered.to != state {
+				return ErrEvidenceConflict
+			}
+			currentVersion += 2
+			index += 2
+		default:
+			return ErrEvidenceConflict
+		}
+	}
+	if currentVersion != target.version || currentRunner != target.runner {
+		return ErrEvidenceConflict
+	}
+	// A leader may change only while an exact pause/take triplet is in flight;
+	// it cannot cross a typed-blocker recovery pair or an arbitrary gap.
+	if (!usedControl && target.leader != source.leader) || (usedControl && target.leader < source.leader) {
+		return ErrEvidenceConflict
+	}
+	return nil
+}
+
 // authenticateProviderRetryAttemptPair is the single authority for a
 // terminal pair that may create or cross a provider-retry epoch.  It starts
 // at the immutable entry binding, then rehydrates each Store-issued claim so
@@ -405,6 +590,7 @@ func authenticateProviderRetryAttemptPair(ctx context.Context, q rowQueryer, ref
 
 	claims := make([]ProviderAttemptClaim, 2)
 	invalid := make([]bool, 2)
+	recoveredCancellation := make([]bool, 2)
 	for i, value := range bound {
 		claim, err := loadAuthenticatedProviderAttemptClaim(ctx, q, value.id)
 		if err != nil || claim.Ref != ref || claim.Phase != phase || claim.Role != value.role || claim.Attempt != value.attempt || claim.BindingDigest != bindingDigest(claim.Binding) {
@@ -419,11 +605,17 @@ func authenticateProviderRetryAttemptPair(ctx context.Context, q rowQueryer, ref
 		if err := q.QueryRowContext(ctx, `SELECT state,outcome,completed_at FROM phase_runs WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND provider=? AND model=? AND family=? AND provider_version=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND worktree_identity=? AND base_sha=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.WorktreeIdentity, claim.BaseSHA).Scan(&phaseState, &phaseOutcome, &phaseFinished); err != nil {
 			return providerRetryAttemptPair{}, err
 		}
-		invalid[i] = attemptState == "failed" && attemptOutcome == providerExhaustionReasonInvalidArtifact && phaseState == "failed" && phaseOutcome == providerExhaustionReasonInvalidArtifact
-		if invalid[i] && (launchState != "drained" || finishedAt == "" || phaseFinished == "") {
+		if attemptState != phaseState || attemptOutcome != phaseOutcome || launchState != "drained" || finishedAt == "" || phaseFinished == "" {
 			return providerRetryAttemptPair{}, ErrEvidenceConflict
 		}
-		if !invalid[i] && ((attemptState != "failed" && attemptState != "cancelled") || (attemptOutcome != "failed" && attemptOutcome != "cancelled") || (phaseState != "failed" && phaseState != "cancelled") || (phaseOutcome != "failed" && phaseOutcome != "cancelled")) {
+		invalid[i] = attemptState == "failed" && attemptOutcome == providerExhaustionReasonInvalidArtifact
+		recoveredCancellation[i] = attemptState == "cancelled" && attemptOutcome == "drained_recovery"
+		if recoveredCancellation[i] && claim.Input.Repair != nil {
+			// A recovery-drained Store-issued repair is non-recoverable; only a
+			// recovery-drained ordinary attempt may contribute to exhaustion.
+			return providerRetryAttemptPair{}, ErrEvidenceConflict
+		}
+		if !invalid[i] && !recoveredCancellation[i] && !((attemptState == "failed" && (attemptOutcome == "failed" || attemptOutcome == "invocation_failed")) || (attemptState == "cancelled" && attemptOutcome == "cancelled")) {
 			return providerRetryAttemptPair{}, ErrEvidenceConflict
 		}
 		claims[i] = claim
@@ -436,11 +628,23 @@ func authenticateProviderRetryAttemptPair(ctx context.Context, q rowQueryer, ref
 		return providerRetryAttemptPair{}, ErrEvidenceConflict
 	}
 	pair := providerRetryAttemptPair{Attempts: [2]int{first, last}}
-	if invalid[0] || invalid[1] {
-		if !invalid[0] || !invalid[1] || claims[0].Binding != claims[1].Binding || claims[0].BindingDigest != claims[1].BindingDigest || claims[0].Role != claims[1].Role || claims[0].Ref != claims[1].Ref || claims[0].Phase != claims[1].Phase || claims[0].LeaderEpoch != claims[1].LeaderEpoch || claims[0].RunnerEpoch != claims[1].RunnerEpoch || claims[0].ExpectedVersion != claims[1].ExpectedVersion || claims[0].Repository != claims[1].Repository || claims[0].Worktree != claims[1].Worktree || claims[0].WorktreeIdentity != claims[1].WorktreeIdentity || claims[0].BaseSHA != claims[1].BaseSHA || claims[0].Input.Repair != nil || claims[1].Input.Repair == nil || claims[1].Input.Repair.PriorAttempt != claims[0].Attempt || claims[1].Input.Repair.PriorRequestDigest != claims[0].RequestDigest {
+	if invalid[0] && invalid[1] {
+		if claims[0].Binding != claims[1].Binding || claims[0].BindingDigest != claims[1].BindingDigest || claims[0].Role != claims[1].Role || claims[0].Ref != claims[1].Ref || claims[0].Phase != claims[1].Phase || claims[0].Repository != claims[1].Repository || claims[0].Worktree != claims[1].Worktree || claims[0].WorktreeIdentity != claims[1].WorktreeIdentity || claims[0].BaseSHA != claims[1].BaseSHA || claims[0].Input.Repair != nil || claims[1].Input.Repair == nil || claims[1].Input.Repair.PriorAttempt != claims[0].Attempt || claims[1].Input.Repair.PriorRequestDigest != claims[0].RequestDigest {
+			return providerRetryAttemptPair{}, ErrEvidenceConflict
+		}
+		if err := validateProviderAttemptEndpointAdvance(ctx, q, ref, phase, providerAttemptEndpoint{version: claims[0].ExpectedVersion, runner: claims[0].RunnerEpoch, leader: claims[0].LeaderEpoch}, providerAttemptEndpoint{version: claims[1].ExpectedVersion, runner: claims[1].RunnerEpoch, leader: claims[1].LeaderEpoch}); err != nil {
 			return providerRetryAttemptPair{}, ErrEvidenceConflict
 		}
 		pair.Reason = providerExhaustionReasonInvalidArtifact
+	} else if invalid[0] || invalid[1] {
+		// Any authenticated ordinary terminal endpoint may be followed by an
+		// ordinary invalid artifact fallback, but neither claim may carry a
+		// Store-issued repair marker. The reverse ordering (invalid first) is
+		// always fail-closed: an actual repair is non-recoverable and a missing
+		// repair marker is not evidence that a new fallback is safe.
+		if !invalid[1] || claims[0].Input.Repair != nil || claims[1].Input.Repair != nil {
+			return providerRetryAttemptPair{}, ErrEvidenceConflict
+		}
 	}
 	return pair, nil
 }

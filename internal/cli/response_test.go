@@ -39,8 +39,9 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 		"recover_mode_refused": ExitAction, "recover_transition_refused": ExitAction, "resume_transition_refused": ExitAction,
 		"decision_refused": ExitAction, "approval_head_changed": ExitAction,
 		"runtime_retirement_failed": ExitAction, "source_commit_required": ExitAction,
-		"ticket_budget_exhausted": ExitAction,
-		"daemon_unavailable":      ExitWait, "daemon_stopping": ExitWait, "provider_waiting": ExitWait, "checks_pending": ExitWait,
+		"ticket_budget_exhausted": ExitAction, "provider_result_indeterminate": ExitAction,
+		"provider_repair_unavailable": ExitAction,
+		"daemon_unavailable":          ExitWait, "daemon_stopping": ExitWait, "provider_waiting": ExitWait, "checks_pending": ExitWait,
 		"store_busy": ExitWait, "projection_unavailable": ExitWait, "external_state_unavailable": ExitWait,
 		"control_state_unavailable": ExitWait, "evidence_unavailable": ExitWait, "logs_unavailable": ExitWait,
 		"status_unavailable": ExitWait, "capacity_unavailable": ExitWait, "leader_lost": ExitWait,
@@ -64,6 +65,46 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 				t.Errorf("%s retryable=%t: got exit %d, want %d", code, retryable, got, want)
 			}
 		}
+	}
+}
+
+func TestProviderSafetyBlockersRemainActionableWithDaemonCancelArgv(t *testing.T) {
+	for _, test := range []struct {
+		code string
+		argv []string
+	}{
+		{code: "provider_result_indeterminate", argv: []string{"sf-dev", "cancel", "SF-dev-provider-blocker"}},
+		{code: "provider_repair_unavailable", argv: []string{"sf", "cancel", "SF-stable-provider-blocker"}},
+	} {
+		t.Run(test.code, func(t *testing.T) {
+			response := api.Response{
+				Version:   api.Version,
+				RequestID: test.code,
+				Error:     &api.Error{Code: test.code},
+				NextAction: &domain.NextAction{
+					Code: test.code,
+					Argv: test.argv,
+				},
+			}
+			if err := validateCLIResponse(response); err != nil {
+				t.Fatalf("response validation: %v", err)
+			}
+			if got := exitCode(response); got != ExitAction {
+				t.Fatalf("exit=%d, want %d", got, ExitAction)
+			}
+			action := nextAction(response)
+			if action == nil {
+				t.Fatal("next action is nil")
+			}
+			if len(action.Argv) != len(test.argv) {
+				t.Fatalf("next action argv=%v, want %v", action.Argv, test.argv)
+			}
+			for i := range test.argv {
+				if action.Argv[i] != test.argv[i] {
+					t.Fatalf("next action argv=%v, want %v", action.Argv, test.argv)
+				}
+			}
+		})
 	}
 }
 

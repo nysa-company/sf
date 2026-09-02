@@ -46,6 +46,16 @@ var (
 	// is the only coordinator outcome that may enter the durable provider
 	// exhaustion pause and, eventually, the one operator retry epoch.
 	ErrProviderAttemptLimit = errors.New("provider attempt window is exhausted")
+	// ErrProviderRepairUnavailable means the immutable phase entry requires its
+	// one exact same-binding repair, but the caller proposed a different
+	// runtime binding. Callers may fail closed to an operator blocker; they must
+	// not reinterpret this as provider availability and launch a fallback.
+	ErrProviderRepairUnavailable = errors.New("provider repair requires the prior runtime binding")
+	// ErrProviderResultIndeterminate means the newest current phase attempt is
+	// terminal without a durable provider result. A new provider launch would
+	// turn that ambiguity into an unauthenticated retry, so only the typed
+	// blocker/cancel path remains available in v1.
+	ErrProviderResultIndeterminate = errors.New("provider result is indeterminate")
 	// ErrProviderAttemptReusable means BeginProviderAttempt found one exact,
 	// immutable completed result under the current admission fence. It carries
 	// no launch authority; callers must reload the key through Store.
@@ -65,7 +75,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 52
+const schemaVersion = 53
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -120,6 +130,7 @@ var migrationChecksums = map[int]string{
 	50: migrationChecksum(migrationV50),
 	51: migrationChecksum(migrationV51),
 	52: migrationChecksum(migrationV52),
+	53: migrationChecksum(migrationV53),
 }
 
 func migrationChecksum(statements []string) string {
@@ -519,6 +530,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV51
 			} else if version == 52 {
 				statements = migrationV52
+			} else if version == 53 {
+				statements = migrationV53
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1443,6 +1456,13 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	if ticketBudgetExhaustionTransition(transition) {
 		return s.transitionTicketBudgetExhausted(ctx, transition)
 	}
+	// A provider response that cannot be durably identified, and a required
+	// same-binding repair that cannot be admitted, are Store-owned terminal
+	// facts.  Caller JSON selects the code but cannot manufacture the result
+	// claim, phase row, or canonical blocker evidence.
+	if providerTerminalBlockerTransition(transition) {
+		return s.transitionProviderTerminalBlocker(ctx, transition)
+	}
 	// These provider transitions carry attempt-window proof and must enter via
 	// TransitionProviderExhausted / TransitionProviderRetry, never generic
 	// lifecycle persistence.
@@ -1542,6 +1562,13 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		if persistedBlockedCode == ticketBudgetExhaustedCode && transition.Trigger == "operator_recover" {
 			return ErrBudgetExhausted
 		}
+		// These provider blockers are terminal in the Store authority, not only
+		// through the normative Engine selector.  Keep the exported generic
+		// transition path from becoming an alternate recovery API: cancellation
+		// remains available through TransitionAndInvalidateRunner.
+		if actual == domain.StateBlocked && nonRecoverableProviderBlockerCode(persistedBlockedCode) && transition.To != domain.StateBlocked {
+			return ErrEvidenceConflict
+		}
 		if transition.Trigger == "operator_resume" && actual == domain.StatePaused && providerStateForPhaseTransition(transition.To) {
 			if !storedResume.Valid || domain.State(storedResume.String) != transition.To {
 				return ErrEvidenceConflict
@@ -1621,6 +1648,170 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 			}
 		}
 		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, transition.Trigger, transition.From, transition.To, transition.EventPayload, time.Now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return err
+		}
+		result.Version = version + 1
+		result.EventID, _ = created.LastInsertId()
+		return nil
+	})
+	return result, err
+}
+
+const (
+	providerResultIndeterminateCode = "provider_result_indeterminate"
+	providerRepairUnavailableCode   = "provider_repair_unavailable"
+	providerTerminalBlockerSchema   = "sf.provider-terminal-blocker/v1"
+)
+
+type providerTerminalBlockerPayload struct {
+	Schema               string       `json:"schema"`
+	Code                 string       `json:"code"`
+	Phase                domain.Phase `json:"phase"`
+	Role                 string       `json:"role"`
+	EntryTicketVersion   uint64       `json:"entry_ticket_version"`
+	ProviderAttemptID    int64        `json:"provider_attempt_id"`
+	ProviderAttempt      int          `json:"provider_attempt"`
+	BindingDigest        string       `json:"binding_digest"`
+	AttemptTicketVersion uint64       `json:"attempt_ticket_version"`
+	AttemptLeaderEpoch   uint64       `json:"attempt_leader_epoch"`
+	AttemptRunnerEpoch   uint64       `json:"attempt_runner_epoch"`
+	Outcome              string       `json:"outcome"`
+	NextAction           string       `json:"next_action"`
+}
+
+func providerTerminalBlockerTransition(transition Transition) bool {
+	if transition.Trigger != "typed_blocker" {
+		return false
+	}
+	var payload struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(transition.EventPayload), &payload) != nil {
+		return false
+	}
+	return nonRecoverableProviderBlockerCode(payload.Code)
+}
+
+func nonRecoverableProviderBlockerCode(code string) bool {
+	return code == providerResultIndeterminateCode || code == providerRepairUnavailableCode
+}
+
+func providerRoleForPhase(phase domain.Phase) string {
+	switch phase {
+	case domain.PhasePlanning:
+		return "planner"
+	case domain.PhaseVerification, domain.PhaseReview:
+		return "reviewer"
+	case domain.PhaseBuild:
+		return "builder"
+	default:
+		return ""
+	}
+}
+
+// transitionProviderTerminalBlocker is the sole authority for provider
+// terminal states which cannot safely be retried in v1.  The event selector
+// deliberately contains only the public code; Store reconstructs the bounded
+// proof from the immutable newest claim in the current phase-entry lineage.
+func (s *Store) transitionProviderTerminalBlocker(ctx context.Context, transition Transition) (TransitionResult, error) {
+	phase, ok := providerPhaseForState(transition.From)
+	if !ok || transition.To != domain.StateBlocked || transition.ResumeState != transition.From || transition.Trigger != "typed_blocker" || transition.Ref.Validate() != nil || transition.ExpectedVersion == 0 || transition.Fence.LeaderEpoch == 0 || transition.Fence.RunnerEpoch == 0 {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	var requested struct {
+		Code string `json:"code"`
+	}
+	if len(transition.EventPayload) == 0 || len(transition.EventPayload) > maxEvidenceJSON || json.Unmarshal([]byte(transition.EventPayload), &requested) != nil || !nonRecoverableProviderBlockerCode(requested.Code) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	role := providerRoleForPhase(phase)
+	if role == "" {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	if err := s.DrainExternalMutations(ctx, transition.Ref); err != nil {
+		return TransitionResult{}, err
+	}
+	observedAt := time.Now().UTC()
+	var result TransitionResult
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		var actual domain.State
+		var version, runner uint64
+		if err := conn.QueryRowContext(ctx, `SELECT state,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&actual, &version, &runner); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if actual != transition.From || version != transition.ExpectedVersion {
+			return ErrStaleFence
+		}
+		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
+			return err
+		}
+		outcome := "result_indeterminate"
+		var claim ProviderAttemptClaim
+		var found bool
+		var authorityErr error
+		if requested.Code == providerRepairUnavailableCode {
+			outcome = "invalid_artifact"
+			// A lone invalid artifact requires the one Store-issued repair. If
+			// that repair could not start because the caller rotated its binding,
+			// the original invalid claim is authoritative. If the Store-issued
+			// repair itself was interrupted, its exact terminal claim and outcome
+			// are authoritative instead.
+			claim, found, authorityErr = s.pendingProviderTerminalClaim(ctx, conn, transition.Ref, phase, role, transition.ExpectedVersion, transition.Fence, "invalid_artifact", true, false)
+			if authorityErr != nil {
+				return authorityErr
+			}
+			if !found {
+				pair, pairFound, pairErr := s.pendingProviderRepairUnavailable(ctx, conn, transition.Ref, phase, role, transition.ExpectedVersion, transition.Fence, false)
+				if pairErr != nil {
+					return pairErr
+				}
+				if pairFound {
+					claim, found, outcome = pair.Latest, true, pair.Outcome
+				}
+			}
+		} else {
+			claim, found, authorityErr = s.pendingProviderTerminalClaim(ctx, conn, transition.Ref, phase, role, transition.ExpectedVersion, transition.Fence, outcome, false, false)
+			if authorityErr != nil {
+				return authorityErr
+			}
+		}
+		if !found {
+			return ErrEvidenceConflict
+		}
+		entry, err := loadCurrentProviderPhaseEntry(ctx, conn, transition.Ref, phase, transition.ExpectedVersion, transition.Fence.RunnerEpoch, transition.Fence.LeaderEpoch)
+		if err != nil || entry.Version == 0 {
+			return ErrEvidenceConflict
+		}
+		payload, err := json.Marshal(providerTerminalBlockerPayload{
+			Schema:               providerTerminalBlockerSchema,
+			Code:                 requested.Code,
+			Phase:                phase,
+			Role:                 role,
+			EntryTicketVersion:   entry.Version,
+			ProviderAttemptID:    claim.ID,
+			ProviderAttempt:      claim.Attempt,
+			BindingDigest:        claim.BindingDigest,
+			AttemptTicketVersion: claim.ExpectedVersion,
+			AttemptLeaderEpoch:   claim.LeaderEpoch,
+			AttemptRunnerEpoch:   claim.RunnerEpoch,
+			Outcome:              outcome,
+			NextAction:           "cancel this ticket and submit a fresh ticket",
+		})
+		if err != nil || len(payload) > maxEvidenceJSON {
+			return ErrEvidenceConflict
+		}
+		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state='blocked',resume_state=?,blocked_code=?,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.From, requested.Code, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
+		if err != nil {
+			return err
+		}
+		if changed, _ := updated.RowsAffected(); changed != 1 {
+			return ErrStaleFence
+		}
+		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, transition.Trigger, transition.From, domain.StateBlocked, string(payload), observedAt.Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}

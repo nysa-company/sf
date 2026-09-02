@@ -739,7 +739,7 @@ func (p *compiledNormalProvider) Invocation(context.Context, contracts.PhaseInpu
 }
 func (p *compiledNormalProvider) Parse(_ context.Context, input contracts.PhaseInput, _ contracts.CommandResult) (contracts.PhaseResult, error) {
 	if input.Phase == domain.PhasePlanning {
-		return contracts.PhaseResult{Artifact: []byte(`{"schema":"sf.planner/v1","acceptance":["compiled normal"],"proof":{"kind":"acceptance","command":["go","test"],"details":"compiled normal"},"paths":["main.go"],"commands":[["go","test"]],"risks":["fixture"]}`), Provider: p.binding.Identity, UsageTrusted: true}, nil
+		return contracts.PhaseResult{Outcome: contracts.PhaseResultCompleted, Artifact: []byte(`{"schema":"sf.planner/v1","acceptance":["compiled normal"],"proof":{"kind":"acceptance","command":["go","test"],"details":"compiled normal"},"paths":["main.go"],"commands":[["go","test"]],"risks":["fixture"]}`), Provider: p.binding.Identity, UsageTrusted: true}, nil
 	}
 	return contracts.PhaseResult{}, fmt.Errorf("unexpected compiled normal phase %q", input.Phase)
 }

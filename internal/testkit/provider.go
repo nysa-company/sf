@@ -193,10 +193,10 @@ func (p *ScriptedProvider) Parse(ctx context.Context, input contracts.PhaseInput
 		return contracts.PhaseResult{}, errors.New("testkit: provider exited before submission")
 	}
 	if step.Behavior == ProviderMalformed {
-		return contracts.PhaseResult{Outcome: "malformed", Artifact: []byte("not-json"), Transcript: step.Transcript, Provider: p.Identity, UsageTrusted: true}, errors.New("testkit: malformed structured output")
+		return contracts.PhaseResult{Outcome: contracts.PhaseResultInvalidArtifact, Artifact: []byte("not-json"), Transcript: step.Transcript, Provider: p.Identity, UsageTrusted: true}, errors.New("testkit: malformed structured output")
 	}
 	if step.Behavior == ProviderOversized {
-		return contracts.PhaseResult{Outcome: "oversized", Artifact: []byte(strings.Repeat("x", 2<<20)), Provider: p.Identity, UsageTrusted: true}, errors.New("testkit: oversized structured output")
+		return contracts.PhaseResult{Outcome: contracts.PhaseResultInvalidArtifact, Artifact: []byte(strings.Repeat("x", 2<<20)), Provider: p.Identity, UsageTrusted: true}, errors.New("testkit: oversized structured output")
 	}
 	if step.Behavior == ProviderSecret {
 		return contracts.PhaseResult{Outcome: "secret", Transcript: "token=fixture-secret-must-redact", Provider: p.Identity}, errors.New("testkit: secret output fixture")
@@ -206,7 +206,7 @@ func (p *ScriptedProvider) Parse(ctx context.Context, input contracts.PhaseInput
 	}
 	outcome := step.Outcome
 	if outcome == "" {
-		outcome = "completed"
+		outcome = contracts.PhaseResultCompleted
 	}
 	return contracts.PhaseResult{
 		Outcome:      outcome,

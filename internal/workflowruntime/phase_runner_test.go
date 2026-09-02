@@ -210,6 +210,28 @@ func TestPhaseRunnerPreservesTicketBudgetExhaustionAsNonRetryable(t *testing.T) 
 	}
 }
 
+func TestPhaseRunnerPreservesProviderSafetyOutcomes(t *testing.T) {
+	request, evidence, coordinator, _, _ := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying
+	evidence.ticket = request.Ticket
+	for _, test := range []struct {
+		outcome providercoord.Outcome
+		want    error
+	}{
+		{providercoord.ResultIndeterminate, workflowworker.ErrProviderResultIndeterminate},
+		{providercoord.RepairUnavailable, workflowworker.ErrProviderRepairUnavailable},
+	} {
+		coordinator.result = providercoord.Result{Code: test.outcome, NeedsOperator: true}
+		_, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).run(
+			context.Background(), request, evidence.project, evidence.worktree,
+			providercoord.RoleReviewer, contracts.PhaseInput{}, phaseartifact.Validation{},
+		)
+		if !errors.Is(err, test.want) {
+			t.Fatalf("outcome %s lost typed blocker: %v", test.outcome, err)
+		}
+	}
+}
+
 func TestPhaseRunnerVerificationCannotBypassPendingAmendment(t *testing.T) {
 	request, evidence, coordinator, _, _ := phaseFixture(t)
 	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying

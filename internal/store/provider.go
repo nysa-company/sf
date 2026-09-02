@@ -387,6 +387,297 @@ func (s *Store) ReuseCurrentCompletedProviderAttempt(ctx context.Context, ref do
 	return key, key.AttemptID != 0, nil
 }
 
+// PendingProviderRepair returns the exact authenticated invalid-artifact
+// claim that requires one same-binding repair in the current phase entry. It
+// is intentionally checked before Coordinator calls Provider.Binding so a
+// daemon restart followed by missing/rotated credentials cannot silently
+// turn the repair into a fallback or an active-ticket retry loop.
+func (s *Store) PendingProviderRepair(ctx context.Context, ref domain.TicketRef, phase domain.Phase, role string, expected uint64, fence domain.Fence) (ProviderAttemptClaim, bool, error) {
+	if ref.Validate() != nil || !validProviderPhase(phase) || !validProviderRole(role) || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return ProviderAttemptClaim{}, false, ErrProviderAttempt
+	}
+	var pending ProviderAttemptClaim
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		claim, found, err := s.pendingProviderTerminalClaim(ctx, conn, ref, phase, role, expected, fence, "invalid_artifact", true, true)
+		if err != nil {
+			return err
+		}
+		if found {
+			pending = claim
+		}
+		return nil
+	})
+	if err != nil {
+		return ProviderAttemptClaim{}, false, err
+	}
+	return pending, pending.ID > 0, nil
+}
+
+// PendingProviderResultIndeterminate returns the newest authenticated terminal
+// claim in the current phase entry when its provider result was not durably
+// established.  It remains valid across a fenced daemon recovery: the ticket
+// fence is current, while the immutable claim retains its original launch
+// fence and is checked against the recovered entry lineage.
+func (s *Store) PendingProviderResultIndeterminate(ctx context.Context, ref domain.TicketRef, phase domain.Phase, role string, expected uint64, fence domain.Fence) (ProviderAttemptClaim, bool, error) {
+	if ref.Validate() != nil || !validProviderPhase(phase) || !validProviderRole(role) || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return ProviderAttemptClaim{}, false, ErrProviderAttempt
+	}
+	var pending ProviderAttemptClaim
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		claim, found, err := s.pendingProviderTerminalClaim(ctx, conn, ref, phase, role, expected, fence, "result_indeterminate", false, true)
+		if err != nil {
+			return err
+		}
+		if found {
+			pending = claim
+		}
+		return nil
+	})
+	if err != nil {
+		return ProviderAttemptClaim{}, false, err
+	}
+	return pending, pending.ID > 0, nil
+}
+
+// PendingProviderRepairUnavailable returns the authoritative latest repair
+// claim when a Store-issued same-binding repair was interrupted after its
+// invalid-artifact predecessor.  It recognizes only the two bounded repair
+// positions (attempt 2 or 4 in a phase entry), so an ordinary failed pair
+// cannot be relabeled as a non-recoverable repair failure.
+func (s *Store) PendingProviderRepairUnavailable(ctx context.Context, ref domain.TicketRef, phase domain.Phase, role string, expected uint64, fence domain.Fence) (ProviderAttemptClaim, bool, error) {
+	if ref.Validate() != nil || !validProviderPhase(phase) || !validProviderRole(role) || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return ProviderAttemptClaim{}, false, ErrProviderAttempt
+	}
+	var pending ProviderAttemptClaim
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		pair, found, err := s.pendingProviderRepairUnavailable(ctx, conn, ref, phase, role, expected, fence, true)
+		if err != nil {
+			return err
+		}
+		if found {
+			pending = pair.Latest
+		}
+		return nil
+	})
+	if err != nil {
+		return ProviderAttemptClaim{}, false, err
+	}
+	return pending, pending.ID > 0, nil
+}
+
+type pendingProviderRepairPair struct {
+	Latest  ProviderAttemptClaim
+	Outcome string
+}
+
+type providerAttemptLifecycle struct {
+	AttemptState, AttemptOutcome string
+	LaunchState, FinishedAt      string
+	PhaseState, PhaseOutcome     string
+	PhaseFinished                string
+	Results                      int
+}
+
+func loadProviderAttemptLifecycle(ctx context.Context, conn *sql.Conn, claim ProviderAttemptClaim) (providerAttemptLifecycle, error) {
+	var lifecycle providerAttemptLifecycle
+	if err := conn.QueryRowContext(ctx, `SELECT a.state,a.outcome,a.launch_state,a.finished_at,p.state,p.outcome,p.completed_at
+		FROM provider_attempts a JOIN phase_runs p ON p.channel=a.channel AND p.project_id=a.project_id AND p.ticket_id=a.ticket_id AND p.phase=a.phase AND p.attempt=a.attempt AND p.provider=a.provider AND p.model=a.model AND p.family=a.family AND p.provider_version=a.version AND p.leader_epoch=a.leader_epoch AND p.runner_epoch=a.runner_epoch AND p.expected_ticket_version=a.expected_ticket_version AND p.worktree_identity=a.worktree_identity AND p.base_sha=a.base_sha
+		WHERE a.id=?`, claim.ID).Scan(&lifecycle.AttemptState, &lifecycle.AttemptOutcome, &lifecycle.LaunchState, &lifecycle.FinishedAt, &lifecycle.PhaseState, &lifecycle.PhaseOutcome, &lifecycle.PhaseFinished); err != nil {
+		return providerAttemptLifecycle{}, ErrEvidenceConflict
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&lifecycle.Results); err != nil {
+		return providerAttemptLifecycle{}, err
+	}
+	return lifecycle, nil
+}
+
+func (lifecycle providerAttemptLifecycle) drainedTerminalWithoutResult() bool {
+	return lifecycle.LaunchState == "drained" && lifecycle.FinishedAt != "" && lifecycle.PhaseFinished != "" && lifecycle.Results == 0
+}
+
+// pendingProviderRepairUnavailable is the private transaction form used by
+// both admission and typed blocking.  The public form uses admission fencing;
+// the blocker calls it after DrainExternalMutations, when only the current
+// durable ticket fence remains admissible.
+func (s *Store) pendingProviderRepairUnavailable(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, phase domain.Phase, role string, expected uint64, fence domain.Fence, admit bool) (pendingProviderRepairPair, bool, error) {
+	assert := s.assertCurrentTicketFence
+	if admit {
+		assert = s.assertTicketFence
+	}
+	if err := assert(ctx, conn, ref, expected, fence); err != nil {
+		return pendingProviderRepairPair{}, false, err
+	}
+	entry, err := loadCurrentProviderPhaseEntry(ctx, conn, ref, phase, expected, fence.RunnerEpoch, fence.LeaderEpoch)
+	if err != nil {
+		return pendingProviderRepairPair{}, false, err
+	}
+	if err := validateProviderPhaseEntryBindings(ctx, conn, ref, entry); err != nil {
+		return pendingProviderRepairPair{}, false, err
+	}
+	var entryRuns int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND entry_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, phase, entry.Version).Scan(&entryRuns); err != nil {
+		return pendingProviderRepairPair{}, false, err
+	}
+	if entryRuns != 2 && entryRuns != 4 {
+		return pendingProviderRepairPair{}, false, nil
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT provider_attempt_id FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND entry_ticket_version=? ORDER BY attempt DESC LIMIT 2`, ref.Channel, ref.Project, ref.Ticket, phase, entry.Version)
+	if err != nil {
+		return pendingProviderRepairPair{}, false, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return pendingProviderRepairPair{}, false, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return pendingProviderRepairPair{}, false, err
+	}
+	if err := rows.Close(); err != nil {
+		return pendingProviderRepairPair{}, false, err
+	}
+	if len(ids) != 2 {
+		return pendingProviderRepairPair{}, false, ErrEvidenceConflict
+	}
+	latest, err := loadAuthenticatedProviderAttemptClaim(ctx, conn, ids[0])
+	if err != nil || latest.Ref != ref || latest.Phase != phase || latest.Role != role || latest.BindingDigest == "" || latest.BindingDigest != bindingDigest(latest.Binding) {
+		return pendingProviderRepairPair{}, false, ErrEvidenceConflict
+	}
+	prior, err := loadAuthenticatedProviderAttemptClaim(ctx, conn, ids[1])
+	if err != nil || prior.Ref != ref || prior.Phase != phase || prior.Role != role || prior.BindingDigest == "" || prior.BindingDigest != bindingDigest(prior.Binding) {
+		return pendingProviderRepairPair{}, false, ErrEvidenceConflict
+	}
+	if prior.Attempt+1 != latest.Attempt {
+		return pendingProviderRepairPair{}, false, ErrEvidenceConflict
+	}
+	priorLifecycle, err := loadProviderAttemptLifecycle(ctx, conn, prior)
+	if err != nil {
+		return pendingProviderRepairPair{}, false, err
+	}
+	latestLifecycle, err := loadProviderAttemptLifecycle(ctx, conn, latest)
+	if err != nil {
+		return pendingProviderRepairPair{}, false, err
+	}
+	if priorLifecycle.AttemptState != priorLifecycle.PhaseState || priorLifecycle.AttemptOutcome != priorLifecycle.PhaseOutcome || latestLifecycle.AttemptState != latestLifecycle.PhaseState || latestLifecycle.AttemptOutcome != latestLifecycle.PhaseOutcome {
+		return pendingProviderRepairPair{}, false, ErrEvidenceConflict
+	}
+	// A fallback pair with no Store-issued repair marker is never an
+	// interrupted repair. In particular, an invocation failure may be followed
+	// by an ordinary fallback on a different qualified binding; that pair is
+	// handled by bounded exhaustion, not this non-recoverable blocker.
+	if latest.Input.Repair == nil {
+		return pendingProviderRepairPair{}, false, nil
+	}
+	if prior.Binding != latest.Binding || prior.BindingDigest != latest.BindingDigest || prior.Role != latest.Role || prior.Ref != latest.Ref || prior.Phase != latest.Phase || !contracts.ValidProviderRepairContext(latest.Input.Repair) || latest.Input.Repair.PriorAttempt != prior.Attempt || latest.Input.Repair.PriorRequestDigest != prior.RequestDigest {
+		return pendingProviderRepairPair{}, false, ErrEvidenceConflict
+	}
+	priorInvalid := priorLifecycle.AttemptState == "failed" && priorLifecycle.AttemptOutcome == "invalid_artifact"
+	if !priorInvalid {
+		return pendingProviderRepairPair{}, false, ErrEvidenceConflict
+	}
+	if !priorLifecycle.drainedTerminalWithoutResult() {
+		return pendingProviderRepairPair{}, false, ErrEvidenceConflict
+	}
+	if !latestLifecycle.drainedTerminalWithoutResult() {
+		// An active repair is not terminal evidence. Any other partial or
+		// terminal-looking lifecycle is a corrupt mixed pair, not a candidate
+		// for a fresh provider admission.
+		if latestLifecycle.AttemptState == "active" && latestLifecycle.AttemptOutcome == "running" && latestLifecycle.PhaseState == "active" && latestLifecycle.PhaseOutcome == "running" {
+			return pendingProviderRepairPair{}, false, nil
+		}
+		return pendingProviderRepairPair{}, false, ErrEvidenceConflict
+	}
+	switch {
+	case latestLifecycle.AttemptState == "failed" && latestLifecycle.AttemptOutcome == "invocation_failed":
+		return pendingProviderRepairPair{Latest: latest, Outcome: "invocation_failed"}, true, nil
+	case latestLifecycle.AttemptState == "failed" && latestLifecycle.AttemptOutcome == "failed":
+		// Compatibility for pre-v53 Store-issued repair attempts. Their generic
+		// failed endpoint does not prove a complete provider result, so it must
+		// remain non-recoverable rather than enter an ordinary exhaustion pause.
+		return pendingProviderRepairPair{Latest: latest, Outcome: "failed"}, true, nil
+	case latestLifecycle.AttemptState == "cancelled" && latestLifecycle.AttemptOutcome == "drained_recovery":
+		return pendingProviderRepairPair{Latest: latest, Outcome: "drained_recovery"}, true, nil
+	case latestLifecycle.AttemptState == "cancelled" && latestLifecycle.AttemptOutcome == "cancelled":
+		// A signed, per-attempt cancellation leaves the ticket otherwise
+		// current, but it is still the terminal endpoint of a Store-issued
+		// repair. Reusing that repair window would make its exact outcome
+		// ambiguous, so it is non-recoverable just like invocation failure.
+		return pendingProviderRepairPair{Latest: latest, Outcome: "cancelled"}, true, nil
+	default:
+		// A fully terminal repair which produced another ordinary provider
+		// failure is governed by the bounded provider-attempt exhaustion path,
+		// not by the non-recoverable interrupted-repair blocker.
+		return pendingProviderRepairPair{}, false, nil
+	}
+}
+
+// pendingProviderTerminalClaim is the shared Store authority for terminal
+// provider-result blockers.  The latest attempt is selected only from the
+// current immutable phase entry, then rehydrated from its input and qualified
+// binding before its matching phase lifecycle is accepted.  A later daemon
+// recovery changes the ticket fence but never changes the terminal claim.
+func (s *Store) pendingProviderTerminalClaim(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, phase domain.Phase, role string, expected uint64, fence domain.Fence, outcome string, repairWindow, admit bool) (ProviderAttemptClaim, bool, error) {
+	if outcome != "invalid_artifact" && outcome != "result_indeterminate" {
+		return ProviderAttemptClaim{}, false, ErrEvidenceConflict
+	}
+	assert := s.assertCurrentTicketFence
+	if admit {
+		assert = s.assertTicketFence
+	}
+	if err := assert(ctx, conn, ref, expected, fence); err != nil {
+		return ProviderAttemptClaim{}, false, err
+	}
+	entry, err := loadCurrentProviderPhaseEntry(ctx, conn, ref, phase, expected, fence.RunnerEpoch, fence.LeaderEpoch)
+	if err != nil {
+		return ProviderAttemptClaim{}, false, err
+	}
+	if err := validateProviderPhaseEntryBindings(ctx, conn, ref, entry); err != nil {
+		return ProviderAttemptClaim{}, false, err
+	}
+	var entryRuns int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND entry_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, phase, entry.Version).Scan(&entryRuns); err != nil {
+		return ProviderAttemptClaim{}, false, err
+	}
+	if entryRuns == 0 || (repairWindow && entryRuns != 1 && entryRuns != 3) {
+		return ProviderAttemptClaim{}, false, nil
+	}
+	var id int64
+	if err := conn.QueryRowContext(ctx, `SELECT provider_attempt_id FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND entry_ticket_version=? ORDER BY attempt DESC LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, phase, entry.Version).Scan(&id); err != nil {
+		return ProviderAttemptClaim{}, false, err
+	}
+	claim, err := loadAuthenticatedProviderAttemptClaim(ctx, conn, id)
+	if err != nil || claim.Ref != ref || claim.Phase != phase || claim.Role != role || claim.BindingDigest == "" || claim.BindingDigest != bindingDigest(claim.Binding) {
+		return ProviderAttemptClaim{}, false, ErrEvidenceConflict
+	}
+	var attemptState, attemptOutcome, launchState, phaseState, phaseOutcome, finishedAt, phaseFinished string
+	if err := conn.QueryRowContext(ctx, `SELECT a.state,a.outcome,a.launch_state,a.finished_at,p.state,p.outcome,p.completed_at
+		FROM provider_attempts a JOIN phase_runs p ON p.channel=a.channel AND p.project_id=a.project_id AND p.ticket_id=a.ticket_id AND p.phase=a.phase AND p.attempt=a.attempt AND p.provider=a.provider AND p.model=a.model AND p.family=a.family AND p.provider_version=a.version AND p.leader_epoch=a.leader_epoch AND p.runner_epoch=a.runner_epoch AND p.expected_ticket_version=a.expected_ticket_version AND p.worktree_identity=a.worktree_identity AND p.base_sha=a.base_sha
+		WHERE a.id=?`, claim.ID).Scan(&attemptState, &attemptOutcome, &launchState, &finishedAt, &phaseState, &phaseOutcome, &phaseFinished); err != nil {
+		return ProviderAttemptClaim{}, false, ErrEvidenceConflict
+	}
+	attemptTerminal := attemptState == "failed" && attemptOutcome == outcome
+	phaseTerminal := phaseState == "failed" && phaseOutcome == outcome
+	if attemptTerminal != phaseTerminal {
+		return ProviderAttemptClaim{}, false, ErrEvidenceConflict
+	}
+	if !attemptTerminal {
+		return ProviderAttemptClaim{}, false, nil
+	}
+	var results int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&results); err != nil {
+		return ProviderAttemptClaim{}, false, err
+	}
+	if launchState != "drained" || finishedAt == "" || phaseFinished == "" || results != 0 {
+		return ProviderAttemptClaim{}, false, ErrEvidenceConflict
+	}
+	return claim, true, nil
+}
+
 func (s *Store) reuseCurrentCompletedProviderAttempt(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, phase domain.Phase, role string, expected uint64, fence domain.Fence) (ProviderAttemptResultKey, bool, error) {
 	var id int64
 	var attempt int
@@ -461,6 +752,20 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		}
 		if err := validateProviderPhaseEntryBindings(ctx, conn, r.Ref, entry); err != nil {
 			return err
+		}
+		// Terminal result indeterminacy and an interrupted Store-issued repair
+		// are non-recoverable in v1.  Refuse them in the same IMMEDIATE
+		// transaction that would otherwise allocate a new provider lease and
+		// attempt number, before generic budget or attempt-limit admission.
+		if _, found, err := s.pendingProviderTerminalClaim(ctx, conn, r.Ref, r.Phase, r.Role, r.ExpectedVersion, r.Fence, "result_indeterminate", false, true); err != nil {
+			return err
+		} else if found {
+			return ErrProviderResultIndeterminate
+		}
+		if _, found, err := s.pendingProviderRepairUnavailable(ctx, conn, r.Ref, r.Phase, r.Role, r.ExpectedVersion, r.Fence, true); err != nil {
+			return err
+		} else if found {
+			return ErrProviderRepairUnavailable
 		}
 		// A Store-authenticated budget rejection is terminal for this immutable
 		// ticket/phase entry.  In particular, a daemon crash after the drained
@@ -610,26 +915,44 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 // not read provider output: the next provider needs only the fact that a
 // schema-invalid response was drained, not any potentially unsafe content.
 func providerRepairContextForRetry(ctx context.Context, conn *sql.Conn, r ProviderAttemptRequest, entry providerPhaseEntry, entryRuns int) (*contracts.ProviderRepairContext, error) {
-	if entryRuns != 1 {
+	// Each Store-owned window contains an ordinary attempt followed by at most
+	// one repair: attempts 1->2 initially and 3->4 only after an explicit
+	// operator-approved retry epoch.
+	if entryRuns != 1 && entryRuns != 3 {
 		return nil, nil
 	}
 	var priorAttempt int
-	var priorDigest string
-	err := conn.QueryRowContext(ctx, `SELECT a.attempt,i.request_digest
+	var priorDigest, priorRole, priorBinding, attemptState, attemptOutcome, launchState, runState, runOutcome string
+	err := conn.QueryRowContext(ctx, `SELECT a.attempt,i.request_digest,a.role,a.binding_digest,a.state,a.outcome,a.launch_state,pr.state,pr.outcome
 		FROM provider_phase_attempt_entries pe
 		JOIN provider_attempts a ON a.id=pe.provider_attempt_id
 		JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id
 		JOIN phase_runs pr ON pr.channel=pe.channel AND pr.project_id=pe.project_id AND pr.ticket_id=pe.ticket_id AND pr.phase=pe.phase AND pr.attempt=pe.attempt
 		WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=?
-		AND a.role=? AND a.provider=? AND a.model=? AND a.family=? AND a.version=?
-		AND a.state='failed' AND a.outcome='invalid_artifact' AND a.launch_state='drained'
-		AND pr.state='failed' AND pr.outcome='invalid_artifact'
-		ORDER BY a.attempt DESC LIMIT 1`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, entry.Version, r.Role, r.Binding.Identity.Provider, r.Binding.Identity.Model, r.Binding.Identity.Family, r.Binding.Identity.Version).Scan(&priorAttempt, &priorDigest)
+		ORDER BY a.attempt DESC LIMIT 1`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, entry.Version).Scan(&priorAttempt, &priorDigest, &priorRole, &priorBinding, &attemptState, &attemptOutcome, &launchState, &runState, &runOutcome)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, ErrEvidenceConflict
 	}
 	if err != nil {
 		return nil, err
+	}
+	attemptInvalid := attemptState == "failed" && attemptOutcome == "invalid_artifact"
+	runInvalid := runState == "failed" && runOutcome == "invalid_artifact"
+	if attemptInvalid != runInvalid {
+		return nil, ErrEvidenceConflict
+	}
+	if !attemptInvalid {
+		return nil, nil
+	}
+	// Once an invalid artifact is durable, its one automatic repair must use
+	// the exact same role and full runtime binding. A changed executable,
+	// policy, fixture, or authentication binding cannot silently become an
+	// ordinary second launch.
+	if launchState != "drained" || priorRole != r.Role || priorBinding == "" {
+		return nil, ErrEvidenceConflict
+	}
+	if priorBinding != bindingDigest(r.Binding) {
+		return nil, ErrProviderRepairUnavailable
 	}
 	context := &contracts.ProviderRepairContext{PriorAttempt: priorAttempt, PriorRequestDigest: priorDigest}
 	if !contracts.ValidProviderRepairContext(context) {
@@ -1704,7 +2027,7 @@ func validPersistedProviderAttemptClaim(claim ProviderAttemptClaim) bool {
 }
 func validAttemptState(v string) bool { return v == "completed" || v == "failed" || v == "cancelled" }
 func safeOutcome(v string) bool {
-	if v == "completed" || v == "failed" || v == "cancelled" || v == "invalid_artifact" || v == "drained_recovery" {
+	if v == "completed" || v == "failed" || v == "cancelled" || v == "invalid_artifact" || v == "result_indeterminate" || v == "drained_recovery" {
 		return true
 	}
 	return false

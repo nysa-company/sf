@@ -18,7 +18,7 @@ import (
 	"github.com/nysa-company/sf/internal/testkit"
 )
 
-func TestMalformedOutputFallsBackAndNeverPersistsSecrets(t *testing.T) {
+func TestMalformedOutputIsIndeterminateAndNeverRepairsOrPersistsSecrets(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "db.sqlite"))
 	if err != nil {
@@ -47,7 +47,9 @@ func TestMalformedOutputFallsBackAndNeverPersistsSecrets(t *testing.T) {
 	}
 	primary := testkit.NewScriptedProvider(id("cursor", "cursor-family"))
 	secret := strings.Join([]string{"token", "must-not-persist"}, "=")
-	primary.Add(domain.PhasePlanning, testkit.ProviderStep{Behavior: testkit.ProviderMalformed, Transcript: secret})
+	// A provider transcript that cannot establish trusted usage is
+	// indeterminate, even though it contains malformed/untrusted output.
+	primary.Add(domain.PhasePlanning, testkit.ProviderStep{Behavior: testkit.ProviderSecret, Transcript: secret})
 	fallback := testkit.NewScriptedProvider(id("claude", "claude-family"))
 	fallback.Add(domain.PhasePlanning, testkit.ProviderStep{Artifact: plannerArtifact()})
 	recordQual(t, db, primary)
@@ -70,8 +72,22 @@ func TestMalformedOutputFallsBackAndNeverPersistsSecrets(t *testing.T) {
 	}
 	r := Request{Role: RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "x", Repository: "/tmp/p", Worktree: root, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"x"}, Timeout: time.Second, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}}
 	result := c.Run(ctx, r)
-	if result.Code != Failed || len(result.Attempts) != 1 || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
+	if result.Code != ResultIndeterminate || !result.NeedsOperator || len(result.Attempts) != 1 || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
 		t.Fatalf("result=%+v", result)
+	}
+	if calls := primary.CallsSnapshot(); len(calls) != 1 {
+		t.Fatalf("indeterminate result was repaired: %v", calls)
+	}
+	if fallbackCalls := fallback.CallsSnapshot(); len(fallbackCalls) != 0 {
+		t.Fatalf("indeterminate result used fallback: %v", fallbackCalls)
+	}
+	attempts, err := db.ProviderAttempts(ctx, ref)
+	if err != nil || len(attempts) != 1 || attempts[0].Outcome != "result_indeterminate" || attempts[0].State != "failed" {
+		t.Fatalf("durable indeterminate attempt=%+v err=%v", attempts, err)
+	}
+	replay := c.Run(ctx, r)
+	if replay.Code != ResultIndeterminate || len(replay.Attempts) != 0 || len(primary.CallsSnapshot()) != 1 {
+		t.Fatalf("indeterminate replay=%+v calls=%v", replay, primary.CallsSnapshot())
 	}
 	rawSecret := sha256.Sum256([]byte(secret))
 	if result.Attempts[0].TranscriptDigest == "" || result.Attempts[0].TranscriptDigest == "sha256:"+fmt.Sprintf("%x", rawSecret) {
@@ -94,6 +110,331 @@ func TestCompletedResultExposesOnlyTheDurableAttemptKey(t *testing.T) {
 	if _, _, err := database.LoadHistoricalProviderAttemptResult(context.Background(), result.ProviderResult); err != nil {
 		t.Fatalf("result key was not durably persisted: %v", err)
 	}
+}
+
+func TestSingleRouteRetriesInvalidArtifactWithinOneAdmission(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
+		{Artifact: []byte(`{"schema":"not-a-planner"}`)},
+		{Artifact: plannerArtifact()},
+	}
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != Completed || result.ProviderResult.Attempt != 2 || len(result.Attempts) != 2 {
+		t.Fatalf("single-route retry=%+v", result)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+	if attempts[0].State != "failed" || attempts[0].Outcome != "invalid_artifact" || attempts[1].State != "completed" || attempts[1].Outcome != "completed" {
+		t.Fatalf("attempt lifecycle=%+v", attempts)
+	}
+	replayed := coordinator.Run(context.Background(), request)
+	if replayed.Code != Completed || replayed.ProviderResult != result.ProviderResult {
+		t.Fatalf("repair result was not reusable: first=%+v replay=%+v", result, replayed)
+	}
+	if attempts, err = database.ProviderAttempts(context.Background(), ref); err != nil || len(attempts) != 2 {
+		t.Fatalf("repair replay attempts=%+v err=%v", attempts, err)
+	}
+}
+
+func TestSingleRoutePausesAfterOneInvalidArtifactRepair(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
+		{Artifact: []byte(`{"schema":"not-a-planner"}`)},
+		{Artifact: []byte(`{"schema":"still-not-a-planner"}`)},
+	}
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != AttemptExhausted || !result.NeedsOperator || len(result.Attempts) != 2 {
+		t.Fatalf("single-route exhaustion=%+v", result)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+	for index, attempt := range attempts {
+		if attempt.State != "failed" || attempt.Outcome != "invalid_artifact" {
+			t.Fatalf("attempt[%d]=%+v", index, attempt)
+		}
+	}
+}
+
+func TestInvalidArtifactRepairsSameRouteBeforeAvailabilityFallback(t *testing.T) {
+	_, request, coordinator, _, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
+		{Artifact: []byte(`{"schema":"not-a-planner"}`)},
+		{Artifact: plannerArtifact()},
+	}
+	fallback, ok := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	if !ok {
+		t.Fatal("fixture fallback provider changed type")
+	}
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != Completed || len(result.Attempts) != 2 || result.Attempts[0].Provider != result.Attempts[1].Provider {
+		t.Fatalf("same-route repair=%+v", result)
+	}
+	if calls := fallback.CallsSnapshot(); len(calls) != 0 {
+		t.Fatalf("availability fallback handled invalid artifact: %v", calls)
+	}
+}
+
+func TestRestartedInvalidArtifactRepairBlocksWhenRuntimeBindingRotated(t *testing.T) {
+	supervisor := testkit.NewSupervisor()
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, supervisor)
+	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Fallback: "claude", Capacity: 1}
+	claim, binding := seedInvalidProviderAttempt(t, database, request, primary, supervisor)
+	request = recoverProviderRequest(t, database, request)
+	if pending, found, err := database.PendingProviderRepair(context.Background(), ref, domain.PhasePlanning, string(RolePlanner), request.ExpectedVersion, request.Fence); err != nil || !found || pending.ID != claim.ID {
+		t.Fatalf("pending repair=%+v found=%v err=%v", pending, found, err)
+	}
+	rotated := binding
+	rotated.AuthDigest = strings.Repeat("f", 64)
+	coordinator.registry.mu.Lock()
+	coordinator.registry.providers["cursor"] = &bindingOverrideProvider{Provider: primary, binding: rotated}
+	coordinator.registry.mu.Unlock()
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != RepairUnavailable || !result.NeedsOperator || len(result.Attempts) != 0 {
+		t.Fatalf("rotated repair result=%+v", result)
+	}
+	fallback := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	if calls := fallback.CallsSnapshot(); len(calls) != 0 {
+		t.Fatalf("rotated repair launched fallback: %v", calls)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 1 || attempts[0].Outcome != "invalid_artifact" {
+		t.Fatalf("rotated repair attempts=%+v err=%v", attempts, err)
+	}
+}
+
+func TestRestartedInvalidArtifactRepairUsesSameBindingExactlyOnce(t *testing.T) {
+	supervisor := testkit.NewSupervisor()
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, supervisor)
+	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	claim, _ := seedInvalidProviderAttempt(t, database, request, primary, supervisor)
+	request = recoverProviderRequest(t, database, request)
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
+
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != Completed || result.ProviderResult.Attempt != claim.Attempt+1 || len(result.Attempts) != 1 {
+		t.Fatalf("recovered repair=%+v", result)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 2 || attempts[0].Outcome != "invalid_artifact" || attempts[1].Outcome != "completed" {
+		t.Fatalf("recovered repair attempts=%+v err=%v", attempts, err)
+	}
+	replay := coordinator.Run(context.Background(), request)
+	if replay.Code != Completed || replay.ProviderResult != result.ProviderResult {
+		t.Fatalf("recovered repair replay=%+v first=%+v", replay, result)
+	}
+}
+
+type interruptedRepairProvider struct {
+	*testkit.ScriptedProvider
+	invocations, bindings int
+}
+
+func (p *interruptedRepairProvider) Binding(ctx context.Context) (contracts.RuntimeBinding, error) {
+	p.bindings++
+	return p.ScriptedProvider.Binding(ctx)
+}
+
+func (p *interruptedRepairProvider) Invocation(ctx context.Context, input contracts.PhaseInput) (contracts.Invocation, error) {
+	p.invocations++
+	if p.invocations == 2 {
+		return contracts.Invocation{}, errors.New("repair invocation failed before launch")
+	}
+	return p.ScriptedProvider.Invocation(ctx, input)
+}
+
+func TestInterruptedRepairIsUnavailableBeforeBindingAndStableAcrossReplay(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Fallback: "claude", Capacity: 1}
+	interrupted := &interruptedRepairProvider{ScriptedProvider: primary}
+	coordinator.registry.providers["cursor"] = interrupted
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: []byte(`{"schema":"not-a-planner"}`)}}
+
+	first := coordinator.Run(context.Background(), request)
+	if first.Code != RepairUnavailable || !first.NeedsOperator || len(first.Attempts) != 2 {
+		t.Fatalf("interrupted repair result=%+v", first)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 2 || attempts[0].Outcome != contracts.PhaseResultInvalidArtifact || attempts[1].Outcome != "invocation_failed" {
+		t.Fatalf("interrupted repair durable attempts=%+v err=%v", attempts, err)
+	}
+	if len(primary.CallsSnapshot()) != 1 {
+		t.Fatalf("repair invocation unexpectedly parsed provider output: %v", primary.CallsSnapshot())
+	}
+	fallback := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	if len(fallback.CallsSnapshot()) != 0 {
+		t.Fatalf("interrupted repair used fallback: %v", fallback.CallsSnapshot())
+	}
+
+	replay := coordinator.Run(context.Background(), request)
+	if replay.Code != RepairUnavailable || !replay.NeedsOperator || len(replay.Attempts) != 0 || interrupted.invocations != 2 || interrupted.bindings != 2 {
+		t.Fatalf("interrupted repair replay=%+v invocations=%d bindings=%d", replay, interrupted.invocations, interrupted.bindings)
+	}
+	if attempts, err = database.ProviderAttempts(context.Background(), ref); err != nil || len(attempts) != 2 {
+		t.Fatalf("replay changed interrupted repair attempts=%+v err=%v", attempts, err)
+	}
+}
+
+type repairTimeoutProvider struct {
+	*testkit.ScriptedProvider
+	mu          sync.Mutex
+	bindings    int
+	invocations int
+}
+
+func (p *repairTimeoutProvider) Binding(ctx context.Context) (contracts.RuntimeBinding, error) {
+	p.mu.Lock()
+	p.bindings++
+	p.mu.Unlock()
+	return p.ScriptedProvider.Binding(ctx)
+}
+
+func (p *repairTimeoutProvider) Invocation(ctx context.Context, input contracts.PhaseInput) (contracts.Invocation, error) {
+	p.mu.Lock()
+	p.invocations++
+	p.mu.Unlock()
+	return p.ScriptedProvider.Invocation(ctx, input)
+}
+
+func (p *repairTimeoutProvider) counts() (int, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.bindings, p.invocations
+}
+
+func TestTimedOutSameBindingRepairIsUnavailableAcrossReplay(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+
+	tracked := &repairTimeoutProvider{ScriptedProvider: primary}
+	coordinator.registry.providers["cursor"] = tracked
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
+		{Artifact: []byte(`{"schema":"not-a-planner"}`)},
+		{Behavior: testkit.ProviderHang},
+	}
+
+	first := coordinator.Run(context.Background(), request)
+	if first.Code != RepairUnavailable || !first.NeedsOperator || len(first.Attempts) != 2 {
+		t.Fatalf("timed-out repair result=%+v", first)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 2 || attempts[0].State != "failed" || attempts[0].Outcome != contracts.PhaseResultInvalidArtifact || attempts[1].State != "cancelled" || attempts[1].Outcome != "cancelled" {
+		t.Fatalf("timed-out repair attempts=%+v err=%v", attempts, err)
+	}
+	bindings, invocations := tracked.counts()
+	if bindings != 2 || invocations != 2 || len(primary.CallsSnapshot()) != 2 {
+		t.Fatalf("timed-out repair launch counts bindings=%d invocations=%d calls=%v", bindings, invocations, primary.CallsSnapshot())
+	}
+
+	fallback := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	replay := coordinator.Run(context.Background(), request)
+	if replay.Code != RepairUnavailable || !replay.NeedsOperator || len(replay.Attempts) != 0 {
+		t.Fatalf("timed-out repair replay=%+v", replay)
+	}
+	newBindings, newInvocations := tracked.counts()
+	if newBindings != bindings || newInvocations != invocations || len(primary.CallsSnapshot()) != 2 || len(fallback.CallsSnapshot()) != 0 {
+		t.Fatalf("timed-out repair replay launched work bindings=%d/%d invocations=%d/%d primary=%v fallback=%v", newBindings, bindings, newInvocations, invocations, primary.CallsSnapshot(), fallback.CallsSnapshot())
+	}
+}
+
+func TestIndeterminateBeginRaceDoesNotLaunchSecondProviderAttempt(t *testing.T) {
+	supervisor := testkit.NewSupervisor()
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, supervisor)
+	blocked := &blockingBindingProvider{ScriptedProvider: primary, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	coordinator.registry.providers["cursor"] = blocked
+	resultB := make(chan Result, 1)
+	go func() { resultB <- coordinator.Run(context.Background(), request) }()
+	select {
+	case <-blocked.entered:
+	case <-time.After(time.Second):
+		t.Fatal("B did not reach binding barrier")
+	}
+
+	indeterminateProvider := &untrustedUsageProvider{ScriptedProvider: testkit.NewScriptedProvider(primary.Identity), usage: 1000}
+	indeterminateProvider.Add(domain.PhasePlanning, testkit.ProviderStep{Artifact: plannerArtifact()})
+	registry := NewRegistry()
+	if err := registry.Register(context.Background(), indeterminateProvider); err != nil {
+		t.Fatal(err)
+	}
+	coordinatorA, err := New(registry, map[Role]Route{RolePlanner: {Primary: indeterminateProvider.Name(), Capacity: 1}}, database, nil, supervisor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultA := coordinatorA.Run(context.Background(), request)
+	if resultA.Code != ResultIndeterminate || len(resultA.Attempts) != 1 {
+		t.Fatalf("A indeterminate result=%+v", resultA)
+	}
+	close(blocked.release)
+	result := <-resultB
+	if result.Code != ResultIndeterminate || !result.NeedsOperator || len(result.Attempts) != 0 || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
+		t.Fatalf("B atomic admission result=%+v", result)
+	}
+	if blocked.InvocationCount() != 0 || len(primary.CallsSnapshot()) != 0 {
+		t.Fatalf("B launched/parsing after indeterminate admission invocations=%d calls=%v", blocked.InvocationCount(), primary.CallsSnapshot())
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 1 || attempts[0].Outcome != "result_indeterminate" {
+		t.Fatalf("atomic admission attempts=%+v err=%v", attempts, err)
+	}
+}
+
+func seedInvalidProviderAttempt(t *testing.T, database *store.Store, request Request, primary *testkit.ScriptedProvider, supervisor *testkit.Supervisor) (store.ProviderAttemptClaim, contracts.RuntimeBinding) {
+	t.Helper()
+	binding, err := primary.Binding(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimInput := request.Input
+	claimInput.Provider, claimInput.AuthMode = binding.Identity, binding.AuthMode
+	claimInput.LeaderEpoch, claimInput.RunnerEpoch, claimInput.ExpectedVersion = request.Fence.LeaderEpoch, request.Fence.RunnerEpoch, request.ExpectedVersion
+	claim, err := database.BeginProviderAttempt(context.Background(), store.ProviderAttemptRequest{
+		Ref: request.Input.Ticket, ExpectedVersion: request.ExpectedVersion, Fence: request.Fence,
+		Phase: request.Input.Phase, Role: string(request.Role), Binding: binding,
+		ConfigDigest: request.ConfigDigest, Capacity: 1, At: time.Now().UTC(),
+		Repository: request.Input.Repository, Worktree: request.Input.Worktree,
+		WorktreeIdentity: request.Input.WorktreeIdentity, BaseSHA: request.Input.BaseSHA,
+		SupervisorKey: supervisor.PublicKey(), Input: claimInput,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RecordProviderLaunch(context.Background(), claim, contracts.ProviderLaunch{PID: 101, PGID: 101, BootIdentity: "boot", ProcessStartIdentity: "start", Worktree: claim.Worktree}); err != nil {
+		t.Fatal(err)
+	}
+	drain, err := supervisor.Drain(context.Background(), drainRequest(claim))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.FinishProviderAttempt(context.Background(), claim, drain, request.ExpectedVersion, request.Fence, "failed", "invalid_artifact", 0, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	return claim, binding
+}
+
+func recoverProviderRequest(t *testing.T, database *store.Store, request Request) Request {
+	t.Helper()
+	leader, err := database.AcquireLeader(context.Background(), request.Input.Ticket.Channel, "provider-repair-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.FenceRecoveredRunners(context.Background(), request.Input.Ticket.Channel, leader); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := database.Ticket(context.Background(), request.Input.Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.ExpectedVersion = ticket.Version
+	request.Fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	return request
 }
 
 func TestCoordinatorReusesOnlyExactCompletedResult(t *testing.T) {
@@ -339,7 +680,7 @@ func TestCoordinatorReviewerBeginRaceReusesCompletionWithoutSecondLaunch(t *test
 
 func TestFallbackCompletionExposesFallbackAttemptKey(t *testing.T) {
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
-	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Behavior: testkit.ProviderMalformed}}
+	primary.InvocationErr = errors.New("primary provider unavailable before launch")
 	// The Store-selected planner qualification is the primary identity. Keep
 	// that durable identity while using a distinct route alias to exercise the
 	// coordinator's fallback path without weakening provider qualification.
@@ -362,6 +703,35 @@ func TestFallbackCompletionExposesFallbackAttemptKey(t *testing.T) {
 	}
 	if _, _, err := database.LoadHistoricalProviderAttemptResult(context.Background(), result.ProviderResult); err != nil {
 		t.Fatalf("fallback key was not durably persisted: %v", err)
+	}
+}
+
+func TestFallbackInvalidArtifactExhaustionIsStableAcrossRestart(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.InvocationErr = errors.New("primary provider unavailable before launch")
+	fallback := &aliasedProvider{ScriptedProvider: testkit.NewScriptedProvider(id("cursor", "cursor-family"))}
+	fallback.Add(domain.PhasePlanning, testkit.ProviderStep{Artifact: []byte(`{"schema":"not-a-planner"}`)})
+	coordinator.registry.providers["claude"] = fallback
+
+	first := coordinator.Run(context.Background(), request)
+	if first.Code != AttemptExhausted || !first.NeedsOperator || len(first.Attempts) != 2 {
+		t.Fatalf("in-process exhaustion=%+v", first)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 2 || attempts[0].Outcome != "invocation_failed" || attempts[1].Outcome != "invalid_artifact" {
+		t.Fatalf("durable attempts=%+v err=%v", attempts, err)
+	}
+	fallbackCalls := len(fallback.CallsSnapshot())
+
+	restarted := coordinator.Run(context.Background(), request)
+	if restarted.Code != AttemptExhausted || !restarted.NeedsOperator || len(restarted.Attempts) != 0 {
+		t.Fatalf("restart exhaustion=%+v", restarted)
+	}
+	if len(fallback.CallsSnapshot()) != fallbackCalls {
+		t.Fatalf("fallback relaunched after durable exhaustion: before=%d after=%d", fallbackCalls, len(fallback.CallsSnapshot()))
+	}
+	if attempts, err = database.ProviderAttempts(context.Background(), ref); err != nil || len(attempts) != 2 {
+		t.Fatalf("restart changed durable attempts=%+v err=%v", attempts, err)
 	}
 }
 
@@ -526,7 +896,7 @@ func TestCanceledResultDoesNotExposeProviderResultKey(t *testing.T) {
 	defer cancel()
 
 	result := coordinator.Run(ctx, request)
-	if !result.NeedsOperator || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
+	if result.Code != Canceled || !result.NeedsOperator || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
 		attempts, _ := database.ProviderAttempts(context.Background(), ref)
 		t.Logf("canceled attempts=%+v", attempts)
 		t.Fatalf("canceled result=%+v", result)
@@ -550,17 +920,61 @@ func TestUntrustedUsageCannotChargeOrExhaustTicketBudget(t *testing.T) {
 	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
 
 	result := coordinator.Run(context.Background(), request)
-	if result.Code != NeedsOperator || result.CostUsed != 0 || result.ProviderResult != (store.ProviderAttemptResultKey{}) || len(result.Attempts) != 1 || result.Attempts[0].UsageUnits != 0 {
+	if result.Code != ResultIndeterminate || result.CostUsed != 0 || result.ProviderResult != (store.ProviderAttemptResultKey{}) || len(result.Attempts) != 1 || result.Attempts[0].UsageUnits != 0 {
 		t.Fatalf("untrusted usage result=%+v", result)
 	}
 	attempts, err := database.ProviderAttempts(context.Background(), ref)
-	if err != nil || len(attempts) != 1 || attempts[0].UsageUnits != 0 || attempts[0].Outcome == "budget_exhausted" {
+	if err != nil || len(attempts) != 1 || attempts[0].UsageUnits != 0 || attempts[0].Outcome != "result_indeterminate" {
 		t.Fatalf("untrusted usage attempts=%+v err=%v", attempts, err)
 	}
 	ticket, err := database.Ticket(context.Background(), ref)
 	if err != nil || ticket.State != domain.StatePlanning || ticket.BlockedCode != "" {
 		t.Fatalf("untrusted usage blocked ticket=%+v err=%v", ticket, err)
 	}
+}
+
+type commandErrorSupervisor struct {
+	*testkit.Supervisor
+	runs, drains int
+}
+
+func (s *commandErrorSupervisor) Run(context.Context, contracts.DrainRequest, contracts.Invocation, contracts.PhaseInput) (contracts.CommandResult, error) {
+	s.runs++
+	return contracts.CommandResult{}, errors.New("supervisor command observation is ambiguous")
+}
+
+func (s *commandErrorSupervisor) Drain(ctx context.Context, request contracts.DrainRequest) (contracts.DrainProof, error) {
+	s.drains++
+	return s.Supervisor.Drain(ctx, request)
+}
+
+func TestSupervisorCommandAmbiguityIsIndeterminateAndStableAcrossReplay(t *testing.T) {
+	supervisor := &commandErrorSupervisor{Supervisor: testkit.NewSupervisor()}
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, supervisor)
+	result := coordinator.Run(context.Background(), request)
+	if result.Code != ResultIndeterminate || !result.NeedsOperator || len(result.Attempts) != 1 || result.ProviderResult != (store.ProviderAttemptResultKey{}) {
+		t.Fatalf("ambiguous command result=%+v", result)
+	}
+	if supervisor.runs != 1 || supervisor.drains != 1 || len(primary.CallsSnapshot()) != 0 {
+		t.Fatalf("ambiguous command launch/drain counts runs=%d drains=%d provider=%v", supervisor.runs, supervisor.drains, primary.CallsSnapshot())
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 1 || attempts[0].State != "failed" || attempts[0].Outcome != "result_indeterminate" {
+		t.Fatalf("ambiguous command durable attempts=%+v err=%v", attempts, err)
+	}
+	replay := coordinator.Run(context.Background(), request)
+	if replay.Code != ResultIndeterminate || len(replay.Attempts) != 0 || supervisor.runs != 1 || supervisor.drains != 1 {
+		t.Fatalf("ambiguous command replay=%+v runs=%d drains=%d", replay, supervisor.runs, supervisor.drains)
+	}
+}
+
+type bindingOverrideProvider struct {
+	contracts.Provider
+	binding contracts.RuntimeBinding
+}
+
+func (p *bindingOverrideProvider) Binding(context.Context) (contracts.RuntimeBinding, error) {
+	return p.binding, nil
 }
 
 func TestExactCostCeilingConsumesCompletedResultBeforeBlockingLaterPhase(t *testing.T) {
@@ -619,7 +1033,7 @@ func TestCoordinatorReportsAttemptExhaustedBeforeThirdProviderInvocation(t *test
 	// next coordinator pass must surface Store's admission refusal without
 	// launching the adapter again.
 	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
-	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Behavior: testkit.ProviderMalformed}, {Behavior: testkit.ProviderMalformed}}
+	primary.InvocationErr = errors.New("definite adapter failure before launch")
 	first := coordinator.Run(context.Background(), request)
 	if first.Code != Failed || len(first.Attempts) != 1 {
 		t.Fatalf("first bounded failure=%+v", first)
@@ -843,6 +1257,25 @@ func TestBindClaimToInputRejectsDurableIdentityDrift(t *testing.T) {
 	input := request.Input
 	if !bindClaimToInput(&input, claim, request, identity) || input.Attempt != claim.Attempt || input.LeaderEpoch != claim.LeaderEpoch || input.RunnerEpoch != claim.RunnerEpoch || input.ExpectedVersion != claim.ExpectedVersion {
 		t.Fatalf("matching claim was not bound: input=%+v", input)
+	}
+	repairLaunch := launch
+	repairLaunch.RequestDigest = ""
+	repairLaunch.Repair = &contracts.ProviderRepairContext{PriorAttempt: 1, PriorRequestDigest: strings.Repeat("a", 64)}
+	_, repairDigest, err := contracts.CanonicalPhaseInput(repairLaunch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairLaunch.RequestDigest = repairDigest
+	repairClaim := claim
+	repairClaim.Input, repairClaim.RequestDigest = repairLaunch, repairDigest
+	repairInput := request.Input
+	if !bindClaimToInput(&repairInput, repairClaim, request, identity) || repairInput.Repair == nil || repairInput.Repair.PriorAttempt != 1 {
+		t.Fatalf("Store repair claim was not bound: input=%+v", repairInput)
+	}
+	forgedRepair := request.Input
+	forgedRepair.Repair = repairLaunch.Repair
+	if bindClaimToInput(&forgedRepair, repairClaim, request, identity) {
+		t.Fatal("caller-supplied repair context was accepted")
 	}
 	for name, mutate := range map[string]func(*contracts.PhaseInput){
 		"ticket":     func(value *contracts.PhaseInput) { value.Ticket.Ticket = "SF-other" },

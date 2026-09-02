@@ -176,7 +176,7 @@ func TestWorkerRealStoreFailsClosedWithoutCommandResultWiring(t *testing.T) {
 	}
 }
 
-func TestWorkerRealStoreProviderAttemptExhaustionPausesExactlyOnce(t *testing.T) {
+func TestWorkerRealStoreInvalidArtifactRepairExhaustionPausesExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "provider-exhaustion.sqlite"))
 	if err != nil {
@@ -691,7 +691,7 @@ func (r *realRunner) Run(ctx context.Context, req PhaseRequest) (PhaseResult, er
 			if proofErr != nil {
 				return proofErr
 			}
-			return r.db.FinishProviderAttempt(ctx, value, proof, req.Ticket.Version, req.Fence, "failed", "failed", 0, time.Now().UTC())
+			return r.db.FinishProviderAttempt(ctx, value, proof, req.Ticket.Version, req.Fence, "failed", "invalid_artifact", 0, time.Now().UTC())
 		}
 		if err := fail(claim); err != nil {
 			return PhaseResult{}, fmt.Errorf("finish exhausted attempt: %w", err)
@@ -699,6 +699,9 @@ func (r *realRunner) Run(ctx context.Context, req PhaseRequest) (PhaseResult, er
 		next, beginErr := r.db.BeginProviderAttempt(ctx, attemptRequest)
 		if beginErr != nil {
 			return PhaseResult{}, fmt.Errorf("begin second exhausted attempt: %w", beginErr)
+		}
+		if next.Input.Repair == nil || next.Input.Repair.PriorAttempt != claim.Attempt || next.Input.Repair.PriorRequestDigest != claim.RequestDigest {
+			return PhaseResult{}, fmt.Errorf("second attempt lacked exact repair context: %+v", next.Input.Repair)
 		}
 		if err := r.db.RecordProviderLaunch(ctx, next, contracts.ProviderLaunch{PID: 100, PGID: 100, BootIdentity: "test", ProcessStartIdentity: "real-worker-second", Worktree: next.Worktree}); err != nil {
 			return PhaseResult{}, fmt.Errorf("record second exhausted launch: %w", err)

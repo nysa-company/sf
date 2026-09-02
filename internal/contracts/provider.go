@@ -133,6 +133,17 @@ type PhaseResult struct {
 	TokenReasoningTokens  int64
 }
 
+// PhaseResult outcome values are adapter-owned classifications.  In
+// particular, invalid_artifact is repairable only when the adapter has
+// observed a clean provider completion and can trust the subscription's zero
+// monetary usage; indeterminate means the provider result or its observation
+// cannot be safely interpreted.
+const (
+	PhaseResultCompleted       = "completed"
+	PhaseResultInvalidArtifact = "invalid_artifact"
+	PhaseResultIndeterminate   = "indeterminate"
+)
+
 // Invocation is an argv-only adapter proposal. The supervisor is the sole
 // component allowed to start it; adapters never receive os/exec authority.
 type Invocation struct {
