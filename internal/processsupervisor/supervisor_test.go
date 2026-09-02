@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -84,6 +85,45 @@ func TestRegisterRuntimeRefreshReusesAndReclaimsStagedSnapshots(t *testing.T) {
 		if len(supervisor.retired) != 0 {
 			t.Fatalf("retired snapshots leaked: %d", len(supervisor.retired))
 		}
+	}
+}
+
+func TestRegisterRuntimeStagesExecutableLargerThanLegacyLimit(t *testing.T) {
+	supervisor, binding, executable, authHome := runtimeRegistration(t)
+	file, err := os.OpenFile(executable, os.O_WRONLY|os.O_TRUNC, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("#!/bin/sh\nexit 0\n"); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Truncate(129 << 20); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.Open(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, source); err != nil {
+		_ = source.Close()
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	binding.BinaryDigest = hex.EncodeToString(hash.Sum(nil))
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatalf("runtime above the legacy 128 MiB limit was rejected: %v", err)
+	}
+	trusted := supervisor.trusted[binding.Identity]
+	if info, err := os.Stat(trusted.stagedPath); err != nil || info.Size() != 129<<20 || !stagedRuntimeMatches(trusted.snapshot, binding.BinaryDigest) {
+		t.Fatalf("large runtime snapshot is incomplete: info=%v err=%v", info, err)
 	}
 }
 

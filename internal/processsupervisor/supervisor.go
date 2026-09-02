@@ -26,7 +26,10 @@ import (
 
 var ErrUnclear = errors.New("provider process drain is unclear")
 
-const maxDrainDuration = 30 * time.Second
+const (
+	maxDrainDuration                 = 30 * time.Second
+	maxProviderRuntimeExecutableSize = 256 << 20
+)
 
 // LaunchRecorder persists the exact child identity before the gate is opened.
 // Implementations must fail closed; a supervisor never releases a child after
@@ -244,7 +247,7 @@ func stagedRuntimeMatches(snapshot *stagedExecutable, digest string) bool {
 		return false
 	}
 	info, err := os.Lstat(snapshot.path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 || info.Size() > 128<<20 || !trustedOwner(info) {
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 || info.Size() <= 0 || info.Size() > maxProviderRuntimeExecutableSize || !trustedOwner(info) {
 		return false
 	}
 	file, err := os.Open(snapshot.path)
@@ -252,9 +255,9 @@ func stagedRuntimeMatches(snapshot *stagedExecutable, digest string) bool {
 		return false
 	}
 	hash := sha256.New()
-	_, copyErr := io.Copy(hash, io.LimitReader(file, 128<<20+1))
+	copied, copyErr := io.Copy(hash, io.LimitReader(file, maxProviderRuntimeExecutableSize+1))
 	closeErr := file.Close()
-	return copyErr == nil && closeErr == nil && hex.EncodeToString(hash.Sum(nil)) == digest
+	return copyErr == nil && closeErr == nil && copied == info.Size() && hex.EncodeToString(hash.Sum(nil)) == digest
 }
 
 // PolicyDigest is the digest of the supervisor-owned environment policy. It
@@ -457,7 +460,7 @@ func authenticateExecutable(path string) (trustedExecutable, error) {
 		return trustedExecutable{}, errors.New("trusted executable could not be resolved")
 	}
 	info, err := os.Stat(resolved)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 || info.Mode()&0o022 != 0 {
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 || info.Mode()&0o022 != 0 || info.Size() <= 0 || info.Size() > maxProviderRuntimeExecutableSize {
 		return trustedExecutable{}, errors.New("trusted executable must be an executable private regular file")
 	}
 	if !trustedOwner(info) {
@@ -508,7 +511,7 @@ func (trusted *trustedExecutable) stage() error {
 	}
 	defer source.Close()
 	info, err := source.Stat()
-	if err != nil || !info.Mode().IsRegular() || !trustedOwner(info) || info.Mode().Perm()&0o022 != 0 {
+	if err != nil || !info.Mode().IsRegular() || !trustedOwner(info) || info.Mode().Perm()&0o022 != 0 || info.Size() <= 0 || info.Size() > maxProviderRuntimeExecutableSize {
 		cleanup()
 		return errors.New("trusted executable changed before staging")
 	}
@@ -519,10 +522,10 @@ func (trusted *trustedExecutable) stage() error {
 		return err
 	}
 	hash := sha256.New()
-	_, copyErr := io.Copy(io.MultiWriter(target, hash), io.LimitReader(source, 128<<20))
+	copied, copyErr := io.Copy(io.MultiWriter(target, hash), io.LimitReader(source, maxProviderRuntimeExecutableSize+1))
 	syncErr := target.Sync()
 	closeErr := target.Close()
-	if copyErr != nil || syncErr != nil || closeErr != nil || hex.EncodeToString(hash.Sum(nil)) != trusted.digest {
+	if copyErr != nil || syncErr != nil || closeErr != nil || copied != info.Size() || hex.EncodeToString(hash.Sum(nil)) != trusted.digest {
 		cleanup()
 		return errors.New("trusted executable changed while staging")
 	}
