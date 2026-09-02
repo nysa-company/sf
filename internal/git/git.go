@@ -46,6 +46,10 @@ var (
 	// The accepted path is one packaged helper configured from code-owned argv;
 	// no ticket, provider, repository config, or caller text may choose it.
 	ErrHTTPSCredentialBoundary = errors.New("HTTPS git publication requires the packaged credential boundary")
+	// ErrPublicationRemoteUnavailable identifies the intentional absence of
+	// every HTTPS publication capability input in a pre-publishing runtime.
+	// It never covers a partial or malformed publication configuration.
+	ErrPublicationRemoteUnavailable = errors.New("GitHub publication remote capability is disabled")
 	// ErrGitHubRefCASUnavailable is returned before any gh command starts. The
 	// GitHub Git Data ref APIs expose create and force/fast-forward update, but
 	// no expected-old-SHA precondition. A read followed by either mutation would
@@ -2741,6 +2745,9 @@ func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error
 		canonical, canonicalErr := safeOrigin(origin)
 		if canonicalErr != nil || canonical != origin {
 			return nil, false, fmt.Errorf("%w: canonical GitHub HTTPS transport is required", ErrIdentityMismatch)
+		}
+		if r.CredentialHelper == "" && r.GHBinary == "" && r.GHBinaryDigest == "" && r.GHConfigDir == "" {
+			return nil, false, ErrPublicationRemoteUnavailable
 		}
 		for _, item := range []struct{ path, name string }{{r.CredentialHelper, "credential helper"}, {r.GHBinary, "gh snapshot"}, {r.GHConfigDir, "gh config directory"}} {
 			if !validAbsolutePath(item.path) {

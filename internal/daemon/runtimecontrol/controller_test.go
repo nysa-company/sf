@@ -110,6 +110,123 @@ func TestInspectTakeoverClassifiesDirtyWorktreeWithoutVerificationAsUnadoptedCha
 	}
 }
 
+func TestInspectTakeoverRetainsDirtyStrictPrePublicationWorktreeWithoutRemoteTransport(t *testing.T) {
+	database, ref, leader, started := controllerFixture(t)
+	ctx := t.Context()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(root, "repository")
+	worktreePath := filepath.Join(root, "worktree")
+	branch := "sf/dev/0123456789abcdef/0123456789abcdef-0123456789abcdef0123456789abcdef"
+	runGit := func(directory string, args ...string) {
+		t.Helper()
+		command := exec.Command("git", append([]string{"-C", directory}, args...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+		}
+	}
+	if err := os.MkdirAll(repository, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGit(repository, "init", "-b", "main")
+	runGit(repository, "config", "user.name", "fixture")
+	runGit(repository, "config", "user.email", "fixture@example.test")
+	if err := os.WriteFile(filepath.Join(repository, "tracked.txt"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(repository, "add", "tracked.txt")
+	runGit(repository, "commit", "-m", "base")
+	// Production accepts this canonical identity during local reauthentication,
+	// but lacks the publication assets that ObservePublicationRemote requires.
+	runGit(repository, "remote", "add", "origin", "https://github.com/nysa-company/sf.git")
+	runGit(repository, "worktree", "add", "-b", branch, worktreePath, "main")
+	worktreePath, err = filepath.EvalSymlinks(worktreePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This deliberately has neither TestLocalTransport nor publication
+	// credentials. The injected local executor supplies the test-only packaged
+	// Git execution boundary without enabling any publication transport.
+	runner := git.Runner{
+		Binary: "/usr/bin/git",
+		Home:   filepath.Join(root, "git-home"),
+		Run: func(ctx context.Context, binary string, argv, env []string) ([]byte, error) {
+			command := exec.CommandContext(ctx, binary, argv...)
+			command.Env = env
+			return command.Output()
+		},
+	}
+	identity, err := runner.Snapshot(ctx, worktreePath, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityJSON, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Path: worktreePath, Branch: branch, IdentityJSON: identityJSON, BaseSHA: identity.BaseHead, HeadSHA: identity.BaseHead}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "operator.txt"), []byte("retained edit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stopping, err := database.TransitionAndInvalidateRunner(ctx, store.Transition{Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateStopping, ResumeState: domain.StatePlanning, Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: `{"intent":"take"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := database.Ticket(ctx, ref)
+	if err != nil || stopped.Version != stopping.Version || stopped.State != domain.StateStopping {
+		t.Fatalf("stopped=%+v transition=%+v err=%v", stopped, stopping, err)
+	}
+	controller, err := New(database, controllerBundle(t), nil, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFallback := func(stage string) contracts.TakeoverInspection {
+		t.Helper()
+		inspection, inspectErr := controller.InspectTakeover(ctx, ref)
+		if inspectErr != nil {
+			t.Fatalf("%s inspect: %v", stage, inspectErr)
+		}
+		if !inspection.Registered || inspection.Clean || inspection.ChangeKind != "unadopted_changes" || len(inspection.ChangedFiles) != 1 || inspection.ChangedFiles[0] != "operator.txt" || inspection.RemoteCandidatePresent || inspection.RemoteCandidateSHA != "" || inspection.RemoteBaseSHA != identity.BaseHead || inspection.RemoteIdentityExact || inspection.HeadSHA != identity.BaseHead {
+			t.Fatalf("%s inspection=%+v", stage, inspection)
+		}
+		return inspection
+	}
+	first := assertFallback("stopping first")
+	_ = assertFallback("stopping replay")
+	registered, err := database.Worktree(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := currentTakeoverRemoteBaseline(registered, git.PublicationRemoteObservation{BaseOID: first.RemoteBaseSHA})
+	drain, err := json.Marshal(map[string]any{"drained": true, "intent": "take", "remote": baseline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CompleteControlTransition(ctx, store.Transition{Ref: ref, ExpectedVersion: stopped.Version, From: domain.StateStopping, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopped.RunnerEpoch}, EventPayload: string(drain)}); err != nil {
+		t.Fatal(err)
+	}
+	paused, err := database.Ticket(ctx, ref)
+	if err != nil || paused.State != domain.StatePaused {
+		t.Fatalf("paused=%+v err=%v", paused, err)
+	}
+	storedBaseline, err := database.OperatorTakeRemoteBaseline(ctx, ref, paused.Version)
+	if err != nil || storedBaseline != baseline {
+		t.Fatalf("stored baseline=%+v want=%+v err=%v", storedBaseline, baseline, err)
+	}
+	_ = assertFallback("paused replay")
+	if err := os.Remove(filepath.Join(worktreePath, "operator.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.InspectTakeover(ctx, ref); err == nil {
+		t.Fatal("clean pre-publication worktree bypassed unavailable remote inspection")
+	}
+}
+
 type controlTickets struct{}
 
 func (controlTickets) ListTickets(context.Context, domain.Channel) ([]store.Ticket, error) {

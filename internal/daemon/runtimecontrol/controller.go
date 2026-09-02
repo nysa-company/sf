@@ -102,8 +102,45 @@ func (c *Controller) InspectTakeover(ctx context.Context, ref domain.TicketRef) 
 		return contracts.TakeoverInspection{}, err
 	}
 	inspection.HeadSHA = changes.Head
+	// Authenticate durable evidence before remote observation. A dirty
+	// worktree that has not crossed the candidate/verification boundary may be
+	// retained by a deliberately pre-publication runtime with no GitHub
+	// transport capability. All other handoffs remain remote-gated.
+	allowedHeads := map[string]struct{}{registered.HeadSHA: {}}
+	candidate, candidateErr := c.store.RecoverableCandidate(ctx, ref)
+	if candidateErr == nil {
+		allowedHeads[candidate.Snapshot.HeadSHA] = struct{}{}
+	} else if !errors.Is(candidateErr, store.ErrNotFound) {
+		return contracts.TakeoverInspection{}, candidateErr
+	}
+	verification, verificationErr := c.store.RecoverableVerification(ctx, ref)
+	if verificationErr == nil {
+		allowedHeads[verification.Checkpoint.CommitOID] = struct{}{}
+		inspection.RetainedProofDigest = verification.Revision.ProofDigest
+		inspection.RetainedPolicyDigest = verification.CommandBinding.PolicyDigest
+		inspection.RetainedVersion = verification.TicketVersion
+		inspection.RetainedLeaderEpoch = verification.Fence.LeaderEpoch
+		inspection.RetainedRunnerEpoch = verification.Fence.RunnerEpoch
+	} else if !errors.Is(verificationErr, store.ErrNotFound) {
+		return contracts.TakeoverInspection{}, verificationErr
+	}
 	remote, err := c.git.ObservePublicationRemote(ctx, worktree)
 	if err != nil || remote.BaseOID == "" {
+		if errors.Is(err, git.ErrPublicationRemoteUnavailable) && errors.Is(candidateErr, store.ErrNotFound) && errors.Is(verificationErr, store.ErrNotFound) && len(changes.Paths) != 0 {
+			prePublication, proofErr := c.store.MergeObservationPrePublication(ctx, ref)
+			if proofErr != nil {
+				return contracts.TakeoverInspection{}, proofErr
+			}
+			if prePublication {
+				// This is the registered expected base, not a remote observation.
+				// It makes the drain event structurally valid while the false
+				// RemoteIdentityExact value keeps provider re-entry remote-gated.
+				inspection.RemoteBaseSHA = registered.BaseSHA
+				inspection.ChangedFiles = append([]string(nil), changes.Paths...)
+				inspection.ChangeKind = "unadopted_changes"
+				return inspection, nil
+			}
+		}
 		if err == nil {
 			err = errors.New("protected remote base is unavailable")
 		}
@@ -117,26 +154,8 @@ func (c *Controller) InspectTakeover(ctx context.Context, ref domain.TicketRef) 
 	// head is valid after it has been recorded. During building, the current
 	// verification checkpoint is the only head from which a dirty source diff
 	// can safely be handed back to the Builder.
-	allowedHeads := map[string]struct{}{registered.HeadSHA: {}}
-	candidate, candidateErr := c.store.RecoverableCandidate(ctx, ref)
-	if candidateErr == nil {
-		allowedHeads[candidate.Snapshot.HeadSHA] = struct{}{}
-	} else if !errors.Is(candidateErr, store.ErrNotFound) {
-		return contracts.TakeoverInspection{}, candidateErr
-	}
 	if remote.Candidate.OID != "" && (candidateErr != nil || remote.Candidate.OID != candidate.Snapshot.HeadSHA) {
 		inspection.RemoteIdentityExact = false
-	}
-	verification, verificationErr := c.store.RecoverableVerification(ctx, ref)
-	if verificationErr == nil {
-		allowedHeads[verification.Checkpoint.CommitOID] = struct{}{}
-		inspection.RetainedProofDigest = verification.Revision.ProofDigest
-		inspection.RetainedPolicyDigest = verification.CommandBinding.PolicyDigest
-		inspection.RetainedVersion = verification.TicketVersion
-		inspection.RetainedLeaderEpoch = verification.Fence.LeaderEpoch
-		inspection.RetainedRunnerEpoch = verification.Fence.RunnerEpoch
-	} else if !errors.Is(verificationErr, store.ErrNotFound) {
-		return contracts.TakeoverInspection{}, verificationErr
 	}
 	ticket, ticketErr := c.store.Ticket(ctx, ref)
 	if ticketErr != nil {

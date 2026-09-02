@@ -1204,6 +1204,17 @@ func TestGitHubHTTPSTransportUsesOnlyPackagedCredentialBridge(t *testing.T) {
 	}
 }
 
+func TestGitHubHTTPSTransportDistinguishesDisabledFromPartialCapability(t *testing.T) {
+	origin := "https://github.com/owner/repository.git"
+	if _, enabled, err := (Runner{}).githubTransportEnvironment(origin); enabled || !errors.Is(err, ErrPublicationRemoteUnavailable) || errors.Is(err, ErrHTTPSCredentialBoundary) {
+		t.Fatalf("disabled HTTPS transport enabled=%v err=%v", enabled, err)
+	}
+	partial := Runner{CredentialHelper: "/tmp/sf-git-credential"}
+	if _, enabled, err := partial.githubTransportEnvironment(origin); enabled || !errors.Is(err, ErrHTTPSCredentialBoundary) || errors.Is(err, ErrPublicationRemoteUnavailable) {
+		t.Fatalf("partial HTTPS transport enabled=%v err=%v", enabled, err)
+	}
+}
+
 func TestGitHubSSHTransportUsesOnlyExactHelperEnvironment(t *testing.T) {
 	root := t.TempDir()
 	runner := Runner{SSHHelper: filepath.Join(root, "sf-ssh"), SSHBinary: filepath.Join(root, "ssh"), SSHKnownHosts: filepath.Join(root, "known-hosts"), SSHAgentSock: filepath.Join(root, "agent.sock"), TestLocalTransport: true}
