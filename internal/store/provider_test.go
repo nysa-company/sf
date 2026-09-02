@@ -367,6 +367,125 @@ func TestProviderRetryEpochsArePhaseScoped(t *testing.T) {
 	}
 }
 
+func TestProviderInvalidArtifactPairPausesWithRepairReasonAndRetries(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-invalid-artifact-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-provider-invalid-artifact-retry", leader)
+	planner, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	fail := func() ProviderAttemptClaim {
+		claim, beginErr := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		if finishErr := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "invalid_artifact", 1, time.Now().UTC()); finishErr != nil {
+			t.Fatal(finishErr)
+		}
+		return claim
+	}
+	first, second := fail(), fail()
+	if first.Input.Repair != nil || second.Input.Repair == nil || second.Input.Repair.PriorAttempt != first.Attempt || second.Input.Repair.PriorRequestDigest != first.RequestDigest {
+		t.Fatalf("invalid-artifact repair pair first=%+v second=%+v", first.Input.Repair, second.Input.Repair)
+	}
+	paused, err := db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw string
+	if err := db.db.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, paused.Version).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var payload providerExhaustionPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil || payload.Reason != providerExhaustionReasonInvalidArtifact {
+		t.Fatalf("invalid-artifact exhaustion payload=%s decoded=%+v err=%v", raw, payload, err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disposition, dispositionErr := db.ProviderRetryDisposition(ctx, ticket); dispositionErr != nil || disposition != ProviderRetryEligible {
+		t.Fatalf("invalid-artifact disposition=%v err=%v", disposition, dispositionErr)
+	}
+	retried, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
+	if err != nil || retried.Version != ticket.Version+1 {
+		t.Fatalf("invalid-artifact retry=%+v err=%v", retried, err)
+	}
+	entry, err := loadProviderPhaseEntryAt(ctx, db.db, ticket.Ref, domain.PhasePlanning, ticket.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, found, err := loadProviderRetryEpochForEntry(ctx, db.db, ticket.Ref, domain.PhasePlanning, entry.Version)
+	if err != nil || !found {
+		t.Fatalf("invalid-artifact epoch=%+v found=%v err=%v", epoch, found, err)
+	}
+	if err := validateProviderRetryAdvance(ctx, db.db, ticket.Ref, domain.PhasePlanning, epoch.ExhaustionVersion-1, epoch.ExhaustionRunner, epoch.ExhaustionLeader, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader); err != nil {
+		t.Fatalf("invalid-artifact retry advance=%v", err)
+	}
+}
+
+func TestProviderInvalidArtifactRepairTamperingRejectsDispositionAndRetry(t *testing.T) {
+	for name, corrupt := range map[string]func(*contracts.PhaseInput){
+		"missing":  func(input *contracts.PhaseInput) { input.Repair = nil },
+		"tampered": func(input *contracts.PhaseInput) { input.Repair.PriorRequestDigest = strings.Repeat("0", 64) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			digest := setupProviderProject(t, db, ctx)
+			leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-invalid-artifact-tamper-"+name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ticket := setupProviderTicket(t, db, ctx, "SF-provider-invalid-artifact-tamper-"+name, leader)
+			planner, _ := setupProviderPair(t, db, ctx)
+			fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+			fail := func() ProviderAttemptClaim {
+				claim, beginErr := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+				if beginErr != nil {
+					t.Fatal(beginErr)
+				}
+				if finishErr := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "invalid_artifact", 1, time.Now().UTC()); finishErr != nil {
+					t.Fatal(finishErr)
+				}
+				return claim
+			}
+			_, second := fail(), fail()
+			paused, err := db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence})
+			if err != nil {
+				t.Fatal(err)
+			}
+			input, err := contracts.DecodeCanonicalPhaseInput(second.RequestPayload)
+			if err != nil || input.Repair == nil {
+				t.Fatalf("repair input=%+v err=%v", input.Repair, err)
+			}
+			corrupt(&input)
+			canonical, requestDigest, err := contracts.CanonicalPhaseInput(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.db.ExecContext(ctx, `DROP TRIGGER provider_attempt_inputs_immutable_update`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.db.ExecContext(ctx, `UPDATE provider_attempt_inputs SET canonical_input=?,request_digest=? WHERE provider_attempt_id=?`, canonical, requestDigest, second.ID); err != nil {
+				t.Fatal(err)
+			}
+			ticket, err = db.Ticket(ctx, ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ProviderRetryDisposition(ctx, ticket); !errors.Is(err, ErrEvidenceConflict) {
+				t.Fatalf("tampered %s disposition=%v", name, err)
+			}
+			if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); !errors.Is(err, ErrEvidenceConflict) {
+				t.Fatalf("tampered %s retry=%v", name, err)
+			}
+		})
+	}
+}
+
 func TestV51BackfillRecognizesOnlyCanonicalRelayPlanningExhaustion(t *testing.T) {
 	db, ctx := openTestStore(t)
 	digest := setupProviderProject(t, db, ctx)

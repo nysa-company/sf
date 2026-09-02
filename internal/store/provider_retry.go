@@ -20,7 +20,13 @@ type providerExhaustionPayload struct {
 	EntryTicketVersion uint64       `json:"entry_ticket_version"`
 	RetryEpoch         int          `json:"retry_epoch"`
 	Attempts           []int        `json:"attempts"`
+	// Reason is Store-derived from the authenticated terminal pair.  Its empty
+	// value preserves the generic failed/cancelled payload used before typed
+	// invalid-artifact repair was introduced.
+	Reason string `json:"reason,omitempty"`
 }
+
+const providerExhaustionReasonInvalidArtifact = "invalid_artifact"
 
 // ProviderRetryDisposition separates generic correction pauses from the two
 // Store-owned provider exhaustion generations. Only Eligible opens capacity;
@@ -351,6 +357,94 @@ func validateProviderPhaseEntryBindings(ctx context.Context, conn *sql.Conn, ref
 	return nil
 }
 
+type providerRetryAttemptPair struct {
+	Attempts [2]int
+	Reason   string
+}
+
+// authenticateProviderRetryAttemptPair is the single authority for a
+// terminal pair that may create or cross a provider-retry epoch.  It starts
+// at the immutable entry binding, then rehydrates each Store-issued claim so
+// the canonical input and every duplicated endpoint fact are checked before
+// a typed invalid-artifact repair marker is trusted.
+func authenticateProviderRetryAttemptPair(ctx context.Context, q rowQueryer, ref domain.TicketRef, phase domain.Phase, entry providerPhaseEntry, first, last int) (providerRetryAttemptPair, error) {
+	if ref.Validate() != nil || phase == "" || entry.Phase != phase || entry.Version == 0 || first <= 0 || last != first+1 {
+		return providerRetryAttemptPair{}, ErrEvidenceConflict
+	}
+	type boundAttempt struct {
+		id      int64
+		role    string
+		attempt int
+	}
+	rows, err := q.QueryContext(ctx, `SELECT provider_attempt_id,role,attempt
+		FROM provider_phase_attempt_entries
+		WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND entry_ticket_version=? AND attempt BETWEEN ? AND ?
+		ORDER BY attempt`, ref.Channel, ref.Project, ref.Ticket, phase, entry.Version, first, last)
+	if err != nil {
+		return providerRetryAttemptPair{}, err
+	}
+	var bound []boundAttempt
+	for rows.Next() {
+		var value boundAttempt
+		if err := rows.Scan(&value.id, &value.role, &value.attempt); err != nil {
+			rows.Close()
+			return providerRetryAttemptPair{}, err
+		}
+		bound = append(bound, value)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return providerRetryAttemptPair{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return providerRetryAttemptPair{}, err
+	}
+	if len(bound) != 2 || bound[0].id <= 0 || bound[1].id <= 0 || bound[0].attempt != first || bound[1].attempt != last || bound[0].role == "" || bound[1].role == "" {
+		return providerRetryAttemptPair{}, ErrEvidenceConflict
+	}
+
+	claims := make([]ProviderAttemptClaim, 2)
+	invalid := make([]bool, 2)
+	for i, value := range bound {
+		claim, err := loadAuthenticatedProviderAttemptClaim(ctx, q, value.id)
+		if err != nil || claim.Ref != ref || claim.Phase != phase || claim.Role != value.role || claim.Attempt != value.attempt || claim.BindingDigest != bindingDigest(claim.Binding) {
+			return providerRetryAttemptPair{}, ErrEvidenceConflict
+		}
+		var attemptState, attemptOutcome, launchState, finishedAt string
+		if err := q.QueryRowContext(ctx, `SELECT state,outcome,launch_state,finished_at FROM provider_attempts WHERE id=?`, claim.ID).Scan(&attemptState, &attemptOutcome, &launchState, &finishedAt); err != nil {
+			return providerRetryAttemptPair{}, err
+		}
+		phaseState, phaseOutcome := "", ""
+		var phaseFinished string
+		if err := q.QueryRowContext(ctx, `SELECT state,outcome,completed_at FROM phase_runs WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND provider=? AND model=? AND family=? AND provider_version=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND worktree_identity=? AND base_sha=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.WorktreeIdentity, claim.BaseSHA).Scan(&phaseState, &phaseOutcome, &phaseFinished); err != nil {
+			return providerRetryAttemptPair{}, err
+		}
+		invalid[i] = attemptState == "failed" && attemptOutcome == providerExhaustionReasonInvalidArtifact && phaseState == "failed" && phaseOutcome == providerExhaustionReasonInvalidArtifact
+		if invalid[i] && (launchState != "drained" || finishedAt == "" || phaseFinished == "") {
+			return providerRetryAttemptPair{}, ErrEvidenceConflict
+		}
+		if !invalid[i] && ((attemptState != "failed" && attemptState != "cancelled") || (attemptOutcome != "failed" && attemptOutcome != "cancelled") || (phaseState != "failed" && phaseState != "cancelled") || (phaseOutcome != "failed" && phaseOutcome != "cancelled")) {
+			return providerRetryAttemptPair{}, ErrEvidenceConflict
+		}
+		claims[i] = claim
+	}
+	var results int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id IN (?,?)`, claims[0].ID, claims[1].ID).Scan(&results); err != nil {
+		return providerRetryAttemptPair{}, err
+	}
+	if results != 0 {
+		return providerRetryAttemptPair{}, ErrEvidenceConflict
+	}
+	pair := providerRetryAttemptPair{Attempts: [2]int{first, last}}
+	if invalid[0] || invalid[1] {
+		if !invalid[0] || !invalid[1] || claims[0].Binding != claims[1].Binding || claims[0].BindingDigest != claims[1].BindingDigest || claims[0].Role != claims[1].Role || claims[0].Ref != claims[1].Ref || claims[0].Phase != claims[1].Phase || claims[0].LeaderEpoch != claims[1].LeaderEpoch || claims[0].RunnerEpoch != claims[1].RunnerEpoch || claims[0].ExpectedVersion != claims[1].ExpectedVersion || claims[0].Repository != claims[1].Repository || claims[0].Worktree != claims[1].Worktree || claims[0].WorktreeIdentity != claims[1].WorktreeIdentity || claims[0].BaseSHA != claims[1].BaseSHA || claims[0].Input.Repair != nil || claims[1].Input.Repair == nil || claims[1].Input.Repair.PriorAttempt != claims[0].Attempt || claims[1].Input.Repair.PriorRequestDigest != claims[0].RequestDigest {
+			return providerRetryAttemptPair{}, ErrEvidenceConflict
+		}
+		pair.Reason = providerExhaustionReasonInvalidArtifact
+	}
+	return pair, nil
+}
+
 func providerRetryDigest(ref domain.TicketRef, epoch providerRetryEpoch) (string, error) {
 	payload := struct {
 		Channel, Project, Ticket  string
@@ -446,7 +540,12 @@ func (s *Store) ProviderRetryDisposition(ctx context.Context, ticket Ticket) (Pr
 	if proof.Phase != phase || proof.EntryTicketVersion == 0 || len(proof.Attempts) != 2 || proof.Attempts[1] != proof.Attempts[0]+1 {
 		return ProviderRetryNotProvider, ErrEvidenceConflict
 	}
-	if entry, entryErr := loadProviderPhaseEntryAt(ctx, s.db, ticket.Ref, phase, proof.EntryTicketVersion); entryErr != nil || entry.Version != proof.EntryTicketVersion || entry.State != ticket.ResumeState {
+	entry, entryErr := loadProviderPhaseEntryAt(ctx, s.db, ticket.Ref, phase, proof.EntryTicketVersion)
+	if entryErr != nil || entry.Version != proof.EntryTicketVersion || entry.State != ticket.ResumeState {
+		return ProviderRetryNotProvider, ErrEvidenceConflict
+	}
+	pair, pairErr := authenticateProviderRetryAttemptPair(ctx, s.db, ticket.Ref, phase, entry, proof.Attempts[0], proof.Attempts[1])
+	if pairErr != nil || pair.Reason != proof.Reason {
 		return ProviderRetryNotProvider, ErrEvidenceConflict
 	}
 	if proof.RetryEpoch == 0 {
@@ -509,13 +608,13 @@ func (s *Store) TransitionProviderExhausted(ctx context.Context, transition Tran
 		if hasEpoch {
 			lower, upper, retryEpoch = epoch.RetryFirst, epoch.RetryLast, 1
 		}
-		query := `SELECT r.attempt,r.state,r.outcome,a.state,a.outcome FROM provider_phase_attempt_entries pe JOIN phase_runs r ON r.channel=pe.channel AND r.project_id=pe.project_id AND r.ticket_id=pe.ticket_id AND r.phase=pe.phase AND r.attempt=pe.attempt JOIN provider_attempts a ON a.id=pe.provider_attempt_id WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=?`
+		query := `SELECT attempt FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND entry_ticket_version=?`
 		args := []any{transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, phase, entry.Version}
 		if hasEpoch {
-			query += ` AND pe.attempt BETWEEN ? AND ?`
+			query += ` AND attempt BETWEEN ? AND ?`
 			args = append(args, lower, upper)
 		}
-		query += ` ORDER BY pe.attempt`
+		query += ` ORDER BY attempt`
 		rows, err := conn.QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
@@ -523,14 +622,9 @@ func (s *Store) TransitionProviderExhausted(ctx context.Context, transition Tran
 		attempts := make([]int, 0, 2)
 		for rows.Next() {
 			var attempt int
-			var runState, runOutcome, attemptState, attemptOutcome string
-			if err := rows.Scan(&attempt, &runState, &runOutcome, &attemptState, &attemptOutcome); err != nil {
+			if err := rows.Scan(&attempt); err != nil {
 				rows.Close()
 				return err
-			}
-			if (runState != "failed" && runState != "cancelled") || (runOutcome != "failed" && runOutcome != "cancelled") || (attemptState != "failed" && attemptState != "cancelled") || (attemptOutcome != "failed" && attemptOutcome != "cancelled") {
-				rows.Close()
-				return ErrEvidenceConflict
 			}
 			attempts = append(attempts, attempt)
 		}
@@ -546,10 +640,11 @@ func (s *Store) TransitionProviderExhausted(ctx context.Context, transition Tran
 				return ErrEvidenceConflict
 			}
 		}
-		var completed, active, activeRuns, leases, gitWriters, commandWriters int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results r JOIN provider_phase_attempt_entries pe ON pe.provider_attempt_id=r.provider_attempt_id WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=? AND pe.attempt BETWEEN ? AND ?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, phase, entry.Version, lower, upper).Scan(&completed); err != nil {
+		pair, err := authenticateProviderRetryAttemptPair(ctx, conn, transition.Ref, phase, entry, lower, upper)
+		if err != nil {
 			return err
 		}
+		var active, activeRuns, leases, gitWriters, commandWriters int
 		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&active); err != nil {
 			return err
 		}
@@ -565,10 +660,10 @@ func (s *Store) TransitionProviderExhausted(ctx context.Context, transition Tran
 		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&commandWriters); err != nil {
 			return err
 		}
-		if completed != 0 || active != 0 || activeRuns != 0 || leases != 0 || gitWriters != 0 || commandWriters != 0 {
+		if active != 0 || activeRuns != 0 || leases != 0 || gitWriters != 0 || commandWriters != 0 {
 			return ErrEvidenceConflict
 		}
-		payload, err := json.Marshal(providerExhaustionPayload{Schema: providerExhaustionSchema, Phase: phase, EntryTicketVersion: entry.Version, RetryEpoch: retryEpoch, Attempts: attempts})
+		payload, err := json.Marshal(providerExhaustionPayload{Schema: providerExhaustionSchema, Phase: phase, EntryTicketVersion: entry.Version, RetryEpoch: retryEpoch, Attempts: pair.Attempts[:], Reason: pair.Reason})
 		if err != nil {
 			return err
 		}
@@ -636,13 +731,11 @@ func (s *Store) TransitionProviderRetry(ctx context.Context, transition Transiti
 		if err != nil || entry.Version != exhaustion.EntryTicketVersion || entry.State != transition.To {
 			return ErrEvidenceConflict
 		}
-		var terminal, results, active, activeRuns, leases, gitWriters, commandWriters int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries pe JOIN phase_runs r ON r.channel=pe.channel AND r.project_id=pe.project_id AND r.ticket_id=pe.ticket_id AND r.phase=pe.phase AND r.attempt=pe.attempt JOIN provider_attempts a ON a.id=pe.provider_attempt_id WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=? AND pe.attempt BETWEEN ? AND ? AND r.state IN ('failed','cancelled') AND r.outcome IN ('failed','cancelled') AND a.state IN ('failed','cancelled') AND a.outcome IN ('failed','cancelled')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, phase, entry.Version, exhaustion.Attempts[0], exhaustion.Attempts[1]).Scan(&terminal); err != nil {
-			return err
+		pair, err := authenticateProviderRetryAttemptPair(ctx, conn, transition.Ref, phase, entry, exhaustion.Attempts[0], exhaustion.Attempts[1])
+		if err != nil || pair.Reason != exhaustion.Reason {
+			return ErrEvidenceConflict
 		}
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results r JOIN provider_phase_attempt_entries pe ON pe.provider_attempt_id=r.provider_attempt_id WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=? AND pe.attempt BETWEEN ? AND ?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, phase, entry.Version, exhaustion.Attempts[0], exhaustion.Attempts[1]).Scan(&results); err != nil {
-			return err
-		}
+		var active, activeRuns, leases, gitWriters, commandWriters int
 		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&active); err != nil {
 			return err
 		}
@@ -658,7 +751,7 @@ func (s *Store) TransitionProviderRetry(ctx context.Context, transition Transiti
 		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&commandWriters); err != nil {
 			return err
 		}
-		if terminal != 2 || results != 0 || active != 0 || activeRuns != 0 || leases != 0 || gitWriters != 0 || commandWriters != 0 {
+		if active != 0 || activeRuns != 0 || leases != 0 || gitWriters != 0 || commandWriters != 0 {
 			return ErrEvidenceConflict
 		}
 		if _, found, err := loadProviderRetryEpochForEntry(ctx, conn, transition.Ref, phase, entry.Version); err != nil || found {
@@ -763,6 +856,14 @@ func validateProviderRetryAdvance(ctx context.Context, q interface {
 	if exhaustionTrigger != "retry_or_correction_exhausted" || exhaustionFrom != providerStateForPhase(phase) || exhaustionTo != domain.StatePaused || json.Unmarshal([]byte(exhaustionRaw), &exhaustion) != nil || exhaustion.Schema != providerExhaustionSchema || exhaustion.Phase != phase || exhaustion.EntryTicketVersion != entry.Version || exhaustion.RetryEpoch != 0 || len(exhaustion.Attempts) != 2 || exhaustion.Attempts[0] != epoch.InitialFirst || exhaustion.Attempts[1] != epoch.InitialLast {
 		return ErrPublicationEvidence
 	}
+	query, ok := q.(rowQueryer)
+	if !ok {
+		return ErrPublicationEvidence
+	}
+	pair, err := authenticateProviderRetryAttemptPair(ctx, query, ref, phase, entry, epoch.InitialFirst, epoch.InitialLast)
+	if err != nil || pair.Reason != exhaustion.Reason {
+		return ErrPublicationEvidence
+	}
 	if err := exactStateChangeEvent(ctx, q, ref, toVersion, "operator_retry", domain.StatePaused, providerStateForPhase(phase)); err != nil {
 		return ErrPublicationEvidence
 	}
@@ -778,16 +879,6 @@ func validateProviderRetryAdvance(ctx context.Context, q interface {
 		RetryEpoch int          `json:"retry_epoch"`
 	}
 	if retryTrigger != "operator_retry" || retryFrom != domain.StatePaused || retryTo != providerStateForPhase(phase) || json.Unmarshal([]byte(retryRaw), &retry) != nil || retry.Schema != providerExhaustionSchema || retry.Phase != phase || retry.RetryEpoch != 1 {
-		return ErrPublicationEvidence
-	}
-	var terminal, results int
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries pe JOIN phase_runs r ON r.channel=pe.channel AND r.project_id=pe.project_id AND r.ticket_id=pe.ticket_id AND r.phase=pe.phase AND r.attempt=pe.attempt JOIN provider_attempts a ON a.id=pe.provider_attempt_id WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=? AND pe.attempt BETWEEN ? AND ? AND r.state IN ('failed','cancelled') AND r.outcome IN ('failed','cancelled') AND a.state IN ('failed','cancelled') AND a.outcome IN ('failed','cancelled')`, ref.Channel, ref.Project, ref.Ticket, phase, entry.Version, epoch.InitialFirst, epoch.InitialLast).Scan(&terminal); err != nil {
-		return err
-	}
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results r JOIN provider_phase_attempt_entries pe ON pe.provider_attempt_id=r.provider_attempt_id WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=? AND pe.attempt BETWEEN ? AND ?`, ref.Channel, ref.Project, ref.Ticket, phase, entry.Version, epoch.InitialFirst, epoch.InitialLast).Scan(&results); err != nil {
-		return err
-	}
-	if terminal != 2 || results != 0 {
 		return ErrPublicationEvidence
 	}
 	return nil
