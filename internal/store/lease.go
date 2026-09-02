@@ -300,6 +300,20 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 			// runner ledger. The surrounding Store write rolls back every ticket
 			// in this startup pass if one is capped.
 			priorLeader := uint64(0)
+			if ticket.state == domain.StateCancelling {
+				if found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
+					priorLeader = latest.LeaderEpoch
+				} else {
+					control, controlFound, controlErr := exactCancellationControlPredecessor(ctx, conn, ref, ticket.version, ticket.runner)
+					if controlErr != nil || !controlFound {
+						return ErrPublicationEvidence
+					}
+					if control.leader >= leaderEpoch {
+						return ErrPublicationEvidence
+					}
+					priorLeader = control.leader
+				}
+			}
 			if ticket.state == domain.StatePublishing {
 				publication, publicationFound, err := loadPublicationEvidenceRow(ctx, conn, ref)
 				if err != nil {

@@ -384,6 +384,137 @@ func prePublicationState(state domain.State) bool {
 	return state == domain.StatePlanning || state == domain.StateVerifying || state == domain.StateBuilding
 }
 
+type stateChangeEvent struct {
+	trigger string
+	from    domain.State
+	to      domain.State
+}
+
+// loadOnlyStateChangeEvent returns the one lifecycle-changing event at a
+// ticket version. Same-state audit events are deliberately ignored; a missing
+// or duplicated lifecycle change is never authority.
+func loadOnlyStateChangeEvent(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, version uint64) (stateChangeEvent, error) {
+	if version == 0 {
+		return stateChangeEvent{}, ErrPublicationEvidence
+	}
+	var count int
+	var event stateChangeEvent
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(trigger),''),COALESCE(MAX(from_state),''),COALESCE(MAX(to_state),'')
+		FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`,
+		ref.Channel, ref.Project, ref.Ticket, version).Scan(&count, &event.trigger, &event.from, &event.to); err != nil || count != 1 || event.trigger == "" || !event.from.Valid() || !event.to.Valid() {
+		return stateChangeEvent{}, ErrPublicationEvidence
+	}
+	return event, nil
+}
+
+// prePublicationControlOriginAt reconstructs only the bounded control shapes
+// that can hide a pre-publication source state. It is intentionally separate
+// from StrictlyPrePublication: rearm authority must not inherit this historical
+// cancellation-only exception.
+func prePublicationControlOriginAt(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, version uint64, state domain.State, depth int) error {
+	if state == domain.StateQueued || prePublicationState(state) {
+		return nil
+	}
+	if version == 0 || depth >= 4 {
+		return ErrPublicationEvidence
+	}
+	event, err := loadOnlyStateChangeEvent(ctx, q, ref, version)
+	if err != nil || event.to != state {
+		return ErrPublicationEvidence
+	}
+	switch state {
+	case domain.StateStopping:
+		if event.trigger != "operator_pause_or_take" || event.from == domain.StateStopping {
+			return ErrPublicationEvidence
+		}
+	case domain.StatePaused:
+		if event.trigger != "needs_operator_input" && event.trigger != "retry_or_correction_exhausted" &&
+			!(event.trigger == "process_and_effects_drained" && event.from == domain.StateStopping) {
+			return ErrPublicationEvidence
+		}
+	case domain.StateBlocked:
+		if event.trigger != "typed_blocker" && !(event.trigger == "operator_resume" && event.from == domain.StatePaused) {
+			return ErrPublicationEvidence
+		}
+	default:
+		return ErrPublicationEvidence
+	}
+	return prePublicationControlOriginAt(ctx, q, ref, version-1, event.from, depth+1)
+}
+
+// exactCancellationControlPredecessor authenticates the Store-owned atomic
+// operator-cancel endpoint before startup appends a new runner-recovery row.
+// It does not decide whether the origin was pre-publication; publication-aware
+// cancellation still needs fencing before it can safely re-observe GitHub.
+func exactCancellationControlPredecessor(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, version, runner uint64) (mutationRevocation, bool, error) {
+	var state string
+	var stop, authority mutationRevocation
+	err := q.QueryRowContext(ctx, `SELECT state,stop_version,stop_leader_epoch,stop_runner_epoch,authority_version,authority_leader_epoch,authority_runner_epoch
+		FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`,
+		ref.Channel, ref.Project, ref.Ticket).Scan(&state, &stop.version, &stop.leader, &stop.runner, &authority.version, &authority.leader, &authority.runner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return mutationRevocation{}, false, nil
+	}
+	if err != nil {
+		return mutationRevocation{}, false, err
+	}
+	if state != "sealed" || stop != authority || authority.version != version || authority.runner != runner || authority.leader == 0 {
+		return mutationRevocation{}, false, nil
+	}
+	event, err := loadOnlyStateChangeEvent(ctx, q, ref, version)
+	if err != nil || event.trigger != "operator_cancel" || event.to != domain.StateCancelling || !runnerInvalidatingCancelSource(event.from) {
+		return mutationRevocation{}, false, ErrPublicationEvidence
+	}
+	return authority, true, nil
+}
+
+// prePublicationCancellationProof follows the durable control endpoint
+// through any signed startup recovery rows and proves that the exact state
+// cancelled by the operator was still on the pre-publication side.
+func prePublicationCancellationProof(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, currentVersion, currentRunner uint64) (bool, error) {
+	var state string
+	var stop, authority mutationRevocation
+	err := q.QueryRowContext(ctx, `SELECT state,stop_version,stop_leader_epoch,stop_runner_epoch,authority_version,authority_leader_epoch,authority_runner_epoch
+		FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`,
+		ref.Channel, ref.Project, ref.Ticket).Scan(&state, &stop.version, &stop.leader, &stop.runner, &authority.version, &authority.leader, &authority.runner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if state != "sealed" || stop != authority || authority.leader == 0 || authority.version == 0 || authority.runner == 0 || authority.version > currentVersion || authority.runner > currentRunner {
+		return false, nil
+	}
+	event, err := loadOnlyStateChangeEvent(ctx, q, ref, authority.version)
+	if err != nil || event.trigger != "operator_cancel" || event.to != domain.StateCancelling || !runnerInvalidatingCancelSource(event.from) {
+		return false, nil
+	}
+	if err := prePublicationControlOriginAt(ctx, q, ref, authority.version-1, event.from, 0); err != nil {
+		return false, nil
+	}
+	if currentVersion == authority.version && currentRunner == authority.runner {
+		return true, nil
+	}
+	var currentLeader uint64
+	if err := q.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ref.Channel).Scan(&currentLeader); err != nil || currentLeader == 0 {
+		return false, err
+	}
+	if err := validateRunnerRecoveryLedger(ctx, q, ref, authority.version, authority.runner, authority.leader, currentVersion, currentRunner, currentLeader); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
 // postPublicationState is the explicit allowlist for a resumed ticket whose
 // durable publication boundary has already been crossed.  Keeping this
 // separate from prePublicationState is important: RecoverAsGuarded and the
@@ -1516,9 +1647,14 @@ func (s *Store) MergeObservationPrePublication(ctx context.Context, ref domain.T
 	if s == nil || ref.Validate() != nil {
 		return false, ErrStaleFence
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	defer tx.Rollback()
 	var ticket Ticket
 	var resume sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT state,resume_state,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&ticket.State, &resume, &ticket.Version, &ticket.RunnerEpoch)
+	err = tx.QueryRowContext(ctx, `SELECT state,resume_state,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&ticket.State, &resume, &ticket.Version, &ticket.RunnerEpoch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, ErrNotFound
 	}
@@ -1530,13 +1666,20 @@ func (s *Store) MergeObservationPrePublication(ctx context.Context, ref domain.T
 		ticket.ResumeState = domain.State(resume.String)
 	}
 	var publication, intents int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND effect_kind NOT IN ('git/create-worktree','git/commit','repository_command')`, ref.Channel, ref.Project, ref.Ticket).Scan(&publication); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND effect_kind NOT IN ('git/create-worktree','git/commit','repository_command')`, ref.Channel, ref.Project, ref.Ticket).Scan(&publication); err != nil {
 		return false, normalizeBusy(ctx, err)
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&intents); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&intents); err != nil {
 		return false, normalizeBusy(ctx, err)
 	}
-	return (TicketControlProof{Ticket: ticket, PublicationOrMergeEffects: publication, MergeIntents: intents}).StrictlyPrePublication(), nil
+	proof := TicketControlProof{Ticket: ticket, PublicationOrMergeEffects: publication, MergeIntents: intents}
+	if proof.StrictlyPrePublication() {
+		return true, nil
+	}
+	if publication != 0 || intents != 0 || ticket.State != domain.StateCancelling || ticket.ResumeState != "" {
+		return false, nil
+	}
+	return prePublicationCancellationProof(ctx, tx, ref, ticket.Version, ticket.RunnerEpoch)
 }
 
 // ControlProof atomically revokes this ticket's current identity and proves

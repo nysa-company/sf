@@ -108,19 +108,23 @@ func validRunnerInvalidatingControlTransition(transition Transition) bool {
 			return false
 		}
 	}
-	cancelState := func(state domain.State) bool {
-		switch state {
-		case domain.StateQueued, domain.StatePlanning, domain.StateVerifying, domain.StateBuilding, domain.StatePublishing, domain.StateWaitingCI, domain.StateReviewing, domain.StateWaitingApproval, domain.StateWaitingManualMerge, domain.StateMerging, domain.StateReconciling, domain.StatePaused, domain.StateBlocked, domain.StateStopping:
-			return true
-		default:
-			return false
-		}
-	}
 	switch transition.Trigger {
 	case "operator_pause_or_take":
 		return transition.To == domain.StateStopping && transition.ResumeState == transition.From && pauseState(transition.From)
 	case "operator_cancel":
-		return transition.To == domain.StateCancelling && transition.ResumeState == "" && cancelState(transition.From)
+		return transition.To == domain.StateCancelling && transition.ResumeState == "" && runnerInvalidatingCancelSource(transition.From)
+	default:
+		return false
+	}
+}
+
+func runnerInvalidatingCancelSource(state domain.State) bool {
+	switch state {
+	case domain.StateQueued, domain.StatePlanning, domain.StateVerifying, domain.StateBuilding,
+		domain.StatePublishing, domain.StateWaitingCI, domain.StateReviewing,
+		domain.StateWaitingApproval, domain.StateWaitingManualMerge, domain.StateMerging,
+		domain.StateReconciling, domain.StatePaused, domain.StateBlocked, domain.StateStopping:
+		return true
 	default:
 		return false
 	}

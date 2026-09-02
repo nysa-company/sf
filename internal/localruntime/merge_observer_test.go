@@ -3,7 +3,9 @@ package localruntime
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -91,6 +93,40 @@ func TestPublishedMergeObserverRequiresPrePublicationProofWhenWitnessIsAbsent(t 
 	storeFake.pre = false
 	if merged, err = (publishedMergeObserver{Store: storeFake, GitHub: publishedObserverFake{}}).MergeObserved(context.Background(), ref); !errors.Is(err, store.ErrPublicationEvidence) || merged {
 		t.Fatalf("effect-before-witness absence merged=%v err=%v", merged, err)
+	}
+}
+
+func TestPublishedMergeObserverAcceptsDurablePrePublicationCancellation(t *testing.T) {
+	ctx := t.Context()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "app", Path: "/tmp/app", BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "app", Ticket: "SF-cancel-observer"}
+	if err := database.CreateTicket(ctx, store.Ticket{
+		Ref: ref, State: domain.StatePlanning, Version: 2, RunnerEpoch: 1,
+		SourceDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Type:         domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "cancel-observer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.TransitionAndInvalidateRunner(ctx, store.Transition{
+		Ref: ref, ExpectedVersion: 2, From: domain.StatePlanning, To: domain.StateCancelling,
+		Trigger: "operator_cancel", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1}, EventPayload: `{"operator":"test"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := (publishedMergeObserver{Store: database, GitHub: publishedObserverFake{}}).MergeObserved(ctx, ref)
+	if err != nil || merged {
+		t.Fatalf("durable pre-publication cancellation merged=%v err=%v", merged, err)
 	}
 }
 
