@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
@@ -50,6 +51,29 @@ type PhaseInput struct {
 	// RequestDigest authenticates this exact launch input. It is issued by the
 	// Store with the provider attempt and is not part of its own digest.
 	RequestDigest string
+	// Repair is an optional Store-issued marker for the one retry immediately
+	// following a fully drained invalid artifact from the same provider and
+	// phase entry. It carries only opaque attempt/input identifiers: never the
+	// previous artifact, transcript, prompt, or credentials.
+	Repair *ProviderRepairContext
+}
+
+// ProviderRepairContext is deliberately small. Its source input digest lets
+// the Store bind a repair request to exactly the failed attempt without
+// exposing any provider output to the next invocation.
+type ProviderRepairContext struct {
+	PriorAttempt       int    `json:"prior_attempt"`
+	PriorRequestDigest string `json:"prior_request_digest"`
+}
+
+// ValidProviderRepairContext is structural validation for a context already
+// authenticated by a PhaseInput digest. Store remains the only component that
+// derives one from durable attempt state.
+func ValidProviderRepairContext(value *ProviderRepairContext) bool {
+	if value == nil || value.PriorAttempt <= 0 || len(value.PriorRequestDigest) != 64 {
+		return false
+	}
+	return strings.ToLower(value.PriorRequestDigest) == value.PriorRequestDigest && strings.Trim(value.PriorRequestDigest, "0123456789abcdef") == ""
 }
 
 // CanonicalPhaseInput returns the stable, complete representation of the

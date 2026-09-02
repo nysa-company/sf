@@ -104,6 +104,32 @@ func TestCodexInvocationUsesBoundedStdinAndPinnedSchema(t *testing.T) {
 	}
 }
 
+func TestCodexInvocationAppendsBoundedRepairInstructionOnlyToDigestBoundInput(t *testing.T) {
+	adapter, _ := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
+	identity, err := adapter.Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := contracts.PhaseInput{Provider: identity, AuthMode: authModeChatGPTSubscription, Phase: domain.PhasePlanning, Worktree: privateDir(t, "repair-worktree"), Prompt: "make a plan", Schema: []byte(`{"type":"object"}`), Repair: &contracts.ProviderRepairContext{PriorAttempt: 1, PriorRequestDigest: strings.Repeat("a", 64)}}
+	_, digest, err := contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.RequestDigest = digest
+	invocation, err := adapter.Invocation(context.Background(), input)
+	if err != nil || string(invocation.Stdin) != input.Prompt+repairInstruction {
+		t.Fatalf("invocation=%+v err=%v", invocation, err)
+	}
+	input.RequestDigest = strings.Repeat("0", 64)
+	if _, err := adapter.Invocation(context.Background(), input); err == nil {
+		t.Fatal("tampered repair input was accepted")
+	}
+	input.RequestDigest = ""
+	if _, err := adapter.Invocation(context.Background(), input); err == nil {
+		t.Fatal("undigested repair input was accepted")
+	}
+}
+
 // TestInstalledCodexExecGuardedConfigParsesWithoutModel exercises the real
 // local CLI parser only. `exec --help` accepts no prompt/stdin and cannot make
 // a model request; this catches config-key drift such as using --profile for a

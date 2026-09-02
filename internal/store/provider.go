@@ -415,6 +415,10 @@ func (s *Store) reuseCurrentCompletedProviderAttempt(ctx context.Context, conn *
 }
 
 func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptRequest) (ProviderAttemptClaim, error) {
+	// Repair context is Store authority, not a caller launch parameter. Clear
+	// any proposed value before admission; a qualifying retry below receives a
+	// fresh marker derived from the immutable prior attempt instead.
+	r.Input.Repair = nil
 	if r.Ref.Validate() != nil || !validProviderPhase(r.Phase) || !validProviderRole(r.Role) || r.ExpectedVersion == 0 || r.Fence.LeaderEpoch == 0 || r.Fence.RunnerEpoch == 0 || r.Capacity < 1 || r.Capacity > 16 || r.At.IsZero() || !validRuntimeBinding(r.Binding) || !validProviderAttemptInput(r) {
 		return ProviderAttemptClaim{}, ErrProviderAttempt
 	}
@@ -551,6 +555,11 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		}
 		prior++ // globally monotonic per ticket+phase, independent of entry.
 		launchInput := r.Input
+		repair, err := providerRepairContextForRetry(ctx, conn, r, entry, entryRuns)
+		if err != nil {
+			return err
+		}
+		launchInput.Repair = repair
 		launchInput.Ticket, launchInput.Phase = r.Ref, r.Phase
 		launchInput.Provider, launchInput.AuthMode = r.Binding.Identity, r.Binding.AuthMode
 		launchInput.Attempt, launchInput.LeaderEpoch, launchInput.RunnerEpoch, launchInput.ExpectedVersion = prior, r.Fence.LeaderEpoch, r.Fence.RunnerEpoch, r.ExpectedVersion
@@ -594,6 +603,39 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		return nil
 	})
 	return claim, err
+}
+
+// providerRepairContextForRetry derives the sole repair marker from the
+// previous attempt in this exact immutable phase entry. It intentionally does
+// not read provider output: the next provider needs only the fact that a
+// schema-invalid response was drained, not any potentially unsafe content.
+func providerRepairContextForRetry(ctx context.Context, conn *sql.Conn, r ProviderAttemptRequest, entry providerPhaseEntry, entryRuns int) (*contracts.ProviderRepairContext, error) {
+	if entryRuns != 1 {
+		return nil, nil
+	}
+	var priorAttempt int
+	var priorDigest string
+	err := conn.QueryRowContext(ctx, `SELECT a.attempt,i.request_digest
+		FROM provider_phase_attempt_entries pe
+		JOIN provider_attempts a ON a.id=pe.provider_attempt_id
+		JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id
+		JOIN phase_runs pr ON pr.channel=pe.channel AND pr.project_id=pe.project_id AND pr.ticket_id=pe.ticket_id AND pr.phase=pe.phase AND pr.attempt=pe.attempt
+		WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase=? AND pe.entry_ticket_version=?
+		AND a.role=? AND a.provider=? AND a.model=? AND a.family=? AND a.version=?
+		AND a.state='failed' AND a.outcome='invalid_artifact' AND a.launch_state='drained'
+		AND pr.state='failed' AND pr.outcome='invalid_artifact'
+		ORDER BY a.attempt DESC LIMIT 1`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, entry.Version, r.Role, r.Binding.Identity.Provider, r.Binding.Identity.Model, r.Binding.Identity.Family, r.Binding.Identity.Version).Scan(&priorAttempt, &priorDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	context := &contracts.ProviderRepairContext{PriorAttempt: priorAttempt, PriorRequestDigest: priorDigest}
+	if !contracts.ValidProviderRepairContext(context) {
+		return nil, ErrEvidenceConflict
+	}
+	return context, nil
 }
 
 func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, state, outcome string, usage int64, finished time.Time) error {
@@ -1635,6 +1677,9 @@ func validProviderAttemptInput(r ProviderAttemptRequest) bool {
 func validPhaseInputForAttempt(r ProviderAttemptRequest, attempt int) bool {
 	in := r.Input
 	if in.Ticket != r.Ref || in.Phase != r.Phase || in.Attempt != attempt || in.LeaderEpoch != r.Fence.LeaderEpoch || in.RunnerEpoch != r.Fence.RunnerEpoch || in.ExpectedVersion != r.ExpectedVersion || in.Provider != r.Binding.Identity || in.AuthMode != r.Binding.AuthMode || in.Repository != r.Repository || in.Worktree != r.Worktree || in.WorktreeIdentity != r.WorktreeIdentity || in.BaseSHA != r.BaseSHA || in.Profile != contracts.ProfileGuarded || (attempt == 0 && in.RequestDigest != "") || strings.TrimSpace(in.Prompt) == "" || len(in.Prompt) > 64<<10 || strings.ContainsRune(in.Prompt, '\x00') || in.Timeout <= 0 || in.Timeout > 45*time.Minute || len(in.Schema) == 0 || len(in.Schema) > 1<<20 || !json.Valid(in.Schema) {
+		return false
+	}
+	if in.Repair != nil && !contracts.ValidProviderRepairContext(in.Repair) {
 		return false
 	}
 	if len(in.AllowedPaths) == 0 || len(in.AllowedPaths) > 256 {

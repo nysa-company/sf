@@ -1106,6 +1106,36 @@ func TestProviderAttemptLaunchInputIsAppendOnly(t *testing.T) {
 	}
 }
 
+func TestBeginProviderAttemptDerivesBoundedRepairContextAfterDrainedInvalidArtifact(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, _ := db.AcquireLeader(ctx, domain.ChannelDev, "repair-context")
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-repair-context", leader), leader, domain.StatePlanning)
+	planner, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	request := supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})
+	// Store ignores caller-supplied repair data; only durable prior state can
+	// add a marker to the issued input.
+	request.Input.Repair = &contracts.ProviderRepairContext{PriorAttempt: 99, PriorRequestDigest: strings.Repeat("f", 64)}
+	first, err := db.BeginProviderAttempt(ctx, request)
+	if err != nil || first.Input.Repair != nil {
+		t.Fatalf("first claim=%+v err=%v", first, err)
+	}
+	if err := db.FinishProviderAttempt(ctx, first, proof(t, first), ticket.Version, fence, "failed", "invalid_artifact", 1, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.BeginProviderAttempt(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Input.Repair == nil || second.Input.Repair.PriorAttempt != first.Attempt || second.Input.Repair.PriorRequestDigest != first.RequestDigest || !contracts.PhaseInputDigestMatches(second.Input, second.RequestDigest) {
+		t.Fatalf("repair context=%+v second=%+v", second.Input.Repair, second)
+	}
+	if strings.Contains(string(second.RequestPayload), "artifact") || strings.Contains(string(second.RequestPayload), "transcript") {
+		t.Fatalf("repair context exposed provider output: %s", second.RequestPayload)
+	}
+}
+
 func TestBeginProviderAttemptRejectsInvalidDirectLaunchInput(t *testing.T) {
 	for name, mutate := range map[string]func(*ProviderAttemptRequest){
 		"prompt":   func(r *ProviderAttemptRequest) { r.Input.Prompt = " " },

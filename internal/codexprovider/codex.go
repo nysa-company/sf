@@ -35,9 +35,10 @@ import (
 )
 
 const (
-	maxProbeOutput = 16 << 10
-	maxJSONL       = 64 << 10
-	maxEvents      = 256
+	maxProbeOutput    = 16 << 10
+	maxJSONL          = 64 << 10
+	maxEvents         = 256
+	repairInstruction = "\n\nRepair instruction: a prior attempt by this same provider for this exact phase entry was fully drained after its final artifact failed validation. Retry the task and return only a final artifact that strictly satisfies the supplied output schema. Do not quote, reproduce, or rely on prior artifact content."
 )
 
 var (
@@ -340,12 +341,16 @@ func (a *Adapter) Invocation(_ context.Context, input contracts.PhaseInput) (con
 	if input.Worktree == "" || !filepath.IsAbs(input.Worktree) || filepath.Clean(input.Worktree) != input.Worktree || input.Worktree == "/" {
 		return contracts.Invocation{}, errors.New("Codex worktree must be an absolute clean path")
 	}
-	if len(input.Prompt) == 0 || len(input.Prompt) > 64<<10 || strings.ContainsRune(input.Prompt, '\x00') || len(input.Schema) == 0 || len(input.Schema) > 1<<20 || !json.Valid(input.Schema) || (input.RequestDigest != "" && !contracts.PhaseInputDigestMatches(input, input.RequestDigest)) {
+	if len(input.Prompt) == 0 || len(input.Prompt) > 64<<10 || strings.ContainsRune(input.Prompt, '\x00') || len(input.Schema) == 0 || len(input.Schema) > 1<<20 || !json.Valid(input.Schema) || (input.RequestDigest != "" && !contracts.PhaseInputDigestMatches(input, input.RequestDigest)) || (input.Repair != nil && (input.RequestDigest == "" || !contracts.ValidProviderRepairContext(input.Repair))) {
 		return contracts.Invocation{}, errors.New("Codex phase input is invalid")
 	}
 	parent, workspaceAccess, ok := permissionProfileForPhase(input.Phase)
 	if !ok {
 		return contracts.Invocation{}, errors.New("Codex phase has no supported sandbox")
+	}
+	prompt := input.Prompt
+	if input.Repair != nil {
+		prompt += repairInstruction
 	}
 	// `-` is the documented exec stdin prompt marker. The argv is fixed except
 	// for supervisor-owned private output paths and the authenticated worktree;
@@ -353,7 +358,7 @@ func (a *Adapter) Invocation(_ context.Context, input contracts.PhaseInput) (con
 	// profile is deliberately code-owned, not project/user configuration.
 	return contracts.Invocation{
 		Argv:               codexArgv(a.executable, a.model, input.Worktree, parent, workspaceAccess),
-		Stdin:              []byte(input.Prompt),
+		Stdin:              []byte(prompt),
 		OutputSchema:       append([]byte(nil), input.Schema...),
 		CaptureLastMessage: true,
 		AuthHome:           a.authHome,
