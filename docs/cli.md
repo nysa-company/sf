@@ -63,7 +63,7 @@ semantics. A next action always contains a non-empty argv.
 
 ## Direct setup and diagnostics
 
-`doctor`, `auth status`, `auth login`, and `init` are direct local
+`doctor`, `auth status`, `auth login`, `init`, and `config apply` are direct local
 setup/diagnostic commands. `providers qualify` is an authenticated local-daemon
 operation because a passing result must carry the current supervisor's
 signature. `init` is implemented: it validates an
@@ -75,6 +75,14 @@ normal form never writes into the repository or contacts a remote. An explicit
 the missing `.sf/config.toml` for one selected bounded pure-kernel test; it
 never overwrites an existing config. See
 [`configuration.md`](configuration.md).
+
+`config apply --project <name>` freezes one next immutable configuration
+generation from the registered repository's current optional config source and
+the selected channel's machine policy. It is local-only, does not require a
+daemon, never writes `.sf/config.toml`, and affects queued work only when that
+work later starts; active tickets retain their existing frozen snapshot. v1
+generations are forward-only: applying an older snapshot is refused rather
+than repointing the project to historical configuration.
 
 The pure TypeScript recipe requires Node `>=22.8.0 <23` from the supported
 Homebrew entrypoint for the host: `/opt/homebrew/bin/node` on Apple Silicon or

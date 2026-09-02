@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/domain"
 )
 
@@ -689,8 +690,9 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 
 // LeaseRequest describes one capacity dimension. Resource names are durable
 // semantic identities such as "machine", a canonical project ID, or a
-// qualified provider/version. Capacity is resolved from the frozen ticket
-// configuration before this boundary is called.
+// qualified provider/version. Generic callers provide already-resolved
+// capacities; production queued-ticket admission resolves its immutable
+// project generation inside StartWithProjectOwnership's transaction.
 type LeaseRequest struct {
 	Scope    string
 	Resource string
@@ -703,6 +705,19 @@ type Lease struct {
 	ScopeKey    string
 	RunnerEpoch uint64
 	AcquiredAt  time.Time
+}
+
+type startAdmission struct {
+	requests []LeaseRequest
+	project  *Project
+}
+
+// SetProjectStartOwnershipHookForTest installs a deterministic test hook. It
+// must not be used by production callers.
+func (s *Store) SetProjectStartOwnershipHookForTest(hook func()) {
+	s.faultMu.Lock()
+	s.startProjectOwnershipHook = hook
+	s.faultMu.Unlock()
 }
 
 // StartWithOwnership admits a queued ticket, reserves every capacity
@@ -723,8 +738,59 @@ func (s *Store) StartWithOwnership(ctx context.Context, ref domain.TicketRef, ex
 	if at.IsZero() {
 		return Ticket{}, false, errors.New("start time is required")
 	}
+	return s.startWithOwnership(ctx, ref, expectedVersion, fence, workflowID, at, func(context.Context, *sql.Conn) (startAdmission, error) {
+		return startAdmission{requests: requests}, nil
+	})
+}
+
+// StartWithProjectOwnership is the production queued-ticket admission
+// boundary. It resolves the current immutable project generation and derives
+// its global/project lease capacities inside the same IMMEDIATE transaction
+// that reserves those slots and freezes the snapshot onto the ticket. A
+// concurrent config apply therefore either happens first (and its tighter
+// capacity is used) or happens after this start (and the ticket retains the
+// earlier generation); it can never mix generation N+1 with generation N's
+// capacity.
+func (s *Store) StartWithProjectOwnership(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, workflowID string, at time.Time) (Ticket, bool, error) {
+	if err := ref.Validate(); err != nil {
+		return Ticket{}, false, err
+	}
+	if workflowID == "" || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
+		return Ticket{}, false, errors.New("workflow identity and fence are required")
+	}
+	if at.IsZero() {
+		return Ticket{}, false, errors.New("start time is required")
+	}
+	s.faultMu.RLock()
+	hook := s.startProjectOwnershipHook
+	s.faultMu.RUnlock()
+	if hook != nil {
+		hook()
+	}
+	return s.startWithOwnership(ctx, ref, expectedVersion, fence, workflowID, at, func(ctx context.Context, conn *sql.Conn) (startAdmission, error) {
+		project, err := loadCurrentProjectConfiguration(ctx, conn, ref.Channel, ref.Project)
+		if err != nil {
+			return startAdmission{}, err
+		}
+		requests, err := projectStartLeaseRequests(ctx, conn, project, ref)
+		if err != nil {
+			return startAdmission{}, err
+		}
+		if project.ConfigGeneration == 0 {
+			// There is intentionally no configuration row to CAS for the exact
+			// legacy tuple. Preserve its historical empty ticket snapshot while
+			// using the default capacities derived above. Once config apply
+			// bootstraps generation one, every future admission takes the fully
+			// bound configured branch below.
+			return startAdmission{requests: requests}, nil
+		}
+		return startAdmission{requests: requests, project: &project}, nil
+	})
+}
+
+func (s *Store) startWithOwnership(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, workflowID string, at time.Time, resolve func(context.Context, *sql.Conn) (startAdmission, error)) (Ticket, bool, error) {
 	observed := false
-	err = s.write(ctx, func(conn *sql.Conn) error {
+	err := s.write(ctx, func(conn *sql.Conn) error {
 		var state domain.State
 		var version, runner uint64
 		var persistedWorkflow string
@@ -746,7 +812,11 @@ func (s *Store) StartWithOwnership(ctx context.Context, ref domain.TicketRef, ex
 			if state != domain.StateQueued || version != expectedVersion {
 				return fmt.Errorf("%w: state=%s", ErrStartState, state)
 			}
-			for _, request := range requests {
+			admission, err := resolve(ctx, conn)
+			if err != nil {
+				return err
+			}
+			for _, request := range admission.requests {
 				lease, ok, err := acquireLease(ctx, conn, ref, runner, request, at.UTC())
 				if err != nil {
 					return err
@@ -756,13 +826,26 @@ func (s *Store) StartWithOwnership(ctx context.Context, ref domain.TicketRef, ex
 				}
 				_ = lease
 			}
-			updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state='planning', version=version+1, workflow_id=?,
-				config_generation=(SELECT current_config_generation FROM projects WHERE channel=? AND id=?),
-				config_digest=COALESCE((SELECT c.digest FROM projects p JOIN project_configurations c ON c.channel=p.channel AND c.project_id=p.id AND c.generation=p.current_config_generation WHERE p.channel=? AND p.id=?), ''),
-				config_snapshot_bytes=COALESCE((SELECT c.snapshot_bytes FROM projects p JOIN project_configurations c ON c.channel=p.channel AND c.project_id=p.id AND c.generation=p.current_config_generation WHERE p.channel=? AND p.id=?), X'')
-				WHERE channel=? AND project_id=? AND id=? AND state='queued' AND version=? AND runner_epoch=?`, workflowID,
-				ref.Channel, ref.Project, ref.Channel, ref.Project, ref.Channel, ref.Project,
-				ref.Channel, ref.Project, ref.Ticket, expectedVersion, runner)
+			var updated sql.Result
+			if admission.project != nil {
+				updated, err = conn.ExecContext(ctx, `UPDATE tickets SET state='planning', version=version+1, workflow_id=?,
+					config_generation=?, config_digest=?, config_snapshot_bytes=?
+					WHERE channel=? AND project_id=? AND id=? AND state='queued' AND version=? AND runner_epoch=?
+					AND EXISTS (SELECT 1 FROM projects p JOIN project_configurations c
+						ON c.channel=p.channel AND c.project_id=p.id AND c.generation=p.current_config_generation
+						WHERE p.channel=? AND p.id=? AND p.current_config_generation=? AND c.digest=? AND c.snapshot_bytes=?)`, workflowID,
+					admission.project.ConfigGeneration, admission.project.ConfigDigest, admission.project.ConfigSnapshot,
+					ref.Channel, ref.Project, ref.Ticket, expectedVersion, runner,
+					ref.Channel, ref.Project, admission.project.ConfigGeneration, admission.project.ConfigDigest, admission.project.ConfigSnapshot)
+			} else {
+				updated, err = conn.ExecContext(ctx, `UPDATE tickets SET state='planning', version=version+1, workflow_id=?,
+					config_generation=(SELECT current_config_generation FROM projects WHERE channel=? AND id=?),
+					config_digest=COALESCE((SELECT c.digest FROM projects p JOIN project_configurations c ON c.channel=p.channel AND c.project_id=p.id AND c.generation=p.current_config_generation WHERE p.channel=? AND p.id=?), ''),
+					config_snapshot_bytes=COALESCE((SELECT c.snapshot_bytes FROM projects p JOIN project_configurations c ON c.channel=p.channel AND c.project_id=p.id AND c.generation=p.current_config_generation WHERE p.channel=? AND p.id=?), X'')
+					WHERE channel=? AND project_id=? AND id=? AND state='queued' AND version=? AND runner_epoch=?`, workflowID,
+					ref.Channel, ref.Project, ref.Channel, ref.Project, ref.Channel, ref.Project,
+					ref.Channel, ref.Project, ref.Ticket, expectedVersion, runner)
+			}
 			if err != nil {
 				return err
 			}
@@ -796,6 +879,104 @@ func (s *Store) StartWithOwnership(ctx context.Context, ref domain.TicketRef, ex
 	}
 	result, err := s.Ticket(ctx, ref)
 	return result, observed, err
+}
+
+func loadCurrentProjectConfiguration(ctx context.Context, conn *sql.Conn, channel domain.Channel, id domain.ProjectID) (Project, error) {
+	project := Project{Channel: channel, ID: id}
+	err := conn.QueryRowContext(ctx, `SELECT p.canonical_path,p.base_ref,p.current_config_generation,
+		COALESCE(c.digest,''),COALESCE(c.snapshot_bytes,X'')
+		FROM projects p LEFT JOIN project_configurations c
+		ON c.channel=p.channel AND c.project_id=p.id AND c.generation=p.current_config_generation
+		WHERE p.channel=? AND p.id=?`, channel, id).Scan(&project.Path, &project.BaseRef, &project.ConfigGeneration, &project.ConfigDigest, &project.ConfigSnapshot)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Project{}, ErrNotFound
+	}
+	if err != nil {
+		return Project{}, err
+	}
+	return project, nil
+}
+
+func projectStartLeaseRequests(ctx context.Context, conn *sql.Conn, project Project, ref domain.TicketRef) ([]LeaseRequest, error) {
+	if project.ConfigGeneration == 0 && project.ConfigDigest == "" && len(project.ConfigSnapshot) == 0 {
+		// A legacy pointer can mean either a deliberately unconfigured project
+		// or a malformed/dangling generation history. Only the former keeps its
+		// historic default admission behavior; a row at any generation makes the
+		// empty current pointer contradictory and fail-closed.
+		var generations int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_configurations WHERE channel=? AND project_id=?`, project.Channel, project.ID).Scan(&generations); err != nil {
+			return nil, err
+		}
+		if generations != 0 {
+			return nil, ErrProjectConflict
+		}
+		// Pre-generation registrations remain readable during a rolling v1
+		// upgrade. Their historical start contract used the conservative local
+		// defaults; config apply can bootstrap generation one before any later
+		// ticket needs a reviewed immutable snapshot.
+		defaults := config.DefaultMachineLimits()
+		return validateLeaseRequests([]LeaseRequest{
+			{Scope: "global", Resource: "machine", Capacity: defaults.MaxConcurrentTickets},
+			{Scope: "project", Resource: string(ref.Project), Capacity: defaults.MaxConcurrentTickets},
+		})
+	}
+	if project.ConfigGeneration == 0 || project.ConfigDigest == "" || len(project.ConfigSnapshot) == 0 {
+		return nil, ErrProjectConflict
+	}
+	effective, err := config.DecodeSnapshot(project.ConfigSnapshot, project.ConfigDigest)
+	if err != nil {
+		return nil, err
+	}
+	if effective.Name != string(project.ID) || effective.Repository != project.Path || effective.BaseBranch != project.BaseRef {
+		return nil, ErrProjectConflict
+	}
+	return validateLeaseRequests([]LeaseRequest{
+		{Scope: "global", Resource: "machine", Capacity: effective.Machine.MaxConcurrentTickets},
+		{Scope: "project", Resource: string(ref.Project), Capacity: effective.MaxConcurrentTickets},
+	})
+}
+
+// StartPreflight authenticates the current project configuration and reports
+// whether a queued ticket could presently obtain every required local slot.
+// It is an advisory read: StartWithProjectOwnership re-derives the same
+// generation and capacities inside its IMMEDIATE transaction before changing
+// the ticket. Keeping validation here makes malformed legacy generation-zero
+// history fail before daemon state-machine admission as well.
+func (s *Store) StartPreflight(ctx context.Context, ref domain.TicketRef) (Project, bool, error) {
+	if err := ref.Validate(); err != nil {
+		return Project{}, false, err
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return Project{}, false, normalizeBusy(ctx, err)
+	}
+	defer conn.Close()
+	project, err := loadCurrentProjectConfiguration(ctx, conn, ref.Channel, ref.Project)
+	if err != nil {
+		return Project{}, false, normalizeBusy(ctx, err)
+	}
+	requests, err := projectStartLeaseRequests(ctx, conn, project, ref)
+	if err != nil {
+		return Project{}, false, normalizeBusy(ctx, err)
+	}
+	for _, request := range requests {
+		available := false
+		for slot := 0; slot < request.Capacity; slot++ {
+			var occupied int
+			err := conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM leases WHERE channel=? AND scope=? AND scope_key=?)`, ref.Channel, request.Scope, leaseKey(request.Resource, slot)).Scan(&occupied)
+			if err != nil {
+				return Project{}, false, normalizeBusy(ctx, err)
+			}
+			if occupied == 0 {
+				available = true
+				break
+			}
+		}
+		if !available {
+			return project, false, nil
+		}
+	}
+	return project, true, nil
 }
 
 // AcquireLeases admits a ticket to every requested capacity dimension in one

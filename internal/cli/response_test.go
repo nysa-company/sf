@@ -31,7 +31,7 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 		"blocked_process": ExitAction, "uncertain_effect": ExitAction, "external_merge_observed": ExitAction,
 		"invalid_transition": ExitAction, "control_drain_failed": ExitAction, "control_completion_failed": ExitAction,
 		"not_configured": ExitAction, "doctor_not_configured": ExitAction, "doctor_failed": ExitAction,
-		"project_conflict": ExitAction, "init_failed": ExitAction, "unknown_project": ExitAction,
+		"project_conflict": ExitAction, "init_failed": ExitAction, "config_apply_failed": ExitAction, "unknown_project": ExitAction,
 		"doctor_required": ExitAction, "start_refused": ExitAction, "submit_refused": ExitAction,
 		"terminal_replay_requires_new": ExitAction, "not_ready": ExitAction, "runtime_activation_failed": ExitAction,
 		"runtime_already_active": ExitAction, "runtime_rearm_unavailable": ExitAction,

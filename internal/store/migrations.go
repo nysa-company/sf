@@ -1299,3 +1299,19 @@ var migrationV51 = []string{
 	`CREATE TRIGGER provider_retry_epochs_immutable_update BEFORE UPDATE ON provider_retry_epochs BEGIN SELECT RAISE(ABORT,'provider retry epoch is immutable'); END`,
 	`CREATE TRIGGER provider_retry_epochs_immutable_delete BEFORE DELETE ON provider_retry_epochs BEGIN SELECT RAISE(ABORT,'provider retry epoch is append-only'); END`,
 }
+
+// v52 makes configuration history and its project pointer append-only. The
+// application already advances the pointer by inserting the next generation
+// in the same transaction; these triggers make that invariant hold for every
+// SQLite writer, including maintenance tools and privileged SQL callers.
+var migrationV52 = []string{
+	`CREATE TRIGGER project_configurations_immutable_update BEFORE UPDATE ON project_configurations BEGIN SELECT RAISE(ABORT,'project configuration generation is immutable'); END`,
+	`CREATE TRIGGER project_configurations_immutable_delete BEFORE DELETE ON project_configurations BEGIN SELECT RAISE(ABORT,'project configuration history is append-only'); END`,
+	`CREATE TRIGGER projects_config_generation_forward BEFORE UPDATE OF current_config_generation ON projects
+	WHEN NEW.current_config_generation != OLD.current_config_generation
+	 AND (NEW.current_config_generation != OLD.current_config_generation + 1
+	      OR NOT EXISTS (SELECT 1 FROM project_configurations
+	                     WHERE channel=NEW.channel AND project_id=NEW.id
+	                       AND generation=NEW.current_config_generation))
+	BEGIN SELECT RAISE(ABORT,'project configuration generation must advance one step to an existing generation'); END`,
+}

@@ -87,9 +87,38 @@ The generated profile also sets `phase_timeout = "60s"`, matching the
 supervisor's one-minute admission bound for pure commands.
 The first registration is immutable generation 1: rerunning the exact command
 only confirms an identical registration, while a changed config, repository,
-or profile is refused as a project conflict. Editing a config file cannot alter
-an active ticket; use a separately supported configuration-generation operation
-when one is introduced.
+or profile is refused as a project conflict. To freeze a reviewed current
+configuration for future starts, use the direct local command:
+
+```text
+sf-dev config apply --project nysa
+```
+
+It reads the registered repository's optional `.sf/config.toml` (or its
+authenticated absence) and the selected channel's current `machine.toml`,
+then atomically appends generation 2, 3, and so on. It never creates or edits
+the repository config, never retargets the registered repository or base
+branch, and preserves earlier generations. Repeating it with the current exact
+snapshot is an observed replay. A queued ticket snapshots whichever generation
+is current when it first enters planning; an already active ticket keeps its
+previous frozen bytes. This is the supported way to narrow a channel to one
+concurrent future ticket by setting `max_concurrent_tickets = 1` in the
+channel-local machine file and applying the project configuration.
+
+`init` and `config apply` coordinate through an owner-local advisory lock on
+the authenticated repository root, followed by the optional `.sf` lock. This
+serializes supported local sf operations; it does not claim to defeat a
+hostile same-UID process outside the documented trusted-local boundary.
+`machine.toml` is sampled and validated immediately before the generation
+transaction. An edit made after that sample is intentionally not folded into
+the in-flight snapshot; it is considered by the next `config apply`.
+
+Configuration generations are forward-only in v1. `config apply` refuses an
+older historical snapshot instead of rolling the project pointer backward. To
+change policy again, make a new reviewed configuration generation; rollback is
+not a supported local operation. A legacy registration that has generation
+zero and no configuration history can be safely bootstrapped once to generation
+one; contradictory partial history is refused.
 
 For the Docker/Colima-free Nysa API compatibility slice, the only TypeScript
 command shape is a typed recipe. Its path is frozen into the ticket

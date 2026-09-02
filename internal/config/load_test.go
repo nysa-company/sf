@@ -141,6 +141,24 @@ func TestEnsureNysaPureConfigRejectsProfileAndPathAmbiguity(t *testing.T) {
 	}
 }
 
+func TestPrepareProjectConfigAuthenticatesOptionalFileStateWithoutCreatingIt(t *testing.T) {
+	repository := t.TempDir()
+	plan, err := PrepareProjectConfig(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	if _, err := os.Lstat(filepath.Join(repository, ".sf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("prepare created .sf: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(repository, ".sf"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.ValidateUnchanged(); err == nil {
+		t.Fatal("configuration appearance during apply was accepted")
+	}
+}
+
 func TestNysaPureBootstrapLockSerializesAndRollsBackOnlyItsInstall(t *testing.T) {
 	repository := t.TempDir()
 	testPath := "apps/api/tests/kernel.test.ts"

@@ -1232,32 +1232,17 @@ func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ do
 	// planning ticket is a replay observation and does not select a second
 	// transition.
 	if stored.State == domain.StateQueued {
-		project, err := daemon.store.Project(ctx, daemon.channel, ref.Project)
+		project, capacityAvailable, err := daemon.store.StartPreflight(ctx, ref)
 		if err != nil {
-			return daemon.failure(request, "unknown_project", "ticket project is not registered", false)
-		}
-		globalCapacity, projectCapacity, err := leaseCapacities(project)
-		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return daemon.failure(request, "unknown_project", "ticket project is not registered", false)
+			}
 			return daemon.failure(request, "invalid_configuration", "the durable project configuration is invalid", false)
 		}
 		doctorGreen := true
 		if daemon.doctor != nil {
 			doctorGreen = daemon.doctor(ctx, project) == nil
 		}
-		globalUsed, projectUsed := 0, 0
-		leases, err := daemon.store.Leases(ctx, daemon.channel)
-		if err != nil {
-			return daemon.failure(request, "capacity_unavailable", "capacity could not be checked", errors.Is(err, store.ErrBusy))
-		}
-		for _, lease := range leases {
-			if lease.Scope == "global" {
-				globalUsed++
-			}
-			if lease.Scope == "project" && lease.Ref.Project == ref.Project {
-				projectUsed++
-			}
-		}
-		capacityAvailable := globalUsed < globalCapacity && projectUsed < projectCapacity
 		if _, err := daemon.spec.Select(string(stored.State), "operator_start", map[string]bool{"doctor_preflight_green": doctorGreen, "capacity_available": capacityAvailable}); err != nil {
 			if !doctorGreen {
 				return daemon.failure(request, "doctor_required", "local doctor preflight is not green", false)
@@ -1265,16 +1250,8 @@ func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ do
 			return daemon.failure(request, "capacity_unavailable", "local capacity is already reserved", true)
 		}
 	}
-	project, err := daemon.store.Project(ctx, daemon.channel, ref.Project)
-	if err != nil {
-		return daemon.failure(request, "unknown_project", "ticket project is not registered", false)
-	}
-	globalCapacity, projectCapacity, err := leaseCapacities(project)
-	if err != nil {
-		return daemon.failure(request, "invalid_configuration", "the durable project configuration is invalid", false)
-	}
 	workflowID := fmt.Sprintf("%s/%s/%s/planning", daemon.channel, ref.Project, ref.Ticket)
-	started, observed, err := daemon.store.StartWithOwnership(ctx, ref, stored.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, workflowID, []store.LeaseRequest{{Scope: "global", Resource: "machine", Capacity: globalCapacity}, {Scope: "project", Resource: string(ref.Project), Capacity: projectCapacity}}, daemon.clock.Now().UTC())
+	started, observed, err := daemon.store.StartWithProjectOwnership(ctx, ref, stored.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, workflowID, daemon.clock.Now().UTC())
 	if err != nil {
 		code := "start_refused"
 		if errors.Is(err, store.ErrLeaseCapacity) {

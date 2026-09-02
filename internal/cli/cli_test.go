@@ -33,6 +33,29 @@ func TestPrimaryCommandsAndSecondarySetupCommandsExist(t *testing.T) {
 	}
 }
 
+func TestConfigApplyCommandExists(t *testing.T) {
+	command := NewCommand(nil, &bytes.Buffer{}, &bytes.Buffer{})
+	var configCommandFound bool
+	for _, child := range command.Commands() {
+		if child.Name() != "config" {
+			continue
+		}
+		configCommandFound = true
+		var applyFound bool
+		for _, nested := range child.Commands() {
+			if nested.Name() == "apply" {
+				applyFound = true
+			}
+		}
+		if !applyFound {
+			t.Fatal("config apply command is missing")
+		}
+	}
+	if !configCommandFound {
+		t.Fatal("config command is missing")
+	}
+}
+
 func TestRootHelpUsesTheSelectedChannelBinary(t *testing.T) {
 	for _, test := range []struct {
 		channel domain.Channel

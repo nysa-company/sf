@@ -65,7 +65,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 51
+const schemaVersion = 52
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -119,6 +119,7 @@ var migrationChecksums = map[int]string{
 	49: migrationChecksum(migrationV49),
 	50: migrationChecksum(migrationV50),
 	51: migrationChecksum(migrationV51),
+	52: migrationChecksum(migrationV52),
 }
 
 func migrationChecksum(statements []string) string {
@@ -138,7 +139,10 @@ type Store struct {
 	faultMu        sync.RWMutex
 	writeFault     func() error
 	ciConsumeFault func(string) error
-	mutations      *ExternalMutationGate
+	// startProjectOwnershipHook is package-test-only synchronization for the
+	// external-preflight to atomic-admission boundary.
+	startProjectOwnershipHook func()
+	mutations                 *ExternalMutationGate
 	// controlProofHook is package-test-only synchronization for proving the
 	// Store control/admission linearization.
 	controlProofHook func()
@@ -189,6 +193,19 @@ type Project struct {
 	ConfigGeneration uint64
 	ConfigDigest     string
 	ConfigSnapshot   []byte
+}
+
+// ProjectConfiguration is a proposed next immutable configuration generation.
+// Path and BaseRef repeat the registration identity intentionally: the Store
+// compares them in the same transaction before it advances the project
+// pointer, so configuration apply can never double as a repository retarget.
+type ProjectConfiguration struct {
+	Channel  domain.Channel
+	Project  domain.ProjectID
+	Path     string
+	BaseRef  string
+	Digest   string
+	Snapshot []byte
 }
 
 type Ticket struct {
@@ -500,6 +517,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV50
 			} else if version == 51 {
 				statements = migrationV51
+			} else if version == 52 {
+				statements = migrationV52
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -650,6 +669,117 @@ func (s *Store) RegisterProject(ctx context.Context, project Project) (bool, err
 		return nil
 	})
 	return created, err
+}
+
+// ApplyProjectConfiguration appends one next immutable configuration
+// generation and atomically advances the project's current pointer. Existing
+// tickets are deliberately not rewritten: a queued ticket snapshots this
+// pointer only when it first starts, while active tickets already carry their
+// own frozen bytes.
+//
+// Reapplying the current exact snapshot is an observed replay. A snapshot that
+// existed in an older generation is not silently repointed or duplicated; the
+// project_configurations uniqueness constraint keeps the generation history
+// monotonic and append-only.
+func (s *Store) ApplyProjectConfiguration(ctx context.Context, proposal ProjectConfiguration) (Project, bool, error) {
+	if err := validateProjectConfiguration(proposal); err != nil {
+		return Project{}, false, err
+	}
+	var result Project
+	observed := false
+	err := s.write(ctx, func(conn *sql.Conn) error {
+		result = Project{Channel: proposal.Channel, ID: proposal.Project}
+		var currentDigest string
+		var currentSnapshot []byte
+		err := conn.QueryRowContext(ctx, `SELECT p.canonical_path, p.base_ref, p.current_config_generation,
+			COALESCE(c.digest, ''), COALESCE(c.snapshot_bytes, X'')
+			FROM projects p LEFT JOIN project_configurations c
+			ON c.channel=p.channel AND c.project_id=p.id AND c.generation=p.current_config_generation
+			WHERE p.channel=? AND p.id=?`, proposal.Channel, proposal.Project).Scan(
+			&result.Path, &result.BaseRef, &result.ConfigGeneration, &currentDigest, &currentSnapshot,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if result.Path != proposal.Path || result.BaseRef != proposal.BaseRef {
+			return ErrProjectConflict
+		}
+		if result.ConfigGeneration != 0 && (currentDigest == "" || len(currentSnapshot) == 0) {
+			return ErrProjectConflict
+		}
+		if result.ConfigGeneration != 0 && currentDigest == proposal.Digest && bytes.Equal(currentSnapshot, proposal.Snapshot) {
+			result.ConfigDigest = currentDigest
+			result.ConfigSnapshot = append([]byte(nil), currentSnapshot...)
+			observed = true
+			return nil
+		}
+		if result.ConfigGeneration == ^uint64(0) {
+			return fmt.Errorf("project configuration generation overflow")
+		}
+		if result.ConfigGeneration == 0 {
+			// A legacy registration with no configuration rows can be upgraded
+			// safely by appending its first immutable generation. Any dangling
+			// history is contradictory and must not be silently adopted.
+			var generations int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_configurations WHERE channel=? AND project_id=?`, proposal.Channel, proposal.Project).Scan(&generations); err != nil {
+				return err
+			}
+			if generations != 0 {
+				return ErrProjectConflict
+			}
+		}
+		var priorGeneration uint64
+		err = conn.QueryRowContext(ctx, `SELECT generation FROM project_configurations
+			WHERE channel=? AND project_id=? AND digest=?`, proposal.Channel, proposal.Project, proposal.Digest).Scan(&priorGeneration)
+		if err == nil {
+			return ErrProjectConflict
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		next := result.ConfigGeneration + 1
+		if _, err := conn.ExecContext(ctx, `INSERT INTO project_configurations(channel, project_id, generation, digest, snapshot_bytes, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)`, proposal.Channel, proposal.Project, next, proposal.Digest, proposal.Snapshot, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+		updated, err := conn.ExecContext(ctx, `UPDATE projects SET current_config_generation=?
+			WHERE channel=? AND id=? AND current_config_generation=?`, next, proposal.Channel, proposal.Project, result.ConfigGeneration)
+		if err != nil {
+			return err
+		}
+		if changed, _ := updated.RowsAffected(); changed != 1 {
+			return ErrBusy
+		}
+		result.ConfigGeneration = next
+		result.ConfigDigest = proposal.Digest
+		result.ConfigSnapshot = append([]byte(nil), proposal.Snapshot...)
+		return nil
+	})
+	return result, observed, err
+}
+
+func validateProjectConfiguration(proposal ProjectConfiguration) error {
+	if !proposal.Channel.Valid() || proposal.Project == "" || proposal.Path == "" || proposal.BaseRef == "" {
+		return errors.New("configuration channel, project, path, and base ref are required")
+	}
+	if len(proposal.Snapshot) == 0 || len(proposal.Snapshot) > config.MaxFileBytes {
+		return errors.New("complete project configuration snapshot is required")
+	}
+	digest := sha256.Sum256(proposal.Snapshot)
+	if proposal.Digest != hex.EncodeToString(digest[:]) {
+		return errors.New("project configuration digest does not match snapshot")
+	}
+	effective, err := config.DecodeSnapshot(proposal.Snapshot, proposal.Digest)
+	if err != nil {
+		return fmt.Errorf("project configuration snapshot is invalid: %w", err)
+	}
+	if effective.Name != string(proposal.Project) || effective.Repository != proposal.Path || effective.BaseBranch != proposal.BaseRef {
+		return errors.New("project configuration snapshot does not match immutable registration identity")
+	}
+	return nil
 }
 
 func validateProjectRegistration(project Project, requireSnapshot bool) error {

@@ -742,6 +742,61 @@ func TestDaemonAdmissionUsesConfiguredTwoTicketDefault(t *testing.T) {
 	}
 }
 
+func TestDaemonStartRefusesDanglingLegacyConfigurationHistory(t *testing.T) {
+	d, paths, _ := testDaemon(t)
+	writer, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	// Simulate malformed generation-zero history written by a pre-v51
+	// database. Current databases reject this rollback at the trigger, but the
+	// daemon must still fail closed while upgrading an already inconsistent
+	// legacy database.
+	if _, err := writer.ExecContext(context.Background(), `DROP TRIGGER projects_config_generation_forward`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.ExecContext(context.Background(), `UPDATE projects SET current_config_generation=0 WHERE channel=? AND id=?`, d.channel, "demo"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.ExecContext(context.Background(), `CREATE TRIGGER projects_config_generation_forward BEFORE UPDATE OF current_config_generation ON projects
+		WHEN NEW.current_config_generation != OLD.current_config_generation
+		 AND (NEW.current_config_generation != OLD.current_config_generation + 1
+		      OR NOT EXISTS (SELECT 1 FROM project_configurations
+		                     WHERE channel=NEW.channel AND project_id=NEW.id
+		                       AND generation=NEW.current_config_generation))
+		BEGIN SELECT RAISE(ABORT,'project configuration generation must advance one step to an existing generation'); END`); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: d.channel, Project: "demo", Ticket: "SF-dangling-legacy-config"}
+	if err := d.store.CreateTicket(context.Background(), store.Ticket{Ref: ref, SourceDigest: "dangling-legacy-config", Type: domain.TicketBug, MergeMode: domain.MergeGuarded}); err != nil {
+		t.Fatal(err)
+	}
+	var eventsBefore int
+	if err := writer.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&eventsBefore); err != nil {
+		t.Fatal(err)
+	}
+	response := d.Handle(context.Background(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{Version: api.Version, RequestID: "dangling-legacy-start", Method: "ticket.start", Ticket: string(ref.Ticket), Parameters: json.RawMessage(`{"channel":"stable","project":"demo"}`)})
+	if response.OK || response.Error == nil || response.Error.Code != "invalid_configuration" || response.Mutation.Attempted {
+		t.Fatalf("dangling legacy start response=%+v", response)
+	}
+	after, err := d.store.Ticket(context.Background(), ref)
+	if err != nil || after.State != domain.StateQueued || after.ConfigGeneration != 0 || len(after.ConfigSnapshot) != 0 {
+		t.Fatalf("dangling daemon admission mutated ticket=%+v err=%v", after, err)
+	}
+	leases, err := d.store.Leases(context.Background(), d.channel)
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("dangling daemon admission leases=%+v err=%v", leases, err)
+	}
+	var owners, events int
+	if err := writer.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM workflow_owners WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&owners); err != nil || owners != 0 {
+		t.Fatalf("dangling daemon admission owners=%d err=%v", owners, err)
+	}
+	if err := writer.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&events); err != nil || events != eventsBefore {
+		t.Fatalf("dangling daemon admission events before=%d after=%d err=%v", eventsBefore, events, err)
+	}
+}
+
 func TestDaemonLogsReturnBoundedRedactedDurableEvents(t *testing.T) {
 	d, paths, _ := testDaemon(t)
 	started := createAndStartControlTicket(t, d, "SF-logs")

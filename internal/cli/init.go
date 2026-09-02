@@ -41,6 +41,10 @@ type initResult struct {
 	Created       bool             `json:"created"`
 }
 
+// afterInitConfigInstall is test-only coordination while a newly created
+// profile file and its enclosing root/.sf locks are still held.
+var afterInitConfigInstall func()
+
 // RunInit is the direct local setup path. It never contacts the daemon or a
 // remote. The explicit profile form may create the requested repository
 // configuration; all other setup remains owner-local.
@@ -71,23 +75,25 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 	if err := config.PrepareChannel(paths); err != nil {
 		return initFailure("init_failed", "channel state could not be prepared: "+err.Error(), []string{binary, "doctor"}, false)
 	}
-	machine, err := config.LoadMachine(paths.Machine)
-	if err != nil {
-		return initFailure("invalid_configuration", err.Error(), initHelp, false)
-	}
-	configPlan, err := config.PrepareNysaPureConfig(repository, request.Profile, request.TestPath)
+	configPlan, err := config.PrepareNysaPureConfigContext(ctx, repository, request.Profile, request.TestPath)
 	if err != nil {
 		return initFailure("invalid_configuration", err.Error(), initHelp, false)
 	}
 	defer configPlan.Close()
+	machine, err := config.LoadMachine(paths.Machine)
+	if err != nil {
+		return initFailure("invalid_configuration", err.Error(), initHelp, false)
+	}
+	loadLocked := func() (config.Effective, []byte, string, error) {
+		if len(configPlan.Encoded) > 0 && !configPlan.Existing {
+			return configPlan.LoadLockedProject(request.Project, machine, &configPlan.Commands)
+		}
+		return configPlan.LoadLockedProject(request.Project, machine, nil)
+	}
 	var effective config.Effective
 	var snapshot []byte
 	var digest string
-	if len(configPlan.Encoded) > 0 && !configPlan.Existing {
-		effective, snapshot, digest, err = config.LoadProjectWithCommands(repository, request.Project, machine, configPlan.Commands)
-	} else {
-		effective, snapshot, digest, err = config.LoadProject(repository, request.Project, machine)
-	}
+	effective, snapshot, digest, err = loadLocked()
 	if err != nil {
 		next := initHelp
 		if errors.Is(err, config.ErrCommandDetection) {
@@ -110,6 +116,9 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 		}
 		return initFailure("init_failed", "profile configuration could not be installed: "+err.Error(), []string{binary, "init", "--project", request.Project, "--repo", repository}, true)
 	}
+	if configCreated && afterInitConfigInstall != nil {
+		afterInitConfigInstall()
+	}
 	registrationConfirmed := false
 	defer func() {
 		if configCreated && !registrationConfirmed {
@@ -119,19 +128,13 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 	if err := configPlan.ValidateUnchanged(); err != nil {
 		return initFailure("init_failed", "profile configuration changed during initialization; registration was not committed: "+err.Error(), []string{binary, "init", "--project", request.Project, "--repo", repository}, true)
 	}
-	if request.Profile != "" {
-		// Re-read the authoritative project document while the profile's
-		// canonical .sf lock is still held. The bytes registered below therefore
-		// describe the same config admission that Install/ValidateUnchanged just
-		// authenticated.
-		if len(configPlan.Encoded) > 0 && !configPlan.Existing {
-			effective, snapshot, digest, err = configPlan.LoadLockedProject(request.Project, machine, &configPlan.Commands)
-		} else {
-			effective, snapshot, digest, err = configPlan.LoadLockedProject(request.Project, machine, nil)
-		}
-		if err != nil {
-			return initFailure("invalid_configuration", "profile configuration could not be re-read under initialization lock: "+err.Error(), initHelp, true)
-		}
+	// Re-read the authoritative project document while the canonical root/.sf
+	// lock remains held. The bytes registered below therefore describe the same
+	// source admission that Install/ValidateUnchanged authenticated, for both
+	// ordinary optional config and explicit profile setup.
+	effective, snapshot, digest, err = loadLocked()
+	if err != nil {
+		return initFailure("invalid_configuration", "project configuration could not be re-read under initialization lock: "+err.Error(), initHelp, true)
 	}
 	created, err := database.RegisterProject(ctx, store.Project{
 		Channel: request.Channel, ID: domain.ProjectID(request.Project), Path: repository, BaseRef: effective.BaseBranch,

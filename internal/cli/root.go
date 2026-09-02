@@ -70,7 +70,7 @@ func (a *app) command() *cobra.Command {
 	root.SetErr(a.errOut)
 	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) { a.ctx = cmd.Context() }
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "render the versioned JSON response")
-	root.AddCommand(a.submitCommand(), a.startCommand(), a.statusCommand(), a.showCommand(), a.logsCommand(), a.controlCommand("pause"), a.controlCommand("resume"), a.recoverCommand(), a.controlCommand("cancel"), a.retryCommand(), a.controlCommand("take"), a.approveCommand(), a.rejectCommand(), a.doctorCommand(), a.authCommand(), a.initCommand(), a.providersCommand(), a.daemonCommand(), a.simpleSetupCommand("config"), a.simpleSetupCommand("update"), a.simpleSetupCommand("rollback"), a.versionCommand())
+	root.AddCommand(a.submitCommand(), a.startCommand(), a.statusCommand(), a.showCommand(), a.logsCommand(), a.controlCommand("pause"), a.controlCommand("resume"), a.recoverCommand(), a.controlCommand("cancel"), a.retryCommand(), a.controlCommand("take"), a.approveCommand(), a.rejectCommand(), a.doctorCommand(), a.authCommand(), a.initCommand(), a.providersCommand(), a.daemonCommand(), a.configCommand(), a.simpleSetupCommand("update"), a.simpleSetupCommand("rollback"), a.versionCommand())
 	return root
 }
 
@@ -470,6 +470,18 @@ func (a *app) initCommand() *cobra.Command {
 	_ = command.MarkFlagRequired("project")
 	_ = command.MarkFlagRequired("repo")
 	return command
+}
+
+func (a *app) configCommand() *cobra.Command {
+	root := &cobra.Command{Use: "config", Args: cobra.NoArgs}
+	var project string
+	apply := &cobra.Command{Use: "apply --project <name>", Short: "freeze the current project configuration for future ticket starts", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		return a.emit(RunConfigApply(cmd.Context(), ConfigApplyRequest{Channel: a.channel, Project: project}))
+	}}
+	apply.Flags().StringVar(&project, "project", "", "registered project name")
+	_ = apply.MarkFlagRequired("project")
+	root.AddCommand(apply)
+	return root
 }
 
 func (a *app) providersCommand() *cobra.Command {

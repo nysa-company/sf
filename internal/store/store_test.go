@@ -955,6 +955,326 @@ func TestRegisterProjectIsExactIdempotentAndSnapshotsOnStart(t *testing.T) {
 	}
 }
 
+func TestApplyProjectConfigurationSnapshotsOnlyWhenQueuedWorkStarts(t *testing.T) {
+	database, ctx := openTestStore(t)
+	project, err := database.Project(ctx, domain.ChannelDev, "nysa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeRef := domain.TicketRef{Channel: domain.ChannelDev, Project: project.ID, Ticket: "SF-config-active"}
+	queuedRef := domain.TicketRef{Channel: domain.ChannelDev, Project: project.ID, Ticket: "SF-config-queued"}
+	if err := database.CreateTicket(ctx, ticket(activeRef, "config-active")); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateTicket(ctx, ticket(queuedRef, "config-queued")); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "config-apply-daemon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeQueued, err := database.Ticket(ctx, activeRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := database.StartOrAdopt(ctx, activeRef, activeQueued.Version, "sf/dev/nysa/SF-config-active", domain.Fence{LeaderEpoch: leader, RunnerEpoch: activeQueued.RunnerEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.ConfigGeneration != 1 {
+		t.Fatalf("active generation=%d, want 1", active.ConfigGeneration)
+	}
+	proposal := nextProjectConfiguration(t, project, 1)
+	applied, observed, err := database.ApplyProjectConfiguration(ctx, proposal)
+	if err != nil || observed || applied.ConfigGeneration != 2 {
+		t.Fatalf("apply=%+v observed=%v err=%v", applied, observed, err)
+	}
+	activeAfter, err := database.Ticket(ctx, activeRef)
+	if err != nil || activeAfter.ConfigGeneration != 1 || !bytes.Equal(activeAfter.ConfigSnapshot, active.ConfigSnapshot) {
+		t.Fatalf("active after=%+v err=%v", activeAfter, err)
+	}
+	queued, err := database.Ticket(ctx, queuedRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.ConfigGeneration != 0 || len(queued.ConfigSnapshot) != 0 {
+		t.Fatalf("queued ticket snapped before start: %+v", queued)
+	}
+	started, observed, err := database.StartWithProjectOwnership(ctx, queuedRef, queued.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: queued.RunnerEpoch}, "sf/dev/nysa/SF-config-queued/planning", time.Now().UTC())
+	if err != nil || observed {
+		t.Fatalf("queued production start=%+v observed=%v err=%v", started, observed, err)
+	}
+	if started.ConfigGeneration != 2 || started.ConfigDigest != proposal.Digest || !bytes.Equal(started.ConfigSnapshot, proposal.Snapshot) {
+		t.Fatalf("queued start config=%+v", started)
+	}
+	frozen, err := config.DecodeSnapshot(started.ConfigSnapshot, started.ConfigDigest)
+	if err != nil || frozen.MaxConcurrentTickets != 1 {
+		t.Fatalf("started capacity=%d err=%v", frozen.MaxConcurrentTickets, err)
+	}
+}
+
+func TestApplyProjectConfigurationIsAtomicIdempotentAndSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sf.sqlite")
+	database, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := testConfigurationProject(t, "apply", "/tmp/apply", 2)
+	if err := database.CreateProject(ctx, project); err != nil {
+		t.Fatal(err)
+	}
+	proposal := nextProjectConfiguration(t, project, 1)
+	type result struct {
+		project  Project
+		observed bool
+		err      error
+	}
+	results := make(chan result, 2)
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			value, observed, err := database.ApplyProjectConfiguration(ctx, proposal)
+			results <- result{project: value, observed: observed, err: err}
+		}()
+	}
+	group.Wait()
+	close(results)
+	observedCount := 0
+	for value := range results {
+		if value.err != nil || value.project.ConfigGeneration != 2 {
+			t.Fatalf("concurrent apply=%+v", value)
+		}
+		if value.observed {
+			observedCount++
+		}
+	}
+	if observedCount != 1 {
+		t.Fatalf("observed concurrent applies=%d, want 1", observedCount)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	loaded, err := reopened.Project(ctx, project.Channel, project.ID)
+	if err != nil || loaded.ConfigGeneration != 2 || loaded.ConfigDigest != proposal.Digest || !bytes.Equal(loaded.ConfigSnapshot, proposal.Snapshot) {
+		t.Fatalf("reopened project=%+v err=%v", loaded, err)
+	}
+	var generations int
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_configurations WHERE channel=? AND project_id=?`, project.Channel, project.ID).Scan(&generations); err != nil || generations != 2 {
+		t.Fatalf("generations=%d err=%v", generations, err)
+	}
+	baseRetarget := nextProjectConfigurationWithBase(t, project, "trunk")
+	if _, _, err := reopened.ApplyProjectConfiguration(ctx, baseRetarget); !errors.Is(err, ErrProjectConflict) {
+		t.Fatalf("base retarget error=%v", err)
+	}
+	if _, _, err := reopened.ApplyProjectConfiguration(ctx, ProjectConfiguration{
+		Channel: project.Channel, Project: project.ID, Path: project.Path, BaseRef: project.BaseRef,
+		Digest: project.ConfigDigest, Snapshot: project.ConfigSnapshot,
+	}); !errors.Is(err, ErrProjectConflict) {
+		t.Fatalf("older generation rollback error=%v, want %v", err, ErrProjectConflict)
+	}
+	stillCurrent, err := reopened.Project(ctx, project.Channel, project.ID)
+	if err != nil || stillCurrent.ConfigGeneration != 2 || stillCurrent.ConfigDigest != proposal.Digest {
+		t.Fatalf("rollback changed current project=%+v err=%v", stillCurrent, err)
+	}
+}
+
+func TestApplyProjectConfigurationBootstrapsLegacyGenerationZero(t *testing.T) {
+	database, ctx := openTestStore(t)
+	legacy := Project{Channel: domain.ChannelDev, ID: "legacy", Path: "/tmp/legacy", BaseRef: "main"}
+	if err := database.CreateProject(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, legacy.Channel, "legacy-config-daemon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRef := domain.TicketRef{Channel: legacy.Channel, Project: legacy.ID, Ticket: "SF-legacy-default"}
+	if err := database.CreateTicket(ctx, ticket(legacyRef, "legacy-default")); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := database.Ticket(ctx, legacyRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, observed, err := database.StartWithProjectOwnership(ctx, legacyRef, queued.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: queued.RunnerEpoch}, "sf/dev/legacy/SF-legacy-default/planning", time.Now().UTC())
+	if err != nil || observed || started.ConfigGeneration != 0 || started.ConfigDigest != "" || len(started.ConfigSnapshot) != 0 {
+		t.Fatalf("legacy default admission=%+v observed=%v err=%v", started, observed, err)
+	}
+	proposal := nextProjectConfiguration(t, testConfigurationProject(t, "legacy", "/tmp/legacy", 1), 1)
+	applied, observed, err := database.ApplyProjectConfiguration(ctx, proposal)
+	if err != nil || observed || applied.ConfigGeneration != 1 || applied.ConfigDigest != proposal.Digest {
+		t.Fatalf("bootstrap applied=%+v observed=%v err=%v", applied, observed, err)
+	}
+	replay, observed, err := database.ApplyProjectConfiguration(ctx, proposal)
+	if err != nil || !observed || replay.ConfigGeneration != 1 {
+		t.Fatalf("bootstrap replay=%+v observed=%v err=%v", replay, observed, err)
+	}
+	var generations int
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_configurations WHERE channel=? AND project_id=?`, legacy.Channel, legacy.ID).Scan(&generations); err != nil || generations != 1 {
+		t.Fatalf("legacy generations=%d err=%v", generations, err)
+	}
+}
+
+func TestStartWithProjectOwnershipRejectsDanglingLegacyGenerationHistory(t *testing.T) {
+	database, ctx := openTestStore(t)
+	legacy := Project{Channel: domain.ChannelDev, ID: "legacy-dangling", Path: "/tmp/legacy-dangling", BaseRef: "main"}
+	if err := database.CreateProject(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	proposal := nextProjectConfiguration(t, testConfigurationProject(t, "legacy-dangling", "/tmp/legacy-dangling", 1), 1)
+	if _, err := database.db.ExecContext(ctx, `INSERT INTO project_configurations(channel,project_id,generation,digest,snapshot_bytes,created_at) VALUES(?,?,?,?,?,?)`, proposal.Channel, proposal.Project, 1, proposal.Digest, proposal.Snapshot, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, legacy.Channel, "legacy-dangling-daemon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: legacy.Channel, Project: legacy.ID, Ticket: "SF-legacy-dangling"}
+	if err := database.CreateTicket(ctx, ticket(ref, "legacy-dangling")); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventsBefore int
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&eventsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := database.StartWithProjectOwnership(ctx, ref, queued.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: queued.RunnerEpoch}, "sf/dev/legacy-dangling/SF-legacy-dangling/planning", time.Now().UTC()); !errors.Is(err, ErrProjectConflict) {
+		t.Fatalf("dangling legacy start error=%v, want %v", err, ErrProjectConflict)
+	}
+	after, err := database.Ticket(ctx, ref)
+	if err != nil || after.State != domain.StateQueued || after.Version != queued.Version || after.ConfigGeneration != 0 || len(after.ConfigSnapshot) != 0 {
+		t.Fatalf("dangling admission mutated ticket=%+v err=%v", after, err)
+	}
+	var leases, owners, events int
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&leases); err != nil || leases != 0 {
+		t.Fatalf("dangling admission leases=%d err=%v", leases, err)
+	}
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM workflow_owners WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&owners); err != nil || owners != 0 {
+		t.Fatalf("dangling admission owners=%d err=%v", owners, err)
+	}
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&events); err != nil || events != eventsBefore {
+		t.Fatalf("dangling admission events=%d before=%d err=%v", events, eventsBefore, err)
+	}
+}
+
+func TestStartWithProjectOwnershipUsesOneAtomicConfigurationGenerationForCapacity(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "sf.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	project := testConfigurationProject(t, "capacity", "/tmp/capacity", 2)
+	if err := database.CreateProject(ctx, project); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "capacity-daemon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRef := domain.TicketRef{Channel: domain.ChannelDev, Project: project.ID, Ticket: "SF-capacity-first"}
+	secondRef := domain.TicketRef{Channel: domain.ChannelDev, Project: project.ID, Ticket: "SF-capacity-second"}
+	if err := database.CreateTicket(ctx, ticket(firstRef, "capacity-first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateTicket(ctx, ticket(secondRef, "capacity-second")); err != nil {
+		t.Fatal(err)
+	}
+	firstQueued, err := database.Ticket(ctx, firstRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, observed, err := database.StartWithProjectOwnership(ctx, firstRef, firstQueued.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: firstQueued.RunnerEpoch}, "sf/dev/capacity/SF-capacity-first/planning", time.Now().UTC())
+	if err != nil || observed || first.ConfigGeneration != 1 {
+		t.Fatalf("first=%+v observed=%v err=%v", first, observed, err)
+	}
+	proposal := nextProjectConfiguration(t, project, 1)
+	database.SetProjectStartOwnershipHookForTest(func() {
+		database.SetProjectStartOwnershipHookForTest(nil)
+		if _, observed, err := database.ApplyProjectConfiguration(ctx, proposal); err != nil || observed {
+			t.Errorf("concurrent config apply observed=%v err=%v", observed, err)
+		}
+	})
+	t.Cleanup(func() { database.SetProjectStartOwnershipHookForTest(nil) })
+	secondQueued, err := database.Ticket(ctx, secondRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := database.StartWithProjectOwnership(ctx, secondRef, secondQueued.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: secondQueued.RunnerEpoch}, "sf/dev/capacity/SF-capacity-second/planning", time.Now().UTC()); !errors.Is(err, ErrLeaseCapacity) {
+		t.Fatalf("start mixed generation/capacity error=%v, want %v", err, ErrLeaseCapacity)
+	}
+	queued, err := database.Ticket(ctx, secondRef)
+	if err != nil || queued.State != domain.StateQueued || queued.ConfigGeneration != 0 || len(queued.ConfigSnapshot) != 0 {
+		t.Fatalf("failed admission mutated queued ticket=%+v err=%v", queued, err)
+	}
+	current, err := database.Project(ctx, project.Channel, project.ID)
+	if err != nil || current.ConfigGeneration != 2 || current.ConfigDigest != proposal.Digest {
+		t.Fatalf("current project=%+v err=%v", current, err)
+	}
+}
+
+func testConfigurationProject(t *testing.T, id, path string, capacity int) Project {
+	t.Helper()
+	effectiveProject := config.DefaultProject(id, path)
+	effectiveProject.MaxConcurrentTickets = capacity
+	effective, err := config.Resolve(config.DefaultMachineLimits(), effectiveProject, config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Project{Channel: domain.ChannelDev, ID: domain.ProjectID(id), Path: path, BaseRef: effective.BaseBranch, ConfigGeneration: 1, ConfigDigest: digest, ConfigSnapshot: snapshot}
+}
+
+func nextProjectConfiguration(t *testing.T, project Project, capacity int) ProjectConfiguration {
+	t.Helper()
+	effective, err := config.DecodeSnapshot(project.ConfigSnapshot, project.ConfigDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective.Project.MaxConcurrentTickets = capacity
+	resolved, err := config.Resolve(effective.Machine, effective.Project, config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ProjectConfiguration{Channel: project.Channel, Project: project.ID, Path: project.Path, BaseRef: project.BaseRef, Digest: digest, Snapshot: snapshot}
+}
+
+func nextProjectConfigurationWithBase(t *testing.T, project Project, base string) ProjectConfiguration {
+	t.Helper()
+	effective, err := config.DecodeSnapshot(project.ConfigSnapshot, project.ConfigDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective.Project.BaseBranch = base
+	resolved, err := config.Resolve(effective.Machine, effective.Project, config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, digest, err := config.Snapshot(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ProjectConfiguration{Channel: project.Channel, Project: project.ID, Path: project.Path, BaseRef: base, Digest: digest, Snapshot: snapshot}
+}
+
 func TestMigrationTransactionRollsBackOnInterruption(t *testing.T) {
 	database, ctx := openTestStore(t)
 	err := database.write(ctx, func(conn *sql.Conn) error {

@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -79,6 +80,7 @@ type nysaPureConfigDocument struct {
 type NysaPureConfigPlan struct {
 	Repository     string
 	Path           string
+	identity       RepositoryIdentity
 	Commands       Commands
 	Encoded        []byte
 	Existing       bool
@@ -89,21 +91,168 @@ type NysaPureConfigPlan struct {
 	lock           *nysaConfigLock
 }
 
-// PrepareNysaPureConfig validates the explicit Nysa profile without mutating
-// the repository. An existing config must already contain the exact requested
-// profile commands and is never replaced.
-func PrepareNysaPureConfig(repository, profile, testPath string) (NysaPureConfigPlan, error) {
-	plan := NysaPureConfigPlan{Repository: repository, Path: filepath.Join(repository, ".sf", "config.toml")}
-	if profile == "" && testPath == "" {
+// ProjectConfigPlan authenticates the optional repository configuration while
+// a descriptor-backed lock is held. Unlike NysaPureConfigPlan it never creates
+// .sf/config.toml: config apply freezes either the committed file or the
+// explicitly re-checked absence used by the normal command-detection path.
+type ProjectConfigPlan struct {
+	Repository     string
+	identity       RepositoryIdentity
+	prepared       []byte
+	preparedDigest string
+	preparedInfo   os.FileInfo
+	exists         bool
+	lock           *nysaConfigLock
+}
+
+// PrepareProjectConfig acquires the canonical configuration lock without
+// changing the repository. It records the exact optional-file state so a
+// later apply cannot silently race a committed config appearing, disappearing,
+// or changing beneath the resolved snapshot.
+func PrepareProjectConfig(repository string) (ProjectConfigPlan, error) {
+	return PrepareProjectConfigContext(context.Background(), repository)
+}
+
+// PrepareProjectConfigContext is the cancellation-aware form used by CLI
+// operations. The lock remains held in the returned plan until Close.
+func PrepareProjectConfigContext(ctx context.Context, repository string) (ProjectConfigPlan, error) {
+	identity, err := CaptureRepositoryIdentity(repository)
+	if err != nil {
+		return ProjectConfigPlan{}, err
+	}
+	return PrepareProjectConfigWithIdentityContext(ctx, repository, identity)
+}
+
+// PrepareProjectConfigWithIdentity continues an already-authenticated
+// repository operation. It refuses a pathname replacement between the caller's
+// Git/root validation and the configuration lock acquisition.
+func PrepareProjectConfigWithIdentity(repository string, identity RepositoryIdentity) (ProjectConfigPlan, error) {
+	return PrepareProjectConfigWithIdentityContext(context.Background(), repository, identity)
+}
+
+// PrepareProjectConfigWithIdentityContext continues an already-authenticated
+// repository operation with a caller-owned cancellation/deadline.
+func PrepareProjectConfigWithIdentityContext(ctx context.Context, repository string, identity RepositoryIdentity) (ProjectConfigPlan, error) {
+	lock, err := acquireProjectConfigLockContext(ctx, repository, false)
+	if err != nil {
+		return ProjectConfigPlan{}, err
+	}
+	plan := ProjectConfigPlan{Repository: repository, identity: identity, lock: lock}
+	if err := lock.validateRepositoryIdentity(repository, identity); err != nil {
+		_ = plan.Close()
+		return ProjectConfigPlan{}, err
+	}
+	data, exists, err := lock.readOptional("config.toml")
+	if err != nil {
+		_ = plan.Close()
+		return ProjectConfigPlan{}, err
+	}
+	plan.exists = exists
+	if !exists {
 		return plan, nil
 	}
-	if profile != NysaPureAPIV1Profile {
+	info, err := lock.fileIdentity("config.toml")
+	if err != nil {
+		_ = plan.Close()
+		return ProjectConfigPlan{}, err
+	}
+	plan.prepared = append([]byte(nil), data...)
+	plan.preparedDigest = configDigest(data)
+	plan.preparedInfo = info
+	return plan, nil
+}
+
+// ValidateUnchanged confirms the current optional source exactly matches the
+// state observed at preparation. It is deliberately called immediately before
+// the Store transaction that advances the immutable generation.
+func (plan *ProjectConfigPlan) ValidateUnchanged() error {
+	if plan == nil || plan.lock == nil {
+		return errors.New("project configuration lock is unavailable")
+	}
+	if err := plan.lock.validateRepositoryIdentity(plan.Repository, plan.identity); err != nil {
+		return err
+	}
+	data, exists, err := plan.lock.readOptional("config.toml")
+	if err != nil {
+		return err
+	}
+	if exists != plan.exists {
+		return errors.New("project configuration presence changed during apply")
+	}
+	if !exists {
+		return nil
+	}
+	info, err := plan.lock.fileIdentity("config.toml")
+	if err != nil {
+		return err
+	}
+	if plan.preparedInfo == nil || !os.SameFile(plan.preparedInfo, info) || configDigest(data) != plan.preparedDigest || !bytes.Equal(data, plan.prepared) {
+		return errors.New("project configuration changed during apply")
+	}
+	return nil
+}
+
+// LoadLockedProject resolves the exact optional configuration authenticated by
+// PrepareProjectConfig. It intentionally reuses the single config resolver;
+// no parallel apply-only configuration format exists.
+func (plan *ProjectConfigPlan) LoadLockedProject(name string, machine MachineLimits) (Effective, []byte, string, error) {
+	if plan == nil || plan.lock == nil {
+		return Effective{}, nil, "", errors.New("project configuration lock is unavailable")
+	}
+	if err := plan.lock.validateRepositoryIdentity(plan.Repository, plan.identity); err != nil {
+		return Effective{}, nil, "", err
+	}
+	data, exists, err := plan.lock.readOptional("config.toml")
+	if err != nil {
+		return Effective{}, nil, "", err
+	}
+	return loadProjectData(plan.Repository, name, machine, nil, data, exists)
+}
+
+// Close releases the lock retained across source validation and Store apply.
+func (plan *ProjectConfigPlan) Close() error {
+	if plan == nil || plan.lock == nil {
+		return nil
+	}
+	err := plan.lock.Close()
+	plan.lock = nil
+	return err
+}
+
+// PrepareNysaPureConfig prepares both ordinary init and the explicit Nysa
+// profile under the shared repository-root configuration lock. An existing
+// config must already contain the exact requested profile commands and is
+// never replaced.
+func PrepareNysaPureConfig(repository, profile, testPath string) (NysaPureConfigPlan, error) {
+	return PrepareNysaPureConfigContext(context.Background(), repository, profile, testPath)
+}
+
+// PrepareNysaPureConfigContext is the cancellation-aware form used by the
+// init CLI. Its lock is retained by the returned plan through registration.
+func PrepareNysaPureConfigContext(ctx context.Context, repository, profile, testPath string) (NysaPureConfigPlan, error) {
+	identity, err := CaptureRepositoryIdentity(repository)
+	if err != nil {
+		return NysaPureConfigPlan{}, err
+	}
+	return prepareNysaPureConfigWithIdentityContext(ctx, repository, identity, profile, testPath)
+}
+
+func prepareNysaPureConfigWithIdentity(repository string, identity RepositoryIdentity, profile, testPath string) (NysaPureConfigPlan, error) {
+	return prepareNysaPureConfigWithIdentityContext(context.Background(), repository, identity, profile, testPath)
+}
+
+func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository string, identity RepositoryIdentity, profile, testPath string) (NysaPureConfigPlan, error) {
+	plan := NysaPureConfigPlan{Repository: repository, Path: filepath.Join(repository, ".sf", "config.toml"), identity: identity}
+	if (profile == "") != (testPath == "") {
+		return NysaPureConfigPlan{}, errors.New("profile and test path must be provided together")
+	}
+	if profile != "" && profile != NysaPureAPIV1Profile {
 		return NysaPureConfigPlan{}, fmt.Errorf("unsupported project profile %q; supported profile is %s", profile, NysaPureAPIV1Profile)
 	}
-	if !nysapure.ValidTestPath(testPath) {
+	if profile != "" && !nysapure.ValidTestPath(testPath) {
 		return NysaPureConfigPlan{}, fmt.Errorf("profile %s requires a canonical repository-relative .test.ts path", profile)
 	}
-	lock, err := acquireNysaConfigLock(repository)
+	lock, err := acquireProjectConfigLockContext(ctx, repository, profile != "")
 	if err != nil {
 		return NysaPureConfigPlan{}, err
 	}
@@ -112,13 +261,30 @@ func PrepareNysaPureConfig(repository, profile, testPath string) (NysaPureConfig
 		_ = plan.Close()
 		return NysaPureConfigPlan{}, err
 	}
-	if err := nysapure.Validate(repository, testPath); err != nil {
-		return fail(fmt.Errorf("validate %s test entrypoint: %w", profile, err))
+	if err := lock.validateRepositoryIdentity(repository, identity); err != nil {
+		return fail(err)
+	}
+	if profile != "" {
+		if err := nysapure.Validate(repository, testPath); err != nil {
+			return fail(fmt.Errorf("validate %s test entrypoint: %w", profile, err))
+		}
 	}
 
 	data, exists, err := lock.readOptional("config.toml")
 	if err != nil {
 		return fail(err)
+	}
+	plan.Existing = exists
+	if exists {
+		plan.prepared = append([]byte(nil), data...)
+		plan.preparedDigest = configDigest(data)
+		plan.preparedInfo, err = lock.fileIdentity("config.toml")
+		if err != nil {
+			return fail(err)
+		}
+	}
+	if profile == "" {
+		return plan, nil
 	}
 	verify := []string{"node", nysapure.RecipeFlag, testPath}
 	plan.Commands = Commands{Verify: Command{Argv: append([]string(nil), verify...)}, Review: Command{Argv: append([]string(nil), verify...)}}
@@ -129,13 +295,6 @@ func PrepareNysaPureConfig(repository, profile, testPath string) (NysaPureConfig
 		}
 		if document.Commands == nil || !sameStrings(document.Commands.Verify, verify) || !sameStrings(document.Commands.Review, verify) {
 			return fail(fmt.Errorf("existing .sf/config.toml has different commands; edit or remove it before selecting profile %s", profile))
-		}
-		plan.Existing = true
-		plan.prepared = append([]byte(nil), data...)
-		plan.preparedDigest = configDigest(data)
-		plan.preparedInfo, err = lock.fileIdentity("config.toml")
-		if err != nil {
-			return fail(err)
 		}
 		return plan, nil
 	}
@@ -156,15 +315,21 @@ func PrepareNysaPureConfig(repository, profile, testPath string) (NysaPureConfig
 // project snapshot. This closes the gap between repository/config validation
 // and RegisterProject without replacing an owner's existing file.
 func (plan *NysaPureConfigPlan) ValidateUnchanged() error {
-	if plan == nil || (len(plan.Encoded) == 0 && !plan.Existing) {
-		return nil
-	}
-	if plan.lock == nil {
+	if plan == nil || plan.lock == nil {
 		return errors.New("profile configuration lock is unavailable")
+	}
+	if err := plan.lock.validateRepositoryIdentity(plan.Repository, plan.identity); err != nil {
+		return err
 	}
 	data, exists, err := plan.lock.readOptional("config.toml")
 	if err != nil {
 		return err
+	}
+	if !plan.Existing && len(plan.Encoded) == 0 {
+		if exists {
+			return errors.New("project configuration appeared during initialization")
+		}
+		return nil
 	}
 	if !exists {
 		return errors.New("profile configuration disappeared during initialization")
@@ -333,6 +498,9 @@ func loadProject(repository, name string, machine MachineLimits, commandsOverrid
 func (plan *NysaPureConfigPlan) LoadLockedProject(name string, machine MachineLimits, commandsOverride *Commands) (Effective, []byte, string, error) {
 	if plan == nil || plan.lock == nil {
 		return Effective{}, nil, "", errors.New("profile configuration lock is unavailable")
+	}
+	if err := plan.lock.validateRepositoryIdentity(plan.Repository, plan.identity); err != nil {
+		return Effective{}, nil, "", err
 	}
 	data, exists, err := plan.lock.readOptional("config.toml")
 	if err != nil {
