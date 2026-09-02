@@ -426,6 +426,9 @@ func prePublicationControlOriginAt(ctx context.Context, q interface {
 	if err != nil || event.to != state {
 		return ErrPublicationEvidence
 	}
+	if _, found, recoveryErr := loadRunnerRecoveryAt(ctx, q, ref, version); recoveryErr != nil || found {
+		return ErrPublicationEvidence
+	}
 	switch state {
 	case domain.StateStopping:
 		if event.trigger != "operator_pause_or_take" || event.from == domain.StateStopping {
@@ -444,6 +447,54 @@ func prePublicationControlOriginAt(ctx context.Context, q interface {
 		return ErrPublicationEvidence
 	}
 	return prePublicationControlOriginAt(ctx, q, ref, version-1, event.from, depth+1)
+}
+
+// prePublicationRecoveredStoppingPauseOrigin proves the one control shape
+// whose stopping endpoint was advanced by signed startup recoveries before
+// process_and_effects_drained entered paused. The later cancel seal replaces
+// the original stop control row, so this proof is deliberately historical:
+// one exact stop event, one contiguous signed stopping chain, then one exact
+// drained event. It never infers an origin from counters alone.
+func prePublicationRecoveredStoppingPauseOrigin(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, pausedVersion, pausedRunner uint64) error {
+	if pausedVersion < 3 || pausedRunner < 2 {
+		return ErrPublicationEvidence
+	}
+	drained, err := loadOnlyStateChangeEvent(ctx, q, ref, pausedVersion)
+	if err != nil || drained.trigger != "process_and_effects_drained" || drained.from != domain.StateStopping || drained.to != domain.StatePaused {
+		return ErrPublicationEvidence
+	}
+	stoppingVersion := pausedVersion - 1
+	stoppingRunner := pausedRunner
+	if _, found, recoveryErr := loadRunnerRecoveryAt(ctx, q, ref, pausedVersion); recoveryErr != nil || found {
+		return ErrPublicationEvidence
+	}
+	latest, found, err := loadRunnerRecoveryAt(ctx, q, ref, stoppingVersion)
+	if err != nil || !found || !validRunnerRecovery(latest) || latest.TicketVersion != stoppingVersion || latest.RunnerEpoch != stoppingRunner {
+		return ErrPublicationEvidence
+	}
+	stoppingLeader := latest.LeaderEpoch
+	for depth := 0; depth < 64; depth++ {
+		if !validRunnerRecovery(latest) || latest.TicketVersion != stoppingVersion || latest.RunnerEpoch != stoppingRunner {
+			return ErrPublicationEvidence
+		}
+		event, eventErr := loadOnlyStateChangeEvent(ctx, q, ref, latest.PriorTicketVersion)
+		if eventErr == nil && event.trigger == "operator_pause_or_take" && event.to == domain.StateStopping && prePublicationState(event.from) && validRunnerInvalidatingControlTransition(Transition{From: event.from, To: event.to, ResumeState: event.from, Trigger: event.trigger}) {
+			if _, found, recoveryErr := loadRunnerRecoveryAt(ctx, q, ref, latest.PriorTicketVersion); recoveryErr != nil || found {
+				return ErrPublicationEvidence
+			}
+			return validateRunnerRecoveryLedgerPrefix(ctx, q, ref, latest.PriorTicketVersion, latest.PriorRunnerEpoch, latest.PriorLeaderEpoch, pausedVersion-1, pausedRunner, stoppingLeader)
+		}
+		next, nextFound, nextErr := loadRunnerRecoveryAt(ctx, q, ref, latest.PriorTicketVersion)
+		if nextErr != nil || !nextFound {
+			return ErrPublicationEvidence
+		}
+		stoppingVersion, stoppingRunner = latest.PriorTicketVersion, latest.PriorRunnerEpoch
+		latest = next
+	}
+	return ErrPublicationEvidence
 }
 
 // exactCancellationControlPredecessor authenticates the Store-owned atomic
@@ -534,8 +585,17 @@ func prePublicationCancellationProof(ctx context.Context, q interface {
 	if err != nil || event.trigger != "operator_cancel" || event.to != domain.StateCancelling || !runnerInvalidatingCancelSource(event.from) {
 		return false, nil
 	}
-	if err := prePublicationControlOriginAt(ctx, q, ref, authority.version-1, event.from, 0); err != nil {
+	if _, found, recoveryErr := loadRunnerRecoveryAt(ctx, q, ref, authority.version); recoveryErr != nil || found {
 		return false, nil
+	}
+	originAuthenticated := false
+	if event.from == domain.StatePaused && authority.version > 1 && authority.runner > 1 {
+		originAuthenticated = prePublicationRecoveredStoppingPauseOrigin(ctx, q, ref, authority.version-1, authority.runner-1) == nil
+	}
+	if !originAuthenticated {
+		if err := prePublicationControlOriginAt(ctx, q, ref, authority.version-1, event.from, 0); err != nil {
+			return false, nil
+		}
 	}
 	if currentVersion == authority.version && currentRunner == authority.runner {
 		return true, nil
