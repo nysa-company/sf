@@ -41,9 +41,9 @@ type initResult struct {
 	Created       bool             `json:"created"`
 }
 
-// afterInitConfigInstall is test-only coordination while a newly created
-// profile file and its enclosing root/.sf locks are still held.
-var afterInitConfigInstall func()
+// afterInitConfigLockAcquired is test-only coordination after configuration
+// preparation has returned with the repository root/.sf locks still held.
+var afterInitConfigLockAcquired func()
 
 // RunInit is the direct local setup path. It never contacts the daemon or a
 // remote. The explicit profile form may create the requested repository
@@ -80,6 +80,9 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 		return initFailure("invalid_configuration", err.Error(), initHelp, false)
 	}
 	defer configPlan.Close()
+	if afterInitConfigLockAcquired != nil {
+		afterInitConfigLockAcquired()
+	}
 	machine, err := config.LoadMachine(paths.Machine)
 	if err != nil {
 		return initFailure("invalid_configuration", err.Error(), initHelp, false)
@@ -115,9 +118,6 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 			_ = configPlan.Rollback()
 		}
 		return initFailure("init_failed", "profile configuration could not be installed: "+err.Error(), []string{binary, "init", "--project", request.Project, "--repo", repository}, true)
-	}
-	if configCreated && afterInitConfigInstall != nil {
-		afterInitConfigInstall()
 	}
 	registrationConfirmed := false
 	defer func() {

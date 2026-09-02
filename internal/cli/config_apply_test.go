@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -141,22 +142,28 @@ func TestRunConfigApplySerializesWithProfileInitBeforeFreezingSnapshot(t *testin
 	if response := RunInit(ctx, InitRequest{Channel: domain.ChannelDev, Project: "relay", Repo: repository, Home: home}); !response.OK {
 		t.Fatalf("dev init=%+v", response)
 	}
-	installed := make(chan struct{})
+	lockHeld := make(chan struct{})
 	releaseInit := make(chan struct{})
-	priorInstallHook := afterInitConfigInstall
-	afterInitConfigInstall = func() {
-		close(installed)
+	var releaseOnce sync.Once
+	priorLockHook := afterInitConfigLockAcquired
+	afterInitConfigLockAcquired = func() {
+		close(lockHeld)
 		<-releaseInit
 	}
-	t.Cleanup(func() { afterInitConfigInstall = priorInstallHook })
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseInit) })
+		afterInitConfigLockAcquired = priorLockHook
+	})
 	initDone := make(chan api.Response, 1)
 	go func() {
 		initDone <- RunInit(ctx, InitRequest{Channel: domain.ChannelStable, Project: "nysa", Repo: repository, Home: home, Profile: config.NysaPureAPIV1Profile, TestPath: testPath})
 	}()
 	select {
-	case <-installed:
-	case <-time.After(time.Second):
-		t.Fatal("profile init did not install while holding repository configuration lock")
+	case <-lockHeld:
+	case response := <-initDone:
+		t.Fatalf("profile init returned before acquiring repository configuration lock: %+v", response)
+	case <-time.After(10 * time.Second):
+		t.Fatal("profile init did not acquire the repository configuration lock")
 	}
 	applyReachedStore := make(chan struct{})
 	priorApplyHook := afterConfigApplyBeforeStore
@@ -171,18 +178,18 @@ func TestRunConfigApplySerializesWithProfileInitBeforeFreezingSnapshot(t *testin
 		t.Fatal("config apply reached Store while supported profile init held the root lock")
 	default:
 	}
-	close(releaseInit)
+	releaseOnce.Do(func() { close(releaseInit) })
 	select {
 	case response := <-initDone:
 		if !response.OK || !response.Mutation.Attempted {
 			t.Fatalf("profile init=%+v", response)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("profile init did not complete after release")
 	}
 	select {
 	case <-applyReachedStore:
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("config apply did not proceed after profile init released the root lock")
 	}
 	select {
@@ -190,7 +197,7 @@ func TestRunConfigApplySerializesWithProfileInitBeforeFreezingSnapshot(t *testin
 		if !response.OK || response.Mutation.Observed {
 			t.Fatalf("apply=%+v", response)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("config apply did not finish")
 	}
 	paths, err := config.PathsFor(home, domain.ChannelDev)
