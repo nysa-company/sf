@@ -31,6 +31,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/github"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -70,6 +71,7 @@ var (
 	hostBootIdentityFn          = hostBootIdentity
 	processStartIdentityFn      = processStartIdentity
 	validatedEnvironmentFn      = validatedEnvironment
+	openExecutableFileFn        = openExecutableFile
 )
 
 // Runner is safe for one production GitHub client. It is not a pool: a
@@ -105,15 +107,16 @@ var _ github.SupervisedCommandRunner = (*Runner)(nil)
 // SHA-256 digest. The input may be a symlink, but the symlink target is pinned
 // and must resolve to the same target before every start.
 func New(executable string) (*Runner, error) {
-	requested, canonical, digest, err := authenticate(executable)
+	authenticated, err := openAuthenticatedExecutable(executable)
 	if err != nil {
 		return nil, err
 	}
-	snapshot, directory, err := snapshotExecutable(canonical, digest)
+	defer authenticated.file.Close()
+	snapshot, directory, err := snapshotExecutable(authenticated.file, authenticated.digest)
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{requested: requested, canonical: canonical, digest: digest, snapshotPath: snapshot, snapshotDir: directory, removeSnapshot: os.RemoveAll}, nil
+	return &Runner{requested: authenticated.requested, canonical: authenticated.canonical, digest: authenticated.digest, snapshotPath: snapshot, snapshotDir: directory, removeSnapshot: os.RemoveAll}, nil
 }
 
 // NewRunner is an explicit spelling of New for composition code.
@@ -876,40 +879,86 @@ func (b *limitedBuffer) Truncated() bool {
 	return b.truncated
 }
 
+type authenticatedExecutable struct {
+	requested string
+	canonical string
+	digest    string
+	file      *os.File
+}
+
 func authenticate(input string) (string, string, string, error) {
+	authenticated, err := openAuthenticatedExecutable(input)
+	if err != nil {
+		return "", "", "", err
+	}
+	defer authenticated.file.Close()
+	return authenticated.requested, authenticated.canonical, authenticated.digest, nil
+}
+
+func openAuthenticatedExecutable(input string) (authenticatedExecutable, error) {
 	if input == "" || !filepath.IsAbs(input) || filepath.Clean(input) != input || strings.IndexByte(input, 0) >= 0 {
-		return "", "", "", ErrInvalidExecutable
+		return authenticatedExecutable{}, ErrInvalidExecutable
 	}
 	canonical, err := filepath.EvalSymlinks(input)
 	if err != nil || !filepath.IsAbs(canonical) || filepath.Clean(canonical) != canonical {
-		return "", "", "", ErrInvalidExecutable
+		return authenticatedExecutable{}, ErrInvalidExecutable
 	}
-	info, err := os.Stat(canonical)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 || info.Mode()&0o022 != 0 || !trustedOwner(info) || !secureAncestors(canonical) {
-		return "", "", "", ErrInvalidExecutable
+	pathInfo, err := os.Lstat(canonical)
+	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !secureSourceAncestors(canonical) {
+		return authenticatedExecutable{}, ErrInvalidExecutable
 	}
-	file, err := os.Open(canonical)
+	file, err := openExecutableFileFn(canonical)
 	if err != nil {
-		return "", "", "", ErrInvalidExecutable
+		return authenticatedExecutable{}, ErrInvalidExecutable
 	}
-	defer file.Close()
+	keepFile := false
+	defer func() {
+		if !keepFile {
+			_ = file.Close()
+		}
+	}()
+	info, err := file.Stat()
+	if err != nil || !os.SameFile(pathInfo, info) || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 || info.Mode()&0o022 != 0 || !trustedOwner(info) {
+		return authenticatedExecutable{}, ErrInvalidExecutable
+	}
 	hash := sha256.New()
 	const maxExecutableSize = 128 << 20
 	count, err := io.Copy(hash, io.LimitReader(file, maxExecutableSize+1))
 	if err != nil || count > maxExecutableSize {
-		return "", "", "", ErrInvalidExecutable
+		return authenticatedExecutable{}, ErrInvalidExecutable
 	}
-	return input, canonical, hex.EncodeToString(hash.Sum(nil)), nil
+	afterInfo, err := os.Lstat(canonical)
+	if err != nil || !os.SameFile(info, afterInfo) || !secureSourceAncestors(canonical) {
+		return authenticatedExecutable{}, ErrInvalidExecutable
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return authenticatedExecutable{}, ErrInvalidExecutable
+	}
+	keepFile = true
+	return authenticatedExecutable{requested: input, canonical: canonical, digest: hex.EncodeToString(hash.Sum(nil)), file: file}, nil
 }
 
-func snapshotExecutable(source, digest string) (string, string, error) {
-	directory, err := os.MkdirTemp(filepath.Dir(source), ".sf-gh-exec-")
+func openExecutableFile(path string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		// A trusted executable directory may be read-only (for example a
-		// package-managed /usr/bin). Keep the snapshot in a private temp dir;
-		// the source itself was already validated through its full chain.
-		directory, err = os.MkdirTemp("", ".sf-gh-exec-")
+		return nil, err
 	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, ErrInvalidExecutable
+	}
+	return file, nil
+}
+
+func snapshotExecutable(source *os.File, digest string) (string, string, error) {
+	if source == nil || digest == "" {
+		return "", "", ErrInvalidExecutable
+	}
+	// Package-manager roots are commonly current-owner group writable. Never
+	// execute the authenticated copy from that mutable tree: pin it in a
+	// private directory whose complete ancestor chain is validated below.
+	directory, err := os.MkdirTemp("", ".sf-gh-exec-")
 	if err != nil {
 		return "", "", ErrInvalidExecutable
 	}
@@ -917,12 +966,16 @@ func snapshotExecutable(source, digest string) (string, string, error) {
 		_ = os.RemoveAll(directory)
 		return "", "", ErrInvalidExecutable
 	}
-	in, err := os.Open(source)
-	if err != nil {
+	canonicalDirectory, err := filepath.EvalSymlinks(directory)
+	if err != nil || !filepath.IsAbs(canonicalDirectory) || filepath.Clean(canonicalDirectory) != canonicalDirectory {
 		_ = os.RemoveAll(directory)
 		return "", "", ErrInvalidExecutable
 	}
-	defer in.Close()
+	directory = canonicalDirectory
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		_ = os.RemoveAll(directory)
+		return "", "", ErrInvalidExecutable
+	}
 	targetPath := filepath.Join(directory, "gh")
 	out, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o500)
 	if err != nil {
@@ -930,9 +983,9 @@ func snapshotExecutable(source, digest string) (string, string, error) {
 		return "", "", ErrInvalidExecutable
 	}
 	hash := sha256.New()
-	count, copyErr := io.Copy(io.MultiWriter(out, hash), io.LimitReader(in, maxExecutableSize+1))
+	count, copyErr := io.Copy(io.MultiWriter(out, hash), io.LimitReader(source, maxExecutableSize+1))
 	syncErr, closeErr := out.Sync(), out.Close()
-	if copyErr != nil || syncErr != nil || closeErr != nil || count > maxExecutableSize || hex.EncodeToString(hash.Sum(nil)) != digest {
+	if copyErr != nil || syncErr != nil || closeErr != nil || count > maxExecutableSize || hex.EncodeToString(hash.Sum(nil)) != digest || !secureAncestors(targetPath) {
 		_ = os.RemoveAll(directory)
 		return "", "", ErrInvalidExecutable
 	}
@@ -967,6 +1020,35 @@ func secureAncestors(path string) bool {
 		entry, err := os.Lstat(current)
 		if err != nil || entry.Mode()&os.ModeSymlink != 0 || !entry.IsDir() || (entry.Mode()&0o022 != 0 && entry.Mode()&os.ModeSticky == 0) || !trustedOwner(entry) {
 			return false
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return true
+		}
+	}
+}
+
+// secureSourceAncestors admits the standard owner-managed package layout
+// while keeping an other-writable or foreign group-writable source fail
+// closed. The executable itself is authenticated through one opened file
+// identity and is copied by digest into a private snapshot before execution.
+func secureSourceAncestors(path string) bool {
+	uid := uint32(os.Getuid())
+	for current := filepath.Dir(path); ; current = filepath.Dir(current) {
+		entry, err := os.Lstat(current)
+		if err != nil || entry.Mode()&os.ModeSymlink != 0 || !entry.IsDir() || !trustedOwner(entry) {
+			return false
+		}
+		if entry.Mode()&os.ModeSticky == 0 {
+			if entry.Mode()&0o002 != 0 {
+				return false
+			}
+			if entry.Mode()&0o020 != 0 {
+				stat, ok := entry.Sys().(*syscall.Stat_t)
+				if !ok || stat.Uid != uid {
+					return false
+				}
+			}
 		}
 		parent := filepath.Dir(current)
 		if parent == current {

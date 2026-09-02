@@ -2,6 +2,8 @@ package ghrunner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -424,6 +426,148 @@ func TestExecutableReplacementRefused(t *testing.T) {
 	}
 	if _, err := runner.Run(context.Background(), path, helperArgs("ok"), runnerEnvironment(t)); !errors.Is(err, ErrExecutableChanged) {
 		t.Fatalf("replacement error %v", err)
+	}
+}
+
+func TestCurrentOwnerGroupWritablePackagePrefixIsSnapshottedPrivately(t *testing.T) {
+	packageRoot := filepath.Join(t.TempDir(), "Cellar")
+	if err := os.Mkdir(packageRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(packageRoot, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(packageRoot, "gh")
+	source, err := os.ReadFile(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, source, 0o555); err != nil {
+		t.Fatal(err)
+	}
+
+	runner, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotDir := runner.snapshotDir
+	if strings.HasPrefix(runner.snapshotDir, packageRoot+string(os.PathSeparator)) {
+		t.Fatalf("snapshot directory %q remained below mutable package prefix", runner.snapshotDir)
+	}
+	if info, statErr := os.Stat(runner.snapshotDir); statErr != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("snapshot directory mode info=%v err=%v", info, statErr)
+	}
+
+	output, runErr := runner.Run(context.Background(), path, helperArgs("ok"), runnerEnvironment(t))
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !strings.Contains(string(output), "stdout") {
+		t.Fatalf("output %q", output)
+	}
+	proof, cleanupErr := runner.Cleanup(context.Background())
+	if cleanupErr != nil || !proof.Drained || proof.Quarantined {
+		t.Fatalf("cleanup=%+v err=%v", proof, cleanupErr)
+	}
+	if err := runner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(snapshotDir); !os.IsNotExist(err) {
+		t.Fatalf("snapshot directory still exists after Close: %v", err)
+	}
+}
+
+func TestOtherWritableExecutableAncestorIsRefused(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "gh")
+	source, err := os.ReadFile(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, source, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(path); !errors.Is(err, ErrInvalidExecutable) {
+		t.Fatalf("other-writable ancestor error=%v", err)
+	}
+}
+
+func TestExecutableSwapToFIFOBeforeOpenFailsBoundedly(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "Cellar")
+	if err := os.Mkdir(directory, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "gh")
+	source, err := os.ReadFile(mustExecutable(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, source, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	originalOpen := openExecutableFileFn
+	defer func() { openExecutableFileFn = originalOpen }()
+	openExecutableFileFn = func(candidate string) (*os.File, error) {
+		if err := os.Rename(candidate, candidate+".original"); err != nil {
+			return nil, err
+		}
+		if err := syscall.Mkfifo(candidate, 0o600); err != nil {
+			return nil, err
+		}
+		return originalOpen(candidate)
+	}
+	started := time.Now()
+	if _, err := New(path); !errors.Is(err, ErrInvalidExecutable) {
+		t.Fatalf("FIFO replacement error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("FIFO replacement blocked for %v", elapsed)
+	}
+}
+
+func TestSnapshotCopiesAuthenticatedDescriptorAfterSourcePathBecomesFIFO(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "gh")
+	contents := []byte("#!/bin/sh\nexit 0\n")
+	if err := os.WriteFile(path, contents, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if err := os.Rename(path, path+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digestBytes := sha256.Sum256(contents)
+	started := time.Now()
+	snapshot, snapshotDir, err := snapshotExecutable(source, hex.EncodeToString(digestBytes[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(snapshotDir)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("snapshot copy blocked for %v", elapsed)
+	}
+	got, err := os.ReadFile(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(contents) {
+		t.Fatalf("snapshot contents %q", got)
 	}
 }
 
