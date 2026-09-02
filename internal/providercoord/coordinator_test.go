@@ -531,6 +531,35 @@ func TestBudgetExhaustionDoesNotExposeProviderResultKey(t *testing.T) {
 	}
 }
 
+func TestCoordinatorReportsAttemptExhaustedBeforeThirdProviderInvocation(t *testing.T) {
+	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	// Consume the two bounded initial attempts with one explicit route. The
+	// next coordinator pass must surface Store's admission refusal without
+	// launching the adapter again.
+	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Behavior: testkit.ProviderMalformed}, {Behavior: testkit.ProviderMalformed}}
+	first := coordinator.Run(context.Background(), request)
+	if first.Code != Failed || len(first.Attempts) != 1 {
+		t.Fatalf("first bounded failure=%+v", first)
+	}
+	secondFailure := coordinator.Run(context.Background(), request)
+	if secondFailure.Code != Failed || len(secondFailure.Attempts) != 1 {
+		t.Fatalf("second bounded failure=%+v", secondFailure)
+	}
+	callsBefore := len(primary.CallsSnapshot())
+	exhausted := coordinator.Run(context.Background(), request)
+	if exhausted.Code != AttemptExhausted || !exhausted.NeedsOperator || len(exhausted.Attempts) != 0 || exhausted.ProviderResult != (store.ProviderAttemptResultKey{}) {
+		t.Fatalf("immediate begin exhaustion=%+v", exhausted)
+	}
+	if callsAfter := len(primary.CallsSnapshot()); callsAfter != callsBefore {
+		t.Fatalf("provider invoked after Store admission refusal: before=%d after=%d", callsBefore, callsAfter)
+	}
+	attempts, err := database.ProviderAttempts(context.Background(), ref)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("durable attempts=%+v err=%v", attempts, err)
+	}
+}
+
 func newCoordinatorFixture(t *testing.T, supervisor contracts.ProcessSupervisor) (*store.Store, Request, *Coordinator, domain.TicketRef, *testkit.ScriptedProvider) {
 	t.Helper()
 	ctx := context.Background()

@@ -172,7 +172,7 @@ func validateRunnerRecoveryLedgerPrefix(ctx context.Context, q interface {
 		// counter gap without its stopping/drained/resume event triplet remains
 		// invalid.
 		if err := validateRunnerControlAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch); err != nil {
-			if err := validateRunnerPhaseChain(ctx, q, ref, expectedVersion, expectedRunner, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil {
+			if err := validateRunnerPhaseChain(ctx, q, ref, expectedVersion, expectedRunner, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
 				return ErrPublicationEvidence
 			}
 		}
@@ -189,11 +189,65 @@ func validateRunnerRecoveryLedgerPrefix(ctx context.Context, q interface {
 		expectedVersion, expectedRunner, expectedLeader = step.TicketVersion, step.RunnerEpoch, step.LeaderEpoch
 	}
 	if validateRunnerControlAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) != nil {
-		if err := validateRunnerPhaseAdvance(ctx, q, ref, expectedVersion, expectedRunner, liveVersion, liveRunner); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) != nil {
+		if err := validateRunnerPhaseAdvance(ctx, q, ref, expectedVersion, expectedRunner, liveVersion, liveRunner); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) != nil && !validProviderRetryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validProviderBlockedRecoveryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) {
 			return ErrPublicationEvidence
 		}
 	}
 	return nil
+}
+
+func validProviderRetryGap(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, fromVersion, fromRunner, fromLeader, toVersion, toRunner, toLeader uint64) bool {
+	for _, phase := range []domain.Phase{domain.PhasePlanning, domain.PhaseVerification, domain.PhaseBuild, domain.PhaseReview} {
+		if validateProviderRetryAdvance(ctx, q, ref, phase, fromVersion, fromRunner, fromLeader, toVersion, toRunner, toLeader) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// validProviderBlockedRecoveryGap admits only the exact same-runner typed
+// provider blocker followed immediately by operator_recover. It is separate
+// from generic control recovery so a forged blocked row can never bridge a
+// daemon fence.
+func validProviderBlockedRecoveryGap(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, ref domain.TicketRef, fromVersion, fromRunner, fromLeader, toVersion, toRunner, toLeader uint64) bool {
+	if fromVersion == 0 || fromRunner == 0 || fromLeader == 0 || toVersion != fromVersion+2 || toRunner != fromRunner || toLeader != fromLeader {
+		return false
+	}
+	var trigger, raw string
+	var from, to domain.State
+	if err := q.QueryRowContext(ctx, `SELECT trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, fromVersion+1).Scan(&trigger, &from, &to, &raw); err != nil || trigger != "typed_blocker" || to != domain.StateBlocked || !providerStateForPhaseTransition(from) || len(raw) > maxEvidenceJSON {
+		return false
+	}
+	var blocker struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(raw), &blocker) != nil || !validBlockedCode(blocker.Code) || blocker.Code == "legacy_provider_phase_entry_unverifiable" {
+		return false
+	}
+	if err := exactStateChangeEvent(ctx, q, ref, fromVersion+1, "typed_blocker", from, domain.StateBlocked); err != nil {
+		return false
+	}
+	if err := exactStateChangeEvent(ctx, q, ref, toVersion, "operator_recover", domain.StateBlocked, from); err != nil {
+		return false
+	}
+	var recoverTrigger string
+	var recoverFrom, recoverTo domain.State
+	if err := q.QueryRowContext(ctx, `SELECT trigger,from_state,to_state FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, toVersion).Scan(&recoverTrigger, &recoverFrom, &recoverTo); err != nil || recoverTrigger != "operator_recover" || recoverFrom != domain.StateBlocked || recoverTo != from {
+		return false
+	}
+	entry, err := loadProviderPhaseEntryAt(ctx, q, ref, phaseForProviderState(from), fromVersion)
+	if err != nil || entry.State != from {
+		return false
+	}
+	if entry.Version == fromVersion {
+		return entry.Runner == fromRunner && entry.Leader == fromLeader
+	}
+	return validateRunnerRecoveryLedgerPrefix(ctx, q, ref, entry.Version, entry.Runner, entry.Leader, fromVersion, fromRunner, fromLeader) == nil
 }
 
 func runnerRecoveryPayload(value RunnerRecoveryLedger) ([]byte, error) {
@@ -524,7 +578,8 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 	// legitimate later recovery is not mistaken for a forged future row, while
 	// a row beyond the actual ticket remains fatal to every reader.
 	var currentVersion, currentRunner, currentLeader uint64
-	if err := q.QueryRowContext(ctx, `SELECT t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&currentVersion, &currentRunner, &currentLeader); err != nil || currentVersion == 0 || currentRunner == 0 || currentLeader == 0 {
+	var currentState domain.State
+	if err := q.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&currentState, &currentVersion, &currentRunner, &currentLeader); err != nil || currentVersion == 0 || currentRunner == 0 || currentLeader == 0 {
 		return ErrPublicationEvidence
 	}
 	liveVersion = currentVersion
@@ -570,7 +625,16 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// events. Its leader is the first independently witnessed leader.
 			if step.PriorRunnerEpoch == 1 {
 				if err := validateInitialLifecycleAdvance(ctx, q, ref, step.PriorTicketVersion); err != nil {
-					return ErrPublicationEvidence
+					// A first daemon recovery may occur after the Store-owned
+					// provider exhaustion/retry or typed-block/recover pair, before
+					// any earlier recovery row exists. Anchor at the immutable phase
+					// entry's canonical initial lifecycle, then authenticate only the
+					// bounded historical continuation to this predecessor.
+					phase, ok := providerPhaseForState(currentState)
+					entry, entryErr := loadProviderPhaseEntryAt(ctx, q, ref, phase, step.PriorTicketVersion)
+					if !ok || entryErr != nil || validateInitialLifecycleAdvance(ctx, q, ref, entry.Version) != nil || validateRunnerRecoveryLedgerPrefix(ctx, q, ref, entry.Version, entry.Runner, entry.Leader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil {
+						return ErrPublicationEvidence
+					}
 				}
 			} else if err := validateRunnerControlAdvance(ctx, q, ref, 1, 1, step.PriorLeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch); err != nil {
 				return ErrPublicationEvidence
@@ -581,7 +645,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// Several ordinary phase completions may occur under one runner before
 			// the next daemon recovery. The chain is accepted only when every
 			// intervening event is a contiguous canonical lifecycle phase_pass.
-			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil {
+			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
 				return ErrPublicationEvidence
 			}
 		}
@@ -598,7 +662,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// A normal phase transition may follow the latest recovery row without
 			// changing the runner. It is current phase authority, not a control
 			// handoff; require the exact canonical phase event.
-			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, liveVersion, liveFence.RunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) != nil {
+			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, liveVersion, liveFence.RunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) {
 				return ErrPublicationEvidence
 			}
 		}
@@ -2063,9 +2127,11 @@ func validatePostPublicationControlAdvance(ctx context.Context, q candidateEvide
 	return nil
 }
 
-func exactStateChangeEvent(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, version uint64, trigger string, from, to domain.State) error {
+func exactStateChangeEvent(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, version uint64, trigger string, from, to domain.State) error {
 	var matching, stateChanges int
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN trigger=? AND from_state=? AND to_state=? THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, trigger, from, to, ref.Channel, ref.Project, ref.Ticket, version).Scan(&matching, &stateChanges); err != nil || matching != 1 || stateChanges != 1 {
+	if err := q.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN trigger=? AND from_state=? AND to_state=? THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN from_state<>to_state THEN 1 ELSE 0 END),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, trigger, from, to, ref.Channel, ref.Project, ref.Ticket, version).Scan(&matching, &stateChanges); err != nil || matching != 1 || stateChanges != 1 {
 		return ErrPublicationEvidence
 	}
 	return nil

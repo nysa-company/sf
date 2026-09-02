@@ -294,10 +294,6 @@ func TestCompiledDevCoordinatorDrainsNormalRunBeforeFinishingAttempt(t *testing.
 	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Path: worktree, Branch: "dev/compiled/SF-compiled-normal", IdentityJSON: []byte(identityJSON), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
-	transition, err := database.Transition(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateBuilding, Trigger: "compiled-normal", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, EventPayload: "{}"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	owner, err := processsupervisor.New(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -335,11 +331,11 @@ func TestCompiledDevCoordinatorDrainsNormalRunBeforeFinishingAttempt(t *testing.
 	if err := registry.Register(ctx, provider); err != nil {
 		t.Fatal(err)
 	}
-	coordinator, err := providercoord.New(registry, map[providercoord.Role]providercoord.Route{providercoord.RoleBuilder: {Primary: provider.Name()}}, database, nil, owner)
+	coordinator, err := providercoord.New(registry, map[providercoord.Role]providercoord.Route{providercoord.RolePlanner: {Primary: provider.Name()}}, database, nil, owner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := coordinator.Run(ctx, providercoord.Request{Role: providercoord.RoleBuilder, ExpectedVersion: transition.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, Prompt: "compiled normal", Repository: worktree, Worktree: worktree, WorktreeIdentity: identityJSON, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}})
+	result := coordinator.Run(ctx, providercoord.Request{Role: providercoord.RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "compiled normal", Repository: worktree, Worktree: worktree, WorktreeIdentity: identityJSON, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}})
 	if result.Code != providercoord.Completed {
 		t.Fatalf("compiled coordinator result=%+v", result)
 	}
@@ -420,12 +416,6 @@ func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T)
 	if err := writer.RegisterWorktree(context.Background(), store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, Path: worktree, Branch: "dev/demo/SF-gated-recovery", IdentityJSON: []byte(identity), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
-	transition, err := writer.Transition(context.Background(), store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateBuilding, Trigger: "integration", Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, EventPayload: "{}"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ticket.Version = transition.Version
-	ticket.State = domain.StateBuilding
 	builderIdentity := domain.ProviderIdentity{Provider: "builder", Model: "builder-model", Family: "builder-family", Version: "1"}
 	binaryDigest, err = owner.RegisterExecutable(builderIdentity, "/bin/sh")
 	if err != nil {
@@ -460,13 +450,13 @@ func TestCompiledDevDaemonRecoversDurableGatedProviderBeforeSocket(t *testing.T)
 	if err := registry.Register(context.Background(), provider); err != nil {
 		t.Fatal(err)
 	}
-	coordinator, err := providercoord.New(registry, map[providercoord.Role]providercoord.Route{providercoord.RoleBuilder: {Primary: "builder"}}, writer, nil, owner)
+	coordinator, err := providercoord.New(registry, map[providercoord.Role]providercoord.Route{providercoord.RolePlanner: {Primary: "builder"}}, writer, nil, owner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	coordinatorDone := make(chan providercoord.Result, 1)
 	go func() {
-		coordinatorDone <- coordinator.Run(context.Background(), providercoord.Request{Role: providercoord.RoleBuilder, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, Prompt: "integration", Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Timeout: 5 * time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}})
+		coordinatorDone <- coordinator.Run(context.Background(), providercoord.Request{Role: providercoord.RolePlanner, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, ConfigDigest: digest, Validation: phaseartifact.Validation{TicketType: domain.TicketFeature}, Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, Prompt: "integration", Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Timeout: 5 * time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}})
 	}()
 	var launch contracts.ProviderLaunch
 	deadline := time.Now().Add(5 * time.Second)
@@ -653,12 +643,6 @@ func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *te
 	if err := writer.RegisterWorktree(context.Background(), store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, Path: worktree, Branch: "dev/demo/SF-mismatched-foreign", IdentityJSON: []byte(identity), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
-	transition, err := writer.Transition(context.Background(), store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateBuilding, Trigger: "integration", Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, EventPayload: "{}"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ticket.Version = transition.Version
-	ticket.State = domain.StateBuilding
 	builderIdentity := domain.ProviderIdentity{Provider: "builder", Model: "builder-model", Family: "builder-family", Version: "1"}
 	binaryDigest, err = owner.RegisterExecutable(builderIdentity, "/bin/sh")
 	if err != nil {
@@ -688,8 +672,8 @@ func TestCompiledDevDaemonQuarantinesMismatchedForeignProviderBeforeSocket(t *te
 	}
 	auth := sha256.Sum256([]byte("auth"))
 	binding := contracts.RuntimeBinding{Identity: builder.Provider, BinaryDigest: builder.BinaryDigest, PolicyDigest: builder.PolicyDigest, FixtureDigest: builder.FixtureDigest, AuthDigest: fmt.Sprintf("%x", auth)}
-	claimInput := contracts.PhaseInput{Ticket: ref, Phase: domain.PhaseBuild, LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch, ExpectedVersion: ticket.Version, Prompt: "foreign recovery fixture", Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}
-	claim, err := writer.BeginProviderAttempt(context.Background(), store.ProviderAttemptRequest{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseBuild, Role: "builder", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(), Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), SupervisorKey: owner.PublicKey(), Input: claimInput})
+	claimInput := contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch, ExpectedVersion: ticket.Version, Prompt: "foreign recovery fixture", Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte("{}")}
+	claim, err := writer.BeginProviderAttempt(context.Background(), store.ProviderAttemptRequest{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: d.Epoch(), RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhasePlanning, Role: "planner", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(), Repository: worktree, Worktree: worktree, WorktreeIdentity: identity, BaseSHA: strings.Repeat("a", 40), SupervisorKey: owner.PublicKey(), Input: claimInput})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -753,8 +737,11 @@ func (p *compiledNormalProvider) Binding(context.Context) (contracts.RuntimeBind
 func (p *compiledNormalProvider) Invocation(context.Context, contracts.PhaseInput) (contracts.Invocation, error) {
 	return contracts.Invocation{Argv: []string{"/bin/sh", "-c", "exit 0"}}, nil
 }
-func (p *compiledNormalProvider) Parse(context.Context, contracts.PhaseInput, contracts.CommandResult) (contracts.PhaseResult, error) {
-	return contracts.PhaseResult{Artifact: []byte(`{"schema":"sf.builder/v1","summary":"compiled normal","changed_files":["main.go"],"commands":[["go","test"]]}`), Provider: p.binding.Identity, UsageTrusted: true}, nil
+func (p *compiledNormalProvider) Parse(_ context.Context, input contracts.PhaseInput, _ contracts.CommandResult) (contracts.PhaseResult, error) {
+	if input.Phase == domain.PhasePlanning {
+		return contracts.PhaseResult{Artifact: []byte(`{"schema":"sf.planner/v1","acceptance":["compiled normal"],"proof":{"kind":"acceptance","command":["go","test"],"details":"compiled normal"},"paths":["main.go"],"commands":[["go","test"]],"risks":["fixture"]}`), Provider: p.binding.Identity, UsageTrusted: true}, nil
+	}
+	return contracts.PhaseResult{}, fmt.Errorf("unexpected compiled normal phase %q", input.Phase)
 }
 
 func (p *compiledIntegrationProvider) Name() string { return p.binding.Identity.Provider }
@@ -892,8 +879,8 @@ case "$1" in
   login) [ "$2" = status ] && { echo 'Logged in using ChatGPT'; exit 0; }; exit 98 ;;
   exec) [ "$2" = '--help' ] && { echo '--json --output-schema --output-last-message --ephemeral --ignore-user-config --ignore-rules --config --model -C'; exit 0; }; exit 97 ;;
   sandbox) case "$*" in
-    *curl*) for arg in "$@"; do url="$arg"; done; /usr/bin/curl -fsS --connect-timeout 1 "$url"; exit $? ;;
-    *CODEX_HOME*) test -r "$CODEX_HOME/auth.json"; exit $? ;;
+    *curl*) exit 7 ;;
+    *CODEX_HOME*) exit 1 ;;
     *'test -r /etc/hosts'*) exit 0 ;;
     *'test -w /etc/hosts'*) exit 1 ;;
     *) exit 0 ;;

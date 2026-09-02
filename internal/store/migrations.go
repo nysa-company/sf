@@ -1256,3 +1256,46 @@ var migrationV50 = []string{
 	`CREATE TRIGGER verification_revisions_immutable_update BEFORE UPDATE ON verification_revisions BEGIN SELECT RAISE(ABORT,'verification revision is immutable'); END`,
 	`CREATE TRIGGER verification_revisions_immutable_delete BEFORE DELETE ON verification_revisions BEGIN SELECT RAISE(ABORT,'verification revision is append-only'); END`,
 }
+
+// v51 records Store-owned provider phase-entry windows and their one
+// operator-authorized retry extension. Provider attempt numbers remain
+// globally monotonic across entries; a completed prior entry never consumes a
+// later correction entry's failure capacity.
+var migrationV51 = []string{
+	`CREATE TABLE provider_phase_entries (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		phase TEXT NOT NULL CHECK(phase IN ('planning','verification','build','review')),
+		entry_ticket_version INTEGER NOT NULL CHECK(entry_ticket_version>0), entry_event_id INTEGER NOT NULL CHECK(entry_event_id>0), entry_event_created_at TEXT NOT NULL CHECK(length(entry_event_created_at) BETWEEN 1 AND 128), entry_leader_epoch INTEGER NOT NULL CHECK(entry_leader_epoch>0), entry_runner_epoch INTEGER NOT NULL CHECK(entry_runner_epoch>0),
+		entry_from_state TEXT NOT NULL CHECK(entry_from_state IN ('queued','planning','verifying','building','reviewing','publishing','waiting_ci','waiting_approval','waiting_manual_merge','paused','blocked')), entry_state TEXT NOT NULL CHECK(entry_state IN ('planning','verifying','building','reviewing')), entry_trigger TEXT NOT NULL CHECK(length(entry_trigger) BETWEEN 1 AND 128), entry_digest TEXT NOT NULL UNIQUE CHECK(length(entry_digest)=64), created_at TEXT NOT NULL CHECK(length(created_at) BETWEEN 1 AND 128),
+		PRIMARY KEY(channel,project_id,ticket_id,phase,entry_ticket_version),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(channel,project_id,ticket_id,entry_ticket_version,entry_event_id,entry_event_created_at,entry_from_state,entry_state,entry_trigger) REFERENCES events(channel,project_id,ticket_id,ticket_version,id,created_at,from_state,to_state,trigger)
+	)`,
+	`CREATE INDEX provider_phase_entries_ticket ON provider_phase_entries(channel,project_id,ticket_id,phase,entry_ticket_version DESC)`,
+	`CREATE TRIGGER provider_phase_entries_immutable_update BEFORE UPDATE ON provider_phase_entries BEGIN SELECT RAISE(ABORT,'provider phase entry is immutable'); END`,
+	`CREATE TRIGGER provider_phase_entries_immutable_delete BEFORE DELETE ON provider_phase_entries BEGIN SELECT RAISE(ABORT,'provider phase entry is append-only'); END`,
+	`CREATE TABLE provider_phase_attempt_entries (
+		provider_attempt_id INTEGER PRIMARY KEY CHECK(provider_attempt_id>0), channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('planning','verification','build','review')), role TEXT NOT NULL CHECK(role IN ('planner','builder','reviewer')), attempt INTEGER NOT NULL CHECK(attempt>0), entry_ticket_version INTEGER NOT NULL CHECK(entry_ticket_version>0), created_at TEXT NOT NULL CHECK(length(created_at) BETWEEN 1 AND 128),
+		UNIQUE(channel,project_id,ticket_id,phase,attempt),
+		FOREIGN KEY(provider_attempt_id) REFERENCES provider_attempts(id),
+		FOREIGN KEY(channel,project_id,ticket_id,phase,role,attempt,provider_attempt_id) REFERENCES provider_attempts(channel,project_id,ticket_id,phase,role,attempt,id),
+		FOREIGN KEY(channel,project_id,ticket_id,phase,attempt) REFERENCES phase_runs(channel,project_id,ticket_id,phase,attempt),
+		FOREIGN KEY(channel,project_id,ticket_id,phase,entry_ticket_version) REFERENCES provider_phase_entries(channel,project_id,ticket_id,phase,entry_ticket_version)
+	)`,
+	`CREATE TRIGGER provider_phase_attempt_entries_immutable_update BEFORE UPDATE ON provider_phase_attempt_entries BEGIN SELECT RAISE(ABORT,'provider phase attempt entry is immutable'); END`,
+	`CREATE TRIGGER provider_phase_attempt_entries_immutable_delete BEFORE DELETE ON provider_phase_attempt_entries BEGIN SELECT RAISE(ABORT,'provider phase attempt entry is append-only'); END`,
+	`CREATE TABLE provider_retry_epochs (
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		phase TEXT NOT NULL CHECK(phase IN ('planning','verification','build','review')),
+		entry_ticket_version INTEGER NOT NULL CHECK(entry_ticket_version>0), epoch INTEGER NOT NULL CHECK(epoch=1),
+		initial_first_attempt INTEGER NOT NULL CHECK(initial_first_attempt>0), initial_last_attempt INTEGER NOT NULL CHECK(initial_last_attempt>=initial_first_attempt), retry_first_attempt INTEGER NOT NULL CHECK(retry_first_attempt=initial_last_attempt+1), retry_last_attempt INTEGER NOT NULL CHECK(retry_last_attempt=retry_first_attempt+1),
+		exhaustion_ticket_version INTEGER NOT NULL CHECK(exhaustion_ticket_version>0), exhaustion_leader_epoch INTEGER NOT NULL CHECK(exhaustion_leader_epoch>0), exhaustion_runner_epoch INTEGER NOT NULL CHECK(exhaustion_runner_epoch>0),
+		retry_ticket_version INTEGER NOT NULL CHECK(retry_ticket_version>exhaustion_ticket_version), retry_leader_epoch INTEGER NOT NULL CHECK(retry_leader_epoch>0), retry_runner_epoch INTEGER NOT NULL CHECK(retry_runner_epoch>0),
+		retry_digest TEXT NOT NULL UNIQUE CHECK(length(retry_digest)=64), created_at TEXT NOT NULL CHECK(length(created_at) BETWEEN 1 AND 128),
+		PRIMARY KEY(channel,project_id,ticket_id,phase,entry_ticket_version,epoch), UNIQUE(channel,project_id,ticket_id,phase,entry_ticket_version),
+		FOREIGN KEY(channel,project_id,ticket_id,phase,entry_ticket_version) REFERENCES provider_phase_entries(channel,project_id,ticket_id,phase,entry_ticket_version)
+	)`,
+	`CREATE INDEX provider_retry_epochs_ticket ON provider_retry_epochs(channel,project_id,ticket_id,phase)`,
+	`CREATE TRIGGER provider_retry_epochs_immutable_update BEFORE UPDATE ON provider_retry_epochs BEGIN SELECT RAISE(ABORT,'provider retry epoch is immutable'); END`,
+	`CREATE TRIGGER provider_retry_epochs_immutable_delete BEFORE DELETE ON provider_retry_epochs BEGIN SELECT RAISE(ABORT,'provider retry epoch is append-only'); END`,
+}

@@ -249,6 +249,10 @@ type fakeEngine struct {
 	signals int
 }
 
+func (e *fakeEngine) SignalProviderExhausted(ctx context.Context, req contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return e.Signal(ctx, req)
+}
+
 func (e *fakeEngine) SignalCandidate(ctx context.Context, req contracts.SignalRequest, _ domain.CandidateSnapshot) (contracts.TransitionResult, error) {
 	return e.Signal(ctx, req)
 }
@@ -357,6 +361,7 @@ type fakeRunner struct {
 	outputs  []fakePhase
 	requests []PhaseRequest
 	evidence *fakeEvidence
+	err      error
 }
 type fakePhase struct {
 	result PhaseResult
@@ -377,6 +382,9 @@ func (fakeCheckpointMaterializer) MaterializeVerificationCheckpoint(_ context.Co
 
 func (r *fakeRunner) Run(_ context.Context, req PhaseRequest) (PhaseResult, error) {
 	r.requests = append(r.requests, req)
+	if r.err != nil {
+		return PhaseResult{}, r.err
+	}
 	if len(r.outputs) == 0 {
 		return PhaseResult{}, errors.New("no scripted output")
 	}
@@ -481,6 +489,16 @@ func TestPlannerPassAndQuestions(t *testing.T) {
 				t.Fatalf("plans=%d", e.plans)
 			}
 		})
+	}
+}
+
+func TestProviderBudgetExhaustionPausesThroughTypedEngineBoundary(t *testing.T) {
+	evidence := &fakeEvidence{}
+	engine := &fakeEngine{}
+	worker := newWorker(domain.StatePlanning, &fakeRunner{err: ErrProviderAttemptExhausted}, evidence, engine)
+	got, err := worker.Run(context.Background(), testRef, testFence)
+	if err != nil || !got.Transitioned || got.State != domain.StatePaused || engine.last.Trigger != "retry_or_correction_exhausted" || engine.signals != 1 {
+		t.Fatalf("run=%+v err=%v signal=%+v calls=%d", got, err, engine.last, engine.signals)
 	}
 }
 

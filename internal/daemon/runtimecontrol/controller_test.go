@@ -239,6 +239,20 @@ func TestRearmRequiresNewStoreProvenActiveIdentity(t *testing.T) {
 	}
 }
 
+func TestRuntimeRearmNeededTreatsUncontrolledProviderRetryAsNoop(t *testing.T) {
+	database, ref, _, _ := controllerFixture(t)
+	controller, err := New(database, controllerBundle(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A provider retry that did not follow pause/take has no
+	// runtime_ticket_controls row. It is already schedulable, so the daemon's
+	// lost-response replay must not turn that normal absence into stale state.
+	if needed, err := controller.RuntimeRearmNeeded(t.Context(), ref); err != nil || needed {
+		t.Fatalf("uncontrolled provider retry rearm needed=%v err=%v", needed, err)
+	}
+}
+
 func TestDrainAfterRearmedActiveBeginAcceptsControllerStoreSeal(t *testing.T) {
 	database, ref, leader, started := controllerFixture(t)
 	worker := &drainingControlWorker{entered: make(chan struct{})}

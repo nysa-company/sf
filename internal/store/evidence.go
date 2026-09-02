@@ -1107,7 +1107,8 @@ func (s *Store) ApplyOperatorDecision(ctx context.Context, request OperatorDecis
 		if err != nil {
 			return err
 		}
-		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket, version+1, "operator_"+decision.Decision, state, to, string(body), now())
+		createdAt := now()
+		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, decision.Ref.Channel, decision.Ref.Project, decision.Ref.Ticket, version+1, "operator_"+decision.Decision, state, to, string(body), createdAt)
 		if err != nil {
 			return err
 		}
@@ -1117,6 +1118,15 @@ func (s *Store) ApplyOperatorDecision(ctx context.Context, request OperatorDecis
 		// recoverable. A sealed or stale admission rolls the whole decision back.
 		if err := advanceOpenRuntimeAuthority(ctx, conn, decision.Ref, version, decision.Fence); err != nil {
 			return err
+		}
+		if decision.Decision == "rejected" {
+			eventID, err := created.LastInsertId()
+			if err != nil {
+				return err
+			}
+			if err := recordProviderPhaseEntry(ctx, conn, decision.Ref, domain.PhaseBuild, version+1, decision.Fence.LeaderEpoch, runner, eventID, createdAt, state, domain.StateBuilding, "operator_rejected"); err != nil {
+				return err
+			}
 		}
 		result.Version = version + 1
 		result.EventID, _ = created.LastInsertId()

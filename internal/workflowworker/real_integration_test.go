@@ -176,6 +176,86 @@ func TestWorkerRealStoreFailsClosedWithoutCommandResultWiring(t *testing.T) {
 	}
 }
 
+func TestWorkerRealStoreProviderAttemptExhaustionPausesExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "provider-exhaustion.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	const projectPath = "/tmp/workflow-worker-exhaustion"
+	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("exhaustion", projectPath), config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, configDigest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "exhaustion", Path: projectPath, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: configDigest, ConfigSnapshot: snapshot}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "exhaustion", Ticket: "SF-real-worker-exhaustion"}
+	if err := db.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: realDigest("provider exhaustion"), Source: []byte("provider exhaustion"), Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "real-worker-exhaustion")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := db.StartOrAdopt(ctx, ref, 1, "dev/exhaustion/SF-real-worker-exhaustion", domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}
+	if err := db.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: fence, Path: projectPath + "/SF-real-worker-exhaustion", Branch: "dev/exhaustion/SF-real-worker-exhaustion", IdentityJSON: []byte(`{"repository":"/tmp/workflow-worker-exhaustion"}`), BaseSHA: realOID("a"), HeadSHA: realOID("b")}); err != nil {
+		t.Fatal(err)
+	}
+	planner := realQualification(t, db, "44444444444444444444444444444444", "exhaustion-planner")
+	reviewer := realQualification(t, db, "55555555555555555555555555555555", "exhaustion-reviewer")
+	if _, _, err := db.SelectProviderPair(ctx, domain.ChannelDev, planner.ID, reviewer.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	signer, err := contracts.NewDrainSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := statemachine.LoadEmbeddedApproved()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &realRunner{db: db, repository: projectPath, configDigest: configDigest, bindings: map[domain.Phase]contracts.RuntimeBinding{domain.PhasePlanning: realBinding(planner)}, signer: signer, exhausted: true}
+	worker := Worker{Evidence: db, Engine: engine.New(db, spec), Runner: runner}
+	got, err := worker.Run(ctx, ref, fence)
+	if errors.Is(err, ErrUnsupportedState) || err != nil || !got.Transitioned || got.State != domain.StatePaused || got.Version != started.Version+1 {
+		t.Fatalf("provider exhaustion run=%+v err=%v", got, err)
+	}
+	countExhaustion := func() (int, error) {
+		events, eventErr := db.Events(ctx, ref.Channel, 0, 100)
+		if eventErr != nil {
+			return 0, eventErr
+		}
+		count := 0
+		for _, event := range events {
+			if event.Ref == ref && event.Trigger == "retry_or_correction_exhausted" && event.From == domain.StatePlanning && event.To == domain.StatePaused {
+				count++
+			}
+		}
+		return count, nil
+	}
+	events, eventErr := countExhaustion()
+	if eventErr != nil || events != 1 {
+		t.Fatalf("provider exhaustion events=%d err=%v", events, eventErr)
+	}
+	if _, err := worker.Run(ctx, ref, fence); err != nil {
+		t.Fatal(err)
+	}
+	events, eventErr = countExhaustion()
+	if eventErr != nil || events != 1 || runner.calls[domain.PhasePlanning] != 1 {
+		t.Fatalf("replayed provider exhaustion events=%d calls=%d err=%v", events, runner.calls[domain.PhasePlanning], eventErr)
+	}
+}
+
 func TestWorkerPlanningRecoveryRebindsOnlyExactRecoveredPlanResult(t *testing.T) {
 	t.Run("rebinds an exact plan after RecordPlan before SignalPlan", func(t *testing.T) {
 		fixture := newRealPlanningRecoveryFixture(t)
@@ -583,6 +663,7 @@ type realRunner struct {
 	calls        map[domain.Phase]int
 	failAfter    map[domain.Phase]bool
 	questions    bool
+	exhausted    bool
 }
 
 func (r *realRunner) Run(ctx context.Context, req PhaseRequest) (PhaseResult, error) {
@@ -596,12 +677,36 @@ func (r *realRunner) Run(ctx context.Context, req PhaseRequest) (PhaseResult, er
 	if repository == "" {
 		repository = "/tmp/workflow-worker-real"
 	}
-	claim, err := r.db.BeginProviderAttempt(ctx, store.ProviderAttemptRequest{Ref: req.Ticket.Ref, ExpectedVersion: req.Ticket.Version, Fence: req.Fence, Phase: req.Phase, Role: role, Binding: binding, ConfigDigest: r.configDigest, Capacity: 1, At: time.Now().UTC(), Repository: repository, Worktree: req.Worktree.Path, WorktreeIdentity: string(req.Worktree.IdentityJSON), BaseSHA: req.Worktree.BaseSHA, SupervisorKey: r.signer.PublicKey(), Input: contracts.PhaseInput{Ticket: req.Ticket.Ref, Phase: req.Phase, LeaderEpoch: req.Fence.LeaderEpoch, RunnerEpoch: req.Fence.RunnerEpoch, ExpectedVersion: req.Ticket.Version, Prompt: "real integration", Repository: repository, Worktree: req.Worktree.Path, WorktreeIdentity: string(req.Worktree.IdentityJSON), BaseSHA: req.Worktree.BaseSHA, AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}})
+	attemptRequest := store.ProviderAttemptRequest{Ref: req.Ticket.Ref, ExpectedVersion: req.Ticket.Version, Fence: req.Fence, Phase: req.Phase, Role: role, Binding: binding, ConfigDigest: r.configDigest, Capacity: 1, At: time.Now().UTC(), Repository: repository, Worktree: req.Worktree.Path, WorktreeIdentity: string(req.Worktree.IdentityJSON), BaseSHA: req.Worktree.BaseSHA, SupervisorKey: r.signer.PublicKey(), Input: contracts.PhaseInput{Ticket: req.Ticket.Ref, Phase: req.Phase, LeaderEpoch: req.Fence.LeaderEpoch, RunnerEpoch: req.Fence.RunnerEpoch, ExpectedVersion: req.Ticket.Version, Prompt: "real integration", Repository: repository, Worktree: req.Worktree.Path, WorktreeIdentity: string(req.Worktree.IdentityJSON), BaseSHA: req.Worktree.BaseSHA, AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}}
+	claim, err := r.db.BeginProviderAttempt(ctx, attemptRequest)
 	if err != nil {
 		return PhaseResult{}, fmt.Errorf("begin %s v%d fence=%+v: %w", req.Phase, req.Ticket.Version, req.Fence, err)
 	}
 	if err := r.db.RecordProviderLaunch(ctx, claim, contracts.ProviderLaunch{PID: 99, PGID: 99, BootIdentity: "test", ProcessStartIdentity: "real-worker", Worktree: claim.Worktree}); err != nil {
 		return PhaseResult{}, fmt.Errorf("record launch: %w", err)
+	}
+	if r.exhausted {
+		fail := func(value store.ProviderAttemptClaim) error {
+			proof, proofErr := r.signer.ProveDrained(realDrainRequest(value))
+			if proofErr != nil {
+				return proofErr
+			}
+			return r.db.FinishProviderAttempt(ctx, value, proof, req.Ticket.Version, req.Fence, "failed", "failed", 0, time.Now().UTC())
+		}
+		if err := fail(claim); err != nil {
+			return PhaseResult{}, fmt.Errorf("finish exhausted attempt: %w", err)
+		}
+		next, beginErr := r.db.BeginProviderAttempt(ctx, attemptRequest)
+		if beginErr != nil {
+			return PhaseResult{}, fmt.Errorf("begin second exhausted attempt: %w", beginErr)
+		}
+		if err := r.db.RecordProviderLaunch(ctx, next, contracts.ProviderLaunch{PID: 100, PGID: 100, BootIdentity: "test", ProcessStartIdentity: "real-worker-second", Worktree: next.Worktree}); err != nil {
+			return PhaseResult{}, fmt.Errorf("record second exhausted launch: %w", err)
+		}
+		if err := fail(next); err != nil {
+			return PhaseResult{}, fmt.Errorf("finish second exhausted attempt: %w", err)
+		}
+		return PhaseResult{}, ErrProviderAttemptExhausted
 	}
 	artifact, changed := r.artifact(req)
 	validation := phaseartifact.Validation{TicketType: req.Ticket.Type}

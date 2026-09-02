@@ -36,6 +36,10 @@ func (e *ciBlockEngine) Signal(_ context.Context, request contracts.SignalReques
 	return contracts.TransitionResult{To: domain.StateBlocked, TicketVersion: request.TicketVersion + 1}, nil
 }
 
+func (e *ciBlockEngine) SignalProviderExhausted(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	return e.Signal(ctx, request)
+}
+
 func (e *ciBlockEngine) SignalPlan(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error) {
 	return contracts.TransitionResult{}, errors.New("unexpected plan signal")
 }

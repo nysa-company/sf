@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
@@ -143,6 +144,40 @@ func TestFinalReviewAndManualMergeContinueAcrossPostPublicationRetry(t *testing.
 	}
 	if got := openRuntimeAuthorityVersion(t, fixture.db, waiting.Ref); got != current.Version {
 		t.Fatalf("manual continuation authority version=%d want=%d", got, current.Version)
+	}
+}
+
+func TestPostPublicationReviewRetryCannotBypassProviderExhaustion(t *testing.T) {
+	fixture := finalReviewLifecycleFixtureFor(t, domain.TicketFeature, domain.MergeManual)
+	defer fixture.db.Close()
+	_, reviewer := setupProviderPair(t, fixture.db, fixture.ctx)
+	worktree, err := fixture.db.Worktree(fixture.ctx, fixture.ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		request := ProviderAttemptRequest{
+			Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, Fence: fixture.fence,
+			Phase: domain.PhaseReview, Role: "reviewer", Binding: runtime(reviewer), ConfigDigest: fixture.ticket.ConfigDigest,
+			Capacity: 1, At: time.Now().UTC(), ExpectedHead: fixture.candidate.Snapshot.HeadSHA, ExpectedProof: fixture.candidate.Snapshot.ProofDigest,
+			Repository: "/tmp/provider", Worktree: worktree.Path, WorktreeIdentity: string(worktree.IdentityJSON), BaseSHA: worktree.BaseSHA,
+			SupervisorKey: providerTestSigner.PublicKey(),
+		}
+		request.Input = contracts.PhaseInput{Ticket: request.Ref, Phase: request.Phase, LeaderEpoch: request.Fence.LeaderEpoch, RunnerEpoch: request.Fence.RunnerEpoch, ExpectedVersion: request.ExpectedVersion, Prompt: "final review", Repository: request.Repository, Worktree: request.Worktree, WorktreeIdentity: request.WorktreeIdentity, BaseSHA: request.BaseSHA, AllowedPaths: []string{"."}, Provider: request.Binding.Identity, AuthMode: request.Binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}
+		claim, err := fixture.db.BeginProviderAttempt(fixture.ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.db.FinishProviderAttempt(fixture.ctx, claim, proof(t, claim), fixture.ticket.Version, fixture.fence, "failed", "failed", 1, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paused, err := fixture.db.TransitionProviderExhausted(fixture.ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, From: domain.StateReviewing, To: domain.StatePaused, ResumeState: domain.StateReviewing, Trigger: "retry_or_correction_exhausted", Fence: fixture.fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Transition(fixture.ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateReviewing, ResumeState: domain.StateReviewing, Trigger: "operator_retry", Fence: fixture.fence, EventPayload: `{}`}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("generic reviewing retry bypassed provider exhaustion: %v", err)
 	}
 }
 

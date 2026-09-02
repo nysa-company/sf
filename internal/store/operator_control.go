@@ -94,6 +94,17 @@ func (s *Store) TransitionRecoverAsGuarded(ctx context.Context, transition Trans
 		if err != nil {
 			return err
 		}
+		eventID, err := created.LastInsertId()
+		if err != nil {
+			return err
+		}
+		var createdAt string
+		if err := conn.QueryRowContext(txCtx, `SELECT created_at FROM events WHERE id=?`, eventID).Scan(&createdAt); err != nil {
+			return err
+		}
+		if err := recordProviderPhaseEntry(txCtx, conn, transition.Ref, domain.PhaseBuild, transition.ExpectedVersion+1, transition.Fence.LeaderEpoch, transition.Fence.RunnerEpoch, eventID, createdAt, transition.From, domain.StateBuilding, transition.Trigger); err != nil {
+			return err
+		}
 		result.Version = transition.ExpectedVersion + 1
 		result.EventID, _ = created.LastInsertId()
 		return nil

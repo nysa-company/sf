@@ -1943,6 +1943,17 @@ func (s *Store) RuntimeRearmNeeded(ctx context.Context, ref domain.TicketRef) (b
 		return false, normalizeBusy(ctx, err)
 	}
 	defer conn.Close()
+	// Unlike every mutation authority, this is an optional discriminator: a
+	// ticket that has never been paused/taken has no control row and requires no
+	// rearm. Check presence before runtimeControlFrom, whose stale-fence result
+	// intentionally conflates a missing row for its stricter mutation callers.
+	var controls int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&controls); err != nil {
+		return false, normalizeBusy(ctx, err)
+	}
+	if controls == 0 {
+		return false, nil
+	}
 	control, err := runtimeControlFrom(ctx, conn, ref)
 	if err != nil {
 		return false, err

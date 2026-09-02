@@ -42,11 +42,12 @@ var (
 )
 
 const (
-	Completed       Outcome = "completed"
-	Failed          Outcome = "failed"
-	Canceled        Outcome = "canceled"
-	NeedsOperator   Outcome = "needs_operator"
-	BudgetExhausted Outcome = "budget_exhausted"
+	Completed        Outcome = "completed"
+	Failed           Outcome = "failed"
+	Canceled         Outcome = "canceled"
+	NeedsOperator    Outcome = "needs_operator"
+	BudgetExhausted  Outcome = "budget_exhausted"
+	AttemptExhausted Outcome = "attempt_exhausted"
 )
 
 type Request struct {
@@ -300,6 +301,9 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			}
 			if errors.Is(err, store.ErrProviderCapacity) {
 				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			}
+			if errors.Is(err, store.ErrProviderAttemptLimit) {
+				return Result{Code: AttemptExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
 			continue
 		}

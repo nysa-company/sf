@@ -285,6 +285,126 @@ func TestDrainedProviderControlInvalidationCancelsExactAttemptAndAdmitsRetry(t *
 	}
 }
 
+// A non-legacy typed blocker may interrupt a provider phase, but its recover
+// path must retain the immutable entry rather than recreating capacity through
+// a generic state transition.
+func TestTypedProviderBlockRecoverRetainsEntryAndAdmitsAttempt(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-block-recover")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-provider-block-recover", leader), leader, domain.StateBuilding)
+	blocked, err := db.Transition(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateBuilding, To: domain.StateBlocked,
+		ResumeState: domain.StateBuilding, Trigger: "typed_blocker",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, EventPayload: `{"code":"provider_runtime_retry_required"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := db.Transition(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: blocked.Version, From: domain.StateBlocked, To: domain.StateBuilding,
+		Trigger: "operator_recover", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, EventPayload: `{}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || current.State != domain.StateBuilding || current.Version != recovered.Version {
+		t.Fatalf("recovered ticket=%+v result=%+v err=%v", current, recovered, err)
+	}
+	builder, _ := setupProviderPair(t, db, ctx)
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{
+		Ref: current.Ref, ExpectedVersion: current.Version,
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: current.RunnerEpoch},
+		Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(builder), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(),
+	}))
+	if err != nil || claim.Attempt != 1 {
+		t.Fatalf("recovered provider admission claim=%+v err=%v", claim, err)
+	}
+}
+
+func recoveredProviderBuildTicket(t *testing.T, name string) (*Store, context.Context, uint64, Ticket, string, contracts.RuntimeBinding) {
+	t.Helper()
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	firstLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, name+"-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, name, firstLeader)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, name+"-recovered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err != nil {
+		t.Fatalf("fence recovered provider ticket: %v", err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.State != domain.StatePlanning || ticket.RunnerEpoch != 2 {
+		t.Fatalf("recovered ticket=%+v err=%v", ticket, err)
+	}
+	builder, _ := setupProviderPair(t, db, ctx)
+	return db, ctx, leader, ticket, digest, runtime(builder)
+}
+
+func TestRecoveredProviderPauseResumeRetainsEntryAndAdmitsAttempt(t *testing.T) {
+	db, ctx, leader, ticket, digest, binding := recoveredProviderBuildTicket(t, "SF-provider-recovered-control")
+	control, stopping := stopProviderControl(t, db, ctx, leader, ticket)
+	paused, err := db.CompleteControlTransition(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: control.Version, From: domain.StateStopping, To: domain.StatePaused,
+		ResumeState: domain.StatePlanning, Trigger: "process_and_effects_drained",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StatePlanning, Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+		t.Fatalf("resume after recovery: %v", err)
+	}
+	current, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openExactRuntimeAdmission(t, db, ticket.Ref)
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: current.Ref, ExpectedVersion: current.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: current.RunnerEpoch}, Phase: domain.PhasePlanning, Role: "planner", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil || claim.Attempt != 1 {
+		t.Fatalf("provider admission after recovered resume claim=%+v err=%v", claim, err)
+	}
+}
+
+func TestRecoveredProviderBlockRecoverRetainsEntryAndAdmitsAttempt(t *testing.T) {
+	db, ctx, leader, ticket, digest, binding := recoveredProviderBuildTicket(t, "SF-provider-recovered-block")
+	blocked, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateBlocked, ResumeState: domain.StatePlanning, Trigger: "typed_blocker", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, EventPayload: `{"code":"provider_runtime_retry_required"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: blocked.Version, From: domain.StateBlocked, To: domain.StatePlanning, Trigger: "operator_recover", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+		t.Fatalf("recover after recovery: %v", err)
+	}
+	current, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-block-after-recover")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, secondLeader); err != nil {
+		t.Fatalf("fence after provider block recovery: %v", err)
+	}
+	current, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: current.Ref, ExpectedVersion: current.Version, Fence: domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: current.RunnerEpoch}, Phase: domain.PhasePlanning, Role: "planner", Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil || claim.Attempt != 1 {
+		t.Fatalf("provider admission after recovered blocker claim=%+v err=%v", claim, err)
+	}
+}
+
 func TestCompleteControlTransitionPreservesQuarantinedProviderClaim(t *testing.T) {
 	db, ctx, leader, ticket, claim := providerControlFixture(t)
 	oldFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}

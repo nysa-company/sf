@@ -1468,6 +1468,15 @@ func (s *Store) ConsumeCIObservation(ctx context.Context, request CIObservationT
 		if count, _ := inserted.RowsAffected(); count != 1 {
 			return ErrCIObservation
 		}
+		if resulting == domain.StateBuilding {
+			if err := recordProviderPhaseEntry(ctx, conn, request.Ref, domain.PhaseBuild, version+1, request.Fence.LeaderEpoch, runner, eventID, createdAt, domain.StateWaitingCI, domain.StateBuilding, trigger); err != nil {
+				return err
+			}
+		} else if resulting == domain.StateReviewing {
+			if err := recordProviderPhaseEntry(ctx, conn, request.Ref, domain.PhaseReview, version+1, request.Fence.LeaderEpoch, runner, eventID, createdAt, domain.StateWaitingCI, domain.StateReviewing, trigger); err != nil {
+				return err
+			}
+		}
 		if observation.Classification == "red" && resulting == domain.StateBuilding {
 			publication, found, err := loadPublicationEvidenceRow(ctx, conn, request.Ref)
 			if err != nil || !found || !ciObservationMatchesPublication(observation, publication) {

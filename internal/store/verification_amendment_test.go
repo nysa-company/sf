@@ -217,6 +217,23 @@ func TestVerificationAmendmentRejectsCommandMismatchAndSourceTamper(t *testing.T
 
 func TestVerificationAmendmentRejectsMissingRequestEvent(t *testing.T) {
 	fixture := verificationAmendmentLifecycle(t, true)
+	// V51 binds this Store-owned amendment transition to its exact phase entry.
+	// Simulate privileged durable corruption by removing the immutable child
+	// witness before deleting its referenced event; ordinary SQL must retain the
+	// foreign-key protection.
+	for _, trigger := range []string{"provider_phase_attempt_entries_immutable_delete", "provider_phase_entries_immutable_delete"} {
+		if _, err := fixture.db.db.ExecContext(fixture.ctx, `DROP TRIGGER `+trigger); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := fixture.db.db.ExecContext(fixture.ctx, `DELETE FROM provider_phase_attempt_entries
+		WHERE channel=? AND project_id=? AND ticket_id=? AND phase='verification' AND entry_ticket_version=?`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket, fixture.ticket.Version); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.db.ExecContext(fixture.ctx, `DELETE FROM provider_phase_entries
+		WHERE channel=? AND project_id=? AND ticket_id=? AND phase='verification' AND entry_ticket_version=?`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket, fixture.ticket.Version); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fixture.db.db.ExecContext(fixture.ctx, `DELETE FROM events
 		WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?
 		AND trigger='verification_amendment_requested' AND from_state='building' AND to_state='verifying'`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket, fixture.ticket.Version); err != nil {

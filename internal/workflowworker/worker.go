@@ -27,6 +27,10 @@ var (
 	ErrAmendmentUnsupported  = errors.New("verification amendment requires an authenticated Store amendment request")
 	ErrStaleEvidence         = errors.New("phase evidence is not current for this ticket fence")
 	ErrUnsupportedState      = errors.New("workflow worker cannot execute this ticket state")
+	// ErrProviderAttemptExhausted is a typed coordinator outcome. It is not a
+	// ticket time/cost budget: Worker converts only this attempt-window limit
+	// through Store's authenticated provider-exhaustion pause boundary.
+	ErrProviderAttemptExhausted = errors.New("workflow provider attempt window is exhausted")
 )
 
 // Evidence is the deliberately small Store surface needed by the walking
@@ -73,6 +77,7 @@ type OperatorSourceResumeProofSource interface {
 // engine.Engine so guards and durable transition persistence are centralized.
 type StateMachine interface {
 	Signal(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
+	SignalProviderExhausted(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 	SignalPlan(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 	SignalVerification(context.Context, contracts.SignalRequest) (contracts.TransitionResult, error)
 	SignalVerificationAmendment(context.Context, contracts.SignalRequest, store.VerificationAmendmentDecision, store.ProviderAttemptResultKey) (contracts.TransitionResult, error)
@@ -222,6 +227,18 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		return result, nil
 	}
 	if err != nil {
+		if errors.Is(err, ErrProviderAttemptExhausted) {
+			_, signalErr := w.Engine.SignalProviderExhausted(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Trigger: "retry_or_correction_exhausted", Fence: fence})
+			if signalErr != nil {
+				return result, signalErr
+			}
+			current, readErr := w.Evidence.Ticket(ctx, ref)
+			if readErr != nil {
+				return result, readErr
+			}
+			result.State, result.Version, result.Transitioned = current.State, current.Version, true
+			return result, nil
+		}
 		if errors.Is(err, ErrAmendmentUnsupported) {
 			if current, readErr := w.Evidence.Ticket(ctx, ref); readErr == nil {
 				result.State, result.Version = current.State, current.Version

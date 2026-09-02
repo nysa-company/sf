@@ -303,9 +303,8 @@ func TestRunnerRecoveryAuthorityAuthenticatesControlGaps(t *testing.T) {
 			t.Fatal(err)
 		}
 		fence.RunnerEpoch = ticket.RunnerEpoch
-		key := completePlanner(t, db, ctx, digest, ticket, fence, planner)
-		if _, _, err := db.LoadCurrentProviderAttemptResult(ctx, key, ticket.Version, fence); !errors.Is(err, ErrStaleFence) {
-			t.Fatalf("unexplained runner gap accepted: %v", err)
+		if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("unexplained runner gap began a provider attempt: %v", err)
 		}
 	})
 
@@ -375,6 +374,19 @@ func TestRunnerRecoveryAuthorityAuthenticatesControlGaps(t *testing.T) {
 		t.Run(tamper.name, func(t *testing.T) {
 			db, ctx, digest, ticket, planner, fence := newPlanning(t, "SF-runner-start-anchor-"+tamper.id)
 			completePlanner(t, db, ctx, digest, ticket, fence, planner)
+			if tamper.version == 2 {
+				for _, trigger := range []string{"provider_phase_attempt_entries_immutable_delete", "provider_phase_entries_immutable_delete"} {
+					if _, err := db.db.ExecContext(ctx, `DROP TRIGGER `+trigger); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := db.db.ExecContext(ctx, `DELETE FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='planning' AND entry_ticket_version=2`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.db.ExecContext(ctx, `DELETE FROM provider_phase_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='planning' AND entry_ticket_version=2`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if _, err := db.db.ExecContext(ctx, `UPDATE events SET trigger=? WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, tamper.trigger, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, tamper.version); err != nil {
 				t.Fatal(err)
 			}
@@ -463,6 +475,119 @@ func TestRunnerRecoveryAuthorityAuthenticatesControlGaps(t *testing.T) {
 		key := completePlanner(t, db, ctx, digest, ticket, fence, planner)
 		if _, _, err := db.LoadCurrentProviderAttemptResult(ctx, key, ticket.Version, fence); err != nil {
 			t.Fatalf("current provider after paused restart=%v", err)
+		}
+	})
+
+	t.Run("resume before controller rearm retains only the sealed provider control endpoint", func(t *testing.T) {
+		db, ctx, _, ticket, _, fence := newPlanning(t, "SF-runner-resume-before-rearm")
+		stopping, err := db.TransitionAndInvalidateRunner(ctx, Transition{
+			Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning,
+			To: domain.StateStopping, ResumeState: domain.StatePlanning,
+			Trigger: "operator_pause_or_take", Fence: fence, EventPayload: `{}`,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stoppingTicket, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paused, err := db.CompleteControlTransition(ctx, Transition{
+			Ref: ticket.Ref, ExpectedVersion: stopping.Version, From: domain.StateStopping,
+			To: domain.StatePaused, ResumeState: domain.StatePlanning,
+			Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: stoppingTicket.RunnerEpoch}, EventPayload: `{}`,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pausedTicket, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resumeLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "runner-resume-before-rearm-handoff")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, resumeLeader); err != nil || changed != 0 {
+			t.Fatalf("paused leader handoff changed=%d err=%v", changed, err)
+		}
+		if _, err := db.Transition(ctx, Transition{
+			Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused,
+			To: domain.StatePlanning, Trigger: "operator_resume",
+			Fence: domain.Fence{LeaderEpoch: resumeLeader, RunnerEpoch: pausedTicket.RunnerEpoch}, EventPayload: `{}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		resumed, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var path string
+		if err := db.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+			t.Fatalf("database path=%q err=%v", path, err)
+		}
+		// Deliberately do not call Controller.Rearm/openExactRuntimeAdmission:
+		// this is the crash window that must be fenced from the sealed control
+		// tuple alone.
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := Open(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		leader, err := reopened.AcquireLeader(ctx, domain.ChannelDev, "runner-resume-before-rearm-restart")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := reopened.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err != nil || changed != 1 {
+			t.Fatalf("sealed pause/resume recovery changed=%d err=%v", changed, err)
+		}
+		live, err := reopened.Ticket(ctx, ticket.Ref)
+		if err != nil || live.Version != resumed.Version+1 || live.RunnerEpoch != resumed.RunnerEpoch+1 {
+			t.Fatalf("fenced ticket=%+v resumed=%+v err=%v", live, resumed, err)
+		}
+		var prior uint64
+		if err := reopened.db.QueryRowContext(ctx, `SELECT prior_leader_epoch FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY ticket_version DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&prior); err != nil || prior != fence.LeaderEpoch {
+			t.Fatalf("sealed predecessor=%d want=%d err=%v", prior, fence.LeaderEpoch, err)
+		}
+	})
+
+	t.Run("operator retry cannot impersonate a sealed provider resume", func(t *testing.T) {
+		db, ctx, _, ticket, _, fence := newPlanning(t, "SF-runner-resume-operator-retry")
+		stopping, err := db.TransitionAndInvalidateRunner(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateStopping, ResumeState: domain.StatePlanning, Trigger: "operator_pause_or_take", Fence: fence, EventPayload: `{}`})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stoppingTicket, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paused, err := db.CompleteControlTransition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: stopping.Version, From: domain.StateStopping, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: stoppingTicket.RunnerEpoch}, EventPayload: `{}`})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pausedTicket, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StatePlanning, Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: pausedTicket.RunnerEpoch}, EventPayload: `{}`}); err != nil {
+			t.Fatal(err)
+		}
+		resumed, err := db.Ticket(ctx, ticket.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.db.ExecContext(ctx, `UPDATE events SET trigger='operator_retry' WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, resumed.Version); err != nil {
+			t.Fatal(err)
+		}
+		leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "runner-resume-operator-retry-restart")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); !errors.Is(err, ErrPublicationEvidence) {
+			t.Fatalf("operator_retry impersonation accepted: %v", err)
 		}
 	})
 

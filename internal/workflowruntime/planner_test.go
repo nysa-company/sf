@@ -108,6 +108,19 @@ func TestPlannerRunnerMapsCodexPlannerAndReturnsAuthenticatedKey(t *testing.T) {
 	}
 }
 
+func TestPlannerRunnerOnlyMapsAttemptWindowExhaustionToProviderPause(t *testing.T) {
+	request, evidence, coordinator := plannerFixture(t)
+	runner := PlannerRunner{Store: evidence, Coordinator: coordinator}
+	coordinator.result = providercoord.Result{Code: providercoord.BudgetExhausted, NeedsOperator: true}
+	if _, err := runner.RunArtifact(context.Background(), request); !errors.Is(err, ErrPlannerNotReady) {
+		t.Fatalf("ticket time/cost budget mapped to provider exhaustion: %v", err)
+	}
+	coordinator.result = providercoord.Result{Code: providercoord.AttemptExhausted, NeedsOperator: true}
+	if _, err := runner.RunArtifact(context.Background(), request); !errors.Is(err, workflowworker.ErrProviderAttemptExhausted) {
+		t.Fatalf("attempt window did not retain typed exhaustion: %v", err)
+	}
+}
+
 func TestPlannerRunnerAcceptsCoordinatorNarrowedTimeout(t *testing.T) {
 	request, evidence, coordinator := plannerFixture(t)
 	bind := coordinator.onRun

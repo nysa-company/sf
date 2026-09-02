@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -73,6 +76,742 @@ func TestProviderAdmissionUsesPairCapacityAndFreshFences(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = reviewer
+}
+
+func TestProviderExhaustionOpensExactlyOneDurableRetryEpoch(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-retry-epoch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-provider-retry-epoch", leader), leader, domain.StatePlanning)
+	planner, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	fail := func(current Ticket) ProviderAttemptClaim {
+		claim, beginErr := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: current.Ref, ExpectedVersion: current.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		if finishErr := db.FinishProviderAttempt(ctx, claim, proof(t, claim), current.Version, fence, "failed", "failed", 1, time.Now().UTC()); finishErr != nil {
+			t.Fatal(finishErr)
+		}
+		return claim
+	}
+	first, second := fail(ticket), fail(ticket)
+	if first.Attempt != 1 || second.Attempt != 2 {
+		t.Fatalf("initial attempts=%d,%d", first.Attempt, second.Attempt)
+	}
+	if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); !errors.Is(err, ErrProviderAttemptLimit) {
+		t.Fatalf("third initial attempt=%v", err)
+	}
+	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence, EventPayload: `{"schema":"sf.provider-exhaustion/v1","phase":"planning","retry_epoch":0,"attempts":[1,2]}`}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("forged provider exhaustion=%v", err)
+	}
+	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence, EventPayload: `{}`}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("generic provider exhaustion=%v", err)
+	}
+	paused, err := db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence})
+	if err != nil || paused.Version != ticket.Version+1 {
+		t.Fatalf("pause=%+v err=%v", paused, err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.State != domain.StatePaused {
+		t.Fatalf("paused ticket=%+v err=%v", ticket, err)
+	}
+	if retryable, retryErr := db.ProviderRetryPause(ctx, ticket); retryErr != nil || !retryable {
+		t.Fatalf("provider retry pause=%v err=%v", retryable, retryErr)
+	}
+	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence, EventPayload: `{}`}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("generic provider retry=%v", err)
+	}
+	retried, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
+	if err != nil || retried.Version != ticket.Version+1 {
+		t.Fatalf("retry=%+v err=%v", retried, err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.State != domain.StatePlanning {
+		t.Fatalf("retried ticket=%+v err=%v", ticket, err)
+	}
+	if replay, replayErr := db.ProviderRetryReplay(ctx, ticket); replayErr != nil || !replay {
+		t.Fatalf("retry replay=%v err=%v", replay, replayErr)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_retry_epochs SET retry_digest='forged' WHERE channel=? AND project_id=? AND ticket_id=? AND phase=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, domain.PhasePlanning); err == nil {
+		t.Fatal("provider retry epoch update unexpectedly succeeded")
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM provider_retry_epochs WHERE channel=? AND project_id=? AND ticket_id=? AND phase=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, domain.PhasePlanning); err == nil {
+		t.Fatal("provider retry epoch delete unexpectedly succeeded")
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_phase_entries SET entry_digest='forged' WHERE channel=? AND project_id=? AND ticket_id=? AND phase=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, domain.PhasePlanning); err == nil {
+		t.Fatal("provider phase entry update unexpectedly succeeded")
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, domain.PhasePlanning); err == nil {
+		t.Fatal("provider phase attempt entry delete unexpectedly succeeded")
+	}
+	newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-retry-epoch-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil {
+		t.Fatalf("retry epoch recovery=%v", err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.Version != retried.Version+1 || ticket.RunnerEpoch != fence.RunnerEpoch+1 {
+		t.Fatalf("recovered retry ticket=%+v err=%v", ticket, err)
+	}
+	fence = domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: ticket.RunnerEpoch}
+	third, fourth := fail(ticket), fail(ticket)
+	if third.Attempt != 3 || fourth.Attempt != 4 {
+		t.Fatalf("retry attempts=%d,%d", third.Attempt, fourth.Attempt)
+	}
+	if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); !errors.Is(err, ErrProviderAttemptLimit) {
+		t.Fatalf("fifth attempt=%v", err)
+	}
+	paused, err = db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence})
+	if err != nil {
+		t.Fatalf("second exhaustion=%v", err)
+	}
+	ticket, _ = db.Ticket(ctx, ticket.Ref)
+	if retryable, retryErr := db.ProviderRetryPause(ctx, ticket); retryErr != nil || retryable {
+		t.Fatalf("second provider retry pause=%v err=%v", retryable, retryErr)
+	}
+	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("second retry=%v", err)
+	}
+}
+
+func TestProviderRetryAfterRecoveryAdmitsAndReusesCurrentResult(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	firstLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-retry-pre-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-provider-retry-pre-fence", firstLeader)
+	planner, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: firstLeader, RunnerEpoch: ticket.RunnerEpoch}
+	fail := func() {
+		claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "failed", 1, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fail()
+	fail()
+	paused, err := db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.Version != paused.Version {
+		t.Fatalf("paused ticket=%+v err=%v", ticket, err)
+	}
+	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-retry-post-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil || claim.Attempt != 3 {
+		t.Fatalf("retry claim=%+v err=%v", claim, err)
+	}
+	if err := db.RecordProviderLaunch(ctx, claim, contracts.ProviderLaunch{PID: int(claim.ID), PGID: int(claim.ID), BootIdentity: "retry-recovery", ProcessStartIdentity: "retry-recovery", Worktree: claim.Worktree}); err != nil {
+		t.Fatal(err)
+	}
+	artifact := []byte(`{"schema":"sf.planner/v1","acceptance":["a"],"proof":{"kind":"acceptance","command":["go","test"],"details":"d"},"paths":["internal"],"commands":[["go","test"]],"risks":["r"]}`)
+	if _, err := db.CompleteProviderAttemptSuccess(ctx, claim, proof(t, claim), ticket.Version, fence, contracts.PhaseResult{Provider: claim.Binding.Identity, Artifact: artifact, UsageTrusted: true, UsageUnits: 1}, phaseartifact.Validation{TicketType: ticket.Type}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	key, reusable, err := db.ReuseCurrentCompletedProviderAttempt(ctx, ticket.Ref, domain.PhasePlanning, "planner", ticket.Version, fence)
+	if err != nil || !reusable || key.AttemptID != claim.ID {
+		t.Fatalf("retry result reuse key=%+v reusable=%v err=%v", key, reusable, err)
+	}
+}
+
+func TestProviderRetryEpochsArePhaseScoped(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-retry-phase-scope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := providerState(t, db, ctx, setupProviderTicket(t, db, ctx, "SF-provider-retry-phase-scope", leader), leader, domain.StatePlanning)
+	planner, reviewer := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	fail := func(current Ticket, phase domain.Phase, role string, binding contracts.RuntimeBinding) ProviderAttemptClaim {
+		claim, beginErr := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: current.Ref, ExpectedVersion: current.Version, Fence: fence, Phase: phase, Role: role, Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		if finishErr := db.FinishProviderAttempt(ctx, claim, proof(t, claim), current.Version, fence, "failed", "failed", 1, time.Now().UTC()); finishErr != nil {
+			t.Fatal(finishErr)
+		}
+		return claim
+	}
+	// Exhausting and retrying planning creates the one immutable planning epoch.
+	fail(ticket, domain.PhasePlanning, "planner", runtime(planner))
+	fail(ticket, domain.PhasePlanning, "planner", runtime(planner))
+	_, err = db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The phase transition itself is not the subject of this capacity test; it
+	// merely establishes the next provider endpoint on the same ticket.
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateVerifying)
+	fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	first := fail(ticket, domain.PhaseVerification, "reviewer", runtime(reviewer))
+	second := fail(ticket, domain.PhaseVerification, "reviewer", runtime(reviewer))
+	if first.Attempt != 1 || second.Attempt != 2 {
+		t.Fatalf("verification initial attempts=%d,%d", first.Attempt, second.Attempt)
+	}
+	if _, err := db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateVerifying, To: domain.StatePaused, ResumeState: domain.StateVerifying, Trigger: "retry_or_correction_exhausted", Fence: fence}); err != nil {
+		t.Fatalf("verification exhaustion=%v", err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StateVerifying, ResumeState: domain.StateVerifying, Trigger: "operator_retry", Fence: fence}); err != nil {
+		t.Fatalf("verification retry after planning retry=%v", err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	third := fail(ticket, domain.PhaseVerification, "reviewer", runtime(reviewer))
+	fourth := fail(ticket, domain.PhaseVerification, "reviewer", runtime(reviewer))
+	if third.Attempt != 3 || fourth.Attempt != 4 {
+		t.Fatalf("verification retry attempts=%d,%d", third.Attempt, fourth.Attempt)
+	}
+	var epochs int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_retry_epochs WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&epochs); err != nil || epochs != 2 {
+		t.Fatalf("phase-scoped epochs=%d err=%v", epochs, err)
+	}
+}
+
+func TestV51BackfillRecognizesOnlyCanonicalRelayPlanningExhaustion(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "v51-backfill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-v51-backfill", leader)
+	planner, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	for range 2 {
+		claim, beginErr := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		if finishErr := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "failed", 1, time.Now().UTC()); finishErr != nil {
+			t.Fatal(finishErr)
+		}
+	}
+	// Simulate the exact v50 durable shape: entries/bindings did not exist yet.
+	for _, statement := range []string{
+		`DROP TRIGGER provider_phase_attempt_entries_immutable_delete`,
+		`DROP TRIGGER provider_phase_entries_immutable_delete`,
+		`DELETE FROM provider_phase_attempt_entries WHERE channel='dev' AND project_id='provider' AND ticket_id='SF-v51-backfill'`,
+		`DELETE FROM provider_phase_entries WHERE channel='dev' AND project_id='provider' AND ticket_id='SF-v51-backfill'`,
+	} {
+		if _, err := db.db.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.write(ctx, func(conn *sql.Conn) error { return backfillV51ProviderPhaseEntries(ctx, conn) }); err != nil {
+		t.Fatal(err)
+	}
+	var entries, bindings int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='planning' AND entry_ticket_version=2`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&entries); err != nil || entries != 1 {
+		t.Fatalf("backfilled entries=%d err=%v", entries, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='planning' AND entry_ticket_version=2`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&bindings); err != nil || bindings != 2 {
+		t.Fatalf("backfilled bindings=%d err=%v", bindings, err)
+	}
+}
+
+func TestV51BlocksUnverifiableLegacyProviderEntry(t *testing.T) {
+	db, ctx := openTestStore(t)
+	_ = setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "v51-legacy-block")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-v51-legacy-block", leader)
+	for _, statement := range []string{
+		`DROP TRIGGER provider_phase_entries_immutable_delete`,
+		`DELETE FROM provider_phase_entries WHERE channel='dev' AND project_id='provider' AND ticket_id='SF-v51-legacy-block'`,
+	} {
+		if _, err := db.db.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.write(ctx, func(conn *sql.Conn) error { return blockUnverifiableV51ProviderEntries(ctx, conn) }); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || blocked.State != domain.StateBlocked || blocked.ResumeState != domain.StatePlanning || blocked.BlockedCode != "legacy_provider_phase_entry_unverifiable" {
+		t.Fatalf("legacy block=%+v err=%v", blocked, err)
+	}
+}
+
+func TestV51OpenBackfillsCanonicalRelayPlanningEntry(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "relay-v50.sqlite")
+	createDatabaseAtVersion(t, path, 50)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := "2026-09-01T00:00:00Z"
+	const source = "relay-source"
+	const workflow = "relay-workflow"
+	authorityDigest := "sha256:" + sha256Digest([]byte("relay-authority"))
+	workflowDigest := "sha256:" + sha256Digest([]byte("relay-workflow"))
+	statements := []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO daemon_instances(channel,leader_epoch,identity,updated_at) VALUES('dev',9,'post-crash','2026-09-01T00:00:01Z')`, nil},
+		{`INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('dev','relay','/relay','main')`, nil},
+		{`INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES('dev','relay','T-204',?,'feature','guarded','planning',2,1,?)`, []any{source, workflow}},
+		{`INSERT INTO runner_start_authorities(channel,project_id,ticket_id,start_ticket_version,runner_epoch,leader_epoch,workflow_id,workflow_digest,created_at,authority_digest) VALUES('dev','relay','T-204',2,1,3,?,?,?,?)`, []any{workflow, workflowDigest, created, authorityDigest}},
+		{`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES('dev','relay','T-204',2,'operator_start','queued','planning','{}',?)`, []any{created}},
+		{`INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES('dev','relay','T-204',2,'worktree_registered','planning','planning','{}','2026-09-01T00:00:00.5Z')`, nil},
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		statements = append(statements,
+			struct {
+				query string
+				args  []any
+			}{`INSERT INTO phase_runs(channel,project_id,ticket_id,phase,attempt,state,leader_epoch,runner_epoch,expected_ticket_version,provider,model,family,provider_version,worktree_identity,base_sha,started_at,completed_at,outcome) VALUES('dev','relay','T-204','planning',?,'failed',3,1,2,'p','m','f','1','identity','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?,?,'failed')`, []any{attempt, created, created}},
+			struct {
+				query string
+				args  []any
+			}{`INSERT INTO provider_attempts(channel,project_id,ticket_id,phase,attempt,provider,model,family,version,outcome,role,state,started_at,finished_at,leader_epoch,runner_epoch,expected_ticket_version,worktree_identity,base_sha) VALUES('dev','relay','T-204','planning',?,'p','m','f','1','failed','planner','failed',?,?,3,1,2,'identity','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`, []any{attempt, created, created}},
+		)
+	}
+	for _, statement := range statements {
+		if _, err := raw.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := OpenChannel(ctx, path, filepath.Join(root, "unused-backups"), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "relay", Ticket: "T-204"}
+	var version, bindings int
+	if err := database.db.QueryRowContext(ctx, `SELECT entry_ticket_version FROM provider_phase_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='planning'`, ref.Channel, ref.Project, ref.Ticket).Scan(&version); err != nil || version != 2 {
+		t.Fatalf("backfilled entry version=%d err=%v", version, err)
+	}
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='planning' AND entry_ticket_version=2`, ref.Channel, ref.Project, ref.Ticket).Scan(&bindings); err != nil || bindings != 2 {
+		t.Fatalf("backfilled bindings=%d err=%v", bindings, err)
+	}
+}
+
+func TestV51OpenClassifiesPausedAndBlockedLegacyProviderEntriesWithoutSyntheticTransitions(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "legacy-provider-pauses-v50.sqlite")
+	createDatabaseAtVersion(t, path, 50)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{
+		`INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('dev','legacy-provider-pauses','/legacy-provider-pauses','main')`,
+		`INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id,blocked_code) VALUES('dev','legacy-provider-pauses','T-active','legacy-active','feature','guarded','planning',6,1,'legacy-active-workflow','')`,
+		`INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,resume_state,version,runner_epoch,workflow_id,blocked_code) VALUES('dev','legacy-provider-pauses','T-paused','legacy-paused','feature','guarded','paused','planning',7,3,'legacy-paused-workflow','')`,
+		`INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,resume_state,version,runner_epoch,workflow_id,blocked_code) VALUES('dev','legacy-provider-pauses','T-blocked','legacy-blocked','feature','guarded','blocked','planning',8,2,'legacy-blocked-workflow','host_repair_required')`,
+		`INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,resume_state,version,runner_epoch,workflow_id,blocked_code) VALUES('dev','legacy-provider-pauses','T-stopping','legacy-stopping','feature','guarded','stopping','planning',9,4,'legacy-stopping-workflow','')`,
+	}
+	for _, statement := range statements {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := OpenChannel(ctx, path, filepath.Join(root, "unused-backups"), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	for _, tc := range []struct {
+		id      domain.TicketID
+		version uint64
+		events  int
+	}{
+		{id: "T-active", version: 7, events: 1},
+		{id: "T-paused", version: 7, events: 0},
+		{id: "T-blocked", version: 8, events: 0},
+		{id: "T-stopping", version: 10, events: 1},
+	} {
+		t.Run(string(tc.id), func(t *testing.T) {
+			var state, resume, code string
+			var version uint64
+			if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='dev' AND project_id='legacy-provider-pauses' AND id=?`, tc.id).Scan(&state, &resume, &code, &version); err != nil {
+				t.Fatal(err)
+			}
+			if state != string(domain.StateBlocked) || resume != string(domain.StatePlanning) || code != "legacy_provider_phase_entry_unverifiable" || version != tc.version {
+				t.Fatalf("legacy classification state=%q resume=%q code=%q version=%d", state, resume, code, version)
+			}
+			var synthetic int
+			if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel='dev' AND project_id='legacy-provider-pauses' AND ticket_id=?`, tc.id).Scan(&synthetic); err != nil || synthetic != tc.events {
+				t.Fatalf("legacy classification events=%d want=%d err=%v", synthetic, tc.events, err)
+			}
+			if tc.id == "T-active" || tc.id == "T-stopping" {
+				from := "planning"
+				if tc.id == "T-stopping" {
+					from = "stopping"
+				}
+				var canonical int
+				if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel='dev' AND project_id='legacy-provider-pauses' AND ticket_id=? AND trigger='typed_blocker' AND from_state=? AND to_state='blocked'`, tc.id, from).Scan(&canonical); err != nil || canonical != 1 {
+					t.Fatalf("%s legacy blocker=%d err=%v", tc.id, canonical, err)
+				}
+			}
+		})
+	}
+}
+
+func TestV51MigrationRecoversLaunchedLegacyBlockedProviderClaims(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		stopping         bool
+		preexistingBlock bool
+		wantFenceChange  int64
+	}{
+		{name: "active claim is fenced before proof drain", wantFenceChange: 1},
+		{name: "stopping claim already belongs to stale runner", stopping: true, wantFenceChange: 0},
+		{name: "preexisting blocked claim uses narrow proof drain", preexistingBlock: true, wantFenceChange: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			if err := os.Chmod(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, "legacy-launched-v50.sqlite")
+			createDatabaseAtVersion(t, path, 50)
+			seedMigrationPhase(t, path, true, false)
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.ExecContext(ctx, `INSERT INTO daemon_instances(channel,leader_epoch,identity,updated_at) VALUES('dev',1,'v50-daemon','2026-09-01T00:00:00Z')`); err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			if tc.stopping {
+				if _, err := raw.ExecContext(ctx, `UPDATE tickets SET state='stopping',resume_state='building',version=2,runner_epoch=2 WHERE channel='dev' AND project_id='migration' AND id='SF-v27'`); err != nil {
+					raw.Close()
+					t.Fatal(err)
+				}
+			}
+			if tc.preexistingBlock {
+				if _, err := raw.ExecContext(ctx, `UPDATE tickets SET state='blocked',resume_state='building',blocked_code='host_repair_required' WHERE channel='dev' AND project_id='migration' AND id='SF-v27'`); err != nil {
+					raw.Close()
+					t.Fatal(err)
+				}
+			}
+			if _, err := raw.ExecContext(ctx, `UPDATE provider_attempts SET launch_state='released',process_pid=71,process_pgid=71,process_boot_identity='v50-boot',process_start_identity='v50-start' WHERE channel='dev' AND project_id='migration' AND ticket_id='SF-v27'`); err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			if _, err := raw.ExecContext(ctx, `UPDATE provider_attempts SET started_at='2026-09-01T00:00:00Z' WHERE channel='dev' AND project_id='migration' AND ticket_id='SF-v27'`); err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			database, err := OpenChannel(ctx, path, filepath.Join(root, "unused-backups"), domain.ChannelDev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "migration", Ticket: "SF-v27"}
+			blocked, err := database.Ticket(ctx, ref)
+			if err != nil || blocked.State != domain.StateBlocked || blocked.ResumeState != domain.StateBuilding || blocked.BlockedCode != "legacy_provider_phase_entry_unverifiable" {
+				t.Fatalf("migrated ticket=%+v err=%v", blocked, err)
+			}
+			newLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "v51-recovery")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := database.SetRecoveryAuthority(ctx, domain.ChannelDev, newLeader, providerTestSigner.PublicKey()); err != nil {
+				t.Fatal(err)
+			}
+			if changed, err := database.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); err != nil || changed != tc.wantFenceChange {
+				t.Fatalf("legacy fence changed=%d want=%d err=%v", changed, tc.wantFenceChange, err)
+			}
+			claims, err := database.ActiveProviderAttempts(ctx, domain.ChannelDev)
+			if err != nil || len(claims) != 1 {
+				t.Fatalf("launched recovery claims=%+v err=%v", claims, err)
+			}
+			if _, err := database.ProviderLaunchIdentity(ctx, claims[0].ProviderAttemptClaim); err != nil {
+				t.Fatalf("launched claim lost its process identity: %v", err)
+			}
+			if err := database.RecoverProviderAttemptClaimWithProof(ctx, claims[0], newLeader, proof(t, claims[0].ProviderAttemptClaim), time.Now().UTC()); err != nil {
+				t.Fatalf("signed legacy recovery=%v", err)
+			}
+			attempts, err := database.ProviderAttempts(ctx, ref)
+			if err != nil || len(attempts) != 1 || attempts[0].State != "cancelled" || attempts[0].Outcome != "drained_recovery" {
+				t.Fatalf("drained legacy attempt=%+v err=%v", attempts, err)
+			}
+			current, err := database.Ticket(ctx, ref)
+			if err != nil || current.State != domain.StateBlocked || current.BlockedCode != "legacy_provider_phase_entry_unverifiable" {
+				t.Fatalf("legacy ticket became schedulable=%+v err=%v", current, err)
+			}
+			if _, err := database.StartOrAdopt(ctx, ref, current.Version, "blocked-legacy", domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: current.RunnerEpoch}); err == nil {
+				t.Fatal("legacy blocked ticket became schedulable")
+			}
+		})
+	}
+}
+
+func TestProviderRetryEvidenceRejectsSameVersionEventTampering(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-retry-event-tamper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-provider-retry-event-tamper", leader)
+	planner, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	fail := func() {
+		claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "failed", 1, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fail()
+	fail()
+	paused, err := db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket.Version, ticket.State = paused.Version, domain.StatePaused
+	ticket.ResumeState = domain.StatePlanning
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.Version, "tampered_exhaustion", domain.StatePlanning, domain.StateBlocked, `{}`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("tampered direct provider retry=%v", err)
+	}
+	if _, err := db.ProviderRetryDisposition(ctx, ticket); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("tampered provider retry disposition=%v", err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='tampered_exhaustion'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket.Version, ticket.State = retried.Version, domain.StatePlanning
+	ticket.ResumeState = ""
+	if replay, err := db.ProviderRetryReplay(ctx, ticket); err != nil || !replay {
+		t.Fatalf("untampered provider retry replay=%v err=%v", replay, err)
+	}
+	entry, err := loadProviderPhaseEntryAt(ctx, db.db, ticket.Ref, domain.PhasePlanning, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.Version, "tampered_retry", domain.StatePlanning, domain.StateBlocked, `{}`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateProviderRetryAdvance(ctx, db.db, ticket.Ref, domain.PhasePlanning, 2, ticket.RunnerEpoch, leader, ticket.Version, ticket.RunnerEpoch, leader); !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("tampered retry advance=%v", err)
+	}
+	if replay, err := db.ProviderRetryReplay(ctx, ticket); err != nil || replay {
+		t.Fatalf("tampered provider retry replay=%v err=%v", replay, err)
+	}
+	if newLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-retry-event-tamper-restart"); err != nil {
+		t.Fatal(err)
+	} else if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("tampered provider retry recovery=%v", err)
+	}
+	_ = entry
+}
+
+func TestProviderBlockedRecoveryEvidenceRejectsSameVersionEventTampering(t *testing.T) {
+	db, ctx := openTestStore(t)
+	setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-blocked-event-tamper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-provider-blocked-event-tamper", leader)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	blocked, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateBlocked, ResumeState: domain.StatePlanning, Trigger: "typed_blocker", Fence: fence, EventPayload: `{"code":"host_repair_required"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: blocked.Version, From: domain.StateBlocked, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_recover", Fence: fence, EventPayload: `{"intent":"recover"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := loadProviderPhaseEntryAt(ctx, db.db, ticket.Ref, domain.PhasePlanning, ticket.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateProviderBlockedRecoveryAdvance(ctx, db.db, ticket.Ref, entry, recovered.Version, ticket.RunnerEpoch, leader); err != nil {
+		t.Fatalf("untampered provider blocked recovery=%v", err)
+	}
+	if !validProviderBlockedRecoveryGap(ctx, db.db, ticket.Ref, ticket.Version, ticket.RunnerEpoch, leader, recovered.Version, ticket.RunnerEpoch, leader) {
+		t.Fatal("untampered provider blocked bridge was rejected")
+	}
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, recovered.Version, "tampered_recover", domain.StateBlocked, domain.StatePlanning, `{}`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateProviderBlockedRecoveryAdvance(ctx, db.db, ticket.Ref, entry, recovered.Version, ticket.RunnerEpoch, leader); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("tampered provider blocked recovery=%v", err)
+	}
+	if validProviderBlockedRecoveryGap(ctx, db.db, ticket.Ref, ticket.Version, ticket.RunnerEpoch, leader, recovered.Version, ticket.RunnerEpoch, leader) {
+		t.Fatal("tampered provider blocked bridge was accepted")
+	}
+}
+
+func TestGenericTransitionRejectsUnauthenticatedCandidateHeadReentry(t *testing.T) {
+	db, ctx := openTestStore(t)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "provider", Ticket: "SF-unbound-candidate-reentry"}
+	if _, err := db.Transition(ctx, Transition{Ref: ref, ExpectedVersion: 1, From: domain.StateWaitingCI, To: domain.StateBuilding, Trigger: "base_or_candidate_head_changed", Fence: domain.Fence{LeaderEpoch: 1, RunnerEpoch: 1}, EventPayload: "{}"}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("generic candidate re-entry=%v", err)
+	}
+}
+
+func TestProviderPhaseEntryTransitionMapCoversAuthenticatedReentryBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		from, to domain.State
+		trigger  string
+		phase    domain.Phase
+	}{
+		{"plan pass", domain.StatePlanning, domain.StateVerifying, "phase_pass", domain.PhaseVerification},
+		{"verification pass", domain.StateVerifying, domain.StateBuilding, "phase_pass", domain.PhaseBuild},
+		{"verification amendment", domain.StateBuilding, domain.StateVerifying, "verification_amendment_requested", domain.PhaseVerification},
+		{"amendment accepted", domain.StateVerifying, domain.StateBuilding, "amendment_accepted", domain.PhaseBuild},
+		{"amendment rejected", domain.StateVerifying, domain.StateBuilding, "amendment_rejected", domain.PhaseBuild},
+		{"review repair build", domain.StateReviewing, domain.StateBuilding, "review_repair", domain.PhaseBuild},
+		{"review repair verification", domain.StateReviewing, domain.StateVerifying, "review_repair", domain.PhaseVerification},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := providerPhaseEntryForTransition(tc.from, tc.to, tc.trigger)
+			if !ok || got != tc.phase {
+				t.Fatalf("entry(%s,%s,%s)=%s,%v want %s,true", tc.from, tc.to, tc.trigger, got, ok, tc.phase)
+			}
+		})
+	}
+	if _, ok := providerPhaseEntryForTransition(domain.StateWaitingCI, domain.StateBuilding, "base_or_candidate_head_changed"); ok {
+		t.Fatal("unsupported generic candidate-head trigger created provider entry")
+	}
+}
+
+func TestProviderPhaseReentryGetsFreshWindowWithoutReusingPriorRetryEpoch(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-entry-reentry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-provider-entry-reentry", leader)
+	_, reviewer := setupProviderPair(t, db, ctx)
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateVerifying)
+	fail := func(current Ticket) ProviderAttemptClaim {
+		fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: current.RunnerEpoch}
+		claim, beginErr := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: current.Ref, ExpectedVersion: current.Version, Fence: fence, Phase: domain.PhaseVerification, Role: "reviewer", Binding: runtime(reviewer), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		if finishErr := db.FinishProviderAttempt(ctx, claim, proof(t, claim), current.Version, fence, "failed", "failed", 1, time.Now().UTC()); finishErr != nil {
+			t.Fatal(finishErr)
+		}
+		return claim
+	}
+	first, second := fail(ticket), fail(ticket)
+	if first.Attempt != 1 || second.Attempt != 2 {
+		t.Fatalf("first verification entry attempts=%d,%d", first.Attempt, second.Attempt)
+	}
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	paused, err := db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateVerifying, To: domain.StatePaused, ResumeState: domain.StateVerifying, Trigger: "retry_or_correction_exhausted", Fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket.Version, ticket.State = paused.Version, domain.StatePaused
+	retried, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StateVerifying, ResumeState: domain.StateVerifying, Trigger: "operator_retry", Fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket.Version, ticket.State = retried.Version, domain.StateVerifying
+	third, fourth := fail(ticket), fail(ticket)
+	if third.Attempt != 3 || fourth.Attempt != 4 {
+		t.Fatalf("retried verification entry attempts=%d,%d", third.Attempt, fourth.Attempt)
+	}
+	if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseVerification, Role: "reviewer", Binding: runtime(reviewer), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); !errors.Is(err, ErrProviderAttemptLimit) {
+		t.Fatalf("original entry admitted fifth attempt: %v", err)
+	}
+	// A later authenticated verification re-entry has a new entry. The old
+	// entry's one retry epoch cannot provide capacity here; global attempt IDs
+	// continue at 5 and 6, but this entry gets only its initial pair.
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateBuilding)
+	ticket = providerState(t, db, ctx, ticket, leader, domain.StateVerifying)
+	fifth, sixth := fail(ticket), fail(ticket)
+	if fifth.Attempt != 5 || sixth.Attempt != 6 {
+		t.Fatalf("re-entered verification attempts=%d,%d", fifth.Attempt, sixth.Attempt)
+	}
+	if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Phase: domain.PhaseVerification, Role: "reviewer", Binding: runtime(reviewer), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); !errors.Is(err, ErrProviderAttemptLimit) {
+		t.Fatalf("prior entry epoch expanded re-entry window: %v", err)
+	}
 }
 
 func TestPlanTransitionConsumesNewestSameFencePlannerResult(t *testing.T) {
@@ -1332,6 +2071,18 @@ func providerState(t *testing.T, db *Store, ctx context.Context, ticket Ticket, 
 	result, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: from, To: state, Trigger: "test_phase", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, EventPayload: "{}"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if phase, ok := providerPhaseForState(state); ok {
+		var eventID int64
+		var createdAt string
+		if err := db.db.QueryRowContext(ctx, `SELECT id,created_at FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='test_phase'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, result.Version).Scan(&eventID, &createdAt); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.write(ctx, func(conn *sql.Conn) error {
+			return recordProviderPhaseEntry(ctx, conn, ticket.Ref, phase, result.Version, leader, ticket.RunnerEpoch, eventID, createdAt, from, state, "test_phase")
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	ticket.State, ticket.Version = state, result.Version
 	return ticket

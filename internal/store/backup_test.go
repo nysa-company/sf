@@ -308,7 +308,7 @@ func seedV37PublicationRows(t *testing.T, path string) {
 	}
 }
 
-func TestV35BlocksOnlyUnboundLegacyWorkflowArtifacts(t *testing.T) {
+func TestV35BlocksLegacyProviderStatesWithoutV51PhaseEntries(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "v34.sqlite")
 	createDatabaseAtVersion(t, path, 34)
@@ -371,7 +371,7 @@ func TestV35BlocksOnlyUnboundLegacyWorkflowArtifacts(t *testing.T) {
 		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='dev' AND project_id='v35' AND id=?`, id).Scan(&gotState, &resume, &code, &version); err != nil {
 			t.Fatal(err)
 		}
-		if gotState != "blocked" || resume != state || code != "legacy_workflow_evidence_unverifiable" || version != 2 {
+		if gotState != "blocked" || resume != state || code != "legacy_provider_phase_entry_unverifiable" || version != 2 {
 			t.Fatalf("legacy %s ticket=%s/%s/%s/v%d", state, gotState, resume, code, version)
 		}
 		if err := database.db.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel='dev' AND project_id='v35' AND ticket_id=? AND trigger='typed_blocker' AND from_state=? AND to_state='blocked'`, id, state).Scan(&payload); err != nil {
@@ -385,18 +385,22 @@ func TestV35BlocksOnlyUnboundLegacyWorkflowArtifacts(t *testing.T) {
 			t.Fatalf("legacy %s blocker events=%d err=%v", state, eventCount, err)
 		}
 	}
-	for _, id := range []string{"SF-v35-plan-bound", "SF-v35-plan-fresh", "SF-v35-verify-plan-bound"} {
+	for _, legacy := range []struct{ id, resume string }{
+		{id: "SF-v35-plan-bound", resume: "planning"},
+		{id: "SF-v35-plan-fresh", resume: "planning"},
+		{id: "SF-v35-verify-plan-bound", resume: "verifying"},
+	} {
 		var state, resume, code string
 		var version int
-		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='dev' AND project_id='v35' AND id=?`, id).Scan(&state, &resume, &code, &version); err != nil {
+		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='dev' AND project_id='v35' AND id=?`, legacy.id).Scan(&state, &resume, &code, &version); err != nil {
 			t.Fatal(err)
 		}
-		if state == "blocked" || resume != "" || code != "" || version != 1 {
-			t.Fatalf("bound/fresh ticket %s changed to %s/%s/%s/v%d", id, state, resume, code, version)
+		if state != "blocked" || resume != legacy.resume || code != "legacy_provider_phase_entry_unverifiable" || version != 2 {
+			t.Fatalf("legacy provider ticket %s changed to %s/%s/%s/v%d", legacy.id, state, resume, code, version)
 		}
-		var eventCount int
-		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel='dev' AND project_id='v35' AND ticket_id=? AND trigger='typed_blocker'`, id).Scan(&eventCount); err != nil || eventCount != 0 {
-			t.Fatalf("bound/fresh ticket %s blocker events=%d err=%v", id, eventCount, err)
+		var payload string
+		if err := database.db.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel='dev' AND project_id='v35' AND ticket_id=? AND trigger='typed_blocker' AND from_state=? AND to_state='blocked'`, legacy.id, legacy.resume).Scan(&payload); err != nil || payload != `{"code":"legacy_provider_phase_entry_unverifiable"}` {
+			t.Fatalf("legacy provider event %s=%q err=%v", legacy.id, payload, err)
 		}
 	}
 	for _, legacy := range []struct{ id, resume string }{
@@ -409,7 +413,7 @@ func TestV35BlocksOnlyUnboundLegacyWorkflowArtifacts(t *testing.T) {
 		if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version FROM tickets WHERE channel='dev' AND project_id='v35' AND id=?`, legacy.id).Scan(&state, &resume, &code, &version); err != nil {
 			t.Fatal(err)
 		}
-		if state != "blocked" || resume != legacy.resume || code != "legacy_repository_command_evidence_unverifiable" || version != 2 {
+		if state != "blocked" || resume != legacy.resume || code != "legacy_provider_phase_entry_unverifiable" || version != 2 {
 			t.Fatalf("v36 command-evidence blocker %s=%s/%s/%s/v%d", legacy.id, state, resume, code, version)
 		}
 		if err := database.db.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel='dev' AND project_id='v35' AND ticket_id=? AND trigger='typed_blocker' AND from_state=? AND to_state='blocked'`, legacy.id, legacy.resume).Scan(&payload); err != nil || payload != `{"code":"legacy_repository_command_evidence_unverifiable","reason":"legacy repository command evidence is unverifiable","next_action":"start a fresh ticket"}` {
@@ -1015,6 +1019,8 @@ func testMigration(version int) []string {
 		return migrationV48
 	case 49:
 		return migrationV49
+	case 50:
+		return migrationV50
 	default:
 		return nil
 	}

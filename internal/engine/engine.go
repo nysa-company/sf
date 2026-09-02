@@ -73,7 +73,32 @@ func (e *Engine) Transition(ctx context.Context, request contracts.TransitionReq
 	if request.Trigger == "phase_pass" && (request.From == domain.StatePlanning || request.From == domain.StateVerifying || request.From == domain.StateBuilding) {
 		return contracts.TransitionResult{}, store.ErrEvidenceConflict
 	}
+	// Provider exhaustion and its one retry epoch are Store-owned evidence
+	// boundaries. This public generic entry point must never mint either
+	// transition. The typed SignalProviderExhausted/SignalProviderRetry paths
+	// deliberately bypass this check and call their dedicated Store proofs.
+	if providerState(request.From) && request.Trigger == "retry_or_correction_exhausted" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	if request.From == domain.StatePaused && request.Trigger == "operator_retry" {
+		ticket, err := e.store.Ticket(ctx, request.Ticket)
+		if err != nil {
+			return contracts.TransitionResult{}, err
+		}
+		if providerState(ticket.ResumeState) {
+			return contracts.TransitionResult{}, store.ErrEvidenceConflict
+		}
+	}
 	return e.transition(ctx, request, e.store.Transition)
+}
+
+func providerState(state domain.State) bool {
+	switch state {
+	case domain.StatePlanning, domain.StateVerifying, domain.StateBuilding, domain.StateReviewing:
+		return true
+	default:
+		return false
+	}
 }
 
 // genericVerificationAmendmentTransition rejects every generic entry to the
@@ -132,6 +157,15 @@ func (e *Engine) SignalOperatorSourceResume(ctx context.Context, request store.O
 }
 
 func (e *Engine) transition(ctx context.Context, request contracts.TransitionRequest, persist func(context.Context, store.Transition) (store.TransitionResult, error)) (contracts.TransitionResult, error) {
+	return e.transitionWithResolvedTargetResume(ctx, request, persist, false)
+}
+
+// transitionWithResolvedTargetResume supplies the resolved target as the
+// Store transition's resume field only for typed provider retry. The durable
+// provider retry boundary requires that field as proof that the operator is
+// reopening the exact paused provider phase; its Store implementation clears
+// the persisted resume_state after the proof is consumed.
+func (e *Engine) transitionWithResolvedTargetResume(ctx context.Context, request contracts.TransitionRequest, persist func(context.Context, store.Transition) (store.TransitionResult, error), useTargetResume bool) (contracts.TransitionResult, error) {
 	guards := make(map[string]bool, len(request.Attributes))
 	for key, value := range request.Attributes {
 		if value == "true" {
@@ -162,6 +196,9 @@ func (e *Engine) transition(ctx context.Context, request contracts.TransitionReq
 	}
 	if transition.ResumeState == "$stored" {
 		resume = ticket.ResumeState
+	}
+	if useTargetResume {
+		resume = target
 	}
 	persisted := store.Transition{
 		Ref: request.Ticket, ExpectedVersion: request.TicketVersion, From: request.From,
@@ -216,6 +253,33 @@ func (e *Engine) Signal(ctx context.Context, request contracts.SignalRequest) (c
 		Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From,
 		Trigger: request.Trigger, Fence: request.Fence, Attributes: request.Attributes, EventPayload: request.EventPayload,
 	})
+}
+
+// SignalProviderExhausted is the typed path from the provider coordinator's
+// durable budget outcome to a pause. Store independently proves the two
+// terminal attempts and absence of live writers.
+func (e *Engine) SignalProviderExhausted(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if !providerState(request.From) || request.Trigger != "retry_or_correction_exhausted" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: request.Trigger, Fence: request.Fence, EventPayload: "{}"}, e.store.TransitionProviderExhausted)
+}
+
+// SignalProviderRetry is the sole operator path that opens the one retry
+// epoch. It never accepts caller-provided exhaustion metadata.
+func (e *Engine) SignalProviderRetry(ctx context.Context, request contracts.SignalRequest) (contracts.TransitionResult, error) {
+	if request.From != domain.StatePaused || request.Trigger != "operator_retry" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	ticket, err := e.store.Ticket(ctx, request.Ticket)
+	if err != nil || !providerState(ticket.ResumeState) {
+		if err != nil {
+			return contracts.TransitionResult{}, err
+		}
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	request.Attributes = map[string]string{"operator_identity_authenticated": "true", "pause_reason_retryable": "true", "typed_prerequisites_satisfied": "true", "runner_epoch_current": "true"}
+	return e.transitionWithResolvedTargetResume(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: request.Trigger, Fence: request.Fence, Attributes: request.Attributes, EventPayload: "{}"}, e.store.TransitionProviderRetry, true)
 }
 
 // SignalPlan is the only planning phase-pass entry point. Store consumes the

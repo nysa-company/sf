@@ -42,6 +42,10 @@ var (
 	ErrReadOnly              = errors.New("store is read-only")
 	ErrProviderCapacity      = errors.New("provider route capacity is exhausted")
 	ErrProviderAttempt       = errors.New("provider attempt cannot be admitted")
+	// ErrProviderAttemptLimit is distinct from the ticket time/cost budget. It
+	// is the only coordinator outcome that may enter the durable provider
+	// exhaustion pause and, eventually, the one operator retry epoch.
+	ErrProviderAttemptLimit = errors.New("provider attempt window is exhausted")
 	// ErrProviderAttemptReusable means BeginProviderAttempt found one exact,
 	// immutable completed result under the current admission fence. It carries
 	// no launch authority; callers must reload the key through Store.
@@ -61,7 +65,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 50
+const schemaVersion = 51
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -114,6 +118,7 @@ var migrationChecksums = map[int]string{
 	48: migrationChecksum(migrationV48),
 	49: migrationChecksum(migrationV49),
 	50: migrationChecksum(migrationV50),
+	51: migrationChecksum(migrationV51),
 }
 
 func migrationChecksum(statements []string) string {
@@ -493,10 +498,20 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV49
 			} else if version == 50 {
 				statements = migrationV50
+			} else if version == 51 {
+				statements = migrationV51
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
 					return fmt.Errorf("run migration %d: %w", version, err)
+				}
+			}
+			if version == 51 {
+				if err := backfillV51ProviderPhaseEntries(ctx, conn); err != nil {
+					return fmt.Errorf("backfill migration %d: %w", version, err)
+				}
+				if err := blockUnverifiableV51ProviderEntries(ctx, conn); err != nil {
+					return fmt.Errorf("block legacy provider entries migration %d: %w", version, err)
 				}
 			}
 			if version == 1 {
@@ -1158,8 +1173,16 @@ func (s *Store) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expected
 			return nil
 		}
 		createdAt := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at)
-			VALUES (?, ?, ?, ?, 'start_or_adopt', ?, ?, '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, state, domain.StatePlanning, createdAt); err != nil {
+		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at)
+			VALUES (?, ?, ?, ?, 'start_or_adopt', ?, ?, '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, state, domain.StatePlanning, createdAt)
+		if err != nil {
+			return err
+		}
+		eventID, err := created.LastInsertId()
+		if err != nil {
+			return err
+		}
+		if err := recordProviderPhaseEntry(ctx, conn, ref, domain.PhasePlanning, version, fence.LeaderEpoch, runner, eventID, createdAt, state, domain.StatePlanning, "start_or_adopt"); err != nil {
 			return err
 		}
 		return recordRunnerStartAuthority(ctx, conn, ref, version, fence, workflowID, createdAt)
@@ -1277,6 +1300,31 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	if transition.Trigger == "external_merge_observed" {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
+	// A candidate/base change that re-enters Builder must be tied to a
+	// dedicated authenticated correction boundary. There is no such boundary
+	// in v1 yet, so generic lifecycle persistence must not create an active
+	// provider state with no phase-entry authority.
+	if transition.Trigger == "base_or_candidate_head_changed" {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	// These provider transitions carry attempt-window proof and must enter via
+	// TransitionProviderExhausted / TransitionProviderRetry, never generic
+	// lifecycle persistence.
+	if (providerStateForPhaseTransition(transition.From) && transition.To == domain.StatePaused && transition.Trigger == "retry_or_correction_exhausted") ||
+		(transition.From == domain.StatePaused && providerStateForPhaseTransition(transition.To) && transition.Trigger == "operator_retry" && transition.To != domain.StateReviewing) {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
+	// A generic correction pause may use the shared exhaustion trigger, but it
+	// may never impersonate the Store-owned provider exhaustion payload. Only
+	// TransitionProviderExhausted can mint that exact schema.
+	if transition.Trigger == "retry_or_correction_exhausted" {
+		var envelope struct {
+			Schema string `json:"schema"`
+		}
+		if json.Unmarshal([]byte(transition.EventPayload), &envelope) == nil && envelope.Schema == providerExhaustionSchema {
+			return TransitionResult{}, ErrEvidenceConflict
+		}
+	}
 	if genericMergeEntryTransition(transition) {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
@@ -1338,7 +1386,9 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		var version, runner uint64
 		var actual domain.State
-		if err := conn.QueryRowContext(ctx, `SELECT state, version, runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&actual, &version, &runner); err != nil {
+		var storedResume sql.NullString
+		var persistedBlockedCode string
+		if err := conn.QueryRowContext(ctx, `SELECT state,resume_state,version,runner_epoch,blocked_code FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&actual, &storedResume, &version, &runner, &persistedBlockedCode); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -1349,6 +1399,69 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		}
 		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
 			return err
+		}
+		if persistedBlockedCode == "legacy_provider_phase_entry_unverifiable" && (transition.Trigger == "operator_resume" || transition.Trigger == "operator_recover") {
+			return ErrEvidenceConflict
+		}
+		if transition.Trigger == "operator_resume" && actual == domain.StatePaused && providerStateForPhaseTransition(transition.To) {
+			if !storedResume.Valid || domain.State(storedResume.String) != transition.To {
+				return ErrEvidenceConflict
+			}
+			if err := validateProviderPausedResumePrefix(ctx, conn, transition.Ref, phaseForProviderState(transition.To), version, runner, transition.Fence.LeaderEpoch, transition.To); err != nil {
+				return err
+			}
+		}
+		if transition.Trigger == "operator_retry" && actual == domain.StatePaused && transition.To == domain.StateReviewing {
+			// Reviewing is a post-publication control target. It may use the
+			// approved retry disposition after a generic pause, but it can never
+			// impersonate V51's provider-exhaustion retry: that exact envelope is
+			// owned by TransitionProviderRetry and carries a bounded new attempt
+			// window rather than a post-publication runtime rearm.
+			var raw string
+			if err := conn.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='retry_or_correction_exhausted' AND from_state='reviewing' AND to_state='paused'`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version).Scan(&raw); err == nil {
+				var envelope struct {
+					Schema string `json:"schema"`
+				}
+				if json.Unmarshal([]byte(raw), &envelope) != nil || envelope.Schema == providerExhaustionSchema {
+					return ErrEvidenceConflict
+				}
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if err := validateProviderPausedResumePrefix(ctx, conn, transition.Ref, domain.PhaseReview, version, runner, transition.Fence.LeaderEpoch, transition.To); err != nil {
+				return err
+			}
+			control, err := runtimeControlFrom(ctx, conn, transition.Ref)
+			if err != nil || control.stop.version != version-1 || control.stop.runner != runner || control.stop.leader == 0 || control.authority != control.stop {
+				return ErrEvidenceConflict
+			}
+			if err := s.authenticatePostPublicationState(ctx, conn, transition.Ref, domain.StateReviewing, version-2, domain.Fence{LeaderEpoch: control.stop.leader, RunnerEpoch: runner - 1}); err != nil {
+				return ErrEvidenceConflict
+			}
+			entry, err := loadCurrentProviderPhaseEntry(ctx, conn, transition.Ref, domain.PhaseReview, version-2, runner-1, control.stop.leader)
+			if err != nil {
+				return ErrEvidenceConflict
+			}
+			if _, found, err := loadProviderRetryEpochForEntry(ctx, conn, transition.Ref, domain.PhaseReview, entry.Version); err != nil || found {
+				return ErrEvidenceConflict
+			}
+			var terminal int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries pe
+				JOIN phase_runs r ON r.channel=pe.channel AND r.project_id=pe.project_id AND r.ticket_id=pe.ticket_id AND r.phase=pe.phase AND r.attempt=pe.attempt
+				JOIN provider_attempts a ON a.id=pe.provider_attempt_id
+				WHERE pe.channel=? AND pe.project_id=? AND pe.ticket_id=? AND pe.phase='review' AND pe.entry_ticket_version=?
+				AND r.state IN ('failed','cancelled') AND r.outcome IN ('failed','cancelled')
+				AND a.state IN ('failed','cancelled') AND a.outcome IN ('failed','cancelled')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, entry.Version).Scan(&terminal); err != nil || terminal >= 2 {
+				return ErrEvidenceConflict
+			}
+		}
+		if transition.Trigger == "operator_recover" && actual == domain.StateBlocked && providerStateForPhaseTransition(transition.To) {
+			if !storedResume.Valid || domain.State(storedResume.String) != transition.To {
+				return ErrEvidenceConflict
+			}
+			if err := validateProviderBlockedRecoveryPrefix(ctx, conn, transition.Ref, phaseForProviderState(transition.To), version, runner, transition.Fence.LeaderEpoch, transition.To, persistedBlockedCode); err != nil {
+				return err
+			}
 		}
 		query := `UPDATE tickets SET state=?, resume_state=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`
 		args := []any{transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner}
@@ -1672,9 +1785,19 @@ func (s *Store) transitionWithEvidence(ctx context.Context, transition Transitio
 				return err
 			}
 		}
-		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, transition.Trigger, transition.From, transition.To, transition.EventPayload, time.Now().UTC().Format(time.RFC3339Nano))
+		createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, transition.Trigger, transition.From, transition.To, transition.EventPayload, createdAt)
 		if err != nil {
 			return err
+		}
+		if phase, enters := providerPhaseEntryForTransition(transition.From, transition.To, transition.Trigger); enters {
+			eventID, err := created.LastInsertId()
+			if err != nil {
+				return err
+			}
+			if err := recordProviderPhaseEntry(ctx, conn, transition.Ref, phase, version+1, transition.Fence.LeaderEpoch, runner, eventID, createdAt, transition.From, transition.To, transition.Trigger); err != nil {
+				return err
+			}
 		}
 		result.Version = version + 1
 		result.EventID, _ = created.LastInsertId()
@@ -1823,9 +1946,19 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 		if n, _ := updated.RowsAffected(); n != 1 {
 			return ErrStaleFence
 		}
-		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, transition.Trigger, transition.From, transition.To, transition.EventPayload, time.Now().UTC().Format(time.RFC3339Nano))
+		createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+		created, err := conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, transition.Trigger, transition.From, transition.To, transition.EventPayload, createdAt)
 		if err != nil {
 			return err
+		}
+		if transition.To == domain.StateReviewing {
+			eventID, err := created.LastInsertId()
+			if err != nil {
+				return err
+			}
+			if err := recordProviderPhaseEntry(ctx, conn, transition.Ref, domain.PhaseReview, version+1, transition.Fence.LeaderEpoch, runner, eventID, createdAt, transition.From, domain.StateReviewing, transition.Trigger); err != nil {
+				return err
+			}
 		}
 		result.Version = version + 1
 		result.EventID, _ = created.LastInsertId()

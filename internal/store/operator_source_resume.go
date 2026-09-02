@@ -658,6 +658,17 @@ func (s *Store) TransitionOperatorSourceResume(ctx context.Context, request Oper
 		if err != nil {
 			return err
 		}
+		eventID, err := created.LastInsertId()
+		if err != nil {
+			return err
+		}
+		var createdAt string
+		if err := conn.QueryRowContext(ctx, `SELECT created_at FROM events WHERE id=?`, eventID).Scan(&createdAt); err != nil {
+			return err
+		}
+		if err := recordProviderPhaseEntry(ctx, conn, request.Ref, domain.PhaseVerification, request.ExpectedVersion+1, request.Fence.LeaderEpoch, request.Fence.RunnerEpoch, eventID, createdAt, domain.StatePaused, domain.StateVerifying, "operator_resume"); err != nil {
+			return err
+		}
 		result.Version = request.ExpectedVersion + 1
 		result.EventID, _ = created.LastInsertId()
 		return nil

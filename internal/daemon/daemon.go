@@ -1711,6 +1711,9 @@ func (daemon *Daemon) recoverTicket(ctx context.Context, request api.Request, id
 	if stored.State != domain.StateBlocked {
 		return daemon.failure(request, "invalid_transition", "only a typed blocked ticket can be recovered", false)
 	}
+	if stored.BlockedCode == "legacy_provider_phase_entry_unverifiable" {
+		return daemon.failure(request, "legacy_provider_entry_unverifiable", "this pre-v51 provider ticket cannot safely resume; cancel it and submit a fresh ticket", false)
+	}
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
 	}
@@ -1785,6 +1788,32 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	// control remains sealed and the ticket is already active, so replay must
 	// finish the handoff rather than attempting a second lifecycle transition.
 	if stored.State != domain.StatePaused {
+		if replay, replayErr := daemon.store.ProviderRetryReplay(ctx, stored); replayErr != nil {
+			return daemon.failure(request, "retry_state_unavailable", "provider retry state could not be authenticated", true)
+		} else if replay {
+			state, ok := daemon.control.(RuntimeRearmStateController)
+			if !ok {
+				return daemon.failure(request, "runtime_rearm_unavailable", "provider retry is durably sealed until runtime admission can be authenticated", true)
+			}
+			needed, stateErr := state.RuntimeRearmNeeded(ctx, ref)
+			if stateErr != nil {
+				return daemon.failure(request, "runtime_rearm_failed", "provider retry state could not determine whether runtime admission is sealed", true)
+			}
+			if needed {
+				controller, ok := daemon.control.(RuntimeRearmController)
+				if !ok {
+					return daemon.failure(request, "runtime_rearm_unavailable", "provider retry is durably sealed until runtime admission is configured", true)
+				}
+				if err := controller.Rearm(ctx, ref); err != nil {
+					return daemon.failure(request, "runtime_rearm_failed", "provider retry is durably sealed until runtime admission is installed; retry after the local runtime is available", true)
+				}
+			}
+			current, currentErr := daemon.store.Ticket(ctx, ref)
+			if currentErr != nil {
+				return daemon.failure(request, "resume_state_unavailable", "provider retry state could not be confirmed after runtime admission", true)
+			}
+			return daemon.success(request, api.Mutation{Attempted: false, Kind: "ticket_" + kind, Identity: string(ref.Ticket), Observed: true}, ticketView(current))
+		}
 		if replay, ok := daemon.control.(RuntimeMergeRetryReplayController); ok {
 			state, stateErr := replay.GuardedMergeRetryReplay(ctx, ref)
 			if stateErr != nil && !errors.Is(stateErr, store.ErrStaleFence) {
@@ -1817,6 +1846,13 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	if !retryable {
 		return daemon.failure(request, "retry_not_available", "retry is available only after a durable retry or correction exhaustion pause", false)
 	}
+	providerRetry, providerRetryErr := daemon.store.ProviderRetryDisposition(ctx, stored)
+	if providerRetryErr != nil {
+		return daemon.failure(request, "retry_state_unavailable", "provider retry pause could not be authenticated", true)
+	}
+	if providerRetry == store.ProviderRetryExhausted {
+		return daemon.failure(request, "provider_retry_exhausted", "the one permitted provider retry window has already been exhausted; cancel and resubmit the ticket", false)
+	}
 	// Merge/reconciliation retry is a post-publication mutation boundary. Stop the
 	// in-memory admission before Store seals and advances the ticket so the
 	// subsequent opaque rearm token has an exact stopped runtime to authorize.
@@ -1838,7 +1874,13 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	if err != nil {
 		return daemon.failure(request, "internal_encoding", "retry metadata could not be encoded", false)
 	}
-	result, err := daemon.engine.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: trigger, Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, Attributes: map[string]string{"operator_identity_authenticated": "true", "pause_reason_retryable": "true", "typed_prerequisites_satisfied": "true", "runner_epoch_current": "true"}, EventPayload: string(payload)})
+	requestSignal := contracts.SignalRequest{Ticket: ref, TicketVersion: stored.Version, From: stored.State, Trigger: trigger, Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, Attributes: map[string]string{"operator_identity_authenticated": "true", "pause_reason_retryable": "true", "typed_prerequisites_satisfied": "true", "runner_epoch_current": "true"}, EventPayload: string(payload)}
+	var result contracts.TransitionResult
+	if providerRetry == store.ProviderRetryEligible {
+		result, err = daemon.engine.SignalProviderRetry(ctx, requestSignal)
+	} else {
+		result, err = daemon.engine.Signal(ctx, requestSignal)
+	}
 	if err != nil {
 		return daemon.failure(request, "retry_transition_refused", "the paused ticket could not start its bounded retry", false)
 	}
@@ -2058,6 +2100,8 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	// the malformed request omitted its ticket. Do not collapse them into
 	// doctor: the daemon already knows which control surface can recover.
 	switch code {
+	case "legacy_provider_entry_unverifiable":
+		argv = []string{binary, "cancel", "--help"}
 	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 		argv = []string{binary, "take", "--help"}
 	case "source_commit_required":
@@ -2084,6 +2128,8 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	}
 	if request.Ticket != "" {
 		switch code {
+		case "legacy_provider_entry_unverifiable":
+			argv = []string{binary, "cancel", request.Ticket}
 		case "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 			// `take` is intentionally idempotent and prints the authenticated
 			// retained path again. It is the only safe next action for edits

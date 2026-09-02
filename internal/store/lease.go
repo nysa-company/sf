@@ -193,7 +193,7 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 		if current != leaderEpoch {
 			return ErrStaleFence
 		}
-		rows, err := conn.QueryContext(ctx, `SELECT project_id,id,state,version,runner_epoch FROM tickets WHERE channel=? AND state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling') ORDER BY project_id,id`, channel)
+		rows, err := conn.QueryContext(ctx, `SELECT project_id,id,state,version,runner_epoch,blocked_code FROM tickets WHERE channel=? AND (state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling') OR (state='blocked' AND blocked_code='legacy_provider_phase_entry_unverifiable' AND EXISTS(SELECT 1 FROM provider_attempts a WHERE a.channel=tickets.channel AND a.project_id=tickets.project_id AND a.ticket_id=tickets.id AND a.runner_epoch=tickets.runner_epoch AND a.state IN ('active','quarantined')) AND EXISTS(SELECT 1 FROM events e WHERE e.channel=tickets.channel AND e.project_id=tickets.project_id AND e.ticket_id=tickets.id AND e.ticket_version=tickets.version AND e.trigger='typed_blocker' AND e.to_state='blocked'))) ORDER BY project_id,id`, channel)
 		if err != nil {
 			return err
 		}
@@ -203,11 +203,12 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 			state   domain.State
 			version uint64
 			runner  uint64
+			code    string
 		}
 		var active []activeTicket
 		for rows.Next() {
 			var ticket activeTicket
-			if err := rows.Scan(&ticket.project, &ticket.id, &ticket.state, &ticket.version, &ticket.runner); err != nil {
+			if err := rows.Scan(&ticket.project, &ticket.id, &ticket.state, &ticket.version, &ticket.runner, &ticket.code); err != nil {
 				rows.Close()
 				return err
 			}
@@ -428,6 +429,31 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					priorLeader = amendmentLeader
 				}
 			}
+			if priorLeader == 0 {
+				if retryLeader, retryFound, retryErr := providerRetryRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); retryErr != nil {
+					return retryErr
+				} else if retryFound {
+					priorLeader = retryLeader
+				}
+			}
+			if priorLeader == 0 {
+				if blockerLeader, blockerFound, blockerErr := providerBlockedRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); blockerErr != nil {
+					return blockerErr
+				} else if blockerFound {
+					priorLeader = blockerLeader
+				}
+			}
+			if priorLeader == 0 {
+				// A crash after the ordinary provider pause/resume transition but
+				// before Controller.Rearm must retain the sealed control endpoint.
+				// This runs before phase-baseline fallback so an old claim or
+				// worktree cannot silently bless a malformed resumed control row.
+				if pausedLeader, pausedFound, pausedErr := providerPausedRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); pausedErr != nil {
+					return pausedErr
+				} else if pausedFound {
+					priorLeader = pausedLeader
+				}
+			}
 			if phase, role, ok := recoveryProviderPhase(ticket.state); ok {
 				baseline, baselineFound, baselineErr := s.loadPhaseRecoveryBaseline(ctx, conn, ref, phase, role)
 				if baselineErr != nil {
@@ -596,6 +622,15 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				}
 			}
 			if priorLeader == 0 {
+				if ticket.state == domain.StateBlocked && ticket.code == "legacy_provider_phase_entry_unverifiable" {
+					legacyLeader, legacyErr := legacyProviderMigrationRecoveryPredecessor(ctx, conn, ref, ticket.version, ticket.runner, leaderEpoch)
+					if legacyErr != nil {
+						return legacyErr
+					}
+					priorLeader = legacyLeader
+				}
+			}
+			if priorLeader == 0 {
 				if phase, role, ok := recoveryProviderPhase(ticket.state); ok {
 					activeLeader, activeFound, activeErr := loadActiveProviderEndpoint(ctx, conn, ref, phase, role, ticket.version, ticket.runner, leaderEpoch)
 					if activeErr != nil {
@@ -632,7 +667,7 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 			if priorLeader == 0 {
 				return ErrPublicationEvidence
 			}
-			result, err := conn.ExecContext(ctx, `UPDATE tickets SET runner_epoch=runner_epoch+1, version=version+1 WHERE channel=? AND project_id=? AND id=? AND version=? AND runner_epoch=? AND state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling')`, channel, ticket.project, ticket.id, ticket.version, ticket.runner)
+			result, err := conn.ExecContext(ctx, `UPDATE tickets SET runner_epoch=runner_epoch+1, version=version+1 WHERE channel=? AND project_id=? AND id=? AND version=? AND runner_epoch=? AND (state IN ('planning','verifying','building','publishing','waiting_ci','reviewing','waiting_approval','waiting_manual_merge','merging','reconciling','stopping','cancelling') OR (state='blocked' AND blocked_code='legacy_provider_phase_entry_unverifiable'))`, channel, ticket.project, ticket.id, ticket.version, ticket.runner)
 			if err != nil {
 				return err
 			}
@@ -739,7 +774,15 @@ func (s *Store) StartWithOwnership(ctx context.Context, ref domain.TicketRef, ex
 				return err
 			}
 			createdAt := at.UTC().Format(time.RFC3339Nano)
-			if _, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'operator_start', 'queued', 'planning', '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, createdAt); err != nil {
+			created, err := conn.ExecContext(ctx, `INSERT INTO events(channel, project_id, ticket_id, ticket_version, trigger, from_state, to_state, payload, created_at) VALUES (?, ?, ?, ?, 'operator_start', 'queued', 'planning', '{}', ?)`, ref.Channel, ref.Project, ref.Ticket, version, createdAt)
+			if err != nil {
+				return err
+			}
+			eventID, err := created.LastInsertId()
+			if err != nil {
+				return err
+			}
+			if err := recordProviderPhaseEntry(ctx, conn, ref, domain.PhasePlanning, version, fence.LeaderEpoch, runner, eventID, createdAt, domain.StateQueued, domain.StatePlanning, "operator_start"); err != nil {
 				return err
 			}
 			if err := recordRunnerStartAuthority(ctx, conn, ref, version, fence, workflowID, createdAt); err != nil {

@@ -701,6 +701,21 @@ func TestOperatorSourceResumePreparedCandidateWitnessBindsSFG(t *testing.T) {
 	rollback := errors.New("rollback tampered source-resume control")
 	var sourceRecoveryErr error
 	if err := database.write(ctx, func(conn *sql.Conn) error {
+		// The V51 phase entry is intentionally FK-bound to this Store-owned
+		// source-resume event. Model a privileged durable corruption by removing
+		// its dependent immutable witnesses inside the rolled-back transaction,
+		// rather than weakening the production foreign key.
+		for _, trigger := range []string{"provider_phase_attempt_entries_immutable_delete", "provider_phase_entries_immutable_delete"} {
+			if _, err := conn.ExecContext(ctx, `DROP TRIGGER `+trigger); err != nil {
+				return err
+			}
+		}
+		if _, err := conn.ExecContext(ctx, `DELETE FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='verification' AND entry_ticket_version=?`, publishing.Ref.Channel, publishing.Ref.Project, publishing.Ref.Ticket, resumed.Version); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `DELETE FROM provider_phase_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='verification' AND entry_ticket_version=?`, publishing.Ref.Channel, publishing.Ref.Project, publishing.Ref.Ticket, resumed.Version); err != nil {
+			return err
+		}
 		if _, err := conn.ExecContext(ctx, `UPDATE events SET to_state='building' WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_resume' AND from_state='paused' AND to_state='verifying'`, publishing.Ref.Channel, publishing.Ref.Project, publishing.Ref.Ticket, resumed.Version); err != nil {
 			return err
 		}

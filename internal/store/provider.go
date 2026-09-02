@@ -502,14 +502,35 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		if active != 0 {
 			return ErrProviderAttempt
 		}
-		var prior int
+		entry, err := loadCurrentProviderPhaseEntry(ctx, conn, r.Ref, r.Phase, version, runner, r.Fence.LeaderEpoch)
+		if err != nil {
+			return err
+		}
+		if err := validateProviderPhaseEntryBindings(ctx, conn, r.Ref, entry); err != nil {
+			return err
+		}
+		var entryRuns, prior int
+		if err = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND entry_ticket_version=?`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, entry.Version).Scan(&entryRuns); err != nil {
+			return err
+		}
 		if err = conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt),0) FROM phase_runs WHERE channel=? AND project_id=? AND ticket_id=? AND phase=?`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase).Scan(&prior); err != nil {
 			return err
 		}
-		if prior >= 2 {
-			return ErrBudgetExhausted
+		epoch, hasRetryEpoch, err := loadProviderRetryEpoch(ctx, conn, r.Ref, r.Phase)
+		if err != nil {
+			return err
 		}
-		prior++
+		if hasRetryEpoch && epoch.EntryVersion != entry.Version {
+			hasRetryEpoch = false
+		}
+		limit := 2
+		if hasRetryEpoch {
+			limit = 4
+		}
+		if entryRuns >= limit {
+			return ErrProviderAttemptLimit
+		}
+		prior++ // globally monotonic per ticket+phase, independent of entry.
 		launchInput := r.Input
 		launchInput.Ticket, launchInput.Phase = r.Ref, r.Phase
 		launchInput.Provider, launchInput.AuthMode = r.Binding.Identity, r.Binding.AuthMode
@@ -544,6 +565,9 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO provider_attempt_inputs(provider_attempt_id,request_digest,canonical_input,created_at) VALUES(?,?,?,?)`, id, requestDigest, payload, r.At.UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO provider_phase_attempt_entries(provider_attempt_id,channel,project_id,ticket_id,phase,role,attempt,entry_ticket_version,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, id, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket, r.Phase, r.Role, prior, entry.Version, r.At.UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 		launchInput.RequestDigest = requestDigest
@@ -1339,18 +1363,27 @@ func (s *Store) recoverProviderAttemptClaim(ctx context.Context, claim ProviderA
 		if currentLeader != leader {
 			return ErrStaleFence
 		}
-		if err := conn.QueryRowContext(ctx, `SELECT runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&currentRunner); err != nil {
+		var ticketState domain.State
+		var blockedCode string
+		if err := conn.QueryRowContext(ctx, `SELECT state,runner_epoch,blocked_code FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&ticketState, &currentRunner, &blockedCode); err != nil {
 			return err
 		}
-		if currentRunner == claim.RunnerEpoch {
+		if currentRunner == claim.RunnerEpoch && (ticketState != domain.StateBlocked || blockedCode != "legacy_provider_phase_entry_unverifiable" || currentLeader <= claim.LeaderEpoch) {
 			return ErrProviderDrain
 		}
-		var state string
-		if err := conn.QueryRowContext(ctx, `SELECT state FROM provider_attempts WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=? AND provider_lease_key=?`, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest, claim.LeaseKey).Scan(&state); err != nil {
+		var state, launchState, launchWorktree, bootIdentity, startIdentity string
+		var pid, pgid int
+		if err := conn.QueryRowContext(ctx, `SELECT state,launch_state,process_pid,process_pgid,process_boot_identity,process_start_identity,worktree_path FROM provider_attempts WHERE id=? AND channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND role=? AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND binding_digest=? AND provider_lease_key=?`, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.BindingDigest, claim.LeaseKey).Scan(&state, &launchState, &pid, &pgid, &bootIdentity, &startIdentity, &launchWorktree); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrStaleFence
 			}
 			return err
+		}
+		if currentRunner == claim.RunnerEpoch {
+			var phaseRuns, leases int
+			if (state != "active" && state != "quarantined") || launchState != "released" || pid <= 0 || pgid <= 0 || pid != pgid || bootIdentity == "" || startIdentity == "" || launchWorktree != claim.Worktree || conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM phase_runs WHERE channel=? AND project_id=? AND ticket_id=? AND phase=? AND attempt=? AND state='active' AND leader_epoch=? AND runner_epoch=? AND expected_ticket_version=? AND provider=? AND model=? AND family=? AND provider_version=? AND worktree_identity=? AND base_sha=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version, claim.WorktreeIdentity, claim.BaseSHA).Scan(&phaseRuns) != nil || phaseRuns != 1 || conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases WHERE channel=? AND project_id=? AND ticket_id=? AND scope='provider' AND scope_key=? AND runner_epoch=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.LeaseKey, claim.RunnerEpoch).Scan(&leases) != nil || leases != 1 {
+				return ErrProviderDrain
+			}
 		}
 		if _, err := conn.ExecContext(ctx, `UPDATE provider_attempts SET state='cancelled',outcome='drained_recovery',finished_at=?,launch_state='drained' WHERE id=? AND state IN ('active','quarantined')`, at.UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
 			return err
