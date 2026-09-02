@@ -98,7 +98,7 @@ func (r PlannerRunner) RunArtifact(ctx context.Context, request workflowworker.P
 	if r.Store == nil || r.Coordinator == nil {
 		return PlannerResult{}, ErrPlannerNotReady
 	}
-	if request.Ticket.Ref.Validate() != nil || request.Ticket.State != domain.StatePlanning || request.Ticket.Version == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 {
+	if request.Ticket.Ref.Validate() != nil || request.Ticket.State != domain.StatePlanning || request.Ticket.Version == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 || request.Ticket.RunnerEpoch != request.Fence.RunnerEpoch {
 		return PlannerResult{}, ErrIdentityMismatch
 	}
 	project, err := r.Store.Project(ctx, request.Ticket.Ref.Channel, request.Ticket.Ref.Project)
@@ -206,11 +206,10 @@ func digestMatches(data []byte, want string) bool {
 }
 
 func validateWorktree(request workflowworker.PhaseRequest, project store.Project) error {
-	worktree := request.Worktree
-	if worktree.State != "registered" || worktree.Path == "" || filepath.IsAbs(worktree.Path) == false || filepath.Clean(worktree.Path) != worktree.Path || worktree.Path == "/" || worktree.Branch == "" || worktree.TicketVersion != request.Ticket.Version || worktree.Fence != request.Fence || worktree.BaseSHA == "" || len(worktree.IdentityJSON) == 0 {
-		return ErrIdentityMismatch
-	}
-	return validateHistoricalWorktree(worktree, project)
+	// Registration is stable evidence created when the linked checkout first
+	// enters planning. Scheduler and Store authenticate the live ticket fence;
+	// a daemon recovery must not rewrite or invalidate this historical row.
+	return validateHistoricalWorktree(request.Worktree, project)
 }
 
 // validateHistoricalWorktree verifies stable registration facts. Worktree

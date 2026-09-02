@@ -180,6 +180,55 @@ func TestProviderExhaustionOpensExactlyOneDurableRetryEpoch(t *testing.T) {
 	}
 }
 
+func TestProviderExhaustionAfterRunnerRecoveryRetainsOriginalAttemptWindow(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	firstLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-exhaustion-before-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-provider-exhaustion-after-recovery", firstLeader)
+	planner, _ := setupProviderPair(t, db, ctx)
+	firstFence := domain.Fence{LeaderEpoch: firstLeader, RunnerEpoch: ticket.RunnerEpoch}
+	for attempt := 1; attempt <= 2; attempt++ {
+		claim, beginErr := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: firstFence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		if beginErr != nil {
+			t.Fatalf("begin attempt %d: %v", attempt, beginErr)
+		}
+		if finishErr := db.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, firstFence, "failed", "failed", 1, time.Now().UTC()); finishErr != nil {
+			t.Fatalf("finish attempt %d: %v", attempt, finishErr)
+		}
+	}
+
+	secondLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-exhaustion-after-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, secondLeader); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondFence := domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: ticket.RunnerEpoch}
+	if _, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: secondFence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()})); !errors.Is(err, ErrProviderAttemptLimit) {
+		t.Fatalf("recovered attempt window admitted a third attempt: %v", err)
+	}
+	attempts, err := db.ProviderAttempts(ctx, ticket.Ref)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+	paused, err := db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: secondFence})
+	if err != nil || paused.Version != ticket.Version+1 {
+		t.Fatalf("pause=%+v err=%v", paused, err)
+	}
+	current, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || current.State != domain.StatePaused || current.ResumeState != domain.StatePlanning {
+		t.Fatalf("current=%+v err=%v", current, err)
+	}
+}
+
 func TestProviderRetryAfterRecoveryAdmitsAndReusesCurrentResult(t *testing.T) {
 	db, ctx := openTestStore(t)
 	digest := setupProviderProject(t, db, ctx)

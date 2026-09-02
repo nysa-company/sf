@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -108,6 +109,114 @@ func TestPlannerRunnerMapsCodexPlannerAndReturnsAuthenticatedKey(t *testing.T) {
 	}
 }
 
+func TestPlannerRunnerAcceptsHistoricalRegisteredWorktreeAfterRunnerRecovery(t *testing.T) {
+	request, evidence, coordinator := plannerFixture(t)
+	request.Worktree.TicketVersion = request.Ticket.Version - 1
+	request.Worktree.Fence = domain.Fence{
+		LeaderEpoch: request.Fence.LeaderEpoch - 1,
+		RunnerEpoch: request.Fence.RunnerEpoch - 1,
+	}
+
+	result, err := (PlannerRunner{Store: evidence, Coordinator: coordinator}).RunArtifact(context.Background(), request)
+	if err != nil {
+		t.Fatalf("historical registered worktree rejected after current fence was authenticated: %v", err)
+	}
+	if result.Key.AttemptID != 11 || coordinator.calls != 1 {
+		t.Fatalf("result=%+v calls=%d", result, coordinator.calls)
+	}
+}
+
+func TestPlannerRunnerUsesHistoricalRegistrationAfterAuthenticatedStoreRecovery(t *testing.T) {
+	request, _, coordinator := plannerFixture(t)
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "planner-recovery.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	if err := database.CreateProject(ctx, store.Project{
+		Channel:          request.Ticket.Ref.Channel,
+		ID:               request.Ticket.Ref.Project,
+		Path:             "/repo",
+		BaseRef:          "main",
+		ConfigGeneration: request.Ticket.ConfigGeneration,
+		ConfigDigest:     request.Ticket.ConfigDigest,
+		ConfigSnapshot:   request.Ticket.ConfigSnapshot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateTicket(ctx, store.Ticket{
+		Ref:             request.Ticket.Ref,
+		SourceDigest:    request.Ticket.SourceDigest,
+		Source:          request.Ticket.Source,
+		Title:           request.Ticket.Title,
+		Acceptance:      request.Ticket.Acceptance,
+		Problem:         request.Ticket.Problem,
+		Type:            request.Ticket.Type,
+		MergeMode:       request.Ticket.MergeMode,
+		CreatedAt:       time.Now().UTC(),
+		MaxDuration:     time.Hour,
+		MaxCostMicroUSD: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	firstLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "planner-recovery-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := database.StartOrAdopt(ctx, request.Ticket.Ref, 1, request.Worktree.Branch, domain.Fence{LeaderEpoch: firstLeader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{
+		Ref:             started.Ref,
+		ExpectedVersion: started.Version,
+		Fence:           domain.Fence{LeaderEpoch: firstLeader, RunnerEpoch: started.RunnerEpoch},
+		Path:            request.Worktree.Path,
+		Branch:          request.Worktree.Branch,
+		IdentityJSON:    request.Worktree.IdentityJSON,
+		BaseSHA:         request.Worktree.BaseSHA,
+		HeadSHA:         request.Worktree.BaseSHA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	secondLeader, err := database.AcquireLeader(ctx, domain.ChannelDev, "planner-recovery-second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.FenceRecoveredRunners(ctx, domain.ChannelDev, secondLeader); err != nil {
+		t.Fatal(err)
+	}
+	current, err := database.Ticket(ctx, started.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, err := database.Worktree(ctx, started.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Version != started.Version+1 || current.RunnerEpoch != started.RunnerEpoch+1 || registered.TicketVersion != started.Version || registered.Fence.LeaderEpoch != firstLeader {
+		t.Fatalf("current=%+v started=%+v registered=%+v", current, started, registered)
+	}
+
+	coordinator.result = providercoord.Result{Code: providercoord.AttemptExhausted, NeedsOperator: true}
+	_, err = (PlannerRunner{Store: database, Coordinator: coordinator}).RunArtifact(ctx, workflowworker.PhaseRequest{
+		Ticket:   current,
+		Worktree: registered,
+		Phase:    domain.PhasePlanning,
+		Fence:    domain.Fence{LeaderEpoch: secondLeader, RunnerEpoch: current.RunnerEpoch},
+	})
+	if !errors.Is(err, workflowworker.ErrProviderAttemptExhausted) || coordinator.calls != 1 {
+		t.Fatalf("planner recovery err=%v calls=%d request=%+v", err, coordinator.calls, coordinator.request)
+	}
+	attempts, err := database.ProviderAttempts(ctx, started.Ref)
+	if err != nil || len(attempts) != 0 {
+		t.Fatalf("planner recovery launched provider attempts=%+v err=%v", attempts, err)
+	}
+}
+
 func TestPlannerRunnerOnlyMapsAttemptWindowExhaustionToProviderPause(t *testing.T) {
 	request, evidence, coordinator := plannerFixture(t)
 	runner := PlannerRunner{Store: evidence, Coordinator: coordinator}
@@ -168,6 +277,11 @@ func TestPlannerRunnerRejectsAutonomousAndMismatchedIdentity(t *testing.T) {
 	request.Worktree.Path = "/foreign"
 	if _, err := (PlannerRunner{Store: evidence, Coordinator: coordinator}).RunArtifact(context.Background(), request); !errors.Is(err, ErrIdentityMismatch) {
 		t.Fatalf("identity err=%v", err)
+	}
+	request, evidence, coordinator = plannerFixture(t)
+	request.Fence.RunnerEpoch--
+	if _, err := (PlannerRunner{Store: evidence, Coordinator: coordinator}).RunArtifact(context.Background(), request); !errors.Is(err, ErrIdentityMismatch) || coordinator.calls != 0 {
+		t.Fatalf("stale runner fence err=%v calls=%d", err, coordinator.calls)
 	}
 }
 
