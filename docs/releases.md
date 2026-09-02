@@ -82,7 +82,9 @@ it here.
    ./bin/sf doctor --repo /absolute/path/to/disposable-fixture
    ```
 
-   `providers qualify` runs the bounded, credential-free local Codex probes
+   `providers qualify` first authenticates the resolved `codex` executable and
+   its exact executable `codex-code-mode-host` sibling as one release bundle,
+   then runs the bounded, credential-free local Codex probes
    (configuration parsing, guarded read/write, network denial, and credential
    isolation) and records guarded-qualified only when those probes pass. It
    does not execute `testdata/hostile-repository` and does not make a model

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/auth"
+	"github.com/nysa-company/sf/internal/codexruntime"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
@@ -255,6 +256,7 @@ func TestCodexCredentialHomeAllowsReadOnlyUserDirectoryButRejectsWritableOrSymli
 	if err := os.WriteFile(executable, []byte("fixture"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	writeCodexRuntimeFixture(t, executable)
 	if _, err := New(Config{Executable: executable, AuthHome: directory, Model: "gpt-5.6-luna", Runner: &fakeProbe{version: []byte("codex 1.2.3"), help: requiredHelp()}}); err != nil {
 		t.Fatalf("read-only credential home rejected: %v", err)
 	}
@@ -288,6 +290,40 @@ func TestCodexAuthDigestBindsOpenedAuthFileIdentityAndMetadata(t *testing.T) {
 	after, err := adapter.Binding(context.Background())
 	if err != nil || before.AuthDigest == after.AuthDigest {
 		t.Fatalf("auth binding did not change after credential metadata changed: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
+func TestBindingReauthenticatesCodeModeHostBundle(t *testing.T) {
+	adapter, _ := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
+	before, err := adapter.Binding(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := filepath.Join(filepath.Dir(adapter.executable), codexruntime.CodeModeHost)
+	if err := os.WriteFile(host, []byte("fixture-code-mode-host-updated"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	after, err := adapter.Binding(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.BinaryDigest == before.BinaryDigest {
+		t.Fatal("code-mode host mutation did not change runtime binding")
+	}
+}
+
+func TestCredentialProbeRejectsChangedRuntimeBundleBeforeLaunch(t *testing.T) {
+	adapter, probe := adapterFixture(t, "codex-builder", "gpt-5.6-luna")
+	host := filepath.Join(filepath.Dir(adapter.executable), codexruntime.CodeModeHost)
+	if err := os.Remove(host); err != nil {
+		t.Fatal(err)
+	}
+	before := len(probe.calls)
+	if _, err := adapter.authMode(context.Background()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("authMode error=%v, want unavailable", err)
+	}
+	if len(probe.calls) != before {
+		t.Fatal("credential-bearing probe ran after runtime bundle validation failed")
 	}
 }
 
@@ -581,6 +617,7 @@ func adapterFixture(t *testing.T, route, model string) (*Adapter, *fakeProbe) {
 	if err := os.WriteFile(executable, []byte("fixture-codex"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	writeCodexRuntimeFixture(t, executable)
 	probe := &fakeProbe{version: []byte("codex 1.2.3\n"), help: requiredHelp(), login: []byte("Logged in using ChatGPT\n"), loginExit: 0}
 	authHome := privateDir(t, "auth")
 	if err := os.WriteFile(filepath.Join(authHome, "auth.json"), []byte(`{"fixture":true}`), 0o600); err != nil {
@@ -591,6 +628,13 @@ func adapterFixture(t *testing.T, route, model string) (*Adapter, *fakeProbe) {
 		t.Fatal(err)
 	}
 	return adapter, probe
+}
+
+func writeCodexRuntimeFixture(t *testing.T, executable string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(filepath.Dir(executable), codexruntime.CodeModeHost), []byte("fixture-code-mode-host"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func requiredHelp() []byte {

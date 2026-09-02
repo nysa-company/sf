@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nysa-company/sf/internal/codexruntime"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"golang.org/x/sys/unix"
@@ -77,6 +78,7 @@ type trustedExecutable struct {
 	authDigest   string
 	authMode     string
 	authHome     string
+	bundle       codexruntime.Bundle
 }
 
 // stagedExecutable is owned by the supervisor, unlike legacy registered
@@ -84,9 +86,10 @@ type trustedExecutable struct {
 // until that exact Run has completely returned, including the pre-launch
 // preparation interval before a process is visible in runs.
 type stagedExecutable struct {
-	path, directory string
-	refs            int
-	cleaning        bool
+	path, helperPath, directory string
+	bundleDigest                string
+	refs                        int
+	cleaning                    bool
 }
 type run struct {
 	identity        Identity
@@ -180,12 +183,13 @@ func (s *Supervisor) RegisterRuntime(binding contracts.RuntimeBinding, executabl
 	if err := privateExistingDirectory(authHome); err != nil {
 		return "", errors.New("Codex authentication home is unsafe")
 	}
-	trusted, err := authenticateExecutable(executable)
+	bundle, err := codexruntime.Resolve(executable)
 	if err != nil {
 		return "", err
 	}
+	trusted := trustedExecutable{path: bundle.Codex.Path, digest: bundle.Digest, bundle: bundle}
 	if trusted.digest != binding.BinaryDigest {
-		return "", errors.New("Codex executable digest does not match qualification")
+		return "", errors.New("Codex runtime bundle digest does not match qualification")
 	}
 	s.mu.Lock()
 	if s.closing || s.closed {
@@ -230,6 +234,7 @@ func (s *Supervisor) RegisterRuntime(binding contracts.RuntimeBinding, executabl
 
 func runtimeBindingMatches(current, candidate trustedExecutable, binding contracts.RuntimeBinding, authHome string) bool {
 	return current.snapshot != nil && stagedRuntimeMatches(current.snapshot, current.digest) && current.path == candidate.path && current.digest == candidate.digest &&
+		current.bundle == candidate.bundle &&
 		current.policyDigest == binding.PolicyDigest && current.authDigest == binding.AuthDigest &&
 		current.authMode == binding.AuthMode && current.authHome == authHome
 }
@@ -245,6 +250,13 @@ func stagedRuntimeMatches(snapshot *stagedExecutable, digest string) bool {
 	directory, err := os.Lstat(snapshot.directory)
 	if err != nil || directory.Mode()&os.ModeSymlink != 0 || !directory.IsDir() || directory.Mode().Perm()&0o077 != 0 || !trustedOwner(directory) {
 		return false
+	}
+	if snapshot.bundleDigest != "" {
+		if snapshot.bundleDigest != digest || snapshot.helperPath != filepath.Join(snapshot.directory, codexruntime.CodeModeHost) {
+			return false
+		}
+		bundle, bundleErr := codexruntime.ResolveStaged(snapshot.path)
+		return bundleErr == nil && bundle.Digest == digest
 	}
 	info, err := os.Lstat(snapshot.path)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 || info.Size() <= 0 || info.Size() > maxProviderRuntimeExecutableSize || !trustedOwner(info) {
@@ -485,7 +497,8 @@ func authenticateExecutable(path string) (trustedExecutable, error) {
 	}
 	defer file.Close()
 	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
+	copied, err := io.Copy(hash, io.LimitReader(file, maxProviderRuntimeExecutableSize+1))
+	if err != nil || copied != info.Size() {
 		return trustedExecutable{}, errors.New("trusted executable digest could not be read")
 	}
 	return trustedExecutable{path: resolved, digest: hex.EncodeToString(hash.Sum(nil))}, nil
@@ -503,6 +516,20 @@ func (trusted *trustedExecutable) stage() error {
 	if err := os.Chmod(directory, 0o700); err != nil {
 		cleanup()
 		return err
+	}
+	if trusted.bundle.Digest != "" {
+		if trusted.bundle.Digest != trusted.digest {
+			cleanup()
+			return errors.New("trusted Codex runtime bundle is incomplete")
+		}
+		targetPath, copyErr := codexruntime.CopyTo(trusted.bundle, directory)
+		if copyErr != nil {
+			cleanup()
+			return errors.New("trusted Codex runtime changed while staging")
+		}
+		trusted.stagedPath, trusted.stagedDir = targetPath, directory
+		trusted.snapshot = &stagedExecutable{path: targetPath, helperPath: filepath.Join(directory, codexruntime.CodeModeHost), directory: directory, bundleDigest: trusted.digest}
+		return nil
 	}
 	source, err := os.Open(trusted.path)
 	if err != nil {
@@ -641,8 +668,8 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 			return contracts.CommandResult{}, errors.New("Codex invocation does not match guarded registered runtime policy")
 		}
 	}
-	providerPath := trusted.stagedPath
-	if providerPath == "" {
+	providerTarget, providerArgv0 := trusted.stagedPath, trusted.stagedPath
+	if providerTarget == "" {
 		return contracts.CommandResult{}, errors.New("provider executable was not staged")
 	}
 	var executable *os.File
@@ -652,7 +679,9 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 			return contracts.CommandResult{}, errors.New("provider executable could not be pinned")
 		}
 		defer executable.Close()
-		providerPath = fmt.Sprintf("/proc/self/fd/%d", 4) // FD 3 is the gate.
+		// The target is fd-pinned, while argv[0] stays the staged codex path so
+		// Codex can resolve its authenticated code-mode-host sibling.
+		providerTarget = fmt.Sprintf("/proc/self/fd/%d", 4) // FD 3 is the gate.
 	}
 	self := s.Executable
 	if self == "" {
@@ -676,7 +705,9 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 		return contracts.CommandResult{}, err
 	}
 	defer gateWrite.Close()
-	argv := append([]string{"__provider_gate", providerPath}, arguments[1:]...)
+	// The gate ABI deliberately carries exec target and argv[0] separately.
+	// They differ only on Linux, where the target is an inherited descriptor.
+	argv := append([]string{"__provider_gate", providerTarget, providerArgv0}, arguments[1:]...)
 	cmd := exec.Command(self, argv...)
 	cmd.Dir = input.Worktree
 	cmd.Env = environment

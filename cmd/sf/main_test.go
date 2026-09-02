@@ -8,12 +8,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/codexruntime"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
@@ -33,6 +35,114 @@ func bindSupervisorTestInput(t *testing.T, request *contracts.DrainRequest) cont
 	}
 	input.RequestDigest, request.RequestDigest = digest, digest
 	return input
+}
+
+func TestProviderGatePreservesStagedArgv0WhenTargetIsPinned(t *testing.T) {
+	target, argv, ok := providerGateCommand([]string{"sf-dev", "__provider_gate", "/proc/self/fd/4", "/private/stage/codex", "exec", "--json"})
+	if !ok || target != "/proc/self/fd/4" || !reflect.DeepEqual(argv, []string{"/private/stage/codex", "exec", "--json"}) {
+		t.Fatalf("target=%q argv=%q ok=%v", target, argv, ok)
+	}
+	if _, _, ok := providerGateCommand([]string{"sf-dev", "__provider_gate", "/private/stage/codex"}); ok {
+		t.Fatal("legacy one-path provider gate ABI was accepted")
+	}
+}
+
+func TestCompiledProviderGateExecutesStagedCodeModeHost(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "sf-dev")
+	build := exec.Command("go", "build", "-ldflags", "-X github.com/nysa-company/sf/internal/version.Channel=dev", "-o", binary, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build sf-dev: %v\n%s", err, output)
+	}
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authHome := filepath.Join(root, "codex-home")
+	if err := os.Mkdir(authHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authHome, "auth.json"), []byte(`{"fixture":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	codex := filepath.Join(root, "codex")
+	launcherSource := filepath.Join(root, "codex-launcher.go")
+	launcher := `package main
+import (
+    "os"
+    "path/filepath"
+    "syscall"
+)
+func main() {
+    host := filepath.Join(filepath.Dir(os.Args[0]), "codex-code-mode-host")
+    if err := syscall.Exec(host, append([]string{host}, os.Args[1:]...), os.Environ()); err != nil {
+        os.Exit(126)
+    }
+}
+`
+	if err := os.WriteFile(launcherSource, []byte(launcher), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	goBinary, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compileLauncher := exec.Command(goBinary, "build", "-o", codex, launcherSource)
+	if output, err := compileLauncher.CombinedOutput(); err != nil {
+		t.Fatalf("build codex launcher: %v\n%s", err, output)
+	}
+	host := filepath.Join(root, codexruntime.CodeModeHost)
+	hostProgram := `#!/bin/sh
+out=''
+previous=''
+for arg in "$@"; do
+  if [ "$previous" = '--output-last-message' ]; then out="$arg"; fi
+  previous="$arg"
+done
+[ -n "$out" ] || exit 64
+printf '{}' > "$out"
+printf '%s\n' '{"type":"turn.completed"}'
+`
+	if err := os.WriteFile(host, []byte(hostProgram), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	supervisor, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor.Executable = binary
+	identity := domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"}
+	bundle, err := codexruntime.Resolve(codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := contracts.RuntimeBinding{Identity: identity, BinaryDigest: bundle.Digest, PolicyDigest: supervisor.PolicyDigest(), FixtureDigest: strings.Repeat("a", 64), AuthDigest: strings.Repeat("b", 64), AuthMode: "chatgpt_subscription"}
+	if _, err := supervisor.RegisterRuntime(binding, codex, authHome); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(host); err != nil {
+		t.Fatal(err)
+	}
+	worktree := filepath.Join(root, "worktree")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	input := contracts.PhaseInput{Ticket: domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-runtime-host"}, Phase: domain.PhaseBuild, Attempt: 1, LeaderEpoch: 1, RunnerEpoch: 1, ExpectedVersion: 1, Prompt: "fixture", Repository: worktree, Worktree: worktree, WorktreeIdentity: "identity", BaseSHA: "base", Provider: identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}
+	_, requestDigest, err := contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.RequestDigest = requestDigest
+	request := contracts.DrainRequest{ClaimID: 42, Identity: identity, Ref: input.Ticket, Phase: input.Phase, Role: "builder", Attempt: input.Attempt, LeaderEpoch: input.LeaderEpoch, RunnerEpoch: input.RunnerEpoch, ExpectedVersion: input.ExpectedVersion, LeaseKey: "lease", BindingDigest: strings.Repeat("c", 64), BinaryDigest: binding.BinaryDigest, PolicyDigest: binding.PolicyDigest, AuthDigest: binding.AuthDigest, AuthMode: binding.AuthMode, Repository: input.Repository, Worktree: input.Worktree, WorktreeIdentity: input.WorktreeIdentity, BaseSHA: input.BaseSHA, RequestDigest: requestDigest}
+	supervisor.SetLaunchRecorder(func(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) error { return nil })
+	invocation := contracts.Invocation{Argv: []string{codex, "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules", "--config", `default_permissions="sf-guarded"`, "--config", `permissions.sf-guarded.extends=":workspace"`, "--config", `permissions.sf-guarded.filesystem={":root"="deny",":minimal"="read",":workspace_roots"="write"}`, "--config", `permissions.sf-guarded.network.enabled=false`, "--model", identity.Model, "-C", worktree, "--output-schema", contracts.OutputSchemaPlaceholder, "--output-last-message", contracts.OutputLastMessagePlaceholder, "-"}, Stdin: []byte("fixture"), OutputSchema: input.Schema, CaptureLastMessage: true, AuthHome: authHome}
+	result, err := supervisor.Run(context.Background(), request, invocation, input)
+	if err != nil || result.ExitCode != 0 || string(result.OutputLastMessage) != "{}" || !bytes.Contains(result.Stdout, []byte(`"turn.completed"`)) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
 }
 
 func TestCompiledDevDoctorBypassesGHPreflight(t *testing.T) {
@@ -792,6 +902,9 @@ esac
 exit 98
 `
 	if err := os.WriteFile(fakeCodex, []byte(fake), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "codex-code-mode-host"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	binary := buildDevRuntimeBundle(t)

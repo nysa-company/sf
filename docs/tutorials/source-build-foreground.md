@@ -11,6 +11,8 @@ the foreground daemon is the only process that owns ticket mutations.
   account you intend to use.
 - One qualified Builder provider and one independently qualified Reviewer
   provider. The local beta pair uses separately qualified Codex model families.
+- A supported Codex installation whose resolved `codex` executable has the
+  exact executable sibling `codex-code-mode-host` from the same release.
 - A trusted local product checkout with a GitHub origin.
 
 Docker, Colima, root access, deployment credentials, and copied GitHub tokens
@@ -77,7 +79,8 @@ cd /absolute/path/to/sf-source
 ```
 
 Qualification is served by the running foreground daemon: its current local
-supervisor signs the exact provider/version/family, executable, non-secret
+supervisor signs the exact provider/version/family, two-file Codex runtime
+bundle, non-secret
 authentication identity, and bounded probe digests before SQLite admits the
 guarded result. It invokes no model. On macOS it fails closed unless the outer
 Seatbelt probe denies loopback/external sockets and CODEX_HOME metadata access.

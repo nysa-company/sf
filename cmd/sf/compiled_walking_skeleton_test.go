@@ -356,6 +356,7 @@ func compiledWalkingSkeletonBundle(t *testing.T) (binary, fixtureBin string) {
 		{filepath.Join(root, "sf-git-exec-dev"), "../../cmd/sf-git-exec"},
 		{filepath.Join(root, "sf-git-credential-dev"), "../../cmd/sf-git-credential"},
 		{filepath.Join(fixtureBin, "codex"), "../../cmd/fake-provider"},
+		{filepath.Join(fixtureBin, "codex-code-mode-host"), "../../cmd/fake-provider"},
 		{filepath.Join(fixtureBin, "gh"), "../../cmd/fake-gh"},
 	} {
 		command := exec.Command(goBinary, "build", "-tags", "sf_e2e", "-ldflags", ldflags, "-o", target.path, target.packagePath)

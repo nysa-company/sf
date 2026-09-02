@@ -28,7 +28,7 @@ import (
 )
 
 func main() {
-	if len(os.Args) >= 3 && os.Args[1] == "__provider_gate" {
+	if target, argv, ok := providerGateCommand(os.Args); ok {
 		// FD 3 is held by the supervisor until the launch PID/PGID is durably
 		// recorded. EOF means the parent died before authority was published.
 		gate := os.NewFile(uintptr(3), "provider-launch-gate")
@@ -39,7 +39,10 @@ func main() {
 		if _, err := gate.Read(one[:]); err != nil {
 			os.Exit(125)
 		}
-		if err := syscall.Exec(os.Args[2], os.Args[2:], os.Environ()); err != nil {
+		// Linux uses an inherited fd as the exec target while retaining the
+		// staged path in argv[0]; Codex resolves code-mode-host relative to that
+		// argv spelling. Darwin uses the same value for both positions.
+		if err := syscall.Exec(target, argv, os.Environ()); err != nil {
 			os.Exit(126)
 		}
 		return
@@ -194,6 +197,16 @@ func main() {
 		return errors.Join(runErr, supervisor.Close())
 	}
 	os.Exit(cli.ExecuteWithDaemon(ctx, os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}, runDaemon))
+}
+
+// providerGateCommand keeps the target used by exec separate from the child
+// argv. Linux passes a descriptor target while Codex must retain the staged
+// launcher spelling in argv[0] to discover code-mode-host next to it.
+func providerGateCommand(args []string) (string, []string, bool) {
+	if len(args) < 4 || args[1] != "__provider_gate" || args[2] == "" || args[3] == "" {
+		return "", nil, false
+	}
+	return args[2], append([]string{args[3]}, args[4:]...), true
 }
 
 func existingDirectory(path string) bool {

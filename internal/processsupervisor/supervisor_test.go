@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/codexruntime"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 )
@@ -42,7 +42,7 @@ func runtimeRegistration(t *testing.T) (*Supervisor, contracts.RuntimeBinding, s
 	if err := os.WriteFile(executable, contents, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(contents)
+	writeCodexCodeModeHost(t, executable)
 	supervisor, err := New(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -50,10 +50,27 @@ func runtimeRegistration(t *testing.T) (*Supervisor, contracts.RuntimeBinding, s
 	supervisor.Executable = testProviderGate(t)
 	binding := contracts.RuntimeBinding{
 		Identity:     domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"},
-		BinaryDigest: hex.EncodeToString(digest[:]), PolicyDigest: supervisor.PolicyDigest(),
+		BinaryDigest: runtimeBundleDigest(t, executable), PolicyDigest: supervisor.PolicyDigest(),
 		FixtureDigest: strings.Repeat("a", 64), AuthDigest: strings.Repeat("b", 64), AuthMode: "chatgpt_subscription",
 	}
 	return supervisor, binding, executable, authHome
+}
+
+func writeCodexCodeModeHost(t *testing.T, executable string) {
+	t.Helper()
+	host := filepath.Join(filepath.Dir(executable), codexruntime.CodeModeHost)
+	if err := os.WriteFile(host, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runtimeBundleDigest(t *testing.T, executable string) string {
+	t.Helper()
+	bundle, err := codexruntime.Resolve(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundle.Digest
 }
 
 func TestRegisterRuntimeRefreshReusesAndReclaimsStagedSnapshots(t *testing.T) {
@@ -105,25 +122,82 @@ func TestRegisterRuntimeStagesExecutableLargerThanLegacyLimit(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	source, err := os.Open(executable)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, source); err != nil {
-		_ = source.Close()
-		t.Fatal(err)
-	}
-	if err := source.Close(); err != nil {
-		t.Fatal(err)
-	}
-	binding.BinaryDigest = hex.EncodeToString(hash.Sum(nil))
+	binding.BinaryDigest = runtimeBundleDigest(t, executable)
 	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
 		t.Fatalf("runtime above the legacy 128 MiB limit was rejected: %v", err)
 	}
 	trusted := supervisor.trusted[binding.Identity]
 	if info, err := os.Stat(trusted.stagedPath); err != nil || info.Size() != 129<<20 || !stagedRuntimeMatches(trusted.snapshot, binding.BinaryDigest) {
 		t.Fatalf("large runtime snapshot is incomplete: info=%v err=%v", info, err)
+	}
+}
+
+func TestRegisterRuntimeStagesExactCodexBundleAndRejectsHelperMutation(t *testing.T) {
+	supervisor, binding, executable, authHome := runtimeRegistration(t)
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	trusted := supervisor.trusted[binding.Identity]
+	if trusted.stagedPath != filepath.Join(trusted.stagedDir, "codex") || trusted.snapshot == nil || trusted.snapshot.helperPath != filepath.Join(trusted.stagedDir, codexruntime.CodeModeHost) || !stagedRuntimeMatches(trusted.snapshot, binding.BinaryDigest) {
+		t.Fatalf("staged Codex bundle is incomplete: %+v", trusted)
+	}
+	if info, err := os.Lstat(trusted.snapshot.helperPath); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o500 {
+		t.Fatalf("staged code-mode host info=%v err=%v", info, err)
+	}
+	host := filepath.Join(filepath.Dir(executable), codexruntime.CodeModeHost)
+	if err := os.WriteFile(host, []byte("#!/bin/sh\nexit 9\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err == nil {
+		t.Fatal("mutated helper was accepted with the old bundle digest")
+	}
+	binding.BinaryDigest = runtimeBundleDigest(t, executable)
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	if got := supervisor.trusted[binding.Identity].stagedDir; got == trusted.stagedDir {
+		t.Fatal("changed runtime helper reused old staged bundle")
+	}
+}
+
+func TestStagedCodexExecutesSiblingHostAfterSourceMutation(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authHome := filepath.Join(root, "codex-home")
+	if err := os.Mkdir(authHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authHome, "auth.json"), []byte(`{"fixture":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(root, "codex")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexec \"$(dirname \"$0\")/codex-code-mode-host\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	host := filepath.Join(root, codexruntime.CodeModeHost)
+	if err := os.WriteFile(host, []byte("#!/bin/sh\nprintf 'staged-host\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	supervisor, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"}, BinaryDigest: runtimeBundleDigest(t, executable), PolicyDigest: supervisor.PolicyDigest(), FixtureDigest: strings.Repeat("a", 64), AuthDigest: strings.Repeat("b", 64), AuthMode: "chatgpt_subscription"}
+	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
+		t.Fatal(err)
+	}
+	staged := supervisor.trusted[binding.Identity].stagedPath
+	if err := os.WriteFile(host, []byte("#!/bin/sh\nprintf 'mutated-source-host\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	output, runErr := exec.Command(staged).CombinedOutput()
+	if runErr != nil || string(output) != "staged-host\n" {
+		t.Fatalf("staged codex output=%q err=%v", output, runErr)
 	}
 }
 
@@ -256,8 +330,7 @@ func TestSupervisorCompletedRuntimeRunDoesNotLeakSnapshotReference(t *testing.T)
 	if err := os.WriteFile(executable, contents, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(contents)
-	binding.BinaryDigest = hex.EncodeToString(digest[:])
+	binding.BinaryDigest = runtimeBundleDigest(t, executable)
 	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +360,7 @@ func TestSupervisorCloseRetainsStagedRuntimeUntilPipeHoldingEscapeeWaits(t *test
 	if err := os.WriteFile(provider, []byte(program), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256([]byte(program))
+	writeCodexCodeModeHost(t, provider)
 	authHome := filepath.Join(root, "codex-home")
 	if err := os.Mkdir(authHome, 0o700); err != nil {
 		t.Fatal(err)
@@ -301,7 +374,7 @@ func TestSupervisorCloseRetainsStagedRuntimeUntilPipeHoldingEscapeeWaits(t *test
 	}
 	supervisor.Executable = testProviderGate(t)
 	supervisor.SoftDrain, supervisor.HardDrain = 100*time.Millisecond, 100*time.Millisecond
-	binding := contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"}, BinaryDigest: hex.EncodeToString(digest[:]), PolicyDigest: supervisor.PolicyDigest(), FixtureDigest: strings.Repeat("a", 64), AuthDigest: strings.Repeat("b", 64), AuthMode: "chatgpt_subscription"}
+	binding := contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"}, BinaryDigest: runtimeBundleDigest(t, provider), PolicyDigest: supervisor.PolicyDigest(), FixtureDigest: strings.Repeat("a", 64), AuthDigest: strings.Repeat("b", 64), AuthMode: "chatgpt_subscription"}
 	if _, err := supervisor.RegisterRuntime(binding, provider, authHome); err != nil {
 		t.Fatal(err)
 	}
@@ -522,13 +595,13 @@ func TestReplacementRetainsSnapshotUntilBlockedRunReturns(t *testing.T) {
 	if err := os.WriteFile(executable, []byte(program), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	sum := sha256.Sum256([]byte(program))
+	writeCodexCodeModeHost(t, executable)
 	supervisor, err := New(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	supervisor.Executable = testProviderGate(t)
-	binding := contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"}, BinaryDigest: hex.EncodeToString(sum[:]), PolicyDigest: supervisor.PolicyDigest(), FixtureDigest: strings.Repeat("a", 64), AuthDigest: strings.Repeat("b", 64), AuthMode: "chatgpt_subscription"}
+	binding := contracts.RuntimeBinding{Identity: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "family", Version: "v1"}, BinaryDigest: runtimeBundleDigest(t, executable), PolicyDigest: supervisor.PolicyDigest(), FixtureDigest: strings.Repeat("a", 64), AuthDigest: strings.Repeat("b", 64), AuthMode: "chatgpt_subscription"}
 	if _, err := supervisor.RegisterRuntime(binding, executable, authHome); err != nil {
 		t.Fatal(err)
 	}
@@ -674,7 +747,7 @@ func testProviderGate(t *testing.T) string {
 	// The helper mirrors the production wrapper's argv shape. The supervisor's
 	// own durable recorder remains the boundary under test here; the helper
 	// intentionally does not consume the inherited release byte.
-	if err := os.WriteFile(gate, []byte("#!/bin/sh\n[ \"$1\" = __provider_gate ] || exit 125\nshift\nprovider=$1\nshift\nexec \"$provider\" \"$@\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(gate, []byte("#!/bin/sh\n[ \"$1\" = __provider_gate ] || exit 125\nshift\ntarget=$1\nshift\n# argv0 is the staged Codex spelling; this shell fixture does not need it.\nshift\nexec \"$target\" \"$@\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return gate

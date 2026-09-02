@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/auth"
+	"github.com/nysa-company/sf/internal/codexruntime"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/redact"
@@ -127,6 +128,11 @@ func (localQualificationFixture) Run(ctx context.Context, adapter *Adapter) ([]s
 	// Seatbelt runner. The inner `codex sandbox` command proves the exact Codex
 	// profile too; neither command receives CODEX_HOME or prompt stdin.
 	probe := func(name string, args []string, env []string, expect func(auth.ProbeResult) bool) error {
+		if hasCodexHome(env) {
+			if err := adapter.currentRuntimeBundle(); err != nil {
+				return err
+			}
+		}
 		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		result, err := adapter.runner.Probe(probeCtx, adapter.executable, args, env, maxProbeOutput)
@@ -305,7 +311,7 @@ func (a *Adapter) Binding(ctx context.Context) (contracts.RuntimeBinding, error)
 	if err != nil {
 		return contracts.RuntimeBinding{}, err
 	}
-	binary, err := digestFile(a.executable)
+	bundle, err := codexruntime.Resolve(a.executable)
 	if err != nil {
 		return contracts.RuntimeBinding{}, err
 	}
@@ -315,7 +321,7 @@ func (a *Adapter) Binding(ctx context.Context) (contracts.RuntimeBinding, error)
 	}
 	return contracts.RuntimeBinding{
 		Identity:      identity,
-		BinaryDigest:  binary,
+		BinaryDigest:  bundle.Digest,
 		PolicyDigest:  policyDigest(),
 		FixtureDigest: fixtureDigest(),
 		AuthDigest:    auth,
@@ -405,6 +411,9 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 const authModeChatGPTSubscription = "chatgpt_subscription"
 
 func (a *Adapter) authMode(ctx context.Context) (string, error) {
+	if err := a.currentRuntimeBundle(); err != nil {
+		return "", err
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	result, err := a.runner.Probe(probeCtx, a.executable, []string{"login", "status"}, a.authEnvironment(), maxProbeOutput)
@@ -415,6 +424,29 @@ func (a *Adapter) authMode(ctx context.Context) (string, error) {
 		return "", ErrUnsupportedAuthMode
 	}
 	return authModeChatGPTSubscription, nil
+}
+
+// currentRuntimeBundle is deliberately rechecked immediately before a probe
+// that receives CODEX_HOME. A source helper replacement must therefore fail
+// before a credential-bearing Codex process is started.
+func (a *Adapter) currentRuntimeBundle() error {
+	if a == nil {
+		return ErrUnavailable
+	}
+	bundle, err := codexruntime.Resolve(a.executable)
+	if err != nil || bundle.Codex.Path != a.executable {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+func hasCodexHome(environment []string) bool {
+	for _, value := range environment {
+		if strings.HasPrefix(value, "CODEX_HOME=") {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Adapter) version(ctx context.Context) (string, error) {
@@ -454,18 +486,11 @@ func (a *Adapter) authEnvironment() []string {
 func probeEnvironment() []string { return []string{"PATH=/usr/bin:/bin", "LANG=C", "HOME=/tmp"} }
 
 func resolveExecutable(value string) (string, error) {
-	if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value {
+	bundle, err := codexruntime.Resolve(value)
+	if err != nil {
 		return "", ErrUnavailable
 	}
-	resolved, err := filepath.EvalSymlinks(value)
-	if err != nil || !filepath.IsAbs(resolved) || filepath.Clean(resolved) != resolved {
-		return "", ErrUnavailable
-	}
-	info, err := os.Stat(resolved)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 || info.Mode()&0o022 != 0 {
-		return "", ErrUnavailable
-	}
-	return resolved, nil
+	return bundle.Codex.Path, nil
 }
 
 func resolveAuthHome(value string) (string, error) {
@@ -492,16 +517,11 @@ func trustedAuthHomeOwner(info os.FileInfo) bool {
 }
 
 func digestFile(path string) (string, error) {
-	file, err := os.Open(path)
+	bundle, err := codexruntime.Resolve(path)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	return bundle.Digest, nil
 }
 
 func policyDigest() string {
