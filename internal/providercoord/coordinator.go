@@ -65,6 +65,7 @@ type Receipt struct {
 	Attempt                          int
 	Provider                         domain.ProviderIdentity
 	ArtifactDigest, TranscriptDigest string
+	ArtifactFailureReason            contracts.ArtifactFailureReason
 	UsageUnits                       int64
 	TokenUsage                       int64
 	ErrorCode                        string
@@ -444,6 +445,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			trustedUsage = raw.UsageUnits
 		}
 		var parsed phaseartifact.Parsed
+		var artifactFailureReason contracts.ArtifactFailureReason
 		// An adapter's explicit invalid-artifact outcome is repairable only when
 		// its monetary usage is trusted. Every supervisor/command error, usage
 		// ambiguity, and explicit indeterminate outcome is terminal and must not
@@ -453,6 +455,10 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			outcome = "result_indeterminate"
 		} else if !cancelled && raw.Outcome == contracts.PhaseResultInvalidArtifact {
 			outcome = contracts.PhaseResultInvalidArtifact
+			artifactFailureReason = raw.ArtifactFailureReason
+			if !contracts.ValidArtifactFailureReason(artifactFailureReason) {
+				artifactFailureReason = contracts.ArtifactFailureAdapterDeclared
+			}
 		} else if valid {
 			parsed, err = phaseartifact.Parse(input.Phase, raw, r.Validation)
 			if err == nil {
@@ -460,12 +466,14 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 					state, outcome = "completed", contracts.PhaseResultCompleted
 				} else {
 					outcome = contracts.PhaseResultInvalidArtifact
+					artifactFailureReason = contracts.ArtifactFailureMutationPath
 				}
 			} else {
 				outcome = contracts.PhaseResultInvalidArtifact
+				artifactFailureReason = contracts.ArtifactFailureSchema
 			}
 		}
-		receipt := Receipt{AttemptID: claim.ID, Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), UsageUnits: trustedUsage}
+		receipt := Receipt{AttemptID: claim.ID, Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), ArtifactFailureReason: artifactFailureReason, UsageUnits: trustedUsage}
 		if raw.TokenUsageTrusted {
 			receipt.TokenUsage = max(raw.TokenUsage, 0)
 		}
@@ -485,6 +493,8 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		var durableResult store.ProviderAttemptResult
 		if state == "completed" {
 			durableResult, finishErr = c.store.CompleteProviderAttemptSuccess(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, raw, r.Validation, finishedAt)
+		} else if outcome == contracts.PhaseResultInvalidArtifact {
+			finishErr = c.store.FinishProviderAttemptWithArtifactFailure(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, artifactFailureReason, trustedUsage, finishedAt)
 		} else {
 			finishErr = c.store.FinishProviderAttempt(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, state, outcome, trustedUsage, finishedAt)
 		}

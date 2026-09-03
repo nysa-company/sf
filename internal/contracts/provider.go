@@ -217,11 +217,15 @@ func DecodeCanonicalPhaseInput(payload []byte) (PhaseInput, error) {
 }
 
 type PhaseResult struct {
-	Outcome      string
-	Artifact     []byte
-	Transcript   string
-	Provider     domain.ProviderIdentity
-	ChangedFiles []string
+	Outcome string
+	// ArtifactFailureReason is a bounded, non-secret classification emitted
+	// only for a clean provider completion whose final artifact is repairable.
+	// It is never provider text, a transcript excerpt, or an adapter error.
+	ArtifactFailureReason ArtifactFailureReason
+	Artifact              []byte
+	Transcript            string
+	Provider              domain.ProviderIdentity
+	ChangedFiles          []string
 	// UsageTrusted and UsageUnits describe a trusted monetary charge in
 	// micro-USD. They alone may be charged against Ticket.MaxCostMicroUSD.
 	// A provider-reported token count must never be placed here.
@@ -252,6 +256,29 @@ const (
 	PhaseResultInvalidArtifact = "invalid_artifact"
 	PhaseResultIndeterminate   = "indeterminate"
 )
+
+// ArtifactFailureReason explains the small repairable subset of an
+// invalid_artifact outcome. Keep this set deliberately closed: it is durable
+// operator evidence, not a diagnostic channel for provider-controlled text.
+type ArtifactFailureReason string
+
+const (
+	ArtifactFailureFinalMessage ArtifactFailureReason = "final_message_missing_or_malformed"
+	ArtifactFailureSchema       ArtifactFailureReason = "schema_validation"
+	ArtifactFailureMutationPath ArtifactFailureReason = "mutation_path"
+	// ArtifactFailureAdapterDeclared covers a trusted adapter's explicit
+	// invalid-artifact result when it has no more precise closed reason.
+	ArtifactFailureAdapterDeclared ArtifactFailureReason = "adapter_declared_invalid_artifact"
+)
+
+func ValidArtifactFailureReason(value ArtifactFailureReason) bool {
+	switch value {
+	case ArtifactFailureFinalMessage, ArtifactFailureSchema, ArtifactFailureMutationPath, ArtifactFailureAdapterDeclared:
+		return true
+	default:
+		return false
+	}
+}
 
 // Invocation is an argv-only adapter proposal. The supervisor is the sole
 // component allowed to start it; adapters never receive os/exec authority.

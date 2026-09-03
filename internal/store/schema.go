@@ -71,6 +71,8 @@ func (s *Store) validateSchema(ctx context.Context) error {
 		"phase_run_state_outcome_update",
 		"provider_attempt_results_immutable_update",
 		"provider_attempt_results_immutable_delete",
+		"provider_artifact_failures_immutable_update",
+		"provider_artifact_failures_immutable_delete",
 		"plan_result_bindings_immutable_update",
 		"plan_result_bindings_immutable_delete",
 		"verification_result_bindings_immutable_update",
@@ -174,6 +176,8 @@ func compositeForeignKey(table, target string, columns ...foreignKeyColumn) comp
 // insufficient: accepting a subset or differently ordered mapping would let a
 // valid value from another candidate, ticket, or fence satisfy the FK.
 var requiredCompositeForeignKeys = []compositeForeignKeyRequirement{
+	compositeForeignKey("provider_artifact_failures", "provider_attempts",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"phase", "phase"}, foreignKeyColumn{"role", "role"}, foreignKeyColumn{"attempt", "attempt"}, foreignKeyColumn{"provider_attempt_id", "id"}),
 	compositeForeignKey("provider_phase_entries", "events",
 		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"entry_ticket_version", "ticket_version"}, foreignKeyColumn{"entry_event_id", "id"}, foreignKeyColumn{"entry_event_created_at", "created_at"}, foreignKeyColumn{"entry_from_state", "from_state"}, foreignKeyColumn{"entry_state", "to_state"}, foreignKeyColumn{"entry_trigger", "trigger"}),
 	compositeForeignKey("provider_phase_attempt_entries", "provider_phase_entries",
@@ -252,6 +256,8 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "approvals", target: "tickets"},
 	{table: "worktrees", target: "tickets"},
 	{table: "provider_attempts", target: "tickets"},
+	{table: "provider_artifact_failures", target: "provider_attempts"},
+	{table: "provider_artifact_failures", target: "tickets"},
 	{table: "provider_attempt_results", target: "provider_attempts"},
 	{table: "provider_attempt_results", target: "tickets"},
 	{table: "leases", target: "tickets"},
@@ -420,6 +426,7 @@ var requiredSchema = map[string][]string{
 	"provider_attempts":                    {"phase", "attempt", "provider", "role", "state", "usage_units", "started_at", "finished_at", "qualification_id", "binding_digest", "provider_lease_key", "leader_epoch", "runner_epoch", "expected_ticket_version", "auth_digest", "auth_mode", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "worktree_path"},
 	"provider_attempt_inputs":              {"provider_attempt_id", "request_digest", "canonical_input", "created_at"},
 	"provider_attempt_results":             {"provider_attempt_id", "raw_artifact", "raw_sha256", "typed_artifact", "typed_sha256", "validation", "validation_sha256", "transcript_sha256", "request_digest", "leader_epoch", "runner_epoch", "expected_ticket_version", "repository_path", "worktree_path", "worktree_identity", "base_sha"},
+	"provider_artifact_failures":           {"provider_attempt_id", "channel", "project_id", "ticket_id", "phase", "role", "attempt", "request_digest", "leader_epoch", "runner_epoch", "expected_ticket_version", "failure_reason", "failure_digest", "created_at"},
 	"leases":                               {"scope", "scope_key", "runner_epoch"},
 	"plans":                                {"ticket_id", "digest", "body"},
 	"verifications":                        {"ticket_id", "intent_digest", "proof_digest", "current_revision"},
@@ -487,6 +494,7 @@ var requiredIndexes = []indexRequirement{
 	{table: "provider_attempts", columns: []string{"channel", "project_id", "ticket_id", "phase", "attempt", "provider"}},
 	{table: "provider_attempts", name: "one_active_provider_attempt", columns: []string{"channel", "project_id", "ticket_id"}, partial: true},
 	{table: "provider_attempt_results", name: "provider_attempt_results_fence", columns: []string{"channel", "project_id", "ticket_id", "phase", "attempt", "leader_epoch", "runner_epoch", "expected_ticket_version"}, nonUnique: true},
+	{table: "provider_artifact_failures", name: "provider_artifact_failures_ticket", columns: []string{"channel", "project_id", "ticket_id", "provider_attempt_id"}, nonUnique: true},
 	{table: "verification_revisions", columns: []string{"channel", "project_id", "ticket_id", "intent_digest", "proof_digest", "checkpoint_id"}},
 	{table: "candidate_snapshots", columns: []string{"channel", "project_id", "ticket_id", "generation"}},
 	{table: "invalidation_receipts", columns: []string{"channel", "project_id", "ticket_id", "generation", "kind"}},

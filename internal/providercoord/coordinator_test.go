@@ -191,6 +191,57 @@ func TestSingleRoutePausesAfterOneInvalidArtifactRepair(t *testing.T) {
 	}
 }
 
+type explicitArtifactFailureProvider struct {
+	*testkit.ScriptedProvider
+	reason contracts.ArtifactFailureReason
+}
+
+func (p *explicitArtifactFailureProvider) Parse(context.Context, contracts.PhaseInput, contracts.CommandResult) (contracts.PhaseResult, error) {
+	return contracts.PhaseResult{Outcome: contracts.PhaseResultInvalidArtifact, ArtifactFailureReason: p.reason, Provider: p.Identity, UsageTrusted: true, UsageUnits: 0}, nil
+}
+
+func TestInvalidArtifactFailureReasonsAreDurableAndBounded(t *testing.T) {
+	for name, configure := range map[string]func(*Coordinator, *testkit.ScriptedProvider){
+		"final_message_missing_or_malformed": func(c *Coordinator, primary *testkit.ScriptedProvider) {
+			c.registry.providers["cursor"] = &explicitArtifactFailureProvider{ScriptedProvider: primary, reason: contracts.ArtifactFailureFinalMessage}
+		},
+		"schema_validation": func(_ *Coordinator, primary *testkit.ScriptedProvider) {
+			primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: []byte(`{"schema":"wrong"}`)}}
+		},
+		"mutation_path": func(_ *Coordinator, primary *testkit.ScriptedProvider) {
+			primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
+				{Artifact: plannerArtifact(), ChangedFiles: []string{"untrusted.txt"}},
+				{Artifact: plannerArtifact(), ChangedFiles: []string{"untrusted.txt"}},
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+			coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+			configure(coordinator, primary)
+			result := coordinator.Run(context.Background(), request)
+			if result.Code != AttemptExhausted || len(result.Attempts) != 2 {
+				t.Fatalf("result=%+v", result)
+			}
+			want := contracts.ArtifactFailureReason(name)
+			for _, receipt := range result.Attempts {
+				if receipt.ErrorCode != "invalid_artifact" || receipt.ArtifactFailureReason != want {
+					t.Fatalf("receipt=%+v want reason=%s", receipt, want)
+				}
+			}
+			failures, err := database.ProviderArtifactFailures(context.Background(), ref)
+			if err != nil || len(failures) != 2 {
+				t.Fatalf("durable failures=%+v err=%v", failures, err)
+			}
+			for _, failure := range failures {
+				if failure.Reason != want || failure.RequestDigest == "" || failure.Digest == "" {
+					t.Fatalf("failure=%+v want reason=%s", failure, want)
+				}
+			}
+		})
+	}
+}
+
 func TestInvalidArtifactRepairsSameRouteBeforeAvailabilityFallback(t *testing.T) {
 	_, request, coordinator, _, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
 	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{

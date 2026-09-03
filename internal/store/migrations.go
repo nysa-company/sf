@@ -1330,3 +1330,24 @@ var migrationV53 = []string{
 	`CREATE TRIGGER phase_run_state_outcome_insert BEFORE INSERT ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome IN ('completed','passed')) OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable','invocation_failed','result_indeterminate'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
 	`CREATE TRIGGER phase_run_state_outcome_update BEFORE UPDATE OF state,outcome ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome IN ('completed','passed')) OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable','invocation_failed','result_indeterminate'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
 }
+
+// v54 records a closed, transcript-free reason for new repairable invalid
+// artifacts. Older invalid-artifact rows intentionally remain reasonless:
+// guessing a reason from raw provider output would create a second, unsafe
+// interpretation of historical evidence.
+var migrationV54 = []string{
+	`CREATE TABLE provider_artifact_failures (
+		provider_attempt_id INTEGER PRIMARY KEY CHECK(provider_attempt_id>0),
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		phase TEXT NOT NULL CHECK(phase IN ('planning','verification','build','review')), role TEXT NOT NULL CHECK(role IN ('planner','builder','reviewer')), attempt INTEGER NOT NULL CHECK(attempt>0),
+		request_digest TEXT NOT NULL CHECK(length(request_digest)=64), leader_epoch INTEGER NOT NULL CHECK(leader_epoch>0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch>0), expected_ticket_version INTEGER NOT NULL CHECK(expected_ticket_version>0),
+		failure_reason TEXT NOT NULL CHECK(failure_reason IN ('final_message_missing_or_malformed','schema_validation','mutation_path','adapter_declared_invalid_artifact')),
+		failure_digest TEXT NOT NULL UNIQUE CHECK(length(failure_digest)=64), created_at TEXT NOT NULL CHECK(length(created_at) BETWEEN 1 AND 128),
+		FOREIGN KEY(provider_attempt_id) REFERENCES provider_attempts(id),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(channel,project_id,ticket_id,phase,role,attempt,provider_attempt_id) REFERENCES provider_attempts(channel,project_id,ticket_id,phase,role,attempt,id)
+	)`,
+	`CREATE INDEX provider_artifact_failures_ticket ON provider_artifact_failures(channel,project_id,ticket_id,provider_attempt_id)`,
+	`CREATE TRIGGER provider_artifact_failures_immutable_update BEFORE UPDATE ON provider_artifact_failures BEGIN SELECT RAISE(ABORT,'provider artifact failure is immutable'); END`,
+	`CREATE TRIGGER provider_artifact_failures_immutable_delete BEFORE DELETE ON provider_artifact_failures BEGIN SELECT RAISE(ABORT,'provider artifact failure is append-only'); END`,
+}

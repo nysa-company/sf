@@ -797,7 +797,7 @@ func TestV53ProviderResultIndeterminateMigration(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 53 {
+	if err := db.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != schemaVersion {
 		t.Fatalf("schema=%d err=%v", version, err)
 	}
 	for _, name := range []string{"provider_attempt_state_outcome_insert", "provider_attempt_state_outcome_update", "phase_run_state_outcome_insert", "phase_run_state_outcome_update"} {

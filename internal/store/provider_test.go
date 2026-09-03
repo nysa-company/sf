@@ -427,6 +427,79 @@ func TestProviderInvalidArtifactPairPausesWithRepairReasonAndRetries(t *testing.
 	}
 }
 
+func TestProviderArtifactFailureIsDurableAuthenticatedAndImmutable(t *testing.T) {
+	db, ctx := openTestStore(t)
+	digest := setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-artifact-failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-provider-artifact-failure", leader)
+	planner, _ := setupProviderPair(t, db, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := time.Now().UTC().Round(0)
+	if err := db.FinishProviderAttemptWithArtifactFailure(ctx, claim, proof(t, claim), ticket.Version, fence, contracts.ArtifactFailureSchema, 0, finished); err != nil {
+		t.Fatal(err)
+	}
+	// ProviderArtifactFailures must close its list cursor before its
+	// per-row authentication queries: Store callers may intentionally use a
+	// single-connection pool.
+	db.db.SetMaxOpenConns(1)
+	readCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	failures, err := db.ProviderArtifactFailures(readCtx, ticket.Ref)
+	if err != nil || len(failures) != 1 {
+		t.Fatalf("artifact failures=%+v err=%v", failures, err)
+	}
+	got := failures[0]
+	if got.AttemptID != claim.ID || got.Ref != ticket.Ref || got.Phase != domain.PhasePlanning || got.Role != "planner" || got.Attempt != claim.Attempt || got.RequestDigest != claim.RequestDigest || got.LeaderEpoch != fence.LeaderEpoch || got.RunnerEpoch != fence.RunnerEpoch || got.ExpectedVersion != ticket.Version || got.Reason != contracts.ArtifactFailureSchema || !validSHA256(got.Digest) || !got.CreatedAt.Equal(finished) {
+		t.Fatalf("artifact failure=%+v", got)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_artifact_failures SET failure_reason='mutation_path' WHERE provider_attempt_id=?`, claim.ID); err == nil {
+		t.Fatal("immutable artifact failure accepted update")
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM provider_artifact_failures WHERE provider_attempt_id=?`, claim.ID); err == nil {
+		t.Fatal("append-only artifact failure accepted delete")
+	}
+	if _, err := db.db.ExecContext(ctx, `DROP TRIGGER provider_artifact_failures_immutable_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE provider_artifact_failures SET failure_reason='mutation_path' WHERE provider_attempt_id=?`, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ProviderArtifactFailures(ctx, ticket.Ref); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("tampered artifact failure accepted: %v", err)
+	}
+}
+
+func TestV54ProviderArtifactFailureMigration(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v53.sqlite")
+	createDatabaseAtVersion(t, path, 53)
+	db, err := OpenChannel(ctx, path, t.TempDir(), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version, table int
+	if err := db.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != schemaVersion {
+		t.Fatalf("schema=%d err=%v", version, err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='provider_artifact_failures'`).Scan(&table); err != nil || table != 1 {
+		t.Fatalf("artifact failure table=%d err=%v", table, err)
+	}
+	for _, name := range []string{"provider_artifact_failures_immutable_update", "provider_artifact_failures_immutable_delete"} {
+		var count int
+		if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, name).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("trigger %s count=%d err=%v", name, count, err)
+		}
+	}
+}
+
 func TestProviderInvalidArtifactRepairTamperingRejectsDispositionAndRetry(t *testing.T) {
 	for name, corrupt := range map[string]func(*contracts.PhaseInput){
 		"missing":  func(input *contracts.PhaseInput) { input.Repair = nil },
