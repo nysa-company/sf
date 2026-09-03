@@ -30,6 +30,11 @@ import (
 var (
 	ErrIdentityMismatch = errors.New("git repository identity mismatch")
 	ErrUnsafeWorktree   = errors.New("git worktree is unsafe")
+	// ErrWorktreeDirty is a read-only classification: the registered checkout
+	// still proved its filesystem identity, but its visible status is not an
+	// exact pristine retry input. Callers must retain it rather than create or
+	// replace a worktree.
+	ErrWorktreeDirty    = errors.New("git worktree is not pristine")
 	ErrUnexpectedRemote = errors.New("remote branch head is unexpected")
 	ErrPushBeforeStart  = errors.New("git candidate push failed before mutation handoff")
 	// ErrPushUncertain means the candidate-ref push crossed the command handoff
@@ -2011,6 +2016,39 @@ func (r Runner) CleanWorktreeHead(ctx context.Context, worktree Worktree) (strin
 	}
 	head, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil || !validOID(head) {
+		return "", fmt.Errorf("%w: worktree head is invalid", ErrIdentityMismatch)
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	return head, nil
+}
+
+// StrictCleanWorktreeHead is the retry-admission variant of
+// CleanWorktreeHead. In addition to staged, unstaged, and untracked files it
+// fails closed on ignored files, because provider output can be hidden by a
+// repository ignore rule. It performs no mutation and preserves identity,
+// command, and context errors so callers do not misclassify them as ordinary
+// retry unready state.
+func (r Runner) StrictCleanWorktreeHead(ctx context.Context, worktree Worktree) (string, error) {
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	status, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(string(status)) != "" {
+		return "", fmt.Errorf("%w: staged, unstaged, untracked, or ignored paths are present", ErrWorktreeDirty)
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	head, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return "", err
+	}
+	if !validOID(head) {
 		return "", fmt.Errorf("%w: worktree head is invalid", ErrIdentityMismatch)
 	}
 	if err := r.InspectWorktree(ctx, worktree); err != nil {
