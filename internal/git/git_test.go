@@ -814,7 +814,7 @@ func TestRunnerExactArgvScrubsHooksAndCredentialEnvironment(t *testing.T) {
 			t.Fatalf("environment leaks %s", forbidden)
 		}
 	}
-	if !strings.Contains(joined, "HOME="+runner.Home) || !strings.Contains(joined, "GIT_TERMINAL_PROMPT=0") {
+	if !strings.Contains(joined, "HOME="+runner.Home) || !strings.Contains(joined, "TMPDIR="+runner.Home) || !strings.Contains(joined, "GIT_TERMINAL_PROMPT=0") {
 		t.Fatalf("environment missing isolation: %q", joined)
 	}
 }

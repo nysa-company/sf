@@ -626,7 +626,13 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	if err := os.MkdirAll(r.Home, 0o700); err != nil {
 		return nil, err
 	}
-	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
+	// Apple Git consults DARWIN_USER_TEMP_DIR during startup. With a stripped
+	// child environment, confstr can emit a warning to stderr; runBounded
+	// intentionally combines stdout and stderr, so that warning would corrupt
+	// machine-readable Git output (for example rev-parse --show-toplevel).
+	// Keep the temp root private and deterministic rather than inheriting the
+	// caller's potentially shared TMPDIR.
+	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "TMPDIR=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
 	seen := map[string]bool{}
 	for _, entry := range extra {
 		key, value, found := strings.Cut(entry, "=")
