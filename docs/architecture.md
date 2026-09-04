@@ -20,6 +20,10 @@ The approved normative design is in
   records the base and protection witnesses; reconciliation proves ancestry
   from the original base rather than expecting the protected branch tip to
   remain old.
+  App-specific required checks are authenticated against GitHub's exact-head
+  check-run response: app ID, name, run URL and result must agree with the
+  required-check observation. Incomplete or ambiguous inventories fail closed;
+  a successful check with the same name from a different app is not evidence.
 - Project configuration is parsed strictly, resolved beneath machine policy,
   and stored as immutable canonical bytes plus a digest. A queued ticket copies
   the exact current generation when it first enters planning, so a later file

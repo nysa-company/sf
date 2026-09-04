@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -462,11 +463,16 @@ func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contr
 	if err != nil {
 		return contracts.CIRequiredCheckPolicyObservation{}, err
 	}
-	checks, err := c.checks(ctx, observed.Identity)
+	var apps map[string]int64
+	checks, err := c.checksBound(ctx, observed.Identity, func(wire []checkWire) error {
+		var authErr error
+		apps, authErr = c.authenticateCheckApps(ctx, observed.Identity, protection, wire)
+		return authErr
+	})
 	if err != nil {
 		return contracts.CIRequiredCheckPolicyObservation{}, err
 	}
-	if !requiredChecksMatchProtection(checks, protection) {
+	if !requiredChecksMatchProtection(checks, protection, apps) {
 		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
 	}
 	// Required-check observation is a separate GitHub read from protected
@@ -480,7 +486,7 @@ func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contr
 	if !sameProtectionWitness(protection, protectionAfter) {
 		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
 	}
-	if !requiredChecksMatchProtection(checks, protectionAfter) {
+	if !requiredChecksMatchProtection(checks, protectionAfter, apps) {
 		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
 	}
 	// A required context is stable policy identity; the run/check URL emitted by
@@ -509,7 +515,7 @@ func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contr
 // requiredChecksMatchProtection binds the live `gh pr checks --required`
 // rows to the complete status-check set configured on the exact protected
 // branch/ruleset witness. Extras or a subset are not a policy observation.
-func requiredChecksMatchProtection(checks []contracts.RequiredCheck, protection strictProtectionWitness) bool {
+func requiredChecksMatchProtection(checks []contracts.RequiredCheck, protection strictProtectionWitness, authenticatedApps ...map[string]int64) bool {
 	if len(protection.Checks) == 0 || len(checks) != len(protection.Checks) {
 		return false
 	}
@@ -524,11 +530,14 @@ func requiredChecksMatchProtection(checks []contracts.RequiredCheck, protection 
 				return false
 			}
 		} else if protection.Kind == "ruleset" {
-			// `gh pr checks --required` exposes run URL/external identity, not a
-			// ruleset integration id. A nonzero integration requirement therefore
-			// cannot be proven by this observer and must fail closed.
-			if len(parts) != 2 || (parts[1] != "-" && parts[1] != "0") {
+			if len(parts) != 2 {
 				return false
+			}
+			if parts[1] != "-" && parts[1] != "0" {
+				id, err := strconv.ParseInt(parts[1], 10, 64)
+				if err != nil || id <= 0 || len(authenticatedApps) != 1 || authenticatedApps[0][name] != id {
+					return false
+				}
 			}
 		} else {
 			return false
@@ -1170,6 +1179,10 @@ func (c Client) WaitChecks(ctx context.Context, identity contracts.PullRequestId
 }
 
 func (c Client) checks(ctx context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
+	return c.checksBound(ctx, identity, nil)
+}
+
+func (c Client) checksBound(ctx context.Context, identity contracts.PullRequestIdentity, authenticate func([]checkWire) error) ([]contracts.RequiredCheck, error) {
 	if !validIdentity(identity) {
 		return nil, ErrPolicyRefusal
 	}
@@ -1189,6 +1202,11 @@ func (c Client) checks(ctx context.Context, identity contracts.PullRequestIdenti
 	// authoritative while a required workflow has not even created a run yet.
 	if err := c.json(ctx, &wire, "pr", "checks", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--required", "--json", "name,state,workflow,link,bucket"); err != nil {
 		return nil, err
+	}
+	if authenticate != nil {
+		if err := authenticate(wire); err != nil {
+			return nil, err
+		}
 	}
 	after, err := c.Observe(ctx, identity)
 	if err != nil || !sameExact(after.Identity, identity) || after.State != "OPEN" || after.Merged {
