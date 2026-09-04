@@ -48,8 +48,9 @@ type testClock struct{ now time.Time }
 func (c testClock) Now() time.Time { return c.now }
 
 type testRuntimeController struct {
-	drain func(context.Context, domain.TicketRef) (bool, error)
-	merge func(context.Context, domain.TicketRef) (bool, error)
+	drain                  func(context.Context, domain.TicketRef) (bool, error)
+	merge                  func(context.Context, domain.TicketRef) (bool, error)
+	providerRetryPreflight func(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error)
 }
 
 type testRuntimeRetirementController struct {
@@ -66,12 +67,14 @@ type takeoverRuntimeController struct {
 
 type retryRuntimeController struct {
 	testRuntimeController
-	needed    bool
-	stateErr  error
-	replay    store.GuardedMergeRetryReplayState
-	replayErr error
-	rearmErr  error
-	rearms    int
+	needed         bool
+	stateErr       error
+	replay         store.GuardedMergeRetryReplayState
+	replayErr      error
+	rearmErr       error
+	rearms         int
+	providerRearm  func(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error)
+	providerRearms int
 }
 
 func (controller *takeoverRuntimeController) InspectTakeover(context.Context, domain.TicketRef) (contracts.TakeoverInspection, error) {
@@ -92,8 +95,70 @@ func (controller *retryRuntimeController) RuntimeRearmNeeded(context.Context, do
 	return controller.needed, controller.stateErr
 }
 
+func (controller *retryRuntimeController) RearmProviderRetry(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	controller.providerRearms++
+	if controller.providerRearm != nil {
+		return controller.providerRearm(ctx, ref, version, fence)
+	}
+	return true, controller.rearmErr
+}
+
 func (controller *retryRuntimeController) GuardedMergeRetryReplay(context.Context, domain.TicketRef) (store.GuardedMergeRetryReplayState, error) {
 	return controller.replay, controller.replayErr
+}
+
+func activateProviderRetryAdmissionForDaemonTest(daemon *Daemon) func(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+	return providerRetryAdmissionForDaemonTest(daemon, false)
+}
+
+func openProviderRetryAdmissionForDaemonTest(daemon *Daemon) func(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+	return providerRetryAdmissionForDaemonTest(daemon, true)
+}
+
+func providerRetryAdmissionForDaemonTest(daemon *Daemon, open bool) func(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+	return func(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+		stopped, err := daemon.store.StoppedRuntimeTicket(ctx, ref)
+		if err != nil {
+			return false, err
+		}
+		capability, err := daemon.store.ProviderRetryRearmProof(ctx, ref, stopped)
+		if err != nil {
+			return false, err
+		}
+		if err := daemon.store.ActivateRearm(ctx, capability, func(admission *store.RuntimeAdmissionCapability) error {
+			gotRef, gotVersion, gotFence, ok := admission.ConsumeRuntimeAdmission()
+			if !ok || gotRef != ref || gotVersion != version || gotFence != fence {
+				return store.ErrStaleFence
+			}
+			if open {
+				return admission.OpenStoreAdmission(ctx)
+			}
+			return nil
+		}); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+}
+
+func installDaemonProviderRetryTakeoverFixture(t *testing.T, daemon *Daemon, ref domain.TicketRef) {
+	t.Helper()
+	registered, registeredErr := daemon.store.Worktree(t.Context(), ref)
+	project, projectErr := daemon.store.Project(t.Context(), ref.Channel, ref.Project)
+	if registeredErr != nil || projectErr != nil {
+		t.Fatalf("provider retry takeover fixture worktree=%v project=%v", registeredErr, projectErr)
+	}
+	daemon.control = &takeoverRuntimeController{inspection: contracts.TakeoverInspection{
+		Registered: true, Path: registered.Path, Branch: registered.Branch, Repository: project.Path,
+		BaseSHA: registered.BaseSHA, HeadSHA: registered.HeadSHA, ChangeKind: "unadopted_changes",
+	}}
+}
+
+func (controller testRuntimeController) AuthenticateProviderRetryWorktree(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	if controller.providerRetryPreflight == nil {
+		return true, nil
+	}
+	return controller.providerRetryPreflight(ctx, ref, version, fence)
 }
 
 type daemonRuntimeEnsure struct{}
@@ -650,6 +715,11 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				"retry_not_available":                     {binary, "retry", "--help"},
 				"retry_transition_refused":                {binary, "retry", "--help"},
 				"retry_required":                          {binary, "retry", "--help"},
+				"provider_retry_exhausted":                {binary, "cancel", "--help"},
+				"provider_retry_resubmit_required":        {binary, "cancel", "--help"},
+				"provider_retry_worktree_unavailable":     {binary, "retry", "--help"},
+				"provider_retry_worktree_unready":         {binary, "take", "--help"},
+				"provider_retry_rearm_blocked":            {binary, "show", "--help"},
 				"recover_mode_refused":                    {binary, "recover", "--help"},
 				"recover_transition_refused":              {binary, "recover", "--help"},
 				"other":                                   {binary, "doctor"},
@@ -688,6 +758,11 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				"retry_state_unavailable":                 {binary, "retry", "SF-action"},
 				"retry_not_available":                     {binary, "retry", "SF-action"},
 				"retry_transition_refused":                {binary, "retry", "SF-action"},
+				"provider_retry_exhausted":                {binary, "cancel", "SF-action"},
+				"provider_retry_resubmit_required":        {binary, "cancel", "SF-action"},
+				"provider_retry_worktree_unavailable":     {binary, "retry", "SF-action"},
+				"provider_retry_worktree_unready":         {binary, "take", "SF-action"},
+				"provider_retry_rearm_blocked":            {binary, "show", "SF-action"},
 				"recover_mode_refused":                    {binary, "recover", "SF-action"},
 				"recover_transition_refused":              {binary, "recover", "SF-action"},
 				"ticket_budget_exhausted":                 {binary, "cancel", "SF-action"},
@@ -1159,6 +1234,11 @@ func TestDaemonRetryUsesOnlyARecordedRetryPause(t *testing.T) {
 	d, _, _ := testDaemon(t)
 	started := createAndStartControlTicket(t, d, "SF-operator-retry")
 	seedDaemonProviderExhaustion(t, d, started)
+	controller := &retryRuntimeController{providerRearm: activateProviderRetryAdmissionForDaemonTest(d)}
+	controller.testRuntimeController.drain = func(ctx context.Context, ref domain.TicketRef) (bool, error) {
+		return true, d.store.SealRuntimeControl(ctx, ref)
+	}
+	d.control = controller
 	response := daemonControl(d, started.Ref.Ticket, "retry")
 	if !response.OK || response.Mutation.Kind != "ticket_retry" {
 		t.Fatalf("retry response=%+v", response)
@@ -1180,16 +1260,240 @@ func TestDaemonRetryUsesOnlyARecordedRetryPause(t *testing.T) {
 	}
 }
 
+func TestDaemonProviderRetryRequiresPristineWorktreeBeforeTransition(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-provider-retry-worktree")
+	seedDaemonProviderExhaustion(t, d, started)
+	paused, err := d.store.Ticket(t.Context(), started.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	d.control = testRuntimeController{providerRetryPreflight: func(_ context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+		calls++
+		if ref != paused.Ref || version != paused.Version || fence != (domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: paused.RunnerEpoch}) {
+			t.Fatalf("preflight ref=%+v version=%d fence=%+v paused=%+v leader=%d", ref, version, fence, paused, d.epoch)
+		}
+		return false, nil
+	}}
+	response := daemonControl(d, paused.Ref.Ticket, "retry")
+	if response.OK || response.Mutation.Attempted || response.Error == nil || response.Error.Code != "provider_retry_worktree_unready" || response.Error.Retryable || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != "sf take "+string(paused.Ref.Ticket) || calls != 1 {
+		t.Fatalf("dirty retry response=%+v calls=%d", response, calls)
+	}
+	unchanged, err := d.store.Ticket(t.Context(), paused.Ref)
+	if err != nil || unchanged.State != domain.StatePaused || unchanged.ResumeState != paused.ResumeState || unchanged.Version != paused.Version || unchanged.RunnerEpoch != paused.RunnerEpoch {
+		t.Fatalf("dirty retry mutated ticket before=%+v after=%+v err=%v", paused, unchanged, err)
+	}
+	installDaemonProviderRetryTakeoverFixture(t, d, paused.Ref)
+	take := daemonControl(d, paused.Ref.Ticket, "take")
+	wantTakeNext := `"next_action":{"code":"provider_retry","argv":["sf","retry","` + string(paused.Ref.Ticket) + `"]}`
+	if !take.OK || !strings.Contains(string(take.Data), wantTakeNext) {
+		t.Fatalf("provider retry take action=%+v", take)
+	}
+
+	// The rejected call did not consume the one bounded retry: after an
+	// operator restores the checkout, the exact same pause can still proceed.
+	var order []string
+	controller := &retryRuntimeController{providerRearm: activateProviderRetryAdmissionForDaemonTest(d)}
+	controller.testRuntimeController.drain = func(ctx context.Context, ref domain.TicketRef) (bool, error) {
+		order = append(order, "drain")
+		return true, d.store.SealRuntimeControl(ctx, ref)
+	}
+	controller.testRuntimeController.providerRetryPreflight = func(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+		order = append(order, "proof")
+		return true, nil
+	}
+	d.control = controller
+	response = daemonControl(d, paused.Ref.Ticket, "retry")
+	if !response.OK || !response.Mutation.Attempted || response.Mutation.Kind != "ticket_retry" || controller.providerRearms != 1 || strings.Join(order, ",") != "proof,drain,proof" {
+		t.Fatalf("clean retry after refusal=%+v provider_rearms=%d order=%v", response, controller.providerRearms, order)
+	}
+	retried, err := d.store.Ticket(t.Context(), paused.Ref)
+	if err != nil || retried.State != paused.ResumeState || retried.Version != paused.Version+1 || retried.RunnerEpoch != paused.RunnerEpoch {
+		t.Fatalf("retried ticket=%+v err=%v", retried, err)
+	}
+}
+
+func TestDaemonProviderRetryRequiresResubmissionForUnsupportedLineage(t *testing.T) {
+	d, paths, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-provider-retry-resubmit")
+	seedDaemonProviderExhaustion(t, d, started)
+	paused, err := d.store.Ticket(t.Context(), started.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	var eventsBefore, attemptsBefore int
+	if err := reader.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=?`, paused.Ref.Channel, paused.Ref.Project, paused.Ref.Ticket).Scan(&eventsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=?`, paused.Ref.Channel, paused.Ref.Project, paused.Ref.Ticket).Scan(&attemptsBefore); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	d.control = testRuntimeController{providerRetryPreflight: func(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+		calls++
+		return false, store.ErrProviderRetryRequiresResubmission
+	}}
+	for attempt := 0; attempt < 2; attempt++ {
+		response := daemonControl(d, paused.Ref.Ticket, "retry")
+		if response.OK || response.Mutation.Attempted || response.Mutation.Observed || response.Error == nil || response.Error.Code != "provider_retry_resubmit_required" || response.Error.Retryable || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != "sf cancel "+string(paused.Ref.Ticket) {
+			t.Fatalf("unsupported provider retry response=%+v", response)
+		}
+	}
+	current, err := d.store.Ticket(t.Context(), paused.Ref)
+	if err != nil || current.State != paused.State || current.ResumeState != paused.ResumeState || current.Version != paused.Version || current.RunnerEpoch != paused.RunnerEpoch {
+		t.Fatalf("unsupported retry mutated ticket before=%+v after=%+v err=%v", paused, current, err)
+	}
+	var eventsAfter, attemptsAfter int
+	if err := reader.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=?`, paused.Ref.Channel, paused.Ref.Project, paused.Ref.Ticket).Scan(&eventsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=?`, paused.Ref.Channel, paused.Ref.Project, paused.Ref.Ticket).Scan(&attemptsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || eventsAfter != eventsBefore || attemptsAfter != attemptsBefore {
+		t.Fatalf("unsupported retry calls=%d events=%d/%d attempts=%d/%d", calls, eventsAfter, eventsBefore, attemptsAfter, attemptsBefore)
+	}
+}
+
+func TestDaemonProviderRetrySecondProofFailureLeavesPauseSealedAndUnconsumed(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	started := createAndStartControlTicket(t, d, "SF-provider-retry-second-proof")
+	seedDaemonProviderExhaustion(t, d, started)
+	paused, err := d.store.Ticket(t.Context(), started.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofs := 0
+	controller := &retryRuntimeController{}
+	controller.testRuntimeController.providerRetryPreflight = func(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+		proofs++
+		return proofs == 1, nil
+	}
+	controller.testRuntimeController.drain = func(ctx context.Context, ref domain.TicketRef) (bool, error) {
+		return true, d.store.SealRuntimeControl(ctx, ref)
+	}
+	d.control = controller
+	response := daemonControl(d, paused.Ref.Ticket, "retry")
+	if response.OK || response.Error == nil || response.Error.Code != "provider_retry_rearm_blocked" || !response.Mutation.Attempted || response.Mutation.Observed || controller.providerRearms != 0 || proofs != 2 || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != "sf show "+string(paused.Ref.Ticket) {
+		t.Fatalf("second provider retry proof response=%+v proofs=%d provider_rearms=%d", response, proofs, controller.providerRearms)
+	}
+	current, err := d.store.Ticket(t.Context(), paused.Ref)
+	if err != nil || current.State != domain.StatePaused || current.ResumeState != paused.ResumeState || current.Version != paused.Version || current.RunnerEpoch != paused.RunnerEpoch {
+		t.Fatalf("second proof failure mutated pause before=%+v after=%+v err=%v", paused, current, err)
+	}
+	stopped, err := d.store.StoppedRuntimeTicket(t.Context(), paused.Ref)
+	if err != nil || stopped.Version != paused.Version || stopped.RunnerEpoch != paused.RunnerEpoch {
+		t.Fatalf("second proof failure durable stop=%+v err=%v", stopped, err)
+	}
+	controller.testRuntimeController.providerRetryPreflight = func(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
+		return true, nil
+	}
+	controller.providerRearm = activateProviderRetryAdmissionForDaemonTest(d)
+	retried := daemonControl(d, paused.Ref.Ticket, "retry")
+	if !retried.OK || !retried.Mutation.Attempted || controller.providerRearms != 1 {
+		t.Fatalf("second proof failure consumed retry=%+v provider_rearms=%d", retried, controller.providerRearms)
+	}
+}
+
 func TestDaemonProviderRetryReplayRearmsAndSecondEpochIsTerminal(t *testing.T) {
+	t.Run("committed retry survives rearm failure without a second transition", func(t *testing.T) {
+		d, _, _ := testDaemon(t)
+		started := createAndStartControlTicket(t, d, "SF-provider-retry-commit-before-rearm")
+		seedDaemonProviderExhaustion(t, d, started)
+		paused, err := d.store.Ticket(t.Context(), started.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		controller := &retryRuntimeController{}
+		controller.testRuntimeController.drain = func(ctx context.Context, ref domain.TicketRef) (bool, error) {
+			return true, d.store.SealRuntimeControl(ctx, ref)
+		}
+		installErr := errors.New("injected rearm response loss")
+		controller.providerRearm = func(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+			stopped, err := d.store.StoppedRuntimeTicket(ctx, ref)
+			if err != nil {
+				return false, err
+			}
+			capability, err := d.store.ProviderRetryRearmProof(ctx, ref, stopped)
+			if err != nil {
+				return false, err
+			}
+			err = d.store.ActivateRearm(ctx, capability, func(admission *store.RuntimeAdmissionCapability) error {
+				gotRef, gotVersion, gotFence, ok := admission.ConsumeRuntimeAdmission()
+				if !ok || gotRef != ref || gotVersion != version || gotFence != fence {
+					return store.ErrStaleFence
+				}
+				return installErr
+			})
+			return false, err
+		}
+		d.control = controller
+
+		first := daemonControl(d, paused.Ref.Ticket, "retry")
+		if first.OK || first.Error == nil || first.Error.Code != "provider_retry_rearm_blocked" || !first.Error.Retryable || !first.Mutation.Attempted || first.Mutation.Observed || controller.providerRearms != 1 {
+			t.Fatalf("commit-before-rearm response=%+v provider_rearms=%d", first, controller.providerRearms)
+		}
+		committed, err := d.store.Ticket(t.Context(), paused.Ref)
+		if err != nil || committed.State != paused.ResumeState || committed.Version != paused.Version+1 || committed.RunnerEpoch != paused.RunnerEpoch {
+			t.Fatalf("committed retry=%+v paused=%+v err=%v", committed, paused, err)
+		}
+		if needed, err := d.store.RuntimeRearmNeeded(t.Context(), committed.Ref); err != nil || !needed {
+			t.Fatalf("committed retry rearm needed=%v err=%v", needed, err)
+		}
+
+		controller.providerRearm = activateProviderRetryAdmissionForDaemonTest(d)
+		second := daemonControl(d, committed.Ref.Ticket, "retry")
+		if !second.OK || second.Mutation.Attempted || !second.Mutation.Observed || controller.providerRearms != 2 {
+			t.Fatalf("commit-before-rearm replay=%+v provider_rearms=%d", second, controller.providerRearms)
+		}
+		replayed, err := d.store.Ticket(t.Context(), committed.Ref)
+		if err != nil || replayed.Version != committed.Version || replayed.State != committed.State || replayed.RunnerEpoch != committed.RunnerEpoch {
+			t.Fatalf("replayed retry mutated ticket before=%+v after=%+v err=%v", committed, replayed, err)
+		}
+		events, err := d.store.Events(t.Context(), d.channel, 0, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		retries := 0
+		for _, event := range events {
+			if event.Ref.Ticket == committed.Ref.Ticket && event.Trigger == "operator_retry" {
+				retries++
+			}
+		}
+		if retries != 1 {
+			t.Fatalf("operator retry transitions=%d events=%+v", retries, events)
+		}
+
+		third := daemonControl(d, committed.Ref.Ticket, "retry")
+		if !third.OK || third.Mutation.Attempted || !third.Mutation.Observed || controller.providerRearms != 2 {
+			t.Fatalf("already-rearmed retry replay=%+v provider_rearms=%d", third, controller.providerRearms)
+		}
+	})
+
 	t.Run("committed provider retry replays runtime rearm", func(t *testing.T) {
 		d, _, _ := testDaemon(t)
 		started := createAndStartControlTicket(t, d, "SF-provider-retry-replay")
 		seedDaemonProviderRetryEpoch(t, d, started, false)
-		controller := &retryRuntimeController{needed: true}
+		controller := &retryRuntimeController{providerRearm: activateProviderRetryAdmissionForDaemonTest(d)}
 		d.control = controller
 		response := daemonControl(d, started.Ref.Ticket, "retry")
-		if !response.OK || !response.Mutation.Observed || response.Mutation.Attempted || controller.rearms != 1 {
-			t.Fatalf("provider retry replay=%+v rearms=%d", response, controller.rearms)
+		if !response.OK || !response.Mutation.Observed || response.Mutation.Attempted || controller.providerRearms != 1 || controller.rearms != 0 {
+			t.Fatalf("provider retry replay=%+v provider_rearms=%d generic_rearms=%d", response, controller.providerRearms, controller.rearms)
+		}
+		replayed := daemonControl(d, started.Ref.Ticket, "retry")
+		if !replayed.OK || !replayed.Mutation.Observed || replayed.Mutation.Attempted || controller.providerRearms != 1 || controller.rearms != 0 {
+			t.Fatalf("already rearmed provider retry=%+v provider_rearms=%d generic_rearms=%d", replayed, controller.providerRearms, controller.rearms)
+		}
+		controller.providerRetryPreflight = func(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) { return false, nil }
+		changed := daemonControl(d, started.Ref.Ticket, "retry")
+		if changed.OK || changed.Error == nil || changed.Error.Code != "provider_retry_worktree_unready" || changed.Error.Retryable || changed.Mutation.Attempted || controller.providerRearms != 1 || changed.NextAction == nil || strings.Join(changed.NextAction.Argv, " ") != "sf take "+string(started.Ref.Ticket) {
+			t.Fatalf("already rearmed physical drift=%+v provider_rearms=%d", changed, controller.providerRearms)
 		}
 	})
 
@@ -1199,8 +1503,56 @@ func TestDaemonProviderRetryReplayRearmsAndSecondEpochIsTerminal(t *testing.T) {
 		seedDaemonProviderRetryEpoch(t, d, started, false)
 		d.control = testRuntimeController{}
 		response := daemonControl(d, started.Ref.Ticket, "retry")
-		if response.OK || response.Error == nil || response.Error.Code != "runtime_rearm_unavailable" {
+		if response.OK || response.Error == nil || response.Error.Code != "provider_retry_rearm_blocked" || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != "sf show "+string(started.Ref.Ticket) {
 			t.Fatalf("provider retry without rearm=%+v", response)
+		}
+	})
+
+	t.Run("legacy unsealed retry directs cancellation and resubmission", func(t *testing.T) {
+		d, paths, _ := testDaemon(t)
+		started := createAndStartControlTicket(t, d, "SF-provider-retry-legacy-unsealed")
+		seedDaemonProviderRetryEpoch(t, d, started, false)
+		writer, err := sql.Open("sqlite", paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.ExecContext(t.Context(), `DELETE FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, started.Ref.Channel, started.Ref.Project, started.Ref.Ticket); err != nil {
+			_ = writer.Close()
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		response := daemonControl(d, started.Ref.Ticket, "retry")
+		if response.OK || response.Error == nil || response.Error.Code != "provider_retry_resubmit_required" || response.Error.Retryable || response.Mutation.Attempted || !response.Mutation.Observed || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != "sf cancel "+string(started.Ref.Ticket) {
+			t.Fatalf("legacy unsealed provider retry=%+v", response)
+		}
+	})
+
+	t.Run("committed provider retry stays sealed when active proof fails", func(t *testing.T) {
+		d, _, _ := testDaemon(t)
+		started := createAndStartControlTicket(t, d, "SF-provider-retry-active-proof-fails")
+		seedDaemonProviderRetryEpoch(t, d, started, false)
+		controller := &retryRuntimeController{rearmErr: errors.New("active worktree changed")}
+		d.control = controller
+		response := daemonControl(d, started.Ref.Ticket, "retry")
+		if response.OK || response.Error == nil || response.Error.Code != "provider_retry_rearm_blocked" || !response.Mutation.Observed || response.Mutation.Attempted || controller.providerRearms != 1 {
+			t.Fatalf("provider retry active proof failure=%+v provider_rearms=%d", response, controller.providerRearms)
+		}
+		if needed, err := d.store.RuntimeRearmNeeded(t.Context(), started.Ref); err != nil || !needed {
+			t.Fatalf("failed active proof runtime rearm needed=%v err=%v", needed, err)
+		}
+	})
+
+	t.Run("committed unsupported lineage requires resubmission", func(t *testing.T) {
+		d, _, _ := testDaemon(t)
+		started := createAndStartControlTicket(t, d, "SF-provider-retry-active-resubmit")
+		seedDaemonProviderRetryEpoch(t, d, started, false)
+		controller := &retryRuntimeController{rearmErr: store.ErrProviderRetryRequiresResubmission}
+		d.control = controller
+		response := daemonControl(d, started.Ref.Ticket, "retry")
+		if response.OK || response.Error == nil || response.Error.Code != "provider_retry_resubmit_required" || response.Error.Retryable || !response.Mutation.Observed || response.Mutation.Attempted || controller.providerRearms != 1 || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != "sf cancel "+string(started.Ref.Ticket) {
+			t.Fatalf("unsupported active provider retry=%+v provider_rearms=%d", response, controller.providerRearms)
 		}
 	})
 
@@ -1209,12 +1561,18 @@ func TestDaemonProviderRetryReplayRearmsAndSecondEpochIsTerminal(t *testing.T) {
 		started := createAndStartControlTicket(t, d, "SF-provider-retry-terminal")
 		seedDaemonProviderRetryEpoch(t, d, started, true)
 		response := daemonControl(d, started.Ref.Ticket, "retry")
-		if response.OK || response.Error == nil || response.Error.Code != "provider_retry_exhausted" {
+		if response.OK || response.Error == nil || response.Error.Code != "provider_retry_exhausted" || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != "sf cancel "+string(started.Ref.Ticket) {
 			t.Fatalf("second provider exhaustion=%+v", response)
 		}
 		current, err := d.store.Ticket(t.Context(), started.Ref)
 		if err != nil || current.State != domain.StatePaused || current.Version != 5 {
 			t.Fatalf("terminal provider retry mutated ticket=%+v err=%v", current, err)
+		}
+		installDaemonProviderRetryTakeoverFixture(t, d, current.Ref)
+		take := daemonControl(d, current.Ref.Ticket, "take")
+		wantTakeNext := `"next_action":{"code":"provider_retry_exhausted","argv":["sf","cancel","` + string(current.Ref.Ticket) + `"]}`
+		if !take.OK || !strings.Contains(string(take.Data), wantTakeNext) {
+			t.Fatalf("exhausted provider take action=%+v", take)
 		}
 	})
 }
@@ -1238,16 +1596,41 @@ func seedDaemonProviderRetryState(t *testing.T, daemon *Daemon, started store.Ti
 	if err != nil {
 		t.Fatal(err)
 	}
-	branch := "sf/" + string(started.Ref.Channel) + "/" + daemonFixtureDigest(string(started.Ref.Project))[:16] + "/" + daemonFixtureDigest(string(started.Ref.Ticket))[:16] + "-" + strings.Repeat("b", 32)
-	worktree := filepath.Join(project.Path, string(started.Ref.Ticket))
-	identity := daemonFixtureIdentity(t, project.Path, worktree, branch, project.BaseRef)
 	fence := domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: started.RunnerEpoch}
-	branchKey := string(started.Ref.Channel) + "\x00" + string(started.Ref.Project) + "\x00" + string(started.Ref.Ticket)
-	if _, err := daemon.store.LoadOrStoreBranchUnderFence(ctx, branchKey, branch, started.Version, fence); err != nil {
-		t.Fatal(err)
-	}
-	if err := daemon.store.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: started.Ref, ExpectedVersion: started.Version, Fence: fence, Path: worktree, Branch: branch, IdentityJSON: identity, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
-		t.Fatal(err)
+	registered, registeredErr := daemon.store.Worktree(ctx, started.Ref)
+	var branch, worktree, baseSHA string
+	var identity []byte
+	if registeredErr == nil {
+		branch, worktree, baseSHA, identity = registered.Branch, registered.Path, registered.BaseSHA, registered.IdentityJSON
+	} else if errors.Is(registeredErr, store.ErrNotFound) {
+		branch = "sf/" + string(started.Ref.Channel) + "/" + daemonFixtureDigest(string(started.Ref.Project))[:16] + "/" + daemonFixtureDigest(string(started.Ref.Ticket))[:16] + "-" + strings.Repeat("b", 32)
+		worktree, err = daemon.store.TicketWorktreePath(started.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		baseSHA = strings.Repeat("a", 40)
+		identity = daemonFixtureIdentity(t, project.Path, worktree, branch, project.BaseRef)
+		branchKey := string(started.Ref.Channel) + "\x00" + string(started.Ref.Project) + "\x00" + string(started.Ref.Ticket)
+		if _, err := daemon.store.LoadOrStoreBranchUnderFence(ctx, branchKey, branch, started.Version, fence); err != nil {
+			t.Fatal(err)
+		}
+		creation := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: started.Ref, TicketVersion: started.Version, Fence: fence}, RequestDigest: "sha256:" + strings.Repeat("0", 64), Repository: project.Path, Worktree: worktree, Branch: branch, Operation: "create-worktree", BaseRef: project.BaseRef, ExpectedBaseOID: baseSHA, ExpectedHeadOID: baseSHA}
+		creation.SemanticKey = store.CanonicalGitMutationSemanticKey(creation)
+		if _, err := daemon.store.PlanEffect(ctx, store.EffectPlan{SemanticKey: creation.SemanticKey, Ref: started.Ref, Kind: "git/create-worktree", TicketVersion: started.Version, Fence: fence, RequestDigest: creation.RequestDigest}); err != nil {
+			t.Fatal(err)
+		}
+		creationClaim, err := daemon.store.IssueGitMutationClaim(ctx, creation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := daemon.store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: creationClaim.SemanticKey, Ref: creationClaim.TicketRef, TicketVersion: creationClaim.TicketVersion, Fence: domain.Fence{LeaderEpoch: creationClaim.LeaderEpoch, RunnerEpoch: creationClaim.RunnerEpoch, ClaimEpoch: creationClaim.ClaimEpoch}}, string(identity)); err != nil {
+			t.Fatal(err)
+		}
+		if err := daemon.store.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: started.Ref, ExpectedVersion: started.Version, Fence: fence, Path: worktree, Branch: branch, IdentityJSON: identity, BaseSHA: baseSHA, HeadSHA: baseSHA}); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		t.Fatal(registeredErr)
 	}
 	planner, _, err := daemon.store.RecordProviderQualification(ctx, daemonFixtureQualification(daemon.channel, strings.Repeat("d", 32), "retry-planner", "retry-family"))
 	if err != nil {
@@ -1267,7 +1650,7 @@ func seedDaemonProviderRetryState(t *testing.T, daemon *Daemon, started store.Ti
 	fail := func(ticket store.Ticket) {
 		fence := domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: ticket.RunnerEpoch}
 		binding := daemonFixtureBinding(planner)
-		request := store.ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: binding, ConfigDigest: ticket.ConfigDigest, Capacity: 1, At: time.Now().UTC(), Repository: project.Path, Worktree: worktree, WorktreeIdentity: string(identity), BaseSHA: strings.Repeat("a", 40), SupervisorKey: signer.PublicKey(), Input: contracts.PhaseInput{Ticket: ticket.Ref, Phase: domain.PhasePlanning, LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch, ExpectedVersion: ticket.Version, Prompt: "retry fixture", Repository: project.Path, Worktree: worktree, WorktreeIdentity: string(identity), BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}}
+		request := store.ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: binding, ConfigDigest: ticket.ConfigDigest, Capacity: 1, At: time.Now().UTC(), Repository: project.Path, Worktree: worktree, WorktreeIdentity: string(identity), BaseSHA: baseSHA, SupervisorKey: signer.PublicKey(), Input: contracts.PhaseInput{Ticket: ticket.Ref, Phase: domain.PhasePlanning, LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch, ExpectedVersion: ticket.Version, Prompt: "retry fixture", Repository: project.Path, Worktree: worktree, WorktreeIdentity: string(identity), BaseSHA: baseSHA, AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}}
 		claim, err := daemon.store.BeginProviderAttempt(ctx, request)
 		if err != nil {
 			t.Fatal(err)
@@ -1289,12 +1672,19 @@ func seedDaemonProviderRetryState(t *testing.T, daemon *Daemon, started store.Ti
 	if !retry {
 		return
 	}
+	if err := daemon.store.SealRuntimeControl(ctx, started.Ref); err != nil {
+		t.Fatal(err)
+	}
 	retried, err := daemon.store.TransitionProviderRetry(ctx, store.Transition{Ref: started.Ref, ExpectedVersion: started.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
 	if err != nil {
 		t.Fatal(err)
 	}
 	started.Version, started.State = retried.Version, domain.StatePlanning
 	if terminal {
+		ready, rearmErr := openProviderRetryAdmissionForDaemonTest(daemon)(ctx, started.Ref, retried.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: started.RunnerEpoch})
+		if rearmErr != nil || !ready {
+			t.Fatalf("open provider retry fixture admission ready=%v err=%v", ready, rearmErr)
+		}
 		fail(started)
 		fail(started)
 		if _, err := daemon.store.TransitionProviderExhausted(ctx, store.Transition{Ref: started.Ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence}); err != nil {

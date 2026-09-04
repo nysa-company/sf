@@ -515,9 +515,7 @@ func TestInvalidArtifactRepairAcrossRecoveryExhaustsAndRetries(t *testing.T) {
 	if err != nil || ticket.Version != paused.Version || ticket.State != domain.StatePaused {
 		t.Fatalf("initial recovered pause ticket=%+v err=%v", ticket, err)
 	}
-	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); err != nil {
-		t.Fatalf("recovered invalid repair retry=%v", err)
-	}
+	transitionProviderRetryCompatibilityTest(t, db, ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
 	ticket, err = db.Ticket(ctx, ticket.Ref)
 	if err != nil {
 		t.Fatal(err)

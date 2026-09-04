@@ -2314,6 +2314,9 @@ func (s *Store) RuntimeAdmissionReady(ctx context.Context, ref domain.TicketRef,
 		return false, ErrStaleFence
 	}
 	if !controlState.Valid {
+		// A missing row is the pre-runtime-control compatibility shape. New
+		// provider retries cannot create it because TransitionProviderRetry now
+		// requires an exact sealed row before committing the active endpoint.
 		return true, nil
 	}
 	if controlState.String != "open" || !authorityVersion.Valid || !authorityLeader.Valid || !authorityRunner.Valid || authorityVersion.Int64 <= 0 || authorityLeader.Int64 <= 0 || authorityRunner.Int64 <= 0 {
@@ -2622,7 +2625,26 @@ func (s *Store) sealRuntimeAdmission(ctx context.Context, ref domain.TicketRef, 
 		if control.state != "open" && control.state != "armed" {
 			return ErrStaleFence
 		}
-		return sealRuntimeControl(sealCtx, conn, ref, expected)
+		// This is compensation for an already-issued rearm authority, not a new
+		// operator stop. Preserve the original stop tuple which authenticates how
+		// the active authority was reached. Replacing it with expected strands
+		// provider and semantic replays after an install failure because their
+		// immutable exhaustion/pause endpoint disappears.
+		updated, err := conn.ExecContext(sealCtx, `UPDATE runtime_ticket_controls
+			SET state='sealed',updated_at=?
+			WHERE channel=? AND project_id=? AND ticket_id=?
+			AND state IN ('armed','open') AND generation=?
+			AND authority_version=? AND authority_leader_epoch=? AND authority_runner_epoch=?`,
+			time.Now().UTC().Format(time.RFC3339Nano),
+			ref.Channel, ref.Project, ref.Ticket, control.generation,
+			expected.version, expected.leader, expected.runner)
+		if err != nil {
+			return err
+		}
+		if changed, _ := updated.RowsAffected(); changed != 1 {
+			return ErrStaleFence
+		}
+		return nil
 	})
 	if err != nil {
 		return normalizeBusy(sealCtx, err)

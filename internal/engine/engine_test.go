@@ -304,6 +304,9 @@ func TestProviderExhaustionAndRetryUseTypedEngineRoundTrip(t *testing.T) {
 	if err != nil || paused.To != domain.StatePaused {
 		t.Fatalf("provider exhaustion result=%+v err=%v", paused, err)
 	}
+	if err := database.SealRuntimeControl(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
 	retried, err := runtime.SignalProviderRetry(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: paused.TicketVersion, From: domain.StatePaused, Trigger: "operator_retry", Fence: fence})
 	if err != nil || retried.To != domain.StatePlanning {
 		t.Fatalf("provider retry result=%+v err=%v", retried, err)

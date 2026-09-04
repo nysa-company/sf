@@ -532,7 +532,7 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					if err := validateRunnerRecoveryLedger(ctx, conn, ref, baseline.version, baseline.runner, baseline.leader, ticket.version, ticket.runner, priorLeader); err != nil {
 						return ErrPublicationEvidence
 					}
-				} else if !baselineFound && ticket.state == domain.StateVerifying {
+				} else if priorLeader == 0 && !baselineFound && ticket.state == domain.StateVerifying {
 					// Planning may have been consumed by the exact planning->verifying
 					// transition before the first reviewer claim was issued. That is a
 					// narrow predecessor: the completed Planner source, one canonical

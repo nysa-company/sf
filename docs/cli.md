@@ -151,7 +151,17 @@ routed into a source resume.
 `retry` applies only to the durable retry/correction-exhaustion pause and
 re-enters its exact stored resume state. If a prior interrupted control action
 left a sealed runtime admission, retry performs its one fenced rearm before a
-new attempt can run. `recover` accepts only a typed blocked ticket after a
+new attempt can run. Before reopening an exhausted provider phase, SQLite
+derives the exact expected commit from its registered worktree and confirmed
+commit-intent chain. A read-only existing-worktree boundary then reauthenticates
+that retained checkout, including ignored files; it never allocates, replaces,
+or cleans a worktree. Provider-written changes or a clean foreign commit
+therefore produce `provider_retry_worktree_unready` before the ticket version
+or one bounded retry window changes. The executable `take` next action shows
+the retained checkout for inspection; sf never deletes or blesses those files.
+After the operator restores the exact clean reviewed checkout, `take` points
+back to the still-available `retry`; a fully consumed provider retry points to
+`cancel` and resubmission. `recover` accepts only a typed blocked ticket after a
 fresh drain; `--mode guarded` is further narrowed to the
 `autonomy_ineligible` blocker and a frozen project configuration whose maximum
 mode is `guarded` or `autonomous` (a `manual` project is refused). It then
@@ -160,6 +170,13 @@ fresh guarded candidate cycle. Pause, take, and cancel invalidate the runner
 fence before draining. Capacity is released only by a final durable `paused`,
 `cancelled`, or terminal workflow transition after Store proves that provider,
 repository-command, Git-mutation, and uncertain-effect writers are gone.
+
+Provider retries cannot reuse a retained checkout whose phase entry crossed an
+operator source-resume or a pending verification-amendment boundary: neither
+lineage has one Store-derived physical HEAD that can be safely replayed. sf
+returns `provider_retry_resubmit_required` without consuming the retry and
+points to the executable `cancel` action. Cancel that ticket and submit a fresh
+ticket; repeating `retry` cannot make the ambiguous lineage valid.
 
 `status` and `show` expose durable ticket/evidence metadata. Human output uses
 product labels when those fields are present; `--json` remains the versioned

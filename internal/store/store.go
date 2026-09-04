@@ -51,6 +51,12 @@ var (
 	// runtime binding. Callers may fail closed to an operator blocker; they must
 	// not reinterpret this as provider availability and launch a fallback.
 	ErrProviderRepairUnavailable = errors.New("provider repair requires the prior runtime binding")
+	// ErrProviderRetryRequiresResubmission identifies the two authenticated
+	// provider lineages whose retained physical checkout cannot be derived
+	// exactly: an operator source resume and a pending verification amendment.
+	// The caller must cancel and submit a fresh ticket; retrying cannot change
+	// this proof outcome.
+	ErrProviderRetryRequiresResubmission = errors.New("provider retry requires ticket resubmission")
 	// ErrProviderResultIndeterminate means the newest current phase attempt is
 	// terminal without a durable provider result. A new provider launch would
 	// turn that ambiguity into an unauthenticated retry, so only the typed

@@ -44,6 +44,35 @@ func proof(t *testing.T, claim ProviderAttemptClaim) contracts.DrainProof {
 	return value
 }
 
+func sealProviderRetryTest(t *testing.T, db *Store, ctx context.Context, ref domain.TicketRef) {
+	t.Helper()
+	if err := db.SealRuntimeControl(ctx, ref); err != nil {
+		t.Fatalf("seal provider retry runtime: %v", err)
+	}
+}
+
+// transitionProviderRetryCompatibilityTest exercises provider-attempt budget
+// semantics without installing a real worktree runtime. Production uses the
+// exported sealed transition and retains its control row; these lower-level
+// Store tests remove that row and in-memory latch only after the exact sealed
+// transition succeeds, modeling a pre-runtime-control durable retry.
+func transitionProviderRetryCompatibilityTest(t *testing.T, db *Store, ctx context.Context, transition Transition) TransitionResult {
+	t.Helper()
+	sealProviderRetryTest(t, db, ctx, transition.Ref)
+	result, err := db.TransitionProviderRetry(ctx, transition)
+	if err != nil {
+		t.Fatalf("transition provider retry: %v", err)
+	}
+	stop := mutationRevocation{version: transition.ExpectedVersion, leader: transition.Fence.LeaderEpoch, runner: transition.Fence.RunnerEpoch}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket); err != nil {
+		t.Fatalf("remove compatibility runtime control: %v", err)
+	}
+	if !db.mutations.openControl(transition.Ref, stop) {
+		t.Fatal("remove compatibility runtime latch")
+	}
+	return result
+}
+
 func TestProviderAdmissionUsesPairCapacityAndFreshFences(t *testing.T) {
 	db, ctx := openTestStore(t)
 	digest := setupProviderProject(t, db, ctx)
@@ -125,16 +154,22 @@ func TestProviderExhaustionOpensExactlyOneDurableRetryEpoch(t *testing.T) {
 	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence, EventPayload: `{}`}); !errors.Is(err, ErrEvidenceConflict) {
 		t.Fatalf("generic provider retry=%v", err)
 	}
-	retried, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
-	if err != nil || retried.Version != ticket.Version+1 {
-		t.Fatalf("retry=%+v err=%v", retried, err)
+	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); !errors.Is(err, ErrControlNotDrained) {
+		t.Fatalf("unsealed provider retry=%v", err)
+	}
+	retried := transitionProviderRetryCompatibilityTest(t, db, ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
+	if retried.Version != ticket.Version+1 {
+		t.Fatalf("retry=%+v", retried)
 	}
 	ticket, err = db.Ticket(ctx, ticket.Ref)
 	if err != nil || ticket.State != domain.StatePlanning {
 		t.Fatalf("retried ticket=%+v err=%v", ticket, err)
 	}
 	if replay, replayErr := db.ProviderRetryReplay(ctx, ticket); replayErr != nil || !replay {
-		t.Fatalf("retry replay=%v err=%v", replay, replayErr)
+		t.Fatalf("unsealed legacy retry replay=%v err=%v", replay, replayErr)
+	}
+	if state, replayErr := db.ProviderRetryRuntimeReplay(ctx, ticket); replayErr != nil || state != ProviderRetryLegacyUnsealed {
+		t.Fatalf("unsealed legacy retry state=%v err=%v", state, replayErr)
 	}
 	if _, err := db.db.ExecContext(ctx, `UPDATE provider_retry_epochs SET retry_digest='forged' WHERE channel=? AND project_id=? AND ticket_id=? AND phase=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, domain.PhasePlanning); err == nil {
 		t.Fatal("provider retry epoch update unexpectedly succeeded")
@@ -175,6 +210,7 @@ func TestProviderExhaustionOpensExactlyOneDurableRetryEpoch(t *testing.T) {
 	if retryable, retryErr := db.ProviderRetryPause(ctx, ticket); retryErr != nil || retryable {
 		t.Fatalf("second provider retry pause=%v err=%v", retryable, retryErr)
 	}
+	sealProviderRetryTest(t, db, ctx, ticket.Ref)
 	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("second retry=%v", err)
 	}
@@ -258,9 +294,7 @@ func TestProviderRetryAfterRecoveryAdmitsAndReusesCurrentResult(t *testing.T) {
 	if err != nil || ticket.Version != paused.Version {
 		t.Fatalf("paused ticket=%+v err=%v", ticket, err)
 	}
-	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); err != nil {
-		t.Fatal(err)
-	}
+	transitionProviderRetryCompatibilityTest(t, db, ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
 	ticket, err = db.Ticket(ctx, ticket.Ref)
 	if err != nil {
 		t.Fatal(err)
@@ -325,9 +359,7 @@ func TestProviderRetryEpochsArePhaseScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); err != nil {
-		t.Fatal(err)
-	}
+	transitionProviderRetryCompatibilityTest(t, db, ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
 	ticket, err = db.Ticket(ctx, ticket.Ref)
 	if err != nil {
 		t.Fatal(err)
@@ -348,9 +380,7 @@ func TestProviderRetryEpochsArePhaseScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StateVerifying, ResumeState: domain.StateVerifying, Trigger: "operator_retry", Fence: fence}); err != nil {
-		t.Fatalf("verification retry after planning retry=%v", err)
-	}
+	transitionProviderRetryCompatibilityTest(t, db, ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StateVerifying, ResumeState: domain.StateVerifying, Trigger: "operator_retry", Fence: fence})
 	ticket, err = db.Ticket(ctx, ticket.Ref)
 	if err != nil {
 		t.Fatal(err)
@@ -410,9 +440,9 @@ func TestProviderInvalidArtifactPairPausesWithRepairReasonAndRetries(t *testing.
 	if disposition, dispositionErr := db.ProviderRetryDisposition(ctx, ticket); dispositionErr != nil || disposition != ProviderRetryEligible {
 		t.Fatalf("invalid-artifact disposition=%v err=%v", disposition, dispositionErr)
 	}
-	retried, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
-	if err != nil || retried.Version != ticket.Version+1 {
-		t.Fatalf("invalid-artifact retry=%+v err=%v", retried, err)
+	retried := transitionProviderRetryCompatibilityTest(t, db, ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
+	if retried.Version != ticket.Version+1 {
+		t.Fatalf("invalid-artifact retry=%+v", retried)
 	}
 	entry, err := loadProviderPhaseEntryAt(ctx, db.db, ticket.Ref, domain.PhasePlanning, ticket.Version)
 	if err != nil {
@@ -552,6 +582,7 @@ func TestProviderInvalidArtifactRepairTamperingRejectsDispositionAndRetry(t *tes
 			if _, err := db.ProviderRetryDisposition(ctx, ticket); !errors.Is(err, ErrEvidenceConflict) {
 				t.Fatalf("tampered %s disposition=%v", name, err)
 			}
+			sealProviderRetryTest(t, db, ctx, ticket.Ref)
 			if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); !errors.Is(err, ErrEvidenceConflict) {
 				t.Fatalf("tampered %s retry=%v", name, err)
 			}
@@ -886,6 +917,7 @@ func TestProviderRetryEvidenceRejectsSameVersionEventTampering(t *testing.T) {
 	if _, err := db.db.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, ticket.Version, "tampered_exhaustion", domain.StatePlanning, domain.StateBlocked, `{}`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
+	sealProviderRetryTest(t, db, ctx, ticket.Ref)
 	if _, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence}); !errors.Is(err, ErrEvidenceConflict) {
 		t.Fatalf("tampered direct provider retry=%v", err)
 	}
@@ -895,14 +927,11 @@ func TestProviderRetryEvidenceRejectsSameVersionEventTampering(t *testing.T) {
 	if _, err := db.db.ExecContext(ctx, `DELETE FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='tampered_exhaustion'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
 		t.Fatal(err)
 	}
-	retried, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
-	if err != nil {
-		t.Fatal(err)
-	}
+	retried := transitionProviderRetryCompatibilityTest(t, db, ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StatePlanning, ResumeState: domain.StatePlanning, Trigger: "operator_retry", Fence: fence})
 	ticket.Version, ticket.State = retried.Version, domain.StatePlanning
 	ticket.ResumeState = ""
 	if replay, err := db.ProviderRetryReplay(ctx, ticket); err != nil || !replay {
-		t.Fatalf("untampered provider retry replay=%v err=%v", replay, err)
+		t.Fatalf("unsealed provider retry replay=%v err=%v", replay, err)
 	}
 	entry, err := loadProviderPhaseEntryAt(ctx, db.db, ticket.Ref, domain.PhasePlanning, 2)
 	if err != nil {
@@ -1029,10 +1058,7 @@ func TestProviderPhaseReentryGetsFreshWindowWithoutReusingPriorRetryEpoch(t *tes
 		t.Fatal(err)
 	}
 	ticket.Version, ticket.State = paused.Version, domain.StatePaused
-	retried, err := db.TransitionProviderRetry(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StateVerifying, ResumeState: domain.StateVerifying, Trigger: "operator_retry", Fence: fence})
-	if err != nil {
-		t.Fatal(err)
-	}
+	retried := transitionProviderRetryCompatibilityTest(t, db, ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePaused, To: domain.StateVerifying, ResumeState: domain.StateVerifying, Trigger: "operator_retry", Fence: fence})
 	ticket.Version, ticket.State = retried.Version, domain.StateVerifying
 	third, fourth := fail(ticket), fail(ticket)
 	if third.Attempt != 3 || fourth.Attempt != 4 {

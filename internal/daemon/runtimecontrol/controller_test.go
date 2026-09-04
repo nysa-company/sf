@@ -35,6 +35,113 @@ func TestCurrentTakeoverRemoteBaselineUsesCanonicalStoreDigest(t *testing.T) {
 	}
 }
 
+func TestAuthenticateProviderRetryWorktreeRejectsNonRetryTicketWithoutCreating(t *testing.T) {
+	database, ref, leader, started := controllerFixture(t)
+	controller, err := New(database, controllerBundle(t), nil, git.Runner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktreePath, err := database.TicketWorktreePath(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := controller.AuthenticateProviderRetryWorktree(t.Context(), ref, started.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch})
+	if err == nil || ready || errors.Is(err, worktreecoord.ErrUnready) {
+		t.Fatalf("non-retry ticket preflight ready=%v err=%v", ready, err)
+	}
+	if _, err := os.Lstat(worktreePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only retry proof created a worktree path: %v", err)
+	}
+}
+
+func TestRearmProviderRetryKeepsDurableSealWhenWorktreeProofIsUnavailable(t *testing.T) {
+	database, ref, leader, started := controllerFixture(t)
+	runner := git.Runner{Binary: "/usr/bin/git", Home: filepath.Join(t.TempDir(), "git-home")}
+	controller, err := New(database, controllerBundle(t), nil, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drained, err := controller.Drain(t.Context(), ref); err != nil || !drained {
+		t.Fatalf("drain=%v err=%v", drained, err)
+	}
+	if _, err := database.Transition(t.Context(), store.Transition{
+		Ref:             ref,
+		ExpectedVersion: started.Version,
+		From:            domain.StatePlanning,
+		To:              domain.StateVerifying,
+		Trigger:         "test_provider_retry_without_worktree_proof",
+		Fence:           domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch},
+		EventPayload:    "{}",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := database.Ticket(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := controller.RearmProviderRetry(t.Context(), ref, current.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: current.RunnerEpoch})
+	if ready || err == nil {
+		t.Fatalf("provider retry rearm without authenticated worktree ready=%v err=%v", ready, err)
+	}
+	sealed, err := database.StoppedRuntimeTicket(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sealed.Version != started.Version || sealed.RunnerEpoch != started.RunnerEpoch {
+		t.Fatalf("failed provider retry rearm changed durable seal=%+v, want version=%d runner=%d", sealed, started.Version, started.RunnerEpoch)
+	}
+}
+
+func TestRearmProviderRetryUsesDurableStopAfterControllerRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sf.sqlite")
+	database, ref, leader, started := controllerFixtureAt(t, path)
+	controller, err := New(database, controllerBundle(t), nil, git.Runner{Binary: "/usr/bin/git", Home: filepath.Join(t.TempDir(), "git-home")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drained, err := controller.Drain(t.Context(), ref); err != nil || !drained {
+		t.Fatalf("drain=%v err=%v", drained, err)
+	}
+	if _, err := database.Transition(t.Context(), store.Transition{
+		Ref:             ref,
+		ExpectedVersion: started.Version,
+		From:            domain.StatePlanning,
+		To:              domain.StateVerifying,
+		Trigger:         "test_provider_retry_restart",
+		Fence:           domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch},
+		EventPayload:    "{}",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	restarted, err := New(reopened, controllerBundle(t), nil, git.Runner{Binary: "/usr/bin/git", Home: filepath.Join(t.TempDir(), "git-home")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := reopened.Ticket(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := restarted.RearmProviderRetry(t.Context(), ref, current.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: current.RunnerEpoch})
+	if ready || err == nil {
+		t.Fatalf("restarted provider retry rearm without authenticated worktree ready=%v err=%v", ready, err)
+	}
+	sealed, err := reopened.StoppedRuntimeTicket(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sealed.Version != started.Version || sealed.RunnerEpoch != started.RunnerEpoch {
+		t.Fatalf("restarted failed rearm changed durable stop=%+v", sealed)
+	}
+}
+
 func TestInspectTakeoverClassifiesDirtyWorktreeWithoutVerificationAsUnadoptedChanges(t *testing.T) {
 	database, ref, leader, started := controllerFixture(t)
 	ctx := t.Context()

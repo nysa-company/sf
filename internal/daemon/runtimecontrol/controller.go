@@ -18,6 +18,7 @@ import (
 	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/workflowruntime"
+	"github.com/nysa-company/sf/internal/worktreecoord"
 )
 
 var ErrMergeProofRequired = errors.New("merge observation requires an authenticated observer after publication begins")
@@ -67,6 +68,73 @@ func New(database *store.Store, runtime *workflowruntime.ControlBundle, observer
 		controller.git = &runners[0]
 	}
 	return controller, nil
+}
+
+// AuthenticateProviderRetryWorktree proves that the already-registered
+// checkout is still the exact pristine input authorized by the exhausted
+// provider phase. Store derives the phase-appropriate expected HEAD; the
+// existing-registration boundary then authenticates only that retained path
+// and can never allocate or create a replacement worktree.
+func (c *Controller) AuthenticateProviderRetryWorktree(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	return c.authenticateProviderRetryWorktree(ctx, ref, version, fence)
+}
+
+func (c *Controller) authenticateProviderRetryWorktree(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	if c == nil || c.store == nil || c.git == nil {
+		return false, errors.New("provider retry worktree authentication is unavailable")
+	}
+	proof, err := c.store.ProviderRetryWorktreeProof(ctx, ref, version, fence)
+	if err != nil {
+		return false, fmt.Errorf("load provider retry worktree proof: %w", err)
+	}
+	observed, err := (worktreecoord.Coordinator{Store: c.store, Git: *c.git}).AuthenticateExistingRegisteredWorktree(ctx, ref, proof.ExpectedHead)
+	if err != nil {
+		if errors.Is(err, worktreecoord.ErrUnready) {
+			return false, nil
+		}
+		return false, err
+	}
+	registered := proof.Worktree
+	if observed.Path != registered.Path || observed.Branch != registered.Branch || observed.State != registered.State || observed.BaseSHA != registered.BaseSHA || observed.HeadSHA != registered.HeadSHA || observed.TicketVersion != registered.TicketVersion || observed.Fence != registered.Fence || !bytes.Equal(observed.IdentityJSON, registered.IdentityJSON) {
+		return false, errors.New("provider retry worktree registration changed during authentication")
+	}
+	return true, nil
+}
+
+// RearmProviderRetry is the only runtime-admission path for a provider retry.
+// The per-ticket mutex serializes it with Drain and any ordinary rearm. The
+// checkout is reauthenticated while the Store/runtime latch remains sealed;
+// only then may the narrow provider-retry capability be activated.
+func (c *Controller) RearmProviderRetry(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	if c == nil || c.store == nil || c.runtime == nil || c.git == nil {
+		return false, errors.New("provider retry runtime controller is not configured")
+	}
+	entry := c.acquireTicket(ref)
+	defer c.releaseTicket(ref, entry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	stopped, found := entry.stopped, entry.hasStop
+	if !found {
+		var err error
+		stopped, err = c.store.StoppedRuntimeTicket(ctx, ref)
+		if err != nil {
+			return false, errors.New("provider retry has not completed a controller drain")
+		}
+		entry.stopped, entry.hasStop = stopped, true
+	}
+	ready, err := c.authenticateProviderRetryWorktree(ctx, ref, version, fence)
+	if err != nil || !ready {
+		return ready, err
+	}
+	capability, err := c.store.ProviderRetryRearmProof(ctx, ref, stopped)
+	if err != nil {
+		return false, err
+	}
+	if err := c.store.ActivateRearm(ctx, capability, c.runtime.ApplyRearm); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // InspectTakeover authenticates the retained worktree before it is shown to

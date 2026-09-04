@@ -36,7 +36,11 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 		"terminal_replay_requires_new": ExitAction, "not_ready": ExitAction, "runtime_activation_failed": ExitAction,
 		"runtime_already_active": ExitAction, "runtime_rearm_unavailable": ExitAction,
 		"retry_required": ExitAction, "retry_not_available": ExitAction, "retry_transition_refused": ExitAction,
-		"recover_mode_refused": ExitAction, "recover_transition_refused": ExitAction, "resume_transition_refused": ExitAction,
+		"provider_retry_exhausted":         ExitAction,
+		"provider_retry_resubmit_required": ExitAction,
+		"provider_retry_worktree_unready":  ExitAction,
+		"provider_retry_rearm_blocked":     ExitAction,
+		"recover_mode_refused":             ExitAction, "recover_transition_refused": ExitAction, "resume_transition_refused": ExitAction,
 		"decision_refused": ExitAction, "approval_head_changed": ExitAction,
 		"runtime_retirement_failed": ExitAction, "source_commit_required": ExitAction,
 		"ticket_budget_exhausted": ExitAction, "provider_result_indeterminate": ExitAction,
@@ -46,7 +50,7 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 		"control_state_unavailable": ExitWait, "evidence_unavailable": ExitWait, "logs_unavailable": ExitWait,
 		"status_unavailable": ExitWait, "capacity_unavailable": ExitWait, "leader_lost": ExitWait,
 		"ticket_id_unavailable": ExitWait, "runtime_rearm_failed": ExitWait, "resume_state_unavailable": ExitWait,
-		"retry_state_unavailable": ExitWait, "approval_evidence_unavailable": ExitWait,
+		"retry_state_unavailable": ExitWait, "provider_retry_worktree_unavailable": ExitWait, "approval_evidence_unavailable": ExitWait,
 		"decision_unavailable": ExitWait, "decision_state_unavailable": ExitWait,
 		"policy_refusal": ExitPolicy, "safety_blocked": ExitPolicy, "unqualified_provider": ExitPolicy,
 		"evidence_conflict": ExitPolicy, "autonomous_unavailable": ExitPolicy,
@@ -75,6 +79,7 @@ func TestProviderSafetyBlockersRemainActionableWithDaemonCancelArgv(t *testing.T
 	}{
 		{code: "provider_result_indeterminate", argv: []string{"sf-dev", "cancel", "SF-dev-provider-blocker"}},
 		{code: "provider_repair_unavailable", argv: []string{"sf", "cancel", "SF-stable-provider-blocker"}},
+		{code: "provider_retry_resubmit_required", argv: []string{"sf-dev", "cancel", "SF-dev-provider-retry"}},
 	} {
 		t.Run(test.code, func(t *testing.T) {
 			response := api.Response{
