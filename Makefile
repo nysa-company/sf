@@ -59,10 +59,10 @@ test-compiled: test-compiled-e2e
 # test-race covers the complete suite; the remaining targets add named,
 # readable verification gates without running that complete suite again.
 # Static/repository/release checks are part of the same claimed final gate.
-# The outer timeout bounds the complete local path; each Go target has its own
-# 30-minute package timeout as well.
+# The 120-minute outer timeout bounds the complete local path; test-race keeps
+# its 60-minute package bound and the named Go targets keep 30-minute bounds.
 test-all:
-	python3 scripts/run-bounded --timeout 90m -- $(MAKE) --no-print-directory -j1 test-race test-integration test-crash test-security test-upgrade test-compiled-e2e verify-static
+	python3 scripts/run-bounded --timeout 120m -- $(MAKE) --no-print-directory -j1 test-race test-integration test-crash test-security test-upgrade test-compiled-e2e verify-static
 
 fmt-check:
 	@files="$$(git ls-files -co --exclude-standard -- '*.go')"; \

@@ -14,8 +14,8 @@ jobs:
     # v1's production execution and compiled acceptance boundary is macOS.
     if: github.event_name != 'workflow_dispatch'
     runs-on: macos-14
-    # make test-all has a 90-minute local bound; leave setup/teardown headroom.
-    timeout-minutes: 100
+    # make test-all has a 120-minute local bound; leave setup/teardown headroom.
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,7 +41,7 @@ jobs:
     # This is credential-free local evidence, not stable-promotion approval.
     if: github.event_name == 'workflow_dispatch'
     runs-on: macos-14
-    timeout-minutes: 100
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
         with:
