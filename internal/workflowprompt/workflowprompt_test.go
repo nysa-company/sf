@@ -298,7 +298,7 @@ func TestPromptsAreDeterministicAndRoleBound(t *testing.T) {
 		}, []string{"Preserve every verification-owned file", "amendment_request", "canonical_artifact"}},
 		{"final-reviewer", func() (contracts.PhaseInput, error) {
 			return FinalReviewer(FinalReviewerInput{ticket, workspace, plan, verification, candidate, checks, runtime})
-		}, []string{"read-only review", "exact candidate head", "exact proof digest", "required-check set", "canonical_artifact"}},
+		}, []string{"read-only review", "exact candidate head", "exact proof digest", "required-check set", "canonical_artifact", "not required to independently run Git", "Read the actual source and tests", "not the whole PR diff", "successful controller-run post-build proof", "do not invent successful command output"}},
 	}
 	for _, tc := range inputs {
 		t.Run(tc.name, func(t *testing.T) {

@@ -81,6 +81,11 @@ setup and diagnostic commands. Each ticket has one channel-prefixed branch and
 worktree. Planner, Builder, and Reviewer are logical roles; Reviewer runs once
 before build to author verification and again fresh after the candidate and CI
 checks exist.
+The final-review prompt distinguishes the verification checkpoint's protected
+files from the Builder's later file delta. SF supplies the authenticated
+checkout identity and independently runs the post-build proof; provider-reported
+command attempts are not that proof. The Reviewer must still inspect source and
+tests, report genuine inconsistencies, and return its own verdict.
 
 Manual and guarded modes use an explicit trusted-provider/repository baseline.
 Autonomous selection and merge are unavailable in v1 pending the guarded pilot
