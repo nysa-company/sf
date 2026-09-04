@@ -355,6 +355,44 @@ func TestEngineTypedProviderBlockAndRecoverPreservesPhase(t *testing.T) {
 	}
 }
 
+func TestEngineVerificationAmendmentInvalidPersistsGenericBlocker(t *testing.T) {
+	ctx := t.Context()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "verification-amendment-invalid.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "nysa", Path: "/tmp/nysa", BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-engine-verification-amendment-invalid"}
+	if err := database.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "engine-verification-amendment-invalid", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, State: domain.StateVerifying}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "engine-verification-amendment-invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := statemachine.LoadEmbeddedApproved()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := New(database, spec)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	result, err := runtime.SignalVerificationAmendmentBlocked(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: ticket.Version, From: domain.StateVerifying, Fence: fence})
+	if err != nil || result.To != domain.StateBlocked {
+		t.Fatalf("amendment-invalid block result=%+v err=%v", result, err)
+	}
+	blocked, err := database.Ticket(ctx, ref)
+	if err != nil || blocked.State != domain.StateBlocked || blocked.ResumeState != domain.StateVerifying || blocked.BlockedCode != "verification_amendment_invalid" || blocked.Version != result.TicketVersion {
+		t.Fatalf("amendment-invalid ticket=%+v err=%v", blocked, err)
+	}
+}
+
 func TestGenericSignalCannotForgeOperatorSourceResume(t *testing.T) {
 	ctx := t.Context()
 	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "source-resume.sqlite"))

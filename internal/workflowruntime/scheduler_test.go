@@ -38,11 +38,13 @@ type runtimeReadyMergeTickets struct {
 
 type sourceResumeProofTickets struct {
 	fakeTickets
-	proof    store.OperatorSourceResumeProof
-	found    bool
-	err      error
-	fresh    bool
-	freshErr error
+	proof     store.OperatorSourceResumeProof
+	found     bool
+	err       error
+	fresh     bool
+	freshErr  error
+	repair    *store.CandidateRepairBuildContext
+	repairErr error
 }
 
 func (f mergeReadyFakeTickets) MergeReconciliationReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error) {
@@ -59,6 +61,16 @@ func (f sourceResumeProofTickets) OperatorSourceResumeProof(context.Context, dom
 
 func (f sourceResumeProofTickets) OperatorSourceResumeRequiresFreshVerification(context.Context, domain.TicketRef, uint64) (bool, error) {
 	return f.fresh, f.freshErr
+}
+
+func (f sourceResumeProofTickets) CandidateRepairBuildContext(context.Context, domain.TicketRef, uint64, domain.Fence) (store.CandidateRepairBuildContext, error) {
+	if f.repairErr != nil {
+		return store.CandidateRepairBuildContext{}, f.repairErr
+	}
+	if f.repair == nil {
+		return store.CandidateRepairBuildContext{}, store.ErrNotFound
+	}
+	return *f.repair, nil
 }
 
 func (f currentFakeTickets) Ticket(context.Context, domain.TicketRef) (store.Ticket, error) {
@@ -303,6 +315,31 @@ func TestSchedulerFailsClosedWhenOperatorSourceResumeProofErrors(t *testing.T) {
 	result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
 	if result.Outcome != OutcomeBusy || len(worker.calls) != 0 || len(ensurer.calls) != 0 {
 		t.Fatalf("proof error bypassed source handoff safety: result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
+func TestSchedulerClassifiesCandidateRepairBeforeHistoricalSourceResume(t *testing.T) {
+	building := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "source-resume-ci-repair"}, domain.StateBuilding)
+	repair := store.CandidateRepairBuildContext{Ref: building.Ref, TargetGeneration: 2, PredecessorGeneration: 1}
+	ensurer := &fakeEnsure{}
+	worker := &fakeWorker{}
+	// If Scheduler incorrectly applies the initial source-resume proof to this
+	// later repair, the injected error would stop the tick before normal Ensure.
+	source := sourceResumeProofTickets{fakeTickets: fakeTickets{tickets: []store.Ticket{building}}, err: store.ErrBusy, repair: &repair}
+	result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeInvoked || len(ensurer.calls) != 1 || len(worker.calls) != 1 || worker.calls[0] != building.Ref {
+		t.Fatalf("candidate repair was classified as initial source resume: result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
+	}
+}
+
+func TestSchedulerFailsClosedOnMalformedCandidateRepairBeforeSourceFallback(t *testing.T) {
+	building := ticket(domain.TicketRef{Channel: domain.ChannelDev, Project: "a", Ticket: "malformed-source-resume-ci-repair"}, domain.StateBuilding)
+	ensurer := &fakeEnsure{}
+	worker := &fakeWorker{}
+	source := sourceResumeProofTickets{fakeTickets: fakeTickets{tickets: []store.Ticket{building}}, found: true, repairErr: store.ErrEvidenceConflict}
+	result := NewScheduler(domain.ChannelDev, source, ensurer, worker).Tick(context.Background(), domain.Fence{LeaderEpoch: 9})
+	if result.Outcome != OutcomeReadiness || !errors.Is(result.Err, ErrReadiness) || len(ensurer.calls) != 0 || len(worker.calls) != 0 {
+		t.Fatalf("malformed repair fell through to source proof: result=%+v worker=%v ensure=%v", result, worker.calls, ensurer.calls)
 	}
 }
 

@@ -178,6 +178,19 @@ returns `provider_retry_resubmit_required` without consuming the retry and
 points to the executable `cancel` action. Cancel that ticket and submit a fresh
 ticket; repeating `retry` cannot make the ambiguous lineage valid.
 
+`verification_amendment_invalid` is likewise nonrecoverable. A malformed
+Builder amendment request or independent Reviewer response is not an
+authenticated acceptance or rejection, so `recover`, `resume`, and `retry`
+must not reinterpret it. `status` and `show` point to the channel-correct
+`cancel <ticket>` action; submit a fresh ticket after preserving any work that
+still needs inspection.
+
+`legacy_candidate_repair_recovery_unverifiable` is also nonrecoverable. It
+means an existing repair lineage predates the signed recovery-prefix evidence
+required by this version. Preserve any needed local work, cancel the ticket,
+and submit a fresh ticket; `recover`, `resume`, and `retry` cannot make the
+legacy lineage valid.
+
 `status` and `show` expose durable ticket/evidence metadata. Human output uses
 product labels when those fields are present; `--json` remains the versioned
 response envelope. `logs` reads bounded redacted durable events and `--follow`

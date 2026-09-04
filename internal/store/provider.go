@@ -204,6 +204,16 @@ func (s *Store) LoadCurrentProviderAttemptResult(ctx context.Context, key Provid
 	if err := s.AssertTicketFence(ctx, key.Ref, expected, fence); err != nil {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, err
 	}
+	if result.Claim.Phase == domain.PhaseBuild && result.Claim.Role == "builder" {
+		if _, repairErr := s.candidateRepairBuildContextAt(ctx, s.db, key.Ref, expected, fence); repairErr == nil {
+			if candidateRepairBuilderEntryResultReachesFence(ctx, s.db, key, result, expected, fence) != nil {
+				return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+			}
+			return result, parsed, nil
+		} else if !errors.Is(repairErr, ErrNotFound) {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+		}
+	}
 	if err := validateRunnerRecoveryAuthority(ctx, s.db, key.Ref, expected, fence); err != nil {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
 	}
@@ -1382,8 +1392,18 @@ func (s *Store) LoadProviderAttemptResult(ctx context.Context, claim ProviderAtt
 	if claim.ID <= 0 || claim.ExpectedVersion != expected || claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
 	}
-	if err := validateRunnerRecoveryAuthority(ctx, s.db, claim.Ref, expected, fence); err != nil {
-		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+	candidateRepairAuthority := false
+	if claim.Phase == domain.PhaseBuild && claim.Role == "builder" {
+		if _, repairErr := s.candidateRepairBuildContextAt(ctx, s.db, claim.Ref, expected, fence); repairErr == nil {
+			candidateRepairAuthority = true
+		} else if !errors.Is(repairErr, ErrNotFound) {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+		}
+	}
+	if !candidateRepairAuthority {
+		if err := validateRunnerRecoveryAuthority(ctx, s.db, claim.Ref, expected, fence); err != nil {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+		}
 	}
 	out, c, err := loadProviderAttemptResultRow(ctx, s.db, claim.ID)
 	if err != nil {
@@ -1429,6 +1449,12 @@ func (s *Store) LoadProviderAttemptResult(ctx context.Context, claim ProviderAtt
 	canonical, _, canonicalErr := phaseartifact.CanonicalTypedArtifact(parsed)
 	if canonicalErr != nil || !bytes.Equal(canonical, out.TypedArtifact) {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	if candidateRepairAuthority {
+		key := ProviderAttemptResultKey{AttemptID: out.AttemptID, Ref: out.Claim.Ref, Phase: out.Claim.Phase, Attempt: out.Claim.Attempt}
+		if candidateRepairBuilderEntryResultReachesFence(ctx, s.db, key, out, expected, fence) != nil {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+		}
 	}
 	return out, parsed, nil
 }
@@ -1645,6 +1671,23 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if live.Version != request.ExpectedVersion || live.RunnerEpoch != request.Fence.RunnerEpoch || liveLeader != request.Fence.LeaderEpoch {
 		return LatestReusableProviderAttemptResult{}, ErrStaleFence
 	}
+	candidateRepairAuthority := false
+	if request.Phase == domain.PhaseBuild && live.State == domain.StateBuilding {
+		if _, contextErr := s.candidateRepairBuildContextAt(ctx, s.db, request.Ref, request.ExpectedVersion, request.Fence); contextErr == nil {
+			repairErr := candidateRepairBuilderEntryResultReachesFence(ctx, s.db, key, historical, request.ExpectedVersion, request.Fence)
+			if repairErr == nil {
+				candidateRepairAuthority = true
+			} else if errors.Is(repairErr, ErrNotFound) {
+				// The newest completed Builder predates the checks_red repair entry.
+				// It remains predecessor provenance, never reusable successor work.
+				return LatestReusableProviderAttemptResult{}, ErrNotFound
+			} else {
+				return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+			}
+		} else if !errors.Is(contextErr, ErrNotFound) {
+			return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+		}
+	}
 	if request.Phase == domain.PhaseVerification || request.Phase == domain.PhaseBuild {
 		boundary, boundaryErr := reviewRepairBoundaryFrom(ctx, s.db, request.Ref, request.Phase, live.Version, historical.Claim.ExpectedVersion)
 		if boundaryErr != nil {
@@ -1659,17 +1702,20 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 			return LatestReusableProviderAttemptResult{}, ErrNotFound
 		}
 	}
+	current := historical.Claim.ExpectedVersion == request.ExpectedVersion && historical.Claim.RunnerEpoch == request.Fence.RunnerEpoch && historical.Claim.LeaderEpoch == request.Fence.LeaderEpoch
+	candidateRepairRecovery := candidateRepairAuthority && !current
 	// Final-review results use the stricter CI/publication authority below.
 	// That proof authenticates the immutable checks_green endpoint and every
 	// exact pause/resume or signed recovery step to the live reviewing fence.
 	// The generic audit cannot represent a first recovery whose predecessor is
 	// normal lifecycle history followed by a post-publication control triplet.
-	if request.Phase != domain.PhaseReview {
+	// A completed candidate-repair witness is likewise a narrower Store-owned
+	// source anchor than the ticket-wide initial lifecycle audit.
+	if request.Phase != domain.PhaseReview && !candidateRepairAuthority {
 		if err := validateRunnerRecoveryAuthority(ctx, s.db, request.Ref, request.ExpectedVersion, request.Fence); err != nil {
 			return LatestReusableProviderAttemptResult{}, ErrStaleFence
 		}
 	}
-	current := historical.Claim.ExpectedVersion == request.ExpectedVersion && historical.Claim.RunnerEpoch == request.Fence.RunnerEpoch && historical.Claim.LeaderEpoch == request.Fence.LeaderEpoch
 	result := LatestReusableProviderAttemptResult{Key: key, Result: historical, Parsed: parsed}
 	if current {
 		currentResult, currentParsed, loadErr := s.LoadProviderAttemptResult(ctx, historical.Claim, request.ExpectedVersion, request.Fence)
@@ -1682,8 +1728,10 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 		if !allowedState {
 			return LatestReusableProviderAttemptResult{}, ErrStaleFence
 		}
-		if err := s.ProviderResultReachesFence(ctx, key, request.ExpectedVersion, request.Fence); err != nil {
-			return LatestReusableProviderAttemptResult{}, ErrStaleFence
+		if !candidateRepairRecovery {
+			if err := s.ProviderResultReachesFence(ctx, key, request.ExpectedVersion, request.Fence); err != nil {
+				return LatestReusableProviderAttemptResult{}, ErrStaleFence
+			}
 		}
 		result.Recovered = true
 	}

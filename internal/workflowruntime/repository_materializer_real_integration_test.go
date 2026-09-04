@@ -283,6 +283,11 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	if _, err := materializer.MaterializeCandidate(ctx, workflowworker.PhaseRequest{Ticket: buildingTicket, Worktree: storedWorktree, Phase: domain.PhaseBuild, Fence: fence, Plan: &storedPlan, Verification: &storedVerification, Candidate: &staleCandidate}, planIdentity, verificationIdentity, *builderParsed.Builder, candidateBefore.BuilderResult); !errors.Is(err, workflowruntime.ErrRepositoryMaterialization) {
 		t.Fatalf("stale candidate fence accepted: %v", err)
 	}
+	tamperedVerification := verificationIdentity
+	tamperedVerification.OwnedFiles = nil
+	if _, err := materializer.MaterializeCandidate(ctx, workflowworker.PhaseRequest{Ticket: buildingTicket, Worktree: storedWorktree, Phase: domain.PhaseBuild, Fence: fence, Plan: &storedPlan, Verification: &storedVerification, Candidate: &candidateBefore}, planIdentity, tamperedVerification, *builderParsed.Builder, candidateBefore.BuilderResult); !errors.Is(err, workflowruntime.ErrRepositoryMaterialization) {
+		t.Fatalf("verification scope tamper accepted on candidate replay: %v", err)
+	}
 	verificationBefore, err := db.CurrentVerification(ctx, ref)
 	if err != nil {
 		t.Fatalf("checkpoint evidence: %v", err)

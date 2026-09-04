@@ -873,6 +873,13 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 			// the old candidate's Builder result unavailable. Continue below to
 			// launch the fresh Builder cycle instead of trying to rebind it.
 			err = store.ErrNotFound
+		} else if reuseErr == nil && reusable.Key != old.BuilderResult {
+			// A red-CI repair retains the immutable predecessor candidate while
+			// admitting exactly one fresh Builder result for the successor
+			// generation. Store authenticated that result against the current
+			// repair entry; it must be materialized below, never used to rebind
+			// or reinterpret the predecessor generation.
+			err = store.ErrNotFound
 		} else if reuseErr != nil || !reusable.Recovered || reusable.Key != old.BuilderResult {
 			return false, false, ErrStaleEvidence
 		} else {

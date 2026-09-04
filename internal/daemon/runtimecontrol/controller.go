@@ -389,9 +389,10 @@ func (c *Controller) Drain(ctx context.Context, ref domain.TicketRef) (bool, err
 
 // Rearm is the only supported way to clear the runtime's ticket stop latch.
 // It re-reads Store after a completed control/resume transition and accepts
-// only a newer durable active pre-publication identity with no writer or
-// uncertain effect.  A caller cannot rearm a ticket merely by retaining an
-// old Runtime pointer.
+// only a newer durable active identity with no writer or uncertain effect.
+// Store selects a separate evidence proof for pre-publication work,
+// candidate-repair Building, and post-publication work; a caller cannot rearm
+// a ticket merely by retaining an old Runtime pointer.
 func (c *Controller) Rearm(ctx context.Context, ref domain.TicketRef) error {
 	if c == nil || c.store == nil || c.runtime == nil {
 		return errors.New("runtime controller is not configured")
@@ -414,7 +415,15 @@ func (c *Controller) Rearm(ctx context.Context, ref domain.TicketRef) error {
 		return err
 	}
 	var capability *store.RuntimeRearmCapability
-	if current.State == domain.StatePublishing || current.State == domain.StateWaitingCI || current.State == domain.StateReviewing || current.State == domain.StateWaitingApproval || current.State == domain.StateWaitingManualMerge || current.State == domain.StateMerging || current.State == domain.StateReconciling {
+	if current.State == domain.StateBuilding {
+		capability, err = c.store.CandidateRepairRearmProof(ctx, ref, stopped)
+		if errors.Is(err, store.ErrNotFound) {
+			// An ordinary pre-publication Building ticket has no candidate-repair
+			// lineage. Only that clean absence may fall back; malformed or stale
+			// repair evidence must leave the runtime sealed.
+			capability, err = c.store.RearmProof(ctx, ref, stopped)
+		}
+	} else if current.State == domain.StatePublishing || current.State == domain.StateWaitingCI || current.State == domain.StateReviewing || current.State == domain.StateWaitingApproval || current.State == domain.StateWaitingManualMerge || current.State == domain.StateMerging || current.State == domain.StateReconciling {
 		capability, err = c.store.PostPublicationRearmProof(ctx, ref, stopped)
 	} else {
 		capability, err = c.store.RearmProof(ctx, ref, stopped)

@@ -294,7 +294,7 @@ func TestPromptsAreDeterministicAndRoleBound(t *testing.T) {
 			return Verification(VerificationInput{Ticket: ticket, Workspace: workspace, Plan: plan, Runtime: runtime, Command: []string{"go", "test", "./..."}})
 		}, []string{"writes the tests or proof", "red", "missing", "baseline", "canonical_artifact", "OUTPUT_BINDING=", `"acceptance_digest":"` + plan.Digest + `"`, `"proof_kind":"regression"`, `"allowed_prebuild_outcomes":["red"]`, `"command":["go","test","./..."]`, "Always emit the final object"}},
 		{"builder", func() (contracts.PhaseInput, error) {
-			return Builder(BuilderInput{ticket, workspace, plan, verification, runtime})
+			return Builder(BuilderInput{Ticket: ticket, Workspace: workspace, Plan: plan, Verification: verification, Runtime: runtime})
 		}, []string{"Preserve every verification-owned file", "amendment_request", "canonical_artifact"}},
 		{"final-reviewer", func() (contracts.PhaseInput, error) {
 			return FinalReviewer(FinalReviewerInput{ticket, workspace, plan, verification, candidate, checks, runtime})

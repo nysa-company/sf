@@ -1598,16 +1598,19 @@ func (daemon *Daemon) resumeTicket(ctx context.Context, request api.Request, ide
 	if response != nil {
 		return *response
 	}
+	stored, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	if stored.State == domain.StateBlocked && nonRecoverableTicketBlocker(stored.BlockedCode) {
+		return daemon.failure(request, stored.BlockedCode, "this ticket's safety boundary cannot be resumed; cancel it, then submit a fresh ticket", false)
+	}
 	controller, ok := daemon.control.(RuntimeRearmController)
 	if !ok {
 		return daemon.failure(request, "runtime_rearm_unavailable", "ticket resume is unavailable until the runtime control boundary is configured", true)
 	}
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
-	}
-	stored, err := daemon.store.Ticket(ctx, ref)
-	if err != nil {
-		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
 	}
 	transitioned := false
 	if stored.State == domain.StatePaused {
@@ -1794,6 +1797,9 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	stored, err := daemon.store.Ticket(ctx, ref)
 	if err != nil {
 		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	if stored.State == domain.StateBlocked && nonRecoverableTicketBlocker(stored.BlockedCode) {
+		return daemon.failure(request, stored.BlockedCode, "this ticket's safety boundary cannot be retried; cancel it, then submit a fresh ticket", false)
 	}
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
@@ -2219,7 +2225,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	switch code {
 	case "legacy_provider_entry_unverifiable":
 		argv = []string{binary, "cancel", "--help"}
-	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "provider_retry_exhausted", "provider_retry_resubmit_required":
+	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
 		argv = []string{binary, "cancel", "--help"}
 	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 		argv = []string{binary, "take", "--help"}
@@ -2255,7 +2261,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 		switch code {
 		case "legacy_provider_entry_unverifiable":
 			argv = []string{binary, "cancel", request.Ticket}
-		case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "provider_retry_exhausted", "provider_retry_resubmit_required":
+		case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
 			argv = []string{binary, "cancel", request.Ticket}
 		case "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 			// `take` is intentionally idempotent and prints the authenticated
@@ -2312,7 +2318,7 @@ func (daemon *Daemon) executable() string {
 
 func nonRecoverableTicketBlocker(code string) bool {
 	switch code {
-	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable":
+	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable":
 		return true
 	default:
 		return false

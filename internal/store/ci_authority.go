@@ -24,11 +24,13 @@ import (
 )
 
 const (
-	maxCIDiagnosticText = 16 << 10
-	maxCIDiagnosticJSON = 64 << 10
-	maxCIChecks         = 512
-	maxCIAggregateDiag  = 256 << 10
-	maxCIClockSkew      = 24 * time.Hour
+	maxCIDiagnosticText             = 16 << 10
+	maxCIDiagnosticJSON             = 64 << 10
+	maxCIChecks                     = 512
+	maxCandidateRepairPromptChecks  = 16
+	maxCandidateRepairCIHistorySpan = 128
+	maxCIAggregateDiag              = 256 << 10
+	maxCIClockSkew                  = 24 * time.Hour
 )
 
 // CIObservationCheck is one member of the exact required check set. Values
@@ -129,6 +131,47 @@ type CandidateRepairCompletion struct {
 	FinalCandidateTreeSHA       string
 	CompletionDigest            string
 	CompletedAt                 time.Time
+}
+
+// CandidateRepairBuildContext is the Store-authenticated correction input for
+// a fresh Builder generation. The verification remains immutable at the
+// predecessor generation, while PredecessorHeadSHA is the only admissible Git
+// parent for the corrected candidate.
+type CandidateRepairBuildContext struct {
+	Ref                      domain.TicketRef
+	TargetGeneration         uint64
+	PredecessorGeneration    uint64
+	PredecessorHeadSHA       string
+	PredecessorTreeSHA       string
+	PublicationWitnessDigest string
+	EntryTicketVersion       uint64
+	EntryFence               domain.Fence
+	Verification             StoredVerification
+	Diagnostic               CandidateRepairDiagnostic
+}
+
+// CandidateRepairDiagnostic is the bounded projection of the exact red CI
+// observation supplied to a correction Builder. It deliberately carries no
+// diagnostic body or JSON: the model receives only authenticated identities,
+// states, and digests. TotalFailingChecks makes deterministic truncation
+// visible when an observation contains more failures than fit safely in a
+// provider prompt.
+type CandidateRepairDiagnostic struct {
+	ObservationDigest  string
+	RequiredSetDigest  string
+	DiagnosticDigest   string
+	TotalFailingChecks int
+	FailingChecks      []CandidateRepairDiagnosticCheck
+}
+
+// CandidateRepairDiagnosticCheck identifies one failing required check. An
+// empty FailingDiagnosticDigest means that the authenticated observation did
+// not carry a per-check diagnostic body.
+type CandidateRepairDiagnosticCheck struct {
+	CanonicalName           string
+	ExternalID              string
+	NormalizedState         string
+	FailingDiagnosticDigest string
 }
 
 func ciDigest(value []byte) string {
@@ -431,6 +474,46 @@ func canonicalCIObservation(value CIObservation) (CIObservation, error) {
 	return value, nil
 }
 
+func candidateRepairDiagnosticForObservation(value CIObservation) (CandidateRepairDiagnostic, error) {
+	if value.Classification != "red" || len(value.RequiredChecks) == 0 || len(value.RequiredChecks) > maxCIChecks || !validCIAuthorityDigest(value.ObservationDigest) || !validDigest(value.RequiredSetDigest) || !validDigest(value.DiagnosticDigest) {
+		return CandidateRepairDiagnostic{}, ErrEvidenceConflict
+	}
+	checks := make([]CandidateRepairDiagnosticCheck, 0, len(value.RequiredChecks))
+	for _, check := range value.RequiredChecks {
+		if check.NormalizedState != "failure" && check.NormalizedState != "cancelled" {
+			continue
+		}
+		name, nameOK := canonicalCIText(check.CanonicalName, 255)
+		externalID, externalOK := canonicalCIText(check.ExternalID, 255)
+		if !nameOK || !externalOK || name == "" || externalID == "" || name != check.CanonicalName || externalID != check.ExternalID || check.FailingDiagnosticDigest != "" && !validDigest(check.FailingDiagnosticDigest) {
+			return CandidateRepairDiagnostic{}, ErrEvidenceConflict
+		}
+		checks = append(checks, CandidateRepairDiagnosticCheck{
+			CanonicalName:           name,
+			ExternalID:              externalID,
+			NormalizedState:         check.NormalizedState,
+			FailingDiagnosticDigest: check.FailingDiagnosticDigest,
+		})
+	}
+	if len(checks) == 0 {
+		return CandidateRepairDiagnostic{}, ErrEvidenceConflict
+	}
+	sort.Slice(checks, func(i, j int) bool {
+		return checks[i].CanonicalName+"\x00"+checks[i].ExternalID < checks[j].CanonicalName+"\x00"+checks[j].ExternalID
+	})
+	total := len(checks)
+	if len(checks) > maxCandidateRepairPromptChecks {
+		checks = checks[:maxCandidateRepairPromptChecks]
+	}
+	return CandidateRepairDiagnostic{
+		ObservationDigest:  value.ObservationDigest,
+		RequiredSetDigest:  value.RequiredSetDigest,
+		DiagnosticDigest:   value.DiagnosticDigest,
+		TotalFailingChecks: total,
+		FailingChecks:      checks,
+	}, nil
+}
+
 func ciObservationEqual(left, right CIObservation) bool {
 	return left.Ref == right.Ref && left.CandidateGeneration == right.CandidateGeneration && left.CandidateHeadSHA == right.CandidateHeadSHA && left.CandidateTreeSHA == right.CandidateTreeSHA && left.PublicationWitnessDigest == right.PublicationWitnessDigest && left.PolicyWitnessDigest == right.PolicyWitnessDigest && left.PullRequest == right.PullRequest && left.ObservedTicketVersion == right.ObservedTicketVersion && left.ObservedFence == right.ObservedFence && left.ObservedAt.Equal(right.ObservedAt) && left.RequiredSetDigest == right.RequiredSetDigest && left.Classification == right.Classification && left.DiagnosticText == right.DiagnosticText && left.DiagnosticJSON == right.DiagnosticJSON && left.DiagnosticDigest == right.DiagnosticDigest && left.ObservationDigest == right.ObservationDigest && bytes.Equal(mustJSON(left.RequiredChecks), mustJSON(right.RequiredChecks))
 }
@@ -704,6 +787,221 @@ func loadCICurrentPublicationAt(ctx context.Context, q ciQuery, ref domain.Ticke
 	return publication, nil
 }
 
+// authenticateCandidateRepairCIHistory authenticates the bounded historical
+// waiting-CI history consumed by one Store-owned repair binding. Unlike the
+// current publication reader, it intentionally ignores rows after consumed;
+// validateRunnerRecoveryAuthority separately audits the complete live ledger.
+// The returned map names the exact fence at every authenticated publication,
+// pending-CI, poll-control, and recovery endpoint through consumed.
+func authenticateCandidateRepairCIHistory(ctx context.Context, q ciQuery, ref domain.TicketRef, publication PublishedCandidateEvidence, consumed uint64, consumedFence domain.Fence, budgetID string) (map[uint64]domain.Fence, error) {
+	if ref.Validate() != nil || !publicationFound(publication) || publication.CurrentTicketVersion == 0 || publication.CurrentTicketVersion == ^uint64(0) || publication.CurrentFence.LeaderEpoch == 0 || publication.CurrentFence.RunnerEpoch == 0 || publication.CurrentFence.ClaimEpoch != 0 || consumedFence.LeaderEpoch == 0 || consumedFence.RunnerEpoch == 0 || consumedFence.ClaimEpoch != 0 || !boundedText(budgetID, 300) {
+		return nil, ErrPublicationEvidence
+	}
+	waitingVersion := publication.CurrentTicketVersion + 1
+	if consumed < waitingVersion || consumed-waitingVersion > maxCandidateRepairCIHistorySpan {
+		return nil, ErrPublicationEvidence
+	}
+
+	publicationPayload, err := json.Marshal(struct {
+		WitnessDigest    string `json:"witness_digest"`
+		WitnessCreatedAt string `json:"witness_created_at"`
+	}{publication.WitnessDigest, publication.CreatedAt.Format(time.RFC3339Nano)})
+	if err != nil {
+		return nil, ErrPublicationEvidence
+	}
+	var publicationRows int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events e JOIN publication_transition_evidence p ON p.channel=e.channel AND p.project_id=e.project_id AND p.ticket_id=e.ticket_id AND p.ticket_version=e.ticket_version AND p.event_created_at=e.created_at WHERE e.channel=? AND e.project_id=? AND e.ticket_id=? AND e.ticket_version=? AND e.trigger='effects_confirmed' AND e.from_state='publishing' AND e.to_state='waiting_ci' AND e.payload=? AND p.witness_digest=? AND p.witness_created_at=?`, ref.Channel, ref.Project, ref.Ticket, waitingVersion, string(publicationPayload), publication.WitnessDigest, publication.CreatedAt.Format(time.RFC3339Nano)).Scan(&publicationRows); err != nil || publicationRows != 1 {
+		return nil, ErrPublicationEvidence
+	}
+	if err := validateCIWaitingVersionEvents(ctx, q, ref, waitingVersion, string(publicationPayload), publication); err != nil {
+		return nil, ErrPublicationEvidence
+	}
+	if _, found, err := loadRunnerRecoveryAt(ctx, q, ref, waitingVersion); err != nil || found {
+		return nil, ErrPublicationEvidence
+	}
+	var baselineTransitions int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, waitingVersion).Scan(&baselineTransitions); err != nil || baselineTransitions != 0 {
+		return nil, ErrPublicationEvidence
+	}
+
+	budgetPayload, err := json.Marshal(struct {
+		RequestID string `json:"request_id"`
+	}{budgetID})
+	if err != nil {
+		return nil, ErrPublicationEvidence
+	}
+	var budgetEvents, exactBudgetEvents, budgetRows int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>=? AND ticket_version<=? AND trigger='budget_correction'`, ref.Channel, ref.Project, ref.Ticket, waitingVersion, consumed).Scan(&budgetEvents); err != nil || budgetEvents != 1 {
+		return nil, ErrPublicationEvidence
+	}
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='budget_correction' AND from_state='waiting_ci' AND to_state='waiting_ci' AND payload=?`, ref.Channel, ref.Project, ref.Ticket, consumed, string(budgetPayload)).Scan(&exactBudgetEvents); err != nil || exactBudgetEvents != 1 {
+		return nil, ErrPublicationEvidence
+	}
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND request_id=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, budgetID, consumed, consumedFence.LeaderEpoch, consumedFence.RunnerEpoch).Scan(&budgetRows); err != nil || budgetRows != 1 {
+		return nil, ErrPublicationEvidence
+	}
+
+	pollPair, hasPollPair, err := findCandidateRepairCIPollResumePair(ctx, q, ref, waitingVersion, consumed, string(budgetPayload))
+	if err != nil {
+		return nil, err
+	}
+	retry, hasRetry, err := loadCIPollRetryEpoch(ctx, q, ref, publication)
+	if err != nil {
+		return nil, err
+	}
+	if hasPollPair {
+		if !hasRetry || retry.initialAttempts < 1 || retry.initialAttempts > ciPollMaxAttempts || retry.exhaustedVersion != pollPair.exhaustedVersion || retry.resumeVersion != pollPair.resumeVersion || retry.leader != publication.CurrentFence.LeaderEpoch || retry.runner != publication.CurrentFence.RunnerEpoch || !retry.resumedAt.Equal(pollPair.resumedAt) || !retry.deadline.Equal(retry.resumedAt.Add(ciPollDeadline)) || retry.digest != ciPollRetryEpochDigest(ref, publication, retry.initialAttempts, retry.exhaustedVersion, retry.resumeVersion, retry.leader, retry.runner, retry.resumedAt, retry.deadline) {
+			return nil, ErrPublicationEvidence
+		}
+	} else if hasRetry {
+		return nil, ErrPublicationEvidence
+	}
+	policy, err := scanCurrentCIPolicy(ctx, q, ref, publication)
+	if err != nil {
+		return nil, ErrPublicationEvidence
+	}
+	endpoints := map[uint64]domain.Fence{
+		publication.CurrentTicketVersion: publication.CurrentFence,
+		waitingVersion:                   publication.CurrentFence,
+	}
+	currentFence := publication.CurrentFence
+	for version := waitingVersion + 1; version <= consumed; {
+		if hasPollPair && version == pollPair.exhaustedVersion {
+			endpoints[pollPair.exhaustedVersion] = currentFence
+			endpoints[pollPair.resumeVersion] = currentFence
+			version = pollPair.resumeVersion + 1
+			continue
+		}
+
+		recovery, recovered, err := loadRunnerRecoveryAt(ctx, q, ref, version)
+		if err != nil {
+			return nil, err
+		}
+		var transitionCount int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&transitionCount); err != nil || transitionCount > 1 {
+			return nil, ErrPublicationEvidence
+		}
+		expectedEvents := 0
+		if version == consumed {
+			expectedEvents++
+		}
+		if recovered {
+			if transitionCount != 0 || !validRunnerRecovery(recovery) || recovery.PriorTicketVersion+1 != version || recovery.PriorTicketVersion != version-1 || recovery.PriorRunnerEpoch != currentFence.RunnerEpoch || recovery.PriorLeaderEpoch != currentFence.LeaderEpoch {
+				return nil, ErrPublicationEvidence
+			}
+			var events int
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&events); err != nil || events != expectedEvents {
+				return nil, ErrPublicationEvidence
+			}
+			currentFence = domain.Fence{LeaderEpoch: recovery.LeaderEpoch, RunnerEpoch: recovery.RunnerEpoch}
+			endpoints[version] = currentFence
+			version++
+			continue
+		}
+		if transitionCount != 1 {
+			return nil, ErrPublicationEvidence
+		}
+		var evidenceVersion, observationVersion uint64
+		var eventID, joinedEventID int64
+		var generation uint64
+		var eventCreated, head, tree, classification, observationDigest, witness, priorState, resultingState, trigger, transitionDigest string
+		var observationLeader, observationRunner uint64
+		var joinedCreated, fromState, toState, eventTrigger, eventPayload string
+		if err := q.QueryRowContext(ctx, `SELECT c.ticket_version,c.event_id,c.event_created_at,c.candidate_generation,c.candidate_head_sha,c.candidate_tree_sha,c.observation_classification,c.observation_digest,c.observation_ticket_version,c.observation_leader_epoch,c.observation_runner_epoch,c.prior_publication_witness_digest,c.prior_state,c.resulting_state,c.resulting_trigger,c.transition_digest,e.id,e.created_at,e.from_state,e.to_state,e.trigger,e.payload FROM ci_transition_evidence c JOIN events e ON e.channel=c.channel AND e.project_id=c.project_id AND e.ticket_id=c.ticket_id AND e.ticket_version=c.ticket_version AND e.id=c.event_id AND e.created_at=c.event_created_at WHERE c.channel=? AND c.project_id=? AND c.ticket_id=? AND c.ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&evidenceVersion, &eventID, &eventCreated, &generation, &head, &tree, &classification, &observationDigest, &observationVersion, &observationLeader, &observationRunner, &witness, &priorState, &resultingState, &trigger, &transitionDigest, &joinedEventID, &joinedCreated, &fromState, &toState, &eventTrigger, &eventPayload); err != nil {
+			return nil, ErrPublicationEvidence
+		}
+		if evidenceVersion != version || eventID != joinedEventID || eventCreated != joinedCreated || generation != publication.Candidate.Snapshot.Generation || head != publication.Candidate.Snapshot.HeadSHA || tree != publication.Candidate.Snapshot.TreeSHA || classification != "pending" || observationVersion+1 != version || observationLeader != currentFence.LeaderEpoch || observationRunner != currentFence.RunnerEpoch || witness != publication.WitnessDigest || priorState != string(domain.StateWaitingCI) || resultingState != string(domain.StateWaitingCI) || trigger != "checks_pending" || fromState != string(domain.StateWaitingCI) || toState != string(domain.StateWaitingCI) || eventTrigger != "checks_pending" {
+			return nil, ErrPublicationEvidence
+		}
+		observation, found, err := scanCIObservation(ctx, q, false, ref, observationDigest)
+		if err != nil || !found || !ciObservationMatchesPublication(observation, publication) || !policyMatchesObservation(policy, observation) || observation.Classification != "pending" || observation.ObservedTicketVersion != observationVersion || observation.ObservedFence != currentFence || transitionDigest != ciTransitionDigest(ref, observation, version, eventID, eventCreated, resultingState, trigger, eventPayload) {
+			return nil, ErrPublicationEvidence
+		}
+		expectedEvents++
+		var events int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&events); err != nil || events != expectedEvents {
+			return nil, ErrPublicationEvidence
+		}
+		endpoints[version] = currentFence
+		version++
+	}
+	if endpoints[consumed] != consumedFence {
+		return nil, ErrPublicationEvidence
+	}
+	return endpoints, nil
+}
+
+// findCandidateRepairCIPollResumePair is the bounded historical form of the
+// ordinary CI poll-pair reader. A red observation may append its one canonical
+// budget event at the resume version, so that row is excluded explicitly from
+// the otherwise exact two-event pair.
+func findCandidateRepairCIPollResumePair(ctx context.Context, q ciQuery, ref domain.TicketRef, baseline, consumed uint64, budgetPayload string) (ciPollResumePair, bool, error) {
+	rows, err := q.QueryContext(ctx, `SELECT ticket_version,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND trigger='ci_poll_exhausted' AND from_state='waiting_ci' AND to_state='paused' ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, baseline, consumed)
+	if err != nil {
+		return ciPollResumePair{}, false, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	var pair ciPollResumePair
+	found := false
+	for rows.Next() {
+		var exhausted uint64
+		var payload string
+		if err := rows.Scan(&exhausted, &payload); err != nil {
+			return ciPollResumePair{}, false, err
+		}
+		var value struct {
+			Code string `json:"code"`
+		}
+		if found || json.Unmarshal([]byte(payload), &value) != nil || (value.Code != "ci_poll_attempts_exhausted" && value.Code != "ci_poll_deadline_exhausted") || exhausted == ^uint64(0) || exhausted+1 > consumed {
+			return ciPollResumePair{}, false, ErrPublicationEvidence
+		}
+		resumed := exhausted + 1
+		var exhaustedCount, resumedCount, exhaustedEvents, resumedEvents, recoveryRows, transitionRows int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='ci_poll_exhausted' AND from_state='waiting_ci' AND to_state='paused'`, ref.Channel, ref.Project, ref.Ticket, exhausted).Scan(&exhaustedCount); err != nil || exhaustedCount != 1 {
+			return ciPollResumePair{}, false, ErrPublicationEvidence
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_resume' AND from_state='paused' AND to_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, resumed).Scan(&resumedCount); err != nil || resumedCount != 1 {
+			return ciPollResumePair{}, false, ErrPublicationEvidence
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, exhausted).Scan(&exhaustedEvents); err != nil || exhaustedEvents != 1 {
+			return ciPollResumePair{}, false, ErrPublicationEvidence
+		}
+		expectedResumeEvents := 1
+		if resumed == consumed {
+			expectedResumeEvents++
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, resumed).Scan(&resumedEvents); err != nil || resumedEvents != expectedResumeEvents {
+			return ciPollResumePair{}, false, ErrPublicationEvidence
+		}
+		if resumed == consumed {
+			var budget int
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='budget_correction' AND from_state='waiting_ci' AND to_state='waiting_ci' AND payload=?`, ref.Channel, ref.Project, ref.Ticket, resumed, budgetPayload).Scan(&budget); err != nil || budget != 1 {
+				return ciPollResumePair{}, false, ErrPublicationEvidence
+			}
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version IN (?,?)`, ref.Channel, ref.Project, ref.Ticket, exhausted, resumed).Scan(&recoveryRows); err != nil || recoveryRows != 0 {
+			return ciPollResumePair{}, false, ErrPublicationEvidence
+		}
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version IN (?,?)`, ref.Channel, ref.Project, ref.Ticket, exhausted, resumed).Scan(&transitionRows); err != nil || transitionRows != 0 {
+			return ciPollResumePair{}, false, ErrPublicationEvidence
+		}
+		var resumedAt string
+		if err := q.QueryRowContext(ctx, `SELECT created_at FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_resume' AND from_state='paused' AND to_state='waiting_ci'`, ref.Channel, ref.Project, ref.Ticket, resumed).Scan(&resumedAt); err != nil {
+			return ciPollResumePair{}, false, ErrPublicationEvidence
+		}
+		parsed, err := parsePublicationTime(resumedAt)
+		if err != nil {
+			return ciPollResumePair{}, false, ErrPublicationEvidence
+		}
+		pair = ciPollResumePair{exhaustedVersion: exhausted, resumeVersion: resumed, resumedAt: parsed}
+		found = true
+	}
+	if err := rows.Err(); err != nil {
+		return ciPollResumePair{}, false, err
+	}
+	return pair, found, nil
+}
+
 // validateCIRecoveryLedger authenticates a runner takeover after the
 // publication boundary. CI self-transitions may advance the ticket version
 // between recovery rows, but every such version must already be an authenticated
@@ -951,9 +1249,77 @@ func NormalizeCIObservationChecks(checks []contracts.RequiredCheck) ([]CIObserva
 	return canonicalCIObservationChecks(out)
 }
 
-// RecordCIObservation atomically inserts one observation and its complete
-// check set. Exact replay is a no-op; any digest or field conflict fails closed.
+func ciObservationClassification(checks []CIObservationCheck) string {
+	pending, red := false, false
+	for _, check := range checks {
+		pending = pending || check.NormalizedState == "pending"
+		red = red || check.NormalizedState == "failure" || check.NormalizedState == "cancelled"
+	}
+	if red {
+		return "red"
+	}
+	if pending {
+		return "pending"
+	}
+	return "green"
+}
+
+// RecordCIObservation refuses raw caller-assembled GitHub facts. Production
+// callers must use RecordCIObservationFromObserver so the Store owns the
+// observer handoff and reauthenticates the result before persistence.
 func (s *Store) RecordCIObservation(ctx context.Context, input CIObservation) error {
+	return ErrCIObservation
+}
+
+// RecordAuthenticatedCIObservation is retained as an explicit fail-closed
+// compatibility surface. A descriptive method name is not an authentication
+// capability; only RecordCIObservationFromObserver may append remote facts.
+func (s *Store) RecordAuthenticatedCIObservation(ctx context.Context, input CIObservation) error {
+	return ErrCIObservation
+}
+
+// RecordCIObservationFromObserver loads the exact current publication before
+// invoking the read-only external boundary. The observer runs without a
+// SQLite write transaction. recordCIObservation then reloads the publication,
+// ticket fence, and required-check policy on one connection before inserting.
+func (s *Store) RecordCIObservationFromObserver(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, observer contracts.CIRequiredChecksObserver) error {
+	if observer == nil || ref.Validate() != nil || expectedVersion == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || fence.ClaimEpoch != 0 {
+		return ErrCIObservation
+	}
+	if err := s.AssertTicketFence(ctx, ref, expectedVersion, fence); err != nil {
+		return err
+	}
+	publication, err := loadCICurrentPublication(ctx, s.db, ref)
+	if err != nil {
+		return errors.Join(ErrCIObservation, fmt.Errorf("load current CI publication: %w", err))
+	}
+	checks, err := observer.RequiredChecks(ctx, publication.PullRequest)
+	if err != nil {
+		return errors.Join(ErrCIObservation, err)
+	}
+	normalized, err := NormalizeCIObservationChecks(checks)
+	if err != nil {
+		return err
+	}
+	return s.recordCIObservation(ctx, CIObservation{
+		Ref:                      ref,
+		CandidateGeneration:      publication.Candidate.Snapshot.Generation,
+		CandidateHeadSHA:         publication.Candidate.Snapshot.HeadSHA,
+		CandidateTreeSHA:         publication.Candidate.Snapshot.TreeSHA,
+		PublicationWitnessDigest: publication.WitnessDigest,
+		PullRequest:              publication.PullRequest,
+		ObservedTicketVersion:    expectedVersion,
+		ObservedFence:            fence,
+		ObservedAt:               time.Now().UTC(),
+		RequiredChecks:           normalized,
+		Classification:           ciObservationClassification(normalized),
+	})
+}
+
+// recordCIObservation is the same-package fixture seam and the sole internal
+// append implementation. Exact replay is a no-op; any digest or field conflict
+// fails closed.
+func (s *Store) recordCIObservation(ctx context.Context, input CIObservation) error {
 	claimedObservationDigest := input.ObservationDigest
 	input.ObservationDigest = ""
 	canonical, err := canonicalCIObservation(input)
@@ -963,14 +1329,14 @@ func (s *Store) RecordCIObservation(ctx context.Context, input CIObservation) er
 	if delta := time.Since(canonical.ObservedAt); delta > maxCIClockSkew || delta < -maxCIClockSkew {
 		return ErrCIObservation
 	}
-	publication, err := loadCICurrentPublication(ctx, s.db, canonical.Ref)
-	if err != nil {
-		return errors.Join(ErrCIObservation, fmt.Errorf("load current CI publication: %w", err))
-	}
-	if !ciObservationMatchesPublication(canonical, publication) {
-		return fmt.Errorf("%w: observation does not match current publication", ErrCIObservation)
-	}
 	err = s.ciWrite(ctx, canonical.Ref, func(conn *sql.Conn) error {
+		publication, err := loadCICurrentPublication(ctx, conn, canonical.Ref)
+		if err != nil {
+			return errors.Join(ErrCIObservation, fmt.Errorf("load current CI publication: %w", err))
+		}
+		if !ciObservationMatchesPublication(canonical, publication) {
+			return fmt.Errorf("%w: observation does not match current publication", ErrCIObservation)
+		}
 		var state string
 		var version, runner, leader uint64
 		if err := conn.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, canonical.Ref.Channel, canonical.Ref.Project, canonical.Ref.Ticket).Scan(&state, &version, &runner, &leader); err != nil {
@@ -1033,12 +1399,6 @@ func (s *Store) RecordCIObservation(ctx context.Context, input CIObservation) er
 		return nil
 	})
 	return err
-}
-
-// RecordAuthenticatedCIObservation is the descriptive alias used by callers
-// that want the authentication boundary visible in their code.
-func (s *Store) RecordAuthenticatedCIObservation(ctx context.Context, input CIObservation) error {
-	return s.RecordCIObservation(ctx, input)
 }
 
 // RecordCIRequiredCheckPolicy stores the exact server-defined required set for
@@ -1133,6 +1493,319 @@ func (s *Store) RecordRequiredCheckPolicy(ctx context.Context, input CIRequiredC
 	return s.RecordCIRequiredCheckPolicy(ctx, input)
 }
 
+type candidateRepairBindingAuthority struct {
+	context                 CandidateRepairBuildContext
+	PRHost, PROwner, PRRepo string
+	PRNumber                int64
+	BranchRef, RemoteHead   string
+	BaseRef, RemoteBase     string
+	ObservationDigest       string
+	ObservationClass        string
+	TransitionDigest        string
+	BudgetKind, BudgetID    string
+	ConsumedVersion         uint64
+	ConsumedFence           domain.Fence
+	RecoveryPrefixDigest    string
+	ContextDigest           string
+	CreatedAt               string
+	// publicationVersion/fence and ciEndpoints are derived, read-only
+	// authentication results. They are deliberately not persisted in the
+	// repair binding: the immutable publication, CI transition, observation,
+	// and recovery rows remain the source of truth.
+	publicationVersion uint64
+	publicationFence   domain.Fence
+	ciEndpoints        map[uint64]domain.Fence
+}
+
+// candidateRepairRecoveryPrefixDigest seals the exact recovery rows which
+// existed when a red-CI observation was consumed. The repair binding is a
+// historical authority after that point, so later rows are intentionally
+// excluded while deletion, insertion, or mutation anywhere at or before the
+// consumed endpoint changes this digest. The live Consume path has already
+// authenticated the CI/publication chain which admitted these rows; historical
+// readers recompute this snapshot instead of circularly treating checks_red as
+// a new recovery root.
+func candidateRepairRecoveryPrefixDigest(ctx context.Context, q ciQuery, ref domain.TicketRef, through uint64) (string, error) {
+	if ref.Validate() != nil || through == 0 {
+		return "", ErrEvidenceConflict
+	}
+	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
+		return "", err
+	}
+	type prefixRow struct {
+		PriorTicketVersion uint64 `json:"prior_ticket_version"`
+		PriorRunnerEpoch   uint64 `json:"prior_runner_epoch"`
+		PriorLeaderEpoch   uint64 `json:"prior_leader_epoch"`
+		TicketVersion      uint64 `json:"ticket_version"`
+		RunnerEpoch        uint64 `json:"runner_epoch"`
+		LeaderEpoch        uint64 `json:"leader_epoch"`
+		RecoveryDigest     string `json:"recovery_digest"`
+		CreatedAt          string `json:"created_at"`
+	}
+	rows, err := q.QueryContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version<=? ORDER BY ticket_version`, ref.Channel, ref.Project, ref.Ticket, through)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	values := make([]prefixRow, 0, 8)
+	for rows.Next() {
+		if len(values) >= 64 {
+			return "", ErrPublicationEvidence
+		}
+		var row prefixRow
+		if err := rows.Scan(&row.PriorTicketVersion, &row.PriorRunnerEpoch, &row.PriorLeaderEpoch, &row.TicketVersion, &row.RunnerEpoch, &row.LeaderEpoch, &row.RecoveryDigest, &row.CreatedAt); err != nil {
+			return "", err
+		}
+		created, err := parseRunnerRecoveryTime(row.CreatedAt)
+		value := RunnerRecoveryLedger{Ref: ref, PriorTicketVersion: row.PriorTicketVersion, PriorRunnerEpoch: row.PriorRunnerEpoch, PriorLeaderEpoch: row.PriorLeaderEpoch, TicketVersion: row.TicketVersion, RunnerEpoch: row.RunnerEpoch, LeaderEpoch: row.LeaderEpoch, RecoveryDigest: row.RecoveryDigest, CreatedAt: created}
+		if err != nil || row.TicketVersion > through || !validRunnerRecovery(value) {
+			return "", ErrPublicationEvidence
+		}
+		values = append(values, row)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(struct {
+		Ref     domain.TicketRef `json:"ref"`
+		Through uint64           `json:"through"`
+		Rows    []prefixRow      `json:"rows"`
+	}{Ref: ref, Through: through, Rows: values})
+	if err != nil {
+		return "", err
+	}
+	return ciAuthorityDigest(payload), nil
+}
+
+// CandidateRepairBuildContext authenticates the exact red-CI correction
+// lineage at the caller's live Building fence. It is deliberately separate
+// from ordinary phase recovery: the prior publication remains durable context
+// while only a fresh Builder result may create the successor generation.
+func (s *Store) CandidateRepairBuildContext(ctx context.Context, ref domain.TicketRef, expected uint64, fence domain.Fence) (CandidateRepairBuildContext, error) {
+	if ref.Validate() != nil || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || fence.ClaimEpoch != 0 {
+		return CandidateRepairBuildContext{}, ErrEvidenceConflict
+	}
+	var state domain.State
+	var version, runner, leader uint64
+	if err := s.db.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state, &version, &runner, &leader); err != nil {
+		return CandidateRepairBuildContext{}, normalizeBusy(ctx, err)
+	}
+	if state != domain.StateBuilding || version != expected || runner != fence.RunnerEpoch || leader != fence.LeaderEpoch {
+		return CandidateRepairBuildContext{}, ErrStaleFence
+	}
+	return s.candidateRepairBuildContextAt(ctx, s.db, ref, expected, fence)
+}
+
+// authenticateCandidateRepairBuildContextAt is the mutation-side proof used
+// by runtime rearm. If a target snapshot already exists, its complete
+// candidate/result/command/completion tuple must also exist; partial target
+// evidence is never treated as a pre-target repair.
+func (s *Store) authenticateCandidateRepairBuildContextAt(ctx context.Context, q ciQuery, ref domain.TicketRef, expected uint64, fence domain.Fence) error {
+	// Runtime rearm authenticates the retained pre-stop endpoint after startup
+	// may already have appended a later recovery row. Keep this source proof
+	// historical; the caller separately audits the complete live ledger.
+	authority, err := s.candidateRepairBuildAuthorityHistoricalAt(ctx, q, ref, expected, fence)
+	if err != nil {
+		return err
+	}
+	var latest uint64
+	if err := q.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation),0) FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&latest); err != nil {
+		return normalizeBusy(ctx, err)
+	}
+	if latest == authority.context.PredecessorGeneration {
+		var targetRows int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, ref.Channel, ref.Project, ref.Ticket, authority.context.TargetGeneration).Scan(&targetRows); err != nil {
+			return normalizeBusy(ctx, err)
+		}
+		if targetRows != 0 {
+			return ErrEvidenceConflict
+		}
+		return nil
+	}
+	if latest != authority.context.TargetGeneration {
+		return ErrEvidenceConflict
+	}
+	candidate, err := s.latestCandidateFrom(ctx, q, ref, false)
+	if err != nil || candidate.Snapshot.Generation != authority.context.TargetGeneration || candidate.Commit.ParentOID != authority.context.PredecessorHeadSHA || candidate.Snapshot.VerificationIntentDigest != authority.context.Verification.Revision.IntentDigest || candidate.Snapshot.ProofDigest != authority.context.Verification.Revision.ProofDigest {
+		return ErrEvidenceConflict
+	}
+	result, _, err := s.loadHistoricalProviderAttemptResult(ctx, q, candidate.BuilderResult)
+	// Runtime rearm authenticates this immutable repair completion at the
+	// pre-stop baseline. The caller separately proves the complete sealed
+	// control and recovery suffix from that baseline to the live owner, so
+	// later signed rows must not make the historical endpoint unverifiable.
+	if err != nil || candidateRepairBuilderResultReachesHistoricalFence(ctx, q, candidate.BuilderResult, result, expected, fence) != nil {
+		return ErrEvidenceConflict
+	}
+	if err := s.reauthenticateStoredCandidateCommandHistoricalFrom(ctx, q, ref, candidate); err != nil {
+		return ErrEvidenceConflict
+	}
+	return nil
+}
+
+func (s *Store) candidateRepairBuildContextAt(ctx context.Context, q ciQuery, ref domain.TicketRef, expected uint64, fence domain.Fence) (CandidateRepairBuildContext, error) {
+	authority, err := s.candidateRepairBuildAuthorityAt(ctx, q, ref, expected, fence)
+	if err != nil {
+		return CandidateRepairBuildContext{}, err
+	}
+	return authority.context, nil
+}
+
+// candidateRepairBuildAuthorityAt authenticates the immutable repair binding
+// for the exact Build phase entry which owns the requested endpoint. A retained
+// earlier CI repair must not shadow a later review-repair or provider-retry
+// Build entry; those unrelated entries return ErrNotFound.
+func (s *Store) candidateRepairBuildAuthorityAt(ctx context.Context, q ciQuery, ref domain.TicketRef, expected uint64, fence domain.Fence) (candidateRepairBindingAuthority, error) {
+	return s.candidateRepairBuildAuthorityAtMode(ctx, q, ref, expected, fence, false)
+}
+
+// candidateRepairBuildAuthorityHistoricalAt authenticates an exact retained
+// repair endpoint while permitting independently authenticated later recovery
+// rows. Only startup/rearm/source-proof paths may use this mode; live readers
+// must additionally run validateRunnerRecoveryAuthority.
+func (s *Store) candidateRepairBuildAuthorityHistoricalAt(ctx context.Context, q ciQuery, ref domain.TicketRef, expected uint64, fence domain.Fence) (candidateRepairBindingAuthority, error) {
+	return s.candidateRepairBuildAuthorityAtMode(ctx, q, ref, expected, fence, true)
+}
+
+func (s *Store) candidateRepairBuildAuthorityAtMode(ctx context.Context, q ciQuery, ref domain.TicketRef, expected uint64, fence domain.Fence, allowFutureRecovery bool) (candidateRepairBindingAuthority, error) {
+	if ref.Validate() != nil || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || fence.ClaimEpoch != 0 {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	entry, entryErr := loadProviderPhaseEntryAt(ctx, q, ref, domain.PhaseBuild, expected)
+	if entryErr != nil {
+		return candidateRepairBindingAuthority{}, entryErr
+	}
+	var totalBindings, entryBindings int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN red_transition_ticket_version=? THEN 1 ELSE 0 END),0) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=?`, entry.Version, ref.Channel, ref.Project, ref.Ticket).Scan(&totalBindings, &entryBindings); err != nil {
+		return candidateRepairBindingAuthority{}, normalizeBusy(ctx, err)
+	}
+	if totalBindings > 1 || entryBindings > 1 {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	if entryBindings == 0 {
+		if entry.From == domain.StateWaitingCI && entry.State == domain.StateBuilding && entry.Trigger == "checks_red" {
+			return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+		}
+		return candidateRepairBindingAuthority{}, ErrNotFound
+	}
+	if totalBindings != 1 || entry.From != domain.StateWaitingCI || entry.State != domain.StateBuilding || entry.Trigger != "checks_red" {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	var value candidateRepairBindingAuthority
+	value.context.Ref = ref
+	err := q.QueryRowContext(ctx, `SELECT target_generation,predecessor_generation,predecessor_head_sha,predecessor_tree_sha,predecessor_publication_witness_digest,
+		pr_host,pr_owner,pr_repo,pr_number,branch_ref,remote_head_oid,base_ref,remote_base_oid,red_observation_digest,red_observation_classification,
+		red_transition_ticket_version,red_transition_digest,correction_budget_kind,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch,consumed_recovery_prefix_digest,repair_context_digest,created_at
+		FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND red_transition_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, entry.Version).Scan(
+		&value.context.TargetGeneration, &value.context.PredecessorGeneration, &value.context.PredecessorHeadSHA, &value.context.PredecessorTreeSHA, &value.context.PublicationWitnessDigest,
+		&value.PRHost, &value.PROwner, &value.PRRepo, &value.PRNumber, &value.BranchRef, &value.RemoteHead, &value.BaseRef, &value.RemoteBase,
+		&value.ObservationDigest, &value.ObservationClass, &value.context.EntryTicketVersion, &value.TransitionDigest, &value.BudgetKind, &value.BudgetID,
+		&value.ConsumedVersion, &value.ConsumedFence.LeaderEpoch, &value.ConsumedFence.RunnerEpoch, &value.RecoveryPrefixDigest, &value.ContextDigest, &value.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return candidateRepairBindingAuthority{}, ErrNotFound
+	}
+	if err != nil {
+		return candidateRepairBindingAuthority{}, normalizeBusy(ctx, err)
+	}
+	if value.context.TargetGeneration == 0 || value.context.PredecessorGeneration == ^uint64(0) || value.context.TargetGeneration != value.context.PredecessorGeneration+1 || !validOID(value.context.PredecessorHeadSHA) || !validOID(value.context.PredecessorTreeSHA) || !validCIAuthorityDigest(value.context.PublicationWitnessDigest) || value.PRNumber <= 0 || !boundedText(value.PRHost, 300) || !boundedText(value.PROwner, 300) || !boundedText(value.PRRepo, 300) || !boundedText(value.BranchRef, 300) || !validOID(value.RemoteHead) || !boundedText(value.BaseRef, 300) || !validOID(value.RemoteBase) || !validCIAuthorityDigest(value.ObservationDigest) || value.ObservationClass != "red" || value.context.EntryTicketVersion == 0 || value.ConsumedVersion == 0 || value.context.EntryTicketVersion != value.ConsumedVersion+1 || value.ConsumedFence.LeaderEpoch == 0 || value.ConsumedFence.RunnerEpoch == 0 || !validCIAuthorityDigest(value.RecoveryPrefixDigest) || !validCIAuthorityDigest(value.TransitionDigest) || value.BudgetKind != "correction" || !boundedText(value.BudgetID, 300) || !validCIAuthorityDigest(value.ContextDigest) {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	if _, err := time.Parse(time.RFC3339Nano, value.CreatedAt); err != nil {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	err = entryErr
+	if err == nil && (entry.Version != expected || entry.Runner != fence.RunnerEpoch || entry.Leader != fence.LeaderEpoch) {
+		if allowFutureRecovery {
+			err = validateRunnerRecoveryLedgerPrefix(ctx, q, ref, entry.Version, entry.Runner, entry.Leader, expected, fence.RunnerEpoch, fence.LeaderEpoch)
+		} else {
+			_, err = loadCurrentProviderPhaseEntry(ctx, q, ref, domain.PhaseBuild, expected, fence.RunnerEpoch, fence.LeaderEpoch)
+		}
+	}
+	if err != nil || entry.Version != value.context.EntryTicketVersion || entry.Leader != value.ConsumedFence.LeaderEpoch || entry.Runner != value.ConsumedFence.RunnerEpoch || entry.From != domain.StateWaitingCI || entry.State != domain.StateBuilding || entry.Trigger != "checks_red" {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	value.context.EntryFence = domain.Fence{LeaderEpoch: entry.Leader, RunnerEpoch: entry.Runner}
+	var eventCount int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND id=? AND ticket_version=? AND created_at=? AND trigger='checks_red' AND from_state='waiting_ci' AND to_state='building'`, ref.Channel, ref.Project, ref.Ticket, entry.EventID, entry.Version, entry.EventCreated).Scan(&eventCount); err != nil || eventCount != 1 {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	prefixDigest, err := candidateRepairRecoveryPrefixDigest(ctx, q, ref, value.ConsumedVersion)
+	if err != nil || prefixDigest != value.RecoveryPrefixDigest {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	publication, found, err := loadPublicationEvidenceRowMatching(ctx, q, ref, value.context.PredecessorGeneration, value.context.PredecessorHeadSHA, value.context.PredecessorTreeSHA, value.context.PublicationWitnessDigest)
+	if err == nil && found {
+		err = loadLatestPublicationRebind(ctx, q, &publication)
+	}
+	if err != nil || publication.Candidate.Snapshot.Generation != value.context.PredecessorGeneration || publication.Candidate.Snapshot.HeadSHA != value.context.PredecessorHeadSHA || publication.Candidate.Snapshot.TreeSHA != value.context.PredecessorTreeSHA || publication.WitnessDigest != value.context.PublicationWitnessDigest || publication.PullRequest.Repository.Host != value.PRHost || publication.PullRequest.Repository.Owner != value.PROwner || publication.PullRequest.Repository.Name != value.PRRepo || int64(publication.PullRequest.Number) != value.PRNumber || publication.RemoteBranchRef != value.BranchRef || publication.RemoteBranchOID != value.RemoteHead || publication.PullRequest.BaseRef != value.BaseRef || publication.RemoteBaseOID != value.RemoteBase {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	if err := s.reauthenticateStoredCandidateCheckpointFrom(ctx, q, ref, publication.Candidate); err != nil {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	observation, observationFound, err := scanCIObservation(ctx, q, false, ref, value.ObservationDigest)
+	if err != nil || !observationFound || observation.Classification != "red" || observation.ObservedTicketVersion != value.ConsumedVersion || observation.ObservedFence != value.ConsumedFence || !ciObservationMatchesPublication(observation, publication) {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	policy, err := scanCurrentCIPolicy(ctx, q, ref, publication)
+	if err != nil || !policyMatchesObservation(policy, observation) {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	diagnostic, err := candidateRepairDiagnosticForObservation(observation)
+	if err != nil {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	var transitionVersion uint64
+	var transitionEventID int64
+	var transitionCreated, priorState, resultingState, trigger, eventPayload, storedDigest string
+	err = q.QueryRowContext(ctx, `SELECT c.ticket_version,c.event_id,c.event_created_at,c.prior_state,c.resulting_state,c.resulting_trigger,c.transition_digest,e.payload
+		FROM ci_transition_evidence c JOIN events e ON e.channel=c.channel AND e.project_id=c.project_id AND e.ticket_id=c.ticket_id AND e.id=c.event_id AND e.ticket_version=c.ticket_version AND e.created_at=c.event_created_at
+		WHERE c.channel=? AND c.project_id=? AND c.ticket_id=? AND c.candidate_generation=? AND c.candidate_head_sha=? AND c.candidate_tree_sha=? AND c.observation_classification='red' AND c.observation_digest=? AND c.prior_publication_witness_digest=?`,
+		ref.Channel, ref.Project, ref.Ticket, value.context.PredecessorGeneration, value.context.PredecessorHeadSHA, value.context.PredecessorTreeSHA, value.ObservationDigest, value.context.PublicationWitnessDigest).Scan(
+		&transitionVersion, &transitionEventID, &transitionCreated, &priorState, &resultingState, &trigger, &storedDigest, &eventPayload)
+	if err != nil || transitionVersion != value.context.EntryTicketVersion || priorState != string(domain.StateWaitingCI) || resultingState != string(domain.StateBuilding) || trigger != "checks_red" || storedDigest != value.TransitionDigest || storedDigest != ciTransitionDigest(ref, observation, transitionVersion, transitionEventID, transitionCreated, resultingState, trigger, eventPayload) {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	if err := validateCorrectionBudgetLedger(ctx, q, ref); err != nil {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	var budgetRows int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND request_id=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, value.BudgetID, value.ConsumedVersion, value.ConsumedFence.LeaderEpoch, value.ConsumedFence.RunnerEpoch).Scan(&budgetRows); err != nil || budgetRows != 1 {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	ciEndpoints, err := authenticateCandidateRepairCIHistory(ctx, q, ref, publication, value.ConsumedVersion, value.ConsumedFence, value.BudgetID)
+	if err != nil {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	value.publicationVersion = publication.CurrentTicketVersion
+	value.publicationFence = publication.CurrentFence
+	value.ciEndpoints = ciEndpoints
+	budget := CorrectionBudgetAuthority{Ref: ref, RequestID: value.BudgetID, TicketVersion: value.ConsumedVersion, Fence: value.ConsumedFence}
+	if value.ContextDigest != candidateRepairContextDigest(ref, observation, publication, budget, value.context.TargetGeneration, value.TransitionDigest, value.RecoveryPrefixDigest) {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	verification, err := s.verificationEvidenceForIdentityFrom(ctx, q, ref,
+		publication.Candidate.Snapshot.VerificationIntentDigest,
+		publication.Candidate.Snapshot.ProofDigest,
+		publication.Candidate.Commit.ParentOID)
+	if err != nil || publication.Candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || publication.Candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest || publication.Candidate.Commit.ParentOID != verification.Checkpoint.CommitOID {
+		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
+	}
+	value.context.Verification = verification
+	value.context.Diagnostic = diagnostic
+	if !allowFutureRecovery {
+		// Every live consumer of the repair authority must audit the entire
+		// ticket ledger, not merely the suffix from the checks_red entry. The
+		// historical mode above is used by that audit itself, preventing
+		// recursion while preserving later legitimate recovery rows.
+		if err := validateRunnerRecoveryAuthority(ctx, q, ref, expected, fence); err != nil {
+			return candidateRepairBindingAuthority{}, ErrStaleFence
+		}
+	}
+	return value, nil
+}
+
 func candidateRepairCompletionDigest(value CandidateRepairCompletion) string {
 	body, _ := json.Marshal(struct {
 		Ref                            domain.TicketRef
@@ -1144,6 +1817,177 @@ func candidateRepairCompletionDigest(value CandidateRepairCompletion) string {
 		CompletedAt                    string
 	}{value.Ref, value.TargetGeneration, value.BuilderResultAttemptID, value.BuilderResultAttempt, value.BuilderBindingTicketVersion, value.BuilderBindingFence.LeaderEpoch, value.BuilderBindingFence.RunnerEpoch, value.FinalCandidateHeadSHA, value.FinalCandidateTreeSHA, value.CompletedAt.UTC().Format(time.RFC3339Nano)})
 	return ciAuthorityDigest(body)
+}
+
+func ensureCandidateRepairCompletionAt(ctx context.Context, conn *sql.Conn, evidence CandidateEvidence, generation uint64, builder ProviderAttemptResult, authority candidateRepairBindingAuthority) error {
+	if generation != authority.context.TargetGeneration || evidence.BuilderResult.AttemptID != builder.Claim.ID || evidence.BuilderResult.Attempt != builder.Claim.Attempt || builder.Claim.Ref != evidence.Ref || builder.Claim.Phase != domain.PhaseBuild || builder.Claim.Role != "builder" || builder.Claim.ExpectedVersion < authority.context.EntryTicketVersion || builder.Claim.LeaderEpoch == 0 || builder.Claim.RunnerEpoch == 0 || evidence.Snapshot.HeadSHA != evidence.Commit.CommitOID || evidence.Snapshot.TreeSHA != evidence.Commit.TreeOID || evidence.Commit.ParentOID != authority.context.PredecessorHeadSHA {
+		return ErrEvidenceConflict
+	}
+	sourceFence := domain.Fence{LeaderEpoch: builder.Claim.LeaderEpoch, RunnerEpoch: builder.Claim.RunnerEpoch}
+	if err := ensureCandidateResultBindingRow(ctx, conn, evidence, generation, builder.Claim.ExpectedVersion, sourceFence); err != nil {
+		return err
+	}
+	var phase, role, state, outcome string
+	if err := conn.QueryRowContext(ctx, `SELECT a.phase,a.role,a.state,a.outcome FROM provider_attempts a JOIN provider_attempt_results r ON r.provider_attempt_id=a.id WHERE a.id=? AND a.attempt=?`, builder.Claim.ID, builder.Claim.Attempt).Scan(&phase, &role, &state, &outcome); err != nil || phase != "build" || role != "builder" || state != "completed" || outcome != "completed" {
+		return ErrEvidenceConflict
+	}
+	var stored CandidateRepairCompletion
+	var completedAt string
+	err := conn.QueryRowContext(ctx, `SELECT builder_result_attempt_id,builder_result_attempt,builder_binding_ticket_version,builder_binding_leader_epoch,builder_binding_runner_epoch,final_candidate_head_sha,final_candidate_tree_sha,completion_digest,completed_at FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, generation).Scan(&stored.BuilderResultAttemptID, &stored.BuilderResultAttempt, &stored.BuilderBindingTicketVersion, &stored.BuilderBindingFence.LeaderEpoch, &stored.BuilderBindingFence.RunnerEpoch, &stored.FinalCandidateHeadSHA, &stored.FinalCandidateTreeSHA, &stored.CompletionDigest, &completedAt)
+	if err == nil {
+		stored.Ref, stored.TargetGeneration = evidence.Ref, generation
+		stored.CompletedAt, err = time.Parse(time.RFC3339Nano, completedAt)
+		if err != nil || stored.BuilderResultAttemptID != builder.Claim.ID || stored.BuilderResultAttempt != builder.Claim.Attempt || stored.BuilderBindingTicketVersion != builder.Claim.ExpectedVersion || stored.BuilderBindingFence != sourceFence || stored.FinalCandidateHeadSHA != evidence.Snapshot.HeadSHA || stored.FinalCandidateTreeSHA != evidence.Snapshot.TreeSHA || stored.CompletionDigest != candidateRepairCompletionDigest(stored) {
+			return ErrEvidenceConflict
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	completed := time.Now().UTC()
+	input := CandidateRepairCompletion{
+		Ref: evidence.Ref, TargetGeneration: generation,
+		BuilderResultAttemptID: builder.Claim.ID, BuilderResultAttempt: builder.Claim.Attempt,
+		BuilderBindingTicketVersion: builder.Claim.ExpectedVersion, BuilderBindingFence: sourceFence,
+		FinalCandidateHeadSHA: evidence.Snapshot.HeadSHA, FinalCandidateTreeSHA: evidence.Snapshot.TreeSHA,
+		CompletedAt: completed,
+	}
+	input.CompletionDigest = candidateRepairCompletionDigest(input)
+	_, err = conn.ExecContext(ctx, `INSERT INTO candidate_repair_completions(channel,project_id,ticket_id,target_generation,builder_result_attempt_id,builder_result_attempt,builder_result_phase,builder_result_role,builder_binding_ticket_version,builder_binding_leader_epoch,builder_binding_runner_epoch,final_candidate_head_sha,final_candidate_tree_sha,completion_digest,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, generation, builder.Claim.ID, builder.Claim.Attempt, "build", "builder", builder.Claim.ExpectedVersion, builder.Claim.LeaderEpoch, builder.Claim.RunnerEpoch, evidence.Snapshot.HeadSHA, evidence.Snapshot.TreeSHA, input.CompletionDigest, completed.Format(time.RFC3339Nano))
+	return err
+}
+
+// candidateRepairBuilderEntryResultReachesFence authenticates a completed
+// Builder result from the Store-owned red-CI repair phase entry before a
+// successor candidate/completion exists. The phase-entry binding prevents the
+// predecessor generation's Builder from being mistaken for fresh repair work.
+func candidateRepairBuilderEntryResultReachesFence(ctx context.Context, q candidateEvidenceQuerier, key ProviderAttemptResultKey, result ProviderAttemptResult, expected uint64, fence domain.Fence) error {
+	if key.Ref.Validate() != nil || key.AttemptID <= 0 || key.Attempt <= 0 || key.Phase != domain.PhaseBuild || result.Claim.ID != key.AttemptID || result.Claim.Ref != key.Ref || result.Claim.Phase != domain.PhaseBuild || result.Claim.Role != "builder" || result.Claim.Attempt != key.Attempt || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || fence.ClaimEpoch != 0 {
+		return ErrEvidenceConflict
+	}
+	authority, err := (&Store{}).candidateRepairBuildAuthorityAt(ctx, q, key.Ref, expected, fence)
+	if err != nil {
+		return err
+	}
+	if result.Claim.ExpectedVersion < authority.context.EntryTicketVersion {
+		return ErrNotFound
+	}
+	entry, err := loadCurrentProviderPhaseEntry(ctx, q, key.Ref, domain.PhaseBuild, result.Claim.ExpectedVersion, result.Claim.RunnerEpoch, result.Claim.LeaderEpoch)
+	if err != nil || entry.Version != authority.context.EntryTicketVersion || entry.Leader != authority.context.EntryFence.LeaderEpoch || entry.Runner != authority.context.EntryFence.RunnerEpoch || entry.From != domain.StateWaitingCI || entry.State != domain.StateBuilding || entry.Trigger != "checks_red" || entry.Digest == "" {
+		return ErrEvidenceConflict
+	}
+	var bindings int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries WHERE provider_attempt_id=? AND channel=? AND project_id=? AND ticket_id=? AND phase='build' AND role='builder' AND attempt=? AND entry_ticket_version=?`, key.AttemptID, key.Ref.Channel, key.Ref.Project, key.Ref.Ticket, key.Attempt, authority.context.EntryTicketVersion).Scan(&bindings); err != nil || bindings != 1 {
+		return ErrEvidenceConflict
+	}
+	return nil
+}
+
+// completedCandidateRepairContextAt authenticates a repaired candidate after
+// its Building lifecycle may already have advanced. It starts from the exact
+// immutable checks_red entry stored in the repair binding and then requires
+// the candidate/result completion to reach the candidate's recorded fence.
+func completedCandidateRepairContextAt(ctx context.Context, q candidateEvidenceQuerier, stored StoredCandidate, builder ProviderAttemptResult) (CandidateRepairBuildContext, error) {
+	if stored.Snapshot.Generation == 0 || stored.BuilderResult.AttemptID <= 0 || stored.BuilderResult.Ref.Validate() != nil || stored.BuilderResult.Ref != builder.Claim.Ref || stored.BuilderResult.AttemptID != builder.Claim.ID || stored.BuilderResult.Attempt != builder.Claim.Attempt {
+		return CandidateRepairBuildContext{}, ErrEvidenceConflict
+	}
+	var entryVersion, consumedLeader, consumedRunner uint64
+	err := q.QueryRowContext(ctx, `SELECT red_transition_ticket_version,consumed_leader_epoch,consumed_runner_epoch FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, stored.BuilderResult.Ref.Channel, stored.BuilderResult.Ref.Project, stored.BuilderResult.Ref.Ticket, stored.Snapshot.Generation).Scan(&entryVersion, &consumedLeader, &consumedRunner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CandidateRepairBuildContext{}, ErrNotFound
+	}
+	if err != nil || entryVersion == 0 || consumedLeader == 0 || consumedRunner == 0 {
+		return CandidateRepairBuildContext{}, ErrEvidenceConflict
+	}
+	authority, err := (&Store{}).candidateRepairBuildAuthorityHistoricalAt(ctx, q, stored.BuilderResult.Ref, entryVersion, domain.Fence{LeaderEpoch: consumedLeader, RunnerEpoch: consumedRunner})
+	if err != nil || authority.context.TargetGeneration != stored.Snapshot.Generation || stored.Commit.ParentOID != authority.context.PredecessorHeadSHA || stored.Snapshot.VerificationIntentDigest != authority.context.Verification.Revision.IntentDigest || stored.Snapshot.ProofDigest != authority.context.Verification.Revision.ProofDigest {
+		return CandidateRepairBuildContext{}, ErrEvidenceConflict
+	}
+	if candidateRepairBuilderResultReachesHistoricalFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence) != nil {
+		return CandidateRepairBuildContext{}, ErrEvidenceConflict
+	}
+	return authority.context, nil
+}
+
+// candidateRepairBuilderResultReachesFence authenticates the one correction
+// path whose Builder result cannot be replayed through the generic ticket-wide
+// provider authority. A red-CI repair deliberately retains the prior
+// publication generation, so its immutable completion is the narrow source
+// anchor for the successor Builder result and the signed recovery/control
+// suffix to the current Building owner.
+func candidateRepairBuilderResultReachesFence(ctx context.Context, q candidateEvidenceQuerier, key ProviderAttemptResultKey, result ProviderAttemptResult, expected uint64, fence domain.Fence) error {
+	return candidateRepairBuilderResultReachesFenceAtMode(ctx, q, key, result, expected, fence, false)
+}
+
+// candidateRepairBuilderResultReachesHistoricalFence authenticates an
+// immutable repair completion at its recorded endpoint while permitting a
+// later, independently signed recovery suffix. It is intentionally narrower
+// than the live helper above: callers must separately authenticate the suffix
+// from this stored endpoint to their current owner.
+func candidateRepairBuilderResultReachesHistoricalFence(ctx context.Context, q candidateEvidenceQuerier, key ProviderAttemptResultKey, result ProviderAttemptResult, expected uint64, fence domain.Fence) error {
+	return candidateRepairBuilderResultReachesFenceAtMode(ctx, q, key, result, expected, fence, true)
+}
+
+func candidateRepairBuilderResultReachesFenceAtMode(ctx context.Context, q candidateEvidenceQuerier, key ProviderAttemptResultKey, result ProviderAttemptResult, expected uint64, fence domain.Fence, allowFutureRecovery bool) error {
+	if key.Ref.Validate() != nil || key.AttemptID <= 0 || key.Attempt <= 0 || key.Phase != domain.PhaseBuild || result.Claim.ID != key.AttemptID || result.Claim.Ref != key.Ref || result.Claim.Phase != domain.PhaseBuild || result.Claim.Role != "builder" || result.Claim.Attempt != key.Attempt || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || fence.ClaimEpoch != 0 {
+		return ErrEvidenceConflict
+	}
+	var count int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND builder_result_attempt_id=? AND builder_result_attempt=?`, key.Ref.Channel, key.Ref.Project, key.Ref.Ticket, key.AttemptID, key.Attempt).Scan(&count); err != nil {
+		return err
+	}
+	if count == 0 {
+		return ErrNotFound
+	}
+	if count != 1 {
+		return ErrEvidenceConflict
+	}
+	var completion CandidateRepairCompletion
+	var completedAt string
+	if err := q.QueryRowContext(ctx, `SELECT target_generation,builder_binding_ticket_version,builder_binding_leader_epoch,builder_binding_runner_epoch,final_candidate_head_sha,final_candidate_tree_sha,completion_digest,completed_at
+		FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND builder_result_attempt_id=? AND builder_result_attempt=?`, key.Ref.Channel, key.Ref.Project, key.Ref.Ticket, key.AttemptID, key.Attempt).Scan(&completion.TargetGeneration, &completion.BuilderBindingTicketVersion, &completion.BuilderBindingFence.LeaderEpoch, &completion.BuilderBindingFence.RunnerEpoch, &completion.FinalCandidateHeadSHA, &completion.FinalCandidateTreeSHA, &completion.CompletionDigest, &completedAt); err != nil {
+		return ErrEvidenceConflict
+	}
+	completion.Ref, completion.BuilderResultAttemptID, completion.BuilderResultAttempt = key.Ref, key.AttemptID, key.Attempt
+	var err error
+	completion.CompletedAt, err = time.Parse(time.RFC3339Nano, completedAt)
+	if err != nil || completion.TargetGeneration == 0 || completion.BuilderBindingTicketVersion == 0 || completion.BuilderBindingFence.LeaderEpoch == 0 || completion.BuilderBindingFence.RunnerEpoch == 0 || !validOID(completion.FinalCandidateHeadSHA) || !validOID(completion.FinalCandidateTreeSHA) || completion.CompletionDigest != candidateRepairCompletionDigest(completion) {
+		return ErrEvidenceConflict
+	}
+	if result.Claim.ExpectedVersion != completion.BuilderBindingTicketVersion || result.Claim.LeaderEpoch != completion.BuilderBindingFence.LeaderEpoch || result.Claim.RunnerEpoch != completion.BuilderBindingFence.RunnerEpoch {
+		return ErrEvidenceConflict
+	}
+	var predecessor uint64
+	var snapshotHead, snapshotTree string
+	if err := q.QueryRowContext(ctx, `SELECT r.predecessor_generation,c.head_sha,c.tree_sha
+		FROM candidate_repair_bindings r JOIN candidate_snapshots c ON c.channel=r.channel AND c.project_id=r.project_id AND c.ticket_id=r.ticket_id AND c.generation=r.target_generation
+		WHERE r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.target_generation=?`, key.Ref.Channel, key.Ref.Project, key.Ref.Ticket, completion.TargetGeneration).Scan(&predecessor, &snapshotHead, &snapshotTree); err != nil || predecessor == ^uint64(0) || predecessor+1 != completion.TargetGeneration || snapshotHead != completion.FinalCandidateHeadSHA || snapshotTree != completion.FinalCandidateTreeSHA {
+		return ErrEvidenceConflict
+	}
+	var boundAttemptID int64
+	var boundAttempt int
+	if err := q.QueryRowContext(ctx, `SELECT provider_attempt_id,provider_attempt FROM candidate_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND generation=? AND binding_ticket_version=? AND leader_epoch=? AND runner_epoch=?`, key.Ref.Channel, key.Ref.Project, key.Ref.Ticket, completion.TargetGeneration, completion.BuilderBindingTicketVersion, completion.BuilderBindingFence.LeaderEpoch, completion.BuilderBindingFence.RunnerEpoch).Scan(&boundAttemptID, &boundAttempt); err != nil || boundAttemptID != key.AttemptID || boundAttempt != key.Attempt {
+		return ErrEvidenceConflict
+	}
+	if !allowFutureRecovery {
+		if err := validateRunnerRecoveryAuthority(ctx, q, key.Ref, expected, fence); err != nil {
+			return ErrStaleFence
+		}
+	}
+	if expected == completion.BuilderBindingTicketVersion && fence == completion.BuilderBindingFence {
+		return nil
+	}
+	var recoveryErr error
+	if allowFutureRecovery {
+		recoveryErr = validateRunnerRecoveryLedgerPrefix(ctx, q, key.Ref, completion.BuilderBindingTicketVersion, completion.BuilderBindingFence.RunnerEpoch, completion.BuilderBindingFence.LeaderEpoch, expected, fence.RunnerEpoch, fence.LeaderEpoch)
+	} else {
+		recoveryErr = validateRunnerRecoveryLedger(ctx, q, key.Ref, completion.BuilderBindingTicketVersion, completion.BuilderBindingFence.RunnerEpoch, completion.BuilderBindingFence.LeaderEpoch, expected, fence.RunnerEpoch, fence.LeaderEpoch)
+	}
+	if recoveryErr != nil {
+		return ErrStaleFence
+	}
+	return nil
 }
 
 // RecordCandidateRepairCompletion authenticates the successor Builder result
@@ -1241,9 +2085,9 @@ func (s *Store) LoadCIObservation(ctx context.Context, ref domain.TicketRef) (CI
 // validateCorrectionBudgetLedger rejects any correction use that is not joined
 // to its exact red transition and repair binding. A legacy/crash orphan fails
 // closed rather than silently authorizing a repair.
-func validateCorrectionBudgetLedger(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) error {
+func validateCorrectionBudgetLedger(ctx context.Context, q ciQuery, ref domain.TicketRef) error {
 	var orphanCount int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses u WHERE u.channel=? AND u.project_id=? AND u.ticket_id=? AND u.kind='correction' AND substr(u.request_id,1,7)='ci-red/' AND NOT EXISTS (
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_budget_uses u WHERE u.channel=? AND u.project_id=? AND u.ticket_id=? AND u.kind='correction' AND substr(u.request_id,1,7)='ci-red/' AND NOT EXISTS (
 		SELECT 1 FROM candidate_repair_bindings b
 		JOIN ci_transition_evidence c ON c.channel=b.channel AND c.project_id=b.project_id AND c.ticket_id=b.ticket_id AND c.candidate_generation=b.predecessor_generation AND c.candidate_head_sha=b.predecessor_head_sha AND c.candidate_tree_sha=b.predecessor_tree_sha AND c.observation_classification=b.red_observation_classification AND c.observation_digest=b.red_observation_digest AND c.prior_publication_witness_digest=b.predecessor_publication_witness_digest AND c.observation_ticket_version=b.consumed_ticket_version AND c.observation_leader_epoch=b.consumed_leader_epoch AND c.observation_runner_epoch=b.consumed_runner_epoch AND c.ticket_version=b.red_transition_ticket_version AND c.transition_digest=b.red_transition_digest
 		WHERE b.channel=u.channel AND b.project_id=u.project_id AND b.ticket_id=u.ticket_id AND b.correction_budget_kind=u.kind AND b.correction_budget_request_id=u.request_id AND b.consumed_ticket_version=u.ticket_version AND b.consumed_leader_epoch=u.leader_epoch AND b.consumed_runner_epoch=u.runner_epoch
@@ -1392,19 +2236,34 @@ func (s *Store) ConsumeCIObservation(ctx context.Context, request CIObservationT
 		resulting := domain.StateReviewing
 		trigger := "checks_green"
 		budgetAuthorized := false
+		repairLoopExhausted := false
 		if observation.Classification == "pending" {
 			resulting, trigger = domain.StateWaitingCI, "checks_pending"
 		} else if observation.Classification == "red" {
 			resulting, trigger = domain.StatePaused, "checks_red"
-			authority := CorrectionBudgetAuthority{}
-			if request.CorrectionBudget != nil {
-				authority = *request.CorrectionBudget
+			var repairBindings int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=?`, request.Ref.Channel, request.Ref.Project, request.Ref.Ticket).Scan(&repairBindings); err != nil {
+				return normalizeBusy(ctx, err)
 			}
-			var budgetErr error
-			budgetAuthorized, budgetErr = consumeCorrectionBudget(ctx, conn, authority, request.Ref, observation.ObservedTicketVersion, observation.ObservedFence, observation.ObservationDigest)
-			if budgetErr != nil {
-				return budgetErr
+			if repairBindings > 1 {
+				return ErrCIObservation
 			}
+			// v1 admits exactly one diagnosed CI repair loop. A second red
+			// observation pauses without consuming the ticket's remaining
+			// shared correction unit, which remains available to the final-review
+			// amendment authority.
+			if repairBindings == 0 {
+				authority := CorrectionBudgetAuthority{}
+				if request.CorrectionBudget != nil {
+					authority = *request.CorrectionBudget
+				}
+				var budgetErr error
+				budgetAuthorized, budgetErr = consumeCorrectionBudget(ctx, conn, authority, request.Ref, observation.ObservedTicketVersion, observation.ObservedFence, observation.ObservationDigest)
+				if budgetErr != nil {
+					return budgetErr
+				}
+			}
+			repairLoopExhausted = repairBindings == 1
 			if budgetAuthorized {
 				resulting = domain.StateBuilding
 			}
@@ -1417,7 +2276,11 @@ func (s *Store) ConsumeCIObservation(ctx context.Context, request CIObservationT
 		payload := map[string]any{"observation_digest": observation.ObservationDigest, "publication_witness_digest": observation.PublicationWitnessDigest}
 		if observation.Classification == "red" && resulting == domain.StatePaused {
 			payload["code"] = "ci_red_exhausted"
-			payload["reason"] = "required CI checks are red and no authenticated correction budget remains"
+			if repairLoopExhausted {
+				payload["reason"] = "required CI checks remain red after the single diagnosed repair loop"
+			} else {
+				payload["reason"] = "required CI checks are red and no authenticated correction budget remains"
+			}
 		} else if request.CorrectionBudget != nil && observation.Classification == "red" {
 			payload["correction_request_id"] = request.CorrectionBudget.RequestID
 		}
@@ -1503,20 +2366,28 @@ func ciTrigger(classification string) string {
 	}
 }
 
-func candidateRepairContextDigest(ref domain.TicketRef, observation CIObservation, publication PublishedCandidateEvidence, authority CorrectionBudgetAuthority, target uint64, transitionDigest string) string {
+func candidateRepairContextDigest(ref domain.TicketRef, observation CIObservation, publication PublishedCandidateEvidence, authority CorrectionBudgetAuthority, target uint64, transitionDigest, recoveryPrefixDigest string) string {
 	body, _ := json.Marshal(struct {
 		Ref                                                                                   domain.TicketRef
 		Target, Predecessor                                                                   uint64
 		Head, Tree, Witness, PRHost, PROwner, PRRepo, Branch, RemoteHead, BaseRef, RemoteBase string
-		ObservationDigest, TransitionDigest, RequestID                                        string
+		ObservationDigest, TransitionDigest, RecoveryPrefixDigest, RequestID                  string
 		TicketVersion, Leader, Runner                                                         uint64
-	}{ref, target, observation.CandidateGeneration, observation.CandidateHeadSHA, observation.CandidateTreeSHA, observation.PublicationWitnessDigest, publication.PullRequest.Repository.Host, publication.PullRequest.Repository.Owner, publication.PullRequest.Repository.Name, publication.RemoteBranchRef, publication.RemoteBranchOID, publication.PullRequest.BaseRef, publication.RemoteBaseOID, observation.ObservationDigest, transitionDigest, authority.RequestID, observation.ObservedTicketVersion, observation.ObservedFence.LeaderEpoch, observation.ObservedFence.RunnerEpoch})
+	}{ref, target, observation.CandidateGeneration, observation.CandidateHeadSHA, observation.CandidateTreeSHA, observation.PublicationWitnessDigest, publication.PullRequest.Repository.Host, publication.PullRequest.Repository.Owner, publication.PullRequest.Repository.Name, publication.RemoteBranchRef, publication.RemoteBranchOID, publication.PullRequest.BaseRef, publication.RemoteBaseOID, observation.ObservationDigest, transitionDigest, recoveryPrefixDigest, authority.RequestID, observation.ObservedTicketVersion, observation.ObservedFence.LeaderEpoch, observation.ObservedFence.RunnerEpoch})
 	return ciAuthorityDigest(body)
 }
 
 func (s *Store) recordRepairBinding(ctx context.Context, conn *sql.Conn, observation CIObservation, publication PublishedCandidateEvidence, authority CorrectionBudgetAuthority, transitionDigest string, createdAt string) error {
 	target := observation.CandidateGeneration + 1
-	contextDigest := candidateRepairContextDigest(observation.Ref, observation, publication, authority, target, transitionDigest)
+	var existing int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=?`, observation.Ref.Channel, observation.Ref.Project, observation.Ref.Ticket).Scan(&existing); err != nil || existing != 0 {
+		return ErrCIObservation
+	}
+	recoveryPrefixDigest, err := candidateRepairRecoveryPrefixDigest(ctx, conn, observation.Ref, observation.ObservedTicketVersion)
+	if err != nil {
+		return ErrCIObservation
+	}
+	contextDigest := candidateRepairContextDigest(observation.Ref, observation, publication, authority, target, transitionDigest, recoveryPrefixDigest)
 	for _, kind := range []string{"github_checks", "final_review", "approval"} {
 		result, err := conn.ExecContext(ctx, `INSERT INTO invalidation_receipts(channel,project_id,ticket_id,generation,kind,ticket_version,reason,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(channel,project_id,ticket_id,generation,kind) DO NOTHING`, observation.Ref.Channel, observation.Ref.Project, observation.Ref.Ticket, observation.CandidateGeneration, kind, observation.ObservedTicketVersion, "required CI checks failed; candidate requires repair", createdAt)
 		if err != nil {
@@ -1526,7 +2397,7 @@ func (s *Store) recordRepairBinding(ctx context.Context, conn *sql.Conn, observa
 			return ErrCIObservation
 		}
 	}
-	result, err := conn.ExecContext(ctx, `INSERT INTO candidate_repair_bindings(channel,project_id,ticket_id,target_generation,predecessor_generation,predecessor_head_sha,predecessor_tree_sha,predecessor_publication_witness_digest,pr_host,pr_owner,pr_repo,pr_number,branch_ref,remote_head_oid,base_ref,remote_base_oid,red_observation_digest,red_observation_classification,red_transition_ticket_version,red_transition_digest,correction_budget_kind,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch,repair_context_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(channel,project_id,ticket_id,target_generation) DO NOTHING`, observation.Ref.Channel, observation.Ref.Project, observation.Ref.Ticket, target, observation.CandidateGeneration, observation.CandidateHeadSHA, observation.CandidateTreeSHA, observation.PublicationWitnessDigest, publication.PullRequest.Repository.Host, publication.PullRequest.Repository.Owner, publication.PullRequest.Repository.Name, publication.PullRequest.Number, publication.RemoteBranchRef, publication.RemoteBranchOID, publication.PullRequest.BaseRef, publication.RemoteBaseOID, observation.ObservationDigest, "red", observation.ObservedTicketVersion+1, transitionDigest, "correction", authority.RequestID, observation.ObservedTicketVersion, observation.ObservedFence.LeaderEpoch, observation.ObservedFence.RunnerEpoch, contextDigest, createdAt)
+	result, err := conn.ExecContext(ctx, `INSERT INTO candidate_repair_bindings(channel,project_id,ticket_id,target_generation,predecessor_generation,predecessor_head_sha,predecessor_tree_sha,predecessor_publication_witness_digest,pr_host,pr_owner,pr_repo,pr_number,branch_ref,remote_head_oid,base_ref,remote_base_oid,red_observation_digest,red_observation_classification,red_transition_ticket_version,red_transition_digest,correction_budget_kind,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch,consumed_recovery_prefix_digest,repair_context_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, observation.Ref.Channel, observation.Ref.Project, observation.Ref.Ticket, target, observation.CandidateGeneration, observation.CandidateHeadSHA, observation.CandidateTreeSHA, observation.PublicationWitnessDigest, publication.PullRequest.Repository.Host, publication.PullRequest.Repository.Owner, publication.PullRequest.Repository.Name, publication.PullRequest.Number, publication.RemoteBranchRef, publication.RemoteBranchOID, publication.PullRequest.BaseRef, publication.RemoteBaseOID, observation.ObservationDigest, "red", observation.ObservedTicketVersion+1, transitionDigest, "correction", authority.RequestID, observation.ObservedTicketVersion, observation.ObservedFence.LeaderEpoch, observation.ObservedFence.RunnerEpoch, recoveryPrefixDigest, contextDigest, createdAt)
 	if err != nil {
 		return err
 	}

@@ -1351,3 +1351,17 @@ var migrationV54 = []string{
 	`CREATE TRIGGER provider_artifact_failures_immutable_update BEFORE UPDATE ON provider_artifact_failures BEGIN SELECT RAISE(ABORT,'provider artifact failure is immutable'); END`,
 	`CREATE TRIGGER provider_artifact_failures_immutable_delete BEFORE DELETE ON provider_artifact_failures BEGIN SELECT RAISE(ABORT,'provider artifact failure is append-only'); END`,
 }
+
+// v55 makes the candidate snapshot match its Store contract and seals the
+// runner-recovery prefix consumed by the single v1 CI-repair loop. The
+// read-only open preflight refuses every nonterminal pre-v55 repair binding:
+// its immutable context digest did not cover that prefix, and its publication
+// evidence may name a remotely merged PR. Terminal history is retained with
+// an empty compatibility value; every new binding must carry the digest.
+var migrationV55 = []string{
+	`ALTER TABLE candidate_repair_bindings ADD COLUMN consumed_recovery_prefix_digest TEXT NOT NULL DEFAULT '' CHECK(length(consumed_recovery_prefix_digest) IN (0,71))`,
+	`CREATE TRIGGER candidate_snapshots_immutable_update BEFORE UPDATE ON candidate_snapshots BEGIN SELECT RAISE(ABORT,'candidate snapshot is immutable'); END`,
+	`CREATE TRIGGER candidate_snapshots_immutable_delete BEFORE DELETE ON candidate_snapshots BEGIN SELECT RAISE(ABORT,'candidate snapshot is append-only'); END`,
+	`CREATE TRIGGER candidate_repair_bindings_prefix_required BEFORE INSERT ON candidate_repair_bindings WHEN NEW.consumed_recovery_prefix_digest='' BEGIN SELECT RAISE(ABORT,'candidate repair recovery prefix is required'); END`,
+	`CREATE TRIGGER candidate_repair_bindings_single_ticket BEFORE INSERT ON candidate_repair_bindings WHEN EXISTS(SELECT 1 FROM candidate_repair_bindings b WHERE b.channel=NEW.channel AND b.project_id=NEW.project_id AND b.ticket_id=NEW.ticket_id) BEGIN SELECT RAISE(ABORT,'only one candidate repair loop is supported'); END`,
+}

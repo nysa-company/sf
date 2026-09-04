@@ -65,6 +65,14 @@ type CIRequiredCheckPolicyObserver interface {
 	ObserveCIRequiredCheckPolicy(context.Context, PullRequestIdentity) (CIRequiredCheckPolicyObservation, error)
 }
 
+// CIRequiredChecksObserver is the narrow read-only boundary for the current
+// state of GitHub's complete required-check set. Store supplies the exact
+// published pull-request identity and persists only rows returned through this
+// interface after reauthenticating the publication and ticket fence.
+type CIRequiredChecksObserver interface {
+	RequiredChecks(context.Context, PullRequestIdentity) ([]RequiredCheck, error)
+}
+
 // PublishedPullRequestObservation is the authenticated all-state PR witness
 // used after publication. It lives in contracts so runtime composition and
 // hermetic fakes do not need to import the concrete GitHub client.

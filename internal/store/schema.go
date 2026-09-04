@@ -49,6 +49,9 @@ func (s *Store) validateSchema(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := validateCandidateRepairCompatibility(ctx, s.db, schemaVersion); err != nil {
+		return err
+	}
 	for _, required := range requiredForeignKeys {
 		if err := hasForeignKey(ctx, s.db, required.table, required.target); err != nil {
 			return err
@@ -79,6 +82,8 @@ func (s *Store) validateSchema(ctx context.Context) error {
 		"verification_result_bindings_immutable_delete",
 		"candidate_result_bindings_immutable_update",
 		"candidate_result_bindings_immutable_delete",
+		"candidate_snapshots_immutable_update",
+		"candidate_snapshots_immutable_delete",
 		"repository_command_results_immutable_update",
 		"repository_command_results_immutable_delete",
 		"verification_command_result_bindings_immutable_update",
@@ -106,6 +111,8 @@ func (s *Store) validateSchema(ctx context.Context) error {
 		"ci_required_check_policies_immutable_delete",
 		"candidate_repair_bindings_immutable_update",
 		"candidate_repair_bindings_immutable_delete",
+		"candidate_repair_bindings_prefix_required",
+		"candidate_repair_bindings_single_ticket",
 		"candidate_repair_completions_immutable_update",
 		"candidate_repair_completions_immutable_delete",
 		"final_review_repair_boundaries_immutable_update",
@@ -461,7 +468,7 @@ var requiredSchema = map[string][]string{
 	"ci_required_check_policies":           {"policy_id", "channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "publication_witness_digest", "protected_branch_ref", "protected_branch_oid", "policy_source_digest", "authenticated_principal", "policy_witness_digest", "required_set_digest", "required_check_count", "required_checks_json", "created_at"},
 	"ci_observation_checks":                {"observation_id", "observation_digest", "canonical_name", "external_id", "normalized_state", "failing_diagnostic_digest", "failing_diagnostic_text"},
 	"ci_transition_evidence":               {"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "ticket_version", "event_id", "event_created_at", "observation_classification", "observation_digest", "observation_ticket_version", "observation_leader_epoch", "observation_runner_epoch", "prior_publication_witness_digest", "prior_state", "resulting_state", "resulting_trigger", "transition_digest", "created_at"},
-	"candidate_repair_bindings":            {"channel", "project_id", "ticket_id", "target_generation", "predecessor_generation", "predecessor_head_sha", "predecessor_tree_sha", "predecessor_publication_witness_digest", "pr_host", "pr_owner", "pr_repo", "pr_number", "branch_ref", "remote_head_oid", "base_ref", "remote_base_oid", "red_observation_digest", "red_observation_classification", "red_transition_ticket_version", "red_transition_digest", "correction_budget_kind", "correction_budget_request_id", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "repair_context_digest", "created_at"},
+	"candidate_repair_bindings":            {"channel", "project_id", "ticket_id", "target_generation", "predecessor_generation", "predecessor_head_sha", "predecessor_tree_sha", "predecessor_publication_witness_digest", "pr_host", "pr_owner", "pr_repo", "pr_number", "branch_ref", "remote_head_oid", "base_ref", "remote_base_oid", "red_observation_digest", "red_observation_classification", "red_transition_ticket_version", "red_transition_digest", "correction_budget_kind", "correction_budget_request_id", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "consumed_recovery_prefix_digest", "repair_context_digest", "created_at"},
 	"candidate_repair_completions":         {"channel", "project_id", "ticket_id", "target_generation", "builder_result_attempt_id", "builder_result_attempt", "builder_result_phase", "builder_result_role", "builder_binding_ticket_version", "builder_binding_leader_epoch", "builder_binding_runner_epoch", "final_candidate_head_sha", "final_candidate_tree_sha", "completion_digest", "completed_at"},
 	"final_review_repair_boundaries":       {"channel", "project_id", "ticket_id", "target_state", "transition_ticket_version", "reviewer_attempt_id", "reviewer_attempt", "reviewer_typed_sha256", "prior_verification_revision", "amendment_reason", "requester", "correction_budget_kind", "correction_budget_request_id", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "created_at"},
 	"verification_amendment_requests":      {"channel", "project_id", "ticket_id", "transition_ticket_version", "prior_verification_revision", "prior_intent_digest", "prior_proof_digest", "prior_checkpoint_id", "builder_attempt_id", "builder_attempt", "builder_result_phase", "builder_result_role", "builder_typed_sha256", "proposed_digest", "proposed_command_json", "amendment_reason", "requester", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "correction_budget_kind", "correction_budget_request_id", "created_at"},

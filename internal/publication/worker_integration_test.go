@@ -933,6 +933,26 @@ func TestRecoveredPublishingRuntimePublishesAfterPrePublicationCrash(t *testing.
 	if priorVersion != candidate.TicketVersion+1 || priorRunner != candidate.Fence.RunnerEpoch || priorLeader != candidate.Fence.LeaderEpoch || recoveredVersion != ticket.Version || recoveredRunner != ticket.RunnerEpoch || recoveredLeader != owner.Epoch() || recoveryDigest == "" || createdAt == "" {
 		t.Fatalf("recovery ledger tuple=(%d,%d,%d)->(%d,%d,%d) digest=%q created=%q candidate=%+v ticket=%+v leader=%d", priorVersion, priorRunner, priorLeader, recoveredVersion, recoveredRunner, recoveredLeader, recoveryDigest, createdAt, candidate, ticket, owner.Epoch())
 	}
+	recoveredFence := domain.Fence{LeaderEpoch: owner.Epoch(), RunnerEpoch: ticket.RunnerEpoch}
+	reusable, err := f.db.LatestReusableProviderAttempt(f.ctx, store.LatestReusableProviderAttemptRequest{
+		Ref: f.ref, Phase: domain.PhaseBuild, Role: "builder",
+		ExpectedVersion: ticket.Version, Fence: recoveredFence,
+	})
+	if err != nil || !reusable.Recovered || reusable.Key != candidate.BuilderResult {
+		t.Fatalf("reusable builder=%+v err=%v", reusable, err)
+	}
+	if _, err := f.db.RecordCandidate(f.ctx, store.CandidateEvidence{
+		Ref: f.ref, ExpectedVersion: ticket.Version, Fence: recoveredFence,
+		Snapshot: candidate.Snapshot, BuilderResult: candidate.BuilderResult,
+		Commit: candidate.Commit, Reason: "rebind before recovered publication",
+		CommandResult: candidate.CommandBinding.Key,
+	}); err != nil {
+		t.Fatalf("rebind current publishing candidate: %v", err)
+	}
+	candidate, err = f.db.RecoverableCandidate(f.ctx, f.ref)
+	if err != nil || candidate.TicketVersion != ticket.Version || candidate.Fence != recoveredFence {
+		t.Fatalf("current publishing candidate=%+v ticket=%+v fence=%+v err=%v", candidate, ticket, recoveredFence, err)
+	}
 	runtimeWorker := localruntime.Worker{
 		Store:              f.db,
 		Publication:        publication.Worker{Store: f.db, Git: f.runner, GitHub: f.github},
@@ -946,12 +966,150 @@ func TestRecoveredPublishingRuntimePublishesAfterPrePublicationCrash(t *testing.
 		captured,
 	)
 	scheduler.AdmitPublishing = true
-	tick := scheduler.Tick(f.ctx, domain.Fence{LeaderEpoch: owner.Epoch(), RunnerEpoch: ticket.RunnerEpoch})
+	tick := scheduler.Tick(f.ctx, recoveredFence)
 	if tick.Outcome != workflowruntime.OutcomeInvoked || tick.Worker.State != domain.StateWaitingCI || !tick.Worker.Transitioned {
 		t.Fatalf("recovered publication outcome=%s worker=%+v worker_err=%v tick_err=%v", tick.Outcome, tick.Worker, captured.err, tick.Err)
 	}
 	if f.gitPushCount != 1 || f.github.MutationCount("pr_create") != 1 {
 		t.Fatalf("recovered publication mutations push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
+	}
+}
+
+func TestRecoveredPublishingRuntimePublishesAfterTwoPrePublicationCrashes(t *testing.T) {
+	f := newPublicationFixture(t)
+	defer f.close()
+
+	// Crash twice after the durable building->publishing transition and before
+	// the first publication effect. Each daemon takeover must extend the signed
+	// runner-recovery chain without manufacturing publication evidence.
+	home, err := os.MkdirTemp("/tmp", "sf-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	paths, err := config.PathsFor(home, domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Backup(f.ctx, paths.Database); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	firstOwner, err := daemon.Start(f.ctx, daemon.Config{Channel: domain.ChannelDev, Paths: paths, DaemonIdentity: "publication-crash-restart-one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = firstOwner.Close() })
+	firstDB, err := store.Open(f.ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db = firstDB
+	f.runner.MutationAuthority = firstDB
+	firstTicket, err := firstDB.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := firstDB.RecoverableCandidate(f.ctx, f.ref)
+	if err != nil {
+		t.Fatalf("first recoverable candidate: %v", err)
+	}
+	firstFence := domain.Fence{LeaderEpoch: firstOwner.Epoch(), RunnerEpoch: firstTicket.RunnerEpoch}
+	if firstTicket.Version != candidate.TicketVersion+2 {
+		t.Fatalf("first recovery version=%d candidate_version=%d", firstTicket.Version, candidate.TicketVersion)
+	}
+	if err := firstDB.AuthenticatePublishingRecovery(f.ctx, f.ref, candidate, firstTicket.Version, firstFence); err != nil {
+		t.Fatalf("first publishing recovery chain: %v candidate=%+v ticket=%+v", err, candidate, firstTicket)
+	}
+	if _, err := firstDB.LoadPublishedCandidate(f.ctx, f.ref); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("first recovery manufactured publication evidence: %v", err)
+	}
+	if err := firstDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.db = nil
+	if err := firstOwner.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	secondOwner, err := daemon.Start(f.ctx, daemon.Config{Channel: domain.ChannelDev, Paths: paths, DaemonIdentity: "publication-crash-restart-two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondOwner.Close()
+	secondDB, err := store.Open(f.ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db = secondDB
+	f.runner.MutationAuthority = secondDB
+	ticket, err := secondDB.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err = secondDB.RecoverableCandidate(f.ctx, f.ref)
+	if err != nil {
+		t.Fatalf("second recoverable candidate: %v", err)
+	}
+	fence := domain.Fence{LeaderEpoch: secondOwner.Epoch(), RunnerEpoch: ticket.RunnerEpoch}
+	if ticket.Version != candidate.TicketVersion+3 {
+		t.Fatalf("second recovery version=%d candidate_version=%d", ticket.Version, candidate.TicketVersion)
+	}
+	if err := secondDB.AuthenticatePublishingRecovery(f.ctx, f.ref, candidate, ticket.Version, fence); err != nil {
+		t.Fatalf("second publishing recovery chain: %v candidate=%+v ticket=%+v", err, candidate, ticket)
+	}
+	if _, err := secondDB.LoadPublishedCandidate(f.ctx, f.ref); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("second recovery manufactured publication evidence: %v", err)
+	}
+	ledgerDB, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledgerDB.Close()
+	var recoveryRows int
+	if err := ledgerDB.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`, f.ref.Channel, f.ref.Project, f.ref.Ticket).Scan(&recoveryRows); err != nil {
+		t.Fatalf("count recovery ledger: %v", err)
+	}
+	if recoveryRows != 2 {
+		t.Fatalf("recovery ledger rows=%d want=2", recoveryRows)
+	}
+
+	worktree, err := secondDB.Worktree(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeWorker := localruntime.Worker{
+		Store:              secondDB,
+		Publication:        publication.Worker{Store: secondDB, Git: f.runner, GitHub: f.github},
+		PublicationEnabled: true,
+	}
+	captured := &capturingRuntimeWorker{worker: runtimeWorker}
+	scheduler := workflowruntime.NewScheduler(
+		f.ref.Channel,
+		workflowruntime.StoreTicketSource{Store: secondDB},
+		staticWorktreeEnsurer{worktree: worktree},
+		captured,
+	)
+	scheduler.AdmitPublishing = true
+	tick := scheduler.Tick(f.ctx, fence)
+	if tick.Outcome != workflowruntime.OutcomeInvoked || tick.Worker.State != domain.StateWaitingCI || !tick.Worker.Transitioned {
+		t.Fatalf("twice-recovered publication outcome=%s worker=%+v worker_err=%v tick_err=%v", tick.Outcome, tick.Worker, captured.err, tick.Err)
+	}
+	if f.gitPushCount != 1 || f.github.MutationCount("pr_create") != 1 {
+		t.Fatalf("twice-recovered publication mutations push=%d pr=%d", f.gitPushCount, f.github.MutationCount("pr_create"))
+	}
+	published, err := secondDB.LoadPublishedCandidate(f.ctx, f.ref)
+	if err != nil {
+		t.Fatalf("load twice-recovered publication: %v", err)
+	}
+	if published.CurrentTicketVersion != ticket.Version || published.CurrentFence != fence || published.Candidate.Snapshot != candidate.Snapshot {
+		t.Fatalf("twice-recovered publication=%+v candidate=%+v ticket=%+v fence=%+v", published, candidate, ticket, fence)
 	}
 }
 

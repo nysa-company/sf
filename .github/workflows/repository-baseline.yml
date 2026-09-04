@@ -24,6 +24,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Expose the setup toolchain at the approved repository-test path
+        run: |
+          set -eu
+          setup_go=$(command -v go)
+          sudo mkdir -p /usr/local/go/bin
+          sudo ln -sfn "$setup_go" /usr/local/go/bin/go
+          test "$(readlink /usr/local/go/bin/go)" = "$setup_go"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -43,6 +50,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Expose the setup toolchain at the approved repository-test path
+        run: |
+          set -eu
+          setup_go=$(command -v go)
+          sudo mkdir -p /usr/local/go/bin
+          sudo ln -sfn "$setup_go" /usr/local/go/bin/go
+          test "$(readlink /usr/local/go/bin/go)" = "$setup_go"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

@@ -218,6 +218,13 @@ func (o daemonCIPolicyObserver) ObserveCIRequiredCheckPolicy(context.Context, co
 	return o.observation, nil
 }
 
+func (o daemonCIPolicyObserver) RequiredChecks(_ context.Context, want contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
+	if o.observation.PullRequest != want {
+		return nil, errors.New("fixture CI pull request identity mismatch")
+	}
+	return append([]contracts.RequiredCheck(nil), o.observation.RequiredChecks...), nil
+}
+
 var daemonFixtureCommandPID int64 = 20_000
 
 func daemonFixtureDigest(value string) string {
@@ -536,19 +543,14 @@ func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain
 		t.Fatal(err)
 	}
 	fence.RunnerEpoch = ticket.RunnerEpoch
-	published, err := daemon.store.LoadPublishedCandidate(ctx, ref)
-	if err != nil {
-		t.Fatal(err)
-	}
 	policyObserver := daemonCIPolicyObserver{observation: contracts.CIRequiredCheckPolicyObservation{PullRequest: pr, ProtectedBranchRef: pr.BaseRef, ProtectedBranchOID: pr.BaseOID, PolicySourceDigest: strings.Repeat("a", 64), AuthenticatedPrincipal: "fixture", RequiredChecks: []contracts.RequiredCheck{{Name: "unit", ExternalID: "run-1", State: "success"}}, ObservedAt: time.Now().UTC()}}
 	if err := daemon.store.RecordCIRequiredCheckPolicyFromObserver(ctx, ref, policyObserver); err != nil {
 		t.Fatal(err)
 	}
-	observation := store.CIObservation{Ref: ref, CandidateGeneration: candidate.Snapshot.Generation, CandidateHeadSHA: candidate.Snapshot.HeadSHA, CandidateTreeSHA: candidate.Snapshot.TreeSHA, PublicationWitnessDigest: published.WitnessDigest, PullRequest: pr, ObservedTicketVersion: ticket.Version, ObservedFence: fence, ObservedAt: time.Now().UTC(), RequiredChecks: []store.CIObservationCheck{{CanonicalName: "unit", ExternalID: "run-1", NormalizedState: "success"}}, Classification: "green"}
-	if err := daemon.store.RecordCIObservation(ctx, observation); err != nil {
+	if err := daemon.store.RecordCIObservationFromObserver(ctx, ref, ticket.Version, fence, policyObserver); err != nil {
 		t.Fatal(err)
 	}
-	observation, err = daemon.store.LoadCurrentCIObservation(ctx, ref)
+	observation, err := daemon.store.LoadCurrentCIObservation(ctx, ref)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,39 +706,41 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				binary = "sf-dev"
 			}
 			for code, want := range map[string][]string{
-				"autonomous_unavailable":                  {binary, "submit", "--help"},
-				"runtime_activation_failed":               {binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"},
-				"runtime_already_active":                  {binary, "daemon", "status"},
-				"terminal_replay_requires_new":            {binary, "submit", "--help"},
-				"ticket_budget_exhausted":                 {binary, "cancel", "--help"},
-				"unknown_project":                         {binary, "init", "--help"},
-				"invalid_submit":                          {binary, "submit", "--help"},
-				"ticket_policy_refused":                   {binary, "submit", "--help"},
-				"invalid_logs":                            {binary, "logs", "--help"},
-				"not_ready":                               {binary, "--help"},
-				"takeover_inspection_failed":              {binary, "take", "--help"},
-				"takeover_changes_unadopted":              {binary, "take", "--help"},
-				"takeover_verification_changes_unadopted": {binary, "resume", "--help"},
-				"takeover_source_out_of_scope":            {binary, "take", "--help"},
-				"invalid_resume":                          {binary, "resume", "--help"},
-				"invalid_retry":                           {binary, "retry", "--help"},
-				"invalid_recover":                         {binary, "recover", "--help"},
-				"runtime_rearm_unavailable":               {binary, "resume", "--help"},
-				"runtime_rearm_failed":                    {binary, "resume", "--help"},
-				"resume_state_unavailable":                {binary, "resume", "--help"},
-				"resume_transition_refused":               {binary, "resume", "--help"},
-				"retry_state_unavailable":                 {binary, "retry", "--help"},
-				"retry_not_available":                     {binary, "retry", "--help"},
-				"retry_transition_refused":                {binary, "retry", "--help"},
-				"retry_required":                          {binary, "retry", "--help"},
-				"provider_retry_exhausted":                {binary, "cancel", "--help"},
-				"provider_retry_resubmit_required":        {binary, "cancel", "--help"},
-				"provider_retry_worktree_unavailable":     {binary, "retry", "--help"},
-				"provider_retry_worktree_unready":         {binary, "take", "--help"},
-				"provider_retry_rearm_blocked":            {binary, "show", "--help"},
-				"recover_mode_refused":                    {binary, "recover", "--help"},
-				"recover_transition_refused":              {binary, "recover", "--help"},
-				"other":                                   {binary, "doctor"},
+				"autonomous_unavailable":                        {binary, "submit", "--help"},
+				"runtime_activation_failed":                     {binary, "providers", "qualify", "--builder", "codex", "--reviewer", "codex"},
+				"runtime_already_active":                        {binary, "daemon", "status"},
+				"terminal_replay_requires_new":                  {binary, "submit", "--help"},
+				"ticket_budget_exhausted":                       {binary, "cancel", "--help"},
+				"verification_amendment_invalid":                {binary, "cancel", "--help"},
+				"legacy_candidate_repair_recovery_unverifiable": {binary, "cancel", "--help"},
+				"unknown_project":                               {binary, "init", "--help"},
+				"invalid_submit":                                {binary, "submit", "--help"},
+				"ticket_policy_refused":                         {binary, "submit", "--help"},
+				"invalid_logs":                                  {binary, "logs", "--help"},
+				"not_ready":                                     {binary, "--help"},
+				"takeover_inspection_failed":                    {binary, "take", "--help"},
+				"takeover_changes_unadopted":                    {binary, "take", "--help"},
+				"takeover_verification_changes_unadopted":       {binary, "resume", "--help"},
+				"takeover_source_out_of_scope":                  {binary, "take", "--help"},
+				"invalid_resume":                                {binary, "resume", "--help"},
+				"invalid_retry":                                 {binary, "retry", "--help"},
+				"invalid_recover":                               {binary, "recover", "--help"},
+				"runtime_rearm_unavailable":                     {binary, "resume", "--help"},
+				"runtime_rearm_failed":                          {binary, "resume", "--help"},
+				"resume_state_unavailable":                      {binary, "resume", "--help"},
+				"resume_transition_refused":                     {binary, "resume", "--help"},
+				"retry_state_unavailable":                       {binary, "retry", "--help"},
+				"retry_not_available":                           {binary, "retry", "--help"},
+				"retry_transition_refused":                      {binary, "retry", "--help"},
+				"retry_required":                                {binary, "retry", "--help"},
+				"provider_retry_exhausted":                      {binary, "cancel", "--help"},
+				"provider_retry_resubmit_required":              {binary, "cancel", "--help"},
+				"provider_retry_worktree_unavailable":           {binary, "retry", "--help"},
+				"provider_retry_worktree_unready":               {binary, "take", "--help"},
+				"provider_retry_rearm_blocked":                  {binary, "show", "--help"},
+				"recover_mode_refused":                          {binary, "recover", "--help"},
+				"recover_transition_refused":                    {binary, "recover", "--help"},
+				"other":                                         {binary, "doctor"},
 			} {
 				response := d.failure(api.Request{Version: api.Version, RequestID: "failure-actions", Method: "ticket.submit"}, code, "failed", false)
 				if response.NextAction == nil || strings.Join(response.NextAction.Argv, "\x00") != strings.Join(want, "\x00") {
@@ -750,36 +754,38 @@ func TestDaemonFailureActionsUseTheDaemonChannelExecutable(t *testing.T) {
 				}
 			}
 			for code, want := range map[string][]string{
-				"invalid_control":                         {binary, "pause", "--help"},
-				"invalid_ticket_reference":                {binary, "pause", "--help"},
-				"invalid_transition":                      {binary, "status", "SF-action"},
-				"external_merge_observed":                 {binary, "status", "SF-action"},
-				"external_state_unavailable":              {binary, "status", "SF-action"},
-				"blocked_process":                         {binary, "status", "SF-action"},
-				"uncertain_effect":                        {binary, "status", "SF-action"},
-				"takeover_changes_unadopted":              {binary, "take", "SF-action"},
-				"takeover_verification_changes_unadopted": {binary, "resume", "SF-action"},
-				"takeover_source_out_of_scope":            {binary, "take", "SF-action"},
-				"takeover_inspection_failed":              {binary, "take", "SF-action"},
-				"retry_required":                          {binary, "retry", "SF-action"},
-				"invalid_resume":                          {binary, "resume", "--help"},
-				"invalid_retry":                           {binary, "retry", "--help"},
-				"invalid_recover":                         {binary, "recover", "--help"},
-				"runtime_rearm_unavailable":               {binary, "resume", "SF-action"},
-				"runtime_rearm_failed":                    {binary, "resume", "SF-action"},
-				"resume_state_unavailable":                {binary, "resume", "SF-action"},
-				"resume_transition_refused":               {binary, "resume", "SF-action"},
-				"retry_state_unavailable":                 {binary, "retry", "SF-action"},
-				"retry_not_available":                     {binary, "retry", "SF-action"},
-				"retry_transition_refused":                {binary, "retry", "SF-action"},
-				"provider_retry_exhausted":                {binary, "cancel", "SF-action"},
-				"provider_retry_resubmit_required":        {binary, "cancel", "SF-action"},
-				"provider_retry_worktree_unavailable":     {binary, "retry", "SF-action"},
-				"provider_retry_worktree_unready":         {binary, "take", "SF-action"},
-				"provider_retry_rearm_blocked":            {binary, "show", "SF-action"},
-				"recover_mode_refused":                    {binary, "recover", "SF-action"},
-				"recover_transition_refused":              {binary, "recover", "SF-action"},
-				"ticket_budget_exhausted":                 {binary, "cancel", "SF-action"},
+				"invalid_control":                               {binary, "pause", "--help"},
+				"invalid_ticket_reference":                      {binary, "pause", "--help"},
+				"invalid_transition":                            {binary, "status", "SF-action"},
+				"external_merge_observed":                       {binary, "status", "SF-action"},
+				"external_state_unavailable":                    {binary, "status", "SF-action"},
+				"blocked_process":                               {binary, "status", "SF-action"},
+				"uncertain_effect":                              {binary, "status", "SF-action"},
+				"takeover_changes_unadopted":                    {binary, "take", "SF-action"},
+				"takeover_verification_changes_unadopted":       {binary, "resume", "SF-action"},
+				"takeover_source_out_of_scope":                  {binary, "take", "SF-action"},
+				"takeover_inspection_failed":                    {binary, "take", "SF-action"},
+				"retry_required":                                {binary, "retry", "SF-action"},
+				"invalid_resume":                                {binary, "resume", "--help"},
+				"invalid_retry":                                 {binary, "retry", "--help"},
+				"invalid_recover":                               {binary, "recover", "--help"},
+				"runtime_rearm_unavailable":                     {binary, "resume", "SF-action"},
+				"runtime_rearm_failed":                          {binary, "resume", "SF-action"},
+				"resume_state_unavailable":                      {binary, "resume", "SF-action"},
+				"resume_transition_refused":                     {binary, "resume", "SF-action"},
+				"retry_state_unavailable":                       {binary, "retry", "SF-action"},
+				"retry_not_available":                           {binary, "retry", "SF-action"},
+				"retry_transition_refused":                      {binary, "retry", "SF-action"},
+				"provider_retry_exhausted":                      {binary, "cancel", "SF-action"},
+				"provider_retry_resubmit_required":              {binary, "cancel", "SF-action"},
+				"provider_retry_worktree_unavailable":           {binary, "retry", "SF-action"},
+				"provider_retry_worktree_unready":               {binary, "take", "SF-action"},
+				"provider_retry_rearm_blocked":                  {binary, "show", "SF-action"},
+				"recover_mode_refused":                          {binary, "recover", "SF-action"},
+				"recover_transition_refused":                    {binary, "recover", "SF-action"},
+				"ticket_budget_exhausted":                       {binary, "cancel", "SF-action"},
+				"verification_amendment_invalid":                {binary, "cancel", "SF-action"},
+				"legacy_candidate_repair_recovery_unverifiable": {binary, "cancel", "SF-action"},
 			} {
 				request := api.Request{Version: api.Version, RequestID: "control-actions", Method: "ticket.pause", Ticket: "SF-action"}
 				response := d.failure(request, code, "failed", false)
@@ -2003,7 +2009,7 @@ func TestDaemonRecoverUsesTypedBlockerAndGuardedNarrowing(t *testing.T) {
 		t.Fatalf("budget recovery=%+v drains=%d ticket=%+v err=%v", budgetResponse, budgetDrains, currentBudget, currentErr)
 	}
 
-	for _, blocker := range []string{"provider_result_indeterminate", "provider_repair_unavailable"} {
+	for _, blocker := range []string{"provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable"} {
 		blockerDaemon, blockerPaths, _ := testDaemonForChannelWithProjectMaximum(t, domain.ChannelStable, domain.MergeGuarded)
 		blocked := createAndStartControlTicket(t, blockerDaemon, domain.TicketID("SF-"+blocker+"-recover"))
 		writer, err := sql.Open("sqlite", blockerPaths.Database)
@@ -2027,11 +2033,13 @@ func TestDaemonRecoverUsesTypedBlockerAndGuardedNarrowing(t *testing.T) {
 			drains++
 			return true, nil
 		}}
-		response := daemonControl(blockerDaemon, blocked.Ref.Ticket, "recover")
-		current, currentErr := blockerDaemon.store.Ticket(ctx, blocked.Ref)
-		wantAction := "sf cancel " + string(blocked.Ref.Ticket)
-		if response.OK || response.Error == nil || response.Error.Code != blocker || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != wantAction || drains != 0 || currentErr != nil || current.State != domain.StateBlocked || current.Version != blocked.Version+1 {
-			t.Fatalf("%s recovery=%+v drains=%d ticket=%+v err=%v", blocker, response, drains, current, currentErr)
+		for _, intent := range []string{"recover", "resume", "retry"} {
+			response := daemonControl(blockerDaemon, blocked.Ref.Ticket, intent)
+			current, currentErr := blockerDaemon.store.Ticket(ctx, blocked.Ref)
+			wantAction := "sf cancel " + string(blocked.Ref.Ticket)
+			if response.OK || response.Error == nil || response.Error.Code != blocker || response.NextAction == nil || strings.Join(response.NextAction.Argv, " ") != wantAction || drains != 0 || currentErr != nil || current.State != domain.StateBlocked || current.Version != blocked.Version+1 {
+				t.Fatalf("%s %s=%+v drains=%d ticket=%+v err=%v", blocker, intent, response, drains, current, currentErr)
+			}
 		}
 	}
 
@@ -2301,7 +2309,7 @@ func TestDaemonNonrecoverableBlockersExposeDevCancelAction(t *testing.T) {
 	}
 	defer writer.Close()
 
-	for _, code := range []string{"ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable"} {
+	for _, code := range []string{"ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable"} {
 		if _, err := writer.ExecContext(context.Background(), `UPDATE tickets SET state='blocked',resume_state='planning',blocked_code=?,version=version+1 WHERE channel='dev' AND project_id='demo' AND id=?`, code, blocked.Ref.Ticket); err != nil {
 			t.Fatal(err)
 		}

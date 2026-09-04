@@ -62,6 +62,8 @@ type phaseStore struct {
 	proof     store.OperatorSourceResumeProof
 	proofOK   bool
 	amendment *store.VerificationAmendment
+	repair    *store.CandidateRepairBuildContext
+	repairErr error
 	final     *store.FinalReviewAuthority
 	results   map[int64]store.ProviderAttemptResult
 	parsed    map[int64]phaseartifact.Parsed
@@ -106,6 +108,15 @@ func (s *phaseStore) PendingVerificationAmendment(context.Context, domain.Ticket
 		return store.VerificationAmendment{}, store.ErrNotFound
 	}
 	return *s.amendment, nil
+}
+func (s *phaseStore) CandidateRepairBuildContext(context.Context, domain.TicketRef, uint64, domain.Fence) (store.CandidateRepairBuildContext, error) {
+	if s.repairErr != nil {
+		return store.CandidateRepairBuildContext{}, s.repairErr
+	}
+	if s.repair == nil {
+		return store.CandidateRepairBuildContext{}, store.ErrNotFound
+	}
+	return *s.repair, nil
 }
 func (s *phaseStore) FinalReviewAuthority(context.Context, domain.TicketRef, uint64, domain.Fence) (store.FinalReviewAuthority, error) {
 	if s.final != nil {

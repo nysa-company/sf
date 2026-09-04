@@ -273,7 +273,7 @@ func validPublishedCandidateEvidence(value PublishedCandidateEvidence) error {
 	if _, ok := canonicalPublicationTime(value.CreatedAt); !ok {
 		return ErrPublicationEvidence
 	}
-	if value.Ref.Validate() != nil || value.TicketVersion == 0 || value.Fence.LeaderEpoch == 0 || value.Fence.RunnerEpoch == 0 || value.Fence.ClaimEpoch != 0 || validateCandidate(value.Candidate.Snapshot) != nil || (value.Candidate.TicketVersion+1 != value.TicketVersion && (value.Candidate.TicketVersion == ^uint64(0) || value.Candidate.TicketVersion+2 != value.TicketVersion)) || value.Candidate.Fence.LeaderEpoch == 0 || value.Candidate.Fence.RunnerEpoch == 0 || value.Candidate.Fence.ClaimEpoch != 0 || value.Candidate.BuilderResult.AttemptID <= 0 || value.Candidate.BuilderResult.Attempt <= 0 || !validOID(value.Candidate.Commit.ParentOID) || value.Candidate.CommandBinding.Key.SemanticKey == "" || value.Candidate.CommandBinding.Key.ClaimEpoch == 0 || !validClaimDigest(value.Candidate.CommandBinding.CommandDigest) || !validClaimDigest(value.Candidate.CommandBinding.SpecDigest) || !validClaimDigest(value.Candidate.CommandBinding.PolicyDigest) || !validStorePath(value.Candidate.CommandBinding.ExecutablePath) || !validRepositoryExecutableDigest(value.Candidate.CommandBinding.ExecutablePath, value.Candidate.CommandBinding.ExecutableDigest) || value.ConfigGeneration == 0 || !validDigest(value.ConfigDigest) || !validDigest(value.ConfigSnapshotDigest) || !validStorePath(value.Worktree.Path) || !boundedText(value.Worktree.Branch, 300) || !boundedText(value.Worktree.State, 100) || !validJSON(value.Worktree.IdentityJSON) || !validOID(value.Worktree.BaseSHA) || value.Worktree.TicketVersion == 0 || value.Worktree.Fence.LeaderEpoch == 0 || value.Worktree.Fence.RunnerEpoch == 0 || value.Worktree.Fence.ClaimEpoch != 0 || !validPublicationRef(value.RemoteBranchRef) || !validOID(value.RemoteBranchOID) || !validOID(value.RemoteBaseOID) || value.RemoteBranchOID != value.Candidate.Snapshot.HeadSHA || value.RemoteBranchRef != value.Worktree.Branch || value.Worktree.BaseSHA != value.Candidate.Snapshot.BaseSHA || value.RemoteBaseOID != value.Worktree.BaseSHA || !validPublicationEffect(value.PushEffect) || !validPublicationEffect(value.PRCreateOrUpdateEffect) || value.PushEffect.Kind != PublicationPushEffectKind || (value.PRCreateOrUpdateEffect.Kind != PublicationPRCreateEffectKind && value.PRCreateOrUpdateEffect.Kind != PublicationPRUpdateEffectKind) || value.PushEffect.SemanticKey == value.PRCreateOrUpdateEffect.SemanticKey || validPublicationPR(value.PullRequest, value.PullRequestState, value.PullRequestDraft, value.PullRequestObservedAt) == false || value.PullRequest.HeadOwner != value.PullRequest.Repository.Owner || value.PullRequest.HeadRepository != value.PullRequest.Repository.Name || value.PullRequest.HeadOID != value.Candidate.Snapshot.HeadSHA || value.PullRequest.BaseOID != value.RemoteBaseOID || value.PullRequest.HeadRef != value.Worktree.Branch || value.PullRequest.BaseRef == "" || !publicationOriginsMatch(value.Worktree.IdentityJSON, value.PullRequest, value.RemoteBaseOID) {
+	if value.Ref.Validate() != nil || value.TicketVersion == 0 || value.Fence.LeaderEpoch == 0 || value.Fence.RunnerEpoch == 0 || value.Fence.ClaimEpoch != 0 || validateCandidate(value.Candidate.Snapshot) != nil || value.Candidate.TicketVersion == 0 || value.Candidate.TicketVersion > value.TicketVersion || value.Candidate.Fence.LeaderEpoch == 0 || value.Candidate.Fence.RunnerEpoch == 0 || value.Candidate.Fence.ClaimEpoch != 0 || value.Candidate.BuilderResult.AttemptID <= 0 || value.Candidate.BuilderResult.Attempt <= 0 || !validOID(value.Candidate.Commit.ParentOID) || value.Candidate.CommandBinding.Key.SemanticKey == "" || value.Candidate.CommandBinding.Key.ClaimEpoch == 0 || !validClaimDigest(value.Candidate.CommandBinding.CommandDigest) || !validClaimDigest(value.Candidate.CommandBinding.SpecDigest) || !validClaimDigest(value.Candidate.CommandBinding.PolicyDigest) || !validStorePath(value.Candidate.CommandBinding.ExecutablePath) || !validRepositoryExecutableDigest(value.Candidate.CommandBinding.ExecutablePath, value.Candidate.CommandBinding.ExecutableDigest) || value.ConfigGeneration == 0 || !validDigest(value.ConfigDigest) || !validDigest(value.ConfigSnapshotDigest) || !validStorePath(value.Worktree.Path) || !boundedText(value.Worktree.Branch, 300) || !boundedText(value.Worktree.State, 100) || !validJSON(value.Worktree.IdentityJSON) || !validOID(value.Worktree.BaseSHA) || value.Worktree.TicketVersion == 0 || value.Worktree.Fence.LeaderEpoch == 0 || value.Worktree.Fence.RunnerEpoch == 0 || value.Worktree.Fence.ClaimEpoch != 0 || !validPublicationRef(value.RemoteBranchRef) || !validOID(value.RemoteBranchOID) || !validOID(value.RemoteBaseOID) || value.RemoteBranchOID != value.Candidate.Snapshot.HeadSHA || value.RemoteBranchRef != value.Worktree.Branch || value.Worktree.BaseSHA != value.Candidate.Snapshot.BaseSHA || value.RemoteBaseOID != value.Worktree.BaseSHA || !validPublicationEffect(value.PushEffect) || !validPublicationEffect(value.PRCreateOrUpdateEffect) || value.PushEffect.Kind != PublicationPushEffectKind || (value.PRCreateOrUpdateEffect.Kind != PublicationPRCreateEffectKind && value.PRCreateOrUpdateEffect.Kind != PublicationPRUpdateEffectKind) || value.PushEffect.SemanticKey == value.PRCreateOrUpdateEffect.SemanticKey || validPublicationPR(value.PullRequest, value.PullRequestState, value.PullRequestDraft, value.PullRequestObservedAt) == false || value.PullRequest.HeadOwner != value.PullRequest.Repository.Owner || value.PullRequest.HeadRepository != value.PullRequest.Repository.Name || value.PullRequest.HeadOID != value.Candidate.Snapshot.HeadSHA || value.PullRequest.BaseOID != value.RemoteBaseOID || value.PullRequest.HeadRef != value.Worktree.Branch || value.PullRequest.BaseRef == "" || !publicationOriginsMatch(value.Worktree.IdentityJSON, value.PullRequest, value.RemoteBaseOID) {
 		return ErrPublicationEvidence
 	}
 	if value.Candidate.CommandBinding.PolicyDigest != "sha256:"+value.Candidate.Snapshot.CommandPolicyDigest {
@@ -338,16 +338,15 @@ func (s *Store) RecordPublishedCandidate(ctx context.Context, value PublishedCan
 		if generation != value.Candidate.Snapshot.Generation || candidate != value.Candidate.Snapshot {
 			return ErrPublicationEvidence
 		}
-		buildVersion := value.Candidate.TicketVersion + 1
-		if value.TicketVersion == value.Candidate.TicketVersion+2 {
-			// The candidate-only crash window is building->publishing at
-			// candidate+1 followed by the first daemon takeover at candidate+2.
-			// Authenticate both exact endpoints; do not infer publication from
-			// the counter gap.
-			if err := authenticateRunnerRecoveryStep(ctx, conn, value.Ref, value.Candidate.TicketVersion+1, value.Candidate.Fence, value.TicketVersion, value.Fence); err != nil {
-				return ErrPublicationEvidence
-			}
-		} else if value.TicketVersion != buildVersion {
+		if err := s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, conn, value.Ref, value.Candidate, value.TicketVersion, value.Fence, false); err != nil {
+			return ErrPublicationEvidence
+		}
+		checkpointVersion, _, err := candidateSnapshotEndpointAt(ctx, conn, value.Ref, value.Candidate)
+		if err != nil {
+			return ErrPublicationEvidence
+		}
+		buildVersion, err := candidatePublishingTransitionVersionAt(ctx, conn, value.Ref, checkpointVersion, value.TicketVersion)
+		if err != nil {
 			return ErrPublicationEvidence
 		}
 		var consumed int
@@ -358,7 +357,6 @@ func (s *Store) RecordPublishedCandidate(ctx context.Context, value PublishedCan
 		if err := conn.QueryRowContext(ctx, `SELECT created_at FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, buildVersion).Scan(&buildEventCreated); err != nil {
 			return ErrPublicationEvidence
 		}
-		var err error
 		if value.BuildTransitionCreatedAt, err = parsePublicationTime(buildEventCreated); err != nil {
 			return ErrPublicationEvidence
 		}
@@ -425,6 +423,25 @@ func semanticPublicationBlockTransition(transition Transition) bool {
 	return transition.Trigger == "typed_blocker" && transition.To == domain.StateBlocked && transition.ResumeState == transition.From && (transition.From == domain.StatePublishing || transition.From == domain.StateWaitingCI)
 }
 
+// validateCandidateOnlyPublicationControl permits a latest candidate to pause
+// or block before its external witness exists, while refusing to hide an
+// unresolved publication or merge mutation. Confirmed/failed effects from an
+// older generation are immutable history and do not make the new generation's
+// control boundary ambiguous.
+func validateCandidateOnlyPublicationControl(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef) error {
+	var unresolved, mergeIntents int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND effect_kind NOT IN ('git/create-worktree','git/commit','repository_command') AND state IN ('planned','executing','uncertain')`, ref.Channel, ref.Project, ref.Ticket).Scan(&unresolved); err != nil {
+		return err
+	}
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM merge_intents WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&mergeIntents); err != nil {
+		return err
+	}
+	if unresolved != 0 || mergeIntents != 0 {
+		return ErrPublicationBlockUnsafe
+	}
+	return nil
+}
+
 // TransitionPublishedBlock records a typed publication blocker only after the
 // current publication witness (and, for waiting_ci, its effects event) is
 // authenticated. The blocked recovery boundary then proves this exact event.
@@ -454,15 +471,51 @@ func (s *Store) TransitionPublishedBlock(ctx context.Context, transition Transit
 		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
 			return err
 		}
-		publication, found, err := loadPublicationEvidenceRow(ctx, conn, transition.Ref)
-		if err != nil {
-			return ErrPublicationEvidence
+		// The pre-publishing-only composition predates candidate authority and
+		// can encounter a legacy publishing ticket with no publication rows at
+		// all. Classify that exact absence before parsing any evidence; every row
+		// that exists must still authenticate through the strict path below.
+		var publications, candidates int
+		if err := conn.QueryRowContext(ctx, `SELECT
+			(SELECT COUNT(*) FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=?),
+			(SELECT COUNT(*) FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=?)`,
+			transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket,
+			transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&publications, &candidates); err != nil {
+			return err
 		}
-		if !found {
-			// A local runtime may discover its publication capability is absent
-			// before it has planned any public effect. It may only fail closed
-			// when this transaction proves that no external identity exists.
+		legacyPrePublishing := publications == 0 && candidates == 0
+		var publication PublishedCandidateEvidence
+		var candidate StoredCandidate
+		var hasCurrentPublication bool
+		if !legacyPrePublishing {
+			var err error
+			publication, candidate, hasCurrentPublication, err = s.publicationForLatestCandidateFrom(ctx, conn, transition.Ref)
+			if err != nil {
+				return ErrPublicationEvidence
+			}
+		}
+		if legacyPrePublishing {
+			if state != domain.StatePublishing {
+				return ErrPublicationEvidence
+			}
+			// No candidate means there is no recovery authority to preserve. Use
+			// the stricter legacy proof: every publication/merge effect, including
+			// confirmed or failed history, must be absent before blocking.
 			if err := validatePublicationBlock(ctx, conn, transition.Ref); err != nil {
+				return err
+			}
+		} else if !hasCurrentPublication {
+			if state != domain.StatePublishing {
+				return ErrPublicationEvidence
+			}
+			// Before the latest candidate has a publication witness, prove its
+			// complete signed publishing history. A prior generation's immutable
+			// publication row is historical correction context, not authority for
+			// the candidate being blocked.
+			if err := s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, conn, transition.Ref, candidate, version, transition.Fence, false); err != nil {
+				return ErrPublicationEvidence
+			}
+			if err := validateCandidateOnlyPublicationControl(ctx, conn, transition.Ref); err != nil {
 				return err
 			}
 		} else {
@@ -535,25 +588,37 @@ func (s *Store) TransitionPublishedPause(ctx context.Context, transition Transit
 		if err := s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence); err != nil {
 			return err
 		}
-		publication, found, err := loadPublicationEvidenceRow(ctx, conn, transition.Ref)
-		if err != nil || !found {
+		publication, candidate, hasCurrentPublication, err := s.publicationForLatestCandidateFrom(ctx, conn, transition.Ref)
+		if err != nil {
 			return ErrPublicationEvidence
 		}
-		if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
-			return err
-		}
-		if publication.CurrentFence.RunnerEpoch != runner || publication.CurrentFence.LeaderEpoch != transition.Fence.LeaderEpoch {
-			return ErrPublicationEvidence
-		}
-		if state == domain.StatePublishing {
-			if version != publication.CurrentTicketVersion {
+		if hasCurrentPublication {
+			if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
+				return err
+			}
+			if publication.CurrentFence.RunnerEpoch != runner || publication.CurrentFence.LeaderEpoch != transition.Fence.LeaderEpoch {
 				return ErrPublicationEvidence
+			}
+			if state == domain.StatePublishing {
+				if version != publication.CurrentTicketVersion {
+					return ErrPublicationEvidence
+				}
+			} else {
+				if publication.CurrentTicketVersion == ^uint64(0) || version != publication.CurrentTicketVersion+1 {
+					return ErrPublicationEvidence
+				}
+				if err := authenticatePublishedWaitingEvent(ctx, conn, transition.Ref, publication, version); err != nil {
+					return err
+				}
 			}
 		} else {
-			if publication.CurrentTicketVersion == ^uint64(0) || version != publication.CurrentTicketVersion+1 {
+			if state != domain.StatePublishing {
 				return ErrPublicationEvidence
 			}
-			if err := authenticatePublishedWaitingEvent(ctx, conn, transition.Ref, publication, version); err != nil {
+			if err := s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, conn, transition.Ref, candidate, version, transition.Fence, false); err != nil {
+				return ErrPublicationEvidence
+			}
+			if err := validateCandidateOnlyPublicationControl(ctx, conn, transition.Ref); err != nil {
 				return err
 			}
 		}
@@ -651,32 +716,38 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 				return err
 			}
 		}
-		publication, found, err := loadPublicationEvidenceRow(ctx, conn, transition.Ref)
+		publication, candidate, hasCurrentPublication, err := s.publicationForLatestCandidateFrom(ctx, conn, transition.Ref)
 		if err != nil {
 			return ErrPublicationEvidence
 		}
 		semanticResume := pausedResume && authenticateSemanticPublicationResume(ctx, conn, transition.Ref, version, newVersion, transition.To) == nil
 		ciPollResume := pausedResume && transition.To == domain.StateWaitingCI && authenticateCIPollResume(ctx, conn, transition.Ref, version, newVersion)
 		if semanticResume {
-			if !found {
-				return ErrPublicationEvidence
-			}
-			if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
-				return err
-			}
-			if publication.CurrentFence.RunnerEpoch != runner || publication.CurrentFence.LeaderEpoch != transition.Fence.LeaderEpoch {
-				return ErrPublicationEvidence
-			}
-			if transition.To == domain.StatePublishing {
-				if publication.CurrentTicketVersion+1 != version {
+			if hasCurrentPublication {
+				if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
+					return err
+				}
+				if publication.CurrentFence.RunnerEpoch != runner || publication.CurrentFence.LeaderEpoch != transition.Fence.LeaderEpoch {
 					return ErrPublicationEvidence
+				}
+				if transition.To == domain.StatePublishing {
+					if publication.CurrentTicketVersion+1 != version {
+						return ErrPublicationEvidence
+					}
+				} else {
+					if publication.CurrentTicketVersion > ^uint64(0)-3 || publication.CurrentTicketVersion+3 != newVersion {
+						return ErrPublicationEvidence
+					}
+					if err := authenticatePublishedWaitingEvent(ctx, conn, transition.Ref, publication, publication.CurrentTicketVersion+1); err != nil {
+						return err
+					}
 				}
 			} else {
-				if publication.CurrentTicketVersion > ^uint64(0)-3 || publication.CurrentTicketVersion+3 != newVersion {
+				if transition.To != domain.StatePublishing {
 					return ErrPublicationEvidence
 				}
-				if err := authenticatePublishedWaitingEvent(ctx, conn, transition.Ref, publication, publication.CurrentTicketVersion+1); err != nil {
-					return err
+				if err := s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, conn, transition.Ref, candidate, newVersion, newFence, false); err != nil {
+					return ErrPublicationEvidence
 				}
 			}
 			// Semantic pause/resume keeps the same runner and has no rebind row.
@@ -684,7 +755,7 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 			return nil
 		}
 		if ciPollResume {
-			if !found {
+			if !hasCurrentPublication {
 				return ErrPublicationEvidence
 			}
 			if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
@@ -710,20 +781,18 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 			return nil
 		}
 		if blockedRecover {
-			if !found {
+			if !hasCurrentPublication {
 				if transition.To != domain.StatePublishing {
 					return ErrPublicationEvidence
 				}
-				candidate, candidateErr := s.latestCandidateFrom(ctx, conn, transition.Ref, false)
-				if candidateErr != nil || candidate.TicketVersion == ^uint64(0) || candidate.TicketVersion+2 != version {
+				if version <= 1 {
 					return ErrPublicationEvidence
 				}
-				var transitions int
-				if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.TicketVersion+1).Scan(&transitions); err != nil || transitions != 1 {
-					return ErrPublicationEvidence
-				}
-				provider, _, providerErr := s.loadHistoricalProviderAttemptResult(ctx, conn, candidate.BuilderResult)
-				if providerErr != nil || providerResultReachesFence(ctx, conn, candidate.BuilderResult, provider, version-1, domain.Fence{LeaderEpoch: transition.Fence.LeaderEpoch, RunnerEpoch: runner}) != nil {
+				// The blocker is the direct successor of the authenticated
+				// pre-block publishing endpoint. That endpoint may itself follow
+				// multiple signed daemon recoveries; never infer its authority from
+				// a fixed counter distance from the immutable candidate.
+				if err := s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, conn, transition.Ref, candidate, newVersion, newFence, false); err != nil {
 					return ErrPublicationEvidence
 				}
 			} else {
@@ -744,7 +813,7 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 				}
 			}
 		} else if transition.To == domain.StateWaitingCI {
-			if !found {
+			if !hasCurrentPublication {
 				return ErrPublicationEvidence
 			}
 			if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
@@ -756,7 +825,7 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 			if err := validateRunnerControlAdvance(ctx, conn, transition.Ref, publication.CurrentTicketVersion+1, publication.CurrentFence.RunnerEpoch, publication.CurrentFence.LeaderEpoch, newVersion, newFence.RunnerEpoch, newFence.LeaderEpoch); err != nil {
 				return ErrPublicationEvidence
 			}
-		} else if found {
+		} else if hasCurrentPublication {
 			if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
 				return err
 			}
@@ -787,16 +856,7 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 				return err
 			}
 		} else {
-			candidate, candidateErr := s.latestCandidateFrom(ctx, conn, transition.Ref, false)
-			if candidateErr != nil || candidate.TicketVersion == ^uint64(0) {
-				return ErrPublicationEvidence
-			}
-			var transitions int
-			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.TicketVersion+1).Scan(&transitions); err != nil || transitions != 1 {
-				return ErrPublicationEvidence
-			}
-			provider, _, providerErr := s.loadHistoricalProviderAttemptResult(ctx, conn, candidate.BuilderResult)
-			if providerErr != nil || providerResultReachesFence(ctx, conn, candidate.BuilderResult, provider, newVersion, newFence) != nil {
+			if err := s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, conn, transition.Ref, candidate, newVersion, newFence, false); err != nil {
 				return ErrPublicationEvidence
 			}
 		}
@@ -850,7 +910,7 @@ func authenticateBlockedResume(ctx context.Context, q interface {
 }
 
 func blockedResumeEventPayload(code string) (string, error) {
-	if !validBlockedCode(code) {
+	if !validBlockedCode(code) || nonRecoverableBlockedRecoveryCode(code) {
 		return "", ErrPublicationEvidence
 	}
 	payload, err := json.Marshal(struct {
@@ -876,7 +936,7 @@ func authenticateSemanticPublicationResume(ctx context.Context, q interface {
 	var trigger string
 	var from, to domain.State
 	var payload string
-	if err := q.QueryRowContext(ctx, `SELECT trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, pausedVersion).Scan(&trigger, &from, &to, &payload); err != nil || (trigger != "retry_or_correction_exhausted" && trigger != "ci_red_exhausted") || to != domain.StatePaused || from != target || len(payload) > maxEvidenceJSON || !json.Valid([]byte(payload)) {
+	if err := q.QueryRowContext(ctx, `SELECT trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, pausedVersion).Scan(&trigger, &from, &to, &payload); err != nil || (trigger != "retry_or_correction_exhausted" && (target != domain.StateWaitingCI || trigger != "ci_red_exhausted")) || to != domain.StatePaused || from != target || len(payload) > maxEvidenceJSON || !json.Valid([]byte(payload)) {
 		return ErrPublicationEvidence
 	}
 	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, resumedVersion).Scan(&count); err != nil || count != 1 {
@@ -885,7 +945,7 @@ func authenticateSemanticPublicationResume(ctx context.Context, q interface {
 	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger IN ('operator_resume','operator_retry') AND from_state='paused' AND to_state=?`, ref.Channel, ref.Project, ref.Ticket, resumedVersion, target).Scan(&count); err != nil || count != 1 {
 		return ErrPublicationEvidence
 	}
-	return nil
+	return rejectRunnerRecoveryOverlap(ctx, q, ref, pausedVersion-1, resumedVersion)
 }
 
 func authenticateBlockedPublicationResume(ctx context.Context, q interface {
@@ -927,7 +987,89 @@ func authenticateBlockedPublicationResume(ctx context.Context, q interface {
 	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, resumedVersion).Scan(&count); err != nil || count != 1 {
 		return ErrPublicationEvidence
 	}
+	return rejectRunnerRecoveryOverlap(ctx, q, ref, blockedVersion-1, resumedVersion)
+}
+
+// rejectRunnerRecoveryOverlap prevents a publication blocker/resume pair from
+// silently consuming a signed runner handoff at either of its lifecycle
+// versions. The pair deliberately preserves runner and leader authority; any
+// overlapping recovery row is a contradictory authority history.
+func rejectRunnerRecoveryOverlap(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, afterVersion, throughVersion uint64) error {
+	if throughVersion <= afterVersion {
+		return ErrPublicationEvidence
+	}
+	var count int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, afterVersion, throughVersion).Scan(&count); err != nil || count != 0 {
+		return ErrPublicationEvidence
+	}
 	return nil
+}
+
+// validPublishingResumeGap admits only a bounded sequence of exact same-runner
+// publication continuations that may occur before the first external witness
+// exists. Every two-version step must be its own authenticated blocker/recover
+// or semantic pause/resume pair; arbitrary counter gaps and provider-phase
+// blocker pairs remain separate authorities.
+func validPublishingResumeGap(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, fromVersion, fromRunner, fromLeader, toVersion, toRunner, toLeader uint64) bool {
+	if fromVersion == 0 || toVersion <= fromVersion || (toVersion-fromVersion)%2 != 0 || fromRunner == 0 || fromLeader == 0 || toRunner != fromRunner || toLeader != fromLeader {
+		return false
+	}
+	pairs := (toVersion - fromVersion) / 2
+	if pairs == 0 || pairs > 64 {
+		return false
+	}
+	for pair := uint64(0); pair < pairs; pair++ {
+		start := fromVersion + pair*2
+		paused := start + 1
+		resumed := start + 2
+		if authenticateBlockedPublicationResume(ctx, q, ref, paused, resumed, domain.StatePublishing, domain.StatePublishing) != nil &&
+			authenticateSemanticPublicationResume(ctx, q, ref, paused, resumed, domain.StatePublishing) != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// validPublishingControlGap composes the two exact kinds of publication
+// continuation that may occur between signed daemon-recovery rows: a
+// same-runner blocker/semantic pause pair and a complete operator
+// pause/take->drain->resume triplet. The generic recovery validator handles
+// either shape in isolation; this walker is needed when both legitimately occur
+// in one candidate-only publishing segment before the external witness exists.
+func validPublishingControlGap(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, fromVersion, fromRunner, fromLeader, toVersion, toRunner, toLeader uint64) bool {
+	if fromVersion == 0 || fromRunner == 0 || fromLeader == 0 || toVersion < fromVersion || toRunner < fromRunner || toLeader < fromLeader {
+		return false
+	}
+	version, runner := fromVersion, fromRunner
+	for steps := 0; version < toVersion && steps < 64; steps++ {
+		if version <= ^uint64(0)-2 && version+2 <= toVersion &&
+			(authenticateBlockedPublicationResume(ctx, q, ref, version+1, version+2, domain.StatePublishing, domain.StatePublishing) == nil ||
+				authenticateSemanticPublicationResume(ctx, q, ref, version+1, version+2, domain.StatePublishing) == nil) {
+			version += 2
+			continue
+		}
+		if version <= ^uint64(0)-3 && runner < ^uint64(0) && version+3 <= toVersion {
+			stopped := Ticket{Ref: ref, State: domain.StatePublishing, Version: version, RunnerEpoch: runner}
+			resumed := Ticket{Ref: ref, State: domain.StatePublishing, Version: version + 3, RunnerEpoch: runner + 1}
+			stop := mutationRevocation{version: version + 1, runner: runner + 1, leader: fromLeader}
+			if authenticatePostPublicationResume(ctx, q, ref, stopped, resumed, stop) == nil {
+				version += 3
+				runner++
+				continue
+			}
+		}
+		return false
+	}
+	// Control events carry no leader identity. A pause/resume may advance the
+	// runner under the same daemon, but only a signed runner-recovery row may
+	// change the leader. Treating the mere presence of an older triplet as proof
+	// of a later leader takeover would make stale evidence current before Fence.
+	return version == toVersion && runner == toRunner && toLeader == fromLeader
 }
 
 func authenticatePublishedWaitingEvent(ctx context.Context, q interface {
@@ -973,12 +1115,18 @@ func (s *Store) TransitionPublishedCandidate(ctx context.Context, transition Tra
 		if err := checkPublicationEffect(ctx, conn, transition.Ref, value.TicketVersion, value.Fence, value.PRCreateOrUpdateEffect); err != nil {
 			return err
 		}
-		buildVersion := value.Candidate.TicketVersion + 1
-		if value.TicketVersion == value.Candidate.TicketVersion+2 {
-			if err := authenticateRunnerRecoveryStep(ctx, conn, transition.Ref, buildVersion, value.Candidate.Fence, value.TicketVersion, value.Fence); err != nil {
-				return ErrPublicationEvidence
-			}
-		} else if value.TicketVersion != buildVersion {
+		// The immutable witness may already have later authenticated publication
+		// rebinds. Validate its candidate-to-witness segment as a prefix; the
+		// current rebind chain and live fence are authenticated below.
+		if err := s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, conn, transition.Ref, value.Candidate, value.TicketVersion, value.Fence, true); err != nil {
+			return ErrPublicationEvidence
+		}
+		checkpointVersion, _, err := candidateSnapshotEndpointAt(ctx, conn, transition.Ref, value.Candidate)
+		if err != nil {
+			return ErrPublicationEvidence
+		}
+		buildVersion, err := candidatePublishingTransitionVersionAt(ctx, conn, transition.Ref, checkpointVersion, value.TicketVersion)
+		if err != nil {
 			return ErrPublicationEvidence
 		}
 		var buildEvents int
@@ -997,6 +1145,9 @@ func (s *Store) TransitionPublishedCandidate(ctx context.Context, transition Tra
 		var version, runner uint64
 		if err := conn.QueryRowContext(ctx, `SELECT state,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&state, &version, &runner); err != nil {
 			return err
+		}
+		if err := rejectFutureRunnerRecoveryRows(ctx, conn, transition.Ref, version); err != nil {
+			return ErrPublicationEvidence
 		}
 		if state == domain.StateWaitingCI && version == transition.ExpectedVersion+1 {
 			if runner != value.CurrentFence.RunnerEpoch || transition.Fence != value.CurrentFence {
@@ -1084,19 +1235,22 @@ func (s *Store) RebindRecoveredPublishedCandidates(ctx context.Context, channel 
 	rows.Close()
 	for _, item := range pending {
 		if item.state == domain.StatePublishing {
-			if err := s.RebindPublishedCandidate(ctx, item.ref, item.version, domain.Fence{LeaderEpoch: leaderEpoch, RunnerEpoch: item.runner}); err != nil {
-				if !errors.Is(err, ErrNotFound) {
-					return err
-				}
+			_, candidate, hasCurrentPublication, err := s.publicationForLatestCandidateFrom(ctx, s.db, item.ref)
+			if err != nil {
+				return err
+			}
+			if !hasCurrentPublication {
 				// A crash can leave the authenticated candidate and the
 				// building->publishing event durable before the external publication
-				// witness exists. Authenticate that candidate through the live
-				// recovery/control chain and leave it available for publication; an
-				// absent witness is not itself a startup failure.
-				if err := s.validateCandidateOnlyPublishingRecovery(ctx, item.ref, item.version, domain.Fence{LeaderEpoch: leaderEpoch, RunnerEpoch: item.runner}); err != nil {
+				// witness exists. An older generation's immutable publication row is
+				// historical correction context, not authority for the latest candidate.
+				if err := s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, s.db, item.ref, candidate, item.version, domain.Fence{LeaderEpoch: leaderEpoch, RunnerEpoch: item.runner}, false); err != nil {
 					return err
 				}
 				continue
+			}
+			if err := s.RebindPublishedCandidate(ctx, item.ref, item.version, domain.Fence{LeaderEpoch: leaderEpoch, RunnerEpoch: item.runner}); err != nil {
+				return err
 			}
 		}
 		if _, err := s.LoadPublishedCandidate(ctx, item.ref); err != nil {
@@ -1106,20 +1260,170 @@ func (s *Store) RebindRecoveredPublishedCandidates(ctx context.Context, channel 
 	return nil
 }
 
-func (s *Store) validateCandidateOnlyPublishingRecovery(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) error {
-	candidate, err := s.latestCandidateFrom(ctx, s.db, ref, false)
-	if err != nil || candidate.TicketVersion == ^uint64(0) {
+// publicationForLatestCandidateFrom classifies the newest immutable
+// publication against the newest candidate generation. A strictly older
+// publication is valid historical correction context, while a same-generation
+// mismatch or a publication ahead of the candidate is contradictory evidence.
+func (s *Store) publicationForLatestCandidateFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef) (PublishedCandidateEvidence, StoredCandidate, bool, error) {
+	publication, found, err := loadPublicationEvidenceRow(ctx, q, ref)
+	if err != nil {
+		return PublishedCandidateEvidence{}, StoredCandidate{}, false, ErrPublicationEvidence
+	}
+	candidate, err := s.latestCandidateFrom(ctx, q, ref, false)
+	if err != nil {
+		return PublishedCandidateEvidence{}, StoredCandidate{}, false, ErrPublicationEvidence
+	}
+	if !found {
+		return PublishedCandidateEvidence{}, candidate, false, nil
+	}
+	if publicationCandidateEqual(publication.Candidate, candidate) {
+		return publication, candidate, true, nil
+	}
+	if publication.Candidate.Snapshot.Generation < candidate.Snapshot.Generation {
+		return publication, candidate, false, nil
+	}
+	return PublishedCandidateEvidence{}, StoredCandidate{}, false, ErrPublicationEvidence
+}
+
+func (s *Store) authenticateCandidateOnlyPublishingRecoveryAt(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, candidate StoredCandidate, version uint64, fence domain.Fence, allowFutureRecovery bool) error {
+	if ref.Validate() != nil || candidate.TicketVersion == 0 || candidate.TicketVersion > version || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || fence.ClaimEpoch != 0 {
 		return ErrPublicationEvidence
 	}
-	var transitions int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, ref.Channel, ref.Project, ref.Ticket, candidate.TicketVersion+1).Scan(&transitions); err != nil || transitions != 1 {
+	durable, err := s.latestCandidateFrom(ctx, q, ref, false)
+	if err != nil || !publicationCandidateEqual(durable, candidate) {
 		return ErrPublicationEvidence
 	}
-	provider, _, err := s.loadHistoricalProviderAttemptResult(ctx, s.db, candidate.BuilderResult)
-	if err != nil || providerResultReachesFence(ctx, s.db, candidate.BuilderResult, provider, version, fence) != nil {
+	if err := s.reauthenticateStoredCandidateCheckpointFrom(ctx, q, ref, durable); err != nil {
+		return ErrPublicationEvidence
+	}
+	checkpointVersion, checkpointFence, err := candidateSnapshotEndpointAt(ctx, q, ref, candidate)
+	if err != nil || checkpointVersion >= version {
+		return ErrPublicationEvidence
+	}
+	// latestCandidateFrom selects the newest append-only result binding for the
+	// immutable generation. Authenticate that selected endpoint independently;
+	// otherwise a contradictory later binding could enter the publication digest
+	// even though the original snapshot-to-live suffix is valid.
+	if candidate.TicketVersion == checkpointVersion {
+		if candidate.Fence != checkpointFence {
+			return ErrPublicationEvidence
+		}
+	} else if validateRunnerRecoveryLedgerPrefix(ctx, q, ref, checkpointVersion, checkpointFence.RunnerEpoch, checkpointFence.LeaderEpoch, candidate.TicketVersion, candidate.Fence.RunnerEpoch, candidate.Fence.LeaderEpoch) != nil {
+		return ErrPublicationEvidence
+	}
+	buildVersion, err := candidatePublishingTransitionVersionAt(ctx, q, ref, checkpointVersion, version)
+	if err != nil {
+		return ErrPublicationEvidence
+	}
+	// RecordCandidate is the Store-owned promotion boundary: it writes the
+	// immutable candidate/result/command bindings only after authenticating the
+	// Builder, repository command, verification, CI-repair, or source-resume
+	// authority that produced them. Publication must not replay the ticket's
+	// entire pre-candidate lifecycle; doing so would reinterpret legitimate
+	// provider-retry, control, amendment, and later-generation repair histories.
+	// Re-authenticate the immutable Builder artifact above, then prove only the
+	// exact building->publishing edge and the signed suffix after that sealed
+	// candidate endpoint.
+	buildFence := checkpointFence
+	if buildVersion != checkpointVersion+1 {
+		buildFence, err = candidatePublishingTransitionFenceAt(ctx, q, ref, candidate, buildVersion, version, fence)
+		if err != nil || validateRunnerRecoveryLedgerPrefix(ctx, q, ref, checkpointVersion, checkpointFence.RunnerEpoch, checkpointFence.LeaderEpoch, buildVersion-1, buildFence.RunnerEpoch, buildFence.LeaderEpoch) != nil {
+			return ErrPublicationEvidence
+		}
+	}
+	if validateRunnerRecoveryLedgerPrefix(ctx, q, ref, buildVersion, buildFence.RunnerEpoch, buildFence.LeaderEpoch, version, fence.RunnerEpoch, fence.LeaderEpoch) != nil {
+		return ErrPublicationEvidence
+	}
+	if !allowFutureRecovery && rejectFutureRunnerRecoveryRows(ctx, q, ref, version) != nil {
 		return ErrPublicationEvidence
 	}
 	return nil
+}
+
+// candidateSnapshotEndpointAt returns the original immutable checkpoint fence.
+// StoredCandidate.TicketVersion is the newest append-only Builder-result
+// binding and may legitimately equal the live publishing version after a lost
+// response. Publication history must still begin at the candidate_snapshots
+// row that sealed the generation, never at that later convenience binding.
+func candidateSnapshotEndpointAt(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, candidate StoredCandidate) (uint64, domain.Fence, error) {
+	var snapshot domain.CandidateSnapshot
+	var version, leader, runner uint64
+	if err := q.QueryRowContext(ctx, `SELECT generation,ticket_version,leader_epoch,runner_epoch,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? AND generation=?`, ref.Channel, ref.Project, ref.Ticket, candidate.Snapshot.Generation).Scan(&snapshot.Generation, &version, &leader, &runner, &snapshot.BaseSHA, &snapshot.HeadSHA, &snapshot.TreeSHA, &snapshot.SourceDigest, &snapshot.VerificationIntentDigest, &snapshot.ProofDigest, &snapshot.CommandPolicyDigest, &snapshot.BuilderEvidenceDigest); err != nil {
+		return 0, domain.Fence{}, ErrPublicationEvidence
+	}
+	if snapshot != candidate.Snapshot || version == 0 || version > candidate.TicketVersion || leader == 0 || runner == 0 {
+		return 0, domain.Fence{}, ErrPublicationEvidence
+	}
+	return version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: runner}, nil
+}
+
+func candidatePublishingTransitionVersionAt(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, candidateVersion, limit uint64) (uint64, error) {
+	if candidateVersion == 0 || candidateVersion == ^uint64(0) || limit <= candidateVersion {
+		return 0, ErrPublicationEvidence
+	}
+	var version uint64
+	var matches int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing' AND payload='{}'`, ref.Channel, ref.Project, ref.Ticket, candidateVersion, limit).Scan(&matches, &version); err != nil || matches != 1 || version <= candidateVersion {
+		return 0, ErrPublicationEvidence
+	}
+	var recoveries int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&recoveries); err != nil || recoveries != 0 {
+		return 0, ErrPublicationEvidence
+	}
+	var stateTransitions int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&stateTransitions); err != nil || stateTransitions != 1 {
+		return 0, ErrPublicationEvidence
+	}
+	return version, nil
+}
+
+// candidatePublishingTransitionFenceAt derives the immutable fence on the
+// building->publishing edge. A candidate may be recorded immediately before a
+// daemon recovery; in that crash window the phase_pass occurs later than
+// candidate+1. The edge itself does not carry a fence, so derive it only from
+// an adjacent signed recovery endpoint (or the already-authenticated target
+// when no later recovery exists), then validate the complete prefix below.
+func candidatePublishingTransitionFenceAt(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, candidate StoredCandidate, buildVersion, targetVersion uint64, targetFence domain.Fence) (domain.Fence, error) {
+	checkpointVersion, _, err := candidateSnapshotEndpointAt(ctx, q, ref, candidate)
+	if err != nil || checkpointVersion == ^uint64(0) || buildVersion <= checkpointVersion+1 || targetVersion < buildVersion || targetFence.LeaderEpoch == 0 || targetFence.RunnerEpoch == 0 {
+		return domain.Fence{}, ErrPublicationEvidence
+	}
+	// RecordCandidate may append an authenticated result binding after a
+	// pause/take while the ticket is still Building. When that binding is the
+	// exact predecessor of the building->publishing transition, it is the only
+	// durable fence for that edge; a later publication control or recovery must
+	// not be projected backwards onto the build event.
+	if candidate.TicketVersion == buildVersion-1 {
+		if candidate.Fence.LeaderEpoch == 0 || candidate.Fence.RunnerEpoch == 0 || candidate.Fence.ClaimEpoch != 0 {
+			return domain.Fence{}, ErrPublicationEvidence
+		}
+		return candidate.Fence, nil
+	}
+	if step, found, err := loadRunnerRecoveryAt(ctx, q, ref, buildVersion-1); err != nil {
+		return domain.Fence{}, ErrPublicationEvidence
+	} else if found {
+		return domain.Fence{LeaderEpoch: step.LeaderEpoch, RunnerEpoch: step.RunnerEpoch}, nil
+	}
+	var priorVersion, priorRunner, priorLeader uint64
+	err = q.QueryRowContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND prior_ticket_version>=? AND ticket_version<=? ORDER BY ticket_version LIMIT 1`, ref.Channel, ref.Project, ref.Ticket, buildVersion, targetVersion).Scan(&priorVersion, &priorRunner, &priorLeader)
+	if err == nil {
+		if priorVersion < buildVersion || priorRunner == 0 || priorLeader == 0 {
+			return domain.Fence{}, ErrPublicationEvidence
+		}
+		return domain.Fence{LeaderEpoch: priorLeader, RunnerEpoch: priorRunner}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return domain.Fence{}, ErrPublicationEvidence
+	}
+	return domain.Fence{LeaderEpoch: targetFence.LeaderEpoch, RunnerEpoch: targetFence.RunnerEpoch}, nil
+}
+
+func (s *Store) validateCandidateOnlyPublishingRecovery(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) error {
+	candidate, err := s.latestCandidateFrom(ctx, s.db, ref, false)
+	if err != nil {
+		return ErrPublicationEvidence
+	}
+	return s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, s.db, ref, candidate, version, fence, false)
 }
 
 // AuthenticatePublishingRecovery proves that the immutable candidate supplied
@@ -1142,7 +1446,7 @@ func (s *Store) AuthenticatePublishingRecovery(ctx context.Context, ref domain.T
 	if err != nil || durable != candidate {
 		return ErrPublicationEvidence
 	}
-	return s.validateCandidateOnlyPublishingRecovery(ctx, ref, version, fence)
+	return s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, s.db, ref, candidate, version, fence, false)
 }
 
 // RebindPublishedCandidate records one controlled runner/leader recovery for
@@ -1332,12 +1636,33 @@ func checkPublicationEffect(ctx context.Context, conn *sql.Conn, ref domain.Tick
 func loadPublicationEvidenceRow(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, ref domain.TicketRef) (PublishedCandidateEvidence, bool, error) {
+	return loadPublicationEvidenceRowMatching(ctx, q, ref, 0, "", "", "")
+}
+
+// loadPublicationEvidenceRowMatching loads the immutable publication named by
+// a retained repair binding. A zero generation preserves the ordinary latest
+// publication lookup. Historical repair authentication must never substitute a
+// newer corrected candidate's publication for the predecessor witness.
+func loadPublicationEvidenceRowMatching(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, generation uint64, head, tree, witness string) (PublishedCandidateEvidence, bool, error) {
 	var value PublishedCandidateEvidence
 	var project, ticket string
 	var draft, owned int
 	var observed, created, buildCreated, identityDigest, worktreeState string
 	var identity []byte
-	err := q.QueryRowContext(ctx, `SELECT channel,project_id,ticket_id,ticket_version,leader_epoch,runner_epoch,candidate_generation,candidate_ticket_version,candidate_leader_epoch,candidate_runner_epoch,candidate_base_sha,candidate_head_sha,candidate_tree_sha,candidate_source_digest,candidate_verification_intent_digest,candidate_proof_digest,candidate_command_policy_digest,candidate_builder_evidence_digest,candidate_builder_attempt_id,candidate_builder_attempt,candidate_commit_parent_oid,candidate_command_semantic_key,candidate_command_claim_epoch,candidate_command_ticket_version,candidate_command_leader_epoch,candidate_command_runner_epoch,candidate_command_digest,candidate_command_spec_digest,candidate_command_policy_claim_digest,candidate_command_executable_path,candidate_command_executable_digest,config_generation,config_digest,config_snapshot_digest,worktree_path,worktree_branch_ref,worktree_state,worktree_ticket_version,worktree_leader_epoch,worktree_runner_epoch,worktree_identity_json,worktree_identity_digest,worktree_base_sha,remote_branch_ref,remote_branch_oid,remote_base_oid,push_effect_semantic_key,push_effect_kind,push_effect_request_digest,push_effect_claim_epoch,push_effect_observed_identity,github_host,github_owner,github_name,github_pr_number,github_head_owner,github_head_repository,github_head_ref,github_head_oid,github_base_ref,github_base_oid,github_state,github_draft,github_factory_owned,github_observed_at,pr_effect_semantic_key,pr_effect_kind,pr_effect_request_digest,pr_effect_claim_epoch,pr_effect_observed_identity,build_transition_created_at,witness_digest,created_at FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY candidate_generation DESC,candidate_head_sha DESC`, ref.Channel, ref.Project, ref.Ticket).Scan(
+	query := `SELECT channel,project_id,ticket_id,ticket_version,leader_epoch,runner_epoch,candidate_generation,candidate_ticket_version,candidate_leader_epoch,candidate_runner_epoch,candidate_base_sha,candidate_head_sha,candidate_tree_sha,candidate_source_digest,candidate_verification_intent_digest,candidate_proof_digest,candidate_command_policy_digest,candidate_builder_evidence_digest,candidate_builder_attempt_id,candidate_builder_attempt,candidate_commit_parent_oid,candidate_command_semantic_key,candidate_command_claim_epoch,candidate_command_ticket_version,candidate_command_leader_epoch,candidate_command_runner_epoch,candidate_command_digest,candidate_command_spec_digest,candidate_command_policy_claim_digest,candidate_command_executable_path,candidate_command_executable_digest,config_generation,config_digest,config_snapshot_digest,worktree_path,worktree_branch_ref,worktree_state,worktree_ticket_version,worktree_leader_epoch,worktree_runner_epoch,worktree_identity_json,worktree_identity_digest,worktree_base_sha,remote_branch_ref,remote_branch_oid,remote_base_oid,push_effect_semantic_key,push_effect_kind,push_effect_request_digest,push_effect_claim_epoch,push_effect_observed_identity,github_host,github_owner,github_name,github_pr_number,github_head_owner,github_head_repository,github_head_ref,github_head_oid,github_base_ref,github_base_oid,github_state,github_draft,github_factory_owned,github_observed_at,pr_effect_semantic_key,pr_effect_kind,pr_effect_request_digest,pr_effect_claim_epoch,pr_effect_observed_identity,build_transition_created_at,witness_digest,created_at FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=?`
+	args := []any{ref.Channel, ref.Project, ref.Ticket}
+	if generation == 0 {
+		query += ` ORDER BY candidate_generation DESC,candidate_head_sha DESC`
+	} else {
+		if !validOID(head) || !validOID(tree) || !validCIAuthorityDigest(witness) {
+			return PublishedCandidateEvidence{}, false, ErrPublicationEvidence
+		}
+		query += ` AND candidate_generation=? AND candidate_head_sha=? AND candidate_tree_sha=? AND witness_digest=?`
+		args = append(args, generation, head, tree, witness)
+	}
+	err := q.QueryRowContext(ctx, query, args...).Scan(
 		&value.Ref.Channel, &project, &ticket, &value.TicketVersion, &value.Fence.LeaderEpoch, &value.Fence.RunnerEpoch,
 		&value.Candidate.Snapshot.Generation, &value.Candidate.TicketVersion, &value.Candidate.Fence.LeaderEpoch, &value.Candidate.Fence.RunnerEpoch, &value.Candidate.Snapshot.BaseSHA, &value.Candidate.Snapshot.HeadSHA, &value.Candidate.Snapshot.TreeSHA,
 		&value.Candidate.Snapshot.SourceDigest, &value.Candidate.Snapshot.VerificationIntentDigest, &value.Candidate.Snapshot.ProofDigest, &value.Candidate.Snapshot.CommandPolicyDigest, &value.Candidate.Snapshot.BuilderEvidenceDigest,
@@ -1368,7 +1693,7 @@ func loadPublicationEvidenceRow(ctx context.Context, q interface {
 	if value.BuildTransitionCreatedAt, parseErr = parsePublicationTime(buildCreated); parseErr != nil {
 		return PublishedCandidateEvidence{}, false, ErrPublicationEvidence
 	}
-	if value.Ref != ref || value.Worktree.IdentityJSON == nil || sha256Digest(value.Worktree.IdentityJSON) != identityDigest {
+	if value.Ref != ref || value.Worktree.IdentityJSON == nil || sha256Digest(value.Worktree.IdentityJSON) != identityDigest || (generation != 0 && (value.Candidate.Snapshot.Generation != generation || value.Candidate.Snapshot.HeadSHA != head || value.Candidate.Snapshot.TreeSHA != tree || value.WitnessDigest != witness)) {
 		return PublishedCandidateEvidence{}, false, ErrPublicationEvidence
 	}
 	if err := validPublishedCandidateEvidence(value); err != nil {
@@ -1517,6 +1842,9 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 	if err != nil {
 		return PublishedCandidateEvidence{}, err
 	}
+	if err := rejectFutureRunnerRecoveryRows(ctx, s.db, ref, ticket.Version); err != nil {
+		return PublishedCandidateEvidence{}, ErrPublicationEvidence
+	}
 	waitingReplay := ticket.State == domain.StateWaitingCI
 	// A pending CI observation is a real, authenticated same-state transition.
 	// The generic publication reader predates that chain and deliberately
@@ -1646,17 +1974,8 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 	if err != nil || !publicationCandidateEqual(candidate, value.Candidate) {
 		return PublishedCandidateEvidence{}, ErrPublicationEvidence
 	}
-	if value.TicketVersion == value.Candidate.TicketVersion+2 {
-		// Candidate-only publishing recovery has no publication witness at the
-		// original publishing endpoint. Require the exact phase endpoint and
-		// signed +1/+1 recovery row before accepting the later witness.
-		var transitions int
-		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, ref.Channel, ref.Project, ref.Ticket, value.Candidate.TicketVersion+1).Scan(&transitions); err != nil || transitions != 1 {
-			return PublishedCandidateEvidence{}, ErrPublicationEvidence
-		}
-		if err := authenticateRunnerRecoveryStep(ctx, s.db, ref, value.Candidate.TicketVersion+1, value.Candidate.Fence, value.TicketVersion, value.Fence); err != nil {
-			return PublishedCandidateEvidence{}, ErrPublicationEvidence
-		}
+	if err := s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, s.db, ref, value.Candidate, value.TicketVersion, value.Fence, true); err != nil {
+		return PublishedCandidateEvidence{}, ErrPublicationEvidence
 	}
 	worktree, err := s.Worktree(ctx, ref)
 	if err != nil || worktree.Path != value.Worktree.Path || worktree.Branch != value.Worktree.Branch || !bytes.Equal(worktree.IdentityJSON, value.Worktree.IdentityJSON) || worktree.BaseSHA != value.Worktree.BaseSHA || worktree.TicketVersion != value.Worktree.TicketVersion || worktree.Fence != value.Worktree.Fence {

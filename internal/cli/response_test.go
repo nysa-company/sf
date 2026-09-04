@@ -44,8 +44,10 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 		"decision_refused": ExitAction, "approval_head_changed": ExitAction,
 		"runtime_retirement_failed": ExitAction, "source_commit_required": ExitAction,
 		"ticket_budget_exhausted": ExitAction, "provider_result_indeterminate": ExitAction,
-		"provider_repair_unavailable": ExitAction,
-		"daemon_unavailable":          ExitWait, "daemon_stopping": ExitWait, "provider_waiting": ExitWait, "checks_pending": ExitWait,
+		"provider_repair_unavailable":                   ExitAction,
+		"verification_amendment_invalid":                ExitAction,
+		"legacy_candidate_repair_recovery_unverifiable": ExitAction,
+		"daemon_unavailable":                            ExitWait, "daemon_stopping": ExitWait, "provider_waiting": ExitWait, "checks_pending": ExitWait,
 		"store_busy": ExitWait, "projection_unavailable": ExitWait, "external_state_unavailable": ExitWait,
 		"control_state_unavailable": ExitWait, "evidence_unavailable": ExitWait, "logs_unavailable": ExitWait,
 		"status_unavailable": ExitWait, "capacity_unavailable": ExitWait, "leader_lost": ExitWait,
@@ -72,13 +74,15 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 	}
 }
 
-func TestProviderSafetyBlockersRemainActionableWithDaemonCancelArgv(t *testing.T) {
+func TestNonrecoverableSafetyBlockersRemainActionableWithDaemonCancelArgv(t *testing.T) {
 	for _, test := range []struct {
 		code string
 		argv []string
 	}{
 		{code: "provider_result_indeterminate", argv: []string{"sf-dev", "cancel", "SF-dev-provider-blocker"}},
 		{code: "provider_repair_unavailable", argv: []string{"sf", "cancel", "SF-stable-provider-blocker"}},
+		{code: "verification_amendment_invalid", argv: []string{"sf-dev", "cancel", "SF-dev-amendment-blocker"}},
+		{code: "legacy_candidate_repair_recovery_unverifiable", argv: []string{"sf", "cancel", "SF-stable-repair-recovery-blocker"}},
 		{code: "provider_retry_resubmit_required", argv: []string{"sf-dev", "cancel", "SF-dev-provider-retry"}},
 	} {
 		t.Run(test.code, func(t *testing.T) {

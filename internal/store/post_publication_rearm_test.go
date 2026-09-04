@@ -180,6 +180,69 @@ func TestPostPublicationRearmProofAuthenticatesWaitingCIResume(t *testing.T) {
 	}
 }
 
+func TestCandidateOnlyMultiRecoveryPublishingRearm(t *testing.T) {
+	for _, restartAfterResume := range []bool{false, true} {
+		name := "direct"
+		if restartAfterResume {
+			name = "after restart"
+		}
+		t.Run(name, func(t *testing.T) {
+			db, ctx, ticket, _ := publicationLifecycleFixture(t)
+			for recovery := 1; recovery <= 2; recovery++ {
+				leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "candidate-only-rearm-recovery")
+				if err != nil {
+					t.Fatalf("recovery %d leader: %v", recovery, err)
+				}
+				if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err != nil || changed != 1 {
+					t.Fatalf("recovery %d fence changed=%d err=%v", recovery, changed, err)
+				}
+				if err := db.RebindRecoveredPublishedCandidates(ctx, domain.ChannelDev, leader); err != nil {
+					t.Fatalf("recovery %d candidate-only startup: %v", recovery, err)
+				}
+			}
+			current, err := db.Ticket(ctx, ticket.Ref)
+			if err != nil || current.State != domain.StatePublishing || current.Version <= ticket.Version+1 {
+				t.Fatalf("multi-recovered publishing ticket=%+v err=%v", current, err)
+			}
+			var leader uint64
+			if err := db.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ticket.Ref.Channel).Scan(&leader); err != nil {
+				t.Fatal(err)
+			}
+			stopped, resumed := postPublicationPauseResumeAt(t, db, current, domain.Fence{LeaderEpoch: leader, RunnerEpoch: current.RunnerEpoch}, domain.StatePublishing)
+
+			if restartAfterResume {
+				var path string
+				if err := db.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+					t.Fatalf("database path=%q err=%v", path, err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				db, err = Open(ctx, path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				leader, err = db.AcquireLeader(ctx, domain.ChannelDev, "candidate-only-rearm-restart")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, leader); err != nil || changed != 1 {
+					t.Fatalf("post-resume fence changed=%d err=%v", changed, err)
+				}
+				stopped, err = db.StoppedRuntimeTicket(ctx, resumed.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			capability, err := db.PostPublicationRearmProof(ctx, resumed.Ref, stopped)
+			if err != nil || capability == nil {
+				t.Fatalf("candidate-only multi-recovery rearm capability=%v err=%v", capability, err)
+			}
+		})
+	}
+}
+
 func TestPostPublicationRearmProofRejectsUncertainMutation(t *testing.T) {
 	db, ticket, fence := ciAuthorityPublishedFixture(t)
 	defer db.Close()

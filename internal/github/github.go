@@ -6,6 +6,7 @@ package github
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1201,11 +1202,7 @@ func (c Client) checks(ctx context.Context, identity contracts.PullRequestIdenti
 		if !validCheck(check.Name, check.Link, check.Workflow, check.Bucket) {
 			return nil, ErrMalformedResponse
 		}
-		identity := check.Link
-		if check.Workflow != "" || check.Bucket != "" {
-			identity = check.Workflow + "\x00" + check.Link + "\x00" + check.Bucket
-		}
-		checks = append(checks, contracts.RequiredCheck{Name: check.Name, State: check.State, ExternalID: identity})
+		checks = append(checks, contracts.RequiredCheck{Name: check.Name, State: check.State, ExternalID: canonicalCheckExternalID(check)})
 	}
 	return checks, nil
 }
@@ -1216,6 +1213,24 @@ type checkWire struct {
 	Workflow string `json:"workflow"`
 	Link     string `json:"link"`
 	Bucket   string `json:"bucket"`
+}
+
+// canonicalCheckExternalID converts GitHub's potentially long workflow and
+// link tuple into the small printable identity accepted by the Store and
+// prompt boundaries. Length prefixes preserve empty optional fields without
+// introducing control characters into the persisted value. State is excluded
+// because the same check changes state while it is being polled; bucket is
+// excluded for the same reason because gh derives it from the current state.
+func canonicalCheckExternalID(check checkWire) string {
+	digest := sha256.New()
+	_, _ = io.WriteString(digest, "sf.github.required-check/v1")
+	var size [4]byte
+	for _, value := range []string{check.Workflow, check.Link} {
+		binary.BigEndian.PutUint32(size[:], uint32(len(value)))
+		_, _ = digest.Write(size[:])
+		_, _ = io.WriteString(digest, value)
+	}
+	return "sha256:" + hex.EncodeToString(digest.Sum(nil))
 }
 
 func evaluateChecks(actual []contracts.RequiredCheck, required []CheckIdentity) error {

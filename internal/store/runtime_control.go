@@ -29,8 +29,9 @@ type TicketControlProof struct {
 }
 
 // RuntimeRearmCapability is an opaque, one-use authorization produced only by
-// RearmProof. Its fields are deliberately private and it can be redeemed only
-// through Store.ActivateRearm, never handed directly to a runtime bundle.
+// one of Store's state-specific rearm proofs. Its fields are deliberately
+// private and it can be redeemed only through Store.ActivateRearm, never
+// handed directly to a runtime bundle.
 type RuntimeRearmCapability struct {
 	mu         sync.Mutex
 	ref        domain.TicketRef
@@ -699,26 +700,32 @@ func runtimeRearmableState(state domain.State) bool {
 func (s *Store) authenticatePostPublicationState(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, baselineVersion uint64, baselineFence domain.Fence) error {
 	switch state {
 	case domain.StatePublishing:
-		// Publishing may legitimately be between the candidate and publication
-		// witness.  The authenticated candidate is the fresh boundary here;
-		// once publication has been recorded, its row is checked below instead.
-		candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
-		if err != nil || candidate.Fence != baselineFence {
+		// Once a publication witness exists, its immutable row and append-only
+		// rebind chain are the authority. Never fall back to candidate-only proof
+		// around a malformed or stale external witness.
+		publication, candidate, hasCurrentPublication, err := s.publicationForLatestCandidateFrom(ctx, conn, ref)
+		if err != nil {
 			return ErrControlNotDrained
 		}
-		if candidate.TicketVersion == baselineVersion {
-			return nil
-		}
-		// TransitionCandidate records the immutable candidate at the building
-		// endpoint, then the authenticated phase_pass advances the ticket into
-		// publishing.  A pause/resume proof for a publishing ticket therefore
-		// authenticates this one exact predecessor event rather than requiring an
-		// impossible candidate row at the publishing version.
-		if candidate.TicketVersion == ^uint64(0) || candidate.TicketVersion+1 != baselineVersion {
+		if hasCurrentPublication {
+			if err := loadLatestPublicationRebind(ctx, conn, &publication); err != nil {
+				return ErrControlNotDrained
+			}
+			if publication.CurrentTicketVersion == baselineVersion && publication.CurrentFence == baselineFence {
+				return nil
+			}
+			if publication.CurrentTicketVersion <= ^uint64(0)-2 && publication.CurrentTicketVersion+2 == baselineVersion && publication.CurrentFence == baselineFence &&
+				(authenticateBlockedPublicationResume(ctx, conn, ref, publication.CurrentTicketVersion+1, baselineVersion, domain.StatePublishing, domain.StatePublishing) == nil ||
+					authenticateSemanticPublicationResume(ctx, conn, ref, publication.CurrentTicketVersion+1, baselineVersion, domain.StatePublishing) == nil) {
+				return nil
+			}
 			return ErrControlNotDrained
 		}
-		var transitions int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='building' AND to_state='publishing'`, ref.Channel, ref.Project, ref.Ticket, baselineVersion).Scan(&transitions); err != nil || transitions != 1 {
+		// Before the first publication witness, authenticate the immutable
+		// candidate through the complete signed publishing suffix. This supports
+		// repeated daemon recoveries and a later live Builder-result rebind without
+		// inferring authority from a fixed counter distance.
+		if s.authenticateCandidateOnlyPublishingRecoveryAt(ctx, conn, ref, candidate, baselineVersion, baselineFence, true) != nil {
 			return ErrControlNotDrained
 		}
 		return nil
@@ -877,7 +884,7 @@ func (s *Store) authenticateHistoricalFinalReview(ctx context.Context, conn *sql
 		return CIObservation{}, 0, ErrEvidenceConflict
 	}
 	verification, err := s.verificationEvidenceForCandidateFrom(ctx, conn, ref)
-	if err != nil || candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest || candidate.Commit.ParentOID != verification.Checkpoint.CommitOID {
+	if err != nil || s.authenticateCandidateVerificationParentFrom(ctx, conn, candidate, verification) != nil {
 		return CIObservation{}, 0, ErrEvidenceConflict
 	}
 	observation, _, reviewVersion, err := finalReviewCIAuthorityFrom(ctx, conn, ref, candidate)
@@ -1920,6 +1927,116 @@ func (s *Store) RearmProof(ctx context.Context, ref domain.TicketRef, stopped Ti
 	return &RuntimeRearmCapability{ref: ref, version: proof.Ticket.Version, fence: proof.Fence, issued: true}, nil
 }
 
+// CandidateRepairRearmProof is the separate runtime-admission authority for
+// a CI-red correction that returned an already-published ticket to Building.
+// Ordinary RearmProof must keep rejecting this shape because historical
+// publication effects make it non-pre-publication; the post-publication proof
+// likewise must not broaden its state allowlist to Building. This boundary
+// authenticates the exact sealed pause/take handoff and the Store-owned
+// candidate-repair lineage on the same IMMEDIATE connection as the drain
+// counts. ErrNotFound means there is no repair lineage, allowing the
+// controller to try the ordinary pre-publication proof. Any detected but
+// malformed repair evidence fails closed without that fallback.
+func (s *Store) CandidateRepairRearmProof(ctx context.Context, ref domain.TicketRef, stopped Ticket) (*RuntimeRearmCapability, error) {
+	if err := ref.Validate(); err != nil || stopped.Ref != ref || stopped.Version == 0 || stopped.RunnerEpoch == 0 {
+		return nil, ErrStaleFence
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	g := s.mutations
+	if g == nil {
+		return nil, ErrStaleFence
+	}
+	if err := g.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer g.unlock()
+	proof, leader, err := s.controlProof(ctx, ref, g, func(txCtx context.Context, conn *sql.Conn, proof TicketControlProof, _ uint64) error {
+		latchedValue, latched := g.control(ref)
+		control, err := runtimeControlFrom(txCtx, conn, ref)
+		if err != nil || control.state != "sealed" || control.stop.version <= 1 || control.stop.version > ^uint64(0)-2 || control.stop.runner <= 1 || control.stop.leader == 0 || proof.Ticket.State != domain.StateBuilding {
+			return ErrStaleFence
+		}
+		stopMatches := control.stop.version == stopped.Version && control.stop.runner == stopped.RunnerEpoch
+		if stopped.Version < ^uint64(0) && stopped.RunnerEpoch < ^uint64(0) {
+			stopMatches = stopMatches || (control.stop.version == stopped.Version+1 && control.stop.runner == stopped.RunnerEpoch+1)
+		}
+		if !stopMatches || (stopped.State != "" && stopped.State != domain.StateBuilding && stopped.State != domain.StateStopping) || !latched || latchedValue != control.authority || proof.Ticket.Version < control.stop.version+2 || proof.Ticket.RunnerEpoch < control.stop.runner {
+			return ErrStaleFence
+		}
+		return nil
+	}, func(txCtx context.Context, conn *sql.Conn, proof TicketControlProof, leader uint64) error {
+		if !proof.Drained() || proof.Ticket.State != domain.StateBuilding {
+			return ErrControlNotDrained
+		}
+		control, err := runtimeControlFrom(txCtx, conn, ref)
+		if err != nil || control.stop.version <= 1 || control.stop.version > ^uint64(0)-2 || control.stop.runner <= 1 || control.stop.leader == 0 {
+			return ErrStaleFence
+		}
+		baseline := Ticket{
+			Ref:         ref,
+			State:       domain.StateBuilding,
+			Version:     control.stop.version - 1,
+			RunnerEpoch: control.stop.runner - 1,
+		}
+		// Classify this Building endpoint before applying the repair-only control
+		// shape. A source-resume or ordinary pre-publication Building ticket can
+		// retain a different, independently authenticated stop lineage; clean
+		// absence of a repair binding must reach Controller's ordinary rearm
+		// fallback. Conversely, a checks_red entry with a missing or malformed
+		// binding remains an evidence conflict and must never fall through.
+		if err := s.authenticateCandidateRepairBuildContextAt(txCtx, conn, ref, baseline.Version, domain.Fence{
+			LeaderEpoch: control.stop.leader,
+			RunnerEpoch: baseline.RunnerEpoch,
+		}); err != nil {
+			return err
+		}
+		if err := authenticateCandidateRepairRuntimeControl(txCtx, conn, ref, control, baseline, proof.Ticket, leader); err != nil {
+			return err
+		}
+		// The retained baseline and sealed control prove the intended rearm
+		// source. Admission still requires a complete audit of every durable
+		// recovery row through the current ticket, including rows before the
+		// repair and any forged suffix beyond it.
+		if err := validateRunnerRecoveryAuthority(txCtx, conn, ref, proof.Ticket.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: proof.Ticket.RunnerEpoch}); err != nil {
+			return ErrStaleFence
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	g.latch(ref, mutationRevocation{version: proof.Ticket.Version, leader: leader, runner: proof.Ticket.RunnerEpoch})
+	return &RuntimeRearmCapability{ref: ref, version: proof.Ticket.Version, fence: proof.Fence, issued: true}, nil
+}
+
+func authenticateCandidateRepairRuntimeControl(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, control durableRuntimeControl, baseline, current Ticket, currentLeader uint64) error {
+	if control.state != "sealed" || baseline.Ref != ref || baseline.State != domain.StateBuilding || baseline.Version == 0 || baseline.Version > ^uint64(0)-3 || baseline.RunnerEpoch == 0 || baseline.RunnerEpoch == ^uint64(0) || current.Ref != ref || current.State != domain.StateBuilding || currentLeader == 0 || control.stop.version != baseline.Version+1 || control.stop.runner != baseline.RunnerEpoch+1 || control.stop.leader == 0 {
+		return ErrStaleFence
+	}
+	if err := authenticatePostPublicationResume(ctx, q, ref, baseline, current, control.stop); err != nil {
+		return err
+	}
+	resumed := mutationRevocation{version: baseline.Version + 3, leader: control.stop.leader, runner: baseline.RunnerEpoch + 1}
+	live := mutationRevocation{version: current.Version, leader: currentLeader, runner: current.RunnerEpoch}
+	if live != resumed && validateRunnerRecoveryLedgerPrefix(ctx, q, ref, resumed.version, resumed.runner, resumed.leader, live.version, live.runner, live.leader) != nil {
+		return ErrStaleFence
+	}
+	if control.authority == control.stop {
+		// The resume committed but no runtime admission was installed. The
+		// exact control events and live recovery suffix above are sufficient.
+		return nil
+	}
+	if control.authority != resumed && validateRunnerRecoveryLedgerPrefix(ctx, q, ref, resumed.version, resumed.runner, resumed.leader, control.authority.version, control.authority.runner, control.authority.leader) != nil {
+		return ErrStaleFence
+	}
+	if control.authority != live && validateRunnerRecoveryLedgerPrefix(ctx, q, ref, control.authority.version, control.authority.runner, control.authority.leader, live.version, live.runner, live.leader) != nil {
+		return ErrStaleFence
+	}
+	return nil
+}
+
 // PostPublicationRearmProof is the separate authority for resuming a ticket
 // after publication has begun.  It shares the sealed/drained serialization
 // with RearmProof but has its own state and evidence allowlist; in particular,
@@ -2112,7 +2229,7 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 // authenticatePostPublicationResume binds the resumed ticket to the exact
 // operator control triplet that followed the sealed stop.  A newer counter
 // without this three-event chain is ambiguous and cannot authorize rearm.
-func authenticatePostPublicationResume(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, stopped, current Ticket, stop mutationRevocation) error {
+func authenticatePostPublicationResume(ctx context.Context, conn candidateEvidenceQuerier, ref domain.TicketRef, stopped, current Ticket, stop mutationRevocation) error {
 	if current.Version < stopped.Version || stopped.Version > ^uint64(0)-3 || stopped.RunnerEpoch > ^uint64(0)-1 || current.Version < stopped.Version+3 || current.RunnerEpoch < stopped.RunnerEpoch+1 || stop.version != stopped.Version+1 || stop.runner != stopped.RunnerEpoch+1 || stop.leader == 0 {
 		return ErrStaleFence
 	}

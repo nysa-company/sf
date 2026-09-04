@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1188,6 +1189,74 @@ func TestChecksRejectsHeadDriftBetweenCheckObservations(t *testing.T) {
 	}
 }
 
+func TestChecksCanonicalizesProductionExternalIdentityForStore(t *testing.T) {
+	repository := contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}
+	identity := contracts.PullRequestIdentity{
+		Repository:     repository,
+		Number:         7,
+		HeadOwner:      "example",
+		HeadRepository: "app",
+		HeadRef:        "sf/dev/example/SF-44-random",
+		HeadOID:        strings.Repeat("a", 40),
+		BaseRef:        "main",
+		BaseOID:        strings.Repeat("c", 40),
+		FactoryOwned:   true,
+	}
+	observed, err := json.Marshal([]map[string]any{mergeWire(identity, "OPEN", "CLEAN", nil, nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := checkWire{Name: "unit", State: "SUCCESS", Workflow: "ci", Link: "https://example.test/actions/runs/1/jobs/2", Bucket: "pass"}
+	longLinkPrefix := "https://example.test/"
+	longWire := checkWire{Name: "lint", State: "PENDING", Link: longLinkPrefix + strings.Repeat("x", 2048-len(longLinkPrefix))}
+	wireJSON, err := json.Marshal([]checkWire{wire, longWire})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if args[0] == "pr" && args[1] == "list" {
+			return observed, nil
+		}
+		if args[0] == "pr" && args[1] == "checks" {
+			return wireJSON, nil
+		}
+		return nil, errors.New("unexpected command")
+	}), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil })}
+
+	checks, err := client.RequiredChecks(context.Background(), identity)
+	if err != nil || len(checks) != 2 {
+		t.Fatalf("checks=%+v err=%v", checks, err)
+	}
+	expected := canonicalCheckExternalID(wire)
+	if checks[0].ExternalID != expected || len(expected) != len("sha256:")+sha256.Size*2 || strings.ContainsRune(expected, '\x00') {
+		t.Fatalf("external identity=%q expected=%q", checks[0].ExternalID, expected)
+	}
+	if _, err := store.NormalizeCIObservationChecks(checks); err != nil {
+		t.Fatalf("Store rejected canonical GitHub check identity: %v", err)
+	}
+	if len(longWire.Link) != 2048 || checks[1].ExternalID != canonicalCheckExternalID(longWire) {
+		t.Fatalf("long link identity=%q link-length=%d", checks[1].ExternalID, len(longWire.Link))
+	}
+	stateChanged := wire
+	stateChanged.State = "PENDING"
+	if canonicalCheckExternalID(stateChanged) != expected {
+		t.Fatal("check state changed stable external identity")
+	}
+	bucketChanged := wire
+	bucketChanged.Bucket = "pending"
+	if canonicalCheckExternalID(bucketChanged) != expected {
+		t.Fatal("state-derived bucket changed stable external identity")
+	}
+	for name, changed := range map[string]checkWire{
+		"workflow": {Name: wire.Name, State: wire.State, Workflow: "other", Link: wire.Link, Bucket: wire.Bucket},
+		"link":     {Name: wire.Name, State: wire.State, Workflow: wire.Workflow, Link: wire.Link + "/3", Bucket: wire.Bucket},
+	} {
+		if canonicalCheckExternalID(changed) == expected {
+			t.Fatalf("%s change retained external identity", name)
+		}
+	}
+}
+
 func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	client, fake, identity := fixture(t)
 	pr := createDraft(t, client, identity, "title", "body")
@@ -1198,14 +1267,15 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "1", State: "SUCCESS"}); err != nil {
 		t.Fatal(err)
 	}
-	checks, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "1"}}, time.Millisecond, time.Millisecond)
+	checkID := canonicalCheckExternalID(checkWire{Link: "1"})
+	checks, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: checkID}}, time.Millisecond, time.Millisecond)
 	if err != nil || len(checks) != 1 {
 		t.Fatalf("checks=%+v err=%v", checks, err)
 	}
 	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "wrong", State: "SUCCESS"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "1"}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksFailed) {
+	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: checkID}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksFailed) {
 		t.Fatalf("strict checks=%v", err)
 	}
 	if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
@@ -2277,7 +2347,8 @@ func TestWaitChecksBoundsBackgroundContext(t *testing.T) {
 	old := maxGHDeadline
 	maxGHDeadline = 300 * time.Millisecond
 	t.Cleanup(func() { maxGHDeadline = old })
-	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "one"}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksPending) {
+	checkID := canonicalCheckExternalID(checkWire{Link: "one"})
+	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: checkID}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksPending) {
 		t.Fatalf("bounded background polling=%v", err)
 	}
 }

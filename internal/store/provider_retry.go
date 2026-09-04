@@ -230,7 +230,7 @@ func validateProviderPausedResumePrefix(ctx context.Context, conn *sql.Conn, ref
 // row is the exact typed interruption of a retained provider entry before an
 // operator_recover appends its resumption event.
 func validateProviderBlockedRecoveryPrefix(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, phase domain.Phase, version, runner, leader uint64, target domain.State, code string) error {
-	if version < 2 || runner == 0 || leader == 0 || !providerStateForPhaseTransition(target) || providerStateForPhase(phase) != target || !validBlockedCode(code) || code == "legacy_provider_phase_entry_unverifiable" {
+	if version < 2 || runner == 0 || leader == 0 || !providerStateForPhaseTransition(target) || providerStateForPhase(phase) != target || !validBlockedCode(code) || code == "legacy_provider_phase_entry_unverifiable" || nonRecoverableBlockedRecoveryCode(code) {
 		return ErrEvidenceConflict
 	}
 	entry, err := loadCurrentProviderPhaseEntry(ctx, conn, ref, phase, version-1, runner, leader)
@@ -282,7 +282,7 @@ func validateProviderBlockedRecoveryAdvance(ctx context.Context, q interface {
 	var payload struct {
 		Code string `json:"code"`
 	}
-	if blockTrigger != "typed_blocker" || blockFrom != entry.State || blockTo != domain.StateBlocked || len(blockRaw) > maxEvidenceJSON || json.Unmarshal([]byte(blockRaw), &payload) != nil || !validBlockedCode(payload.Code) || payload.Code == "legacy_provider_phase_entry_unverifiable" || recoverTrigger != "operator_recover" || recoverFrom != domain.StateBlocked || recoverTo != entry.State {
+	if blockTrigger != "typed_blocker" || blockFrom != entry.State || blockTo != domain.StateBlocked || len(blockRaw) > maxEvidenceJSON || json.Unmarshal([]byte(blockRaw), &payload) != nil || !validBlockedCode(payload.Code) || payload.Code == "legacy_provider_phase_entry_unverifiable" || nonRecoverableBlockedRecoveryCode(payload.Code) || recoverTrigger != "operator_recover" || recoverFrom != domain.StateBlocked || recoverTo != entry.State {
 		return ErrEvidenceConflict
 	}
 	if err := exactStateChangeEvent(ctx, q, ref, version-1, "typed_blocker", entry.State, domain.StateBlocked); err != nil {
@@ -538,7 +538,7 @@ func validateProviderAttemptControlBlockAdvance(ctx context.Context, q rowQuerye
 			var blocker struct {
 				Code string `json:"code"`
 			}
-			if json.Unmarshal([]byte(first.payload), &blocker) != nil || !validBlockedCode(blocker.Code) || blocker.Code == "legacy_provider_phase_entry_unverifiable" || nonRecoverableProviderBlockerCode(blocker.Code) {
+			if json.Unmarshal([]byte(first.payload), &blocker) != nil || !validBlockedCode(blocker.Code) || blocker.Code == "legacy_provider_phase_entry_unverifiable" || nonRecoverableBlockedRecoveryCode(blocker.Code) {
 				return ErrEvidenceConflict
 			}
 			recovered := changes[index+1]
@@ -1275,9 +1275,12 @@ func providerPausedRecoveryPredecessor(ctx context.Context, conn *sql.Conn, ref 
 		return 0, false, ErrPublicationEvidence
 	}
 	stopVersion := control.stop.version
-	entry, err := loadProviderPhaseEntryAt(ctx, conn, ref, phase, stopVersion-1)
-	if err != nil || entry.State != state || entry.Version != stopVersion-1 ||
-		entry.Runner+1 != runner || entry.Leader != control.stop.leader {
+	// Runner recovery never rewrites the immutable phase entry. Authenticate
+	// that historical entry through the complete signed suffix to the exact
+	// pre-stop endpoint instead of requiring the row itself to have been
+	// rebound there.
+	entry, err := loadCurrentProviderPhaseEntry(ctx, conn, ref, phase, stopVersion-1, control.stop.runner-1, control.stop.leader)
+	if err != nil || entry.State != state {
 		return 0, false, ErrPublicationEvidence
 	}
 	if err := validateProviderPhaseEntryBindings(ctx, conn, ref, entry); err != nil {

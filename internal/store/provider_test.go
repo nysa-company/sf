@@ -992,6 +992,49 @@ func TestProviderBlockedRecoveryEvidenceRejectsSameVersionEventTampering(t *test
 	}
 }
 
+func TestProviderBlockedRecoveryEvidenceRejectsVerificationAmendmentInvalid(t *testing.T) {
+	db, ctx := openTestStore(t)
+	setupProviderProject(t, db, ctx)
+	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-amendment-invalid-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, db, ctx, "SF-provider-amendment-invalid-recovery", leader)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	blocked, err := db.Transition(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version,
+		From: domain.StatePlanning, To: domain.StateBlocked, ResumeState: domain.StatePlanning,
+		Trigger: "typed_blocker", Fence: fence, EventPayload: `{"code":"host_repair_required"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := db.Transition(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: blocked.Version,
+		From: domain.StateBlocked, To: domain.StatePlanning, ResumeState: domain.StatePlanning,
+		Trigger: "operator_recover", Fence: fence, EventPayload: `{"intent":"recover"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := loadProviderPhaseEntryAt(ctx, db.db, ticket.Ref, domain.PhasePlanning, ticket.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE events SET payload=? WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='typed_blocker'`, `{"code":"verification_amendment_invalid"}`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, blocked.Version); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateProviderBlockedRecoveryAdvance(ctx, db.db, ticket.Ref, entry, recovered.Version, ticket.RunnerEpoch, leader); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("amendment-invalid provider recovery advance=%v", err)
+	}
+	if validProviderBlockedRecoveryGap(ctx, db.db, ticket.Ref, ticket.Version, ticket.RunnerEpoch, leader, recovered.Version, ticket.RunnerEpoch, leader) {
+		t.Fatal("amendment-invalid provider recovery was accepted as a runner bridge")
+	}
+	if _, err := loadCurrentProviderPhaseEntry(ctx, db.db, ticket.Ref, domain.PhasePlanning, recovered.Version, ticket.RunnerEpoch, leader); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("amendment-invalid recovery renewed provider entry: %v", err)
+	}
+}
+
 func TestGenericTransitionRejectsUnauthenticatedCandidateHeadReentry(t *testing.T) {
 	db, ctx := openTestStore(t)
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "provider", Ticket: "SF-unbound-candidate-reentry"}
@@ -1261,6 +1304,13 @@ func TestVerificationAndCandidateTransitionsConsumeNewestSameFenceResult(t *test
 	}
 	if _, e = db.TransitionCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}, stored.Snapshot); e != nil {
 		t.Fatal(e)
+	}
+	publishing, e := db.Ticket(ctx, ticket.Ref)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = db.AuthenticatePublishingRecovery(ctx, publishing.Ref, stored, publishing.Version, fence); e != nil {
+		t.Fatalf("recovered candidate publication authority=%v", e)
 	}
 	if after := eventCount(t, db, ctx, ticket.Ref); after != before+2 {
 		t.Fatalf("events=%d want=%d", after, before+2)

@@ -765,7 +765,11 @@ func TestUnexpectedRemoteHeadNeverOverwritten(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := filepath.Join(t.TempDir(), "other")
-	rawGit(t, t.TempDir(), "clone", remote, other)
+	// A freshly initialized bare repository keeps its implementation-defined
+	// HEAD until a server explicitly changes it. Select the protected branch
+	// during clone so this fixture does not depend on the host's
+	// init.defaultBranch setting (GitHub runners and developer machines differ).
+	rawGit(t, t.TempDir(), "clone", "--branch", "main", remote, other)
 	rawGit(t, other, "checkout", branch)
 	rawGit(t, other, "config", "user.name", "other")
 	rawGit(t, other, "config", "user.email", "other@example.test")
@@ -1013,7 +1017,10 @@ func TestPushRefusesMovedRemoteBaseBeforeCandidatePublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := filepath.Join(t.TempDir(), "other")
-	rawGit(t, t.TempDir(), "clone", remote, other)
+	// The bare test remote does not have an authoritative symbolic HEAD.
+	// Select the protected branch explicitly so the fixture is independent of
+	// the host's init.defaultBranch setting.
+	rawGit(t, t.TempDir(), "clone", "--branch", "main", remote, other)
 	rawGit(t, other, "config", "user.name", "other")
 	rawGit(t, other, "config", "user.email", "other@example.test")
 	if err := os.WriteFile(filepath.Join(other, "base.txt"), []byte("moved\n"), 0o600); err != nil {
