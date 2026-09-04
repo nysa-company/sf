@@ -747,6 +747,44 @@ func TestPublicationInventoryRejectsForeignAndAmbiguousOpenSourceBase(t *testing
 	}
 }
 
+func TestPublicationInventoryAcceptsDocumentedRepositoryObjectFields(t *testing.T) {
+	identity := contracts.PullRequestIdentity{
+		Repository:     contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"},
+		HeadOwner:      "example",
+		HeadRepository: "app",
+		HeadRef:        "sf/dev/example/SF-44-random",
+		HeadOID:        strings.Repeat("a", 40),
+		BaseRef:        "main",
+		BaseOID:        strings.Repeat("c", 40),
+		FactoryOwned:   true,
+	}
+	payload, err := json.Marshal([]map[string]any{{
+		"number":              7,
+		"title":               "title",
+		"body":                ownershipMarker(identity),
+		"headRepositoryOwner": map[string]any{"id": "O_example", "login": identity.HeadOwner},
+		"headRepository":      map[string]any{"id": "R_example", "name": identity.HeadRepository, "nameWithOwner": identity.HeadOwner + "/" + identity.HeadRepository},
+		"headRefName":         identity.HeadRef,
+		"headRefOid":          identity.HeadOID,
+		"baseRefName":         identity.BaseRef,
+		"baseRefOid":          identity.BaseOID,
+		"isDraft":             true,
+		"mergedAt":            nil,
+		"mergeCommit":         nil,
+		"state":               "OPEN",
+		"mergeStateStatus":    "CLEAN",
+		"autoMergeRequest":    nil,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	match, found, err := refreshTestClient(t, payload, &calls).ObservePublicationCandidate(context.Background(), identity)
+	if err != nil || !found || match.Identity.Number != 7 || !sameExact(match.Identity, identity) {
+		t.Fatalf("live-shaped publication inventory match=%+v found=%v err=%v", match, found, err)
+	}
+}
+
 func TestPublicationInventoryRefusesEmptyExpectedBaseWithoutMutation(t *testing.T) {
 	client, fake, identity := fixture(t)
 	identity.BaseOID = ""

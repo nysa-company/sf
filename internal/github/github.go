@@ -1844,9 +1844,12 @@ const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefNa
 type prWire struct {
 	Number         int `json:"number"`
 	HeadRepository struct {
+		ID            string `json:"id"`
+		Name          string `json:"name"`
 		NameWithOwner string `json:"nameWithOwner"`
 	} `json:"headRepository"`
 	HeadRepositoryOwner struct {
+		ID    string `json:"id"`
 		Login string `json:"login"`
 	} `json:"headRepositoryOwner"`
 	HeadRef     string  `json:"headRefName"`
