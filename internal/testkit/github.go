@@ -1678,7 +1678,10 @@ func validateOfficialArgv(argv []string) error {
 			return err
 		}
 	case "repo view":
-		allowed["--repo"], allowed["--json"] = true, true
+		allowed["--json"] = true
+		if len(argv) < 3 || strings.HasPrefix(argv[2], "--") || !validFakeRepositoryArg(argv[2]) {
+			return fmt.Errorf("fake-gh: %s requires a positional owner/name", key)
+		}
 		if err := require("--json", "nameWithOwner,url"); err != nil {
 			return err
 		}
@@ -1833,7 +1836,7 @@ func prNumber(argv []string) int {
 
 func (f *FakeGH) runRepoView(argv []string) ([]byte, error) {
 	identity := contracts.RepositoryIdentity{Host: "github.com"}
-	value := option(argv, "--repo")
+	value := argv[2]
 	parts := strings.Split(value, "/")
 	if len(parts) == 2 {
 		identity.Owner, identity.Name = parts[0], parts[1]
@@ -1843,6 +1846,23 @@ func (f *FakeGH) runRepoView(argv []string) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(map[string]string{"nameWithOwner": result.Owner + "/" + result.Name, "url": "https://" + result.Host + "/" + result.Owner + "/" + result.Name})
+}
+
+func validFakeRepositoryArg(value string) bool {
+	parts := strings.Split(value, "/")
+	return len(parts) == 2 && validFakeRepositoryPart(parts[0]) && validFakeRepositoryPart(parts[1])
+}
+
+func validFakeRepositoryPart(value string) bool {
+	if value == "" || len(value) > 100 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 func identityFromArgs(argv []string, number int) contracts.PullRequestIdentity {

@@ -830,7 +830,7 @@ func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryId
 		NameWithOwner string `json:"nameWithOwner"`
 		URL           string `json:"url"`
 	}
-	if err := c.json(ctx, &repo, "repo", "view", "--repo", repoArg(repository), "--json", "nameWithOwner,url"); err != nil {
+	if err := c.json(ctx, &repo, "repo", "view", repoArg(repository), "--json", "nameWithOwner,url"); err != nil {
 		return Principal{}, err
 	}
 	if repo.NameWithOwner != repository.Owner+"/"+repository.Name || repo.URL == "" {

@@ -601,6 +601,44 @@ func TestAuthStatusAcceptsOfficialHostsStateShape(t *testing.T) {
 	}
 }
 
+func TestPreflightUsesPositionalRepositoryArg(t *testing.T) {
+	var calls [][]string
+	client := Client{
+		binaryPath: "/bin/echo",
+		home:       t.TempDir(),
+		configDir:  t.TempDir(),
+		runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+			calls = append(calls, append([]string(nil), args...))
+			switch len(calls) {
+			case 1:
+				return []byte(`{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"sf-test"}]}}`), nil
+			case 2:
+				return []byte(`{"nameWithOwner":"example/app","url":"https://github.com/example/app"}`), nil
+			default:
+				return nil, errors.New("unexpected extra invocation")
+			}
+		}),
+		quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }),
+	}
+	repository := contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}
+	principal, err := client.Preflight(context.Background(), repository)
+	if err != nil || principal.Login != "sf-test" {
+		t.Fatalf("preflight=%+v err=%v", principal, err)
+	}
+	want := [][]string{
+		{"auth", "status", "--json", "hosts"},
+		{"repo", "view", "example/app", "--json", "nameWithOwner,url"},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("argv=%#v want %#v", calls, want)
+	}
+	for _, arg := range calls[1] {
+		if arg == "--repo" {
+			t.Fatal("repo view must not use --repo")
+		}
+	}
+}
+
 func TestMergeQueueGraphQLFailsClosedBeforeMerge(t *testing.T) {
 	client, _, identity := fixture(t)
 	identity.Number = 7
