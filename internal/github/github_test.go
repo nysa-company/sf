@@ -2397,9 +2397,8 @@ func TestRunBoundedKillsProcessGroupOnDeadline(t *testing.T) {
 func TestRunBoundedClosesRetainedPipeFromEscapedDescendant(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	started := time.Now()
 	ready := filepath.Join(t.TempDir(), "escaped-child-ready")
-	script := "import os,time\nif os.fork()==0:\n if os.fork()==0:\n  os.setsid(); print('escaped-child-pid='+str(os.getpid()), flush=True); open(os.environ['SF_TEST_READY'],'w').close(); time.sleep(5)\n os._exit(0)\ntime.sleep(5)"
+	script := "import os,time\nif os.fork()==0:\n if os.fork()==0:\n  os.setsid(); print('escaped-child-pid='+str(os.getpid()), flush=True); ready=os.environ['SF_TEST_READY']; open(ready+'.tmp','w').write(str(os.getpid())); os.replace(ready+'.tmp',ready); time.sleep(5)\n os._exit(0)\ntime.sleep(5)"
 	type boundedResult struct {
 		output []byte
 		err    error
@@ -2426,17 +2425,35 @@ func TestRunBoundedClosesRetainedPipeFromEscapedDescendant(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	cancel()
-	result := <-done
-	output, err := result.output, result.err
-	if !errors.Is(err, ErrProcessCleanup) || time.Since(started) > 2*time.Second {
-		t.Fatalf("escaped retained pipe err=%v elapsed=%s output=%q", err, time.Since(started), output)
+	readyPID, err := os.ReadFile(ready)
+	if err != nil {
+		cancel()
+		result := <-done
+		t.Fatalf("read escaped child pid: %v; fixture err=%v output=%q", err, result.err, result.output)
 	}
-	for _, field := range strings.Fields(string(output)) {
-		if strings.HasPrefix(field, "escaped-child-pid=") {
-			if pid, parseErr := strconv.Atoi(strings.TrimPrefix(field, "escaped-child-pid=")); parseErr == nil && pid > 0 {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}
+	escapedPID, err := strconv.Atoi(strings.TrimSpace(string(readyPID)))
+	if err != nil || escapedPID <= 0 {
+		cancel()
+		result := <-done
+		t.Fatalf("parse escaped child pid %q: %v; fixture err=%v output=%q", readyPID, err, result.err, result.output)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(escapedPID, syscall.SIGKILL)
+	})
+	cleanupDeadline := time.NewTimer(2 * time.Second)
+	defer cleanupDeadline.Stop()
+	cancel()
+	var result boundedResult
+	select {
+	case result = <-done:
+	case <-cleanupDeadline.C:
+		t.Fatal("escaped retained pipe cleanup exceeded 2 seconds after cancellation")
+	}
+	output, err := result.output, result.err
+	if !errors.Is(err, ErrProcessCleanup) {
+		t.Fatalf("escaped retained pipe err=%v output=%q", err, output)
+	}
+	if !strings.Contains(string(output), "escaped-child-pid="+strconv.Itoa(escapedPID)) {
+		t.Fatalf("escaped child pid missing from output: pid=%d output=%q", escapedPID, output)
 	}
 }
