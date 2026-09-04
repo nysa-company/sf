@@ -574,6 +574,21 @@ func (s *Store) RecoverableVerification(ctx context.Context, ref domain.TicketRe
 	return s.verificationEvidenceForCandidate(ctx, ref)
 }
 
+// HistoricalVerification authenticates the immutable verification checkpoint
+// at the fence where it was recorded. It is for read-only status projections;
+// it deliberately does not make that historical checkpoint current transition
+// authority.
+func (s *Store) HistoricalVerification(ctx context.Context, ref domain.TicketRef) (StoredVerification, error) {
+	verification, err := s.RecoverableVerification(ctx, ref)
+	if err != nil {
+		return StoredVerification{}, err
+	}
+	if err := s.reauthenticateStoredVerificationCommandHistoricalFrom(ctx, s.db, ref, verification); err != nil {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	return verification, nil
+}
+
 func (s *Store) LatestCandidate(ctx context.Context, ref domain.TicketRef) (StoredCandidate, error) {
 	return s.latestCandidate(ctx, ref, true)
 }
@@ -584,6 +599,20 @@ func (s *Store) LatestCandidate(ctx context.Context, ref domain.TicketRef) (Stor
 // use LatestCandidate, which rejects a stale historical binding.
 func (s *Store) RecoverableCandidate(ctx context.Context, ref domain.TicketRef) (StoredCandidate, error) {
 	return s.latestCandidate(ctx, ref, false)
+}
+
+// HistoricalCandidate authenticates the immutable candidate checkpoint at the
+// fence where it was recorded. It is for read-only status projections; callers
+// that need current transition authority must continue to use LatestCandidate.
+func (s *Store) HistoricalCandidate(ctx context.Context, ref domain.TicketRef) (StoredCandidate, error) {
+	candidate, err := s.RecoverableCandidate(ctx, ref)
+	if err != nil {
+		return StoredCandidate{}, err
+	}
+	if err := s.reauthenticateStoredCandidateCommandHistoricalFrom(ctx, s.db, ref, candidate); err != nil {
+		return StoredCandidate{}, ErrEvidenceConflict
+	}
+	return candidate, nil
 }
 
 func (s *Store) latestCandidate(ctx context.Context, ref domain.TicketRef, authenticateFence bool) (StoredCandidate, error) {

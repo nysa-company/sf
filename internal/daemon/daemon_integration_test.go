@@ -350,6 +350,14 @@ func daemonFixtureCompleteCommand(t *testing.T, database *store.Store, ref domai
 // provenance required for a guarded operator retry. It never invokes a GitHub,
 // Git, or provider adapter: the immutable observations are explicit fixtures.
 func prepareDaemonGuardedMergeRetry(t *testing.T, daemon *Daemon, ticketID domain.TicketID) store.Ticket {
+	return prepareDaemonGuardedLifecycle(t, daemon, ticketID, false)
+}
+
+func prepareDaemonPublishingStatusFixture(t *testing.T, daemon *Daemon, ticketID domain.TicketID) store.Ticket {
+	return prepareDaemonGuardedLifecycle(t, daemon, ticketID, true)
+}
+
+func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain.TicketID, stopAtPublishing bool) store.Ticket {
 	t.Helper()
 	ctx := t.Context()
 	ref := domain.TicketRef{Channel: daemon.channel, Project: "demo", Ticket: ticketID}
@@ -486,6 +494,12 @@ func prepareDaemonGuardedMergeRetry(t *testing.T, daemon *Daemon, ticketID domai
 	ticket, err = daemon.store.Ticket(ctx, ref)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if stopAtPublishing {
+		if ticket.State != domain.StatePublishing {
+			t.Fatalf("publishing fixture ticket=%+v", ticket)
+		}
+		return ticket
 	}
 	candidate, err := daemon.store.RecoverableCandidate(ctx, ref)
 	if err != nil {
@@ -2232,6 +2246,49 @@ func TestDaemonShowAndStatusExposeBoundedAuthenticatedEvidence(t *testing.T) {
 		if !response.OK || !strings.Contains(string(response.Data), `"next_action":{"code":"ticket_budget_exhausted","argv":["sf","cancel","SF-budget-action-view"]}`) {
 			t.Fatalf("%s budget action response=%+v data=%s", method, response, response.Data)
 		}
+	}
+}
+
+func TestDaemonDetailedStatusAuthenticatesHistoricalEvidenceAfterPublishing(t *testing.T) {
+	d, _, _ := testDaemon(t)
+	publishing := prepareDaemonPublishingStatusFixture(t, d, "SF-publishing-status-evidence")
+	if publishing.State != domain.StatePublishing {
+		t.Fatalf("fixture ticket=%+v", publishing)
+	}
+	if _, err := d.store.CurrentVerification(t.Context(), publishing.Ref); !errors.Is(err, store.ErrEvidenceConflict) {
+		t.Fatalf("strict verification accepted publishing history: %v", err)
+	}
+	if _, err := d.store.LatestCandidate(t.Context(), publishing.Ref); !errors.Is(err, store.ErrStaleFence) {
+		t.Fatalf("strict candidate accepted publishing history: %v", err)
+	}
+	response := d.Handle(t.Context(), transport.Peer{UID: uint32(os.Getuid())}, api.Request{
+		Version: api.Version, RequestID: "status-publishing-evidence", Method: "ticket.status", Ticket: string(publishing.Ref.Ticket),
+		OperatorLabel: "operator", Parameters: json.RawMessage(`{"channel":"stable","project":"demo","watch":false}`),
+	})
+	if !response.OK {
+		t.Fatalf("publishing status=%+v data=%s", response, response.Data)
+	}
+	var view struct {
+		Ticket struct {
+			State domain.State `json:"state"`
+		} `json:"ticket"`
+		Evidence struct {
+			Verification struct {
+				TicketVersion uint64 `json:"ticket_version"`
+				CheckpointID  string `json:"checkpoint_id"`
+			} `json:"verification"`
+			Candidate struct {
+				Generation    uint64 `json:"generation"`
+				TicketVersion uint64 `json:"ticket_version"`
+				HeadSHA       string `json:"head_sha"`
+			} `json:"candidate"`
+		} `json:"evidence"`
+	}
+	if err := json.Unmarshal(response.Data, &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Ticket.State != domain.StatePublishing || view.Evidence.Verification.TicketVersion != publishing.Version-2 || view.Evidence.Verification.CheckpointID == "" || view.Evidence.Candidate.Generation != 1 || view.Evidence.Candidate.TicketVersion != publishing.Version-1 || view.Evidence.Candidate.HeadSHA == "" {
+		t.Fatalf("publishing status view=%+v", view)
 	}
 }
 
