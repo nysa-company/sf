@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
@@ -222,8 +223,39 @@ func TestPhaseRunnerVerificationUsesStoredPlannerWitness(t *testing.T) {
 	if err != nil || out.ProviderResult != key {
 		t.Fatalf("out=%+v err=%v", out, err)
 	}
-	if coordinator.request.Role != providercoord.RoleReviewer || coordinator.request.Input.Phase != domain.PhaseVerification || !reflect.DeepEqual(coordinator.request.Input.AllowedPaths, plan.Plan.Paths) || !reflect.DeepEqual(coordinator.request.Validation, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest}) {
+	if coordinator.request.Role != providercoord.RoleReviewer || coordinator.request.Input.Phase != domain.PhaseVerification || !reflect.DeepEqual(coordinator.request.Input.AllowedPaths, plan.Plan.Paths) || !reflect.DeepEqual(coordinator.request.Validation, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ExpectedVerificationCommand: []string{"go", "test", "./..."}}) {
 		t.Fatalf("request=%+v", coordinator.request)
+	}
+}
+
+func TestPhaseRunnerVerificationCarriesConfigOwnedCommand(t *testing.T) {
+	request, evidence, coordinator, _, _ := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying
+	request.Plan = &evidence.plan
+	evidence.hasVerify = false
+	effective, err := decodeTicketConfig(request.Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective.Commands.Verify.Argv = []string{"node", "--test"}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Ticket.ConfigSnapshot, request.Ticket.ConfigDigest = snapshot, digest
+	evidence.ticket = request.Ticket
+	key := store.ProviderAttemptResultKey{AttemptID: 13, Ref: request.Ticket.Ref, Phase: domain.PhaseVerification, Attempt: 2}
+	result := phaseProviderResult(key, request, providercoord.RoleReviewer)
+	evidence.results[key.AttemptID] = result
+	evidence.parsed[key.AttemptID] = phaseartifact.Parsed{Phase: domain.PhaseVerification, Provider: result.Claim.Binding.Identity, Verify: evidence.parsed[12].Verify}
+	coordinator.result = providercoord.Result{Code: providercoord.Completed, ProviderResult: key}
+	bindCoordinatorResult(t, coordinator, evidence, key, time.Minute)
+
+	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(coordinator.request.Validation.ExpectedVerificationCommand, []string{"node", "--test"}) || !strings.Contains(coordinator.request.Input.Prompt, `"command":["node","--test"]`) {
+		t.Fatalf("verification command binding=%+v prompt=%q", coordinator.request.Validation, coordinator.request.Input.Prompt)
 	}
 }
 
@@ -276,6 +308,30 @@ func TestPhaseRunnerVerificationCannotBypassPendingAmendment(t *testing.T) {
 	}
 	if coordinator.calls != 0 {
 		t.Fatalf("pending amendment launched reviewer: calls=%d", coordinator.calls)
+	}
+}
+
+func TestPhaseRunnerLegacyAmendmentCommandMismatchReturnsTypedBlocker(t *testing.T) {
+	request, evidence, coordinator, _, _ := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying
+	evidence.ticket = request.Ticket
+	request.Plan = &evidence.plan
+	evidence.hasVerify = false
+	amendment := store.VerificationAmendment{
+		TransitionTicketVersion: request.Ticket.Version,
+		Prior:                   store.VerificationRevision{Revision: 1, ProofDigest: strings.Repeat("a", 64)},
+		ProposedDigest:          strings.Repeat("b", 64),
+		ProposedCommand:         []string{"node", "--test", "one_test.js"},
+		Reason:                  "legacy amendment narrowed the frozen command",
+		Requester:               "builder",
+	}
+	request.Amendment, evidence.amendment = &amendment, &amendment
+
+	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); !errors.Is(err, workflowworker.ErrVerificationAmendmentInvalid) {
+		t.Fatalf("legacy amendment mismatch err=%v", err)
+	}
+	if coordinator.calls != 0 {
+		t.Fatalf("legacy amendment launched reviewer: calls=%d", coordinator.calls)
 	}
 }
 
@@ -347,7 +403,7 @@ func TestPhaseRunnerBuildUsesExactVerificationAndRejectsRefusals(t *testing.T) {
 	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	want := phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ProtectedVerification: verification.OwnedFiles}
+	want := phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ExpectedVerificationCommand: []string{"go", "test", "./..."}, ProtectedVerification: verification.OwnedFiles}
 	if coordinator.request.Role != providercoord.RoleBuilder || !reflect.DeepEqual(coordinator.request.Input.AllowedPaths, plan.Plan.Paths) || !reflect.DeepEqual(coordinator.request.Validation, want) {
 		t.Fatalf("request=%+v", coordinator.request)
 	}

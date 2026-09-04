@@ -820,6 +820,28 @@ func TestVerificationAmendmentIgnoresHistoricalReviewerResultAndLaunchesFresh(t 
 	}
 }
 
+func TestVerificationAmendmentInvalidRunnerResultBecomesTypedBlocker(t *testing.T) {
+	evidence := &fakeEvidence{
+		hasPlan: true,
+		amendment: &store.VerificationAmendment{
+			TransitionTicketVersion: 1,
+			Prior:                   store.VerificationRevision{Revision: 1, ProofDigest: digest},
+			ProposedDigest:          strings.Repeat("b", 64),
+			ProposedCommand:         []string{"node", "--test", "one_test.js"},
+			Reason:                  "legacy amendment narrowed the frozen command",
+			Requester:               "builder",
+		},
+	}
+	engine := &fakeEngine{}
+	runner := &fakeRunner{err: ErrVerificationAmendmentInvalid}
+	worker := newWorker(domain.StateVerifying, runner, evidence, engine)
+
+	result, err := worker.Run(context.Background(), testRef, testFence)
+	if err != nil || !result.Transitioned || result.Replayed || len(runner.requests) != 1 || engine.state.State != domain.StateBlocked {
+		t.Fatalf("legacy amendment blocker=%+v err=%v calls=%d state=%s", result, err, len(runner.requests), engine.state.State)
+	}
+}
+
 func TestStaleFenceAndCancellation(t *testing.T) {
 	e := &fakeEvidence{}
 	eng := &fakeEngine{}

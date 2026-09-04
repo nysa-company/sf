@@ -193,12 +193,16 @@ func (r PhaseRunner) verification(ctx context.Context, request workflowworker.Ph
 		Workspace: phaseWorkspace(project, worktree, identity.Plan.Paths),
 		Plan:      identity,
 		Runtime:   phaseRuntime(effective.PhaseTimeout),
+		Command:   append([]string(nil), effective.Commands.Verify.Argv...),
 		Amendment: amendmentPrompt(request.Amendment),
 	})
 	if err != nil {
+		if request.Amendment != nil {
+			return workflowworker.PhaseResult{}, workflowworker.ErrVerificationAmendmentInvalid
+		}
 		return workflowworker.PhaseResult{}, ErrConfigSnapshotInvalid
 	}
-	return r.run(ctx, request, project, worktree, providercoord.RoleReviewer, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: identity.Digest})
+	return r.run(ctx, request, project, worktree, providercoord.RoleReviewer, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: identity.Digest, ExpectedVerificationCommand: append([]string(nil), effective.Commands.Verify.Argv...)})
 }
 
 func amendmentPrompt(value *store.VerificationAmendment) *workflowprompt.AmendmentReview {
@@ -237,7 +241,7 @@ func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequ
 	// A protected verification change is admissible only as a bounded Builder
 	// amendment request. The Store records and charges that request before a
 	// fresh independent Reviewer may accept the exact proposed proof.
-	return r.run(ctx, request, project, worktree, providercoord.RoleBuilder, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ProtectedVerification: append([]string(nil), verification.OwnedFiles...)})
+	return r.run(ctx, request, project, worktree, providercoord.RoleBuilder, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ExpectedVerificationCommand: append([]string(nil), effective.Commands.Verify.Argv...), ProtectedVerification: append([]string(nil), verification.OwnedFiles...)})
 }
 
 func (r PhaseRunner) admit(ctx context.Context, request workflowworker.PhaseRequest, state domain.State, route string) (store.Project, config.Effective, store.StoredWorktree, error) {
