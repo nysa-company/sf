@@ -18,6 +18,7 @@ import (
 	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/workflowruntime"
+	"github.com/nysa-company/sf/internal/worktreecoord"
 )
 
 var ErrMergeProofRequired = errors.New("merge observation requires an authenticated observer after publication begins")
@@ -69,6 +70,73 @@ func New(database *store.Store, runtime *workflowruntime.ControlBundle, observer
 	return controller, nil
 }
 
+// AuthenticateProviderRetryWorktree proves that the already-registered
+// checkout is still the exact pristine input authorized by the exhausted
+// provider phase. Store derives the phase-appropriate expected HEAD; the
+// existing-registration boundary then authenticates only that retained path
+// and can never allocate or create a replacement worktree.
+func (c *Controller) AuthenticateProviderRetryWorktree(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	return c.authenticateProviderRetryWorktree(ctx, ref, version, fence)
+}
+
+func (c *Controller) authenticateProviderRetryWorktree(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	if c == nil || c.store == nil || c.git == nil {
+		return false, errors.New("provider retry worktree authentication is unavailable")
+	}
+	proof, err := c.store.ProviderRetryWorktreeProof(ctx, ref, version, fence)
+	if err != nil {
+		return false, fmt.Errorf("load provider retry worktree proof: %w", err)
+	}
+	observed, err := (worktreecoord.Coordinator{Store: c.store, Git: *c.git}).AuthenticateExistingRegisteredWorktree(ctx, ref, proof.ExpectedHead)
+	if err != nil {
+		if errors.Is(err, worktreecoord.ErrUnready) {
+			return false, nil
+		}
+		return false, err
+	}
+	registered := proof.Worktree
+	if observed.Path != registered.Path || observed.Branch != registered.Branch || observed.State != registered.State || observed.BaseSHA != registered.BaseSHA || observed.HeadSHA != registered.HeadSHA || observed.TicketVersion != registered.TicketVersion || observed.Fence != registered.Fence || !bytes.Equal(observed.IdentityJSON, registered.IdentityJSON) {
+		return false, errors.New("provider retry worktree registration changed during authentication")
+	}
+	return true, nil
+}
+
+// RearmProviderRetry is the only runtime-admission path for a provider retry.
+// The per-ticket mutex serializes it with Drain and any ordinary rearm. The
+// checkout is reauthenticated while the Store/runtime latch remains sealed;
+// only then may the narrow provider-retry capability be activated.
+func (c *Controller) RearmProviderRetry(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
+	if c == nil || c.store == nil || c.runtime == nil || c.git == nil {
+		return false, errors.New("provider retry runtime controller is not configured")
+	}
+	entry := c.acquireTicket(ref)
+	defer c.releaseTicket(ref, entry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	stopped, found := entry.stopped, entry.hasStop
+	if !found {
+		var err error
+		stopped, err = c.store.StoppedRuntimeTicket(ctx, ref)
+		if err != nil {
+			return false, errors.New("provider retry has not completed a controller drain")
+		}
+		entry.stopped, entry.hasStop = stopped, true
+	}
+	ready, err := c.authenticateProviderRetryWorktree(ctx, ref, version, fence)
+	if err != nil || !ready {
+		return ready, err
+	}
+	capability, err := c.store.ProviderRetryRearmProof(ctx, ref, stopped)
+	if err != nil {
+		return false, err
+	}
+	if err := c.store.ActivateRearm(ctx, capability, c.runtime.ApplyRearm); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // InspectTakeover authenticates the retained worktree before it is shown to
 // an operator or used to select the unchanged-resume path. A dirty checkout
 // is classified, not rejected: the daemon can explain that its source is not
@@ -102,8 +170,45 @@ func (c *Controller) InspectTakeover(ctx context.Context, ref domain.TicketRef) 
 		return contracts.TakeoverInspection{}, err
 	}
 	inspection.HeadSHA = changes.Head
+	// Authenticate durable evidence before remote observation. A dirty
+	// worktree that has not crossed the candidate/verification boundary may be
+	// retained by a deliberately pre-publication runtime with no GitHub
+	// transport capability. All other handoffs remain remote-gated.
+	allowedHeads := map[string]struct{}{registered.HeadSHA: {}}
+	candidate, candidateErr := c.store.RecoverableCandidate(ctx, ref)
+	if candidateErr == nil {
+		allowedHeads[candidate.Snapshot.HeadSHA] = struct{}{}
+	} else if !errors.Is(candidateErr, store.ErrNotFound) {
+		return contracts.TakeoverInspection{}, candidateErr
+	}
+	verification, verificationErr := c.store.RecoverableVerification(ctx, ref)
+	if verificationErr == nil {
+		allowedHeads[verification.Checkpoint.CommitOID] = struct{}{}
+		inspection.RetainedProofDigest = verification.Revision.ProofDigest
+		inspection.RetainedPolicyDigest = verification.CommandBinding.PolicyDigest
+		inspection.RetainedVersion = verification.TicketVersion
+		inspection.RetainedLeaderEpoch = verification.Fence.LeaderEpoch
+		inspection.RetainedRunnerEpoch = verification.Fence.RunnerEpoch
+	} else if !errors.Is(verificationErr, store.ErrNotFound) {
+		return contracts.TakeoverInspection{}, verificationErr
+	}
 	remote, err := c.git.ObservePublicationRemote(ctx, worktree)
 	if err != nil || remote.BaseOID == "" {
+		if errors.Is(err, git.ErrPublicationRemoteUnavailable) && errors.Is(candidateErr, store.ErrNotFound) && errors.Is(verificationErr, store.ErrNotFound) && len(changes.Paths) != 0 {
+			prePublication, proofErr := c.store.MergeObservationPrePublication(ctx, ref)
+			if proofErr != nil {
+				return contracts.TakeoverInspection{}, proofErr
+			}
+			if prePublication {
+				// This is the registered expected base, not a remote observation.
+				// It makes the drain event structurally valid while the false
+				// RemoteIdentityExact value keeps provider re-entry remote-gated.
+				inspection.RemoteBaseSHA = registered.BaseSHA
+				inspection.ChangedFiles = append([]string(nil), changes.Paths...)
+				inspection.ChangeKind = "unadopted_changes"
+				return inspection, nil
+			}
+		}
 		if err == nil {
 			err = errors.New("protected remote base is unavailable")
 		}
@@ -117,26 +222,8 @@ func (c *Controller) InspectTakeover(ctx context.Context, ref domain.TicketRef) 
 	// head is valid after it has been recorded. During building, the current
 	// verification checkpoint is the only head from which a dirty source diff
 	// can safely be handed back to the Builder.
-	allowedHeads := map[string]struct{}{registered.HeadSHA: {}}
-	candidate, candidateErr := c.store.RecoverableCandidate(ctx, ref)
-	if candidateErr == nil {
-		allowedHeads[candidate.Snapshot.HeadSHA] = struct{}{}
-	} else if !errors.Is(candidateErr, store.ErrNotFound) {
-		return contracts.TakeoverInspection{}, candidateErr
-	}
 	if remote.Candidate.OID != "" && (candidateErr != nil || remote.Candidate.OID != candidate.Snapshot.HeadSHA) {
 		inspection.RemoteIdentityExact = false
-	}
-	verification, verificationErr := c.store.RecoverableVerification(ctx, ref)
-	if verificationErr == nil {
-		allowedHeads[verification.Checkpoint.CommitOID] = struct{}{}
-		inspection.RetainedProofDigest = verification.Revision.ProofDigest
-		inspection.RetainedPolicyDigest = verification.CommandBinding.PolicyDigest
-		inspection.RetainedVersion = verification.TicketVersion
-		inspection.RetainedLeaderEpoch = verification.Fence.LeaderEpoch
-		inspection.RetainedRunnerEpoch = verification.Fence.RunnerEpoch
-	} else if !errors.Is(verificationErr, store.ErrNotFound) {
-		return contracts.TakeoverInspection{}, verificationErr
 	}
 	ticket, ticketErr := c.store.Ticket(ctx, ref)
 	if ticketErr != nil {
@@ -302,9 +389,10 @@ func (c *Controller) Drain(ctx context.Context, ref domain.TicketRef) (bool, err
 
 // Rearm is the only supported way to clear the runtime's ticket stop latch.
 // It re-reads Store after a completed control/resume transition and accepts
-// only a newer durable active pre-publication identity with no writer or
-// uncertain effect.  A caller cannot rearm a ticket merely by retaining an
-// old Runtime pointer.
+// only a newer durable active identity with no writer or uncertain effect.
+// Store selects a separate evidence proof for pre-publication work,
+// candidate-repair Building, and post-publication work; a caller cannot rearm
+// a ticket merely by retaining an old Runtime pointer.
 func (c *Controller) Rearm(ctx context.Context, ref domain.TicketRef) error {
 	if c == nil || c.store == nil || c.runtime == nil {
 		return errors.New("runtime controller is not configured")
@@ -327,7 +415,15 @@ func (c *Controller) Rearm(ctx context.Context, ref domain.TicketRef) error {
 		return err
 	}
 	var capability *store.RuntimeRearmCapability
-	if current.State == domain.StatePublishing || current.State == domain.StateWaitingCI || current.State == domain.StateReviewing || current.State == domain.StateWaitingApproval || current.State == domain.StateWaitingManualMerge || current.State == domain.StateMerging || current.State == domain.StateReconciling {
+	if current.State == domain.StateBuilding {
+		capability, err = c.store.CandidateRepairRearmProof(ctx, ref, stopped)
+		if errors.Is(err, store.ErrNotFound) {
+			// An ordinary pre-publication Building ticket has no candidate-repair
+			// lineage. Only that clean absence may fall back; malformed or stale
+			// repair evidence must leave the runtime sealed.
+			capability, err = c.store.RearmProof(ctx, ref, stopped)
+		}
+	} else if current.State == domain.StatePublishing || current.State == domain.StateWaitingCI || current.State == domain.StateReviewing || current.State == domain.StateWaitingApproval || current.State == domain.StateWaitingManualMerge || current.State == domain.StateMerging || current.State == domain.StateReconciling {
 		capability, err = c.store.PostPublicationRearmProof(ctx, ref, stopped)
 	} else {
 		capability, err = c.store.RearmProof(ctx, ref, stopped)

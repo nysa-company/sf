@@ -291,10 +291,10 @@ func TestPromptsAreDeterministicAndRoleBound(t *testing.T) {
 	}{
 		{"planner", func() (contracts.PhaseInput, error) { return Planner(PlannerInput{ticket, workspace, runtime}) }, []string{"read-only", "Planner", "workflow states"}},
 		{"verification", func() (contracts.PhaseInput, error) {
-			return Verification(VerificationInput{ticket, workspace, plan, runtime, nil})
-		}, []string{"writes the tests or proof", "red", "missing", "baseline", "canonical_artifact"}},
+			return Verification(VerificationInput{Ticket: ticket, Workspace: workspace, Plan: plan, Runtime: runtime, Command: []string{"go", "test", "./..."}})
+		}, []string{"writes the tests or proof", "red", "missing", "baseline", "canonical_artifact", "OUTPUT_BINDING=", `"acceptance_digest":"` + plan.Digest + `"`, `"proof_kind":"regression"`, `"allowed_prebuild_outcomes":["red"]`, `"command":["go","test","./..."]`, "Always emit the final object"}},
 		{"builder", func() (contracts.PhaseInput, error) {
-			return Builder(BuilderInput{ticket, workspace, plan, verification, runtime})
+			return Builder(BuilderInput{Ticket: ticket, Workspace: workspace, Plan: plan, Verification: verification, Runtime: runtime})
 		}, []string{"Preserve every verification-owned file", "amendment_request", "canonical_artifact"}},
 		{"final-reviewer", func() (contracts.PhaseInput, error) {
 			return FinalReviewer(FinalReviewerInput{ticket, workspace, plan, verification, candidate, checks, runtime})
@@ -322,6 +322,29 @@ func TestPromptsAreDeterministicAndRoleBound(t *testing.T) {
 				t.Error("prompt exposes model-selectable lifecycle fields")
 			}
 		})
+	}
+}
+
+func TestVerificationPromptBindsFeatureOutputWithoutWeakeningSchema(t *testing.T) {
+	ticket := testTicket()
+	ticket.Type = domain.TicketFeature
+	plan := testPlan()
+	plan.Plan.Proof.Kind = phaseartifact.ProofAcceptance
+	var err error
+	plan, err = NewPlanIdentity(plan.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := Verification(VerificationInput{Ticket: ticket, Workspace: testWorkspace(), Plan: plan, Runtime: testRuntime(), Command: []string{"node", "--test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `OUTPUT_BINDING={"acceptance_digest":"` + plan.Digest + `","proof_kind":"acceptance","allowed_prebuild_outcomes":["red","missing"],"command":["node","--test"]}`
+	if !strings.Contains(input.Prompt, want) || !strings.Contains(input.Prompt, "one argv token array") {
+		t.Fatalf("verification output binding missing from prompt: %q", input.Prompt)
+	}
+	if !bytes.Equal(input.Schema, VerificationSchema()) {
+		t.Fatal("verification output binding changed the strict provider schema")
 	}
 }
 

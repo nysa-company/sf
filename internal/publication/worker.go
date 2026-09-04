@@ -145,14 +145,15 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	if candidate.Snapshot.SourceDigest != ticket.SourceDigest {
 		return result, ErrPublicationDrift
 	}
-	if candidate.TicketVersion+1 != ticket.Version || candidate.Fence != fence {
-		// A crash after building->publishing leaves the immutable candidate at
-		// its source endpoint while daemon recovery advances the live fence once.
-		// The publication witness keeps that immutable source identity and Store
-		// verifies the exact transition plus runner ledger before admitting it.
-		if candidate.TicketVersion+2 != ticket.Version || w.Store.AuthenticatePublishingRecovery(ctx, ref, candidate, ticket.Version, fence) != nil {
-			return result, ErrPublicationDrift
-		}
+	if candidate.TicketVersion > ticket.Version {
+		return result, ErrPublicationDrift
+	}
+	// Authenticate every admission, including the direct building->publishing
+	// successor. Besides proving the immutable candidate and exact transition,
+	// this rejects malformed, over-cap, or future recovery rows before any
+	// external push/PR mutation can begin.
+	if w.Store.AuthenticatePublishingRecovery(ctx, ref, candidate, ticket.Version, fence) != nil {
+		return result, ErrPublicationDrift
 	}
 	if err := w.GitHub.AuthStatus(ctx); err != nil {
 		return result, err

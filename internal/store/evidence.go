@@ -699,18 +699,6 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 	if err != nil || builderDigest != evidence.Snapshot.BuilderEvidenceDigest {
 		return nil, ErrEvidenceConflict
 	}
-	// A source-resume candidate may only be recorded after its prepared G has
-	// been confirmed. The recoverable witness is materializer-only; this Store
-	// authority boundary must use the strict witness and bind it to the exact
-	// candidate evidence being recorded.
-	if _, sourceFound, sourceErr := s.OperatorSourceResumeProof(ctx, evidence.Ref, evidence.ExpectedVersion, evidence.Fence); sourceErr != nil {
-		return nil, ErrEvidenceConflict
-	} else if sourceFound {
-		prepared, preparedFound, preparedErr := s.OperatorSourceResumePreparedCandidateWitness(ctx, evidence.Ref, evidence.ExpectedVersion, evidence.Fence)
-		if preparedErr != nil || !preparedFound || prepared.Ref != evidence.Ref || prepared.Version != evidence.ExpectedVersion || prepared.Fence != evidence.Fence || prepared.Builder != evidence.BuilderResult || prepared.Command.Key != evidence.CommandResult || prepared.Commit != evidence.Commit || prepared.Source.Worktree.BaseSHA != evidence.Snapshot.BaseSHA || prepared.Verification.Revision.IntentDigest != evidence.Snapshot.VerificationIntentDigest || prepared.Verification.Revision.ProofDigest != evidence.Snapshot.ProofDigest || strings.TrimPrefix(prepared.Command.Claim.PolicyDigest, "sha256:") != evidence.Snapshot.CommandPolicyDigest {
-			return nil, ErrEvidenceConflict
-		}
-	}
 	receipts := make([]InvalidationReceipt, 0, 4)
 	err = s.write(ctx, func(conn *sql.Conn) error {
 		if err := s.assertTicketFence(ctx, conn, evidence.Ref, evidence.ExpectedVersion, evidence.Fence); err != nil {
@@ -753,10 +741,59 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if path != builder.Claim.Worktree || identity != builder.Claim.WorktreeIdentity || base != builder.Claim.BaseSHA || base != evidence.Snapshot.BaseSHA {
 			return ErrEvidenceConflict
 		}
+		var current uint64
+		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation), 0) FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&current); err != nil {
+			return err
+		}
+		var repair candidateRepairBindingAuthority
+		repairActive := false
+		if liveState == domain.StateBuilding {
+			var repairErr error
+			repair, repairErr = s.candidateRepairBuildAuthorityAt(ctx, conn, evidence.Ref, evidence.ExpectedVersion, evidence.Fence)
+			if repairErr == nil {
+				repairActive = true
+			} else if !errors.Is(repairErr, ErrNotFound) {
+				return ErrEvidenceConflict
+			}
+		}
+		if repairActive {
+			// Candidate repair owns the current Building endpoint. If its immutable
+			// predecessor was created by a source-only resume, authenticate that
+			// source lineage at the predecessor candidate boundary; never reinterpret
+			// the later publication/CI/repair lifecycle as an initial source-resume
+			// Building suffix.
+			if err := s.authenticateOperatorSourceResumeRepairPredecessor(ctx, conn, evidence.Ref, repair); err != nil {
+				return ErrEvidenceConflict
+			}
+		} else {
+			// A source-resume candidate may only be recorded after its prepared G has
+			// been confirmed. Keep this classification and witness read on the same
+			// connection as the append so a concurrent authority change cannot turn a
+			// source candidate into an ordinary one.
+			if _, sourceFound, sourceErr := s.operatorSourceResumeProofFrom(ctx, conn, evidence.Ref, evidence.ExpectedVersion, evidence.Fence); sourceErr != nil {
+				return ErrEvidenceConflict
+			} else if sourceFound {
+				prepared, preparedFound, preparedErr := s.operatorSourceResumePreparedCandidateWitnessFrom(ctx, conn, evidence.Ref, evidence.ExpectedVersion, evidence.Fence, false)
+				if preparedErr != nil || !preparedFound || prepared.Ref != evidence.Ref || prepared.Version != evidence.ExpectedVersion || prepared.Fence != evidence.Fence || prepared.Builder != evidence.BuilderResult || prepared.Command.Key != evidence.CommandResult || prepared.Commit != evidence.Commit || prepared.Source.Worktree.BaseSHA != evidence.Snapshot.BaseSHA || prepared.Verification.Revision.IntentDigest != evidence.Snapshot.VerificationIntentDigest || prepared.Verification.Revision.ProofDigest != evidence.Snapshot.ProofDigest || strings.TrimPrefix(prepared.Command.Claim.PolicyDigest, "sha256:") != evidence.Snapshot.CommandPolicyDigest {
+					return ErrEvidenceConflict
+				}
+			}
+		}
 		var revision uint64
 		var intent, proof, owned, checkpoint string
 		var intentBytes, proofBytes []byte
-		if err := conn.QueryRowContext(ctx, `SELECT r.revision,r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&revision, &intent, &intentBytes, &proof, &proofBytes, &owned, &checkpoint); err != nil || revision == 0 || intent != evidence.Snapshot.VerificationIntentDigest || proof != evidence.Snapshot.ProofDigest || sha256Digest(intentBytes) != intent || sha256Digest(proofBytes) != proof || !validOID(checkpoint) || evidence.Commit.ParentOID != checkpoint {
+		if err := conn.QueryRowContext(ctx, `SELECT r.revision,r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&revision, &intent, &intentBytes, &proof, &proofBytes, &owned, &checkpoint); err != nil || revision == 0 || intent != evidence.Snapshot.VerificationIntentDigest || proof != evidence.Snapshot.ProofDigest || sha256Digest(intentBytes) != intent || sha256Digest(proofBytes) != proof || !validOID(checkpoint) {
+			return ErrEvidenceConflict
+		}
+		expectedParent := checkpoint
+		if repairActive {
+			generationStateValid := (current == repair.context.PredecessorGeneration && repair.context.TargetGeneration == current+1) || current == repair.context.TargetGeneration
+			if !generationStateValid || repair.context.TargetGeneration != repair.context.PredecessorGeneration+1 || evidence.Snapshot.VerificationIntentDigest != repair.context.Verification.Revision.IntentDigest || evidence.Snapshot.ProofDigest != repair.context.Verification.Revision.ProofDigest || checkpoint != repair.context.Verification.Revision.CheckpointID {
+				return ErrEvidenceConflict
+			}
+			expectedParent = repair.context.PredecessorHeadSHA
+		}
+		if evidence.Commit.ParentOID != expectedParent {
 			return ErrEvidenceConflict
 		}
 		var ownedFiles []string
@@ -770,9 +807,35 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if err != nil {
 			return err
 		}
-		var current uint64
-		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation), 0) FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&current); err != nil {
-			return err
+		if liveState == domain.StatePublishing && current > 0 {
+			var publications int
+			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket).Scan(&publications); err != nil {
+				return err
+			}
+			if publications > 0 {
+				// Once publication embeds a candidate binding, publication rebinds—not
+				// Builder replay—own later runner/leader handoffs. Permit only an exact
+				// lost-response replay of a binding already present before the witness;
+				// never append a newer binding that would invalidate the immutable row.
+				var existing domain.CandidateSnapshot
+				if err := conn.QueryRowContext(ctx, `SELECT generation,base_sha,head_sha,tree_sha,source_digest,verification_intent_digest,proof_digest,command_policy_digest,builder_evidence_digest FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? AND generation=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, current).Scan(&existing.Generation, &existing.BaseSHA, &existing.HeadSHA, &existing.TreeSHA, &existing.SourceDigest, &existing.VerificationIntentDigest, &existing.ProofDigest, &existing.CommandPolicyDigest, &existing.BuilderEvidenceDigest); err != nil {
+					return ErrEvidenceConflict
+				}
+				candidate := evidence.Snapshot
+				if candidate.Generation == 0 {
+					candidate.Generation = current
+				}
+				if candidate != existing {
+					return ErrEvidenceConflict
+				}
+				var id int64
+				var attempt int
+				var parent string
+				if err := conn.QueryRowContext(ctx, `SELECT provider_attempt_id,provider_attempt,commit_parent_oid FROM candidate_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND generation=? AND binding_ticket_version=? AND leader_epoch=? AND runner_epoch=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, current, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch).Scan(&id, &attempt, &parent); err != nil || id != evidence.BuilderResult.AttemptID || attempt != evidence.BuilderResult.Attempt || parent != evidence.Commit.ParentOID {
+					return ErrEvidenceConflict
+				}
+				return ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding)
+			}
 		}
 		// A red CI transition opens one immutable repair lineage. A Builder
 		// result in the old generation must not bypass that pending successor.
@@ -781,7 +844,7 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND predecessor_generation=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, current).Scan(&pendingRepair); err != nil {
 				return err
 			}
-			if pendingRepair != 0 && evidence.Snapshot.Generation != current+1 {
+			if pendingRepair != 0 && evidence.Snapshot.Generation != 0 && evidence.Snapshot.Generation != current+1 {
 				return ErrEvidenceConflict
 			}
 		}
@@ -796,11 +859,21 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 				if err := s.ensureCandidateBinding(ctx, conn, evidence, current, builder); err != nil {
 					return err
 				}
-				return ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding)
+				if err := ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding); err != nil {
+					return err
+				}
+				if repairActive {
+					return ensureCandidateRepairCompletionAt(ctx, conn, evidence, current, builder, repair)
+				}
+				return nil
 			}
 		}
 		if evidence.Snapshot.Generation == 0 {
-			evidence.Snapshot.Generation = current + 1
+			if repairActive {
+				evidence.Snapshot.Generation = repair.context.TargetGeneration
+			} else {
+				evidence.Snapshot.Generation = current + 1
+			}
 		}
 		if evidence.Snapshot.Generation < current {
 			return ErrEvidenceConflict
@@ -814,7 +887,13 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			if err := s.ensureCandidateBinding(ctx, conn, evidence, current, builder); err != nil {
 				return err
 			}
-			return ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding)
+			if err := ensureCandidateCommandBinding(ctx, conn, evidence.Ref, current, commandBinding); err != nil {
+				return err
+			}
+			if repairActive {
+				return ensureCandidateRepairCompletionAt(ctx, conn, evidence, current, builder, repair)
+			}
+			return nil
 		}
 		if liveState == domain.StatePublishing {
 			// Publishing recovery can only append a live binding to the latest
@@ -836,6 +915,11 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 		if err := ensureCandidateCommandBinding(ctx, conn, evidence.Ref, evidence.Snapshot.Generation, commandBinding); err != nil {
 			return err
 		}
+		if repairActive {
+			if err := ensureCandidateRepairCompletionAt(ctx, conn, evidence, evidence.Snapshot.Generation, builder, repair); err != nil {
+				return err
+			}
+		}
 		for _, kind := range []string{"proof_result", "github_checks", "final_review", "approval"} {
 			at := time.Now().UTC()
 			if _, err := conn.ExecContext(ctx, `INSERT INTO invalidation_receipts(channel, project_id, ticket_id, generation, kind, ticket_version, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, evidence.Snapshot.Generation, kind, evidence.ExpectedVersion, evidence.Reason, at.Format(time.RFC3339Nano)); err != nil {
@@ -853,14 +937,27 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 
 func (s *Store) ensureCandidateBinding(ctx context.Context, conn *sql.Conn, evidence CandidateEvidence, generation uint64, provider ProviderAttemptResult) error {
 	if err := providerResultReachesFence(ctx, conn, evidence.BuilderResult, provider, evidence.ExpectedVersion, evidence.Fence); err != nil {
-		if sourceErr := s.operatorSourceResumeProviderResultReachesFence(ctx, conn, evidence.Ref, evidence.BuilderResult, provider, evidence.ExpectedVersion, evidence.Fence); sourceErr != nil {
+		repairErr := candidateRepairBuilderResultReachesFence(ctx, conn, evidence.BuilderResult, provider, evidence.ExpectedVersion, evidence.Fence)
+		if repairErr != nil {
+			if sourceErr := s.operatorSourceResumeProviderResultReachesFence(ctx, conn, evidence.Ref, evidence.BuilderResult, provider, evidence.ExpectedVersion, evidence.Fence); sourceErr != nil {
+				return ErrEvidenceConflict
+			}
+		}
+		if repairErr != nil && !errors.Is(repairErr, ErrNotFound) {
 			return ErrEvidenceConflict
 		}
+	}
+	return ensureCandidateResultBindingRow(ctx, conn, evidence, generation, evidence.ExpectedVersion, evidence.Fence)
+}
+
+func ensureCandidateResultBindingRow(ctx context.Context, conn *sql.Conn, evidence CandidateEvidence, generation, version uint64, fence domain.Fence) error {
+	if generation == 0 || version == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || fence.ClaimEpoch != 0 {
+		return ErrEvidenceConflict
 	}
 	var id int64
 	var attempt int
 	var parent string
-	err := conn.QueryRowContext(ctx, `SELECT provider_attempt_id,provider_attempt,commit_parent_oid FROM candidate_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND generation=? AND binding_ticket_version=? AND leader_epoch=? AND runner_epoch=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, generation, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch).Scan(&id, &attempt, &parent)
+	err := conn.QueryRowContext(ctx, `SELECT provider_attempt_id,provider_attempt,commit_parent_oid FROM candidate_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND generation=? AND binding_ticket_version=? AND leader_epoch=? AND runner_epoch=?`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, generation, version, fence.LeaderEpoch, fence.RunnerEpoch).Scan(&id, &attempt, &parent)
 	if err == nil {
 		if id == evidence.BuilderResult.AttemptID && attempt == evidence.BuilderResult.Attempt && parent == evidence.Commit.ParentOID {
 			return nil
@@ -870,7 +967,7 @@ func (s *Store) ensureCandidateBinding(ctx context.Context, conn *sql.Conn, evid
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	_, err = conn.ExecContext(ctx, `INSERT INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES(?,?,?,?,?,?,?,?,?,?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, generation, evidence.ExpectedVersion, evidence.Fence.LeaderEpoch, evidence.Fence.RunnerEpoch, evidence.BuilderResult.AttemptID, evidence.BuilderResult.Attempt, evidence.Commit.ParentOID)
+	_, err = conn.ExecContext(ctx, `INSERT INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES(?,?,?,?,?,?,?,?,?,?)`, evidence.Ref.Channel, evidence.Ref.Project, evidence.Ref.Ticket, generation, version, fence.LeaderEpoch, fence.RunnerEpoch, evidence.BuilderResult.AttemptID, evidence.BuilderResult.Attempt, evidence.Commit.ParentOID)
 	return err
 }
 

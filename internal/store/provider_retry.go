@@ -38,6 +38,20 @@ const (
 	ProviderRetryNotProvider ProviderRetryDisposition = iota
 	ProviderRetryEligible
 	ProviderRetryExhausted
+	ProviderRetryResubmissionRequired
+)
+
+// ProviderRetryReplayState is the runtime-control disposition of an exact
+// already-committed provider retry. LegacyUnsealed is retained only so an
+// upgrade can identify an old durable row and give an operator a deterministic
+// recovery action; it never grants fresh runtime admission.
+type ProviderRetryReplayState uint8
+
+const (
+	ProviderRetryNotReplay ProviderRetryReplayState = iota
+	ProviderRetryNeedsRearm
+	ProviderRetryAlreadyRearmed
+	ProviderRetryLegacyUnsealed
 )
 
 type providerRetryEpoch struct {
@@ -216,7 +230,7 @@ func validateProviderPausedResumePrefix(ctx context.Context, conn *sql.Conn, ref
 // row is the exact typed interruption of a retained provider entry before an
 // operator_recover appends its resumption event.
 func validateProviderBlockedRecoveryPrefix(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, phase domain.Phase, version, runner, leader uint64, target domain.State, code string) error {
-	if version < 2 || runner == 0 || leader == 0 || !providerStateForPhaseTransition(target) || providerStateForPhase(phase) != target || !validBlockedCode(code) || code == "legacy_provider_phase_entry_unverifiable" {
+	if version < 2 || runner == 0 || leader == 0 || !providerStateForPhaseTransition(target) || providerStateForPhase(phase) != target || !validBlockedCode(code) || code == "legacy_provider_phase_entry_unverifiable" || nonRecoverableBlockedRecoveryCode(code) {
 		return ErrEvidenceConflict
 	}
 	entry, err := loadCurrentProviderPhaseEntry(ctx, conn, ref, phase, version-1, runner, leader)
@@ -268,7 +282,7 @@ func validateProviderBlockedRecoveryAdvance(ctx context.Context, q interface {
 	var payload struct {
 		Code string `json:"code"`
 	}
-	if blockTrigger != "typed_blocker" || blockFrom != entry.State || blockTo != domain.StateBlocked || len(blockRaw) > maxEvidenceJSON || json.Unmarshal([]byte(blockRaw), &payload) != nil || !validBlockedCode(payload.Code) || payload.Code == "legacy_provider_phase_entry_unverifiable" || recoverTrigger != "operator_recover" || recoverFrom != domain.StateBlocked || recoverTo != entry.State {
+	if blockTrigger != "typed_blocker" || blockFrom != entry.State || blockTo != domain.StateBlocked || len(blockRaw) > maxEvidenceJSON || json.Unmarshal([]byte(blockRaw), &payload) != nil || !validBlockedCode(payload.Code) || payload.Code == "legacy_provider_phase_entry_unverifiable" || nonRecoverableBlockedRecoveryCode(payload.Code) || recoverTrigger != "operator_recover" || recoverFrom != domain.StateBlocked || recoverTo != entry.State {
 		return ErrEvidenceConflict
 	}
 	if err := exactStateChangeEvent(ctx, q, ref, version-1, "typed_blocker", entry.State, domain.StateBlocked); err != nil {
@@ -360,6 +374,7 @@ func validateProviderPhaseEntryBindings(ctx context.Context, conn *sql.Conn, ref
 type providerRetryAttemptPair struct {
 	Attempts [2]int
 	Reason   string
+	Claims   [2]ProviderAttemptClaim
 }
 
 type providerAttemptEndpoint struct {
@@ -523,7 +538,7 @@ func validateProviderAttemptControlBlockAdvance(ctx context.Context, q rowQuerye
 			var blocker struct {
 				Code string `json:"code"`
 			}
-			if json.Unmarshal([]byte(first.payload), &blocker) != nil || !validBlockedCode(blocker.Code) || blocker.Code == "legacy_provider_phase_entry_unverifiable" || nonRecoverableProviderBlockerCode(blocker.Code) {
+			if json.Unmarshal([]byte(first.payload), &blocker) != nil || !validBlockedCode(blocker.Code) || blocker.Code == "legacy_provider_phase_entry_unverifiable" || nonRecoverableBlockedRecoveryCode(blocker.Code) {
 				return ErrEvidenceConflict
 			}
 			recovered := changes[index+1]
@@ -627,7 +642,7 @@ func authenticateProviderRetryAttemptPair(ctx context.Context, q rowQueryer, ref
 	if results != 0 {
 		return providerRetryAttemptPair{}, ErrEvidenceConflict
 	}
-	pair := providerRetryAttemptPair{Attempts: [2]int{first, last}}
+	pair := providerRetryAttemptPair{Attempts: [2]int{first, last}, Claims: [2]ProviderAttemptClaim{claims[0], claims[1]}}
 	if invalid[0] && invalid[1] {
 		if claims[0].Binding != claims[1].Binding || claims[0].BindingDigest != claims[1].BindingDigest || claims[0].Role != claims[1].Role || claims[0].Ref != claims[1].Ref || claims[0].Phase != claims[1].Phase || claims[0].Repository != claims[1].Repository || claims[0].Worktree != claims[1].Worktree || claims[0].WorktreeIdentity != claims[1].WorktreeIdentity || claims[0].BaseSHA != claims[1].BaseSHA || claims[0].Input.Repair != nil || claims[1].Input.Repair == nil || claims[1].Input.Repair.PriorAttempt != claims[0].Attempt || claims[1].Input.Repair.PriorRequestDigest != claims[0].RequestDigest {
 			return providerRetryAttemptPair{}, ErrEvidenceConflict
@@ -748,11 +763,17 @@ func (s *Store) ProviderRetryDisposition(ctx context.Context, ticket Ticket) (Pr
 	if entryErr != nil || entry.Version != proof.EntryTicketVersion || entry.State != ticket.ResumeState {
 		return ProviderRetryNotProvider, ErrEvidenceConflict
 	}
+	if err := authenticateProviderRetryPhaseEntryEvent(ctx, s.db, ticket.Ref, entry); err != nil {
+		return ProviderRetryNotProvider, err
+	}
 	pair, pairErr := authenticateProviderRetryAttemptPair(ctx, s.db, ticket.Ref, phase, entry, proof.Attempts[0], proof.Attempts[1])
 	if pairErr != nil || pair.Reason != proof.Reason {
 		return ProviderRetryNotProvider, ErrEvidenceConflict
 	}
 	if proof.RetryEpoch == 0 {
+		if providerRetryLineageRequiresResubmission(phase, entry) {
+			return ProviderRetryResubmissionRequired, nil
+		}
 		return ProviderRetryEligible, nil
 	}
 	if proof.RetryEpoch == 1 {
@@ -890,7 +911,10 @@ func (s *Store) TransitionProviderExhausted(ctx context.Context, transition Tran
 }
 
 // TransitionProviderRetry records the sole operator-approved extension for
-// this immutable phase entry before restoring the paused provider phase. It is
+// this immutable phase entry before restoring the paused provider phase. The
+// runtime must already be durably sealed at this exact pause; persisted retry
+// rows created by older versions remain replayable, but no new active retry
+// may be committed without the proof-before-transition handoff. It is
 // deliberately independent of the ticket-wide fallback budget: a later,
 // separately authenticated phase entry gets its own bounded extension.
 func (s *Store) TransitionProviderRetry(ctx context.Context, transition Transition) (TransitionResult, error) {
@@ -911,6 +935,11 @@ func (s *Store) TransitionProviderRetry(ctx context.Context, transition Transiti
 		}
 		if actual != domain.StatePaused || !resume.Valid || domain.State(resume.String) != transition.To || version != transition.ExpectedVersion || s.currentFence(ctx, conn, transition.Ref.Channel, version, runner, transition.Fence) != nil {
 			return ErrStaleFence
+		}
+		control, err := runtimeControlFrom(ctx, conn, transition.Ref)
+		expectedControl := mutationRevocation{version: version, leader: transition.Fence.LeaderEpoch, runner: runner}
+		if err != nil || control.state != "sealed" || control.generation == 0 || control.stop != expectedControl || control.authority != expectedControl {
+			return ErrControlNotDrained
 		}
 		if err := exactStateChangeEvent(ctx, conn, transition.Ref, version, "retry_or_correction_exhausted", transition.To, domain.StatePaused); err != nil {
 			return ErrEvidenceConflict
@@ -935,9 +964,15 @@ func (s *Store) TransitionProviderRetry(ctx context.Context, transition Transiti
 		if err != nil || entry.Version != exhaustion.EntryTicketVersion || entry.State != transition.To {
 			return ErrEvidenceConflict
 		}
+		if err := authenticateProviderRetryPhaseEntryEvent(ctx, conn, transition.Ref, entry); err != nil {
+			return err
+		}
 		pair, err := authenticateProviderRetryAttemptPair(ctx, conn, transition.Ref, phase, entry, exhaustion.Attempts[0], exhaustion.Attempts[1])
 		if err != nil || pair.Reason != exhaustion.Reason {
 			return ErrEvidenceConflict
+		}
+		if providerRetryLineageRequiresResubmission(phase, entry) {
+			return ErrProviderRetryRequiresResubmission
 		}
 		var active, activeRuns, leases, gitWriters, commandWriters int
 		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('active','quarantined')`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&active); err != nil {
@@ -993,34 +1028,94 @@ func (s *Store) TransitionProviderRetry(ctx context.Context, transition Transiti
 }
 
 // ProviderRetryReplay recognizes the exact already-committed retry response
-// window. It is intentionally a narrow daemon lost-response aid.
+// window. It is intentionally a narrow daemon lost-response aid. New daemon
+// handoffs carry a runtime-control row: sealed means the active retry still
+// needs its provider-specific worktree rearm, while armed/open proves that
+// rearm was already installed and must not be repeated. Pre-control rows keep
+// the original exact-fence replay behavior for migration compatibility, but
+// gain no runtime-rearm authority.
 func (s *Store) ProviderRetryReplay(ctx context.Context, ticket Ticket) (bool, error) {
+	state, err := s.ProviderRetryRuntimeReplay(ctx, ticket)
+	return state != ProviderRetryNotReplay, err
+}
+
+// ProviderRetryRuntimeReplay classifies the exact runtime-control handoff for
+// a committed provider retry in one read transaction. Daemon composition uses
+// this stronger form so it can rearm a sealed retry, observe an armed/open
+// retry without repeating the handoff, and fail closed on a pre-hardening row
+// which has no durable runtime seal.
+func (s *Store) ProviderRetryRuntimeReplay(ctx context.Context, ticket Ticket) (ProviderRetryReplayState, error) {
 	phase, ok := providerPhaseForState(ticket.State)
-	if !ok {
-		return false, nil
+	if s == nil || ticket.Ref.Validate() != nil || ticket.Version == 0 || ticket.RunnerEpoch == 0 || !ok {
+		return ProviderRetryNotReplay, nil
 	}
-	var leader uint64
-	if err := s.db.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ticket.Ref.Channel).Scan(&leader); err != nil {
-		return false, err
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	entry, err := loadCurrentProviderPhaseEntry(ctx, s.db, ticket.Ref, phase, ticket.Version, ticket.RunnerEpoch, leader)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		if errors.Is(err, ErrEvidenceConflict) {
+		return ProviderRetryNotReplay, normalizeBusy(ctx, err)
+	}
+	defer tx.Rollback()
+	var leader uint64
+	if err := tx.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, ticket.Ref.Channel).Scan(&leader); err != nil {
+		return ProviderRetryNotReplay, normalizeBusy(ctx, err)
+	}
+	var controls int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&controls); err != nil {
+		return ProviderRetryNotReplay, normalizeBusy(ctx, err)
+	}
+	if controls == 0 {
+		replay, err := providerRetryLegacyReplayFrom(ctx, tx, ticket, phase, leader)
+		if err != nil || !replay {
+			return ProviderRetryNotReplay, err
+		}
+		return ProviderRetryLegacyUnsealed, nil
+	}
+	if controls != 1 {
+		return ProviderRetryNotReplay, ErrEvidenceConflict
+	}
+	proof, err := s.providerRetryWorktreeProofFrom(ctx, tx, ticket.Ref, ticket.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch})
+	if err != nil {
+		if errors.Is(err, ErrEvidenceConflict) || errors.Is(err, ErrStaleFence) || errors.Is(err, ErrNotFound) {
+			return ProviderRetryNotReplay, nil
+		}
+		return ProviderRetryNotReplay, err
+	}
+	if proof.Phase != phase || proof.Version != ticket.Version || proof.Fence.LeaderEpoch != leader || proof.Fence.RunnerEpoch != ticket.RunnerEpoch {
+		return ProviderRetryNotReplay, nil
+	}
+	current := mutationRevocation{version: ticket.Version, leader: leader, runner: ticket.RunnerEpoch}
+	control, _, err := providerRetryRuntimeControlFrom(ctx, tx, ticket.Ref, phase, current)
+	if err != nil {
+		return ProviderRetryNotReplay, normalizeBusy(ctx, err)
+	}
+	switch control.state {
+	case "sealed":
+		return ProviderRetryNeedsRearm, nil
+	case "armed", "open":
+		return ProviderRetryAlreadyRearmed, nil
+	default:
+		return ProviderRetryNotReplay, ErrEvidenceConflict
+	}
+}
+
+func providerRetryLegacyReplayFrom(ctx context.Context, q rowQueryer, ticket Ticket, phase domain.Phase, leader uint64) (bool, error) {
+	entry, err := loadCurrentProviderPhaseEntry(ctx, q, ticket.Ref, phase, ticket.Version, ticket.RunnerEpoch, leader)
+	if err != nil {
+		if errors.Is(err, ErrEvidenceConflict) || errors.Is(err, ErrNotFound) {
 			return false, nil
 		}
 		return false, err
 	}
-	epoch, found, err := loadProviderRetryEpochForEntry(ctx, s.db, ticket.Ref, phase, entry.Version)
+	epoch, found, err := loadProviderRetryEpochForEntry(ctx, q, ticket.Ref, phase, entry.Version)
 	if err != nil || !found {
 		return false, err
 	}
-	if epoch.RetryVersion != ticket.Version || epoch.RetryRunner != ticket.RunnerEpoch {
+	if epoch.RetryVersion != ticket.Version || epoch.RetryRunner != ticket.RunnerEpoch || epoch.RetryLeader != leader || epoch.ExhaustionVersion == 0 {
 		return false, nil
 	}
-	if leader != epoch.RetryLeader || epoch.ExhaustionVersion == 0 {
-		return false, nil
-	}
-	if err := validateProviderRetryAdvance(ctx, s.db, ticket.Ref, phase, epoch.ExhaustionVersion-1, epoch.ExhaustionRunner, epoch.ExhaustionLeader, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader); err != nil {
+	if err := validateProviderRetryAdvance(ctx, q, ticket.Ref, phase, epoch.ExhaustionVersion-1, epoch.ExhaustionRunner, epoch.ExhaustionLeader, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader); err != nil {
 		return false, nil
 	}
 	return true, nil
@@ -1180,9 +1275,12 @@ func providerPausedRecoveryPredecessor(ctx context.Context, conn *sql.Conn, ref 
 		return 0, false, ErrPublicationEvidence
 	}
 	stopVersion := control.stop.version
-	entry, err := loadProviderPhaseEntryAt(ctx, conn, ref, phase, stopVersion-1)
-	if err != nil || entry.State != state || entry.Version != stopVersion-1 ||
-		entry.Runner+1 != runner || entry.Leader != control.stop.leader {
+	// Runner recovery never rewrites the immutable phase entry. Authenticate
+	// that historical entry through the complete signed suffix to the exact
+	// pre-stop endpoint instead of requiring the row itself to have been
+	// rebound there.
+	entry, err := loadCurrentProviderPhaseEntry(ctx, conn, ref, phase, stopVersion-1, control.stop.runner-1, control.stop.leader)
+	if err != nil || entry.State != state {
 		return 0, false, ErrPublicationEvidence
 	}
 	if err := validateProviderPhaseEntryBindings(ctx, conn, ref, entry); err != nil {

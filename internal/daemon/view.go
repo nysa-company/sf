@@ -28,7 +28,7 @@ func (daemon *Daemon) evidenceView(ctx context.Context, ref domain.TicketRef) (m
 		return nil, err
 	}
 
-	verification, err := daemon.store.CurrentVerification(ctx, ref)
+	verification, err := daemon.store.HistoricalVerification(ctx, ref)
 	if err == nil {
 		view["verification"] = map[string]any{
 			"revision": verification.Revision.Revision, "intent_digest": verification.Revision.IntentDigest,
@@ -40,7 +40,7 @@ func (daemon *Daemon) evidenceView(ctx context.Context, ref domain.TicketRef) (m
 		return nil, err
 	}
 
-	candidate, err := daemon.store.LatestCandidate(ctx, ref)
+	candidate, err := daemon.store.HistoricalCandidate(ctx, ref)
 	if err == nil {
 		view["candidate"] = map[string]any{
 			"generation": candidate.Snapshot.Generation, "base_sha": candidate.Snapshot.BaseSHA,

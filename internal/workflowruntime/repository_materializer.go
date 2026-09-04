@@ -188,6 +188,10 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 	if err := candidateChangedFilesWithinScope(builder.ChangedFiles, allowed); err != nil {
 		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate changed-file scope: %w", err)
 	}
+	parent, repair, err := m.candidateParent(ctx, request, verification)
+	if err != nil {
+		return workflowworker.CandidateWitness{}, err
+	}
 	if request.Candidate != nil {
 		if request.Candidate.BuilderResult != key {
 			return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
@@ -195,34 +199,46 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 		// Candidate replay is observation-only. In particular, a stale-fence
 		// replay may prove the old immutable witness but must not launch another
 		// repository command while Store has no historical-command rebind.
-		return m.replayCandidate(ctx, request, verification, builder, *request.Candidate)
+		return m.replayCandidate(ctx, request, verification, builder, *request.Candidate, parent)
 	}
-	// Source-resume has one additional prepared-but-not-recorded boundary.  A
-	// crash after Builder's post-build command and Git child G must not turn the
-	// later recovery fence into a second command/commit intent. Store returns a
-	// single authenticated witness spanning source S, fresh verification F,
-	// Builder, command, and G; the live Git observation below is the only
-	// runtime work performed before RecordCandidate.
-	if recovered, found, recoveryErr := m.Store.OperatorSourceResumeRecoverablePreparedCandidateWitness(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence); recoveryErr != nil {
-		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
-	} else if found {
-		if recovered.EffectState == store.EffectUncertain {
-			// G crossed update-ref, but the first observation response was lost.
-			// Re-observe and confirm this exact prepared tuple before replaying
-			// the witness. This path never reruns post-build or issues Commit.
-			confirmed, err := m.confirmSourceResumePreparedCandidate(ctx, request, recovered)
-			if err != nil {
-				return workflowworker.CandidateWitness{}, err
-			}
-			recovered = confirmed
+	if repair {
+		// A correction has its own immutable prepared-successor boundary. A
+		// restart after the old-fence command and confirmed Git child must only
+		// observe that exact child; changing the fence and issuing either effect
+		// again would strand the already-advanced branch.
+		recovered, found, recoveryErr := m.Store.CandidateRepairRecoverablePreparedCandidateWitness(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence, key)
+		if recoveryErr != nil {
+			return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
 		}
-		return m.replaySourceResumePreparedCandidate(ctx, request, plan, verification, builder, key, recovered)
+		if found {
+			return m.replayCandidateRepairPreparedCandidate(ctx, request, plan, verification, builder, key, allowed, recovered)
+		}
+	} else {
+		// Source-resume has one additional prepared-but-not-recorded boundary. A
+		// crash after Builder's post-build command and Git child G must not turn
+		// the later recovery fence into a second command/commit intent. This
+		// reader is intentionally skipped for later red-CI repair lifecycles.
+		if recovered, found, recoveryErr := m.Store.OperatorSourceResumeRecoverablePreparedCandidateWitness(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence); recoveryErr != nil {
+			return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
+		} else if found {
+			if recovered.EffectState == store.EffectUncertain {
+				// G crossed update-ref, but the first observation response was lost.
+				// Re-observe and confirm this exact prepared tuple before replaying
+				// the witness. This path never reruns post-build or issues Commit.
+				confirmed, err := m.confirmSourceResumePreparedCandidate(ctx, request, recovered)
+				if err != nil {
+					return workflowworker.CandidateWitness{}, err
+				}
+				recovered = confirmed
+			}
+			return m.replaySourceResumePreparedCandidate(ctx, request, plan, verification, builder, key, recovered)
+		}
 	}
 	command, result, err := m.runCommand(ctx, request, store.RepositoryCommandPurposePostbuildCandidate, key, phaseartifact.Verification{}, verification.CheckpointID)
 	if err != nil || result.Result.ExitCode != 0 {
 		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate post-build command (exit=%d): %w", result.Result.ExitCode, materializeErr(err))
 	}
-	observation, err := m.commit(ctx, request, key, verification.CheckpointID, allowed, verification.OwnedFiles, commitDigest("candidate", request, key, command, result.ResultDigest, struct {
+	observation, err := m.commit(ctx, request, key, parent, allowed, verification.OwnedFiles, commitDigest("candidate", request, key, command, result.ResultDigest, struct {
 		Plan         workflowprompt.PlanIdentity
 		Verification workflowprompt.VerificationIdentity
 		Builder      phaseartifact.Builder
@@ -237,6 +253,60 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 		}
 	}
 	return witness, nil
+}
+
+// replayCandidateRepairPreparedCandidate converts Store's authenticated
+// old-fence command/G tuple into the ordinary Worker witness. It performs only
+// identity, clean-worktree, and exact commit observations; it never executes a
+// repository command, stages files, or issues a Git mutation.
+func (m RepositoryMaterializer) replayCandidateRepairPreparedCandidate(ctx context.Context, request workflowworker.PhaseRequest, plan workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, key store.ProviderAttemptResultKey, allowed []string, recovered store.CandidateRepairPreparedCandidateWitness) (workflowworker.CandidateWitness, error) {
+	worktree, err := m.worktree(request)
+	if err != nil {
+		return workflowworker.CandidateWitness{}, ErrRepositoryMaterialization
+	}
+	project, err := m.Store.Project(ctx, request.Ticket.Ref.Channel, request.Ticket.Ref.Project)
+	if err != nil || recovered.Ref != request.Ticket.Ref || recovered.Version != request.Ticket.Version || recovered.Fence != request.Fence || recovered.Project.Path != project.Path || recovered.Project.BaseRef != project.BaseRef || recovered.Project.ConfigGeneration != project.ConfigGeneration || recovered.Project.ConfigDigest != project.ConfigDigest || !bytes.Equal(recovered.Project.ConfigSnapshot, project.ConfigSnapshot) || recovered.Builder != key || recovered.EffectState != store.EffectConfirmed {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared witness authority: %w", ErrRepositoryMaterialization)
+	}
+	if recovered.Worktree.Path != request.Worktree.Path || recovered.Worktree.Branch != request.Worktree.Branch || recovered.Worktree.BaseSHA != request.Worktree.BaseSHA || recovered.Worktree.HeadSHA != request.Worktree.HeadSHA || !bytes.Equal(recovered.Worktree.IdentityJSON, request.Worktree.IdentityJSON) || recovered.Project.Path != worktree.Identity.Repository || recovered.Project.BaseRef != worktree.Identity.BaseRef {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared witness worktree: %w", ErrRepositoryMaterialization)
+	}
+	if recovered.Repair.Ref != request.Ticket.Ref || recovered.Repair.TargetGeneration != recovered.Repair.PredecessorGeneration+1 || recovered.Repair.PredecessorHeadSHA != recovered.Commit.ParentOID || recovered.Repair.Verification.Revision.IntentDigest != verification.IntentDigest || recovered.Repair.Verification.Revision.ProofDigest != verification.ProofDigest || recovered.Repair.Verification.Revision.CheckpointID != verification.CheckpointID || !sameStoredVerificationIdentity(recovered.Verification, recovered.Repair.Verification) {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared witness lineage: %w", ErrRepositoryMaterialization)
+	}
+	if recovered.Plan.Document.Planner == nil {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared plan: %w", ErrRepositoryMaterialization)
+	}
+	planIdentity, err := workflowprompt.NewPlanIdentity(*recovered.Plan.Document.Planner)
+	if err != nil || !reflect.DeepEqual(planIdentity, plan) {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared plan identity: %w", ErrRepositoryMaterialization)
+	}
+	if _, err := phaseartifact.BuilderEvidenceDigest(builder); err != nil || !sameJSON(recovered.BuilderArtifact, builder) {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared Builder: %w", ErrRepositoryMaterialization)
+	}
+	if recovered.Command.Key.SemanticKey == "" || recovered.Command.Key.ClaimEpoch == 0 || recovered.Command.Result.ExitCode != 0 || recovered.Command.Claim.TicketRef != request.Ticket.Ref || recovered.Command.Claim.Repository != worktree.Identity.Repository || recovered.Command.Claim.Worktree != request.Worktree.Path || recovered.Command.Claim.WorktreeIdentity != string(request.Worktree.IdentityJSON) || recovered.Command.Claim.Branch != request.Worktree.Branch || recovered.Command.Claim.BaseRef != worktree.Identity.BaseRef || recovered.Command.Claim.BaseSHA != request.Worktree.BaseSHA || !strings.HasPrefix(recovered.Command.Claim.PolicyDigest, "sha256:") || recovered.Commit.CommitOID == "" || recovered.Commit.TreeOID == "" || recovered.Claim.ExpectedHeadOID != recovered.Commit.ParentOID {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared command/G binding: %w", ErrRepositoryMaterialization)
+	}
+	durableCommand, err := m.Store.LoadRepositoryCommandResult(ctx, recovered.Command.Key)
+	if err != nil || !reflect.DeepEqual(durableCommand, recovered.Command) {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared command reload: %w", ErrRepositoryMaterialization)
+	}
+	before, err := m.Git.CleanWorktreeHead(ctx, worktree)
+	if err != nil || before != recovered.Commit.CommitOID {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared clean head: %w", ErrRepositoryMaterialization)
+	}
+	if err := m.Git.ValidateDiff(ctx, worktree.Path, worktree.Identity.BaseRef, git.DiffPolicy{ExpectedHead: recovered.Commit.CommitOID, AllowedPaths: allowed, ProtectedPaths: verification.OwnedFiles}); err != nil {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared diff: %w", ErrRepositoryMaterialization)
+	}
+	observed, err := m.Git.ObserveCommit(ctx, worktree)
+	if err != nil || (store.CommitObservation{CommitOID: observed.CommitOID, ParentOID: observed.ParentOID, TreeOID: observed.TreeOID}) != recovered.Commit {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared commit observation: %w", ErrRepositoryMaterialization)
+	}
+	after, err := m.Git.CleanWorktreeHead(ctx, worktree)
+	if err != nil || after != recovered.Commit.CommitOID {
+		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate repair prepared clean recheck: %w", ErrRepositoryMaterialization)
+	}
+	return workflowworker.CandidateWitness{Commit: recovered.Commit, CommandPolicyDigest: strings.TrimPrefix(recovered.Command.Claim.PolicyDigest, "sha256:"), Reason: "recovered authenticated CI repair candidate", CommandResult: recovered.Command.Key}, nil
 }
 
 // confirmSourceResumePreparedCandidate settles an uncertain source-resume G
@@ -330,8 +400,8 @@ func (m RepositoryMaterializer) replaySourceResumePreparedCandidate(ctx context.
 	return workflowworker.CandidateWitness{Commit: recovered.Commit, CommandPolicyDigest: strings.TrimPrefix(recovered.Command.Claim.PolicyDigest, "sha256:"), Reason: "recovered authenticated source-resume candidate", CommandResult: recovered.Command.Key}, nil
 }
 
-func (m RepositoryMaterializer) replayCandidate(ctx context.Context, request workflowworker.PhaseRequest, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, candidate store.StoredCandidate) (workflowworker.CandidateWitness, error) {
-	if err := candidateMatches(request, verification, builder, candidate); err != nil {
+func (m RepositoryMaterializer) replayCandidate(ctx context.Context, request workflowworker.PhaseRequest, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, candidate store.StoredCandidate, parent string) (workflowworker.CandidateWitness, error) {
+	if err := candidateMatches(request, verification, builder, candidate, parent); err != nil {
 		return workflowworker.CandidateWitness{}, err
 	}
 	if err := m.Store.ProviderResultReachesFence(ctx, candidate.BuilderResult, request.Ticket.Version, request.Fence); err != nil {
@@ -352,12 +422,68 @@ func (m RepositoryMaterializer) replayCandidate(ctx context.Context, request wor
 	return workflowworker.CandidateWitness{Commit: candidate.Commit, CommandPolicyDigest: strings.TrimPrefix(result.Claim.PolicyDigest, "sha256:"), Reason: "authenticated post-build verification", CommandResult: candidate.CommandBinding.Key}, nil
 }
 
-func candidateMatches(request workflowworker.PhaseRequest, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, candidate store.StoredCandidate) error {
+func candidateMatches(request workflowworker.PhaseRequest, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, candidate store.StoredCandidate, parent string) error {
 	digest, err := phaseartifact.BuilderEvidenceDigest(builder)
-	if err != nil || candidate.BuilderResult.AttemptID == 0 || candidate.Commit.CommitOID != candidate.Snapshot.HeadSHA || candidate.Commit.TreeOID != candidate.Snapshot.TreeSHA || candidate.Commit.ParentOID != verification.CheckpointID || candidate.Snapshot.BaseSHA != request.Worktree.BaseSHA || candidate.Snapshot.SourceDigest != request.Ticket.SourceDigest || candidate.Snapshot.VerificationIntentDigest != verification.IntentDigest || candidate.Snapshot.ProofDigest != verification.ProofDigest || candidate.Snapshot.BuilderEvidenceDigest != digest || candidate.CommandBinding.Key.SemanticKey == "" || candidate.CommandBinding.Key.ClaimEpoch == 0 {
+	if err != nil || parent == "" || candidate.BuilderResult.AttemptID == 0 || candidate.Commit.CommitOID != candidate.Snapshot.HeadSHA || candidate.Commit.TreeOID != candidate.Snapshot.TreeSHA || candidate.Commit.ParentOID != parent || candidate.Snapshot.BaseSHA != request.Worktree.BaseSHA || candidate.Snapshot.SourceDigest != request.Ticket.SourceDigest || candidate.Snapshot.VerificationIntentDigest != verification.IntentDigest || candidate.Snapshot.ProofDigest != verification.ProofDigest || candidate.Snapshot.BuilderEvidenceDigest != digest || candidate.CommandBinding.Key.SemanticKey == "" || candidate.CommandBinding.Key.ClaimEpoch == 0 {
 		return ErrRepositoryMaterialization
 	}
 	return nil
+}
+
+// candidateParent keeps the immutable verification checkpoint as the command
+// and proof anchor, while allowing one separately authenticated Git parent for
+// a red-CI correction. The caller cannot select that parent: Store derives it
+// from the exact published predecessor and repair budget lineage at this live
+// Building fence.
+func (m RepositoryMaterializer) candidateParent(ctx context.Context, request workflowworker.PhaseRequest, verification workflowprompt.VerificationIdentity) (string, bool, error) {
+	if m.Store == nil || request.Verification == nil || request.Ticket.Ref.Validate() != nil || verification.CheckpointID == "" {
+		return "", false, ErrRepositoryMaterialization
+	}
+	current, err := m.authenticatedCandidateVerification(ctx, request, verification)
+	if err != nil {
+		return "", false, err
+	}
+	repair, err := m.Store.CandidateRepairBuildContext(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+	if errors.Is(err, store.ErrNotFound) {
+		return current.Revision.CheckpointID, false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("candidate repair authority: %w", ErrRepositoryMaterialization)
+	}
+	if request.Ticket.State != domain.StateBuilding || current.TicketVersion != request.Ticket.Version || current.Fence != request.Fence || repair.Ref != request.Ticket.Ref || repair.EntryTicketVersion == 0 || repair.TargetGeneration != repair.PredecessorGeneration+1 || repair.PredecessorHeadSHA == "" || !sameStoredVerificationIdentity(current, repair.Verification) {
+		return "", false, fmt.Errorf("candidate repair verification binding: %w", ErrRepositoryMaterialization)
+	}
+	return repair.PredecessorHeadSHA, true, nil
+}
+
+// authenticatedCandidateVerification reloads the complete Store-owned
+// verification before either an ordinary build or a red-CI correction can
+// select its Git parent. In particular, callers cannot narrow OwnedFiles (or
+// alter any other verification field) while retaining the immutable digests.
+func (m RepositoryMaterializer) authenticatedCandidateVerification(ctx context.Context, request workflowworker.PhaseRequest, supplied workflowprompt.VerificationIdentity) (store.StoredVerification, error) {
+	current, err := m.Store.CurrentVerification(ctx, request.Ticket.Ref)
+	if err != nil || !reflect.DeepEqual(current, *request.Verification) {
+		return store.StoredVerification{}, fmt.Errorf("candidate verification reload: %w", ErrRepositoryMaterialization)
+	}
+	provider, parsed, err := m.Store.LoadHistoricalProviderAttemptResult(ctx, current.ProviderResult)
+	if err != nil || provider.Claim.Ref != request.Ticket.Ref || provider.Claim.Phase != domain.PhaseVerification || provider.Claim.Role != "reviewer" || parsed.Verify == nil {
+		return store.StoredVerification{}, fmt.Errorf("candidate verification result: %w", ErrRepositoryMaterialization)
+	}
+	expected, err := workflowprompt.NewVerificationIdentity(*parsed.Verify, current.Revision.IntentDigest, current.Revision.ProofDigest, current.Revision.CheckpointID)
+	if err != nil || !reflect.DeepEqual(expected, supplied) {
+		return store.StoredVerification{}, fmt.Errorf("candidate verification identity: %w", ErrRepositoryMaterialization)
+	}
+	return current, nil
+}
+
+// sameStoredVerificationIdentity deliberately excludes only the projected
+// live ticket/fence. All immutable Reviewer, checkpoint, command, amendment,
+// and timestamp fields must remain byte-for-byte identical to the retained
+// predecessor verification.
+func sameStoredVerificationIdentity(current, retained store.StoredVerification) bool {
+	current.TicketVersion, retained.TicketVersion = 0, 0
+	current.Fence, retained.Fence = domain.Fence{}, domain.Fence{}
+	return reflect.DeepEqual(current, retained)
 }
 
 // currentCandidatePlanScope re-authenticates every mutable input immediately
@@ -430,7 +556,8 @@ func candidateChangedFilesWithinScope(changed, scope []string) error {
 }
 
 func (m RepositoryMaterializer) AuthenticateCandidate(ctx context.Context, request workflowworker.PhaseRequest, _ workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, _ phaseartifact.Builder, witness workflowworker.CandidateWitness) error {
-	if m.Store == nil || witness.CommandResult.SemanticKey == "" || witness.CommandResult.ClaimEpoch == 0 || witness.Commit.ParentOID != verification.CheckpointID {
+	parent, _, err := m.candidateParent(ctx, request, verification)
+	if err != nil || m.Store == nil || witness.CommandResult.SemanticKey == "" || witness.CommandResult.ClaimEpoch == 0 || witness.Commit.ParentOID != parent {
 		return ErrRepositoryMaterialization
 	}
 	observed, err := m.observe(ctx, request)

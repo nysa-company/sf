@@ -86,6 +86,88 @@ type ProviderAttemptResultKey struct {
 	Attempt   int
 }
 
+// ProviderArtifactFailure is bounded, transcript-free evidence for a
+// repairable invalid_artifact provider attempt. It deliberately stores only a
+// closed reason enum and immutable claim identity, never raw artifact bytes,
+// provider stderr, transcript text, or an adapter error string.
+type ProviderArtifactFailure struct {
+	AttemptID       int64
+	Ref             domain.TicketRef
+	Phase           domain.Phase
+	Role            string
+	Attempt         int
+	RequestDigest   string
+	LeaderEpoch     uint64
+	RunnerEpoch     uint64
+	ExpectedVersion uint64
+	Reason          contracts.ArtifactFailureReason
+	Digest          string
+	CreatedAt       time.Time
+}
+
+type providerArtifactFailureCanonical struct {
+	AttemptID       int64                           `json:"attempt_id"`
+	Channel         domain.Channel                  `json:"channel"`
+	Project         domain.ProjectID                `json:"project"`
+	Ticket          domain.TicketID                 `json:"ticket"`
+	Phase           domain.Phase                    `json:"phase"`
+	Role            string                          `json:"role"`
+	Attempt         int                             `json:"attempt"`
+	RequestDigest   string                          `json:"request_digest"`
+	LeaderEpoch     uint64                          `json:"leader_epoch"`
+	RunnerEpoch     uint64                          `json:"runner_epoch"`
+	ExpectedVersion uint64                          `json:"expected_version"`
+	Reason          contracts.ArtifactFailureReason `json:"reason"`
+	CreatedAt       string                          `json:"created_at"`
+}
+
+func providerArtifactFailureDigest(value ProviderArtifactFailure) (string, error) {
+	if value.AttemptID <= 0 || value.Ref.Validate() != nil || !validProviderPhase(value.Phase) || !validProviderRole(value.Role) || value.Attempt <= 0 || !validSHA256(value.RequestDigest) || value.LeaderEpoch == 0 || value.RunnerEpoch == 0 || value.ExpectedVersion == 0 || !contracts.ValidArtifactFailureReason(value.Reason) || value.CreatedAt.IsZero() {
+		return "", ErrProviderAttempt
+	}
+	canonical, err := json.Marshal(providerArtifactFailureCanonical{
+		AttemptID:       value.AttemptID,
+		Channel:         value.Ref.Channel,
+		Project:         value.Ref.Project,
+		Ticket:          value.Ref.Ticket,
+		Phase:           value.Phase,
+		Role:            value.Role,
+		Attempt:         value.Attempt,
+		RequestDigest:   value.RequestDigest,
+		LeaderEpoch:     value.LeaderEpoch,
+		RunnerEpoch:     value.RunnerEpoch,
+		ExpectedVersion: value.ExpectedVersion,
+		Reason:          value.Reason,
+		CreatedAt:       value.CreatedAt.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return "", err
+	}
+	return rawDigest(canonical), nil
+}
+
+func providerArtifactFailureForClaim(claim ProviderAttemptClaim, reason contracts.ArtifactFailureReason, createdAt time.Time) (ProviderArtifactFailure, error) {
+	value := ProviderArtifactFailure{
+		AttemptID:       claim.ID,
+		Ref:             claim.Ref,
+		Phase:           claim.Phase,
+		Role:            claim.Role,
+		Attempt:         claim.Attempt,
+		RequestDigest:   claim.RequestDigest,
+		LeaderEpoch:     claim.LeaderEpoch,
+		RunnerEpoch:     claim.RunnerEpoch,
+		ExpectedVersion: claim.ExpectedVersion,
+		Reason:          reason,
+		CreatedAt:       createdAt.UTC(),
+	}
+	digest, err := providerArtifactFailureDigest(value)
+	if err != nil {
+		return ProviderArtifactFailure{}, err
+	}
+	value.Digest = digest
+	return value, nil
+}
+
 // LatestReusableProviderAttemptRequest asks for the single newest completed
 // immutable provider result eligible to be reused after a restart.  Reuse is
 // deliberately limited to the non-mutating Planner and Reviewer roles.
@@ -121,6 +203,16 @@ func (s *Store) LoadCurrentProviderAttemptResult(ctx context.Context, key Provid
 	}
 	if err := s.AssertTicketFence(ctx, key.Ref, expected, fence); err != nil {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, err
+	}
+	if result.Claim.Phase == domain.PhaseBuild && result.Claim.Role == "builder" {
+		if _, repairErr := s.candidateRepairBuildContextAt(ctx, s.db, key.Ref, expected, fence); repairErr == nil {
+			if candidateRepairBuilderEntryResultReachesFence(ctx, s.db, key, result, expected, fence) != nil {
+				return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+			}
+			return result, parsed, nil
+		} else if !errors.Is(repairErr, ErrNotFound) {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+		}
 	}
 	if err := validateRunnerRecoveryAuthority(ctx, s.db, key.Ref, expected, fence); err != nil {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
@@ -965,7 +1057,22 @@ func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttempt
 	if state == "completed" || outcome == "completed" {
 		return ErrProviderAttempt
 	}
-	return s.finishProviderAttempt(ctx, claim, proof, expected, fence, state, outcome, usage, finished, nil)
+	return s.finishProviderAttempt(ctx, claim, proof, expected, fence, state, outcome, usage, finished, nil, nil)
+}
+
+// FinishProviderAttemptWithArtifactFailure records the only durable detail for
+// a repairable invalid artifact. The reason is a closed enum and is written in
+// the same transaction as the drained failed attempt, phase run, and lease
+// release. It never accepts or persists provider-controlled diagnostic text.
+func (s *Store) FinishProviderAttemptWithArtifactFailure(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, reason contracts.ArtifactFailureReason, usage int64, finished time.Time) error {
+	if !contracts.ValidArtifactFailureReason(reason) {
+		return ErrProviderAttempt
+	}
+	failure, err := providerArtifactFailureForClaim(claim, reason, finished)
+	if err != nil {
+		return err
+	}
+	return s.finishProviderAttempt(ctx, claim, proof, expected, fence, "failed", contracts.PhaseResultInvalidArtifact, usage, finished, nil, &failure)
 }
 
 // RetireProviderAttemptAfterControlInvalidation is the narrow terminal path
@@ -1105,7 +1212,7 @@ func (s *Store) CompleteProviderAttemptSuccess(ctx context.Context, claim Provid
 		}
 		return ProviderAttemptResult{}, ErrProviderAttempt
 	}
-	err = s.finishProviderAttempt(ctx, claim, proof, expected, fence, "completed", "completed", raw.UsageUnits, finished, &result)
+	err = s.finishProviderAttempt(ctx, claim, proof, expected, fence, "completed", "completed", raw.UsageUnits, finished, &result, nil)
 	if err != nil {
 		// A concurrent exact replay may have committed between the initial
 		// lookup and our transaction.  Re-read instead of weakening the update
@@ -1156,12 +1263,21 @@ func sameProviderAttemptResult(a, b ProviderAttemptResult) bool {
 	return a.AttemptID == b.AttemptID && a.RawSHA256 == b.RawSHA256 && a.TypedSHA256 == b.TypedSHA256 && a.ValidationSHA256 == b.ValidationSHA256 && a.TranscriptSHA256 == b.TranscriptSHA256 && bytes.Equal(a.RawArtifact, b.RawArtifact) && bytes.Equal(a.TypedArtifact, b.TypedArtifact) && bytes.Equal(a.Validation, b.Validation)
 }
 
-func (s *Store) finishProviderAttempt(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, state, outcome string, usage int64, finished time.Time, result *ProviderAttemptResult) error {
+func (s *Store) finishProviderAttempt(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, state, outcome string, usage int64, finished time.Time, result *ProviderAttemptResult, artifactFailure *ProviderArtifactFailure) error {
 	if claim.ID <= 0 || claim.ExpectedVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || !validAttemptState(state) || !safeOutcome(outcome) || usage < 0 || finished.IsZero() {
 		return ErrProviderAttempt
 	}
 	if result != nil && (state != "completed" || outcome != "completed") {
 		return ErrProviderAttempt
+	}
+	if artifactFailure != nil {
+		if state != "failed" || outcome != contracts.PhaseResultInvalidArtifact || artifactFailure.AttemptID != claim.ID || artifactFailure.Ref != claim.Ref || artifactFailure.Phase != claim.Phase || artifactFailure.Role != claim.Role || artifactFailure.Attempt != claim.Attempt || artifactFailure.RequestDigest != claim.RequestDigest || artifactFailure.LeaderEpoch != claim.LeaderEpoch || artifactFailure.RunnerEpoch != claim.RunnerEpoch || artifactFailure.ExpectedVersion != claim.ExpectedVersion || !artifactFailure.CreatedAt.Equal(finished.UTC()) {
+			return ErrProviderAttempt
+		}
+		digest, err := providerArtifactFailureDigest(*artifactFailure)
+		if err != nil || digest != artifactFailure.Digest {
+			return ErrProviderAttempt
+		}
 	}
 	if claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch {
 		return ErrStaleFence
@@ -1252,6 +1368,12 @@ func (s *Store) finishProviderAttempt(ctx context.Context, claim ProviderAttempt
 		if n != 1 {
 			return ErrStaleFence
 		}
+		if artifactFailure != nil {
+			_, err = conn.ExecContext(ctx, `INSERT INTO provider_artifact_failures(provider_attempt_id,channel,project_id,ticket_id,phase,role,attempt,request_digest,leader_epoch,runner_epoch,expected_ticket_version,failure_reason,failure_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, artifactFailure.AttemptID, artifactFailure.Ref.Channel, artifactFailure.Ref.Project, artifactFailure.Ref.Ticket, artifactFailure.Phase, artifactFailure.Role, artifactFailure.Attempt, artifactFailure.RequestDigest, artifactFailure.LeaderEpoch, artifactFailure.RunnerEpoch, artifactFailure.ExpectedVersion, artifactFailure.Reason, artifactFailure.Digest, artifactFailure.CreatedAt.UTC().Format(time.RFC3339Nano))
+			if err != nil {
+				return err
+			}
+		}
 		row, err = conn.ExecContext(ctx, `DELETE FROM leases WHERE channel=? AND scope='provider' AND scope_key=? AND project_id=? AND ticket_id=? AND runner_epoch=? AND EXISTS(SELECT 1 FROM provider_attempts a WHERE a.id=? AND a.channel=? AND a.project_id=? AND a.ticket_id=? AND a.phase=? AND a.attempt=? AND a.role=? AND a.provider=? AND a.model=? AND a.family=? AND a.version=? AND a.binding_digest=? AND a.provider_lease_key=? AND a.leader_epoch=? AND a.runner_epoch=? AND a.expected_ticket_version=? AND a.repository_path=? AND a.worktree_path=? AND a.worktree_identity=? AND a.base_sha=? AND a.auth_digest=? AND a.auth_mode=?)`, claim.Ref.Channel, claim.LeaseKey, claim.Ref.Project, claim.Ref.Ticket, claim.RunnerEpoch, claim.ID, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket, claim.Phase, claim.Attempt, claim.Role, claim.Binding.Identity.Provider, claim.Binding.Identity.Model, claim.Binding.Identity.Family, claim.Binding.Identity.Version, claim.BindingDigest, claim.LeaseKey, claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion, claim.Repository, claim.Worktree, claim.WorktreeIdentity, claim.BaseSHA, claim.Binding.AuthDigest, claim.Binding.AuthMode)
 		if err != nil {
 			return err
@@ -1270,8 +1392,18 @@ func (s *Store) LoadProviderAttemptResult(ctx context.Context, claim ProviderAtt
 	if claim.ID <= 0 || claim.ExpectedVersion != expected || claim.LeaderEpoch != fence.LeaderEpoch || claim.RunnerEpoch != fence.RunnerEpoch {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
 	}
-	if err := validateRunnerRecoveryAuthority(ctx, s.db, claim.Ref, expected, fence); err != nil {
-		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+	candidateRepairAuthority := false
+	if claim.Phase == domain.PhaseBuild && claim.Role == "builder" {
+		if _, repairErr := s.candidateRepairBuildContextAt(ctx, s.db, claim.Ref, expected, fence); repairErr == nil {
+			candidateRepairAuthority = true
+		} else if !errors.Is(repairErr, ErrNotFound) {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+		}
+	}
+	if !candidateRepairAuthority {
+		if err := validateRunnerRecoveryAuthority(ctx, s.db, claim.Ref, expected, fence); err != nil {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+		}
 	}
 	out, c, err := loadProviderAttemptResultRow(ctx, s.db, claim.ID)
 	if err != nil {
@@ -1317,6 +1449,12 @@ func (s *Store) LoadProviderAttemptResult(ctx context.Context, claim ProviderAtt
 	canonical, _, canonicalErr := phaseartifact.CanonicalTypedArtifact(parsed)
 	if canonicalErr != nil || !bytes.Equal(canonical, out.TypedArtifact) {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderAttempt
+	}
+	if candidateRepairAuthority {
+		key := ProviderAttemptResultKey{AttemptID: out.AttemptID, Ref: out.Claim.Ref, Phase: out.Claim.Phase, Attempt: out.Claim.Attempt}
+		if candidateRepairBuilderEntryResultReachesFence(ctx, s.db, key, out, expected, fence) != nil {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
+		}
 	}
 	return out, parsed, nil
 }
@@ -1533,6 +1671,23 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if live.Version != request.ExpectedVersion || live.RunnerEpoch != request.Fence.RunnerEpoch || liveLeader != request.Fence.LeaderEpoch {
 		return LatestReusableProviderAttemptResult{}, ErrStaleFence
 	}
+	candidateRepairAuthority := false
+	if request.Phase == domain.PhaseBuild && live.State == domain.StateBuilding {
+		if _, contextErr := s.candidateRepairBuildContextAt(ctx, s.db, request.Ref, request.ExpectedVersion, request.Fence); contextErr == nil {
+			repairErr := candidateRepairBuilderEntryResultReachesFence(ctx, s.db, key, historical, request.ExpectedVersion, request.Fence)
+			if repairErr == nil {
+				candidateRepairAuthority = true
+			} else if errors.Is(repairErr, ErrNotFound) {
+				// The newest completed Builder predates the checks_red repair entry.
+				// It remains predecessor provenance, never reusable successor work.
+				return LatestReusableProviderAttemptResult{}, ErrNotFound
+			} else {
+				return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+			}
+		} else if !errors.Is(contextErr, ErrNotFound) {
+			return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+		}
+	}
 	if request.Phase == domain.PhaseVerification || request.Phase == domain.PhaseBuild {
 		boundary, boundaryErr := reviewRepairBoundaryFrom(ctx, s.db, request.Ref, request.Phase, live.Version, historical.Claim.ExpectedVersion)
 		if boundaryErr != nil {
@@ -1547,17 +1702,20 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 			return LatestReusableProviderAttemptResult{}, ErrNotFound
 		}
 	}
+	current := historical.Claim.ExpectedVersion == request.ExpectedVersion && historical.Claim.RunnerEpoch == request.Fence.RunnerEpoch && historical.Claim.LeaderEpoch == request.Fence.LeaderEpoch
+	candidateRepairRecovery := candidateRepairAuthority && !current
 	// Final-review results use the stricter CI/publication authority below.
 	// That proof authenticates the immutable checks_green endpoint and every
 	// exact pause/resume or signed recovery step to the live reviewing fence.
 	// The generic audit cannot represent a first recovery whose predecessor is
 	// normal lifecycle history followed by a post-publication control triplet.
-	if request.Phase != domain.PhaseReview {
+	// A completed candidate-repair witness is likewise a narrower Store-owned
+	// source anchor than the ticket-wide initial lifecycle audit.
+	if request.Phase != domain.PhaseReview && !candidateRepairAuthority {
 		if err := validateRunnerRecoveryAuthority(ctx, s.db, request.Ref, request.ExpectedVersion, request.Fence); err != nil {
 			return LatestReusableProviderAttemptResult{}, ErrStaleFence
 		}
 	}
-	current := historical.Claim.ExpectedVersion == request.ExpectedVersion && historical.Claim.RunnerEpoch == request.Fence.RunnerEpoch && historical.Claim.LeaderEpoch == request.Fence.LeaderEpoch
 	result := LatestReusableProviderAttemptResult{Key: key, Result: historical, Parsed: parsed}
 	if current {
 		currentResult, currentParsed, loadErr := s.LoadProviderAttemptResult(ctx, historical.Claim, request.ExpectedVersion, request.Fence)
@@ -1570,8 +1728,10 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 		if !allowedState {
 			return LatestReusableProviderAttemptResult{}, ErrStaleFence
 		}
-		if err := s.ProviderResultReachesFence(ctx, key, request.ExpectedVersion, request.Fence); err != nil {
-			return LatestReusableProviderAttemptResult{}, ErrStaleFence
+		if !candidateRepairRecovery {
+			if err := s.ProviderResultReachesFence(ctx, key, request.ExpectedVersion, request.Fence); err != nil {
+				return LatestReusableProviderAttemptResult{}, ErrStaleFence
+			}
 		}
 		result.Recovered = true
 	}
@@ -1909,6 +2069,64 @@ func (s *Store) ProviderAttempts(ctx context.Context, ref domain.TicketRef) ([]P
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// ProviderArtifactFailures returns authenticated, non-secret explanations for
+// repairable invalid provider artifacts on one ticket. Legacy failures made
+// before this evidence table existed intentionally have no row rather than a
+// guessed classification.
+func (s *Store) ProviderArtifactFailures(ctx context.Context, ref domain.TicketRef) ([]ProviderArtifactFailure, error) {
+	if ref.Validate() != nil {
+		return nil, ErrProviderAttempt
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT provider_attempt_id,phase,role,attempt,request_digest,leader_epoch,runner_epoch,expected_ticket_version,failure_reason,failure_digest,created_at FROM provider_artifact_failures WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY provider_attempt_id`, ref.Channel, ref.Project, ref.Ticket)
+	if err != nil {
+		return nil, normalizeBusy(ctx, err)
+	}
+	defer rows.Close()
+	// Materialize and close this cursor before authenticating each row below.
+	// Store is intentionally usable with a one-connection SQLite pool, where a
+	// nested query while this cursor is open would otherwise wait for itself.
+	var values []ProviderArtifactFailure
+	for rows.Next() {
+		var value ProviderArtifactFailure
+		var created string
+		if err := rows.Scan(&value.AttemptID, &value.Phase, &value.Role, &value.Attempt, &value.RequestDigest, &value.LeaderEpoch, &value.RunnerEpoch, &value.ExpectedVersion, &value.Reason, &value.Digest, &created); err != nil {
+			return nil, err
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, created)
+		if err != nil {
+			return nil, ErrEvidenceConflict
+		}
+		value.Ref, value.CreatedAt = ref, createdAt
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	var out []ProviderArtifactFailure
+	for _, value := range values {
+		claim, err := loadAuthenticatedProviderAttemptClaim(ctx, s.db, value.AttemptID)
+		if err != nil || claim.Ref != ref || claim.Phase != value.Phase || claim.Role != value.Role || claim.Attempt != value.Attempt || claim.RequestDigest != value.RequestDigest || claim.LeaderEpoch != value.LeaderEpoch || claim.RunnerEpoch != value.RunnerEpoch || claim.ExpectedVersion != value.ExpectedVersion {
+			return nil, ErrEvidenceConflict
+		}
+		var attemptState, attemptOutcome, phaseState, phaseOutcome string
+		var resultCount int
+		if err := s.db.QueryRowContext(ctx, `SELECT a.state,a.outcome,p.state,p.outcome,(SELECT COUNT(*) FROM provider_attempt_results r WHERE r.provider_attempt_id=a.id) FROM provider_attempts a JOIN phase_runs p ON p.channel=a.channel AND p.project_id=a.project_id AND p.ticket_id=a.ticket_id AND p.phase=a.phase AND p.attempt=a.attempt AND p.provider=a.provider AND p.model=a.model AND p.family=a.family AND p.provider_version=a.version AND p.leader_epoch=a.leader_epoch AND p.runner_epoch=a.runner_epoch AND p.expected_ticket_version=a.expected_ticket_version AND p.worktree_identity=a.worktree_identity AND p.base_sha=a.base_sha WHERE a.id=?`, value.AttemptID).Scan(&attemptState, &attemptOutcome, &phaseState, &phaseOutcome, &resultCount); err != nil || attemptState != "failed" || attemptOutcome != contracts.PhaseResultInvalidArtifact || phaseState != "failed" || phaseOutcome != contracts.PhaseResultInvalidArtifact || resultCount != 0 {
+			return nil, ErrEvidenceConflict
+		}
+		digest, err := providerArtifactFailureDigest(value)
+		if err != nil || digest != value.Digest {
+			return nil, ErrEvidenceConflict
+		}
+		out = append(out, value)
+	}
+	return out, nil
 }
 
 func currentRuntimeQualification(ctx context.Context, conn *sql.Conn, channel domain.Channel, role string, b contracts.RuntimeBinding) (ProviderQualification, error) {

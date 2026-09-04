@@ -107,6 +107,23 @@ type RuntimeTakeoverInspector interface {
 	InspectTakeover(context.Context, domain.TicketRef) (contracts.TakeoverInspection, error)
 }
 
+// RuntimeProviderRetryWorktreePreflight is the local, read-only filesystem
+// proof required before an exhausted provider phase is reopened. A failed
+// provider may have written files before returning an invalid artifact; the
+// retry transition must not be consumed until the retained registered
+// worktree reauthenticates as pristine.
+type RuntimeProviderRetryWorktreePreflight interface {
+	AuthenticateProviderRetryWorktree(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error)
+}
+
+// RuntimeProviderRetryRearmController is the sealed, provider-specific
+// admission handoff. It repeats the active checkout proof and redeems Store's
+// exact retry capability; generic pre/post-publication rearm authority cannot
+// substitute for this boundary.
+type RuntimeProviderRetryRearmController interface {
+	RearmProviderRetry(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error)
+}
+
 // WorkflowRuntime is the daemon lifecycle boundary for a composed workflow
 // runtime. Implementations own their goroutines and must not return from
 // Close until those goroutines have stopped. The fence is supplied by the
@@ -1535,7 +1552,22 @@ func (daemon *Daemon) takeoverSuccess(ctx context.Context, request api.Request, 
 		"retained_proof_digest": inspection.RetainedProofDigest, "retained_policy_digest": inspection.RetainedPolicyDigest,
 		"retained_version": inspection.RetainedVersion, "retained_leader_epoch": inspection.RetainedLeaderEpoch, "retained_runner_epoch": inspection.RetainedRunnerEpoch,
 	}
-	view["next_action"] = domain.NextAction{Code: "takeover_resume", Argv: []string{daemon.executable(), "resume", string(stored.Ref.Ticket)}}
+	next := domain.NextAction{Code: "takeover_resume", Argv: []string{daemon.executable(), "resume", string(stored.Ref.Ticket)}}
+	if disposition, dispositionErr := daemon.store.ProviderRetryDisposition(ctx, stored); dispositionErr == nil {
+		switch disposition {
+		case store.ProviderRetryEligible:
+			next = domain.NextAction{Code: "provider_retry", Argv: []string{daemon.executable(), "retry", string(stored.Ref.Ticket)}}
+		case store.ProviderRetryExhausted:
+			next = domain.NextAction{Code: "provider_retry_exhausted", Argv: []string{daemon.executable(), "cancel", string(stored.Ref.Ticket)}}
+		case store.ProviderRetryResubmissionRequired:
+			next = domain.NextAction{Code: "provider_retry_resubmit_required", Argv: []string{daemon.executable(), "cancel", string(stored.Ref.Ticket)}}
+		default:
+			if retryable, retryableErr := daemon.store.RetryablePause(ctx, stored); retryableErr == nil && retryable {
+				next = domain.NextAction{Code: "ticket_retry", Argv: []string{daemon.executable(), "retry", string(stored.Ref.Ticket)}}
+			}
+		}
+	}
+	view["next_action"] = next
 	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_take", Identity: string(stored.Ref.Ticket), Observed: observed}, view)
 }
 
@@ -1566,16 +1598,19 @@ func (daemon *Daemon) resumeTicket(ctx context.Context, request api.Request, ide
 	if response != nil {
 		return *response
 	}
+	stored, err := daemon.store.Ticket(ctx, ref)
+	if err != nil {
+		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
+	}
+	if stored.State == domain.StateBlocked && nonRecoverableTicketBlocker(stored.BlockedCode) {
+		return daemon.failure(request, stored.BlockedCode, "this ticket's safety boundary cannot be resumed; cancel it, then submit a fresh ticket", false)
+	}
 	controller, ok := daemon.control.(RuntimeRearmController)
 	if !ok {
 		return daemon.failure(request, "runtime_rearm_unavailable", "ticket resume is unavailable until the runtime control boundary is configured", true)
 	}
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
-	}
-	stored, err := daemon.store.Ticket(ctx, ref)
-	if err != nil {
-		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
 	}
 	transitioned := false
 	if stored.State == domain.StatePaused {
@@ -1763,6 +1798,9 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	if err != nil {
 		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
 	}
+	if stored.State == domain.StateBlocked && nonRecoverableTicketBlocker(stored.BlockedCode) {
+		return daemon.failure(request, stored.BlockedCode, "this ticket's safety boundary cannot be retried; cancel it, then submit a fresh ticket", false)
+	}
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
 	}
@@ -1771,31 +1809,54 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	// control remains sealed and the ticket is already active, so replay must
 	// finish the handoff rather than attempting a second lifecycle transition.
 	if stored.State != domain.StatePaused {
-		if replay, replayErr := daemon.store.ProviderRetryReplay(ctx, stored); replayErr != nil {
+		providerReplay, replayErr := daemon.store.ProviderRetryRuntimeReplay(ctx, stored)
+		if errors.Is(replayErr, store.ErrProviderRetryRequiresResubmission) {
+			return daemon.providerRetryResubmitFailure(request, ref, false, true)
+		}
+		if replayErr != nil {
 			return daemon.failure(request, "retry_state_unavailable", "provider retry state could not be authenticated", true)
-		} else if replay {
-			state, ok := daemon.control.(RuntimeRearmStateController)
+		}
+		switch providerReplay {
+		case store.ProviderRetryNeedsRearm:
+			controller, ok := daemon.control.(RuntimeProviderRetryRearmController)
 			if !ok {
-				return daemon.failure(request, "runtime_rearm_unavailable", "provider retry is durably sealed until runtime admission can be authenticated", true)
+				return daemon.providerRetryRearmFailure(request, ref, false, true, "the provider retry is durably committed, but this runtime cannot authenticate and rearm its retained worktree")
 			}
-			needed, stateErr := state.RuntimeRearmNeeded(ctx, ref)
-			if stateErr != nil {
-				return daemon.failure(request, "runtime_rearm_failed", "provider retry state could not determine whether runtime admission is sealed", true)
+			fence := domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}
+			ready, rearmErr := controller.RearmProviderRetry(ctx, ref, stored.Version, fence)
+			if errors.Is(rearmErr, store.ErrProviderRetryRequiresResubmission) {
+				return daemon.providerRetryResubmitFailure(request, ref, false, true)
 			}
-			if needed {
-				controller, ok := daemon.control.(RuntimeRearmController)
-				if !ok {
-					return daemon.failure(request, "runtime_rearm_unavailable", "provider retry is durably sealed until runtime admission is configured", true)
-				}
-				if err := controller.Rearm(ctx, ref); err != nil {
-					return daemon.failure(request, "runtime_rearm_failed", "provider retry is durably sealed until runtime admission is installed; retry after the local runtime is available", true)
-				}
+			if rearmErr != nil || !ready {
+				return daemon.providerRetryRearmFailure(request, ref, false, true, "the provider retry is durably committed, but its active worktree could not be reauthenticated; runtime admission remains sealed")
 			}
 			current, currentErr := daemon.store.Ticket(ctx, ref)
 			if currentErr != nil {
 				return daemon.failure(request, "resume_state_unavailable", "provider retry state could not be confirmed after runtime admission", true)
 			}
 			return daemon.success(request, api.Mutation{Attempted: false, Kind: "ticket_" + kind, Identity: string(ref.Ticket), Observed: true}, ticketView(current))
+		case store.ProviderRetryAlreadyRearmed:
+			preflight, ok := daemon.control.(RuntimeProviderRetryWorktreePreflight)
+			if !ok {
+				return daemon.failure(request, "provider_retry_worktree_unavailable", "the committed provider retry cannot reauthenticate its retained worktree in this runtime", true)
+			}
+			ready, proofErr := preflight.AuthenticateProviderRetryWorktree(ctx, ref, stored.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch})
+			if errors.Is(proofErr, store.ErrProviderRetryRequiresResubmission) {
+				return daemon.providerRetryResubmitFailure(request, ref, false, true)
+			}
+			if proofErr != nil {
+				return daemon.failure(request, "provider_retry_worktree_unavailable", "the committed provider retry could not reauthenticate its retained worktree", true)
+			}
+			if !ready {
+				return daemon.failure(request, "provider_retry_worktree_unready", "the committed provider retry worktree is no longer pristine and authenticated; inspect it with take before continuing", false)
+			}
+			current, currentErr := daemon.store.Ticket(ctx, ref)
+			if currentErr != nil {
+				return daemon.failure(request, "resume_state_unavailable", "provider retry state could not be confirmed after runtime admission", true)
+			}
+			return daemon.success(request, api.Mutation{Attempted: false, Kind: "ticket_" + kind, Identity: string(ref.Ticket), Observed: true}, ticketView(current))
+		case store.ProviderRetryLegacyUnsealed:
+			return daemon.providerRetryResubmitFailure(request, ref, false, true)
 		}
 		if replay, ok := daemon.control.(RuntimeMergeRetryReplayController); ok {
 			state, stateErr := replay.GuardedMergeRetryReplay(ctx, ref)
@@ -1836,6 +1897,51 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	if providerRetry == store.ProviderRetryExhausted {
 		return daemon.failure(request, "provider_retry_exhausted", "the one permitted provider retry window has already been exhausted; cancel and resubmit the ticket", false)
 	}
+	if providerRetry == store.ProviderRetryResubmissionRequired {
+		return daemon.providerRetryResubmitFailure(request, ref, false, false)
+	}
+	if providerRetry == store.ProviderRetryEligible {
+		preflight, ok := daemon.control.(RuntimeProviderRetryWorktreePreflight)
+		if !ok {
+			return daemon.failure(request, "provider_retry_worktree_unavailable", "the retained retry worktree cannot be authenticated by this runtime; sf did not consume the retry", true)
+		}
+		fence := domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}
+		ready, readinessErr := preflight.AuthenticateProviderRetryWorktree(ctx, ref, stored.Version, fence)
+		if errors.Is(readinessErr, store.ErrProviderRetryRequiresResubmission) {
+			return daemon.providerRetryResubmitFailure(request, ref, false, false)
+		}
+		if readinessErr != nil {
+			return daemon.failure(request, "provider_retry_worktree_unavailable", "the retained retry worktree could not be authenticated; sf did not consume the retry", true)
+		}
+		if !ready {
+			return daemon.failure(request, "provider_retry_worktree_unready", "the retained retry worktree is not pristine and authenticated; sf did not consume the retry—inspect it with take, restore it to a clean reviewed state, then retry, or cancel and resubmit", false)
+		}
+		if _, ok := daemon.control.(RuntimeProviderRetryRearmController); !ok {
+			return daemon.failure(request, "runtime_rearm_unavailable", "provider retry requires the sealed local runtime rearm authority; sf did not consume the retry", true)
+		}
+		drained, drainErr := daemon.control.Drain(ctx, ref)
+		if drainErr != nil || !drained {
+			return daemon.controlFailure(request, stored, kind, "blocked_process", "provider retry requires a completed local drain; sf did not consume the retry", drainErr != nil, true)
+		}
+		if err := daemon.lease.Validate(); err != nil {
+			return daemon.providerRetryRearmFailure(request, ref, true, false, "daemon leadership changed after the provider retry runtime was durably sealed; sf did not consume the retry")
+		}
+		drainedTicket, ticketErr := daemon.store.Ticket(ctx, ref)
+		if ticketErr != nil || drainedTicket.State != domain.StatePaused || drainedTicket.ResumeState != stored.ResumeState || drainedTicket.Version != stored.Version || drainedTicket.RunnerEpoch != stored.RunnerEpoch {
+			return daemon.providerRetryRearmFailure(request, ref, true, false, "the provider retry pause changed after its runtime was durably sealed; sf did not consume the retry")
+		}
+		ready, readinessErr = preflight.AuthenticateProviderRetryWorktree(ctx, ref, drainedTicket.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: drainedTicket.RunnerEpoch})
+		if errors.Is(readinessErr, store.ErrProviderRetryRequiresResubmission) {
+			return daemon.providerRetryResubmitFailure(request, ref, true, false)
+		}
+		if readinessErr != nil {
+			return daemon.providerRetryRearmFailure(request, ref, true, false, "the retained retry worktree could not be reauthenticated after the runtime was durably sealed; sf did not consume the retry")
+		}
+		if !ready {
+			return daemon.providerRetryRearmFailure(request, ref, true, false, "the retained retry worktree changed while the runtime was draining; sf did not consume the retry")
+		}
+		stored = drainedTicket
+	}
 	// Merge/reconciliation retry is a post-publication mutation boundary. Stop the
 	// in-memory admission before Store seals and advances the ticket so the
 	// subsequent opaque rearm token has an exact stopped runtime to authorize.
@@ -1871,6 +1977,20 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 	if err != nil || current.Version != result.TicketVersion {
 		return daemon.failure(request, "resume_state_unavailable", "retry transition could not be confirmed", true)
 	}
+	if providerRetry == store.ProviderRetryEligible {
+		if err := daemon.lease.Validate(); err != nil {
+			return daemon.providerRetryRearmFailure(request, ref, true, false, "the provider retry committed, but daemon leadership changed before runtime admission; the runtime remains sealed")
+		}
+		controller := daemon.control.(RuntimeProviderRetryRearmController)
+		ready, rearmErr := controller.RearmProviderRetry(ctx, ref, current.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: current.RunnerEpoch})
+		if errors.Is(rearmErr, store.ErrProviderRetryRequiresResubmission) {
+			return daemon.providerRetryResubmitFailure(request, ref, true, false)
+		}
+		if rearmErr != nil || !ready {
+			return daemon.providerRetryRearmFailure(request, ref, true, false, "the provider retry committed, but its active worktree could not be reauthenticated; the runtime remains sealed")
+		}
+		return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_" + kind, Identity: string(ref.Ticket)}, ticketView(current))
+	}
 	if requiresGuardedMergeRearm {
 		if err := mergeRearm.Rearm(ctx, ref); err != nil {
 			return daemon.failure(request, "runtime_rearm_failed", "retry is durably sealed until runtime admission is installed; retry after the local runtime is available", true)
@@ -1897,6 +2017,18 @@ func (daemon *Daemon) resumeWithTrigger(ctx context.Context, request api.Request
 		}
 	}
 	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_" + kind, Identity: string(ref.Ticket)}, ticketView(current))
+}
+
+func (daemon *Daemon) providerRetryRearmFailure(request api.Request, ref domain.TicketRef, attempted, observed bool, message string) api.Response {
+	response := daemon.failure(request, "provider_retry_rearm_blocked", message+"; inspect the ticket and retained worktree, restore the exact authenticated head if needed, then run retry again", true)
+	response.Mutation = api.Mutation{Attempted: attempted, Observed: observed, Kind: "ticket_retry", Identity: string(ref.Ticket)}
+	return response
+}
+
+func (daemon *Daemon) providerRetryResubmitFailure(request api.Request, ref domain.TicketRef, attempted, observed bool) api.Response {
+	response := daemon.failure(request, "provider_retry_resubmit_required", "this retry crosses a source-resume or verification-amendment boundary whose retained worktree cannot be safely reused; cancel and resubmit the ticket", false)
+	response.Mutation = api.Mutation{Attempted: attempted, Observed: observed, Kind: "ticket_retry", Identity: string(ref.Ticket)}
+	return response
 }
 
 func (daemon *Daemon) ticketRefByID(ctx context.Context, request api.Request) (domain.TicketRef, *api.Response) {
@@ -2093,7 +2225,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	switch code {
 	case "legacy_provider_entry_unverifiable":
 		argv = []string{binary, "cancel", "--help"}
-	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable":
+	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
 		argv = []string{binary, "cancel", "--help"}
 	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 		argv = []string{binary, "take", "--help"}
@@ -2111,6 +2243,12 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 		argv = []string{binary, operatorVerb("resume"), "--help"}
 	case "retry_state_unavailable", "retry_not_available", "retry_transition_refused", "retry_required":
 		argv = []string{binary, "retry", "--help"}
+	case "provider_retry_worktree_unavailable":
+		argv = []string{binary, "retry", "--help"}
+	case "provider_retry_worktree_unready":
+		argv = []string{binary, "take", "--help"}
+	case "provider_retry_rearm_blocked":
+		argv = []string{binary, "show", "--help"}
 	case "recover_mode_refused", "recover_transition_refused":
 		argv = []string{binary, "recover", "--help"}
 	}
@@ -2123,7 +2261,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 		switch code {
 		case "legacy_provider_entry_unverifiable":
 			argv = []string{binary, "cancel", request.Ticket}
-		case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable":
+		case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
 			argv = []string{binary, "cancel", request.Ticket}
 		case "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 			// `take` is intentionally idempotent and prints the authenticated
@@ -2146,6 +2284,12 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 			argv = []string{binary, operatorVerb("resume"), request.Ticket}
 		case "retry_state_unavailable", "retry_not_available", "retry_transition_refused":
 			argv = []string{binary, "retry", request.Ticket}
+		case "provider_retry_worktree_unavailable":
+			argv = []string{binary, "retry", request.Ticket}
+		case "provider_retry_worktree_unready":
+			argv = []string{binary, "take", request.Ticket}
+		case "provider_retry_rearm_blocked":
+			argv = []string{binary, "show", request.Ticket}
 		case "recover_mode_refused", "recover_transition_refused":
 			argv = []string{binary, "recover", request.Ticket}
 		}
@@ -2174,7 +2318,7 @@ func (daemon *Daemon) executable() string {
 
 func nonRecoverableTicketBlocker(code string) bool {
 	switch code {
-	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable":
+	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable":
 		return true
 	default:
 		return false

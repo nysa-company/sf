@@ -86,3 +86,21 @@ func TestEvidenceReadsFailClosedOnAbsenceAndTampering(t *testing.T) {
 		t.Fatalf("tampered plan error=%v", err)
 	}
 }
+
+func TestRecoverableVerificationDistinguishesAbsenceFromTampering(t *testing.T) {
+	database, ctx, ref, _, _ := evidenceFixture(t)
+	if _, err := database.RecoverableVerification(ctx, ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing verification error=%v", err)
+	}
+
+	fixture := spikeReviewLifecycleFixture(t)
+	if _, err := fixture.db.RecoverableVerification(fixture.ctx, fixture.ticket.Ref); err != nil {
+		t.Fatalf("valid verification error=%v", err)
+	}
+	if _, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE verifications SET current_revision=current_revision+1 WHERE channel=? AND project_id=? AND ticket_id=?`, fixture.ticket.Ref.Channel, fixture.ticket.Ref.Project, fixture.ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.RecoverableVerification(fixture.ctx, fixture.ticket.Ref); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("tampered verification error=%v", err)
+	}
+}

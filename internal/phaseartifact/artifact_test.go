@@ -1,6 +1,7 @@
 package phaseartifact
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -84,9 +85,41 @@ func TestVerificationTypeRulesAndAcceptanceSeal(t *testing.T) {
 	}
 }
 
+func TestVerificationCommandBindsCurrentConfigAndLegacyValidationRemainsReadable(t *testing.T) {
+	value := Verification{
+		Schema: "sf.verification/v1", AcceptanceDigest: "accepted", ProofKind: ProofRegression,
+		OwnedFiles: []string{"internal/reminder/regression_test.go"}, Command: []string{"node", "--test"},
+		PrebuildOutcome: "red", EvidenceDigest: "evidence",
+	}
+	validation := Validation{TicketType: domain.TicketBug, AcceptanceDigest: "accepted", ExpectedVerificationCommand: []string{"node", "--test"}}
+	if _, err := Parse(domain.PhaseVerification, result(t, value), validation); err != nil {
+		t.Fatal(err)
+	}
+	value.Command = []string{"node", "--test", "app/tests/job-count.test.js"}
+	if _, err := Parse(domain.PhaseVerification, result(t, value), validation); err == nil {
+		t.Fatal("verification command narrowed from the configuration snapshot was accepted")
+	}
+
+	legacy := Validation{TicketType: domain.TicketBug, AcceptanceDigest: "accepted"}
+	data, _, err := CanonicalValidation(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("ExpectedVerificationCommand")) {
+		t.Fatalf("legacy validation unexpectedly encoded new command field: %s", data)
+	}
+	decoded, err := DecodeCanonicalValidation(data)
+	if err != nil || decoded.ExpectedVerificationCommand != nil {
+		t.Fatalf("legacy validation decode=%+v err=%v", decoded, err)
+	}
+	if _, err := Parse(domain.PhaseVerification, result(t, value), decoded); err != nil {
+		t.Fatalf("legacy validation rejected historical verification command: %v", err)
+	}
+}
+
 func TestBuilderCannotSilentlyChangeProtectedVerification(t *testing.T) {
 	value := Builder{Schema: "sf.builder/v1", Summary: "fix", ChangedFiles: []string{"proof_test.go"}, Commands: [][]string{{"go", "test", "./..."}}}
-	validation := Validation{ProtectedVerification: []string{"proof_test.go"}}
+	validation := Validation{ExpectedVerificationCommand: []string{"go", "test", "./..."}, ProtectedVerification: []string{"proof_test.go"}}
 	if _, err := Parse(domain.PhaseBuild, result(t, value), validation); err == nil {
 		t.Fatal("protected proof edit accepted without amendment")
 	}
@@ -95,6 +128,11 @@ func TestBuilderCannotSilentlyChangeProtectedVerification(t *testing.T) {
 	if _, err := Parse(domain.PhaseBuild, result(t, value), validation); err != nil {
 		t.Fatal(err)
 	}
+	value.AmendmentRequest.ProposedCommand = []string{"go", "test", "proof_test.go"}
+	if _, err := Parse(domain.PhaseBuild, result(t, value), validation); err == nil {
+		t.Fatal("verification amendment narrowed the configuration command")
+	}
+	value.AmendmentRequest.ProposedCommand = []string{"go", "test", "./..."}
 	value.ChangedFiles = []string{"../escape"}
 	if _, err := Parse(domain.PhaseBuild, result(t, value), validation); err == nil {
 		t.Fatal("escaping changed-file path accepted")

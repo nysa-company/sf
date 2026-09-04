@@ -1,8 +1,10 @@
 package providercoord
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -17,6 +19,33 @@ import (
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/testkit"
 )
+
+func TestReusedInputMatchesExactLegacyPhaseInput(t *testing.T) {
+	input := contracts.PhaseInput{
+		Ticket: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "SF-legacy-reuse"}, Phase: domain.PhasePlanning,
+		Attempt: 1, LeaderEpoch: 4, RunnerEpoch: 1, ExpectedVersion: 2, Prompt: "plan", Repository: "/repo", Worktree: "/repo/.sf/worktree", WorktreeIdentity: "identity", BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Provider: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "openai", Version: "1"}, AuthMode: "chatgpt_subscription", Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`),
+	}
+	payload, _, err := contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := bytes.TrimSuffix(payload, []byte(`,"Repair":null}`))
+	if len(legacy) == len(payload) {
+		t.Fatalf("current payload has no v53 repair suffix: %s", payload)
+	}
+	legacy = append(append([]byte(nil), legacy...), '}')
+	sum := sha256.Sum256(legacy)
+	digest := fmt.Sprintf("%x", sum)
+	decoded, err := contracts.DecodeCanonicalPhaseInput(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ProviderAttemptClaim{Attempt: 1, Binding: contracts.RuntimeBinding{Identity: input.Provider, AuthMode: input.AuthMode}, LeaderEpoch: 4, RunnerEpoch: 1, ExpectedVersion: 2, Input: decoded, RequestDigest: digest, RequestPayload: legacy}
+	input.Provider, input.AuthMode, input.Attempt, input.LeaderEpoch, input.RunnerEpoch, input.ExpectedVersion = domain.ProviderIdentity{}, "", 0, 0, 0, 0
+	if !reusedInputMatches(Request{Input: input}, claim) {
+		t.Fatal("logical request did not reuse exact legacy claim input")
+	}
+}
 
 func TestMalformedOutputIsIndeterminateAndNeverRepairsOrPersistsSecrets(t *testing.T) {
 	ctx := context.Background()
@@ -160,6 +189,125 @@ func TestSingleRoutePausesAfterOneInvalidArtifactRepair(t *testing.T) {
 		if attempt.State != "failed" || attempt.Outcome != "invalid_artifact" {
 			t.Fatalf("attempt[%d]=%+v", index, attempt)
 		}
+	}
+}
+
+// TestReviewerCommandMismatchIsInvalidArtifactAndRepairedBeforeCompletion
+// keeps a narrowed reviewer command inside the coordinator's bounded repair
+// loop. A rejected result must never reach the later repository materializer,
+// where provider-written files would otherwise strand the worktree.
+func TestReviewerCommandMismatchIsInvalidArtifactAndRepairedBeforeCompletion(t *testing.T) {
+	ctx := context.Background()
+	database, planning, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
+	planningResult := coordinator.Run(ctx, planning)
+	if planningResult.Code != Completed {
+		t.Fatalf("planning=%+v", planningResult)
+	}
+	_, planner, err := database.LoadCurrentProviderAttemptResult(ctx, planningResult.ProviderResult, planning.ExpectedVersion, planning.Fence)
+	if err != nil || planner.Planner == nil {
+		t.Fatalf("planner result=%+v parsed=%+v err=%v", planningResult, planner, err)
+	}
+	if _, err := database.RecordPlan(ctx, store.PlanArtifact{Ref: ref, ExpectedVersion: planning.ExpectedVersion, Fence: planning.Fence, Document: store.PlanDocument{
+		Planner: planner.Planner, ProviderResult: &planningResult.ProviderResult,
+		Acceptance: planner.Planner.Acceptance, ProofKind: string(planner.Planner.Proof.Kind), Paths: planner.Planner.Paths, Commands: planner.Planner.Commands, Risks: planner.Planner.Risks,
+	}}); err != nil {
+		t.Fatalf("record plan: %v", err)
+	}
+	if _, err := database.TransitionPlan(ctx, store.Transition{Ref: ref, ExpectedVersion: planning.ExpectedVersion, Fence: planning.Fence, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass"}); err != nil {
+		t.Fatalf("transition plan: %v", err)
+	}
+	verifying, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer := planning
+	reviewer.Role = RoleReviewer
+	reviewer.ExpectedVersion = verifying.Version
+	reviewer.Fence = domain.Fence{LeaderEpoch: planning.Fence.LeaderEpoch, RunnerEpoch: verifying.RunnerEpoch}
+	reviewer.Input.Phase = domain.PhaseVerification
+	reviewer.Input.Prompt = "review"
+	reviewer.Input.AllowedPaths = append([]string(nil), planner.Planner.Paths...)
+	reviewer.Validation = phaseartifact.Validation{
+		TicketType:                  verifying.Type,
+		AcceptanceDigest:            planner.Digest,
+		ExpectedVerificationCommand: []string{"node", "--test"},
+	}
+
+	provider, ok := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	if !ok {
+		t.Fatal("fixture reviewer provider changed type")
+	}
+	provider.Steps[domain.PhaseVerification] = []testkit.ProviderStep{
+		{Artifact: reviewerArtifactWithCommand(planner.Digest, "x/reviewer_test.go", []string{"node", "--test", "app/tests/job-count.test.js"})},
+		{Artifact: reviewerArtifactWithCommand(planner.Digest, "x/reviewer_test.go", []string{"node", "--test"})},
+	}
+	coordinator.routes[RoleReviewer] = Route{Primary: "claude", Capacity: 1}
+
+	result := coordinator.Run(ctx, reviewer)
+	if result.Code != Completed || result.ProviderResult.Attempt != 2 || len(result.Attempts) != 2 {
+		t.Fatalf("reviewer repair result=%+v", result)
+	}
+	if result.Attempts[0].ErrorCode != "invalid_artifact" || result.Attempts[0].ArtifactFailureReason != contracts.ArtifactFailureSchema {
+		t.Fatalf("narrowed command was not rejected as a schema artifact failure: %+v", result.Attempts[0])
+	}
+	if result.Parsed == nil || result.Parsed.Verify == nil || len(result.Parsed.Verify.Command) != 2 || result.Parsed.Verify.Command[0] != "node" || result.Parsed.Verify.Command[1] != "--test" {
+		t.Fatalf("completed reviewer command=%+v", result.Parsed)
+	}
+	attempts, err := database.ProviderAttempts(ctx, ref)
+	if err != nil || len(attempts) != 3 || attempts[1].Outcome != "invalid_artifact" || attempts[2].Outcome != "completed" {
+		t.Fatalf("reviewer attempts=%+v err=%v", attempts, err)
+	}
+}
+
+type explicitArtifactFailureProvider struct {
+	*testkit.ScriptedProvider
+	reason contracts.ArtifactFailureReason
+}
+
+func (p *explicitArtifactFailureProvider) Parse(context.Context, contracts.PhaseInput, contracts.CommandResult) (contracts.PhaseResult, error) {
+	return contracts.PhaseResult{Outcome: contracts.PhaseResultInvalidArtifact, ArtifactFailureReason: p.reason, Provider: p.Identity, UsageTrusted: true, UsageUnits: 0}, nil
+}
+
+func TestInvalidArtifactFailureReasonsAreDurableAndBounded(t *testing.T) {
+	for name, configure := range map[string]func(*Coordinator, *testkit.ScriptedProvider){
+		"final_message_missing_or_malformed": func(c *Coordinator, primary *testkit.ScriptedProvider) {
+			c.registry.providers["cursor"] = &explicitArtifactFailureProvider{ScriptedProvider: primary, reason: contracts.ArtifactFailureFinalMessage}
+		},
+		"schema_validation": func(_ *Coordinator, primary *testkit.ScriptedProvider) {
+			primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: []byte(`{"schema":"wrong"}`)}}
+		},
+		"mutation_path": func(_ *Coordinator, primary *testkit.ScriptedProvider) {
+			primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
+				{Artifact: plannerArtifact(), ChangedFiles: []string{"untrusted.txt"}},
+				{Artifact: plannerArtifact(), ChangedFiles: []string{"untrusted.txt"}},
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+			coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+			configure(coordinator, primary)
+			result := coordinator.Run(context.Background(), request)
+			if result.Code != AttemptExhausted || len(result.Attempts) != 2 {
+				t.Fatalf("result=%+v", result)
+			}
+			want := contracts.ArtifactFailureReason(name)
+			for _, receipt := range result.Attempts {
+				if receipt.ErrorCode != "invalid_artifact" || receipt.ArtifactFailureReason != want {
+					t.Fatalf("receipt=%+v want reason=%s", receipt, want)
+				}
+			}
+			failures, err := database.ProviderArtifactFailures(context.Background(), ref)
+			if err != nil || len(failures) != 2 {
+				t.Fatalf("durable failures=%+v err=%v", failures, err)
+			}
+			for _, failure := range failures {
+				if failure.Reason != want || failure.RequestDigest == "" || failure.Digest == "" {
+					t.Fatalf("failure=%+v want reason=%s", failure, want)
+				}
+			}
+		})
 	}
 }
 
@@ -1224,8 +1372,16 @@ func plannerArtifact() []byte {
 }
 
 func reviewerArtifact(acceptanceDigest, ownedFile string) []byte {
-	return []byte(fmt.Sprintf(`{"schema":"sf.verification/v1","acceptance_digest":%q,"proof_kind":"acceptance","owned_files":[%q],"command":["go","test","./..."],"prebuild_outcome":"red","evidence_digest":"%s"}`,
-		acceptanceDigest, ownedFile, strings.Repeat("e", 64)))
+	return reviewerArtifactWithCommand(acceptanceDigest, ownedFile, []string{"go", "test", "./..."})
+}
+
+func reviewerArtifactWithCommand(acceptanceDigest, ownedFile string, command []string) []byte {
+	encodedCommand, err := json.Marshal(command)
+	if err != nil {
+		panic(err)
+	}
+	return []byte(fmt.Sprintf(`{"schema":"sf.verification/v1","acceptance_digest":%q,"proof_kind":"acceptance","owned_files":[%q],"command":%s,"prebuild_outcome":"red","evidence_digest":"%s"}`,
+		acceptanceDigest, ownedFile, encodedCommand, strings.Repeat("e", 64)))
 }
 func recordQual(t *testing.T, db *store.Store, p *testkit.ScriptedProvider) {
 	t.Helper()

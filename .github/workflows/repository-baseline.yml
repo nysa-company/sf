@@ -14,8 +14,8 @@ jobs:
     # v1's production execution and compiled acceptance boundary is macOS.
     if: github.event_name != 'workflow_dispatch'
     runs-on: macos-14
-    # make test-all has a 90-minute local bound; leave setup/teardown headroom.
-    timeout-minutes: 100
+    # make test-all has a 120-minute local bound; leave setup/teardown headroom.
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,6 +24,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Expose the setup toolchain at the approved repository-test path
+        run: |
+          set -eu
+          setup_go=$(command -v go)
+          sudo mkdir -p /usr/local/go/bin
+          sudo ln -sfn "$setup_go" /usr/local/go/bin/go
+          test "$(readlink /usr/local/go/bin/go)" = "$setup_go"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -34,7 +41,7 @@ jobs:
     # This is credential-free local evidence, not stable-promotion approval.
     if: github.event_name == 'workflow_dispatch'
     runs-on: macos-14
-    timeout-minutes: 100
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,6 +50,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Expose the setup toolchain at the approved repository-test path
+        run: |
+          set -eu
+          setup_go=$(command -v go)
+          sudo mkdir -p /usr/local/go/bin
+          sudo ln -sfn "$setup_go" /usr/local/go/bin/go
+          test "$(readlink /usr/local/go/bin/go)" = "$setup_go"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

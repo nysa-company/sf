@@ -118,6 +118,64 @@ func TestGenericTransitionCannotForgeVerificationAmendment(t *testing.T) {
 	}
 }
 
+func TestVerificationAmendmentInvalidBlockerCannotRecover(t *testing.T) {
+	fixture := verificationAmendmentLifecycle(t, false)
+	if fixture.ticket.State != domain.StateVerifying {
+		t.Fatalf("amendment fixture state=%s, want verifying", fixture.ticket.State)
+	}
+	blockedResult, err := fixture.db.Transition(fixture.ctx, Transition{
+		Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version,
+		From: domain.StateVerifying, To: domain.StateBlocked, ResumeState: domain.StateVerifying,
+		Trigger: "typed_blocker", Fence: fixture.fence,
+		EventPayload: `{"code":"verification_amendment_invalid"}`,
+	})
+	if err != nil {
+		t.Fatalf("persist amendment-invalid blocker: %v", err)
+	}
+	blocked, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+	if err != nil || blocked.State != domain.StateBlocked || blocked.ResumeState != domain.StateVerifying || blocked.BlockedCode != verificationAmendmentInvalidBlockerCode || blocked.Version != blockedResult.Version {
+		t.Fatalf("amendment-invalid ticket=%+v result=%+v err=%v", blocked, blockedResult, err)
+	}
+	var payload string
+	if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, blocked.Ref.Channel, blocked.Ref.Project, blocked.Ref.Ticket, blocked.Version).Scan(&payload); err != nil || payload != `{"code":"verification_amendment_invalid"}` {
+		t.Fatalf("amendment-invalid payload=%q err=%v", payload, err)
+	}
+	fixture.ticket = blocked
+	before := snapshotVerificationAmendmentAuthority(t, fixture)
+	if _, err := fixture.db.Transition(fixture.ctx, Transition{
+		Ref: blocked.Ref, ExpectedVersion: blocked.Version,
+		From: domain.StateBlocked, To: domain.StateBlocked, ResumeState: domain.StateVerifying,
+		Trigger: "typed_blocker", Fence: fixture.fence,
+		EventPayload: `{"code":"autonomy_ineligible"}`,
+	}); !errors.Is(err, ErrEvidenceConflict) {
+		t.Fatalf("amendment-invalid blocker was relabeled: %v", err)
+	}
+	afterRelabel := snapshotVerificationAmendmentAuthority(t, fixture)
+	if !reflect.DeepEqual(afterRelabel, before) {
+		t.Fatalf("rejected relabel mutated amendment authority: before=%+v after=%+v", before, afterRelabel)
+	}
+	for _, trigger := range []string{"operator_recover", "operator_resume", "operator_retry", "arbitrary"} {
+		if _, err := fixture.db.Transition(fixture.ctx, Transition{
+			Ref: blocked.Ref, ExpectedVersion: blocked.Version,
+			From: domain.StateBlocked, To: domain.StateVerifying, ResumeState: domain.StateVerifying,
+			Trigger: trigger, Fence: fixture.fence, EventPayload: `{}`,
+		}); !errors.Is(err, ErrEvidenceConflict) {
+			t.Fatalf("amendment-invalid blocker escaped through %s: %v", trigger, err)
+		}
+		after := snapshotVerificationAmendmentAuthority(t, fixture)
+		if !reflect.DeepEqual(after, before) {
+			t.Fatalf("rejected %s mutated amendment authority: before=%+v after=%+v", trigger, before, after)
+		}
+	}
+	if _, err := fixture.db.TransitionAndInvalidateRunner(fixture.ctx, Transition{
+		Ref: blocked.Ref, ExpectedVersion: blocked.Version,
+		From: domain.StateBlocked, To: domain.StateCancelling,
+		Trigger: "operator_cancel", Fence: fixture.fence, EventPayload: `{}`,
+	}); err != nil {
+		t.Fatalf("amendment-invalid blocker could not be cancelled: %v", err)
+	}
+}
+
 func TestTransitionVerificationAmendmentRequestRejectsNonCanonicalPayload(t *testing.T) {
 	fixture := verificationAmendmentLifecycle(t, false)
 	if _, err := fixture.db.TransitionVerificationAmendmentRejected(fixture.ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, From: domain.StateVerifying, To: domain.StateBuilding, Trigger: "amendment_rejected", Fence: fixture.fence, EventPayload: "{}"}, fixture.amendedKey); err != nil {
@@ -528,6 +586,140 @@ func TestVerificationAmendmentDecisionHistoryCrossesRecoveryBeforeDecision(t *te
 			}
 		})
 	}
+}
+
+func TestCandidatePublishingAuthenticatesAmendmentDecisionAfterRunnerRecovery(t *testing.T) {
+	fixture := verificationAmendmentLifecycleWithReviewer(t, false, func(value *phaseartifact.Verification) {
+		// recordReplacement=false leaves the request undecided. Restore the exact
+		// Builder-proposed replacement so the first decision below is accepted.
+		value.EvidenceDigest = sha256Digest([]byte("replacement"))
+	})
+	requestVersion, requestFence := fixture.ticket.Version, fixture.fence
+
+	recoverAmendmentFixtureFence(t, &fixture, "before-first-decision")
+	if fixture.ticket.Version != requestVersion+1 || fixture.ticket.RunnerEpoch != requestFence.RunnerEpoch+1 {
+		t.Fatalf("recovered ticket=%+v request=%d/%+v", fixture.ticket, requestVersion, requestFence)
+	}
+	pending, err := fixture.db.PendingVerificationAmendment(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence)
+	if err != nil || pending.TransitionTicketVersion != requestVersion || pending.Fence != requestFence {
+		t.Fatalf("pending=%+v request=%d/%+v err=%v", pending, requestVersion, requestFence, err)
+	}
+	decision, err := fixture.db.VerificationAmendmentDecision(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence, fixture.amendedKey)
+	if err != nil || decision != VerificationAmendmentAccepted {
+		t.Fatalf("decision=%q err=%v", decision, err)
+	}
+
+	replay := fixture.amendedArt
+	replay.ExpectedVersion = fixture.ticket.Version
+	replay.Fence = fixture.fence
+	replay.ProviderResult = &fixture.amendedKey
+	revision, err := fixture.db.RecordVerification(fixture.ctx, replay)
+	if err != nil {
+		t.Fatalf("record recovered amendment: %v", err)
+	}
+	if revision.Revision != fixture.priorRev+1 || revision.Amends != fixture.priorRev {
+		t.Fatalf("amended revision=%+v prior=%d", revision, fixture.priorRev)
+	}
+	if _, err := fixture.db.TransitionVerificationAmendmentAccepted(fixture.ctx, Transition{
+		Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version,
+		From: domain.StateVerifying, To: domain.StateBuilding,
+		Trigger: "amendment_accepted", Fence: fixture.fence, EventPayload: "{}",
+	}, fixture.amendedKey); err != nil {
+		t.Fatalf("accept recovered amendment: %v", err)
+	}
+
+	building, err := fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+	if err != nil || building.State != domain.StateBuilding {
+		t.Fatalf("building ticket=%+v err=%v", building, err)
+	}
+	fence := domain.Fence{LeaderEpoch: fixture.fence.LeaderEpoch, RunnerEpoch: building.RunnerEpoch}
+	builderArtifact := phaseartifact.Builder{
+		Schema:       "sf.builder/v1",
+		Summary:      "build candidate from recovered amendment",
+		ChangedFiles: []string{"internal/implementation.go"},
+		Commands:     [][]string{{"go", "test", "./..."}},
+	}
+	builderRaw, err := json.Marshal(builderArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builderClaim, err := fixture.db.BeginProviderAttempt(fixture.ctx, supervised(t, ProviderAttemptRequest{
+		Ref: building.Ref, ExpectedVersion: building.Version, Fence: fence,
+		Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(fixture.builder),
+		ConfigDigest: fixture.config, Capacity: 1, At: time.Now().UTC(),
+	}))
+	if err != nil {
+		t.Fatalf("begin candidate Builder: %v", err)
+	}
+	if err := fixture.db.RecordProviderLaunch(fixture.ctx, builderClaim, contracts.ProviderLaunch{
+		PID: int(builderClaim.ID), PGID: int(builderClaim.ID), BootIdentity: "amendment-candidate",
+		ProcessStartIdentity: fmt.Sprintf("amendment-candidate-%d", builderClaim.ID), Worktree: builderClaim.Worktree,
+	}); err != nil {
+		t.Fatalf("record candidate Builder launch: %v", err)
+	}
+	if _, err := fixture.db.CompleteProviderAttemptSuccess(fixture.ctx, builderClaim, proof(t, builderClaim), building.Version, fence, contracts.PhaseResult{
+		Provider: builderClaim.Binding.Identity, Artifact: builderRaw, UsageTrusted: true, UsageUnits: 1,
+	}, phaseartifact.Validation{
+		TicketType: building.Type, ExpectedVerificationCommand: fixture.amended.Command,
+		ProtectedVerification: fixture.amended.OwnedFiles,
+	}, time.Now().UTC()); err != nil {
+		t.Fatalf("complete candidate Builder: %v", err)
+	}
+
+	builderKey := ProviderAttemptResultKey{AttemptID: builderClaim.ID, Ref: building.Ref, Phase: domain.PhaseBuild, Attempt: builderClaim.Attempt}
+	_, parsed, err := fixture.db.LoadHistoricalProviderAttemptResult(fixture.ctx, builderKey)
+	if err != nil || parsed.Builder == nil {
+		t.Fatalf("load candidate Builder result=%+v err=%v", parsed, err)
+	}
+	builderDigest, err := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := fixture.db.CurrentVerification(fixture.ctx, building.Ref)
+	if err != nil || verification.Revision.Revision != revision.Revision {
+		t.Fatalf("current verification=%+v err=%v", verification, err)
+	}
+	worktree, err := fixture.db.Worktree(fixture.ctx, building.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	policy := sha256Digest([]byte("recovered-amendment-candidate-policy"))
+	head, tree := strings.Repeat("1", 40), strings.Repeat("2", 40)
+	snapshot := domain.CandidateSnapshot{
+		BaseSHA: worktree.BaseSHA, HeadSHA: head, TreeSHA: tree, SourceDigest: building.SourceDigest,
+		VerificationIntentDigest: verification.Revision.IntentDigest, ProofDigest: verification.Revision.ProofDigest,
+		CommandPolicyDigest: policy, BuilderEvidenceDigest: builderDigest,
+	}
+	command := completeEvidenceRepositoryCommand(t, fixture.db, fixture.ctx, RepositoryCommandPurposePostbuildCandidate,
+		building.Ref, building.Version, fence, builderKey, verification.Revision.IntentDigest,
+		verification.Revision.ProofDigest, verification.Checkpoint.CommitOID, "sha256:"+policy, 0)
+	if _, err := fixture.db.RecordCandidate(fixture.ctx, CandidateEvidence{
+		Ref: building.Ref, ExpectedVersion: building.Version, Fence: fence, Snapshot: snapshot,
+		BuilderResult: builderKey, Commit: CommitObservation{CommitOID: head, ParentOID: verification.Checkpoint.CommitOID, TreeOID: tree},
+		Reason: "candidate after recovered verification amendment", CommandResult: command,
+	}); err != nil {
+		t.Fatalf("record candidate: %v", err)
+	}
+	candidate, err := fixture.db.RecoverableCandidate(fixture.ctx, building.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.TransitionCandidate(fixture.ctx, Transition{
+		Ref: building.Ref, ExpectedVersion: building.Version,
+		From: domain.StateBuilding, To: domain.StatePublishing,
+		Trigger: "phase_pass", Fence: fence, EventPayload: "{}",
+	}, candidate.Snapshot); err != nil {
+		t.Fatalf("publish candidate: %v", err)
+	}
+	publishing, err := fixture.db.Ticket(fixture.ctx, building.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.AuthenticatePublishingRecovery(fixture.ctx, publishing.Ref, candidate, publishing.Version, fence); err != nil {
+		t.Fatalf("amendment/recovery candidate authority: %v", err)
+	}
+
 }
 
 func recoverAmendmentFixtureFence(t *testing.T, fixture *verificationAmendmentFixture, workflow string) {

@@ -101,7 +101,7 @@ func finalReviewLifecycleFixtureForPending(t *testing.T, ticketType domain.Ticke
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := db.RecordCIObservation(ctx, observation); err != nil {
+		if err := db.recordCIObservation(ctx, observation); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := db.ConsumeCIObservation(ctx, CIObservationTransition{Ref: waiting.Ref, ObservationDigest: canonicalObservation.ObservationDigest, ExpectedVersion: waiting.Version, Fence: fence}); err != nil {

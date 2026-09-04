@@ -364,7 +364,7 @@ func (s *Store) reauthenticateStoredCandidateCommand(ctx context.Context, ref do
 // holding Store's write transaction, so falling back to s.db here would both
 // miss its transactional view and risk SQLite self-contention.
 func (s *Store) reauthenticateStoredCandidateCommandFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredCandidate) error {
-	return s.reauthenticateStoredCandidateCommandAt(ctx, q, ref, stored, true)
+	return s.reauthenticateStoredCandidateCommandAtMode(ctx, q, ref, stored, true, false)
 }
 
 // reauthenticateStoredCandidateCommandHistoricalFrom authenticates an
@@ -373,10 +373,25 @@ func (s *Store) reauthenticateStoredCandidateCommandFrom(ctx context.Context, q 
 // signed recovery ledger have already proven the old binding reaches the live
 // owner; callers must never use it as generic current-fence authority.
 func (s *Store) reauthenticateStoredCandidateCommandHistoricalFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredCandidate) error {
-	return s.reauthenticateStoredCandidateCommandAt(ctx, q, ref, stored, false)
+	return s.reauthenticateStoredCandidateCommandAtMode(ctx, q, ref, stored, false, false)
+}
+
+// reauthenticateStoredCandidateCheckpointFrom treats the immutable
+// candidate/result binding as the already-completed Store promotion boundary.
+// It reauthenticates every material Builder, repository-command,
+// verification, worktree, and config fact without replaying lifecycle history
+// from before that boundary. Publication uses this mode because provider
+// retry, CI repair, and source-resume each have distinct Store authorities that
+// RecordCandidate already consumed atomically.
+func (s *Store) reauthenticateStoredCandidateCheckpointFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredCandidate) error {
+	return s.reauthenticateStoredCandidateCommandAtMode(ctx, q, ref, stored, false, true)
 }
 
 func (s *Store) reauthenticateStoredCandidateCommandAt(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredCandidate, requireLiveBuilderAuthority bool) error {
+	return s.reauthenticateStoredCandidateCommandAtMode(ctx, q, ref, stored, requireLiveBuilderAuthority, false)
+}
+
+func (s *Store) reauthenticateStoredCandidateCommandAtMode(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, stored StoredCandidate, requireLiveBuilderAuthority, acceptSealedCandidateBinding bool) error {
 	result, found, err := loadRepositoryCommandResult(ctx, q, stored.CommandBinding.Key, true)
 	if err != nil || !found || result.Claim.TicketRef != ref || !matchingBinding(stored.CommandBinding, result) || result.Result.ExitCode != 0 || !candidatePolicyMatches(stored.Snapshot.CommandPolicyDigest, result.Claim.PolicyDigest) {
 		return ErrEvidenceConflict
@@ -384,29 +399,39 @@ func (s *Store) reauthenticateStoredCandidateCommandAt(ctx context.Context, q ca
 	// The provider source may predate this append-only candidate binding after a
 	// restart.  Authenticate the exact source-to-binding recovery chain instead
 	// of treating matching counters or the command witness as provider proof.
-	builder, _, err := s.loadHistoricalProviderAttemptResult(ctx, q, stored.BuilderResult)
-	if err != nil || builder.Claim.Ref != ref || builder.Claim.Phase != domain.PhaseBuild || builder.Claim.Role != "builder" {
+	builder, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, q, stored.BuilderResult)
+	if err != nil || parsed.Builder == nil || builder.Claim.Ref != ref || builder.Claim.Phase != domain.PhaseBuild || builder.Claim.Role != "builder" {
+		return ErrEvidenceConflict
+	}
+	builderDigest, err := phaseartifact.BuilderEvidenceDigest(*parsed.Builder)
+	if err != nil || builderDigest != stored.Snapshot.BuilderEvidenceDigest {
 		return ErrEvidenceConflict
 	}
 	if requireLiveBuilderAuthority && providerResultReachesFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence) != nil {
-		// A source-only operator handoff starts a separately authenticated
-		// recovery lineage. RecordCandidate admits that lineage only through its
-		// complete prepared-candidate witness; the strict current reader must
-		// revalidate that exact witness rather than treating the historical
-		// Builder claim as ordinary provider authority or suffix-only proof.
-		var witness OperatorSourceResumePreparedCandidateWitness
-		var found bool
-		var witnessErr error
-		if conn, ok := q.(*sql.Conn); ok {
-			witness, found, witnessErr = s.operatorSourceResumePreparedCandidateWitnessFrom(ctx, conn, ref, stored.TicketVersion, stored.Fence, false)
-		} else {
-			witness, found, witnessErr = s.OperatorSourceResumePreparedCandidateWitness(ctx, ref, stored.TicketVersion, stored.Fence)
-		}
-		if witnessErr != nil || !found || witness.Ref != ref || witness.Version != stored.TicketVersion || witness.Fence != stored.Fence || witness.Builder != stored.BuilderResult || witness.Command.Key != stored.CommandBinding.Key || witness.Command.Claim.PolicyDigest != stored.CommandBinding.PolicyDigest || !candidatePolicyMatches(stored.Snapshot.CommandPolicyDigest, witness.Command.Claim.PolicyDigest) || witness.Commit != stored.Commit || witness.Commit.CommitOID != stored.Snapshot.HeadSHA || witness.Commit.TreeOID != stored.Snapshot.TreeSHA || witness.Source.Worktree.BaseSHA != stored.Snapshot.BaseSHA || witness.Verification.Revision.IntentDigest != stored.Snapshot.VerificationIntentDigest || witness.Verification.Revision.ProofDigest != stored.Snapshot.ProofDigest || witness.Verification.Revision.CheckpointID != stored.Commit.ParentOID || witness.Verification.Checkpoint.CommitOID != stored.Commit.ParentOID {
+		repairErr := candidateRepairBuilderResultReachesFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence)
+		if repairErr != nil && !errors.Is(repairErr, ErrNotFound) {
 			return ErrEvidenceConflict
 		}
+		if repairErr != nil {
+			// A source-only operator handoff starts a separately authenticated
+			// recovery lineage. RecordCandidate admits that lineage only through its
+			// complete prepared-candidate witness; the strict current reader must
+			// revalidate that exact witness rather than treating the historical
+			// Builder claim as ordinary provider authority or suffix-only proof.
+			var witness OperatorSourceResumePreparedCandidateWitness
+			var found bool
+			var witnessErr error
+			if conn, ok := q.(*sql.Conn); ok {
+				witness, found, witnessErr = s.operatorSourceResumePreparedCandidateWitnessFrom(ctx, conn, ref, stored.TicketVersion, stored.Fence, false)
+			} else {
+				witness, found, witnessErr = s.OperatorSourceResumePreparedCandidateWitness(ctx, ref, stored.TicketVersion, stored.Fence)
+			}
+			if witnessErr != nil || !found || witness.Ref != ref || witness.Version != stored.TicketVersion || witness.Fence != stored.Fence || witness.Builder != stored.BuilderResult || witness.Command.Key != stored.CommandBinding.Key || witness.Command.Claim.PolicyDigest != stored.CommandBinding.PolicyDigest || !candidatePolicyMatches(stored.Snapshot.CommandPolicyDigest, witness.Command.Claim.PolicyDigest) || witness.Commit != stored.Commit || witness.Commit.CommitOID != stored.Snapshot.HeadSHA || witness.Commit.TreeOID != stored.Snapshot.TreeSHA || witness.Source.Worktree.BaseSHA != stored.Snapshot.BaseSHA || witness.Verification.Revision.IntentDigest != stored.Snapshot.VerificationIntentDigest || witness.Verification.Revision.ProofDigest != stored.Snapshot.ProofDigest || witness.Verification.Revision.CheckpointID != stored.Commit.ParentOID || witness.Verification.Checkpoint.CommitOID != stored.Commit.ParentOID {
+				return ErrEvidenceConflict
+			}
+		}
 	}
-	if !requireLiveBuilderAuthority && providerResultReachesHistoricalFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence) != nil {
+	if !requireLiveBuilderAuthority && !acceptSealedCandidateBinding && providerResultReachesHistoricalFence(ctx, q, stored.BuilderResult, builder, stored.TicketVersion, stored.Fence) != nil {
 		return ErrEvidenceConflict
 	}
 	var builderCreated string
@@ -421,9 +446,15 @@ func (s *Store) reauthenticateStoredCandidateCommandAt(ctx context.Context, q ca
 	// predates the Builder result. Read that immutable revision directly rather
 	// than asking CurrentVerification to re-walk the reviewer's old recovery
 	// chain through the candidate's later live fence.
-	verification, err := s.verificationEvidenceForCandidateFrom(ctx, q, ref)
-	if err != nil || stored.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || stored.Snapshot.ProofDigest != verification.Revision.ProofDigest || stored.Commit.ParentOID != verification.Checkpoint.CommitOID {
+	verification, err := s.verificationEvidenceForIdentityFrom(ctx, q, ref, stored.Snapshot.VerificationIntentDigest, stored.Snapshot.ProofDigest, "")
+	if err != nil || stored.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || stored.Snapshot.ProofDigest != verification.Revision.ProofDigest {
 		return ErrEvidenceConflict
+	}
+	if stored.Commit.ParentOID != verification.Checkpoint.CommitOID {
+		repair, repairErr := completedCandidateRepairContextAt(ctx, q, stored, builder)
+		if repairErr != nil || stored.Commit.ParentOID != repair.PredecessorHeadSHA || repair.Verification.Revision.IntentDigest != verification.Revision.IntentDigest || repair.Verification.Revision.ProofDigest != verification.Revision.ProofDigest || repair.Verification.Revision.CheckpointID != verification.Revision.CheckpointID {
+			return ErrEvidenceConflict
+		}
 	}
 	var worktreePath, worktreeIdentity, worktreeBase string
 	if err := q.QueryRowContext(ctx, `SELECT path,identity_json,base_sha FROM worktrees WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&worktreePath, &worktreeIdentity, &worktreeBase); err != nil || !boundedText(worktreePath, 1_000) || !validJSON([]byte(worktreeIdentity)) || !validOID(worktreeBase) || stored.Snapshot.BaseSHA != worktreeBase || result.Claim.Worktree != worktreePath || result.Claim.WorktreeIdentity != worktreeIdentity || result.Claim.BaseSHA != worktreeBase {
@@ -455,16 +486,60 @@ func (s *Store) verificationEvidenceForCandidate(ctx context.Context, ref domain
 }
 
 func (s *Store) verificationEvidenceForCandidateFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef) (StoredVerification, error) {
+	return s.verificationEvidenceForIdentityFrom(ctx, q, ref, "", "", "")
+}
+
+// verificationEvidenceForIdentityFrom authenticates the immutable revision
+// named by a historical candidate. Empty identity fields preserve the ordinary
+// current-revision lookup; retained repair bindings must pass all three fields
+// so a later final-review amendment cannot rewrite their source verification.
+func (s *Store) verificationEvidenceForIdentityFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, intentDigest, proofDigest, checkpointID string) (StoredVerification, error) {
 	var stored StoredVerification
-	var owned string
-	err := q.QueryRowContext(ctx, `SELECT r.revision,r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id
-		FROM verifications v JOIN verification_revisions r
-		ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision
-		WHERE v.channel=? AND v.project_id=? AND v.ticket_id=?
-		AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`, ref.Channel, ref.Project, ref.Ticket).Scan(
-		&stored.Revision.Revision, &stored.Revision.IntentDigest, &stored.Intent, &stored.Revision.ProofDigest, &stored.Proof, &owned, &stored.Revision.CheckpointID,
+	var owned, created string
+	var amends sql.NullInt64
+	query := `SELECT r.revision,r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id,r.amends_revision,r.amendment_reason,r.requester,r.created_at FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id`
+	args := []any{ref.Channel, ref.Project, ref.Ticket}
+	if intentDigest == "" && proofDigest == "" && checkpointID == "" {
+		query += ` AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`
+	} else {
+		if !validSHA256(intentDigest) || !validSHA256(proofDigest) || (checkpointID != "" && !validOID(checkpointID)) {
+			return StoredVerification{}, ErrEvidenceConflict
+		}
+		if checkpointID == "" {
+			var matches int
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM verification_revisions WHERE channel=? AND project_id=? AND ticket_id=? AND intent_digest=? AND proof_digest=?`, ref.Channel, ref.Project, ref.Ticket, intentDigest, proofDigest).Scan(&matches); err != nil || matches != 1 {
+				return StoredVerification{}, ErrEvidenceConflict
+			}
+			query += ` WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND r.intent_digest=? AND r.proof_digest=?`
+			args = append(args, intentDigest, proofDigest)
+		} else {
+			query += ` WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND r.intent_digest=? AND r.proof_digest=? AND r.checkpoint_id=?`
+			args = append(args, intentDigest, proofDigest, checkpointID)
+		}
+	}
+	err := q.QueryRowContext(ctx, query, args...).Scan(
+		&stored.Revision.Revision, &stored.Revision.IntentDigest, &stored.Intent, &stored.Revision.ProofDigest, &stored.Proof, &owned, &stored.Revision.CheckpointID, &amends, &stored.AmendmentReason, &stored.Requester, &created,
 	)
+	if errors.Is(err, sql.ErrNoRows) {
+		var exists int
+		existsErr := q.QueryRowContext(ctx, `SELECT 1 FROM verifications WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&exists)
+		if errors.Is(existsErr, sql.ErrNoRows) {
+			return StoredVerification{}, ErrNotFound
+		}
+		return StoredVerification{}, ErrEvidenceConflict
+	}
 	if err != nil || stored.Revision.Revision == 0 || sha256Digest(stored.Intent) != stored.Revision.IntentDigest || sha256Digest(stored.Proof) != stored.Revision.ProofDigest || json.Unmarshal([]byte(owned), &stored.Revision.OwnedFiles) != nil || validOwnedFiles(stored.Revision.OwnedFiles) != nil || !validOID(stored.Revision.CheckpointID) {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	if amends.Valid {
+		if amends.Int64 <= 0 || uint64(amends.Int64) >= stored.Revision.Revision || !boundedText(stored.AmendmentReason, 2_000) || !boundedText(stored.Requester, 200) {
+			return StoredVerification{}, ErrEvidenceConflict
+		}
+		stored.Revision.Amends = uint64(amends.Int64)
+	} else if stored.AmendmentReason != "" || stored.Requester != "" {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	if stored.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
 	err = q.QueryRowContext(ctx, `SELECT binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid

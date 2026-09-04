@@ -1,13 +1,17 @@
 package workflowruntime
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/phaseartifact"
@@ -16,6 +20,35 @@ import (
 	"github.com/nysa-company/sf/internal/workflowprompt"
 	"github.com/nysa-company/sf/internal/workflowworker"
 )
+
+func TestMatchesLaunchInputAcceptsExactLegacyPhaseInput(t *testing.T) {
+	input := contracts.PhaseInput{
+		Ticket: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "SF-legacy-launch"}, Phase: domain.PhaseVerification,
+		Attempt: 1, LeaderEpoch: 5, RunnerEpoch: 1, ExpectedVersion: 3, Prompt: "verify", Repository: "/repo", Worktree: "/repo/.sf/worktree", WorktreeIdentity: "identity", BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Provider: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "openai", Version: "1"}, AuthMode: "chatgpt_subscription", Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`),
+	}
+	payload, _, err := contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := bytes.TrimSuffix(payload, []byte(`,"Repair":null}`))
+	if len(legacy) == len(payload) {
+		t.Fatalf("current payload has no v53 repair suffix: %s", payload)
+	}
+	legacy = append(append([]byte(nil), legacy...), '}')
+	sum := sha256.Sum256(legacy)
+	digest := fmt.Sprintf("%x", sum)
+	decoded, err := contracts.DecodeCanonicalPhaseInput(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ProviderAttemptClaim{ID: 9, Ref: input.Ticket, Phase: input.Phase, Role: string(providercoord.RoleReviewer), Attempt: 1, Binding: contracts.RuntimeBinding{Identity: input.Provider, AuthMode: input.AuthMode}, LeaderEpoch: 5, RunnerEpoch: 1, ExpectedVersion: 3, Repository: input.Repository, Worktree: input.Worktree, WorktreeIdentity: input.WorktreeIdentity, BaseSHA: input.BaseSHA, Input: decoded, RequestDigest: digest, RequestPayload: legacy}
+	key := store.ProviderAttemptResultKey{AttemptID: claim.ID, Ref: input.Ticket, Phase: input.Phase, Attempt: claim.Attempt}
+	input.Provider, input.AuthMode, input.Attempt, input.LeaderEpoch, input.RunnerEpoch, input.ExpectedVersion = domain.ProviderIdentity{}, "", 0, 0, 0, 0
+	input.Timeout = 2 * time.Minute
+	if !matchesLaunchInput(claim, key, input) {
+		t.Fatal("logical phase request did not match exact legacy launch input")
+	}
+}
 
 type phaseStore struct {
 	project   store.Project
@@ -29,6 +62,8 @@ type phaseStore struct {
 	proof     store.OperatorSourceResumeProof
 	proofOK   bool
 	amendment *store.VerificationAmendment
+	repair    *store.CandidateRepairBuildContext
+	repairErr error
 	final     *store.FinalReviewAuthority
 	results   map[int64]store.ProviderAttemptResult
 	parsed    map[int64]phaseartifact.Parsed
@@ -73,6 +108,15 @@ func (s *phaseStore) PendingVerificationAmendment(context.Context, domain.Ticket
 		return store.VerificationAmendment{}, store.ErrNotFound
 	}
 	return *s.amendment, nil
+}
+func (s *phaseStore) CandidateRepairBuildContext(context.Context, domain.TicketRef, uint64, domain.Fence) (store.CandidateRepairBuildContext, error) {
+	if s.repairErr != nil {
+		return store.CandidateRepairBuildContext{}, s.repairErr
+	}
+	if s.repair == nil {
+		return store.CandidateRepairBuildContext{}, store.ErrNotFound
+	}
+	return *s.repair, nil
 }
 func (s *phaseStore) FinalReviewAuthority(context.Context, domain.TicketRef, uint64, domain.Fence) (store.FinalReviewAuthority, error) {
 	if s.final != nil {
@@ -190,8 +234,39 @@ func TestPhaseRunnerVerificationUsesStoredPlannerWitness(t *testing.T) {
 	if err != nil || out.ProviderResult != key {
 		t.Fatalf("out=%+v err=%v", out, err)
 	}
-	if coordinator.request.Role != providercoord.RoleReviewer || coordinator.request.Input.Phase != domain.PhaseVerification || !reflect.DeepEqual(coordinator.request.Input.AllowedPaths, plan.Plan.Paths) || !reflect.DeepEqual(coordinator.request.Validation, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest}) {
+	if coordinator.request.Role != providercoord.RoleReviewer || coordinator.request.Input.Phase != domain.PhaseVerification || !reflect.DeepEqual(coordinator.request.Input.AllowedPaths, plan.Plan.Paths) || !reflect.DeepEqual(coordinator.request.Validation, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ExpectedVerificationCommand: []string{"go", "test", "./..."}}) {
 		t.Fatalf("request=%+v", coordinator.request)
+	}
+}
+
+func TestPhaseRunnerVerificationCarriesConfigOwnedCommand(t *testing.T) {
+	request, evidence, coordinator, _, _ := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying
+	request.Plan = &evidence.plan
+	evidence.hasVerify = false
+	effective, err := decodeTicketConfig(request.Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective.Commands.Verify.Argv = []string{"node", "--test"}
+	snapshot, digest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Ticket.ConfigSnapshot, request.Ticket.ConfigDigest = snapshot, digest
+	evidence.ticket = request.Ticket
+	key := store.ProviderAttemptResultKey{AttemptID: 13, Ref: request.Ticket.Ref, Phase: domain.PhaseVerification, Attempt: 2}
+	result := phaseProviderResult(key, request, providercoord.RoleReviewer)
+	evidence.results[key.AttemptID] = result
+	evidence.parsed[key.AttemptID] = phaseartifact.Parsed{Phase: domain.PhaseVerification, Provider: result.Claim.Binding.Identity, Verify: evidence.parsed[12].Verify}
+	coordinator.result = providercoord.Result{Code: providercoord.Completed, ProviderResult: key}
+	bindCoordinatorResult(t, coordinator, evidence, key, time.Minute)
+
+	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(coordinator.request.Validation.ExpectedVerificationCommand, []string{"node", "--test"}) || !strings.Contains(coordinator.request.Input.Prompt, `"command":["node","--test"]`) {
+		t.Fatalf("verification command binding=%+v prompt=%q", coordinator.request.Validation, coordinator.request.Input.Prompt)
 	}
 }
 
@@ -244,6 +319,30 @@ func TestPhaseRunnerVerificationCannotBypassPendingAmendment(t *testing.T) {
 	}
 	if coordinator.calls != 0 {
 		t.Fatalf("pending amendment launched reviewer: calls=%d", coordinator.calls)
+	}
+}
+
+func TestPhaseRunnerLegacyAmendmentCommandMismatchReturnsTypedBlocker(t *testing.T) {
+	request, evidence, coordinator, _, _ := phaseFixture(t)
+	request.Phase, request.Ticket.State = domain.PhaseVerification, domain.StateVerifying
+	evidence.ticket = request.Ticket
+	request.Plan = &evidence.plan
+	evidence.hasVerify = false
+	amendment := store.VerificationAmendment{
+		TransitionTicketVersion: request.Ticket.Version,
+		Prior:                   store.VerificationRevision{Revision: 1, ProofDigest: strings.Repeat("a", 64)},
+		ProposedDigest:          strings.Repeat("b", 64),
+		ProposedCommand:         []string{"node", "--test", "one_test.js"},
+		Reason:                  "legacy amendment narrowed the frozen command",
+		Requester:               "builder",
+	}
+	request.Amendment, evidence.amendment = &amendment, &amendment
+
+	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); !errors.Is(err, workflowworker.ErrVerificationAmendmentInvalid) {
+		t.Fatalf("legacy amendment mismatch err=%v", err)
+	}
+	if coordinator.calls != 0 {
+		t.Fatalf("legacy amendment launched reviewer: calls=%d", coordinator.calls)
 	}
 }
 
@@ -315,7 +414,7 @@ func TestPhaseRunnerBuildUsesExactVerificationAndRejectsRefusals(t *testing.T) {
 	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	want := phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ProtectedVerification: verification.OwnedFiles}
+	want := phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ExpectedVerificationCommand: []string{"go", "test", "./..."}, ProtectedVerification: verification.OwnedFiles}
 	if coordinator.request.Role != providercoord.RoleBuilder || !reflect.DeepEqual(coordinator.request.Input.AllowedPaths, plan.Plan.Paths) || !reflect.DeepEqual(coordinator.request.Validation, want) {
 		t.Fatalf("request=%+v", coordinator.request)
 	}

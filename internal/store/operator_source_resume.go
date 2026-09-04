@@ -754,6 +754,20 @@ type operatorSourceResumeEndpoint struct {
 // handoff.  Once that shape exists, malformed or ambiguous durable evidence is
 // fatal rather than an invitation to fall back to ordinary worktree handling.
 func (s *Store) operatorSourceResumeEndpointFrom(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) (operatorSourceResumeEndpoint, bool, error) {
+	return s.operatorSourceResumeEndpointAtMode(ctx, conn, ref, false)
+}
+
+// operatorSourceResumeEndpointHistoricalFrom authenticates the immutable
+// source handoff itself without requiring the current runtime-control authority
+// to remain in the initial Verifying/Building/Publishing suffix. A later
+// Store-authenticated CI repair owns that live suffix; its caller must
+// independently prove the repair authority and use this endpoint only to
+// authenticate the predecessor candidate's original promotion boundary.
+func (s *Store) operatorSourceResumeEndpointHistoricalFrom(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) (operatorSourceResumeEndpoint, bool, error) {
+	return s.operatorSourceResumeEndpointAtMode(ctx, conn, ref, true)
+}
+
+func (s *Store) operatorSourceResumeEndpointAtMode(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, allowLaterLifecycle bool) (operatorSourceResumeEndpoint, bool, error) {
 	control, err := runtimeControlFrom(ctx, conn, ref)
 	if errors.Is(err, ErrStaleFence) {
 		return operatorSourceResumeEndpoint{}, false, nil
@@ -802,16 +816,18 @@ func (s *Store) operatorSourceResumeEndpointFrom(ctx context.Context, conn *sql.
 		if control.authority.version < resumeVersion || control.authority.runner < control.stop.runner {
 			return operatorSourceResumeEndpoint{}, false, ErrEvidenceConflict
 		}
-		// A recovery row advances the ticket version while preserving Verifying;
-		// version arithmetic alone therefore cannot infer the live lifecycle
-		// endpoint. Authenticate the only source-resume suffixes that can carry
-		// the original sealed control: verifying, building, or candidate-only
-		// publishing before an external publication witness exists.
-		source := operatorSourceResumeEndpoint{version: resumeVersion, runner: control.stop.runner, leader: control.stop.leader}
-		if verifyingErr := validateOperatorSourceResumeFenceSuffix(ctx, conn, ref, source, domain.StateVerifying, control.authority.version, control.authority.runner, control.authority.leader); verifyingErr != nil {
-			if buildingErr := validateOperatorSourceResumeFenceSuffix(ctx, conn, ref, source, domain.StateBuilding, control.authority.version, control.authority.runner, control.authority.leader); buildingErr != nil {
-				if publishingErr := validateOperatorSourceResumeFenceSuffix(ctx, conn, ref, source, domain.StatePublishing, control.authority.version, control.authority.runner, control.authority.leader); publishingErr != nil {
-					return operatorSourceResumeEndpoint{}, false, ErrEvidenceConflict
+		if !allowLaterLifecycle {
+			// A recovery row advances the ticket version while preserving Verifying;
+			// version arithmetic alone therefore cannot infer the live lifecycle
+			// endpoint. Authenticate the only source-resume suffixes that can carry
+			// the original sealed control: verifying, building, or candidate-only
+			// publishing before an external publication witness exists.
+			source := operatorSourceResumeEndpoint{version: resumeVersion, runner: control.stop.runner, leader: control.stop.leader}
+			if verifyingErr := validateOperatorSourceResumeFenceSuffix(ctx, conn, ref, source, domain.StateVerifying, control.authority.version, control.authority.runner, control.authority.leader); verifyingErr != nil {
+				if buildingErr := validateOperatorSourceResumeFenceSuffix(ctx, conn, ref, source, domain.StateBuilding, control.authority.version, control.authority.runner, control.authority.leader); buildingErr != nil {
+					if publishingErr := validateOperatorSourceResumeFenceSuffix(ctx, conn, ref, source, domain.StatePublishing, control.authority.version, control.authority.runner, control.authority.leader); publishingErr != nil {
+						return operatorSourceResumeEndpoint{}, false, ErrEvidenceConflict
+					}
 				}
 			}
 		}
@@ -840,15 +856,35 @@ func (s *Store) operatorSourceResumeEndpointFrom(ctx context.Context, conn *sql.
 // "fresh verification required" capability so neither can silently forget the
 // source-only mode after a daemon restart.
 func operatorSourceResumeStateLineage(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, endpoint operatorSourceResumeEndpoint, state domain.State, version, runner, leader uint64) error {
+	return operatorSourceResumeStateLineageAtMode(ctx, conn, ref, endpoint, state, version, runner, leader, false)
+}
+
+func operatorSourceResumeStateLineagePrefix(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, endpoint operatorSourceResumeEndpoint, state domain.State, version, runner, leader uint64) error {
+	return operatorSourceResumeStateLineageAtMode(ctx, conn, ref, endpoint, state, version, runner, leader, true)
+}
+
+func operatorSourceResumeStateLineageAtMode(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, endpoint operatorSourceResumeEndpoint, state domain.State, version, runner, leader uint64, historical bool) error {
 	if version < endpoint.version || runner < endpoint.runner || leader == 0 {
 		return ErrEvidenceConflict
 	}
-	if err := validateRunnerRecoveryLedger(ctx, conn, ref, endpoint.version, endpoint.runner, endpoint.leader, version, runner, leader); err != nil {
+	var recoveryErr error
+	if historical {
+		recoveryErr = validateRunnerRecoveryLedgerPrefix(ctx, conn, ref, endpoint.version, endpoint.runner, endpoint.leader, version, runner, leader)
+	} else {
+		recoveryErr = validateRunnerRecoveryLedger(ctx, conn, ref, endpoint.version, endpoint.runner, endpoint.leader, version, runner, leader)
+	}
+	if recoveryErr != nil {
 		return ErrEvidenceConflict
 	}
-	rows, err := conn.QueryContext(ctx, `SELECT ticket_version,trigger,from_state,to_state FROM events
-		WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND from_state<>to_state
-		ORDER BY ticket_version,id`, ref.Channel, ref.Project, ref.Ticket, endpoint.version)
+	query := `SELECT ticket_version,trigger,from_state,to_state FROM events
+		WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND from_state<>to_state`
+	args := []any{ref.Channel, ref.Project, ref.Ticket, endpoint.version}
+	if historical {
+		query += ` AND ticket_version<=?`
+		args = append(args, version)
+	}
+	query += ` ORDER BY ticket_version,id`
+	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -887,6 +923,121 @@ func operatorSourceResumeStateLineage(ctx context.Context, conn *sql.Conn, ref d
 		return ErrEvidenceConflict
 	}
 	return nil
+}
+
+// authenticateOperatorSourceResumeRepairPredecessor preserves source-only
+// provenance when a later red-CI repair owns the live Building endpoint. The
+// repair authority has already authenticated the immutable publication and
+// predecessor candidate; this proof deliberately stops at that candidate's
+// original Store promotion boundary. Applying the initial source-resume state
+// suffix to the later waiting_ci->Building repair would reject valid history,
+// while skipping a detected malformed source endpoint would lose provenance.
+func (s *Store) authenticateOperatorSourceResumeRepairPredecessor(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, repair candidateRepairBindingAuthority) error {
+	if conn == nil || ref.Validate() != nil || repair.context.Ref != ref || repair.context.PredecessorGeneration == 0 || repair.context.EntryTicketVersion == 0 {
+		return ErrEvidenceConflict
+	}
+	endpoint, found, err := s.operatorSourceResumeEndpointHistoricalFrom(ctx, conn, ref)
+	if err != nil {
+		return ErrEvidenceConflict
+	}
+	if !found {
+		// The current runtime-control row can be replaced by a later operator
+		// stop while the original source-resume event remains immutable.  That
+		// must not erase provenance: a detected source handoff whose complete
+		// historical endpoint can no longer be authenticated is ambiguity, not
+		// clean absence that may fall through to an ordinary repair.
+		hasSourceHistory, historyErr := operatorSourceResumeHistoryPresent(ctx, conn, ref)
+		if historyErr != nil || hasSourceHistory {
+			return ErrEvidenceConflict
+		}
+		return nil
+	}
+	publication, publicationFound, err := loadPublicationEvidenceRowMatching(ctx, conn, ref,
+		repair.context.PredecessorGeneration,
+		repair.context.PredecessorHeadSHA,
+		repair.context.PredecessorTreeSHA,
+		repair.context.PublicationWitnessDigest,
+	)
+	if err != nil || !publicationFound {
+		return ErrEvidenceConflict
+	}
+	candidate := publication.Candidate
+	version, fence, err := candidateSnapshotEndpointAt(ctx, conn, ref, candidate)
+	if err != nil || operatorSourceResumeStateLineagePrefix(ctx, conn, ref, endpoint, domain.StateBuilding, version, fence.RunnerEpoch, fence.LeaderEpoch) != nil {
+		return ErrEvidenceConflict
+	}
+	verification := repair.context.Verification
+	if candidate.Snapshot.Generation != repair.context.PredecessorGeneration ||
+		candidate.Snapshot.HeadSHA != repair.context.PredecessorHeadSHA ||
+		candidate.Snapshot.TreeSHA != repair.context.PredecessorTreeSHA ||
+		candidate.Snapshot.BaseSHA != endpoint.proof.Worktree.BaseSHA ||
+		candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest ||
+		candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest ||
+		verification.Revision.Revision <= endpoint.proof.Verification.Revision.Revision ||
+		verification.Checkpoint.ParentOID != endpoint.event.SourceCommit.CommitOID ||
+		verification.Checkpoint.CommitOID == endpoint.event.SourceCommit.CommitOID ||
+		candidate.Commit.ParentOID != verification.Checkpoint.CommitOID {
+		return ErrEvidenceConflict
+	}
+	return nil
+}
+
+func operatorSourceResumeHistoryPresent(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef) (bool, error) {
+	if q == nil || ref.Validate() != nil {
+		return false, ErrEvidenceConflict
+	}
+	// Detect the Store-owned source handoff by its unique lifecycle shape, not
+	// by the authority-bearing resume payload. The current runtime-control row
+	// may later be replaced by another stop. If the old payload is then damaged,
+	// parsing it as the presence test would misclassify a real (but malformed)
+	// source lineage as clean absence and allow an unrelated recovery fallback.
+	// Payload, event cardinality, control, and evidence authentication remain the
+	// responsibility of operatorSourceResumeEndpointHistoricalFrom; this query
+	// only establishes that such history exists and therefore must fail closed
+	// when that complete endpoint cannot be reconstructed.
+	var count int
+	err := q.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM events resumed
+		JOIN events drained ON drained.channel=resumed.channel AND drained.project_id=resumed.project_id AND drained.ticket_id=resumed.ticket_id AND drained.ticket_version+1=resumed.ticket_version
+		JOIN events stopped ON stopped.channel=resumed.channel AND stopped.project_id=resumed.project_id AND stopped.ticket_id=resumed.ticket_id AND stopped.ticket_version+2=resumed.ticket_version
+		WHERE resumed.channel=? AND resumed.project_id=? AND resumed.ticket_id=?
+		AND resumed.trigger='operator_resume' AND resumed.from_state='paused' AND resumed.to_state='verifying'
+		AND drained.trigger='process_and_effects_drained' AND drained.from_state='stopping' AND drained.to_state='paused'
+		AND stopped.trigger='operator_pause_or_take' AND stopped.from_state='building' AND stopped.to_state='stopping'`, ref.Channel, ref.Project, ref.Ticket).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	if count > 0 {
+		return true, nil
+	}
+	// Retain marker detection as a second, independent ambiguity signal. It
+	// catches a partial/tampered lifecycle whose resume payload still declares a
+	// source commit; the structural query above catches the inverse case where
+	// the triplet survives but that payload has been corrupted.
+	rows, err := q.QueryContext(ctx, `SELECT payload FROM events
+		WHERE channel=? AND project_id=? AND ticket_id=?
+		AND trigger='operator_resume' AND from_state='paused' AND to_state='verifying'
+		ORDER BY ticket_version,id`, ref.Channel, ref.Project, ref.Ticket)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return false, err
+		}
+		var marker struct {
+			ChangeKind string `json:"change_kind"`
+		}
+		if validJSON([]byte(raw)) && json.Unmarshal([]byte(raw), &marker) == nil && marker.ChangeKind == "source_commit" {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // operatorSourceResumeProviderResultReachesFence is the source-resume-specific
@@ -1320,19 +1471,32 @@ func (s *Store) verificationEvidenceAtRevisionFrom(ctx context.Context, q candid
 // invalidate the old event or let the old event borrow the newer fence.
 func (s *Store) verificationEvidenceAtRevisionBindingFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, revision, bindingVersion uint64) (StoredVerification, error) {
 	var stored StoredVerification
-	var owned string
-	query := `SELECT r.revision,r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id FROM verification_revisions r WHERE r.channel=? AND r.project_id=? AND r.ticket_id=?`
+	var owned, created string
+	var amends sql.NullInt64
+	query := `SELECT r.revision,r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id,r.amends_revision,r.amendment_reason,r.requester,r.created_at FROM verification_revisions r WHERE r.channel=? AND r.project_id=? AND r.ticket_id=?`
 	args := []any{ref.Channel, ref.Project, ref.Ticket}
 	if revision != 0 {
 		query += ` AND r.revision=?`
 		args = append(args, revision)
 	} else {
-		query = `SELECT r.revision,r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`
+		query = `SELECT r.revision,r.intent_digest,r.intent_bytes,r.proof_digest,r.proof_bytes,r.owned_files_json,r.checkpoint_id,r.amends_revision,r.amendment_reason,r.requester,r.created_at FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=? AND v.intent_digest=r.intent_digest AND v.proof_digest=r.proof_digest`
 	}
-	if err := q.QueryRowContext(ctx, query, args...).Scan(&stored.Revision.Revision, &stored.Revision.IntentDigest, &stored.Intent, &stored.Revision.ProofDigest, &stored.Proof, &owned, &stored.Revision.CheckpointID); err != nil {
+	if err := q.QueryRowContext(ctx, query, args...).Scan(&stored.Revision.Revision, &stored.Revision.IntentDigest, &stored.Intent, &stored.Revision.ProofDigest, &stored.Proof, &owned, &stored.Revision.CheckpointID, &amends, &stored.AmendmentReason, &stored.Requester, &created); err != nil {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
 	if stored.Revision.Revision == 0 || sha256Digest(stored.Intent) != stored.Revision.IntentDigest || sha256Digest(stored.Proof) != stored.Revision.ProofDigest || json.Unmarshal([]byte(owned), &stored.Revision.OwnedFiles) != nil || validOwnedFiles(stored.Revision.OwnedFiles) != nil || !validOID(stored.Revision.CheckpointID) {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	if amends.Valid {
+		if amends.Int64 <= 0 || uint64(amends.Int64) >= stored.Revision.Revision || !boundedText(stored.AmendmentReason, 2_000) || !boundedText(stored.Requester, 200) {
+			return StoredVerification{}, ErrEvidenceConflict
+		}
+		stored.Revision.Amends = uint64(amends.Int64)
+	} else if stored.AmendmentReason != "" || stored.Requester != "" {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	var createdErr error
+	if stored.CreatedAt, createdErr = time.Parse(time.RFC3339Nano, created); createdErr != nil {
 		return StoredVerification{}, ErrEvidenceConflict
 	}
 	bindingQuery := `SELECT binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,checkpoint_commit_oid,checkpoint_parent_oid,checkpoint_tree_oid FROM verification_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND revision=?`

@@ -30,6 +30,11 @@ import (
 var (
 	ErrIdentityMismatch = errors.New("git repository identity mismatch")
 	ErrUnsafeWorktree   = errors.New("git worktree is unsafe")
+	// ErrWorktreeDirty is a read-only classification: the registered checkout
+	// still proved its filesystem identity, but its visible status is not an
+	// exact pristine retry input. Callers must retain it rather than create or
+	// replace a worktree.
+	ErrWorktreeDirty    = errors.New("git worktree is not pristine")
 	ErrUnexpectedRemote = errors.New("remote branch head is unexpected")
 	ErrPushBeforeStart  = errors.New("git candidate push failed before mutation handoff")
 	// ErrPushUncertain means the candidate-ref push crossed the command handoff
@@ -46,6 +51,10 @@ var (
 	// The accepted path is one packaged helper configured from code-owned argv;
 	// no ticket, provider, repository config, or caller text may choose it.
 	ErrHTTPSCredentialBoundary = errors.New("HTTPS git publication requires the packaged credential boundary")
+	// ErrPublicationRemoteUnavailable identifies the intentional absence of
+	// every HTTPS publication capability input in a pre-publishing runtime.
+	// It never covers a partial or malformed publication configuration.
+	ErrPublicationRemoteUnavailable = errors.New("GitHub publication remote capability is disabled")
 	// ErrGitHubRefCASUnavailable is returned before any gh command starts. The
 	// GitHub Git Data ref APIs expose create and force/fast-forward update, but
 	// no expected-old-SHA precondition. A read followed by either mutation would
@@ -622,7 +631,13 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	if err := os.MkdirAll(r.Home, 0o700); err != nil {
 		return nil, err
 	}
-	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
+	// Apple Git consults DARWIN_USER_TEMP_DIR during startup. With a stripped
+	// child environment, confstr can emit a warning to stderr; runBounded
+	// intentionally combines stdout and stderr, so that warning would corrupt
+	// machine-readable Git output (for example rev-parse --show-toplevel).
+	// Keep the temp root private and deterministic rather than inheriting the
+	// caller's potentially shared TMPDIR.
+	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "TMPDIR=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
 	seen := map[string]bool{}
 	for _, entry := range extra {
 		key, value, found := strings.Cut(entry, "=")
@@ -2009,6 +2024,39 @@ func (r Runner) CleanWorktreeHead(ctx context.Context, worktree Worktree) (strin
 	return head, nil
 }
 
+// StrictCleanWorktreeHead is the retry-admission variant of
+// CleanWorktreeHead. In addition to staged, unstaged, and untracked files it
+// fails closed on ignored files, because provider output can be hidden by a
+// repository ignore rule. It performs no mutation and preserves identity,
+// command, and context errors so callers do not misclassify them as ordinary
+// retry unready state.
+func (r Runner) StrictCleanWorktreeHead(ctx context.Context, worktree Worktree) (string, error) {
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	status, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(string(status)) != "" {
+		return "", fmt.Errorf("%w: staged, unstaged, untracked, or ignored paths are present", ErrWorktreeDirty)
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	head, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return "", err
+	}
+	if !validOID(head) {
+		return "", fmt.Errorf("%w: worktree head is invalid", ErrIdentityMismatch)
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	return head, nil
+}
+
 // WorktreeChanges is a bounded, read-only observation of uncommitted paths.
 // It is suitable for an operator handback classification only after the
 // worktree's registered identity has been reauthenticated. It is not a diff
@@ -2741,6 +2789,9 @@ func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error
 		canonical, canonicalErr := safeOrigin(origin)
 		if canonicalErr != nil || canonical != origin {
 			return nil, false, fmt.Errorf("%w: canonical GitHub HTTPS transport is required", ErrIdentityMismatch)
+		}
+		if r.CredentialHelper == "" && r.GHBinary == "" && r.GHBinaryDigest == "" && r.GHConfigDir == "" {
+			return nil, false, ErrPublicationRemoteUnavailable
 		}
 		for _, item := range []struct{ path, name string }{{r.CredentialHelper, "credential helper"}, {r.GHBinary, "gh snapshot"}, {r.GHConfigDir, "gh config directory"}} {
 			if !validAbsolutePath(item.path) {

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -49,6 +50,152 @@ func TestStableChannelBacksUpBeforeSchemaMigration(t *testing.T) {
 	info, err := os.Lstat(files[0])
 	if err != nil || info.Mode().Perm() != 0o600 || !info.Mode().IsRegular() {
 		t.Fatalf("backup info=%v err=%v", info, err)
+	}
+}
+
+func TestStoredMigrationHistoryPreflightRefusesBeforeAnyMutation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		tamper  string
+		wantErr string
+	}{
+		{name: "mismatched current checksum", tamper: `UPDATE schema_migrations SET checksum='tampered' WHERE version=54`, wantErr: "stored migration 54 checksum mismatch"},
+		{name: "empty historical checksum", tamper: `UPDATE schema_migrations SET checksum='' WHERE version=17`, wantErr: "stored migration 17 checksum mismatch"},
+		{name: "missing historical row", tamper: `DELETE FROM schema_migrations WHERE version=53`, wantErr: "stored migration history is not contiguous at version 53"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			if err := os.Chmod(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, "tampered-v54.sqlite")
+			createDatabaseAtVersion(t, path, 54)
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.ExecContext(ctx, `PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE;
+				INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('stable','preflight','/preflight','main');
+				INSERT INTO tickets(channel,project_id,id,source_digest,ticket_type,merge_mode,state,version,runner_epoch,workflow_id) VALUES('stable','preflight','SF-preflight','preflight-source','feature','guarded','building',7,3,'preflight-workflow');
+				INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES('stable','preflight','SF-preflight',7,'fixture','verifying','building','{}','2026-09-04T00:00:00Z'); `+test.tamper); err != nil {
+				_ = raw.Close()
+				t.Fatal(err)
+			}
+			beforeAuthority := snapshotAuthorityTables(t, raw)
+			var beforeJournal string
+			if err := raw.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&beforeJournal); err != nil || beforeJournal != "delete" {
+				_ = raw.Close()
+				t.Fatalf("journal before preflight=%q err=%v", beforeJournal, err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			beforeBytes, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			backups := filepath.Join(root, "backups")
+			if err := os.Mkdir(backups, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			database, err := OpenChannel(ctx, path, backups, domain.ChannelStable)
+			if err == nil {
+				_ = database.Close()
+				t.Fatal("tampered migration history opened")
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("preflight error=%q want %q", err, test.wantErr)
+			}
+			afterBytes, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(beforeBytes, afterBytes) {
+				t.Fatal("checksum preflight failure changed database bytes")
+			}
+			entries, err := os.ReadDir(backups)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("checksum preflight created backup entries=%v err=%v", entries, err)
+			}
+			raw, err = sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			afterAuthority := snapshotAuthorityTables(t, raw)
+			var afterVersion int
+			var afterJournal string
+			if err := raw.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&afterVersion); err != nil {
+				_ = raw.Close()
+				t.Fatal(err)
+			}
+			if err := raw.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&afterJournal); err != nil {
+				_ = raw.Close()
+				t.Fatal(err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if fmt.Sprint(afterAuthority) != fmt.Sprint(beforeAuthority) || afterVersion != 54 || afterJournal != beforeJournal {
+				t.Fatalf("checksum preflight mutated authority/schema/journal: authority=%v version=%d journal=%s", afterAuthority, afterVersion, afterJournal)
+			}
+		})
+	}
+}
+
+func TestStoredMigrationHistoryPreflightShapes(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		version       int
+		setup         string
+		wantErr       string
+		wantSucceeded bool
+	}{
+		{name: "exact legacy v1", version: 1, setup: `CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES(1,'now')`, wantSucceeded: true},
+		{name: "v1 with checksum column", version: 1, setup: `CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL,checksum TEXT NOT NULL DEFAULT ''); INSERT INTO schema_migrations VALUES(1,'now','')`, wantErr: "invalid pre-checksum"},
+		{name: "v2 missing checksum column", version: 2, setup: `CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES(1,'now'),(2,'now')`, wantErr: "invalid checksummed"},
+		{name: "v2 foreign checksum column", version: 2, setup: `CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL,checksum BLOB NOT NULL DEFAULT ''); INSERT INTO schema_migrations VALUES(1,'now',?), (2,'now',?)`, wantErr: "invalid checksummed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "history.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var args []any
+			if strings.Contains(test.setup, "?") {
+				args = []any{migrationChecksums[1], migrationChecksums[2]}
+			}
+			if _, err := db.Exec(test.setup, args...); err != nil {
+				t.Fatal(err)
+			}
+			err = validateStoredMigrationHistory(context.Background(), db, test.version)
+			if test.wantSucceeded {
+				if err != nil {
+					t.Fatalf("exact history refused: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("history shape error=%v want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestExactLegacyV1MigrationAuthorityUpgrades(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v1.sqlite")
+	createDatabaseAtVersion(t, path, 1)
+	database, err := OpenChannel(context.Background(), path, filepath.Join(t.TempDir(), "unused"), domain.ChannelDev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := rawSchemaVersion(t, path); got != schemaVersion {
+		t.Fatalf("migrated exact v1 schema=%d want=%d", got, schemaVersion)
 	}
 }
 
@@ -1027,6 +1174,10 @@ func testMigration(version int) []string {
 		return migrationV52
 	case 53:
 		return migrationV53
+	case 54:
+		return migrationV54
+	case 55:
+		return migrationV55
 	default:
 		return nil
 	}

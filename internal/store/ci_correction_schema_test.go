@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -438,7 +439,13 @@ func insertV41FixtureOptions(t *testing.T, database *Store, ctx context.Context,
 	insertArgs(t, database.db, `INSERT INTO ci_transition_evidence(channel,project_id,ticket_id,candidate_generation,candidate_head_sha,candidate_tree_sha,ticket_version,event_id,event_created_at,observation_classification,observation_digest,observation_ticket_version,observation_leader_epoch,observation_runner_epoch,prior_publication_witness_digest,prior_state,resulting_state,resulting_trigger,transition_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, 1, f.head1, f.tree1, 2, f.eventID, f.eventCreated, "red", f.observation, 1, 7, 2, f.witness, "waiting_ci", "paused", "checks_red", f.trans, f.eventCreated)
 	insertArgs(t, database.db, `INSERT INTO ticket_budget_uses(channel,project_id,ticket_id,kind,request_id,ticket_version,leader_epoch,runner_epoch,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, "correction", "budget-1", 1, 7, 2, f.eventCreated)
 	if withBinding {
-		insertArgs(t, database.db, `INSERT INTO candidate_repair_bindings(channel,project_id,ticket_id,target_generation,predecessor_generation,predecessor_head_sha,predecessor_tree_sha,predecessor_publication_witness_digest,pr_host,pr_owner,pr_repo,pr_number,branch_ref,remote_head_oid,base_ref,remote_base_oid,red_observation_digest,red_observation_classification,red_transition_ticket_version,red_transition_digest,correction_budget_kind,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch,repair_context_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, 2, 1, f.head1, f.tree1, f.witness, "github.com", "owner", "repo", 1, "branch", f.head1, "main", base, f.observation, "red", 2, f.trans, "correction", "budget-1", 1, 7, 2, "sha256:"+plain('0'), f.eventCreated)
+		var prefixColumns int
+		hasRecoveryPrefix := database.db.QueryRow(`SELECT COUNT(consumed_recovery_prefix_digest) FROM candidate_repair_bindings`).Scan(&prefixColumns) == nil
+		if hasRecoveryPrefix {
+			insertArgs(t, database.db, `INSERT INTO candidate_repair_bindings(channel,project_id,ticket_id,target_generation,predecessor_generation,predecessor_head_sha,predecessor_tree_sha,predecessor_publication_witness_digest,pr_host,pr_owner,pr_repo,pr_number,branch_ref,remote_head_oid,base_ref,remote_base_oid,red_observation_digest,red_observation_classification,red_transition_ticket_version,red_transition_digest,correction_budget_kind,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch,consumed_recovery_prefix_digest,repair_context_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, 2, 1, f.head1, f.tree1, f.witness, "github.com", "owner", "repo", 1, "branch", f.head1, "main", base, f.observation, "red", 2, f.trans, "correction", "budget-1", 1, 7, 2, "sha256:"+plain('4'), "sha256:"+plain('0'), f.eventCreated)
+		} else {
+			insertArgs(t, database.db, `INSERT INTO candidate_repair_bindings(channel,project_id,ticket_id,target_generation,predecessor_generation,predecessor_head_sha,predecessor_tree_sha,predecessor_publication_witness_digest,pr_host,pr_owner,pr_repo,pr_number,branch_ref,remote_head_oid,base_ref,remote_base_oid,red_observation_digest,red_observation_classification,red_transition_ticket_version,red_transition_digest,correction_budget_kind,correction_budget_request_id,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch,repair_context_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, 2, 1, f.head1, f.tree1, f.witness, "github.com", "owner", "repo", 1, "branch", f.head1, "main", base, f.observation, "red", 2, f.trans, "correction", "budget-1", 1, 7, 2, "sha256:"+plain('0'), f.eventCreated)
+		}
 	}
 	if withCompletion {
 		insertArgs(t, database.db, `INSERT INTO candidate_repair_completions(channel,project_id,ticket_id,target_generation,builder_result_attempt_id,builder_result_attempt,builder_result_phase,builder_result_role,builder_binding_ticket_version,builder_binding_leader_epoch,builder_binding_runner_epoch,final_candidate_head_sha,final_candidate_tree_sha,completion_digest,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, 2, 1, 1, "build", "builder", 2, 7, 2, f.head2, f.tree2, "sha256:"+plain('9'), f.eventCreated)
@@ -631,7 +638,13 @@ func TestCIV41RowsSurviveV42V43MigrationAndRemainImmutable(t *testing.T) {
 		_, err := conn.ExecContext(ctx, "COMMIT")
 		return err
 	}}
-	insertV41Fixture(t, staged, ctx)
+	fixture := insertV41Fixture(t, staged, ctx)
+	// V55 may retain legacy repair authority only as terminal history. Active
+	// bindings are intentionally refused before the upgrade begins.
+	if _, err := raw.ExecContext(ctx, `UPDATE tickets SET state='done',version=2,runner_epoch=2 WHERE channel=? AND project_id=? AND id=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -692,6 +705,201 @@ func TestCIV41RowsSurviveV42V43MigrationAndRemainImmutable(t *testing.T) {
 	}
 	if info, err := os.Stat(files[0]); err != nil || !info.Mode().IsRegular() {
 		t.Fatalf("invalid migration backup info=%v err=%v", info, err)
+	}
+}
+
+func TestV55DispositionsLegacyCandidateRepairAuthorityWithoutRewritingEvidence(t *testing.T) {
+	ctx := context.Background()
+	templatePath := filepath.Join(t.TempDir(), "v54-candidate-repair-template.sqlite")
+	createDatabaseAtVersion(t, templatePath, 54)
+	template, err := sql.Open("sqlite", templatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := template.ExecContext(ctx, `PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; INSERT INTO projects(channel,id,canonical_path,base_ref) VALUES('dev','nysa','/nysa','main')`); err != nil {
+		_ = template.Close()
+		t.Fatal(err)
+	}
+	staged := &Store{db: template, commit: func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, "COMMIT")
+		return err
+	}}
+	fixture := insertV41Fixture(t, staged, ctx)
+	if err := template.Close(); err != nil {
+		t.Fatal(err)
+	}
+	templateBytes, err := os.ReadFile(templatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, state := range domain.AllStates() {
+		state := state
+		t.Run(string(state), func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "v54-candidate-repair.sqlite")
+			if err := os.WriteFile(path, templateBytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resume, blocker := "", ""
+			var resumeValue any
+			switch state {
+			case domain.StateStopping, domain.StatePaused:
+				resume, resumeValue = string(domain.StateBuilding), string(domain.StateBuilding)
+			case domain.StateBlocked:
+				resume, resumeValue, blocker = string(domain.StateBuilding), string(domain.StateBuilding), "fixture_blocker"
+			}
+			if _, err := raw.ExecContext(ctx, `UPDATE tickets SET state=?,resume_state=?,blocked_code=?,version=2,runner_epoch=2 WHERE channel=? AND project_id=? AND id=?`, state, resumeValue, blocker, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket); err != nil {
+				_ = raw.Close()
+				t.Fatal(err)
+			}
+			beforeAuthority := snapshotAuthorityTables(t, raw)
+			var beforeJournal string
+			if err := raw.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&beforeJournal); err != nil || beforeJournal != "delete" {
+				_ = raw.Close()
+				t.Fatalf("journal before v55 preflight=%q err=%v", beforeJournal, err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			beforeBytes, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			backups := filepath.Join(root, "backups")
+			if err := os.Mkdir(backups, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			database, openErr := OpenChannel(ctx, path, backups, domain.ChannelStable)
+			if !state.Terminal() {
+				if openErr == nil {
+					_ = database.Close()
+					t.Fatal("nonterminal legacy candidate repair upgraded")
+				}
+				for _, want := range []string{"refused before schema, ticket, effect, or evidence mutation", "cannot upgrade to schema 55", "compatible_schema=54", "exact previous channel binary", "authenticate and reconcile any published merge", "cancel only after it proves exact merge absence", string(state), string(fixture.ref.Ticket)} {
+					if !strings.Contains(openErr.Error(), want) {
+						t.Fatalf("upgrade refusal=%q want %q", openErr, want)
+					}
+				}
+				afterBytes, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(beforeBytes, afterBytes) {
+					t.Fatal("legacy repair upgrade refusal changed database bytes")
+				}
+				entries, err := os.ReadDir(backups)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("legacy repair refusal created backup entries=%v err=%v", entries, err)
+				}
+				raw, err = sql.Open("sqlite", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				afterAuthority := snapshotAuthorityTables(t, raw)
+				var version, prefixColumns int
+				var gotState, gotResume, gotBlocker, journal string
+				var ticketVersion, runner int
+				if err := raw.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+					_ = raw.Close()
+					t.Fatal(err)
+				}
+				if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('candidate_repair_bindings') WHERE name='consumed_recovery_prefix_digest'`).Scan(&prefixColumns); err != nil {
+					_ = raw.Close()
+					t.Fatal(err)
+				}
+				if err := raw.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket).Scan(&gotState, &gotResume, &gotBlocker, &ticketVersion, &runner); err != nil {
+					_ = raw.Close()
+					t.Fatal(err)
+				}
+				if err := raw.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journal); err != nil {
+					_ = raw.Close()
+					t.Fatal(err)
+				}
+				if err := raw.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if fmt.Sprint(afterAuthority) != fmt.Sprint(beforeAuthority) || version != 54 || prefixColumns != 0 || gotState != string(state) || gotResume != resume || gotBlocker != blocker || ticketVersion != 2 || runner != 2 || journal != beforeJournal {
+					t.Fatalf("refusal mutated v54 authority: schema=%d prefix_columns=%d ticket=%s/%s/%s v%d r%d journal=%s authority=%v", version, prefixColumns, gotState, gotResume, gotBlocker, ticketVersion, runner, journal, afterAuthority)
+				}
+				return
+			}
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			afterAuthority := snapshotAuthorityTables(t, database.db)
+			if fmt.Sprint(afterAuthority) != fmt.Sprint(beforeAuthority) {
+				_ = database.Close()
+				t.Fatalf("terminal legacy history migration rewrote authority: before=%v after=%v", beforeAuthority, afterAuthority)
+			}
+			var version, bindings, completions int
+			var gotState, gotResume, gotBlocker string
+			var ticketVersion, runner int
+			if err := database.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+				_ = database.Close()
+				t.Fatal(err)
+			}
+			if err := database.db.QueryRowContext(ctx, `SELECT state,COALESCE(resume_state,''),blocked_code,version,runner_epoch FROM tickets WHERE channel=? AND project_id=? AND id=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket).Scan(&gotState, &gotResume, &gotBlocker, &ticketVersion, &runner); err != nil {
+				_ = database.Close()
+				t.Fatal(err)
+			}
+			if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND consumed_recovery_prefix_digest=''`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket).Scan(&bindings); err != nil {
+				_ = database.Close()
+				t.Fatal(err)
+			}
+			if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket).Scan(&completions); err != nil {
+				_ = database.Close()
+				t.Fatal(err)
+			}
+			if version != 55 || gotState != string(state) || gotResume != resume || gotBlocker != blocker || ticketVersion != 2 || runner != 2 || bindings != 1 || completions != 1 {
+				_ = database.Close()
+				t.Fatalf("terminal history migration=%d ticket=%s/%s/%s v%d r%d bindings=%d completions=%d", version, gotState, gotResume, gotBlocker, ticketVersion, runner, bindings, completions)
+			}
+			for _, trigger := range []string{"candidate_repair_bindings_prefix_required", "candidate_repair_bindings_single_ticket", "candidate_snapshots_immutable_update", "candidate_snapshots_immutable_delete"} {
+				var count int
+				if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigger).Scan(&count); err != nil || count != 1 {
+					_ = database.Close()
+					t.Fatalf("required v55 trigger %s count=%d err=%v", trigger, count, err)
+				}
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// A current v55 open must continue to accept terminal compatibility
+			// history with an empty prefix; it must not create another backup.
+			database, err = OpenChannel(ctx, path, backups, domain.ChannelStable)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+			files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v054-to-v055-*.sqlite"))
+			if err != nil || len(files) != 1 {
+				t.Fatalf("terminal v54 migration backup=%v err=%v", files, err)
+			}
+			backup, err := sql.Open("sqlite", files[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer backup.Close()
+			var backupVersion int
+			var backupState string
+			if err := backup.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&backupVersion); err != nil {
+				t.Fatal(err)
+			}
+			if err := backup.QueryRowContext(ctx, `SELECT state FROM tickets WHERE channel=? AND project_id=? AND id=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket).Scan(&backupState); err != nil {
+				t.Fatal(err)
+			}
+			if backupVersion != 54 || backupState != string(state) {
+				t.Fatalf("terminal v54 backup schema=%d state=%s", backupVersion, backupState)
+			}
+		})
 	}
 }
 

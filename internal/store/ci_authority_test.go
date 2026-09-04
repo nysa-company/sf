@@ -376,6 +376,116 @@ func TestCIPollRetryEpochUsesArbitraryPendingChainAcrossRecovery(t *testing.T) {
 	}
 }
 
+func TestCandidateRepairCIHistoryAuthenticatesPollRetryEpochAndRejectsTamper(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *Store, domain.TicketRef)
+	}{
+		{name: "valid"},
+		{
+			name: "retry digest",
+			mutate: func(t *testing.T, db *Store, ref domain.TicketRef) {
+				t.Helper()
+				if _, err := db.db.ExecContext(t.Context(), `UPDATE ci_poll_retry_epochs SET retry_digest=? WHERE channel=? AND project_id=? AND ticket_id=?`, "sha256:"+strings.Repeat("f", 64), ref.Channel, ref.Project, ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "retry deadline",
+			mutate: func(t *testing.T, db *Store, ref domain.TicketRef) {
+				t.Helper()
+				var raw string
+				if err := db.db.QueryRowContext(t.Context(), `SELECT deadline_at FROM ci_poll_retry_epochs WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&raw); err != nil {
+					t.Fatal(err)
+				}
+				deadline, err := time.Parse(time.RFC3339Nano, raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.db.ExecContext(t.Context(), `UPDATE ci_poll_retry_epochs SET deadline_at=? WHERE channel=? AND project_id=? AND ticket_id=?`, deadline.Add(time.Second).Format(time.RFC3339Nano), ref.Channel, ref.Project, ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, waiting, fence := ciAuthorityPublishedFixture(t)
+			defer db.Close()
+			ctx := t.Context()
+			publication, err := db.LoadPublishedCandidate(ctx, waiting.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := recordCIAuthorityPolicy(db, ctx, publication, waiting, ciAuthorityLintPolicy()); err != nil {
+				t.Fatal(err)
+			}
+
+			start := time.Now().UTC().Truncate(time.Microsecond)
+			admission, err := db.AdmitCIPoll(ctx, waiting.Ref, fence, start)
+			if err != nil || !admission.Due {
+				t.Fatalf("initial poll admission=%+v err=%v", admission, err)
+			}
+			next := admission.NextPoll
+			for attempt := 2; attempt <= ciPollMaxAttempts; attempt++ {
+				admission, err = db.AdmitCIPoll(ctx, waiting.Ref, fence, next)
+				if err != nil || !admission.Due || admission.Attempt != attempt {
+					t.Fatalf("poll attempt %d admission=%+v err=%v", attempt, admission, err)
+				}
+				next = admission.NextPoll
+			}
+			if exhausted, err := db.AdmitCIPoll(ctx, waiting.Ref, fence, next); err != nil || !exhausted.Expired {
+				t.Fatalf("poll exhaustion=%+v err=%v", exhausted, err)
+			}
+			paused, err := db.Ticket(ctx, waiting.Ref)
+			if err != nil || paused.State != domain.StatePaused {
+				t.Fatalf("paused ticket=%+v err=%v", paused, err)
+			}
+			if _, err := db.TransitionPublishedResume(ctx, Transition{Ref: waiting.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateWaitingCI, Trigger: "operator_resume", Fence: fence, EventPayload: `{}`}); err != nil {
+				t.Fatal(err)
+			}
+			resumed, err := db.Ticket(ctx, waiting.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if retry, err := db.AdmitCIPoll(ctx, waiting.Ref, fence, next); err != nil || !retry.Due || retry.Attempt != 1 {
+				t.Fatalf("retry epoch admission=%+v err=%v", retry, err)
+			}
+
+			red := ciAuthorityObservationFor(publication, resumed, fence, "red", time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "failure", FailingDiagnosticText: "retry epoch remains red"}})
+			if err := db.recordCIObservation(ctx, red); err != nil {
+				t.Fatal(err)
+			}
+			red, err = db.LoadCurrentCIObservation(ctx, waiting.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authority := redCICorrectionAuthority(t, resumed, red)
+			if _, err := db.ConsumeCIObservation(ctx, CIObservationTransition{Ref: waiting.Ref, ObservationDigest: red.ObservationDigest, ExpectedVersion: resumed.Version, Fence: red.ObservedFence, CorrectionBudget: &authority}); err != nil {
+				t.Fatal(err)
+			}
+			building, err := db.Ticket(ctx, waiting.Ref)
+			if err != nil || building.State != domain.StateBuilding {
+				t.Fatalf("repair ticket=%+v err=%v", building, err)
+			}
+			buildFence := domain.Fence{LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: building.RunnerEpoch}
+			if _, err := db.CandidateRepairBuildContext(ctx, waiting.Ref, building.Version, buildFence); err != nil {
+				t.Fatalf("valid retry epoch repair context: %v", err)
+			}
+			if test.mutate == nil {
+				return
+			}
+			if _, err := db.db.ExecContext(ctx, `DROP TRIGGER ci_poll_retry_epochs_immutable_update`); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, db, waiting.Ref)
+			if _, err := db.CandidateRepairBuildContext(ctx, waiting.Ref, building.Version, buildFence); err == nil {
+				t.Fatal("candidate repair accepted tampered CI poll retry epoch")
+			}
+		})
+	}
+}
+
 func TestCIPollAdmissionBackoffCapAndRestart(t *testing.T) {
 	db, ticket, fence := ciAuthorityPublishedFixture(t)
 	ctx := t.Context()
@@ -555,7 +665,7 @@ func TestCIPollAdmissionRejectsTamperedDeadline(t *testing.T) {
 
 func pollCIAuthority(ctx context.Context, db *Store, ticket Ticket, fence domain.Fence, gh interface {
 	contracts.CIRequiredCheckPolicyObserver
-	RequiredChecks(context.Context, contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error)
+	contracts.CIRequiredChecksObserver
 }) error {
 	publication, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
 	if err != nil {
@@ -574,26 +684,7 @@ func pollCIAuthority(ctx context.Context, db *Store, ticket Ticket, fence domain
 	if err := db.RecordCIRequiredCheckPolicyFromObserver(ctx, ticket.Ref, gh); err != nil {
 		return fmt.Errorf("record fresh CI policy: %w", err)
 	}
-	checks, err := gh.RequiredChecks(ctx, publication.PullRequest)
-	if err != nil {
-		return fmt.Errorf("read live required checks: %w", err)
-	}
-	normalized, err := NormalizeCIObservationChecks(checks)
-	if err != nil {
-		return fmt.Errorf("normalize required checks: %w", err)
-	}
-	classification := "green"
-	for _, check := range normalized {
-		if check.NormalizedState == "failure" || check.NormalizedState == "cancelled" {
-			classification = "red"
-			break
-		}
-		if check.NormalizedState == "pending" {
-			classification = "pending"
-		}
-	}
-	observation := CIObservation{Ref: ticket.Ref, CandidateGeneration: publication.Candidate.Snapshot.Generation, CandidateHeadSHA: publication.Candidate.Snapshot.HeadSHA, CandidateTreeSHA: publication.Candidate.Snapshot.TreeSHA, PublicationWitnessDigest: publication.WitnessDigest, PullRequest: publication.PullRequest, ObservedTicketVersion: ticket.Version, ObservedFence: fence, ObservedAt: time.Now().UTC(), RequiredChecks: normalized, Classification: classification}
-	if err := db.RecordAuthenticatedCIObservation(ctx, observation); err != nil {
+	if err := db.RecordCIObservationFromObserver(ctx, ticket.Ref, ticket.Version, fence, gh); err != nil {
 		return fmt.Errorf("record authenticated CI observation: %w", err)
 	}
 	stored, err := db.LoadCIObservation(ctx, ticket.Ref)
@@ -624,14 +715,14 @@ func TestCIObservationRecordLoadAndRedExhaustedReplay(t *testing.T) {
 	if err := recordCIAuthorityPolicy(db, ctx, publication, ticket, []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-1"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RecordCIObservation(ctx, observation); err != nil {
+	if err := db.recordCIObservation(ctx, observation); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := db.LoadCurrentCIObservation(ctx, ticket.Ref)
 	if err != nil || loaded.Classification != "red" || loaded.RequiredChecks[0].FailingDiagnosticDigest == "" {
 		t.Fatalf("loaded=%+v err=%v", loaded, err)
 	}
-	if err := db.RecordCIObservation(ctx, observation); err != nil {
+	if err := db.recordCIObservation(ctx, observation); err != nil {
 		t.Fatalf("exact observation replay=%v", err)
 	}
 	result, err := db.ConsumeCIObservation(ctx, CIObservationTransition{Ref: ticket.Ref, ObservationDigest: loaded.ObservationDigest, ExpectedVersion: ticket.Version, Fence: loaded.ObservedFence})
@@ -689,6 +780,12 @@ func (f fakeCIAuthorityPolicyObserver) ObserveCIRequiredCheckPolicy(_ context.Co
 	return f.value, nil
 }
 
+type ciRequiredChecksObserverFunc func(context.Context, contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error)
+
+func (f ciRequiredChecksObserverFunc) RequiredChecks(ctx context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
+	return f(ctx, identity)
+}
+
 func recordCIAuthorityPolicy(db *Store, ctx context.Context, publication PublishedCandidateEvidence, ticket Ticket, checks []CIObservationCheck) error {
 	observedChecks := make([]contracts.RequiredCheck, len(checks))
 	for i, check := range checks {
@@ -716,7 +813,7 @@ func redCIConsumptionFixture(t *testing.T) (*Store, Ticket, PublishedCandidateEv
 		t.Fatal(err)
 	}
 	observation := ciAuthorityObservationFor(publication, ticket, fence, "red", time.Now().UTC(), checks)
-	if err := db.RecordCIObservation(t.Context(), observation); err != nil {
+	if err := db.recordCIObservation(t.Context(), observation); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -751,6 +848,118 @@ func TestCIRequiredCheckPolicyRejectsRawCallerInjection(t *testing.T) {
 	}
 	if err := db.RecordCIRequiredCheckPolicy(ctx, ciAuthorityPolicyFor(publication, ticket, ciAuthorityLintPolicy())); !errors.Is(err, ErrCIObservation) {
 		t.Fatalf("raw policy caller accepted: %v", err)
+	}
+}
+
+func TestCIObservationRejectsRawGreenAndRedCallerInjection(t *testing.T) {
+	for _, classification := range []string{"green", "red"} {
+		classification := classification
+		t.Run(classification, func(t *testing.T) {
+			db, ticket, fence := ciAuthorityPublishedFixture(t)
+			defer db.Close()
+			publication, err := db.LoadPublishedCandidate(t.Context(), ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := recordCIAuthorityPolicy(db, t.Context(), publication, ticket, ciAuthorityLintPolicy()); err != nil {
+				t.Fatal(err)
+			}
+			state := "success"
+			if classification == "red" {
+				state = "failure"
+			}
+			input := ciAuthorityObservationFor(publication, ticket, fence, classification, time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: state}})
+			for name, record := range map[string]func(context.Context, CIObservation) error{
+				"raw":                   db.RecordCIObservation,
+				"descriptive-alias-raw": db.RecordAuthenticatedCIObservation,
+			} {
+				if err := record(t.Context(), input); !errors.Is(err, ErrCIObservation) {
+					t.Fatalf("%s accepted caller-assembled %s observation: %v", name, classification, err)
+				}
+			}
+			if _, err := db.LoadCurrentCIObservation(t.Context(), ticket.Ref); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("raw %s observation left durable evidence: %v", classification, err)
+			}
+		})
+	}
+}
+
+func TestRecordCIObservationFromObserverAuthenticatesExactPublication(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	publication, err := db.LoadPublishedCandidate(t.Context(), ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordCIAuthorityPolicy(db, t.Context(), publication, ticket, ciAuthorityLintPolicy()); err != nil {
+		t.Fatal(err)
+	}
+	observer := ciRequiredChecksObserverFunc(func(_ context.Context, want contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
+		if want != publication.PullRequest {
+			return nil, errors.New("observer received the wrong pull request")
+		}
+		return []contracts.RequiredCheck{{Name: "lint", ExternalID: "check-lint", State: "FAILURE"}}, nil
+	})
+	if err := db.RecordCIObservationFromObserver(t.Context(), ticket.Ref, ticket.Version, fence, observer); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.LoadCurrentCIObservation(t.Context(), ticket.Ref)
+	if err != nil || stored.Classification != "red" || len(stored.RequiredChecks) != 1 || stored.RequiredChecks[0].NormalizedState != "failure" {
+		t.Fatalf("stored observer observation=%+v err=%v", stored, err)
+	}
+}
+
+func TestRecordCIObservationFromObserverRejectsStaleFenceBeforeRead(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	called := false
+	observer := ciRequiredChecksObserverFunc(func(context.Context, contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
+		called = true
+		return []contracts.RequiredCheck{{Name: "lint", ExternalID: "check-lint", State: "SUCCESS"}}, nil
+	})
+	fence.LeaderEpoch++
+	if err := db.RecordCIObservationFromObserver(t.Context(), ticket.Ref, ticket.Version, fence, observer); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("stale observer fence=%v", err)
+	}
+	if called {
+		t.Fatal("observer ran before the initial fence check")
+	}
+}
+
+func TestRecordCIObservationFromObserverRejectsPublicationRecoveryRace(t *testing.T) {
+	db, ticket, fence := ciAuthorityPublishedFixture(t)
+	defer db.Close()
+	publication, err := db.LoadPublishedCandidate(t.Context(), ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordCIAuthorityPolicy(db, t.Context(), publication, ticket, ciAuthorityLintPolicy()); err != nil {
+		t.Fatal(err)
+	}
+	var recoveryErr error
+	observer := ciRequiredChecksObserverFunc(func(ctx context.Context, want contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
+		if want != publication.PullRequest {
+			return nil, errors.New("observer received the wrong pull request")
+		}
+		leader, err := db.AcquireLeader(ctx, ticket.Ref.Channel, "ci-observation-race")
+		if err == nil {
+			_, err = db.FenceRecoveredRunners(ctx, ticket.Ref.Channel, leader)
+		}
+		if err == nil {
+			err = db.RebindRecoveredPublishedCandidates(ctx, ticket.Ref.Channel, leader)
+		}
+		recoveryErr = err
+		return []contracts.RequiredCheck{{Name: "lint", ExternalID: "check-lint", State: "SUCCESS"}}, nil
+	})
+	err = db.RecordCIObservationFromObserver(t.Context(), ticket.Ref, ticket.Version, fence, observer)
+	if recoveryErr != nil {
+		t.Fatalf("fixture publication recovery: %v", recoveryErr)
+	}
+	if err == nil {
+		t.Fatal("observation survived a publication/fence recovery during the external read")
+	}
+	if _, loadErr := db.LoadCurrentCIObservation(t.Context(), ticket.Ref); !errors.Is(loadErr, ErrNotFound) {
+		t.Fatalf("racing observation left durable evidence: %v", loadErr)
 	}
 }
 
@@ -796,7 +1005,7 @@ func TestCIObservationRequiresExactPersistedPolicySet(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			observation := ciAuthorityObservationFor(publication, ticket, publicationFence, "green", time.Now().UTC(), checks)
-			if err := db.RecordCIObservation(ctx, observation); !errors.Is(err, ErrCIObservation) {
+			if err := db.recordCIObservation(ctx, observation); !errors.Is(err, ErrCIObservation) {
 				t.Fatalf("policy mismatch accepted: %v", err)
 			}
 		})
@@ -819,7 +1028,7 @@ func TestCIObservationPendingAndGreenReducers(t *testing.T) {
 				t.Fatal(err)
 			}
 			observation := ciAuthorityObservationFor(publication, ticket, publicationFence, classification, time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: map[string]string{"pending": "in_progress", "green": "success"}[classification]}})
-			if err := db.RecordCIObservation(ctx, observation); err != nil {
+			if err := db.recordCIObservation(ctx, observation); err != nil {
 				t.Fatal(err)
 			}
 			loaded, err := db.LoadCurrentCIObservation(ctx, ticket.Ref)
@@ -858,7 +1067,7 @@ func TestCIObservationBindsPolicyWitnessBeforeDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 	observation := ciAuthorityObservationFor(publication, ticket, publicationFence, "green", time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "success"}})
-	if err := db.RecordCIObservation(ctx, observation); err != nil {
+	if err := db.recordCIObservation(ctx, observation); err != nil {
 		t.Fatalf("empty caller digests rejected: %v", err)
 	}
 	loaded, err := db.LoadCurrentCIObservation(ctx, ticket.Ref)
@@ -867,7 +1076,7 @@ func TestCIObservationBindsPolicyWitnessBeforeDigest(t *testing.T) {
 	}
 	tampered := observation
 	tampered.ObservationDigest = strings.Repeat("f", 64)
-	if err := db.RecordCIObservation(ctx, tampered); !errors.Is(err, ErrCIObservation) {
+	if err := db.recordCIObservation(ctx, tampered); !errors.Is(err, ErrCIObservation) {
 		t.Fatalf("tampered observation digest accepted: %v", err)
 	}
 }
@@ -915,7 +1124,7 @@ func TestCIObservationMalformedBudgetPausesRed(t *testing.T) {
 				t.Fatal(err)
 			}
 			observation := ciAuthorityObservationFor(publication, ticket, publicationFence, "red", time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "failure", FailingDiagnosticText: "failed"}})
-			if err := db.RecordCIObservation(ctx, observation); err != nil {
+			if err := db.recordCIObservation(ctx, observation); err != nil {
 				t.Fatal(err)
 			}
 			loaded, err := db.LoadCurrentCIObservation(ctx, ticket.Ref)
@@ -1085,7 +1294,7 @@ func TestCIObservationValidRepairBudgetRequiresSuccessorCompletion(t *testing.T)
 		t.Fatal(err)
 	}
 	red := ciAuthorityObservationFor(publication, ticket, publicationFence, "red", time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "failure", FailingDiagnosticText: "failed"}})
-	if err := db.RecordCIObservation(ctx, red); err != nil {
+	if err := db.recordCIObservation(ctx, red); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := db.LoadCurrentCIObservation(ctx, ticket.Ref)
@@ -1143,16 +1352,22 @@ func TestCIObservationValidRepairBudgetRequiresSuccessorCompletion(t *testing.T)
 		t.Fatal(err)
 	}
 	checkpoint := publication.Candidate.Commit.ParentOID
+	predecessorHead := publication.Candidate.Snapshot.HeadSHA
 	policyDigest := sha256Digest([]byte("repair-policy"))
 	command := completeEvidenceRepositoryCommand(t, db, ctx, RepositoryCommandPurposePostbuildCandidate, ticket.Ref, building.Version, buildFence, key, publication.Candidate.Snapshot.VerificationIntentDigest, publication.Candidate.Snapshot.ProofDigest, checkpoint, "sha256:"+policyDigest, 0)
 	successor := domain.CandidateSnapshot{Generation: publication.Candidate.Snapshot.Generation + 1, BaseSHA: publication.Candidate.Snapshot.BaseSHA, HeadSHA: strings.Repeat("7", 40), TreeSHA: strings.Repeat("8", 40), SourceDigest: publication.Candidate.Snapshot.SourceDigest, VerificationIntentDigest: publication.Candidate.Snapshot.VerificationIntentDigest, ProofDigest: publication.Candidate.Snapshot.ProofDigest, CommandPolicyDigest: policyDigest, BuilderEvidenceDigest: builderDigest}
-	if _, err := db.RecordCandidate(ctx, CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: building.Version, Fence: buildFence, Snapshot: successor, BuilderResult: key, Commit: CommitObservation{CommitOID: successor.HeadSHA, ParentOID: checkpoint, TreeOID: successor.TreeSHA}, Reason: "CI repair", CommandResult: command}); err != nil {
+	if _, err := db.RecordCandidate(ctx, CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: building.Version, Fence: buildFence, Snapshot: successor, BuilderResult: key, Commit: CommitObservation{CommitOID: successor.HeadSHA, ParentOID: predecessorHead, TreeOID: successor.TreeSHA}, Reason: "CI repair", CommandResult: command}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.TransitionCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: building.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: buildFence, EventPayload: "{}"}, successor); !errors.Is(err, ErrEvidenceConflict) {
-		t.Fatalf("successor published without repair completion: %v", err)
+	completion := CandidateRepairCompletion{Ref: ticket.Ref, TargetGeneration: successor.Generation}
+	var completedAt string
+	if err := db.db.QueryRowContext(ctx, `SELECT builder_result_attempt_id,builder_result_attempt,builder_binding_ticket_version,builder_binding_leader_epoch,builder_binding_runner_epoch,final_candidate_head_sha,final_candidate_tree_sha,completion_digest,completed_at FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, successor.Generation).Scan(&completion.BuilderResultAttemptID, &completion.BuilderResultAttempt, &completion.BuilderBindingTicketVersion, &completion.BuilderBindingFence.LeaderEpoch, &completion.BuilderBindingFence.RunnerEpoch, &completion.FinalCandidateHeadSHA, &completion.FinalCandidateTreeSHA, &completion.CompletionDigest, &completedAt); err != nil {
+		t.Fatalf("atomic repair completion: %v", err)
 	}
-	completion := CandidateRepairCompletion{Ref: ticket.Ref, TargetGeneration: successor.Generation, BuilderResultAttemptID: claim.ID, BuilderResultAttempt: claim.Attempt, BuilderBindingTicketVersion: building.Version, BuilderBindingFence: buildFence, FinalCandidateHeadSHA: successor.HeadSHA, FinalCandidateTreeSHA: successor.TreeSHA, CompletedAt: time.Now().UTC()}
+	completion.CompletedAt, err = time.Parse(time.RFC3339Nano, completedAt)
+	if err != nil || completion.BuilderResultAttemptID != claim.ID || completion.BuilderResultAttempt != claim.Attempt || completion.BuilderBindingTicketVersion != building.Version || completion.BuilderBindingFence != buildFence || completion.FinalCandidateHeadSHA != successor.HeadSHA || completion.FinalCandidateTreeSHA != successor.TreeSHA || completion.CompletionDigest != candidateRepairCompletionDigest(completion) {
+		t.Fatalf("atomic repair completion=%+v parseErr=%v", completion, err)
+	}
 	tampered := completion
 	tampered.FinalCandidateTreeSHA = strings.Repeat("9", 40)
 	if err := db.RecordCandidateRepairCompletion(ctx, tampered); !errors.Is(err, ErrEvidenceConflict) {
@@ -1180,8 +1395,61 @@ func TestCIObservationValidRepairBudgetRequiresSuccessorCompletion(t *testing.T)
 	if err := db.RecordCandidateRepairCompletion(ctx, completion); err != nil {
 		t.Fatalf("exact recovered completion replay=%v", err)
 	}
+	// This is the production workflow replay: after startup fencing, the Worker
+	// authenticates the reusable Builder result and appends a current binding
+	// before it asks TransitionCandidate to consume phase_pass.
+	recoveredFence := domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: recovered.RunnerEpoch}
+	builderResultForRecovery, _, err := db.LoadHistoricalProviderAttemptResult(ctx, key)
+	repairRecoveryErr := candidateRepairBuilderResultReachesFence(ctx, db.db, key, builderResultForRecovery, recovered.Version, recoveredFence)
+	if err != nil || repairRecoveryErr != nil {
+		t.Fatalf("repaired Builder completion recovery result=%+v loadErr=%v recoveryErr=%v", builderResultForRecovery, err, repairRecoveryErr)
+	}
+	reusableBuilder, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: ticket.Ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: recovered.Version, Fence: recoveredFence})
+	if err != nil || !reusableBuilder.Recovered || reusableBuilder.Key != key {
+		t.Fatalf("reusable repaired Builder=%+v err=%v", reusableBuilder, err)
+	}
+	if _, found, sourceErr := db.OperatorSourceResumeProof(ctx, ticket.Ref, recovered.Version, recoveredFence); sourceErr != nil || found {
+		t.Fatalf("candidate repair misclassified as source resume found=%v err=%v", found, sourceErr)
+	}
+	// Exercise the same conn-scoped subproofs RecordCandidate consumes before
+	// asking the public boundary to append the recovered binding. The rollback
+	// keeps this an authentication-only diagnostic and catches accidental use of
+	// Store.db from inside the mutation transaction.
+	conn, err := db.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	recoveredEvidence := CandidateEvidence{Ref: ticket.Ref, ExpectedVersion: recovered.Version, Fence: recoveredFence, Snapshot: successor, BuilderResult: key, Commit: CommitObservation{CommitOID: successor.HeadSHA, ParentOID: predecessorHead, TreeOID: successor.TreeSHA}, Reason: "recovered immutable candidate evidence", CommandResult: command}
+	repairAuthority, err := db.candidateRepairBuildAuthorityAt(ctx, conn, ticket.Ref, recovered.Version, recoveredFence)
+	if err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		conn.Close()
+		t.Fatalf("recovered repair authority: %v", err)
+	}
+	_, commandBinding, err := authenticateCandidateCommandEvidence(ctx, conn, recoveredEvidence, builderResultForRecovery, publication.Candidate.Snapshot.VerificationIntentDigest, publication.Candidate.Snapshot.ProofDigest, checkpoint)
+	if err == nil {
+		err = db.ensureCandidateBinding(ctx, conn, recoveredEvidence, successor.Generation, builderResultForRecovery)
+	}
+	if err == nil {
+		err = ensureCandidateCommandBinding(ctx, conn, ticket.Ref, successor.Generation, commandBinding)
+	}
+	if err == nil {
+		err = ensureCandidateRepairCompletionAt(ctx, conn, recoveredEvidence, successor.Generation, builderResultForRecovery, repairAuthority)
+	}
+	_, _ = conn.ExecContext(ctx, "ROLLBACK")
+	_ = conn.Close()
+	if err != nil {
+		t.Fatalf("recovered conn-scoped candidate proof: %v", err)
+	}
+	if _, err := db.RecordCandidate(ctx, recoveredEvidence); err != nil {
+		t.Fatalf("rebind repaired candidate after recovery: %v", err)
+	}
 	recoveredCandidate, err := db.latestCandidateFrom(ctx, db.db, ticket.Ref, false)
-	if err != nil || recoveredCandidate.Snapshot != successor || recoveredCandidate.TicketVersion != building.Version || recoveredCandidate.Fence != buildFence {
+	if err != nil || recoveredCandidate.Snapshot != successor || recoveredCandidate.TicketVersion != recovered.Version || recoveredCandidate.Fence != recoveredFence {
 		t.Fatalf("recovered repair candidate=%+v err=%v", recoveredCandidate, err)
 	}
 	if err := validateRunnerRecoveryLedger(ctx, db.db, ticket.Ref, building.Version, buildFence.RunnerEpoch, buildFence.LeaderEpoch, recovered.Version, recovered.RunnerEpoch, newLeader); err != nil {
@@ -1194,8 +1462,43 @@ func TestCIObservationValidRepairBudgetRequiresSuccessorCompletion(t *testing.T)
 	if err := db.reauthenticateStoredCandidateCommandHistoricalFrom(ctx, db.db, ticket.Ref, recoveredCandidate); err != nil {
 		t.Fatalf("recovered repair candidate command=%v", err)
 	}
-	if _, err := db.TransitionCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: recovered.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: recovered.RunnerEpoch}, EventPayload: "{}"}, successor); err != nil {
+	if err := db.reauthenticateStoredCandidateCheckpointFrom(ctx, db.db, ticket.Ref, recoveredCandidate); err != nil {
+		t.Fatalf("recovered repair candidate checkpoint=%v", err)
+	}
+	originalCandidate := recoveredCandidate
+	originalCandidate.TicketVersion = building.Version
+	originalCandidate.Fence = buildFence
+	if err := providerResultReachesHistoricalFence(ctx, db.db, originalCandidate.BuilderResult, builderResult, originalCandidate.TicketVersion, originalCandidate.Fence); err != nil {
+		t.Fatalf("original repair Builder historical fence=%v", err)
+	}
+	if err := candidateRepairBuilderResultReachesFence(ctx, db.db, originalCandidate.BuilderResult, builderResult, originalCandidate.TicketVersion, originalCandidate.Fence); err != nil {
+		t.Fatalf("original repair Builder completion fence=%v", err)
+	}
+	if _, err := db.candidateRepairBuildAuthorityAt(ctx, db.db, ticket.Ref, building.Version, buildFence); err != nil {
+		t.Fatalf("original repair authority=%v", err)
+	}
+	if _, err := completedCandidateRepairContextAt(ctx, db.db, originalCandidate, builderResult); err != nil {
+		t.Fatalf("original completed repair context=%v", err)
+	}
+	if err := db.reauthenticateStoredCandidateCommandHistoricalFrom(ctx, db.db, ticket.Ref, originalCandidate); err != nil {
+		t.Fatalf("original repair candidate command=%v", err)
+	}
+	if _, err := db.TransitionCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: recovered.Version, From: domain.StateBuilding, To: domain.StatePublishing, Trigger: "phase_pass", Fence: recoveredFence, EventPayload: "{}"}, successor); err != nil {
 		t.Fatal(err)
+	}
+	var bindingCountAfterTransition int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND generation=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, successor.Generation).Scan(&bindingCountAfterTransition); err != nil {
+		t.Fatal(err)
+	}
+	if bindingCountAfterTransition != 2 {
+		t.Fatalf("recovered phase_pass changed exact binding cardinality: %d", bindingCountAfterTransition)
+	}
+	publishing, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AuthenticatePublishingRecovery(ctx, ticket.Ref, recoveredCandidate, publishing.Version, domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: publishing.RunnerEpoch}); err != nil {
+		t.Fatalf("successor repair candidate publication authority=%v", err)
 	}
 	var completionCount int
 	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, successor.Generation).Scan(&completionCount); err != nil {
@@ -1203,6 +1506,112 @@ func TestCIObservationValidRepairBudgetRequiresSuccessorCompletion(t *testing.T)
 	}
 	if completionCount != 1 {
 		t.Fatalf("completion cardinality=%d", completionCount)
+	}
+
+	// Generation one remains an immutable publication witness while the
+	// corrected generation is still candidate-only. Repeated restarts and
+	// publication controls must classify that row as historical context rather
+	// than rebinding or authorizing it as the current generation.
+	for recovery := 1; recovery <= 2; recovery++ {
+		newLeader, err = db.AcquireLeader(ctx, domain.ChannelDev, "successor-publication-recovery")
+		if err != nil {
+			t.Fatalf("successor recovery %d leader: %v", recovery, err)
+		}
+		if changed, fenceErr := db.FenceRecoveredRunners(ctx, domain.ChannelDev, newLeader); fenceErr != nil || changed != 1 {
+			t.Fatalf("successor recovery %d fence changed=%d err=%v", recovery, changed, fenceErr)
+		}
+		latestAfterFence, candidateErr := db.latestCandidateFrom(ctx, db.db, ticket.Ref, false)
+		if candidateErr != nil || db.reauthenticateStoredCandidateCheckpointFrom(ctx, db.db, ticket.Ref, latestAfterFence) != nil {
+			t.Fatalf("successor recovery %d historical candidate checkpoint=%+v err=%v", recovery, latestAfterFence, candidateErr)
+		}
+		if err := db.RebindRecoveredPublishedCandidates(ctx, domain.ChannelDev, newLeader); err != nil {
+			t.Fatalf("successor recovery %d startup publication proof: %v", recovery, err)
+		}
+	}
+	publishing, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil || publishing.State != domain.StatePublishing {
+		t.Fatalf("multi-recovered successor publishing=%+v err=%v", publishing, err)
+	}
+	publishingFence := domain.Fence{LeaderEpoch: newLeader, RunnerEpoch: publishing.RunnerEpoch}
+	blocked, err := db.TransitionPublishedBlock(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: publishing.Version, From: domain.StatePublishing, To: domain.StateBlocked,
+		ResumeState: domain.StatePublishing, Trigger: "typed_blocker", Fence: publishingFence,
+		EventPayload: `{"code":"publication_retry_required"}`,
+	})
+	if err != nil {
+		t.Fatalf("successor candidate-only block: %v", err)
+	}
+	resumedBlock, err := db.TransitionPublishedResume(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: blocked.Version, From: domain.StateBlocked, To: domain.StatePublishing,
+		Trigger: "operator_recover", Fence: publishingFence, EventPayload: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("successor candidate-only block recovery: %v", err)
+	}
+	publishing, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil || publishing.Version != resumedBlock.Version {
+		t.Fatalf("successor block recovery ticket=%+v result=%+v err=%v", publishing, resumedBlock, err)
+	}
+	paused, err := db.TransitionPublishedPause(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: publishing.Version, From: domain.StatePublishing, To: domain.StatePaused,
+		ResumeState: domain.StatePublishing, Trigger: "retry_or_correction_exhausted", Fence: publishingFence, EventPayload: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("successor candidate-only semantic pause: %v", err)
+	}
+	resumedPause, err := db.TransitionPublishedResume(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StatePublishing,
+		Trigger: "operator_retry", Fence: publishingFence, EventPayload: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("successor candidate-only semantic resume: %v", err)
+	}
+	publishing, err = db.Ticket(ctx, ticket.Ref)
+	if err != nil || publishing.Version != resumedPause.Version {
+		t.Fatalf("successor semantic resume ticket=%+v result=%+v err=%v", publishing, resumedPause, err)
+	}
+	stopped, pausedControl := postPublicationPauseAt(t, db, publishing, publishingFence)
+	resumedResult, err := db.TransitionPublishedResume(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: pausedControl.Version, From: domain.StatePaused, To: domain.StatePublishing,
+		Trigger: "operator_resume", Fence: domain.Fence{LeaderEpoch: publishingFence.LeaderEpoch, RunnerEpoch: pausedControl.RunnerEpoch}, EventPayload: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("successor paused leader-takeover resume: %v", err)
+	}
+	resumed, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || resumed.Version != resumedResult.Version || resumed.State != domain.StatePublishing {
+		t.Fatalf("successor paused leader-takeover ticket=%+v result=%+v err=%v", resumed, resumedResult, err)
+	}
+
+	var path string
+	if err := db.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
+		t.Fatalf("successor database path=%q err=%v", path, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	restartLeader, err := db.AcquireLeader(ctx, domain.ChannelDev, "successor-publication-rearm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, fenceErr := db.FenceRecoveredRunners(ctx, domain.ChannelDev, restartLeader); fenceErr != nil || changed != 1 {
+		t.Fatalf("successor rearm fence changed=%d err=%v", changed, fenceErr)
+	}
+	if err := db.RebindRecoveredPublishedCandidates(ctx, domain.ChannelDev, restartLeader); err != nil {
+		t.Fatalf("successor rearm startup publication proof: %v", err)
+	}
+	stopped, err = db.StoppedRuntimeTicket(ctx, resumed.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := db.PostPublicationRearmProof(ctx, resumed.Ref, stopped)
+	if err != nil || capability == nil {
+		t.Fatalf("successor candidate-only rearm capability=%v err=%v", capability, err)
 	}
 }
 
@@ -1219,11 +1628,11 @@ func TestCIObservationFutureAdmissionDoesNotPoisonNextValidRecord(t *testing.T) 
 		t.Fatal(err)
 	}
 	future := ciAuthorityObservationFor(publication, ticket, publicationFence, "green", time.Now().UTC().Add(48*time.Hour), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "success"}})
-	if err := db.RecordCIObservation(ctx, future); !errors.Is(err, ErrCIObservation) {
+	if err := db.recordCIObservation(ctx, future); !errors.Is(err, ErrCIObservation) {
 		t.Fatalf("future observation accepted: %v", err)
 	}
 	valid := ciAuthorityObservationFor(publication, ticket, publicationFence, "green", time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "success"}})
-	if err := db.RecordCIObservation(ctx, valid); err != nil {
+	if err := db.recordCIObservation(ctx, valid); err != nil {
 		t.Fatalf("valid observation poisoned by future attempt: %v", err)
 	}
 }
@@ -1244,7 +1653,7 @@ func TestCIObservationOldTransitionReplayAfterLaterObservation(t *testing.T) {
 		t.Fatal("policy tamper was accepted")
 	}
 	first := ciAuthorityObservationFor(publication, ticket, publicationFence, "pending", time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "pending"}})
-	if err := db.RecordCIObservation(ctx, first); err != nil {
+	if err := db.recordCIObservation(ctx, first); err != nil {
 		t.Fatal(err)
 	}
 	firstLoaded, err := db.LoadCurrentCIObservation(ctx, ticket.Ref)
@@ -1260,7 +1669,7 @@ func TestCIObservationOldTransitionReplayAfterLaterObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	later := ciAuthorityObservationFor(publication, laterTicket, publicationFence, "pending", time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "pending"}})
-	if err := db.RecordCIObservation(ctx, later); err != nil {
+	if err := db.recordCIObservation(ctx, later); err != nil {
 		t.Fatal(err)
 	}
 	laterLoaded, err := db.LoadCurrentCIObservation(ctx, ticket.Ref)
@@ -1302,7 +1711,7 @@ func TestCIObservationPublicationChainGapFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	observation := ciAuthorityObservationFor(publication, ticket, publicationFence, "pending", time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "pending"}})
-	if err := db.RecordCIObservation(ctx, observation); err != nil {
+	if err := db.recordCIObservation(ctx, observation); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := db.LoadCurrentCIObservation(ctx, ticket.Ref)
@@ -1342,7 +1751,7 @@ func TestCIObservationLatestTamperAndCardinalityFailClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 			observation := ciAuthorityObservationFor(publication, ticket, publicationFence, "green", time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "check-lint", NormalizedState: "success"}})
-			if err := db.RecordCIObservation(ctx, observation); err != nil {
+			if err := db.recordCIObservation(ctx, observation); err != nil {
 				t.Fatal(err)
 			}
 			loaded, err := db.LoadCurrentCIObservation(ctx, ticket.Ref)

@@ -410,7 +410,7 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	// artifact failure, including an absent, truncated, malformed, or oversized
 	// final message. It is the only adapter outcome eligible for repair.
 	if result.OutputLastMessageTruncated || len(artifact) == 0 || !json.Valid(artifact) || len(artifact) > 1<<20 {
-		return contracts.PhaseResult{Outcome: contracts.PhaseResultInvalidArtifact, Transcript: transcript, Provider: input.Provider, UsageTrusted: input.AuthMode == authModeChatGPTSubscription, UsageUnits: 0}, ErrNoFinalArtifact
+		return contracts.PhaseResult{Outcome: contracts.PhaseResultInvalidArtifact, ArtifactFailureReason: contracts.ArtifactFailureFinalMessage, Transcript: transcript, Provider: input.Provider, UsageTrusted: input.AuthMode == authModeChatGPTSubscription, UsageUnits: 0}, ErrNoFinalArtifact
 	}
 	if input.AuthMode != authModeChatGPTSubscription {
 		return contracts.PhaseResult{}, ErrUnsupportedAuthMode

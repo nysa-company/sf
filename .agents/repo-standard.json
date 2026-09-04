@@ -26,7 +26,7 @@
     "files": {
       ".conductor/settings.toml": "7d6c6d5396079d00a782330a32e03050bbc44288808f68ace685ce1850d02127",
       ".github/pull_request_template.md": "ab378f0d77c2e8644e9839e12d5ab9490bcaaa5ef064b70882473e0ccb2c424d",
-      ".github/workflows/repository-baseline.yml": "6efa695e12e0d6cd10c675097212ba54bdc858b998179171f320f1f14e0b178c",
+      ".github/workflows/repository-baseline.yml": "e79fb22356659ef5dbe7f06f3a72f2c891187b32dc8b9028756fb390df65e13d",
       "docs/git-flow.md": "3aff2ae40cda90c1180f381a28fe4c3e164e3748be9bf9b258256955865b0108",
       "scripts/repo-check": "b5303449acb9c46c23e15c1261e131ca9acaed119d1ede761df7125f600e8da1",
       "scripts/secret-scan": "fa59f18dd4f32efc10ed7fdb14629c0c21776335d71b2fd81483389d1a4dc81f"

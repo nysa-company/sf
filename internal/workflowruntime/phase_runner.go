@@ -31,6 +31,7 @@ type PhaseEvidence interface {
 	OperatorSourceResumeRequiresFreshVerification(context.Context, domain.TicketRef, uint64) (bool, error)
 	OperatorSourceResumeProof(context.Context, domain.TicketRef, uint64, domain.Fence) (store.OperatorSourceResumeProof, bool, error)
 	PendingVerificationAmendment(context.Context, domain.TicketRef, uint64, domain.Fence) (store.VerificationAmendment, error)
+	CandidateRepairBuildContext(context.Context, domain.TicketRef, uint64, domain.Fence) (store.CandidateRepairBuildContext, error)
 	FinalReviewAuthority(context.Context, domain.TicketRef, uint64, domain.Fence) (store.FinalReviewAuthority, error)
 	AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error
 	LoadCurrentProviderAttemptResult(context.Context, store.ProviderAttemptResultKey, uint64, domain.Fence) (store.ProviderAttemptResult, phaseartifact.Parsed, error)
@@ -193,12 +194,16 @@ func (r PhaseRunner) verification(ctx context.Context, request workflowworker.Ph
 		Workspace: phaseWorkspace(project, worktree, identity.Plan.Paths),
 		Plan:      identity,
 		Runtime:   phaseRuntime(effective.PhaseTimeout),
+		Command:   append([]string(nil), effective.Commands.Verify.Argv...),
 		Amendment: amendmentPrompt(request.Amendment),
 	})
 	if err != nil {
+		if request.Amendment != nil {
+			return workflowworker.PhaseResult{}, workflowworker.ErrVerificationAmendmentInvalid
+		}
 		return workflowworker.PhaseResult{}, ErrConfigSnapshotInvalid
 	}
-	return r.run(ctx, request, project, worktree, providercoord.RoleReviewer, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: identity.Digest})
+	return r.run(ctx, request, project, worktree, providercoord.RoleReviewer, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: identity.Digest, ExpectedVerificationCommand: append([]string(nil), effective.Commands.Verify.Argv...)})
 }
 
 func amendmentPrompt(value *store.VerificationAmendment) *workflowprompt.AmendmentReview {
@@ -206,6 +211,34 @@ func amendmentPrompt(value *store.VerificationAmendment) *workflowprompt.Amendme
 		return nil
 	}
 	return &workflowprompt.AmendmentReview{PriorProofDigest: value.Prior.ProofDigest, ProposedDigest: value.ProposedDigest, ProposedCommand: append([]string(nil), value.ProposedCommand...), Reason: value.Reason, Requester: value.Requester}
+}
+
+func candidateRepairPrompt(value store.CandidateRepairBuildContext, verification workflowprompt.VerificationIdentity) (*workflowprompt.BuilderRepair, error) {
+	if value.Ref.Validate() != nil || value.Verification.Revision.IntentDigest != verification.IntentDigest || value.Verification.Revision.ProofDigest != verification.ProofDigest || value.Verification.Revision.CheckpointID != verification.CheckpointID || !reflect.DeepEqual(value.Verification.Revision.OwnedFiles, verification.OwnedFiles) {
+		return nil, ErrProviderResultInvalid
+	}
+	checks := make([]workflowprompt.BuilderRepairCheck, len(value.Diagnostic.FailingChecks))
+	for index, check := range value.Diagnostic.FailingChecks {
+		checks[index] = workflowprompt.BuilderRepairCheck{
+			Name:             check.CanonicalName,
+			ExternalID:       check.ExternalID,
+			State:            check.NormalizedState,
+			DiagnosticDigest: check.FailingDiagnosticDigest,
+		}
+	}
+	return &workflowprompt.BuilderRepair{
+		Schema:                   workflowprompt.BuilderRepairSchema,
+		TargetGeneration:         value.TargetGeneration,
+		PredecessorGeneration:    value.PredecessorGeneration,
+		PredecessorHeadSHA:       value.PredecessorHeadSHA,
+		PredecessorTreeSHA:       value.PredecessorTreeSHA,
+		PublicationWitnessDigest: value.PublicationWitnessDigest,
+		ObservationDigest:        value.Diagnostic.ObservationDigest,
+		RequiredSetDigest:        value.Diagnostic.RequiredSetDigest,
+		DiagnosticDigest:         value.Diagnostic.DiagnosticDigest,
+		TotalFailingChecks:       value.Diagnostic.TotalFailingChecks,
+		FailingChecks:            checks,
+	}, nil
 }
 
 func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequest) (workflowworker.PhaseResult, error) {
@@ -224,12 +257,26 @@ func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequ
 	if err != nil {
 		return workflowworker.PhaseResult{}, err
 	}
+	var repair *workflowprompt.BuilderRepair
+	repairContext, repairErr := r.Store.CandidateRepairBuildContext(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+	if repairErr == nil {
+		if repairContext.Ref != request.Ticket.Ref {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
+		repair, err = candidateRepairPrompt(repairContext, verification)
+		if err != nil {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
+	} else if !errors.Is(repairErr, store.ErrNotFound) {
+		return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+	}
 	input, err := workflowprompt.Builder(workflowprompt.BuilderInput{
 		Ticket:       phaseTicket(request.Ticket),
 		Workspace:    phaseWorkspace(project, worktree, plan.Plan.Paths),
 		Plan:         plan,
 		Verification: verification,
 		Runtime:      phaseRuntime(effective.PhaseTimeout),
+		CIRepair:     repair,
 	})
 	if err != nil {
 		return workflowworker.PhaseResult{}, ErrConfigSnapshotInvalid
@@ -237,7 +284,7 @@ func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequ
 	// A protected verification change is admissible only as a bounded Builder
 	// amendment request. The Store records and charges that request before a
 	// fresh independent Reviewer may accept the exact proposed proof.
-	return r.run(ctx, request, project, worktree, providercoord.RoleBuilder, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ProtectedVerification: append([]string(nil), verification.OwnedFiles...)})
+	return r.run(ctx, request, project, worktree, providercoord.RoleBuilder, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ExpectedVerificationCommand: append([]string(nil), effective.Commands.Verify.Argv...), ProtectedVerification: append([]string(nil), verification.OwnedFiles...)})
 }
 
 func (r PhaseRunner) admit(ctx context.Context, request workflowworker.PhaseRequest, state domain.State, route string) (store.Project, config.Effective, store.StoredWorktree, error) {
@@ -447,12 +494,11 @@ func matchesLaunchInput(claim store.ProviderAttemptClaim, key store.ProviderAtte
 		return false
 	}
 	input.Timeout = claim.Input.Timeout
-	payload, digest, err := contracts.CanonicalPhaseInput(input)
+	payload, digest, err := contracts.CanonicalPhaseInput(claim.Input)
 	if err != nil {
 		return false
 	}
-	input.RequestDigest = digest
-	return digest == claim.RequestDigest && bytes.Equal(payload, claim.RequestPayload) && reflect.DeepEqual(input, claim.Input)
+	return digest == claim.RequestDigest && bytes.Equal(payload, claim.RequestPayload) && contracts.PhaseInputMatchesAuthenticatedClaim(input, claim.Input, claim.RequestDigest)
 }
 
 func parsedForPhase(parsed phaseartifact.Parsed, phase domain.Phase) bool {
