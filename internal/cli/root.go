@@ -79,6 +79,7 @@ func (a *app) command() *cobra.Command {
 	root.AddCommand(a.runCommand())
 	root.AddCommand(a.bundleCommand())
 	a.configureTicketSelection(root)
+	a.configureDecisionSelection(root)
 	return root
 }
 
@@ -436,24 +437,42 @@ func (a *app) retryCommand() *cobra.Command {
 
 func (a *app) approveCommand() *cobra.Command {
 	operator := defaultOperatorLabel()
+	var head string
 	command := &cobra.Command{Use: "approve <ticket> --operator <identity>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return a.emit(a.request("ticket.approve", args[0], params(map[string]any{"operator": operator}, a.channel)))
+		values := map[string]any{"operator": operator}
+		if cmd.Flags().Changed("head") {
+			if !api.ValidReviewedHead(head) {
+				return a.emit(failure("invalid_argument", "--head requires a full lowercase 40- or 64-character Git object ID", commandHelpAction(cmd)))
+			}
+			values["reviewed_head"] = head
+		}
+		return a.emit(a.request("ticket.approve", args[0], params(values, a.channel)))
 	}}
 	command.Flags().StringVar(&operator, "operator", operator, "authenticated operator identity")
+	command.Flags().StringVar(&head, "head", "", "refuse unless this exact inspected commit is still the reviewed candidate")
 	return command
 }
 
 func (a *app) rejectCommand() *cobra.Command {
 	var reason string
+	var head string
 	operator := defaultOperatorLabel()
 	command := &cobra.Command{Use: "reject <ticket> --operator <identity> --reason <text>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if len(reason) > 4096 {
 			return a.emit(failure("invalid_argument", "rejection reason exceeds 4096 bytes", []string{binaryName(), "reject", "--help"}))
 		}
-		return a.emit(a.request("ticket.reject", args[0], params(map[string]any{"operator": operator, "reason": reason}, a.channel)))
+		values := map[string]any{"operator": operator, "reason": reason}
+		if cmd.Flags().Changed("head") {
+			if !api.ValidReviewedHead(head) {
+				return a.emit(failure("invalid_argument", "--head requires a full lowercase 40- or 64-character Git object ID", commandHelpAction(cmd)))
+			}
+			values["reviewed_head"] = head
+		}
+		return a.emit(a.request("ticket.reject", args[0], params(values, a.channel)))
 	}}
 	command.Flags().StringVar(&operator, "operator", operator, "authenticated operator identity")
 	command.Flags().StringVar(&reason, "reason", "", "bounded rejection reason")
+	command.Flags().StringVar(&head, "head", "", "refuse unless this exact inspected commit is still the reviewed candidate")
 	_ = command.MarkFlagRequired("reason")
 	return command
 }

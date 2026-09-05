@@ -357,14 +357,14 @@ func daemonFixtureCompleteCommand(t *testing.T, database *store.Store, ref domai
 // provenance required for a guarded operator retry. It never invokes a GitHub,
 // Git, or provider adapter: the immutable observations are explicit fixtures.
 func prepareDaemonGuardedMergeRetry(t *testing.T, daemon *Daemon, ticketID domain.TicketID) store.Ticket {
-	return prepareDaemonGuardedLifecycle(t, daemon, ticketID, false)
+	return prepareDaemonGuardedLifecycle(t, daemon, ticketID, domain.StateMerging)
 }
 
 func prepareDaemonPublishingStatusFixture(t *testing.T, daemon *Daemon, ticketID domain.TicketID) store.Ticket {
-	return prepareDaemonGuardedLifecycle(t, daemon, ticketID, true)
+	return prepareDaemonGuardedLifecycle(t, daemon, ticketID, domain.StatePublishing)
 }
 
-func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain.TicketID, stopAtPublishing bool) store.Ticket {
+func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain.TicketID, stopAt domain.State) store.Ticket {
 	t.Helper()
 	ctx := t.Context()
 	ref := domain.TicketRef{Channel: daemon.channel, Project: "demo", Ticket: ticketID}
@@ -502,7 +502,7 @@ func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stopAtPublishing {
+	if stopAt == domain.StatePublishing {
 		if ticket.State != domain.StatePublishing {
 			t.Fatalf("publishing fixture ticket=%+v", ticket)
 		}
@@ -574,6 +574,9 @@ func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain
 		t.Fatal(err)
 	}
 	fence.RunnerEpoch = ticket.RunnerEpoch
+	if stopAt == domain.StateWaitingApproval {
+		return ticket
+	}
 	if _, err := daemon.store.ApplyOperatorDecision(ctx, store.OperatorDecisionRequest{OperatorDecision: store.OperatorDecision{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, ReviewedHead: candidate.Snapshot.HeadSHA, OperatorUID: 501, Decision: "approved"}}); err != nil {
 		t.Fatal(err)
 	}

@@ -34,10 +34,17 @@ sf recover <ticket> [--mode guarded] [--operator <identity>]
 sf cancel <ticket> --operator <identity>
 sf retry <ticket> [--operator <identity>]
 sf take <ticket> --operator <identity>
-sf approve <ticket> --operator <identity>
-sf reject <ticket> --operator <identity> --reason <text>
+sf approve <ticket> --operator <identity> [--head <full-reviewed-commit>]
+sf reject <ticket> --operator <identity> --reason <text> [--head <full-reviewed-commit>]
 sf doctor [--repo <path>]
 ```
+
+Use `--head` with the full lowercase 40- or 64-character commit ID you inspected
+for approval or rejection. The daemon refuses a different current candidate;
+it never substitutes that candidate for the supplied head. A matching head is
+still subject to the existing review, ticket-version and authority checks.
+Omitting the option preserves the older current-candidate decision behavior.
+Older daemons reject the new parameter rather than silently ignoring it.
 
 `--json` is available on every command. Human and JSON output are rendered from
 the same versioned response envelope. The CLI never invents success: a command
@@ -56,8 +63,12 @@ with distinct full IDs and projects.
 These commands and `status` also accept a unique 6–31 character lowercase hex
 ID prefix, with or without `SF-`. Ambiguous prefixes require an interactive
 choice or a longer ID; incomplete inventories fail closed. Piped input and
-`--json` never prompt. Full IDs keep the direct path. Approval and rejection
-still require full IDs pending candidate-bound interactive confirmation.
+`--json` never prompt. Full IDs keep the direct path. In a terminal, omitted
+approval/rejection IDs open a picker followed by the complete reviewed head.
+Type the command name (`approve` or `reject`) to confirm; anything else cancels.
+`--select` requests confirmation even with a full ID. These interactive
+decisions always send the displayed head. Scripts require a full ID and should
+use `--head`; they never select or confirm interactively.
 The daemon checks current state and authority after selection; a menu is not
 permission to bypass those checks.
 

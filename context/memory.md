@@ -2,6 +2,37 @@
 
 ## Current truth
 
+- Interactive decision picker now implemented atop optional --head:
+  omitted ID / --select / prefix+project interactive path selects exact ID,
+  reads ticket.status, requires waiting_approval plus valid full head, displays
+  full head/title/channel/project, requires typed approve/reject (not yes),
+  dispatches that head through existing decision path. JSON/noninteractive
+  must supply full ID, should --head; no silent head replacement. Existing
+  explicit full-ID path retained. readSelectionAnswer reads one bounded line
+  without discarding subsequent confirmation input (old Scanner read-ahead).
+  Normal picker fixture initially failed only because fake stale-head response
+  used invalid NextAction(nil); fixed fixture argv. Full CLI race81136 PASS
+  46.665s; compiled real-PTY picker48230 PASS4.088s (confirm + cancel; private
+  fake socket, no real approval). Focused prior daemon head-binding race passed.
+  Full normal/static gate27735 TERMINAL exit0: all packages (Store133.926s,
+  workflowruntime119.657s, worktreecoord136.404s), vet, repo/secret/docs/artifact
+  checks PASS. Source review found no additional blocking issue. Ready to commit.
+  Broad goal still includes stack/provider expansion; do not claim complete.
+
+- Approval-head checkpoint uncommitted on0c23998. CLI approve/reject now
+  accept optional --head and transmit reviewed_head only when explicitly set;
+  api.ValidReviewedHead requires full lowercase40/64hex. Daemon RawMessage
+  distinguishes omitted legacy field from null/empty/invalid; mismatched
+  candidate refuses before ApplyOperatorDecision, whose version/fence CAS
+  remains unchanged. Existing no-head commands retain compatibility. New
+  real Store fixture can stop at waiting_approval. Normal44856 PASS CLI0.549s,
+  daemon0.917s, both matching and mismatched/malformed/null heads. Race73574
+  TERMINAL exit0 (CLI1.708s,daemon9.846s), docs-smoke PASS; no full suite yet. Docs describe
+  explicit binding and old-daemon refusal. Interactive approval picker is now
+  implemented and validated in the checkpoint above, keeping JSON/noninteractive
+  deterministic and never substituting a changed head.
+  No live binary restart or PR approval. Untracked API/test files intentional.
+
 - Mixed-stack fix verification complete:69395 TERMINAL exit0, full normal
   suite (Store137.631s, workflowruntime122.455s, worktreecoord137.215s), vet,
   repo/secret/docs/artifact PASS. Focused config/CLI race73529 also passed.

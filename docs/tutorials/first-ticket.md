@@ -130,17 +130,22 @@ Find existing tickets by title and state with
 `./bin/sf-dev start --project my-app` offers a numbered picker; `q` cancels.
 The picker never chooses a ticket implicitly. Unique six-character hex ID
 prefixes work too, for example `status 543bc4 --project my-app`. Scripts must
-provide an unambiguous ID and never prompt; approval/rejection still
-require full IDs until candidate-bound confirmation is available.
+provide an unambiguous ID and never prompt. Approval/rejection use a separate
+confirmation that displays and binds the complete reviewed head.
 
 SF plans, writes independent verification, implements, runs proof, publishes a
 draft PR, checks CI, and performs independent final review. When it requests
 approval, inspect the actual PR diff and reviewed head before approving:
 
 ```text
-./bin/sf-dev approve <ticket-id>
+./bin/sf-dev approve <ticket-id> --head <full-reviewed-commit>
 ```
 
+Use the full commit ID from the PR you inspected, not an abbreviated hash.
+Alternatively, `./bin/sf-dev approve --project my-app` opens a ticket picker
+and displays its reviewed head. Inspect that commit, then type `approve` to
+confirm it; any other answer cancels without a decision.
+The supplied head must still match when the daemon records the decision.
 Approval is not automatic. A changed candidate requires fresh evidence and
 approval. Keep watching until SF records `done`, not merely until a PR exists.
 

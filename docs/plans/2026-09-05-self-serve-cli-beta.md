@@ -71,6 +71,22 @@ This is not an unattended multi-platform stable-v1 delivery promise.
 
 ## Current checkpoint
 
+The candidate-bound decision picker now covers approval and rejection too.
+Omitted IDs in a terminal (or `--select`) show title/project/state, then fetch
+and display the complete reviewed commit. The operator must type the decision;
+the daemon refuses a changed head before its existing Store authority checks.
+Explicit `--head` supports noninteractive binding, while omitted legacy fields
+remain compatible. Older daemons refuse the new field instead of ignoring it.
+Full normal Go, vet, repository/secret/docs/artifact checks, full CLI race,
+focused daemon race, and compiled real-PTY confirmation/cancellation tests
+passed. The PTY test uses a private fake authority socket, not a live approval.
+The isolated Go acceptance ticket has reached waiting_approval with passing CI;
+human approval, merge, and terminal reconciliation remain pending. See the
+[acceptance report](../reports/2026-09-05-cli-onboarding-acceptance.md).
+
+Earlier checkpoint history follows; pending items below describe those earlier
+checkpoints, not replacements for the current evidence above.
+
 Started CLI descriptions/examples, contextual help on input errors, and a
 discoverable first-ticket guide. Added read-only project-scoped ticket listing,
 titles in daemon status projection, interactive numbered selection, and unique

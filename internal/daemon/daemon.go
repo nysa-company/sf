@@ -1307,9 +1307,10 @@ type controlParameters struct {
 }
 
 type operatorDecisionParameters struct {
-	Operator string         `json:"operator"`
-	Reason   string         `json:"reason"`
-	Channel  domain.Channel `json:"channel"`
+	Operator     string          `json:"operator"`
+	Reason       string          `json:"reason"`
+	Channel      domain.Channel  `json:"channel"`
+	ReviewedHead json.RawMessage `json:"reviewed_head,omitempty"`
 }
 
 // operatorDecision keeps approval and rejection on the owner-only socket
@@ -1322,6 +1323,12 @@ func (daemon *Daemon) operatorDecision(ctx context.Context, request api.Request,
 	}
 	if decision == "approved" && parameters.Reason != "" {
 		return daemon.failure(request, "invalid_decision", "approval does not accept a reason", false)
+	}
+	expectedHead := ""
+	if len(parameters.ReviewedHead) != 0 {
+		if json.Unmarshal(parameters.ReviewedHead, &expectedHead) != nil || !api.ValidReviewedHead(expectedHead) {
+			return daemon.failure(request, "invalid_decision", "reviewed_head requires a complete canonical Git object ID", false)
+		}
 	}
 	if decision == "rejected" && (!boundedOperatorReason(parameters.Reason)) {
 		return daemon.failure(request, "invalid_decision", "rejection requires a bounded non-empty reason", false)
@@ -1340,6 +1347,9 @@ func (daemon *Daemon) operatorDecision(ctx context.Context, request api.Request,
 	candidate, err := daemon.store.RecoverableCandidate(ctx, ref)
 	if err != nil {
 		return daemon.failure(request, "approval_evidence_unavailable", "the exact reviewed candidate is unavailable", errors.Is(err, store.ErrBusy))
+	}
+	if expectedHead != "" && expectedHead != candidate.Snapshot.HeadSHA {
+		return daemon.failure(request, "approval_head_changed", "the inspected head is no longer the reviewed candidate; inspect the current candidate before deciding", false)
 	}
 	reasonDigest := ""
 	if parameters.Reason != "" {

@@ -1,8 +1,8 @@
 package cli
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -36,8 +36,7 @@ func (a *app) canSelectInteractively() bool {
 
 // Selection only resolves an identity, never authorizes a transition. The
 // daemon rechecks state and authority for the resulting full ticket ID.
-// Approval/rejection deliberately keep explicit IDs until selection can bind
-// the exact reviewed candidate displayed in their confirmation UI.
+// Approval/rejection use a separate candidate-bound confirmation flow.
 func (a *app) configureTicketSelection(root *cobra.Command) {
 	allowed := map[string]bool{"start": true, "status": true, "show": true, "logs": true, "pause": true, "resume": true, "recover": true, "cancel": true, "retry": true, "take": true}
 	for _, command := range root.Commands() {
@@ -45,7 +44,7 @@ func (a *app) configureTicketSelection(root *cobra.Command) {
 			continue
 		}
 		command.Use = strings.Replace(command.Use, "<ticket>", "[ticket]", 1)
-		command.Long = command.Short + ".\n\nUse a full ticket ID or a unique 6–31 character lowercase hex prefix.\nOmit the ID in a terminal to choose by title; q cancels without an action.\nPiped input and --json require an explicit ID or unique prefix.\nApproval and rejection use separate explicit-ID commands."
+		command.Long = command.Short + ".\n\nUse a full ticket ID or a unique 6–31 character lowercase hex prefix.\nOmit the ID in a terminal to choose by title; q cancels without an action.\nPiped input and --json require an explicit ID or unique prefix.\nApproval and rejection use a separate candidate-bound confirmation flow."
 		if command.Name() == "status" {
 			command.Long += "\nPlain status lists all tickets; use --select for the interactive picker."
 		}
@@ -160,12 +159,11 @@ func (a *app) selectTicket(cmd *cobra.Command, input, project string) (string, *
 	if cmd.Context().Err() != nil {
 		return fail("ticket selection cancelled; no action was taken")
 	}
-	scanner := bufio.NewScanner(io.LimitReader(reader, 129))
-	scanner.Buffer(make([]byte, 128), 128)
-	if !scanner.Scan() || cmd.Context().Err() != nil {
+	line, err := readSelectionAnswer(reader)
+	if err != nil || cmd.Context().Err() != nil {
 		return fail("ticket selection cancelled; no action was taken")
 	}
-	answer := strings.TrimSpace(scanner.Text())
+	answer := strings.TrimSpace(line)
 	if answer == "q" || answer == "" {
 		return fail("ticket selection cancelled; no action was taken")
 	}
@@ -174,6 +172,32 @@ func (a *app) selectTicket(cmd *cobra.Command, input, project string) (string, *
 		return fail("invalid selection; no action was taken")
 	}
 	return matches[index-1].ID, nil
+}
+
+// Do not read ahead into a later confirmation prompt. A new Scanner per
+// prompt can otherwise consume and discard the next answer from buffered input.
+func readSelectionAnswer(reader io.Reader) (string, error) {
+	var value strings.Builder
+	var one [1]byte
+	for value.Len() <= 128 {
+		n, err := reader.Read(one[:])
+		if n == 1 {
+			if one[0] == '\n' {
+				return value.String(), nil
+			}
+			value.WriteByte(one[0])
+		}
+		if err != nil {
+			if err == io.EOF && value.Len() > 0 && value.Len() <= 128 {
+				return value.String(), nil
+			}
+			return "", err
+		}
+		if n == 0 {
+			return "", io.ErrNoProgress
+		}
+	}
+	return "", errors.New("selection answer exceeds bound")
 }
 
 func safeSelectionLabel(value string) string {
