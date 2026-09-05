@@ -31,6 +31,14 @@ The approved normative design is in
 - Each ticket's unguessable channel-prefixed branch is allocated once through
   SQLite and protected by ticket and channel uniqueness. Git does not own a
   second branch-name ledger.
+  With authenticated publication transport, worktree creation observes the
+  current hosted base and fetches it under the durable creation lease into a
+  ticket-specific `refs/sf/worktree-base/` ref. The primary checkout and its
+  branch are not advanced. Registration, later identity checks, and diff
+  validation use that pinned object, so later tickets include prior hosted
+  merges without changing an existing ticket's base. The explicitly
+  pre-publication-only runtime still uses its local base; remote failures in
+  a configured publication runtime never silently select that local fallback.
 - GitHub publication preserves the exact local candidate SHA through an
   ordinary fast-forward Git push. Canonical
   `https://github.com/<owner>/<repository>.git` remotes use the packaged

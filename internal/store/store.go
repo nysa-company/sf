@@ -1657,6 +1657,18 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 			if err := validateProviderBlockedRecoveryPrefix(ctx, conn, transition.Ref, phaseForProviderState(transition.To), version, runner, transition.Fence.LeaderEpoch, transition.To, persistedBlockedCode); err != nil {
 				return err
 			}
+			prior, err := providerBlockedEndpointLeader(ctx, conn, transition.Ref, phaseForProviderState(transition.To), version-1, runner)
+			if err != nil {
+				return err
+			}
+			payload, err := json.Marshal(providerBlockedLeaderBridge{providerBlockedBridgeSchema, "recover", version + 1, runner, prior, transition.Fence.LeaderEpoch, json.RawMessage(transition.EventPayload)})
+			if err != nil {
+				return err
+			}
+			if len(payload) > maxEvidenceJSON {
+				return ErrEvidenceConflict
+			}
+			transition.EventPayload = string(payload)
 		}
 		query := `UPDATE tickets SET state=?, resume_state=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`
 		args := []any{transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner}

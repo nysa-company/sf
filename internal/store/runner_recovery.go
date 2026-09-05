@@ -238,7 +238,7 @@ func validProviderBlockedRecoveryGap(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }, ref domain.TicketRef, fromVersion, fromRunner, fromLeader, toVersion, toRunner, toLeader uint64) bool {
-	if fromVersion == 0 || fromRunner == 0 || fromLeader == 0 || toVersion != fromVersion+2 || toRunner != fromRunner || toLeader != fromLeader {
+	if fromVersion == 0 || fromRunner == 0 || fromLeader == 0 || toVersion != fromVersion+2 || toRunner != fromRunner || toLeader < fromLeader {
 		return false
 	}
 	var trigger, raw string
@@ -258,9 +258,12 @@ func validProviderBlockedRecoveryGap(ctx context.Context, q interface {
 	if err := exactStateChangeEvent(ctx, q, ref, toVersion, "operator_recover", domain.StateBlocked, from); err != nil {
 		return false
 	}
-	var recoverTrigger string
+	var recoverTrigger, recoverRaw string
 	var recoverFrom, recoverTo domain.State
-	if err := q.QueryRowContext(ctx, `SELECT trigger,from_state,to_state FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, toVersion).Scan(&recoverTrigger, &recoverFrom, &recoverTo); err != nil || recoverTrigger != "operator_recover" || recoverFrom != domain.StateBlocked || recoverTo != from {
+	if err := q.QueryRowContext(ctx, `SELECT trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, toVersion).Scan(&recoverTrigger, &recoverFrom, &recoverTo, &recoverRaw); err != nil || recoverTrigger != "operator_recover" || recoverFrom != domain.StateBlocked || recoverTo != from {
+		return false
+	}
+	if toLeader != fromLeader && !providerBlockedBridgeMatches(recoverRaw, toVersion, toRunner, fromLeader, toLeader) {
 		return false
 	}
 	entry, err := loadProviderPhaseEntryAt(ctx, q, ref, phaseForProviderState(from), fromVersion)

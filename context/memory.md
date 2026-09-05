@@ -12,7 +12,9 @@
   autonomous execution: a `setsid`/double-fork child can retain worktree write
   access after its supervisor returns. Guarded/manual remain the trusted
   provider/repository baseline.
-- No remote, Nysa mutation, or legacy retirement is currently authorized.
+- Sofia separately authorized the SF remote and private `sf-v1-relay-pilot`
+  repository. Nysa mutation, stable-channel changes, and legacy retirement
+  remain out of scope.
 - The trusted-local v1 does not attempt arbitrary npm/process-tree containment;
   full project verification is authoritative in required GitHub CI. The local
   Reviewer still authors verification before the Builder changes product code.
@@ -38,6 +40,28 @@
 ## Log
 
 Record durable decisions, reversals, incidents, and repeated pitfalls. Never store secrets, raw customer or financial data, or raw agent transcripts.
+
+### 2026-09-05 — Real delivery and bounded repeatability
+
+The factory delivered Relay PR #3 through test-first verification, independent
+review, exact-head human approval, guarded squash merge, and `done`; hosted
+main advanced to `add08cff903e8c9bbe46b1a4a97d5c6eabcea53b`. This is one real
+delivery, not a general stable-v1 or load-test verdict.
+
+The next ticket exposed stale local-main selection: new worktrees omitted the
+hosted merge, and publication correctly refused the mismatch. Preserve that
+Inspect Job trial as failed and paused, with its worktree/evidence intact. Do
+not rewrite its candidate, restore the database, or count it as a clean trial.
+The repair observes the hosted base for new tickets, fetches it under the
+existing repository lease into a per-ticket cache ref, and authenticates the
+pinned base against SQLite without rewriting the operator's primary branch.
+
+An isolated blocked-provider restart regression also exposed use of the new
+daemon leader against old phase evidence. Its repair records both authenticated
+leader endpoints atomically with operator recovery and preserves the attempt
+window. Freeze only after tests, then run two serial nonoverlapping Relay
+tickets without SF code changes between deliveries. No concurrency or live
+fault injection; recovery probes use isolated fixtures.
 
 ### 2026-08-29 — Local v1 implementation begins
 

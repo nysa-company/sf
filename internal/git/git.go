@@ -1285,11 +1285,11 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 	if err != nil {
 		return Identity{}, err
 	}
-	baseHead, err := r.one(ctx, worktree, "rev-parse", "--verify", baseRef+"^{commit}")
+	headRef, err := r.one(ctx, worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if err != nil {
 		return Identity{}, err
 	}
-	headRef, err := r.one(ctx, worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
+	baseHead, err := r.worktreeBaseHead(ctx, worktree, headRef, baseRef)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -1675,9 +1675,8 @@ func (r Runner) PreflightRepository(ctx context.Context, repository, baseRef str
 
 // ObserveRepositoryBase proves the primary-checkout identity and returns the
 // exact protected-base object that a caller may bind into a durable mutation
-// claim. It intentionally remains read-only: creation re-observes the same
-// object immediately before it acquires the claim, so a moving base fails
-// closed instead of being silently retried.
+// claim. It intentionally remains read-only: creation re-observes and fetches
+// the same object under its durable lease, so a moving base fails closed.
 func (r Runner) ObserveRepositoryBase(ctx context.Context, repository, baseRef string) (string, string, error) {
 	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
 		return "", "", err
@@ -1686,11 +1685,76 @@ func (r Runner) ObserveRepositoryBase(ctx context.Context, repository, baseRef s
 	if err != nil {
 		return "", "", err
 	}
-	base, err := r.one(ctx, canonical, "rev-parse", "--verify", baseRef+"^{commit}")
+	base, _, _, err := r.creationBase(ctx, canonical, baseRef)
 	if err != nil || !validOID(base) {
 		return "", "", fmt.Errorf("%w: invalid repository base", ErrIdentityMismatch)
 	}
 	return canonical, base, nil
+}
+
+// creationBase observes the hosted branch when the explicit transport is
+// available. The credential-free pre-publication mode retains its local-only
+// contract; malformed/partial transport or a failed remote read never falls
+// back to a stale local branch.
+func (r Runner) creationBase(ctx context.Context, repository, baseRef string) (string, string, []string, error) {
+	origin, err := r.one(ctx, repository, "remote", "get-url", "origin")
+	if err != nil {
+		return "", "", nil, err
+	}
+	extra, _, err := r.githubTransportEnvironment(origin)
+	if errors.Is(err, ErrPublicationRemoteUnavailable) {
+		base, localErr := r.one(ctx, repository, "rev-parse", "--verify", baseRef+"^{commit}")
+		return base, "", nil, localErr
+	}
+	if err != nil {
+		return "", "", nil, err
+	}
+	dev, ino, err := directoryIdentity(repository)
+	if err != nil {
+		return "", "", nil, err
+	}
+	base, err := r.remoteHeadEnv(ctx, repository, dev, ino, origin, baseRef, extra)
+	if err != nil || !validOID(base) {
+		return "", "", nil, fmt.Errorf("%w: protected creation base is unavailable", ErrUnexpectedRemote)
+	}
+	return base, origin, extra, nil
+}
+
+func worktreeBaseRef(branch string) string {
+	sum := sha256.Sum256([]byte(branch))
+	return fmt.Sprintf("refs/sf/worktree-base/%x", sum)
+}
+
+func (r Runner) pinnedWorktreeBase(ctx context.Context, directory, branch string) (string, error) {
+	ref := worktreeBaseRef(branch)
+	output, err := r.command(ctx, directory, "for-each-ref", "--format=%(refname) %(objectname)", ref)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) == 0 {
+		return "", nil
+	}
+	if len(fields) != 2 || fields[0] != ref || !validOID(fields[1]) {
+		return "", ErrIdentityMismatch
+	}
+	return fields[1], nil
+}
+
+// Each new hosted worktree has its own pinned base. Updating a remote tracking
+// ref for another ticket must not change this ticket's authenticated identity.
+// Old/offline worktrees retain the original named-local-base interpretation.
+func (r Runner) worktreeBaseHead(ctx context.Context, worktree, branch, baseRef string) (string, error) {
+	if strings.HasPrefix(branch, "sf/") {
+		pinned, err := r.pinnedWorktreeBase(ctx, worktree, branch)
+		if err != nil {
+			return "", err
+		}
+		if pinned != "" {
+			return pinned, nil
+		}
+	}
+	return r.one(ctx, worktree, "rev-parse", "--verify", baseRef+"^{commit}")
 }
 
 func canonicalExistingRepository(path string) (string, error) {
@@ -1753,7 +1817,7 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	if dev, ino, identityErr := directoryIdentity(repository); identityErr != nil || dev != repositoryDev || ino != repositoryIno {
 		return Worktree{}, fmt.Errorf("%w: primary repository changed before worktree creation", ErrIdentityMismatch)
 	}
-	baseHead, err := r.one(ctx, repository, "rev-parse", "--verify", baseRef+"^{commit}")
+	baseHead, origin, transportEnv, err := r.creationBase(ctx, repository, baseRef)
 	if err != nil || !validOID(baseHead) {
 		return Worktree{}, fmt.Errorf("%w: invalid creation base", ErrIdentityMismatch)
 	}
@@ -1777,7 +1841,28 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return Worktree{}, err
 	}
-	if _, err := r.commandExpected(ctx, repository, repositoryDev, repositoryIno, "worktree", "add", "-b", branch, path, "--", baseRef); err != nil {
+	if origin != "" {
+		// Fetch only the exact protected branch into this ticket's namespace,
+		// under the same durable repository lease as worktree creation. Never
+		// update the operator's main branch, index, or checkout.
+		ref := worktreeBaseRef(branch)
+		existing, err := r.pinnedWorktreeBase(ctx, repository, branch)
+		if err != nil || (existing != "" && existing != baseHead) {
+			return Worktree{}, ErrIdentityMismatch
+		}
+		if _, err := r.commandEnvExpected(ctx, repository, repositoryDev, repositoryIno, transportEnv, "fetch", "--no-write-fetch-head", "--no-tags", origin, "refs/heads/"+baseRef+":"+ref); err != nil {
+			return Worktree{}, err
+		}
+		fetched, err := r.oneExpected(ctx, repository, repositoryDev, repositoryIno, "rev-parse", "--verify", ref+"^{commit}")
+		if err != nil || fetched != baseHead {
+			return Worktree{}, ErrUnexpectedRemote
+		}
+		current, err := r.remoteHeadEnv(ctx, repository, repositoryDev, repositoryIno, origin, baseRef, transportEnv)
+		if err != nil || current != baseHead {
+			return Worktree{}, ErrUnexpectedRemote
+		}
+	}
+	if _, err := r.commandExpected(ctx, repository, repositoryDev, repositoryIno, "worktree", "add", "-b", branch, path, "--", baseHead); err != nil {
 		return Worktree{}, err
 	}
 	createdPath, err := openPinnedDirectory(path)
@@ -2215,6 +2300,17 @@ func (r Runner) ValidateDiff(ctx context.Context, worktree, baseRef string, poli
 	if !validAbsolutePath(worktree) || !validRef(baseRef) || len(policy.AllowedPaths) == 0 {
 		return fmt.Errorf("allowed paths are required")
 	}
+	if !validOID(baseRef) {
+		branch, err := r.one(ctx, worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
+		if err != nil {
+			return err
+		}
+		base, err := r.worktreeBaseHead(ctx, worktree, branch, baseRef)
+		if err != nil {
+			return err
+		}
+		baseRef = base
+	}
 	if _, err := canonicalExistingWorktree(worktree); err != nil {
 		return err
 	}
@@ -2547,7 +2643,7 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	}
 	treePolicy := request.Policy
 	treePolicy.ExpectedHead = request.ExpectedParent
-	if err := r.validateImmutableTree(ctx, worktree.Path, request.BaseRef, tree, treePolicy); err != nil {
+	if err := r.validateImmutableTree(ctx, worktree.Path, worktree.Identity.BaseHead, tree, treePolicy); err != nil {
 		return "", err
 	}
 	// The tree is immutable, but the control plane and parent are not. Prove
@@ -2909,7 +3005,7 @@ func (r Runner) PublishGitHub(ctx context.Context, request GitHubPublicationRequ
 	}
 	policy := request.Policy
 	policy.ExpectedHead = request.ExpectedHead
-	if err := r.validateImmutableTree(ctx, request.Worktree.Path, request.Worktree.Identity.BaseRef, tree, policy); err != nil {
+	if err := r.validateImmutableTree(ctx, request.Worktree.Path, request.Worktree.Identity.BaseHead, tree, policy); err != nil {
 		return "", err
 	}
 	if err := authority.ValidateGitHubPublication(ctx, request.Claim); err != nil {

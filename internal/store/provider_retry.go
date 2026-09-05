@@ -233,7 +233,11 @@ func validateProviderBlockedRecoveryPrefix(ctx context.Context, conn *sql.Conn, 
 	if version < 2 || runner == 0 || leader == 0 || !providerStateForPhaseTransition(target) || providerStateForPhase(phase) != target || !validBlockedCode(code) || code == "legacy_provider_phase_entry_unverifiable" || nonRecoverableBlockedRecoveryCode(code) {
 		return ErrEvidenceConflict
 	}
-	entry, err := loadCurrentProviderPhaseEntry(ctx, conn, ref, phase, version-1, runner, leader)
+	prior, err := providerBlockedEndpointLeader(ctx, conn, ref, phase, version-1, runner)
+	if err != nil || prior > leader {
+		return ErrEvidenceConflict
+	}
+	entry, err := loadCurrentProviderPhaseEntry(ctx, conn, ref, phase, version-1, runner, prior)
 	if err != nil || entry.State != target {
 		return ErrEvidenceConflict
 	}
@@ -254,6 +258,67 @@ func validateProviderBlockedRecoveryPrefix(ctx context.Context, conn *sql.Conn, 
 	return validateProviderPhaseEntryBindings(ctx, conn, ref, entry)
 }
 
+// A blocked ticket does not receive startup runner fencing. Resolve its
+// historical pre-block leader from durable authority, never the new daemon.
+func providerBlockedEndpointLeader(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, phase domain.Phase, version, runner uint64) (uint64, error) {
+	entry, err := loadProviderPhaseEntryAt(ctx, q, ref, phase, version)
+	if err != nil {
+		return 0, err
+	}
+	if step, found, err := loadRunnerRecoveryAt(ctx, q, ref, version); err != nil {
+		return 0, err
+	} else if found && step.RunnerEpoch == runner {
+		return step.LeaderEpoch, nil
+	}
+	if entry.Version == version && entry.Runner == runner {
+		return entry.Leader, nil
+	}
+	if leader, found, err := loadRuntimeControlEndpointLeader(ctx, q, ref, version, runner); err != nil {
+		return 0, err
+	} else if found {
+		return leader, nil
+	}
+	if epoch, found, err := loadProviderRetryEpochForEntry(ctx, q, ref, phase, entry.Version); err != nil {
+		return 0, err
+	} else if found && epoch.RetryVersion == version && epoch.RetryRunner == runner {
+		return epoch.RetryLeader, nil
+	}
+	var raw string
+	if err := q.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_recover' AND from_state='blocked'`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&raw); err == nil {
+		var proof providerBlockedLeaderBridge
+		if json.Unmarshal([]byte(raw), &proof) == nil && proof.Schema == providerBlockedBridgeSchema && proof.Version == version && proof.Runner == runner && proof.Leader > 0 {
+			return proof.Leader, nil // caller authenticates the complete prefix
+		}
+		if proof.Schema == "" && version > 2 {
+			// Legacy same-leader recovery events had no explicit endpoint.
+			// Resolve the predecessor; the caller still validates both events.
+			return providerBlockedEndpointLeader(ctx, q, ref, phase, version-2, runner)
+		}
+	}
+	return 0, ErrEvidenceConflict
+}
+
+const providerBlockedBridgeSchema = "sf.provider-blocked-recovery/v1"
+
+type providerBlockedLeaderBridge struct {
+	Schema      string          `json:"schema"`
+	Intent      string          `json:"intent"`
+	Version     uint64          `json:"version"`
+	Runner      uint64          `json:"runner"`
+	PriorLeader uint64          `json:"prior_leader"`
+	Leader      uint64          `json:"leader"`
+	Control     json.RawMessage `json:"control"`
+}
+
+func providerBlockedBridgeMatches(raw string, version, runner, prior, leader uint64) bool {
+	var stored providerBlockedLeaderBridge
+	if len(raw) > maxEvidenceJSON || json.Unmarshal([]byte(raw), &stored) != nil || len(stored.Control) == 0 {
+		return false
+	}
+	want, err := json.Marshal(providerBlockedLeaderBridge{providerBlockedBridgeSchema, "recover", version, runner, prior, leader, stored.Control})
+	return err == nil && raw == string(want) && prior > 0 && leader >= prior
+}
+
 // validateProviderBlockedRecoveryAdvance is used only after the recovery event
 // was atomically appended.  No generic state gap or leader change is accepted.
 func validateProviderBlockedRecoveryAdvance(ctx context.Context, q interface {
@@ -267,16 +332,23 @@ func validateProviderBlockedRecoveryAdvance(ctx context.Context, q interface {
 	// the phase entry at the exact pre-block endpoint first; requiring its
 	// creation version here would strand a recovered phase on the next operator
 	// action.
-	preBlock, err := loadCurrentProviderPhaseEntry(ctx, q, ref, entry.Phase, version-2, runner, leader)
+	prior, err := providerBlockedEndpointLeader(ctx, q, ref, entry.Phase, version-2, runner)
+	if err != nil || prior > leader {
+		return ErrEvidenceConflict
+	}
+	preBlock, err := loadCurrentProviderPhaseEntry(ctx, q, ref, entry.Phase, version-2, runner, prior)
 	if err != nil || preBlock.Version != entry.Version || preBlock.Digest != entry.Digest || preBlock.State != entry.State {
 		return ErrEvidenceConflict
 	}
-	var blockTrigger, recoverTrigger, blockRaw string
+	var blockTrigger, recoverTrigger, blockRaw, recoverRaw string
 	var blockFrom, blockTo, recoverFrom, recoverTo domain.State
 	if err := q.QueryRowContext(ctx, `SELECT trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version-1).Scan(&blockTrigger, &blockFrom, &blockTo, &blockRaw); err != nil {
 		return ErrEvidenceConflict
 	}
-	if err := q.QueryRowContext(ctx, `SELECT trigger,from_state,to_state FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&recoverTrigger, &recoverFrom, &recoverTo); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&recoverTrigger, &recoverFrom, &recoverTo, &recoverRaw); err != nil {
+		return ErrEvidenceConflict
+	}
+	if prior != leader && !providerBlockedBridgeMatches(recoverRaw, version, runner, prior, leader) {
 		return ErrEvidenceConflict
 	}
 	var payload struct {
@@ -511,7 +583,7 @@ func validateProviderAttemptControlBlockAdvance(ctx context.Context, q rowQuerye
 		return ErrEvidenceConflict
 	}
 
-	currentVersion, currentRunner := source.version, source.runner
+	currentVersion, currentRunner, currentLeader := source.version, source.runner, source.leader
 	usedControl := false
 	for index := 0; index < len(changes); {
 		first := changes[index]
@@ -545,6 +617,19 @@ func validateProviderAttemptControlBlockAdvance(ctx context.Context, q rowQuerye
 			if recovered.version != currentVersion+2 || recovered.trigger != "operator_recover" || recovered.from != domain.StateBlocked || recovered.to != state {
 				return ErrEvidenceConflict
 			}
+			var bridge providerBlockedLeaderBridge
+			if json.Unmarshal([]byte(recovered.payload), &bridge) != nil {
+				return ErrEvidenceConflict
+			}
+			if bridge.Schema != "" {
+				if usedControl && bridge.PriorLeader >= currentLeader {
+					currentLeader = bridge.PriorLeader
+				}
+				if !providerBlockedBridgeMatches(recovered.payload, recovered.version, currentRunner, currentLeader, bridge.Leader) {
+					return ErrEvidenceConflict
+				}
+				currentLeader = bridge.Leader
+			}
 			currentVersion += 2
 			index += 2
 		default:
@@ -554,9 +639,9 @@ func validateProviderAttemptControlBlockAdvance(ctx context.Context, q rowQuerye
 	if currentVersion != target.version || currentRunner != target.runner {
 		return ErrEvidenceConflict
 	}
-	// A leader may change only while an exact pause/take triplet is in flight;
-	// it cannot cross a typed-blocker recovery pair or an arbitrary gap.
-	if (!usedControl && target.leader != source.leader) || (usedControl && target.leader < source.leader) {
+	// Legacy block pairs cannot change leaders. New pairs must carry the exact
+	// Store-written endpoint bridge, retaining the same bounded attempt window.
+	if (!usedControl && target.leader != currentLeader) || (usedControl && target.leader < currentLeader) {
 		return ErrEvidenceConflict
 	}
 	return nil
@@ -1342,25 +1427,27 @@ func providerBlockedRecoveryPredecessor(ctx context.Context, q interface {
 		return 0, false, ErrPublicationEvidence
 	}
 	preVersion := version - 2
-	var prior uint64
-	if recovery, found, err := loadRunnerRecoveryAt(ctx, q, ref, preVersion); err != nil {
-		return 0, false, err
-	} else if found && recovery.RunnerEpoch == runner {
-		prior = recovery.LeaderEpoch
+	prior, err := providerBlockedEndpointLeader(ctx, q, ref, phase, preVersion, runner)
+	if err != nil {
+		return 0, false, ErrPublicationEvidence
 	}
 	entry, err := loadProviderPhaseEntryAt(ctx, q, ref, phase, preVersion)
 	if err != nil {
-		return 0, false, nil
+		return 0, false, ErrPublicationEvidence
 	}
-	if prior == 0 && entry.Version == preVersion && entry.Runner == runner {
-		prior = entry.Leader
+	// New recovery events seal both leader endpoints in the same transaction
+	// as the operator transition. Legacy same-leader pairs retain their old
+	// interpretation; a leader replacement requires the canonical bridge.
+	var recoveryRaw string
+	if err := q.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_recover'`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&recoveryRaw); err != nil {
+		return 0, false, ErrPublicationEvidence
 	}
-	if prior == 0 {
-		if epoch, found, err := loadProviderRetryEpochForEntry(ctx, q, ref, phase, entry.Version); err != nil {
-			return 0, false, err
-		} else if found && epoch.RetryVersion == preVersion && epoch.RetryRunner == runner {
-			prior = epoch.RetryLeader
+	var bridge providerBlockedLeaderBridge
+	if json.Unmarshal([]byte(recoveryRaw), &bridge) == nil && bridge.Schema == providerBlockedBridgeSchema {
+		if !providerBlockedBridgeMatches(recoveryRaw, version, runner, prior, bridge.Leader) {
+			return 0, false, ErrPublicationEvidence
 		}
+		prior = bridge.Leader
 	}
 	if prior == 0 || prior >= newLeader || validateProviderBlockedRecoveryAdvance(ctx, q, ref, entry, version, runner, prior) != nil {
 		return 0, false, ErrPublicationEvidence
