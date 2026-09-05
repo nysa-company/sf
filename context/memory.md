@@ -2,6 +2,15 @@
 
 ## Current truth
 
+- Installer fix committed67f718f; acceptance/picker docs8fed9d4. Clean
+  bundle build42834 PASS (onboarding3, exact8fed9d407fd6e62c677ac95d4d4e0d9ead678382).
+  Installed at /Users/sofiagonzalez-2/Projects/sf-clean-install.bTBsFX/installed;
+  runtime core/publication validation, version, template PASS. Fresh HOME
+  beneath same root init --check against acceptance project PASS, no registration.
+  Unsafe /private/tmp acceptance/rejected-install3 refused before creation,
+  absence verified. Active acceptance daemon19839 unchanged, no new ticket
+  or approval. Full unassisted onboarding/four-stack beta remain unproven.
+
 - Fresh onboarding acceptance ticket SF-543bc4cd3b9a9a6291c2bbc7ca20b3b1
   is waiting_approval v9/r1 (live CLI rechecked), not delivered yet. Created
   2026-09-05T21:48:45Z with2h/$20 ceiling; deadline23:48:45Z. Private repo

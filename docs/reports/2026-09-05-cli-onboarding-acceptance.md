@@ -49,12 +49,23 @@ vet, repository, secret, docs and artifact checks passed. A sandbox-only run
 could not preserve special-mode fixture bits; the exact host rerun passed.
 
 This is not an unassisted clean onboarding success, and no <=10-minute setup
-claim is made. A repeat trial on the corrected installer remains necessary.
+claim is made.
+
+A subsequent clean build at `8fed9d407fd6e62c677ac95d4d4e0d9ead678382`
+produced onboarding3. Installation beneath trusted ancestry passed, including
+the new runtime helper checks, installed version identity and ticket template.
+The same binary refused a private leaf below `/private/tmp` before creating
+the destination. Installed `init --check` passed against the Go fixture with
+a fresh HOME and reported providers/runtime/publication as not checked.
+This repeat proves local installation and preview, not an independent user's
+complete setup or a second provider delivery. The active acceptance daemon
+was not replaced during its approval wait.
 
 ## Remaining acceptance
 
 - Exact-head human approval, merge and terminal reconciliation of this ticket.
-- Repeat clean installation/onboarding without the repairs above.
+- Complete clean onboarding without author intervention beyond the passing
+  repeat installation/local-preview checks above.
 - Supported-stack expansion and execution fixtures for dependency-bearing
   Node/TypeScript, Python and Rails; actual Claude execution composition.
 - Three unfamiliar external users and the ten-ticket reliability target.
