@@ -225,3 +225,44 @@ and usage units are not an audited monetary bill. Explicit operator actions
 included four exact-head approvals, six cancellations, qualification after
 repair rollouts and one post-merge recovery restart. Report those interventions
 rather than describing the campaign as unattended.
+
+## Second confirmation and final-review refresh defect
+
+Relay31 (`f267719`) started a fresh pair at14:39 UTC with full90-minute/$20
+limits. SF-f0e41df7a1b66127a00a1068477cbd31 delivered
+[PR13](https://github.com/nysa-company/sf-v1-relay-pilot/pull/13), merged at
+14:48:06 to `3b2ff8479ad890496db846661123756e779f7807`; local state is donev11.
+Its exact reviewed head was `0ef53b0cb7e5c60a843355538e6f4d7335cfd702`, with
+required CI33972768370 and independent final review passing before SF approval.
+
+Sibling SF-8f05243f19d6be0cc1592764490fcf3e retained
+[PR14](https://github.com/nysa-company/sf-v1-relay-pilot/pull/14) through an
+automatic protected-base refresh. Candidate2 head
+`83474cf25a4a7568d7396d4085b52ac1f5066c6f` uses PR13's merge as its base;
+CI33972962797 passed. At16:00 it remained reviewingv12, with no fresh review
+attempt. It is **not counted as delivered**.
+
+Independent timestamp audit proves135.939 seconds of successful cross-ticket
+provider overlap, peak2. Native diffs for both sibling generations and PR13
+contain only their two declared regular files. There was one PR14 creation and
+one edit, not two PRs. These facts do not establish two completed workflows.
+
+Read-only diagnosis proved current final-review authority and clean worktree
+both pass. The reusable-result selector instead selects the old v7 review,
+then rejects its attempt to traverse the refresh as a stale fence. Worker
+launches a new review only on authenticated absence, so every tick stalls.
+The narrow repair recognizes only the exact predecessor review consumed by
+an authenticated completed refresh, validates current successor/CI authority,
+and reports that a fresh review is required. It does not reuse the old review.
+The new full-lifecycle Store regression passes with the repair and fails with
+`ticket fence is stale` when the repair call is disabled. Unrelated historical
+review evidence remains refused. Full normal validation (`go test -p 2 -count=1
+-timeout=30m ./...`), the targeted race regression, and `make verify-static`
+all passed in session34163. Store239.218s, Git429.559s, workflowruntime215.325s,
+and the targeted race17.355s are recorded wall times, not throughput promises.
+Relay31 has not been replaced and PR14 has not been approved. Its original
+deadline passed at16:09:21. Supported SF cancellation completed at16:11 UTC,
+leaving cancelledv14/runner2 and preserving draft PR14 and its worktree. This
+second confirmation is one delivery and one cancellation, not a successful
+concurrent-delivery pair. The regression/validation delay is an operator
+intervention and is included in the failed trial's elapsed time.

@@ -2,6 +2,17 @@
 
 ## Current truth
 
+- 2026-09-05 capacity-two campaign remains active. Original ten:4done/6cancelled.
+  Follow-up PR12 and PR13 delivered separately; no pair with actual provider
+  overlap has yet both delivered. See the campaign report for immutable counts.
+  Live Relay31/f267719 (dev leader37) exposed a PR14 review stall after an
+  automatic base refresh. Its old review blocked new review selection. A narrow Store
+  cutover repair plus full lifecycle regression passes before/after validation:
+  regression fails without the fix; full normal/race/static session34163 PASS.
+  PR14's original deadline passed16:09UTC; supported SF cancellation completed
+  at16:11 (cancelledv14/R2), preserving its draft/worktree. Never approve it.
+  Validated repair is ready for a dev-only rollout. Live DB/worktree repairs
+  are prohibited. Remaining fresh pair, if necessary, uses original specs02/09.
 - `sf` is a new local Go implementation; the legacy factory is not migrated.
 - The approved plan and normative state machine live under `docs/plans/`.
 - SQLite is the sole application authority; logs and NDJSON are projections.

@@ -1725,6 +1725,13 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if live.Version != request.ExpectedVersion || live.RunnerEpoch != request.Fence.RunnerEpoch || liveLeader != request.Fence.LeaderEpoch {
 		return LatestReusableProviderAttemptResult{}, ErrStaleFence
 	}
+	if request.Phase == domain.PhaseReview && live.State == domain.StateReviewing {
+		if superseded, err := s.reviewPredatesProtectedBaseRefresh(ctx, request, key); err != nil {
+			return LatestReusableProviderAttemptResult{}, err
+		} else if superseded {
+			return LatestReusableProviderAttemptResult{}, ErrNotFound
+		}
+	}
 	candidateRepairAuthority := false
 	if request.Phase == domain.PhaseBuild && live.State == domain.StateBuilding {
 		if refresh, refreshErr := s.protectedBaseRefreshBuildContextAt(ctx, s.db, request.Ref, request.ExpectedVersion, request.Fence); refreshErr == nil {
@@ -1834,6 +1841,51 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 		return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
 	}
 	return result, nil
+}
+
+// reviewPredatesProtectedBaseRefresh retires only an authenticated review of
+// the exact predecessor consumed by a completed base refresh. It does not
+// widen recovery: the successor still needs its own Reviewer result. Read the
+// current CI/candidate and historical result in one snapshot before reporting
+// absence to a caller that may launch a fresh review.
+func (s *Store) reviewPredatesProtectedBaseRefresh(ctx context.Context, request LatestReusableProviderAttemptRequest, key ProviderAttemptResultKey) (bool, error) {
+	var superseded bool
+	err := s.readProtectedBaseRefreshSnapshot(ctx, func(q *sql.Conn) error {
+		refresh, completion, err := protectedBaseRefreshForTicketAt(ctx, q, request.Ref)
+		if errors.Is(err, ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return ErrEvidenceConflict
+		}
+		historical, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, q, key)
+		if err != nil {
+			return ErrEvidenceConflict
+		}
+		if historical.Claim.ExpectedVersion >= completion.Version {
+			return nil
+		}
+		authority, err := s.finalReviewAuthorityFrom(ctx, q, request.Ref, request.ExpectedVersion, request.Fence)
+		if err != nil {
+			return ErrEvidenceConflict
+		}
+		builder, _, err := s.loadHistoricalProviderAttemptResult(ctx, q, authority.Candidate.BuilderResult)
+		if err != nil {
+			return ErrEvidenceConflict
+		}
+		if _, err := protectedBaseRefreshCandidateAt(ctx, q, authority.Candidate, builder); err != nil {
+			return ErrEvidenceConflict
+		}
+		validation, err := phaseartifact.DecodeCanonicalValidation(historical.Validation)
+		predecessor := refresh.Candidate.Snapshot
+		claim := historical.Claim
+		if err != nil || parsed.Reviewer == nil || claim.Ref != request.Ref || claim.Phase != domain.PhaseReview || claim.Role != "reviewer" || claim.ExpectedVersion > refresh.TicketVersion || claim.Worktree != refresh.Worktree.Path || claim.WorktreeIdentity != string(refresh.Worktree.IdentityJSON) || claim.BaseSHA != predecessor.BaseSHA || validation.ExpectedReviewedHead != predecessor.HeadSHA || validation.ExpectedProofDigest != predecessor.ProofDigest || parsed.Reviewer.ReviewedHead != predecessor.HeadSHA || parsed.Reviewer.ProofDigest != predecessor.ProofDigest {
+			return ErrEvidenceConflict
+		}
+		superseded = true
+		return nil
+	})
+	return superseded, err
 }
 
 // FailProviderAttemptBeforeLaunch releases a claim only when adapter
