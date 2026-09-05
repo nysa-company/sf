@@ -2,6 +2,64 @@
 
 ## Current truth
 
+- New uncommitted internal/pythonclosure manifest layer (not execution
+  admission): descriptor-relative bounded capture of prepared regular files
+  and directories; hashes bytes/path/kind/mode/size; canonical shape/parent/
+  ordering checks; no ambient root reopen or shared directory cursor.
+  Rejects symlinks/special files, changed bytes/mode/inventory, malformed
+  evidence; caller must authenticate root and exclude writers separately.
+  Focused race57458 PASS1.457s; depth tightening race+real stage11958 PASS
+  1.453s plus pre/post verification of .context/python-stage-3937252858
+  manifest sha256:f56fd5e38e1ce35b8468c53a49df88d1d601946654540d4891ecbe45a7eedb03.
+  No Store/schema/command allowlist change. Full normal/vet/repo/secret/docs/
+  artifact gate10486 TERMINAL exit0: Store133.305s, workflowruntime123.965s,
+  worktreecoord135.747s, all static checks PASS. Ten-repeat race86365 PASS
+  1.531s. Runtime preparation must materialize aliases as regular layout.
+  Next integration anchors recorded in .context/python-integration-next.md:
+  shared resolver/supervisor identity, explicit channel root, combined runtime/
+  dependency/bootstrap binding, and scratch ownership through proven drain.
+
+- Modern Python feasibility now PASS in disposable scratch, not SF support:
+  .context/python-modern.OC2EHL holds public standalone3.13.15 ARM64 release
+  20260901, archive SHA256 verified against GitHub API. Private pip wheelhouse
+  and requirements.lock pin pytest8.4.2+4deps; installed offline with hashes.
+  Fixed isolated bootstrap + deny-default profile + private TMPDIR passes7
+  tests (count/read-only input, project write/network/subprocess refusal,
+  private tmp_path roundtrip, symlink escape refusal), normal FD capture.
+  Needs /dev/null device read/write, fixture cwd; no SF root read added.
+  No global install, production allowlist, live daemon, or ticket changed.
+  Next convert feasibility into authenticated runtime/dependency/scratch
+  composition with Store binding and cancel/recovery tests, not unsupported
+  execution claims. Evidence in .context/python-runtime-feasibility.md.
+
+- Python relocation spike passed (not production support): ignored Go tool
+  .context/python-stage-probe.go creates bounded private hashed snapshot,
+  preserving interpreter/framework/stdlib layout, no site-packages/dev cache.
+  21060 PASS first;11491 PASS strengthened with original-runtime read denial.
+  Latest .context/python-stage-256035698 contains778 files/36,742,075 bytes;
+  sys.executable/prefix/json module use stage. File write/network/subprocess
+  and original json module read all EPERM. No production policy or live state
+  changed. Still needs modern runtime/native/dependency closure, Store identity
+  binding and cache/lease/cancel/recovery tests before Python can be admitted.
+
+- b23a042 is the committed ticket/decision picker checkpoint; worktree was
+  clean after commit. Python feasibility is now recorded in ignored
+  .context/python-runtime-feasibility.md: host CLT Python3.9.6 -I/-S/-B flags
+  work, but deny-default Seatbelt probe fails before code (symlink EPERM then
+  canonical path exit134; cause unproven). No passing sandbox claim, no runtime
+  allowlist/qualification/dependency install/live change. Next expansion needs
+  explicit authenticated CPython+stdlib/native/dependency snapshot and its
+  real execution/fault tests, not a pytest allowlist exception.
+
+- Python probe follow-up DONE_WITH_CONCERNS: dyld crash was missing literal
+  root read (sandbox log proof); allowing /System alone did not fix it. Then
+  canonical CLT bin/python3.9 revealed posix_spawn of framework Python.app.
+  Direct framework interpreter under deny-default + exact exec passed three
+  times, EPERM for file write/network/subprocess, forbidden file absent.
+  .context/python-runtime-profile.sb and python-runtime-probe.py reproduce.
+  This is not production qualification: runtime tree is unstaged, Apple3.9.6
+  only, dependencies/lease/recovery untested. No production code changed.
+
 - Interactive decision picker now implemented atop optional --head:
   omitted ID / --select / prefix+project interactive path selects exact ID,
   reads ticket.status, requires waiting_approval plus valid full head, displays
