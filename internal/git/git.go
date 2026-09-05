@@ -2817,7 +2817,7 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 		if err != nil {
 			return "", beforeStart(err)
 		}
-		return "", beforeStart(fmt.Errorf("%w: remote base moved", ErrUnexpectedRemote))
+		return "", beforeStart(protectedBaseChange(worktree.Identity.BaseHead, remoteBase))
 	}
 	// Use the strict observer for the candidate ref. Unlike the generic remote
 	// helper, it rejects whitespace/duplicate ls-remote output and rechecks the

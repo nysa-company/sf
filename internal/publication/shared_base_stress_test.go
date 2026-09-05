@@ -1,10 +1,12 @@
 package publication_test
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 
 	"github.com/nysa-company/sf/internal/domain"
+	gitboundary "github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/publication"
 )
 
@@ -24,8 +26,13 @@ func TestSharedBaseMovementNeverPublishesStaleCandidateOnRetry(t *testing.T) {
 	}
 	worker := publication.Worker{Store: f.db, Git: f.runner, GitHub: f.github}
 	for attempt := 0; attempt < 3; attempt++ {
-		if result, err := worker.Run(f.ctx, f.ref, f.fence); err == nil || result.Transitioned {
-			t.Fatalf("retry %d accepted stale base: result=%+v err=%v", attempt, result, err)
+		result, runErr := worker.Run(f.ctx, f.ref, f.fence)
+		if runErr == nil || result.Transitioned {
+			t.Fatalf("retry %d accepted stale base: result=%+v err=%v", attempt, result, runErr)
+		}
+		var change *gitboundary.ProtectedBaseChange
+		if !errors.As(runErr, &change) || !errors.Is(runErr, gitboundary.ErrPushBeforeStart) || change.Expected != f.candidate.Snapshot.BaseSHA || change.Observed != moved {
+			t.Fatalf("retry %d did not preserve exact before-handoff base drift: %v", attempt, runErr)
 		}
 		if f.gitPushCount != 0 || f.github.MutationCount("pr_create") != 0 {
 			t.Fatalf("retry %d mutated stale candidate: pushes=%d creates=%d", attempt, f.gitPushCount, f.github.MutationCount("pr_create"))
