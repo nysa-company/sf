@@ -90,6 +90,18 @@ policy and runtime readiness are still checked at submission and execution.
 
 ## Submit, start, and observe
 
+For the composed path, use:
+
+```sh
+sf-dev run ticket.md --project my-app --watch
+```
+
+This submits and starts the exact queued ticket, then follows its status.
+Ctrl-C stops watching, not the ticket. If start is refused, submission still
+exists and its deadline is running; follow the reported action. Paused/blocked
+tickets are never implicitly resumed. The separate commands below remain
+available when you want to inspect submission before starting.
+
 From the SF source directory, replace `my-app` with the registered name:
 
 ```sh

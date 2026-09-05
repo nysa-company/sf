@@ -2,6 +2,15 @@
 
 ## Current truth
 
+- Run composition checkpoint: `run <file> --project <name> [--watch]`
+  reuses daemon submit/start/status, validates returned scope/identity, starts
+  queued only, never retries mutation or implicitly resumes blocked/paused
+  tickets. Narrow tests pass (51289); full CLI race passes (53118). Real
+  socket/Store tests prove same-source replay, start refusal retaining queued
+  submission, and lost committed submit/start responses without duplicate
+  tickets/start events; focused daemon race passes (46124). Initial
+  fake status used the wrong envelope and hung; corrected to the actual nested
+  daemon shape and bounded the fixture context. No live runtime changes.
 - 2026-09-05 second onboarding checkpoint is committed as 7e1f67e: cwd/project defaults
   and read-only `init --check`, with explicit unsupported-stack explanations.
   Focused CLI/config tests pass (session51388); full normal and static/release

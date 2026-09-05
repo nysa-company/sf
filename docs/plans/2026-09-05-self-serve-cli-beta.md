@@ -89,4 +89,9 @@ preview. Ticket template/validation and interactive creation are implemented:
 the full draft is previewed, saving requires explicit confirmation, existing
 files are never overwritten, and no submission occurs. Focused normal and
 full CLI race tests pass. Compiled interactive acceptance is still pending.
-Next: safe run/watch composition.
+Run/watch composition is implemented through existing daemon requests, with
+scope/identity validation and no automatic mutation retries or pause recovery.
+Real socket/Store tests cover replay, start refusal, and lost committed
+submit/start responses; focused daemon race and full CLI race pass. Compiled
+interactive onboarding and fresh full delivery still remain to be proven.
+Next: compiled onboarding acceptance and explicit readiness/distribution work.

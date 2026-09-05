@@ -19,6 +19,7 @@ sf ticket template
 sf ticket new <ticket.md>
 sf ticket validate <ticket.md>
 sf submit <ticket.md> --project <name>
+sf run <ticket.md> --project <name> [--watch]
 sf tickets [--project <name>]
 sf start <ticket>
 sf status [ticket] [--watch]
@@ -82,6 +83,16 @@ new private file; existing files are never overwritten. Edit the saved Markdown
 to change its limits or add detail. JSON and piped calls do not prompt or create
 a file; use the template and validation commands instead. Creation never
 submits work or starts the deadline.
+
+`run` composes submission and start through the existing daemon. It starts only
+the exact queued ticket returned for that source/project/channel. Repeating it
+does not request a new identity: an active ticket is observed, while paused,
+blocked, stopping or cancelling tickets require explicit operator action.
+It never automatically resumes, retries or approves. An uncertain response
+stops the command with an inspection action; no mutation is retried by the CLI.
+After a refused start, the submitted ticket still exists and its deadline is
+already running. `--watch` follows that exact ticket; Ctrl-C stops watching,
+not the work. JSON watch output is newline-delimited response envelopes.
 
 For newly recorded indeterminate provider results, `sf logs <ticket> --json`
 includes a `provider_result_diagnostic` event. Its closed `reason` distinguishes
