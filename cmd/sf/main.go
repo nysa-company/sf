@@ -219,15 +219,22 @@ func existingDirectory(path string) bool {
 // requested. Direct commands such as doctor, version, and init must remain
 // usable on a host without gh or GitHub authentication.
 func publicationCapability(home string, channel domain.Channel) (ownerHome, ghBinary, ghConfigDir string, prePublishingOnly bool, err error) {
+	return publicationCapabilityWith(home, channel, os.Getenv("GH_CONFIG_DIR"), os.Getenv("XDG_CONFIG_HOME"), exec.LookPath, githubAuthenticated)
+}
+
+func publicationCapabilityWith(home string, channel domain.Channel, explicit, xdg string, lookup func(string) (string, error), authenticate func(string, string, string) (bool, error)) (ownerHome, ghBinary, ghConfigDir string, prePublishingOnly bool, err error) {
 	ghBinary = ""
-	if resolved, lookErr := exec.LookPath("gh"); lookErr == nil {
+	if resolved, lookErr := lookup("gh"); lookErr == nil {
 		ghBinary = resolved
 	}
-	ghConfigDir = filepath.Join(home, ".config", "gh")
-	prePublishingOnly = home == "" || ghBinary == "" || !existingDirectory(ghConfigDir)
+	ghConfigDir, err = selectedGitHubConfigDirectory(home, explicit, xdg)
+	if err != nil {
+		return "", "", "", false, err
+	}
+	prePublishingOnly = home == "" || ghBinary == "" || ghConfigDir == ""
 	if !prePublishingOnly {
 		var authenticated bool
-		authenticated, err = githubAuthenticated(ghBinary, home, ghConfigDir)
+		authenticated, err = authenticate(ghBinary, home, ghConfigDir)
 		if err != nil {
 			return "", "", "", false, fmt.Errorf("GitHub capability preflight failed safely; run sf-%s doctor, install/repair gh, and authenticate GitHub: %w", channel, err)
 		}

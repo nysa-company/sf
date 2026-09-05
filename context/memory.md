@@ -2,6 +2,33 @@
 
 ## Current truth
 
+- GitHub configuration checkpoint is uncommitted on4fb00b4. Shared auth
+  selector serves both daemon and auth status/login: GH_CONFIG_DIR, then
+  XDG_CONFIG_HOME/gh, then HOME/.config/gh. Existing directories require safe
+  ownership/mode/canonical identity; missing selection never falls back to a
+  different account. Only GitHub receives this path. No tokens forwarded or
+  credentials copied. Focused48417 PASS; compiled38155 predates shared helper.
+  Baseline75623 PASS all normal packages + vet/repo/secret/docs. Follow-up
+  changed auth/CLI/codexprovider/cmd/sf (confirmed reverse imports); final
+  uncached four-package + auth race + static gate73877 PASS (auth0.463s,
+  CLI4.147s,codexprovider1.488s,cmd88.434s,auth race1.459s; vet/repo/secret/docs).
+  Report baseline plus final affected-package evidence, not a frozen full run.
+  Clean4fb bundle/install exists at /private/tmp/sf-cli-beta.q2uEO9; new
+  committed build/install is still required before the fresh daemon trial.
+
+- Isolated acceptance: /private/tmp/sf-onboarding-acceptance.R2QvPm/project,
+  HEAD22e26b50d480839dd4273b2584d9f8b607a0591f, dependency-free Go counter.
+  Private remote https://github.com/nysa-company/sf-cli-beta-acceptance-20260905
+  created/verified private. Initial CI33993171561 completed SUCCESS at that
+  exact SHA. New main protection verified strict required test/admin-enforced,
+  force pushes/deletions false. No existing project/protection changed.
+  HOME sibling /home mode0700; ticket sibling /ticket.md (CountNonEmpty, six
+  criteria, guarded,2h/$20), digest
+  ac3974b9d9ada11daa9acd965a5f689917a337dfc8d6871b7823a996620d04e9.
+  Installed4fb ticket validate/init --check and seed go test pass. Requested
+  implementation is absent. Preserve seed/ticket for trial; use explicit
+  project name. No registration/submission/provider work or delivery yet.
+
 - Combined readiness/deadline/Doctor/scheduler-diagnostics checkpoint on parent
   894165a passed full normal suite and vet/repo/secret/artifact/docs/release gate
   43551. Source stayed frozen during that gate (only documentation/audit updates).

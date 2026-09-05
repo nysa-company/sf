@@ -20,12 +20,13 @@ type runnerCall struct {
 }
 
 type fakeRunner struct {
-	calls          []runnerCall
-	authenticated  bool
-	interactive    int
-	interactiveErr error
-	versionOutput  []byte
-	statusOutput   []byte
+	calls                  []runnerCall
+	authenticated          bool
+	interactive            int
+	interactiveErr         error
+	interactiveEnvironment []string
+	versionOutput          []byte
+	statusOutput           []byte
 }
 
 func (runner *fakeRunner) Probe(_ context.Context, executable string, arguments, environment []string, limit int) (ProbeResult, error) {
@@ -48,8 +49,9 @@ func (runner *fakeRunner) Probe(_ context.Context, executable string, arguments,
 	return ProbeResult{ExitCode: exit, Output: output}, nil
 }
 
-func (runner *fakeRunner) Interactive(_ context.Context, _ string, _ []string, _ []string, terminal Terminal) (int, error) {
+func (runner *fakeRunner) Interactive(_ context.Context, _ string, _ []string, environment []string, terminal Terminal) (int, error) {
 	runner.interactive++
+	runner.interactiveEnvironment = append([]string(nil), environment...)
 	if terminal.In == nil || terminal.Out == nil || terminal.Err == nil {
 		return -1, errors.New("terminal missing")
 	}
@@ -249,7 +251,7 @@ func canonicalTempDir(t *testing.T) string {
 
 func assertSafeEnvironment(t *testing.T, environment []string) {
 	t.Helper()
-	allowed := map[string]bool{"HOME": true, "PATH": true, "LC_ALL": true, "LANG": true, "USER": true, "LOGNAME": true, "TERM": true}
+	allowed := map[string]bool{"HOME": true, "PATH": true, "LC_ALL": true, "LANG": true, "USER": true, "LOGNAME": true, "TERM": true, "GH_CONFIG_DIR": true}
 	for _, item := range environment {
 		key, _, ok := strings.Cut(item, "=")
 		if !ok || !allowed[key] {

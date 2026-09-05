@@ -69,6 +69,21 @@ cd /absolute/path/to/sf-source
 ./bin/sf-dev daemon run
 ```
 
+`sf auth status/login` and the daemon select GitHub CLI configuration in this order:
+`GH_CONFIG_DIR`, then `$XDG_CONFIG_HOME/gh`, then `$HOME/.config/gh`.
+Overrides must be clean absolute paths to real owner-controlled directories
+(not symlinks or group/world-writable directories). A missing selected
+directory or inactive authentication disables publication; SF never silently
+falls back to another account. Set overrides in the daemon's terminal before
+starting it. Use the same overrides in the terminal running `sf auth`.
+Official interactive login can create its selected missing configuration;
+SF itself does not create it or fall back to the default account.
+Credentials are referenced in place, not copied into SF's state.
+Changing the GitHub configuration location does not change SF's HOME-based
+stable/dev state directories. This follows the
+[GitHub CLI configuration precedence](https://cli.github.com/manual/gh_help_environment),
+with SF's additional directory safety checks.
+
 Return to the first terminal and qualify the two Codex-backed logical roles,
 then run the read-only diagnostic:
 
