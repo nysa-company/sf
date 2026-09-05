@@ -413,6 +413,13 @@ func (manager Manager) environment(executable string, provider Provider) ([]stri
 		// than omitting it and accidentally selecting a default account.
 		environment = append(environment, "GH_CONFIG_DIR="+selected)
 	}
+	if provider == Codex {
+		selected, err := codexConfigDirectory(home, manager.Getenv("CODEX_HOME"))
+		if err != nil {
+			return nil, err
+		}
+		environment = append(environment, "CODEX_HOME="+selected)
+	}
 	for _, key := range []string{"USER", "LOGNAME", "TERM"} {
 		if value := manager.Getenv(key); safeEnvironmentValue(value) {
 			environment = append(environment, key+"="+value)

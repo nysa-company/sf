@@ -2,6 +2,21 @@
 
 ## Current truth
 
+- GitHub checkpoint committed5d36c8d7f4853e09a994e45232e0f58538d1881d;
+  artifact/release94235 PASS. Clean build+verified install45405 PASS at
+  /private/tmp/sf-onboarding-acceptance.R2QvPm/{bundle,installed}, version
+  0.1.0-dev.onboarding1. Isolated installed auth status proves GitHub active,
+  but Codex unauthenticated: Manager ignored CODEX_HOME while composer honors
+  it. Follow-up now implements Codex-only validated directory forwarding,
+  tests missing/unsafe paths and no cross-provider leakage; not committed.
+  Official docs verified via OpenAI Docs skill:
+  https://learn.chatgpt.com/docs/auth (file credentials under CODEX_HOME),
+  https://learn.chatgpt.com/docs/config-file/config-advanced (default ~/.codex).
+  Auth race13234 PASS1.569s. Fresh affected-package + vet/repo/secret/docs/
+  artifact gate49361 PASS (auth0.506s,CLI4.123s,codexprovider1.472s,cmd88.469s).
+  Committed build and isolated auth
+  recheck still required. No model invoked or login performed.
+
 - GitHub configuration checkpoint is uncommitted on4fb00b4. Shared auth
   selector serves both daemon and auth status/login: GH_CONFIG_DIR, then
   XDG_CONFIG_HOME/gh, then HOME/.config/gh. Existing directories require safe
@@ -22,6 +37,8 @@
   created/verified private. Initial CI33993171561 completed SUCCESS at that
   exact SHA. New main protection verified strict required test/admin-enforced,
   force pushes/deletions false. No existing project/protection changed.
+  GraphQL recheck confirms main exact strict/admin-enforced, required context
+  test, both bypass counts0; parent-inclusive ruleset inventory empty.
   HOME sibling /home mode0700; ticket sibling /ticket.md (CountNonEmpty, six
   criteria, guarded,2h/$20), digest
   ac3974b9d9ada11daa9acd965a5f689917a337dfc8d6871b7823a996620d04e9.

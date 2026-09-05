@@ -72,8 +72,16 @@ func TestGitHubUnsafeConfigRefusesBeforeProbeOrLogin(t *testing.T) {
 
 func TestGitHubConfigIsNotForwardedToOtherProviders(t *testing.T) {
 	manager, runner := managerFixture(t)
-	manager.Getenv = func(string) string { return "relative" }
+	manager.Getenv = func(key string) string {
+		if key == "GH_CONFIG_DIR" {
+			return "relative"
+		}
+		return ""
+	}
 	manager.Status(context.Background(), Codex)
+	if len(runner.calls) == 0 {
+		t.Fatal("Codex probe did not run")
+	}
 	for _, call := range runner.calls {
 		for _, entry := range call.environment {
 			if strings.HasPrefix(entry, "GH_CONFIG_DIR=") {

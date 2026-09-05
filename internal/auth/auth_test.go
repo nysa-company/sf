@@ -251,7 +251,7 @@ func canonicalTempDir(t *testing.T) string {
 
 func assertSafeEnvironment(t *testing.T, environment []string) {
 	t.Helper()
-	allowed := map[string]bool{"HOME": true, "PATH": true, "LC_ALL": true, "LANG": true, "USER": true, "LOGNAME": true, "TERM": true, "GH_CONFIG_DIR": true}
+	allowed := map[string]bool{"HOME": true, "PATH": true, "LC_ALL": true, "LANG": true, "USER": true, "LOGNAME": true, "TERM": true, "GH_CONFIG_DIR": true, "CODEX_HOME": true}
 	for _, item := range environment {
 		key, _, ok := strings.Cut(item, "=")
 		if !ok || !allowed[key] {

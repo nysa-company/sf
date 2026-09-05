@@ -84,6 +84,13 @@ stable/dev state directories. This follows the
 [GitHub CLI configuration precedence](https://cli.github.com/manual/gh_help_environment),
 with SF's additional directory safety checks.
 
+For Codex, set `CODEX_HOME` consistently in both terminals if you use a custom
+location. SF's authentication commands and runtime select that directory,
+defaulting to `$HOME/.codex`; SF validates the directory without reading or
+copying credentials. This follows the documented
+[Codex configuration location](https://learn.chatgpt.com/docs/config-file/config-advanced#config-and-state-locations).
+Authentication alone does not qualify the runtime or authorize a ticket.
+
 Return to the first terminal and qualify the two Codex-backed logical roles,
 then run the read-only diagnostic:
 
