@@ -43,6 +43,18 @@ Record durable decisions, reversals, incidents, and repeated pitfalls. Never sto
 
 ### 2026-09-05 — First campaign delivery and native contention
 
+Relay28/cf5fbf1 demonstrated two simultaneously released planners and exactly
+two machine/project/provider leases. Third admission refused without mutation.
+PR8 merged0fe4514343fe4afde2a60e2d3176d382630bf01a, but its protected-ref
+proof collided with a sibling provider and became uncertain; the existing
+merge recovery intentionally requires a restart. Extend only the same typed
+pre-insert bounded wait to protected-ref-fetch, not uncertain merge replay.
+Race45003 passed Git2.366s for proof wait and ambiguous response refusal.
+The full suite preceded this two-line extension and must be rerun before the
+campaign is declared complete. Supported idle dev restart is the recovery path;
+no manual live rows or worktree changes. The sibling automatically refreshed
+its base, reran Builder, produced generation2/PR9, passed CI and final review.
+
 Relay27/031ba66 passed full normal tests, focused race and static verification.
 Its native absence recovery unstranded the second ticket's worktree creation
 without DB or checkout edits. The third ticket delivered PR7 through native

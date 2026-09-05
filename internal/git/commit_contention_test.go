@@ -41,6 +41,8 @@ func TestGitCommitWaitsOnlyForDefiniteContention(t *testing.T) {
 		ok              bool
 	}{
 		{"commit waits", "commit", contracts.ErrGitMutationContended, false, 2, true},
+		{"protected proof waits", "protected-ref-fetch", contracts.ErrGitMutationContended, false, 2, true},
+		{"protected proof lost response", "protected-ref-fetch", errors.New("lost acquisition response"), false, 1, false},
 		{"lost response", "commit", errors.New("lost acquisition response"), false, 1, false},
 		{"lease and error", "commit", contracts.ErrGitMutationContended, true, 1, false},
 		{"creation remains immediate", "create-worktree", contracts.ErrGitMutationContended, false, 1, false},

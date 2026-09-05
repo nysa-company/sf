@@ -549,7 +549,8 @@ func (r Runner) acquireMutation(ctx context.Context, claim contracts.GitMutation
 	}
 	acquireCtx := ctx
 	var cancel context.CancelFunc
-	if operation == "commit" {
+	waitForContention := operation == "commit" || operation == "protected-ref-fetch"
+	if waitForContention {
 		acquireCtx, cancel = context.WithTimeout(ctx, gitCommitContentionMaxWait)
 		defer cancel()
 	}
@@ -558,7 +559,7 @@ func (r Runner) acquireMutation(ctx context.Context, claim contracts.GitMutation
 	var err error
 	for {
 		lease, err = r.MutationAuthority.AcquireGitMutation(acquireCtx, claim)
-		if operation != "commit" || lease != nil || !errors.Is(err, contracts.ErrGitMutationContended) {
+		if !waitForContention || lease != nil || !errors.Is(err, contracts.ErrGitMutationContended) {
 			break
 		}
 		timer := time.NewTimer(backoff)
