@@ -73,6 +73,17 @@ version/leader/runner's capacity. It does not infer an answer, change the
 lifecycle, or weaken outstanding-effect protection. The missing answer loop
 remains a product limitation, not a passing unattended-delivery claim.
 
+Final frozen relay25 (`adb3ef5`) delivered linked-event PR #4 and status-count
+PR #5 serially to `done`, with no code/runtime/worktree changes between their
+actual starts and completion. All eight provider phases succeeded on first
+attempts; required and post-merge CI passed. Actual start-to-done times were
+6m33s and 5m33s; the first also had a separately recorded 22-minute pre-start
+queue/repair wait. Guarded approvals were applied under Sofia's standing
+delegated authorization. The bounded isolated recovery matrix passed afterward.
+See `docs/reports/2026-09-05-relay-repeatability.md` for exact OIDs, CI, retained
+failed trials, unavailable billing detail, and scope limitations. This closes
+the bounded repeatability goal, not a general stable-v1 or load-test gate.
+
 ### 2026-08-29 — Local v1 implementation begins
 
 Sofia approved the root-authored replacement plan. The local working repository
