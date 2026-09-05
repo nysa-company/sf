@@ -150,12 +150,16 @@ func TestPublishedBaseRefreshLostApplyResponseRecoversToBuilding(t *testing.T) {
 	if err := f.github.SetBaseHeadOIDForTest(newBase); err != nil {
 		t.Fatal(err)
 	}
+	remoteState := f.github.Snapshot()
+	if len(remoteState.PRs) != 1 || remoteState.PRs[0].Identity.BaseOID != published.PullRequest.BaseOID || remoteState.PRs[0].Identity.BaseOID == newBase {
+		t.Fatalf("fixture did not retain immutable PR base after main advanced: %+v", remoteState.PRs)
+	}
 	if got := gitOutput(t, f.bare, "rev-parse", "refs/heads/"+oldWorktree.Branch+"^{commit}"); got != oldCandidate.Snapshot.HeadSHA {
 		t.Fatalf("initial published branch=%s want=%s", got, oldCandidate.Snapshot.HeadSHA)
 	}
 
 	adapter := &baseRefreshIntegrationGit{store: f.db, runner: f.runner, loseNextApply: true}
-	hosted := baseRefreshIntegrationGitHub{FakeGH: f.github}
+	hosted := contracts.GitHub(f.github)
 	fence := domain.Fence{LeaderEpoch: f.fence.LeaderEpoch, RunnerEpoch: oldTicket.RunnerEpoch}
 	first, err := baseRefreshIntegrationWorkerWithGitHub(f, adapter, hosted).Run(ctx, f.ref, fence)
 	if !errors.Is(err, errBaseRefreshApplyResponseLost) {
@@ -188,6 +192,59 @@ func TestPublishedBaseRefreshLostApplyResponseRecoversToBuilding(t *testing.T) {
 	assertBaseRefreshIntegrationPublicationPreserved(t, ctx, f, published)
 	if got := gitOutput(t, f.bare, "rev-parse", "refs/heads/"+oldWorktree.Branch+"^{commit}"); got != oldCandidate.Snapshot.HeadSHA {
 		t.Fatalf("refresh repushed published branch=%s want=%s", got, oldCandidate.Snapshot.HeadSHA)
+	}
+}
+
+func TestPublishedBaseRefreshRejectsUnrelatedObservedPullRequestBase(t *testing.T) {
+	f := newPublicationFixture(t)
+	defer f.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	initial, err := (publication.Worker{Store: f.db, Git: f.runner, GitHub: f.github}).Run(ctx, f.ref, f.fence)
+	if err != nil || initial.State != domain.StateWaitingCI || !initial.Transitioned {
+		t.Fatalf("initial publication=%+v err=%v", initial, err)
+	}
+	published, err := f.db.LoadPublishedCandidate(ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := f.db.Ticket(ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := f.db.Worktree(ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worktree.Path, "update-ref", baseRefreshIntegrationWorktreeBaseRef(worktree.Branch), worktree.BaseSHA)
+
+	newBase := advanceBaseRefreshIntegrationMain(t, f.bare)
+	unrelatedBase := strings.Repeat("f", len(newBase))
+	if unrelatedBase == published.PullRequest.BaseOID || unrelatedBase == newBase {
+		t.Fatal("fixture produced a non-distinct unrelated base")
+	}
+	if err := f.github.SetBaseHeadOIDForTest(unrelatedBase); err != nil {
+		t.Fatal(err)
+	}
+	before := f.github.Snapshot()
+	adapter := &baseRefreshIntegrationGit{store: f.db, runner: f.runner}
+	hosted := baseRefreshIntegrationGitHub{FakeGH: f.github}
+	result, err := baseRefreshIntegrationWorkerWithGitHub(f, adapter, hosted).Run(ctx, f.ref, domain.Fence{LeaderEpoch: f.fence.LeaderEpoch, RunnerEpoch: ticket.RunnerEpoch})
+	if !errors.Is(err, store.ErrPublicationEvidence) || result.State != domain.StateWaitingCI || result.Version != ticket.Version {
+		t.Fatalf("unrelated PR base result=%+v err=%v", result, err)
+	}
+	if pending, found, pendingErr := f.db.PendingProtectedBaseRefresh(ctx, f.ref, ticket.Version, domain.Fence{LeaderEpoch: f.fence.LeaderEpoch, RunnerEpoch: ticket.RunnerEpoch}); pendingErr != nil || found || pending.ID != 0 {
+		t.Fatalf("unrelated PR base reserved refresh: found=%v pending=%+v err=%v", found, pending, pendingErr)
+	}
+	if adapter.verifyCalls != 0 || adapter.prepareCalls != 0 || adapter.applyCalls != 0 || adapter.refTransactions != 0 {
+		t.Fatalf("unrelated PR base reached refresh verify=%d prepare=%d apply=%d ref_transactions=%d", adapter.verifyCalls, adapter.prepareCalls, adapter.applyCalls, adapter.refTransactions)
+	}
+	if after := f.github.Snapshot(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("unrelated PR base changed hosted state: before=%+v after=%+v", before, after)
+	}
+	if retained, loadErr := f.db.LoadPublishedCandidate(ctx, f.ref); loadErr != nil || !reflect.DeepEqual(retained, published) {
+		t.Fatalf("unrelated PR base changed publication=%+v err=%v", retained, loadErr)
 	}
 }
 

@@ -41,6 +41,29 @@
 
 Record durable decisions, reversals, incidents, and repeated pitfalls. Never store secrets, raw customer or financial data, or raw agent transcripts.
 
+### 2026-09-05 — Ten-ticket campaign terminal, stricter confirmation pending
+
+Original campaign ended4done/6cancelled,37 provider attempts/33 immutable
+completed results. Exact delivered PRs7/8/9/11 each contain only the declared
+tool/test pair and one confirmed create/merge. Main3eb86bb9 passed hosted CI.
+No active/quarantined writer, Git/command/admission lease or executing/uncertain
+effect remained. Cancelled PR10 stays draft; no source/DB repair or silent
+budget extension. The audit found real capacity-two provider overlap only in
+done/cancelled pairs, although successful ticket lifetimes overlapped. Do not
+call that two successful simultaneous provider workflows. A fresh confirmation
+pair is required, reported separately from the four-of-ten result.
+
+PR10 exposed a real GitHub old-base snapshot: its BaseOID stayed at original
+61f9b6f while main advanced3eb86bb9. Published refresh now accepts only that
+authenticated original base or the independently observed exact new base,
+never a third value. No merge/ancestry/CAS authority is relaxed. Plain FakeGH
+regression retains the old PR base instead of overwriting it, including lost
+Apply recovery; negative third-base case refuses before reservation. Focused
+race36372 passed publication45.998s. Final full normal1802 passed; compiled
+acceptance234.557s and all static/release gates passed. Final rollout and
+fresh live confirmation pair still pending. Details are in
+docs/reports/2026-09-05-relay-concurrency-campaign.md.
+
 ### 2026-09-05 — First campaign delivery and native contention
 
 Relay28/cf5fbf1 demonstrated two simultaneously released planners and exactly

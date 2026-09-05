@@ -80,7 +80,12 @@ func (w Worker) refreshProtectedBase(ctx context.Context, ticket store.Ticket, f
 		if err != nil {
 			return result, true, err
 		}
-		if !samePublishedIdentity(observed.Identity, publication.PullRequest) || observed.State != "OPEN" || observed.Merged || observed.MergeCommit != "" || observed.Identity.BaseOID != remote.BaseOID {
+		// GitHub can retain the PR's original base snapshot after the branch
+		// advances. Accept that authenticated old snapshot or the exact fresh
+		// remote tip, never an unrelated third value. The new base authority
+		// still comes from the independent Git proof and leased refresh CAS.
+		baseMatches := observed.Identity.BaseOID == publication.PullRequest.BaseOID || observed.Identity.BaseOID == remote.BaseOID
+		if !samePublishedIdentity(observed.Identity, publication.PullRequest) || observed.State != "OPEN" || observed.Merged || observed.MergeCommit != "" || !baseMatches {
 			return result, true, store.ErrPublicationEvidence
 		}
 	} else {
