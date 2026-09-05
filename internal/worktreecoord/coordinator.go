@@ -158,6 +158,17 @@ func (c Coordinator) Ensure(ctx context.Context, request EnsureRequest) (store.S
 			// writer, so neither confirmation nor an assumed release is safe.
 			return store.StoredWorktree{}, fmt.Errorf("%w: Git writer lease release was not durable: %w", ErrQuarantined, createErr)
 		}
+		if errors.Is(createErr, git.ErrCreateBeforeStart) {
+			// Only the runner's current-invocation, pre-mutation proof allows
+			// retry. A missing directory or lease is never such a proof for an
+			// already uncertain historical claim.
+			recordCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if _, err := c.Store.ObserveEffect(recordCtx, store.EffectObservation{EffectFence: effectFence(claim), Present: false}); err != nil {
+				return store.StoredWorktree{}, fmt.Errorf("%w: record unlaunched creation: %w", ErrQuarantinePersistence, err)
+			}
+			return store.StoredWorktree{}, fmt.Errorf("%w: creation was not launched: %w", ErrInProgress, createErr)
+		}
 		return c.postClaimFailure(request, project, path, claim, createErr)
 	}
 	if c.afterCreate != nil {
@@ -574,6 +585,8 @@ func (c Coordinator) waitForCreation(ctx context.Context, request EnsureRequest,
 		if facts.Effect.State != store.EffectExecuting {
 			if info, err := os.Lstat(path); err == nil && info.IsDir() {
 				return c.reconcileCreation(ctx, request, project, path, facts)
+			} else if errors.Is(err, os.ErrNotExist) && facts.Effect.State == store.EffectUncertain {
+				return c.reconcileAbsentCreation(ctx, request, project, path, facts)
 			} else {
 				// An old result that is no longer executing must either prove the
 				// exact visible directory or remain quarantined.  Treating a
@@ -612,6 +625,39 @@ func (c Coordinator) waitForCreation(ctx context.Context, request EnsureRequest,
 			return store.StoredWorktree{}, fmt.Errorf("%w: creation effect changed while waiting: %v", ErrQuarantined, err)
 		}
 	}
+}
+
+// A negative recovery result is admissible only while a Store-issued,
+// non-launchable observation lease excludes all repository writers and the
+// original claim has been revoked. Native Git must prove every artifact absent.
+func (c Coordinator) reconcileAbsentCreation(ctx context.Context, request EnsureRequest, project store.Project, path string, facts store.GitMutationIntentFacts) (store.StoredWorktree, error) {
+	claim := facts.Claim
+	if claim.TicketRef != request.Ref || claim.Repository != project.Path || claim.Worktree != path || claim.BaseRef != project.BaseRef || claim.ExpectedBaseOID != claim.ExpectedHeadOID {
+		return store.StoredWorktree{}, ErrQuarantined
+	}
+	proofCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	fence := request.Fence
+	fence.ClaimEpoch = facts.Effect.ClaimEpoch
+	handle, err := c.Store.BeginWorktreeCreationAbsence(proofCtx, claim, store.EffectFence{SemanticKey: claim.SemanticKey, Ref: request.Ref, TicketVersion: request.Version, Fence: fence})
+	if err != nil {
+		return store.StoredWorktree{}, fmt.Errorf("%w: exclusive creation observation unavailable: %w", ErrQuarantined, err)
+	}
+	if err = handle.Check(proofCtx); err == nil {
+		err = c.Git.ObserveWorktreeCreationAbsent(proofCtx, claim)
+	}
+	if err == nil {
+		err = handle.CompleteAbsent(proofCtx)
+	}
+	if err != nil {
+		if releaseErr := handle.Release(); releaseErr != nil {
+			return store.StoredWorktree{}, errors.Join(ErrQuarantinePersistence, err, releaseErr)
+		}
+		return store.StoredWorktree{}, fmt.Errorf("%w: creation absence not proven: %w", ErrQuarantined, err)
+	}
+	// Return to the scheduler, not recursive Ensure: creation needs a fresh
+	// current claim and another capacity/admission check on the next tick.
+	return store.StoredWorktree{}, ErrInProgress
 }
 
 func effectFence(claim contracts.GitMutationClaim) store.EffectFence {

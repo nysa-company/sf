@@ -81,7 +81,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 56
+const schemaVersion = 57
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -140,6 +140,7 @@ var migrationChecksums = map[int]string{
 	54: migrationChecksum(migrationV54),
 	55: migrationChecksum(migrationV55),
 	56: migrationChecksum(migrationV56),
+	57: migrationChecksum(migrationV57),
 }
 
 func migrationChecksum(statements []string) string {
@@ -564,6 +565,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV55
 			} else if version == 56 {
 				statements = migrationV56
+			} else if version == 57 {
+				statements = migrationV57
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1705,6 +1708,7 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 const (
 	providerResultIndeterminateCode         = "provider_result_indeterminate"
 	providerRepairUnavailableCode           = "provider_repair_unavailable"
+	postbuildCommandFailedBlockerCode       = "postbuild_command_failed"
 	verificationAmendmentInvalidBlockerCode = "verification_amendment_invalid"
 	legacyCandidateRepairUnverifiableCode   = "legacy_candidate_repair_recovery_unverifiable"
 	providerTerminalBlockerSchema           = "sf.provider-terminal-blocker/v1"
@@ -1745,11 +1749,13 @@ func nonRecoverableProviderBlockerCode(code string) bool {
 
 // nonRecoverableBlockedRecoveryCode is deliberately separate from
 // nonRecoverableProviderBlockerCode. The provider helper selects the
-// attempt-backed canonical blocker writer; verification_amendment_invalid has
-// no terminal provider attempt when prompt construction fails and must remain
-// on the generic typed-block writer while still refusing every recovery path.
+// attempt-backed canonical blocker writer. verification_amendment_invalid and
+// postbuild_command_failed have no terminal provider failure to consume: the
+// latter retains a completed Builder plus an immutable failed repository
+// command. Both remain on the generic typed-block writer while refusing every
+// recovery path.
 func nonRecoverableBlockedRecoveryCode(code string) bool {
-	return nonRecoverableProviderBlockerCode(code) || code == verificationAmendmentInvalidBlockerCode || code == legacyCandidateRepairUnverifiableCode
+	return nonRecoverableProviderBlockerCode(code) || code == postbuildCommandFailedBlockerCode || code == verificationAmendmentInvalidBlockerCode || code == legacyCandidateRepairUnverifiableCode
 }
 
 func providerRoleForPhase(phase domain.Phase) string {

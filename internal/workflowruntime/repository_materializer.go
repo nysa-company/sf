@@ -235,8 +235,8 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 		}
 	}
 	command, result, err := m.runCommand(ctx, request, store.RepositoryCommandPurposePostbuildCandidate, key, phaseartifact.Verification{}, verification.CheckpointID)
-	if err != nil || result.Result.ExitCode != 0 {
-		return workflowworker.CandidateWitness{}, fmt.Errorf("candidate post-build command (exit=%d): %w", result.Result.ExitCode, materializeErr(err))
+	if err := postbuildCommandError(result, err); err != nil {
+		return workflowworker.CandidateWitness{}, err
 	}
 	observation, err := m.commit(ctx, request, key, parent, allowed, verification.OwnedFiles, commitDigest("candidate", request, key, command, result.ResultDigest, struct {
 		Plan         workflowprompt.PlanIdentity
@@ -1036,6 +1036,27 @@ func materializeErr(err error) error {
 		return err
 	}
 	return ErrRepositoryMaterialization
+}
+
+func postbuildCommandError(result store.RepositoryCommandResult, err error) error {
+	if err != nil {
+		// An unavailable, unauthenticated, or ambiguous result is not equivalent
+		// to an observed command failure and must retain its existing fail-closed
+		// disposition.
+		return fmt.Errorf("candidate post-build command (exit=%d): %w", result.Result.ExitCode, materializeErr(err))
+	}
+	if result.Key.SemanticKey == "" || result.Key.ClaimEpoch == 0 || result.ResultDigest == "" || !result.Result.Observed {
+		return fmt.Errorf("candidate post-build command result: %w", ErrRepositoryMaterialization)
+	}
+	if result.Result.ExitCode != 0 {
+		// runCommand returns nil only after Store has loaded and authenticated the
+		// immutable terminal result. This narrow case is safe to classify without
+		// authorizing a rerun or a verification amendment. Preserve the broad
+		// materialization classification for existing callers while exposing the
+		// narrower worker disposition.
+		return fmt.Errorf("candidate post-build command (exit=%d): %w", result.Result.ExitCode, errors.Join(ErrRepositoryMaterialization, workflowworker.ErrPostbuildCommandFailed))
+	}
+	return nil
 }
 
 var _ workflowworker.VerificationCheckpointMaterializer = RepositoryMaterializer{}

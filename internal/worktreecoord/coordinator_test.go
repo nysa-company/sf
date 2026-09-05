@@ -514,6 +514,90 @@ func TestEnsureQuarantinePersistenceFailureIsFailClosed(t *testing.T) {
 	}
 }
 
+func TestEnsureCreationClaimContendsWithRepositoryMutationLease(t *testing.T) {
+	f := setupCoordinator(t, "SF-create-contended")
+	ctx := context.Background()
+	// Establish a second, valid Git mutation claim against the same repository
+	// without touching its filesystem. The hook acquires it after the target's
+	// create claim is issued, reproducing the narrow repository-mutex race.
+	other := domain.TicketRef{Channel: domain.ChannelDev, Project: f.project.ID, Ticket: "SF-create-contender"}
+	if err := f.db.CreateTicket(ctx, store.Ticket{Ref: other, SourceDigest: "source-contender", Type: domain.TicketBug, MergeMode: domain.MergeGuarded}); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := f.db.Ticket(ctx, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := f.db.StartOrAdopt(ctx, other, queued.Version, "dev/nysa/SF-create-contender/worktree", f.request.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := f.db.TicketWorktreePath(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := (git.Allocator{Authority: f.db}).Allocate(ctx, other.Channel, other.Project, other.Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, base, err := f.runner.ObserveRepositoryBase(ctx, f.project.Path, f.project.BaseRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := store.GitMutationIntent{
+		EffectFence:   store.EffectFence{Ref: other, TicketVersion: started.Version, Fence: f.request.Fence},
+		RequestDigest: ensureDigest(other, repository, path, branch, f.project.BaseRef, base),
+		Repository:    repository, Worktree: path, Branch: branch, Operation: "create-worktree",
+		BaseRef: f.project.BaseRef, ExpectedBaseOID: base, ExpectedHeadOID: base,
+	}
+	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)
+	if _, err := f.db.PlanEffect(ctx, store.EffectPlan{SemanticKey: intent.SemanticKey, Ref: other, Kind: "git/create-worktree", TicketVersion: started.Version, Fence: f.request.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	contender, err := f.db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var held contracts.GitMutationLease
+	c := coordinatorFor(f)
+	c.afterCreationClaim = func(contracts.GitMutationClaim) {
+		var acquireErr error
+		held, acquireErr = f.db.AcquireGitMutation(ctx, contender)
+		if acquireErr != nil {
+			t.Fatalf("acquire competing repository lease: %v", acquireErr)
+		}
+	}
+	_, err = c.Ensure(ctx, f.request)
+	if !errors.Is(err, ErrInProgress) || !errors.Is(err, git.ErrCreateBeforeStart) {
+		t.Fatalf("contended creation error=%v, want proven unlaunched retry", err)
+	}
+	if held == nil {
+		t.Fatal("competing repository lease was not acquired")
+	}
+	if err := held.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Worktree(ctx, f.ref); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("contended creation registered worktree: %v", err)
+	}
+	if _, err := f.db.WorktreeCreationIntent(ctx, f.ref); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unlaunched creation still has unresolved intent: %v", err)
+	}
+	c.afterCreationClaim = nil
+	created, err := c.Ensure(ctx, f.request)
+	if err != nil {
+		t.Fatalf("creation retry after contention: %v", err)
+	}
+	facts, err := f.db.WorktreeCreationIntent(ctx, f.ref)
+	if err != nil || facts.Effect.State != store.EffectConfirmed || facts.Claim.ClaimEpoch != 2 {
+		t.Fatalf("retry did not confirm exactly the second claim: %+v %v", facts, err)
+	}
+	replayed, err := c.Ensure(ctx, f.request)
+	if err != nil || replayed.Path != created.Path {
+		t.Fatalf("creation replay: %+v %v", replayed, err)
+	}
+}
+
 func TestEnsureParentFailureAfterClaimPersistsUncertainty(t *testing.T) {
 	f := setupCoordinator(t, "SF-parent-failure")
 	ctx := context.Background()
@@ -754,7 +838,7 @@ func TestEnsureExcludesActiveRepositoryCommandWriter(t *testing.T) {
 	}
 	blocked := EnsureRequest{Ref: ref, Version: started.Version, Fence: domain.Fence{LeaderEpoch: f.request.Fence.LeaderEpoch, RunnerEpoch: started.RunnerEpoch}}
 	path, _ := f.db.TicketWorktreePath(ref)
-	if _, err := coordinatorFor(f).Ensure(ctx, blocked); !errors.Is(err, ErrQuarantined) {
+	if _, err := coordinatorFor(f).Ensure(ctx, blocked); !errors.Is(err, ErrInProgress) || !errors.Is(err, git.ErrCreateBeforeStart) {
 		t.Fatalf("repository command writer did not exclude Git: %v", err)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {

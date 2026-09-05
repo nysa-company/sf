@@ -2256,7 +2256,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	switch code {
 	case "legacy_provider_entry_unverifiable":
 		argv = []string{binary, "cancel", "--help"}
-	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
+	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "postbuild_command_failed", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
 		argv = []string{binary, "cancel", "--help"}
 	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 		argv = []string{binary, "take", "--help"}
@@ -2292,7 +2292,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 		switch code {
 		case "legacy_provider_entry_unverifiable":
 			argv = []string{binary, "cancel", request.Ticket}
-		case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
+		case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "postbuild_command_failed", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
 			argv = []string{binary, "cancel", request.Ticket}
 		case "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 			// `take` is intentionally idempotent and prints the authenticated
@@ -2349,7 +2349,7 @@ func (daemon *Daemon) executable() string {
 
 func nonRecoverableTicketBlocker(code string) bool {
 	switch code {
-	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable":
+	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "postbuild_command_failed", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable":
 		return true
 	default:
 		return false

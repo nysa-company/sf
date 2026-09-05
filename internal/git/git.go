@@ -38,6 +38,10 @@ var (
 	ErrWorktreeDirty    = errors.New("git worktree is not pristine")
 	ErrUnexpectedRemote = errors.New("remote branch head is unexpected")
 	ErrPushBeforeStart  = errors.New("git candidate push failed before mutation handoff")
+	// ErrCreateBeforeStart proves this CreateWorktree invocation did not acquire
+	// its mutation lease or launch a mutating command. It never describes an
+	// ambiguous prior invocation, an existing path, or a failed lease release.
+	ErrCreateBeforeStart = errors.New("git worktree creation refused before mutation handoff")
 	// ErrPushUncertain means the candidate-ref push crossed the command handoff
 	// but the authenticated candidate and protected-base witnesses did not both
 	// converge. The caller must durably reconcile, never blindly replay it.
@@ -1843,7 +1847,10 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	}
 	lease, err := r.acquireSuppliedMutation(ctx, claim, contracts.GitMutationClaim{Repository: repository, Worktree: path, Branch: branch, Operation: "create-worktree", BaseRef: baseRef, ExpectedBaseOID: baseHead, ExpectedHeadOID: baseHead})
 	if err != nil {
-		return Worktree{}, err
+		if errors.Is(err, ErrMutationLeaseRelease) {
+			return Worktree{}, err
+		}
+		return Worktree{}, errors.Join(ErrCreateBeforeStart, err)
 	}
 	defer func() {
 		returnedErr = mergeMutationLeaseRelease(returnedErr, lease)

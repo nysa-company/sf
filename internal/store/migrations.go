@@ -1424,3 +1424,10 @@ var migrationV56 = []string{
 	`CREATE TRIGGER protected_base_refresh_completions_immutable_update BEFORE UPDATE ON protected_base_refresh_completions BEGIN SELECT RAISE(ABORT,'protected base refresh completion is immutable'); END`,
 	`CREATE TRIGGER protected_base_refresh_completions_immutable_delete BEFORE DELETE ON protected_base_refresh_completions BEGIN SELECT RAISE(ABORT,'protected base refresh completion is append-only'); END`,
 }
+
+// v57 distinguishes a repository-exclusive, read-only absence observation
+// lease from a mutation lease. It is additive so existing mutation rows retain
+// their launch-capable default.
+var migrationV57 = []string{
+	`ALTER TABLE git_mutation_leases ADD COLUMN observation_only INTEGER NOT NULL DEFAULT 0 CHECK(observation_only IN (0,1))`,
+}

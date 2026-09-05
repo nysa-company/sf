@@ -41,6 +41,32 @@
 
 Record durable decisions, reversals, incidents, and repeated pitfalls. Never store secrets, raw customer or financial data, or raw agent transcripts.
 
+### 2026-09-05 — Capacity-two live campaign exposed recovery gaps
+
+The authorized concurrency campaign merged pilot setup-only PR6, applied a
+distinct immutable capacity-two/90-minute/$20 dev configuration generation,
+and started two tickets on relay26. A third start correctly refused capacity.
+This is admission evidence, not two concurrent deliveries. Preserve all prior
+pilot records and the registered primary checkout; stable and Nysa remain out
+of scope. Campaign IDs and command evidence are in ignored
+`.context/concurrency-campaign/PLAN.md`.
+
+The second ticket became uncertain before worktree creation when repository
+lease acquisition contended. The new runner distinguishes a current invocation
+that never crossed mutation handoff. Historical uncertainty requires a separate
+exclusive native absence proof for directory, branch, private base ref, and Git
+registration. Additive schema57 marks its lease observation-only: it cannot
+launch a child, and restart abandons only the observation while retaining the
+uncertain effect. Never infer absence from a missing directory or lease alone.
+
+The first ticket's completed Builder failed a contradictory Reviewer test.
+No live test was edited. A durable nonzero postbuild result now produces
+`postbuild_command_failed`, preserving evidence without repeating Builder or
+publishing a candidate. The supported disposition is cancel and fresh submit,
+not an invented verification amendment. The current source passed the complete
+serialized suite; final race/static verification and dev rollout follow. This
+does not close the concurrency goal or establish stable v1.
+
 ### 2026-09-05 — Real delivery and bounded repeatability
 
 The factory delivered Relay PR #3 through test-first verification, independent

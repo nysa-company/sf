@@ -24,9 +24,15 @@ var (
 	ErrCandidateRequired     = errors.New("builder did not provide a Store-authenticated candidate witness")
 	ErrCheckpointRequired    = errors.New("verification did not provide an authenticated checkpoint witness")
 	ErrCommandResultRequired = errors.New("phase did not provide an authenticated repository command result")
-	ErrAmendmentUnsupported  = errors.New("verification amendment requires an authenticated Store amendment request")
-	ErrStaleEvidence         = errors.New("phase evidence is not current for this ticket fence")
-	ErrUnsupportedState      = errors.New("workflow worker cannot execute this ticket state")
+	// ErrPostbuildCommandFailed is emitted only after the repository boundary
+	// has loaded a durable, terminal post-build command result with a non-zero
+	// exit. Worker turns it into a non-recoverable blocker: the failed proof and
+	// completed Builder remain evidence, but v1 does not invent a repair or rerun
+	// the same Builder. The operator must cancel and submit a fresh ticket.
+	ErrPostbuildCommandFailed = errors.New("authenticated post-build repository command failed")
+	ErrAmendmentUnsupported   = errors.New("verification amendment requires an authenticated Store amendment request")
+	ErrStaleEvidence          = errors.New("phase evidence is not current for this ticket fence")
+	ErrUnsupportedState       = errors.New("workflow worker cannot execute this ticket state")
 	// ErrProviderAttemptExhausted is a typed coordinator outcome. It is not a
 	// ticket time/cost budget: Worker converts only this attempt-window limit
 	// through Store's authenticated provider-exhaustion pause boundary.
@@ -273,6 +279,8 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		}
 		blockCode := ""
 		switch {
+		case errors.Is(err, ErrPostbuildCommandFailed):
+			blockCode = "postbuild_command_failed"
 		case errors.Is(err, ErrProviderResultIndeterminate):
 			blockCode = "provider_result_indeterminate"
 		case errors.Is(err, ErrProviderRepairUnavailable):
