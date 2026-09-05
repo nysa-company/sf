@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/nysa-company/sf/internal/version"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,9 @@ import (
 )
 
 func main() {
+	if version.PrintHelperBuildInfo(os.Args, os.Stdout) {
+		return
+	}
 	if len(os.Args) < 6 || strings.Join(os.Args[1:4], "\x00") != "--worktree-fd=3\x00--git-dir-fd=4\x00--common-dir-fd=5" {
 		refuse("invalid invocation")
 	}

@@ -2,6 +2,23 @@
 
 ## Current truth
 
+- Distribution checkpoint in internal/bundle: exact inventory,
+  bounded regular files, canonical manifest, permissions/SHA-256, build path
+  and Mach-O linked version/commit/channel strings. Real Makefile bundle and
+  tamper tests pass (70116). Reproducible trimpath builds omit linker flags;
+  helpers now retain version fields through exact read-only --sf-build-info.
+  Normal helper invocations unchanged; version/helper package compile tests
+  pass. CLI bundle manifest/verify/install is wired; installer verifies before
+  and after copying, refuses existing paths, keeps partial failure explicit,
+  and does not execute payloads. Real install/local intake tests pass (54566).
+  Make bundle/bundle-dev require clean source; tutorial local-bundle.md added.
+  Compiled CLI install/overwrite tests pass (19762); failed copies retain
+  non-executable partial files. Focused bundle/version race passes (27647)
+  after permission and directory-sync tightening. Full normal/static
+  regression is running in session32148. Clean-source Make targets still
+  need final validation after this checkpoint is committed.
+  Linked .str symbol representation is a fail-closed toolchain dependency;
+  checksums are not publisher signatures. No live bundles replaced.
 - Compiled local onboarding acceptance now passes three repeats (92809): full
   dev helper bundle, controlled private HOME/PATH, cwd-derived registration
   and replay, preview with no writes, stable isolation, template/validation

@@ -15,6 +15,9 @@ are never installed silently.
 
 ```text
 sf init [--project <name>] [--repo <path>] [--check]
+sf bundle manifest <directory>
+sf bundle verify <directory>
+sf bundle install <directory> --to <new-directory>
 sf ticket template
 sf ticket new <ticket.md>
 sf ticket validate <ticket.md>
@@ -103,6 +106,11 @@ text. It is diagnostic only: it does not authorize retry, and historical failure
 without this event cannot be assigned a more precise cause retroactively.
 
 ## Exit codes
+
+The local [bundle workflow](tutorials/local-bundle.md) verifies an exact
+matching-version helper distribution before installation. It does not publish
+releases, change PATH, replace existing files or operate on running daemons.
+Manifest hashes establish integrity, not publisher authenticity.
 
 | Code | Meaning |
 | ---: | --- |

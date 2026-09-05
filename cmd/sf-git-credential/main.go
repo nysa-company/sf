@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/nysa-company/sf/internal/version"
 	"os"
 	"time"
 
@@ -10,6 +11,9 @@ import (
 )
 
 func main() {
+	if version.PrintHelperBuildInfo(os.Args, os.Stdout) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := gitcredential.Run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.LookupEnv, gitcredential.OSRunner{}); err != nil {

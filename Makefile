@@ -1,4 +1,4 @@
-.PHONY: build build-dev test test-full test-race test-integration test-crash test-security test-upgrade test-compiled test-compiled-e2e test-all fmt-check test-native-profile verify-static check
+.PHONY: build build-dev bundle bundle-dev test test-full test-race test-integration test-crash test-security test-upgrade test-compiled test-compiled-e2e test-all fmt-check test-native-profile verify-static check
 
 VERSION ?=
 DEV_VERSION ?= 0.0.0-dev
@@ -28,6 +28,18 @@ build-dev:
 
 test:
 	go test -count=1 -shuffle=off -timeout 30m ./...
+
+# Choose a fresh BIN_DIR. Manifest creation refuses extra payloads or overwrite.
+# These targets produce local artifacts, never publish or install them.
+bundle:
+	@git diff --quiet HEAD && test -z "$$(git ls-files --others --exclude-standard)" || { echo "bundle requires a clean committed source tree" >&2; exit 2; }
+	$(MAKE) build
+	"$(BIN_DIR)/sf" bundle manifest "$(abspath $(BIN_DIR))" --json
+
+bundle-dev:
+	@git diff --quiet HEAD && test -z "$$(git ls-files --others --exclude-standard)" || { echo "bundle requires a clean committed source tree" >&2; exit 2; }
+	$(MAKE) build-dev
+	"$(BIN_DIR)/sf-dev" bundle manifest "$(abspath $(BIN_DIR))" --json
 
 # Race runs the complete credential-free Go suite once, serializing package
 # execution because several durable SQLite tests intentionally contend.

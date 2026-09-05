@@ -39,7 +39,9 @@ It currently previews existing configuration, not `--profile`/`--test` setup.
 Follow [source build and foreground setup](source-build-foreground.md) to build
 the dev bundle, authenticate, register your repository, start the daemon in a
 second terminal, qualify the provider pair, and run doctor. Public installation
-and automatic updates are not shipped yet. Doctor's host/provider checks do
+and automatic updates are not shipped yet. A verified explicit
+[local bundle install](local-bundle.md) is available from a clean source build.
+Doctor's host/provider checks do
 not prove your GitHub protection and required checks are merge-ready.
 
 Use a disposable supported project for your first run. Keep your real project

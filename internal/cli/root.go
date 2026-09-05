@@ -77,6 +77,7 @@ func (a *app) command() *cobra.Command {
 	root.AddCommand(a.ticketsCommand())
 	root.AddCommand(a.ticketDraftCommand())
 	root.AddCommand(a.runCommand())
+	root.AddCommand(a.bundleCommand())
 	a.configureTicketSelection(root)
 	return root
 }
