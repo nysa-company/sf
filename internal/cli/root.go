@@ -468,6 +468,13 @@ func defaultOperatorLabel() string {
 func (a *app) doctorCommand() *cobra.Command {
 	var repo string
 	command := &cobra.Command{Use: "doctor", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		if repo != "" {
+			absolute, err := filepath.Abs(repo)
+			if err != nil {
+				return a.emit(failure("invalid_repository", "repository path could not be resolved", []string{binaryName(), "doctor", "--help"}))
+			}
+			repo = absolute
+		}
 		report := RunDoctor(cmd.Context(), productionDoctorDeps(a.channel, repo))
 		return a.emit(reportResponse(report))
 	}}

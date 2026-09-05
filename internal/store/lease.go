@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -15,6 +16,7 @@ import (
 )
 
 var ErrLeaseCapacity = errors.New("lease capacity is exhausted")
+var ErrStartConfigurationChanged = errors.New("project configuration changed after start preflight")
 
 type phaseRecoveryBaseline struct{ version, runner, leader, currentLeader uint64 }
 
@@ -899,6 +901,23 @@ func (s *Store) StartWithOwnership(ctx context.Context, ref domain.TicketRef, ex
 // earlier generation); it can never mix generation N+1 with generation N's
 // capacity.
 func (s *Store) StartWithProjectOwnership(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, workflowID string, at time.Time) (Ticket, bool, error) {
+	return s.startWithProjectOwnership(ctx, ref, expectedVersion, fence, workflowID, at, nil)
+}
+
+// StartWithCheckedProjectOwnership binds an external, read-only readiness
+// check to the exact immutable project snapshot admitted in the transaction.
+// It does not turn that check into execution authority: launch still requires
+// the normal provider and repository-command claims. A changed generation is
+// refused before reserving capacity or changing the queued ticket.
+func (s *Store) StartWithCheckedProjectOwnership(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, workflowID string, at time.Time, checked Project) (Ticket, bool, error) {
+	if checked.Channel != ref.Channel || checked.ID != ref.Project {
+		return Ticket{}, false, ErrStartConfigurationChanged
+	}
+	checked.ConfigSnapshot = append([]byte(nil), checked.ConfigSnapshot...)
+	return s.startWithProjectOwnership(ctx, ref, expectedVersion, fence, workflowID, at, &checked)
+}
+
+func (s *Store) startWithProjectOwnership(ctx context.Context, ref domain.TicketRef, expectedVersion uint64, fence domain.Fence, workflowID string, at time.Time, checked *Project) (Ticket, bool, error) {
 	if err := ref.Validate(); err != nil {
 		return Ticket{}, false, err
 	}
@@ -918,6 +937,9 @@ func (s *Store) StartWithProjectOwnership(ctx context.Context, ref domain.Ticket
 		project, err := loadCurrentProjectConfiguration(ctx, conn, ref.Channel, ref.Project)
 		if err != nil {
 			return startAdmission{}, err
+		}
+		if checked != nil && (checked.Path != project.Path || checked.BaseRef != project.BaseRef || checked.ConfigGeneration != project.ConfigGeneration || checked.ConfigDigest != project.ConfigDigest || !bytes.Equal(checked.ConfigSnapshot, project.ConfigSnapshot)) {
+			return startAdmission{}, ErrStartConfigurationChanged
 		}
 		requests, err := projectStartLeaseRequests(ctx, conn, project, ref)
 		if err != nil {

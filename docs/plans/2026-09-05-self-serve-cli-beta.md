@@ -118,3 +118,23 @@ separate. Test installation under a fresh temporary home, verify helper layout,
 run version/help/local onboarding there, and test corrupt payload/refused
 overwrite. No public release or installation into the operator's active PATH
 is required to exercise this checkpoint.
+
+Implemented and verified at `894165a`: clean-source `bundle-dev`, manifest
+verification, exclusive CLI installation, and installed version identity in
+a private temporary directory. Full normal regression and static/release
+checks passed. Public signing, downloads and in-place upgrades remain pending.
+
+## Operational visibility checkpoint
+
+Status now projects the stored submission deadline and remaining time. Queue
+and pause time count; submission age is not presented as execution duration.
+Terminal tickets omit the active countdown, and missing budgets are not
+guessed. This display does not authorize execution or change lifecycle state.
+
+The readiness checkpoint now protects actual start, not just `init --check`:
+production supplies a stored command-recipe/macOS preflight. Store admission
+compares the exact checked configuration, refusing a concurrent configuration
+advance without reserving capacity or leaving queued state. This is necessary
+preflight only, not a complete readiness verdict.
+Provider qualification, repository command support, and publication capability
+must remain separate checks, not one inferred green flag.

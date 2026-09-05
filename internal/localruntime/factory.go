@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/baserefresh"
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/daemon/runtimecontrol"
 	"github.com/nysa-company/sf/internal/domain"
@@ -213,6 +214,13 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 type managedRuntime struct {
 	runtime *workflowruntime.Runtime
 	gh      *ghrunner.Runner
+}
+
+func (r *managedRuntime) RuntimeDiagnostics() []contracts.RuntimeDiagnostic {
+	if r == nil {
+		return nil
+	}
+	return r.runtime.RuntimeDiagnostics()
 }
 
 func (r *managedRuntime) Start(ctx context.Context, fence domain.Fence) error {

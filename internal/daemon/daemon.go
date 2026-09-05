@@ -1251,6 +1251,7 @@ func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ do
 	// checks are not part of Phase 1 and cannot make a ticket autonomous. A
 	// planning ticket is a replay observation and does not select a second
 	// transition.
+	var checkedProject *store.Project
 	if stored.State == domain.StateQueued {
 		project, capacityAvailable, err := daemon.store.StartPreflight(ctx, ref)
 		if err != nil {
@@ -1260,19 +1261,37 @@ func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ do
 			return daemon.failure(request, "invalid_configuration", "the durable project configuration is invalid", false)
 		}
 		doctorGreen := true
+		var doctorErr error
 		if daemon.doctor != nil {
-			doctorGreen = daemon.doctor(ctx, project) == nil
+			doctorErr = daemon.doctor(ctx, project)
+			doctorGreen = doctorErr == nil
+			checkedProject = &project
 		}
 		if _, err := daemon.spec.Select(string(stored.State), "operator_start", map[string]bool{"doctor_preflight_green": doctorGreen, "capacity_available": capacityAvailable}); err != nil {
 			if !doctorGreen {
+				if errors.Is(doctorErr, ErrStartRecipeUnsupported) {
+					return daemon.failure(request, "unsupported_repository_recipe", "the stored verification or review command is not supported by this runtime; inspect init --check and the supported recipes before applying configuration", false)
+				}
+				if errors.Is(doctorErr, ErrStartRuntimeUnsupported) {
+					return daemon.failure(request, "unsupported_runtime", "local execution requires macOS", false)
+				}
 				return daemon.failure(request, "doctor_required", "local doctor preflight is not green", false)
 			}
 			return daemon.failure(request, "capacity_unavailable", "local capacity is already reserved", true)
 		}
 	}
 	workflowID := fmt.Sprintf("%s/%s/%s/planning", daemon.channel, ref.Project, ref.Ticket)
-	started, observed, err := daemon.store.StartWithProjectOwnership(ctx, ref, stored.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, workflowID, daemon.clock.Now().UTC())
+	var started store.Ticket
+	var observed bool
+	if checkedProject != nil {
+		started, observed, err = daemon.store.StartWithCheckedProjectOwnership(ctx, ref, stored.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, workflowID, daemon.clock.Now().UTC(), *checkedProject)
+	} else {
+		started, observed, err = daemon.store.StartWithProjectOwnership(ctx, ref, stored.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, workflowID, daemon.clock.Now().UTC())
+	}
 	if err != nil {
+		if errors.Is(err, store.ErrStartConfigurationChanged) {
+			return daemon.failure(request, "start_configuration_changed", "project configuration changed during readiness checks; run start again to check the new generation", true)
+		}
 		code := "start_refused"
 		if errors.Is(err, store.ErrLeaseCapacity) {
 			code = "capacity_unavailable"
@@ -2170,6 +2189,8 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, id
 			return daemon.failure(request, evidenceErrorCode(err), "durable workflow evidence could not be authenticated", errors.Is(err, store.ErrBusy))
 		}
 		view := map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "current_version": stored.Version, "operator": operatorView(identity), "ticket": ticketView(stored), "evidence": evidence}
+		view["budget_clock"] = ticketTiming(stored, daemon.clock.Now())
+		view["runtime_activity"] = daemon.runtimeActivity(&stored.Ref)
 		if action, ok := daemon.ticketBlockedNextAction(stored); ok {
 			view["next_action"] = action
 		}
@@ -2180,8 +2201,10 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, id
 		return daemon.failure(request, "status_unavailable", "ticket status could not be read", errors.Is(err, store.ErrBusy))
 	}
 	views := make([]map[string]any, 0, len(items))
+	now := daemon.clock.Now()
 	for _, item := range items {
 		view := ticketView(item)
+		view["budget_clock"] = ticketTiming(item, now)
 		if action, ok := daemon.ticketBlockedNextAction(item); ok {
 			view["next_action"] = action
 		}
@@ -2194,7 +2217,7 @@ func (daemon *Daemon) status(request api.Request, identity domain.OperatorIdenti
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
 	}
-	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "leader_epoch": daemon.epoch, "operator": operatorView(identity), "socket_ready": true, "event_projection_ready": !daemon.eventProjectionPending()})
+	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "leader_epoch": daemon.epoch, "operator": operatorView(identity), "socket_ready": true, "event_projection_ready": !daemon.eventProjectionPending(), "runtime_activity": daemon.runtimeActivity(nil)})
 }
 
 func (daemon *Daemon) success(request api.Request, mutation api.Mutation, value any) api.Response {

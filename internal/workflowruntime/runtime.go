@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/store"
 )
@@ -31,10 +32,11 @@ type Runtime struct {
 	Interval  time.Duration
 	workers   int
 
-	mu      sync.Mutex
-	started bool
-	cancel  context.CancelFunc
-	done    chan struct{}
+	mu          sync.Mutex
+	started     bool
+	cancel      context.CancelFunc
+	done        chan struct{}
+	diagnostics []contracts.RuntimeDiagnostic
 }
 
 type RuntimeConfig struct {
@@ -164,7 +166,8 @@ func (r *Runtime) loop(ctx context.Context, fence domain.Fence) {
 		}
 		// Tick owns the complete Ensure -> Worker sequence. It returns only
 		// once the in-flight operation has honored cancellation or completed.
-		r.Scheduler.Tick(ctx, fence)
+		result := r.Scheduler.Tick(ctx, fence)
+		r.recordDiagnostic(result, time.Now())
 		if ctx.Err() != nil {
 			return
 		}

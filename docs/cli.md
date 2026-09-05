@@ -61,6 +61,23 @@ still require full IDs pending candidate-bound interactive confirmation.
 The daemon checks current state and authority after selection; a menu is not
 permission to bypass those checks.
 
+Status includes a submission-budget clock: age since submission, immutable
+deadline, and remaining time for nonterminal tickets. Queue and pause time are
+included. This is not execution duration and does not itself transition an
+expired ticket. Unknown historical budgets are not guessed; completed tickets
+do not show an active countdown.
+
+Single-ticket status and `daemon status --json` also expose recent completed
+scheduler observations when the composed runtime provides them. This is a
+bounded process-local diagnostic history (latest observation per ticket,
+at most 64), not SQLite lifecycle state. Each observation names its historical
+version/fence/time; a readiness/worker failure does not authorize replay.
+Idle/pool-contention ticks do not erase useful observations, and a subsequent
+completed invocation replaces the previous failure. Restart clears this
+history. No raw tool output or exception text is retained. Status does not
+wait for runtime reconfiguration to finish: it reports diagnostics unavailable
+during that handoff instead.
+
 `init` defaults to the current repository root and a normalized directory-based
 project name. Override these with `--repo` and `--project`. `init --check`
 previews existing configuration and local recipe compatibility without creating
@@ -96,6 +113,16 @@ stops the command with an inspection action; no mutation is retried by the CLI.
 After a refused start, the submitted ticket still exists and its deadline is
 already running. `--watch` follows that exact ticket; Ctrl-C stops watching,
 not the work. JSON watch output is newline-delimited response envelopes.
+
+Production `start` checks the stored verification and review recipes before
+entering planning. Unsupported recipes return `unsupported_repository_recipe`;
+the ticket stays queued. Explicit configuration is not permission to execute
+arbitrary commands. If configuration changes while readiness is checked,
+`start_configuration_changed` refuses admission; explicitly run start again
+to check the new generation. These checks do not certify dependency closures,
+executable versions, provider qualification or publication readiness; those
+remain separate runtime checks. No Python/Rails/Claude execution support is
+implied by recognizing their configuration or authentication.
 
 For newly recorded indeterminate provider results, `sf logs <ticket> --json`
 includes a `provider_result_diagnostic` event. Its closed `reason` distinguishes
@@ -166,7 +193,14 @@ runtime; it does not trust `PATH`, NVM, or another ambient Node installation.
 
 Doctor performs read-only checks for the
 channel root, socket, disk space, Git/gh executables, and an optional
-repository worktree. When an owner-only socket exists it also performs a
+repository worktree. `doctor --repo .` resolves the current directory and
+previews its working-tree configuration/test closure through the same read-only
+checks as `init --check`. This preview does not register a project or replace
+its stored configuration. A refused preview prevents a green guarded
+eligibility report. The report explicitly labels its scope: host/provider
+qualification and optional recipe preview are not ticket execution or merge
+approval, and do not certify the runtime dependency/executable launch checks.
+When an owner-only socket exists it also performs a
 read-only `daemon.status` handshake. A missing socket points to `daemon run`;
 a present but unhealthy socket points to `daemon status`, so Doctor does not
 loop back into the same failed probe. Human Doctor output includes every

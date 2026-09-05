@@ -43,6 +43,10 @@ and automatic updates are not shipped yet. A verified explicit
 [local bundle install](local-bundle.md) is available from a clean source build.
 Doctor's host/provider checks do
 not prove your GitHub protection and required checks are merge-ready.
+From the repository root, `sf-dev doctor --repo .` also previews the local
+configuration/test recipe. A failed `repository_recipe` check points back to
+`sf-dev init --check`; it does not modify your configuration. The report labels
+its scope so a green host/provider verdict is not mistaken for launch approval.
 
 Use a disposable supported project for your first run. Keep your real project
 credentials out of ticket text. Do not change branch protection to bypass a

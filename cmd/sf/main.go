@@ -171,6 +171,7 @@ func main() {
 		}
 		runErr := daemon.Run(runCtx, daemon.Config{
 			Channel: channel, Paths: paths,
+			Doctor:                   localruntime.CheckProjectStart,
 			DaemonIdentity:           fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
 			RecoveryAuthorityKey:     supervisor.PublicKey(),
 			ProviderSupervisor:       supervisor,

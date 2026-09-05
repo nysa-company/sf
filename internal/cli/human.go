@@ -85,6 +85,13 @@ func renderTickets(writer io.Writer, parent map[string]any, values []any) error 
 				return err
 			}
 		}
+		if budget, ok := item["budget_clock"].(map[string]any); ok && boolField(budget, "available") {
+			if remaining := stringField(budget, "remaining"); remaining != "" {
+				if _, err := fmt.Fprintf(writer, "  Deadline remaining: %s (includes queue/pause time)\n", remaining); err != nil {
+					return err
+				}
+			}
+		}
 		if action, ok := item["next_action"].(map[string]any); ok {
 			if err := renderAction(writer, "  Next", action); err != nil {
 				return err
@@ -119,8 +126,23 @@ func renderTicket(writer io.Writer, ticket map[string]any, evidence any, context
 			}
 		}
 	}
+	if budget, ok := context["budget_clock"].(map[string]any); ok && boolField(budget, "available") {
+		if _, err := fmt.Fprintf(writer, "Age since submission: %s\nDeadline: %s\n", stringField(budget, "age"), stringField(budget, "deadline_at")); err != nil {
+			return err
+		}
+		if remaining := stringField(budget, "remaining"); remaining != "" {
+			if _, err := fmt.Fprintf(writer, "Deadline remaining: %s (includes queue/pause time)\n", remaining); err != nil {
+				return err
+			}
+		}
+	}
 	if operator, ok := context["operator"].(map[string]any); ok {
 		if err := renderOperator(writer, operator); err != nil {
+			return err
+		}
+	}
+	if activity, ok := context["runtime_activity"].(map[string]any); ok {
+		if err := renderRuntimeActivity(writer, activity); err != nil {
 			return err
 		}
 	}
@@ -362,6 +384,11 @@ func renderEvents(writer io.Writer, parent map[string]any, events []any) error {
 func renderDoctor(writer io.Writer, report map[string]any) error {
 	if _, err := fmt.Fprintf(writer, "Doctor (channel: %s)\n", stringField(report, "channel")); err != nil {
 		return err
+	}
+	if scope := stringField(report, "readiness_scope"); scope != "" {
+		if _, err := fmt.Fprintf(writer, "Scope: %s\n", scope); err != nil {
+			return err
+		}
 	}
 	if value, ok := report["guarded_eligible"].(bool); ok {
 		if _, err := fmt.Fprintf(writer, "Guarded eligible: %t\n", value); err != nil {

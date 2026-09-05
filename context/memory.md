@@ -2,6 +2,69 @@
 
 ## Current truth
 
+- Combined readiness/deadline/Doctor/scheduler-diagnostics checkpoint on parent
+  894165a passed full normal suite and vet/repo/secret/artifact/docs/release gate
+  43551. Source stayed frozen during that gate (only documentation/audit updates).
+  Focused race evidence: readiness52521/33524, Doctor96616, diagnostics80605;
+  full CLI/daemon timing race66139. Ready for checkpoint commit.
+  Read-only acceptance preflight: live dev PID37274 remains relay32/c6913ab,
+  leader38;16 cancelled/11 done/2 paused, no admission/Git/repository-command
+  leases, provider rows only completed/failed, effects only confirmed/failed.
+  Existing paused tickets were retained untouched. GitHub auth exit-status
+  probe passed with all output discarded. No live writes or bundle changes.
+
+- Runtime support source audit is recorded in ignored
+  .context/2026-09-05-runtime-support-audit.md. Confirmed Go/narrow Node-only
+  execution and Codex-only composition; corrected stale Go-only sentence in
+  docs/configuration.md. Primary Python/Bundler references inform next design:
+  discovery imports code, interpreter flags/lockfile settings are not OS
+  containment. No recipe or provider support widened during frozen gate43551.
+
+- Scheduler diagnostics follow-up: Runtime retains at most64
+  latest completed meaningful tick observations (no Err/output/full Ticket),
+  skips idle/pool contention, exposes owned snapshots through managedRuntime.
+  Daemon status/single-ticket status project channel/ref-scoped diagnostics;
+  TryLock prevents waiting on runtime reconfiguration. Historical version/time
+  labels make no lifecycle/replay claim. Focused runtime/daemon/CLI race80605
+  passed (1.740s/4.839s/1.627s), including retention, copies, concurrent readers,
+  live loop failure, scoped socket status and no state mutation. Full45818
+  passed normal/static/release but predates these diagnostic changes; no claim
+  it verifies the complete final tree. Final frozen normal/static/release
+  gate43551 subsequently passed.
+
+- Doctor readiness follow-up: selected --repo (including .)
+  runs read-only init recipe preview, separate from host/provider qualification.
+  Report scope explicitly disclaims execution/merge approval; failed preview
+  prevents guarded eligibility. No registration, code execution or config write.
+  New injected and production-preview tests added. Initial45384 failed only
+  existing Unix socket fixtures denied by sandbox; host CLI race96616 passed
+  (55.600s), including production recipe preview without config/channel writes.
+  Full gate45818 predates this Doctor follow-up (do not claim it covers it).
+
+- Status timing: daemon projects immutable submission budget
+  into age/deadline/remaining (queue+pause included), without changing lifecycle.
+  Terminal countdown omitted; missing budget unavailable; clock skew clamped.
+  Pure and real Store/socket timing tests pass (21300). Full CLI/daemon race
+  regression66139 passed (45.823s/300.032s). Broad distribution regression32148
+  passed all packages plus vet/repo/secret/artifact/docs/release checks; its
+  normal suite predates timing edits.
+- Readiness safeguard: StartWithCheckedProjectOwnership
+  compares the exact checked generation/digest/bytes/path/base inside admission
+  before capacity/state writes. Doctor-backed starts use it; Store race test
+  proves changed config stays queued without ownership/phase rows, fresh config
+  and replay work (52521). Production now injects localruntime.CheckProjectStart:
+  static stored verify/review recipe allowlist and macOS check, no repository
+  code/TOML execution. Safe typed refusal messages preserve queued tickets.
+  Local recipe matrix passes (54763); that run's compiled regex matched no tests.
+  Corrected exact compiled onboarding plus new refusal/CLI-run race tests
+  passed33524 (localruntime1.741s/daemon20.102s/compiled4.594s).
+  This is necessary preflight only; dependency/executable,
+  provider and publication readiness are not yet unified onboarding checks.
+  Full normal/static/release gate45818 passed; it preceded the scheduler
+  diagnostic follow-up. Final combined gate43551 passed.
+- Clean-source bundle-dev -> verify -> CLI install -> installed version passed
+  at commit894165a (65452), isolated at /private/tmp/sf-bundle-check.L9aqVr.
+  No PATH, active bundle, database or service modification.
 - Distribution checkpoint in internal/bundle: exact inventory,
   bounded regular files, canonical manifest, permissions/SHA-256, build path
   and Mach-O linked version/commit/channel strings. Real Makefile bundle and
@@ -15,8 +78,8 @@
   Compiled CLI install/overwrite tests pass (19762); failed copies retain
   non-executable partial files. Focused bundle/version race passes (27647)
   after permission and directory-sync tightening. Full normal/static
-  regression is running in session32148. Clean-source Make targets still
-  need final validation after this checkpoint is committed.
+  regression32148 passed. Clean-source bundle-dev/verify/install/version also
+  passed at894165a (65452).
   Linked .str symbol representation is a fail-closed toolchain dependency;
   checksums are not publisher signatures. No live bundles replaced.
 - Compiled local onboarding acceptance now passes three repeats (92809): full

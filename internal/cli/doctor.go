@@ -43,6 +43,7 @@ type DoctorCheck struct {
 
 type DoctorReport struct {
 	Schema             string              `json:"schema"`
+	ReadinessScope     string              `json:"readiness_scope,omitempty"`
 	Channel            domain.Channel      `json:"channel"`
 	Checks             []DoctorCheck       `json:"checks"`
 	Authentication     []authStatusView    `json:"authentication"`
@@ -80,6 +81,9 @@ type DoctorDeps struct {
 	StatFS     func(string) (*syscall.Statfs_t, error)
 	CurrentUID func() uint32
 	Worktree   func(context.Context, string) error
+	// Recipe previews local configuration/closure only; it is not persisted
+	// ticket configuration or executable/provider launch authority.
+	Recipe     func(context.Context, string) error
 	AuthStatus func(context.Context) []localauth.Status
 	Pair       func(context.Context, domain.Channel) (store.ProviderPair, error)
 	Attempts   func(context.Context, domain.Channel) ([]store.ProviderAttempt, error)
@@ -136,6 +140,13 @@ func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
 	deps := (DoctorDeps{Channel: channel, Repo: repo}).defaults()
 	manager := localauth.NewManager()
 	deps.AuthStatus = manager.StatusAll
+	deps.Recipe = func(ctx context.Context, repository string) error {
+		response := RunInitCheck(ctx, InitRequest{Channel: channel, Repo: repository, Paths: deps.Paths})
+		if !response.OK {
+			return errors.New("local recipe preview refused")
+		}
+		return nil
+	}
 	databasePath := deps.Paths.Database
 	deps.Pair = func(ctx context.Context, selected domain.Channel) (store.ProviderPair, error) {
 		database, err := store.OpenReadOnly(ctx, databasePath)
@@ -184,6 +195,7 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	deps = deps.defaults()
 	report := DoctorReport{
 		Schema: doctorSchema, Channel: deps.Channel, Checks: []DoctorCheck{},
+		ReadinessScope: "Host and provider qualification, plus optional working-tree recipe preview; not ticket execution or merge approval.",
 		Authentication: []authStatusView{}, GuardedEligible: false, AutonomousEligible: false, CredentialsStored: false,
 	}
 	if !deps.Channel.Valid() {
@@ -216,6 +228,13 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 		report.Checks = append(report.Checks, failedCheck("repository_worktree", "selected repository is not a Git worktree", deps.Binary, "doctor"))
 	} else {
 		report.Checks = append(report.Checks, DoctorCheck{ID: "repository_worktree", Status: CheckPass, Summary: "selected repository is a Git worktree"})
+	}
+	if deps.Repo == "" || deps.Recipe == nil || !doctorChecksPass(report, "repository_worktree") {
+		report.Checks = append(report.Checks, DoctorCheck{ID: "repository_recipe", Status: CheckNotRun, Summary: "local configuration and dependency recipe were not previewed"})
+	} else if err := deps.Recipe(ctx, deps.Repo); err != nil {
+		report.Checks = append(report.Checks, failedCheck("repository_recipe", "local recipe preview did not pass; inspect init --check for the selected repository", deps.Binary, "init", "--help"))
+	} else {
+		report.Checks = append(report.Checks, DoctorCheck{ID: "repository_recipe", Status: CheckPass, Summary: "working-tree configuration and local test closure preview accepted; stored configuration and executable versions are checked separately"})
 	}
 	report.Checks = append(report.Checks, checkExecutable(deps, "gh", "gh executable is available"))
 	pair, pairAvailable := checkProviderPair(ctx, deps, &report)
@@ -326,6 +345,9 @@ func doctorQualification(role string, value store.ProviderQualification) DoctorP
 func guardedEligibilityChecksPass(report DoctorReport) bool {
 	mandatory := []string{"channel_root", "disk_space", "git_executable", "gh_executable", "authority_database", "provider_recovery", "authentication", "provider_pair", "github_auth", "builder_auth", "reviewer_auth"}
 	for _, check := range report.Checks {
+		if check.ID == "repository_recipe" && check.Status != CheckNotRun {
+			mandatory = append(mandatory, check.ID)
+		}
 		if check.ID == "repository_worktree" && check.Status != CheckNotRun {
 			mandatory = append(mandatory, check.ID)
 		}
