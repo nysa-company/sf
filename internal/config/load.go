@@ -620,6 +620,26 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 	if goMod && packageJSON {
 		return Commands{}, detectionError("repository contains both go.mod and package.json; add explicit commands to .sf/config.toml")
 	}
+	// Inspect every known stack before choosing a default. Rails commonly
+	// includes package.json; that alone does not make its verification Node.
+	otherStack := ""
+	for _, marker := range []struct{ path, stack string }{
+		{"Gemfile", "Ruby/Rails"}, {"pyproject.toml", "Python"}, {"requirements.txt", "Python"}, {"setup.py", "Python"},
+	} {
+		present, err := regularRepositoryFile(filepath.Join(repository, marker.path), marker.path)
+		if err != nil {
+			return Commands{}, err
+		}
+		if present && otherStack == "" {
+			otherStack = marker.stack
+		}
+	}
+	if otherStack != "" {
+		if goMod || packageJSON {
+			return Commands{}, detectionError("repository contains multiple stack markers; choose explicit supported verification/review commands in .sf/config.toml. Python and Ruby/Rails execution remain unsupported")
+		}
+		return Commands{}, detectionError(otherStack + " local execution is not supported yet; an explicit command does not enable it. Use a supported Go or dependency-free Node project for this beta")
+	}
 	if goMod {
 		if _, err := goclosure.Validate(repository); err != nil {
 			if errors.Is(err, goclosure.ErrUnvendored) {
@@ -636,17 +656,6 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 		}
 		command := Command{Argv: []string{"node", "--test"}}
 		return Commands{Verify: command, Review: command}, nil
-	}
-	for _, marker := range []struct{ path, stack string }{
-		{"Gemfile", "Ruby/Rails"}, {"pyproject.toml", "Python"}, {"requirements.txt", "Python"}, {"setup.py", "Python"},
-	} {
-		present, err := regularRepositoryFile(filepath.Join(repository, marker.path), marker.path)
-		if err != nil {
-			return Commands{}, err
-		}
-		if present {
-			return Commands{}, detectionError(marker.stack + " local execution is not supported yet; an explicit command does not enable it. Use a supported Go or dependency-free Node project for this beta")
-		}
 	}
 	return Commands{}, detectionError("repository type has no supported detected local recipe; use a supported Go or dependency-free Node project, or consult the explicit bounded TypeScript profile in docs/configuration.md")
 }

@@ -15,6 +15,9 @@ general-purpose runner for every project or provider.
 
 See [configuration](../configuration.md) for exact constraints. An explicit
 command in TOML does not grant permission to run an unsupported recipe.
+Mixed-stack roots require an explicit supported verification/review recipe:
+for example, a Rails `Gemfile` beside `package.json` is not automatically a
+Node project. SF refuses to guess which tests represent the project.
 The qualified live beta uses Codex for independent Builder/Reviewer model
 families. Using Claude already does not itself establish an SF-qualified
 Claude runtime. Provider expansion is tracked in the

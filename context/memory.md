@@ -2,6 +2,51 @@
 
 ## Current truth
 
+- Mixed-stack fix verification complete:69395 TERMINAL exit0, full normal
+  suite (Store137.631s, workflowruntime122.455s, worktreecoord137.215s), vet,
+  repo/secret/docs/artifact PASS. Focused config/CLI race73529 also passed.
+  All previous disk-full failures passed after cache-only cleanup; no runtime
+  safety changes made to obtain green. Investigation DONE: early default
+  selection hid Python/Ruby markers behind Go/Node; scan known markers before
+  selecting, refuse ambiguity, retain explicit supported recipes. Durable
+  lesson: mixed Rails roots often contain package.json; dependency-free Node
+  fixture must include a discovered test to reproduce actual acceptance.
+  Next CLI checkpoint: add caller-specified reviewed-head binding before
+  considering interactive approval selection. daemon.operatorDecision currently
+  loads its current candidate, but approve sends only operator, no expected
+  head. Store CAS must remain authoritative. Live acceptance PR1 still needs
+  human approval; no response has been received and no merge attempted.
+
+- Disk recovery:54904 TERMINAL exit1 (worktreecoord passed132.788s).
+  Cache-only cleanup48453 TERMINAL exit0 via explicit GOCACHE go clean -cache;
+  freed5.7GiB, df now6.2GiB available. No DB/worktree/runtime files deleted.
+  Exact failed Store/runtime cases plus new detection regressions10584 TERMINAL
+  exit0: config0.397s, Store2.225s, workflowruntime109.509s. Same source now
+  passes after cache cleanup, supporting disk exhaustion as the staging cause.
+  Full normal/static gate69395 restarted after this result with6.0GiB free;
+  must pass before commit.54904 is terminal failed and must not be polled.
+
+- Mixed-stack detection repair in progress on1904dc2 (not committed).
+  Root cause: detectRepositoryCommands returned for go.mod/package.json
+  before checking Gemfile/Python markers. Eight mixed-root regressions
+  reproduced nil error before fix (Node fixture needs discovered .test.js
+  to reach actual acceptance). Fix inspects all known markers before default
+  selection and refuses mixed stacks pending explicit supported commands;
+  runtime policy unchanged. Narrow red/green verified, explicit-config and
+  standalone-Go tests pass. Added symlink-marker rejection. Investigate
+  skill root-cause/regression workflow used; no global hooks/analytics altered.
+  Focused race73529 TERMINAL exit0, config PASS1.467s, CLI PASS50.328s. Full frozen
+  gate54904 still live but has failed: Store two tests report database/disk
+  full(13), workflowruntime two gate-staging failures. df confirms444MiB free;
+  /private/tmp/sf-gocache3 is5.7GiB disposable build cache, canonical Go env
+  verified. Await terminal handle, then clear only that cache with go clean
+  before rerunning failed packages/full suite. No live state cleanup.
+  normal -p2 was followed conditionally by vet/repo/secret/docs/artifact,
+  so those trailing gates have NOT run after this failure. Poll exact
+  handles before new tests; no commit until complete. Scope: config/load.go,
+  config/load_test.go, first-ticket docs, this memory only. Skill completion
+  remains pending broad verification; no claim of Python/Rails execution.
+
 - Installer fix committed67f718f; acceptance/picker docs8fed9d4. Clean
   bundle build42834 PASS (onboarding3, exact8fed9d407fd6e62c677ac95d4d4e0d9ead678382).
   Installed at /Users/sofiagonzalez-2/Projects/sf-clean-install.bTBsFX/installed;
