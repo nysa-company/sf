@@ -69,6 +69,12 @@ var (
 
 const maxGitOutput = 1 << 20
 
+const (
+	gitCommitContentionInitialBackoff = 100 * time.Millisecond
+	gitCommitContentionMaxBackoff     = 500 * time.Millisecond
+	gitCommitContentionMaxWait        = 2 * time.Minute
+)
+
 // BranchAuthority is implemented by the daemon's SQLite-backed store. Git
 // never creates a second persistence authority for ticket branch identity;
 // loading must be available as a separate operation so allocation can replay
@@ -541,9 +547,39 @@ func (r Runner) acquireMutation(ctx context.Context, claim contracts.GitMutation
 	if !validMutationClaim(claim) || claim.Repository != repository || claim.Worktree != worktree || claim.Branch != branch || claim.Operation != operation || claim.BaseRef != baseRef || claim.ExpectedBaseOID != baseOID || claim.ExpectedHeadOID != headOID {
 		return nil, fmt.Errorf("%w: caller mutation claim does not bind %s", ErrIdentityMismatch, operation)
 	}
-	lease, err := r.MutationAuthority.AcquireGitMutation(ctx, claim)
+	acquireCtx := ctx
+	var cancel context.CancelFunc
+	if operation == "commit" {
+		acquireCtx, cancel = context.WithTimeout(ctx, gitCommitContentionMaxWait)
+		defer cancel()
+	}
+	backoff := gitCommitContentionInitialBackoff
+	var lease contracts.GitMutationLease
+	var err error
+	for {
+		lease, err = r.MutationAuthority.AcquireGitMutation(acquireCtx, claim)
+		if operation != "commit" || lease != nil || !errors.Is(err, contracts.ErrGitMutationContended) {
+			break
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-acquireCtx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("%w: mutation authority refused %s: %w", ErrIdentityMismatch, operation, errors.Join(err, acquireCtx.Err()))
+		case <-timer.C:
+		}
+		if ctxErr := acquireCtx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("%w: mutation authority refused %s: %w", ErrIdentityMismatch, operation, errors.Join(err, ctxErr))
+		}
+		if backoff < gitCommitContentionMaxBackoff {
+			backoff *= 2
+			if backoff > gitCommitContentionMaxBackoff {
+				backoff = gitCommitContentionMaxBackoff
+			}
+		}
+	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: mutation authority refused %s: %v", ErrIdentityMismatch, operation, err)
+		return nil, fmt.Errorf("%w: mutation authority refused %s: %w", ErrIdentityMismatch, operation, err)
 	}
 	if lease == nil {
 		return nil, fmt.Errorf("%w: mutation authority returned no lease", ErrIdentityMismatch)

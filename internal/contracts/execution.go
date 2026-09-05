@@ -2,6 +2,7 @@ package contracts
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -196,6 +197,14 @@ type RepositoryCommandGroupRecorder interface {
 type RepositoryCommandAuthority interface {
 	AcquireRepositoryCommand(context.Context, RepositoryCommandClaim) (RepositoryCommandLease, error)
 }
+
+// ErrRepositoryCommandContended means the authority authenticated the exact
+// current claim and proved that another, different repository writer held the
+// exclusion before this acquire could insert a lease. It is safe to retry only
+// while the same caller and command scope remain live. Authorities must never
+// use it for a same-claim lease, quarantined writer, SQL/commit failure, or any
+// other response whose acquisition outcome is ambiguous.
+var ErrRepositoryCommandContended = errors.New("repository command is waiting for another authenticated repository writer")
 
 type RepositoryCommandResultRecorder interface {
 	CompleteRepositoryCommand(context.Context, RepositoryCommandClaim, CommandResult) error

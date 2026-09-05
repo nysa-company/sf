@@ -41,6 +41,43 @@
 
 Record durable decisions, reversals, incidents, and repeated pitfalls. Never store secrets, raw customer or financial data, or raw agent transcripts.
 
+### 2026-09-05 — First campaign delivery and native contention
+
+Relay27/031ba66 passed full normal tests, focused race and static verification.
+Its native absence recovery unstranded the second ticket's worktree creation
+without DB or checkout edits. The third ticket delivered PR7 through native
+proof, CI, independent review and the user-authorized exact-head SF approval;
+merge54d3c9514185a9434555ba0b51bdfdac8727d785, durable donev11. This is one
+campaign delivery, not two concurrently executing providers or stable-v1 proof.
+
+Two scheduler workers and two ticket slots did not produce model overlap:
+the composed shared provider/auth route defaulted to one. The opt-in
+SF_CODEX_PROVIDER_CAPACITY=2 retains default1 and rejects all other values;
+Store still owns ticket and provider lease admission. A restart also requires
+current-leader qualification before runtime activation, even when doctor's
+host-capability checks pass. Report this intervention rather than treating an
+idle daemon as executing work.
+
+The second Builder completed, but ordinary sibling-writer contention during
+repository-command acquisition left an unleased executing intent. Its cancel
+therefore entered cancelling and refused drain. Existing startup recovery
+retires that exact closed-gate claim before reconciliation/fencing; a new
+Store regression proves cancellation can then finish without fabricated command
+evidence. No live rows or files are changed manually. Prevention keeps the
+same Worker invocation alive for only native Store-proven active contention:
+repository commands share one caller/spec deadline; Git commit acquisition has
+a two-minute upper bound. Same-claim leases, quarantine and uncertain responses
+are never blindly retried. The adjacent commit wait matters because retiring
+an unprepared Git intent does not clean the completed Builder's source files;
+ordinary pristine scheduler admission cannot re-enter that dirty checkout.
+Full serialized Go suite46348 passed, including Git171.973s, Store117.874s,
+workflowruntime108.149s and worktreecoord125.525s. Targeted contention/capacity
+race91807 passed Git2.307s, Store37.893s, repositoryexec1.585s and
+Codex4.601s. The complete static gate (vet, format, repository/secret/artifact/
+docs checks and release-build smoke) passed. The next frozen dev rollout and
+actual two-provider overlap are still pending; these checks are not delivery
+evidence.
+
 ### 2026-09-05 — Capacity-two live campaign exposed recovery gaps
 
 The authorized concurrency campaign merged pilot setup-only PR6, applied a

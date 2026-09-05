@@ -78,6 +78,12 @@ cd /absolute/path/to/sf-source
 ./bin/sf-dev doctor --repo /absolute/path/to/nysa-app
 ```
 
+The foreground runtime keeps the shared Codex provider/auth lease at capacity
+one by default. For an explicit two-ticket local campaign, set
+`SF_CODEX_PROVIDER_CAPACITY=2` before starting the daemon. Only the exact
+values `1` and `2` are accepted; Store still enforces the machine, project,
+and provider lease limits.
+
 Qualification is served by the running foreground daemon: its current local
 supervisor signs the exact provider/version/family, two-file Codex runtime
 bundle, non-secret

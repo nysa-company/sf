@@ -375,11 +375,21 @@ func (s *Store) AcquireGitMutation(ctx context.Context, claim contracts.GitMutat
 		if err := s.assertGitIntentCurrent(ctx, conn, claim); err != nil {
 			return err
 		}
-		if err := repositoryHasProviderWriter(ctx, conn, claim.Repository); err != nil {
+		if err := repositoryHasProviderWriterForGitClaim(ctx, conn, claim.Repository); err != nil {
 			return err
 		}
-		if err := repositoryHasCommandWriter(ctx, conn, claim.Repository); err != nil {
+		if err := repositoryHasCommandWriterForGitClaim(ctx, conn, claim.Repository); err != nil {
 			return err
+		}
+		var otherGit, quarantinedGit int
+		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN state='active' AND observation_only=0 AND semantic_key<>? THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END),0) FROM git_mutation_leases WHERE repository_path=?`, claim.SemanticKey, claim.Repository).Scan(&otherGit, &quarantinedGit); err != nil {
+			return err
+		}
+		if quarantinedGit != 0 {
+			return ErrGitMutationLease
+		}
+		if otherGit != 0 {
+			return errors.Join(contracts.ErrGitMutationContended, ErrGitMutationLease)
 		}
 		result, err := conn.ExecContext(ctx, `INSERT INTO git_mutation_leases(repository_path,semantic_key,nonce,channel,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,state,launch_state,acquired_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active','unrecorded',?) ON CONFLICT(repository_path) DO NOTHING`, claim.Repository, claim.SemanticKey, nonce, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch, claim.Worktree, claim.Branch, claim.Operation, claim.BaseRef, claim.ExpectedBaseOID, claim.ExpectedHeadOID, time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
@@ -1080,3 +1090,31 @@ func repositoryHasCommandWriter(ctx context.Context, conn *sql.Conn, repository 
 }
 
 var _ contracts.GitMutationAuthority = (*Store)(nil)
+
+func repositoryHasProviderWriterForGitClaim(ctx context.Context, conn *sql.Conn, repository string) error {
+	var active, quarantined int
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN state='active' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END),0) FROM provider_attempts WHERE repository_path=?`, repository).Scan(&active, &quarantined); err != nil {
+		return err
+	}
+	if quarantined != 0 {
+		return ErrProviderAttempt
+	}
+	if active != 0 {
+		return errors.Join(contracts.ErrGitMutationContended, ErrProviderAttempt)
+	}
+	return nil
+}
+
+func repositoryHasCommandWriterForGitClaim(ctx context.Context, conn *sql.Conn, repository string) error {
+	var active, quarantined int
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN state='active' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END),0) FROM repository_command_leases WHERE repository_path=?`, repository).Scan(&active, &quarantined); err != nil {
+		return err
+	}
+	if quarantined != 0 {
+		return ErrRepositoryCommandLease
+	}
+	if active != 0 {
+		return errors.Join(contracts.ErrGitMutationContended, ErrRepositoryCommandLease)
+	}
+	return nil
+}

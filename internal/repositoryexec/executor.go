@@ -23,6 +23,11 @@ import (
 
 var ErrInvalidBinding = errors.New("repository command binding is invalid")
 
+const (
+	repositoryCommandContentionInitialBackoff = 100 * time.Millisecond
+	repositoryCommandContentionMaxBackoff     = 500 * time.Millisecond
+)
+
 type Request struct {
 	Claim  contracts.RepositoryCommandClaim
 	Spec   contracts.CommandSpec
@@ -70,6 +75,9 @@ func SpecDigest(spec contracts.CommandSpec, stdinDigest string) (string, error) 
 }
 
 func (e Executor) Run(ctx context.Context, req Request) (result contracts.CommandResult, returnedErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	acquired := false
 	acquireAmbiguous := false
 	defer func() {
@@ -113,10 +121,9 @@ func (e Executor) Run(ctx context.Context, req Request) (result contracts.Comman
 	if _, err := os.Stat(req.Claim.Worktree); err != nil {
 		return contracts.CommandResult{}, err
 	}
-	lease, err := e.Authority.AcquireRepositoryCommand(ctx, req.Claim)
-	// Any error from the authority is an acquisition ambiguity, including a nil
-	// lease. The transaction may have committed and the response may have been
-	// lost or malformed; only Store recovery can safely decide its disposition.
+	operationCtx, operationCancel := context.WithTimeout(ctx, req.Spec.Timeout)
+	defer operationCancel()
+	lease, err := acquireRepositoryCommand(operationCtx, e.Authority, req.Claim)
 	if lease != nil {
 		acquired = true
 	}
@@ -126,27 +133,31 @@ func (e Executor) Run(ctx context.Context, req Request) (result contracts.Comman
 				return contracts.CommandResult{}, errors.Join(err, quarantineErr)
 			}
 		}
-		acquireAmbiguous = true
+		// Only the typed nil-lease contention response proves that this call did
+		// not insert a lease. The deferred exact retirement is therefore safe
+		// when the bounded wait expires. Every other authority error remains an
+		// acquisition ambiguity for startup recovery to adjudicate.
+		acquireAmbiguous = !errors.Is(err, contracts.ErrRepositoryCommandContended)
 		return contracts.CommandResult{}, err
 	}
 	if lease == nil {
 		acquireAmbiguous = true
 		return contracts.CommandResult{}, ErrInvalidBinding
 	}
-	result, runErr := e.Supervisor.Run(ctx, req.Claim, req.Spec, req.Policy, lease)
+	result, runErr := e.Supervisor.Run(operationCtx, req.Claim, req.Spec, req.Policy, lease)
 	// A cancellation/deadline is control-plane authority, not command evidence.
 	// The supervisor may have reaped the child and therefore return an observed
 	// non-zero result, but recording it would let cancellation masquerade as a
 	// provider-declared red verification result. Retire the exact drained lease,
 	// intent, and effect atomically without recording a result.
-	if result.Observed && repositoryCommandCanceled(ctx, runErr) {
+	if result.Observed && repositoryCommandCanceled(operationCtx, runErr) {
 		if err := retireObservedCanceledRepositoryCommand(e.Authority, lease, req.Claim); err != nil {
 			return result, err
 		}
 		if runErr != nil {
 			return result, runErr
 		}
-		return result, ctx.Err()
+		return result, operationCtx.Err()
 	}
 	// Once a lease is acquired, an unobserved result is always uncertain. Do
 	// not infer success from CommandResult's zero-valued exit code.
@@ -203,6 +214,32 @@ func (e Executor) Run(ctx context.Context, req Request) (result contracts.Comman
 		return result, releaseErr
 	}
 	return result, runErr
+}
+
+func acquireRepositoryCommand(ctx context.Context, authority contracts.RepositoryCommandAuthority, claim contracts.RepositoryCommandClaim) (contracts.RepositoryCommandLease, error) {
+	backoff := repositoryCommandContentionInitialBackoff
+	for {
+		lease, err := authority.AcquireRepositoryCommand(ctx, claim)
+		if lease != nil || err == nil || !errors.Is(err, contracts.ErrRepositoryCommandContended) {
+			return lease, err
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Join(contracts.ErrRepositoryCommandContended, err)
+		}
+		if backoff < repositoryCommandContentionMaxBackoff {
+			backoff *= 2
+			if backoff > repositoryCommandContentionMaxBackoff {
+				backoff = repositoryCommandContentionMaxBackoff
+			}
+		}
+	}
 }
 
 // RetireUnleased settles an exact issued claim when Run failed before the

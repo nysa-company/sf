@@ -221,6 +221,84 @@ func TestRepositoryCommandIssueResponseLossReturnsExactClaim(t *testing.T) {
 	}
 }
 
+func TestRepositoryCommandAcquireRetriesOnlyDifferentActiveCommand(t *testing.T) {
+	t.Run("active", func(t *testing.T) {
+		db, ctx := openTestStore(t)
+		holder, waiter := repositoryCommandContendingClaimsFixture(t, db, ctx)
+		holderLease, err := db.AcquireRepositoryCommand(ctx, holder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.AcquireRepositoryCommand(ctx, holder); !errors.Is(err, ErrRepositoryCommandLease) || errors.Is(err, contracts.ErrRepositoryCommandContended) {
+			t.Fatalf("same-semantic response was retryable: %v", err)
+		}
+		if _, err := db.AcquireRepositoryCommand(ctx, waiter); !errors.Is(err, ErrRepositoryCommandLease) || !errors.Is(err, contracts.ErrRepositoryCommandContended) {
+			t.Fatalf("different active command was not typed contention: %v", err)
+		}
+		if err := holderLease.Release(); err != nil {
+			t.Fatal(err)
+		}
+		waiterLease, err := db.AcquireRepositoryCommand(ctx, waiter)
+		if err != nil {
+			t.Fatalf("same claim was not admitted after contender release: %v", err)
+		}
+		if err := waiterLease.Release(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("quarantined", func(t *testing.T) {
+		db, ctx := openTestStore(t)
+		holder, waiter := repositoryCommandContendingClaimsFixture(t, db, ctx)
+		holderLease, err := db.AcquireRepositoryCommand(ctx, holder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := holderLease.Quarantine(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.AcquireRepositoryCommand(ctx, waiter); !errors.Is(err, ErrRepositoryCommandLease) || errors.Is(err, contracts.ErrRepositoryCommandContended) {
+			t.Fatalf("quarantined command was retryable: %v", err)
+		}
+	})
+}
+
+func repositoryCommandContendingClaimsFixture(t *testing.T, db *Store, ctx context.Context) (contracts.RepositoryCommandClaim, contracts.RepositoryCommandClaim) {
+	t.Helper()
+	holderIntent := repositoryCommandIntentFixture(t, db, ctx, "native-contention-holder")
+	waiterRef := domain.TicketRef{Channel: holderIntent.Ref.Channel, Project: holderIntent.Ref.Project, Ticket: "SF-command-native-contention-waiter"}
+	if err := db.CreateTicket(ctx, ticket(waiterRef, "source-native-contention-waiter")); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := db.Ticket(ctx, waiterRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiterBranch := "sf/dev/aaaaaaaa/native-contention-waiter"
+	waiterTicket, err := db.StartOrAdopt(ctx, waiterRef, queued.Version, waiterBranch, domain.Fence{LeaderEpoch: holderIntent.Fence.LeaderEpoch, RunnerEpoch: queued.RunnerEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiterWorktree := "/tmp/nysa/worktree-waiter"
+	waiterIdentity := repositoryCommandIdentity(t, holderIntent.Repository, waiterWorktree, waiterBranch, holderIntent.BaseRef)
+	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: waiterRef, ExpectedVersion: waiterTicket.Version, Fence: domain.Fence{LeaderEpoch: holderIntent.Fence.LeaderEpoch, RunnerEpoch: waiterTicket.RunnerEpoch}, Path: waiterWorktree, Branch: waiterBranch, IdentityJSON: []byte(waiterIdentity), BaseSHA: holderIntent.BaseSHA, HeadSHA: strings.Repeat("c", 40)}); err != nil {
+		t.Fatal(err)
+	}
+	waiterIntent := RepositoryCommandIntent{EffectFence: EffectFence{SemanticKey: "repository-command/native-contention-waiter", Ref: waiterRef, TicketVersion: waiterTicket.Version, Fence: domain.Fence{LeaderEpoch: holderIntent.Fence.LeaderEpoch, RunnerEpoch: waiterTicket.RunnerEpoch}}, RequestDigest: repositoryCommandDigest("4"), Repository: holderIntent.Repository, Worktree: waiterWorktree, WorktreeIdentity: waiterIdentity, Branch: waiterBranch, BaseRef: holderIntent.BaseRef, BaseSHA: holderIntent.BaseSHA, CommandDigest: holderIntent.CommandDigest, SpecDigest: holderIntent.SpecDigest, PolicyDigest: holderIntent.PolicyDigest, ExecutablePath: holderIntent.ExecutablePath, ExecutableDigest: holderIntent.ExecutableDigest}
+	if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: waiterIntent.SemanticKey, Ref: waiterIntent.Ref, Kind: "repository_command", TicketVersion: waiterIntent.TicketVersion, Fence: waiterIntent.Fence, RequestDigest: waiterIntent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := db.IssueRepositoryCommandClaim(ctx, holderIntent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter, err := db.IssueRepositoryCommandClaim(ctx, waiterIntent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return holder, waiter
+}
+
 func TestRecoverUnleasedRepositoryCommandRetiresGateClosedClaimForRetry(t *testing.T) {
 	db, ctx := openTestStore(t)
 	intent := repositoryCommandIntentFixture(t, db, ctx, "unleased-restart")

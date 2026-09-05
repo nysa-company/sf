@@ -77,7 +77,11 @@ type executableRegistrar interface {
 // can be re-probed in this daemon environment. This deliberately leaves the
 // daemon usable for Doctor and operator repair when Codex is absent or stale.
 func Compose(ctx context.Context, channel domain.Channel, database *store.Store, process contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
-	return ComposeProfiles(ctx, channel, database, process, defaultProfiles())
+	capacity, err := configuredProviderCapacity()
+	if err != nil {
+		return nil, err
+	}
+	return ComposeProfilesWithCapacity(ctx, channel, database, process, defaultProfiles(), capacity)
 }
 
 // ComposeProfiles is the explicit production configuration boundary. Each
@@ -85,6 +89,17 @@ func Compose(ctx context.Context, channel domain.Channel, database *store.Store,
 // profiles are independent only when their recorded families differ. No route
 // is synthesized from an alias or a duplicate family.
 func ComposeProfiles(ctx context.Context, channel domain.Channel, database *store.Store, process contracts.ProcessSupervisor, profiles []Config) (*providercoord.Coordinator, error) {
+	return ComposeProfilesWithCapacity(ctx, channel, database, process, profiles, 1)
+}
+
+// ComposeProfilesWithCapacity applies an explicit, tightly bounded capacity
+// to the shared provider/auth lease. Store remains the authority for machine,
+// project, and provider admission; this only permits the caller to opt into
+// the already-supported two-worker ceiling.
+func ComposeProfilesWithCapacity(ctx context.Context, channel domain.Channel, database *store.Store, process contracts.ProcessSupervisor, profiles []Config, capacity int) (*providercoord.Coordinator, error) {
+	if capacity < 1 || capacity > 2 {
+		return nil, errors.New("invalid Codex provider capacity")
+	}
 	registry := providercoord.NewRegistry()
 	routes := map[providercoord.Role]providercoord.Route{}
 	if !channel.Valid() || database == nil || process == nil {
@@ -122,10 +137,27 @@ func ComposeProfiles(ctx context.Context, channel domain.Channel, database *stor
 	if !builderOK || !reviewerOK || builder.Name() == reviewer.Name() {
 		return providercoord.New(providercoord.NewRegistry(), routes, database, nil, process)
 	}
-	routes[providercoord.RolePlanner] = providercoord.Route{Primary: builder.Name()}
-	routes[providercoord.RoleBuilder] = providercoord.Route{Primary: builder.Name()}
-	routes[providercoord.RoleReviewer] = providercoord.Route{Primary: reviewer.Name()}
+	routes = composeRoutes(builder.Name(), reviewer.Name(), capacity)
 	return providercoord.New(registry, routes, database, nil, process)
+}
+
+func composeRoutes(builder, reviewer string, capacity int) map[providercoord.Role]providercoord.Route {
+	return map[providercoord.Role]providercoord.Route{
+		providercoord.RolePlanner:  {Primary: builder, Capacity: capacity},
+		providercoord.RoleBuilder:  {Primary: builder, Capacity: capacity},
+		providercoord.RoleReviewer: {Primary: reviewer, Capacity: capacity},
+	}
+}
+
+func configuredProviderCapacity() (int, error) {
+	switch os.Getenv("SF_CODEX_PROVIDER_CAPACITY") {
+	case "", "1":
+		return 1, nil
+	case "2":
+		return 2, nil
+	default:
+		return 0, errors.New("invalid SF_CODEX_PROVIDER_CAPACITY: expected 1 or 2")
+	}
 }
 
 func qualificationMatches(database *store.Store, ctx context.Context, channel domain.Channel, binding contracts.RuntimeBinding) bool {
