@@ -39,6 +39,21 @@
 
 ## Log
 
+- 2026-09-05: Relay30 confirmation delivered PR12 (attempts-since-retry),
+  merge37bc539209819ed7b7075611c8dd79a8c8d4fc94, localdonev11. Its prepared
+  checkpoint safely reconciled at the same claim after sibling provider drain.
+  Sibling d6c217 failed two Builder artifacts after editing Reviewer-owned proof;
+  supported retry refused dirty state, then cancel preserved evidence. Fresh
+  eb3bcc planner returned indeterminate and was cancelled without manual repair.
+  No successful-provider-overlap pair yet; original batch remains4done/6cancel.
+  Live Relay30/b0fac2f leader36 PTY33181 is idle, zero leases/unresolved effects.
+  Diagnostic repair under validation: closed reasons, atomic same-state event,
+  no output text/schema change/retry permission. Focused66582+75391 PASS;
+  full normal/targetedrace/static session16271 PASS. Race contracts1.467s,
+  adapter1.573s, coordinator7.837s, Store10.927s; all static gates PASS.
+  Empty-output classification corrected to protocol_invalid and covered by the
+  final race pass. Ready for dev-only rollout and fresh draft08/09 pair.
+
 Record durable decisions, reversals, incidents, and repeated pitfalls. Never store secrets, raw customer or financial data, or raw agent transcripts.
 
 ### 2026-09-05 — Ten-ticket campaign terminal, stricter confirmation pending

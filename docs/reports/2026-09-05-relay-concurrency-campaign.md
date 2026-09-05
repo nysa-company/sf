@@ -145,7 +145,7 @@ The full suite includes these representative regressions:
 | --- | --- |
 | Targeted pause/drain leaves sibling running | `TestDaemonFactoryTwoWorkerPauseDrainsOnlyTargetAndResumeRearms` |
 | Duplicate admission and reuse | `TestSeededLeaseAdmissionStress`, `TestEnsureConcurrentCallersCreateExactlyOneWorktree` |
-| Lost creation/push response | `TestEnsureReconcilesCreationResponseLossAfterReopen`, `TestWorkerKeepsUnprovenPushUncertainAfterLostCommandResult` |
+| Lost creation response / unproven push refusal | `TestEnsureReconcilesCreationResponseLossAfterReopen`, `TestWorkerKeepsUnprovenPushUncertainAfterLostCommandResult` |
 | Lost edit/merge response | `TestUpdateFactoryPullRequestReconcilesLostResponseWithoutSecondEdit`, `TestMergeLostResponseReconcilesFromOriginalBaseWitness` |
 | Invalid artifact bounded repair | `TestInvalidArtifactFailureReasonsAreDurableAndBounded`, `TestFallbackInvalidArtifactExhaustionIsStableAcrossRestart` |
 | Unavailable/malformed GitHub observation | `TestCreateFinalHandoffRefusesUnavailableOrMalformedBaseObservation` |
@@ -169,6 +169,44 @@ Validation checkpoints:
   confirmation pair remains pending and is not implied by these tests.
 
 ## Next priorities
+
+### Fresh confirmation update, 14:11 UTC
+
+Validated commit b0fac2f ran as Relay30, leader36, qualified pair59/60,
+capacity2. Fresh submissions at13:59:32 did not inherit depleted queue budgets.
+SF-3aa375b829a6e219034c1ccdac0075bb delivered through
+[PR12](https://github.com/nysa-company/sf-v1-relay-pilot/pull/12): exact head
+9fcc98da6f9c3404aa102013eecf72e791b07748, required CI33970876772 passed,
+independent final review passed, fresh protection/diff checked, SF-approved,
+merged14:11:01 to37bc539209819ed7b7075611c8dd79a8c8d4fc94, localdonev11.
+Its prepared uncertain verification commit recovered automatically at14:05:56
+without restart or manual repair.
+
+Sibling SF-d6c21776cdeefd08aca00f7b1827d539 overlapped planning and verification,
+but failed two Builder artifacts after rewriting its Reviewer-owned test.
+Supported retry refused dirty state without mutation; supported cancel left
+the worktree intact. Replacement SF-eb3bcc8b59745a87fb3410ac8e65b22b started
+after the successful sibling's final provider call and returned an indeterminate
+planner result after30s. Supported cancellation retained its evidence and
+released admission. These extra
+trials are separate from the original4/10 and do not prove successful provider
+overlap. The goal remains open.
+
+Coverage precision: the push-loss fixture returns before running Git; it proves
+no blind replay, not composed recovery after an applied push loses its reply.
+Creation/edit/merge tests independently cover post-mutation lost responses.
+The daemon pause test directly checks sibling continuity after pause, but not a
+second sibling snapshot after terminal cancellation. Neither stronger claim is
+made here.
+
+Next diagnostic repair: indeterminate provider results currently persist no
+closed failure category beyond the generic outcome. Exit code and truncation
+flags exist only transiently; raw provider output must remain unpersisted.
+The recurring30s planner failure cannot be attributed to any particular cause
+from present evidence. Bounded non-secret classification is now implemented;
+full normal suite16271, targeted race (contracts1.467s, adapter1.573s,
+coordinator7.837s, Store10.927s), and all static gates passed before rollout.
+This does not retrospectively identify the old failures or authorize blind retry.
 
 1. Keep capacity at two. Fix generated verification quality before another
    broad stress run: deterministic examples/property assertions must agree

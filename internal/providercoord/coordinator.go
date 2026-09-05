@@ -495,6 +495,16 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			durableResult, finishErr = c.store.CompleteProviderAttemptSuccess(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, raw, r.Validation, finishedAt)
 		} else if outcome == contracts.PhaseResultInvalidArtifact {
 			finishErr = c.store.FinishProviderAttemptWithArtifactFailure(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, artifactFailureReason, trustedUsage, finishedAt)
+		} else if outcome == "result_indeterminate" {
+			reason := raw.FailureReason
+			if commandErr != nil {
+				reason = contracts.ProviderFailureCommand
+			} else if !raw.UsageTrusted || raw.UsageUnits < 0 || raw.Provider != binding.Identity {
+				reason = contracts.ProviderFailureBinding
+			} else if !contracts.ValidProviderFailureReason(reason) {
+				reason = contracts.ProviderFailureAdapter
+			}
+			finishErr = c.store.FinishProviderAttemptWithIndeterminateFailure(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, reason, trustedUsage, finishedAt)
 		} else {
 			finishErr = c.store.FinishProviderAttempt(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, state, outcome, trustedUsage, finishedAt)
 		}

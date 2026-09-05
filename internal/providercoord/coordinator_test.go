@@ -122,6 +122,30 @@ func TestMalformedOutputIsIndeterminateAndNeverRepairsOrPersistsSecrets(t *testi
 	if result.Attempts[0].TranscriptDigest == "" || result.Attempts[0].TranscriptDigest == "sha256:"+fmt.Sprintf("%x", rawSecret) {
 		t.Fatalf("unsafe digest=%+v", result.Attempts[0])
 	}
+	assertIndeterminateDiagnostic(t, db, ref, string(contracts.ProviderFailureBinding), secret)
+}
+
+// assertIndeterminateDiagnostic checks the durable, closed diagnostic only;
+// provider-controlled output must never be copied into the event payload.
+func assertIndeterminateDiagnostic(t *testing.T, db *store.Store, ref domain.TicketRef, reason, forbidden string) {
+	t.Helper()
+	events, err := db.Events(context.Background(), ref.Channel, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Ref != ref || event.Trigger != "provider_result_diagnostic" {
+			continue
+		}
+		if event.From != event.To || !strings.Contains(event.Payload, `"reason":"`+reason+`"`) {
+			t.Fatalf("invalid provider diagnostic event=%+v", event)
+		}
+		if forbidden != "" && strings.Contains(event.Payload, forbidden) {
+			t.Fatalf("provider diagnostic persisted raw output: %q", event.Payload)
+		}
+		return
+	}
+	t.Fatalf("provider diagnostic event not found for %s", ref.Ticket)
 }
 
 func TestCompletedResultExposesOnlyTheDurableAttemptKey(t *testing.T) {
@@ -1110,6 +1134,7 @@ func TestSupervisorCommandAmbiguityIsIndeterminateAndStableAcrossReplay(t *testi
 	if err != nil || len(attempts) != 1 || attempts[0].State != "failed" || attempts[0].Outcome != "result_indeterminate" {
 		t.Fatalf("ambiguous command durable attempts=%+v err=%v", attempts, err)
 	}
+	assertIndeterminateDiagnostic(t, database, ref, string(contracts.ProviderFailureCommand), "supervisor command observation is ambiguous")
 	replay := coordinator.Run(context.Background(), request)
 	if replay.Code != ResultIndeterminate || len(replay.Attempts) != 0 || supervisor.runs != 1 || supervisor.drains != 1 {
 		t.Fatalf("ambiguous command replay=%+v runs=%d drains=%d", replay, supervisor.runs, supervisor.drains)

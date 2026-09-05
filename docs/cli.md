@@ -35,6 +35,14 @@ the same versioned response envelope. The CLI never invents success: a command
 that is not configured returns a typed error, exit code, and one executable
 next action.
 
+For newly recorded indeterminate provider results, `sf logs <ticket> --json`
+includes a `provider_result_diagnostic` event. Its closed `reason` distinguishes
+`command_error`, `nonzero_exit`, `output_limit`, `protocol_invalid`,
+`provider_terminal_failure`, `binding_or_usage`, and `adapter_error`.
+The event contains authenticated attempt identity, not provider output or error
+text. It is diagnostic only: it does not authorize retry, and historical failures
+without this event cannot be assigned a more precise cause retroactively.
+
 ## Exit codes
 
 | Code | Meaning |

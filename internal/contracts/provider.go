@@ -218,6 +218,8 @@ func DecodeCanonicalPhaseInput(payload []byte) (PhaseInput, error) {
 
 type PhaseResult struct {
 	Outcome string
+	// FailureReason is a closed diagnostic, never provider text or authority to retry.
+	FailureReason ProviderFailureReason
 	// ArtifactFailureReason is a bounded, non-secret classification emitted
 	// only for a clean provider completion whose final artifact is repairable.
 	// It is never provider text, a transcript excerpt, or an adapter error.
@@ -261,6 +263,27 @@ const (
 // invalid_artifact outcome. Keep this set deliberately closed: it is durable
 // operator evidence, not a diagnostic channel for provider-controlled text.
 type ArtifactFailureReason string
+
+type ProviderFailureReason string
+
+const (
+	ProviderFailureCommand  ProviderFailureReason = "command_error"
+	ProviderFailureExit     ProviderFailureReason = "nonzero_exit"
+	ProviderFailureOutput   ProviderFailureReason = "output_limit"
+	ProviderFailureProtocol ProviderFailureReason = "protocol_invalid"
+	ProviderFailureTerminal ProviderFailureReason = "provider_terminal_failure"
+	ProviderFailureBinding  ProviderFailureReason = "binding_or_usage"
+	ProviderFailureAdapter  ProviderFailureReason = "adapter_error"
+)
+
+func ValidProviderFailureReason(value ProviderFailureReason) bool {
+	switch value {
+	case ProviderFailureCommand, ProviderFailureExit, ProviderFailureOutput, ProviderFailureProtocol, ProviderFailureTerminal, ProviderFailureBinding, ProviderFailureAdapter:
+		return true
+	default:
+		return false
+	}
+}
 
 const (
 	ArtifactFailureFinalMessage ArtifactFailureReason = "final_message_missing_or_malformed"

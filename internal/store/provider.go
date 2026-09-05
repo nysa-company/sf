@@ -105,6 +105,12 @@ type ProviderArtifactFailure struct {
 	CreatedAt       time.Time
 }
 
+type providerResultDiagnosticFence struct {
+	TicketVersion uint64 `json:"ticket_version"`
+	LeaderEpoch   uint64 `json:"leader_epoch"`
+	RunnerEpoch   uint64 `json:"runner_epoch"`
+}
+
 type providerArtifactFailureCanonical struct {
 	AttemptID       int64                           `json:"attempt_id"`
 	Channel         domain.Channel                  `json:"channel"`
@@ -1060,6 +1066,18 @@ func (s *Store) FinishProviderAttempt(ctx context.Context, claim ProviderAttempt
 	return s.finishProviderAttempt(ctx, claim, proof, expected, fence, state, outcome, usage, finished, nil, nil)
 }
 
+// FinishProviderAttemptWithIndeterminateFailure records a closed, transcript-
+// free reason for an indeterminate provider result. The diagnostic is a
+// same-state event written in the same transaction as attempt completion and
+// lease release; it is observability only and grants no retry or recovery
+// authority.
+func (s *Store) FinishProviderAttemptWithIndeterminateFailure(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, reason contracts.ProviderFailureReason, usage int64, finished time.Time) error {
+	if !contracts.ValidProviderFailureReason(reason) {
+		return ErrProviderAttempt
+	}
+	return s.finishProviderAttempt(ctx, claim, proof, expected, fence, "failed", "result_indeterminate", usage, finished, nil, nil, reason)
+}
+
 // FinishProviderAttemptWithArtifactFailure records the only durable detail for
 // a repairable invalid artifact. The reason is a closed enum and is written in
 // the same transaction as the drained failed attempt, phase run, and lease
@@ -1263,9 +1281,19 @@ func sameProviderAttemptResult(a, b ProviderAttemptResult) bool {
 	return a.AttemptID == b.AttemptID && a.RawSHA256 == b.RawSHA256 && a.TypedSHA256 == b.TypedSHA256 && a.ValidationSHA256 == b.ValidationSHA256 && a.TranscriptSHA256 == b.TranscriptSHA256 && bytes.Equal(a.RawArtifact, b.RawArtifact) && bytes.Equal(a.TypedArtifact, b.TypedArtifact) && bytes.Equal(a.Validation, b.Validation)
 }
 
-func (s *Store) finishProviderAttempt(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, state, outcome string, usage int64, finished time.Time, result *ProviderAttemptResult, artifactFailure *ProviderArtifactFailure) error {
+func (s *Store) finishProviderAttempt(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, state, outcome string, usage int64, finished time.Time, result *ProviderAttemptResult, artifactFailure *ProviderArtifactFailure, providerFailure ...contracts.ProviderFailureReason) error {
 	if claim.ID <= 0 || claim.ExpectedVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || !validAttemptState(state) || !safeOutcome(outcome) || usage < 0 || finished.IsZero() {
 		return ErrProviderAttempt
+	}
+	if len(providerFailure) > 1 {
+		return ErrProviderAttempt
+	}
+	var diagnosticReason contracts.ProviderFailureReason
+	if len(providerFailure) == 1 {
+		diagnosticReason = providerFailure[0]
+		if !contracts.ValidProviderFailureReason(diagnosticReason) || state != "failed" || outcome != "result_indeterminate" || result != nil || artifactFailure != nil {
+			return ErrProviderAttempt
+		}
 	}
 	if result != nil && (state != "completed" || outcome != "completed") {
 		return ErrProviderAttempt
@@ -1371,6 +1399,32 @@ func (s *Store) finishProviderAttempt(ctx context.Context, claim ProviderAttempt
 		if artifactFailure != nil {
 			_, err = conn.ExecContext(ctx, `INSERT INTO provider_artifact_failures(provider_attempt_id,channel,project_id,ticket_id,phase,role,attempt,request_digest,leader_epoch,runner_epoch,expected_ticket_version,failure_reason,failure_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, artifactFailure.AttemptID, artifactFailure.Ref.Channel, artifactFailure.Ref.Project, artifactFailure.Ref.Ticket, artifactFailure.Phase, artifactFailure.Role, artifactFailure.Attempt, artifactFailure.RequestDigest, artifactFailure.LeaderEpoch, artifactFailure.RunnerEpoch, artifactFailure.ExpectedVersion, artifactFailure.Reason, artifactFailure.Digest, artifactFailure.CreatedAt.UTC().Format(time.RFC3339Nano))
 			if err != nil {
+				return err
+			}
+		}
+		if diagnosticReason != "" {
+			payload := struct {
+				Schema            string                          `json:"schema"`
+				ProviderAttemptID int64                           `json:"provider_attempt_id"`
+				Phase             domain.Phase                    `json:"phase"`
+				Attempt           int                             `json:"attempt"`
+				RequestDigest     string                          `json:"request_digest"`
+				Fence             providerResultDiagnosticFence   `json:"fence"`
+				Reason            contracts.ProviderFailureReason `json:"reason"`
+			}{
+				Schema:            "sf.provider-diagnostic/v1",
+				ProviderAttemptID: claim.ID,
+				Phase:             claim.Phase,
+				Attempt:           claim.Attempt,
+				RequestDigest:     claim.RequestDigest,
+				Fence: providerResultDiagnosticFence{
+					TicketVersion: claim.ExpectedVersion,
+					LeaderEpoch:   claim.LeaderEpoch,
+					RunnerEpoch:   claim.RunnerEpoch,
+				},
+				Reason: diagnosticReason,
+			}
+			if err := evidenceEvent(ctx, conn, claim.Ref, expected, "provider_result_diagnostic", payload); err != nil {
 				return err
 			}
 		}

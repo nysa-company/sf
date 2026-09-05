@@ -47,6 +47,7 @@ var (
 	ErrUnsupportedAuthMode = errors.New("codex authentication mode is not the supported ChatGPT subscription")
 	ErrCapability          = errors.New("codex executable lacks required exec capabilities")
 	ErrMalformedJSONL      = errors.New("codex JSONL output is malformed")
+	ErrTerminalFailure     = errors.New("codex returned a structured terminal failure")
 	ErrNoFinalArtifact     = errors.New("codex did not return a final structured artifact")
 	ErrOutputTooLarge      = errors.New("codex output exceeded the bounded contract")
 	ErrUnsafeConfiguration = errors.New("codex adapter configuration is unsafe")
@@ -396,13 +397,21 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	// never trusted unless the complete JSONL protocol was parsed.
 	indeterminate := contracts.PhaseResult{Outcome: contracts.PhaseResultIndeterminate, Provider: input.Provider, UsageTrusted: input.AuthMode == authModeChatGPTSubscription, UsageUnits: 0}
 	if result.StdoutTruncated || result.StderrTruncated || len(result.Stdout) > maxJSONL || len(result.Stderr) > maxJSONL {
+		indeterminate.FailureReason = contracts.ProviderFailureOutput
 		return indeterminate, ErrOutputTooLarge
 	}
 	if result.ExitCode != 0 {
+		indeterminate.FailureReason = contracts.ProviderFailureExit
 		return indeterminate, fmt.Errorf("codex exec exited %d", result.ExitCode)
 	}
 	transcript, usage, usageTrusted, usageDetail, err := parseJSONL(result.Stdout, result.Stderr)
 	if err != nil {
+		indeterminate.FailureReason = contracts.ProviderFailureProtocol
+		if errors.Is(err, ErrTerminalFailure) {
+			indeterminate.FailureReason = contracts.ProviderFailureTerminal
+		} else if errors.Is(err, ErrOutputTooLarge) && len(result.Stdout) != 0 {
+			indeterminate.FailureReason = contracts.ProviderFailureOutput
+		}
 		return indeterminate, err
 	}
 	artifact := bytes.TrimSpace(result.OutputLastMessage)
@@ -733,7 +742,7 @@ func parseJSONL(stdout, stderr []byte) (string, int64, bool, tokenUsage, error) 
 			return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 		}
 		if event.Type == "error" || strings.HasSuffix(event.Type, ".failed") || strings.HasSuffix(event.Type, ".error") || strings.HasSuffix(event.Type, ".cancelled") || strings.HasSuffix(event.Type, ".canceled") || strings.HasSuffix(event.Type, ".aborted") || event.Status == "failed" || event.Status == "error" || event.Status == "cancelled" || event.Status == "canceled" || event.Status == "aborted" || (len(event.Error) != 0 && string(event.Error) != "null") {
-			return "", 0, false, tokenUsage{}, errors.New("codex returned a structured terminal failure")
+			return "", 0, false, tokenUsage{}, ErrTerminalFailure
 		}
 		if event.Type == "turn.completed" {
 			completed++
