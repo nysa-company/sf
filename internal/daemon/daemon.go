@@ -1379,10 +1379,41 @@ func (daemon *Daemon) controlTicket(ctx context.Context, request api.Request, id
 		return daemon.controlSuccess(request, stored, intent, true)
 	}
 	if intent != "cancel" && stored.State == domain.StatePaused {
-		if intent == "take" {
-			return daemon.takeoverSuccess(ctx, request, stored, true)
+		// A semantic pause (for example Planner questions) can retain admission
+		// capacity without having run the operator stop/drain protocol. Do not
+		// mistake the state alone for a completed runtime join.
+		leases, err := daemon.store.Leases(ctx, daemon.channel)
+		if err != nil {
+			return daemon.failure(request, "control_state_unavailable", "paused ticket capacity could not be inspected", true)
 		}
-		return daemon.controlSuccess(request, stored, intent, true)
+		holdsCapacity := false
+		for _, lease := range leases {
+			holdsCapacity = holdsCapacity || lease.Ref == ref
+		}
+		if holdsCapacity {
+			if err := daemon.lease.Validate(); err != nil {
+				return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+			}
+			drained, err := daemon.control.Drain(ctx, ref)
+			if err != nil || !drained {
+				return daemon.controlFailure(request, stored, intent, "control_drain_failed", "paused ticket runtime must drain before capacity is released", true, true)
+			}
+			// ControlProof seals admission and rechecks every durable writer.
+			// ReleaseLeases then checks the exact same version/leader/runner;
+			// a concurrent resume cannot turn this into an active-ticket release.
+			proof, err := daemon.store.ControlProof(ctx, ref)
+			fence := domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}
+			if err != nil || !proof.Drained() || proof.Ticket.State != domain.StatePaused || proof.Ticket.Version != stored.Version || proof.Fence != fence {
+				return daemon.controlFailure(request, stored, intent, "control_drain_failed", "paused ticket drain evidence changed; capacity remains reserved", true, true)
+			}
+			if _, err := daemon.store.ReleaseLeases(ctx, ref, stored.Version, fence); err != nil {
+				return daemon.controlFailure(request, stored, intent, "control_completion_failed", "paused ticket capacity could not be released under its exact drained fence", true, true)
+			}
+		}
+		if intent == "take" {
+			return daemon.takeoverSuccess(ctx, request, stored, !holdsCapacity)
+		}
+		return daemon.controlSuccess(request, stored, intent, !holdsCapacity)
 	}
 	if err := daemon.lease.Validate(); err != nil {
 		return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)

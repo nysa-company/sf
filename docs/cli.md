@@ -120,7 +120,11 @@ stop/drain authority as pause, then returns the authenticated absolute
 worktree path, branch, repository, base, and head. It never opens an editor or
 GUI. If an active ticket is stopped before a worktree exists, the human view
 says so and prints the channel-correct `resume` command instead of inventing a
-path. A repeated `take` is read-only and returns the same retained handoff.
+path. After completed drain, a repeated `take` is read-only and returns the
+same retained handoff. A semantic pause (such as Planner questions) may still
+hold capacity: `pause` or `take` first joins that runtime and proves all
+writers/effects drained before releasing its slot. It preserves the paused
+ticket and its evidence; it does not answer Planner questions or resume work.
 
 `resume` reauthenticates the registered worktree, branch, remote candidate,
 protected base, and filesystem identity. A clean checkout at an existing

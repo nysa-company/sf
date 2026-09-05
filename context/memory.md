@@ -63,6 +63,16 @@ window. Freeze only after tests, then run two serial nonoverlapping Relay
 tickets without SF code changes between deliveries. No concurrency or live
 fault injection; recovery probes use isolated fixtures.
 
+The fresh-base repair passed live registration, but a later Planner asked a
+whitespace-ID question and entered `paused`. There is no supported answer
+command yet; preserve this trial instead of modifying its immutable result.
+An explicit pause of an already semantically paused ticket previously returned
+early while its capacity leases remained held. The control path now joins the
+runtime, obtains sealed Store drain proof, and releases only the exact paused
+version/leader/runner's capacity. It does not infer an answer, change the
+lifecycle, or weaken outstanding-effect protection. The missing answer loop
+remains a product limitation, not a passing unattended-delivery claim.
+
 ### 2026-08-29 — Local v1 implementation begins
 
 Sofia approved the root-authored replacement plan. The local working repository
