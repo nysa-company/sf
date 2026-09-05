@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/api"
+	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/runtimeassets"
 )
 
 func TestRealBundleManifestRejectsPayloadAndMetadataTamper(t *testing.T) {
@@ -134,6 +136,26 @@ func TestRealBundleManifestRejectsPayloadAndMetadataTamper(t *testing.T) {
 	if _, err := Verify(ctx, directory); err != nil {
 		t.Fatalf("fixture not restored: %v", err)
 	}
+	t.Run("reject writable ancestor before creating destination", func(t *testing.T) {
+		root, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(root, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		private := filepath.Join(root, "private")
+		if err := os.Mkdir(private, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		destination := filepath.Join(private, "installed")
+		if _, created, err := Install(ctx, directory, destination); err == nil || created {
+			t.Fatalf("accepted runtime-unusable ancestry: created=%v err=%v", created, err)
+		}
+		if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+			t.Fatal("unsafe installation created files")
+		}
+	})
 	t.Run("install and execute local intake", func(t *testing.T) {
 		parent, err := filepath.EvalSymlinks(t.TempDir())
 		if err != nil {
@@ -146,6 +168,12 @@ func TestRealBundleManifestRejectsPayloadAndMetadataTamper(t *testing.T) {
 		}
 		if _, err := Verify(ctx, destination); err != nil {
 			t.Fatal(err)
+		}
+		if _, err := runtimeassets.ResolveCore(domain.ChannelDev, filepath.Join(destination, "sf-dev")); err != nil {
+			t.Fatalf("installed core unusable: %v", err)
+		}
+		if _, err := runtimeassets.ResolvePublication(domain.ChannelDev, filepath.Join(destination, "sf-dev")); err != nil {
+			t.Fatalf("installed publication helper unusable: %v", err)
 		}
 		if _, created, err := Install(ctx, directory, destination); err == nil || created {
 			t.Fatalf("overwrote destination: created=%v err=%v", created, err)

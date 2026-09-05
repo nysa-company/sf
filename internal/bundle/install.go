@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"syscall"
+
+	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/runtimeassets"
 )
 
 // Install returns created=true once the exclusively-created destination
@@ -29,6 +32,9 @@ func Install(ctx context.Context, source, destination string) (manifest Manifest
 	parent, err := filepath.EvalSymlinks(filepath.Dir(destination))
 	if err != nil || parent != filepath.Dir(destination) {
 		return Manifest{}, false, errors.New("destination parent must exist and be canonical")
+	}
+	if err := runtimeassets.ValidateInstallParent(parent); err != nil {
+		return Manifest{}, false, errors.New("destination ancestry is unsafe; choose an owner-controlled location with no group/world-writable ancestors, not a shared temporary directory")
 	}
 	if err := ctx.Err(); err != nil {
 		return Manifest{}, false, err
@@ -60,6 +66,18 @@ func Install(ctx context.Context, source, destination string) (manifest Manifest
 	}
 	if _, err := Verify(ctx, destination); err != nil {
 		return Manifest{}, true, err
+	}
+	primary := "sf"
+	if manifest.Identity.Channel == "dev" {
+		primary = "sf-dev"
+	}
+	executable := filepath.Join(destination, primary)
+	channel := domain.Channel(manifest.Identity.Channel)
+	if _, err := runtimeassets.ResolveCore(channel, executable); err != nil {
+		return Manifest{}, true, errors.New("installed runtime core is unsafe; partial destination retained")
+	}
+	if _, err := runtimeassets.ResolvePublication(channel, executable); err != nil {
+		return Manifest{}, true, errors.New("installed publication helper is unsafe; partial destination retained")
 	}
 	directory, err := os.Open(destination)
 	if err != nil {

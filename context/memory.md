@@ -2,6 +2,57 @@
 
 ## Current truth
 
+- Fresh onboarding acceptance ticket SF-543bc4cd3b9a9a6291c2bbc7ca20b3b1
+  is waiting_approval v9/r1 (live CLI rechecked), not delivered yet. Created
+  2026-09-05T21:48:45Z with2h/$20 ceiling; deadline23:48:45Z. Private repo
+  nysa-company/sf-cli-beta-acceptance-20260905 PR1 is draft, exact head
+  ee35025e60092cfd25480121537acec4e4f33a1d, required test SUCCESS
+  (run33994270868). Human exact-head approval requested; none recorded.
+  New run command submitted/started it; short SF-543bc4 lookup worked.
+  Watcher63612 stopped via Ctrl-C exit0; ticket remained waiting_approval.
+  Acceptance daemon19839 is the current handle (50093 stopped), leader2,
+  running unchanged70c5072 onboarding2 from trusted Projects ancestry:
+  /Users/sofiagonzalez-2/Projects/sf-onboarding-runtime.2AOeAW/installed.
+  HOME remains /private/tmp/sf-onboarding-acceptance.R2QvPm/home; project
+  onboarding-counter. Qualification1343 passed both independent roles;
+  doctor passed required checks. Existing live dev factory was not changed.
+  Installer ancestry repair is uncommitted: regression30656 RED before fix,
+  host race8932 PASS bundle/runtimeassets; full frozen gate46189 TERMINAL
+  exit0: all normal packages, vet, repo/secret/docs/artifact checks PASS.
+  Do not restart active acceptance work to deploy an install-only fix.
+  Earlier chronological notes below describe superseded checkpoints, not
+  current process state. Four-stack/provider expansion and external beta
+  acceptance remain incomplete; this Go ticket is not the whole goal.
+
+- Acceptance activation investigation: qualification43344 TERMINAL exit3;
+  both roles qualified_guarded/independent, zero failed probes/model calls,
+  but runtime_activation_failed. Confirmed root cause via read-only
+  .context/onboarding-runtime-probe: runtimeassets.ResolveCore(installed2/sf-dev)
+  returns unsafe executable metadata. secureParents rejects /private/tmp1777;
+  installer only checked immediate canonical parent and therefore accepted
+  a location runtime cannot use. Do NOT weaken runtime secureParents.
+  Next fix: installer prechecks the same parent-chain authority before mkdir,
+  regression for private leaf beneath writable ancestor + trusted success;
+  docs clarify trusted ancestry. Then install under a fresh private directory
+  beneath /Users/sofiagonzalez-2/Projects (not /private/tmp). Existing bundles
+  retained as evidence, no delete/overwrite. Investigation skill fully read
+  (initial cat truncated middle recovered by lines300-700), root-cause-first
+  workflow used; no global setup/hooks/telemetry changes. New acceptance
+  daemon50093 stopped cleanly (Ctrl-C, exit0, daemon stopped). No ticket
+  submitted, all original live factory state untouched.
+
+- Codex auth follow-up committed70c507281c7493d01528a3eeb945417feb7e7db9.
+  Clean bundle/install80258 PASS at acceptance/{bundle2,installed2}, version
+  0.1.0-dev.onboarding2. Installed isolated auth18614 confirms both GitHub and
+  Codex authenticated; no login/model/credential copy. Project onboarding-counter
+  registered only in acceptance HOME (digest10de8b55333abfd7fb2267e9515773ed80b3c51162721c8f73f108bea8211d52).
+  Acceptance foreground daemon session50093 LIVE, leader1/socket ready. HOME
+  /private/tmp/sf-onboarding-acceptance.R2QvPm/home; GH_CONFIG_DIR references
+  /Users/sofiagonzalez-2/.config/gh; CODEX_HOME references existing ~/.codex;
+  SF_CODEX_PROVIDER_CAPACITY=2. Qualification command session43344 RUNNING;
+  poll before retrying. No ticket submitted. Existing dev DB still shows
+  16cancelled/11done/2paused and zero admission leases; untouched.
+
 - GitHub checkpoint committed5d36c8d7f4853e09a994e45232e0f58538d1881d;
   artifact/release94235 PASS. Clean build+verified install45405 PASS at
   /private/tmp/sf-onboarding-acceptance.R2QvPm/{bundle,installed}, version

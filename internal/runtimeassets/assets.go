@@ -172,3 +172,17 @@ func secureParents(directory string) bool {
 		directory = parent
 	}
 }
+
+// ValidateInstallParent exposes the runtime's existing ancestry rule so an
+// installer cannot report success for a location the runtime will reject.
+// It does not create directories, execute payloads or grant launch authority.
+func ValidateInstallParent(directory string) error {
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+		return fmt.Errorf("%w: install parent must be absolute and clean", ErrUnsafeBundle)
+	}
+	canonical, err := filepath.EvalSymlinks(directory)
+	if err != nil || canonical != directory || !secureParents(directory) {
+		return fmt.Errorf("%w: install ancestry must be canonical, owner-controlled and not group/world-writable", ErrUnsafeBundle)
+	}
+	return nil
+}

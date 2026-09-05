@@ -30,6 +30,11 @@ Helpers expose the same identity through the read-only `--sf-build-info` flag.
 
 Choose a new private directory beneath an existing canonical parent:
 
+Every ancestor must be owned by you or root and must not be group/world-writable.
+A private leaf beneath `/tmp` or `/private/tmp` is not a valid runtime install
+location. Installation checks this before creating files and checks the runtime
+helpers again after copying. It does not loosen the runtime's path policy.
+
 ```sh
 mkdir -p "$HOME/.local/sf"
 .context/bundle-dev/sf-dev bundle install "$(pwd)/.context/bundle-dev" \
