@@ -2,6 +2,11 @@
 
 ## Current truth
 
+- 2026-09-05 second onboarding checkpoint is uncommitted: cwd/project defaults
+  and read-only `init --check`, with explicit unsupported-stack explanations.
+  Focused CLI/config tests pass (session51388); broad verification pending.
+  Preview never claims provider/publication/executable readiness. Explicit
+  profile creation is not previewed yet. No live channel/project changes.
 - 2026-09-05 self-serve CLI beta goal is active, separate from the completed
   concurrency campaign. Audience: Claude/Codex users on Go, Node/TS, Python,
   and Rails. Scope/acceptance: `docs/plans/2026-09-05-self-serve-cli-beta.md`.

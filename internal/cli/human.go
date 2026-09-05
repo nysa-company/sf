@@ -19,6 +19,14 @@ func renderHumanData(writer io.Writer, value any) error {
 	if _, hasChecks := object["checks"]; hasChecks {
 		return renderDoctor(writer, object)
 	}
+	if setup, ok := object["setup"].(map[string]any); ok {
+		for _, field := range []struct{ label, key string }{{"Project", "project"}, {"Repository", "repository"}, {"Configuration", "configuration"}, {"Local recipe", "local_recipe"}, {"Runtime", "runtime"}, {"Providers", "providers"}, {"Publication", "publication"}, {"Note", "reason"}} {
+			if _, err := fmt.Fprintf(writer, "%s: %s\n", field.label, safeSelectionLabel(stringField(setup, field.key))); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if events, ok := object["events"].([]any); ok {
 		return renderEvents(writer, object, events)
 	}

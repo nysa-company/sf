@@ -31,9 +31,9 @@ func TestInputErrorsPointToSpecificCommandHelpWithoutCallingDaemon(t *testing.T)
 		args []string
 		path string
 	}{
+		{[]string{"init", "--invalid-option"}, "init"},
 		{[]string{"submit"}, "submit"},
 		{[]string{"start"}, "start"},
-		{[]string{"init"}, "init"},
 		{[]string{"providers", "qualify"}, "providers qualify"},
 		{[]string{"status", "--invalid-option"}, "status"},
 	} {

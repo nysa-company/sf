@@ -22,6 +22,20 @@ Claude runtime. Provider expansion is tracked in the
 
 ## Prepare once
 
+From the repository root, preview the local configuration without registering
+anything:
+
+```sh
+sf-dev init --check
+sf-dev init
+```
+
+The project name defaults to the directory name (normalized to a valid name).
+Use `--project my-app` to override it and `--repo /absolute/path` to select a
+different repository root. `--check` does not execute tests, contact providers
+or GitHub, or prove full runtime readiness; those checks remain separate.
+It currently previews existing configuration, not `--profile`/`--test` setup.
+
 Follow [source build and foreground setup](source-build-foreground.md) to build
 the dev bundle, authenticate, register your repository, start the daemon in a
 second terminal, qualify the provider pair, and run doctor. Public installation

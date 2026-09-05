@@ -79,5 +79,10 @@ ambiguous inventories refuse noninteractive dispatch. Approval/rejection retain
 explicit full IDs pending candidate-bound confirmation. No schema, provider,
 or execution-policy changes in this checkpoint. Full normal Go suite, CLI race,
 vet/repository/secret/artifact/docs/release checks passed on 2026-09-05. Compiled
-interactive acceptance and the overall beta gates remain pending. Next:
-current-directory defaults and a non-mutating compatibility preview.
+interactive acceptance and the overall beta gates remain pending. The second
+checkpoint adds current-directory/project defaults and `init --check`, a
+non-mutating existing-configuration/recipe preview. Unsupported Python/Rails
+and dependency-bearing Node diagnostics are explicit. CLI/config focused tests
+pass; broader second-checkpoint verification is in progress. Runtime executable,
+provider and publication readiness are deliberately not inferred from the
+preview. Next: ticket template/validation and safe run/watch composition.

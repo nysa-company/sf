@@ -29,8 +29,8 @@ const MaxFileBytes = 64 * 1024
 // the project owner and frozen into the registered configuration snapshot.
 const NysaPureAPIV1Profile = "nysa-api-pure-v1"
 
-// ErrCommandDetection identifies a repository whose command contract needs an
-// explicit .sf/config.toml. The CLI turns it into a channel-correct next
+// ErrCommandDetection identifies a repository whose command contract cannot
+// be inferred safely. Explicit config does not grant runtime support. The CLI turns it into a channel-correct next
 // action; callers can still distinguish it from malformed explicit config.
 var ErrCommandDetection = errors.New("project command detection failed")
 
@@ -606,8 +606,8 @@ func loadProjectData(repository, name string, machine MachineLimits, commandsOve
 
 // detectRepositoryCommands selects only a small, typed walking-skeleton
 // default. It intentionally refuses to guess for repositories whose build
-// contract is not obvious; an explicit .sf/config.toml can opt into another
-// argv-only command without adding shell interpretation.
+// contract is not obvious. Explicit argv configuration remains subject to
+// the independent repository execution policy and runtime admission.
 func detectRepositoryCommands(repository string) (Commands, error) {
 	goMod, err := regularRepositoryFile(filepath.Join(repository, "go.mod"), "go.mod")
 	if err != nil {
@@ -637,7 +637,18 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 		command := Command{Argv: []string{"node", "--test"}}
 		return Commands{Verify: command, Review: command}, nil
 	}
-	return Commands{}, detectionError("repository type is unsupported; add explicit commands to .sf/config.toml")
+	for _, marker := range []struct{ path, stack string }{
+		{"Gemfile", "Ruby/Rails"}, {"pyproject.toml", "Python"}, {"requirements.txt", "Python"}, {"setup.py", "Python"},
+	} {
+		present, err := regularRepositoryFile(filepath.Join(repository, marker.path), marker.path)
+		if err != nil {
+			return Commands{}, err
+		}
+		if present {
+			return Commands{}, detectionError(marker.stack + " local execution is not supported yet; an explicit command does not enable it. Use a supported Go or dependency-free Node project for this beta")
+		}
+	}
+	return Commands{}, detectionError("repository type has no supported detected local recipe; use a supported Go or dependency-free Node project, or consult the explicit bounded TypeScript profile in docs/configuration.md")
 }
 
 func regularRepositoryFile(path, name string) (bool, error) {

@@ -490,15 +490,22 @@ func (a *app) authCommand() *cobra.Command {
 
 func (a *app) initCommand() *cobra.Command {
 	var project, repo, profile, testPath string
-	command := &cobra.Command{Use: "init --project <name> --repo <path> [--profile <name> --test <path>]", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		return a.emit(RunInit(cmd.Context(), InitRequest{Channel: a.channel, Project: project, Repo: repo, Profile: profile, TestPath: testPath}))
+	var check bool
+	command := &cobra.Command{Use: "init [--project <name>] [--repo <path>] [--check]", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		request, err := resolveInitRequest(cmd.Context(), InitRequest{Channel: a.channel, Project: project, Repo: repo, Profile: profile, TestPath: testPath})
+		if err != nil {
+			return a.emit(failure("invalid_repository", err.Error(), []string{binaryName(), "init", "--help"}))
+		}
+		if check {
+			return a.emit(RunInitCheck(cmd.Context(), request))
+		}
+		return a.emit(RunInit(cmd.Context(), request))
 	}}
-	command.Flags().StringVar(&project, "project", "", "project name")
-	command.Flags().StringVar(&repo, "repo", "", "trusted repository path")
+	command.Flags().StringVar(&project, "project", "", "project name (default: repository directory name)")
+	command.Flags().StringVar(&repo, "repo", ".", "trusted repository path (default: current directory)")
+	command.Flags().BoolVar(&check, "check", false, "preview local compatibility without registering or changing files")
 	command.Flags().StringVar(&profile, "profile", "", "explicit project profile (for example nysa-api-pure-v1)")
 	command.Flags().StringVar(&testPath, "test", "", "repository-relative .test.ts entrypoint for the selected profile")
-	_ = command.MarkFlagRequired("project")
-	_ = command.MarkFlagRequired("repo")
 	return command
 }
 

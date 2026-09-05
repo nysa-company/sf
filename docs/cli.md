@@ -14,6 +14,7 @@ are never installed silently.
 ## Primary verbs
 
 ```text
+sf init [--project <name>] [--repo <path>] [--check]
 sf submit <ticket.md> --project <name>
 sf tickets [--project <name>]
 sf start <ticket>
@@ -52,6 +53,16 @@ choice or a longer ID; incomplete inventories fail closed. Piped input and
 still require full IDs pending candidate-bound interactive confirmation.
 The daemon checks current state and authority after selection; a menu is not
 permission to bypass those checks.
+
+`init` defaults to the current repository root and a normalized directory-based
+project name. Override these with `--repo` and `--project`. `init --check`
+previews existing configuration and local recipe compatibility without creating
+configuration, registering a project, invoking a provider, or contacting GitHub.
+It reports runtime, provider, and publication checks separately; recipe support
+is not full execution readiness. The preview currently does not combine with
+the explicit `--profile`/`--test` configuration-creation flags. Python/Rails and
+general dependency-bearing Node/TypeScript local runtimes remain unsupported;
+writing an arbitrary command in configuration does not enable them.
 
 For newly recorded indeterminate provider results, `sf logs <ticket> --json`
 includes a `provider_result_diagnostic` event. Its closed `reason` distinguishes
