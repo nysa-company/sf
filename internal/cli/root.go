@@ -75,6 +75,7 @@ func (a *app) command() *cobra.Command {
 	root.AddCommand(a.submitCommand(), a.startCommand(), a.statusCommand(), a.showCommand(), a.logsCommand(), a.controlCommand("pause"), a.controlCommand("resume"), a.recoverCommand(), a.controlCommand("cancel"), a.retryCommand(), a.controlCommand("take"), a.approveCommand(), a.rejectCommand(), a.doctorCommand(), a.authCommand(), a.initCommand(), a.providersCommand(), a.daemonCommand(), a.configCommand(), a.simpleSetupCommand("update"), a.simpleSetupCommand("rollback"), a.versionCommand())
 	configureCommandHelp(root)
 	root.AddCommand(a.ticketsCommand())
+	root.AddCommand(a.ticketDraftCommand())
 	a.configureTicketSelection(root)
 	return root
 }

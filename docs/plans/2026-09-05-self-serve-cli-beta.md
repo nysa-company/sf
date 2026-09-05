@@ -83,6 +83,10 @@ interactive acceptance and the overall beta gates remain pending. The second
 checkpoint adds current-directory/project defaults and `init --check`, a
 non-mutating existing-configuration/recipe preview. Unsupported Python/Rails
 and dependency-bearing Node diagnostics are explicit. CLI/config focused tests
-pass; broader second-checkpoint verification is in progress. Runtime executable,
+pass; full normal and static/release checks passed for the setup checkpoint. Runtime executable,
 provider and publication readiness are deliberately not inferred from the
-preview. Next: ticket template/validation and safe run/watch composition.
+preview. Ticket template/validation and interactive creation are implemented:
+the full draft is previewed, saving requires explicit confirmation, existing
+files are never overwritten, and no submission occurs. Focused normal and
+full CLI race tests pass. Compiled interactive acceptance is still pending.
+Next: safe run/watch composition.

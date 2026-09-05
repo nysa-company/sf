@@ -19,6 +19,27 @@ func renderHumanData(writer io.Writer, value any) error {
 	if _, hasChecks := object["checks"]; hasChecks {
 		return renderDoctor(writer, object)
 	}
+	if source, ok := object["ticket_template"].(string); ok {
+		_, err := io.WriteString(writer, source)
+		return err
+	}
+	if draft, ok := object["ticket_draft"].(map[string]any); ok {
+		_, err := fmt.Fprintf(writer, "Saved draft: %s\n%s\n", safeSelectionLabel(stringField(draft, "path")), stringField(draft, "note"))
+		return err
+	}
+	if validation, ok := object["ticket_validation"].(map[string]any); ok {
+		if _, err := fmt.Fprintf(writer, "Valid ticket syntax: %s\nAcceptance criteria: %s\n%s\n", safeSelectionLabel(stringField(validation, "title")), displayField(validation, "acceptance_count"), stringField(validation, "note")); err != nil {
+			return err
+		}
+		if warnings, ok := validation["warnings"].([]any); ok {
+			for _, warning := range warnings {
+				if _, err := fmt.Fprintf(writer, "Note: %s\n", warning); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	if setup, ok := object["setup"].(map[string]any); ok {
 		for _, field := range []struct{ label, key string }{{"Project", "project"}, {"Repository", "repository"}, {"Configuration", "configuration"}, {"Local recipe", "local_recipe"}, {"Runtime", "runtime"}, {"Providers", "providers"}, {"Publication", "publication"}, {"Note", "reason"}} {
 			if _, err := fmt.Fprintf(writer, "%s: %s\n", field.label, safeSelectionLabel(stringField(setup, field.key))); err != nil {

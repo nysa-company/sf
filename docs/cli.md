@@ -15,6 +15,9 @@ are never installed silently.
 
 ```text
 sf init [--project <name>] [--repo <path>] [--check]
+sf ticket template
+sf ticket new <ticket.md>
+sf ticket validate <ticket.md>
 sf submit <ticket.md> --project <name>
 sf tickets [--project <name>]
 sf start <ticket>
@@ -63,6 +66,22 @@ is not full execution readiness. The preview currently does not combine with
 the explicit `--profile`/`--test` configuration-creation flags. Python/Rails and
 general dependency-bearing Node/TypeScript local runtimes remain unsupported;
 writing an arbitrary command in configuration does not enable them.
+
+`ticket template` prints an editable Markdown template (`--json` returns it in
+the response data). Save it to a new file, replace the example requirements,
+then run `ticket validate <file>`. Validation uses the submission parser without
+contacting the daemon, starting the ticket deadline, or submitting work. It
+checks syntax only, not feasibility, project limits, provider qualification or
+readiness. Missing acceptance criteria and omitted budget limits produce notes.
+Files must be regular, non-symlink files of at most 1 MiB.
+
+In a terminal, `ticket new <file>` collects a title, a one-line problem/scope,
+and up to 32 acceptance criteria. It previews the complete guarded ticket with
+explicit 1h/$10 ceilings, then saves only if you type `yes`. The output is a
+new private file; existing files are never overwritten. Edit the saved Markdown
+to change its limits or add detail. JSON and piped calls do not prompt or create
+a file; use the template and validation commands instead. Creation never
+submits work or starts the deadline.
 
 For newly recorded indeterminate provider results, `sf logs <ticket> --json`
 includes a `provider_result_diagnostic` event. Its closed `reason` distinguishes

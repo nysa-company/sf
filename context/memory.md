@@ -2,11 +2,22 @@
 
 ## Current truth
 
-- 2026-09-05 second onboarding checkpoint is uncommitted: cwd/project defaults
+- 2026-09-05 second onboarding checkpoint is committed as 7e1f67e: cwd/project defaults
   and read-only `init --check`, with explicit unsupported-stack explanations.
-  Focused CLI/config tests pass (session51388); broad verification pending.
+  Focused CLI/config tests pass (session51388); full normal and static/release
+  verification passed (53101).
   Preview never claims provider/publication/executable readiness. Explicit
   profile creation is not previewed yet. No live channel/project changes.
+- Ticket facade checkpoint: `ticket template` prints editable
+  Markdown; `ticket validate` uses the shared parser locally, reports syntax
+  only, bounds files, refuses special/symlink files and omits invalid values
+  from diagnostics. `ticket new` collects title/problem/acceptance, previews
+  the entire draft and requires yes before an exclusive private-file write.
+  No daemon calls. Narrow tests pass (57456/68516), full CLI race passes
+  (13034); the later preview-file-race regression passes separately (95937).
+  Run/watch composition, compiled interactive acceptance, runtime expansion
+  and packaging remain incomplete. Broad setup suite predates these facade
+  edits; CLI race covers the new facade production code.
 - 2026-09-05 self-serve CLI beta goal is active, separate from the completed
   concurrency campaign. Audience: Claude/Codex users on Go, Node/TS, Python,
   and Rails. Scope/acceptance: `docs/plans/2026-09-05-self-serve-cli-beta.md`.

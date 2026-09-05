@@ -48,9 +48,12 @@ refusal. The initial supported path uses GitHub and guarded merge.
 
 ## Write one small ticket
 
-Create `ticket.md` yourself, adapting the paths and requirements to your
-project. For a dependency-free Node repository, this is a complete format
-example (not an automatically generated or automatically submitted ticket):
+Run `sf-dev ticket new ticket.md` in a terminal for guided creation and a full
+preview before saving. Alternatively, use `sf-dev ticket template` and save its
+output to a new `ticket.md`, then replace the sample requirements. Do not
+overwrite an existing ticket. Creation does not submit anything.
+For a dependency-free Node repository, this is a complete format example
+(not an automatically submitted ticket):
 
 ```markdown
 ---
@@ -75,6 +78,15 @@ dependency-free. Add verification in `test/count-items.test.js` using node:test.
 
 Ticket duration starts at submission, not at execution. Submit when ready to
 start; queue time consumes the same deadline. Costs are ceilings, not estimates.
+
+Before submitting, check the format without starting that deadline:
+
+```sh
+sf-dev ticket validate ticket.md
+```
+
+This checks syntax and highlights omitted acceptance/budget fields; project
+policy and runtime readiness are still checked at submission and execution.
 
 ## Submit, start, and observe
 
