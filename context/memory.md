@@ -2,17 +2,22 @@
 
 ## Current truth
 
-- 2026-09-05 capacity-two campaign remains active. Original ten:4done/6cancelled.
-  Follow-up PR12 and PR13 delivered separately; no pair with actual provider
-  overlap has yet both delivered. See the campaign report for immutable counts.
-  Live Relay31/f267719 (dev leader37) exposed a PR14 review stall after an
-  automatic base refresh. Its old review blocked new review selection. A narrow Store
-  cutover repair plus full lifecycle regression passes before/after validation:
-  regression fails without the fix; full normal/race/static session34163 PASS.
-  PR14's original deadline passed16:09UTC; supported SF cancellation completed
-  at16:11 (cancelledv14/R2), preserving its draft/worktree. Never approve it.
-  Validated repair is ready for a dev-only rollout. Live DB/worktree repairs
-  are prohibited. Remaining fresh pair, if necessary, uses original specs02/09.
+- 2026-09-05 scoped capacity-two stress/delivery campaign completed: PR15 and
+  PR16 both merged through SF and are done, with177.439s successful provider
+  overlap at peak2. Final pair10/10 provider calls succeeded, no retries or
+  repair/restart intervention; two guarded exact-head approvals. PR16 refreshed
+  in place and ran a fresh Builder/CI/final Reviewer. Final live authority
+  inventory is zero. See `docs/reports/2026-09-05-relay-concurrency-campaign.md`.
+- Current dev runtime is Relay32/c6913abbc34e2b3f26cec608f8f8889e840604ff,
+  leader38, qualified pair63/64, capacity2, idle after delivery. The final
+  review-cutover regression fails before/passes after; full normal/race/static
+  session34163 passed. No stable/Nysa change, no live DB/worktree repair.
+- Preserve cohort counts: original10=4done/6cancelled; follow-ups3=1done/2cancel,
+  then2=1done/1cancel, final2=2done. Total8/17 is not a reliability benchmark.
+  Draft PR1/2/10/14 and failed worktrees remain evidence. PR14 expired and was
+  cancelledv14/R2; never approve it. Next priorities: generated-test quality,
+  intake/budget visibility, and explicit refresh-plus-further-repair coverage.
+  Do not raise live concurrency above2 or call this unattended stable-v1.
 - `sf` is a new local Go implementation; the legacy factory is not migrated.
 - The approved plan and normative state machine live under `docs/plans/`.
 - SQLite is the sole application authority; logs and NDJSON are projections.

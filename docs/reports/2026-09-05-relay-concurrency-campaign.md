@@ -4,6 +4,14 @@ Date: 2026-09-05. All timestamps below are UTC.
 
 ## Verdict
 
+**The scoped concurrency/stress campaign is complete.** Final confirmation
+[PR15](https://github.com/nysa-company/sf-v1-relay-pilot/pull/15) and
+[PR16](https://github.com/nysa-company/sf-v1-relay-pilot/pull/16) both delivered,
+with177.439 seconds of successful provider overlap at peak2. The second
+delivery exercised same-PR base refresh and a fresh independent review.
+See the final confirmation and completion audit below. This is not a stable-v1
+or unattended-reliability certification.
+
 The ten-ticket live stress run finished with four factory deliveries and six
 cancelled trials. Capacity-two operation, overlapping provider execution,
 guarded exact-head merges, protected-base refresh, and native restart recovery
@@ -90,9 +98,10 @@ with explicit `SF_CODEX_PROVIDER_CAPACITY=2` for this campaign.
 The final independent timestamp audit found **zero provider-call overlaps
 between two eventually delivered tickets** in this original ten-ticket batch.
 Peak provider concurrency was two, but those pairs each included a cancelled
-trial. A separate fresh confirmation pair is therefore still required for the
+trial. A separate fresh confirmation pair was therefore required for the
 stronger goal of two successful, simultaneously executing provider workflows.
-It must not be folded into the original four-of-ten success rate.
+The final confirmation below satisfies it, separately from the original
+four-of-ten success rate.
 
 Across the original ten tickets there were37 provider attempts and33 immutable
 completed results: two invalid-artifact failures, one indeterminate result and
@@ -166,7 +175,8 @@ Validation checkpoints:
   Store121.218s, workflowruntime110.951s, worktreecoord128.909s. Compiled
   guarded/manual/takeover/channel-coexistence passed234.557s. All static gates,
   including release-build smoke, passed in the same run. The stronger live
-  confirmation pair remains pending and is not implied by these tests.
+  confirmation pair was still pending at that checkpoint and was not implied
+  by those tests.
 
 ## Next priorities
 
@@ -266,3 +276,88 @@ leaving cancelledv14/runner2 and preserving draft PR14 and its worktree. This
 second confirmation is one delivery and one cancellation, not a successful
 concurrent-delivery pair. The regression/validation delay is an operator
 intervention and is included in the failed trial's elapsed time.
+
+## Final confirmation: two concurrent deliveries
+
+Validated repair `c6913abbc34e2b3f26cec608f8f8889e840604ff` ran as Relay32,
+dev leader38, independent qualified pair63/64, capacity2. The idle Relay31
+stopped cleanly before rollout; no active leases existed. Two unchanged,
+previously undelivered specs were submitted just in time at16:22:04 and started
+back-to-back, each with its original90-minute/$20 ceiling.
+
+| Ticket | Delivery | Submitted to done | Reviewed head | Merge |
+| --- | --- | --- | --- | --- |
+| SF-679b3a5bcb5c8e3e369ca065b4644c1e, approval count | PR15, donev11 at16:30:11.896 | 487.144s | 9890cff59469f6a4685e984fd42e171aabe8027d | a57886d38daff844f15eff041ca9859310e40bf7 at16:30:07 |
+| SF-6a37a4f7028c8654529c98a7043db323, retry count | PR16, donev16 at16:34:00.407 | 715.622s | fe028f814c63e9fda2fb1698443f24223842cd3f | e65a0bc5438f66ca32db1436d73c1a226c0e0e4f at16:33:54 |
+
+Required PR CI33977959697 and33978152528 passed. Protected-main CI33978261707
+also passed on the final merge. Protection was freshly rechecked before both
+SF approvals: exact active Repository ruleset22065613, strict test15368,
+squash-only, no bypass, no additional parent/evaluate rulesets.
+
+Both delivered workflows had successful overlapping provider calls:
+
+| Calls | Exact UTC overlap | Seconds |
+| --- | --- | --- |
+| Both planners | 16:22:27.085057–16:23:07.329765 | 40.244708 |
+| Approval verification / retry planner | 16:23:08.967183–16:23:15.171291 | 6.204108 |
+| Both verification reviewers | 16:23:16.679741–16:25:04.580935 | 107.901194 |
+| Both initial final reviewers | 16:28:51.115684–16:29:14.204300 | 23.088616 |
+
+Union overlap177.438626s; peak2. Approval count used4/4 successful provider
+calls. Retry count used6/6: its second Builder and final Reviewer belong to
+new authenticated refresh phase entries, not failed-attempt retries. There
+were zero provider failures/retries, no runtime restart, no cancellation, and
+no worktree/DB repair during this final pair. Operator actions after start
+were the two exact-head SF approvals following diff/protection checks.
+
+The second candidate's initial head wasfa51540a34e88a7124e18027f8847e4d9536f82e
+on base3b2ff8479ad890496db846661123756e779f7807. After PR15 merged, SF refreshed
+to its merge base, created candidate2, updated the same PR16, and completed
+fresh CI and review2 at16:32:45.841603 before approval. This reproduces and
+verifies the repaired review-selection behavior in the real factory.
+
+Independent read-only SQLite and native Git audit verified:
+
+- All three candidate generations differ from their exact base only by the
+  declared tool and test, each regular mode100644; refreshed tool/test blobs
+  were preserved. No cross-ticket changes.
+- Each ticket has exactly one draft creation, merge effect, guarded merged
+  observation, and approval. PR16 has one edit and two generation-specific
+  pushes but one distinct PR. Semantic keys are unique.
+- Effect counts are10 and16. Each includes one expected failed prebuild
+  command proving the implementation was missing, not a provider failure.
+  Two pre-launch claim reclaims retain one semantic operation each.
+- Final global active/quarantined providers0, Git leases0, command leases0,
+  admission leases0, executing/uncertain effects0, external quarantines0.
+- Draft PR1/2/10/14 and failed worktrees remain retained evidence. The primary
+  local pilot checkout remains clean at2373b836; stable and Nysa were not
+  modified. No manual live SQL or factory-file repair occurred.
+
+Keep outcomes separate: original10 trials4done/6cancelled; first confirmation
+3trials1done/2cancelled; second confirmation2trials1done/1cancelled; final
+confirmation2trials2done. Overall8 deliveries across17 trials is not a clean
+throughput or reliability benchmark because repair/validation pauses consumed
+earlier ticket budgets. Failed trials have not been relabelled as successes.
+
+## Completion audit against the authorized objective
+
+| Requirement | Evidence and result |
+| --- | --- |
+| Two real concurrent Relay deliveries, cap2 | PR15/16 done; exact successful overlap above; peak2; no production cap4 |
+| Ten-ticket campaign | Original ten immutable outcomes recorded, including all six cancellations |
+| Repeatable isolated capacity2/4 stress | 200 seeded Store/runtime/Scheduler cases, baseline race run and current full normal suite; source asserts bounds, duplicate admission, drain and zero residual runs/leases |
+| Shared-base collision and recovery | Private-bare refusal regression; same-PR refresh/lost-Apply tests; live PR16 refresh + new Builder/CI/review/approval |
+| Restart, targeted pause/cancel, duplicate requests | Named fault regressions above; original live cancellation/startup recovery and prepared commit recovery; final pair needs no recovery intervention |
+| Lost responses, invalid artifacts, unavailable GitHub, budgets | Named current regressions above plus retained live failures; no claim that pre-push failure tests prove applied-push lost-response recovery |
+| Reproduced blockers fixed with regressions | Creation/command/proof contention, old observed PR base, and final-review cutover repairs; exact final regression fails before/passes after and live PR16 confirms it |
+| No duplicate mutations, cross-ticket writes, leaked authority | Independent current DB/Git audit and exact final counts above |
+| Preserve stable/Nysa/prior evidence; no manual repairs | Dev-only runtimes and SF controls; clean unchanged primary checkout; retained failed trials/PRs; no direct DB/worktree mutation |
+| Record timings, retries, interventions | Original outcome table, separate confirmation cohorts, exact overlap and elapsed times, approvals/cancellations/rollouts; dollar cost explicitly unavailable |
+
+Recommended next work is generated-test quality and predictable intake/budget
+visibility, not a higher concurrency limit. The combined sequence of base
+refresh followed by a further CI-repair generation remains unproven; this
+repair authenticates the direct refreshed successor and fails closed outside
+that case. Do not present the completed campaign as exhaustive edge-case
+coverage or permission for unattended deployment.
