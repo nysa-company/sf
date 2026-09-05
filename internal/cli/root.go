@@ -24,14 +24,16 @@ import (
 )
 
 type app struct {
-	client    Client
-	out       io.Writer
-	errOut    io.Writer
-	json      bool
-	channel   domain.Channel
-	last      *api.Response
-	ctx       context.Context
-	runDaemon func(context.Context) error
+	client      Client
+	out         io.Writer
+	errOut      io.Writer
+	json        bool
+	channel     domain.Channel
+	last        *api.Response
+	ctx         context.Context
+	runDaemon   func(context.Context) error
+	input       io.Reader
+	interactive func() bool
 }
 
 // NewCommand returns the public CLI. The client is injected so command tests
@@ -71,6 +73,9 @@ func (a *app) command() *cobra.Command {
 	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) { a.ctx = cmd.Context() }
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "render the versioned JSON response")
 	root.AddCommand(a.submitCommand(), a.startCommand(), a.statusCommand(), a.showCommand(), a.logsCommand(), a.controlCommand("pause"), a.controlCommand("resume"), a.recoverCommand(), a.controlCommand("cancel"), a.retryCommand(), a.controlCommand("take"), a.approveCommand(), a.rejectCommand(), a.doctorCommand(), a.authCommand(), a.initCommand(), a.providersCommand(), a.daemonCommand(), a.configCommand(), a.simpleSetupCommand("update"), a.simpleSetupCommand("rollback"), a.versionCommand())
+	configureCommandHelp(root)
+	root.AddCommand(a.ticketsCommand())
+	a.configureTicketSelection(root)
 	return root
 }
 
@@ -95,8 +100,8 @@ func ExecuteWithDaemon(ctx context.Context, args []string, out, errOut io.Writer
 		_ = Render(errOut, response, a.json)
 		return int(exitCode(response))
 	}
-	if err := command.ExecuteContext(ctx); err != nil {
-		response := failure("invalid_command", err.Error(), []string{binaryName(), "--help"})
+	if executed, err := command.ExecuteContextC(ctx); err != nil {
+		response := failure("invalid_command", err.Error(), commandHelpAction(executed))
 		_ = Render(errOut, response, a.json)
 		return int(exitCode(response))
 	}
@@ -276,11 +281,36 @@ func (a *app) statusCommand() *cobra.Command {
 	return command
 }
 
+func (a *app) ticketsCommand() *cobra.Command {
+	var project string
+	command := &cobra.Command{
+		Use: "tickets", Short: "List tickets by title and state, optionally within a project",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.emit(a.request("ticket.status", "", params(map[string]any{"project": project, "watch": false}, a.channel)))
+		},
+	}
+	command.Flags().StringVar(&project, "project", "", "filter by registered project name")
+	return command
+}
+
 const statusWatchInterval = 500 * time.Millisecond
 
 func (a *app) watchStatus(ctx context.Context, ticket string) error {
+	return a.watchScopedStatus(ctx, ticket, "")
+}
+
+func (a *app) watchProjectStatus(ctx context.Context, project string) error {
+	return a.watchScopedStatus(ctx, "", project)
+}
+
+func (a *app) watchScopedStatus(ctx context.Context, ticket, project string) error {
 	for {
-		response := a.request("ticket.status", ticket, params(map[string]any{"watch": false}, a.channel))
+		values := map[string]any{"watch": false}
+		if project != "" {
+			values["project"] = project
+		}
+		response := a.request("ticket.status", ticket, params(values, a.channel))
 		if err := a.emit(response); err != nil {
 			return err
 		}

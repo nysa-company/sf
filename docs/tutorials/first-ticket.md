@@ -1,0 +1,109 @@
+# Run your first ticket
+
+SF delegates implementation while you retain control of the reviewed merge.
+The current beta is for trusted local macOS repositories. It is not yet a
+general-purpose runner for every project or provider.
+
+## Check whether your project fits
+
+| Project | Current local execution |
+|---|---|
+| Go | Dependency-free module or compatible checked-in vendor closure |
+| JavaScript | Dependency-free Node project using `node --test` |
+| TypeScript | Only the configured bounded Nysa pure-test recipe |
+| Python / Ruby on Rails | Not yet supported locally |
+
+See [configuration](../configuration.md) for exact constraints. An explicit
+command in TOML does not grant permission to run an unsupported recipe.
+The qualified live beta uses Codex for independent Builder/Reviewer model
+families. Using Claude already does not itself establish an SF-qualified
+Claude runtime. Provider expansion is tracked in the
+[self-serve beta plan](../plans/2026-09-05-self-serve-cli-beta.md).
+
+## Prepare once
+
+Follow [source build and foreground setup](source-build-foreground.md) to build
+the dev bundle, authenticate, register your repository, start the daemon in a
+second terminal, qualify the provider pair, and run doctor. Public installation
+and automatic updates are not shipped yet. Doctor's host/provider checks do
+not prove your GitHub protection and required checks are merge-ready.
+
+Use a disposable supported project for your first run. Keep your real project
+credentials out of ticket text. Do not change branch protection to bypass a
+refusal. The initial supported path uses GitHub and guarded merge.
+
+## Write one small ticket
+
+Create `ticket.md` yourself, adapting the paths and requirements to your
+project. For a dependency-free Node repository, this is a complete format
+example (not an automatically generated or automatically submitted ticket):
+
+```markdown
+---
+type: feature
+merge: guarded
+max_duration: 1h
+max_cost_usd: 10
+---
+# Count items without modifying them
+
+Add a named `countItems` export in `src/count-items.js` that returns the length
+of an array. Use the existing project module format. Keep the implementation
+dependency-free. Add verification in `test/count-items.test.js` using node:test.
+
+## Acceptance
+- An empty array returns 0.
+- An array of three elements returns 3, including null and undefined elements.
+- A non-array throws TypeError with message "items must be an array".
+- The input array is not modified.
+- No dependencies or unrelated files are changed.
+```
+
+Ticket duration starts at submission, not at execution. Submit when ready to
+start; queue time consumes the same deadline. Costs are ceilings, not estimates.
+
+## Submit, start, and observe
+
+From the SF source directory, replace `my-app` with the registered name:
+
+```sh
+./bin/sf-dev submit /absolute/path/to/ticket.md --project my-app
+```
+
+Submission does not start work. Copy the returned ticket ID, then run:
+
+```text
+./bin/sf-dev start <ticket-id>
+./bin/sf-dev status <ticket-id> --watch
+```
+
+Find existing tickets by title and state with
+`./bin/sf-dev tickets --project my-app`. In an interactive terminal,
+`./bin/sf-dev start --project my-app` offers a numbered picker; `q` cancels.
+Use `status --select` to choose a ticket to inspect. Unique six-character
+hex ID prefixes work too. Scripts never prompt, and approval/rejection still
+require full IDs until candidate-bound confirmation is available.
+
+SF plans, writes independent verification, implements, runs proof, publishes a
+draft PR, checks CI, and performs independent final review. When it requests
+approval, inspect the actual PR diff and reviewed head before approving:
+
+```text
+./bin/sf-dev approve <ticket-id>
+```
+
+Approval is not automatic. A changed candidate requires fresh evidence and
+approval. Keep watching until SF records `done`, not merely until a PR exists.
+
+## When something stops
+
+Read the reported next action and use `logs <ticket-id>` for sanitized events.
+`pause`, `take`, `resume`, `retry`, and `cancel` have different meanings; use
+[the CLI reference](../cli.md) before modifying an interrupted worktree.
+Do not edit the database or delete worktrees to unstick a ticket. Some failures
+still require operator restoration or resubmission; the beta does not promise
+unattended recovery from every failure.
+
+Use `--help` on any command and `--json` for automation. Stop a foreground
+daemon with Ctrl-C in its terminal. Stable and dev are separate channels;
+always use the same binary/channel for a ticket.

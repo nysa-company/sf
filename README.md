@@ -11,6 +11,13 @@ machine. Docker and Colima are not required and are never silently installed.
 Autonomous selection or merge is deliberately unavailable in v1 pending a
 stronger native containment proof and a guarded pilot.
 
+## Try a first ticket
+
+Start with the [first-ticket guide](docs/tutorials/first-ticket.md). It includes
+the current supported-project matrix, setup path, a complete ticket example,
+and the submit/start/watch/approve workflow. This is a macOS source-build beta,
+not yet a packaged general-purpose installer for every language or provider.
+
 ## Development
 
 Prerequisites: Go 1.25 or newer, Git, the official `gh` CLI, and supported AI

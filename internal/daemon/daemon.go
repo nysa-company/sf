@@ -2364,7 +2364,7 @@ func (daemon *Daemon) ticketBlockedNextAction(value store.Ticket) (domain.NextAc
 }
 
 func ticketView(value store.Ticket) map[string]any {
-	return map[string]any{"channel": value.Ref.Channel, "project": value.Ref.Project, "ticket": value.Ref.Ticket, "state": value.State, "resume_state": value.ResumeState, "version": value.Version, "runner_epoch": value.RunnerEpoch, "merge_mode": value.MergeMode, "blocked_code": value.BlockedCode, "created_at": value.CreatedAt.UTC().Format(time.RFC3339Nano)}
+	return map[string]any{"channel": value.Ref.Channel, "project": value.Ref.Project, "ticket": value.Ref.Ticket, "title": value.Title, "state": value.State, "resume_state": value.ResumeState, "version": value.Version, "runner_epoch": value.RunnerEpoch, "merge_mode": value.MergeMode, "blocked_code": value.BlockedCode, "created_at": value.CreatedAt.UTC().Format(time.RFC3339Nano)}
 }
 
 func operatorView(identity domain.OperatorIdentity) map[string]any {

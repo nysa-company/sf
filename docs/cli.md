@@ -15,6 +15,7 @@ are never installed silently.
 
 ```text
 sf submit <ticket.md> --project <name>
+sf tickets [--project <name>]
 sf start <ticket>
 sf status [ticket] [--watch]
 sf show <ticket> [--json]
@@ -34,6 +35,23 @@ sf doctor [--repo <path>]
 the same versioned response envelope. The CLI never invents success: a command
 that is not configured returns a typed error, exit code, and one executable
 next action.
+
+`tickets` is a read-only list using the same status authority. It shows ticket
+IDs, titles, states, and available next actions; `--project` filters the list.
+`start`, `show`, `logs`, `pause`, `resume`, `recover`, `cancel`, `retry`, and
+`take` offer numbered selection when the ID is omitted in an interactive
+terminal. Enter `q` to cancel; no ticket is selected by default, even for a
+single match. `status --select` opens the same picker; plain `status` still
+lists tickets. `--project` scopes selection, and duplicate titles are shown
+with distinct full IDs and projects.
+
+These commands and `status` also accept a unique 6–31 character lowercase hex
+ID prefix, with or without `SF-`. Ambiguous prefixes require an interactive
+choice or a longer ID; incomplete inventories fail closed. Piped input and
+`--json` never prompt. Full IDs keep the direct path. Approval and rejection
+still require full IDs pending candidate-bound interactive confirmation.
+The daemon checks current state and authority after selection; a menu is not
+permission to bypass those checks.
 
 For newly recorded indeterminate provider results, `sf logs <ticket> --json`
 includes a `provider_result_diagnostic` event. Its closed `reason` distinguishes

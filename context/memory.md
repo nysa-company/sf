@@ -2,6 +2,15 @@
 
 ## Current truth
 
+- 2026-09-05 self-serve CLI beta goal is active, separate from the completed
+  concurrency campaign. Audience: Claude/Codex users on Go, Node/TS, Python,
+  and Rails. Scope/acceptance: `docs/plans/2026-09-05-self-serve-cli-beta.md`.
+  First checkpoint adds help, quickstart, titled ticket inventory, project
+  filtering, unique hex prefixes and terminal selection. Approval/rejection
+  retain explicit IDs pending candidate-bound UI; incomplete inventories refuse
+  selection. Full `go test -p 2 -count=1 -timeout=30m ./...`, CLI race, and
+  `make verify-static` passed (session6232). No live runtime changes. Setup,
+  stack/provider expansion, packaging, and final acceptance remain incomplete.
 - 2026-09-05 scoped capacity-two stress/delivery campaign completed: PR15 and
   PR16 both merged through SF and are done, with177.439s successful provider
   overlap at peak2. Final pair10/10 provider calls succeeded, no retries or
