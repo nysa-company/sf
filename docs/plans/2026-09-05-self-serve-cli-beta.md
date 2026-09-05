@@ -84,6 +84,16 @@ exercise Store claims or production cancellation/restart. Shared runtime
 resolution, preparation UX, supervisor integration and lifecycle acceptance
 remain required before setup may report Python execution as supported.
 
+The shared materializer/supervisor identity resolver now supports an explicitly
+composed private prepared-Python directory, without ambient PATH/HOME fallback.
+The typed pytest entrypoint disables plugin auto-discovery and project pytest
+configuration; it is a deliberately limited recipe, not arbitrary pytest argv.
+The production profile generator passes the disposable OS-backed fixture.
+Child-only hard limits cover per-file size, open descriptors and core dumps;
+they do not provide an aggregate scratch quota. Python policy admission remains
+disabled pending the actual launch gate, scratch budget, durable lease and
+cancel/restart tests. No setup command currently installs this environment.
+
 The candidate-bound decision picker now covers approval and rejection too.
 Omitted IDs in a terminal (or `--select`) show title/project/state, then fetch
 and display the complete reviewed commit. The operator must type the decision;

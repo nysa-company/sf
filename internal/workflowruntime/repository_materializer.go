@@ -22,7 +22,6 @@ import (
 	"github.com/nysa-company/sf/internal/executionpolicy"
 	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/phaseartifact"
-	"github.com/nysa-company/sf/internal/processsupervisor"
 	"github.com/nysa-company/sf/internal/repositoryexec"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/workflowprompt"
@@ -612,7 +611,7 @@ func (m RepositoryMaterializer) runCommand(ctx context.Context, request workflow
 		timeout = 45 * time.Minute
 	}
 	spec := contracts.CommandSpec{Argv: argv, Directory: request.Worktree.Path, Timeout: timeout, Profile: contracts.ProfileGuarded}
-	executable, executableDigest, err := processsupervisor.RepositoryCommandExecutableIdentity(argv)
+	executable, executableDigest, err := m.Executor.Supervisor.CommandExecutableIdentity(ctx, argv)
 	if err != nil {
 		return contracts.RepositoryCommandResultKey{}, store.RepositoryCommandResult{}, err
 	}

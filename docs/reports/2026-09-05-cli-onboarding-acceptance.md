@@ -23,6 +23,13 @@ PR head is `ee35025e60092cfd25480121537acec4e4f33a1d`; only
 passed. Human approval remains pending, so merge/reconciliation/done are not
 proven by this checkpoint.
 
+A later live CLI read after 23:48:45Z reported `waiting_approval` with
+`deadline_elapsed=true` and `remaining=0s`. No approval was supplied and no
+budget extension or merge was performed. The status clock does not itself
+transition the ticket; this is an elapsed-budget approval wait, not evidence
+of completed delivery or a terminal cancellation. Do not count this trial as
+delivered, and do not reset it to manufacture a passing acceptance result.
+
 Short-ID status lookup (`SF-543bc4`) succeeded. A live status watcher was
 interrupted with Ctrl-C and exited successfully; a separate status call
 confirmed the ticket remained waiting for approval rather than cancelled.

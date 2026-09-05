@@ -2,6 +2,72 @@
 
 ## Current truth
 
+- Combined gate96357 TERMINAL exit0: full normal Go, vet, repo/secret/docs/
+  artifact checks PASS; Store136.140s, workflowruntime122.393s,
+  worktreecoord137.199s. Python child-only resource limits added: hard file
+  size16MiB/open descriptors128/no core, never raises stricter inherited limit.
+  OS-backed focused race8732 PASS2.504s: EFBIG and file bounded by kernel;
+  parent/daemon limits untouched. This is NOT aggregate scratch quota. Latest
+  complete pythonclosure/processsupervisor race85180 TERMINAL exit0:
+  pythonclosure1.473s, processsupervisor75.923s. Diff-check clean. Ready for
+  checkpoint commit; no process/admission/setup support claim.
+
+- Acceptance fresh read after deadline: waiting_approval, deadline_elapsed=true,
+  remaining0s. No approval, budget extension or merge performed. Updated
+  acceptance report to retain this outcome, not claim delivery or cancellation.
+
+- Production Python sandbox profile generator now uncommitted: validates
+  canonical roots, private scratch/runtime/dependencies, exact factory
+  bootstrap bytes, executable inside runtime, and no scratch/read-root overlap.
+  Deny default/network/fork; only selected executable; project/runtime/deps
+  read-only, private scratch and /dev/null writable. Separate launch resource
+  limits still required; profile alone does not claim aggregate disk bounds.
+  Focused profile race90513 PASS1.629s. OS-backed probe94327 TERMINAL exit0:
+  production profile + existing prepared runtime/bootstrap passed7 pytest
+  tests0.01s, pre/post environment identity and no-project-write checks.
+  Retained .context/python-profile-3585785728.sb, reproducible through
+  .context/python-profile-probe.go (no extra runtime copy). No gate/allowlist
+  admission yet. Full96357 still running; Store136.140s already PASS.
+
+- Shared Python openPythonRuntime now returns the retained prepared handle to
+  launch owners; identity-only wrapper closes its own handle. Resolver test
+  also injects the existing staged-artifact settlement helper: ambiguous drain
+  quarantines without closing verified FDs, proven disappearance finishes and
+  closes once. Race64025 PASS1.362s. This is helper composition coverage, not
+  an actual Python process/Store launch test. Full96357 remains running.
+  Fresh acceptance status read at age1h58m29s: waiting_approval,90s budget left;
+  no approval/budget/runtime mutation made. Re-read before claiming outcome.
+
+- Python prepared recipe/bootstrap and shared supervisor identity resolver are
+  now uncommitted with the prepared loader. Materializer calls supervisor-owned
+  CommandExecutableIdentity(ctx,argv); existing Go/Node behavior retained,
+  python3 typed recipe requires explicitly composed private channel snapshot
+  root and frozen environment/lock plus factory bootstrap digests. No production
+  root composition or Python executionpolicy/Preflight admission yet. Recipe
+  excludes custom pytest config/plugin autodiscovery; no flags/shell/PATH input.
+  Factory bootstrap real sandbox probe24701 PASS7 tests0.01s; pre/post expected
+  environment verification passed, stage .context/python-environment-1209705896
+  digest sha256:a9721c1ecd236cf5d323a496d9e459dd08ee0e88fcbf2a5fb0cb51d2d12fec13.
+  Focused recipe/loader race41222 PASS1.538s; compile26006 PASS. Resolver tamper
+  fixture initially tried writing0500 file and got permission denied; changed
+  fixture to temporarily0700 then restore0500 so byte change is tested without
+  weakening production seals. Rerun25172 PASS: supervisor race1.416s and
+  pythonclosure race1.408s. Full combined normal/vet/repo/secret/docs/artifact
+  gate96357 running; do not restart or claim terminal until polled.
+
+- Prepared Python loader now uncommitted atop f921ac7: opens digest-addressed
+  environment.json/runtime/dependencies relative to a caller-authenticated
+  channel FD, no symlinks/ambient HOME/fallback; requires private same-owner
+  roots/manifest and independent expected identities. Retains root descriptors;
+  Close never deletes cache evidence. Tests cover wrong channel, link/FIFO,
+  permissions, digest/lock/bootstrap/content tamper, cancellation, replacement
+  root and idempotent Close. No execution admission yet. First positive test
+  failed because Go testing.TempDir children are0755 (testing.go Mkdir0777),
+  confirmed by diagnostic stat755 for all three roots. Fixed fixture to0700;
+  production check unchanged, diagnostics removed. Investigation scope only
+  internal/pythonclosure; global skill setup/telemetry not part of task.
+  Broad validation for this loader checkpoint remains pending.
+
 - Python environment binding checkpoint atop bd3d065: combines runtime and
   dependency manifests, executable interpreter relative path, lock digest and
   bootstrap digest. Exact canonical decoding rejects alternate/duplicate/
