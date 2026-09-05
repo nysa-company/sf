@@ -98,4 +98,23 @@ Compiled local onboarding passes three repetitions using a full dev helper
 bundle and controlled private HOME: init preview/defaults/replay, channel
 isolation, local template/validation, and real PTY creation/cancellation.
 This does not prove provider delivery, installation or compiled ticket picking.
-Next: remaining compiled selection and explicit readiness/distribution work.
+Compiled selection also passes three repetitions against a private socket
+fixture and real PTY: duplicate titles, exact ID dispatch and cancel-without-
+start. Next: explicit readiness and distribution work.
+
+## Distribution checkpoint contract
+
+Build a local macOS bundle containing the channel executable, all three
+matching Git/SSH helpers, and pinned GitHub known-hosts data. Include version,
+commit, architecture, file modes and SHA-256 hashes in a manifest. Verification
+must reject missing, extra, modified or symlinked payloads before installation.
+Checksums establish bundle integrity, not publisher authenticity; public release
+signing/notarization and distribution are separate pending gates.
+
+Installation is explicitly invoked against a user-selected private directory;
+it must not replace existing files, modify shell startup files, register a
+service, migrate a database, or restart a daemon. Keep each channel's bundle
+separate. Test installation under a fresh temporary home, verify helper layout,
+run version/help/local onboarding there, and test corrupt payload/refused
+overwrite. No public release or installation into the operator's active PATH
+is required to exercise this checkpoint.
