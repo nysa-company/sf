@@ -114,18 +114,20 @@ From the SF source directory, replace `my-app` with the registered name:
 ./bin/sf-dev submit /absolute/path/to/ticket.md --project my-app
 ```
 
-Submission does not start work. Copy the returned ticket ID, then run:
+Submission does not start work. In a terminal, select the ticket by its title
+and state instead of copying its full ID:
 
 ```text
-./bin/sf-dev start <ticket-id>
-./bin/sf-dev status <ticket-id> --watch
+./bin/sf-dev start --project my-app
+./bin/sf-dev status --select --project my-app --watch
 ```
 
 Find existing tickets by title and state with
 `./bin/sf-dev tickets --project my-app`. In an interactive terminal,
 `./bin/sf-dev start --project my-app` offers a numbered picker; `q` cancels.
-Use `status --select` to choose a ticket to inspect. Unique six-character
-hex ID prefixes work too. Scripts never prompt, and approval/rejection still
+The picker never chooses a ticket implicitly. Unique six-character hex ID
+prefixes work too, for example `status 543bc4 --project my-app`. Scripts must
+provide an unambiguous ID and never prompt; approval/rejection still
 require full IDs until candidate-bound confirmation is available.
 
 SF plans, writes independent verification, implements, runs proof, publishes a
