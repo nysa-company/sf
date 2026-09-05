@@ -94,4 +94,8 @@ scope/identity validation and no automatic mutation retries or pause recovery.
 Real socket/Store tests cover replay, start refusal, and lost committed
 submit/start responses; focused daemon race and full CLI race pass. Compiled
 interactive onboarding and fresh full delivery still remain to be proven.
-Next: compiled onboarding acceptance and explicit readiness/distribution work.
+Compiled local onboarding passes three repetitions using a full dev helper
+bundle and controlled private HOME: init preview/defaults/replay, channel
+isolation, local template/validation, and real PTY creation/cancellation.
+This does not prove provider delivery, installation or compiled ticket picking.
+Next: remaining compiled selection and explicit readiness/distribution work.

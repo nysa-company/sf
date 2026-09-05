@@ -2,6 +2,12 @@
 
 ## Current truth
 
+- Compiled local onboarding acceptance now passes three repeats (92809): full
+  dev helper bundle, controlled private HOME/PATH, cwd-derived registration
+  and replay, preview with no writes, stable isolation, template/validation
+  without submitted rows, JSON no-prompt refusal, real macOS PTY draft save
+  and cancellation. This is local intake evidence, not provider delivery or
+  installer acceptance. Compiled ticket selection remains pending.
 - Run composition checkpoint: `run <file> --project <name> [--watch]`
   reuses daemon submit/start/status, validates returned scope/identity, starts
   queued only, never retries mutation or implicitly resumes blocked/paused
