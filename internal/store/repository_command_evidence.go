@@ -285,8 +285,7 @@ func (s *Store) reauthenticateStoredVerificationCommandAt(ctx context.Context, q
 	if err != nil || commandDigest != result.Claim.CommandDigest || expectedVerificationExit(parsed.Verify.PrebuildOutcome, result.Result.ExitCode) != nil || stored.CommandBinding.ExpectedOutcome != parsed.Verify.PrebuildOutcome {
 		return ErrEvidenceConflict
 	}
-	var worktreePath, worktreeIdentity, worktreeBase string
-	if err := q.QueryRowContext(ctx, `SELECT path,identity_json,base_sha FROM worktrees WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&worktreePath, &worktreeIdentity, &worktreeBase); err != nil || !boundedText(worktreePath, 1_000) || !validJSON([]byte(worktreeIdentity)) || !validOID(worktreeBase) || result.Claim.Worktree != worktreePath || result.Claim.WorktreeIdentity != worktreeIdentity || result.Claim.BaseSHA != worktreeBase || result.Claim.BaseSHA != provider.Claim.BaseSHA || result.Claim.Worktree != provider.Claim.Worktree || result.Claim.WorktreeIdentity != provider.Claim.WorktreeIdentity {
+	if !evidenceWorktreeMatchesAt(ctx, q, ref, result.Claim.TicketVersion, result.Claim.Worktree, result.Claim.WorktreeIdentity, result.Claim.BaseSHA) || result.Claim.BaseSHA != provider.Claim.BaseSHA || result.Claim.Worktree != provider.Claim.Worktree || result.Claim.WorktreeIdentity != provider.Claim.WorktreeIdentity {
 		return ErrEvidenceConflict
 	}
 	request := commandEvidenceRequest(RepositoryCommandPurposePrebuildVerification, ref, result.Claim.TicketVersion, domain.Fence{LeaderEpoch: result.Claim.LeaderEpoch, RunnerEpoch: result.Claim.RunnerEpoch}, stored.ProviderResult, stored.Revision.IntentDigest, stored.Revision.ProofDigest, "", commandDigest, result)
@@ -451,13 +450,11 @@ func (s *Store) reauthenticateStoredCandidateCommandAtMode(ctx context.Context, 
 		return ErrEvidenceConflict
 	}
 	if stored.Commit.ParentOID != verification.Checkpoint.CommitOID {
-		repair, repairErr := completedCandidateRepairContextAt(ctx, q, stored, builder)
-		if repairErr != nil || stored.Commit.ParentOID != repair.PredecessorHeadSHA || repair.Verification.Revision.IntentDigest != verification.Revision.IntentDigest || repair.Verification.Revision.ProofDigest != verification.Revision.ProofDigest || repair.Verification.Revision.CheckpointID != verification.Revision.CheckpointID {
+		if err := s.authenticateCandidateVerificationParentFrom(ctx, q, stored, verification); err != nil {
 			return ErrEvidenceConflict
 		}
 	}
-	var worktreePath, worktreeIdentity, worktreeBase string
-	if err := q.QueryRowContext(ctx, `SELECT path,identity_json,base_sha FROM worktrees WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&worktreePath, &worktreeIdentity, &worktreeBase); err != nil || !boundedText(worktreePath, 1_000) || !validJSON([]byte(worktreeIdentity)) || !validOID(worktreeBase) || stored.Snapshot.BaseSHA != worktreeBase || result.Claim.Worktree != worktreePath || result.Claim.WorktreeIdentity != worktreeIdentity || result.Claim.BaseSHA != worktreeBase {
+	if stored.Snapshot.BaseSHA != result.Claim.BaseSHA || !evidenceWorktreeMatchesAt(ctx, q, ref, result.Claim.TicketVersion, result.Claim.Worktree, result.Claim.WorktreeIdentity, result.Claim.BaseSHA) {
 		return ErrEvidenceConflict
 	}
 	var configDigest string

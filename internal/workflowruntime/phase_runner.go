@@ -454,6 +454,19 @@ func (r PhaseRunner) run(ctx context.Context, request workflowworker.PhaseReques
 
 func (r PhaseRunner) loadHistorical(ctx context.Context, key store.ProviderAttemptResultKey, ref domain.TicketRef, project store.Project, worktree store.StoredWorktree, phase domain.Phase, role providercoord.Role) (store.ProviderAttemptResult, phaseartifact.Parsed, error) {
 	result, parsed, err := r.Store.LoadHistoricalProviderAttemptResult(ctx, key)
+	if err == nil && (result.Claim.BaseSHA != worktree.BaseSHA || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON)) {
+		reader, ok := r.Store.(interface {
+			HistoricalProviderWorktree(context.Context, store.ProviderAttemptResultKey) (store.StoredWorktree, error)
+		})
+		if !ok {
+			return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
+		}
+		prior, historyErr := reader.HistoricalProviderWorktree(ctx, key)
+		if historyErr != nil || prior.Path != worktree.Path || prior.Branch != worktree.Branch {
+			return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
+		}
+		worktree = prior // comparison only; new phaseWorkspace still uses the live registration
+	}
 	if err != nil || key.AttemptID <= 0 || key.Ref != ref || key.Phase != phase || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || result.Claim.Ref != ref || result.Claim.Phase != phase || result.Claim.Role != string(role) || result.Claim.ExpectedVersion == 0 || result.Claim.LeaderEpoch == 0 || result.Claim.RunnerEpoch == 0 || result.Claim.Repository != project.Path || result.Claim.Worktree != worktree.Path || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || result.Claim.BaseSHA != worktree.BaseSHA || result.Claim.Binding.Identity.Provider != "codex" || parsed.Phase != phase || parsed.Provider != result.Claim.Binding.Identity || parsed.Provider.Provider != "codex" || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes {
 		return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
 	}

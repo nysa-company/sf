@@ -97,7 +97,7 @@ func validGitIntent(i GitMutationIntent) bool {
 
 func validGitOperation(operation string) bool {
 	switch operation {
-	case "create-worktree", "remove-worktree", "commit", "push", "protected-ref-fetch":
+	case "create-worktree", "remove-worktree", "commit", "push", "protected-ref-fetch", "refresh-base":
 		return true
 	default:
 		return false
@@ -207,6 +207,11 @@ func (s *Store) IssueGitMutationClaim(ctx context.Context, intent GitMutationInt
 		// protected base are likewise prerequisites for minting a Git claim.
 		if repository != intent.Repository || worktree != intent.Worktree || branch != intent.Branch || baseRef != intent.BaseRef {
 			return ErrGitMutationIntent
+		}
+		if intent.Operation == "refresh-base" {
+			if err := s.authenticateProtectedBaseRefreshMutationAt(ctx, conn, intent); err != nil {
+				return err
+			}
 		}
 		effect, err := effectFrom(ctx, conn, intent.SemanticKey)
 		if err != nil {
@@ -381,6 +386,15 @@ func (s *Store) AcquireGitMutation(ctx context.Context, claim contracts.GitMutat
 		}
 		if n, _ := result.RowsAffected(); n != 1 {
 			return ErrGitMutationLease
+		}
+		if claim.Operation == "refresh-base" {
+			facts, err := gitMutationIntentFactsFrom(ctx, conn, claim.SemanticKey)
+			if err != nil {
+				return ErrGitMutationLease
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET prepared_commit_oid=?,prepared_tree_oid=? WHERE repository_path=? AND semantic_key=? AND nonce=?`, facts.PreparedCommitOID, facts.PreparedTreeOID, claim.Repository, claim.SemanticKey, nonce); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -666,6 +680,15 @@ func gitMutationIntentFactsFrom(ctx context.Context, query interface {
 	}
 	if !validGitMutationFacts(out.Claim.Operation, out.Claim.ExpectedBaseOID, out.Claim.ExpectedHeadOID, out.PreparedCommitOID, out.PreparedTreeOID, prior, out.PriorRemoteOID) {
 		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
+	if out.Claim.Operation == "refresh-base" {
+		id, value, mutation, err := loadProtectedBaseRefreshReservationAt(ctx, query, semanticKey)
+		if err != nil || !sameGitMutationBinding(mutation, out.Claim) || validateProtectedBaseRefreshPreparationAt(ctx, query, id, value, mutation.RequestDigest, out.PreparedCommitOID, out.PreparedTreeOID) != nil {
+			return GitMutationIntentFacts{}, ErrGitMutationIntent
+		}
+		if out.Effect.State == EffectConfirmed && (out.PreparedCommitOID == "" || out.ObservedIdentity != out.PreparedCommitOID) {
+			return GitMutationIntentFacts{}, ErrGitMutationIntent
+		}
 	}
 	if out.Claim.Operation == "commit" && out.Effect.State == EffectConfirmed && out.Effect.ObservedIdentity != out.PreparedCommitOID {
 		// A confirmed commit is only linked to this immutable intent when the
@@ -963,7 +986,7 @@ func validGitMutationFacts(operation, base, expectedHead, preparedCommit, prepar
 		return false
 	}
 	switch operation {
-	case "commit":
+	case "commit", "refresh-base":
 		// OIDs are individually optional to support other fact shapes, but a
 		// prepared commit is an inseparable commit/tree tuple. Never let the
 		// optional-width helper turn a partial tuple into a valid fact.
@@ -988,6 +1011,12 @@ func (s *Store) assertGitIntentCurrent(ctx context.Context, conn *sql.Conn, c co
 	}
 	if n != 1 {
 		return ErrGitMutationIntent
+	}
+	if c.Operation == "refresh-base" {
+		intent := GitMutationIntent{EffectFence: EffectFence{SemanticKey: c.SemanticKey, Ref: c.TicketRef, TicketVersion: c.TicketVersion, Fence: domain.Fence{LeaderEpoch: c.LeaderEpoch, RunnerEpoch: c.RunnerEpoch}}, RequestDigest: c.RequestDigest, Repository: c.Repository, Worktree: c.Worktree, Branch: c.Branch, Operation: c.Operation, BaseRef: c.BaseRef, ExpectedBaseOID: c.ExpectedBaseOID, ExpectedHeadOID: c.ExpectedHeadOID}
+		if err := s.authenticateProtectedBaseRefreshMutationAt(ctx, conn, intent); err != nil {
+			return err
+		}
 	}
 	return nil
 }

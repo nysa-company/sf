@@ -77,6 +77,19 @@ The approved normative design is in
   uncertain effect and is never blindly retried; explicit exact reconciliation
   is required before another mutation.
 
+Protected-base refresh is a single guarded operation per ticket. Store first
+authenticates the exact remote tip, then appends an immutable reservation and
+prepared ordered two-parent anchor (old candidate head, new protected base).
+Git applies that anchor only under an exclusive repository lease and paired
+ref CAS; foreign heads, conflicts, and identity drift fail closed. The
+original verification-owned files and historical provider/PR evidence remain
+immutable. Completion projects the effective worktree to the new base, after
+which a fresh Builder, post-build proof, CI, final review, and approval are
+required while retaining the same PR when one exists. Pending Apply recovery
+reuses only the authenticated reservation. Unreserved exact-proof recovery is
+limited to eight same-fence retries of the private proof ref; it cannot move
+the ticket or refresh a different base.
+
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
 one custom Go state engine over the application schema; DBOS is retained only
 as a reproducible rejected spike. See

@@ -93,6 +93,27 @@ type GitMutationRecoveryFactsLease interface {
 	RecordPushPriorRemote(context.Context, string) error
 }
 
+// GitBaseRefreshPreparationLease is deliberately separate from ordinary
+// single-parent commit facts. Its two ordered parents are [candidate,new base].
+// The production lease durably binds them before either branch/base ref moves.
+type GitBaseRefreshPreparationLease interface {
+	GitMutationLease
+	RecordBaseRefreshPreparation(context.Context, string, string, [2]string) error
+}
+
+type GitBaseRefreshPreparation struct {
+	CommitOID string
+	TreeOID   string
+	Parents   [2]string
+}
+
+// GitBaseRefreshPreparedReader authenticates a recorded object under the
+// current live nonce. A caller-supplied commit is not ref-update authority.
+type GitBaseRefreshPreparedReader interface {
+	GitMutationLease
+	PreparedBaseRefresh(context.Context) (GitBaseRefreshPreparation, bool, error)
+}
+
 // GitMutationLaunchLease is implemented by the production SQLite lease.  A
 // Git child remains behind its supervisor gate until RecordGitMutationLaunch
 // commits; FinishGitMutationLaunch is permitted only after the parent has

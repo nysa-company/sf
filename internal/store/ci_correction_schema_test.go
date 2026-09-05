@@ -856,7 +856,7 @@ func TestV55DispositionsLegacyCandidateRepairAuthorityWithoutRewritingEvidence(t
 				_ = database.Close()
 				t.Fatal(err)
 			}
-			if version != 55 || gotState != string(state) || gotResume != resume || gotBlocker != blocker || ticketVersion != 2 || runner != 2 || bindings != 1 || completions != 1 {
+			if version != schemaVersion || gotState != string(state) || gotResume != resume || gotBlocker != blocker || ticketVersion != 2 || runner != 2 || bindings != 1 || completions != 1 {
 				_ = database.Close()
 				t.Fatalf("terminal history migration=%d ticket=%s/%s/%s v%d r%d bindings=%d completions=%d", version, gotState, gotResume, gotBlocker, ticketVersion, runner, bindings, completions)
 			}
@@ -870,7 +870,7 @@ func TestV55DispositionsLegacyCandidateRepairAuthorityWithoutRewritingEvidence(t
 			if err := database.Close(); err != nil {
 				t.Fatal(err)
 			}
-			// A current v55 open must continue to accept terminal compatibility
+			// A current-schema open must continue to accept terminal compatibility
 			// history with an empty prefix; it must not create another backup.
 			database, err = OpenChannel(ctx, path, backups, domain.ChannelStable)
 			if err != nil {
@@ -879,7 +879,7 @@ func TestV55DispositionsLegacyCandidateRepairAuthorityWithoutRewritingEvidence(t
 			if err := database.Close(); err != nil {
 				t.Fatal(err)
 			}
-			files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v054-to-v055-*.sqlite"))
+			files, err := filepath.Glob(filepath.Join(backups, fmt.Sprintf("sf-schema-v054-to-v%03d-*.sqlite", schemaVersion)))
 			if err != nil || len(files) != 1 {
 				t.Fatalf("terminal v54 migration backup=%v err=%v", files, err)
 			}

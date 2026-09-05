@@ -587,6 +587,13 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					priorLeader = candidateLeader
 				}
 			}
+			if priorLeader == 0 {
+				if refreshLeader, refreshFound, refreshErr := s.protectedBaseRefreshRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch, latest, found); refreshErr != nil {
+					return refreshErr
+				} else if refreshFound {
+					priorLeader = refreshLeader
+				}
+			}
 			if phase, role, ok := recoveryProviderPhase(ticket.state); ok {
 				baseline, baselineFound, baselineErr := s.loadPhaseRecoveryBaseline(ctx, conn, ref, phase, role)
 				if baselineErr != nil {

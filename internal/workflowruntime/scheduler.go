@@ -42,6 +42,13 @@ type MergeReconciliationReadiness interface {
 	MergeReconciliationReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error)
 }
 
+// PendingBaseRefreshSource authenticates a reserved Git transformation that
+// may already have changed the physical checkout. Only its dedicated worker
+// may resume it; ordinary pristine Ensure must not reinterpret that state.
+type PendingBaseRefreshSource interface {
+	PendingProtectedBaseRefresh(context.Context, domain.TicketRef, uint64, domain.Fence) (store.ProtectedBaseRefresh, bool, error)
+}
+
 // OperatorSourceResumeProofSource loads the typed Store proof for one exact
 // source takeover handback. It is necessary but insufficient: Worktrees must also
 // implement OperatorSourceResumeAuthenticator and physically reauthenticate
@@ -95,6 +102,13 @@ func (s StoreTicketSource) MergeReconciliationReady(ctx context.Context, ref dom
 		return false, ErrInvalidScheduler
 	}
 	return s.Store.MergeReconciliationReady(ctx, ref, version, fence)
+}
+
+func (s StoreTicketSource) PendingProtectedBaseRefresh(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (store.ProtectedBaseRefresh, bool, error) {
+	if s.Store == nil {
+		return store.ProtectedBaseRefresh{}, false, ErrInvalidScheduler
+	}
+	return s.Store.PendingProtectedBaseRefresh(ctx, ref, version, fence)
 }
 
 func (s StoreTicketSource) OperatorSourceResumeProof(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (store.OperatorSourceResumeProof, bool, error) {
@@ -277,6 +291,24 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 			end()
 			lastBenign = &TickResult{Outcome: OutcomeCanceled, Ref: ticket.Ref, Ticket: current, Fence: candidateFence, Err: ErrCanceled}
 			continue
+		}
+		if pendingSource, ok := s.Tickets.(PendingBaseRefreshSource); ok && s.AdmitPublishing {
+			_, pending, pendingErr := pendingSource.PendingProtectedBaseRefresh(runCtx, ticket.Ref, ticket.Version, candidateFence)
+			if pendingErr != nil {
+				end()
+				return classify(pendingErr, candidateFence, ticket.Ref)
+			}
+			if pending {
+				workerResult, workerErr := s.Worker.Run(runCtx, ticket.Ref, candidateFence)
+				end()
+				result.Worker = workerResult
+				if workerErr != nil {
+					result.Outcome, result.Err = classifyWorker(workerErr)
+					return result
+				}
+				result.Outcome = OutcomeInvoked
+				return result
+			}
 		}
 		if ticket.State == domain.StatePublishing && !s.AdmitPublishing {
 			// The explicit pre-publishing composition must block before it asks

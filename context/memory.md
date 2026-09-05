@@ -157,3 +157,60 @@ repository/secret/artifact/docs checks, stable/dev release builds, and compiled
 foreground-daemon/client smokes. The project still has no remote and has not
 mutated Nysa; autonomous merge remains ineligible under the native-profile
 verdict and requires a separate future authorization and containment design.
+
+### 2026-09-05 — Concurrency campaign, not yet a delivery verdict
+
+The user approved a capacity-two Relay stress campaign, two concurrent real
+deliveries, and ten tickets, with fixes for reproduced blockers. Stable/Nysa
+remain excluded. Seeded Store/runtime tests (200 cases) passed under race;
+full normal suite and repository/secret checks passed at stress baseline
+`029424b`. The report is `docs/reports/2026-09-05-concurrency-stress-baseline.md`.
+
+Real private-bare reproduction shows protected-base drift safely refuses every
+publication retry but leaves the sibling in publishing. That reproduced the
+concurrency-delivery blocker addressed by the unshipped refresh source below,
+not a reason to relax base equality. `eb70756` adds exact typed drift
+diagnostics and a pure two-parent merge-tree parser with private-bare tests;
+it does not enable production refresh execution.
+
+Draft unshipped v56 work in progress adds immutable refresh intent/preparation/
+completion records and strict canonical payloads. Do not run a dirty v56 binary
+against live databases before the complete authority/recovery flow is tested.
+Current source preserves old registration/history while Store completion
+CAS-updates the current worktree projection. Refresh reruns
+proof/CI/review/approval and retain the exact existing PR when one exists.
+
+No new live tickets, capacity changes, or runtime restarts have occurred in
+this campaign. A separate two-line setup PR #6 updates the pilot's capacity
+documentation; it is not a factory-delivered ticket. It passed33 Node tests and
+required GitHub CI. Auto-review blocked merging exact head27cd365; explicit
+approval is pending, no merge occurred. The frozen dev runtime remains relay25-adb3ef5;
+pilot hosted main was observed at `92b048aaa4d1c16eba2e7079d0eb078373876326`.
+Ten reviewed ticket drafts and the execution checkpoint are ignored local
+files under `.context/concurrency-campaign/`. The goal remains active.
+
+### 2026-09-05 — Protected-base refresh source checkpoint
+
+Store/Git refresh source now includes authenticated completion/recovery, fresh
+Builder/candidate anchoring, and same-PR Apply integration. Root session 6827
+passed in 17.157s (real Store/proof/prepare plus typed Apply). Fresh Builder
+old-result rejection was reproduced and repaired; session 34459 passed in
+0.967s for no-publication and with-publication cases. Full affected session
+55594 passed all six packages. Session59005 passed lost proof/Apply responses,
+same-PR fresh generation and actual Worker-to-fresh-Builder admission.
+Race session46798 passed Git/runtime/publication but caught a test-only
+off-by-one in the eight-proof-reclaim assertion. Corrected bounded-reclaim
+and seeded Store/runtime rerun84505 passed (34.039s/1.610s); production was
+unchanged. Full serialized suite69767 passed all packages, including Store
+114.522s, workflowruntime106.984s and worktreecoord112.143s. Final test-only
+extension55469 passed lost-Apply recovery before and after first publication
+(15.149s); the latter preserves one existing PR, one push, no edit. Go vet
+passed. Compiled isolated guarded/manual delivery, takeover and stable/dev
+coexistence acceptance13337 passed225.635s. Final schema-registry-only checks
+43631 passed1.081s. Format, repo/secret/artifact/docs checks and isolated
+release-build smoke passed. The full suite preceded only the final test
+extension and four redundant FK-target registry entries, validated separately.
+V56 is ready for a local frozen candidate commit on parent `eb70756`.
+Live campaign remains gated on exact setup PR6 approval; no live deployment,
+database migration or capacity change has occurred. Isolated passing tests do
+not close the live delivery goal.

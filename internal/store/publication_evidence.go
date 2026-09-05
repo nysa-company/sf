@@ -1999,32 +1999,48 @@ func (s *Store) LoadPublishedCandidate(ctx context.Context, ref domain.TicketRef
 // It is used only to carry a single factory PR identity across a candidate
 // correction; it never authorizes a ticket transition or external mutation.
 func (s *Store) LoadHistoricalPublishedCandidate(ctx context.Context, ref domain.TicketRef) (PublishedCandidateEvidence, error) {
+	var value PublishedCandidateEvidence
+	err := s.readProtectedBaseRefreshSnapshot(ctx, func(conn *sql.Conn) error {
+		var err error
+		value, err = s.loadHistoricalPublishedCandidateAt(ctx, conn, ref)
+		return err
+	})
+	return value, err
+}
+
+func (s *Store) loadHistoricalPublishedCandidateAt(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef) (PublishedCandidateEvidence, error) {
 	if err := ref.Validate(); err != nil {
 		return PublishedCandidateEvidence{}, err
 	}
-	value, found, err := loadPublicationEvidenceRow(ctx, s.db, ref)
+	value, found, err := loadPublicationEvidenceRow(ctx, q, ref)
 	if err != nil {
 		return PublishedCandidateEvidence{}, err
 	}
 	if !found {
 		return PublishedCandidateEvidence{}, ErrNotFound
 	}
-	if err := loadLatestPublicationRebind(ctx, s.db, &value); err != nil {
+	if err := loadLatestPublicationRebind(ctx, q, &value); err != nil {
 		return PublishedCandidateEvidence{}, err
 	}
-	if err := s.validateStoredPublicationEffect(ctx, ref, value.TicketVersion, value.Fence, value.PushEffect); err != nil {
+	if err := validateStoredPublicationEffectQuery(ctx, q, ref, value.TicketVersion, value.Fence, value.PushEffect); err != nil {
 		return PublishedCandidateEvidence{}, err
 	}
-	if err := s.validateStoredPublicationEffect(ctx, ref, value.TicketVersion, value.Fence, value.PRCreateOrUpdateEffect); err != nil {
+	if err := validateStoredPublicationEffectQuery(ctx, q, ref, value.TicketVersion, value.Fence, value.PRCreateOrUpdateEffect); err != nil {
 		return PublishedCandidateEvidence{}, err
 	}
-	worktree, err := s.Worktree(ctx, ref)
+	var worktree StoredWorktree
+	err = q.QueryRowContext(ctx, `SELECT path,branch_ref,state,identity_json,base_sha FROM worktrees WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&worktree.Path, &worktree.Branch, &worktree.State, &worktree.IdentityJSON, &worktree.BaseSHA)
 	// The allocation identity is durable across a candidate correction, but
 	// its ticket/fence/base fields describe the historical registration and
 	// may advance while the same branch/checkout is retained. Path, branch,
 	// state, and full identity remain fixed ownership evidence.
-	if err != nil || worktree.Path != value.Worktree.Path || worktree.Branch != value.Worktree.Branch || worktree.State != value.Worktree.State || !bytes.Equal(worktree.IdentityJSON, value.Worktree.IdentityJSON) {
+	if err != nil || worktree.Path != value.Worktree.Path || worktree.Branch != value.Worktree.Branch || worktree.State != value.Worktree.State {
 		return PublishedCandidateEvidence{}, ErrPublicationEvidence
+	}
+	if !bytes.Equal(worktree.IdentityJSON, value.Worktree.IdentityJSON) {
+		if !evidenceWorktreeMatchesAt(ctx, q, ref, value.TicketVersion, value.Worktree.Path, string(value.Worktree.IdentityJSON), value.Worktree.BaseSHA) {
+			return PublishedCandidateEvidence{}, ErrPublicationEvidence
+		}
 	}
 	return value, nil
 }

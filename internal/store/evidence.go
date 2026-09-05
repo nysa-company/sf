@@ -786,6 +786,26 @@ func (s *Store) RecordCandidate(ctx context.Context, evidence CandidateEvidence)
 			return ErrEvidenceConflict
 		}
 		expectedParent := checkpoint
+		if !repairActive {
+			value, completion, refreshErr := protectedBaseRefreshForTicketAt(ctx, conn, evidence.Ref)
+			if refreshErr == nil && evidence.Snapshot.BaseSHA == value.NewBaseSHA {
+				next := StoredCandidate{Snapshot: evidence.Snapshot, BuilderResult: evidence.BuilderResult, Commit: evidence.Commit, TicketVersion: evidence.ExpectedVersion, Fence: evidence.Fence}
+				if next.Snapshot.Generation == 0 {
+					next.Snapshot.Generation = value.Candidate.Snapshot.Generation + 1
+				}
+				if _, err := protectedBaseRefreshCandidateAt(ctx, conn, next, builder); err != nil || (current != value.Candidate.Snapshot.Generation && current != next.Snapshot.Generation) {
+					return ErrEvidenceConflict
+				}
+				verification, err := s.verificationEvidenceForIdentityFrom(ctx, conn, evidence.Ref, value.Candidate.Snapshot.VerificationIntentDigest, value.Candidate.Snapshot.ProofDigest, "")
+				if err != nil || verification.Revision.CheckpointID != checkpoint || !equalStringSlices(verification.Revision.OwnedFiles, value.ProtectedPaths) {
+					return ErrEvidenceConflict
+				}
+				expectedParent = completion.Preparation.CommitOID
+				evidence.Snapshot.Generation = next.Snapshot.Generation
+			} else if refreshErr != nil && !errors.Is(refreshErr, ErrNotFound) {
+				return ErrEvidenceConflict
+			}
+		}
 		if repairActive {
 			generationStateValid := (current == repair.context.PredecessorGeneration && repair.context.TargetGeneration == current+1) || current == repair.context.TargetGeneration
 			if !generationStateValid || repair.context.TargetGeneration != repair.context.PredecessorGeneration+1 || evidence.Snapshot.VerificationIntentDigest != repair.context.Verification.Revision.IntentDigest || evidence.Snapshot.ProofDigest != repair.context.Verification.Revision.ProofDigest || checkpoint != repair.context.Verification.Revision.CheckpointID {

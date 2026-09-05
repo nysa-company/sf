@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nysa-company/sf/internal/baserefresh"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/daemon/runtimecontrol"
 	"github.com/nysa-company/sf/internal/domain"
@@ -172,7 +173,7 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 			if clientErr != nil {
 				return daemon.WorkflowRuntimeComponents{}, fmt.Errorf("compose GitHub client: %w", errors.Join(clientErr, gh.Close()))
 			}
-			runtimeWorker = Worker{Store: dependencies.Store, Engine: dependencies.Engine, Workflow: worker, Publication: publication.Worker{Store: dependencies.Store, Git: gitRunner, GitHub: githubClient}, CI: CIWorker{Store: dependencies.Store, Observer: githubClient}, PublicationEnabled: true}
+			runtimeWorker = Worker{Store: dependencies.Store, Engine: dependencies.Engine, Workflow: worker, Publication: publication.Worker{Store: dependencies.Store, Git: gitRunner, GitHub: githubClient}, CI: CIWorker{Store: dependencies.Store, Observer: githubClient}, PublicationEnabled: true, BaseRefreshEnabled: true, BaseRefresh: baserefresh.Coordinator{Store: dependencies.Store, Git: gitRunner}}
 			mergeObserver = publishedMergeObserver{Store: dependencies.Store, GitHub: githubClient}
 		}
 		scheduler := workflowruntime.NewScheduler(

@@ -81,7 +81,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 55
+const schemaVersion = 56
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -139,6 +139,7 @@ var migrationChecksums = map[int]string{
 	53: migrationChecksum(migrationV53),
 	54: migrationChecksum(migrationV54),
 	55: migrationChecksum(migrationV55),
+	56: migrationChecksum(migrationV56),
 }
 
 func migrationChecksum(statements []string) string {
@@ -561,6 +562,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV54
 			} else if version == 55 {
 				statements = migrationV55
+			} else if version == 56 {
+				statements = migrationV56
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -2487,7 +2490,17 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 				return ErrEvidenceConflict
 			}
 		} else if checkpoint != parent {
-			return ErrEvidenceConflict
+			// A protected-base refresh has its own immutable two-parent anchor.
+			// Reuse the same full authority check as candidate recording; a
+			// different parent alone is never sufficient to admit publication.
+			authenticated, candidateErr := s.latestCandidateFrom(ctx, conn, transition.Ref, true)
+			builder, _, builderErr := s.loadHistoricalProviderAttemptResult(ctx, conn, authenticated.BuilderResult)
+			if candidateErr != nil || builderErr != nil || authenticated.Snapshot != candidate || authenticated.Commit.ParentOID != parent {
+				return ErrEvidenceConflict
+			}
+			if _, err := protectedBaseRefreshCandidateAt(ctx, conn, authenticated, builder); err != nil {
+				return ErrEvidenceConflict
+			}
 		}
 		if source != candidate.SourceDigest || base != candidate.BaseSHA || intent != candidate.VerificationIntentDigest || proof != candidate.ProofDigest {
 			return ErrEvidenceConflict

@@ -3,6 +3,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -401,6 +402,15 @@ func (r Runner) commandEnvExpected(ctx context.Context, directory string, expect
 }
 
 func (r Runner) commandEnvExpectedWithHandoff(ctx context.Context, directory string, expectedDev, expectedIno uint64, extra []string, handedOff *bool, args ...string) ([]byte, error) {
+	return r.commandEnvInputExpectedWithHandoff(ctx, directory, expectedDev, expectedIno, extra, nil, handedOff, args...)
+}
+
+// Only fixed code-owned ref transactions use stdin. Bound the already-built
+// bytes before opening a process; never accept a potentially blocking Reader.
+func (r Runner) commandEnvInputExpectedWithHandoff(ctx context.Context, directory string, expectedDev, expectedIno uint64, extra []string, input []byte, handedOff *bool, args ...string) ([]byte, error) {
+	if len(input) > 4096 || (len(input) > 0 && r.Run != nil) {
+		return nil, ErrIdentityMismatch
+	}
 	if directory == "" {
 		return nil, fmt.Errorf("git directory is required")
 	}
@@ -456,7 +466,7 @@ func (r Runner) commandEnvExpectedWithHandoff(ctx context.Context, directory str
 	if handedOff != nil {
 		*handedOff = true
 	}
-	output, err := runBounded(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file, caps.gitDir.file, caps.commonDir.file})
+	output, err := runBoundedInput(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file, caps.gitDir.file, caps.commonDir.file}, input)
 	if verifyErr := pinned.verify(); verifyErr != nil {
 		return output, verifyErr
 	}
@@ -907,6 +917,13 @@ func openGitCapabilities(directory string) (*gitCapabilities, error) {
 }
 
 func runBounded(ctx context.Context, helper, binary string, argv, env []string, directories []*os.File) ([]byte, error) {
+	return runBoundedInput(ctx, helper, binary, argv, env, directories, nil)
+}
+
+func runBoundedInput(ctx context.Context, helper, binary string, argv, env []string, directories []*os.File, input []byte) ([]byte, error) {
+	if len(input) > 4096 {
+		return nil, ErrIdentityMismatch
+	}
 	if len(directories) != 3 || directories[0] == nil || directories[1] == nil || directories[2] == nil {
 		return nil, fmt.Errorf("pinned command directory is required")
 	}
@@ -950,6 +967,9 @@ func runBounded(ctx context.Context, helper, binary string, argv, env []string, 
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.WaitDelay = 750 * time.Millisecond
 	command.Env = env
+	if len(input) > 0 {
+		command.Stdin = bytes.NewReader(input)
+	}
 	runDone := make(chan struct{})
 	defer close(runDone)
 	killGroup := func(signal syscall.Signal) {
@@ -3058,6 +3078,22 @@ func (r Runner) remoteHeadEnv(ctx context.Context, directory string, expectedDev
 // caller's durable lease; no FETCH_HEAD is written and the retained proof ref
 // is collision-safe (derived from the full durable witness).
 func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.ProtectedBranchWitness) (returnedErr error) {
+	return r.verifyProtectedBranch(ctx, witness, false)
+}
+
+// VerifyExactProtectedBase uses the same fenced, private-ref fetch as merge
+// proof, but proves an exact tip rather than mere containment. A refresh must
+// not accept B1 just because the protected ref has already advanced to B2.
+// The caller must supply a distinct Store-issued proof intent and still
+// reobserve the tip under the eventual refresh mutation lease.
+func (r Runner) VerifyExactProtectedBase(ctx context.Context, witness contracts.ProtectedBranchWitness) error {
+	if witness.OriginalBaseOID == witness.MergeOID {
+		return fmt.Errorf("%w: refreshed base must differ from original base", ErrUnexpectedRemote)
+	}
+	return r.verifyProtectedBranch(ctx, witness, true)
+}
+
+func (r Runner) verifyProtectedBranch(ctx context.Context, witness contracts.ProtectedBranchWitness, exactTip bool) (returnedErr error) {
 	if !validAbsolutePath(witness.Repository) || !validAbsolutePath(witness.Worktree) || !validRef(witness.ProtectedRef) || !validOID(witness.OriginalBaseOID) || !validOID(witness.MergeOID) {
 		return fmt.Errorf("%w: invalid protected-branch witness", ErrIdentityMismatch)
 	}
@@ -3085,6 +3121,9 @@ func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.Pro
 			return err
 		}
 		return fmt.Errorf("%w: protected ref is absent", ErrUnexpectedRemote)
+	}
+	if exactTip && remote != witness.MergeOID {
+		return fmt.Errorf("%w: protected base changed before refresh proof", ErrUnexpectedRemote)
 	}
 	ticket := witness.MutationClaim.TicketRef
 	proofKey := sha256.Sum256([]byte(string(ticket.Channel) + "\x00" + string(ticket.Project) + "\x00" + string(ticket.Ticket) + "\x00" + witness.MutationClaim.SemanticKey + "\x00" + witness.ProtectedRef + "\x00" + witness.OriginalBaseOID + "\x00" + witness.MergeOID))

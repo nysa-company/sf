@@ -853,7 +853,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			}
 			if !firstAuthenticated {
 				repairBaseline, repairErr := validateCandidateRepairRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
-				if repairErr != nil || !repairBaseline {
+				if repairErr != nil || (!repairBaseline && !protectedBaseRefreshRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)) {
 					return ErrPublicationEvidence
 				}
 			}
@@ -867,7 +867,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 				repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
 					previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
 					step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
-				if repairErr != nil || !repairGap {
+				if repairErr != nil || (!repairGap && !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)) {
 					return ErrPublicationEvidence
 				}
 			}
@@ -889,7 +889,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 				repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
 					previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
 					liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch)
-				if repairErr != nil || !repairGap {
+				if repairErr != nil || (!repairGap && !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch)) {
 					return ErrPublicationEvidence
 				}
 			}

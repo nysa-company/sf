@@ -1673,6 +1673,16 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	}
 	candidateRepairAuthority := false
 	if request.Phase == domain.PhaseBuild && live.State == domain.StateBuilding {
+		if refresh, refreshErr := s.protectedBaseRefreshBuildContextAt(ctx, s.db, request.Ref, request.ExpectedVersion, request.Fence); refreshErr == nil {
+			// A completed refresh starts a new Builder cycle. The prior
+			// generation remains immutable provenance, not reusable work on
+			// the newly authenticated base/worktree.
+			if historical.Claim.ExpectedVersion < refresh.Completion.Version {
+				return LatestReusableProviderAttemptResult{}, ErrNotFound
+			}
+		} else if !errors.Is(refreshErr, ErrNotFound) {
+			return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+		}
 		if _, contextErr := s.candidateRepairBuildContextAt(ctx, s.db, request.Ref, request.ExpectedVersion, request.Fence); contextErr == nil {
 			repairErr := candidateRepairBuilderEntryResultReachesFence(ctx, s.db, key, historical, request.ExpectedVersion, request.Fence)
 			if repairErr == nil {

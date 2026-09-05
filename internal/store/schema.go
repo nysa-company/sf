@@ -113,6 +113,12 @@ func (s *Store) validateSchema(ctx context.Context) error {
 		"candidate_repair_bindings_immutable_delete",
 		"candidate_repair_bindings_prefix_required",
 		"candidate_repair_bindings_single_ticket",
+		"protected_base_refresh_intents_immutable_update",
+		"protected_base_refresh_intents_immutable_delete",
+		"protected_base_refresh_preparations_immutable_update",
+		"protected_base_refresh_preparations_immutable_delete",
+		"protected_base_refresh_completions_immutable_update",
+		"protected_base_refresh_completions_immutable_delete",
 		"candidate_repair_completions_immutable_update",
 		"candidate_repair_completions_immutable_delete",
 		"final_review_repair_boundaries_immutable_update",
@@ -247,6 +253,18 @@ var requiredCompositeForeignKeys = []compositeForeignKeyRequirement{
 		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"target_generation", "generation"}, foreignKeyColumn{"builder_binding_ticket_version", "binding_ticket_version"}, foreignKeyColumn{"builder_binding_leader_epoch", "leader_epoch"}, foreignKeyColumn{"builder_binding_runner_epoch", "runner_epoch"}, foreignKeyColumn{"builder_result_attempt_id", "provider_attempt_id"}, foreignKeyColumn{"builder_result_attempt", "provider_attempt"}),
 	compositeForeignKey("candidate_repair_completions", "candidate_snapshots",
 		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"target_generation", "generation"}, foreignKeyColumn{"final_candidate_head_sha", "head_sha"}, foreignKeyColumn{"final_candidate_tree_sha", "tree_sha"}),
+	compositeForeignKey("protected_base_refresh_intents", "candidate_snapshots",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"old_candidate_generation", "generation"}, foreignKeyColumn{"old_candidate_head_sha", "head_sha"}, foreignKeyColumn{"old_candidate_tree_sha", "tree_sha"}),
+	compositeForeignKey("protected_base_refresh_intents", "effects",
+		foreignKeyColumn{"base_proof_semantic_key", "semantic_key"}, foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}),
+	compositeForeignKey("protected_base_refresh_intents", "effects",
+		foreignKeyColumn{"refresh_effect_semantic_key", "semantic_key"}, foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}),
+	compositeForeignKey("protected_base_refresh_intents", "project_configurations",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"config_generation", "generation"}),
+	compositeForeignKey("protected_base_refresh_preparations", "protected_base_refresh_intents",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"refresh_id", "refresh_id"}, foreignKeyColumn{"old_candidate_head_sha", "old_candidate_head_sha"}, foreignKeyColumn{"new_base_sha", "new_base_sha"}),
+	compositeForeignKey("protected_base_refresh_completions", "protected_base_refresh_preparations",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"refresh_id", "refresh_id"}, foreignKeyColumn{"prepared_commit_oid", "prepared_commit_oid"}, foreignKeyColumn{"prepared_tree_oid", "prepared_tree_oid"}, foreignKeyColumn{"prepared_parent_1_oid", "prepared_parent_1_oid"}, foreignKeyColumn{"prepared_parent_2_oid", "prepared_parent_2_oid"}),
 	compositeForeignKey("manual_merge_observations", "publication_evidence",
 		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"candidate_generation", "candidate_generation"}, foreignKeyColumn{"candidate_head_sha", "candidate_head_sha"}, foreignKeyColumn{"candidate_tree_sha", "candidate_tree_sha"}, foreignKeyColumn{"publication_witness_digest", "witness_digest"}, foreignKeyColumn{"publication_host", "github_host"}, foreignKeyColumn{"publication_owner", "github_owner"}, foreignKeyColumn{"publication_name", "github_name"}, foreignKeyColumn{"publication_pr_number", "github_pr_number"}, foreignKeyColumn{"publication_head_owner", "github_head_owner"}, foreignKeyColumn{"publication_head_repository", "github_head_repository"}, foreignKeyColumn{"publication_head_ref", "github_head_ref"}, foreignKeyColumn{"publication_head_oid", "github_head_oid"}, foreignKeyColumn{"publication_base_ref", "github_base_ref"}, foreignKeyColumn{"publication_base_oid", "github_base_oid"}, foreignKeyColumn{"publication_factory_owned", "github_factory_owned"}),
 }
@@ -336,6 +354,14 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "verification_amendment_requests", target: "provider_attempt_results"},
 	{table: "verification_amendment_requests", target: "ticket_budget_uses"},
 	{table: "manual_merge_observations", target: "tickets"},
+	{table: "protected_base_refresh_intents", target: "tickets"},
+	{table: "protected_base_refresh_intents", target: "candidate_snapshots"},
+	{table: "protected_base_refresh_intents", target: "effects"},
+	{table: "protected_base_refresh_intents", target: "project_configurations"},
+	{table: "protected_base_refresh_preparations", target: "tickets"},
+	{table: "protected_base_refresh_preparations", target: "protected_base_refresh_intents"},
+	{table: "protected_base_refresh_completions", target: "tickets"},
+	{table: "protected_base_refresh_completions", target: "protected_base_refresh_preparations"},
 }
 
 func hasForeignKey(ctx context.Context, db *sql.DB, table, target string) error {
@@ -474,6 +500,9 @@ var requiredSchema = map[string][]string{
 	"verification_amendment_requests":      {"channel", "project_id", "ticket_id", "transition_ticket_version", "prior_verification_revision", "prior_intent_digest", "prior_proof_digest", "prior_checkpoint_id", "builder_attempt_id", "builder_attempt", "builder_result_phase", "builder_result_role", "builder_typed_sha256", "proposed_digest", "proposed_command_json", "amendment_reason", "requester", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "correction_budget_kind", "correction_budget_request_id", "created_at"},
 	"runner_start_authorities":             {"channel", "project_id", "ticket_id", "start_ticket_version", "runner_epoch", "leader_epoch", "workflow_id", "workflow_digest", "created_at", "authority_digest"},
 	"manual_merge_observations":            {"observation_id", "channel", "project_id", "ticket_id", "current_ticket_version", "current_leader_epoch", "current_runner_epoch", "candidate_generation", "candidate_head_sha", "candidate_base_sha", "candidate_tree_sha", "publication_witness_digest", "publication_host", "publication_owner", "publication_name", "publication_pr_number", "publication_head_owner", "publication_head_repository", "publication_head_ref", "publication_head_oid", "publication_base_ref", "publication_base_oid", "publication_factory_owned", "observed_host", "observed_owner", "observed_name", "observed_pr_number", "observed_head_owner", "observed_head_repository", "observed_head_ref", "observed_head_oid", "observed_base_ref", "observed_base_oid", "observed_factory_owned", "merge_commit", "observed_protected_base", "observation_digest", "created_at"},
+	"protected_base_refresh_intents":       {"refresh_id", "channel", "project_id", "ticket_id", "ticket_version", "leader_epoch", "runner_epoch", "source_digest", "config_generation", "config_digest", "config_snapshot_digest", "intent_json", "intent_digest", "old_candidate_generation", "old_candidate_head_sha", "old_candidate_tree_sha", "old_candidate_base_sha", "worktree_path", "worktree_identity_json", "worktree_identity_digest", "new_base_sha", "base_proof_digest", "base_proof_semantic_key", "refresh_effect_semantic_key", "refresh_effect_request_digest", "created_at"},
+	"protected_base_refresh_preparations":  {"refresh_id", "channel", "project_id", "ticket_id", "old_candidate_head_sha", "new_base_sha", "prepared_commit_oid", "prepared_tree_oid", "prepared_parent_1_oid", "prepared_parent_2_oid", "prepared_digest", "prepared_at"},
+	"protected_base_refresh_completions":   {"refresh_id", "channel", "project_id", "ticket_id", "prepared_commit_oid", "prepared_tree_oid", "prepared_parent_1_oid", "prepared_parent_2_oid", "effective_base_sha", "effective_worktree_identity_json", "effective_worktree_identity_digest", "completion_ticket_version", "completion_leader_epoch", "completion_runner_epoch", "completion_digest", "completed_at"},
 }
 
 type indexRequirement struct {
@@ -557,6 +586,11 @@ var requiredIndexes = []indexRequirement{
 	{table: "manual_merge_observations", name: "manual_merge_observations_ticket", columns: []string{"channel", "project_id", "ticket_id", "observation_id"}, nonUnique: true},
 	{table: "manual_merge_observations", name: "manual_merge_observations_digest", columns: []string{"observation_digest"}},
 	{table: "publication_evidence", name: "publication_evidence_manual_merge_authority", columns: []string{"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "witness_digest", "github_host", "github_owner", "github_name", "github_pr_number", "github_head_owner", "github_head_repository", "github_head_ref", "github_head_oid", "github_base_ref", "github_base_oid", "github_factory_owned"}},
+	{table: "protected_base_refresh_intents", name: "protected_base_refresh_intents_ticket", columns: []string{"channel", "project_id", "ticket_id"}},
+	{table: "effects", name: "effects_refresh_ticket_identity", columns: []string{"semantic_key", "channel", "project_id", "ticket_id"}},
+	{table: "protected_base_refresh_intents", name: "protected_base_refresh_intents_candidate", columns: []string{"refresh_id", "old_candidate_head_sha", "new_base_sha"}},
+	{table: "protected_base_refresh_preparations", name: "protected_base_refresh_preparations_identity", columns: []string{"channel", "project_id", "ticket_id", "refresh_id", "prepared_commit_oid", "prepared_tree_oid", "prepared_parent_1_oid", "prepared_parent_2_oid"}},
+	{table: "protected_base_refresh_completions", name: "protected_base_refresh_completions_digest", columns: []string{"completion_digest"}},
 }
 
 func hasIndex(ctx context.Context, db *sql.DB, required indexRequirement) error {

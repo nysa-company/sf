@@ -445,6 +445,16 @@ func (m RepositoryMaterializer) candidateParent(ctx context.Context, request wor
 	}
 	repair, err := m.Store.CandidateRepairBuildContext(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
 	if errors.Is(err, store.ErrNotFound) {
+		refresh, refreshErr := m.Store.ProtectedBaseRefreshBuildContext(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+		if refreshErr == nil {
+			if !sameStoredVerificationIdentity(current, refresh.Verification) || refresh.Completion.Worktree.BaseSHA != request.Worktree.BaseSHA || !bytes.Equal(refresh.Completion.Worktree.IdentityJSON, request.Worktree.IdentityJSON) {
+				return "", false, ErrRepositoryMaterialization
+			}
+			return refresh.Completion.Preparation.CommitOID, false, nil
+		}
+		if !errors.Is(refreshErr, store.ErrNotFound) {
+			return "", false, ErrRepositoryMaterialization
+		}
 		return current.Revision.CheckpointID, false, nil
 	}
 	if err != nil {
@@ -517,8 +527,14 @@ func (m RepositoryMaterializer) currentCandidatePlanScope(ctx context.Context, r
 		return nil, ErrRepositoryMaterialization
 	}
 	provider, parsed, err := m.Store.LoadHistoricalProviderAttemptResult(ctx, *plan.Document.ProviderResult)
-	if err != nil || provider.Claim.Ref != request.Ticket.Ref || provider.Claim.Phase != domain.PhasePlanning || provider.Claim.Role != "planner" || provider.Claim.ExpectedVersion != plan.TicketVersion || provider.Claim.LeaderEpoch != plan.Fence.LeaderEpoch || provider.Claim.RunnerEpoch != plan.Fence.RunnerEpoch || provider.Claim.Repository != project.Path || provider.Claim.Worktree != request.Worktree.Path || provider.Claim.WorktreeIdentity != string(request.Worktree.IdentityJSON) || provider.Claim.BaseSHA != request.Worktree.BaseSHA || parsed.Planner == nil || !sameJSON(*plan.Document.Planner, *parsed.Planner) {
+	if err != nil || provider.Claim.Ref != request.Ticket.Ref || provider.Claim.Phase != domain.PhasePlanning || provider.Claim.Role != "planner" || provider.Claim.ExpectedVersion != plan.TicketVersion || provider.Claim.LeaderEpoch != plan.Fence.LeaderEpoch || provider.Claim.RunnerEpoch != plan.Fence.RunnerEpoch || provider.Claim.Repository != project.Path || provider.Claim.Worktree != request.Worktree.Path || parsed.Planner == nil || !sameJSON(*plan.Document.Planner, *parsed.Planner) {
 		return nil, ErrRepositoryMaterialization
+	}
+	if provider.Claim.WorktreeIdentity != string(request.Worktree.IdentityJSON) || provider.Claim.BaseSHA != request.Worktree.BaseSHA {
+		historical, historyErr := m.Store.HistoricalProviderWorktree(ctx, *plan.Document.ProviderResult)
+		if historyErr != nil || historical.Path != request.Worktree.Path || historical.Branch != request.Worktree.Branch || provider.Claim.WorktreeIdentity != string(historical.IdentityJSON) || provider.Claim.BaseSHA != historical.BaseSHA {
+			return nil, ErrRepositoryMaterialization
+		}
 	}
 	worktree, err := m.Store.Worktree(ctx, request.Ticket.Ref)
 	if err != nil || worktree.Path != request.Worktree.Path || worktree.Branch != request.Worktree.Branch || worktree.BaseSHA != request.Worktree.BaseSHA || worktree.TicketVersion != request.Worktree.TicketVersion || worktree.Fence != request.Worktree.Fence || !bytes.Equal(worktree.IdentityJSON, request.Worktree.IdentityJSON) {
