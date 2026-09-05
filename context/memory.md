@@ -2,7 +2,28 @@
 
 ## Current truth
 
-- New uncommitted internal/pythonclosure manifest layer (not execution
+- Python environment binding checkpoint atop bd3d065: combines runtime and
+  dependency manifests, executable interpreter relative path, lock digest and
+  bootstrap digest. Exact canonical decoding rejects alternate/duplicate/
+  unknown wire shapes; bounded input and pre-marshal allocation; both retained
+  directory FDs verified under one overall deadline. Content identity only,
+  not provenance or execution permission. Focused race88237 PASS1.469s.
+  Added AuthenticateEnvironmentFD requiring independently supplied environment,
+  lock and factory-bootstrap digests before retained-root verification; stale
+  expected identities refuse. Added oversized pre-allocation bound regression.
+  Latest focused race70463 PASS1.465s; prior helper race48723 PASS1.459s.
+  Real disposable modern runtime probe15535 TERMINAL exit0:2142 selected
+  regular files/70,823,634 bytes,7 pytest tests PASS0.01s; pre/post environment
+  verification passed. Stage .context/python-environment-642701669 retained,
+  digest sha256:5a07ad5adcb04188ad3e4a883c222fa4103e7a20f559c9e30c9d627223cc8489.
+  Probe code .context/python-environment-probe.go; no production admission or
+  live change. Full normal/vet/repo/secret/docs/artifact handle80093 TERMINAL
+  exit0: Store134.287s, workflowruntime121.707s, worktreecoord138.234s; all
+  static gates PASS, no leaks. Latest tests also covered by race70463.
+  Acceptance ticket freshly
+  read through installed CLI remains waiting_approval; no approval performed.
+
+- Committed bd3d065 internal/pythonclosure manifest layer (not execution
   admission): descriptor-relative bounded capture of prepared regular files
   and directories; hashes bytes/path/kind/mode/size; canonical shape/parent/
   ordering checks; no ambient root reopen or shared directory cursor.

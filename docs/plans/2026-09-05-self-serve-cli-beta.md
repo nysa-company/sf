@@ -71,6 +71,19 @@ This is not an unattended multi-platform stable-v1 delivery promise.
 
 ## Current checkpoint
 
+Python preparation is being implemented, not yet admitted as an SF recipe.
+The prepared-content manifest binds regular-file paths, modes, sizes and
+digests. The environment binding adds the selected executable, dependency
+snapshot, lock digest and factory-bootstrap digest, with strict canonical
+decoding and retained-directory verification. These are integrity checks, not
+publisher authentication or permission to execute. Focused race tests pass.
+A disposable Python 3.13/pytest sandbox probe passes seven tests, including
+project-write, network, subprocess and scratch-symlink escape refusal, with
+environment verification before and after execution. This probe does not
+exercise Store claims or production cancellation/restart. Shared runtime
+resolution, preparation UX, supervisor integration and lifecycle acceptance
+remain required before setup may report Python execution as supported.
+
 The candidate-bound decision picker now covers approval and rejection too.
 Omitted IDs in a terminal (or `--select`) show title/project/state, then fetch
 and display the complete reviewed commit. The operator must type the decision;
