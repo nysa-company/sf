@@ -2,6 +2,26 @@
 
 ## Current truth
 
+- ACCEPTANCE4537 EXIT0: native Go18.87s / Node13.45s / NysaPure13.17s all
+  PASS (no skips); make test-compiled-e2e PASS241.088s (guarded/manual,
+  takeover, stable/dev); explicit Python cold setup/workflow PASS68.240s.
+  No active test suite remains. Docs now explain deliberate bundle replacement,
+  stable-only automatic migration backups, no universal rollback/dev backup.
+  Next clean-source final bundle, use installed CLI in a new private HOME to
+  prepare pinned Python, then explicit Store fault/crash fixture with returned
+  code-owned digests. No live project/daemon changes or public release.
+
+- DIAGNOSTICS COMMITTED899db19 (clean immediately after commit). Explicit
+  acceptance4537 LIVE: native verbose Go/Node/Nysa-pure gate tests, then
+  make test-compiled-e2e, then SF_TEST_PYTHON_CLI_DOWNLOAD=1 make test-python-e2e.
+  Go PASS18.87s, dependency-free Node PASS13.45s (not skipped); Nysa pure
+  started. Poll4537; no competing suite. Full41791 is terminal EXIT0.
+  Next after tags: explicit prepared-Python Store execution/crash fault fixture
+  requires SF_TEST_PYTHON_SNAPSHOTS/DIGEST/LOCK (ordinary Go skips it), then
+  fresh clean-source bundle/verify/exclusive install and final requirement map.
+  No live runtime/project edits, provider call, PR action or release. Existing
+  installed onboarding11 and delivered ticket stay unchanged.
+
 - VALIDATION41791 EXIT0: review diagnostic targeted race PASS; full Go PASS
   (cmd/sf91.242s, daemon21.628s, processsupervisor66.210s, publication94.826s,
   Store122.632s, workflowruntime111.856s, worktreecoord131.571s), vet,

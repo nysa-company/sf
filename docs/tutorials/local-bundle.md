@@ -56,3 +56,31 @@ automatic cleanup, rollback or migration is implied.
 Continue with [your first ticket](first-ticket.md). Installation does not
 qualify providers, make unsupported languages executable, or establish GitHub
 publication readiness.
+
+## Replace a bundle deliberately
+
+There is no automatic updater or general rollback command. Install a verified
+new bundle into a different private directory first; keep the old bundle.
+Check its version and channel before pointing any daemon at existing state.
+
+Use the old channel's `status` to inspect in-flight work. For the simplest beta
+upgrade, wait for tickets to finish. Stop that foreground daemon with Ctrl-C
+and wait for successful shutdown before starting its replacement. A cleanup
+or drain error is not permission to launch a second writer; follow its reported
+recovery action instead. Do not stop or replace the other channel.
+
+Keep HOME, registered repositories, linked worktrees and runtime snapshots in
+their original durable locations. Preserve a trusted backup before a stateful
+upgrade; copying a live SQLite file or restoring only a database is not a
+supported recovery procedure. Stable-channel startup makes an owner-only
+database backup before a recognized schema migration. Development-channel
+startup can migrate without that automatic backup. Do not assume dev has
+stable's backup policy or that an older executable can read an upgraded schema.
+Future/foreign schemas and incompatible migration history are refused rather
+than forced; retain the evidence and follow the compatibility error.
+
+Start the replacement with the same HOME and channel using `daemon run`, then
+inspect `status` and `doctor`. Re-qualify providers if requested. A restart may
+require explicit recovery/rearm; do not resubmit or reapprove a ticket merely
+because the daemon changed. This is a deliberate local replacement procedure,
+not a claim of unattended upgrades or universal rollback support.

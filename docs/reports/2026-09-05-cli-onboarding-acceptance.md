@@ -22,6 +22,16 @@ observed during PR #2's final review. The installed acceptance daemon has not
 been replaced for this change. Tagged workflow/isolation and explicit prepared
 Python acceptance remain separately accounted gates, not implied by this run.
 
+Explicit acceptance 4537 subsequently passed (exit 0) on the diagnostics
+checkpoint: Go gate 18.87s, dependency-free Node gate 13.45s, restricted
+TypeScript gate 13.17s, all executed rather than skipped. `make test-compiled-e2e`
+passed in 241.088s, covering guarded/manual workflows, operator takeover and
+stable/dev coexistence. `SF_TEST_PYTHON_CLI_DOWNLOAD=1 make test-python-e2e`
+passed in 68.240s, covering cold preparation/registration and the compiled
+Python workflow with controlled provider/GitHub fixtures. Explicit Store
+Python fault inputs and a fresh final bundle remain the next checks; these
+results do not claim live-model Python delivery or unfamiliar-user adoption.
+
 ## September 6 durable-storage trial: delivered through repaired recovery
 
 At `2026-09-06T20:49:36Z`, the installed onboarding11 bundle (`5216d13`)
