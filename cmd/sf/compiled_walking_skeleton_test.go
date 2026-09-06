@@ -38,6 +38,19 @@ func TestCompiledDevManualWalkingSkeleton(t *testing.T) {
 }
 
 func compiledDevWalkingSkeleton(t *testing.T, mergeMode domain.MergeMode) {
+	compiledDevWalkingSkeletonProfile(t, mergeMode, false)
+}
+
+// Real CLI/daemon/Python execution with process-boundary provider/GitHub fixtures.
+// Public downloads are opt-in; no real provider credentials or remote mutation.
+func TestCompiledPythonGuardedWalkingSkeleton(t *testing.T) {
+	if os.Getenv("SF_TEST_PYTHON_CLI_DOWNLOAD") != "1" || runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("requires explicit pinned Python download acceptance on macOS ARM64")
+	}
+	compiledDevWalkingSkeletonProfile(t, domain.MergeGuarded, true)
+}
+
+func compiledDevWalkingSkeletonProfile(t *testing.T, mergeMode domain.MergeMode, python bool) {
 	t.Helper()
 	if runtime.GOOS != "darwin" {
 		t.Skip("guarded repository command execution is Darwin-only")
@@ -74,6 +87,24 @@ func compiledDevWalkingSkeleton(t *testing.T, mergeMode domain.MergeMode) {
 		t.Fatal(err)
 	}
 	repository, bare, base := compiledWalkingSkeletonRepository(t, bareRoot)
+	if python {
+		// Only this newly created disposable fixture is changed.
+		if err := os.Remove(filepath.Join(repository, "go.mod")); err != nil {
+			t.Fatal(err)
+		}
+		for name, content := range map[string]string{
+			"pyproject.toml":     "[project]\nname='sf-python-fixture'\nversion='0.1.0'\n",
+			"test_sf_fixture.py": "# Independent Reviewer will author the proof.\n",
+		} {
+			if err := os.WriteFile(filepath.Join(repository, name), []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		walkingSkeletonGit(t, repository, "add", ".")
+		walkingSkeletonGit(t, repository, "commit", "-m", "Python fixture baseline")
+		walkingSkeletonGit(t, repository, "push", bare, "main")
+		base = walkingSkeletonGitOutput(t, repository, "rev-parse", "HEAD")
+	}
 	if got := walkingSkeletonGitOutput(t, repository, "config", "--get", "remote.origin.url"); got != "https://github.com/acme/app.git" {
 		t.Fatalf("origin URL=%q, want exact GitHub fixture URL", got)
 	}
@@ -120,7 +151,12 @@ func compiledDevWalkingSkeleton(t *testing.T, mergeMode domain.MergeMode) {
 	t.Setenv("SF_E2E_GIT_BARE", bare)
 	t.Setenv("PATH", fixtureBin+":"+filepath.Dir(binary)+":"+filepath.Dir(goBinary)+":/usr/bin:/bin:/usr/sbin:/sbin")
 
-	compiledWalkingSkeletonCLI(t, binary, home, "init", "--project", "app", "--repo", repository, "--json")
+	if python {
+		compiledWalkingSkeletonCLI(t, binary, home, "runtimes", "prepare", "python", "--download", "--json")
+		compiledWalkingSkeletonCLI(t, binary, home, "init", "--project", "app", "--repo", repository, "--profile", "python-pytest-v1", "--test", "test_sf_fixture.py", "--json")
+	} else {
+		compiledWalkingSkeletonCLI(t, binary, home, "init", "--project", "app", "--repo", repository, "--json")
+	}
 	var daemonOutput compiledSafeBuffer
 	daemonCommand := exec.Command(binary, "daemon", "run")
 	daemonCommand.Env = os.Environ()
@@ -165,6 +201,9 @@ func compiledDevWalkingSkeleton(t *testing.T, mergeMode domain.MergeMode) {
 	compiledWalkingSkeletonCLI(t, binary, home, "providers", "qualify", "--builder", "codex", "--reviewer", "codex", "--json")
 	ticketPath := filepath.Join(home, "ticket.md")
 	ticketSource := fmt.Sprintf("---\ntype: feature\nmerge: %s\nmax_duration: 30m\nmax_cost_usd: 10\n---\n# Implement the fixture\n\nThe verification fixture deliberately begins without its implementation.\n\n## Acceptance\n- The fixture workflow completes.\n", mergeMode)
+	if python {
+		ticketSource = strings.Replace(ticketSource, "The verification fixture", "SF_E2E_PYTHON_PYTEST: The verification fixture", 1)
+	}
 	if err := os.WriteFile(ticketPath, []byte(ticketSource), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -200,6 +239,14 @@ func compiledDevWalkingSkeleton(t *testing.T, mergeMode domain.MergeMode) {
 	postbuild, err := readOnly.LoadRepositoryCommandResult(context.Background(), candidate.CommandBinding.Key)
 	if err != nil || postbuild.Result.ExitCode != 0 || !postbuild.Result.Observed {
 		t.Fatalf("post-build verification result=%+v err=%v", postbuild, err)
+	}
+	if python {
+		if prebuild.Claim.ExecutableDigest != postbuild.Claim.ExecutableDigest || !strings.Contains(postbuild.Claim.ExecutablePath, "python3.13") {
+			t.Fatal("workflow did not execute the same prepared Python interpreter")
+		}
+		if got := walkingSkeletonGitOutput(t, bare, "show", candidate.Snapshot.HeadSHA+":sf_fixture.py"); !strings.Contains(got, "def software_factory_fixture") {
+			t.Fatal("published candidate lacks Python implementation")
+		}
 	}
 
 	if err := github.SetChecks(1, contracts.RequiredCheck{Name: "unit", ExternalID: "unit-1", State: "success"}); err != nil {

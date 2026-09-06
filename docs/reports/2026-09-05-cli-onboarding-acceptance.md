@@ -2,6 +2,23 @@
 
 Status: partial acceptance, not a completed beta or delivered-ticket verdict.
 
+## Requirement evidence map
+
+Test names identify the scope to preserve. The fixture extension's integrated
+verdict is below; fixture success does not prove live delivery.
+
+| Gate | Evidence and limit |
+| --- | --- |
+| Local install bundle | `internal/bundle` inventory/install tests and the clean installed-binary repeat below. Public publisher authentication/signing is not proved by checksums. |
+| Clean local onboarding | `TestCompiledDevOnboardingUsesPrivateHomeAndLocalCommands` uses the full helper bundle, isolated HOME, real registration/replay and no stable-channel writes. It deliberately does not launch a provider. |
+| Explicit stack readiness | `TestInitCheckExplainsUnsupportedStacksWithoutRunningThem` refuses unprepared Python, Rails and dependency-bearing Node before writes/execution. Prepared Python has separate compiled acceptance; refusal is not language support. |
+| Ticket selection and run/watch | CLI selection tests cover exact resolved identity, ambiguity, stale state and terminal-control sanitization; run tests cover submit/start/watch, replay and uncertain mutation refusal. Real-PTY tests exercise the interactive path separately. |
+| Human decision | Decision picker tests bind confirmation to the displayed full head. The real ticket below still has no human approval. |
+| Python workflow and faults | Real interpreter execution, Store/executor cancellation/recovery and compiled workflow fixtures pass as described below and in the beta plan. Controlled model/GitHub fixtures are not live-model delivery. |
+| Isolation and capacity | Existing channel-coexistence and capacity suites remain required. The Python extension does not change their production settings or replace those tests with its single-ticket fixture. |
+| Fresh delivered ticket | Not proved: the real acceptance PR is open/draft, unmerged at the observed head. |
+| External beta | Three unfamiliar users and the ten-ticket reliability target remain unobserved; no success rate or onboarding-time claim. |
+
 ## Executed path
 
 The isolated macOS acceptance used a fresh HOME, a separate dev database,
@@ -73,11 +90,38 @@ was not replaced during its approval wait.
 - Exact-head human approval, merge and terminal reconciliation of this ticket.
 - Complete clean onboarding without author intervention beyond the passing
   repeat installation/local-preview checks above.
-- Supported-stack expansion and execution fixtures for dependency-bearing
-  Node/TypeScript, Python and Rails; actual Claude execution composition.
+- Dependency-bearing Node/TypeScript and Rails support; actual Claude execution
+  composition. Python now has a narrow pinned runtime and passing compiled
+  setup/workflow fixtures, separately described below; live-model Python
+  delivery remains unproven.
 - Three unfamiliar external users and the ten-ticket reliability target.
 - Public signing/distribution and upgrade experience, where separately
   authorized; no public release has been published by this checkpoint.
 
 Passing the current Go path must not be presented as evidence that the other
 stacks/providers or the complete self-serve beta are ready.
+
+## Subsequent isolated Python acceptance
+
+The Python preparation/setup implementation is committed at `86bf334` with
+full normal Go, vet, repository/secret/docs/artifact and release-build checks
+passing. A subsequent test-only workflow extension has passed its first run,
+two repetitions, and the explicit `make test-python-e2e` target. The target
+requires macOS ARM64 and `SF_TEST_PYTHON_CLI_DOWNLOAD=1`; it refuses missing
+consent or an unsupported host instead of counting skipped tests as coverage.
+
+This acceptance uses the compiled CLI and daemon, pinned public Python/pytest
+artifacts, real repository commands, Store evidence and ordinary transitions.
+It observes a nonzero pre-build test, a passing post-build command, publication
+of the actual Python implementation, exact guarded fixture approval and merge,
+and terminal reconciliation. Provider and GitHub processes are controlled
+fixtures, with a disposable local bare remote. No real PR was approved or
+merged by this test. Existing Go guarded acceptance also passed after the
+shared fixture extension; fixture race tests passed. The extension's full run
+failed two Go workflow fixtures with explicit disk-exhaustion diagnostics;
+all other packages passed, but chained static checks did not run. After
+clearing verified obsolete Go build caches (not project or runtime data),
+the exact regressions passed, followed by a fresh full Go suite, vet,
+repo-check, secret-scan, docs-smoke and artifact-check (terminal exit 0).
+These results do not complete the real
+Go acceptance ticket above or establish unattended live-model Python delivery.

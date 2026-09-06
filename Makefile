@@ -66,6 +66,13 @@ test-upgrade:
 test-compiled-e2e:
 	go test -count=1 -shuffle=off -p 1 -timeout 30m -tags sf_e2e ./cmd/sf -run '^(TestCompiledDev(GuardedWalkingSkeleton|ManualWalkingSkeleton|FriendlyOperatorTakeover)|TestCompiledStableAndDevDaemonsCoexist)$$'
 
+# Explicit public-download acceptance; never silently pass by skipping on CI.
+.PHONY: test-python-e2e
+test-python-e2e:
+	@test "$$(uname -s)/$$(uname -m)" = Darwin/arm64 || { echo "Python E2E requires macOS ARM64" >&2; exit 2; }
+	@test "$$SF_TEST_PYTHON_CLI_DOWNLOAD" = 1 || { echo "Set SF_TEST_PYTHON_CLI_DOWNLOAD=1 to allow pinned public downloads into disposable test homes" >&2; exit 2; }
+	go test -count=1 -shuffle=off -p 1 -timeout 15m -tags sf_e2e ./cmd/sf -run '^(TestCompiledPythonPreparationAndInit|TestCompiledPythonGuardedWalkingSkeleton)$$'
+
 test-compiled: test-compiled-e2e
 
 # test-race covers the complete suite; the remaining targets add named,

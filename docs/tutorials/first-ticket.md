@@ -11,7 +11,7 @@ general-purpose runner for every project or provider.
 | Go | Dependency-free module or compatible checked-in vendor closure |
 | JavaScript | Dependency-free Node project using `node --test` |
 | TypeScript | Only the configured bounded Nysa pure-test recipe |
-| Python | Experimental pinned Python/pytest profile on Apple Silicon; no additional dependencies; full workflow acceptance pending |
+| Python | Experimental pinned Python/pytest profile on Apple Silicon; no additional dependencies; automated workflow passes, live-model delivery pending |
 | Ruby on Rails | Not yet supported locally |
 
 See [configuration](../configuration.md) for exact constraints. An explicit
@@ -54,9 +54,11 @@ sf-dev init --check
 The first command previews without writing or downloading. `--download` fetches
 pinned public runtime/pytest artifacts into the dev channel's private cache;
 it does not install project dependencies, modify PATH, or execute project code.
-Preparation and profile registration have compiled clean-environment coverage;
-this does **not** yet establish a completed Python ticket workflow. Use the Go
-or dependency-free Node path for the established first-ticket workflow. See
+Preparation and profile registration have compiled clean-environment coverage.
+An isolated compiled Python workflow also passes through real test execution,
+publication and terminal reconciliation using controlled provider/GitHub
+fixtures; live-model Python delivery is still pending. Use the Go or
+dependency-free Node path for the established first-ticket workflow. See
 [Python configuration](../configuration.md) for the restricted recipe and
 [the acceptance plan](../plans/2026-09-05-self-serve-cli-beta.md) for remaining
 validation. Provider qualification and publication readiness remain separate.

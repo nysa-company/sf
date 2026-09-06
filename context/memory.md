@@ -2,6 +2,44 @@
 
 ## Current truth
 
+- Python onboarding checkpoint committed86bf334; full21715 passed. New uncommitted
+  fixture integration adds cmd/fake-provider/python.go and extends codex.go plus
+  compiled_walking_skeleton_test.go. Existing Go wrappers unchanged; Python
+  opt-in test uses explicit preparation/init and real compiled Factory/executor,
+  exact controller recipe, actual .py test/implementation and fixture-only PR.
+  Compile/fake-provider77951 PASS. First Python E2E60263 failed invalid fixture
+  Markdown (marker after acceptance list); moved marker into problem paragraph,
+  no parser change. E2E31128 PASS48.591s: real prepared Python prebuild nonzero,
+  postbuild0, candidate .py published, guarded fixture approval/merge/done and
+  terminal cleanup. Controlled provider/GitHub only, NOT live-model delivery.
+  57865 PASS: fake-provider race1.473s with exact-binding/write-scope tests;
+  two repeated Python E2Es95.522s. Added explicit make test-python-e2e, requiring
+  Darwin/arm64 and SF_TEST_PYTHON_CLI_DOWNLOAD=1 (no silent skip-as-pass).
+  Missing-download-opt-in target check refuses with exit2 before Go/network.
+  Named target84087 PASS66.432s (cold preparation + Python workflow), then
+  existing Go guarded workflow PASS65.931s. Current docs distinguish automated
+  Python workflow from pending live-model delivery. New full normal Go/vet/
+  repo/secret/docs/artifact verification11376 TERMINAL FAIL: the two materializer
+  workflow tests again reported explicit 'no space left on device FAIL'. All
+  other package results passed; chained static checks did not run. Disk491MiB.
+  Verified six obsolete Go cache directories (README, owner, no active builds),
+  then used Go clean -cache only on sf-integrated-review-gocache,
+  sf-provider-v51-all-cache, sf-provider-v51-all2-cache,
+  sf-provider-v51-final-all-cache, sf-v52-host-full-cache and
+  sf-v52-postfix-full-cache in /private/tmp. Free space now2.7GiB. No live state,
+  source or runtime snapshot removed. Session74056 TERMINAL PASS: exact two
+  regressions111.563s, then full serialized Go/vet/repo/secret/docs/artifact.
+  cmd/sf88.291s, CLI4.179s, Git182.169s, GitHub61.084s, supervisor64.996s,
+  publication92.124s, Store120.960s, workflowruntime112.283s,
+  worktreecoord130.293s; chain exit0, repository/secret/docs/artifact all PASS.
+  Disk2.4GiB before last workflow packages. No Python
+  opt-in env; explicit Python tests already ran above, do not count normal skips.
+  No live project/provider/PR mutation. New fixture checkpoint ready to commit.
+  Source-build guide corrected for Python profile creation and isolated Go-cache
+  disk requirements; acceptance report has a requirement evidence map. Real
+  approval explicitly requested for ee35025e60092cfd25480121537acec4e4f33a1d;
+  no answer received. Automated goal continuations are not that approval.
+
 - Integrated validation21715 TERMINAL PASS: serialized full Go + vet/repo/secret/
   docs/artifact/release chain and Python fixture env as96360 below. Started with
   1.2GiB free after verified obsolete-cache cleanup. Go source frozen until

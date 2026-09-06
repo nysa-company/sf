@@ -200,7 +200,11 @@ func runCodexExec(argv []string) error {
 		return err
 	}
 	if role == "builder" {
-		if strings.Contains(string(prompt), "SF_E2E_TAKEOVER") {
+		if _, python := pythonFixtureCommand(string(prompt)); python {
+			if err := writeCodexWorktreeFile(parsed.worktree, pythonBuilderFile, []byte(pythonBuilderSource)); err != nil {
+				return err
+			}
+		} else if strings.Contains(string(prompt), "SF_E2E_TAKEOVER") {
 			if err := validateTakeoverBuilderFile(parsed.worktree); err != nil {
 				return err
 			}
@@ -235,6 +239,10 @@ func SoftwareFactoryFixture() string { return "ready" }
 }
 
 func writeCodexVerificationFixture(worktree, prompt string) ([]byte, error) {
+	if _, python := pythonFixtureCommand(prompt); python {
+		content := []byte(pythonVerificationSource)
+		return content, writeCodexWorktreeFile(worktree, pythonVerificationFile, content)
+	}
 	content := []byte(`package app
 
 import "testing"
@@ -367,6 +375,11 @@ func codexRole(prompt string) string {
 }
 
 func codexArtifact(role, prompt string, verificationFixture []byte) ([]byte, error) {
+	if command, python := pythonFixtureCommand(prompt); python {
+		if data, handled, err := pythonFixtureArtifact(role, prompt, command); handled {
+			return data, err
+		}
+	}
 	ticket := map[string]any{}
 	_ = decodePromptObject(prompt, "TICKET=", &ticket)
 	ticketType, _ := ticket["type"].(string)

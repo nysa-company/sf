@@ -43,8 +43,8 @@ configuration under the same project name is refused rather than silently
 replacing the registration.
 
 For the dependency-bearing Nysa monorepo, explicitly select the bounded pure
-API test recipe. This is the only `init` form that may create the missing
-project config, and it never overwrites an existing file:
+API test recipe. Explicit profile setup may create the missing project config;
+it never overwrites an existing file:
 
 ```text
 ./bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app \
@@ -55,6 +55,20 @@ project config, and it never overwrites an existing file:
 The selected entrypoint and its relative `.js`-to-`.ts` closure are validated
 before the config is installed. The resulting command uses no npm, package
 scripts, network, or `node_modules`.
+
+For the experimental pinned Python/pytest profile, follow the separate
+[first-ticket guide](first-ticket.md). It requires explicit runtime download
+consent on macOS ARM64; the ordinary `init` command does not download runtimes.
+
+When validating SF from source, check available disk space before starting
+the full native suite. Go command fixtures compile inside isolated caches in
+addition to the outer Go build cache. Runs on this development host with less
+than 1 GiB free exhausted disk space and correctly blocked their fixture
+tickets, obscuring the intended recovery assertions. Keep several GiB free
+and serialize broad suites with `go test -p 1 ./...`. If space is exhausted,
+inspect obsolete build caches and use Go's cache-clean command only for an
+identified, unused cache. Do not delete SF databases, worktrees, or retained
+runtime snapshots to make a test pass.
 
 `auth login` starts the official interactive login flow in your terminal. It
 does not send a displayed token to the daemon. `auth status` reports only a

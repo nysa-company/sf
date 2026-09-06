@@ -71,9 +71,13 @@ This is not an unattended multi-platform stable-v1 delivery promise.
 
 ## Current checkpoint
 
-Python preparation and explicit profile setup are implemented in the working
-checkpoint; compiled clean-HOME acceptance and full integrated validation pass.
-This is not a released beta or Python workflow-delivery proof.
+Python preparation and explicit profile setup are committed at `86bf334`;
+compiled clean-HOME acceptance and that checkpoint's full integrated validation
+pass. The subsequent workflow fixture passes explicit compiled acceptance and
+repeat runs. Its fresh full Go, vet, repository/secret/docs/artifact rerun also
+passes after clearing verified obsolete build caches. The earlier run failed
+two Go workflow fixtures with disk-exhaustion diagnostics and remains recorded.
+This is not a released beta or live-provider Python delivery proof.
 The prepared-content manifest binds regular-file paths, modes, sizes and
 digests. The environment binding adds the selected executable, dependency
 snapshot, lock digest and factory-bootstrap digest, with strict canonical
@@ -137,8 +141,8 @@ Do not substitute one layer's green result for another layer's contract:
 | Requirement | Current evidence | Next proof |
 | --- | --- | --- |
 | Python clean setup | Compiled private-HOME pinned preparation, init, replay and readiness plus full integrated validation pass | Preserve these checks when extending workflow coverage |
-| Python bounded execution and recovery | Real prepared runtime through Store/executor, including cancellation and reopened-Store recovery, passes | Production Factory/scheduler/provider composition through verification and building |
-| Python workflow | Not yet demonstrated | A deterministic provider fixture must produce valid phase artifacts and actual Python changes, while the real recipe executes; then observe publication through the existing authority |
+| Python bounded execution and recovery | Real prepared runtime through Store/executor, including cancellation and reopened-Store recovery, passes | Preserve fault/recovery checks as workflow coverage expands |
+| Python workflow | Compiled CLI/daemon/Factory workflow, repeat runs and integrated validation pass with controlled provider/GitHub processes, real Python red-to-green commands, publication and terminal reconciliation | Live-provider delivery remains separate |
 | Fresh CLI delivery | Go acceptance PR 1 remains open/draft at `ee35025e60092cfd25480121537acec4e4f33a1d` on the latest read-only check | Exact-head human decision, merge and terminal reconciliation; expired budget must not be silently extended |
 | External adoption | No unfamiliar-user observations | Report the three-user and ten-ticket targets as pending until observed |
 
@@ -150,6 +154,13 @@ adapters are acceptable for this automated composition test but must be
 reported as fixtures, not live provider or remote delivery. Assert persisted
 verification/build evidence and no residual active command lease. Keep a
 separate real-provider delivery acceptance gate.
+
+Run the explicit Python acceptance on macOS ARM64 with
+`SF_TEST_PYTHON_CLI_DOWNLOAD=1 make test-python-e2e`. This downloads pinned
+public artifacts into disposable private homes and runs both cold setup and
+the compiled workflow. The named target refuses a missing opt-in or unsupported
+host instead of silently reporting skipped coverage. It uses no live provider
+credentials or GitHub mutation; the approval is exclusively a fixture action.
 
 The candidate-bound decision picker now covers approval and rejection too.
 Omitted IDs in a terminal (or `--select`) show title/project/state, then fetch
