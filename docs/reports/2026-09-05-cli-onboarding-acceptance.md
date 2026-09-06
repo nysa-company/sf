@@ -100,7 +100,8 @@ not a replacement for the real delivered-ticket gate.
 
 ## Remaining acceptance
 
-- Exact-head human approval, merge and terminal reconciliation of this ticket.
+- Terminal reconciliation of this ticket. Exact-head human approval and the
+  GitHub merge are now verified; see the September 6 checkpoint below.
 - Complete clean onboarding without author intervention beyond the passing
   repeat installation/local-preview checks above.
 - Dependency-bearing Node/TypeScript and Rails support; actual Claude execution
@@ -138,3 +139,28 @@ the exact regressions passed, followed by a fresh full Go suite, vet,
 repo-check, secret-scan, docs-smoke and artifact-check (terminal exit 0).
 These results do not complete the real
 Go acceptance ticket above or establish unattended live-model Python delivery.
+
+## September 6 real merge checkpoint
+
+The user explicitly approved PR #1 at
+`ee35025e60092cfd25480121537acec4e4f33a1d`. The installed onboarding4 CLI
+recorded that exact approval through SF. After normal provider qualification
+activated the restarted runtime, SF marked the PR ready and merged it.
+GitHub reports `MERGED`, at `2026-09-06T05:03:08Z`, with merge commit
+`00860455167278a63b17ad40d5599b74aae5f636`. No direct `gh pr merge` or database
+mutation was used to substitute for SF's workflow.
+
+This is a delivered GitHub change, but not yet a passing terminal acceptance.
+SF remains in `merging`; its merge and child protected-ref-fetch effects are
+uncertain. Restart recovery advanced the ticket to version 13 / runner 4.
+The restarted daemon required fresh leader-bound provider qualification.
+Ownerless sockets were preserved under inode-specific names after process
+and listener checks, rather than deleted. These are author interventions,
+not evidence of unattended self-service.
+
+A read-only diagnostic using the production Git runner, authenticated helper
+and an authority stub that always refuses acquisition successfully reached
+the mutation boundary. Checkout authentication and protected remote lookup
+therefore passed in that probe; no fetch was permitted by the stub. The
+subsequent local proof failure remains under investigation. Do not count the
+ticket as `done`, or this run as intervention-free, until Store confirms it.

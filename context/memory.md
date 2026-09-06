@@ -2,6 +2,23 @@
 
 ## Current truth
 
+- September 6 exact user approval is no longer a blocker. Acceptance PR1 in
+  nysa-company/sf-cli-beta-acceptance-20260905 is MERGED at approved source
+  ee35025e60092cfd25480121537acec4e4f33a1d; merge commit
+  00860455167278a63b17ad40d5599b74aae5f636, 05:03:08Z. SF performed the merge.
+  Ticket SF-543bc4cd3b9a9a6291c2bbc7ca20b3b1 still merging v13/r4, leader5;
+  merge and protected-ref-fetch uncertain. No direct DB repair or gh merge.
+  Acceptance HOME /private/tmp/sf-onboarding-acceptance.R2QvPm/home;
+  installed onboarding4 binary .context/onboarding4.ChUnCq/installed/sf-dev.
+  Daemon PTY session60628 last confirmed live; each new leader needs normal
+  provider qualification (QualificationCurrent requires attested epoch).
+  Ownerless socket inodes62558095 and66628685 preserved, not deleted.
+  Read-only .context/proof-preflight.go uses production Git runner and refusing
+  authority; reached acquisition refusal, proving pre-acquire snapshot/remote
+  lookup pass. No proof fetch launched by diagnostic. Local proof failure
+  remains to isolate; full goal NOT complete. Earlier approval-pending notes
+  below are historical and superseded.
+
 - Python compiled workflow checkpoint committed87c6172, full74056 exit0; clean
   tree at commit. Fresh clean bundle onboarding4 built from exact
   87c61724a9b1a3a561dfdd8af4c7e44f1fccb377 into ignored
