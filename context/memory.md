@@ -2,6 +2,24 @@
 
 ## Current truth
 
+- ONBOARDING7 LIVE ROLLOUT 2026-09-06T15:43Z: validated source d848697,
+  bundle/install `.context/onboarding7.xzLCPG/{bundle,installed}` all verify
+  PASS60550. Old41299 Ctrl-C exit0; new isolated daemon94247 LIVE same durable
+  HOME/env. Qualification16027 exit0 independent pair leader4. Normal recover
+  returned runtime_rearm_failed, observed=true/attempted=false (CLI replay
+  discrimination fixed), no fresh review. DB reviewingv11/r2; sealed stop
+  remains9/L3/R1 but authority is now11/L4/R2. This proves ActivateRearm advanced
+  authority and its install callback failed/compensated by sealing.
+  Source: runtime.ControlBundle.ApplyRearm -> admission.Rearm requires an
+  in-memory stopped entry. Controller.Rearm after restart loads durable stop
+  but does not call runtime.Drain/Stop, so fresh scheduler can lack that entry.
+  Needs real controller/runtime restart composition regression (existing Store
+  and daemon tests use callback/fake runtime). Also reviewBlockedRearmFrom
+  requires authority==stop, so compensated failed installation now blocks its
+  own retry; support only authenticated current authority plus same original
+  stop/ledger, never arbitrary drift. Do not blindly recover again or edit DB.
+  Next reproduce these two composition conditions before further source fix.
+
 - REVIEW REARM FOLLOW-UP: affected full Store/daemon/runtimecontrol suite83756
   completed PASS (121.334s/21.476s/7.467s). Regression76952 then proved old
   needs_operator review was reused after recovery in all three cases: same
