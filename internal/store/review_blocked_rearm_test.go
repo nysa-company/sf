@@ -216,8 +216,79 @@ func TestReviewBlockedRecoveryRearmsExactSealedEndpoint(t *testing.T) {
 			if reused, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: fixture.ticket.Ref, Phase: domain.PhaseReview, Role: "reviewer", ExpectedVersion: result.Version, Fence: fence}); err != nil || reused.Key.AttemptID != fresh.ID {
 				t.Fatalf("fresh review must remain reusable: key=%+v err=%v", reused.Key, err)
 			}
-			if _, err := db.TransitionFinalReview(ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: result.Version, From: domain.StateReviewing, To: domain.StateWaitingApproval, Trigger: "review_pass", Fence: fence, EventPayload: `{}`}); err != nil {
+			if scenario == 3 {
+				var path string
+				if err := db.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				db, err = Open(ctx, path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				fence.LeaderEpoch, err = db.AcquireLeader(ctx, domain.ChannelDev, "after-fresh-pass")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = db.FenceRecoveredRunners(ctx, domain.ChannelDev, fence.LeaderEpoch); err != nil {
+					t.Fatal(err)
+				}
+				current, err := db.Ticket(ctx, fixture.ticket.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result.Version, fence.RunnerEpoch = current.Version, current.RunnerEpoch
+				capability, err := db.PostPublicationRearmProof(ctx, fixture.ticket.Ref, stopped)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := db.ActivateRearm(ctx, capability, func(c *RuntimeAdmissionCapability) error {
+					_, _, _, ok := c.ConsumeRuntimeAdmission()
+					if !ok {
+						t.Fatal("missing admission")
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.openRuntimeAdmission(ctx, fixture.ticket.Ref, result.Version, fence); err != nil {
+					t.Fatal(err)
+				}
+			}
+			waiting, err := db.TransitionFinalReview(ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: result.Version, From: domain.StateReviewing, To: domain.StateWaitingApproval, Trigger: "review_pass", Fence: fence, EventPayload: `{}`})
+			if err != nil {
 				t.Fatalf("fresh passing review must advance to approval: %v", err)
+			}
+			conn, err := db.db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			endpoint, completionErr := db.reviewCompletionRecoveryEndpoint(ctx, conn, fixture.ticket.Ref, domain.StateWaitingApproval, waiting.Version)
+			conn.Close()
+			if completionErr != nil || endpoint.version != waiting.Version || endpoint.runner != fence.RunnerEpoch || endpoint.leader != fence.LeaderEpoch {
+				t.Fatalf("completion reader: %+v %v", endpoint, completionErr)
+			}
+			if scenario == 3 {
+				// An old pass is not enough: the immutable recovery bridge is
+				// mandatory. Simulate durable corruption in this disposable DB.
+				if _, err := db.db.ExecContext(ctx, `DROP TRIGGER runner_recovery_ledger_immutable_delete`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.db.ExecContext(ctx, `DELETE FROM runner_recovery_ledger WHERE ticket_id=? AND ticket_version=?`, fixture.ticket.Ref.Ticket, result.Version); err != nil {
+					t.Fatal(err)
+				}
+				conn, err := db.db.Conn(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = db.reviewCompletionRecoveryEndpoint(ctx, conn, fixture.ticket.Ref, domain.StateWaitingApproval, waiting.Version)
+				conn.Close()
+				if err == nil {
+					t.Fatal("recovered review accepted without signed bridge")
+				}
 			}
 		})
 	}

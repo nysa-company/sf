@@ -76,8 +76,20 @@ two review attempts and zero approvals. Fresh GitHub inspection confirms PR #2
 is open/draft at the reviewed candidate and its required `test` check passed.
 This proves the repaired real recovery-to-approval path, not terminal delivery.
 
-The next acceptance steps are this ticket's own human approval and terminal
-reconciliation. PR #1's approval cannot authorize PR #2. CLI status
+The user explicitly approved PR #2. On September 6 at 20:18Z, the installed
+CLI recorded that approval for the unchanged reviewed head, and SF merged
+the PR at `f6e2afc9117bf5b101742314ff9736335f417b0b` (20:18:35Z). The original
+deadline had elapsed; approval was accepted without changing that budget.
+The ticket remains `merging` v15/r4 rather than `done`. Its merge, ready and
+protected-ref-fetch effects are confirmed. A read-only diagnostic traced the
+handoff refusal to the historical review-completion reader: it required a
+result issued at reviewing v13, while the passing result was issued at v12
+and legitimately reused through signed recovery to v13. A regression now
+reproduces that completion-reader failure. The targeted repair and missing
+recovery-record negative pass race validation. Full validation passed
+(57535, exit 0): targeted race, full Go suite, repository and secret scans,
+and diff check. Real installed reconciliation remains pending.
+Terminal reconciliation remains an acceptance requirement. CLI status
 currently omits the review finding, requiring a read-only typed-result query;
 that operator-facing diagnostic gap remains work to do. Neither this repaired
 trial nor the earlier failed persistence trial counts as unassisted acceptance.

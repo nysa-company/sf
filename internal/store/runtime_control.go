@@ -849,16 +849,32 @@ func (s *Store) reviewCompletionRecoveryEndpoint(ctx context.Context, conn *sql.
 	var attempt int
 	var resultCount int
 	var resultVersion, resultLeader, resultRunner uint64
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(a.id),0) FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id WHERE r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase='review' AND r.role='reviewer' AND a.state='completed' AND a.outcome='completed' AND a.expected_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, reviewVersion).Scan(&resultCount, &attemptID); err != nil || resultCount != 1 || attemptID <= 0 {
+	// Match the transition's newest completed review, including a pass reused
+	// after signed runner recovery. Never fall back past a newer verdict, and
+	// retain exact result cardinality at the selected source endpoint.
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(a.expected_ticket_version),0) FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id WHERE r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase='review' AND r.role='reviewer' AND a.state='completed' AND a.outcome='completed' AND a.expected_ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, reviewVersion).Scan(&resultVersion); err != nil || resultVersion == 0 {
 		return normalRecoveryEndpoint{}, ErrEvidenceConflict
 	}
-	if err := conn.QueryRowContext(ctx, `SELECT r.attempt,a.expected_ticket_version,a.leader_epoch,a.runner_epoch FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id WHERE r.provider_attempt_id=?`, attemptID).Scan(&attempt, &resultVersion, &resultLeader, &resultRunner); err != nil || attempt <= 0 || resultVersion != reviewVersion || resultLeader == 0 || resultRunner == 0 {
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(a.id),0) FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id WHERE r.channel=? AND r.project_id=? AND r.ticket_id=? AND r.phase='review' AND r.role='reviewer' AND a.state='completed' AND a.outcome='completed' AND a.expected_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, resultVersion).Scan(&resultCount, &attemptID); err != nil || resultCount != 1 || attemptID <= 0 {
+		return normalRecoveryEndpoint{}, ErrEvidenceConflict
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT r.attempt,a.expected_ticket_version,a.leader_epoch,a.runner_epoch FROM provider_attempt_results r JOIN provider_attempts a ON a.id=r.provider_attempt_id WHERE r.provider_attempt_id=?`, attemptID).Scan(&attempt, &resultVersion, &resultLeader, &resultRunner); err != nil || attempt <= 0 || resultVersion > reviewVersion || resultLeader == 0 || resultRunner == 0 {
 		return normalRecoveryEndpoint{}, ErrEvidenceConflict
 	}
 	key := ProviderAttemptResultKey{AttemptID: attemptID, Ref: ref, Phase: domain.PhaseReview, Attempt: attempt}
 	result, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, conn, key)
-	if err != nil || parsed.Reviewer == nil || parsed.Reviewer.Decision != phaseartifact.ReviewPass || parsed.Reviewer.ReviewedHead != candidate.Snapshot.HeadSHA || parsed.Reviewer.ProofDigest != candidate.Snapshot.ProofDigest || result.Claim.ExpectedVersion != reviewVersion || result.Claim.LeaderEpoch != resultLeader || result.Claim.RunnerEpoch != resultRunner || providerResultReachesHistoricalFence(ctx, conn, key, result, reviewVersion, domain.Fence{LeaderEpoch: resultLeader, RunnerEpoch: resultRunner}) != nil {
+	if err != nil || parsed.Reviewer == nil || parsed.Reviewer.Decision != phaseartifact.ReviewPass || parsed.Reviewer.ReviewedHead != candidate.Snapshot.HeadSHA || parsed.Reviewer.ProofDigest != candidate.Snapshot.ProofDigest || result.Claim.ExpectedVersion != resultVersion || result.Claim.LeaderEpoch != resultLeader || result.Claim.RunnerEpoch != resultRunner {
 		return normalRecoveryEndpoint{}, ErrEvidenceConflict
+	}
+	if resultVersion < reviewVersion {
+		recovery, found, err := loadRunnerRecoveryAt(ctx, conn, ref, reviewVersion)
+		if err != nil || !found || !validRunnerRecovery(recovery) {
+			return normalRecoveryEndpoint{}, ErrPublicationEvidence
+		}
+		resultLeader, resultRunner = recovery.LeaderEpoch, recovery.RunnerEpoch
+	}
+	if providerResultReachesHistoricalFence(ctx, conn, key, result, reviewVersion, domain.Fence{LeaderEpoch: resultLeader, RunnerEpoch: resultRunner}) != nil {
+		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
 	if err := validatePostPublicationEndpointAdvance(ctx, conn, ref, domain.StateReviewing,
 		normalRecoveryEndpoint{version: historicalReviewVersion, runner: observation.ObservedFence.RunnerEpoch, leader: observation.ObservedFence.LeaderEpoch},

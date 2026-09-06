@@ -2,6 +2,50 @@
 
 ## Current truth
 
+- VALIDATION57535 EXIT0: recovered-review regression race28.589s, full Go
+  suite PASS (Store264.445s, Git359.465s, compiled CLI228.460s), repo-check,
+  secret-scan and diff-check PASS. Commit recovered-review completion repair
+  and build fresh onboarding10 bundle next; ticket PR2 already merged, no
+  second approval or merge needed. Only normal restart/reconciliation pending.
+
+- RECOVERED REVIEW FIX VALIDATING: runtime_control.go completion reader now
+  selects the latest completed review source at/before the pass endpoint,
+  requires one result there, authenticates its canonical pass/head/proof, and
+  when older requires the exact signed recovery row plus full historical
+  provider-result chain. Existing CI/control endpoint authentication remains.
+  Extended review_blocked_rearm_test reproduces real close/reopen after a fresh
+  passing review, normal rearm, reuse to review_pass, and completion read.
+  RED43178 failed completion reader; GREEN10391 passed (2.867s). Added missing
+  recovery-row negative. Session57535 LIVE runs regression race then full Go,
+  repo-check, secret-scan, diff-check. Await that exact handle before commit or
+  isolated daemon rollout. No production DB/worktree edits or new merge call.
+
+- PR2 APPROVED AND MERGED 2026-09-06T20:18Z: user explicitly said
+  "Approve PR #2". Fresh GitHub check confirmed head
+  e9d40f0922130e72edc6d439f7ce6b78d71862bc and test SUCCESS. Installed onboarding9
+  approve with full ticket ID SF-bf816eaad3a060153d28c99b3a3be7ef and --head
+  succeeded, state merging v15/r4. Short ID in nonterminal approve was refused
+  without mutation; scripts must use full ID. SF itself merged PR2 at
+  f6e2afc9117bf5b101742314ff9736335f417b0b, mergedAt20:18:35Z. No direct gh merge.
+  Deadline had elapsed but Store accepted approval; no budget change.
+  GitHub PR is MERGED/non-draft. Ticket is NOT done: scheduler worker_failed,
+  state merging v15. Merge, pr_ready and git/protected-ref-fetch all confirmed.
+  Daemon4460 was polled live (no output, handle alive), not restarted.
+
+- POST-MERGE DIAGNOSIS 2026-09-06T20:24Z: temporary read-only Store diagnostic
+  TestLiveMergeDiagnosticReadOnly PASS46469 proved singleRecoveryMergeIntent
+  and guarded observation match succeed; approvalRecoveryEndpoint fails, hence
+  confirmedMergeRecoveryEndpoint fails. Temporary test removed immediately.
+  runtime_control.go reviewCompletionRecoveryEndpoint requires result at
+  waitingVersion-1 (13). Actual passing review attempt2 is v12/L5/R3; signed
+  recovery ledger bridges v12/L5/R3 to v13/L6/R4, and review_pass event is v14.
+  Thus exact-version result query rejects legitimate recovered verdict reused
+  by prior fix746216a. Next: regression for recovered review -> approval ->
+  guarded merge observed; authenticate immutable pass via signed recovery to
+  review endpoint, preserving candidate/proof/cardinality. No production edits
+  yet. Full beta goal remains incomplete. Earlier "approval missing" notes below
+  are historical, superseded by this explicit approval and remote merge.
+
 - DISPLAY VALIDATION35083 EXIT0 2026-09-06T16:47Z: full CLI race50.856s,
   full Go suite, repo-check/secret-scan/docs-smoke/diff PASS. Display-only fix
   ready/saved; no installed daemon replacement required. Live read-only DB
