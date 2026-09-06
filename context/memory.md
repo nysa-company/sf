@@ -2,6 +2,22 @@
 
 ## Current truth
 
+- REAL TERMINAL DELIVERY 2026-09-06T20:49:36Z: PR2 ticket
+  SF-bf816eaad3a060153d28c99b3a3be7ef is durable DONE v18/r5. Installed
+  onboarding11 `.context/onboarding11.1XBwtL/installed/sf-dev` at5216d13;
+  build/verify/install90250 EXIT0. Daemon30089 LIVE isolated HOME
+  `/Users/sofiagonzalez-2/Projects/.sf-beta.24jdFP`, leader8. Qualification86834
+  EXIT0 independent Luna5.6/GPT5.5, model_call_made=false. Normal CLI
+  `resume SF-bf816e --json` EXIT0 observed=true/attempted=false, then scheduler
+  reconciled old confirmed effects to current fence, merge_observed v17 and
+  reconcile_pass v18. SQLite: approvals1, merge_intents1, capacity leases0;
+  attempts planning1/verification1/build1/review2 (no new model attempt).
+  GitHub fresh confirms PR2 MERGED f6e2afc9117bf5b101742314ff9736335f417b0b,
+  exact source e9d40f0922130e72edc6d439f7ce6b78d71862bc. No DB/worktree edit,
+  budget reset, duplicate approval or merge. This is repaired delivery, NOT
+  unassisted reliability success. Full beta goal requires remaining requirement
+  audit; external unfamiliar users/general unsupported stacks are not passed.
+
 - VALIDATION38718 EXIT0: targeted race35.539s; fullGo PASS (Store222.815s,
   compiledCLI212.577s, publication200.971s), repo-check/secret-scan/diff PASS.
   Commit review-control merge recovery and build onboarding11 next. Isolated

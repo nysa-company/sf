@@ -5,7 +5,23 @@ terminal `done` reconciliation remains unproven; this is not a completed beta.
 The executed-path notes below retain historical observations. The September 6
 checkpoint supersedes their earlier approval-pending and open-PR status.
 
-## September 6 durable-storage trial: merged, reconciliation incomplete
+## September 6 durable-storage trial: delivered through repaired recovery
+
+At `2026-09-06T20:49:36Z`, the installed onboarding11 bundle (`5216d13`)
+completed PR #2's ticket as durable `done`, version 18 / runner 5. Startup
+recovered the retained review-control and merge evidence; normal CLI `resume`
+installed runtime admission without another lifecycle transition. SF then
+recorded `merge_observed` and `reconcile_pass`. Read-only SQLite checks show
+one approval, one merge intent, zero capacity leases, and unchanged provider
+attempt counts (one planner, verifier and builder; two final reviews).
+GitHub confirms merge `f6e2afc9117bf5b101742314ff9736335f417b0b` of reviewed
+head `e9d40f0922130e72edc6d439f7ce6b78d71862bc`.
+
+Validation38718 passed targeted race, full Go, repository/secret and diff
+checks; bundle90250 passed manifest, verification and installation. This is
+real terminal delivery using the new CLI, but required factory repairs and
+therefore is not an unassisted acceptance success. The history below preserves
+those failures rather than removing them from the result.
 
 A separately identified trial uses an owner-private directory under `Projects`,
 not temporary storage. Installed onboarding5 registered `onboarding-durable`;
@@ -133,7 +149,7 @@ verdict is below; fixture success does not prove live delivery.
 | Human decision | Decision picker tests bind confirmation to the displayed full head. The user approved the real ticket's exact head, and SF recorded the approval; see September 6 below. |
 | Python workflow and faults | Real interpreter execution, Store/executor cancellation/recovery and compiled workflow fixtures pass as described below and in the beta plan. Controlled model/GitHub fixtures are not live-model delivery. |
 | Isolation and capacity | Existing channel-coexistence and capacity suites remain required. The Python extension does not change their production settings or replace those tests with its single-ticket fixture. |
-| Fresh delivered ticket | Both real PR merges are verified. The earlier PR #1 trial lost its temporary environment; PR #2 uses durable storage but currently needs the authenticated review-control recovery repair before SF can reach `done`. Neither failure is omitted from acceptance. |
+| Fresh delivered ticket | PR #2 reached durable `done` through the installed CLI and authenticated recovery on September 6. PR #1 lost its temporary environment. Both failures and repair interventions remain in acceptance history. |
 | External beta | Three unfamiliar users and the ten-ticket reliability target remain unobserved; no success rate or onboarding-time claim. |
 
 ## Executed path
@@ -217,8 +233,8 @@ not a replacement for the real delivered-ticket gate.
 
 ## Remaining acceptance
 
-- Terminal reconciliation of this ticket. Exact-head human approval and the
-  GitHub merge are now verified; see the September 6 checkpoint below.
+- Terminal reconciliation of PR #2 is complete; PR #1's lost-environment
+  trial remains a failure, not a fabricated terminal success.
 - Complete clean onboarding without author intervention beyond the passing
   repeat installation/local-preview checks above.
 - Dependency-bearing Node/TypeScript and Rails support; actual Claude execution
