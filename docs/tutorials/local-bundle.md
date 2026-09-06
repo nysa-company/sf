@@ -16,7 +16,7 @@ make bundle-dev DEV_VERSION=0.1.0-dev.local BIN_DIR=.context/bundle-dev
 ```
 
 The build records the checkout commit. The bundle contains `sf-dev`,
-`sf-ssh-dev`, `sf-git-exec-dev`, `sf-git-credential-dev`, `github_known_hosts`
+`sf-ssh-dev`, `sf-git-exec-dev`, `sf-git-credential-dev`, `github_known_hosts`, `LICENSE`
 and `sf-bundle.json`. Stable builds use `make bundle VERSION=<semver>` and
 unsuffixed executables. These commands do not publish a release.
 
@@ -25,6 +25,10 @@ platform, and embedded executable version/commit/channel. It never executes
 the payloads. Current verification requires the unstripped Mach-O metadata
 produced by these build targets; other toolchain representations fail closed.
 Helpers expose the same identity through the read-only `--sf-build-info` flag.
+The SF MIT license is part of the verified inventory and is copied on install.
+Older internal five-payload bundles lack this notice; rebuild from the current
+source rather than editing their manifests. Third-party distribution notices
+remain part of public-release review, not a claim made by bundle verification.
 
 ## Install without replacing anything
 

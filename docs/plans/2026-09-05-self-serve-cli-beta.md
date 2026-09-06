@@ -1,6 +1,9 @@
 # Self-serve CLI beta
 
-Status: active implementation goal. Audience approved by the operator:
+Status: local implementation and automated acceptance checkpoint passed on
+September 6; external adoption/reliability and public release remain pending.
+See the [requirement audit](../reports/2026-09-05-cli-onboarding-acceptance.md).
+Audience approved by the operator:
 open-source developers already using Claude/Codex, working in Go,
 Node/TypeScript, Python, and Ruby on Rails.
 
@@ -102,7 +105,10 @@ Planning estimate: 2–3 working days for onboarding on today's supported runtim
 constraints. Re-estimate after compatibility and provider feasibility checks.
 This is not an unattended multi-platform stable-v1 delivery promise.
 
-## Current checkpoint
+## Implementation checkpoint history
+
+The final September 6 requirement audit linked above supersedes pending
+validation statements in this chronological implementation history.
 
 Python preparation and explicit profile setup are committed at `86bf334`;
 compiled clean-HOME acceptance and that checkpoint's full integrated validation

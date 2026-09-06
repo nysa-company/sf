@@ -1,5 +1,9 @@
 # sf
 
+SF source is available under the [MIT License](LICENSE). Third-party
+dependencies retain their own licenses. Public release packaging and publisher
+verification remain separate from this local source-build beta.
+
 `sf` is a local, operator-controlled software factory. It turns a Markdown
 ticket into a planned, independently verified implementation and a reviewed
 GitHub pull request. v1 supports manual external merge observation and a

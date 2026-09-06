@@ -33,12 +33,32 @@ func TestRealBundleManifestRejectsPayloadAndMetadataTamper(t *testing.T) {
 		t.Fatalf("build=%v %s", err, output)
 	}
 	manifest, err := CreateManifest(ctx, directory, identity)
-	if err != nil || len(manifest.Files) != 5 {
+	if err != nil || len(manifest.Files) != 6 {
 		t.Fatalf("manifest=%+v err=%v", manifest, err)
 	}
 	if _, err := Verify(ctx, directory); err != nil {
 		t.Fatal(err)
 	}
+	t.Run("license required and authenticated", func(t *testing.T) {
+		path := filepath.Join(directory, "LICENSE")
+		original, err := os.ReadFile(path)
+		if err != nil || !strings.Contains(string(original), "MIT License") {
+			t.Fatalf("license absent: %v", err)
+		}
+		defer os.WriteFile(path, original, 0644)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Verify(ctx, directory); err == nil {
+			t.Fatal("accepted missing license")
+		}
+		if err := os.WriteFile(path, []byte("changed license"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Verify(ctx, directory); err == nil {
+			t.Fatal("accepted changed license")
+		}
+	})
 	if _, err := CreateManifest(ctx, directory, identity); err == nil {
 		t.Fatal("overwrote manifest")
 	}
@@ -168,6 +188,10 @@ func TestRealBundleManifestRejectsPayloadAndMetadataTamper(t *testing.T) {
 		}
 		if _, err := Verify(ctx, destination); err != nil {
 			t.Fatal(err)
+		}
+		license, err := os.ReadFile(filepath.Join(destination, "LICENSE"))
+		if err != nil || !strings.Contains(string(license), "MIT License") {
+			t.Fatalf("installed license: %v", err)
 		}
 		if _, err := runtimeassets.ResolveCore(domain.ChannelDev, filepath.Join(destination, "sf-dev")); err != nil {
 			t.Fatalf("installed core unusable: %v", err)

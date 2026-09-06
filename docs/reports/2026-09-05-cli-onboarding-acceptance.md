@@ -1,9 +1,51 @@
 # CLI onboarding acceptance checkpoint
 
-Status: partial beta acceptance. PR #2 is merged and its SF ticket is durably
-`done`. This proves repaired delivery, not unassisted reliability or a completed beta.
+Status: local CLI implementation and automated acceptance gates passed on
+macOS ARM64. PR #2 is merged and its SF ticket is durably `done`. External
+beta adoption, unassisted reliability and public release are not established.
 The executed-path notes below retain historical observations. The September 6
 checkpoint supersedes their earlier approval-pending and open-PR status.
+
+## Final requirement audit — September 6
+
+This audits the self-serve CLI objective, not a universal four-stack runner or
+a public/stable release. Unsupported combinations and external validation are
+reported explicitly, as required by the objective.
+
+| Requirement | Inspected evidence and verdict |
+| --- | --- |
+| Verified install bundle | Clean commit `3f6179af181dd9b3f8f9f91d0d30ab5c6a189d0f`, version `0.1.0-dev.beta-check`; build, five-payload manifest, verification, exclusive installation and installed identity passed in 47718. Artifact root: `.context/beta-final.rYUXD6/{bundle,installed}`. Integrity is not publisher authentication. |
+| Discoverable help and complete quickstart | README links `docs/tutorials/first-ticket.md`, including prerequisites, actual support matrix, complete ticket, validation, run/watch and exact-head approval. CLI help/input-error tests and docs-smoke pass. |
+| Clean local onboarding | `TestCompiledDevOnboardingUsesPrivateHomeAndLocalCommands` builds helpers, proves non-mutating preview, registration replay, no stable/socket mutation, valid template, PTY preview/save/cancel and no implicit submission. Full Go run 41791 passed. Bundle tests additionally execute the installed copy and refuse inventory, ancestry, symlink and overwrite faults. |
+| Explicit stack/provider readiness | `TestInitCheckIsReadOnlyAndDoesNotClaimFullReadiness` and unsupported-stack cases distinguish local recipe from untested provider/publication readiness. Native Go, dependency-free Node and restricted TypeScript gate tests all executed and passed in 4537. Pinned Python cold preparation/init/workflow passed with explicit download opt-in. Rails, general dependency-bearing Node/TS, extra Python dependencies and actual Claude execution remain unsupported. |
+| Simple ticket selection and safe run/watch | Real-PTY compiled picker tests prove duplicate-title disambiguation, cancellation and full-head decision binding. CLI run tests prove exact submit/start/watch, no implicit resume, and no blind retry after a lost mutation response; real Store/socket composition tests passed in the integrated suite. |
+| Actionable timing and diagnostics | Stored-budget tests cover queue/pause time, elapsed/future clocks, terminal countdown omission and JSON/human rendering. Runtime observations are scoped historical diagnostics. New immutable review projection tests cover tamper refusal, redaction, bounds, historical labels and unavailable results. Existing recovery actions remain the only mutation routes. |
+| Fault and recovery acceptance | Compiled operator takeover passed in 4537. Explicit `TestPreparedPythonStoreExecution` passed all eight cases in 44741 (28.578s): pass, red, timeout, cancellation, quota, file limit, restart and restart-unclear. The latter proves a surviving child, quarantine, competing-writer refusal, no fabricated result, later group disappearance and zero lease residue. |
+| SQLite authority and approval invariants | Diagnostics add only snapshot-scoped reads. Full Store/daemon/workflow regressions pass. Guarded/manual compiled workflows passed in 4537; manual never requests merge, guarded requires the fixture's exact approval. Real PR #2 has one approval and one merge intent, not duplicate retries. |
+| Stable/dev isolation and capacity two | Compiled coexistence passes while replacing dev and retaining the stable PID/socket/authority. `TestLeaseCapacityIsBoundedUnderConcurrency` admits exactly two of three contenders; configured provider capacity rejects values outside one/two. No production capacity setting was changed for this checkpoint. |
+| Fresh CLI-led delivery | Fresh read-only SQLite check confirms `SF-bf816eaad3a060153d28c99b3a3be7ef` is `done` v18/r5, one approval, one merge intent, zero capacity leases. GitHub PR #2 is merged at `f6e2afc9117bf5b101742314ff9736335f417b0b`. This required source repairs and is not an unassisted success. |
+| External limits and no unauthorized rollout | No existing project or installed daemon was replaced for final validation; no public release, PATH change or service installation. Three unfamiliar users, <=10-minute setup and ten-ticket >=9 unassisted delivery targets remain unobserved. Public signing/distribution, third-party notice review and universal rollback remain pending, not passed gates. |
+
+The final bundle's installed CLI prepared the explicit fault-test cache under
+its new private `fault-home` (71948, exit 0), with code-owned environment
+digest `sha256:e65fcb836e0f19815114cf5a06349ef7260e03f60d4a62cce63b7406f4cf8b1a`
+and lock digest `sha256:a9b45fd1379d4d31cd7765c0a8b53b547b42762ba359d6aaaf0af949e726f428`.
+Preparation created no project, database or daemon. Those values were supplied
+explicitly to 44741; skipped tests were not counted as execution evidence.
+
+The final audit found a missing source license. The standard
+[MIT license](https://opensource.org/license/mit) was selected under the
+operator's open-source direction and added as `LICENSE`, with an SF contributors
+notice. Current builds include it as a sixth authenticated payload; missing or
+changed notices refuse verification, and installation preserves the notice.
+Focused native bundle tests pass. Packaging validation 15839 passed bundle
+race, full Go, vet, repository/secret/docs/artifact and diff checks (exit 0).
+A replacement licensed bundle is next; the five-payload `3f6179a`
+receipt above describes the earlier internal artifact, not that replacement.
+Third-party notices and publisher authentication still need public-release
+review. No repository or release has been published by this work.
+The original lost-environment trial and all author repair interventions remain
+in the history below; do not remove them from future reliability reporting.
 
 ## Review diagnostic checkpoint
 

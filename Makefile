@@ -16,6 +16,8 @@ build:
 	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=stable" -o "$(BIN_DIR)/sf-git-credential" ./cmd/sf-git-credential
 	cp internal/gitssh/github_known_hosts "$(BIN_DIR)/github_known_hosts"
 	chmod 0644 "$(BIN_DIR)/github_known_hosts"
+	cp LICENSE "$(BIN_DIR)/LICENSE"
+	chmod 0644 "$(BIN_DIR)/LICENSE"
 
 build-dev:
 	mkdir -p "$(BIN_DIR)"
@@ -25,6 +27,8 @@ build-dev:
 	go build -trimpath -buildvcs=false -ldflags "-X $(VERSION_PACKAGE).Version=$(DEV_VERSION) -X $(VERSION_PACKAGE).Commit=$(COMMIT) -X $(VERSION_PACKAGE).Channel=dev" -o "$(BIN_DIR)/sf-git-credential-dev" ./cmd/sf-git-credential
 	cp internal/gitssh/github_known_hosts "$(BIN_DIR)/github_known_hosts"
 	chmod 0644 "$(BIN_DIR)/github_known_hosts"
+	cp LICENSE "$(BIN_DIR)/LICENSE"
+	chmod 0644 "$(BIN_DIR)/LICENSE"
 
 test:
 	go test -count=1 -shuffle=off -timeout 30m ./...

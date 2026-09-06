@@ -2,6 +2,41 @@
 
 ## Current truth
 
+- LICENSE PACKAGING15839 EXIT0: bundle race6.948s, fullGo (compiledCLI90.115s,
+  bundle4.781s, CLI4.478s, daemon21.717s, GitHub64.232s, supervisor65.058s,
+  workflowruntime111.349s), vet/repo/secret/docs/artifact/diff PASS. No active
+  test handles. Commit all intended MIT/license-preserving package changes,
+  then build/verify/install new six-payload bundle. Final local audit and
+  explicit unsupported/external limits are recorded; no live rollout planned.
+
+- FINAL LICENSE GAP REPAIRED, VALIDATING15839: user open-source direction +
+  best-judgment authority used to add standard OSI MIT LICENSE, Copyright2026
+  SF contributors; no public push/release. Makefile copies notice; bundle
+  inventory requires6 payloads (including LICENSE); missing/tampered notice
+  and installed-copy tests PASS11479 (5.542s). README/local-bundle docs updated.
+  15839 LIVE: bundle race then fullGo/vet/repo/secret/docs/artifact/diff.
+  Re-poll exact session. Earlier build47718 at3f6179a was five-payload internal
+  artifact; MUST rebuild clean licensed successor after15839 before closing
+  goal. No further runtime feature change needed. Final report explicitly
+  leaves external adoption/reliability/third-party notices/signing/public
+  distribution/unsupported combinations pending, not claimed passed.
+  44741 Python fault acceptance and4537 tags both terminalPASS;86129 staticPASS.
+
+- FINAL LOCAL BETA AUDIT: 47718 EXIT0 clean bundle at3f6179a verified/installed
+  `.context/beta-final.rYUXD6/{bundle,installed}`, identity0.1.0-dev.beta-check.
+  71948 EXIT0 installed CLI prepared pinned Python under new fault-home (no
+  DB/project/daemon). 44741 EXIT0 all8 explicit Store Python execution/crash
+  cases28.578s; ambiguity retained quarantine until independently gone, no
+  reusable abort results, no surviving group/lease residue. 4537 and41791 are
+  terminal PASS. Fresh live read-only acceptance DB: PR2 ticket DONE18/r5,
+  approvals1/intents1/leases0. No runtime rollout, real model/PR action or
+  release in final validation. Requirement-by-requirement audit is at top of
+  docs/reports/2026-09-05-cli-onboarding-acceptance.md. External3 users/10-ticket
+  reliability/10-minute setup remain unobserved; unsupported stacks/providers
+  remain explicit; no LICENSE exists (choose before public distribution), no
+  publisher authenticity, universal rollback or public release is claimed.
+  Final documentation/static check pending before saving this receipt.
+
 - ACCEPTANCE4537 EXIT0: native Go18.87s / Node13.45s / NysaPure13.17s all
   PASS (no skips); make test-compiled-e2e PASS241.088s (guarded/manual,
   takeover, stable/dev); explicit Python cold setup/workflow PASS68.240s.

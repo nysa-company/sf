@@ -57,7 +57,7 @@ func payloads(identity Identity) (map[string]string, error) {
 	if identity.Channel == "dev" {
 		suffix = "-dev"
 	}
-	return map[string]string{"sf" + suffix: "sf", "sf-ssh" + suffix: "sf-ssh", "sf-git-exec" + suffix: "sf-git-exec", "sf-git-credential" + suffix: "sf-git-credential", "github_known_hosts": ""}, nil
+	return map[string]string{"sf" + suffix: "sf", "sf-ssh" + suffix: "sf-ssh", "sf-git-exec" + suffix: "sf-git-exec", "sf-git-credential" + suffix: "sf-git-credential", "github_known_hosts": "", "LICENSE": ""}, nil
 }
 
 // CreateManifest accepts only an exact complete build directory. It never
