@@ -90,8 +90,10 @@ CLI/daemon composition is implemented as `daemon cleanup prepare` and
 `daemon cleanup recover`. Focused owner/channel/caller-evidence, checkpoint
 replay, and same-boot daemon-restart tests pass. Targeted race tests, the full
 Go suite, vet, repository/secret/docs checks and diff checks pass on the final
-source (session 50924, exit 0). Real post-reboot acceptance remains incomplete. No live
-quarantine has been checkpointed or retired by this implementation work.
+source (session 50924, exit 0). The installed onboarding5 bundle now saved the
+real acceptance checkpoint through the CLI; exact replay was observed and
+same-boot recovery refused with exit 3. The quarantine remains present and
+no recovery audit exists yet. Real post-reboot acceptance remains incomplete.
 
 ## Estimate and constraints
 

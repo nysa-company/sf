@@ -2,6 +2,31 @@
 
 ## Current truth
 
+- RECOVERY CHECKPOINT LIVE (original isolated acceptance host): source commit
+  3f36eb799cf6a4f3a40941ab26ddac5b3cfa82e8; verified full dev bundle + exclusive
+  install at `.context/onboarding5.Ga8mYI/{bundle,installed}`. Installed version
+  0.1.0-dev.onboarding5, exact source commit, darwin/arm64. Build session88508
+  exit0. Old daemon PID91647/session36311 was exact-path/socket/DB verified,
+  gracefully SIGINT-stopped, exit0. New daemon SESSION75245 is active using
+  the same private acceptance HOME and trusted per-user TMPDIR; no stable or
+  other project runtime touched. Normal startup/migration succeeded.
+  CLI prepare saved checkpoint; second prepare observed=true/attempted=false;
+  same-boot recover refused host_reboot_required with exit3/no mutation.
+  Read-only DB: quarantine1/checkpoints1/recoveries0, ticket mergingv15/r6.
+  No host reboot, quarantine retirement, effect confirmation or new approval.
+  NEXT EXTERNAL PREREQUISITE: user saves work and manually reboots original
+  Mac. Never reboot automatically, forge boot facts, delete the row, or replace
+  DB/worktree. After reboot start exact installed onboarding5 binary in SAME
+  HOME `/private/tmp/sf-onboarding-acceptance.R2QvPm/home`, with TMPDIR
+  `/private/var/folders/01/fnjrykjs5k721nqj3wf04t3r0000gn/T`, actual GH_CONFIG_DIR
+  `/Users/sofiagonzalez-2/.config/gh`, CODEX_HOME `/Users/sofiagonzalez-2/.codex`,
+  capacity2, PATH including .local/bin,/opt/homebrew/bin,/usr/bin,/bin,/usr/sbin,
+  /sbin. Run ordinary `daemon cleanup recover --json`, then status and normal
+  qualification/reconciliation if requested; no model rerun or merge approval
+  is implicitly needed. Ticket SF-543bc4cd3b9a9a6291c2bbc7ca20b3b1 is NOT done.
+  First external-reboot prerequisite encounter, not three-turn blocked yet.
+  Remaining external adoption/unsupported combinations are explicitly reported.
+
 - FINAL50924 TERMINAL exit0: targeted recovery/CLI/hostidentity race tests,
   full `go test -p 1 ./...`, vet, repo-check, secret-scan (617 commits/no leaks),
   docs-smoke and diff-check all PASS. No Go source changed during this run.

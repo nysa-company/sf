@@ -197,3 +197,29 @@ policy exit 5, with regression coverage. Real recovery is still pending.
 The generic ticket recovery command is not a substitute for that host proof.
 The ticket's nonterminal state remains an acceptance blocker; passing
 prevention or simulated-reboot tests does not resolve the live evidence.
+
+### Validated recovery bundle and live checkpoint
+
+Recovery source is committed at `3f36eb799cf6a4f3a40941ab26ddac5b3cfa82e8`.
+The private onboarding5 macOS ARM64 bundle passed manifest creation,
+verification, exclusive installation, installed identity and cleanup-help
+checks. No release, PATH change, or background-service installation occurred.
+
+The old isolated acceptance daemon was identified by its exact executable and
+open database/socket descriptors, then stopped gracefully (exit 0). The new
+installed dev daemon started normally against the same acceptance HOME,
+including ordinary schema migration and runner recovery. Stable and existing
+project runtimes were not changed.
+
+Installed `daemon cleanup prepare --json` saved one checkpoint. Repeating it
+returned `observed=true`, `attempted=false`. Installed `daemon cleanup recover`
+on the same boot returned `host_reboot_required`, exit 3, with no mutation.
+A read-only database check confirmed one quarantine, one checkpoint, zero
+recovery audits, and the ticket still `merging` at version 15 / runner 6.
+No effect was confirmed by these commands. This proves the real checkpoint
+and refusal paths, not post-reboot recovery or terminal delivery.
+
+The remaining real prerequisite is a manual reboot of the original host after
+saving other work. After restarting the same isolated channel/HOME, explicit
+cleanup recovery may inspect the new boot; normal exact-merge reconciliation
+must still finish independently. A daemon restart alone is insufficient.
