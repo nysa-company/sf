@@ -2,6 +2,33 @@
 
 ## Current truth
 
+- Validation32843 TERMINAL exit0: full normal Go (explicit Python fixture),
+  vet, repo/secret/docs/artifact PASS. Store178.408s, workflowruntime135.629s,
+  worktreecoord135.672s. Prepared-cache publisher checkpoint ready to commit.
+  Prior active-handle notes below are historical; no broad test is running.
+
+- Full publication-helper validation32843 remains ACTIVE; latest poll includes
+  Git196.955s, GitHub59.545s, supervisor66.277s PASS. Keep Go files frozen until
+  this handle is terminal; do not restart on silent polls. Fresh public release
+  metadata agrees with the tested runtime artifact (25,147,663 bytes, d3904b...)
+  and all five pinned pytest wheels. New preparation-provenance report records
+  exact filenames/sizes/hashes, platform boundary and extraction constraints;
+  docs-smoke and diff-check pass. Wheel metadata inspected: all Wheel-Version1.0,
+  Root-Is-Purelib true, py3-none-any; no .data/.pth/native-library entries found.
+  Runtime archive has eight relative symlink aliases: materialize internally or
+  explicitly omit unused aliases, never let them pass the regular-file verifier.
+  No new archive download or install. Implement catalog/downloader/extractor
+  together with focused tests after32843, then one broad integrated checkpoint.
+
+- Prepared Python execution committed as1bf36f4. New uncommitted publication
+  helper authenticates staged content under retained private parent FDs, uses
+  Darwin RENAME_EXCL, verifies an existing exact snapshot for idempotence, and
+  never removes/replaces corrupt destination evidence. Parent synchronization
+  errors report whether publication occurred; no downloader/CLI integration yet.
+  Focused whole-pythonclosure race98979 PASS2.142s; expanded retained-handle,
+  corrupt-cache and concurrent tests race45610 count3 PASS2.980s. Unsupported
+  hosts refuse publication. Broad validation for these new files pending.
+
 - Python execution checkpoint: full validation27393 TERMINAL exit0. Fresh
   `go test -p 2 -count=1 ./...`, `go vet ./...`, repo-check, secret-scan,
   docs-smoke and working-tree artifact-check PASS. Explicit prepared fixture

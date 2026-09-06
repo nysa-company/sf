@@ -115,6 +115,12 @@ checkpoint. The next checkpoint is no-overwrite prepared-cache publication and
 verified provisioning, followed by channel-specific readiness and explicit init
 selection. Ordinary init remains network-free; preparation must not run project
 code, mutate a live ticket, or replace an executing snapshot.
+The internal prepared-cache publisher is now implemented with independently
+verified identities and Darwin exclusive rename. Focused repeated race tests
+cover competing preparations, exact replay, corrupt/partial destinations,
+symlinks, cancellation, private-directory checks and retained handles. Full
+normal Go, vet and repository/secret/docs/artifact checks pass for that helper;
+it is not yet a download/setup command.
 
 The candidate-bound decision picker now covers approval and rejection too.
 Omitted IDs in a terminal (or `--select`) show title/project/state, then fetch
