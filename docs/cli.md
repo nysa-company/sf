@@ -95,9 +95,10 @@ previews existing configuration and local recipe compatibility without creating
 configuration, registering a project, invoking a provider, or contacting GitHub.
 It reports runtime, provider, and publication checks separately; recipe support
 is not full execution readiness. The preview currently does not combine with
-the explicit `--profile`/`--test` configuration-creation flags. Python/Rails and
-general dependency-bearing Node/TypeScript local runtimes remain unsupported;
-writing an arbitrary command in configuration does not enable them.
+the explicit `--profile`/`--test` configuration-creation flags. Python requires
+the prepared `python-pytest-v1` profile described below. Rails and general
+dependency-bearing Node/TypeScript local runtimes remain unsupported; writing
+an arbitrary command in configuration does not enable them.
 
 `ticket template` prints an editable Markdown template (`--json` returns it in
 the response data). Save it to a new file, replace the example requirements,
@@ -132,8 +133,8 @@ arbitrary commands. If configuration changes while readiness is checked,
 `start_configuration_changed` refuses admission; explicitly run start again
 to check the new generation. These checks do not certify dependency closures,
 executable versions, provider qualification or publication readiness; those
-remain separate runtime checks. No Python/Rails/Claude execution support is
-implied by recognizing their configuration or authentication.
+remain separate runtime checks. No additional Python dependencies, Rails or
+Claude execution support is implied by recognizing configuration/authentication.
 
 For newly recorded indeterminate provider results, `sf logs <ticket> --json`
 includes a `provider_result_diagnostic` event. Its closed `reason` distinguishes
@@ -188,6 +189,21 @@ normal form never writes into the repository or contacts a remote. An explicit
 the missing `.sf/config.toml` for one selected bounded pure-kernel test; it
 never overwrites an existing config. See
 [`configuration.md`](configuration.md).
+
+`runtimes prepare python` previews the pinned Python 3.13.15/pytest 8.4.2
+environment without network or filesystem changes. `--download` explicitly
+allows verified public downloads into this channel's private runtime cache;
+it does not install Python on PATH, run pip/project code, register a project,
+open a database or restart a daemon. Existing exact snapshots are reused;
+corrupt snapshots are refused, never overwritten. Normal output shows the
+runtime and next action; `--json` also includes the exact environment/lock
+digests. Preparation currently supports Apple Silicon macOS only. Afterwards,
+run `init --profile python-pytest-v1 --test tests` (or select an existing `.py`
+test file). Init authenticates the prepared runtime before registration and
+creates only an absent config; replay never overwrites one. The profile admits
+standard-library/local modules and bundled pytest, not additional dependencies
+or arbitrary pytest options. Preparation success is not a provider or
+publication-readiness verdict. Start rechecks the frozen runtime identity.
 
 `config apply --project <name>` freezes one next immutable configuration
 generation from the registered repository's current optional config source and

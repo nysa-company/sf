@@ -78,6 +78,7 @@ func (a *app) command() *cobra.Command {
 	root.AddCommand(a.ticketDraftCommand())
 	root.AddCommand(a.runCommand())
 	root.AddCommand(a.bundleCommand())
+	root.AddCommand(a.runtimesCommand())
 	a.configureTicketSelection(root)
 	a.configureDecisionSelection(root)
 	return root
@@ -534,7 +535,7 @@ func (a *app) initCommand() *cobra.Command {
 	command.Flags().StringVar(&repo, "repo", ".", "trusted repository path (default: current directory)")
 	command.Flags().BoolVar(&check, "check", false, "preview local compatibility without registering or changing files")
 	command.Flags().StringVar(&profile, "profile", "", "explicit project profile (for example nysa-api-pure-v1)")
-	command.Flags().StringVar(&testPath, "test", "", "repository-relative .test.ts entrypoint for the selected profile")
+	command.Flags().StringVar(&testPath, "test", "", "repository-relative entrypoint: .test.ts for TypeScript, .py or tests directory for Python")
 	return command
 }
 

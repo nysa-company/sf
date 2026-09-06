@@ -37,11 +37,12 @@ const defaultWorkers = 2
 // Config contains only process-local composition choices. Ticket limits,
 // commands, providers, and merge policy remain frozen Store configuration.
 type Config struct {
-	Channel     domain.Channel
-	GitHome     string
-	OwnerHome   string
-	GHConfigDir string
-	GHBinary    string
+	Channel         domain.Channel
+	GitHome         string
+	PythonSnapshots string
+	OwnerHome       string
+	GHConfigDir     string
+	GHBinary        string
 	// GHAuthenticated is a sanitized result of the explicit, read-only
 	// `gh auth status` preflight performed by cmd/sf. It is never a credential.
 	GHAuthenticated bool
@@ -125,10 +126,11 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 			gitRunner.GHConfigDir = configuration.GHConfigDir
 		}
 		repositorySupervisor := processsupervisor.RepositoryCommandSupervisor{
-			Executable: core.Executable,
-			GitRunner:  gitRunner,
-			SoftDrain:  2 * time.Second,
-			HardDrain:  2 * time.Second,
+			PythonSnapshots: configuration.PythonSnapshots,
+			Executable:      core.Executable,
+			GitRunner:       gitRunner,
+			SoftDrain:       2 * time.Second,
+			HardDrain:       2 * time.Second,
 		}
 		materializer := workflowruntime.RepositoryMaterializer{
 			Store: dependencies.Store,

@@ -2,6 +2,117 @@
 
 ## Current truth
 
+- Integrated validation21715 TERMINAL PASS: serialized full Go + vet/repo/secret/
+  docs/artifact/release chain and Python fixture env as96360 below. Started with
+  1.2GiB free after verified obsolete-cache cleanup. Go source frozen until
+  terminal result now received: exit0. Store154.487s, workflowruntime118.903s,
+  worktreecoord129.206s; repo/secret/docs/artifact/release smoke PASS; vet PASS.
+  No new failure, only expected deprecated Seatbelt API build warnings.
+  Bounded observer cell2396 completed; underlying21715 remains active.
+  Earlier observer notes are superseded by the terminal result above.
+  Ignored .context/python-codex-fixture.go is a draft for the next compiled
+  Python workflow acceptance, NOT integrated or tested. It uses exact pinned
+  recipe plus OUTPUT_BINDING and actual .py source; preserve normal Go fixture.
+
+- Validation96360 TERMINAL FAIL: serialized `go test -p 1 -count=1 ./...` with
+  SF_TEST_PYTHON_PREPARED/SNAPSHOTS=.context/python-onboarding-cache,
+  DIGEST=e65fcb...f8b1a, LOCK=a9b45f...f428 and CLI_DOWNLOAD=1, followed by
+  vet/repo/secret/docs/artifact/release smoke (these chained checks did NOT run).
+  Two workflowruntime failures: TestRepositoryMaterializerRealStoreGitReplay
+  expected candidate evidence response loss but got nil; source-resume prepared
+  observation-loss case also got nil. All other package results passed, including
+  Store159.787s and worktreecoord129.553s. Investigate skill: no root cause yet.
+  Added state/version/transitioned assertion diagnostics only in those tests.
+  Narrow reproduction96052 PASS both cases without production edits:58.10s
+  and78.90s, package137.575s. Root cause remains unproven; do not call it fixed.
+  Whole workflowruntime67553 FAIL129.357s with original Python fixture env:
+  source-resume case returns nil but state=blocked v9 transitioned=true.
+  Added test-only embedded-Store CompleteRepositoryCommand diagnostics for exit,
+  duration and fixed error categories only (no raw output); actual recording
+  still delegated unchanged. Reproduction4398 FAIL70.973s: all three command
+  results exit1 with fixed category 'no space left on device FAIL'; blockedv9.
+  Root cause for reproduced failure is disk exhaustion, not proof replay.
+  Verified old SF Go-cache README/ownership and no consumers, then Go clean
+  -cache ONLY /private/tmp/sf-qualification-go-cache, sf-config-v51-go-cache,
+  sf-publication-store-go-cache. Regenerable artifacts only, no source/runtime/
+  live state removed; free space343MiB ->1.2GiB. Exact two-test rerun48660
+  PASS111.311s (44.29s/66.57s): expected red/missing exit1 then postbuild exit0,
+  no disk-exhaustion category. No production change required. Retain safe
+  diagnostics; fresh full integrated validation still required before commit.
+  Narrow run used exact two-test regex and host permission,
+  GOCACHE=/private/tmp/sf-gocache3, no Python fixture env needed for these Go tests.
+  Do not commit or claim integrated green. Archive extractor
+  pinned-local-source acceptance was separately52908/33140; this full run
+  does not set SF_TEST_PYTHON_ARCHIVES. Do not claim skipped tests passed.
+  Processsupervisor passed75.969s. Disk last observed534MiB free before broad
+  process cleanup; no cleanup or parallel build.
+  Read-only acceptance PR check still OPEN/draft, unmerged, exact head
+  ee35025e60092cfd25480121537acec4e4f33a1d. No approval was supplied or sent.
+  Next Python composition can reuse compiledDevWalkingSkeleton, but its
+  cmd/fake-provider/codex.go artifacts/file writers currently hard-code Go.
+  Adapt the fixture only after validation finishes; keep real Factory and
+  repository executor, use exact configured Python argv and actual .py files.
+
+- Python profile composition now implemented, UNCOMMITTED: config
+  python-pytest-v1 generates both exact pinned argv under existing config lock;
+  selected .py/tests path verified without symlinks or executing code. CLI init
+  refuses missing runtime before creating config/state; explicit existing config
+  also rechecked before registration. Init-check/doctor recipe preview verifies
+  prepared runtime; main passes channel cache to Factory and ProjectStartChecker,
+  which checks BOTH frozen Python recipes before budget. Tests93168 PASS all
+  config/CLI/localruntime/pythonclosure; only initial58111 failure was stale
+  Python unsupported-message assertion, updated to new explicit profile guidance.
+  CLI/current-start race72414 PASS11.973s/3.062s using real prepared cache.
+  Actual public Prepare74456 PASS produced e65...f8b1a in ignored private
+  .context/python-onboarding-cache, no live project/install/daemon change.
+  Store native 8-case acceptance81367 PASS29.399s on that factory-produced
+  environment: pass/red/timeout/cancel/quota/filelimit/restart/unclear restart.
+  Compiled clean-HOME cold-download/profile-init/replay/readiness/isolation
+  acceptance78599 PASS18.663s; explicit SF_TEST_PYTHON_CLI_DOWNLOAD=1,
+  no credentials, provider or daemon. Not a workflow/PR delivery proof.
+  Corrupt existing cache now has ErrCacheInvalid/runtime_cache_unverified,
+  retained-evidence inspection guidance rather than blind download retry;
+  narrow48106 PASS CLI0.624s/prepare0.764s. Docs updated. Broad integrated
+  validation running as96360; serialize packages to limit fixture overlap.
+
+- Python preparation integrated source is UNCOMMITTED on26bda9c: catalog,
+  bounded downloads, retained-archive hash reauthentication, descriptor-relative
+  TAR/ZIP extraction, fixed alias omission (targets required), pure-wheel shape
+  admission, independently pinned deterministic environment, exclusive cache
+  publication and staging cleanup. Actual pinned archive extraction33140 PASS
+  11.289s: env e65fcb836e0f19815114cf5a06349ef7260e03f60d4a62cce63b7406f4cf8b1a,
+  1800 runtime/510 dependency entries. Full pythonprepare race52908 PASS37.905s
+  with SF_TEST_PYTHON_ARCHIVES=.context/python-modern.OC2EHL explicitly enabled:
+  offline transport copies pinned bytes, cache replay performs no second fetch,
+  corruption remains untouched, temporary staging gone, retained handles valid.
+  Adversarial archives and failure cleanup included. No actual network download
+  or live installation performed. Early focused runs20297/23099/28176 all PASS.
+  CLI now exposes `runtimes prepare python` preview (read-only), --download
+  explicit preparation; channel-only directories (no DB/config/socket), human
+  output hides hashes, JSON includes exact digests. CLI/config race96971 PASS
+  46.158s/1.568s incl preview/no mutation, both channels, unsupported/failure/
+  returned identity mismatch and rendering. Broad integration remains pending.
+  Next: compose prepared root into Factory, add doctor/runtime readiness and
+  explicit Python init profile through config lock+Store generation, then
+  compiled clean-HOME preparation/init acceptance and real Python workflow.
+  Do not advertise registration yet; CLI/docs explicitly say not enabled.
+  No active tool process. Keep broad test until this composition checkpoint.
+
+- Cache publication committed26bda9c after full32843 PASS. New uncommitted
+  internal/pythonprepare catalog/download files: code-owned Darwin ARM64
+  Python3.13.15 and five pytest wheels, exact public sizes/URLs/SHA256 plus
+  lockdigest a9b45f...f428. HTTP client has no ambient proxy, two-minute bound,
+  HTTPS host-limited redirects, exclusive FD-relative private staging writes,
+  length/hash checks before0400+sync retention, own partial cleanup only,
+  sanitized failures (no raw redirect/server error). Offline race70913 PASS1.568s
+  covers success/hash/short/long/status/encoding/cancel/transport error,
+  overwrite/symlink/private-parent/traversal/credentials/foreign URL/redirect
+  bounds/catalog-copy isolation. No actual download invoked, no CLI use yet.
+  Next implement bounded archive extraction and deterministic environment
+  capture, then CLI preparation + channel-root/doctor/init composition. Keep
+  focused tests while developing that integrated checkpoint; broad suite at
+  its end, not after each helper. No current test handle remains active.
+
 - Validation32843 TERMINAL exit0: full normal Go (explicit Python fixture),
   vet, repo/secret/docs/artifact PASS. Store178.408s, workflowruntime135.629s,
   worktreecoord135.672s. Prepared-cache publisher checkpoint ready to commit.

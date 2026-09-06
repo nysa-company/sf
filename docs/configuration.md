@@ -39,9 +39,42 @@ unvendored Go metadata, or use symlinked marker files are refused with an
 actionable `sf config --help` (or `sf-dev config --help`) next step. An
 explicit file may record another exact argv pair without shell interpretation,
 but that is CI/operator metadata: the local repository executor still admits
-only the exact dependency-closed Go and supported Node recipes described here.
+only the exact dependency-closed Go, supported Node and prepared Python recipes
+described here.
 Production start refuses unsupported stored verification/review recipes before
 planning; a TOML command is not permission to execute it.
+
+## Prepared Python profile (Apple Silicon macOS)
+
+From a Python repository with an existing `tests` directory:
+
+```sh
+sf runtimes prepare python
+sf runtimes prepare python --download
+sf init --profile python-pytest-v1 --test tests
+sf init --check
+```
+
+Use `sf-dev` throughout for the development channel. The first command is a
+read-only preview. The second explicitly downloads pinned Python 3.13.15 and
+pytest 8.4.2 wheels into that channel's private cache; it never runs pip or
+project code, changes PATH, opens a database, or starts a daemon. Existing exact
+snapshots are reused, and corrupt snapshots are refused rather than replaced.
+
+The explicit profile freezes environment/lock identities and the selected test
+path into both verification and review commands. Users do not type hashes.
+`--test` also accepts an existing repository-relative `.py` file; symlinked or
+missing paths are refused. Init retains the existing configuration lock and
+SQLite registration boundary and never overwrites an existing config.
+
+This is a bounded pytest recipe: standard-library and local project modules
+plus the bundled pytest environment. It does not install project dependencies,
+load user packages or auto-discover pytest plugins. Project pytest configuration
+is not loaded; conftest/test code still executes inside the guarded profile.
+The project is read-only during tests; scratch writes are bounded. Runtime
+availability, provider qualification and GitHub publication remain separate
+requirements. Intel macOS, arbitrary Python flags, dependency installation and
+Rails execution are not admitted by this profile.
 
 Example explicit configuration:
 

@@ -15,6 +15,7 @@ import (
 	"github.com/nysa-company/sf/internal/api"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/pythonprepare"
 	"github.com/nysa-company/sf/internal/store"
 )
 
@@ -72,6 +73,15 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 			return failure("init_failed", "channel paths could not be resolved", initHelp)
 		}
 	}
+	if request.Profile == config.PythonPytestV1Profile {
+		argv, recipeErr := pythonprepare.RecipeArgv(request.TestPath)
+		if recipeErr != nil {
+			return failure("invalid_argument", "select a repository-relative .py file or tests directory", initHelp)
+		}
+		if err := checkPythonRecipeReady(ctx, paths, repository, argv); err != nil {
+			return failure("not_ready", "the selected Python test path or prepared runtime is unavailable; prepare the pinned runtime and verify the test path before registration", []string{binary, "runtimes", "prepare", "python"})
+		}
+	}
 	if err := config.PrepareChannel(paths); err != nil {
 		return initFailure("init_failed", "channel state could not be prepared: "+err.Error(), []string{binary, "doctor"}, false)
 	}
@@ -103,6 +113,9 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 			next = []string{binary, "config", "--help"}
 		}
 		return initFailure("invalid_configuration", err.Error(), next, false)
+	}
+	if err := checkConfiguredPython(ctx, paths, repository, effective); err != nil {
+		return initFailure("not_ready", "configured Python commands require the current prepared runtime and a real selected test path; no project was registered", []string{binary, "runtimes", "prepare", "python"}, false)
 	}
 	if err := verifyBaseRef(ctx, repository, effective.BaseBranch); err != nil {
 		return initFailure("invalid_repository", "configured base branch is unavailable in the local repository", []string{binary, "doctor", "--repo", repository}, false)

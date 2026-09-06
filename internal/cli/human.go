@@ -19,6 +19,10 @@ func renderHumanData(writer io.Writer, value any) error {
 	if _, hasChecks := object["checks"]; hasChecks {
 		return renderDoctor(writer, object)
 	}
+	if preparation, ok := object["runtime_preparation"].(map[string]any); ok {
+		_, err := fmt.Fprintf(writer, "Runtime: %s\nPreparation: %s\nLocation: %s\nDownload: %s bytes\n%s\nNext: %s\n", safeSelectionLabel(stringField(preparation, "runtime")), safeSelectionLabel(stringField(preparation, "status")), safeSelectionLabel(stringField(preparation, "destination")), displayField(preparation, "download_bytes"), safeSelectionLabel(stringField(preparation, "note")), safeSelectionLabel(stringField(preparation, "next_command")))
+		return err
+	}
 	if source, ok := object["ticket_template"].(string); ok {
 		_, err := io.WriteString(writer, source)
 		return err

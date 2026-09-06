@@ -174,7 +174,7 @@ func main() {
 		}
 		runErr := daemon.Run(runCtx, daemon.Config{
 			Channel: channel, Paths: paths,
-			Doctor:                   localruntime.CheckProjectStart,
+			Doctor:                   localruntime.ProjectStartChecker(config.PythonSnapshotsPath(paths)),
 			DaemonIdentity:           fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
 			RecoveryAuthorityKey:     supervisor.PublicKey(),
 			ProviderSupervisor:       supervisor,
@@ -190,6 +190,7 @@ func main() {
 			WorkflowRuntimeFactory: localruntime.Factory(localruntime.Config{
 				Channel:           channel,
 				GitHome:           filepath.Join(filepath.Dir(paths.Socket), "git-home"),
+				PythonSnapshots:   config.PythonSnapshotsPath(paths),
 				OwnerHome:         ownerHome,
 				GHConfigDir:       ghConfigDir,
 				GHBinary:          ghBinary,

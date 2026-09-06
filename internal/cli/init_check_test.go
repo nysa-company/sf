@@ -83,7 +83,7 @@ func TestInitCheckRefusesInvalidConfigWithoutWritingState(t *testing.T) {
 
 func TestInitCheckExplainsUnsupportedStacksWithoutRunningThem(t *testing.T) {
 	for _, test := range []struct{ marker, content, reason string }{
-		{"pyproject.toml", "[project]\nname='example'\n", "Python local execution is not supported"},
+		{"pyproject.toml", "[project]\nname='example'\n", "Python requires the prepared python-pytest-v1 profile"},
 		{"Gemfile", "raise 'must never execute'\n", "Ruby/Rails local execution is not supported"},
 		{"package.json", `{"dependencies":{"typescript":"5.0.0"}}`, "dependency-free Node"},
 	} {

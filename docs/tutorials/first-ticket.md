@@ -11,7 +11,8 @@ general-purpose runner for every project or provider.
 | Go | Dependency-free module or compatible checked-in vendor closure |
 | JavaScript | Dependency-free Node project using `node --test` |
 | TypeScript | Only the configured bounded Nysa pure-test recipe |
-| Python / Ruby on Rails | Not yet supported locally |
+| Python | Experimental pinned Python/pytest profile on Apple Silicon; no additional dependencies; full workflow acceptance pending |
+| Ruby on Rails | Not yet supported locally |
 
 See [configuration](../configuration.md) for exact constraints. An explicit
 command in TOML does not grant permission to run an unsupported recipe.
@@ -38,6 +39,27 @@ Use `--project my-app` to override it and `--repo /absolute/path` to select a
 different repository root. `--check` does not execute tests, contact providers
 or GitHub, or prove full runtime readiness; those checks remain separate.
 It currently previews existing configuration, not `--profile`/`--test` setup.
+
+For the experimental Python profile, use the explicit setup instead of plain
+`init`. Start with an existing dependency-free Python project and a `tests`
+directory (or substitute an existing `.py` test path):
+
+```sh
+sf-dev runtimes prepare python
+sf-dev runtimes prepare python --download
+sf-dev init --profile python-pytest-v1 --test tests
+sf-dev init --check
+```
+
+The first command previews without writing or downloading. `--download` fetches
+pinned public runtime/pytest artifacts into the dev channel's private cache;
+it does not install project dependencies, modify PATH, or execute project code.
+Preparation and profile registration have compiled clean-environment coverage;
+this does **not** yet establish a completed Python ticket workflow. Use the Go
+or dependency-free Node path for the established first-ticket workflow. See
+[Python configuration](../configuration.md) for the restricted recipe and
+[the acceptance plan](../plans/2026-09-05-self-serve-cli-beta.md) for remaining
+validation. Provider qualification and publication readiness remain separate.
 
 Follow [source build and foreground setup](source-build-foreground.md) to build
 the dev bundle, authenticate, register your repository, start the daemon in a

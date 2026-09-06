@@ -156,6 +156,14 @@ func RunInitCheck(ctx context.Context, request InitRequest) api.Response {
 			} else {
 				closureErr = nodeclosure.Validate(request.Repo)
 			}
+		case "python3":
+			closureErr = checkPythonRecipeReady(ctx, paths, request.Repo, command.Argv)
+			if closureErr != nil {
+				preview.Runtime = "unavailable"
+				next = []string{binaryForChannel(request.Channel), "runtimes", "prepare", "python"}
+				return refuse("Python requires the pinned prepared runtime and a real selected test path; additional dependencies are not installed by this profile")
+			}
+			preview.Runtime = "Python prepared; other runtime checks remain separate"
 		default:
 			closureErr = errors.New("unsupported recipe")
 		}

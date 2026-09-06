@@ -19,6 +19,8 @@ import (
 	"github.com/nysa-company/sf/internal/goclosure"
 	"github.com/nysa-company/sf/internal/nodeclosure"
 	"github.com/nysa-company/sf/internal/nysapure"
+	"github.com/nysa-company/sf/internal/pythonclosure"
+	"github.com/nysa-company/sf/internal/pythonprepare"
 )
 
 const MaxFileBytes = 64 * 1024
@@ -28,6 +30,8 @@ const MaxFileBytes = 64 * 1024
 // name rather than a repository-specific path: the entrypoint is supplied by
 // the project owner and frozen into the registered configuration snapshot.
 const NysaPureAPIV1Profile = "nysa-api-pure-v1"
+
+const PythonPytestV1Profile = "python-pytest-v1"
 
 // ErrCommandDetection identifies a repository whose command contract cannot
 // be inferred safely. Explicit config does not grant runtime support. The CLI turns it into a channel-correct next
@@ -246,11 +250,14 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 	if (profile == "") != (testPath == "") {
 		return NysaPureConfigPlan{}, errors.New("profile and test path must be provided together")
 	}
-	if profile != "" && profile != NysaPureAPIV1Profile {
-		return NysaPureConfigPlan{}, fmt.Errorf("unsupported project profile %q; supported profile is %s", profile, NysaPureAPIV1Profile)
+	if profile != "" && profile != NysaPureAPIV1Profile && profile != PythonPytestV1Profile {
+		return NysaPureConfigPlan{}, fmt.Errorf("unsupported project profile %q; supported profiles are %s and %s", profile, NysaPureAPIV1Profile, PythonPytestV1Profile)
 	}
-	if profile != "" && !nysapure.ValidTestPath(testPath) {
+	if profile == NysaPureAPIV1Profile && !nysapure.ValidTestPath(testPath) {
 		return NysaPureConfigPlan{}, fmt.Errorf("profile %s requires a canonical repository-relative .test.ts path", profile)
+	}
+	if profile == PythonPytestV1Profile && !pythonclosure.ValidTestPath(testPath) {
+		return NysaPureConfigPlan{}, fmt.Errorf("profile %s requires a canonical repository-relative .py file or tests directory", profile)
 	}
 	lock, err := acquireProjectConfigLockContext(ctx, repository, profile != "")
 	if err != nil {
@@ -264,8 +271,13 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 	if err := lock.validateRepositoryIdentity(repository, identity); err != nil {
 		return fail(err)
 	}
-	if profile != "" {
+	if profile == NysaPureAPIV1Profile {
 		if err := nysapure.Validate(repository, testPath); err != nil {
+			return fail(fmt.Errorf("validate %s test entrypoint: %w", profile, err))
+		}
+	}
+	if profile == PythonPytestV1Profile {
+		if err := pythonclosure.ValidateTestPath(repository, testPath); err != nil {
 			return fail(fmt.Errorf("validate %s test entrypoint: %w", profile, err))
 		}
 	}
@@ -287,6 +299,12 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 		return plan, nil
 	}
 	verify := []string{"node", nysapure.RecipeFlag, testPath}
+	if profile == PythonPytestV1Profile {
+		verify, err = pythonprepare.RecipeArgv(testPath)
+		if err != nil {
+			return fail(err)
+		}
+	}
 	plan.Commands = Commands{Verify: Command{Argv: append([]string(nil), verify...)}, Review: Command{Argv: append([]string(nil), verify...)}}
 	if exists {
 		var document projectDocument
@@ -636,7 +654,10 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 	}
 	if otherStack != "" {
 		if goMod || packageJSON {
-			return Commands{}, detectionError("repository contains multiple stack markers; choose explicit supported verification/review commands in .sf/config.toml. Python and Ruby/Rails execution remain unsupported")
+			return Commands{}, detectionError("repository contains multiple stack markers; choose an explicit supported profile or verification/review commands in .sf/config.toml. Ruby/Rails execution remains unsupported")
+		}
+		if otherStack == "Python" {
+			return Commands{}, detectionError("Python requires the prepared python-pytest-v1 profile: run runtimes prepare python, then init --profile python-pytest-v1 --test tests (or select a .py test file). Only standard-library, local modules and bundled pytest are supported; dependencies are not installed")
 		}
 		return Commands{}, detectionError(otherStack + " local execution is not supported yet; an explicit command does not enable it. Use a supported Go or dependency-free Node project for this beta")
 	}

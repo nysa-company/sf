@@ -8,6 +8,7 @@ import (
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/executionpolicy"
+	"github.com/nysa-company/sf/internal/pythonprepare"
 	"github.com/nysa-company/sf/internal/store"
 )
 
@@ -17,13 +18,35 @@ import (
 // proof: executable, closure, provider and publication checks remain mandatory
 // at their respective authority boundaries.
 func CheckProjectStart(ctx context.Context, project store.Project) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	return ProjectStartChecker("")(ctx, project)
+}
+
+// ProjectStartChecker binds read-only runtime readiness to the same explicit
+// channel cache as the supervisor. Missing Python must not break Go/Node.
+func ProjectStartChecker(pythonSnapshots string) func(context.Context, store.Project) error {
+	return func(ctx context.Context, project store.Project) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if runtime.GOOS != "darwin" {
+			return daemon.ErrStartRuntimeUnsupported
+		}
+		if err := checkProjectRecipes(project); err != nil {
+			return err
+		}
+		frozen, err := config.DecodeSnapshot(project.ConfigSnapshot, project.ConfigDigest)
+		if err != nil {
+			return err
+		}
+		for _, command := range []config.Command{frozen.Commands.Verify, frozen.Commands.Review} {
+			if len(command.Argv) > 0 && command.Argv[0] == "python3" {
+				if err := pythonprepare.CheckRecipe(ctx, pythonSnapshots, command.Argv); err != nil {
+					return daemon.ErrStartRecipeUnsupported
+				}
+			}
+		}
+		return nil
 	}
-	if runtime.GOOS != "darwin" {
-		return daemon.ErrStartRuntimeUnsupported
-	}
-	return checkProjectRecipes(project)
 }
 
 func checkProjectRecipes(project store.Project) error {

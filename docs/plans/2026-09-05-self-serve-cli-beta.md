@@ -71,7 +71,9 @@ This is not an unattended multi-platform stable-v1 delivery promise.
 
 ## Current checkpoint
 
-Python preparation is being implemented, not yet available through project setup.
+Python preparation and explicit profile setup are implemented in the working
+checkpoint; compiled clean-HOME acceptance and full integrated validation pass.
+This is not a released beta or Python workflow-delivery proof.
 The prepared-content manifest binds regular-file paths, modes, sizes and
 digests. The environment binding adds the selected executable, dependency
 snapshot, lock digest and factory-bootstrap digest, with strict canonical
@@ -82,7 +84,7 @@ project-write, network, subprocess and scratch-symlink escape refusal, with
 environment verification before and after execution. This probe does not
 exercise Store claims or production cancellation/restart; those separate
 internal acceptance results are recorded below. Preparation UX and production
-composition remain required before setup may report Python execution supported.
+composition are now connected and being validated with the prepared fixture.
 
 The shared materializer/supervisor identity resolver now supports an explicitly
 composed private prepared-Python directory, without ambient PATH/HOME fallback.
@@ -91,9 +93,9 @@ configuration; it is a deliberately limited recipe, not arbitrary pytest argv.
 The production profile generator passes the disposable OS-backed fixture.
 Child-only hard limits cover per-file size, open descriptors and core dumps;
 they do not provide an aggregate scratch quota. The internal exact Python recipe
-now requires an explicitly composed prepared root; production composition still
-leaves it unavailable pending provisioning and lifecycle acceptance. The
-internal compiled gate now passes an OS-backed disposable pytest fixture and
+now requires an explicitly composed prepared root; production composition
+supplies the explicit channel cache, with a read-only start check of frozen
+runtime identity. The internal compiled gate passes an OS-backed pytest fixture and
 refuses EOF before release. A retained-descriptor scratch monitor enforces
 bounded observations (16 MiB per file, 128 MiB logical/allocated file bytes,
 4096 entries); it is not an atomic filesystem quota. Store-backed compiled-gate
@@ -108,19 +110,46 @@ ambiguous-drain quarantine, competing-writer refusal, and exact recovery replay.
 Transient process-group ambiguity stays quarantined until disappearance is
 independently observed; the fixture explicitly retries recovery at that point.
 These fixtures do not prove provisioning, whole-daemon restart, CLI readiness,
-or Python workflow delivery. No setup command installs this environment yet.
+or Python workflow delivery. The new preparation command now builds the pinned
+environment without executing project code, and explicit profile registration
+checks that environment before committing Store configuration.
 Fresh full normal Go tests (with the explicit prepared fixture), vet,
-repo-check, secret-scan, docs-smoke and artifact-check pass for this execution
-checkpoint. The next checkpoint is no-overwrite prepared-cache publication and
-verified provisioning, followed by channel-specific readiness and explicit init
-selection. Ordinary init remains network-free; preparation must not run project
-code, mutate a live ticket, or replace an executing snapshot.
+repo-check, secret-scan, docs-smoke and artifact-check passed for the earlier
+execution checkpoint. The subsequent no-overwrite publisher also passed its
+integrated checks. The current preparation/profile composition is a distinct
+checkpoint whose full Go, vet, repository/secret/docs/artifact and release-build
+validation now passes. The first broad run exposed disk exhaustion in Go
+workflow fixtures; clearing only verified obsolete build caches restored the
+expected red-to-green sequence without a production change. Ordinary init remains
+network-free; preparation must not run project code, mutate a live ticket, or
+replace an executing snapshot.
 The internal prepared-cache publisher is now implemented with independently
 verified identities and Darwin exclusive rename. Focused repeated race tests
 cover competing preparations, exact replay, corrupt/partial destinations,
 symlinks, cancellation, private-directory checks and retained handles. Full
 normal Go, vet and repository/secret/docs/artifact checks pass for that helper;
-it is not yet a download/setup command.
+the current working checkpoint adds the separate download/setup command.
+
+### Remaining acceptance evidence
+
+Do not substitute one layer's green result for another layer's contract:
+
+| Requirement | Current evidence | Next proof |
+| --- | --- | --- |
+| Python clean setup | Compiled private-HOME pinned preparation, init, replay and readiness plus full integrated validation pass | Preserve these checks when extending workflow coverage |
+| Python bounded execution and recovery | Real prepared runtime through Store/executor, including cancellation and reopened-Store recovery, passes | Production Factory/scheduler/provider composition through verification and building |
+| Python workflow | Not yet demonstrated | A deterministic provider fixture must produce valid phase artifacts and actual Python changes, while the real recipe executes; then observe publication through the existing authority |
+| Fresh CLI delivery | Go acceptance PR 1 remains open/draft at `ee35025e60092cfd25480121537acec4e4f33a1d` on the latest read-only check | Exact-head human decision, merge and terminal reconciliation; expired budget must not be silently extended |
+| External adoption | No unfamiliar-user observations | Report the three-user and ten-ticket targets as pending until observed |
+
+The Python composition fixture must use a disposable repository and Store, the
+channel's explicit prepared root, production runtime composition, and the
+ordinary phase transitions. It must not fabricate evidence rows or replace
+the repository executor with a passing stub. Controlled provider/GitHub
+adapters are acceptable for this automated composition test but must be
+reported as fixtures, not live provider or remote delivery. Assert persisted
+verification/build evidence and no residual active command lease. Keep a
+separate real-provider delivery acceptance gate.
 
 The candidate-bound decision picker now covers approval and rejection too.
 Omitted IDs in a terminal (or `--select`) show title/project/state, then fetch

@@ -18,6 +18,11 @@ type ChannelPaths struct {
 	Backups   string
 }
 
+// PythonSnapshotsPath is a derivative cache, never an application-state store.
+func PythonSnapshotsPath(paths ChannelPaths) string {
+	return filepath.Join(paths.Root, "runtimes", "python")
+}
+
 func PathsFor(home string, channel domain.Channel) (ChannelPaths, error) {
 	if home == "" {
 		return ChannelPaths{}, fmt.Errorf("home directory is required")
