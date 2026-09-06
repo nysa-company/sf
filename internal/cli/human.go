@@ -125,6 +125,11 @@ func renderTicket(writer io.Writer, ticket map[string]any, evidence any, context
 		{"Version", "version"}, {"Runner epoch", "runner_epoch"}, {"Blocker", "blocked_code"},
 	} {
 		if text := displayField(ticket, field.key); text != "" {
+			if field.key == "blocked_code" && stringField(ticket, "state") != "blocked" {
+				// Store can retain the reason across authenticated recovery. It
+				// remains diagnostic history, not a second lifecycle state.
+				field.label = "Recorded blocker"
+			}
 			if _, err := fmt.Fprintf(writer, "%s: %s\n", field.label, text); err != nil {
 				return err
 			}

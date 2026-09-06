@@ -53,6 +53,11 @@ the same versioned response envelope. The CLI never invents success: a command
 that is not configured returns a typed error, exit code, and one executable
 next action.
 
+`State` is the current lifecycle status. A blocker reason retained after recovery
+is labelled `Recorded blocker`, not `Blocker`; it is diagnostic history and does
+not override the current state or authorize another recovery. JSON preserves
+the stored `blocked_code` field alongside `state`.
+
 `tickets` is a read-only list using the same status authority. It shows ticket
 IDs, titles, states, and available next actions; `--project` filters the list.
 `start`, `show`, `logs`, `pause`, `resume`, `recover`, `cancel`, `retry`, and

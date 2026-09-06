@@ -382,6 +382,7 @@ func TestHumanRendererProjectsKnownTicketAndLogShapes(t *testing.T) {
 		data string
 		want []string
 	}{
+		{name: "recovered_review", data: `{"ticket":"SF-8","state":"waiting_approval","blocked_code":"review_needs_operator"}`, want: []string{"State: waiting_approval", "Recorded blocker: review_needs_operator"}},
 		{name: "ticket", data: `{"channel":"dev","project":"nysa","ticket":"SF-1","state":"waiting_approval","merge_mode":"guarded"}`, want: []string{"SF-1", "Channel: dev", "State: waiting_approval", "Merge mode: guarded"}},
 		{name: "detail", data: `{"channel":"stable","project":"nysa","ticket":"SF-2","state":"done","title":"Fix reminders","problem":"A bounded problem.","acceptance":["one"]}`, want: []string{"SF-2  Fix reminders", "Problem: A bounded problem.", "Acceptance: 1 item(s)"}},
 		{name: "takeover", data: `{"channel":"dev","project":"nysa","ticket":"SF-4","state":"paused","resume_state":"building","takeover":{"registered":true,"path":"/private/tmp/SF-4","branch":"sf/SF-4","repository":"/private/tmp/repo","base_sha":"base","head_sha":"head","clean":true,"change_kind":"none","changed_files":[],"source_resumable":false}}`, want: []string{"SF-4", "State: paused", "Resume state: building", "Takeover worktree: /private/tmp/SF-4", "Branch: sf/SF-4", "Repository: /private/tmp/repo", "Local base: base", "Local head: head", "Change kind: none"}},

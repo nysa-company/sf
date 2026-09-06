@@ -2,6 +2,31 @@
 
 ## Current truth
 
+- DISPLAY VALIDATION35083 EXIT0 2026-09-06T16:47Z: full CLI race50.856s,
+  full Go suite, repo-check/secret-scan/docs-smoke/diff PASS. Display-only fix
+  ready/saved; no installed daemon replacement required. Live read-only DB
+  recheck: waiting_approvalv14/r4, approvals0, merge_intents0. Explicit PR2 human
+  approval remains missing after repeated goal continuations; do not treat those
+  messages as consent. Pause goal as blocked on that required decision after
+  saving this checkpoint. Reply approval can resume normal installed onboarding9
+  `approve SF-bf816e --head e9d40f0922130e72edc6d439f7ce6b78d71862bc --json`, then
+  observe merge/reconciliation (never direct gh merge). Recheck head/CI/deadline
+  first. Daemon4460 LIVE, isolated HOME `.sf-beta.24jdFP`; deadline18:32:16Z.
+  No DB/worktree surgery, budget reset, approval or merge has been performed.
+
+- DISPLAY DIAGNOSTIC PATCH UNCOMMITTED: while PR2 approval is outstanding,
+  investigated retained blocked_code shown as current "Blocker" even after
+  authenticated recovery. CLI human renderer now labels it "Recorded blocker"
+  whenever state is not blocked; JSON/Store/lifecycle/approval unchanged.
+  Six-line source/test diff only internal/cli/{human.go,cli_test.go}. Regression
+  85333 RED; full CLI race35083 PASS50.856s. Same35083 LIVE runs full Go suite,
+  then repo-check/secret-scan/docs-smoke/diff; compiled CLI89.386 and daemon21.537
+  already PASS, remaining packages still running. Wait exact35083, no duplicate
+  suite/source edits. Commit after exit0; no daemon rollout required for this
+  cosmetic change. Installed onboarding9 daemon4460 remains live. User has NOT
+  answered explicit PR2 approval request; automatic goal continuation is not
+  approval. Preserve waiting_approval and original deadline until user responds.
+
 - REAL WAITING_APPROVAL 2026-09-06T16:37Z: repair committed746216a, complete
   onboarding9 bundle/verify/exclusive install/version PASS56958 at
   `.context/onboarding9.g17C0B/{bundle,installed}`. Old daemon21758 Ctrl-C EXIT0;
