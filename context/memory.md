@@ -2,6 +2,25 @@
 
 ## Current truth
 
+- Reconciliation diagnosis checkpoint: daemon60628 deliberately stopped with
+  Ctrl-C to stop repeated child-proof retries; terminal exit7 included context
+  canceled / gh runner already in use. Do not treat it as still live. Live
+  ticket remains merging; PR already merged. No live DB modifications by
+  diagnostics. Fresh SQLite backups at /private/tmp/sf-proof-diagnostic.4L86Wt
+  prove current ReclaimProtectedRefFetch + Acquire + Check + Release all pass.
+  Stopped WAL DB requires immutable=1 for read-only backup when sidecars absent;
+  use only after proving daemon stopped (live reads must not use immutable).
+  .context/proof-preflight.go proves persisted CleanWorktreeHead passes and
+  remote preflight reaches rejecting authority. .context/proof-launch-diagnostic.go
+  uses COPIED Store and gates off fetch: all read-only commands and durable
+  launch records pass through the fetch gate. .context/proof-fetch-diagnostic.go
+  uses disposable cloned repository/worktree and real HTTPS packaged helpers:
+  entire protected-ref proof PASS first with fixture lease, then with COPIED
+  Store real launch recording. No remote writes. Thus standalone Git/Store
+  paths work; actual daemon composition/context remains unisolated. Do not
+  claim root cause fixed. Scope next diagnostic to actual boundary error,
+  not more broad source guessing. No production code edited this checkpoint.
+
 - September 6 exact user approval is no longer a blocker. Acceptance PR1 in
   nysa-company/sf-cli-beta-acceptance-20260905 is MERGED at approved source
   ee35025e60092cfd25480121537acec4e4f33a1d; merge commit
