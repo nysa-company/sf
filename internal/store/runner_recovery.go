@@ -1360,7 +1360,7 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 	if err != nil {
 		return 0, false, ErrPublicationEvidence
 	}
-	if semanticMergeRetryControl(control) {
+	if (state == domain.StateMerging || state == domain.StateReconciling) && semanticMergeRetryControl(control) {
 		current := Ticket{Ref: ref, State: state, Version: version, RunnerEpoch: runner}
 		priorLeader, semanticErr := s.authenticatePostPublicationSemanticRetryPreFence(ctx, conn, ref, control, current)
 		if semanticErr != nil || priorLeader == 0 || priorLeader >= newLeader {

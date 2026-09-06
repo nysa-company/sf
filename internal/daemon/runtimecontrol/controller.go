@@ -408,6 +408,13 @@ func (c *Controller) Rearm(ctx context.Context, ref domain.TicketRef) error {
 		if err != nil {
 			return errors.New("ticket has not completed a controller drain")
 		}
+		// A replacement controller can load a durable stop while its fresh
+		// scheduler has no corresponding volatile latch. Join/stop that exact
+		// runtime ticket before proving and installing the rearm capability.
+		// Do not reseal Store here: its original stop is recovery evidence.
+		if err := c.runtime.Drain(ctx, ref); err != nil {
+			return err
+		}
 		entry.stopped, entry.hasStop = stopped, true
 	}
 	current, err := c.store.Ticket(ctx, ref)

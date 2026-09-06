@@ -542,6 +542,31 @@ func TestRearmRequiresNewStoreProvenActiveIdentity(t *testing.T) {
 	}
 }
 
+func TestRearmReconstructsRuntimeStopAfterControllerReplacement(t *testing.T) {
+	database, ref, leader, started := controllerFixture(t)
+	controller, err := New(database, controllerBundle(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drained, err := controller.Drain(t.Context(), ref); err != nil || !drained {
+		t.Fatalf("drain=%v err=%v", drained, err)
+	}
+	if _, err := database.Transition(t.Context(), store.Transition{Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "test_restart_rearm", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	// Replacement has the durable Store stop but no volatile scheduler stop.
+	controller, err = New(database, controllerBundle(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Rearm(t.Context(), ref); err != nil {
+		t.Fatalf("reconstruct stopped runtime before capability installation: %v", err)
+	}
+	if needed, err := controller.RuntimeRearmNeeded(t.Context(), ref); err != nil || needed {
+		t.Fatalf("replacement did not install admission: needed=%v err=%v", needed, err)
+	}
+}
+
 func TestRuntimeRearmNeededTreatsUncontrolledProviderRetryAsNoop(t *testing.T) {
 	database, ref, _, _ := controllerFixture(t)
 	controller, err := New(database, controllerBundle(t), nil)

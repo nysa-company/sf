@@ -41,7 +41,18 @@ transition. A further regression reproduced reuse of the consumed blocked
 verdict; the repaired selector permits a fresh attempt 2 without resetting the
 budget and preserves replay of that new result. Full integrated validation
 passed (session 10632, exit 0): Go suite, vet, repository/secret/docs/diff checks.
-This repair is not yet installed into the live trial.
+The verified onboarding7 bundle installed that repair. Live recovery then
+reached capability installation but failed because the replacement scheduler
+had no in-memory stop latch. The compensating seal kept execution closed, but
+its advanced authority endpoint was not accepted on another recovery attempt.
+
+Both failures now have reproducing tests. A follow-up restores the volatile
+stop before capability installation and authenticates the compensated endpoint
+through the signed recovery chain. A daemon test uses the real controller and
+scheduler to prove the exact first Begin opens Store and admits the worker.
+Targeted race checks and full follow-up validation pass (38621, exit 0):
+Go suite, vet, repository/secret/docs/diff checks.
+The live ticket remains sealed at reviewing version 11, with no fresh review.
 
 The next acceptance steps are validated-bundle rollout, ordinary recovery and
 a fresh independent review, followed by this ticket's own human approval and

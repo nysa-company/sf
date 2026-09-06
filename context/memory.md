@@ -2,6 +2,25 @@
 
 ## Current truth
 
+- REPLACEMENT RUNTIME REPAIR UNCOMMITTED: regressions67604 RED proved both
+  missing volatile stopped entry in fresh Controller and compensated authority
+  rejection. Controller.Rearm now reconstructs runtime.Drain after loading the
+  durable stop, before proof/installation (does not overwrite Store stop).
+  reviewBlockedRearmFrom accepts only compensated authority on exact signed
+  recovery chain, with prefix validation for historical segment and full
+  validation to current. Merge-retry counter-shape dispatch now restricted to
+  merging/reconciling, including startup helper; review has overlapping counters
+  but different authority. Regression48996 PASS Store1.359/controller.701;
+  includes reopen after compensated install, new attempt2, fresh-result replay.
+  Real daemon/controller/scheduler regression16920 PASS .886s: recovery installs
+  token, Store stays sealed before Begin, exact Tick opens and enters worker.
+  Added authority-runner tamper refusal. Final race+full validation38621 EXIT0;
+  race Store22.159/daemon6.057/controller7.867s; full Go/vet/repo/secret/docs/diff
+  all PASS. Six intended source/test files changed. Live94247
+  still onboarding7, reviewingv11/r2 sealed; no repeated recovery, DB edits or
+  review/approval/merge. Next wait38621, commit/bundle onboarding8, normal restart
+  and recover through the compensated path. Maintain original ticket budget.
+
 - ONBOARDING7 LIVE ROLLOUT 2026-09-06T15:43Z: validated source d848697,
   bundle/install `.context/onboarding7.xzLCPG/{bundle,installed}` all verify
   PASS60550. Old41299 Ctrl-C exit0; new isolated daemon94247 LIVE same durable

@@ -2070,7 +2070,7 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 		if err != nil || control.state != "sealed" {
 			return ErrStaleFence
 		}
-		if semanticMergeRetryControl(control) {
+		if (proof.Ticket.State == domain.StateMerging || proof.Ticket.State == domain.StateReconciling) && semanticMergeRetryControl(control) {
 			currentLeader, semanticErr := s.authenticatePostPublicationSemanticRetry(txCtx, conn, ref, control, proof.Ticket)
 			if semanticErr != nil || currentLeader != leader || !latched {
 				return ErrStaleFence
@@ -2263,7 +2263,7 @@ func (s *Store) reviewBlockedRearmFrom(ctx context.Context, q candidateEvidenceQ
 	if count == 0 {
 		return false, nil
 	}
-	if count != 1 || control.state != "sealed" || control.generation == 0 || control.authority != control.stop || control.stop.runner == 0 || control.stop.leader == 0 {
+	if count != 1 || control.state != "sealed" || control.generation == 0 || control.stop.runner == 0 || control.stop.leader == 0 {
 		return false, ErrStaleFence
 	}
 	prior, err := providerBlockedEndpointLeader(ctx, q, ref, domain.PhaseReview, control.stop.version-1, control.stop.runner)
@@ -2273,6 +2273,17 @@ func (s *Store) reviewBlockedRearmFrom(ctx context.Context, q candidateEvidenceQ
 	var recoveryRaw string
 	if err := q.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_recover'`, ref.Channel, ref.Project, ref.Ticket, control.stop.version+1).Scan(&recoveryRaw); err != nil || !providerBlockedBridgeMatches(recoveryRaw, control.stop.version+1, control.stop.runner, prior, control.stop.leader) {
 		return false, ErrStaleFence
+	}
+	// ActivateRearm advances authority before installing the runtime token.
+	// Its compensating seal retains that endpoint if installation fails. Only
+	// an endpoint on this exact recovery chain may replace the original stop.
+	if control.authority != control.stop {
+		if err := validateRunnerRecoveryLedgerPrefix(ctx, q, ref, control.stop.version+1, control.stop.runner, control.stop.leader, control.authority.version, control.authority.runner, control.authority.leader); err != nil {
+			return false, ErrStaleFence
+		}
+		if err := validateRunnerRecoveryLedger(ctx, q, ref, control.authority.version, control.authority.runner, control.authority.leader, current.Version, current.RunnerEpoch, leader); err != nil {
+			return false, ErrStaleFence
+		}
 	}
 	if err := validateRunnerRecoveryLedger(ctx, q, ref, control.stop.version+1, control.stop.runner, control.stop.leader, current.Version, current.RunnerEpoch, leader); err != nil {
 		return false, ErrStaleFence

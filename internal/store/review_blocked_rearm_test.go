@@ -9,7 +9,7 @@ import (
 )
 
 func TestReviewBlockedRecoveryRearmsExactSealedEndpoint(t *testing.T) {
-	for _, scenario := range []int{0, 1, 2} {
+	for _, scenario := range []int{0, 1, 2, 3} {
 		replacement := scenario > 0
 		name := "same-leader"
 		if replacement {
@@ -17,6 +17,9 @@ func TestReviewBlockedRecoveryRearmsExactSealedEndpoint(t *testing.T) {
 		}
 		if scenario == 2 {
 			name = "reopen-after-committed-recover"
+		}
+		if scenario == 3 {
+			name = "reopen-after-compensated-install"
 		}
 		t.Run(name, func(t *testing.T) {
 			fixture := finalReviewLifecycleFixture(t)
@@ -114,6 +117,52 @@ func TestReviewBlockedRecoveryRearmsExactSealedEndpoint(t *testing.T) {
 			}
 			if ready, err := db.RuntimeAdmissionReady(ctx, fixture.ticket.Ref, result.Version, fence); err != nil || ready {
 				t.Fatalf("proof must not open runtime: %v %v", ready, err)
+			}
+			installFailure := errors.New("runtime replacement not yet latched")
+			if err := db.ActivateRearm(ctx, capability, func(*RuntimeAdmissionCapability) error { return installFailure }); !errors.Is(err, installFailure) {
+				t.Fatalf("failed runtime installation: %v", err)
+			}
+			if scenario == 3 {
+				var path string
+				if err := db.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				db, err = Open(ctx, path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				fence.LeaderEpoch, err = db.AcquireLeader(ctx, domain.ChannelDev, "review-rearm-after-install-failure")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, fence.LeaderEpoch); err != nil || changed != 1 {
+					t.Fatalf("fence after compensated install: %d %v", changed, err)
+				}
+				current, err := db.Ticket(ctx, fixture.ticket.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result.Version, fence.RunnerEpoch = current.Version, current.RunnerEpoch
+			}
+			if pending, err := db.ReviewBlockedRecoveryPending(ctx, fixture.ticket.Ref); err != nil || !pending {
+				t.Fatalf("compensated installation must remain recoverable: %v %v", pending, err)
+			}
+			if _, err := db.db.ExecContext(ctx, `UPDATE runtime_ticket_controls SET authority_runner_epoch=authority_runner_epoch+1 WHERE ticket_id=?`, fixture.ticket.Ref.Ticket); err != nil {
+				t.Fatal(err)
+			}
+			if pending, err := db.ReviewBlockedRecoveryPending(ctx, fixture.ticket.Ref); err == nil || pending {
+				t.Fatal("unbound compensated authority accepted")
+			}
+			if _, err := db.db.ExecContext(ctx, `UPDATE runtime_ticket_controls SET authority_runner_epoch=authority_runner_epoch-1 WHERE ticket_id=?`, fixture.ticket.Ref.Ticket); err != nil {
+				t.Fatal(err)
+			}
+			capability, err = db.PostPublicationRearmProof(ctx, fixture.ticket.Ref, stopped)
+			if err != nil {
+				t.Fatalf("retry compensated installation: %v", err)
 			}
 			if err := db.ActivateRearm(ctx, capability, func(admission *RuntimeAdmissionCapability) error {
 				ref, version, gotFence, ok := admission.ConsumeRuntimeAdmission()

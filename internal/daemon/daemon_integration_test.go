@@ -2151,6 +2151,67 @@ func TestDaemonReviewRecoverRetriesOnlyCommittedSealedHandoff(t *testing.T) {
 	}
 }
 
+func TestDaemonReviewRecoveryInstallsReplacementSchedulerAdmission(t *testing.T) {
+	d, _, _ := testDaemonForChannelWithProjectMaximum(t, domain.ChannelStable, domain.MergeGuarded)
+	ticket := prepareDaemonGuardedLifecycle(t, d, "SF-review-recover-real-runtime", domain.StateBlocked)
+	d.control = reviewRecoveryController{
+		testRuntimeController: testRuntimeController{drain: func(ctx context.Context, ref domain.TicketRef) (bool, error) {
+			if err := d.store.SealRuntimeControl(ctx, ref); err != nil {
+				return false, err
+			}
+			proof, err := d.store.ControlProof(ctx, ref)
+			return proof.Drained(), err
+		}},
+		rearm: func(context.Context, domain.TicketRef) error { return errors.New("installation interrupted") },
+	}
+	if response := daemonControl(d, ticket.Ref.Ticket, "recover"); response.OK || response.Error == nil || response.Error.Code != "runtime_rearm_failed" {
+		t.Fatalf("expected committed sealed recovery: %+v", response)
+	}
+	worker := newDaemonRuntimeWorker()
+	scheduler := workflowruntime.NewScheduler(domain.ChannelStable, workflowruntime.StoreTicketSource{Store: d.store}, daemonRuntimeEnsure{}, worker)
+	runtime, err := workflowruntime.NewRuntime(scheduler, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := runtimecontrol.New(d.store, runtime.ControlBundle(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.control = controller
+	if response := daemonControl(d, ticket.Ref.Ticket, "recover"); !response.OK || response.Mutation.Attempted || !response.Mutation.Observed {
+		t.Fatalf("real replacement controller recovery: %+v", response)
+	}
+	current, err := d.store.Ticket(t.Context(), ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := domain.Fence{LeaderEpoch: d.epoch, RunnerEpoch: current.RunnerEpoch}
+	if ready, err := d.store.RuntimeAdmissionReady(t.Context(), ticket.Ref, current.Version, fence); err != nil || ready {
+		t.Fatalf("installation opened Store before scheduler Begin: %v %v", ready, err)
+	}
+	runCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan workflowruntime.TickResult, 1)
+	go func() { done <- scheduler.Tick(runCtx, domain.Fence{LeaderEpoch: d.epoch}) }()
+	select {
+	case ref := <-worker.entered:
+		if ref != ticket.Ref {
+			t.Fatalf("wrong ticket admitted: %v", ref)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("fresh scheduler failed to admit recovered review")
+	}
+	if ready, err := d.store.RuntimeAdmissionReady(t.Context(), ticket.Ref, current.Version, fence); err != nil || !ready {
+		t.Fatalf("exact Begin did not open Store: %v %v", ready, err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("recovered worker did not join")
+	}
+}
+
 func TestDaemonPauseRemainsStoppingUntilRuntimeDrains(t *testing.T) {
 	d, _, _ := testDaemon(t)
 	started := createAndStartControlTicket(t, d, "SF-blocked-pause")
