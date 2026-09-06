@@ -2,6 +2,17 @@
 
 ## Current truth
 
+- Python compiled workflow checkpoint committed87c6172, full74056 exit0; clean
+  tree at commit. Fresh clean bundle onboarding4 built from exact
+  87c61724a9b1a3a561dfdd8af4c7e44f1fccb377 into ignored
+  .context/onboarding4.ChUnCq/bundle and installed exclusively to sibling
+  installed/. Version/manifest/core/publication helper validation PASS.
+  Installed start help has title/prefix selection. Fresh empty home/ Go init
+  --check, sample ticket validate and Python preparation preview all PASS,
+  mutation=false, HOME still empty. No download/provider/live mutation.
+  Earlier 'ready to commit' below is superseded. No active test/build process;
+  real acceptance exact-head approval remains unanswered.
+
 - Python onboarding checkpoint committed86bf334; full21715 passed. New uncommitted
   fixture integration adds cmd/fake-provider/python.go and extends codex.go plus
   compiled_walking_skeleton_test.go. Existing Go wrappers unchanged; Python

@@ -85,6 +85,19 @@ This repeat proves local installation and preview, not an independent user's
 complete setup or a second provider delivery. The active acceptance daemon
 was not replaced during its approval wait.
 
+A further clean build at `87c61724a9b1a3a561dfdd8af4c7e44f1fccb377`
+produced onboarding4 after the Python workflow checkpoint. Full helper-bundle
+manifest verification and exclusive installation beneath trusted ancestry
+passed. The installed binary reported that exact commit and dev channel;
+`start --help` documented title selection and short IDs. With a fresh, empty
+HOME, installed `init --check` accepted a disposable Go repository while
+labeling runtime/provider/publication checks as not checked. Ticket validation
+accepted the sample and reported omitted budget fields; Python preparation
+preview reported the pinned runtime and explicit download next action.
+HOME remained empty after these commands. No provider, daemon, download, PR,
+or existing project was touched. This is installation/local-readiness evidence,
+not a replacement for the real delivered-ticket gate.
+
 ## Remaining acceptance
 
 - Exact-head human approval, merge and terminal reconciliation of this ticket.
