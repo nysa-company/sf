@@ -333,6 +333,19 @@ var _ contracts.RepositoryCommandUnleasedRetirer = (*Store)(nil)
 // would permanently block control recovery. Retire all three exact records in
 // one transaction instead; a later retry must issue a fresh claim epoch.
 func (s *Store) RetireObservedCanceledRepositoryCommand(ctx context.Context, claim contracts.RepositoryCommandClaim) error {
+	return s.retireObservedRepositoryCommand(ctx, claim, "canceled:repository-command-observed")
+}
+
+// RetireObservedResourceLimitedRepositoryCommand requires the same exact
+// current/drained authority as cancellation, but records a distinct factory
+// outcome. No test result is minted, and ambiguous launches are not eligible.
+func (s *Store) RetireObservedResourceLimitedRepositoryCommand(ctx context.Context, claim contracts.RepositoryCommandClaim) error {
+	return s.retireObservedRepositoryCommand(ctx, claim, "resource-limit:repository-command-observed")
+}
+
+var _ contracts.RepositoryCommandResourceRetirer = (*Store)(nil)
+
+func (s *Store) retireObservedRepositoryCommand(ctx context.Context, claim contracts.RepositoryCommandClaim, identity string) error {
 	if !validRepositoryCommandClaim(claim) {
 		return ErrRepositoryCommandIntent
 	}
@@ -344,7 +357,7 @@ func (s *Store) RetireObservedCanceledRepositoryCommand(ctx context.Context, cla
 		if err := c.QueryRowContext(ctx, `SELECT COUNT(*) FROM repository_command_leases WHERE repository_path=? AND semantic_key=? AND channel=? AND project_id=? AND ticket_id=? AND request_digest=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=? AND worktree_path=? AND worktree_identity=? AND branch_ref=? AND base_ref=? AND base_sha=? AND command_digest=? AND spec_digest=? AND policy_digest=? AND executable_path=? AND executable_digest=? AND state='active' AND launch_state='drained'`, claim.Repository, claim.SemanticKey, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch, claim.Worktree, claim.WorktreeIdentity, claim.Branch, claim.BaseRef, claim.BaseSHA, claim.CommandDigest, claim.SpecDigest, claim.PolicyDigest, claim.ExecutablePath, claim.ExecutableDigest).Scan(&active); err != nil || active != 1 {
 			return ErrRepositoryCommandLease
 		}
-		updated, err := c.ExecContext(ctx, `UPDATE effects SET state='failed',observed_identity='canceled:repository-command-observed' WHERE semantic_key=? AND state='executing' AND claim_epoch=? AND request_digest=?`, claim.SemanticKey, claim.ClaimEpoch, claim.RequestDigest)
+		updated, err := c.ExecContext(ctx, `UPDATE effects SET state='failed',observed_identity=? WHERE semantic_key=? AND state='executing' AND claim_epoch=? AND request_digest=?`, identity, claim.SemanticKey, claim.ClaimEpoch, claim.RequestDigest)
 		if err != nil {
 			return err
 		}

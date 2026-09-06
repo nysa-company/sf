@@ -2,6 +2,45 @@
 
 ## Current truth
 
+- Validation97852 TERMINAL exit0: full normal Go, vet, repo/secret/docs/artifact
+  checks PASS (Store139.706s, workflowruntime124.183s, worktreecoord137.618s).
+  Resource retirement and bounded wait checkpoint can be committed; internal
+  runPython and its retained-path test additions remain unfinished/uncommitted.
+  Later wait/root tests passed race68906. Full suite is not evidence of a real
+  Python launch: dispatch/policy are still disabled and no positive Run test yet.
+
+- Internal runPython composition now written but NOT dispatched by Run/Preflight
+  and policy still denies Python. Binds recipe/argv/spec/policy/prepared identity,
+  authenticates worktree and retained-root path identity, creates per-launch
+  scratch/bootstrap/staged gate, records launch before gate release, monitors
+  scratch and bounded wait, durably finishes before Observed, retains ambiguity.
+  Final monitor channel + scratch scan catch completion races; SIGXFSZ is a
+  resource abort. Cleanup runs after monitor stop and proven drain. OS-child/
+  retained-root race68906 PASS1.654s (plus compilation), NOT a successful
+  Store-backed Python launch. Next must exercise real prepared Python and Store
+  lifecycle before wiring dispatch/setup. Full97852 still live at latest poll.
+
+- Python wait helper added but not launch-wired: separate exit/abort/reaped
+  values; authenticates boot/start/PGID before TERM/KILL, soft/hard bounded
+  waits, uncertain when Wait notification absent, rejects settings over30s.
+  Resource inspection failures are ErrUnclear, only ErrLimit maps to factory
+  resource sentinel; normal owner must inspect scratch again and prove drain
+  before Finish/Observed. Focused OS-child race99425 TERMINAL PASS1.684s:
+  quota/inspection/closed monitor, cancellation, wrong identity no signal,
+  overlong limits no signal, withheld Wait returns bounded uncertainty.
+  Full validation97852 still running, latest processsupervisor65.813s PASS;
+  independent focused run covers latest wait-helper edits. No policy admission.
+
+- Resource-abort authority uncommitted atop329344b: distinct contracts sentinel
+  and optional resource-retirer; Executor handles only Observed resource aborts
+  before ordinary result recording. Store shares exact current/drained atomic
+  retirement with cancellation but uses resource-limit:repository-command-observed.
+  No result row, no new schema, no Python admission. Store normal75590 PASS1.480s;
+  focused race5593 TERMINAL exit0 (executor1.459s, Store26.055s), covering
+  dedicated dispatch/bounded persistence, missing authority/failure quarantine,
+  unrecorded/active/quarantined/wrong claim refusal, rollback and fresh retry.
+  Full normal/static validation97852 newly launched; poll same handle before commit.
+
 - Python gate/scratch checkpoint validation99018 TERMINAL exit0: full normal
   Go, vet, repo-check, secret-scan, docs-smoke and working-tree artifact-check
   PASS. Store138.123s, workflowruntime127.572s, worktreecoord138.587s. Afterwards

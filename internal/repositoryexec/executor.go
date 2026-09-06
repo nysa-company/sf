@@ -145,6 +145,14 @@ func (e Executor) Run(ctx context.Context, req Request) (result contracts.Comman
 		return contracts.CommandResult{}, ErrInvalidBinding
 	}
 	result, runErr := e.Supervisor.Run(operationCtx, req.Claim, req.Spec, req.Policy, lease)
+	// Factory resource stops are not red verification evidence. The observed
+	// bit proves drain independently; unobserved stops continue to quarantine.
+	if result.Observed && errors.Is(runErr, contracts.ErrRepositoryCommandResourceLimit) {
+		if err := retireObservedResourceLimitedRepositoryCommand(e.Authority, lease, req.Claim); err != nil {
+			return result, errors.Join(runErr, err)
+		}
+		return result, runErr
+	}
 	// A cancellation/deadline is control-plane authority, not command evidence.
 	// The supervisor may have reaped the child and therefore return an observed
 	// non-zero result, but recording it would let cancellation masquerade as a
@@ -261,6 +269,21 @@ func RetireUnleased(authority contracts.RepositoryCommandAuthority, claim contra
 
 func repositoryCommandCanceled(ctx context.Context, runErr error) bool {
 	return ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
+}
+
+func retireObservedResourceLimitedRepositoryCommand(authority contracts.RepositoryCommandAuthority, lease contracts.RepositoryCommandLease, claim contracts.RepositoryCommandClaim) error {
+	recorder, ok := authority.(contracts.RepositoryCommandResourceRetirer)
+	if !ok {
+		_ = lease.Quarantine()
+		return ErrInvalidBinding
+	}
+	persistCtx, cancel := repositoryPersistenceContext()
+	defer cancel()
+	if err := recorder.RetireObservedResourceLimitedRepositoryCommand(persistCtx, claim); err != nil {
+		_ = lease.Quarantine()
+		return fmt.Errorf("retire resource-limited repository command: %w", err)
+	}
+	return nil
 }
 
 func retireObservedCanceledRepositoryCommand(authority contracts.RepositoryCommandAuthority, lease contracts.RepositoryCommandLease, claim contracts.RepositoryCommandClaim) error {

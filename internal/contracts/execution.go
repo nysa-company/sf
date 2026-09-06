@@ -206,6 +206,18 @@ type RepositoryCommandAuthority interface {
 // other response whose acquisition outcome is ambiguous.
 var ErrRepositoryCommandContended = errors.New("repository command is waiting for another authenticated repository writer")
 
+// ErrRepositoryCommandResourceLimit is a supervisor-enforced resource abort,
+// never a test assertion outcome. Observed still independently requires proven
+// process drain; this error alone must not authorize lease release.
+var ErrRepositoryCommandResourceLimit = errors.New("repository command exceeded a factory resource limit")
+
+// RepositoryCommandResourceRetirer retires a current, exactly drained launch
+// without creating reusable command evidence. Kept separate from cancellation
+// so a factory fault cannot be mislabeled as operator control.
+type RepositoryCommandResourceRetirer interface {
+	RetireObservedResourceLimitedRepositoryCommand(context.Context, RepositoryCommandClaim) error
+}
+
 type RepositoryCommandResultRecorder interface {
 	CompleteRepositoryCommand(context.Context, RepositoryCommandClaim, CommandResult) error
 	RetireObservedCanceledRepositoryCommand(context.Context, RepositoryCommandClaim) error
