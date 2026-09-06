@@ -2,6 +2,17 @@
 
 ## Current truth
 
+- ONBOARDING8 RECOVERY SUCCEEDED 2026-09-06T16:08Z: source1423edb,
+  verified bundle/install `.context/onboarding8.UEs4Ss/{bundle,installed}`
+  PASS8553. Old94247 Ctrl-C exit0; replacement21758 LIVE same durable HOME/env.
+  Qualification25641 PASS independent pair leader5. Normal recover exit0,
+  observed=true/attempted=false, reviewingv12/r3. Normal status confirms fresh
+  GPT5.5 review attempt2 active since16:08:19.076326Z. Original candidate/PR2
+  retained; no budget reset/worktree repair/DB edit/approval. Read-only status
+  watch7748 LIVE (large JSON stream; compact latest object when polling).
+  Next observe reviewer verdict. Only fresh passing review may reach approval;
+  user approval for old PR1 does not cover PR2. Deadline remains18:32:16Z/$20.
+
 - REPLACEMENT RUNTIME REPAIR UNCOMMITTED: regressions67604 RED proved both
   missing volatile stopped entry in fresh Controller and compensated authority
   rejection. Controller.Rearm now reconstructs runtime.Drain after loading the

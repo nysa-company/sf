@@ -52,7 +52,12 @@ through the signed recovery chain. A daemon test uses the real controller and
 scheduler to prove the exact first Begin opens Store and admits the worker.
 Targeted race checks and full follow-up validation pass (38621, exit 0):
 Go suite, vet, repository/secret/docs/diff checks.
-The live ticket remains sealed at reviewing version 11, with no fresh review.
+The verified onboarding8 bundle then restarted the same durable trial and
+qualified the independent provider pair. Normal CLI recovery succeeded at
+reviewing version 12 / runner 3, reporting the already-committed recovery
+without another transition. CLI status confirms a fresh GPT-5.5 review attempt
+2 started at `2026-09-06T16:08:19Z`. Its verdict and terminal delivery remain
+pending; no budget reset or manual database/worktree repair was used.
 
 The next acceptance steps are validated-bundle rollout, ordinary recovery and
 a fresh independent review, followed by this ticket's own human approval and
