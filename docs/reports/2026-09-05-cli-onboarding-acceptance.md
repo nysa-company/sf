@@ -5,6 +5,31 @@ terminal `done` reconciliation remains unproven; this is not a completed beta.
 The executed-path notes below retain historical observations. The September 6
 checkpoint supersedes their earlier approval-pending and open-PR status.
 
+## Post-reboot result: acceptance environment lost
+
+After the operator reboot, `/private/tmp/sf-onboarding-acceptance.R2QvPm`
+no longer existed. The installed onboarding5 bundle and private SQLite backup
+survived in the SF checkout; `PRAGMA quick_check` on that backup returned `ok`.
+The OS boot differs from the recorded checkpoint. The backup still records
+one quarantine, one checkpoint, zero recoveries, and ticket `merging` v15/r6.
+No backup was installed as a new runtime and no recovery or second merge ran.
+
+This is a failed persistence setup for the real acceptance trial, not a passing
+post-reboot recovery. Only the database was preserved before reboot; the
+registered repository and linked worktree were not. The merge-proof coordinator
+requires a snapshot of that worktree even before reusing a confirmed proof;
+ordinary worktree authentication also validates its persisted identity.
+Recreating the path or cloning the remote is therefore not a supported way to
+complete this ticket. The delivered GitHub change remains recorded separately
+from the unproved terminal outcome.
+
+Future live and reboot acceptance must start in a durable owner-only directory
+and retain the registered directories in place. Temporary fixtures remain
+appropriate for single-process automated tests, not cross-reboot acceptance.
+Keep this trial in the reliability denominator; do not reset or relabel it as
+successful. A fresh trial must be separately identified and cannot repair this
+trial's evidence. Supported lost-checkout recovery is not established.
+
 ## Requirement evidence map
 
 Test names identify the scope to preserve. The fixture extension's integrated

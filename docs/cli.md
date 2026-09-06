@@ -263,7 +263,12 @@ they do not accept caller-provided machine or boot identities.
 1. Run `sf daemon cleanup prepare` while the quarantined daemon is available.
    This records an immutable checkpoint for that exact quarantine and leaves
    the gate sealed. Repeating it returns the same checkpoint.
-2. Save your work, stop the foreground daemon normally, and reboot the host
+2. Before rebooting, verify that HOME, the database, registered repository,
+   linked worktrees, and required runtime snapshots are in durable storage,
+   not `/tmp` or `/private/tmp`. A database backup alone cannot restore a lost
+   checkout's registered filesystem identity. If any required path is temporary,
+   stop here: do not move it and assume the old identity remains valid.
+   Save your work, stop the foreground daemon normally, and reboot the host
    when safe. SF never initiates this reboot. A daemon-only restart is not
    sufficient; copying the database to another machine does not qualify.
 3. Start the same channel daemon, then run `sf daemon cleanup recover`.

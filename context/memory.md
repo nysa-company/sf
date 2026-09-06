@@ -2,6 +2,18 @@
 
 ## Current truth
 
+- POST-REBOOT 2026-09-06: original `/private/tmp/sf-onboarding-acceptance.R2QvPm`
+  is gone. OS boot differs from checkpoint. Private DB backup quick_check=ok;
+  quarantine1/checkpoint1/recoveries0 and mergingv15/r6 preserved. Installed
+  onboarding5 exists and version/source match. No daemon started, no backup
+  restored, no authority changed. Mergeproof requires original worktree snapshot;
+  a replacement clone/path is not authenticated recovery. This acceptance trial
+  delivered its GitHub PR but has failed local persistence/terminal acceptance.
+  Do not erase that result or claim done. Next: durable-location acceptance setup
+  and explicit restart/reboot retention checks; assess lost-checkout recovery as
+  separate scope without DB surgery. First-ticket/reboot docs now warn against
+  temporary HOME/project roots and database-only preservation.
+
 - REBOOT HANDOFF SAVED 2026-09-06T14:15Z: user will restart the Mac.
   Authoritative next-session instructions: `context/checkpoints/20260906-141545-acceptance-reboot-recovery.md`.
   Native process/socket inspection found no running sf daemon and no owner of

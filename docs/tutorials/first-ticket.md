@@ -26,6 +26,15 @@ Claude runtime. Provider expansion is tracked in the
 
 ## Prepare once
 
+Keep the project in a durable directory, such as your normal projects folder.
+Use your normal HOME for a real run. If you deliberately isolate HOME, put that
+directory in durable owner-only storage too. Do not use `/tmp`, `/private/tmp`,
+or a test framework's temporary directory for a run that must survive reboot.
+SF binds work to the registered checkout's filesystem identity; a clone or
+file copy is not an authenticated replacement for a lost checkout. A SQLite
+backup alone does not preserve the repository, linked worktrees, or runtime
+snapshots needed to finish an in-flight ticket.
+
 From the repository root, preview the local configuration without registering
 anything:
 
