@@ -2,6 +2,17 @@
 
 ## Current truth
 
+- REBOOT HANDOFF SAVED 2026-09-06T14:15Z: user will restart the Mac.
+  Authoritative next-session instructions: `context/checkpoints/20260906-141545-acceptance-reboot-recovery.md`.
+  Native process/socket inspection found no running sf daemon and no owner of
+  the isolated acceptance socket; session75245 is no longer available. No signal
+  or reboot was issued in this save turn. Read-only DB still reports quarantine1,
+  checkpoints1, recoveries0, ticket mergingv15/r6. Installed onboarding5 exists.
+  Private SQLite backup `.context/reboot-backup.Lt2dWD/sf.sqlite` passes quick_check;
+  it is preservation only, not a replacement runtime or recovery proof.
+  No code changes/tests/remote writes. Goal remains blocked pending same-host
+  reboot and verified normal reconciliation to done. Older bullets below are history.
+
 - RECOVERY CHECKPOINT LIVE (original isolated acceptance host): source commit
   3f36eb799cf6a4f3a40941ab26ddac5b3cfa82e8; verified full dev bundle + exclusive
   install at `.context/onboarding5.Ga8mYI/{bundle,installed}`. Installed version
