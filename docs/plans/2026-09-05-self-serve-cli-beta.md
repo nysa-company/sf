@@ -91,8 +91,14 @@ configuration; it is a deliberately limited recipe, not arbitrary pytest argv.
 The production profile generator passes the disposable OS-backed fixture.
 Child-only hard limits cover per-file size, open descriptors and core dumps;
 they do not provide an aggregate scratch quota. Python policy admission remains
-disabled pending the actual launch gate, scratch budget, durable lease and
-cancel/restart tests. No setup command currently installs this environment.
+disabled pending durable launch integration and cancel/restart tests. The
+internal compiled gate now passes an OS-backed disposable pytest fixture and
+refuses EOF before release. A retained-descriptor scratch monitor enforces
+bounded observations (16 MiB per file, 128 MiB logical/allocated file bytes,
+4096 entries); it is not an atomic filesystem quota. These components are not
+yet wired into Store-backed Python execution. Resource-limit aborts must not
+become reusable failing-test evidence. No setup command currently installs
+this environment.
 
 The candidate-bound decision picker now covers approval and rejection too.
 Omitted IDs in a terminal (or `--select`) show title/project/state, then fetch

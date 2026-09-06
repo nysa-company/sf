@@ -19,13 +19,15 @@ type Recipe struct {
 }
 
 func ParseRecipe(argv []string) (Recipe, error) {
-	if len(argv) != 5 || argv[0] != "python3" || argv[1] != RecipeFlag || !validDigest(argv[2]) || !validDigest(argv[3]) || !validTestPath(argv[4]) {
+	if len(argv) != 5 || argv[0] != "python3" || argv[1] != RecipeFlag || !validDigest(argv[2]) || !validDigest(argv[3]) || !ValidTestPath(argv[4]) {
 		return Recipe{}, ErrInvalid
 	}
 	return Recipe{argv[2], argv[3], argv[4]}, nil
 }
 
-func validTestPath(value string) bool {
+// ValidTestPath admits one relative Python file or tests directory, not flags
+// or glob expansion. The supervisor separately authenticates the worktree.
+func ValidTestPath(value string) bool {
 	return validPath(value) && !strings.HasPrefix(value, "-") && !strings.ContainsAny(value, "*?[]") && strings.Count(value, "/") <= maximum.depth && (strings.HasSuffix(value, ".py") || path.Base(value) == "tests")
 }
 

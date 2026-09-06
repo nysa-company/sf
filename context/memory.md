@@ -2,6 +2,50 @@
 
 ## Current truth
 
+- Python gate/scratch checkpoint validation99018 TERMINAL exit0: full normal
+  Go, vet, repo-check, secret-scan, docs-smoke and working-tree artifact-check
+  PASS. Store138.123s, workflowruntime127.572s, worktreecoord138.587s. Afterwards
+  added test-only preexisting scratch-limit refusal and concurrent Stop checks;
+  focused monitor race45589 PASS1.584s. These do not admit Python execution.
+  Next integration must treat factory resource-limit abort as non-evidence,
+  with exact durable retirement or retained uncertainty, not ordinary red test
+  evidence or a falsely labeled operator cancellation. No live runtime changed.
+
+- Scratch monitor uncommitted: owns F_DUPFD_CLOEXEC descriptor, initial bounded
+  inspection then100ms polls, single error channel, silent cancellation, Stop
+  waits for own FD close and never deletes scratch. Constructor refuses bad
+  root/context; lifecycle owner must terminate/drain on error. Race49055 PASS
+  1.637s: caller-FD closure survives, later oversize reported once, cancellation
+  and repeat Stop clean. No Store-backed Python Run yet. Gate race46758 PASS
+  2.866s (malformed input + EOF child). Combined normal/vet/repo/secret/docs/
+  artifact validation99018 passed (see latest checkpoint above).
+
+- Python internal launch gate now uncommitted: strict canonical path envelope
+  plus typed test path, waits FD3 byte1, fchdir FD4 and exact cwd, verifies
+  factory bootstrap/profile, applies hard rlimits+Seatbelt, closes inherited
+  gate/worktree descriptors on exec, executes fixed -I/-S/-B bootstrap argv
+  with minimal environment. Main dispatches internal gate only; Python remains
+  denied by repository policy/Preflight pending Store-backed Run integration.
+  Malformed gate normal67084 PASS0.635s. Disposable compiled SF build40074
+  exit0 (Go module stat-cache permission warning, build succeeded). Actual
+  compiled-gate probe72071 TERMINAL exit0: before-release EOF refuses125,
+  released gate passes7 pytest tests0.01s under production limits/profile;
+  pre/post environment verification passes. Scratch script
+  .context/python-profile-probe.go gate, binary .context/python-gate-sf.
+  No live runtime/ticket/install changed. Added permanent EOF child regression;
+  full combined validation passed; Store-backed launch admission remains pending.
+
+- Scratch accounting uncommitted atop81c5aea: InspectScratchDirectoryFD uses
+  private retained root, fresh directory cursors, nofollow stat/open,250ms
+  observation deadline,16MiB individual file/128MiB logical+allocated file
+  bytes/4096 entries/depth32 limits; refuses specials/errors, tolerates removed
+  temp entries, accounts symlink itself without traversal. Not atomic quota;
+  caller must monitor, stop/drain on errors and recheck completion. Limits now
+  share file-size constant with gate rlimit. Tests: root replacement, symlink,
+  repeatedFD, sparse oversized file/total, entry/depth/FIFO/private/cancel.
+  Race90367 pythonclosure PASS2.035s, supervisor compile PASS0.371s. No monitor
+  launch wiring or admission yet; broad combined validation passed.
+
 - Combined gate96357 TERMINAL exit0: full normal Go, vet, repo/secret/docs/
   artifact checks PASS; Store136.140s, workflowruntime122.393s,
   worktreecoord137.199s. Python child-only resource limits added: hard file

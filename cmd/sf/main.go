@@ -28,6 +28,9 @@ import (
 )
 
 func main() {
+	if handled, code := repositoryPythonGate(os.Args); handled {
+		os.Exit(code)
+	}
 	if target, argv, ok := providerGateCommand(os.Args); ok {
 		// FD 3 is held by the supervisor until the launch PID/PGID is durably
 		// recorded. EOF means the parent died before authority was published.

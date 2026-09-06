@@ -3,9 +3,11 @@ package processsupervisor
 import (
 	"runtime"
 	"syscall"
+
+	"github.com/nysa-company/sf/internal/pythonclosure"
 )
 
-const RepositoryPythonFileSizeLimit = 16 << 20
+const RepositoryPythonFileSizeLimit = pythonclosure.ScratchFileBytes
 const RepositoryPythonOpenFileLimit = 128
 
 // ApplyRepositoryPythonResourceLimits is called only in the isolated gate
