@@ -2,6 +2,49 @@
 
 ## Current truth
 
+- PROMPT VALIDATION81372 TERMINAL exit0: full serialized Go suite (including
+  workflowprompt regression), vet, repo-check, secret-scan, docs-smoke and
+  diff-check all pass. Source unchanged during run; acceptance report updated
+  to retain both trials and diagnostic limitations. Next clean commit/bundle,
+  isolated daemon replacement, qualify and ordinary recover of SF-bf816e.
+  Live status rechecked blockedv9/r1 review_needs_operator; no approval or
+  Store review substitution. Original reboot trial remains failed acceptance.
+
+- PROMPT VALIDATION ACTIVE81372: full `go test -p 1 ./...`, vet, repo-check,
+  secret-scan, docs-smoke, diff-check. Go source frozen. Guidance-only probe24494
+  returned needs_operator claiming JSON schema prevents tool calls. Added explicit
+  final-response-only schema clarification. Probe27063 completed actual source
+  reads and ended pass (43.024s), though intermediate JSON chatter still occurred.
+  No deterministic reliability claim. Temporary live probe moved to
+  `.context/diagnostics/codex_read_probe_test.go.txt`; not in normal test tree.
+  Production diff only workflowprompt.go + its test. Read minimal PATH/final-only
+  schema regression, preserve no-escalation/read-only rules. Wait81372 terminal
+  before commit/bundle/rollout; live daemon35724 remains old onboarding5 and ticket
+  remains blocked. Probe verdict is never substituted for Store review.
+
+- EXACT-PROMPT DIAGNOSTIC21787 exit0 (23.510s): original recorded review
+  prompt/schema under staged runtime/vetted env emitted early needs_operator,
+  then `rg` command-not-found, then successful source/test reads and final pass.
+  Parse uses OutputLastMessage, not first agent_message, so no selection defect
+  found. This is model/tool behavior evidence, not replacement Store review.
+  Narrow final-review prompt clarification now UNCOMMITTED in workflowprompt.go:
+  minimal PATH, optional rg absence != sandbox denial, cat/sed fallback, no
+  escalation, exact denied-read evidence. Regression test RED before/GREEN after
+  (workflowprompt .335s). Needs live amended-prompt probe and full validation;
+  no live daemon rollout/state recovery/approval yet. Temporary diagnostic test
+  remains uncommitted; retain or remove deliberately after investigation.
+
+- STAGED MODEL PROBE42058 exit0 (22.364s): temporary opt-in diagnostic
+  `internal/processsupervisor/codex_read_probe_test.go` copied authenticated
+  Codex bundle, used production vettedEnvironment and exact read-only flags,
+  GPT5.5, and a narrow read-two-files prompt. Both command_execution items
+  completed and read expected source/tests. Original blanket sandbox claim
+  still not reproduced. Probe lacks original review prompt/schema, so do not
+  infer original root cause or pass final review. Test file is UNCOMMITTED
+  diagnostic, not full validated production change; next compare exact original
+  prompt/schema with bounded retained tool evidence. No permission relaxations,
+  ticket mutations, second review or approval performed. Live ticket stays blocked.
+
 - REVIEW INVESTIGATION: direct native `codex sandbox --permission-profile
   sf-guarded` with exact SF read-only filesystem/network config successfully
   ran `/usr/bin/wc -c` on both candidate files (304/1566 bytes, exit0). No model

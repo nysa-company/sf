@@ -5,6 +5,39 @@ terminal `done` reconciliation remains unproven; this is not a completed beta.
 The executed-path notes below retain historical observations. The September 6
 checkpoint supersedes their earlier approval-pending and open-PR status.
 
+## September 6 durable-storage trial: final review pending recovery
+
+A separately identified trial uses an owner-private directory under `Projects`,
+not temporary storage. Installed onboarding5 registered `onboarding-durable`;
+a clean daemon stop/start preserved that registration before submission. This
+is daemon-restart evidence, not an OS-reboot test.
+
+Normal CLI `run` started ticket `SF-bf816eaad3a060153d28c99b3a3be7ef`,
+“Count distinct nonempty values”, at `2026-09-06T14:32:16Z`, with a four-hour
+deadline and $20 ceiling. Planning, independent verification and implementation
+each completed their first attempt. SF committed candidate
+`e9d40f0922130e72edc6d439f7ce6b78d71862bc`, published draft PR #2 in the private
+acceptance repository, and observed passing required CI (run `34039674698`).
+
+The final reviewer returned `needs_operator` at `14:37:06Z`, claiming that its
+read-only tool environment prevented inspection. Live CLI status subsequently
+confirmed `blocked`, version 9, `review_needs_operator`, with no approval.
+Read-only production-shaped probes could read the files. Exact-prompt probes
+exposed confusion about missing optional `rg` and whether the final JSON schema
+prohibited tool calls. A prompt-only clarification preserves the read-only,
+no-escalation boundary; its amended diagnostic completed inspection and returned
+pass, but that diagnostic is not a Store review and does not authorize delivery.
+Full integrated validation of the clarification passed (session 81372, exit 0):
+serialized Go suite, vet, repository checks, secret scan, docs smoke and diff
+checks. The installed daemon has not yet been replaced or the ticket recovered.
+
+The next acceptance steps are validated-bundle rollout, ordinary recovery and
+a fresh independent review, followed by this ticket's own human approval and
+terminal reconciliation. PR #1's approval cannot authorize PR #2. CLI status
+currently omits the review finding, requiring a read-only typed-result query;
+that operator-facing diagnostic gap remains work to do. Neither this repaired
+trial nor the earlier failed persistence trial counts as unassisted acceptance.
+
 ## Post-reboot result: acceptance environment lost
 
 After the operator reboot, `/private/tmp/sf-onboarding-acceptance.R2QvPm`
