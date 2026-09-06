@@ -2,6 +2,42 @@
 
 ## Current truth
 
+- VALIDATION98415 TERMINAL EXIT0 2026-09-06T16:35Z: targeted Store race47.246s,
+  full Go suite (Store122.522, workflowruntime108.553, worktreecoord130.381s),
+  vet/repo-check/secret-scan/docs-smoke/diff all PASS. Current reader repair
+  ready to commit and bundle as onboarding9; no source changes during run.
+  Important learning: current final-review readers must use the same strict
+  CI/publication authority as launch and transition, including pending CI
+  self-transitions before first recovery. Generic lifecycle audit differs.
+
+- VALIDATION98415 LIVE 2026-09-06T16:22Z: full Store37767 EXIT0 (132.807s).
+  Focused race Store PASS47.246s for recovered review, pending-CI tamper and
+  connection-scoped transition. Same98415 now runs full `go test -p 1 ./...`,
+  then vet/repo-check/secret-scan/docs-smoke/diff. Wait this exact handle; do not
+  start another suite or edit Go files. Source remains two-file reader repair;
+  docs memory/report also intentional. Live daemon21758 still onboarding8,
+  reviewingv12/r3; read-only count review attempts2, approvals0. No source commit
+  or bundle yet. After exit0 commit exact four files, build verified onboarding9,
+  stop only21758 via Ctrl-C, restart same durable HOME/env, qualify if required,
+  and observe existing passing review reused (no manual Signal/DB mutation).
+  New startup will advance fence; verify runtime admission normally before any
+  recover request. Ask approval for PR2 only once normal waiting_approval.
+
+- REVIEW PASS READER FIX 2026-09-06T16:18Z UNCOMMITTED: live reviewer attempt2
+  completed with pass/no findings at v12/L5/R3, but worker reuse returned stale.
+  Read-only diagnostic proved candidate/FinalReviewAuthority/finalReviewerResult
+  all authenticate while LatestReusableProviderAttempt fails. Root: current
+  result readers still use generic initial-lifecycle recovery, which rejects a
+  pending CI self-transition before review followed by startup recovery.
+  Regression with pending CI + block/recover + reopen failed63061 in both reopen
+  cases. provider.go now authenticates current final-review results through the
+  existing strict FinalReviewAuthority and exact reviewed-head/proof validation.
+  Regression20674 PASS; read-only actual DB probe47495 now reuse PASS (no writes
+  or model call). Temporary opt-in diagnostic removed. Two source/test files
+  changed; full Store37767 is running. Next full/race validation, commit, verified
+  onboarding9 bundle, normal isolated replacement/reuse. Daemon21758 remains
+  onboarding8; no approval/merge or budget change. Deadline18:32:16Z unchanged.
+
 - ONBOARDING8 RECOVERY SUCCEEDED 2026-09-06T16:08Z: source1423edb,
   verified bundle/install `.context/onboarding8.UEs4Ss/{bundle,installed}`
   PASS8553. Old94247 Ctrl-C exit0; replacement21758 LIVE same durable HOME/env.

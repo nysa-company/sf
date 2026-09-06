@@ -210,6 +210,12 @@ func (s *Store) LoadCurrentProviderAttemptResult(ctx context.Context, key Provid
 	if err := s.AssertTicketFence(ctx, key.Ref, expected, fence); err != nil {
 		return ProviderAttemptResult{}, phaseartifact.Parsed{}, err
 	}
+	if result.Claim.Phase == domain.PhaseReview && result.Claim.Role == "reviewer" {
+		if err := s.authenticateCurrentFinalReviewResult(ctx, result, parsed, expected, fence); err != nil {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, err
+		}
+		return result, parsed, nil
+	}
 	if result.Claim.Phase == domain.PhaseBuild && result.Claim.Role == "builder" {
 		if _, repairErr := s.candidateRepairBuildContextAt(ctx, s.db, key.Ref, expected, fence); repairErr == nil {
 			if candidateRepairBuilderEntryResultReachesFence(ctx, s.db, key, result, expected, fence) != nil {
@@ -1454,7 +1460,8 @@ func (s *Store) LoadProviderAttemptResult(ctx context.Context, claim ProviderAtt
 			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
 		}
 	}
-	if !candidateRepairAuthority {
+	finalReview := claim.Phase == domain.PhaseReview && claim.Role == "reviewer"
+	if !candidateRepairAuthority && !finalReview {
 		if err := validateRunnerRecoveryAuthority(ctx, s.db, claim.Ref, expected, fence); err != nil {
 			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
 		}
@@ -1510,7 +1517,29 @@ func (s *Store) LoadProviderAttemptResult(ctx context.Context, claim ProviderAtt
 			return ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrStaleFence
 		}
 	}
+	if finalReview {
+		if err := s.authenticateCurrentFinalReviewResult(ctx, out, parsed, expected, fence); err != nil {
+			return ProviderAttemptResult{}, phaseartifact.Parsed{}, err
+		}
+	}
 	return out, parsed, nil
+}
+
+// Final review is anchored at immutable CI/publication evidence, not the
+// initial phase-only lifecycle. Pending CI observations and exact control or
+// recovery steps are authenticated by this same authority at launch and exit.
+// Reuse must retain that proof rather than reinterpret its history generically.
+func (s *Store) authenticateCurrentFinalReviewResult(ctx context.Context, result ProviderAttemptResult, parsed phaseartifact.Parsed, expected uint64, fence domain.Fence) error {
+	authority, err := s.FinalReviewAuthority(ctx, result.Claim.Ref, expected, fence)
+	if err != nil {
+		return ErrStaleFence
+	}
+	validation, err := phaseartifact.DecodeCanonicalValidation(result.Validation)
+	candidate := authority.Candidate.Snapshot
+	if err != nil || parsed.Reviewer == nil || parsed.Reviewer.ReviewedHead != candidate.HeadSHA || parsed.Reviewer.ProofDigest != candidate.ProofDigest || validation.ExpectedReviewedHead != candidate.HeadSHA || validation.ExpectedProofDigest != candidate.ProofDigest {
+		return ErrEvidenceConflict
+	}
+	return nil
 }
 
 // loadProviderAttemptResultRow reads immutable output first by its sole key.

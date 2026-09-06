@@ -22,7 +22,7 @@ func TestReviewBlockedRecoveryRearmsExactSealedEndpoint(t *testing.T) {
 			name = "reopen-after-compensated-install"
 		}
 		t.Run(name, func(t *testing.T) {
-			fixture := finalReviewLifecycleFixture(t)
+			fixture := finalReviewLifecycleFixtureWithPending(t, 1)
 			db, ctx := fixture.db, fixture.ctx
 			completeFinalReviewWith(t, fixture, phaseartifact.ReviewNeedsOperator, "operator")
 			blocked, err := db.TransitionReviewNeedsOperator(ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version, From: domain.StateReviewing, To: domain.StateBlocked, ResumeState: domain.StateReviewing, Trigger: "typed_blocker", Fence: fixture.fence, EventPayload: `{"code":"review_needs_operator"}`})
@@ -151,6 +151,20 @@ func TestReviewBlockedRecoveryRearmsExactSealedEndpoint(t *testing.T) {
 			if pending, err := db.ReviewBlockedRecoveryPending(ctx, fixture.ticket.Ref); err != nil || !pending {
 				t.Fatalf("compensated installation must remain recoverable: %v %v", pending, err)
 			}
+			if scenario == 3 {
+				fence.LeaderEpoch, err = db.AcquireLeader(ctx, domain.ChannelDev, "review-rearm-second-recovery")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, fence.LeaderEpoch); err != nil || changed != 1 {
+					t.Fatalf("second recovery: %d %v", changed, err)
+				}
+				current, err := db.Ticket(ctx, fixture.ticket.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result.Version, fence.RunnerEpoch = current.Version, current.RunnerEpoch
+			}
 			if _, err := db.db.ExecContext(ctx, `UPDATE runtime_ticket_controls SET authority_runner_epoch=authority_runner_epoch+1 WHERE ticket_id=?`, fixture.ticket.Ref.Ticket); err != nil {
 				t.Fatal(err)
 			}
@@ -191,8 +205,19 @@ func TestReviewBlockedRecoveryRearmsExactSealedEndpoint(t *testing.T) {
 			if fresh.Attempt != 2 || fresh.ExpectedVersion != result.Version {
 				t.Fatalf("fresh review reset attempt budget or used old endpoint: %+v", fresh)
 			}
+			if _, _, err := db.LoadCurrentProviderAttemptResult(ctx, ProviderAttemptResultKey{AttemptID: fresh.ID, Ref: fresh.Ref, Phase: fresh.Phase, Attempt: fresh.Attempt}, result.Version, fence); err != nil {
+				t.Fatalf("fresh result current reader: %v", err)
+			}
+			wrongFence := fence
+			wrongFence.LeaderEpoch++
+			if _, _, err := db.LoadProviderAttemptResult(ctx, fresh, result.Version, wrongFence); !errors.Is(err, ErrStaleFence) {
+				t.Fatalf("wrong leader accepted by result reader: %v", err)
+			}
 			if reused, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: fixture.ticket.Ref, Phase: domain.PhaseReview, Role: "reviewer", ExpectedVersion: result.Version, Fence: fence}); err != nil || reused.Key.AttemptID != fresh.ID {
 				t.Fatalf("fresh review must remain reusable: key=%+v err=%v", reused.Key, err)
+			}
+			if _, err := db.TransitionFinalReview(ctx, Transition{Ref: fixture.ticket.Ref, ExpectedVersion: result.Version, From: domain.StateReviewing, To: domain.StateWaitingApproval, Trigger: "review_pass", Fence: fence, EventPayload: `{}`}); err != nil {
+				t.Fatalf("fresh passing review must advance to approval: %v", err)
 			}
 		})
 	}

@@ -5,7 +5,7 @@ terminal `done` reconciliation remains unproven; this is not a completed beta.
 The executed-path notes below retain historical observations. The September 6
 checkpoint supersedes their earlier approval-pending and open-PR status.
 
-## September 6 durable-storage trial: final review pending recovery
+## September 6 durable-storage trial: passing review awaiting transition
 
 A separately identified trial uses an owner-private directory under `Projects`,
 not temporary storage. Installed onboarding5 registered `onboarding-durable`;
@@ -56,11 +56,20 @@ The verified onboarding8 bundle then restarted the same durable trial and
 qualified the independent provider pair. Normal CLI recovery succeeded at
 reviewing version 12 / runner 3, reporting the already-committed recovery
 without another transition. CLI status confirms a fresh GPT-5.5 review attempt
-2 started at `2026-09-06T16:08:19Z`. Its verdict and terminal delivery remain
-pending; no budget reset or manual database/worktree repair was used.
+2 started at `2026-09-06T16:08:19Z` and completed with `pass`, no findings, at
+`16:08:56Z`. The ticket remained reviewing because current-result readers used
+the generic initial-lifecycle recovery check, which rejected the earlier pending
+CI observation after restart. The final-review authority itself authenticated
+the exact candidate, CI, recovery and verdict. A regression with pending CI,
+blocked recovery and reopened Store reproduces the stale-reader refusal. The
+reader repair uses the existing strict final-review authority and exact
+head/proof binding; its regression and read-only live-database probe pass.
+Full validation passed (98415, exit 0): targeted recovery race, full Go suite,
+vet, repository/secret/docs/diff checks. No new model call, budget reset or manual
+database/worktree repair was used.
 
 The next acceptance steps are validated-bundle rollout, ordinary recovery and
-a fresh independent review, followed by this ticket's own human approval and
+reuse of the already-passing independent review, followed by this ticket's own human approval and
 terminal reconciliation. PR #1's approval cannot authorize PR #2. CLI status
 currently omits the review finding, requiring a read-only typed-result query;
 that operator-facing diagnostic gap remains work to do. Neither this repaired
