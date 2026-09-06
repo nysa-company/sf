@@ -2,6 +2,16 @@
 
 ## Current truth
 
+- REVIEW INVESTIGATION: direct native `codex sandbox --permission-profile
+  sf-guarded` with exact SF read-only filesystem/network config successfully
+  ran `/usr/bin/wc -c` on both candidate files (304/1566 bytes, exit0). No model
+  call or file mutation. Therefore blanket filesystem denial is NOT reproduced.
+  Supervisor uses staged codex + code-mode-host, vetted HOME/TMPDIR, fixed argv;
+  no outer Seatbelt wrapper in Run. Remaining hypothesis is model tool dispatch
+  or staged-runtime/environment behavior. Need bounded same-invocation inspection
+  probe with retained sanitized tool outcome before any permission/prompt fix.
+  Investigate skill read fully; no fixes applied without confirmed root cause.
+
 - DURABLE TRIAL REVIEW BLOCK 2026-09-06T14:37:06Z: final reviewer completed
   attempt1 with needs_operator/operator. Ticket now blockedv9/r1,
   resume=reviewing, code review_needs_operator. Typed review finding says its
