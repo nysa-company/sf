@@ -5,7 +5,7 @@ terminal `done` reconciliation remains unproven; this is not a completed beta.
 The executed-path notes below retain historical observations. The September 6
 checkpoint supersedes their earlier approval-pending and open-PR status.
 
-## September 6 durable-storage trial: passing review awaiting transition
+## September 6 durable-storage trial: awaiting human approval
 
 A separately identified trial uses an owner-private directory under `Projects`,
 not temporary storage. Installed onboarding5 registered `onboarding-durable`;
@@ -68,9 +68,16 @@ Full validation passed (98415, exit 0): targeted recovery race, full Go suite,
 vet, repository/secret/docs/diff checks. No new model call, budget reset or manual
 database/worktree repair was used.
 
-The next acceptance steps are validated-bundle rollout, ordinary recovery and
-reuse of the already-passing independent review, followed by this ticket's own human approval and
-terminal reconciliation. PR #1's approval cannot authorize PR #2. CLI status
+The verified onboarding9 bundle (`746216a`) was installed into the isolated
+trial. After clean replacement startup and normal qualification/recovery, SF
+reused the passing review and recorded `review_pass` into `waiting_approval`,
+version 14 / runner 4, at approximately `16:37Z`. SQLite still contains exactly
+two review attempts and zero approvals. Fresh GitHub inspection confirms PR #2
+is open/draft at the reviewed candidate and its required `test` check passed.
+This proves the repaired real recovery-to-approval path, not terminal delivery.
+
+The next acceptance steps are this ticket's own human approval and terminal
+reconciliation. PR #1's approval cannot authorize PR #2. CLI status
 currently omits the review finding, requiring a read-only typed-result query;
 that operator-facing diagnostic gap remains work to do. Neither this repaired
 trial nor the earlier failed persistence trial counts as unassisted acceptance.

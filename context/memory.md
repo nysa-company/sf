@@ -2,6 +2,22 @@
 
 ## Current truth
 
+- REAL WAITING_APPROVAL 2026-09-06T16:37Z: repair committed746216a, complete
+  onboarding9 bundle/verify/exclusive install/version PASS56958 at
+  `.context/onboarding9.g17C0B/{bundle,installed}`. Old daemon21758 Ctrl-C EXIT0;
+  new isolated daemon4460 LIVE, same durable HOME/env, leader6. Qualification
+  91310 PASS independent pair, no model call. Normal `recover SF-bf816e` EXIT0
+  observed prior handoff, then scheduler reused passing attempt2 and committed
+  review_pass reviewing->waiting_approval v14/r4. SQLite confirms review
+  attempts2, approvals0. Fresh gh read PR2 OPEN/draft, exact head
+  e9d40f0922130e72edc6d439f7ce6b78d71862bc, required test SUCCESS. Next ask user
+  simple approval for this PR2, then normal installed CLI approve and observe
+  guarded merge/reconciliation to done. Old PR1 approval is not reusable.
+  Deadline18:32:16Z unchanged. No DB/worktree edits or new model attempt.
+  Goal remains active, terminal delivery still unproven. Current blocked_code
+  projection retains historical review_needs_operator even though state is
+  waiting_approval; fix/report diagnostic separately, never treat it as state.
+
 - VALIDATION98415 TERMINAL EXIT0 2026-09-06T16:35Z: targeted Store race47.246s,
   full Go suite (Store122.522, workflowruntime108.553, worktreecoord130.381s),
   vet/repo-check/secret-scan/docs-smoke/diff all PASS. Current reader repair
