@@ -844,6 +844,26 @@ func TestEnsureExcludesActiveRepositoryCommandWriter(t *testing.T) {
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("blocked ensure created %s: %v", path, err)
 	}
+	// Releasing the exact unlaunched command lease must unblock the sibling,
+	// without replacing the first ticket's registered worktree or duplicating
+	// the previously refused creation on replay.
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		created, err := coordinatorFor(f).Ensure(ctx, blocked)
+		if err != nil || created.Path != path || created.Path == owner.Path {
+			t.Fatalf("sibling ensure after release: %+v err=%v", created, err)
+		}
+	}
+	unchanged, err := f.db.Worktree(ctx, f.ref)
+	if err != nil || unchanged.Path != owner.Path || string(unchanged.IdentityJSON) != string(owner.IdentityJSON) {
+		t.Fatalf("sibling creation changed holder identity: %+v err=%v", unchanged, err)
+	}
+	listed := mustGit(t, f.project.Path, "worktree", "list", "--porcelain")
+	if strings.Count(listed, "worktree "+path+"\n") != 1 || strings.Count(listed, "worktree "+owner.Path+"\n") != 1 {
+		t.Fatalf("expected exactly one linked worktree per ticket:\n%s", listed)
+	}
 }
 
 func TestTakeoverWorktreeIdentityDigestUsesStoreCanonicalForm(t *testing.T) {

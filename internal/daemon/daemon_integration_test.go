@@ -36,9 +36,14 @@ import (
 	"github.com/nysa-company/sf/internal/worktreecoord"
 )
 
-type testIDs struct{ next int }
+type testIDs struct {
+	mu   sync.Mutex
+	next int
+}
 
 func (g *testIDs) NewTicketID(domain.Channel) (domain.TicketID, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.next++
 	return domain.TicketID(fmt.Sprintf("SF-test-%d", g.next)), nil
 }
@@ -1086,6 +1091,23 @@ func TestDaemonFactoryTwoWorkerPauseDrainsOnlyTargetAndResumeRearms(t *testing.T
 	}
 	if response := daemonControl(d, target.Ref.Ticket, "cancel"); !response.OK || !response.Mutation.Observed {
 		t.Fatalf("terminal cancel retry=%+v", response)
+	}
+	// The released slot is useful, not merely absent from SQLite: a fresh
+	// ticket must enter the real two-loop runtime beside the unaffected sibling.
+	next := createAndStartControlTicket(t, d, "SF-runtime-next")
+	select {
+	case ref := <-worker.entered:
+		if ref != next.Ref {
+			t.Fatalf("released slot ran %v, want %v", ref, next.Ref)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("released runtime slot did not admit the next ticket")
+	}
+	if calls, active := worker.snapshot(sibling.Ref); calls != 1 || !active {
+		t.Fatalf("slot transfer disturbed sibling: calls=%d active=%v", calls, active)
+	}
+	if calls, active := worker.snapshot(next.Ref); calls != 1 || !active {
+		t.Fatalf("new ticket not active exactly once: calls=%d active=%v", calls, active)
 	}
 }
 

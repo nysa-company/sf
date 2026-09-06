@@ -51,6 +51,14 @@ func TestCompiledPythonGuardedWalkingSkeleton(t *testing.T) {
 }
 
 func compiledDevWalkingSkeletonProfile(t *testing.T, mergeMode domain.MergeMode, python bool) {
+	compiledDevWalkingSkeletonScenario(t, mergeMode, python, false)
+}
+
+func TestCompiledDevConcurrentTicketsReachIndependentPRs(t *testing.T) {
+	compiledDevWalkingSkeletonScenario(t, domain.MergeGuarded, false, true)
+}
+
+func compiledDevWalkingSkeletonScenario(t *testing.T, mergeMode domain.MergeMode, python, concurrent bool) {
 	t.Helper()
 	if runtime.GOOS != "darwin" {
 		t.Skip("guarded repository command execution is Darwin-only")
@@ -149,6 +157,12 @@ func compiledDevWalkingSkeletonProfile(t *testing.T, mergeMode domain.MergeMode,
 	t.Setenv("CODEX_HOME", codexHome)
 	t.Setenv("GH_CONFIG_DIR", ghConfig)
 	t.Setenv("SF_E2E_GIT_BARE", bare)
+	if concurrent {
+		t.Setenv("SF_CODEX_PROVIDER_CAPACITY", "2")
+		if err := github.SetChecks(2, contracts.RequiredCheck{Name: "unit", ExternalID: "unit-2", State: "pending"}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	t.Setenv("PATH", fixtureBin+":"+filepath.Dir(binary)+":"+filepath.Dir(goBinary)+":/usr/bin:/bin:/usr/sbin:/sbin")
 
 	if python {
@@ -199,6 +213,10 @@ func compiledDevWalkingSkeletonProfile(t *testing.T, mergeMode domain.MergeMode,
 	compiledWalkingSkeletonWaitSocket(t, paths.Socket, daemonDone, &daemonOutput, &daemonStopped)
 
 	compiledWalkingSkeletonCLI(t, binary, home, "providers", "qualify", "--builder", "codex", "--reviewer", "codex", "--json")
+	if concurrent {
+		compiledConcurrentTicketsReachPRs(t, binary, home, paths.Database, bare, github, &daemonOutput)
+		return
+	}
 	ticketPath := filepath.Join(home, "ticket.md")
 	ticketSource := fmt.Sprintf("---\ntype: feature\nmerge: %s\nmax_duration: 30m\nmax_cost_usd: 10\n---\n# Implement the fixture\n\nThe verification fixture deliberately begins without its implementation.\n\n## Acceptance\n- The fixture workflow completes.\n", mergeMode)
 	if python {
@@ -336,6 +354,78 @@ func compiledDevWalkingSkeletonProfile(t *testing.T, mergeMode domain.MergeMode,
 	}
 	if err := retirement.RetireRuntime(context.Background(), func(domain.TicketRef) error { return nil }); err != nil {
 		t.Fatalf("retire terminal Store proof: %v", err)
+	}
+}
+
+// Full compiled CLI/daemon/runtime and native red-to-green commands, with
+// controlled provider/GitHub processes. Approval is deliberately not granted.
+func compiledConcurrentTicketsReachPRs(t *testing.T, binary, home, databasePath, bare string, github *testkit.FakeGH, output *compiledSafeBuffer) {
+	t.Helper()
+	refs := make([]domain.TicketRef, 2)
+	for index := range refs {
+		path := filepath.Join(home, fmt.Sprintf("concurrent-%d.md", index))
+		source := fmt.Sprintf("---\ntype: feature\nmerge: guarded\nmax_duration: 30m\n---\n# Concurrent fixture %d\n\nImplement the fixture in this ticket's independent worktree.\n\n## Acceptance\n- The verification fixture passes.\n", index)
+		if err := os.WriteFile(path, []byte(source), 0600); err != nil {
+			t.Fatal(err)
+		}
+		refs[index] = walkingSkeletonSubmittedRef(t, compiledWalkingSkeletonCLI(t, binary, home, "submit", path, "--project", "app", "--json"))
+	}
+	for _, ref := range refs {
+		compiledWalkingSkeletonCLI(t, binary, home, "start", string(ref.Ticket), "--json")
+	}
+	database, err := store.OpenReadOnly(t.Context(), databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var attempts [2][]store.ProviderAttempt
+	worktrees, numbers := map[string]bool{}, map[int]bool{}
+	for index, ref := range refs {
+		walkingSkeletonWaitState(t, database, ref, domain.StateWaitingCI, github, bare, output)
+		published, err := database.LoadHistoricalPublishedCandidate(t.Context(), ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if numbers[published.PullRequest.Number] {
+			t.Fatal("tickets shared a PR")
+		}
+		numbers[published.PullRequest.Number] = true
+		candidate, err := database.RecoverableCandidate(t.Context(), ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof, err := database.LoadRepositoryCommandResult(t.Context(), candidate.CommandBinding.Key)
+		if err != nil || !proof.Result.Observed || proof.Result.ExitCode != 0 {
+			t.Fatalf("candidate proof: %+v err=%v", proof, err)
+		}
+		worktree, err := database.Worktree(t.Context(), ref)
+		if err != nil || worktrees[worktree.Path] {
+			t.Fatalf("worktree isolation: %+v err=%v", worktree, err)
+		}
+		worktrees[worktree.Path] = true
+		attempts[index], err = database.ProviderAttempts(t.Context(), ref)
+		if err != nil || len(attempts[index]) != 3 {
+			t.Fatalf("attempts=%+v err=%v", attempts[index], err)
+		}
+		for _, attempt := range attempts[index] {
+			if attempt.State != "completed" || attempt.Outcome != "completed" {
+				t.Fatalf("incomplete attempt: %+v", attempt)
+			}
+		}
+	}
+	// The two real ticket pipelines must overlap, even when a short repository
+	// writer boundary serializes a particular provider or command interval.
+	if !attempts[0][0].StartedAt.Before(attempts[1][2].FinishedAt) || !attempts[1][0].StartedAt.Before(attempts[0][2].FinishedAt) {
+		t.Fatal("ticket pipelines did not overlap")
+	}
+	if github.MutationCount("pr_create") != 2 || github.MutationCount("pr_ready") != 0 || github.MutationCount("pr_merge") != 0 {
+		t.Fatal("unexpected or duplicate publication mutations")
+	}
+	if active, err := database.ActiveProviderAttempts(t.Context(), domain.ChannelDev); err != nil || len(active) != 0 {
+		t.Fatalf("active provider residue: %+v err=%v", active, err)
+	}
+	if leases, err := database.ActiveRepositoryCommandLeases(t.Context(), domain.ChannelDev); err != nil || len(leases) != 0 {
+		t.Fatalf("command residue: %+v err=%v", leases, err)
 	}
 }
 

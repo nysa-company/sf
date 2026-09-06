@@ -2,6 +2,45 @@
 
 ## Current truth
 
+- CONCURRENCY ACCEPTANCE PASSED (2026-09-06): all test handles terminal.
+  Compiled46457 EXIT0 twice90.34/90.54s: production CLI/daemon/native test
+  executor + controlled provider/GH, two same-repo tickets with overlapping
+  pipelines per trial, distinct worktrees/PRs, passing proofs, active provider
+  and command leases zero, ready/merge zero. Four fixture PRs, NOT live delivery.
+  Race12438 daemon55.459/runtime1.680 count3PASS; race56714 worktree57.034,
+  Store113.276, publication99.443PASS; final slot-transfer race73293 11.975PASS.
+  73293 fullGo/vet/repo/secret/docs/artifact/diffPASS. New real socket CLI test
+  covers three concurrent runs, two admitted/third queued, exact replay,
+  cancel retains capacity until drain, sibling unchanged and third then starts.
+  Two-ticket/two-restart fixture preserves exact occupied slots and fences.
+  Only fix was testIDs mutex; no production behavior changes. Initial harness
+  race and malformed restart requests retained in scorecard, not hidden.
+  Reproduce with make test-concurrency; exact target constituents ran, combined
+  target dry-run checked. Plan/report dated2026-09-06 saved. Existing live
+  runtimes/projects/DBs/remotes untouched; no merge/push/release. Next live-model
+  concurrency and ten-ticket reliability remain separate, unproved gates.
+
+- CONCURRENCY GOAL ACTIVE (2026-09-06), baseline bfae1fd. Approved bounded
+  isolated capacity-two campaign; plan docs/plans/2026-09-06-concurrent-ticket-acceptance.md.
+  New daemon concurrent_cli_run_test covers 3 simultaneous real CLI/socket run
+  requests, exact replay, retained third queued, cancel/drain gate, slot reuse
+  and sibling unchanged; also two occupied tickets through two daemon restarts.
+  Normal initial10 repetitions passed; race found fixture testIDs unsynchronized
+  counter (not production crypto IDs), fixed with mutex. Restart fixture initial
+  requests incorrectly used test-only operator alias then omitted parameters;
+  corrected to authenticated peer plus exact channel/project. Race12438 EXIT0:
+  daemon55.459s/workflowruntime1.680s, count3 across new tests and existing
+  two-worker control/lost-response/50-seed scheduler cases. Extended runtime test
+  now adds next ticket after cancel, proving active sibling+new slot; NOT YET
+  rerun after this addition. Extended real-Git worktree command-holder test
+  proves release unblocks sibling and replay preserves exactly one worktree.
+  RUNNING56714: race count3 worktreecoord/store/publication targeted contention,
+  seeded capacity, stale terminal, lost create/push, two publishing restarts.
+  Poll exact handle; do not start competing tests. No production behavior edits,
+  live DB/project/provider/remote mutations, commits or push. Goal remains active;
+  next finish targeted validation, baseline suite/static checks and scorecard.
+  Boundary tests are not live-model ten-ticket reliability evidence.
+
 - LOCAL CLI BETA ACCEPTANCE COMPLETE (2026-09-06): final licensed six-payload
   bundle67867 EXIT0, sourceb79166a4ea965b70914b0c460d191aaefa53d769,
   version0.1.0-dev.beta-check.2, `.context/beta-licensed.fC5WjT/bundle` and

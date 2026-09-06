@@ -53,6 +53,14 @@ test-race:
 # Friendly explicit alias for the complete serialized race suite.
 test-full: test-race
 
+# Credential-free capacity-two/fault campaign. Fixtures include real sockets,
+# SQLite and local Git, not live model or hosted delivery evidence.
+.PHONY: test-concurrency
+test-concurrency:
+	@test "$$(uname -s)" = Darwin || { echo "Concurrency acceptance requires the supported macOS host" >&2; exit 2; }
+	go test -race -count=3 -shuffle=off -p 1 -timeout 15m ./internal/daemon ./internal/workflowruntime ./internal/worktreecoord ./internal/store ./internal/publication -run '^Test(ConcurrentCLIRunQueuesThirdWithoutDuplicatingStarts|ConcurrentTicketCapacitySurvivesTwoDaemonRestarts|RuntimePoolConcurrencyStress|SchedulerFourCallerConcurrencyStress|DaemonFactoryTwoWorkerPauseDrainsOnlyTargetAndResumeRearms|CLIRunRealDaemonLostResponseDoesNotDuplicateWork|EnsureExcludesActiveRepositoryCommandWriter|EnsureConcurrentCallersCreateExactlyOneWorktree|SeededLeaseAdmissionStress|RepositoryCommandAcquireRetriesOnlyDifferentActiveCommand|TerminalTicketCannotMintWritersAfterCapacityIsReassigned|SharedBaseMovementNeverPublishesStaleCandidateOnRetry|WorkerReconcilesLostCreateWithoutBlindReplay|WorkerKeepsUnprovenPushUncertainAfterLostCommandResult|RecoveredPublishingRuntimePublishesAfterTwoPrePublicationCrashes)$$'
+	go test -count=2 -shuffle=off -p 1 -timeout 15m -tags sf_e2e ./cmd/sf -run '^TestCompiledDevConcurrentTicketsReachIndependentPRs$$'
+
 test-integration:
 	go test -count=1 -shuffle=off -p 1 -timeout 30m ./cmd/sf ./internal/daemon ./internal/github ./internal/localruntime ./internal/publication ./internal/workflowruntime ./internal/workflowworker
 
