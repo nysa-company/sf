@@ -2,6 +2,30 @@
 
 ## Current truth
 
+- LIVE REARM BLOCK after validated prompt rollout: commit91a3632, bundle
+  `.context/onboarding6.qzmmk5/{bundle,installed}` manifest/verify/install/version
+  all pass (61286 exit0). Old isolated daemon35724 Ctrl-C exit0. New daemon
+  41299 LIVE, same durable HOME `.sf-beta.24jdFP`, same env as onboarding5;
+  normal qualification18606 exit0 independent Luna5.6/GPT5.5, leader3.
+  Normal `recover SF-bf816e --json` returned runtime_rearm_failed exit4.
+  IMPORTANT committed transition despite response attempted=false: ticket now
+  reviewingv10/r1, blocked_code retained review_needs_operator; runtime sealed
+  generation2 stop=authority=(v9,L3,R1). No fresh review/approval/merge.
+  Do not repeat recover blindly (only accepts blocked). Existing candidate
+  and PR unchanged; status runtime observations empty.
+  Read-only diagnosis: eventv9 typed_blocker reviewing->blocked; eventv10
+  operator_recover carries canonical sf.provider-blocked-recovery/v1 bridge
+  priorL2->L3, sameR1. Controller.Rearm dispatches Reviewing to
+  PostPublicationRearmProof, whose ordinary branch requires stop.runner>1
+  and pause/take->drained->resume triplet. This exact provider-blocked recovery
+  has neither; it is an authenticated distinct shape, not malformed data.
+  Existing validProviderBlockedRecoveryGap/validateProviderBlockedRecoveryAdvance
+  authenticate the shape, but rearm lacks composition. Next add a narrow real
+  Store/controller regression before repair; preserve sealed/drained counts,
+  exact event/phase/candidate/CI authority, and safe lost-response replay.
+  No production fix yet. CLI reports attempted=false and suggests recover
+  after committing reviewing: separate diagnostic/replay defect to cover.
+
 - PROMPT VALIDATION81372 TERMINAL exit0: full serialized Go suite (including
   workflowprompt regression), vet, repo-check, secret-scan, docs-smoke and
   diff-check all pass. Source unchanged during run; acceptance report updated
