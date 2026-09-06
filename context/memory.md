@@ -2,6 +2,81 @@
 
 ## Current truth
 
+- Python execution checkpoint: full validation27393 TERMINAL exit0. Fresh
+  `go test -p 2 -count=1 ./...`, `go vet ./...`, repo-check, secret-scan,
+  docs-smoke and working-tree artifact-check PASS. Explicit prepared fixture
+  variables enabled all eight Store Python cases, including restart and
+  ambiguous recovery (Store174.412s, supervisor66.227s). Six non-crash cases
+  separately passed race70276; restart pair passed count3 in68225.
+  Production Factory still does not compose PythonSnapshots: setup remains
+  unsupported, and these are not full Python workflow/delivery acceptance.
+  Next: bounded no-overwrite prepared-cache publication, verified provisioning,
+  then channel-root/doctor/init composition and compiled onboarding acceptance.
+  Preserve the pending exact-head human approval for external Go delivery;
+  do not treat the expired waiting-approval ticket as delivered. No live project,
+  daemon, installed runtime or remote changed. Disk last1.7GiB free.
+
+### Historical checkpoint notes
+
+The entries below describe earlier checkpoints, not current process status.
+The terminal validation and remaining work above supersede their pending notes.
+
+- Real Python executor-crash/reopen recovery now tested: executor is killed
+  after released launch; surviving child is drained by production Store/native
+  drainer; failed effect/no result/zero lease and recovery replay checked.
+  Ambiguous-drainer case retains quarantined lease, refuses a newly issued
+  current-leader competing writer, then exact native recovery clears it.
+  Native Darwin first drain can return ErrUnclear with group EPERM during exit;
+  tests now preserve quarantine and wait for independent ESRCH before explicit
+  retry (no production weakening). Repeated restart pair68225 PASS27.557s,
+  three repetitions. Earlier86654 PASS6.952s;44598/87795 exposed that transient.
+  Cleanup registered immediately after authenticated child capture.
+  Full74042 TERMINAL FAIL: Store compile saw new call before new helper file
+  entered its startup file inventory. Not a green run. Freeze Go source for
+  fresh full rerun27393 now active; do not add test files during an already-
+  started full build. Poll27393 before claiming completion or restarting it.
+
+- Six-case real Python Store race70276 TERMINAL PASS44.045s: pass/red/timeout/
+  post-launch cancel/aggregate quota/per-file SIGXFSZ. Corrected environment
+  9471ec...da78 with lock a9b45f...f428 now required for the fixture. Regression
+  fails before bootstrap fix and passes after; no pytest exception parsing is
+  used as authority. Fresh full normal/vet/repo/secret/docs/artifact74042 launched
+  with SF_TEST_PYTHON_* explicitly set, so its Python fixture will not skip.
+  Disk2.4GiB free; no cleanup/new installs performed. Goal remains active;
+  restart/ambiguity/provisioning/CLI Python workflow remain incomplete.
+
+- SIGXFSZ investigation confirmed/fixed: pre-fix real Store regression9870
+  failed as observed ExitCode1/EFBIG (ordinary red). Factory bootstrap now
+  restores signal.SIGXFSZ to SIG_DFL before pytest. New snapshot generated
+  without changing prior cache by .context/python-rebind-bootstrap.go;
+  authenticate-old -> copy -> new canonical bootstrap binding -> verify-new.
+  New env9471ec153b03a83367aadaeb830815a8d32f096509a7e33347c3b2c48802da78,
+  bootstrap aa3a660e211092f1cf3001d3b1c25c2b6d5fc24e3d4031bf783865cf6e9a0654,
+  same root/lock. Post-fix16545 PASS6.302s: filelimit is observed resource abort,
+  no reusable result and no lease residue. Whole six-case race newly launched;
+  no code checkpoint complete until broad normal/static checks. This is
+  trusted-repository behavior, not hostile Python signal-handler containment.
+
+- Prepared Python real Store/Executor/compiled-gate acceptance44150 PASS16.366s:
+  pass3.22s, red2.11s, timeout5.68s, aggregate quota2.07s. Abort rows have no
+  result and zero lease residue. Post-launch cancel4944 PASS6.595s (case3.68s).
+  Explicit test root .context/python-launch-snapshots, env digest
+  a9721c1ecd236cf5d323a496d9e459dd08ee0e88fcbf2a5fb0cb51d2d12fec13,
+  lock a9b45fd1379d4d31cd7765c0a8b53b547b42762ba359d6aaaf0af949e726f428.
+  Runtime copied from previously authenticated disposable Python3.13 snapshot;
+  no download/install/live project changes. Full test skips unless independently
+  supplied SF_TEST_PYTHON_SNAPSHOTS/DIGEST/LOCK; skip is not acceptance.
+  Typed exact policy and Supervisor dispatch now wired ONLY with explicit root;
+  production Factory leaves PythonSnapshots empty, setup remains unsupported.
+  Focused race43604 PASS policy1.398s/executor1.363s/supervisor2.788s. All new
+  launch/policy/Store acceptance changes uncommitted pending remaining faults.
+  Next important case VERIFIED: exact prepared Python -I/-S/-B reports
+  signal.getsignal(SIGXFSZ)==SIG_IGN. RLIMIT_FSIZE can become caught EFBIG/ordinary
+  red. Restore default SIGXFSZ in factory bootstrap before pytest, regenerate
+  expected bootstrap-bound environment (do not mutate an old prepared cache),
+  and add exact per-file-limit abort regression before resource acceptance.
+  Restart/ambiguous launch and provisioning remain unproven.
+
 - Validation97852 TERMINAL exit0: full normal Go, vet, repo/secret/docs/artifact
   checks PASS (Store139.706s, workflowruntime124.183s, worktreecoord137.618s).
   Resource retirement and bounded wait checkpoint can be committed; internal

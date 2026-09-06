@@ -174,7 +174,7 @@ func TestNPMRecipeNeverAcquiresRepositoryLease(t *testing.T) {
 	}
 }
 
-func TestNodeRecipeIsTheOnlyNonGoRepositoryPolicyAlternative(t *testing.T) {
+func TestNodeRecipeRemainsExact(t *testing.T) {
 	if _, err := executionpolicy.NewCommandSnapshot([]string{"node", "--test"}); err != nil {
 		t.Fatalf("exact Node recipe rejected: %v", err)
 	}

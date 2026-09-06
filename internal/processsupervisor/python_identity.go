@@ -11,8 +11,8 @@ import (
 
 // CommandExecutableIdentity shares the explicitly composed runtime view with
 // command execution. Existing Go/Node resolution is unchanged. Prepared Python
-// identity is content evidence only: Preflight still refuses Python until its
-// launch, sandbox and lease lifecycle integration is complete.
+// identity is content evidence only: execution also requires exact policy,
+// worktree, Store lease and sandbox authentication. Empty composition refuses.
 func (s RepositoryCommandSupervisor) CommandExecutableIdentity(ctx context.Context, argv []string) (string, string, error) {
 	if ctx == nil {
 		return "", "", ErrUnclear

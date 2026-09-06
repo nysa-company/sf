@@ -39,6 +39,7 @@ func ValidTestPath(value string) bool {
 const BootstrapSource = `"""SF prepared pytest entrypoint v1."""
 import os
 import pathlib
+import signal
 import sys
 
 if len(sys.argv) != 4:
@@ -53,6 +54,10 @@ if pathlib.Path(test).is_absolute() or ".." in pathlib.Path(test).parts:
 os.environ.pop("PYTEST_ADDOPTS", None)
 os.environ.pop("PYTEST_PLUGINS", None)
 os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+# CPython ignores SIGXFSZ on startup. Restore the kernel action so the
+# supervisor classifies a hard file-size stop as a resource abort, not pytest
+# red evidence caused by an EFBIG exception.
+signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
 sys.path[:0] = [dependencies, worktree]
 import pytest
 raise SystemExit(pytest.main([

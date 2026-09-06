@@ -78,6 +78,8 @@ func (s RepositoryCommandSupervisor) Preflight(spec contracts.CommandSpec) error
 	switch filepath.Base(spec.Argv[0]) {
 	case "go", "node":
 		return nil
+	case "python3":
+		return s.pythonPreflight(spec)
 	case "npm":
 		return ErrSubprocessRecipeUnsupported
 	default:
@@ -93,6 +95,9 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	}
 	if filepath.Base(spec.Argv[0]) == "node" {
 		return s.runNode(ctx, claim, spec, policy, lease)
+	}
+	if spec.Argv[0] == "python3" {
+		return s.runPython(ctx, claim, spec, policy, lease)
 	}
 	if lease == nil || spec.Profile != contracts.ProfileGuarded || len(spec.Argv) == 0 || spec.Directory != claim.Worktree || spec.Timeout <= 0 || spec.Timeout > 45*time.Minute || s.SoftDrain > 30*time.Second || s.HardDrain > 30*time.Second || policy.Authorize(spec.Argv) != nil || policy.Digest() != claim.PolicyDigest {
 		return contracts.CommandResult{}, ErrUnclear

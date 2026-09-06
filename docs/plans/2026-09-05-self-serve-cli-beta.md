@@ -71,7 +71,7 @@ This is not an unattended multi-platform stable-v1 delivery promise.
 
 ## Current checkpoint
 
-Python preparation is being implemented, not yet admitted as an SF recipe.
+Python preparation is being implemented, not yet available through project setup.
 The prepared-content manifest binds regular-file paths, modes, sizes and
 digests. The environment binding adds the selected executable, dependency
 snapshot, lock digest and factory-bootstrap digest, with strict canonical
@@ -80,9 +80,9 @@ publisher authentication or permission to execute. Focused race tests pass.
 A disposable Python 3.13/pytest sandbox probe passes seven tests, including
 project-write, network, subprocess and scratch-symlink escape refusal, with
 environment verification before and after execution. This probe does not
-exercise Store claims or production cancellation/restart. Shared runtime
-resolution, preparation UX, supervisor integration and lifecycle acceptance
-remain required before setup may report Python execution as supported.
+exercise Store claims or production cancellation/restart; those separate
+internal acceptance results are recorded below. Preparation UX and production
+composition remain required before setup may report Python execution supported.
 
 The shared materializer/supervisor identity resolver now supports an explicitly
 composed private prepared-Python directory, without ambient PATH/HOME fallback.
@@ -90,15 +90,31 @@ The typed pytest entrypoint disables plugin auto-discovery and project pytest
 configuration; it is a deliberately limited recipe, not arbitrary pytest argv.
 The production profile generator passes the disposable OS-backed fixture.
 Child-only hard limits cover per-file size, open descriptors and core dumps;
-they do not provide an aggregate scratch quota. Python policy admission remains
-disabled pending durable launch integration and cancel/restart tests. The
+they do not provide an aggregate scratch quota. The internal exact Python recipe
+now requires an explicitly composed prepared root; production composition still
+leaves it unavailable pending provisioning and lifecycle acceptance. The
 internal compiled gate now passes an OS-backed disposable pytest fixture and
 refuses EOF before release. A retained-descriptor scratch monitor enforces
 bounded observations (16 MiB per file, 128 MiB logical/allocated file bytes,
-4096 entries); it is not an atomic filesystem quota. These components are not
-yet wired into Store-backed Python execution. Resource-limit aborts must not
-become reusable failing-test evidence. No setup command currently installs
-this environment.
+4096 entries); it is not an atomic filesystem quota. Store-backed compiled-gate
+acceptance now passes with an explicitly supplied Python 3.13/pytest fixture:
+passing test, red assertion, timeout, post-launch cancellation, aggregate
+scratch abort, and per-file kernel limit. All six also pass under the race
+detector. The factory bootstrap restores SIGXFSZ's default action so CPython
+does not turn that limit into an ordinary EFBIG test failure. Abort cases
+retire without reusable test results; ordinary outcomes persist exact results.
+Separate executor-crash/reopened-Store cases pass three repetitions, including
+ambiguous-drain quarantine, competing-writer refusal, and exact recovery replay.
+Transient process-group ambiguity stays quarantined until disappearance is
+independently observed; the fixture explicitly retries recovery at that point.
+These fixtures do not prove provisioning, whole-daemon restart, CLI readiness,
+or Python workflow delivery. No setup command installs this environment yet.
+Fresh full normal Go tests (with the explicit prepared fixture), vet,
+repo-check, secret-scan, docs-smoke and artifact-check pass for this execution
+checkpoint. The next checkpoint is no-overwrite prepared-cache publication and
+verified provisioning, followed by channel-specific readiness and explicit init
+selection. Ordinary init remains network-free; preparation must not run project
+code, mutate a live ticket, or replace an executing snapshot.
 
 The candidate-bound decision picker now covers approval and rejection too.
 Omitted IDs in a terminal (or `--select`) show title/project/state, then fetch

@@ -70,6 +70,26 @@ func TestPreparedPythonIdentityUsesOnlyComposedRoot(t *testing.T) {
 	if launchPath != executable || launchDigest != got {
 		t.Fatal("launch and claim identity differ")
 	}
+	paths := PythonSandboxPaths{Runtime: filepath.Join(prepared, "runtime"), Dependencies: filepath.Join(prepared, "dependencies")}
+	if !pythonPreparedPathsMatch(handle, paths) {
+		t.Fatal("matching retained roots refused")
+	}
+	held := paths.Runtime + "-held"
+	if err := os.Rename(paths.Runtime, held); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(paths.Runtime, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if pythonPreparedPathsMatch(handle, paths) {
+		t.Fatal("replacement path authenticated as retained root")
+	}
+	if err := os.Remove(paths.Runtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(held, paths.Runtime); err != nil {
+		t.Fatal(err)
+	}
 	closed, finished, quarantined := 0, 0, 0
 	artifacts := &stagedNodeArtifacts{runtime: func() { closed++; handle.Close() }}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -83,9 +103,12 @@ func TestPreparedPythonIdentityUsesOnlyComposedRoot(t *testing.T) {
 	if closed != 1 || finished != 1 || handle.RuntimeFD() != -1 {
 		t.Fatal("proven drain did not release once")
 	}
-	// A content resolver is not an admission policy or interpreter qualifier.
-	if s.Preflight(contracts.CommandSpec{Argv: argv}) == nil || executionpolicy.EvaluateRepositoryCommand(argv).Allowed {
-		t.Fatal("identity enabled premature execution")
+	if pythonPreparedPathsMatch(handle, paths) {
+		t.Fatal("closed roots authenticated")
+	}
+	// The typed recipe is eligible only with explicit runtime composition.
+	if (RepositoryCommandSupervisor{}).Preflight(contracts.CommandSpec{Argv: argv}) == nil || !executionpolicy.EvaluateRepositoryCommand(argv).Allowed {
+		t.Fatal("prepared recipe lost its explicit composition requirement")
 	}
 	for _, other := range []string{"", t.TempDir(), root + "-missing"} {
 		if _, _, err := (RepositoryCommandSupervisor{PythonSnapshots: other}).CommandExecutableIdentity(t.Context(), argv); err == nil {
