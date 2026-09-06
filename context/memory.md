@@ -2,6 +2,24 @@
 
 ## Current truth
 
+- LOCAL CLI BETA ACCEPTANCE COMPLETE (2026-09-06): final licensed six-payload
+  bundle67867 EXIT0, sourceb79166a4ea965b70914b0c460d191aaefa53d769,
+  version0.1.0-dev.beta-check.2, `.context/beta-licensed.fC5WjT/bundle` and
+  `/installed/sf-dev`; manifest/verify/exclusive install/identity/LICENSE cmp
+  and release-build-smoke PASS. 15839 fullGo/bundle race/staticPASS;4537 explicit
+  Go/Node/TS + compiled guarded/manual/takeover/coexistence + Python cold/setup
+  workflowPASS;44741 eight explicit Python execution/crash casesPASS. All
+  test/build handles terminal. Fresh ticket remainsDONE18/r5 approvals1,
+  mergeintents1,leases0; no duplicate mutation or live DB/worktree surgery.
+  Complete requirement map and limitations are at top of acceptance report.
+  Source is now MIT licensed under authorized best judgment, notice included
+  in bundles. No public release/push, PATH/service install or live daemon
+  replacement. External3-user/10-ticket/10-minute targets remain unobserved;
+  no unassisted reliability claim; Rails/general NodeTS/Claude execution remain
+  unsupported, Python experimental/live-model unproved; third-party public
+  distribution review/signing still pending. Goal completion is local beta
+  implementation + requested acceptance/explicit limits, NOT stable/public v1.
+
 - LICENSE PACKAGING15839 EXIT0: bundle race6.948s, fullGo (compiledCLI90.115s,
   bundle4.781s, CLI4.478s, daemon21.717s, GitHub64.232s, supervisor65.058s,
   workflowruntime111.349s), vet/repo/secret/docs/artifact/diff PASS. No active

@@ -14,7 +14,7 @@ reported explicitly, as required by the objective.
 
 | Requirement | Inspected evidence and verdict |
 | --- | --- |
-| Verified install bundle | Clean commit `3f6179af181dd9b3f8f9f91d0d30ab5c6a189d0f`, version `0.1.0-dev.beta-check`; build, five-payload manifest, verification, exclusive installation and installed identity passed in 47718. Artifact root: `.context/beta-final.rYUXD6/{bundle,installed}`. Integrity is not publisher authentication. |
+| Verified install bundle | Clean commit `b79166a4ea965b70914b0c460d191aaefa53d769`, version `0.1.0-dev.beta-check.2`; build, six-payload manifest including LICENSE, verification, exclusive installation, installed identity, exact license copy and release-build smoke passed in 67867. Artifact root: `.context/beta-licensed.fC5WjT/{bundle,installed}`. Integrity is not publisher authentication. |
 | Discoverable help and complete quickstart | README links `docs/tutorials/first-ticket.md`, including prerequisites, actual support matrix, complete ticket, validation, run/watch and exact-head approval. CLI help/input-error tests and docs-smoke pass. |
 | Clean local onboarding | `TestCompiledDevOnboardingUsesPrivateHomeAndLocalCommands` builds helpers, proves non-mutating preview, registration replay, no stable/socket mutation, valid template, PTY preview/save/cancel and no implicit submission. Full Go run 41791 passed. Bundle tests additionally execute the installed copy and refuse inventory, ancestry, symlink and overwrite faults. |
 | Explicit stack/provider readiness | `TestInitCheckIsReadOnlyAndDoesNotClaimFullReadiness` and unsupported-stack cases distinguish local recipe from untested provider/publication readiness. Native Go, dependency-free Node and restricted TypeScript gate tests all executed and passed in 4537. Pinned Python cold preparation/init/workflow passed with explicit download opt-in. Rails, general dependency-bearing Node/TS, extra Python dependencies and actual Claude execution remain unsupported. |
@@ -40,10 +40,13 @@ notice. Current builds include it as a sixth authenticated payload; missing or
 changed notices refuse verification, and installation preserves the notice.
 Focused native bundle tests pass. Packaging validation 15839 passed bundle
 race, full Go, vet, repository/secret/docs/artifact and diff checks (exit 0).
-A replacement licensed bundle is next; the five-payload `3f6179a`
-receipt above describes the earlier internal artifact, not that replacement.
+A replacement licensed bundle passed build/verify/install and release-build
+smoke in 67867 (exit 0), as recorded in the requirement map. Its license hash is
+`fffa17f02b5aba29ecdc96e4336464417b5349a12b3cffe60e5339d9476623c8`.
+The five-payload `3f6179a` build in `.context/beta-final.rYUXD6` is an earlier
+internal artifact; use the licensed successor above for this checkpoint.
 Third-party notices and publisher authentication still need public-release
-review. No repository or release has been published by this work.
+review. Final validation published no public repository or release.
 The original lost-environment trial and all author repair interventions remain
 in the history below; do not remove them from future reliability reporting.
 
