@@ -2,6 +2,29 @@
 
 ## Current truth
 
+- VALIDATION41791 EXIT0: review diagnostic targeted race PASS; full Go PASS
+  (cmd/sf91.242s, daemon21.628s, processsupervisor66.210s, publication94.826s,
+  Store122.632s, workflowruntime111.856s, worktreecoord131.571s), vet,
+  repo-check/secret-scan/docs-smoke/diff PASS. Commit diagnostics checkpoint
+  then run explicit tagged compiled/isolation + Python acceptance next. The
+  diagnostic gap is implemented and validated, not rolled into the live daemon.
+
+- REVIEW DIAGNOSTICS IMPLEMENTED, VALIDATING: eight intended source/test/doc
+  files add a snapshot-scoped LatestReviewDiagnostic (newest attempt only,
+  immutable historical result authentication), bounded/redacted daemon
+  evidence.review_diagnostic and historical CLI rendering. Five findings max,
+  JSON512 runes/human160 with truncation; no raw artifact/transcript, no
+  transition/recovery authority changes. Store test covers missing, foreign
+  channel, leader change, failed latest and tampered result. Daemon/CLI tests
+  cover redaction, controls, bounds, historical labels and unavailable verdict.
+  Focused48885 EXIT0; targeted race in41791 PASS. Full validation41791 is LIVE
+  (go test -p1 ./... then vet/repo-check/secret-scan/docs-smoke/diff); cmd/sf
+  PASS91.242s, CLI PASS4.359s so far. Re-poll this exact handle, do not start a
+  competing suite. No commit yet and no installed/live daemon change. Earlier
+  focused test failed only fixture column attempt_id, fixed to provider_attempt_id.
+  Full objective audit still needs explicit skipped/tagged gate accounting
+  (Python test-python-e2e and compiled coexistence), not ordinary Go PASS alone.
+
 - BETA COMPLETION AUDIT 2026-09-06: fresh GitHub read confirms PR2 MERGED
   at f6e2afc; no repeated approval/mutation. Corrected stale terminal-pending
   summaries in the beta plan and acceptance report, preserving failed-trial

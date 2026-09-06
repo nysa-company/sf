@@ -58,6 +58,17 @@ is labelled `Recorded blocker`, not `Blocker`; it is diagnostic history and does
 not override the current state or authorize another recovery. JSON preserves
 the stored `blocked_code` field alongside `state`.
 
+Single-ticket status also shows `Recorded review` when the newest final-review
+attempt has an authenticated completed result. Its decision, reviewed head,
+source version and findings are historical provider evidence, not approval or
+instructions to execute. Findings are credential-redacted and terminal-control
+sanitized: JSON includes at most five 512-character summaries; human output
+shortens each to 160 characters and reports truncation. This is pattern-based
+redaction, not a guarantee that arbitrary source text contains no secrets.
+A newer failed/incomplete attempt suppresses older findings. Authentication
+failure reports the diagnostic unavailable without inferring a verdict or
+hiding the ticket's durable state. No raw transcript or artifact is displayed.
+
 `tickets` is a read-only list using the same status authority. It shows ticket
 IDs, titles, states, and available next actions; `--project` filters the list.
 `start`, `show`, `logs`, `pause`, `resume`, `recover`, `cancel`, `retry`, and

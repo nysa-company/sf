@@ -258,6 +258,11 @@ func renderOperator(writer io.Writer, operator map[string]any) error {
 }
 
 func renderEvidence(writer io.Writer, evidence map[string]any) error {
+	if review, ok := evidence["review_diagnostic"].(map[string]any); ok {
+		if err := renderReviewDiagnostic(writer, review); err != nil {
+			return err
+		}
+	}
 	if plan, ok := evidence["plan"].(map[string]any); ok {
 		parts := []string{}
 		for _, field := range []struct{ label, key string }{{"digest", "digest"}, {"proof", "proof_kind"}, {"acceptance", "acceptance_count"}, {"paths", "path_count"}, {"commands", "command_count"}, {"risks", "risk_count"}} {

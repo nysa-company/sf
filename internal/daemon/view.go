@@ -3,9 +3,12 @@ package daemon
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/redact"
 	"github.com/nysa-company/sf/internal/store"
 )
 
@@ -82,6 +85,14 @@ func (daemon *Daemon) evidenceView(ctx context.Context, ref domain.TicketRef) (m
 	}
 	view["phase_attempts"] = attemptViews
 	view["phase_attempts_truncated"] = truncatedAttempts
+	review, err := daemon.store.LatestReviewDiagnostic(ctx, ref)
+	if err == nil {
+		view["review_diagnostic"] = reviewDiagnosticView(review, daemon.projector.Policy)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		// Unavailable diagnostics must not hide the durable ticket state or
+		// display an older verdict as if it authenticated successfully.
+		view["review_diagnostic"] = map[string]any{"available": false, "error_code": evidenceErrorCode(err)}
+	}
 
 	decisions, err := daemon.store.OperatorDecisions(ctx, ref)
 	if err != nil {
@@ -102,6 +113,35 @@ func (daemon *Daemon) evidenceView(ctx context.Context, ref domain.TicketRef) (m
 	view["operator_decisions"] = decisionViews
 	view["operator_decisions_truncated"] = truncatedDecisions
 	return view, nil
+}
+
+func reviewDiagnosticView(value store.HistoricalReviewDiagnostic, policy redact.Policy) map[string]any {
+	const maxFindings = 5
+	findings := make([]string, 0, maxFindings)
+	truncated := len(value.Review.Findings) > maxFindings
+	for i, finding := range value.Review.Findings {
+		if i == maxFindings {
+			break
+		}
+		text := policy.String(finding)
+		text = strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+				return ' '
+			}
+			return r
+		}, text)
+		// Redact before truncation so a cut credential cannot evade matching.
+		runes := []rune(policy.String(text))
+		if len(runes) > 512 {
+			runes = runes[:512]
+			truncated = true
+		}
+		findings = append(findings, string(runes))
+	}
+	return map[string]any{"available": true, "historical": true,
+		"attempt": value.Attempt, "ticket_version": value.TicketVersion,
+		"decision": value.Review.Decision, "reviewed_head": value.Review.ReviewedHead,
+		"findings": findings, "truncated": truncated}
 }
 
 func timeView(value time.Time) string {

@@ -5,6 +5,23 @@ Status: partial beta acceptance. PR #2 is merged and its SF ticket is durably
 The executed-path notes below retain historical observations. The September 6
 checkpoint supersedes their earlier approval-pending and open-PR status.
 
+## Review diagnostic checkpoint
+
+Single-ticket status now projects the newest final-review attempt's
+authenticated immutable result as historical evidence, including its reviewed
+head, source version and bounded findings. It does not expose raw artifacts or
+transcripts or grant approval/recovery authority. Findings are redacted,
+terminal-control sanitized and truncated explicitly. A newer incomplete/failed
+attempt suppresses older findings; invalid evidence reports the diagnostic
+unavailable without hiding the durable ticket state.
+
+Focused Store/daemon/CLI tests and targeted race tests pass. Integrated
+validation 41791 completed with exit 0: full Go suite, vet, repo-check,
+secret-scan, docs-smoke and diff-check. This closes the source diagnostic gap
+observed during PR #2's final review. The installed acceptance daemon has not
+been replaced for this change. Tagged workflow/isolation and explicit prepared
+Python acceptance remain separately accounted gates, not implied by this run.
+
 ## September 6 durable-storage trial: delivered through repaired recovery
 
 At `2026-09-06T20:49:36Z`, the installed onboarding11 bundle (`5216d13`)
@@ -106,9 +123,9 @@ recovery-record negative pass race validation. Full validation passed
 (57535, exit 0): targeted race, full Go suite, repository and secret scans,
 and diff check. Real installed reconciliation remains pending.
 At that historical checkpoint terminal reconciliation was still pending; the
-September 6 durable-storage result above closes it. CLI status
-currently omits the review finding, requiring a read-only typed-result query;
-that operator-facing diagnostic gap remains work to do. Neither this repaired
+September 6 durable-storage result above closes it. At that checkpoint CLI
+status omitted the review finding, requiring a read-only typed-result query;
+the review diagnostic checkpoint above repairs that source gap. Neither this repaired
 trial nor the earlier failed persistence trial counts as unassisted acceptance.
 
 ## Post-reboot result: acceptance environment lost
