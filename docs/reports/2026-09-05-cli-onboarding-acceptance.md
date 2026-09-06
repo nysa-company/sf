@@ -1,7 +1,7 @@
 # CLI onboarding acceptance checkpoint
 
-Status: partial acceptance. The real change is merged on GitHub, but SF's
-terminal `done` reconciliation remains unproven; this is not a completed beta.
+Status: partial beta acceptance. PR #2 is merged and its SF ticket is durably
+`done`. This proves repaired delivery, not unassisted reliability or a completed beta.
 The executed-path notes below retain historical observations. The September 6
 checkpoint supersedes their earlier approval-pending and open-PR status.
 
@@ -105,7 +105,8 @@ reproduces that completion-reader failure. The targeted repair and missing
 recovery-record negative pass race validation. Full validation passed
 (57535, exit 0): targeted race, full Go suite, repository and secret scans,
 and diff check. Real installed reconciliation remains pending.
-Terminal reconciliation remains an acceptance requirement. CLI status
+At that historical checkpoint terminal reconciliation was still pending; the
+September 6 durable-storage result above closes it. CLI status
 currently omits the review finding, requiring a read-only typed-result query;
 that operator-facing diagnostic gap remains work to do. Neither this repaired
 trial nor the earlier failed persistence trial counts as unassisted acceptance.

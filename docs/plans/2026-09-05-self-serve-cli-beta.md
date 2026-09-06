@@ -176,7 +176,7 @@ Do not substitute one layer's green result for another layer's contract:
 | Python clean setup | Compiled private-HOME pinned preparation, init, replay and readiness plus full integrated validation pass | Preserve these checks when extending workflow coverage |
 | Python bounded execution and recovery | Real prepared runtime through Store/executor, including cancellation and reopened-Store recovery, passes | Preserve fault/recovery checks as workflow coverage expands |
 | Python workflow | Compiled CLI/daemon/Factory workflow, repeat runs and integrated validation pass with controlled provider/GitHub processes, real Python red-to-green commands, publication and terminal reconciliation | Live-provider delivery remains separate |
-| Fresh CLI delivery | Go acceptance PR 1 was human-approved at `ee35025e60092cfd25480121537acec4e4f33a1d` and merged by SF; merge commit `00860455167278a63b17ad40d5599b74aae5f636` | Terminal reconciliation is blocked by persistent cleanup quarantine; no database reset or expired-budget extension is permitted |
+| Fresh CLI delivery | PR #2 reached durable `done` v18/r5 on September 6 through the installed CLI; exact reviewed head `e9d40f0922130e72edc6d439f7ce6b78d71862bc`, merge `f6e2afc9117bf5b101742314ff9736335f417b0b`, one approval/merge intent and zero capacity leases | Delivery required factory repairs; preserve those interventions and PR #1's lost-environment failure. Unassisted reliability remains unproved |
 | External adoption | No unfamiliar-user observations | Report the three-user and ten-ticket targets as pending until observed |
 
 The Python composition fixture must use a disposable repository and Store, the
@@ -204,8 +204,8 @@ remain compatible. Older daemons refuse the new field instead of ignoring it.
 Full normal Go, vet, repository/secret/docs/artifact checks, full CLI race,
 focused daemon race, and compiled real-PTY confirmation/cancellation tests
 passed. The PTY test uses a private fake authority socket, not a live approval.
-The isolated Go acceptance ticket passed CI and was subsequently approved and
-merged. Terminal reconciliation remains pending. See the
+The second isolated Go acceptance ticket passed CI, was approved and merged,
+and reached durable `done` through repaired recovery. See the
 [acceptance report](../reports/2026-09-05-cli-onboarding-acceptance.md).
 
 Earlier checkpoint history follows; pending items below describe those earlier

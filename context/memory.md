@@ -2,6 +2,18 @@
 
 ## Current truth
 
+- BETA COMPLETION AUDIT 2026-09-06: fresh GitHub read confirms PR2 MERGED
+  at f6e2afc; no repeated approval/mutation. Corrected stale terminal-pending
+  summaries in the beta plan and acceptance report, preserving failed-trial
+  history. docs-smoke and diff-check PASS. Full goal remains active: next
+  concrete implementation gate is sanitized final-review findings in status.
+  Source inspection of daemon/view.go confirms it exposes phase outcome and
+  artifact counts, not the typed review finding. Use authenticated immutable
+  result readers, bounded/redacted text and historical labels; never raw model
+  output or a second lifecycle authority. Then finish current evidence audit
+  for installed onboarding, supported profiles, fault tests and explicit gaps.
+  No new runtime/model action or live project change in this audit.
+
 - REAL TERMINAL DELIVERY 2026-09-06T20:49:36Z: PR2 ticket
   SF-bf816eaad3a060153d28c99b3a3be7ef is durable DONE v18/r5. Installed
   onboarding11 `.context/onboarding11.1XBwtL/installed/sf-dev` at5216d13;
