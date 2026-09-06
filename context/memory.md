@@ -2,6 +2,17 @@
 
 ## Current truth
 
+- DURABLE TRIAL STARTED 2026-09-06T14:32:16Z: normal `run` submitted/started
+  `SF-bf816eaad3a060153d28c99b3a3be7ef`, onboarding-durable, planningv2/r1.
+  Ticket source `/Users/sofiagonzalez-2/Projects/.sf-beta.24jdFP/ticket.md`:
+  Count distinct nonempty values, explicit exact string semantics/no mutation,
+  4h/$20, guarded. Doctor initially failed only missing provider pair; ordinary
+  qualification71823 exit0 selected Luna5.6 Builder/GPT5.5 Reviewer independent,
+  no model call during qualification. Repeated doctor exit0 guarded_eligible.
+  Daemon35724 remains the exact installed onboarding5 process in durable HOME.
+  No approval exists for this new ticket/head. Old PR1 approval is not reusable.
+  Poll normal status/daemon, do not start duplicate ticket or reset budgets.
+
 - DURABLE ACCEPTANCE SETUP 2026-09-06: new owner-only HOME
   `/Users/sofiagonzalez-2/Projects/.sf-beta.24jdFP`; project at `project/` beneath
   it is a new clean clone of private `nysa-company/sf-cli-beta-acceptance-20260905`
