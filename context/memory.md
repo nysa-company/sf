@@ -2,6 +2,28 @@
 
 ## Current truth
 
+- Root cause CONFIRMED with env differential: same disposable proof binary
+  passes normal environment, fails env-i without TMPDIR with "runner execution
+  helper is unsafe", passes env-i + trusted per-user macOS TMPDIR. ghrunner
+  snapshotExecutable uses os.MkdirTemp and accepts sticky ancestors; Git
+  secureExecutableParents rejects all writable ancestors. Without TMPDIR,
+  gh snapshot under /private/tmp fails Git validation. Original daemon launch
+  env was author-provided scrubbed env; do not weaken Git check. Daemon36311
+  restarted with TMPDIR=/private/var/folders/01/fnjrykjs5k721nqj3wf04t3r0000gn/T,
+  requalified normal CLI; ticket now merging v14/r5 leader6.
+  SECOND BLOCKER: external_mutation_quarantine singleton cleanup_uncertain at
+  2026-09-06T07:03:36.433731Z was recorded during prior Ctrl-C shutdown. It
+  blocks Client.runWithHandoff before any gh call, so ObserveMergeIntent masks
+  it as external_merged. Read-only production-client diagnostic on copied
+  Store confirmed no runner invocation. There is no quarantine-clear API.
+  Do NOT delete the live row or bypass it. Source likely cancellation bug:
+  github.runWithHandoff calls runner.Cleanup(ctx) with already-canceled request
+  ctx; ghrunner boundedCleanupContext inherits cancellation, fails proof,
+  quarantines and Close returns runner already in use. Needs regression and
+  bounded independent cleanup context, plus safe recovery for existing latch.
+  .context/merge-observe-diagnostic.go and proof-fetch-diagnostic.go contain
+  repro harnesses, disposable copy only. Goal remains incomplete.
+
 - Reconciliation diagnosis checkpoint: daemon60628 deliberately stopped with
   Ctrl-C to stop repeated child-proof retries; terminal exit7 included context
   canceled / gh runner already in use. Do not treat it as still live. Live
