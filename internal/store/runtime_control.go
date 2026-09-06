@@ -873,7 +873,10 @@ func (s *Store) reviewCompletionRecoveryEndpoint(ctx context.Context, conn *sql.
 		}
 		resultLeader, resultRunner = recovery.LeaderEpoch, recovery.RunnerEpoch
 	}
-	if providerResultReachesHistoricalFence(ctx, conn, key, result, reviewVersion, domain.Fence{LeaderEpoch: resultLeader, RunnerEpoch: resultRunner}) != nil {
+	// This is the immutable review completion, not the current ticket. Later
+	// approval/merge recovery is authenticated by its caller; those later rows
+	// must not invalidate this already witnessed historical segment.
+	if validateRunnerRecoveryLedgerPrefix(ctx, conn, ref, result.Claim.ExpectedVersion, result.Claim.RunnerEpoch, result.Claim.LeaderEpoch, reviewVersion, resultRunner, resultLeader) != nil {
 		return normalRecoveryEndpoint{}, ErrPublicationEvidence
 	}
 	if err := validatePostPublicationEndpointAdvance(ctx, conn, ref, domain.StateReviewing,
@@ -2076,6 +2079,7 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 	defer g.unlock()
 	semanticResume := false
 	reviewBlockedResume := false
+	reviewBlockedMerge := false
 	controlledReconcile := false
 	semanticReconcile := false
 	controlledApprovalMerge := false
@@ -2100,6 +2104,15 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 		}
 		if !stopMatches {
 			return ErrStaleFence
+		}
+		if endpoint, matched, err := s.recoveredReviewMergeControlFrom(txCtx, conn, ref, control, proof.Ticket); err != nil {
+			return err
+		} else if matched {
+			if !latched || endpoint.leader != leader {
+				return ErrStaleFence
+			}
+			reviewBlockedMerge = true
+			return nil
 		}
 		if proof.Ticket.State == domain.StateReviewing && (stopped.State == "" || stopped.State == domain.StateBlocked) {
 			matched, matchErr := s.reviewBlockedRearmFrom(txCtx, conn, ref, control, proof.Ticket, leader)
@@ -2209,6 +2222,13 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 			}
 			return nil
 		}
+		if reviewBlockedMerge {
+			endpoint, matched, err := s.recoveredReviewMergeControlFrom(txCtx, conn, ref, control, proof.Ticket)
+			if err != nil || !matched || endpoint.leader != leader {
+				return ErrControlNotDrained
+			}
+			return s.authenticatePostPublicationMergeState(txCtx, conn, ref, proof.Ticket.Version, proof.Fence)
+		}
 		if semanticResume {
 			currentLeader, semanticErr := s.authenticatePostPublicationSemanticRetry(txCtx, conn, ref, control, proof.Ticket)
 			if semanticErr != nil || currentLeader != leader {
@@ -2263,6 +2283,54 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 	}
 	g.latch(ref, mutationRevocation{version: proof.Ticket.Version, leader: leader, runner: proof.Ticket.RunnerEpoch})
 	return &RuntimeRearmCapability{ref: ref, version: proof.Ticket.Version, fence: proof.Fence, issued: true}, nil
+}
+
+// recoveredReviewMergeControlFrom authenticates the retained review-block stop
+// after review_pass and approval have advanced its open runtime authority.
+// This is not a pause/resume triplet: each review recovery and both business
+// transitions must be proven before the old stop can authorize merge rearm.
+func (s *Store) recoveredReviewMergeControlFrom(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, control durableRuntimeControl, current Ticket) (normalRecoveryEndpoint, bool, error) {
+	if current.State != domain.StateMerging || control.stop.version < 2 || control.stop.version == ^uint64(0) {
+		return normalRecoveryEndpoint{}, false, nil
+	}
+	var count int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='typed_blocker' AND from_state='reviewing' AND to_state='blocked'`, ref.Channel, ref.Project, ref.Ticket, control.stop.version).Scan(&count); err != nil {
+		return normalRecoveryEndpoint{}, false, err
+	}
+	if count == 0 {
+		return normalRecoveryEndpoint{}, false, nil
+	}
+	fail := func() (normalRecoveryEndpoint, bool, error) {
+		return normalRecoveryEndpoint{}, true, ErrPublicationEvidence
+	}
+	if count != 1 || control.state != "sealed" || control.generation == 0 || control.stop.runner == 0 || control.stop.leader == 0 {
+		return fail()
+	}
+	prior, err := providerBlockedEndpointLeader(ctx, conn, ref, domain.PhaseReview, control.stop.version-1, control.stop.runner)
+	if err != nil || !validProviderBlockedRecoveryGap(ctx, conn, ref, control.stop.version-1, control.stop.runner, prior, control.stop.version+1, control.stop.runner, control.stop.leader) {
+		return fail()
+	}
+	waiting, err := s.finalReviewRecoveryEndpoint(ctx, conn, ref, domain.StateWaitingApproval)
+	if err != nil || waiting.version <= control.stop.version+1 {
+		return fail()
+	}
+	if err := validateRunnerRecoveryLedgerPrefix(ctx, conn, ref, control.stop.version+1, control.stop.runner, control.stop.leader, waiting.version-1, waiting.runner, waiting.leader); err != nil {
+		return fail()
+	}
+	approval, err := s.approvalRecoveryEndpoint(ctx, conn, ref)
+	if err != nil {
+		return fail()
+	}
+	authority := normalRecoveryEndpoint{version: control.authority.version, runner: control.authority.runner, leader: control.authority.leader}
+	leader, err := normalRecoveryLeaderAt(ctx, conn, ref, approval, authority.version, authority.runner)
+	if err != nil || leader != authority.leader {
+		return fail()
+	}
+	leader, err = normalRecoveryLeaderAt(ctx, conn, ref, authority, current.Version, current.RunnerEpoch)
+	if err != nil {
+		return fail()
+	}
+	return normalRecoveryEndpoint{version: current.Version, runner: current.RunnerEpoch, leader: leader}, true, nil
 }
 
 // reviewBlockedRearmFrom recognizes only the sealed typed-provider recovery,

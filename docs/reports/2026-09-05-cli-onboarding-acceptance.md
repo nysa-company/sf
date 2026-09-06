@@ -5,7 +5,7 @@ terminal `done` reconciliation remains unproven; this is not a completed beta.
 The executed-path notes below retain historical observations. The September 6
 checkpoint supersedes their earlier approval-pending and open-PR status.
 
-## September 6 durable-storage trial: awaiting human approval
+## September 6 durable-storage trial: merged, reconciliation incomplete
 
 A separately identified trial uses an owner-private directory under `Projects`,
 not temporary storage. Installed onboarding5 registered `onboarding-durable`;
@@ -133,7 +133,7 @@ verdict is below; fixture success does not prove live delivery.
 | Human decision | Decision picker tests bind confirmation to the displayed full head. The user approved the real ticket's exact head, and SF recorded the approval; see September 6 below. |
 | Python workflow and faults | Real interpreter execution, Store/executor cancellation/recovery and compiled workflow fixtures pass as described below and in the beta plan. Controlled model/GitHub fixtures are not live-model delivery. |
 | Isolation and capacity | Existing channel-coexistence and capacity suites remain required. The Python extension does not change their production settings or replace those tests with its single-ticket fixture. |
-| Fresh delivered ticket | GitHub delivery proved by the September 6 merge. Terminal CLI acceptance is incomplete: cleanup quarantine prevents local reconciliation to `done`. |
+| Fresh delivered ticket | Both real PR merges are verified. The earlier PR #1 trial lost its temporary environment; PR #2 uses durable storage but currently needs the authenticated review-control recovery repair before SF can reach `done`. Neither failure is omitted from acceptance. |
 | External beta | Three unfamiliar users and the ten-ticket reliability target remain unobserved; no success rate or onboarding-time claim. |
 
 ## Executed path

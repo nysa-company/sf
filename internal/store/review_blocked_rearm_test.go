@@ -272,8 +272,66 @@ func TestReviewBlockedRecoveryRearmsExactSealedEndpoint(t *testing.T) {
 				t.Fatalf("completion reader: %+v %v", endpoint, completionErr)
 			}
 			if scenario == 3 {
-				// An old pass is not enough: the immutable recovery bridge is
-				// mandatory. Simulate durable corruption in this disposable DB.
+				// Exercise the complete post-review merge/restart authority.
+				if _, err := db.ApplyOperatorDecision(ctx, OperatorDecisionRequest{OperatorDecision: OperatorDecision{Ref: fixture.ticket.Ref, ExpectedVersion: waiting.Version, Fence: fence, ReviewedHead: fixture.candidate.Snapshot.HeadSHA, OperatorUID: 701, Decision: "approved"}}); err != nil {
+					t.Fatal(err)
+				}
+				merging, err := db.Ticket(ctx, fixture.ticket.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fixture.db = db
+				bindTerminalMergeEffect(t, db, fixture, merging, fence, "recovered-review-merge")
+				var path string
+				if err := db.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				db, err = Open(ctx, path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				fence.LeaderEpoch, err = db.AcquireLeader(ctx, domain.ChannelDev, "after-confirmed-merge")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if changed, err := db.FenceRecoveredRunners(ctx, domain.ChannelDev, fence.LeaderEpoch); err != nil || changed != 1 {
+					t.Fatalf("recover merged review: %d %v", changed, err)
+				}
+				current, err := db.Ticket(ctx, fixture.ticket.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fence.RunnerEpoch = current.RunnerEpoch
+				if _, err := db.db.ExecContext(ctx, `UPDATE runtime_ticket_controls SET stop_leader_epoch=stop_leader_epoch+1 WHERE ticket_id=?`, fixture.ticket.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.PostPublicationRearmProof(ctx, fixture.ticket.Ref, stopped); err == nil {
+					t.Fatal("tampered review stop rearmed merge")
+				}
+				if _, err := db.db.ExecContext(ctx, `UPDATE runtime_ticket_controls SET stop_leader_epoch=stop_leader_epoch-1 WHERE ticket_id=?`, fixture.ticket.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+				capability, err := db.PostPublicationRearmProof(ctx, fixture.ticket.Ref, stopped)
+				if err != nil {
+					t.Fatalf("rearm recovered merge: %v", err)
+				}
+				if err := db.ActivateRearm(ctx, capability, func(c *RuntimeAdmissionCapability) error {
+					_, _, _, ok := c.ConsumeRuntimeAdmission()
+					if !ok {
+						t.Fatal("missing merge admission")
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.openRuntimeAdmission(ctx, fixture.ticket.Ref, current.Version, fence); err != nil {
+					t.Fatal(err)
+				}
+				// An old pass is insufficient without the immutable recovery bridge.
 				if _, err := db.db.ExecContext(ctx, `DROP TRIGGER runner_recovery_ledger_immutable_delete`); err != nil {
 					t.Fatal(err)
 				}

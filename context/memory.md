@@ -2,6 +2,41 @@
 
 ## Current truth
 
+- VALIDATION38718 EXIT0: targeted race35.539s; fullGo PASS (Store222.815s,
+  compiledCLI212.577s, publication200.971s), repo-check/secret-scan/diff PASS.
+  Commit review-control merge recovery and build onboarding11 next. Isolated
+  daemon is still stopped; existing merged PR2 needs ordinary startup/rearm.
+
+- MERGE CONTROL REPAIR VALIDATING38718: source-only helper
+  recoveredReviewMergeControlFrom recognizes retained typed review-block stop
+  only for merging; authenticates blocked recovery, review ledger prefix,
+  immutable review completion, exact approval and authority/current endpoints.
+  Startup still checks normal merge intent/effect predecessor; PostPublication
+  rearm repeats proof under sealed/drained authority and merge evidence.
+  Completion reader now authenticates historical prefix (later merge recovery
+  is checked by callers), instead of rejecting legitimate later ledger rows.
+  Extended real Store fixture includes approval, terminal merge effect/proof,
+  close/reopen/Fence and ActivateRearm/openRuntimeAdmission. RED6183 startup,
+  RED26968 historical reader after merge fence, GREEN81477 all4 scenarios.
+  Added tampered stop leader and missing review recovery negatives; diagnostics
+  removed. 38718 LIVE: targeted race then fullGo/repo/secret/diff. No rollout,
+  daemon remains stopped after onboarding10 startup refusal. No live SQL edits.
+
+- ONBOARDING10 ROLLOUT: committed d191b75ae9e6377fac49ff6ae0fb10d6c103db8d.
+  Build/manifest/verify/install/version20250 EXIT0, installed at
+  `.context/onboarding10.vdzluo/installed/sf-dev`. Old daemon4460 Ctrl-C clean
+  EXIT0. New daemon76305 EXIT7 before socket: invalidate recovered runners:
+  ErrPublicationEvidence. Do NOT repeat startup blindly. Isolated daemon is
+  currently STOPPED, PR2 remains merged. No direct DB edits.
+  Read-only diagnostic28406 proves the repaired approval and confirmed-merge
+  endpoints now both authenticate v15/r4/L6; normalPostPublicationRecoveryPredecessor
+  returns L6,true,nil. But postPublicationRecoveryBaseline returns error first,
+  so lease.go:737-741 never reaches the valid normal predecessor. Old review
+  control row remains after review_pass/approval; investigate exact control
+  shape authentication, not a blanket swallow/reorder of malformed evidence.
+  Temporary diagnostic removed. Next add regression for full recovered-review
+  pass -> approval -> confirmed merge -> reopen/Fence, then scoped repair.
+
 - VALIDATION57535 EXIT0: recovered-review regression race28.589s, full Go
   suite PASS (Store264.445s, Git359.465s, compiled CLI228.460s), repo-check,
   secret-scan and diff-check PASS. Commit recovered-review completion repair
