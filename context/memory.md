@@ -2,6 +2,27 @@
 
 ## Current truth
 
+- Follow-up source audit: ObserveMergeIntent combines viewNumber error with
+  nonmatching merged identity and maps both to ErrExternalMerged. This hides
+  ErrProcessCleanup before any GitHub call when the durable quarantine is set.
+  Next isolated regression should require preserving the original read error,
+  while retaining ErrExternalMerged for an actually observed identity mismatch.
+  Full validation43135 exited 0: all Go packages, vet, repo-check,
+  secret-scan, docs-smoke and diff-check PASS. External quarantine schema has only reason/timestamp, no
+  process or boot identity; prevention is not authority to clear legacy rows.
+
+- Cancellation cleanup VERIFIED:
+  internal/github/cleanup_cancel_test.go reproduced ErrProcessCleanup when
+  Run cancels the request before Cleanup; red2828. github.go now invokes
+  Cleanup with context.WithTimeout(context.WithoutCancel(ctx),5s), leaving
+  Run and subsequent commands canceled. Focused new/contradictory/quarantine
+  tests28312 PASS; full github+ghrunner48002 PASS63.144s/12.556s. New test is
+  included with this checkpoint. Broad validation43135 exited 0 (Go ./...,
+  vet,repo-check,secret-scan,docs-smoke,diff-check). Existing live quarantine remains
+  untouched and unresolved; this prevention fix cannot retroactively prove
+  the old child drained. Daemon36311 last live, leader6, already quarantined;
+  do not requalify/restart repeatedly. Goal not complete.
+
 - Root cause CONFIRMED with env differential: same disposable proof binary
   passes normal environment, fails env-i without TMPDIR with "runner execution
   helper is unsafe", passes env-i + trusted per-user macOS TMPDIR. ghrunner

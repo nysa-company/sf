@@ -2066,7 +2066,14 @@ func (c Client) runWithHandoff(ctx context.Context, handedOff *bool, args ...str
 		if errors.Is(runErr, ErrRunnerBusy) {
 			return nil, runErr
 		}
-		proof, cleanupErr := c.runner.Cleanup(ctx)
+		// A cancelled request still owes an OS-backed drain proof. Reusing its
+		// cancelled context can turn an ordinary shutdown into a permanent
+		// cleanup quarantine without allowing the runner to inspect its child.
+		// Detach cancellation only for this bounded cleanup, never for Run or
+		// for any subsequent external command.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		proof, cleanupErr := c.runner.Cleanup(cleanupCtx)
+		cleanupCancel()
 		if cleanupErr != nil || !proof.valid() || errors.Is(runErr, ErrProcessCleanup) {
 			return nil, c.quarantineCleanup()
 		}

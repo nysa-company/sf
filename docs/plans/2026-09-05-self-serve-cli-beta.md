@@ -143,7 +143,7 @@ Do not substitute one layer's green result for another layer's contract:
 | Python clean setup | Compiled private-HOME pinned preparation, init, replay and readiness plus full integrated validation pass | Preserve these checks when extending workflow coverage |
 | Python bounded execution and recovery | Real prepared runtime through Store/executor, including cancellation and reopened-Store recovery, passes | Preserve fault/recovery checks as workflow coverage expands |
 | Python workflow | Compiled CLI/daemon/Factory workflow, repeat runs and integrated validation pass with controlled provider/GitHub processes, real Python red-to-green commands, publication and terminal reconciliation | Live-provider delivery remains separate |
-| Fresh CLI delivery | Go acceptance PR 1 remains open/draft at `ee35025e60092cfd25480121537acec4e4f33a1d` on the latest read-only check | Exact-head human decision, merge and terminal reconciliation; expired budget must not be silently extended |
+| Fresh CLI delivery | Go acceptance PR 1 was human-approved at `ee35025e60092cfd25480121537acec4e4f33a1d` and merged by SF; merge commit `00860455167278a63b17ad40d5599b74aae5f636` | Terminal reconciliation is blocked by persistent cleanup quarantine; no database reset or expired-budget extension is permitted |
 | External adoption | No unfamiliar-user observations | Report the three-user and ten-ticket targets as pending until observed |
 
 The Python composition fixture must use a disposable repository and Store, the
@@ -171,8 +171,8 @@ remain compatible. Older daemons refuse the new field instead of ignoring it.
 Full normal Go, vet, repository/secret/docs/artifact checks, full CLI race,
 focused daemon race, and compiled real-PTY confirmation/cancellation tests
 passed. The PTY test uses a private fake authority socket, not a live approval.
-The isolated Go acceptance ticket has reached waiting_approval with passing CI;
-human approval, merge, and terminal reconciliation remain pending. See the
+The isolated Go acceptance ticket passed CI and was subsequently approved and
+merged. Terminal reconciliation remains pending. See the
 [acceptance report](../reports/2026-09-05-cli-onboarding-acceptance.md).
 
 Earlier checkpoint history follows; pending items below describe those earlier

@@ -164,3 +164,28 @@ the mutation boundary. Checkout authentication and protected remote lookup
 therefore passed in that probe; no fetch was permitted by the stub. The
 subsequent local proof failure remains under investigation. Do not count the
 ticket as `done`, or this run as intervention-free, until Store confirms it.
+
+### Diagnosed launch and shutdown failures
+
+The protected-ref proof succeeded in a disposable checkout with both a test
+lease and the real launch recorder backed by a copied Store. The same binary
+failed under the daemon's manually scrubbed environment without `TMPDIR`,
+then passed when the trusted macOS per-user temp directory was supplied.
+The GitHub runner's snapshot can be placed beneath sticky `/private/tmp`,
+but Git's executable-parent validation rejects that shared writable ancestor.
+This is a composition/readiness mismatch, not a reason to relax validation.
+
+Stopping the retrying daemon during a GitHub check then recorded persistent
+`cleanup_uncertain` quarantine. A regression reproduced that a canceled
+request context was passed into cleanup, preventing a drain proof even when
+the runner could supply one. A bounded independent cleanup-context fix passes
+focused GitHub and real-process runner suites. Full serialized Go tests, vet,
+repository checks, secret scan, docs smoke and diff checks passed (session
+43135, terminal exit 0).
+The original command is still canceled, and uncertain cleanup still refuses.
+
+The existing quarantine is preserved. There is currently no supported command
+to clear this GitHub cleanup latch after independently proving recovery.
+The generic ticket recovery command must not be presented as such a command.
+This missing recovery mechanism and the ticket's nonterminal state remain
+acceptance blockers; passing prevention tests do not resolve old evidence.
