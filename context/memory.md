@@ -2,6 +2,19 @@
 
 ## Current truth
 
+- DURABLE ACCEPTANCE SETUP 2026-09-06: new owner-only HOME
+  `/Users/sofiagonzalez-2/Projects/.sf-beta.24jdFP`; project at `project/` beneath
+  it is a new clean clone of private `nysa-company/sf-cli-beta-acceptance-20260905`
+  main at 0086045. Remote PR1 freshly confirmed merged; no remote writes.
+  onboarding5 bundle reverified, installed version/source exact. Normal init
+  registered `onboarding-durable`. Daemon session43061 status leader1/tickets0,
+  Ctrl-C exit0; restarted session35724 now active, status leader2/tickets0,
+  projects1/quarantine0. This is clean daemon restart evidence, NOT an OS-reboot
+  test or delivery. Same env as saved handoff except HOME above (no /private/tmp).
+  Next: normal doctor/qualification, then separately tracked bounded acceptance
+  ticket through CLI. Old backup/trial remain untouched and are not repaired by
+  this new registration. Do not reuse old trial's approval for a new head.
+
 - POST-REBOOT 2026-09-06: original `/private/tmp/sf-onboarding-acceptance.R2QvPm`
   is gone. OS boot differs from checkpoint. Private DB backup quick_check=ok;
   quarantine1/checkpoint1/recoveries0 and mergingv15/r6 preserved. Installed
