@@ -579,6 +579,17 @@ func (a *app) daemonCommand() *cobra.Command {
 	root.AddCommand(&cobra.Command{Use: "status", Short: "read local daemon status", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		return a.emit(a.request("daemon.status", "", params(map[string]any{}, a.channel)))
 	}})
+	cleanup := &cobra.Command{Use: "cleanup", Short: "checkpoint and recover quarantined GitHub processes after a host reboot", Args: cobra.NoArgs}
+	for _, operation := range []struct{ name, description string }{
+		{"prepare", "record a same-host recovery checkpoint without clearing quarantine"},
+		{"recover", "retire checkpointed quarantine only after a verified host reboot"},
+	} {
+		operation := operation
+		cleanup.AddCommand(&cobra.Command{Use: operation.name, Short: operation.description, Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+			return a.emit(a.request("daemon.cleanup."+operation.name, "", params(map[string]any{}, a.channel)))
+		}})
+	}
+	root.AddCommand(cleanup)
 	return root
 }
 

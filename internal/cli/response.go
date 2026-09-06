@@ -33,8 +33,10 @@ func exitCode(response api.Response) ExitCode {
 	switch response.Error.Code {
 	case "unsupported_runtime":
 		return ExitCompatibility
-	case "runtime_preparation_failed", "runtime_cache_unverified":
+	case "runtime_preparation_failed", "runtime_cache_unverified", "host_reboot_required", "host_identity_unavailable":
 		return ExitAction
+	case "external_cleanup_recovery_refused":
+		return ExitPolicy
 	case "invalid_command", "invalid_request", "invalid_ticket", "invalid_argument", "invalid_repository", "invalid_configuration", "invalid_control", "invalid_ticket_reference", "invalid_submit", "invalid_logs", "wrong_channel", "ticket_not_found", "invalid_resume", "invalid_retry", "invalid_recover", "invalid_decision":
 		return ExitInput
 	case "operator_action_required", "operator_identity_required", "provider_auth_missing", "provider_unavailable", "auth_login_failed", "blocked_process", "uncertain_effect", "external_merge_observed", "invalid_transition", "control_drain_failed", "control_completion_failed", "not_configured", "not_ready", "doctor_not_configured", "doctor_failed", "project_conflict", "init_failed", "config_apply_failed", "unknown_project", "doctor_required", "start_refused", "submit_refused", "terminal_replay_requires_new", "runtime_activation_failed", "runtime_already_active", "runtime_rearm_unavailable", "retry_required", "retry_not_available", "retry_transition_refused", "provider_retry_exhausted", "provider_retry_resubmit_required", "provider_retry_worktree_unready", "provider_retry_rearm_blocked", "recover_mode_refused", "recover_transition_refused", "resume_transition_refused", "decision_refused", "approval_head_changed", "runtime_retirement_failed", "source_commit_required", "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "postbuild_command_failed", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable":

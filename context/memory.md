@@ -2,6 +2,126 @@
 
 ## Current truth
 
+- FINAL50924 TERMINAL exit0: targeted recovery/CLI/hostidentity race tests,
+  full `go test -p 1 ./...`, vet, repo-check, secret-scan (617 commits/no leaks),
+  docs-smoke and diff-check all PASS. No Go source changed during this run.
+  Recovery+diagnostics source is ready to commit and package as a new private
+  dev bundle. No live checkpoint/migration/quarantine retirement or host reboot
+  performed. Acceptance PR is merged but ticket is not `done`; next real steps
+  are validated isolated bundle, ordinary daemon startup, checkpoint prepare,
+  MANUAL host reboot, then ordinary cleanup recover + exact reconciliation.
+
+- FINAL-TREE validation SESSION50924 is running: targeted -race for hostidentity,
+  Store/daemon cleanup and CLI exit classification, then `go test -p 1 ./...`,
+  vet/repo-check/secret-scan/docs-smoke/diff-check. Hostidentity race passed
+  1.397s, Store22.909s, daemon16.642s and CLI1.629s all PASS. The chained full
+  normal suite is now running. Source is frozen. Poll50924; do not start
+  another suite. No terminal final-tree verdict yet.
+
+- Frozen recovery validation94280 TERMINAL exit0: all Go packages, vet,
+  repo-check, secret-scan (617 commits/no leaks), docs-smoke, diff-check PASS.
+  Follow-up CLI-only exit classification regression60834 RED: new recovery
+  errors incorrectly defaulted to7. Explicit reboot/host-inspection action3
+  and evidence-refusal policy5 mappings now implemented; native CLI/daemon
+  regression30742 PASS (0.488s/1.318s), including exact same-boot exit3.
+  No recovery authority rules changed in this follow-up. Final-tree focused
+  race and integrated validation are next; do not claim those already passed.
+  No live daemon/DB/quarantine changes, no host reboot, no remote writes.
+
+- Read-only review during frozen94280 found a remaining CLI classification
+  defect: response.go has no cases for host_reboot_required,
+  host_identity_unavailable, external_cleanup_recovery_refused, so all default
+  to ExitInternal7. After94280 is terminal, add table regressions + explicit
+  action3/action3/policy5 mappings, assert exact same-boot CLI exit3, and run
+  focused then final-tree validation. Do not edit Go while94280 is active.
+
+- Fresh frozen-tree integrated validation SESSION94280 recovered from this
+  thread's own tool transcript; write_stdin successfully resumes it. CLI,
+  daemon/runtimecontrol, bundle, ghrunner and Git (214.659s) have passed so far;
+  full command is still running, not a terminal pass. Continue polling94280.
+  No new suite launched and no Go source changed during this run.
+
+- Fresh frozen-tree integrated validation is CONFIRMED LIVE: shell PID12241,
+  Go PID12248; last native process inspection shows git.test PID38727 running
+  under that Go parent. Command is full serialized Go ./... then vet,
+  repo-check, secret-scan, docs-smoke and diff-check. Tool session ID was lost
+  when previous output was truncated; no terminal result is available yet.
+  Do not duplicate the suite or infer success from elapsed time. No Go source
+  changed after launch. Acceptance report's top evidence map now correctly
+  distinguishes verified GitHub merge from still-unproven local `done`;
+  earlier approval-pending narrative is explicitly historical.
+
+- CLI/daemon cleanup composition IMPLEMENTED, still uncommitted. New commands
+  daemon cleanup prepare/recover via owner-authenticated socket, exact channel,
+  no caller host fields; runtime close serialization + Store current leader.
+  Prepare replay reports observed; same-boot recover requires host reboot.
+  Native real daemon/CLI tests60564 PASS (daemon1.239s/CLI0.650s/Store1.351s),
+  lost response + restart53939 PASS1.376s. Held-gate same-boot regression44558
+  RED (timeout hid reboot requirement); inspection-before-gate plus full
+  revalidation-under-gate55678 PASS Store1.425s/daemon1.325s. Missing channel
+  leader now maps ErrStaleFence rather than no-quarantine; final focused69177
+  PASS1.444s. Held-gate test deadlines raised to1s for host-load tolerance,
+  no timing-success assertion changed. Docs include manual reboot sequence; no host reboot,
+  live checkpoint, live schema migration or quarantine retirement performed.
+  Broad78125 TERMINAL exit1 (Store build file-list mismatch after in-flight
+  additions), not valid final coverage. Source must now freeze for fresh full
+  validation. No other test remains after69177. No remote updates authorized.
+
+- Full78125 INVALIDATED by concurrent source additions: old Go file enumeration
+  omitted new external_cleanup_recovery.go while seeing schema dispatch58,
+  producing undefined migrationV58 in Store. This is NOT a full pass. Focused
+  fresh invocation30530/56244 compiles/passes new Store code. Remaining old
+  workflow fixtures are draining naturally (go PID66142/shell66139 observed);
+  do not restart another broad suite or claim old run validates V58. Finish
+  composition, then freeze source for a fresh full run. Prior full43135 and
+  committed cancellation0598b6f remain valid. Lesson: new files + schema wire
+  cannot be edited during go test package discovery/build; earlier packages
+  may compile from different source lists. No daemon was signalled/stopped.
+
+- V58 recovery Store foundation UNCOMMITTED: new external_cleanup_recovery.go
+  and tests; schemaVersion/checksum/dispatch/testMigration wired to58; required
+  columns and immutable checkpoint/recovery triggers. Prepare obtains OS
+  identity and records exact quarantine without taking/unlocking latched gate.
+  Recover obtains OS identity, acquires mutation gate, validates current daemon
+  leader plus canonical checkpoint, requires same machine/different boot,
+  atomically appends audit + CAS deletes exact quarantine. Effects untouched.
+  Focused new tests30530 PASS1.667s + hostidentity0.419s; expanded changed-row
+  and rollback tests56244 PASS1.855s. No CLI/daemon wiring or live migration yet.
+  Worktree-creation schema test now compares schemaVersion instead of hardcoded57.
+  Full78125 predates V58 source: it is NOT final-tree coverage for this foundation;
+  let it terminate, then run new full validation after composition. No public
+  API accepts caller-supplied host identity; only private test helpers do so.
+  Remaining: daemon/CLI checkpoint + recover surface, reopen/replay integration,
+  integrated tests, new isolated dev bundle, then real checkpoint/host reboot
+  prerequisite (never reboot automatically) and exact merge reconciliation.
+
+- Recovery foundation added (UNTRACKED internal/hostidentity, not yet wired):
+  fixed /usr/sbin/ioreg + kern.bootsessionuuid; hashed platform UUID, 64KiB
+  output cap, 5s context plus bounded pipe wait, no inherited environment/raw
+  identifier output. Isolated native test52691 PASS0.653s; duplicate malformed-key
+  hardening rerun1800 PASS0.881s. No Store/CLI recovery capability yet.
+  Plan records exact-quarantine checkpoint now -> different boot on SAME host
+  before retirement. This handles legacy missing identity without guessing:
+  checkpoint never clears, unknown old writers cannot survive later reboot.
+  No automatic reboot authorized/performed. Need immutable Store checkpoint,
+  same-host/changed-boot/current-authority/CAS/gate tests and CLI composition.
+  Full78125 still tests diagnostics; it started before new package existed, so
+  do not claim its package enumeration covers hostidentity. Native reader has
+  separate focused evidence only. No live state changed.
+
+- Cancellation prevention committed as 0598b6f after full43135 exit0.
+  Follow-up diagnostics are implemented but UNCOMMITTED: ObserveMergeIntent
+  preserves viewNumber errors (red48867, green6780); doctor adds read-only
+  external_mutation_recovery as a mandatory guarded-readiness check. New
+  tests cover clear/quarantined/unavailable/unconfigured inspection and a real
+  Store latch remaining unchanged. Initial doctor fixture omissions corrected;
+  sandbox-only Unix bind failures40922 reran on host2056 PASS (CLI1.953s,
+  GitHub0.607s). Broad final-tree validation78125 is RUNNING; poll exact session,
+  do not start a second suite. Include untracked merge_observation_error_test.go
+  when committing. No live daemon, DB, quarantine, worktree or remote changed.
+  Remaining acceptance blocker is safe recovery of existing external quarantine,
+  not another merge approval. Goal stays active, ticket not yet done.
+
 - Follow-up source audit: ObserveMergeIntent combines viewNumber error with
   nonmatching merged identity and maps both to ErrExternalMerged. This hides
   ErrProcessCleanup before any GitHub call when the durable quarantine is set.

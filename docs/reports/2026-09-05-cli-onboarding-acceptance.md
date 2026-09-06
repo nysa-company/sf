@@ -1,6 +1,9 @@
 # CLI onboarding acceptance checkpoint
 
-Status: partial acceptance, not a completed beta or delivered-ticket verdict.
+Status: partial acceptance. The real change is merged on GitHub, but SF's
+terminal `done` reconciliation remains unproven; this is not a completed beta.
+The executed-path notes below retain historical observations. The September 6
+checkpoint supersedes their earlier approval-pending and open-PR status.
 
 ## Requirement evidence map
 
@@ -13,10 +16,10 @@ verdict is below; fixture success does not prove live delivery.
 | Clean local onboarding | `TestCompiledDevOnboardingUsesPrivateHomeAndLocalCommands` uses the full helper bundle, isolated HOME, real registration/replay and no stable-channel writes. It deliberately does not launch a provider. |
 | Explicit stack readiness | `TestInitCheckExplainsUnsupportedStacksWithoutRunningThem` refuses unprepared Python, Rails and dependency-bearing Node before writes/execution. Prepared Python has separate compiled acceptance; refusal is not language support. |
 | Ticket selection and run/watch | CLI selection tests cover exact resolved identity, ambiguity, stale state and terminal-control sanitization; run tests cover submit/start/watch, replay and uncertain mutation refusal. Real-PTY tests exercise the interactive path separately. |
-| Human decision | Decision picker tests bind confirmation to the displayed full head. The real ticket below still has no human approval. |
+| Human decision | Decision picker tests bind confirmation to the displayed full head. The user approved the real ticket's exact head, and SF recorded the approval; see September 6 below. |
 | Python workflow and faults | Real interpreter execution, Store/executor cancellation/recovery and compiled workflow fixtures pass as described below and in the beta plan. Controlled model/GitHub fixtures are not live-model delivery. |
 | Isolation and capacity | Existing channel-coexistence and capacity suites remain required. The Python extension does not change their production settings or replace those tests with its single-ticket fixture. |
-| Fresh delivered ticket | Not proved: the real acceptance PR is open/draft, unmerged at the observed head. |
+| Fresh delivered ticket | GitHub delivery proved by the September 6 merge. Terminal CLI acceptance is incomplete: cleanup quarantine prevents local reconciliation to `done`. |
 | External beta | Three unfamiliar users and the ten-ticket reliability target remain unobserved; no success rate or onboarding-time claim. |
 
 ## Executed path
@@ -184,8 +187,13 @@ repository checks, secret scan, docs smoke and diff checks passed (session
 43135, terminal exit 0).
 The original command is still canceled, and uncertain cleanup still refuses.
 
-The existing quarantine is preserved. There is currently no supported command
-to clear this GitHub cleanup latch after independently proving recovery.
-The generic ticket recovery command must not be presented as such a command.
-This missing recovery mechanism and the ticket's nonterminal state remain
-acceptance blockers; passing prevention tests do not resolve old evidence.
+The existing quarantine is preserved. The installed acceptance binary has no
+supported command to clear this latch. New source adds explicit host-checkpoint
+and post-reboot recovery commands through Store. Focused CLI/daemon/Store tests,
+targeted race tests, full Go tests, vet, repository/secret/docs checks and diff
+checks pass on the final source (session 50924, exit 0). Reboot and host-inspection
+requirements return operator-action exit 3; rejected recovery evidence returns
+policy exit 5, with regression coverage. Real recovery is still pending.
+The generic ticket recovery command is not a substitute for that host proof.
+The ticket's nonterminal state remains an acceptance blocker; passing
+prevention or simulated-reboot tests does not resolve the live evidence.

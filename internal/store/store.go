@@ -81,7 +81,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 57
+const schemaVersion = 58
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -141,6 +141,7 @@ var migrationChecksums = map[int]string{
 	55: migrationChecksum(migrationV55),
 	56: migrationChecksum(migrationV56),
 	57: migrationChecksum(migrationV57),
+	58: migrationChecksum(migrationV58),
 }
 
 func migrationChecksum(statements []string) string {
@@ -567,6 +568,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV56
 			} else if version == 57 {
 				statements = migrationV57
+			} else if version == 58 {
+				statements = migrationV58
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {

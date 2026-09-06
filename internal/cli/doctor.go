@@ -87,6 +87,9 @@ type DoctorDeps struct {
 	AuthStatus func(context.Context) []localauth.Status
 	Pair       func(context.Context, domain.Channel) (store.ProviderPair, error)
 	Attempts   func(context.Context, domain.Channel) ([]store.ProviderAttempt, error)
+	// ExternalQuarantine inspects the channel database's durable GitHub
+	// cleanup latch. This read never clears or repairs it.
+	ExternalQuarantine func(context.Context) (bool, error)
 	// DaemonStatus is an optional read-only protocol handshake. It is called
 	// only when the socket passed the filesystem checks, so a fresh install
 	// remains usable without a running daemon.
@@ -164,6 +167,14 @@ func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
 		defer database.Close()
 		return database.ActiveProviderAttempts(ctx, selected)
 	}
+	deps.ExternalQuarantine = func(ctx context.Context) (bool, error) {
+		database, err := store.OpenReadOnly(ctx, databasePath)
+		if err != nil {
+			return false, err
+		}
+		defer database.Close()
+		return database.ExternalMutationsQuarantined(ctx)
+	}
 	deps.DaemonStatus = func(ctx context.Context, paths config.ChannelPaths) error {
 		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -239,11 +250,26 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	report.Checks = append(report.Checks, checkExecutable(deps, "gh", "gh executable is available"))
 	pair, pairAvailable := checkProviderPair(ctx, deps, &report)
 	checkQuarantinedProviders(ctx, deps, &report)
+	checkExternalQuarantine(ctx, deps, &report)
 	checkAuthentication(ctx, deps, pair, pairAvailable, &report)
 	report.GuardedEligible = pairAvailable && guardedEligibilityChecksPass(report)
 	report.Checks = append(report.Checks, DoctorCheck{ID: "container_runtime", Status: CheckNotRun, Summary: "Docker and Colima are not required"})
 	report.Checks = append(report.Checks, DoctorCheck{ID: "autonomous_mode", Status: CheckPass, Summary: "autonomous mode is disabled by policy"})
 	return report
+}
+
+func checkExternalQuarantine(ctx context.Context, deps DoctorDeps, report *DoctorReport) {
+	check := DoctorCheck{ID: "external_mutation_recovery", Status: CheckNotRun, Summary: "external process cleanup quarantine could not be inspected"}
+	if deps.ExternalQuarantine != nil {
+		quarantined, err := deps.ExternalQuarantine(ctx)
+		if err == nil && quarantined {
+			check = failedCheck("external_mutation_recovery", "GitHub commands are blocked by persistent process-cleanup quarantine; prepare a host recovery checkpoint, then reboot before recovery; no automatic clear is performed", deps.Binary, "daemon", "cleanup", "prepare")
+		} else if err == nil {
+			check.Status = CheckPass
+			check.Summary = "no persistent external process cleanup quarantine was found"
+		}
+	}
+	report.Checks = append(report.Checks, check)
 }
 
 func checkQuarantinedProviders(ctx context.Context, deps DoctorDeps, report *DoctorReport) {
@@ -343,7 +369,7 @@ func doctorQualification(role string, value store.ProviderQualification) DoctorP
 }
 
 func guardedEligibilityChecksPass(report DoctorReport) bool {
-	mandatory := []string{"channel_root", "disk_space", "git_executable", "gh_executable", "authority_database", "provider_recovery", "authentication", "provider_pair", "github_auth", "builder_auth", "reviewer_auth"}
+	mandatory := []string{"channel_root", "disk_space", "git_executable", "gh_executable", "authority_database", "provider_recovery", "external_mutation_recovery", "authentication", "provider_pair", "github_auth", "builder_auth", "reviewer_auth"}
 	for _, check := range report.Checks {
 		if check.ID == "repository_recipe" && check.Status != CheckNotRun {
 			mandatory = append(mandatory, check.ID)

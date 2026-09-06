@@ -17,7 +17,7 @@ func TestV57GitMutationLeaseObservationOnlyColumn(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 57 {
+	if err := db.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != schemaVersion {
 		t.Fatalf("schema version=%d err=%v", version, err)
 	}
 	var ddl sql.NullString

@@ -327,6 +327,8 @@ func TestLifecycleVerbsForwardTheirMethodsChannelAndOperator(t *testing.T) {
 		{name: "reject", args: []string{"reject", "SF-1", "--operator", "sofia", "--reason", "needs tests"}, method: "ticket.reject", ticket: "SF-1"},
 		{name: "providers qualify", args: []string{"providers", "qualify", "--builder", "cursor", "--reviewer", "claude"}, method: "provider.qualify"},
 		{name: "daemon status", args: []string{"daemon", "status"}, method: "daemon.status"},
+		{name: "cleanup prepare", args: []string{"daemon", "cleanup", "prepare"}, method: "daemon.cleanup.prepare"},
+		{name: "cleanup recover", args: []string{"daemon", "cleanup", "recover"}, method: "daemon.cleanup.recover"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

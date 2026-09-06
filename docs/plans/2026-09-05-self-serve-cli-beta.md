@@ -10,8 +10,10 @@ A developer unfamiliar with SF can install a macOS beta, add a supported
 trusted project, submit and run a ticket, understand waits, and approve the
 exact reviewed head without help from the author or database/worktree surgery.
 Support must be explicit for each provider and stack; authentication support
-alone is not a qualified execution adapter. Python, Rails, and general
-dependency-bearing Node/TypeScript are expansion work, not current capabilities.
+alone is not a qualified execution adapter. Python is limited to the explicit
+experimental pinned profile described below. Additional Python dependencies,
+Rails, and general dependency-bearing Node/TypeScript remain expansion work,
+not current capabilities.
 
 ## Sequence
 
@@ -61,6 +63,35 @@ dependency-bearing Node/TypeScript are expansion work, not current capabilities.
 - Reliability target: ten preselected small tickets, >=9 delivered without
   code/DB/worktree repair and with intended approvals only; zero leaked writers,
   duplicate mutations, or safety violations. Do not hide failed trials.
+
+### External-cleanup recovery checkpoint
+
+The real acceptance run exposed a persistent GitHub cleanup quarantine with
+no recorded process/boot identity. Prevention and diagnostic fixes cannot
+retroactively prove its process drained. Recovery must not delete that row
+because a PR merged, a process is absent, a timeout elapsed, or tests passed.
+
+The recovery implementation binds an immutable checkpoint to the
+exact existing quarantine, a hashed OS machine identity, and the current OS
+boot-session UUID while leaving the gate sealed. A later recovery may retire
+that exact quarantine only after observing a different boot on the same
+machine, under current daemon/Store authority and mutation serialization.
+Missing/malformed checkpoint, same boot, different machine, changed quarantine,
+stale authority, and ambiguous evidence must refuse. The audit history remains;
+uncertain effects still require normal remote reconciliation. Never reboot
+the operator's host automatically or claim that a daemon restart proves drain.
+
+The bounded macOS identity reader has isolated native tests. Store checkpoint
+and retirement APIs and append-only v58 audit tables are implemented; focused
+tests cover replay, same-boot/different-host/stale-authority refusal, mutation
+serialization, changed quarantine, tamper, and atomic rollback. Production
+Store APIs obtain OS identity themselves, never from caller-supplied evidence.
+CLI/daemon composition is implemented as `daemon cleanup prepare` and
+`daemon cleanup recover`. Focused owner/channel/caller-evidence, checkpoint
+replay, and same-boot daemon-restart tests pass. Targeted race tests, the full
+Go suite, vet, repository/secret/docs checks and diff checks pass on the final
+source (session 50924, exit 0). Real post-reboot acceptance remains incomplete. No live
+quarantine has been checkpointed or retired by this implementation work.
 
 ## Estimate and constraints
 

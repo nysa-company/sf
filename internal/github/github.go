@@ -1790,7 +1790,12 @@ func (c Client) ObserveMergeIntent(ctx context.Context, intent domain.MergeInten
 	}
 	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: intent.RepositoryHost, Owner: intent.RepositoryOwner, Name: intent.RepositoryName}, Number: intent.PullRequestNumber, HeadOwner: intent.HeadOwner, HeadRepository: intent.HeadRepository, HeadRef: intent.HeadRef, HeadOID: intent.HeadOID, BaseRef: intent.BaseRef, FactoryOwned: true}
 	observed, err := c.viewNumber(ctx, identity.Repository, identity.Number)
-	if err != nil || !observed.Merged || !sameMergeIdentity(observed.Identity, identity) || observed.Identity.HeadOID != intent.HeadOID || observed.Identity.BaseRef != intent.BaseRef || observed.MergeCommit == "" {
+	if err != nil {
+		// A failed read supplies no evidence about who merged the PR. Keep
+		// cleanup and transport failures actionable without confirming a merge.
+		return "", err
+	}
+	if !observed.Merged || !sameMergeIdentity(observed.Identity, identity) || observed.Identity.HeadOID != intent.HeadOID || observed.Identity.BaseRef != intent.BaseRef || observed.MergeCommit == "" {
 		return "", ErrExternalMerged
 	}
 	if err := c.reconcileStrictMerge(ctx, observed.Identity, intent.HeadOID, intent.OriginalBaseOID, intent); err != nil {

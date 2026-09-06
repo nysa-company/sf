@@ -109,6 +109,65 @@ func TestDoctorGuardedEligibilityRejectsQuarantinedProvider(t *testing.T) {
 	}
 }
 
+func TestDoctorExternalQuarantineReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		probe    func(context.Context) (bool, error)
+		status   CheckStatus
+		eligible bool
+	}{
+		{"clear", func(context.Context) (bool, error) { return false, nil }, CheckPass, true},
+		{"quarantined", func(context.Context) (bool, error) { return true, nil }, CheckFail, false},
+		{"unreadable", func(context.Context) (bool, error) { return false, errors.New("sensitive diagnostic") }, CheckNotRun, false},
+		{"not configured", nil, CheckNotRun, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := healthyDoctorDeps(t)
+			deps.Pair = func(context.Context, domain.Channel) (store.ProviderPair, error) { return qualifiedDoctorPair(), nil }
+			deps.AuthStatus = completeDoctorAuth
+			deps.Attempts = func(context.Context, domain.Channel) ([]store.ProviderAttempt, error) { return nil, nil }
+			deps.ExternalQuarantine = tc.probe
+			report := RunDoctor(context.Background(), deps)
+			check := doctorCheckByID(t, report, "external_mutation_recovery")
+			if check.Status != tc.status || report.GuardedEligible != tc.eligible || strings.Contains(check.Summary, "sensitive diagnostic") {
+				t.Fatalf("check=%+v eligible=%v", check, report.GuardedEligible)
+			}
+		})
+	}
+}
+
+func TestProductionDoctorReadsPersistentExternalQuarantine(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	deps := productionDoctorDeps(domain.ChannelDev, "")
+	ctx := context.Background()
+	if err := os.MkdirAll(filepath.Dir(deps.Paths.Database), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(ctx, deps.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if quarantined, err := deps.ExternalQuarantine(ctx); err != nil || quarantined {
+		t.Fatalf("initial quarantine=%v err=%v", quarantined, err)
+	}
+	if err := database.QuarantineExternalMutations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if quarantined, err := deps.ExternalQuarantine(ctx); err != nil || !quarantined {
+			t.Fatalf("persistent quarantine=%v err=%v", quarantined, err)
+		}
+	}
+	if quarantined, err := database.ExternalMutationsQuarantined(ctx); err != nil || !quarantined {
+		t.Fatalf("doctor changed quarantine=%v err=%v", quarantined, err)
+	}
+}
+
 func TestDoctorGuardedEligibilityRejectsDuplicateAuthenticationInventory(t *testing.T) {
 	deps := healthyDoctorDeps(t)
 	deps.Pair = func(context.Context, domain.Channel) (store.ProviderPair, error) { return qualifiedDoctorPair(), nil }
@@ -493,11 +552,12 @@ func healthyDoctorDeps(t *testing.T) DoctorDeps {
 		t.Fatal(err)
 	}
 	return DoctorDeps{
-		Channel: domain.ChannelDev,
-		Binary:  "sf-dev",
-		Paths:   config.ChannelPaths{Root: root, Socket: filepath.Join(root, "missing.sock")},
-		Lookup:  func(string) (string, error) { return "/bin/tool", nil },
-		StatFS:  func(string) (*syscall.Statfs_t, error) { return &syscall.Statfs_t{Bavail: 100_000, Bsize: 4096}, nil },
+		ExternalQuarantine: func(context.Context) (bool, error) { return false, nil },
+		Channel:            domain.ChannelDev,
+		Binary:             "sf-dev",
+		Paths:              config.ChannelPaths{Root: root, Socket: filepath.Join(root, "missing.sock")},
+		Lookup:             func(string) (string, error) { return "/bin/tool", nil },
+		StatFS:             func(string) (*syscall.Statfs_t, error) { return &syscall.Statfs_t{Bavail: 100_000, Bsize: 4096}, nil },
 		Pair: func(context.Context, domain.Channel) (store.ProviderPair, error) {
 			return store.ProviderPair{}, store.ErrNotFound
 		},

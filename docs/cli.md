@@ -37,6 +37,8 @@ sf take <ticket> --operator <identity>
 sf approve <ticket> --operator <identity> [--head <full-reviewed-commit>]
 sf reject <ticket> --operator <identity> --reason <text> [--head <full-reviewed-commit>]
 sf doctor [--repo <path>]
+sf daemon cleanup prepare
+sf daemon cleanup recover
 ```
 
 Use `--head` with the full lowercase 40- or 64-character commit ID you inspected
@@ -227,6 +229,12 @@ its stored configuration. A refused preview prevents a green guarded
 eligibility report. The report explicitly labels its scope: host/provider
 qualification and optional recipe preview are not ticket execution or merge
 approval, and do not certify the runtime dependency/executable launch checks.
+Doctor also reads the channel database's persistent external-process cleanup
+quarantine. A quarantine, unavailable database, or unconfigured inspection
+prevents a green guarded-eligibility report. The `external_mutation_recovery`
+check does not clear the latch. Its next action prepares a host-recovery
+checkpoint without reopening the gate. Repeated ticket `recover` calls or
+daemon restarts are not proof that the previous process drained.
 When an owner-only socket exists it also performs a
 read-only `daemon.status` handshake. A missing socket points to `daemon run`;
 a present but unhealthy socket points to `daemon status`, so Doctor does not
@@ -245,6 +253,33 @@ exact local `Logged in using ChatGPT` subscription status, binds that bounded
 mode into the supervisor attestation, and performs no model call. API-key,
 metered, and unknown login statuses fail before an invocation; tokens remain
 observability while the trusted incremental subscription charge is zero.
+
+### Recovering external-process cleanup quarantine
+
+Use the same channel executable and HOME/database throughout. For development,
+replace `sf` with `sf-dev`. These commands require the owner-only daemon socket;
+they do not accept caller-provided machine or boot identities.
+
+1. Run `sf daemon cleanup prepare` while the quarantined daemon is available.
+   This records an immutable checkpoint for that exact quarantine and leaves
+   the gate sealed. Repeating it returns the same checkpoint.
+2. Save your work, stop the foreground daemon normally, and reboot the host
+   when safe. SF never initiates this reboot. A daemon-only restart is not
+   sufficient; copying the database to another machine does not qualify.
+3. Start the same channel daemon, then run `sf daemon cleanup recover`.
+   Recovery requires an OS-observed different boot on the same checkpointed
+   machine and current daemon authority. Missing, changed or malformed
+   evidence refuses without clearing quarantine.
+4. Inspect `sf status` and `sf doctor`. Follow any provider-qualification
+   prerequisite shown by the daemon. Recovery does not confirm a merge or
+   retry an uncertain mutation; normal exact remote reconciliation still runs.
+
+The checkpoint and retirement audit remain in SQLite. This procedure is only
+for the persistent GitHub cleanup latch; it does not clear provider or
+repository-command leases, discard worktrees, or bypass ticket controls.
+It assumes the database has remained on the host where the quarantine arose.
+Moving an uncheckpointed legacy database to another machine is unsupported:
+rebooting that other machine cannot prove the original host's processes died.
 
 `daemon run` is the foreground entry point for development and tests (for
 example, `sf-dev daemon run`). Its socket-backed lifecycle commands use the

@@ -822,6 +822,8 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 		response = daemon.operatorDecision(ctx, request, identity, "rejected")
 	case "daemon.status":
 		response = daemon.status(request, identity)
+	case "daemon.cleanup.prepare", "daemon.cleanup.recover":
+		response = daemon.externalCleanupRecovery(ctx, request)
 	case "provider.qualify":
 		response = daemon.qualifyProvider(ctx, request)
 	default:
