@@ -2,6 +2,17 @@
 
 ## Current truth
 
+- DURABLE TRIAL REVIEW BLOCK 2026-09-06T14:37:06Z: final reviewer completed
+  attempt1 with needs_operator/operator. Ticket now blockedv9/r1,
+  resume=reviewing, code review_needs_operator. Typed review finding says its
+  shell tool was rejected by read-only sandbox/current approval policy, so it
+  could not inspect candidate files. This is provider-reported evidence, not
+  yet a confirmed root cause. CLI show/status omit the finding (only blocker
+  and completed phase), so a read-only typed_artifact query was needed.
+  Next investigate actual read-only Codex tool composition without weakening
+  sandbox or overriding review. No review pass/approval/merge should be claimed.
+  Candidate remains e9d40f0..., draft PR2/CI green; no model retry or state repair.
+
 - DURABLE TRIAL PROGRESS 2026-09-06T14:37Z: ticket SF-bf816e... reached
   reviewingv8/r1; planning, verification, build all completed attempt1 with
   Luna/GPT5.5/Luna. Candidate e9d40f0922130e72edc6d439f7ce6b78d71862bc.
