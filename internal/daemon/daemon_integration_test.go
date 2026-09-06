@@ -77,6 +77,15 @@ type retryRuntimeController struct {
 	providerRearms int
 }
 
+type reviewRecoveryController struct {
+	testRuntimeController
+	rearm func(context.Context, domain.TicketRef) error
+}
+
+func (c reviewRecoveryController) Rearm(ctx context.Context, ref domain.TicketRef) error {
+	return c.rearm(ctx, ref)
+}
+
 func (controller *takeoverRuntimeController) InspectTakeover(context.Context, domain.TicketRef) (contracts.TakeoverInspection, error) {
 	return controller.inspection, controller.inspectErr
 }
@@ -562,9 +571,23 @@ func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain
 		t.Fatal(err)
 	}
 	fence.RunnerEpoch = ticket.RunnerEpoch
-	reviewed := launch(domain.PhaseReview, "reviewer", daemonFixtureBinding(reviewer), []byte(fmt.Sprintf(`{"schema":"sf.reviewer/v1","decision":"pass","repair_owner":"","findings":[],"reviewed_head":"%s","proof_digest":"%s"}`, candidate.Snapshot.HeadSHA, candidate.Snapshot.ProofDigest)), phaseartifact.Validation{TicketType: ticket.Type, ExpectedReviewedHead: candidate.Snapshot.HeadSHA, ExpectedProofDigest: candidate.Snapshot.ProofDigest}, candidate.Snapshot.HeadSHA, candidate.Snapshot.ProofDigest)
+	reviewDecision := `"decision":"pass","repair_owner":"","findings":[]`
+	if stopAt == domain.StateBlocked {
+		reviewDecision = `"decision":"needs_operator","repair_owner":"operator","findings":["inspection unavailable"]`
+	}
+	reviewed := launch(domain.PhaseReview, "reviewer", daemonFixtureBinding(reviewer), []byte(fmt.Sprintf(`{"schema":"sf.reviewer/v1",%s,"reviewed_head":"%s","proof_digest":"%s"}`, reviewDecision, candidate.Snapshot.HeadSHA, candidate.Snapshot.ProofDigest)), phaseartifact.Validation{TicketType: ticket.Type, ExpectedReviewedHead: candidate.Snapshot.HeadSHA, ExpectedProofDigest: candidate.Snapshot.ProofDigest}, candidate.Snapshot.HeadSHA, candidate.Snapshot.ProofDigest)
 	if reviewed.ID == 0 {
 		t.Fatal("final review did not create a provider attempt")
+	}
+	if stopAt == domain.StateBlocked {
+		if _, err := daemon.store.TransitionReviewNeedsOperator(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StateReviewing, To: domain.StateBlocked, ResumeState: domain.StateReviewing, Trigger: "typed_blocker", Fence: fence, EventPayload: `{"code":"review_needs_operator"}`}); err != nil {
+			t.Fatal(err)
+		}
+		current, err := daemon.store.Ticket(ctx, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return current
 	}
 	if _, err := daemon.store.TransitionFinalReview(ctx, store.Transition{Ref: ref, ExpectedVersion: ticket.Version, From: domain.StateReviewing, To: domain.StateWaitingApproval, Trigger: "review_pass", Fence: fence, EventPayload: "{}"}); err != nil {
 		t.Fatal(err)
@@ -2068,6 +2091,63 @@ func TestDaemonRecoverUsesTypedBlockerAndGuardedNarrowing(t *testing.T) {
 	current, err := d.store.Ticket(ctx, ref)
 	if err != nil || current.State != domain.StateBuilding || current.MergeMode != domain.MergeGuarded {
 		t.Fatalf("guarded current=%+v err=%v", current, err)
+	}
+}
+
+func TestDaemonReviewRecoverRetriesOnlyCommittedSealedHandoff(t *testing.T) {
+	d, _, _ := testDaemonForChannelWithProjectMaximum(t, domain.ChannelStable, domain.MergeGuarded)
+	ticket := prepareDaemonGuardedLifecycle(t, d, "SF-review-recover-replay", domain.StateBlocked)
+	drains, rearms := 0, 0
+	d.control = reviewRecoveryController{
+		testRuntimeController: testRuntimeController{drain: func(ctx context.Context, ref domain.TicketRef) (bool, error) {
+			drains++
+			if err := d.store.SealRuntimeControl(ctx, ref); err != nil {
+				return false, err
+			}
+			proof, err := d.store.ControlProof(ctx, ref)
+			return proof.Drained(), err
+		}},
+		rearm: func(ctx context.Context, ref domain.TicketRef) error {
+			rearms++
+			if rearms == 1 {
+				return errors.New("simulated lost installation")
+			}
+			stopped, err := d.store.StoppedRuntimeTicket(ctx, ref)
+			if err != nil {
+				return err
+			}
+			capability, err := d.store.PostPublicationRearmProof(ctx, ref, stopped)
+			if err != nil {
+				return err
+			}
+			return d.store.ActivateRearm(ctx, capability, func(admission *store.RuntimeAdmissionCapability) error {
+				_, _, _, ok := admission.ConsumeRuntimeAdmission()
+				if !ok {
+					return errors.New("admission refused")
+				}
+				return nil
+			})
+		},
+	}
+	first := daemonControl(d, ticket.Ref.Ticket, "recover")
+	if first.OK || first.Error == nil || first.Error.Code != "runtime_rearm_failed" || !first.Mutation.Attempted || !first.Mutation.Observed {
+		t.Fatalf("committed failure misreported: %+v", first)
+	}
+	current, err := d.store.Ticket(t.Context(), ticket.Ref)
+	if err != nil || current.State != domain.StateReviewing || current.Version != ticket.Version+1 {
+		t.Fatalf("committed endpoint: %+v %v", current, err)
+	}
+	second := daemonControl(d, ticket.Ref.Ticket, "recover")
+	if !second.OK || second.Mutation.Attempted || !second.Mutation.Observed || drains != 1 || rearms != 2 {
+		t.Fatalf("recovery replay: %+v drains=%d rearms=%d", second, drains, rearms)
+	}
+	third := daemonControl(d, ticket.Ref.Ticket, "recover")
+	if third.OK || drains != 1 || rearms != 2 {
+		t.Fatalf("armed recovery reexecuted: %+v", third)
+	}
+	current, err = d.store.Ticket(t.Context(), ticket.Ref)
+	if err != nil || current.Version != ticket.Version+1 {
+		t.Fatalf("duplicate transition: %+v %v", current, err)
 	}
 }
 

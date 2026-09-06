@@ -1840,6 +1840,26 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if err != nil || authority.Candidate.Snapshot != candidate.Snapshot || authority.Verification.Revision.IntentDigest != candidate.Snapshot.VerificationIntentDigest || authority.Verification.Revision.ProofDigest != candidate.Snapshot.ProofDigest {
 		return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
 	}
+	// A needs-operator verdict consumed by an authenticated blocked/recover
+	// pair is historical evidence, not a verdict for the recovered invocation.
+	// The source/result and complete live CI/recovery chain were authenticated
+	// above. Returning absence does not grant admission or reset attempt budgets;
+	// BeginProviderAttempt still enforces both at the current fence.
+	if result.Parsed.Reviewer.Decision == phaseartifact.ReviewNeedsOperator {
+		var consumed int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events b JOIN events r
+			ON r.channel=b.channel AND r.project_id=b.project_id AND r.ticket_id=b.ticket_id AND r.ticket_version=b.ticket_version+1
+			WHERE b.channel=? AND b.project_id=? AND b.ticket_id=?
+			AND b.ticket_version>? AND r.ticket_version<=?
+			AND b.trigger='typed_blocker' AND b.from_state='reviewing' AND b.to_state='blocked'
+			AND b.payload='{"code":"review_needs_operator"}'
+			AND r.trigger='operator_recover' AND r.from_state='blocked' AND r.to_state='reviewing'`, request.Ref.Channel, request.Ref.Project, request.Ref.Ticket, historical.Claim.ExpectedVersion, request.ExpectedVersion).Scan(&consumed); err != nil {
+			return LatestReusableProviderAttemptResult{}, normalizeBusy(ctx, err)
+		}
+		if consumed != 0 {
+			return LatestReusableProviderAttemptResult{}, ErrNotFound
+		}
+	}
 	return result, nil
 }
 

@@ -1786,6 +1786,30 @@ func (daemon *Daemon) recoverTicket(ctx context.Context, request api.Request, id
 		return daemon.failure(request, "ticket_not_found", "ticket is not present in this channel", false)
 	}
 	if stored.State != domain.StateBlocked {
+		// A prior recover may have committed its exact provider transition but
+		// failed before runtime installation. Resume only that authenticated
+		// sealed handoff; never drain again or append a second transition.
+		if parameters.Mode == "" && stored.State == domain.StateReviewing {
+			pending, proofErr := daemon.store.ReviewBlockedRecoveryPending(ctx, ref)
+			if proofErr != nil {
+				return daemon.failure(request, "recover_transition_refused", "the retained recovery evidence is unavailable or inconsistent", false)
+			}
+			if pending {
+				if err := daemon.lease.Validate(); err != nil {
+					return daemon.failure(request, "leader_lost", "daemon leadership is no longer valid", true)
+				}
+				controller, ok := daemon.control.(RuntimeRearmController)
+				if !ok {
+					return daemon.failure(request, "runtime_rearm_failed", "recovery is durably sealed until runtime admission is installed", true)
+				}
+				if err := controller.Rearm(ctx, ref); err != nil {
+					response := daemon.failure(request, "runtime_rearm_failed", "recovery is durably sealed until runtime admission is installed", true)
+					response.Mutation = api.Mutation{Observed: true, Kind: "ticket_recover", Identity: string(ref.Ticket)}
+					return response
+				}
+				return daemon.success(request, api.Mutation{Observed: true, Kind: "ticket_recover", Identity: string(ref.Ticket)}, ticketView(stored))
+			}
+		}
 		return daemon.failure(request, "invalid_transition", "only a typed blocked ticket can be recovered", false)
 	}
 	if stored.BlockedCode == "legacy_provider_phase_entry_unverifiable" {
@@ -1829,7 +1853,9 @@ func (daemon *Daemon) recoverTicket(ctx context.Context, request api.Request, id
 	}
 	if controller, ok := daemon.control.(RuntimeRearmController); ok && current.State != domain.StatePublishing && current.State != domain.StateWaitingCI {
 		if err := controller.Rearm(ctx, ref); err != nil {
-			return daemon.failure(request, "runtime_rearm_failed", "recovery is durably sealed until runtime admission is installed", true)
+			response := daemon.failure(request, "runtime_rearm_failed", "recovery is durably sealed until runtime admission is installed", true)
+			response.Mutation = api.Mutation{Attempted: true, Observed: true, Kind: "ticket_recover", Identity: string(ref.Ticket)}
+			return response
 		}
 	}
 	return daemon.success(request, api.Mutation{Attempted: true, Kind: "ticket_recover", Identity: string(ref.Ticket)}, ticketView(current))

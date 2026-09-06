@@ -2,6 +2,24 @@
 
 ## Current truth
 
+- REVIEW REARM FOLLOW-UP: affected full Store/daemon/runtimecontrol suite83756
+  completed PASS (121.334s/21.476s/7.467s). Regression76952 then proved old
+  needs_operator review was reused after recovery in all three cases: same
+  leader, replacement leader, reopen after committed recovery. Provider result
+  selector now excludes that consumed verdict only after authenticating the
+  result/current CI/recovery chain and locating the typed block/recover pair.
+  Regression12293 PASS (1.117s) also opens runtime admission, completes a fresh
+  review as attempt2 without budget reset, and proves new result replay works.
+  Six source/test files are intentional and uncommitted (including untracked
+  review_blocked_rearm_test.go); no runtime rollout/DB edits/approval performed.
+  Full integrated validation10632 TERMINAL exit0: GOCACHE=/private/tmp/sf-gocache3
+  go test -p 1 ./... then vet, repo-check, secret-scan, docs-smoke, diff-check
+  all PASS. Targeted recovery race6852 exit0: Store20.101s, daemon6.029s,
+  including ordinary completed-review recovery preservation. Ready to commit
+  and build onboarding7; old isolated daemon41299 remains live/sealed.
+  Goal remains active. Next validate, checkpoint, bundle and recover through
+  the new CLI replay path; do not claim the real ticket delivered yet.
+
 - LIVE REARM BLOCK after validated prompt rollout: commit91a3632, bundle
   `.context/onboarding6.qzmmk5/{bundle,installed}` manifest/verify/install/version
   all pass (61286 exit0). Old isolated daemon35724 Ctrl-C exit0. New daemon

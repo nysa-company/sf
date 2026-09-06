@@ -2291,6 +2291,9 @@ func validatePostPublicationControlAdvance(ctx context.Context, q candidateEvide
 		}
 		return nil
 	}
+	if state == domain.StateReviewing && validProviderBlockedRecoveryGap(ctx, q, ref, source.version, source.runner, source.leader, target.version, target.runner, target.leader) {
+		return nil
+	}
 	rows, err := q.QueryContext(ctx, `SELECT ticket_version,trigger,from_state,to_state,payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=? AND from_state<>to_state ORDER BY ticket_version,id`, ref.Channel, ref.Project, ref.Ticket, source.version, target.version)
 	if err != nil {
 		return err

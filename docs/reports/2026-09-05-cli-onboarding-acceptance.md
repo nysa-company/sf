@@ -29,7 +29,19 @@ no-escalation boundary; its amended diagnostic completed inspection and returned
 pass, but that diagnostic is not a Store review and does not authorize delivery.
 Full integrated validation of the clarification passed (session 81372, exit 0):
 serialized Go suite, vet, repository checks, secret scan, docs smoke and diff
-checks. The installed daemon has not yet been replaced or the ticket recovered.
+checks. The verified onboarding6 bundle was subsequently installed in the
+isolated trial. Ordinary recovery committed `reviewing` version 10, but runtime
+rearming failed because it expected a pause/drain/resume triplet rather than
+the authenticated typed-block/recover pair. Runtime remains sealed; no fresh
+review or approval has occurred.
+
+A local recovery repair now has passing Store/daemon regression coverage for
+same-leader recovery, replacement leadership, and reopen after the committed
+transition. A further regression reproduced reuse of the consumed blocked
+verdict; the repaired selector permits a fresh attempt 2 without resetting the
+budget and preserves replay of that new result. Full integrated validation
+passed (session 10632, exit 0): Go suite, vet, repository/secret/docs/diff checks.
+This repair is not yet installed into the live trial.
 
 The next acceptance steps are validated-bundle rollout, ordinary recovery and
 a fresh independent review, followed by this ticket's own human approval and

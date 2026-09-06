@@ -59,7 +59,9 @@ const (
 	GuardedMergeRetryAlreadyRearmed
 )
 
-func runtimeControlFrom(ctx context.Context, conn *sql.Conn, ref domain.TicketRef) (durableRuntimeControl, error) {
+func runtimeControlFrom(ctx context.Context, conn interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef) (durableRuntimeControl, error) {
 	var value durableRuntimeControl
 	err := conn.QueryRowContext(ctx, `SELECT state,generation,stop_version,stop_leader_epoch,stop_runner_epoch,authority_version,authority_leader_epoch,authority_runner_epoch
 		FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(
@@ -2057,6 +2059,7 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 	}
 	defer g.unlock()
 	semanticResume := false
+	reviewBlockedResume := false
 	controlledReconcile := false
 	semanticReconcile := false
 	controlledApprovalMerge := false
@@ -2081,6 +2084,19 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 		}
 		if !stopMatches {
 			return ErrStaleFence
+		}
+		if proof.Ticket.State == domain.StateReviewing && (stopped.State == "" || stopped.State == domain.StateBlocked) {
+			matched, matchErr := s.reviewBlockedRearmFrom(txCtx, conn, ref, control, proof.Ticket, leader)
+			if matchErr != nil {
+				return matchErr
+			}
+			if matched {
+				if !latched {
+					return ErrStaleFence
+				}
+				reviewBlockedResume = true
+				return nil
+			}
 		}
 		if proof.Ticket.State == domain.StateReconciling && controlledMergeReconcileShape(control) {
 			if stopped.State != "" && stopped.State != domain.StateMerging && stopped.State != domain.StateWaitingManualMerge {
@@ -2170,6 +2186,13 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 		if controlErr != nil {
 			return ErrControlNotDrained
 		}
+		if reviewBlockedResume {
+			matched, err := s.reviewBlockedRearmFrom(txCtx, conn, ref, control, proof.Ticket, leader)
+			if err != nil || !matched {
+				return ErrControlNotDrained
+			}
+			return nil
+		}
 		if semanticResume {
 			currentLeader, semanticErr := s.authenticatePostPublicationSemanticRetry(txCtx, conn, ref, control, proof.Ticket)
 			if semanticErr != nil || currentLeader != leader {
@@ -2224,6 +2247,75 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 	}
 	g.latch(ref, mutationRevocation{version: proof.Ticket.Version, leader: leader, runner: proof.Ticket.RunnerEpoch})
 	return &RuntimeRearmCapability{ref: ref, version: proof.Ticket.Version, fence: proof.Fence, issued: true}, nil
+}
+
+// reviewBlockedRearmFrom recognizes only the sealed typed-provider recovery,
+// never a generic active Reviewing row. The stop is the blocked endpoint (not
+// a pause's invalidated runner); every subsequent restart must have a ledger.
+func (s *Store) reviewBlockedRearmFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, control durableRuntimeControl, current Ticket, leader uint64) (bool, error) {
+	if current.State != domain.StateReviewing || control.stop.version < 2 || control.stop.version == ^uint64(0) {
+		return false, nil
+	}
+	var count int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='typed_blocker' AND from_state='reviewing' AND to_state='blocked'`, ref.Channel, ref.Project, ref.Ticket, control.stop.version).Scan(&count); err != nil {
+		return false, err
+	}
+	if count == 0 {
+		return false, nil
+	}
+	if count != 1 || control.state != "sealed" || control.generation == 0 || control.authority != control.stop || control.stop.runner == 0 || control.stop.leader == 0 {
+		return false, ErrStaleFence
+	}
+	prior, err := providerBlockedEndpointLeader(ctx, q, ref, domain.PhaseReview, control.stop.version-1, control.stop.runner)
+	if err != nil || !validProviderBlockedRecoveryGap(ctx, q, ref, control.stop.version-1, control.stop.runner, prior, control.stop.version+1, control.stop.runner, control.stop.leader) {
+		return false, ErrStaleFence
+	}
+	var recoveryRaw string
+	if err := q.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_recover'`, ref.Channel, ref.Project, ref.Ticket, control.stop.version+1).Scan(&recoveryRaw); err != nil || !providerBlockedBridgeMatches(recoveryRaw, control.stop.version+1, control.stop.runner, prior, control.stop.leader) {
+		return false, ErrStaleFence
+	}
+	if err := validateRunnerRecoveryLedger(ctx, q, ref, control.stop.version+1, control.stop.runner, control.stop.leader, current.Version, current.RunnerEpoch, leader); err != nil {
+		return false, ErrStaleFence
+	}
+	if _, err := s.finalReviewAuthorityFrom(ctx, q, ref, current.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: current.RunnerEpoch}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ReviewBlockedRecoveryPending is a read-only lost-response discriminator.
+// It grants no admission; PostPublicationRearmProof must repeat authentication
+// and drain checks under mutation serialization before installing a capability.
+func (s *Store) ReviewBlockedRecoveryPending(ctx context.Context, ref domain.TicketRef) (bool, error) {
+	if s == nil || ref.Validate() != nil {
+		return false, ErrStaleFence
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var current Ticket
+	var leader uint64
+	current.Ref = ref
+	if err := tx.QueryRowContext(ctx, `SELECT t.state,t.version,t.runner_epoch,d.leader_epoch FROM tickets t JOIN daemon_instances d ON d.channel=t.channel WHERE t.channel=? AND t.project_id=? AND t.id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&current.State, &current.Version, &current.RunnerEpoch, &leader); err != nil {
+		return false, err
+	}
+	if current.State != domain.StateReviewing {
+		return false, nil
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=? AND state='sealed'`, ref.Channel, ref.Project, ref.Ticket).Scan(&count); err != nil {
+		return false, err
+	}
+	if count == 0 {
+		return false, nil
+	}
+	control, err := runtimeControlFrom(ctx, tx, ref)
+	if err != nil {
+		return false, err
+	}
+	return s.reviewBlockedRearmFrom(ctx, tx, ref, control, current, leader)
 }
 
 // authenticatePostPublicationResume binds the resumed ticket to the exact
