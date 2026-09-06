@@ -2,6 +2,15 @@
 
 ## Current truth
 
+- DURABLE TRIAL PROGRESS 2026-09-06T14:37Z: ticket SF-bf816e... reached
+  reviewingv8/r1; planning, verification, build all completed attempt1 with
+  Luna/GPT5.5/Luna. Candidate e9d40f0922130e72edc6d439f7ce6b78d71862bc.
+  Factory created draft PR2 in sf-cli-beta-acceptance-20260905; fresh gh read
+  confirms exact head, OPEN/draft, CI test SUCCESS (run34039674698). Independent
+  GPT5.5 final review active attempt1. No code/worktree/DB repair or approval.
+  Daemon35724 live; status watcher67907 also live/read-only. Do not confuse
+  publication/CI with approval or terminal done. Existing trial failure retained.
+
 - DURABLE TRIAL STARTED 2026-09-06T14:32:16Z: normal `run` submitted/started
   `SF-bf816eaad3a060153d28c99b3a3be7ef`, onboarding-durable, planningv2/r1.
   Ticket source `/Users/sofiagonzalez-2/Projects/.sf-beta.24jdFP/ticket.md`:
