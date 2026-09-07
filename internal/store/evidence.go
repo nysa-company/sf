@@ -267,6 +267,7 @@ type reviewRepairAmendment struct {
 	PriorRevision uint64
 	Reason        string
 	Requester     string
+	ReviewedHead  string
 }
 
 // reviewRepairVerificationAmendment exposes only the Store-authenticated
@@ -276,7 +277,7 @@ type reviewRepairAmendment struct {
 // source row is rehydrated and its complete signed lineage is authenticated to
 // the live fence. It never trusts a Worker-provided reason or lets an older
 // repair shadow a live Builder amendment.
-func (s *Store) reviewRepairVerificationAmendment(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, version uint64, fence domain.Fence) (reviewRepairAmendment, bool, error) {
+func (s *Store) reviewRepairVerificationAmendment(ctx context.Context, conn rowQueryer, ref domain.TicketRef, version uint64, fence domain.Fence) (reviewRepairAmendment, bool, error) {
 	var result reviewRepairAmendment
 	var transitionVersion, consumedVersion, consumedLeader, consumedRunner uint64
 	var reviewerID int64
@@ -343,6 +344,7 @@ func (s *Store) reviewRepairVerificationAmendment(ctx context.Context, conn *sql
 	} else if validateRunnerRecoveryLedger(ctx, conn, ref, transitionVersion, consumedRunner, consumedLeader, version, fence.RunnerEpoch, fence.LeaderEpoch) != nil {
 		return reviewRepairAmendment{}, false, ErrEvidenceConflict
 	}
+	result.ReviewedHead = parsed.Reviewer.ReviewedHead
 	return result, true, nil
 }
 

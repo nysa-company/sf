@@ -354,9 +354,10 @@ func TestSupervisorCloseRetainsStagedRuntimeUntilPipeHoldingEscapeeWaits(t *test
 	}
 	ready := filepath.Join(root, "ready")
 	release := filepath.Join(root, "release")
+	homes := filepath.Join(root, "runtime-homes")
 	escapee := buildDetachedPipeHolder(t, root, ready, release)
 	provider := filepath.Join(root, "codex")
-	program := fmt.Sprintf("#!/bin/sh\n\"%s\" &\nwhile [ ! -f \"%s\" ]; do sleep 0.01; done\nexit 0\n", escapee, ready)
+	program := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n%%s\\n' \"$HOME\" \"$CODEX_HOME\" > \"%s\"\n\"%s\" &\nwhile [ ! -f \"%s\" ]; do sleep 0.01; done\nexit 0\n", homes, escapee, ready)
 	if err := os.WriteFile(provider, []byte(program), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -380,6 +381,11 @@ func TestSupervisorCloseRetainsStagedRuntimeUntilPipeHoldingEscapeeWaits(t *test
 	}
 	staged := supervisor.trusted[binding.Identity].stagedDir
 	request, invocation, input := codexRunFixture(t, provider, binding, authHome)
+	t.Cleanup(func() {
+		// Even a failed readiness assertion must release the fixture child.
+		_ = os.WriteFile(release, []byte("release"), 0o600)
+		_ = supervisor.Close()
+	})
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runDone := make(chan error, 1)
@@ -404,7 +410,24 @@ func TestSupervisorCloseRetainsStagedRuntimeUntilPipeHoldingEscapeeWaits(t *test
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
-	defer func() { _ = os.WriteFile(release, []byte("release"), 0o600) }()
+	// The shared Run/Wait cleanup owns the private environment as well as the
+	// executable snapshot. Capture only fixture directory paths, never tokens.
+	homeBytes, err := os.ReadFile(homes)
+	if err != nil {
+		t.Fatal("fixture runtime homes were not recorded")
+	}
+	runtimeHomes := strings.Split(strings.TrimSuffix(string(homeBytes), "\n"), "\n")
+	if len(runtimeHomes) != 2 {
+		t.Fatal("fixture runtime home shape changed")
+	}
+	for _, home := range runtimeHomes {
+		if !filepath.IsAbs(home) || home == authHome || home == root || home == "/" {
+			t.Fatal("runtime did not receive a distinct private home")
+		}
+		if info, err := os.Stat(home); err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {
+			t.Fatal("runtime home is not private")
+		}
+	}
 	cancel()
 	select {
 	case err := <-runDone:
@@ -420,10 +443,24 @@ func TestSupervisorCloseRetainsStagedRuntimeUntilPipeHoldingEscapeeWaits(t *test
 	if _, err := os.Stat(staged); err != nil {
 		t.Fatalf("Close reclaimed staged evidence before wait completion: %v", err)
 	}
+	for _, home := range runtimeHomes {
+		if _, err := os.Stat(home); err != nil {
+			t.Fatal("Close reclaimed private environment before wait completion")
+		}
+	}
+	if _, err := os.Stat(filepath.Join(runtimeHomes[1], "auth.json")); err != nil {
+		t.Fatal("Close removed fixture credentials while process streams remain live")
+	}
 	if err := os.WriteFile(release, []byte("release"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	awaitMissing(t, staged, 2*time.Second)
+	for _, home := range runtimeHomes {
+		awaitMissing(t, home, 2*time.Second)
+	}
+	if _, err := os.Stat(filepath.Join(authHome, "auth.json")); err != nil {
+		t.Fatal("runtime cleanup removed the source credential fixture")
+	}
 }
 
 func buildDetachedPipeHolder(t *testing.T, directory, ready, release string) string {

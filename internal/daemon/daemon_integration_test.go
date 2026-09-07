@@ -409,11 +409,12 @@ func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain
 	if err := daemon.store.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Path: worktreePath, Branch: branch, IdentityJSON: identity, BaseSHA: base, HeadSHA: base}); err != nil {
 		t.Fatal(err)
 	}
-	builder, _, err := daemon.store.RecordProviderQualification(ctx, daemonFixtureQualification(daemon.channel, strings.Repeat("a", 32), "cursor", "cursor-family"))
+	// Credential-free lifecycle fixtures are not production CLI qualifications.
+	builder, _, err := daemon.store.RecordProviderQualification(ctx, daemonFixtureQualification(daemon.channel, strings.Repeat("a", 32), "fixture-cursor", "cursor-family"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	reviewer, _, err := daemon.store.RecordProviderQualification(ctx, daemonFixtureQualification(daemon.channel, strings.Repeat("b", 32), "claude", "claude-family"))
+	reviewer, _, err := daemon.store.RecordProviderQualification(ctx, daemonFixtureQualification(daemon.channel, strings.Repeat("b", 32), "fixture-claude", "claude-family"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,5 +1,157 @@
 # `sf` CLI
 
+## Estimated provider accounting (multi-CLI)
+
+`sf start <ticket> --accept-cost-estimates` explicitly opts a ticket into
+reported cost estimates before its first provider attempt. Estimates are not
+verified charges and do not guarantee a hard dollar cap. Missing cost remains
+unknown. SF limits Claude/Cursor admission to 16 total ticket attempts and
+45 minutes per invocation, also subject to the ticket deadline; these are SF
+launch limits, not provider-internal API request limits. Reaching the reported
+estimate ceiling stops another launch. Ordinary `start` does not opt in.
+
+The composed `sf run ticket.md --project app --accept-cost-estimates --watch`
+path forwards the same explicit consent only when starting its exact queued
+ticket. It never changes accounting for an already active ticket. Omitting the
+flag keeps the existing default and does not opt in.
+
+This flag does not install, authenticate, or qualify a provider. Existing
+in-flight tickets cannot change accounting policy after their first attempt.
+
+## Overview
+
+For a Claude/Codex pair, use `sf providers qualify --builder claude --reviewer
+codex` (or reverse the roles). Claude defaults to Sonnet 5 and qualification
+makes two small model-bearing CLI launches plus a cancelled startup; each CLI
+may make several API requests, so it is not a free
+login check. Pair selection changes only after both roles qualify. Cursor has
+an experimental trusted-hooks path: ambient hooks are trusted dependencies,
+not claimed to be disabled or contained. SF applies its own role filesystem
+profile and requires a signed native qualification. Luna Low and Sonnet Low have
+passed qualification; disposable full-ticket tests passed in both Cursor/Claude
+role directions. Cursor concurrency/restart acceptance remains pending. The model picker offers
+exact Cursor IDs and filters same-family reviewers across CLIs; each model still
+requires its own qualification. Cursor qualification may invoke paid models and never treats
+login as execution authority. New Claude/Cursor tickets
+require the explicit estimate opt-in described above. Login status alone is
+not execution readiness.
+
+Qualification accepts the same pair presets as setup:
+
+```sh
+sf providers qualify --preset select       # numbered terminal picker
+sf providers qualify --preset select --models select # choose pair and exact models
+sf providers qualify --preset claude-codex # noninteractive, also supports --json
+sf providers qualify --preset claude-codex --builder-model claude-sonnet-5 --reviewer-model gpt-5.6-luna
+```
+
+Do not combine `--preset` with `--builder` or `--reviewer`. Cancelling the
+picker makes no request. Selecting a pair requests qualification and may invoke
+paid models; it is not merely a preview. Use `sf doctor` to inspect the exact
+qualified model/family and authentication state without qualifying again.
+
+`--builder-model` and `--reviewer-model` pin exact supported IDs for this
+qualification; Planner follows Builder. Unknown IDs, aliases, and a
+same-family pair are refused rather than replaced. Omitted IDs keep the
+daemon's existing role defaults. The selected identities remain channel-local
+qualification authority, not portable project settings. Qualification is
+refused while the workflow runtime is already active; do not interpret editing
+project preferences as changing an in-flight model. A restarted daemon
+reconstructs selected Codex models from their stored qualifications and still
+requires current binary/auth/policy qualification before execution.
+
+`--models select` prompts for both exact models before sending any request.
+The Reviewer menu excludes the Builder's inference family, even when the two
+CLI names differ. Cancelling either answer makes no qualification request.
+The menu is a supported catalog, not an account-entitlement or readiness
+verdict; the daemon must still qualify the selection. Do not combine it with
+explicit model flags. JSON and nonterminal callers must use exact IDs instead.
+
+Qualification does not overwrite a project's immutable configuration. Before
+registering a new project, choose an initial preset without editing TOML:
+
+```sh
+sf init --project app --repo /absolute/project --providers claude-codex
+# Or choose the initial pair by number in a terminal:
+sf init --project app --repo /absolute/project --providers select
+```
+
+Presets are `codex-codex`, `claude-codex`, `codex-claude`, plus experimental
+`cursor-codex`, `codex-cursor`, `cursor-claude`, `claude-cursor`, and
+`cursor-cursor`. Planner follows Builder. Cursor is a transport, not a model
+family: Claude through Cursor cannot independently review Claude Code.
+Use `providers qualify --preset <pair> --models select` to select independent
+exact models before qualification. The `select` picker uses stderr, offers cancellation without changes,
+and is unavailable with JSON or piped input; scripts use an explicit preset.
+This creates a missing `.sf/config.toml` under the existing config
+lock and freezes its preferences in the initial project generation. It does
+not qualify providers, opt into estimates, or select models. Existing files
+are accepted only if the preset already matches; they are never overwritten.
+The flag can accompany a supported `--profile`/`--test` recipe, but not
+read-only `--check`. Registration failure rolls back only the generated file.
+
+For an existing project, use the numbered editor, then explicitly apply the
+new configuration for future tickets:
+
+```sh
+sf config providers --project app --preset select
+sf config apply --project app
+```
+
+The editor preserves unrelated settings and creates a backup. It does not
+qualify models or change in-flight tickets. Noninteractive callers can use
+`--preset claude-codex` (or the reverse preset). The equivalent TOML is:
+
+```toml
+[providers]
+planner = ["claude"]
+builder = ["claude"]
+reviewer = ["codex"]
+```
+
+Reverse these names for Codex Builder/Claude Reviewer. Use one provider per
+role; fallback lists are not supported by this workflow. Existing tickets
+retain their frozen configuration. A selected pair that does not match a
+ticket's role refuses before launch rather than silently substituting a model.
+Use `providers qualify --preset select --models select` for exact model
+selection, separately from the project preference editor.
+
+### Which model actually runs?
+
+| CLI | Current factory selection | Readiness |
+| --- | --- | --- |
+| Claude Code | Defaults to `claude-sonnet-5`; explicit supported IDs through qualification | Native qualification required; subscription OAuth, estimated cost only |
+| Codex | Builder defaults to `gpt-5.6-luna`; Reviewer defaults to `gpt-5.5` | Existing native qualification and subscription accounting |
+| Cursor | Experimental exact-model qualifier; default Builder Luna Low, Reviewer Sonnet 5 Low | Trusted hooks; signed native qualification required. Luna Low and Sonnet Low passed native qualification; disposable Cursor/Claude ticket tests passed in both role directions. Concurrency/restart acceptance remains incomplete |
+
+The pinned Cursor CLI's explicit Luna Low selection reports 272K context,
+despite its catalog's 1M label. Sonnet Low reports 300K with thinking disabled,
+also despite the catalog's 1M label. SF binds those measured session identities;
+it does not claim the catalog context or thinking capability. Other selections
+still require their own native qualification; Grok Low has not passed it.
+
+For Claude Builder with Codex Luna Reviewer, start the foreground daemon,
+then qualify exact models from another terminal:
+
+```sh
+sf-dev daemon run
+# In another terminal, using the same channel:
+sf-dev providers qualify --preset claude-codex --builder-model claude-sonnet-5 --reviewer-model gpt-5.6-luna
+```
+
+Use `sf` instead of `sf-dev` for the stable channel. This does not start a
+second daemon alongside an existing one: stop the existing foreground daemon
+before changing its model environment. Qualification reports the exact selected
+model and family. A Codex-only pair still requires different model families;
+two role names pointing to Luna do not create independent review. No provider
+or model is silently substituted if the requested choice is unavailable.
+
+If Claude reports that authentication cannot cover the required launch window,
+run `claude auth login` to renew the subscription login, then repeat the same
+qualification command. SF requires more than 46 minutes of credential validity
+before launch and does not refresh credentials, switch to API billing, or send
+a prompt to work around an expired login. Never paste tokens into SF settings.
+
 `sf` is a thin client for one channel-specific local daemon. Ticket lifecycle
 commands never open SQLite or mutate workflow state in the CLI. The stable
 binary uses the `stable` channel; a development build uses `dev`, so the two
@@ -223,6 +375,20 @@ standard-library/local modules and bundled pytest, not additional dependencies
 or arbitrary pytest options. Preparation success is not a provider or
 publication-readiness verdict. Start rechecks the frozen runtime identity.
 
+For an existing registered project with `.sf/config.toml`, use
+`config providers --project <name> --preset select` for a numbered terminal
+picker, or specify `claude-codex`, `codex-claude`, `codex-codex`, or an
+experimental Cursor pair such as `cursor-claude` directly
+(also supported with `--json`). The first provider plans/builds; the second
+verifies/reviews. The command edits only provider preferences, preserves
+unrelated configuration, and retains an original-byte backup whose path is
+reported. Concurrent source/directory changes are refused. Repeating an
+already-selected preset does not rewrite the file or create another backup.
+This command does not qualify providers, call models, change the stored
+configuration generation, or affect active tickets. Review the edited file,
+then explicitly run `config apply`. For a missing config, use
+`init --providers <preset>` instead.
+
 `config apply --project <name>` freezes one next immutable configuration
 generation from the registered repository's current optional config source and
 the selected channel's machine policy. It is local-only, does not require a
@@ -264,6 +430,11 @@ Colima as an error. `auth status` probes only the four allowlisted official CLIs
 `cursor-agent`, `claude`, and `codex`) with bounded, discarded output. `auth
 login <provider>` delegates to that CLI's official interactive flow and then
 re-probes status; sf never accepts, captures, or stores a credential byte. The
+human and JSON authentication reports explicitly assess login only—not runtime
+qualification, independent models, billing limits, or ticket readiness. After
+successful login, run the channel's `sf doctor` (or `sf-dev doctor`) to inspect
+readiness. A successful Claude or Cursor login does not enable that runtime.
+The
 Codex qualification is a foreground-daemon operation: it admits only the
 exact local `Logged in using ChatGPT` subscription status, binds that bounded
 mode into the supervisor attestation, and performs no model call. API-key,
@@ -343,6 +514,37 @@ digests, and the channel-correct next action. sf never overwrites edits or
 treats them as Builder/proof authority. Verification-file changes require the
 separate authenticated verification-amendment flow; they are never silently
 routed into a source resume.
+
+Provider retry has three distinct cases:
+
+- Automatic artifact repair permits one additional attempt after a safely
+  drained invalid artifact, on the same role and runtime binding. It is not
+  an API/network retry and does not add a separate hidden launch budget.
+- Automatic server-rejection retry is narrowly supported for Claude under a
+  freshly qualified streaming policy. The supervisor must observe a complete
+  server-error-only rejection, prove process and stream completion, and sign
+  the exact attempt plus an independently inspected clean checkpoint. Store
+  authenticates that receipt and persists a bounded backoff; the next attempt
+  rechecks the physical checkout before launch and uses the same role, model,
+  authentication and runtime binding. It shares the artifact-repair attempt
+  budget, rather than adding another retry allowance. Restart does not reset
+  that budget or backoff. This is not enabled by login alone; older Claude
+  qualifications must be renewed for the changed policy.
+- Operator `retry` applies only to an eligible durable exhaustion pause and
+  requires the physical-worktree and Store checks below. It never changes
+  provider/model as a fallback.
+
+An arbitrary API/network error, retry hint, timeout, missing final response,
+or partial write is **not** eligible for automatic retry. Without the exact
+signed rejection and checkpoint proof, sf preserves the uncertain outcome
+instead of blindly relaunching. Cursor automatic API retry is not yet enabled.
+In pinned Cursor CLI `2026.09.02-c22c1a3`, the print-mode error handler emits
+an error string and exits rather than producing an authenticated terminal
+server-rejection record. Text containing `503` is therefore insufficient to
+authorize another launch. Complete artifact-validation failures still follow
+the bounded same-role repair path; this limitation concerns uncertain API errors.
+Failed requests with no reported cost remain explicitly
+unknown, not free; the ticket's request/time limits still apply.
 
 `retry` applies only to the durable retry/correction-exhaustion pause and
 re-enters its exact stored resume state. If a prior interrupted control action

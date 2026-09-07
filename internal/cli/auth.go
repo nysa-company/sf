@@ -31,16 +31,19 @@ type authStatusView struct {
 
 type authReport struct {
 	Schema                string           `json:"schema"`
+	Scope                 string           `json:"scope"`
 	Channel               domain.Channel   `json:"channel"`
 	CredentialsStoredBySF bool             `json:"credentials_stored_by_sf"`
 	Providers             []authStatusView `json:"providers"`
 }
 
+const authScope = "Login status only; runtime qualification, model independence, billing limits, and ticket readiness are not assessed."
+
 func RunAuthStatus(ctx context.Context, channel domain.Channel, service authenticationService) api.Response {
 	if !channel.Valid() || service == nil {
 		return failure("invalid_argument", "authentication status requires a valid channel", []string{binaryForChannel(channel), "auth", "status"})
 	}
-	report := authReport{Schema: authSchema, Channel: channel, CredentialsStoredBySF: false}
+	report := authReport{Schema: authSchema, Scope: authScope, Channel: channel, CredentialsStoredBySF: false}
 	for _, status := range service.StatusAll(ctx) {
 		report.Providers = append(report.Providers, authView(channel, status))
 	}
@@ -66,7 +69,7 @@ func RunAuthLogin(ctx context.Context, channel domain.Channel, providerName stri
 		response.Mutation = api.Mutation{Attempted: attempted, Kind: "credential.login", Identity: string(provider)}
 		return response
 	}
-	report := authReport{Schema: authSchema, Channel: channel, CredentialsStoredBySF: false, Providers: []authStatusView{authView(channel, status)}}
+	report := authReport{Schema: authSchema, Scope: authScope, Channel: channel, CredentialsStoredBySF: false, Providers: []authStatusView{authView(channel, status)}}
 	data, marshalErr := json.Marshal(report)
 	if marshalErr != nil {
 		response := failure("internal_error", "authentication succeeded but its response could not be encoded", []string{binary, "auth", "status"})
@@ -100,6 +103,8 @@ func authView(channel domain.Channel, status localauth.Status) authStatusView {
 	}
 	binary := binaryForChannel(channel)
 	switch status.State {
+	case localauth.StateAuthenticated:
+		view.NextAction = &domain.NextAction{Code: "inspect_readiness", Argv: []string{binary, "doctor"}}
 	case localauth.StateUnauthenticated:
 		view.NextAction = &domain.NextAction{Code: "provider_auth_missing", Argv: []string{binary, "auth", "login", string(status.Provider)}}
 	case localauth.StateUnavailable:

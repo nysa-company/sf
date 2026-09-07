@@ -1569,12 +1569,12 @@ func newPublicationFixtureMode(t *testing.T, mergeMode domain.MergeMode) *public
 		t.Fatal(err)
 	}
 
-	bq, _, err := db.RecordProviderQualification(ctx, qualification("11111111111111111111111111111111", "cursor", "cursor-family"))
+	bq, _, err := db.RecordProviderQualification(ctx, qualification("11111111111111111111111111111111", "fixture-cursor", "cursor-family"))
 	if err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
-	rq, _, err := db.RecordProviderQualification(ctx, qualification("22222222222222222222222222222222", "claude", "claude-family"))
+	rq, _, err := db.RecordProviderQualification(ctx, qualification("22222222222222222222222222222222", "fixture-claude", "claude-family"))
 	if err != nil {
 		db.Close()
 		t.Fatal(err)
@@ -1849,7 +1849,7 @@ func qualification(run, provider, family string) store.ProviderQualification {
 	return store.ProviderQualification{Channel: domain.ChannelDev, RunID: run, Provider: domain.ProviderIdentity{Provider: provider, Model: provider + "-model", Family: family, Version: "1.0"}, BinaryDigest: strings.Repeat("a", 64), PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()}
 }
 func runtimeBinding(q store.ProviderQualification) contracts.RuntimeBinding {
-	return contracts.RuntimeBinding{Identity: q.Provider, BinaryDigest: q.BinaryDigest, PolicyDigest: q.PolicyDigest, FixtureDigest: q.FixtureDigest, AuthDigest: strings.Repeat("d", 64), AuthMode: "subscription"}
+	return contracts.RuntimeBinding{Identity: q.Provider, BinaryDigest: q.BinaryDigest, PolicyDigest: q.PolicyDigest, FixtureDigest: q.FixtureDigest, AuthDigest: strings.Repeat("d", 64)}
 }
 func refType() domain.TicketType   { return domain.TicketFeature }
 func digestHex(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }

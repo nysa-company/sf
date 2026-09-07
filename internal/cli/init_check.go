@@ -92,8 +92,8 @@ func RunInitCheck(ctx context.Context, request InitRequest) api.Response {
 		return failure("invalid_repository", err.Error(), next)
 	}
 	request = resolved
-	if request.Profile != "" || request.TestPath != "" {
-		return failure("invalid_argument", "--check currently previews existing configuration; omit --profile and --test", next)
+	if request.Profile != "" || request.TestPath != "" || request.ProviderPreset != "" {
+		return failure("invalid_argument", "--check currently previews existing configuration; omit --profile, --test, and --providers", next)
 	}
 	preview := initPreview{Project: request.Project, Repository: request.Repo, Configuration: "not_checked", LocalRecipe: "not_checked", Runtime: "not_checked", Providers: "not_checked", Publication: "not_checked"}
 	response := api.Response{Version: api.Version, RequestID: requestID(), OK: true, Mutation: api.Mutation{}}

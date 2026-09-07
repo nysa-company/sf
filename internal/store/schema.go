@@ -68,6 +68,12 @@ func (s *Store) validateSchema(ctx context.Context) error {
 		}
 	}
 	for _, trigger := range []string{
+		"provider_server_rejections_immutable_update",
+		"provider_server_rejections_immutable_delete",
+		"provider_accounting_policies_immutable_update",
+		"provider_accounting_policies_immutable_delete",
+		"provider_cost_estimates_immutable_update",
+		"provider_cost_estimates_immutable_delete",
 		"provider_attempt_state_outcome_insert",
 		"provider_attempt_state_outcome_update",
 		"phase_run_state_outcome_insert",
@@ -193,6 +199,10 @@ func compositeForeignKey(table, target string, columns ...foreignKeyColumn) comp
 // insufficient: accepting a subset or differently ordered mapping would let a
 // valid value from another candidate, ticket, or fence satisfy the FK.
 var requiredCompositeForeignKeys = []compositeForeignKeyRequirement{
+	compositeForeignKey("provider_server_rejections", "provider_attempts",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"phase", "phase"}, foreignKeyColumn{"role", "role"}, foreignKeyColumn{"attempt", "attempt"}, foreignKeyColumn{"provider_attempt_id", "id"}),
+	compositeForeignKey("provider_accounting_policies", "tickets",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "id"}),
 	compositeForeignKey("provider_artifact_failures", "provider_attempts",
 		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"phase", "phase"}, foreignKeyColumn{"role", "role"}, foreignKeyColumn{"attempt", "attempt"}, foreignKeyColumn{"provider_attempt_id", "id"}),
 	compositeForeignKey("provider_phase_entries", "events",
@@ -285,6 +295,10 @@ var requiredForeignKeys = []foreignKeyRequirement{
 	{table: "approvals", target: "tickets"},
 	{table: "worktrees", target: "tickets"},
 	{table: "provider_attempts", target: "tickets"},
+	{table: "provider_accounting_policies", target: "tickets"},
+	{table: "provider_server_rejections", target: "provider_attempts"},
+	{table: "provider_cost_estimates", target: "provider_attempts"},
+	{table: "provider_cost_estimates", target: "provider_accounting_policies"},
 	{table: "provider_artifact_failures", target: "provider_attempts"},
 	{table: "provider_artifact_failures", target: "tickets"},
 	{table: "provider_attempt_results", target: "provider_attempts"},
@@ -460,6 +474,9 @@ var requiredSchema = map[string][]string{
 	"effects":                               {"semantic_key", "claim_epoch", "observed_identity"},
 	"approvals":                             {"reviewed_head", "operator_uid", "invalidated"},
 	"worktrees":                             {"path", "branch_ref"},
+	"provider_cost_estimates":               {"provider_attempt_id", "channel", "project_id", "ticket_id", "estimate_micro_usd"},
+	"provider_accounting_policies":          {"channel", "project_id", "ticket_id", "policy", "request_limit", "request_timeout_ns", "estimate_limit_micro_usd", "ticket_version", "leader_epoch", "runner_epoch"},
+	"provider_server_rejections":            {"provider_attempt_id", "channel", "project_id", "ticket_id", "phase", "role", "attempt", "canonical_receipt", "receipt_sha256", "observed_unix_nanos", "not_before_unix_nanos"},
 	"provider_attempts":                     {"phase", "attempt", "provider", "role", "state", "usage_units", "started_at", "finished_at", "qualification_id", "binding_digest", "provider_lease_key", "leader_epoch", "runner_epoch", "expected_ticket_version", "auth_digest", "auth_mode", "launch_state", "process_pid", "process_pgid", "process_boot_identity", "process_start_identity", "worktree_path"},
 	"provider_attempt_inputs":               {"provider_attempt_id", "request_digest", "canonical_input", "created_at"},
 	"provider_attempt_results":              {"provider_attempt_id", "raw_artifact", "raw_sha256", "typed_artifact", "typed_sha256", "validation", "validation_sha256", "transcript_sha256", "request_digest", "leader_epoch", "runner_epoch", "expected_ticket_version", "repository_path", "worktree_path", "worktree_identity", "base_sha"},

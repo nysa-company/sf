@@ -261,11 +261,11 @@ func TestProviderExhaustionAndRetryUseTypedEngineRoundTrip(t *testing.T) {
 	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Path: worktree, Branch: "sf/dev/nysa/engine-provider", IdentityJSON: []byte(`{}`), BaseSHA: base, HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
-	planner, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: strings.Repeat("1", 32), Provider: domain.ProviderIdentity{Provider: "cursor", Model: "cursor-model", Family: "cursor-family", Version: "1"}, BinaryDigest: strings.Repeat("a", 64), PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()})
+	planner, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: strings.Repeat("1", 32), Provider: domain.ProviderIdentity{Provider: "fixture-cursor", Model: "cursor-model", Family: "cursor-family", Version: "1"}, BinaryDigest: strings.Repeat("a", 64), PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	reviewer, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: strings.Repeat("2", 32), Provider: domain.ProviderIdentity{Provider: "claude", Model: "claude-model", Family: "claude-family", Version: "1"}, BinaryDigest: strings.Repeat("d", 64), PolicyDigest: strings.Repeat("e", 64), FixtureDigest: strings.Repeat("f", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()})
+	reviewer, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: strings.Repeat("2", 32), Provider: domain.ProviderIdentity{Provider: "fixture-claude", Model: "claude-model", Family: "claude-family", Version: "1"}, BinaryDigest: strings.Repeat("d", 64), PolicyDigest: strings.Repeat("e", 64), FixtureDigest: strings.Repeat("f", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +276,7 @@ func TestProviderExhaustionAndRetryUseTypedEngineRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding := contracts.RuntimeBinding{Identity: planner.Provider, BinaryDigest: planner.BinaryDigest, PolicyDigest: planner.PolicyDigest, FixtureDigest: planner.FixtureDigest, AuthDigest: strings.Repeat("d", 64), AuthMode: "test"}
+	binding := contracts.RuntimeBinding{Identity: planner.Provider, BinaryDigest: planner.BinaryDigest, PolicyDigest: planner.PolicyDigest, FixtureDigest: planner.FixtureDigest, AuthDigest: strings.Repeat("d", 64)}
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}
 	for range 2 {
 		request := store.ProviderAttemptRequest{Ref: ref, ExpectedVersion: started.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: binding, ConfigDigest: started.ConfigDigest, Capacity: 1, At: time.Now().UTC(), Repository: repository, Worktree: worktree, WorktreeIdentity: "{}", BaseSHA: base, SupervisorKey: signer.PublicKey(), Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch, ExpectedVersion: started.Version, Prompt: "engine provider retry fixture", Repository: repository, Worktree: worktree, WorktreeIdentity: "{}", BaseSHA: base, AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}}

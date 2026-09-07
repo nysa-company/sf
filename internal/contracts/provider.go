@@ -233,6 +233,11 @@ type PhaseResult struct {
 	// A provider-reported token count must never be placed here.
 	UsageTrusted bool
 	UsageUnits   int64
+	// ReportedCostEstimateMicroUSD is optional, unverified provider list-price
+	// metadata, rounded upward to micro-USD. Nil means unknown, not zero.
+	// It never grants UsageTrusted or authorizes a launch/retry. Any estimated
+	// budget policy must be separately persisted and enforced by Store.
+	ReportedCostEstimateMicroUSD *int64
 	// TokenUsage is optional provider observability. It is separate because
 	// tokens cannot be compared to a monetary ceiling without an immutable
 	// pricing or reservation policy.

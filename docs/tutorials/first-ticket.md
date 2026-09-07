@@ -19,10 +19,14 @@ command in TOML does not grant permission to run an unsupported recipe.
 Mixed-stack roots require an explicit supported verification/review recipe:
 for example, a Rails `Gemfile` beside `package.json` is not automatically a
 Node project. SF refuses to guess which tests represent the project.
-The qualified live beta uses Codex for independent Builder/Reviewer model
-families. Using Claude already does not itself establish an SF-qualified
-Claude runtime. Provider expansion is tracked in the
-[self-serve beta plan](../plans/2026-09-05-self-serve-cli-beta.md).
+Codex remains supported. The current multi-CLI source also supports qualified
+Claude/Codex pairs in either direction; native model trials have passed with
+local simulated GitHub. Login alone is not qualification. Cursor's experimental
+trusted-hooks path has a passing Luna Low native qualification, but full-ticket
+acceptance is still pending; use the tested Claude/Codex pair for this guide.
+See the [provider setup and model picker](../cli.md#overview)
+and [acceptance ledger](../plans/2026-09-06-multi-cli-acceptance.md) for exact
+tested scope and remaining gates.
 
 ## Prepare once
 
@@ -44,6 +48,11 @@ sf-dev init
 ```
 
 The project name defaults to the directory name (normalized to a valid name).
+For a new Claude/Codex project, replace plain `init` above with
+`sf-dev init --providers select` to choose by number. Existing projects use
+`sf-dev config providers --project <name> --preset select`, followed by
+`sf-dev config apply --project <name>` for future tickets. Provider preferences
+do not install, log in, or qualify models.
 Use `--project my-app` to override it and `--repo /absolute/path` to select a
 different repository root. `--check` does not execute tests, contact providers
 or GitHub, or prove full runtime readiness; those checks remain separate.
@@ -119,7 +128,11 @@ dependency-free. Add verification in `test/count-items.test.js` using node:test.
 ```
 
 Ticket duration starts at submission, not at execution. Submit when ready to
-start; queue time consumes the same deadline. Costs are ceilings, not estimates.
+start; queue time consumes the same deadline. Claude tickets require explicit
+`--accept-cost-estimates` when starting. Their reported estimates can stop
+further launches but do not guarantee a hard-dollar ceiling on actual charges;
+missing cost stays unknown. Read [estimated accounting](../cli.md#estimated-provider-accounting-multi-cli)
+before opting in. Codex-only accounting remains unchanged.
 
 Before submitting, check the format without starting that deadline:
 
@@ -136,9 +149,13 @@ For the composed path, use:
 
 ```sh
 sf-dev run ticket.md --project my-app --watch
+# For a qualified Claude/Codex project, explicitly accept estimated accounting:
+sf-dev run ticket.md --project my-app --accept-cost-estimates --watch
 ```
 
 This submits and starts the exact queued ticket, then follows its status.
+Choose the appropriate command above, not both. Estimate consent is sent only
+when starting a queued ticket; it cannot change an already active ticket.
 Ctrl-C stops watching, not the ticket. If start is refused, submission still
 exists and its deadline is running; follow the reported action. Paused/blocked
 tickets are never implicitly resumed. The separate commands below remain

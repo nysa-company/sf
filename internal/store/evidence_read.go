@@ -262,6 +262,12 @@ func finalReviewCIAuthorityFrom(ctx context.Context, q candidateEvidenceQuerier,
 // dispensable prelude to green: each must be contiguous, policy-matched, and
 // bound to its exact event and digest.
 func finalReviewCIPendingChainFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, publication PublishedCandidateEvidence, policy CIRequiredCheckPolicy) (CIObservation, uint64, error) {
+	return finalReviewCIPendingChainThrough(ctx, q, ref, publication, policy, ^uint64(0)>>1)
+}
+
+// Historical refresh provenance stops at its immutable reservation endpoint.
+// Later generations' CI cannot invalidate that already-consumed segment.
+func finalReviewCIPendingChainThrough(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, publication PublishedCandidateEvidence, policy CIRequiredCheckPolicy, through uint64) (CIObservation, uint64, error) {
 	waitingVersion := publication.CurrentTicketVersion + 1
 	payload, err := json.Marshal(struct {
 		WitnessDigest    string `json:"witness_digest"`
@@ -279,7 +285,7 @@ func finalReviewCIPendingChainFrom(ctx context.Context, q candidateEvidenceQueri
 	}
 	var greenCount int
 	var reviewVersion uint64
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND candidate_tree_sha=? AND observation_classification='green' AND resulting_state='reviewing' AND resulting_trigger='checks_green'`, ref.Channel, ref.Project, ref.Ticket, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA, publication.Candidate.Snapshot.TreeSHA).Scan(&greenCount, &reviewVersion); err != nil || greenCount != 1 || reviewVersion <= waitingVersion {
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND candidate_tree_sha=? AND observation_classification='green' AND resulting_state='reviewing' AND resulting_trigger='checks_green' AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA, publication.Candidate.Snapshot.TreeSHA, through).Scan(&greenCount, &reviewVersion); err != nil || greenCount != 1 || reviewVersion <= waitingVersion {
 		return CIObservation{}, 0, fmt.Errorf("%w: final review CI green cardinality", ErrEvidenceConflict)
 	}
 	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
@@ -338,7 +344,7 @@ func finalReviewCIPendingChainFrom(ctx context.Context, q candidateEvidenceQueri
 		return CIObservation{}, 0, fmt.Errorf("%w: final review CI missing green endpoint", ErrEvidenceConflict)
 	}
 	var afterGreen int
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ref.Channel, ref.Project, ref.Ticket, reviewVersion).Scan(&afterGreen); err != nil || afterGreen != 0 {
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, reviewVersion, through).Scan(&afterGreen); err != nil || afterGreen != 0 {
 		return CIObservation{}, 0, fmt.Errorf("%w: final review CI trailing transition", ErrEvidenceConflict)
 	}
 	return green, reviewVersion, nil

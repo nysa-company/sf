@@ -1351,6 +1351,39 @@ func (f *FakeGH) UseBareRepositoryForTest(bare string) error {
 	return nil
 }
 
+// SyncPullRequestRefsFromBareForTest explicitly simulates GitHub refreshing an
+// open same-repository PR after a Git push. Read the actual private bare refs;
+// never accept caller-supplied OIDs. Ordinary fixtures retain their recorded
+// snapshots so intentional stale/foreign-identity tests remain meaningful.
+func (f *FakeGH) SyncPullRequestRefsFromBareForTest(number int) (contracts.PullRequestIdentity, error) {
+	var result contracts.PullRequestIdentity
+	err := f.withState(func() (bool, error) {
+		for index := range f.state.PRs {
+			pr := &f.state.PRs[index]
+			if pr.Identity.Number != number {
+				continue
+			}
+			if number <= 0 || pr.Merged || pr.Identity.HeadOwner != f.state.Repository.Owner || pr.Identity.HeadRepository != f.state.Repository.Name || pr.Identity.Repository != f.state.Repository {
+				return false, errors.New("fake-gh: only open same-repository PR refs can sync")
+			}
+			head, headFound, err := readFakeBareRef(f.bare, pr.Identity.HeadRef)
+			if err != nil || !headFound {
+				return false, errors.New("fake-gh: missing private source ref")
+			}
+			base, baseFound, err := readFakeBareRef(f.bare, pr.Identity.BaseRef)
+			if err != nil || !baseFound {
+				return false, errors.New("fake-gh: missing private base ref")
+			}
+			changed := pr.Identity.HeadOID != head || pr.Identity.BaseOID != base
+			pr.Identity.HeadOID, pr.Identity.BaseOID = head, base
+			result = pr.Identity
+			return changed, nil
+		}
+		return false, errors.New("fake-gh: pull request not found")
+	})
+	return result, err
+}
+
 func fakeBareFromMarker(configDir string) (string, bool, error) {
 	if configDir == "" || !filepath.IsAbs(configDir) || filepath.Clean(configDir) != configDir || configDir == string(filepath.Separator) {
 		return "", false, errors.New("fake-gh: invalid GH_CONFIG_DIR")

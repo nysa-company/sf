@@ -76,22 +76,31 @@ func (m RepositoryMaterializer) MaterializeVerificationCheckpoint(ctx context.Co
 	}
 	command, result, err := m.runCommand(ctx, request, store.RepositoryCommandPurposePrebuildVerification, key, artifact, "")
 	if err != nil || !verificationOutcome(artifact.PrebuildOutcome, result.Result.ExitCode) {
+		if err != nil {
+			reportVerificationCheckpointFailure("command")
+		} else {
+			reportVerificationCheckpointFailure("outcome")
+		}
 		return workflowworker.VerificationCheckpoint{}, materializeErr(err)
 	}
 	parent, err := m.verificationParent(ctx, request)
 	if err != nil {
+		reportVerificationCheckpointFailure("parent")
 		return workflowworker.VerificationCheckpoint{}, err
 	}
 	allowed, protected, err := m.verificationCommitPolicy(ctx, request, artifact, parent)
 	if err != nil {
+		reportVerificationCheckpointFailure("policy")
 		return workflowworker.VerificationCheckpoint{}, err
 	}
 	evidence, err := m.verificationCheckpointCommitDigest(ctx, request, key, command, result.ResultDigest, artifact)
 	if err != nil {
+		reportVerificationCheckpointFailure("evidence")
 		return workflowworker.VerificationCheckpoint{}, err
 	}
 	observation, err := m.commit(ctx, request, key, parent, allowed, protected, evidence)
 	if err != nil {
+		reportVerificationCheckpointFailure("commit")
 		return workflowworker.VerificationCheckpoint{}, err
 	}
 	checkpoint := workflowworker.VerificationCheckpoint{ID: observation.CommitOID, Commit: observation, CommandResult: command}
@@ -133,6 +142,13 @@ func (m RepositoryMaterializer) verificationParent(ctx context.Context, request 
 		return "", ErrRepositoryMaterialization
 	}
 	if !found {
+		repair, repaired, repairErr := m.Store.ReviewRepairVerificationCheckpoint(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+		if repairErr != nil {
+			return "", repairErr
+		}
+		if repaired {
+			return repair.ParentOID, nil
+		}
 		return parent, nil
 	}
 	if request.Ticket.State != domain.StateVerifying || proof.Ref != request.Ticket.Ref || proof.Version != request.Ticket.Version || proof.Fence != request.Fence || proof.Verification.Checkpoint.CommitOID == "" || proof.Verification.Checkpoint.CommitOID != proof.Verification.Revision.CheckpointID || proof.SourceCommit.ParentOID != proof.Verification.Checkpoint.CommitOID || proof.SourceCommit.CommitOID == "" {
@@ -148,6 +164,21 @@ func (m RepositoryMaterializer) verificationCommitPolicy(ctx context.Context, re
 		return nil, nil, ErrRepositoryMaterialization
 	}
 	if !found {
+		repair, repaired, repairErr := m.Store.ReviewRepairVerificationCheckpoint(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+		if repairErr != nil {
+			return nil, nil, repairErr
+		}
+		if repaired {
+			if parent != repair.ParentOID {
+				return nil, nil, ErrRepositoryMaterialization
+			}
+			for _, path := range repair.ProtectedPaths {
+				if !containsPath(allowed, path) {
+					allowed = append(allowed, path)
+				}
+			}
+			return allowed, repair.ProtectedPaths, nil
+		}
 		return allowed, nil, nil
 	}
 	if parent != proof.SourceCommit.CommitOID || !reflect.DeepEqual(artifact.OwnedFiles, proof.Verification.Revision.OwnedFiles) {

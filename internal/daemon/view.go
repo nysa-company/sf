@@ -19,6 +19,16 @@ const maxStatusHistory = 100
 // deliberately excluded from the operator/status response.
 func (daemon *Daemon) evidenceView(ctx context.Context, ref domain.TicketRef) (map[string]any, error) {
 	view := map[string]any{}
+	accounting, err := daemon.store.ProviderAccountingPolicy(ctx, ref)
+	if err == nil {
+		view["provider_accounting"] = map[string]any{
+			"mode": accounting.Policy, "actual_total_known": false, "hard_dollar_cap": false,
+			"sf_launch_limit": accounting.RequestLimit, "request_timeout": accounting.RequestTimeout.String(),
+			"estimate_limit_micro_usd": accounting.EstimateLimitMicroUSD,
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
 	plan, err := daemon.store.Plan(ctx, ref)
 	if err == nil {
 		view["plan"] = map[string]any{

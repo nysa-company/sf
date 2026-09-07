@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/cli"
-	"github.com/nysa-company/sf/internal/codexprovider"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
@@ -21,6 +20,7 @@ import (
 	"github.com/nysa-company/sf/internal/ghrunner"
 	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/localruntime"
+	"github.com/nysa-company/sf/internal/multiprovider"
 	"github.com/nysa-company/sf/internal/processsupervisor"
 	"github.com/nysa-company/sf/internal/providercoord"
 	"github.com/nysa-company/sf/internal/store"
@@ -182,10 +182,10 @@ func main() {
 			GitMutationDrainer:       git.MutationDrainer{},
 			RepositoryCommandDrainer: processsupervisor.RepositoryCommandDrainer{},
 			ProviderCoordinatorFactory: func(database *store.Store, process contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
-				return codexprovider.Compose(context.Background(), channel, database, process)
+				return multiprovider.Compose(context.Background(), channel, database, process)
 			},
-			ProviderQualifier: func(qualifyCtx context.Context, database *store.Store, value domain.Channel, builder, reviewer string) (any, error) {
-				return codexprovider.QualifyLocalPair(qualifyCtx, database, value, builder, reviewer, supervisor)
+			ProviderModelQualifier: func(qualifyCtx context.Context, database *store.Store, value domain.Channel, builder, reviewer, builderModel, reviewerModel string) (any, error) {
+				return multiprovider.QualifyLocalModels(qualifyCtx, database, value, builder, reviewer, builderModel, reviewerModel, supervisor)
 			},
 			WorkflowRuntimeFactory: localruntime.Factory(localruntime.Config{
 				Channel:           channel,

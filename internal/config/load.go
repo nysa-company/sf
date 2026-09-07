@@ -234,11 +234,18 @@ func PrepareNysaPureConfig(repository, profile, testPath string) (NysaPureConfig
 // PrepareNysaPureConfigContext is the cancellation-aware form used by the
 // init CLI. Its lock is retained by the returned plan through registration.
 func PrepareNysaPureConfigContext(ctx context.Context, repository, profile, testPath string) (NysaPureConfigPlan, error) {
+	return PrepareInitialConfigContext(ctx, repository, profile, testPath, "")
+}
+
+// PrepareInitialConfigContext combines an optional command recipe and explicit
+// provider preset in one no-overwrite, descriptor-locked initialization plan.
+// A preset names preferences only; it grants no runtime or billing authority.
+func PrepareInitialConfigContext(ctx context.Context, repository, profile, testPath, preset string) (NysaPureConfigPlan, error) {
 	identity, err := CaptureRepositoryIdentity(repository)
 	if err != nil {
 		return NysaPureConfigPlan{}, err
 	}
-	return prepareNysaPureConfigWithIdentityContext(ctx, repository, identity, profile, testPath)
+	return prepareInitialConfigWithIdentityContext(ctx, repository, identity, profile, testPath, preset)
 }
 
 func prepareNysaPureConfigWithIdentity(repository string, identity RepositoryIdentity, profile, testPath string) (NysaPureConfigPlan, error) {
@@ -246,7 +253,15 @@ func prepareNysaPureConfigWithIdentity(repository string, identity RepositoryIde
 }
 
 func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository string, identity RepositoryIdentity, profile, testPath string) (NysaPureConfigPlan, error) {
+	return prepareInitialConfigWithIdentityContext(ctx, repository, identity, profile, testPath, "")
+}
+
+func prepareInitialConfigWithIdentityContext(ctx context.Context, repository string, identity RepositoryIdentity, profile, testPath, preset string) (NysaPureConfigPlan, error) {
 	plan := NysaPureConfigPlan{Repository: repository, Path: filepath.Join(repository, ".sf", "config.toml"), identity: identity}
+	providers, err := ProviderPreset(preset)
+	if err != nil {
+		return plan, err
+	}
 	if (profile == "") != (testPath == "") {
 		return NysaPureConfigPlan{}, errors.New("profile and test path must be provided together")
 	}
@@ -259,7 +274,7 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 	if profile == PythonPytestV1Profile && !pythonclosure.ValidTestPath(testPath) {
 		return NysaPureConfigPlan{}, fmt.Errorf("profile %s requires a canonical repository-relative .py file or tests directory", profile)
 	}
-	lock, err := acquireProjectConfigLockContext(ctx, repository, profile != "")
+	lock, err := acquireProjectConfigLockContext(ctx, repository, profile != "" || preset != "")
 	if err != nil {
 		return NysaPureConfigPlan{}, err
 	}
@@ -296,6 +311,25 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 		}
 	}
 	if profile == "" {
+		if preset != "" && !exists {
+			// A providers-only file must not suppress normal recipe detection
+			// and accidentally give a Node/Python/Ruby project Go defaults.
+			detected, detectErr := detectRepositoryCommands(repository)
+			if detectErr != nil {
+				return fail(detectErr)
+			}
+			plan.Commands = detected
+			encoded, encodeErr := toml.Marshal(struct {
+				Commands nysaPureCommandsDocument `toml:"commands"`
+			}{Commands: nysaPureCommandsDocument{Verify: detected.Verify.Argv, Review: detected.Review.Argv}})
+			if encodeErr != nil {
+				return fail(encodeErr)
+			}
+			plan.Encoded = encoded
+		}
+		if err := plan.addProviderPreset(preset, providers); err != nil {
+			return fail(err)
+		}
 		return plan, nil
 	}
 	verify := []string{"node", nysapure.RecipeFlag, testPath}
@@ -314,6 +348,9 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 		if document.Commands == nil || !sameStrings(document.Commands.Verify, verify) || !sameStrings(document.Commands.Review, verify) {
 			return fail(fmt.Errorf("existing .sf/config.toml has different commands; edit or remove it before selecting profile %s", profile))
 		}
+		if err := plan.addProviderPreset(preset, providers); err != nil {
+			return fail(err)
+		}
 		return plan, nil
 	}
 
@@ -325,6 +362,9 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 		return fail(fmt.Errorf("encode profile configuration: %w", err))
 	}
 	plan.Encoded = encoded
+	if err := plan.addProviderPreset(preset, providers); err != nil {
+		return fail(err)
+	}
 	return plan, nil
 }
 
@@ -523,6 +563,9 @@ func (plan *NysaPureConfigPlan) LoadLockedProject(name string, machine MachineLi
 	data, exists, err := plan.lock.readOptional("config.toml")
 	if err != nil {
 		return Effective{}, nil, "", err
+	}
+	if !exists && !plan.Existing && plan.installed == nil && len(plan.Encoded) > 0 {
+		data, exists = plan.Encoded, true
 	}
 	return loadProjectData(plan.Repository, name, machine, commandsOverride, data, exists)
 }

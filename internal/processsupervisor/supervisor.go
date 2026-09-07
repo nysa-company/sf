@@ -19,8 +19,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nysa-company/sf/internal/claudeprovider"
+	"github.com/nysa-company/sf/internal/cliruntime"
 	"github.com/nysa-company/sf/internal/codexruntime"
 	"github.com/nysa-company/sf/internal/contracts"
+	"github.com/nysa-company/sf/internal/cursorprovider"
 	"github.com/nysa-company/sf/internal/domain"
 	"golang.org/x/sys/unix"
 )
@@ -48,7 +51,10 @@ type Identity struct {
 type Supervisor struct {
 	Signer   *contracts.DrainSigner
 	Recorder LaunchRecorder
-	trusted  map[domain.ProviderIdentity]trustedExecutable
+	// rejectionCheckpoint is installed only by trusted runtime composition before
+	// runs start. Provider adapters never supply physical checkpoint evidence.
+	rejectionCheckpoint contracts.RejectionCheckpointInspector
+	trusted             map[domain.ProviderIdentity]trustedExecutable
 	// Executable is the sf binary that implements __provider_gate. It is only
 	// overridden by compiled-boundary tests; production uses os.Executable.
 	Executable           string
@@ -79,6 +85,7 @@ type trustedExecutable struct {
 	authMode     string
 	authHome     string
 	bundle       codexruntime.Bundle
+	cliBundle    *cliruntime.Bundle
 }
 
 // stagedExecutable is owned by the supervisor, unlike legacy registered
@@ -88,6 +95,7 @@ type trustedExecutable struct {
 type stagedExecutable struct {
 	path, helperPath, directory string
 	bundleDigest                string
+	cliKind                     string
 	refs                        int
 	cleaning                    bool
 }
@@ -99,6 +107,8 @@ type run struct {
 	finished        chan struct{}
 	releaseSnapshot func()
 	completeOnce    sync.Once
+	rejection       *claudeprovider.RejectionObservation // protected by Supervisor.mu
+	controlDraining bool                                 // irrevocably suppresses a rejection receipt
 }
 
 func (r *run) completeWait() {
@@ -177,19 +187,18 @@ func (s *Supervisor) RegisterExecutable(identity domain.ProviderIdentity, path s
 // replace the staged path before launch; descriptor-level pinning is outside
 // this supervisor's documented trust boundary.
 func (s *Supervisor) RegisterRuntime(binding contracts.RuntimeBinding, executable, authHome string) (string, error) {
-	if s == nil || binding.Identity.Provider != "codex" || binding.BinaryDigest == "" || binding.PolicyDigest != environmentPolicyDigest() || binding.AuthDigest == "" || binding.AuthMode != "chatgpt_subscription" || authHome == "" {
-		return "", errors.New("complete Codex runtime binding is required")
+	if s == nil || binding.BinaryDigest == "" || binding.AuthDigest == "" || authHome == "" {
+		return "", errors.New("complete provider runtime binding is required")
 	}
 	if err := privateExistingDirectory(authHome); err != nil {
-		return "", errors.New("Codex authentication home is unsafe")
+		return "", errors.New("provider authentication home is unsafe")
 	}
-	bundle, err := codexruntime.Resolve(executable)
+	trusted, err := registeredRuntime(binding, executable)
 	if err != nil {
 		return "", err
 	}
-	trusted := trustedExecutable{path: bundle.Codex.Path, digest: bundle.Digest, bundle: bundle}
 	if trusted.digest != binding.BinaryDigest {
-		return "", errors.New("Codex runtime bundle digest does not match qualification")
+		return "", errors.New("provider runtime bundle digest does not match qualification")
 	}
 	s.mu.Lock()
 	if s.closing || s.closed {
@@ -234,9 +243,16 @@ func (s *Supervisor) RegisterRuntime(binding contracts.RuntimeBinding, executabl
 
 func runtimeBindingMatches(current, candidate trustedExecutable, binding contracts.RuntimeBinding, authHome string) bool {
 	return current.snapshot != nil && stagedRuntimeMatches(current.snapshot, current.digest) && current.path == candidate.path && current.digest == candidate.digest &&
-		current.bundle == candidate.bundle &&
+		current.bundle == candidate.bundle && cliBundleMatches(current.cliBundle, candidate.cliBundle) &&
 		current.policyDigest == binding.PolicyDigest && current.authDigest == binding.AuthDigest &&
 		current.authMode == binding.AuthMode && current.authHome == authHome
+}
+
+func cliBundleMatches(a, b *cliruntime.Bundle) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Kind() == b.Kind() && a.Digest() == b.Digest() && a.Executable() == b.Executable()
 }
 
 // stagedRuntimeMatches rechecks a cached snapshot before a refresh reuses it.
@@ -252,6 +268,10 @@ func stagedRuntimeMatches(snapshot *stagedExecutable, digest string) bool {
 		return false
 	}
 	if snapshot.bundleDigest != "" {
+		if snapshot.cliKind != "" {
+			bundle, err := cliruntime.Resolve(context.Background(), snapshot.cliKind, snapshot.path)
+			return err == nil && snapshot.bundleDigest == digest && bundle.Digest() == digest
+		}
 		if snapshot.bundleDigest != digest || snapshot.helperPath != filepath.Join(snapshot.directory, codexruntime.CodeModeHost) {
 			return false
 		}
@@ -508,6 +528,22 @@ func (trusted *trustedExecutable) stage() error {
 	if trusted == nil || trusted.path == "" || trusted.digest == "" {
 		return errors.New("trusted executable is incomplete")
 	}
+	if trusted.cliBundle != nil {
+		if trusted.bundle.Digest != "" || trusted.cliBundle.Digest() != trusted.digest || trusted.cliBundle.Executable() != trusted.path {
+			return errors.New("trusted CLI runtime bundle is inconsistent")
+		}
+		parent, err := filepath.EvalSymlinks(os.TempDir())
+		if err != nil {
+			return err
+		}
+		stage, err := trusted.cliBundle.Stage(context.Background(), parent)
+		if err != nil {
+			return err
+		}
+		trusted.stagedPath, trusted.stagedDir = stage.Executable(), filepath.Dir(stage.Executable())
+		trusted.snapshot = &stagedExecutable{path: trusted.stagedPath, directory: trusted.stagedDir, bundleDigest: stage.Digest(), cliKind: stage.Kind()}
+		return nil
+	}
 	directory, err := os.MkdirTemp("", "sf-provider-exec-")
 	if err != nil {
 		return err
@@ -630,6 +666,12 @@ func validCodexInvocation(invocation contracts.Invocation, identity domain.Provi
 }
 
 func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, invocation contracts.Invocation, input contracts.PhaseInput) (contracts.CommandResult, error) {
+	return s.runWithCLISecrets(ctx, request, invocation, input, lookupCLISecret)
+}
+
+// Credential lookup is fixed by Run in production. This private seam lets
+// process tests use synthetic credentials without reading the host Keychain.
+func (s *Supervisor) runWithCLISecrets(ctx context.Context, request contracts.DrainRequest, invocation contracts.Invocation, input contracts.PhaseInput, lookup cliSecretLookup) (contracts.CommandResult, error) {
 	if s == nil || !validDrainDurations(s.SoftDrain, s.HardDrain) {
 		return contracts.CommandResult{}, errors.New("provider drain durations exceed the machine bound")
 	}
@@ -668,6 +710,16 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 			return contracts.CommandResult{}, errors.New("Codex invocation does not match guarded registered runtime policy")
 		}
 	}
+	if request.Identity.Provider == "claude" {
+		if trusted.cliBundle == nil || input.AuthMode != claudeprovider.AuthModeSubscription || request.AuthDigest == "" || request.AuthDigest != trusted.authDigest || request.AuthMode != trusted.authMode || !claudeprovider.MatchesInvocation(ctx, trusted.path, trusted.authHome, input, invocation) {
+			return contracts.CommandResult{}, errors.New("Claude invocation does not match guarded registered runtime policy")
+		}
+	}
+	if request.Identity.Provider == "cursor" {
+		if trusted.cliBundle == nil || input.AuthMode != cursorprovider.AuthModeBrowser || request.AuthDigest == "" || request.AuthDigest != trusted.authDigest || request.AuthMode != trusted.authMode || !cursorprovider.MatchesInvocation(ctx, trusted.path, trusted.authHome, input, invocation) {
+			return contracts.CommandResult{}, errors.New("Cursor invocation does not match guarded registered runtime policy")
+		}
+	}
 	providerTarget, providerArgv0 := trusted.stagedPath, trusted.stagedPath
 	if providerTarget == "" {
 		return contracts.CommandResult{}, errors.New("provider executable was not staged")
@@ -691,14 +743,56 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 			return contracts.CommandResult{}, err
 		}
 	}
-	environment, temporary, cleanupEnvironment, err := vettedEnvironment(invocation.AuthHome)
+	var environment []string
+	var temporary string
+	var cleanupEnvironment func()
+	var err error
+	if request.Identity.Provider == "claude" {
+		environment, temporary, cleanupEnvironment, err = vettedCLIEnvironment(ctx, "claude", trusted.authDigest, lookup)
+	} else if request.Identity.Provider == "cursor" {
+		var home string
+		environment, home, _, cleanupEnvironment, err = cursorEnvironment(ctx, trusted.authDigest, lookup)
+		temporary = filepath.Join(home, "tmp")
+	} else {
+		environment, temporary, cleanupEnvironment, err = vettedEnvironment(invocation.AuthHome)
+	}
 	if err != nil {
 		return contracts.CommandResult{}, err
 	}
-	defer cleanupEnvironment()
+	// Private credentials and materialized input files follow the same lifetime
+	// as the staged executable. An ambiguous cancellation may return before
+	// cmd.Wait closes the streams; do not remove a still-running process's home.
+	runReturned, processCompleted := cleanupAfterRunAndWait(cleanupEnvironment)
+	defer runReturned()
+	defer func() {
+		if !releasedToWait {
+			processCompleted()
+		}
+	}()
 	arguments, finalMessage, err := materializeInvocationFiles(invocation, temporary)
 	if err != nil {
 		return contracts.CommandResult{}, err
+	}
+	if request.Identity.Provider == "cursor" {
+		home := filepath.Dir(temporary)
+		policy, policyErr := cursorprovider.Permissions(input)
+		profile, profileErr := cursorRoleSandboxProfile(input, trusted.stagedDir, home)
+		if policyErr != nil || profileErr != nil {
+			return contracts.CommandResult{}, errors.New("Cursor role profile is unavailable")
+		}
+		f, fileErr := os.OpenFile(filepath.Join(home, ".cursor", "cli-config.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if fileErr != nil {
+			return contracts.CommandResult{}, errors.New("Cursor private policy unavailable")
+		}
+		_, writeErr := f.Write(policy)
+		closeErr := f.Close()
+		if writeErr != nil || closeErr != nil {
+			return contracts.CommandResult{}, errors.New("Cursor private policy unavailable")
+		}
+		// The existing durable gate owns this entire process group. Neither
+		// the adapter nor the CLI can select or omit the outer profile.
+		arguments = append([]string{"/bin/bash", "-c", cursorOwnedLifecycleScript, "sf-cursor-owned", repositorySandboxExec, profile, trusted.stagedPath}, arguments[1:]...)
+		providerTarget, providerArgv0 = "/bin/bash", "/bin/bash"
 	}
 	gateRead, gateWrite, err := os.Pipe()
 	if err != nil {
@@ -758,7 +852,7 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 		s.mu.Unlock()
 		return contracts.CommandResult{}, ErrUnclear
 	}
-	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: startIdentity}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{}), finished: make(chan struct{}), releaseSnapshot: release}
+	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: startIdentity}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{}), finished: make(chan struct{}), releaseSnapshot: func() { processCompleted(); release() }}
 	// Once a process exists, its staged runtime remains referenced until the
 	// single cmd.Wait path has observed both process exit and stream closure.
 	// The deferred release above remains the prelaunch/startup failure fallback.
@@ -808,6 +902,20 @@ func (s *Supervisor) Run(ctx context.Context, request contracts.DrainRequest, in
 	lastMessage, lastTruncated, lastErr := readBoundedFile(finalMessage, 1<<20)
 	result := contracts.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), OutputLastMessage: lastMessage, StdoutTruncated: stdout.exceeded(), StderrTruncated: stderr.exceeded(), OutputLastMessageTruncated: lastTruncated}
 	if runErr != nil {
+		// Preserve the conservative public error result. Only supervisor-owned
+		// complete output with a normal exit can contribute private evidence.
+		var exit *exec.ExitError
+		if ctx.Err() == nil && errors.As(runErr, &exit) && exit.ExitCode() == 1 {
+			observed := result
+			observed.ExitCode = 1
+			if rejection, err := claudeprovider.ObserveRejection(ctx, input, observed); err == nil && rejection.AllFailuresServerErrors {
+				s.mu.Lock()
+				if s.runs[requestKey] == r && !r.controlDraining {
+					r.rejection = &rejection
+				}
+				s.mu.Unlock()
+			}
+		}
 		result.ExitCode = -1
 		return result, runErr
 	}
@@ -1059,6 +1167,10 @@ func (s *Supervisor) Drain(ctx context.Context, request contracts.DrainRequest) 
 	defer cancel()
 	s.mu.Lock()
 	r := s.runs[key(request)]
+	if r != nil {
+		r.controlDraining = true
+		r.rejection = nil
+	}
 	s.mu.Unlock()
 	if r == nil {
 		return contracts.DrainProof{}, ErrUnclear

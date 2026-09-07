@@ -20,6 +20,33 @@ type lostRunResponseClient struct {
 	dropped bool
 }
 
+func TestCLIStartEstimatesRecordsConsentBeforePlanning(t *testing.T) {
+	d, paths, _ := testDaemon(t)
+	ctx := context.Background()
+	path := writeTicket(t, t.TempDir(), "Estimate opt in")
+	if code, output, _ := executeCLI(t, ctx, paths, "submit", path, "--project", "demo", "--json"); code != 0 {
+		t.Fatalf("submit %d %s", code, output)
+	}
+	tickets, err := d.store.Tickets(ctx, domain.ChannelStable, "demo", 10)
+	if err != nil || len(tickets) != 1 {
+		t.Fatal("ticket missing", err)
+	}
+	ref := tickets[0].Ref
+	for i := 0; i < 2; i++ {
+		if code, output, _ := executeCLI(t, ctx, paths, "start", string(ref.Ticket), "--accept-cost-estimates", "--json"); code != 0 {
+			t.Fatalf("start %d %s", code, output)
+		}
+	}
+	policy, err := d.store.ProviderAccountingPolicy(ctx, ref)
+	if err != nil || policy.Policy != "reported_estimate_v1" {
+		t.Fatalf("policy %+v %v", policy, err)
+	}
+	current, err := d.store.Ticket(ctx, ref)
+	if err != nil || current.State != domain.StatePlanning || current.Version != 2 {
+		t.Fatalf("ticket %+v %v", current, err)
+	}
+}
+
 func (c *lostRunResponseClient) Call(ctx context.Context, request api.Request) (api.Response, error) {
 	response, err := c.client.Call(ctx, request)
 	if err == nil && response.OK && request.Method == c.method && !c.dropped {

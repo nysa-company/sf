@@ -76,13 +76,13 @@ func TestExpiredTicketFlowsCoordinatorThroughWorkerIntoOneDurableBudgetBlocker(t
 		t.Fatal(err)
 	}
 
-	provider := testkit.NewScriptedProvider(domain.ProviderIdentity{Provider: "cursor", Model: "budget", Family: "budget-family", Version: "1"})
+	provider := testkit.NewScriptedProvider(domain.ProviderIdentity{Provider: "fixture-cursor", Model: "budget", Family: "budget-family", Version: "1"})
 	provider.Add(domain.PhasePlanning, testkit.ProviderStep{Behavior: testkit.ProviderHang})
 	registry := providercoord.NewRegistry()
 	if err := registry.Register(ctx, provider); err != nil {
 		t.Fatal(err)
 	}
-	coordinator, err := providercoord.New(registry, map[providercoord.Role]providercoord.Route{providercoord.RolePlanner: {Primary: "cursor", Capacity: 1}}, database, nil, testkit.NewSupervisor())
+	coordinator, err := providercoord.New(registry, map[providercoord.Role]providercoord.Route{providercoord.RolePlanner: {Primary: "fixture-cursor", Capacity: 1}}, database, nil, testkit.NewSupervisor())
 	if err != nil {
 		t.Fatal(err)
 	}

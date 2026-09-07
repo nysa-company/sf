@@ -2438,11 +2438,14 @@ func TestFinalReviewValidationRejectsUnboundEvidence(t *testing.T) {
 	}
 }
 
-func setupProviderProject(t *testing.T, db *Store, ctx context.Context) string {
+func setupProviderProject(t *testing.T, db *Store, ctx context.Context, plannerProvider ...string) string {
 	t.Helper()
 	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("provider", "/tmp/provider"), config.TicketOverride{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(plannerProvider) == 1 {
+		effective.Providers.Planner = []string{plannerProvider[0]}
 	}
 	raw, digest, err := config.Snapshot(effective)
 	if err != nil {
@@ -2472,11 +2475,11 @@ func setupProviderTicket(t *testing.T, db *Store, ctx context.Context, id string
 }
 func setupProviderPair(t *testing.T, db *Store, ctx context.Context) (ProviderQualification, ProviderQualification) {
 	t.Helper()
-	b, _, err := db.RecordProviderQualification(ctx, qualificationValue("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "cursor", "cursor-family", QualificationGuarded))
+	b, _, err := db.RecordProviderQualification(ctx, qualificationValue("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "fixture-cursor", "cursor-family", QualificationGuarded))
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, _, err := db.RecordProviderQualification(ctx, qualificationValue("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "claude", "claude-family", QualificationGuarded))
+	r, _, err := db.RecordProviderQualification(ctx, qualificationValue("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "fixture-claude", "claude-family", QualificationGuarded))
 	if err != nil {
 		t.Fatal(err)
 	}

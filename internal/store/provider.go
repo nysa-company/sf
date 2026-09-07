@@ -726,7 +726,7 @@ func (s *Store) pendingProviderRepairUnavailable(ctx context.Context, conn *sql.
 // binding before its matching phase lifecycle is accepted.  A later daemon
 // recovery changes the ticket fence but never changes the terminal claim.
 func (s *Store) pendingProviderTerminalClaim(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, phase domain.Phase, role string, expected uint64, fence domain.Fence, outcome string, repairWindow, admit bool) (ProviderAttemptClaim, bool, error) {
-	if outcome != "invalid_artifact" && outcome != "result_indeterminate" {
+	if outcome != "invalid_artifact" && outcome != "result_indeterminate" && outcome != providerServerRejected {
 		return ProviderAttemptClaim{}, false, ErrEvidenceConflict
 	}
 	assert := s.assertCurrentTicketFence
@@ -778,6 +778,11 @@ func (s *Store) pendingProviderTerminalClaim(ctx context.Context, conn *sql.Conn
 	}
 	if launchState != "drained" || finishedAt == "" || phaseFinished == "" || results != 0 {
 		return ProviderAttemptClaim{}, false, ErrEvidenceConflict
+	}
+	if outcome == providerServerRejected {
+		if _, _, err := loadServerRejectionFrom(ctx, conn, claim); err != nil {
+			return ProviderAttemptClaim{}, false, err
+		}
 	}
 	return claim, true, nil
 }
@@ -927,7 +932,28 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		if qualification.ID <= 0 {
 			return ErrProviderPairRefused
 		}
+		if err := validateEstimatedProviderRoute(ctx, conn, r); err != nil {
+			return err
+		}
 		var spent int64
+		if contracts.UsesMultiCLIRequestLimit(r.Binding.Identity.Provider) {
+			policy, err := loadProviderAccountingPolicy(ctx, conn, r.Ref)
+			if err != nil || policy.EstimateLimitMicroUSD != maxCost {
+				return ErrProviderAttempt
+			}
+			// Estimates are a separate stop signal, never verified charges.
+			// NULL observations remain unknown; request/time bounds still apply.
+			var estimated int64
+			if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(estimate_micro_usd),0) FROM provider_cost_estimates WHERE channel=? AND project_id=? AND ticket_id=?`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket).Scan(&estimated); err != nil {
+				return err
+			}
+			if estimated >= policy.EstimateLimitMicroUSD {
+				return ErrBudgetExhausted
+			}
+		}
+		if err := admitProviderRequestLimit(ctx, conn, r); err != nil {
+			return err
+		}
 		if err = conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(usage_units),0) FROM provider_attempts WHERE channel=? AND project_id=? AND ticket_id=?`, r.Ref.Channel, r.Ref.Project, r.Ref.Ticket).Scan(&spent); err != nil {
 			return err
 		}
@@ -973,6 +999,9 @@ func (s *Store) BeginProviderAttempt(ctx context.Context, r ProviderAttemptReque
 		launchInput.Provider, launchInput.AuthMode = r.Binding.Identity, r.Binding.AuthMode
 		launchInput.Attempt, launchInput.LeaderEpoch, launchInput.RunnerEpoch, launchInput.ExpectedVersion = prior, r.Fence.LeaderEpoch, r.Fence.RunnerEpoch, r.ExpectedVersion
 		launchInput.Repository, launchInput.Worktree, launchInput.WorktreeIdentity, launchInput.BaseSHA = r.Repository, r.Worktree, r.WorktreeIdentity, r.BaseSHA
+		if err := serverRejectionAdmission(ctx, conn, r, entry, launchInput, entryRuns); err != nil {
+			return err
+		}
 		payload, requestDigest, err := contracts.CanonicalPhaseInput(launchInput)
 		if err != nil || len(payload) == 0 || len(payload) > 2<<20 {
 			return ErrProviderAttempt
@@ -1212,7 +1241,7 @@ func (s *Store) retireProviderAttemptAfterControlInvalidation(ctx context.Contex
 // immutable evidence, marks both lifecycle rows completed, and releases the
 // exact lease in one SQLite transaction.
 func (s *Store) CompleteProviderAttemptSuccess(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, raw contracts.PhaseResult, validation phaseartifact.Validation, finished time.Time) (ProviderAttemptResult, error) {
-	if !raw.UsageTrusted || raw.UsageUnits < 0 {
+	if !s.ProviderResultAccountingAccepted(ctx, claim, raw) {
 		return ProviderAttemptResult{}, ErrProviderAttempt
 	}
 	immutable, err := loadAuthenticatedProviderAttemptClaim(ctx, s.db, claim.ID)
@@ -1255,7 +1284,7 @@ func loadAuthenticatedProviderAttemptClaim(ctx context.Context, query rowQueryer
 	var value ProviderAttemptClaim
 	var channel, project, ticket string
 	var qualification sql.NullInt64
-	err := query.QueryRowContext(ctx, `SELECT a.channel,a.project_id,a.ticket_id,a.phase,a.attempt,a.provider,a.model,a.family,a.version,a.role,a.qualification_id,a.binding_digest,a.provider_lease_key,a.leader_epoch,a.runner_epoch,a.expected_ticket_version,a.repository_path,a.worktree_path,a.worktree_identity,a.base_sha,a.supervisor_key,a.auth_digest,a.auth_mode,q.binary_digest,q.policy_digest,q.fixture_digest,i.request_digest,i.canonical_input FROM provider_attempts a JOIN provider_qualifications q ON q.id=a.qualification_id AND q.channel=a.channel AND q.provider=a.provider AND q.model=a.model AND q.family=a.family AND q.provider_version=a.version AND q.profile IN ('qualified_guarded','autonomous_eligible') AND (a.provider<>'codex' OR (q.auth_digest=a.auth_digest AND q.auth_mode=a.auth_mode AND length(q.probe_digest)=64 AND q.attested_leader_epoch>0 AND length(q.attestation_signature)=64)) JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id WHERE a.id=?`, id).Scan(&channel, &project, &ticket, &value.Phase, &value.Attempt, &value.Binding.Identity.Provider, &value.Binding.Identity.Model, &value.Binding.Identity.Family, &value.Binding.Identity.Version, &value.Role, &qualification, &value.BindingDigest, &value.LeaseKey, &value.LeaderEpoch, &value.RunnerEpoch, &value.ExpectedVersion, &value.Repository, &value.Worktree, &value.WorktreeIdentity, &value.BaseSHA, &value.SupervisorKey, &value.Binding.AuthDigest, &value.Binding.AuthMode, &value.Binding.BinaryDigest, &value.Binding.PolicyDigest, &value.Binding.FixtureDigest, &value.RequestDigest, &value.RequestPayload)
+	err := query.QueryRowContext(ctx, `SELECT a.channel,a.project_id,a.ticket_id,a.phase,a.attempt,a.provider,a.model,a.family,a.version,a.role,a.qualification_id,a.binding_digest,a.provider_lease_key,a.leader_epoch,a.runner_epoch,a.expected_ticket_version,a.repository_path,a.worktree_path,a.worktree_identity,a.base_sha,a.supervisor_key,a.auth_digest,a.auth_mode,q.binary_digest,q.policy_digest,q.fixture_digest,i.request_digest,i.canonical_input FROM provider_attempts a JOIN provider_qualifications q ON q.id=a.qualification_id AND q.channel=a.channel AND q.provider=a.provider AND q.model=a.model AND q.family=a.family AND q.provider_version=a.version AND q.profile IN ('qualified_guarded','autonomous_eligible') AND ((a.provider<>'codex' AND a.auth_mode='' AND q.auth_mode='') OR (q.auth_digest=a.auth_digest AND q.auth_mode=a.auth_mode AND length(q.probe_digest)=64 AND q.attested_leader_epoch>0 AND length(q.attestation_signature)=64)) JOIN provider_attempt_inputs i ON i.provider_attempt_id=a.id WHERE a.id=?`, id).Scan(&channel, &project, &ticket, &value.Phase, &value.Attempt, &value.Binding.Identity.Provider, &value.Binding.Identity.Model, &value.Binding.Identity.Family, &value.Binding.Identity.Version, &value.Role, &qualification, &value.BindingDigest, &value.LeaseKey, &value.LeaderEpoch, &value.RunnerEpoch, &value.ExpectedVersion, &value.Repository, &value.Worktree, &value.WorktreeIdentity, &value.BaseSHA, &value.SupervisorKey, &value.Binding.AuthDigest, &value.Binding.AuthMode, &value.Binding.BinaryDigest, &value.Binding.PolicyDigest, &value.Binding.FixtureDigest, &value.RequestDigest, &value.RequestPayload)
 	if err != nil {
 		return ProviderAttemptClaim{}, err
 	}
@@ -1288,6 +1317,13 @@ func sameProviderAttemptResult(a, b ProviderAttemptResult) bool {
 }
 
 func (s *Store) finishProviderAttempt(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, state, outcome string, usage int64, finished time.Time, result *ProviderAttemptResult, artifactFailure *ProviderArtifactFailure, providerFailure ...contracts.ProviderFailureReason) error {
+	return s.finishProviderAttemptWithReceipt(ctx, claim, proof, expected, fence, state, outcome, usage, finished, result, artifactFailure, nil, providerFailure...)
+}
+
+func (s *Store) finishProviderAttemptWithReceipt(ctx context.Context, claim ProviderAttemptClaim, proof contracts.DrainProof, expected uint64, fence domain.Fence, state, outcome string, usage int64, finished time.Time, result *ProviderAttemptResult, artifactFailure *ProviderArtifactFailure, receipt *contracts.ServerRejectionAttestation, providerFailure ...contracts.ProviderFailureReason) error {
+	if (outcome == providerServerRejected) != (receipt != nil) || receipt != nil && (state != "failed" || result != nil || artifactFailure != nil || len(providerFailure) != 0) {
+		return ErrProviderServerRejection
+	}
 	if claim.ID <= 0 || claim.ExpectedVersion == 0 || claim.LeaderEpoch == 0 || claim.RunnerEpoch == 0 || !validAttemptState(state) || !safeOutcome(outcome) || usage < 0 || finished.IsZero() {
 		return ErrProviderAttempt
 	}
@@ -1341,8 +1377,33 @@ func (s *Store) finishProviderAttempt(ctx context.Context, claim ProviderAttempt
 		if err := conn.QueryRowContext(ctx, `SELECT state FROM provider_attempts WHERE id=?`, claim.ID).Scan(&persistedState); err != nil {
 			return err
 		}
-		if persistedState != "active" || !sameImmutableProviderAttemptClaim(claim, persisted) || claim.Input.RequestDigest != persisted.Input.RequestDigest || persisted.BindingDigest == "" || persisted.BindingDigest != bindingDigest(persisted.Binding) {
+		if !sameImmutableProviderAttemptClaim(claim, persisted) || claim.Input.RequestDigest != persisted.Input.RequestDigest || persisted.BindingDigest == "" || persisted.BindingDigest != bindingDigest(persisted.Binding) {
 			return ErrStaleFence
+		}
+		if persistedState == "failed" && receipt != nil {
+			stored, _, err := loadServerRejectionFrom(ctx, conn, claim)
+			if err != nil {
+				return err
+			}
+			storedBytes, _, _, err := canonicalServerRejection(claim, stored)
+			if err != nil {
+				return err
+			}
+			requestedBytes, _, _, err := canonicalServerRejection(claim, *receipt)
+			if err != nil || !bytes.Equal(storedBytes, requestedBytes) {
+				return ErrProviderServerRejection
+			}
+			// Observational replay only: never release a lease key which may
+			// already belong to a subsequent attempt, or recalculate backoff.
+			return nil
+		}
+		if persistedState != "active" {
+			return ErrStaleFence
+		}
+		if receipt != nil {
+			if err := s.recordServerRejectionFrom(ctx, conn, claim, *receipt, finished); err != nil {
+				return err
+			}
 		}
 		var maxCost, spent, maxDuration int64
 		if err := conn.QueryRowContext(ctx, `SELECT max_cost_micro_usd FROM tickets WHERE channel=? AND project_id=? AND id=?`, claim.Ref.Channel, claim.Ref.Project, claim.Ref.Ticket).Scan(&maxCost); err != nil {
@@ -2299,13 +2360,9 @@ func currentRuntimeQualification(ctx context.Context, conn *sql.Conn, channel do
 	q := ProviderQualification{}
 	q.ID = 0
 	query := `SELECT q.id,q.channel,q.run_id,q.provider,q.model,q.family,q.provider_version,q.binary_digest,q.policy_digest,q.fixture_digest,q.profile,q.failed_probes_json,q.reason_code,q.created_at,q.auth_digest,q.auth_mode,q.probe_digest,q.attested_leader_epoch,q.attestation_signature FROM provider_qualifications q`
-	where := ` WHERE q.channel=? AND q.provider=? AND q.model=? AND q.family=? AND q.provider_version=? AND q.binary_digest=? AND q.policy_digest=? AND q.fixture_digest=? AND q.profile IN ('qualified_guarded','autonomous_eligible') AND (q.provider <> 'codex' OR (q.auth_digest=? AND q.auth_mode=? AND length(q.probe_digest)=64 AND q.attested_leader_epoch>0 AND length(q.attestation_signature)=64))`
+	where := ` WHERE q.channel=? AND q.provider=? AND q.model=? AND q.family=? AND q.provider_version=? AND q.binary_digest=? AND q.policy_digest=? AND q.fixture_digest=? AND q.profile IN ('qualified_guarded','autonomous_eligible') AND ((q.provider <> 'codex' AND q.auth_mode='') OR (q.auth_digest=? AND q.auth_mode=? AND length(q.probe_digest)=64 AND q.attested_leader_epoch>0 AND length(q.attestation_signature)=64))`
 	args := []any{channel, b.Identity.Provider, b.Identity.Model, b.Identity.Family, b.Identity.Version, b.BinaryDigest, b.PolicyDigest, b.FixtureDigest}
-	if b.Identity.Provider == "codex" {
-		args = append(args, b.AuthDigest, b.AuthMode)
-	} else {
-		args = append(args, "", "")
-	}
+	args = append(args, b.AuthDigest, b.AuthMode)
 	if role == "planner" || role == "builder" || role == "reviewer" {
 		col := "planner_qualification_id"
 		if role == "builder" {
@@ -2321,7 +2378,10 @@ func currentRuntimeQualification(ctx context.Context, conn *sql.Conn, channel do
 	if err != nil {
 		return ProviderQualification{}, ErrProviderPairRefused
 	}
-	if value.Provider.Provider == "codex" {
+	if value.Provider.Provider == "codex" || value.AuthMode != "" || b.AuthMode != "" {
+		if !attestedProviderAuthMode(value.Provider.Provider, value.AuthMode) || value.AuthMode != b.AuthMode || value.AuthDigest != b.AuthDigest {
+			return ProviderQualification{}, ErrProviderPairRefused
+		}
 		var epoch uint64
 		var key []byte
 		if err := conn.QueryRowContext(ctx, `SELECT leader_epoch,recovery_public_key FROM daemon_instances WHERE channel=?`, channel).Scan(&epoch, &key); err != nil || value.AttestedLeaderEpoch != epoch || !contracts.VerifyQualificationAttestation(key, contracts.QualificationAttestation{Channel: value.Channel, RunID: value.RunID, Identity: value.Provider, BinaryDigest: value.BinaryDigest, PolicyDigest: value.PolicyDigest, FixtureDigest: value.FixtureDigest, AuthDigest: value.AuthDigest, AuthMode: value.AuthMode, ProbeDigest: value.ProbeDigest, Profile: contracts.ProfileGuarded, CreatedUnixNanos: value.CreatedAt.UnixNano(), LeaderEpoch: value.AttestedLeaderEpoch, Nonce: value.RunID, Signature: value.AttestationSignature}) {
@@ -2410,13 +2470,16 @@ func validPersistedProviderAttemptClaim(claim ProviderAttemptClaim) bool {
 }
 func validAttemptState(v string) bool { return v == "completed" || v == "failed" || v == "cancelled" }
 func safeOutcome(v string) bool {
+	if v == providerServerRejected {
+		return true
+	}
 	if v == "completed" || v == "failed" || v == "cancelled" || v == "invalid_artifact" || v == "result_indeterminate" || v == "drained_recovery" {
 		return true
 	}
 	return false
 }
 func validRuntimeBinding(v contracts.RuntimeBinding) bool {
-	return v.Identity.Provider != "" && hexDigest(v.BinaryDigest) && hexDigest(v.PolicyDigest) && hexDigest(v.FixtureDigest) && hexDigest(v.AuthDigest) && (v.Identity.Provider != "codex" || v.AuthMode == "chatgpt_subscription")
+	return v.Identity.Provider != "" && hexDigest(v.BinaryDigest) && hexDigest(v.PolicyDigest) && hexDigest(v.FixtureDigest) && hexDigest(v.AuthDigest) && ((v.Identity.Provider != "codex" && v.AuthMode == "") || attestedProviderAuthMode(v.Identity.Provider, v.AuthMode))
 }
 func validProviderIdentityClaim(r ProviderAttemptRequest) bool {
 	return r.Repository != "" && r.Worktree != "" && r.WorktreeIdentity != "" && validOID(r.BaseSHA) && len(r.SupervisorKey) == 32

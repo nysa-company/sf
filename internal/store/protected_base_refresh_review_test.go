@@ -68,9 +68,80 @@ func TestProtectedBaseRefreshRequiresFreshFinalReview(t *testing.T) {
 	})
 }
 
-func protectedBaseRefreshReviewFixture(t *testing.T) (finalReviewFixture, ProviderAttemptClaim) {
+func TestProtectedBaseRefreshAfterWaitingCIRestartAuthenticatesFreshBuilder(t *testing.T) {
+	t.Run("pending before restart", func(t *testing.T) {
+		fixture, _ := protectedBaseRefreshReviewFixture(t, true, true, true)
+		defer fixture.db.Close()
+	})
+	for _, pending := range []bool{false, true} {
+		t.Run(map[bool]string{false: "green", true: "pending then green"}[pending], func(t *testing.T) {
+			fixture, _ := protectedBaseRefreshReviewFixture(t, true, pending)
+			defer fixture.db.Close()
+		})
+	}
+}
+
+func TestProtectedBaseRefreshReviewedRecoveryRejectsTamperedHistory(t *testing.T) {
+	for _, tc := range []struct{ name, trigger, query string }{
+		{"CI transition", "ci_transition_evidence_immutable_update", `UPDATE ci_transition_evidence SET transition_digest=? WHERE candidate_generation=1 AND observation_classification='green'`},
+		{"pending CI transition", "ci_transition_evidence_immutable_update", `UPDATE ci_transition_evidence SET transition_digest=? WHERE candidate_generation=1 AND observation_classification='pending'`},
+		{"CI policy", "ci_required_check_policies_immutable_update", `UPDATE ci_required_check_policies SET policy_witness_digest=? WHERE candidate_generation=1`},
+		{"review event", "", `UPDATE events SET payload=? WHERE trigger='review_pass'`},
+		{"review result", "provider_attempt_results_immutable_update", `UPDATE provider_attempt_results SET typed_sha256=? WHERE phase='review' AND provider_attempt_id=(SELECT MIN(id) FROM provider_attempts WHERE phase='review')`},
+		{"recovery row", "runner_recovery_ledger_immutable_update", `UPDATE runner_recovery_ledger SET recovery_digest=?`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, _ := protectedBaseRefreshReviewFixture(t, true, true, true)
+			defer f.db.Close()
+			value, completion, err := protectedBaseRefreshForTicketAt(f.ctx, f.db.db, f.ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			step, found, err := loadLatestRunnerRecovery(f.ctx, f.db.db, f.ticket.Ref)
+			if err != nil || !found {
+				t.Fatal("missing fixture recovery")
+			}
+			check := func(runner uint64) bool {
+				return protectedBaseRefreshRecoveryGap(f.ctx, f.db.db, value.Ref, step.TicketVersion, runner, step.LeaderEpoch, completion.Version, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch)
+			}
+			root := func(runner uint64) bool {
+				return protectedBaseRefreshRecoveryTarget(f.ctx, f.db.db, value.Ref, step.PriorTicketVersion, runner, step.PriorLeaderEpoch)
+			}
+			// Revalidate after the successor's publication/green CI has already
+			// been appended: historical provenance must stay generation-bound.
+			if !check(step.RunnerEpoch) || check(step.RunnerEpoch+1) || !root(step.PriorRunnerEpoch) || root(step.PriorRunnerEpoch+1) {
+				t.Fatal("historical refreshed proof or source fence mismatch")
+			}
+			if tc.trigger != "" {
+				if _, err := f.db.db.ExecContext(f.ctx, "DROP TRIGGER "+tc.trigger); err != nil {
+					t.Fatal(err)
+				}
+			}
+			corrupt := "sha256:" + strings.Repeat("e", 64)
+			if tc.name == "review result" {
+				corrupt = strings.Repeat("e", 64)
+			}
+			changed, err := f.db.db.ExecContext(f.ctx, tc.query, corrupt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count, err := changed.RowsAffected(); err != nil || count == 0 {
+				t.Fatal("tamper fixture did not change a row")
+			}
+			if check(step.RunnerEpoch) || root(step.PriorRunnerEpoch) {
+				t.Fatal("tampered history authorized refresh recovery")
+			}
+		})
+	}
+}
+
+func protectedBaseRefreshReviewFixture(t *testing.T, restartWaitingCI ...bool) (finalReviewFixture, ProviderAttemptClaim) {
 	t.Helper()
-	fixture := finalReviewLifecycleFixture(t)
+	pending := 0
+	if len(restartWaitingCI) > 1 && restartWaitingCI[1] {
+		pending = 1
+	}
+	fixture := finalReviewLifecycleFixtureForPending(t, domain.TicketFeature, domain.MergeGuarded, pending, restartWaitingCI...)
 	predecessor := completeFinalReview(t, fixture)
 	if _, err := fixture.db.TransitionFinalReview(fixture.ctx, Transition{
 		Ref: fixture.ticket.Ref, ExpectedVersion: fixture.ticket.Version,
@@ -162,6 +233,12 @@ func protectedBaseRefreshReviewFixture(t *testing.T) (finalReviewFixture, Provid
 	}
 	buildFence := domain.Fence{LeaderEpoch: completion.Fence.LeaderEpoch, RunnerEpoch: building.RunnerEpoch}
 	builderKey, builder := completeCandidateRepairBuilderBeforeCandidate(t, fixture.db, building, buildFence)
+	if _, _, err := fixture.db.LoadCurrentProviderAttemptResult(fixture.ctx, builderKey, building.Version, buildFence); err != nil {
+		t.Fatalf("fresh refreshed Builder result failed current authority: %v", err)
+	}
+	if err := fixture.db.ProviderResultReachesFence(fixture.ctx, builderKey, building.Version, buildFence); err != nil {
+		t.Fatalf("fresh refreshed Builder result failed materializer authority: %v", err)
+	}
 	builderDigest, err := phaseartifact.BuilderEvidenceDigest(builder)
 	if err != nil {
 		fixture.db.Close()

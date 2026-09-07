@@ -2,6 +2,2073 @@
 
 ## Current truth
 
+- User authorized consolidating the validated multiCLI tree and Codex beta
+  through sf PR #2 into main. Preparing one commit and updating the PR;
+  main's ruleset requires one approving review and squash merge. Do not
+  bypass protection or replace a live daemon. Earlier local-only delivery
+  notes below are historical; consult GitHub for the current merge state.
+
+- MultiCLI implementation/validation goal completed with declared capability
+  limits; receipt docs/plans/2026-09-07-multi-cli-completion-audit.md.
+  Full87903 TERMINAL PASS exit0 (workflowruntime113.036s final), live28572
+  PASS752.36s both Done/restart/separate approvals/base refresh, vet and
+  repo/docs/diff/secret gates PASS. All test handles terminal, no paid calls
+  active. Candidate10576 ready locally, not installed. MultiCLI source remains
+  uncommitted and NOT in Codex beta PR #2. Cursor API-error automatic retry
+  lacks authoritative terminal protocol; Grok Low unqualified. These remain
+  explicit unavailable capabilities; no fallback/containment/cost claims added.
+
+- Local development candidate10576 built successfully at
+  .context/multicli-candidate.9H4KK6/bin (complete four binaries/known hosts/LICENSE).
+  Version0.1.0-dev.multicli-local, base6f12229-dirty, channeldev. Version JSON
+  and provider/config help pass. Not a release bundle or daemon replacement.
+  Baseline87903 remains active; supervisor74.006s and Store cached PASS,
+  workflow packages pending. Original default-cache build was sandbox-refused;
+  private GOCACHE rerun succeeded with no source change.
+
+- Completion audit drafted at docs/plans/2026-09-07-multi-cli-completion-audit.md.
+  Requirement/source/test mapping inspected; Cursor automatic API retry is
+  explicitly unavailable because pinned CLI prints unstructured error/exit
+  (docs/cli.md), not signed terminal evidence. Grok Low unqualified; neither
+  bypassed. Current full vet PASS; repo-check/docs-smoke/diff-check PASS after
+  audit document. Baseline87903 still running (cmd/sf106.491s,
+  daemon22.745s, GitHub64.534s passed; supervisor onward pending).
+  Poll87903, not beta91548 or live28572, which are terminal PASS.
+
+- Full multiCLI baseline87903 NOW RUNNING after passing live28572:
+  GOCACHE=/private/tmp/sf-multi-cli-go-cache go test -p 1 ./...
+  native host, all paid/live opt-ins off. Poll87903 exact handle; no paid
+  runs remain active. Next after terminal: completion audit against full plan,
+  current source/coverage and declared unavailable Grok/usage capabilities.
+
+- Live Cursor concurrency28572 TERMINAL PASS752.36s/package752.998s,
+  exit0: real Cursor Luna Low Builder/Planner + Claude Sonnet5 Reviewer,
+  two tickets, restart/requalification, separate approvals, fresh sibling
+  Builder/review after exact protected-base refresh, both Done. Disposable
+  native daemon/Store/local Git/FakeGH only, not hosted Relay. Initial roles
+  and fresh Builder all completed without failed attempts in observed DB.
+  Test cleanup removed disposable DB; do not query it as live. No duplicate
+  trial needed. Full current multiCLI baseline refresh is the next gate;
+  goal remains active pending requirement-by-requirement completion audit.
+
+- Isolated exact beta6f12229 full suite91548 TERMINAL PASS exit0:
+  cmd/sf128.018s, Git258.021s, GitHub87.700s, supervisor81.991s,
+  publication136.905s, Store182.126s, workflowruntime163.628s,
+  worktreecoord171.418s. PR #2 remains exact beta, dirty multiCLI excluded.
+  Serialized orchestrator3327 completed and launched live multiCLI28572:
+  GOCACHE=/private/tmp/sf-multi-cli-go-cache SF_TEST_LIVE_CURSOR_CONCURRENT=1
+  go test -tags sf_e2e -p 1 -count=1 -timeout 25m ./cmd/sf
+  -run '^TestCompiledLiveCursorConcurrentTicketsRestartBeforeSeparateApprovals$' -v
+  Native host, authorized paid models, disposable Git/GitHub only. Poll28572;
+  no duplicate launch on silence. No passing live result yet. Current-tree
+  repo/secret checks83523 PASS after assertion correction.
+
+- MultiCLI assertion fix validated: regression65374 PASS0.865s, race count3
+  87126 PASS2.159s, exact Store/Coordinator no-process authority57908 PASS
+  (0.910s/0.750s). Production unchanged. Beta baseline91548 remains live,
+  latest ghrunner12.875s; poll exact handle to completion before launching
+  paid concurrency to avoid host contention. Native expiry-only Claude check
+  reports462 minutes, sufficient. Next: original bounded live Cursor concurrent
+  test command below, then full current-tree validation; goal not complete.
+
+- Published exact committed Codex beta6f12229 as SF PR #2:
+  https://github.com/nysa-company/sf/pull/2, branch feat/codex-beta-testing.
+  User requested immediate publication without review; dirty multiCLI excluded.
+  Isolated beta baseline91548 is still running; no fresh green claim in PR.
+  MultiCLI goal remains active. Live55528 TERMINAL FAIL476.08s:
+  attempt-history assertion rejected failed/invocation_failed. Store's sole
+  writer proves no process launched, so this is a test-only false rejection,
+  not an uncertain execution. Regression80021 RED,65374 GREEN0.865s after
+  permitting that exact failed outcome; indeterminate/cancelled/unknown and
+  quarantined outcomes still reject. No production retry-policy change.
+  Original live scenario rerun remains pending; do not poll55528 as active.
+
+- Baseline86750 TERMINAL PASS, workflowruntime171.412s completed last;
+  paid opt-ins off, some unchanged packages cached. Current full vet/static/
+  secret checks passed. Live Cursor concurrency55528 NOW RUNNING:
+  GOCACHE=/private/tmp/sf-multi-cli-go-cache SF_TEST_LIVE_CURSOR_CONCURRENT=1
+  go test -tags sf_e2e -p 1 -count=1 -timeout 25m ./cmd/sf
+  -run '^TestCompiledLiveCursorConcurrentTicketsRestartBeforeSeparateApprovals$' -v
+  Native host, authorized paid models, disposable local Git/GitHub, no hosted
+  Relay/live channel mutation. Poll55528; do not duplicate on silent output.
+
+- Claude lifetime blocker CLEARED without user action: one authorized native
+  Sonnet5 tool-disabled/safe-mode/no-session request in disposable temp dir
+  57959 PASS, response discarded. Native CLI refreshed its own browser login;
+  expiry-only Keychain check now479 minutes (>=46). No SF credential policy
+  bypass, token printing or Cursor charge. Wait for baseline86750 terminal,
+  then run bounded live Cursor concurrent restart acceptance. Do not ask user
+  to renew based on the superseded four-minute observation below.
+
+- Baseline86750 still RUNNING, now Store159.858s and supervisor79.492s
+  PASS; final workflow/worktree packages pending. Keep polling same handle.
+  User asked which stable branch to test: clarified local tested beta6f12229
+  on feat/local-factory-v1, not dirty multi-provider source. Fresh GitHub read:
+  public sf main remains ff2f9e2 (Sept2), releases empty. Local tracking branch
+  origin/feat/local-factory-v1 is8dab8f6; localHEAD ahead71. Do not imply the
+  local beta commit has been published or can be fetched from a fresh clone.
+
+- Current baseline86750 remains RUNNING (last output codexprovider/config/
+  contracts/cursorprovider passed; cmd/sf91.465s passed). Poll this exact
+  handle, do not duplicate. Full vet independent exit0; repo-check and
+  secret-scan84871 PASS (644 commits +90.55MB, no leaks); diff-check PASS.
+  Native Claude auth status is logged in, but expiry-only metadata check found
+  only four minutes remaining, insufficient for 46-minute launch window. The
+  sandbox status falsely showed logged out; native host result is authoritative.
+  No paid run launched. Live concurrent restart remains pending renewed lifetime.
+
+- Joined synthetic process/Store retry regression now PASS: real supervised
+  rejection receipt -> Store finish -> close/reopen -> durable backoff -> same
+  binding attempt 2 -> real Git checkpoint inspection -> second process and
+  persisted rejection. All five receipt scenarios race count3 PASS (63066,
+  33.254s). Initial joined fixture admission failure was missing exact input
+  fence/provider/auth fields, fixed in test only. Native supervisor full race
+  29469 also PASS79.264s before joined fixture addition. No paid calls. This
+  still uses synthetic CLI/credentials/qualification/test gate, not a hosted
+  vendor rejection or full Coordinator acceptance. Claude renewed-auth/live
+  concurrency restart acceptance remains unverified.
+
+- New nonpaid native-process receipt coverage: private runWithCLISecrets seam
+  (public Run still fixed lookupCLISecret; no caller/config/env override).
+  Synthetic CLI + credential + existing test gate/recorder; actual supervisor
+  Run capture, completed process/drain, signed receipt exact/single-use.
+  Positive and partial/false-success/stderr-only cases race41349 PASS5.960s
+  count3. Early fixture failures corrected missing recorder and noncanonical
+  digest/identity fields; no production authority relaxed. This is NOT installed
+  Claude nor production gate nor Store retry integration. Full supervisor race
+  active29469.67096 baseline below predates this small refactor/new tests.
+  No paid calls; Claude renewal/live restart and combined Store retry still open.
+
+- Full current-tree67096 PASS exit0: cmd/sf91.778s,supervisor65.283s,
+  providercoord37.695s,publication91.274s,Store127.843s,
+  workflowruntime109.769s,workflowworker1.453s,worktreecoord132.015s.
+  Some unchanged packages cached; paid/live opt-ins off. Current full vet,
+  repo-check/secret-scan59473 and diff-check PASS. All test handles terminal.
+  No paid calls active. Live Cursor restart confirmation awaits Claude auth
+  renewal; combined native rejection Run→receipt→retry remains a coverage gap.
+  Goal NOT complete; no commits or remote/live Relay mutations made.
+
+- Reverse live80038 PASS308.16s (package308.684s): Claude Builder/Cursor
+  Reviewer disposable compiled ticket. Both Cursor/Claude directions now pass.
+  Concurrent2248 FAIL336.65s at test-only hardcoded Claude/Codex identity
+  assertion, observed correct Cursor Luna. No production defect established.
+  Root: concurrent helper did not receive selected builder/reviewer; final
+  review also hardcoded Codex. Pass selected pair and share exact identity
+  matcher with single-ticket assertion. Nonpaid regression15497 red Cursor;
+  26550 green0.606s. Compiled nonpaid concurrency82480 PASS160.88s
+  (package161.415s), including restart/separate approvals/base refresh.
+  Corrected69217 FAIL365.56s (package366.037s): restart daemon before socket,
+  recover stranded Git mutations -> SQLite write deadline/context deadline.
+  Prior closed diagnostics repeatedly CHECKPOINT=commit. No raw model output.
+  No active paid run; investigate recovery locally before spending again.
+  Goal remains active, final baseline pending.
+  Source hypothesis: daemon.Start starts default5s startupCtx before calling
+  ProviderCoordinatorFactory; cmd/sf factory calls multiprovider.Compose with
+  Background. Compose observes Cursor/Claude runtimes before ComposeQualified
+  checks QualificationCurrent. On restart all qualifications are old-leader;
+  expensive unnecessary observation can exhaust startupCtx before first Git
+  recovery query. Need deterministic pre-observation stale-qualification test
+  and early same-authority refusal, not blanket timeout increase. Unproven
+  live root until reproduction. Local recovery race count5 active40953.
+  Update:40953 PASS188.017s. Deterministic composeLocal injected candidate
+  factory62917 red proved stale pair still observes runtimes. Early exact
+  QualificationCurrent/profile/auth/probe/signature gate before all runtime
+  observation returns idle through existing ComposeQualified; current authority
+  rechecked after inspection as before. Race93500 PASS4.775s. Added positive
+  current-pair inspection case;38839 racePASS4.684s. Two production/test files only.
+  Focused81138 PASS daemon22.412s/providercoord37.974s/multiprovider0.674s.
+  58623 FAIL67.99s at initial qualification: Cursor qualified, Claude auth
+  cannot cover launch window. No restart exercised, startup live confirmation
+  still pending. No active paid run. Do not repeat until Claude auth renewed.
+  Active67096 full current-tree nonpaid baseline, native host Go -p1 ./....
+  Repo-check/secret-scan59473 PASS644commits/tree no leaks; diff-check clean.
+  Current full go vet PASS (terminal, no session). Acceptance requirement table
+  refreshed: both Cursor directions passed; Cursor restart/live auth and combined
+  native supervised retry remain incomplete.67096 confirmed still live; through
+  Github/localruntime/multiprovider passed, later packages pending.
+  Latest67096: supervisor65.283s/providercoord37.695s/publication91.274s PASS;
+  Store and later packages pending. Native combined retry remains engineering
+  coverage gap, not solely auth: existing local Claude probe uses bare synthetic
+  API auth (not Supervisor.Run); Run uses fixed Keychain lookup and qualified
+  subscription environment. Do not relabel layered proof as combined or expose
+  an arbitrary credential/endpoint override to production to satisfy a test.
+  Latest67096 Store PASS127.843s/testkit3.120s; workflowruntime/worktreecoord
+  remain pending. No duplicate baseline launched. Original plan retry assertions
+  map to Store/providercoord real-Git tests, while combined native Run evidence
+  is still not proven; do not describe the layered test as native end-to-end.
+  No paid run. User informed renewal via claude auth login needed for remaining
+  live acceptance; no API key/additional spending request. Continue nonpaid work.
+  Live causal confirmation still pending; do not infer SQLite locking fix.
+  Post-repair35189
+  PASS: Store129.582s/workflowruntime113.814s/workflowworker1.527s.
+  35781 repo-check and secret-scan PASS. No real Relay/remote mutation.
+
+- Repair root now reproduced/fixed: deterministic compiled63389 failed outcome
+  because fixture claimed missing but ran green; corrected fixture to genuine
+  failing replacement. Compiled77973 then failed at CHECKPOINT=commit, proving
+  ordinary base-parent path cannot commit on existing reviewed candidate.
+  Added Store.ReviewRepairVerificationCheckpoint read-transaction proof:
+  current fence, existing authenticated final-review repair/budget/ledger,
+  exact historical candidate/head and immutable Builder artifact. Materializer
+  uses that parent and protects inherited Builder files unchanged. No HEAD
+  inference or generic authority bypass. New Store53392 PASS; existing repair
+  restart68209 PASS; compiled1793 PASS75.89s to fresh verification/building,
+  ready0/merge0. This is not full repair delivery or paid reverse acceptance.
+  Full98977 PASS (predates this repair change). All paid handles terminal.
+  Broader Store/workflowruntime/workflowworker started after fix; capture handle
+  from current tool result. No commits/remotes/live Relay state touched.
+
+- Current goal turn: native Sonnet metadata probes52675/65781 PASS (~20s each),
+  exact closed metadata `Claude Sonnet 5 300K Low No Thinking`; pinned CLI
+  format-param-summary appends No Thinking when thinking=false. Added exact
+  catalog1M Low->measured300K No Thinking SessionDisplay mapping, no inference
+  during parsing. Red test failed then cursorprovider race89083 PASS1.326s.
+  Native signed Sonnet qualification63082 PASS61.67s. Five model-capable Cursor
+  launches this turn (2 probes +3 qualification incl cancel startup), dollars
+  unknown. Luna full-ticket pass remains valid; reverse/full concurrency pending.
+  Local invalid-syntax reproduction24237 proved it can reach recorded proof
+  (then fixture's intentional response-loss signal); syntax alone is NOT the
+  checkpoint-stall cause. Temporary fixture edits removed completely. Added
+  deterministic compiled final-review repair marker in fake-provider/test;
+  active69013 `go test -tags sf_e2e -p1 ./cmd/sf -run ^TestCompiledDevFinalReviewVerificationRepair$ -count=1 -v -timeout5m` (nonpaid).
+  Full98977 still observed live; most packages passed, final worktreecoord pending.
+
+- Active non-paid full post-fix baseline98977: `GOCACHE=/private/tmp/sf-multi-cli-go-cache go test -p 1 ./...` host escalated. Poll exact handle; no paid run active.
+
+- Latest terminals: reverse Claude Builder/Cursor Reviewer66737 FAILED756.13s
+  at verifying v8 after completed planning/verification/build/final-review and
+  second verification. Events include checks_green,budget_correction,review_repair.
+  Cursor verification repair produced duplicate package declaration in add_test.go;
+  local draft created1, ready0, merge0. Do NOT assert this alone proves the
+  materialization rejection cause. Added closed sf_e2e checkpoint stage hook
+  (command/outcome/parent/policy/evidence/commit), production noop; test83445 PASS.
+  No paid retry of this failure yet. Cursor concurrency remains held, unrun.
+  Backoff race32893 PASS57.856s. Grok low native74121 FAILED33.86s terminal_artifact;
+  Sonnet low native27813 FAILED35.36s init model mismatch (catalog 1m low,
+  observed shape other low other thinking). No guessed alias, both unqualified.
+  All paid handles terminal. Need diagnose verification repair checkpoint and
+  missing final-review findings in fresh verification prompt (source concern,
+  not yet proven cause); no production repair-path edits. Goal active/incomplete.
+
+- Latest regression60864: workflowruntime PASS109.323s; providercoord FAILED
+  second-server-error (one launch, needs_operator). Root timing boundary:
+  authenticated not-before may elapse between Store check and clock read;
+  helper rejected negative delay. Regression50198 fails red at -1ns; helper
+  now returns to Store admission when elapsed (no launch authorization), still
+  rejects >3s delay and cancellation, preserves bounded retry loop. Narrow
+  backoff+budget/checkout tests40638 PASS count5,42.909s. Full package pending.
+  Reverse paid66737 still active as of19:12UTC; concurrency14562 compile/skip
+  only (not acceptance). No other paid run active.
+
+- New terminal result: compiled Cursor Builder/Claude Reviewer77965 PASS328.87s
+  (package329.480s), first complete Cursor ticket through disposable local
+  publication/merge, not hosted Relay. Planner OUTPUT_BINDING fix is validated
+  live. Prompt/artifact race13336 PASS; vet/diff clean; repo-check/secret-scan
+  37181 PASS644 commits. Reverse Claude Builder/Cursor Reviewer66737 active.
+  Added opt-in TestCompiledLiveCursorConcurrentTicketsRestartBeforeSeparateApprovals
+  using existing strict two-ticket restart/independent approvals fixture;
+  not run yet. No claim that intermittent prior model failures are eliminated.
+
+- Sept7 latest: baseline16725 `go test -p 1 ./...` PASS (before Planner fix).
+  Compiled95843 FAILED223.35s: two Cursor planning invalid_artifact attempts,
+  both closed schema diagnostic proof_kind; qualification passed, no PR.
+  Root: generic Planner schema offered six proof kinds but prompt omitted
+  ticket-type mapping. Added canonical RequiredProofKind + controller-derived
+  OUTPUT_BINDING to Planner; all-six-types regression failed red then prompt/
+  phaseartifact packages49482 PASS1.339s/0.331s. No validator relaxation.
+  Active bounded compiled Cursor/Claude77965 uses corrected prompt, same opt-in
+  and disposable fixture. Earlier paid handles all terminal; known Cursor CLI
+  model-capable launches54 plus up to5 unverified before77965, not API calls or
+  known dollars. Old persisted prompt bytes remain immutable; no live upgrade.
+
+- Sept7 current investigation: prior turn was progress, not blocked. Added
+  counts-only cursorFixtureWriteShape diagnostic (no raw messages/paths/content;
+  never admission evidence). Unit98353 PASS0.471s, race18228 PASS1.412s.
+  Standalone native qualification57426 PASS57.65s unchanged. Compiled98403
+  FAILED241.34s after Cursor planning completed and Claude verification wrote
+  add_test.go but returned result_indeterminate. Ticket safely blocked, no PR
+  mutation. Qualification passed; missing-write root remains intermittent.
+  Added sf_e2e-only closed command/Claude parser-stage diagnostic; tests63615
+  PASS0.564s. Active compiled95843 repeats exact acceptance with diagnostics.
+  Active nonpaid full baseline16725. Repo-check/secret-scan51462 PASS644 commits.
+  Source pinned Cursor shouldBlockWrite resolves
+  paths before explicit permission checks; relative/absolute mismatch is not
+  established. Do not widen sandbox or accept missing result.txt. Added7 Cursor
+  model-capable launches this turn (3 native +3 qualification +1 planner),
+  excluding active95843; charges unknown. Pinned CLI4347.index.js print-error
+  handler emits String(error) and exits1 without terminal rejection envelope.
+  Untyped503/no-final adapter regressions PASS0.438s; docs explain why Cursor
+  automatic API retry remains unavailable, rather than guessing safe replay.
+
+- Sept7 newer Cursor checkpoint supersedes the diagnostic history below:
+  signed native Luna Low qualification73465 PASS59.82s, covering role writes,
+  outside-read denial, readonly Reviewer, owned cleanup and launch cancellation.
+  Root fix: pinned ReadToolResult.error.errorMessage, not ReadResult.error.error.
+  Paired strict parser regression failed red then passed; no raw diagnostics.
+  Full host non-paid `go test -p 1 ./...`37400 PASS, including Store127.619s
+  and workflowruntime110.554s; repo-check/secret-scan29345 PASS644 commits.
+  Production multiprovider/daemon now route Cursor via signed Store qualification
+  and exact binding; no fallback. CLI/config Cursor presets and independent
+  model picker added after baseline; focused73241 PASS cli/config.
+  Native after-write cancellation58825 PASS28.95s (signed drain + preserved
+  marker). Earlier77132/44063 failed before tools; canonical macOS worktree
+  fixture path resolved startup, no sandbox widening. CLI/config62567 PASS.
+  Compiled Cursor/Claude and reverse ticket opt-in cases added; compilation-only
+  skip87726 PASS (not acceptance). Terminal paid handle90145 ran only Cursor
+  Builder/Claude Reviewer with SF_TEST_LIVE_CURSOR_TICKET, sf_e2e, -timeout15m;
+  disposable compiled daemon/Git/FakeGH, no hosted/live channel. Race75944 PASS
+  cli/config/cursorprovider. Latest CLI32895 PASS5.524s after two old
+  unsupported-Cursor expectations were updated; package45075 otherwise passed
+  config/cursorprovider/multiprovider/processsupervisor66.707s. Focused vet and
+  diff-check PASS; repo-check/secret-scan11578 PASS644 commits.
+  90145 qualified both providers but FAILED620.76s planning with zero attempts.
+  Read-only test DB/show confirms worktree registered and no provider attempt.
+  Root: workflowruntime.configuredProvider still allowed only codex/claude.
+  Regression39103 failed red; explicit cursor selector fix75231 PASS0.449s.
+  Store/coordinator/supervisor qualification remains mandatory. Nonpaid
+  host workflowruntime full64018 PASS114.924s. Native90145 cleaned up.
+  Corrected compiled16903 FAILED40.34s at qualification: file_inventory_builder
+  result_present=false forbidden_unchanged=true (strict stream had passed).
+  No admission/pair selection; do not weaken required writes. One unchanged
+  bounded repeat10478 FAILED37.09s with the same missing result.txt inventory.
+  Native inventory variability is a reliability concern, not repaired by the
+  selector. Nonpaid race89553 selector PASS1.659s + repo-check/diff PASS.
+  Latest workflowruntime vet PASS. No full Cursor ticket success yet.
+  ALL known handles terminal; no paid/background tests active. Do not blindly
+  repeat missing-write qualification again. Next diagnose paired write-tool
+  presence/outcome using code-owned booleans only (no raw stream), and pinned
+  CLI permission matching for relative/absolute tool paths. The failures passed
+  strict session/denied-read evidence but never created result.txt; omitted
+  write versus refused file tool is not yet distinguished. Keep guard intact.
+  This is still NOT full Cursor ticket/concurrency acceptance or automatic API
+  retry support. Ambient hooks are user-approved trusted dependencies, not
+  contained/disabled. Cursor actual spend remains unknown; current continuation
+  adds at most thirteen Cursor model-capable launches to prior29(+up to5
+  unverified): eight probes plus three in90145 qualification and one each in
+  16903/10478. No compiled ticket provider attempts occurred. API counts and
+  actual dollar charges remain unknown.
+  Broad shared dirty tree preserved, no commit/live daemon/remote/DB mutation.
+
+- Sept7 Cursor continuation supersedes older "invocation unchanged" notes:
+  adapter/catalog/metadata observer and Supervisor trusted-hooks execution are
+  implemented, but CLI/composition and signed qualification remain unfinished.
+  Native metadata observer43450 PASS9.617s (status/catalog only). SF-owned
+  lifecycle wrapper fixed Cursor's lingering local worker: native9192 and all
+  subsequent completed qualification probes passed drain, then failed Builder
+  result validation. Fresh tests2495/3415/98801/52076/3047 isolated a catalog
+  versus parameterized-session model display mismatch, not a hook failure.
+  Installed7932.index.js constructs session display separately from3279's
+  catalog rendering. Native76119 identified exact context mismatch:
+  observed GPT-5.6 Luna 272K Low vs catalog GPT-5.6 Luna 1M Low. Removed the
+  attempted generic formatting normalization (it did not help); stream labels
+  remain exact. SessionDisplay now requires the exact Luna-low catalog entry
+  and binds its measured 272K session label. No 1M support claim. Native38873
+  passed model/terminal validation then failed tool_shape. Installed index.js
+  ToolCall schema includes toolCallId/startedAtMs/completedAtMs and hook contexts
+  alongside one tool; parser now validates/removes only those known metadata
+  fields, then demands one tool and paired calls. Native51361 advanced to
+  read_args: completed calls omit args. Start/completion pairing now carries
+  the exact read target and rejects retargeting. Native83289 then reached
+  missing denial; native82901 (latest, FAIL43.801s) narrows it to
+  outside_denial_unrecognized, not missing call/completion. No passing signed
+  verdict yet. Generic ReadError now checks its schema's error field for fixed
+  EACCES/EPERM/OS denial strings; if its optional redundant path is absent it
+  uses the paired start, but contradictory paths refuse. Relative paths are
+  resolved against the known worktree. These latest source changes have unit
+  coverage88378 PASS0.449s but have NOT had a native rerun. Next diagnosis
+  should inspect fixed outcome/field presence categories in one probe, not
+  repeatedly run full fixtures for single diagnostic flags; never print raw
+  output or accept generic errors as permission proof. Native paid runs are
+  all terminal. Non-paid host focused80796 PASS (cursorprovider0.378s,
+  processsupervisor1.141s), including real physical sandbox writes. Current
+  focused vet and diff-check PASS. Cursor race54301 PASS1.338s. No active
+  tool/test handles remain. Full baseline/scripts still need final-source run.
+  Do not enable Cursor until signed
+  qualification and composition tests pass. No arbitrary provider text logged.
+  Earlier full baseline70933 completed PASS, but predates this integration;
+  previous focused51431/final native handle from compaction are unavailable,
+  so their outcomes are unverified. Process inventory confirmed no old go/
+  Cursor probe remained before these runs. Sandbox-only82118 physical test
+  failed host sandbox_apply EPERM; rerun that fixture on authorized host.
+  This continuation added eleven completed Builder CLI launches; earlier
+  known18 plus up tofive unverified launches remain
+  separately unconfirmed. Actual billing unknown. No live SF/Relay/DB/remote
+  changes, no commit; preserve broad shared dirty/untracked work.
+
+- Sept7 latest Cursor checkpoint: Reviewer-only native fixture49409 PASS19.326s.
+  The prior Reviewer protocol error was pinned CLI `thinking` delta/completed
+  events, verified in4347.index.js and shape-only session diagnostics. Stream
+  parser now permits only those subtypes with same-session checks; never logs
+  their contents or treats them as result. Unit/race33876 PASS1.400s. Builder
+  native file+artifact passed repeatedly in43893,48563,69363. Reviewer physical
+  file immutability and terminal artifact now both pass49409. Runtime still
+  NOT qualified/enabled: production invocation not switched, outer profile
+  is experimental, cancellation/drain/observer/composition gates remain.
+  Known incremental-window CLI launches total16 (includes startup failures),
+  plus up to2 for unverified54711; actual billing unknown. Do not launch more
+  paid compatibility probes without a distinct new evidence need. Full baseline
+ 70933 remains running (last package phaseartifact); started before parser fix,
+  so rerun affected packages/full baseline on final source. Repo-check and
+  secret-scan82921 PASS644commits+workingtree; focused vet passed before parser
+  fix. No currently running paid probe. No live project/DB/remote changes.
+
+- Sept7 Cursor trusted-hooks continuation: native allowlist-only build fixtures
+  55727 and 64269 changed forbidden.txt, both with and without --force. This
+  is NOT a hook blocker; it proves Cursor allow entries are not a physical
+  default-deny write boundary. Added experimental cursorRoleSandboxProfile
+  (not production wired) and credential-free physical write test PASS0.536s,
+  repeated PASS0.363s. macOS dyld needed literal / read (kernel deny evidence);
+  Cursor launcher needed exact basename/dirname/realpath helpers. Short private
+  /private/tmp/sf-cursor-* homes avoid pinned CLI's >84-character fallback to
+  /tmp/.cursor. Native nested Cursor sandbox refused startup; fixture now
+  disables INNER sandbox only while retaining SF OUTER file restriction.
+  Production Invocation remains unchanged until qualification is measured.
+  Native runs 43893/48563 passed Builder file+artifact invariants and Reviewer
+  physical unchanged-file checks, but Reviewer StreamArtifact rejected.
+  Extra classifier run 69363 pending; full non-opt-in baseline 70933 pending.
+  Earlier handle54711 is no longer retrievable: result unverified, do not mark
+  pass. Known new-window CLI launches before69363 total12, plus up to2 from
+  unverified54711;69363 adds at most2. Some failed before model dispatch, but
+  actual billing remains unknown, not zero. No more vendor/hook approval is
+  required. Cursor is still unqualified; observer/drain/Store composition and
+  native delivery are unfinished. Focused cursorprovider race PASS1.386s;
+  focused vet and diff-check pass. No live channel/DB/remote mutations.
+
+- Sept7 USER SUPERSEDES HOOK BLOCKER: explicitly assume Cursor hooks do not
+  interfere and continue. Treat ambient hooks as trusted dependencies in a
+  separately named policy, not disabled or proven contained. Do not keep asking
+  for vendor support on that waived requirement. Role permissions, exact model/
+  family, Store authority, process drain, and native delivery remain mandatory.
+  New native TestCursorNativeTrustedHooksStdinProbe PASS19.223s (98677): one
+  staged browser-auth CLI launch, gpt-5.6-luna-low, stdin prompt and bounded
+  stream artifact, disposable home, no requested tools. Dollar charge unknown;
+  this is first launch against the additional $100, not qualification or a
+  role-permission proof. Added exec-free cursorprovider Invocation/Permissions/
+  MatchesInvocation with exact version/model, role modes, stdin-only schema/
+  prompt and tamper validation; unit package PASS0.554s (78154). Proposals are
+  NOT yet wired to Supervisor/Store admission and must not be exposed as ready.
+  Next: native write/read-only policy fixtures, runtime registration/observer,
+  adapter/composition, then qualified disposable delivery. Existing hard Cursor
+  refusal remains until passing policy exists. Old blocked notes below are
+  historical and superseded by this explicit user scope decision.
+
+- Sept7 resumed blocked audit reached three consecutive turns with the same
+  Cursor qualification gap. Final read-only check: installed CLI unchanged at
+  2026.09.02-c22c1a3; Supervisor.Run still deliberately refuses Cursor and
+  ProviderPolicyDigest supplies no Cursor policy. Local-loader and ACP checks
+  found separate ambient/team/prompt-hook paths; no verified supported control
+  covering them was established. Full goal remains incomplete and is marked
+  BLOCKED again, not complete. Additional $100 remains unspent. No active
+  process handle, new paid call, credential change, or live runtime mutation.
+  Reopen on concrete supported isolation evidence or an explicitly revised
+  provider requirement; do not silently downgrade authority to enable Cursor.
+
+- Sept7 follow-up checked the supported ACP alternative: installed 5421.index.js
+  retains promptHookClient plus asynchronous team-hook merges and hook-wrapped
+  session resources. ACP permissions and documented sandbox filesystem/network
+  policy do not establish fixed hook/model/cost isolation. No model call, ACP
+  session, credential lookup, production edit, or live-state change. New Cursor
+  allowance remains wholly unspent. Last turn made evidence progress by ruling
+  out this alternate path; Cursor qualification remains unresolved. No live
+  test handle is waiting.
+
+- Sept7 user explicitly authorized an additional $100 Cursor test budget and
+  continuation. Treat this as a new incremental ceiling, not evidence that
+  earlier spending was zero; new-window spend is $0 so far. No paid model call
+  was launched in this resumption. Claude's combined native forced-rejection
+  test is an engineering coverage gap, not an operator login prerequisite.
+  Passing Claude/Codex delivery remains usable independently of Cursor.
+  Offline installed Cursor loader probe passed: `loadProjectHooks=false`
+  still checks enterprise, team, user, and Claude-user configuration sources.
+  Probe uses the extracted unmodified loader and a fake filesystem reporting
+  no files; it does not execute hooks, validate hook payloads, read actual
+  config, or qualify native role execution. Scratch reproduction:
+  `.context/cursor-hook-path-probe.cjs`; loader SHA256
+  0b7e60bf9d8642df918dd8a789dc16b6a953975ffc944d120f3e8f8adbff87c5.
+  Additional installed source in 4347.index.js updates hook configuration
+  directly from teamHooksResultPromise, so denying local hook-file reads alone
+  does not prove isolation from managed in-memory hooks. No managed policy
+  was removed, CLI modified, credentials inspected, or live SF state changed.
+  Metadata-only CLI config check found authInfo.teamId present (no value or
+  identity printed); do not assume a team-free account or remove this binding.
+  This does not prove installed team hooks or enterprise management.
+
+- Goal marked BLOCKED after three consecutive external-gate audits. Installed
+  Cursor remains 2026.09.02-c22c1a3 without a verified role isolation policy;
+  combined native Claude subscription rejection/capture/receipt/retry acceptance
+  remains unproven without a supported fault-injection mechanism. Prior turn
+  was no progress, not a running-test wait. All test handles are terminal;
+  baseline23540 and recorded native Claude/Codex delivery evidence are preserved.
+  No additional paid probes, CLI changes, credentials, or live state mutations.
+  Resume when capability evidence changes; full objective is not complete.
+
+- Post-test baseline23540 PASS, exit0: native host `go test -p 1 ./...`, all
+  paid/live opt-ins disabled (some unchanged packages cached). cmd/sf90.214s,
+  Git183.626s, supervisor65.448s, providercoord37.529s, Store127.310s,
+  workflowruntime111.178s, worktreecoord131.928s. repo-check/secret-scan40522
+  PASS (644 commits + working tree, no leaks), diff-check PASS. Sept7 source/
+  official-doc gate recheck: agent/cursor-agent symlinks still point to
+  2026.09.02-c22c1a3; current parameters/config docs provide no demonstrated
+  all-ambient-hook isolation, and prompt-hook model evaluation remains a
+  distinct path. Claude CLI reference provides no demonstrated way to force
+  a subscription server rejection through the current authenticated SF Run.
+  This is missing supported evidence, not a proof that no solution can exist.
+  Do not send OAuth to a mock endpoint, change billing, or manufacture a
+  qualification. No paid calls/install/config changes in this gate check.
+  Original plan explicitly time-boxes incompatible provider spikes and says not
+  to block the passing Claude slice on Cursor. Full goal is not complete;
+  safe external-gate alternatives remain exhausted after this baseline.
+
+- Retry acceptance advanced with test-only changes: real registered Git
+  worktree now joins Store/coordinator signed-rejection retry flow. New
+  TestServerRejectionRetryReauthenticatesRealGitWorktree covers clean success/
+  idempotent replay and tracked, untracked, ignored writes after receipt:
+  dirty cases preserve bytes, terminate both durable attempts, and perform only
+  one provider Run. Targeted race94831 PASS58.638s including prior synthetic
+  budget/recheck suite; initial real-Git normal73509 PASS12.786s. Full
+  providercoord/vet/repo-check/secret-scan12026 PASS (providercoord40.761s;
+  scanner644 commits + working tree, no leaks); diff-check PASS. No live handle.
+  Only estimated_retry_test.go/provider_rejection_test.go changed; actual
+  provider process/qualification/signing remains an explicit fixture. No
+  native Claude rejection claim or credential/endpoint bypass. Native Run→
+  capture→receipt→retry acceptance and Cursor gates remain open. No paid calls.
+  Prior full baseline49283 predates these test-only fixture additions.
+
+- User renewed Claude login; host boolean lifetime gate PASS. Native fresh
+  qualification29331 PASS22.639s after investigating real-stream compatibility.
+  Earlier native trials failed closed, first on thinking_tokens, then native
+  permission_denied/rate_limit_event metadata, then Reviewer Edit/Write attempts
+  that the CLI refused as disabled. Installed 2.1.263 source corroborates all
+  shapes, including the exact NO_SUCH_TOOL disabled-session suffix. Parser now
+  validates bounded thinking counters (not usage), same-session allowed quota
+  metadata (not billing), exact pending denial/tool-result pairing, and only
+  exact unavailable Write/Edit results for read-only roles. Ordinary write
+  failures, successful writes, shell, foreign identities and missing results
+  still refuse. Actual CLI tool restrictions and physical role checks unchanged.
+  Policy v4 now binds complete-stream-json-v2, requiring fresh qualification.
+  Fixed code-owned diagnostic stage/index/role errors retained; temporary
+  fingerprint/lookahead diagnostics removed. New regressions each reproduced
+  before fix; full Claude adapter tests PASS. Focused full race16087 PASS:
+  claudeprovider/providerjson/processsupervisor, native localhost mock probes on,
+  paid/live opt-ins off (supervisor79.418s, process exit0). Disposable real-model
+  Claude/Codex delivery59836 PASS213.094s (local publication fixtures, not hosted).
+  Reverse Codex/Claude45777 PASS231.612s. Full vet73699 PASS. Focused vet/repo-check/
+  secret-scan89527 PASS (644 commits + working tree, no leaks).
+  current-policy concurrency/restart15849 FAIL86.871s before publication:
+  Planner exhausted two schema-invalid artifacts, clean checkout, zero PRs.
+  Root cause not yet known. Added sf_e2e-only
+  closed Planner validation categories (never raw artifacts); diagnostic tests
+  61509 PASS0.560s. Instrumented concurrency92204 PASS391.931s (two tickets,
+  restart/requalification, separate approvals, fresh sibling build/review).
+  Prior Planner failure did not reproduce; keep reliability caveat, no claimed
+  root-cause fix. Full serialized baseline49283 PASS, exit0, paid/live opt-ins
+  off: cmd/sf102.714s, Git275.181s, GitHub86.995s, supervisor82.616s,
+  providercoord14.927s, publication96.612s, Store130.428s,
+  workflowruntime113.608s, worktreecoord136.795s; all other packages passed.
+  Refreshed full vet79999/repo-check/diff-check PASS; secret-scan58422 PASS
+  (644 commits + working tree, no leaks). All handles terminal. No Cursor paid
+  calls, live SF/Relay changes, commits or remotes. Full goal still incomplete:
+  combined native supervised server-rejection→signed receipt→physical check→
+  durable retry acceptance missing; Cursor isolation/spend gates unresolved;
+  Planner schema-exhaustion reliability observation retained. No more blind
+  paid retries; do not bypass Keychain/auth/endpoint policy for a green fixture.
+
+- Post-baseline acceptance audit: actual Supervisor.Run uses fixed host
+  Keychain lookup and exact registered Claude policy before launch; the native
+  local API fixture cannot stand in for that production credential/qualification
+  path. Do not add a credential or endpoint bypass merely to obtain a green
+  combined retry test. Renewed-login policy-v4 acceptance remains necessary.
+  Corrected docs/cli.md's stale blanket "automatic retries disabled" statement:
+  documents the narrow signed Claude server-rejection path, shared attempt
+  budget, persisted backoff, prelaunch physical reinspection, no fallback,
+  and ordinary ambiguous-error refusal. Documentation-only since baseline36092;
+  repo-check and diff-check PASS. No processes, paid calls or live state changed.
+
+- Claude streaming policy implemented: invocation now stream-json+verbose,
+  success parser authenticates bounded full event sequence/session/model,
+  root-only messages, role-allowed tool use/result pairing, internal retry
+  notices and one final success. Only final envelope enters existing artifact/
+  cost parsing; malformed/missing/truncated stream remains indeterminate.
+  Policy v4 / fixture v3 require fresh qualification; Codex policy unchanged.
+  Qualification checks whole-stream canary disclosure before extraction.
+  Native synthetic localhost success+503-then-success PASS68052 2.088s;
+  full Claude/providerjson race with native local success/rejection probes15972
+  PASS6.012/1.293s (external endpoint refusal asserted, no real credentials or
+  paid requests). Targeted parser/qualification race39582 PASS. Full vet70077,
+  repo-check and secret-scan6322 PASS644commits+workingtree, no leaks.
+  Full native go test -p1 -count=1 ./... handle36092 PASS, exit0: paid/live
+  opt-ins explicitly zero; cmd/sf111.427s, Git244.012s, supervisor66.747s,
+  Store130.050s, workflowruntime112.092s, worktreecoord135.098s. All handles
+  terminal; no active test run remains. Status-only host
+  Keychain check confirms OAuth present but expired; requested login renewal
+  asynchronously again. No live SF DB/daemon/Relay/remote touched. Remaining:
+  renewed-login v4 qualification and live delivery/retry
+  acceptance; Cursor still lacks qualified hook isolation and spend balance.
+
+- Coordinator signed-rejection orchestration is now wired: optional combined
+  drain/receipt, unknown-cost recording, atomic finish, bounded persisted
+  backoff, same-binding repeat. Pending Store rejection pins binding before
+  probes/restart; new active retry has Store checkpoint -> trusted physical
+  inspector -> Store recheck before Run. Refusal finishes unlaunched and stops,
+  never fallback; ordinary uncertainty still cannot retry. Store exposes typed
+  authenticated backoff deadline and active-retry checkpoint metadata.
+  Full providercoord/Store20360 PASS6.094/130.765s; combined Store+Coordinator
+  synthetic process/filesystem test28027 PASS9.164s (success, second-server
+  exhaustion, changed checkout=no second Run, replay=no extra launch).
+  Focused race45165 PASS20.163/16.439s; Store/providercoord vet PASS. Final
+  cancellation/missing-route hardening: full providercoord race47126
+  PASS152.953s. All test handles terminal; repo-check/diff-check PASS.
+  Streaming policy/parser/new
+  qualification and native combined retry remain pending. No paid/live changes.
+
+- Signed rejection finish now supports exact same-current-fence receipt replay
+  without deleting another lease or changing the deadline. Altered receipt
+  replay refuses. New close/Open/AcquireLeader/Fence/requalification regression
+  proves persisted backoff and two-attempt budget survive restart. Fixture
+  initially reused a stored qualification ID; normalizeQualification correctly
+  refused it. Resetting only the new fixture qualification ID fixed setup, with
+  no production qualification relaxation. TestServerRejection normal49910
+  PASS1.162s and race22680 PASS16.120s; both terminal. Coordinator orchestration,
+  physical retry reinspection and qualified streaming remain unfinished.
+
+- Atomic signed server rejection finish and receipt-aware Begin admission now
+  implemented (provider_rejection.go/provider.go). New server_rejected outcome
+  is allowed by v60's generated exact provider/phase triggers; generic Finish
+  cannot mint it. Signed checkpoint/current exact active claim, receipt insert,
+  failed attempt+phase and exact lease delete share existing write transaction.
+  Admission authenticates all entry rejection rows (missing receipt refuses),
+  same full binding/role, deterministic persisted deadline, and immediate retry
+  logical input with only exact endpoint/attempt/shortened timeout normalization.
+  Existing total entry count2/4 remains authority; exhaustion authenticates
+  receipts and handles invalid-artifact -> server-rejected repair as same budget.
+  Schema/basic8544 PASS; atomic97737 PASS0.766s; rejection/schema/backup race26922
+  PASS15.744s incl late phase-write rollback/missing receipt; full Store55745
+  PASS130.572s incl new reverse mixed-order pause regression. Store vet,
+  repo-check/diff-check PASS. All handles terminal. No paid/live/remote changes.
+  V60 is still uncommitted/unshipped; changed its own trigger list in same repair,
+  no historical migration altered. Test fixture now accepts optional planner
+  preference to mint synthetic attested Claude via real Store APIs.
+  Remaining: exact finish replay/restart+new qualification recovery tests,
+  coordinator combined drain receipt/backoff orchestration and physical retry
+  reinspection, qualified streaming policy/parser+live auth acceptance. Current
+  production terminal-JSON/Coordinator never invokes new writer yet. No full
+  go./... result after new changes; goal incomplete and Cursor/login gates persist.
+
+- Receipt canonicalization prerequisites implemented before atomic finish:
+  Store canonicalServerRejection verifies exact immutable claim/supervisor
+  signature and derives 2.0-2.9s deterministic backoff solely from signed
+  observed time (not load/commit time or CLI internal Retry-After). Decoder
+  verifies exact bytes, digest, duplicate observed time/deadline and signature;
+  malformed/noncanonical/foreign/modified deadline refuse. Checkpoint digest
+  encoding moved unchanged to Store.ProviderAttemptCheckpointDigest and physical
+  inspector now shares it, preventing independent wire-format drift.
+  Focused encoding/checkpoint/schema race80796 PASS34.693s; Store/worktree vet
+  14748 +diff-check PASS. All handles terminal. NO writer/admission change yet;
+  first inspected admission/exhaustion paths: Begin counts all entry attempts
+  (limit2/4 with operator epoch), repair helper ignores non-invalid-artifact;
+  new server_rejected outcome must be checked with receipt/backoff before
+  acquisition and authenticated by exhaustion-pair logic. Preserve exact input
+  except legitimate attempt/fence/shortened deadline fields; missing receipt
+  must not fall through as generic failed. Atomic finish has 4 internal callers,
+  should use a wrapper/optional receipt to avoid altering generic failure APIs.
+  Still no paid/live/remote changes. Goal incomplete, broad baseline pending.
+
+- Append-only v60 schema now reserves provider_server_rejections with exact
+  seven-column attempt FK, bounded canonical receipt+hex digest, positive
+  observed timestamp and immutable bounded not-before. One row per attempt;
+  UPDATE/DELETE refuse. No legacy backfill or public writer/admission change.
+  store.go version/checksum/migration dispatch, backup fixture and required
+  columns/composite FK/triggers wired. Schema9496 PASS1.054s; focused schema+
+  stable/dev backup+history refusal+legacy v1/v10 upgrades race55993 PASS26.054s;
+  Store vet/diff-check PASS. All handles terminal. Migration only applied to
+  disposable test databases, not live SF. Shared dirty worktree uncommitted.
+  Next must implement atomic receipt/finish with admission backoff together;
+  don't expose a generic failed-receipt writer while BeginProviderAttempt could
+  ignore its deadline. Existing finish helper has four callers plus definition;
+  safeOutcome/state triggers currently lack server_rejected. New outcome needs
+  explicit schema and shared budget integration, not invalid_artifact disguise.
+  Full49030 predates these changes; goal incomplete; login/Cursor gates unchanged.
+
+- Trusted inspector wired through localruntime.Factory -> providercoord optional
+  ConfigureRejectionCheckpoint -> supervisor private, lock-protected inspector.
+  Configuration refuses active runs/shutdown; no adapter-supplied evidence.
+  worktreecoord now implements contracts.RejectionCheckpointInspector, using
+  Store.ProviderAttemptCheckpointForRequest (full persisted claim + exact full
+  DrainRequest equality in one snapshot) before/after physical inspection.
+  Store race37805 PASS30.944s incl request auth/model/policy/digest/lease/fence
+  tamper. Initial54825 FactoryPASS; providercoord no selected tests; broad New
+  regex selected existing Git setup which sandbox-refused. Correct native
+  race8889 PASS supervisor1.524/localruntime23.065/worktreecoord27.150s. Focused
+  six-package vet2261 +diff-check PASS. All handles terminal.
+  Automatic retry still unwired: coordinator must choose combined receipt,
+  Store atomic signed receipt/backoff/shared-window admission migration after59,
+  qualified streaming policy + live acceptance. Inspector is now configured,
+  not merely a standalone helper. No paid/live/remote changes. Uncommitted.
+
+- Supervisor rejection receipt lifecycle implemented: private Run capture uses
+  only own complete output/normal exit1/uncancelled all-server classification;
+  public Run still returns conservative ExitCode=-1+error. New optional
+  DrainServerRejection waits finished/process/I/O, invokes trusted inspector,
+  rechecks ownership/control/closing under lock, signs own exact drain+receipt,
+  removes run once. Ordinary Drain irrevocably clears receipt eligibility at
+  entry; control during inspection suppresses signing. Missing/dirty/cancelled
+  inspection returns no receipt; ordinary Drain remains conservative fallback.
+  New tests seed private completed metadata (not live streaming evidence):
+  exact/single-use/wrong-request/control-race/unclear refusal race32927 PASS1.536s.
+  Full native supervisor suite8088 PASS68.467s; focused vet/diff-check PASS.
+  All handles terminal. Current Claude terminal-JSON policy cannot supply an
+  eligible stream; no automatic retry/paid call enabled. Trusted inspector
+  interface still needs request-to-Store/worktree implementation+composition,
+  then Store receipt migration/backoff/shared budget, new streaming policy and
+  qualification. No paid/live/remote changes, broad worktree uncommitted.
+
+- Physical checkpoint composition added in new worktreecoord/provider_checkpoint.go
+  and sequencing tests. It loads exact active Store authority, calls existing
+  strict registered Git identity/clean-HEAD inspection (including ignored files),
+  then reloads identical Store authority; revocation/change/cancellation yields
+  no result. Returns domain-separated metadata digest, not signed retry admission.
+  Race37694 failed in existing real-Git setup at durable child identity gate
+  before inspection; identical native-host race51037 PASS26.666s (sequencing plus
+  real-Git dirtiness/ignored/foreign-head/replacement/cancel tests). No policy
+  weakened. Focused worktreecoord vet10719 and diff-check PASS. All handles
+  terminal. Tests separate sequencing from Store and real-Git proofs; a single
+  active-attempt/real-Git/supervisor end-to-end fixture is still required.
+  No paid call, live runtime/DB, repository remote or login change. Retry
+  production wiring/backoff/migration/qualification remain incomplete; full49030
+  predates new checkpoint/signature code. Changes uncommitted.
+
+- Active-attempt checkpoint authority now exists in new
+  `internal/store/provider_attempt_checkpoint.go` (plus tests). One read
+  transaction rehydrates the full immutable claim, checks live ticket/leader,
+  active attempt/phase and exact provider lease, phase-entry binding, immutable
+  worktree creation and semantic checkpoint/commit lineage. It accepts no
+  caller HEAD, performs no filesystem inspection and grants no retry itself.
+  Internal connection-scoped form is for the eventual atomic terminal receipt.
+  Focused17879 initially failed only a malformed test tamper (phase outcome);
+  fixed fixture to use valid failed/invalid_artifact tuple, preserving schema.
+  Race27011 PASS17.406s; expanded four-role checkpoint race32214 PASS27.925s;
+  focused Store/contracts vet and diff-check PASS. No process active.
+  Supervisor combined drain/capture, physical inspector, signed receipt Store
+  migration/backoff/shared budget and streaming qualification remain unwired.
+  Broad full49030 still predates both new checkpoint and signature files.
+  No live login/paid call/runtime/remote mutation; goal remains incomplete.
+
+- Signed rejection primitive added in `internal/contracts/provider_rejection.go`
+  with exhaustive field-binding, wrong-key, exact-drain, signature-domain and
+  malformed-evidence regressions. Focused test92885 PASS0.356s; full contracts
+  race3874 PASS1.422s; diff-check PASS. The prior unknown focused process was
+  confirmed absent before rerunning. No test remains active.
+  This primitive signs bounded metadata only, requires its own exact drain
+  proof, and grants no retry admission. Supervisor capture/physical checkpoint,
+  Store atomic persistence/backoff/shared attempt budget and qualified streaming
+  invocation are still unwired. No new broad baseline run for these files;
+  full49030 predates them. Claude renewal and Cursor isolation gates unchanged.
+  Changes remain uncommitted; no paid call/live runtime/remote mutation.
+
+- Full49030 TERMINAL PASS after rejectionobserver: cmd/sf98.885s,
+  GitHub64.453s, supervisor67.789s, workflowruntime113.920s; otherpackagesPASS
+  includingcachedStore/publication/worktree. Freshvet98594/diffcheck PASS;
+  no process/model remainsactive. Observerunit/native/race63167 and
+  repo-check/secret-scan90312 previouslyPASS. Goal remainsincomplete. No live
+  credentials renewed, Cursor unsupported, signedrejection/Storebackoff notwired.
+  Integration source reading is in approved plan; begin with domain-separated
+  exactclaim attestation requiring own signeddrain and separate checkpoint
+  inspection, then production streamingpolicy+coordinator/Store integration.
+  Preserve publicRun error semantics and oldindeterminate recovery. No source
+  edits thisturn beyondplan/memory; broadworktree remainsuncommitted.
+
+- Full49030 still active; cmd/sf98.885s/GitHub64.453s and packages through
+  phaseartifact PASS (manycached), supervisor rebuilding with expected Darwin
+  warnings. Samehandle; source unchanged this turn. New integration design in
+  approved multi-cli plan records concrete gaps: Run collapses nonzero exits
+  to-1/commandErr so adapter parsing is skipped; Drain removesrun, so optional
+  combined drain+signed-rejection must retain supervisor-only realexit/metadata.
+  Existing ProviderRetryWorktreeProof requires exhausted operator epoch and
+  cannot authorize firstautomatic retry. Separate exactattempt checkpoint +
+  trustedphysicalinspection +atomic signedreceipt/not-before/finish/lease release
+  afterv59 needed; sharetwo-attemptwindow withartifactrepair. Nothing wired yet,
+  no production policy change; keep unknown/429 quota/mixedhistory ineligible.
+
+- ACTIVE49030 full go test -p1 ./... after new pure rejection observer; poll
+  samehandle, no duplicate. secret-scan90312 PASS644commits+workingtree;
+  repo-check/diffcheck PASS. Latest49030 output only expected Darwin sandbox
+  deprecation warnings during rebuild; no overall result yet.
+  internal/claudeprovider/rejection.go +rejection_test.go new; native_retry_test
+  expanded to known503 +unknown400. Unit30856/race6081 passed. Nativefailures
+  32534/96731/26944 proved400 category=unknown; retained strict refusal, fixed
+  testexpectation, removeddiagnostics. Native46650 PASS3.231s; final native+unit
+  race63167 PASS (Claude4.407s/providerjson1.313s). Fuzz32519 smokePASS6.559s but
+  only3mutations, not substantialcoverage. Observer validates completebounded
+  session/model/UUID/order/type/HTTP retry consistency, text-only APIerror,
+  terminalerror, retains all-server-errors vs mixedauth/quota history, returns
+  digest/counters/category only; NO authority/policy/production invocationchange.
+  Goalstillincomplete: qualifiedstreaming +signedretry/worktreeproof +Store
+  durablebackoff/shared2attemptbudget next; Claude loginrenewal/Cursor gate
+  unchanged. No paid call/liveSF/Relay/remote mutation. Changesuncommitted.
+
+- Full43603 TERMINAL PASS: go test -p1 ./... including Git187.759s,
+  GitHub64.027s, supervisor66.379s, publication95.643s, Store126.727s,
+  workflowruntime113.214s, worktreecoord135.839s. Fresh go vet PASS after it.
+  Native local retry race15519 PASS3runs, repo-check/secret-scan63423 PASS.
+  No paid call; no live/remote mutation. Local synthetic all429 probe40639
+  PASSframing: CLAUDE_CODE_MAX_RETRIES=1 yields2message requests,1retry event
+  (attempt1/max1/delay1000),1terminal error,typed assistant.error=rate_limit,
+  no toolmessages/model/session mismatch/truncation/timeout. This is API mock,
+  notsubscription qualification or safe retry proof.503 probe98482 TERMINAL:
+  same2requests/1retry(max1)/1terminalerror,typed assistant.error=server_error,
+  0toolmessages,exactmodel/session,bounded/no timeout. No process now active.
+  Next implementation candidate: strict complete-stream rejection validator;
+  keep observations separate from supervisor-signed admission and physical
+  worktree proof; do not authorize another launch from last error alone or
+  conflate429 with transient capacity vs exhausted quota. No policy change.
+  Cursor/login gates
+  remain, goal incomplete. Older ACTIVE records below are historical.
+
+- Full43603 remains active, waitcell2044 completed with no new output; retain
+  samehandle. Read-only official SDK reference confirms assistant.error closed
+  categories (not isApiErrorMessage); official Claude changelog confirms
+  CLAUDE_CODE_MAX_RETRIES knob/watchdog distinction. Next NON-PAID probe after
+  fullsuite: loopback-only all429 with explicit small maxretry, no watchdog,
+  inspect typed category and fullstream ordering; installed semantics unverified.
+  Sources linked acceptanceledger. No production policychange; do not infer
+  preexecution from last retry/status or zero usage. This research changes the
+  next safe protocol experiment; loginrenewal stillneeded forpaidlivecheck.
+
+- Verified wait checkpoint: full43603 is still active; wait cell2042 completed
+  (its nested write_stdin returned active43603). cmd/sf96.291s, Claude0.406s,
+  CLI5.598s, daemon22.526s/runtimecontrol7.520s and packages through ghrunner
+  PASS. No overall verdict yet. Poll43603 only. No source changed this turn.
+  Review confirms DrainProof/FinishIndeterminate cannot be reused as API
+  rejection authority; unknown failure stays indeterminate across recovery.
+  Credential renewal/Cursor isolation still unresolved; no paid call launched.
+
+- Local retry race15519 PASS5.542s (-count3). Full non-paid Go baseline is now
+  ACTIVE43603 (go test -p1 ./..., no native opt-in). Poll43603, do not duplicate.
+  git diff --check and repo-check PASS; secret-scan63423 PASS644commits plus
+  working tree. Latest poll43603 still running (cmd/fake-provider PASS).
+  No paid/model work active; login renewal still needed for live restart.
+
+- ACTIVE15519: opt-in local native retry regression, race -count3; no paid
+  calls. New internal/claudeprovider/native_retry_test.go (Darwin, explicit
+  SF_TEST_CLAUDE_LOCAL_RETRY=1) uses pinnedCLI/privateHOME/syntheticAPIkey,
+  Seatbelt mock-only network (independent forbidden endpoint assertion), no
+  tools. Initial55941/95692 failed retry cardinality: firstHTTP request wasn't
+  necessarily /v1/messages. Endpoint-specific429 injection fixedfixture;
+  55285 PASS1.996s (two message requests, one retry, terminalerror,indeterminate).
+  Production invocation/policy/Store retry unchanged. No claim that a stream
+  event alone authenticates safe relaunch. Baseline rerun pending after race.
+  Current blocker login renewal/Cursor isolation unchanged; no live SF/Relay,
+  remote or paid model mutation. Earlier handles below are terminal/historical.
+
+- Latest checkpoint: no test/model process active. Full58282/vet8778/repo-check/
+  secret-scan3179 PASS; recovered focused credential race29262 PASS1.861s.
+  Previous race output was unavailable; ps confirmed no process before rerun.
+  Native non-paid protocol probe completed: pinnedClaude2.1.263, synthetic API
+  key/private HOME/bare/restricted/safe/no tools, Seatbelt loopback-only. Mock
+  429->401 made6requests/retryevents, max_retries10, killed at35s. Mock429->400
+  made2requests,1retryevent,1terminalresult,0toolmessages,exit1 withouttimeout.
+  Scratch .context/claude-retry-probe.py; no real account/API/model usage,
+  rawoutput discarded. Details in multi-cli acceptance ledger. This is NOT
+  subscription qualification or safe SF relaunch proof. No retry policy changed.
+  Live restart remains blocked on Claude login renewal (user asked via async
+  tool; no ready reply). Cursor hook-isolation gate remains. Goal active and
+  incomplete; no Cursor spend, live SF/Relay/DB or remote mutations. Work remains
+  uncommitted. Earlier ACTIVE records below are historical.
+
+- Full58282 PASS after renewal-diagnostic change: Store126.526s,
+  workflowruntime112.631s, worktreecoord135.176s. Vet8778 and repo-check PASS;
+  secret-scan3179 PASS644commits + working tree. Focused credential/observer
+  race now running (current handle); no paid/native job in parallel.
+  New official-doc evidence to investigate next: headless system/api_retry
+  emits status/category/delay/attempt bounds, but these are CLI-internal retries,
+  not SF relaunch authority. A pinned local mock-transport test with synthetic
+  credentials/private HOME is the next non-paid evidence step, not a claim
+  that safe automatic retries already work. URL code.claude.com/docs/en/headless.
+
+- ACTIVE58282 full non-paid go test -p1 -count=1 ./... after a small
+  Claude credential-renewal diagnostic repair; poll58282, source frozen.
+  Live36505 TERMINAL FAIL6.286s at initial qualification, before ticket submit.
+  InstalledClaude version still2.1.263. Status-only28850 FAIL0.946s; fixed-service
+  Keychain boolean-only read proves OAuth present but expired and below46m
+  requiredwindow. No tokens/accounts persisted. No blind paid retry.
+  Added opt-in live restart entrypoint (skip62329 PASS); this is NOT live success.
+  Regression9215 FAIL0.483s (lost renewal guidance); repair preserves fixed
+  expiry category through prepareCredentials -> observer -> qualification,
+  without changing credential validity or policy. Focused35271 PASS0.951s.
+  Native status-only55826 still refuses expired auth, now with exact safe
+  'run claude auth login' guidance. Three production files and one new test
+  cli_auth_renewal_test.go. User login renewal required before further live calls.
+  Cursor qualification and safe API retry remain open; no Cursor spend.
+
+- ACTIVE36505: one authorized real Claude Sonnet5/Codex Luna concurrent
+  restart + separate two-delivery trial. Exact command SF_TEST_LIVE_MIXED_CONCURRENT=1
+  GOCACHE=/private/tmp/sf-multi-cli-go-cache go test -timeout 20m -tags sf_e2e
+  -p1 -count=1 ./cmd/sf
+  -run '^TestCompiledLiveMixedConcurrentTicketsRestartBeforeSeparateApprovals$' -v.
+  Poll36505 only; no parallel paid/native jobs and no retry on silence.
+  Added opt-in-only entrypoint reusing passing fixture80111 helper, no production
+  changes since full10444/race36110. Unset opt-in skip62329 PASS0.615s.
+  Local FakeGH/bare/private SF state only, no Cursor call or live Relay changes.
+  Both tickets retain20m/$10 estimated budgets and existing request bounds.
+  Cursor isolation and authenticated pre-execution API failure remain open.
+
+- No test/model job active. Recovery repair validation COMPLETE locally:
+  compiled80111 PASS162.672s, full10444 PASS, focused Store race36110
+  PASS123.115s, vet76172 PASS, repo-check and secret-scan61161 PASS.
+  No paid calls, live daemon/DB, Relay or remote changes this turn. All code
+  remains uncommitted. Goal remains active/incomplete: Cursor hook isolation
+  and safe automatic transient API retry are not delivered. Paid mixed-model
+  restart is not claimed; prior Claude v3/Codex live two-delivery remains valid
+  evidence for its tested pre-repair source. Next work must preserve these
+  boundaries; no blind Cursor probe or unsafe retry to force completion.
+  Earlier ACTIVE records below are historical, not active handles.
+
+- Full baseline10444 PASS: go test -p1 -count=1 ./..., including Store127.161s,
+  workflowruntime113.632s, worktreecoord134.856s. Vet76172 PASS; repo-check PASS;
+  secret-scan61161 PASS644commits + working tree. Current source includes the
+  complete pending-before-restart recovery repair, compiled80111 PASS.
+  Focused Store protected-base-refresh race is now running as36110; poll36110.
+  No paid calls this turn; goal remains incomplete for Cursor and safe API retry.
+
+- Compiled80111 PASS162.672s: two fixture-backed concurrent tickets survive
+  restart/requalification; first delivered, sibling refreshed onto merged base,
+  fresh Builder result/review accepted and separately approved/delivered.
+  Exact history/PR/head checks pass, no duplicate mutations. FakeCodex/FakeGH
+  and local bare only, not a paid model or hosted GitHub delivery.
+  Full go test -p1 -count=1 ./... is now running as10444; poll10444 only.
+  Source frozen during baseline. Cursor/API retry remain unavailable.
+
+- ACTIVE80111: fixture-only compiled restart/concurrent separate-approval test
+  on the expanded Store repair. Poll80111; no paid/native test in parallel.
+  31263 FAIL248.905s: current result/reuse/fence false, refresh context and
+  verification true. Diagnostic91667 FAIL130.579s showed reviewed prefix
+  itself PASSES. Root difference: native CI pending can precede first restart;
+  initial recovery anchor rejected those same-state poll versions. Added that
+  ordering to Store fixture34254, reproducing stale result in0.855s.
+  Repair authenticates original publication lifecycle plus exact recovery row
+  inside historical CI/review chain. 36061 PASS2.907s: all three orderings and
+  six tamper cases, including pending observation, plus wrong source runner.
+  Temporary diagnostic type/tagged file removed. Full baseline predates repair.
+  Earlier ACTIVE entries below are historical and must not be polled.
+
+- ACTIVE31263: compiled restart regression with read-only boolean authority
+  probes in tagged test (current result, result fence, refresh context,
+  verification, reusable). Same non-paid command as20385; poll31263 only.
+  20385 FAIL250.216s: sibling building v11/r2 after an extra checks_pending,
+  Builder2 complete. Store positive now includes pending->green variant and
+  passes21826 (1.096s), so remaining compiled failure needs probe evidence.
+  Do not claim original scenario fixed yet. No new production changes since
+  the bounded prefix repair; source frozen during31263. No paid calls.
+
+- ACTIVE20385: original fixture-only compiled restart reproduction on repaired
+  Store source. GOCACHE=/private/tmp/sf-multi-cli-go-cache go test -timeout 10m
+  -tags sf_e2e -p 1 -count=1 ./cmd/sf
+  -run '^TestCompiledConcurrentTicketsRestartBeforeSeparateApprovals$' -v.
+  Poll20385 only; no paid model/native job in parallel. Source frozen while
+  running. Direct positive+tamper regression44808 PASS; no temporary diagnostics.
+
+- Recovery repair checkpoint: direct Store test84834 FAILED0.828s with fresh
+  Builder current-loader stale fence; diagnostic93831 proved live AssertFence
+  passes, recovery authority/refresh pre-prefix fail, refresh suffix passes.
+  Added bounded historical CI/review prefix in protected_base_refresh_recovery.go
+  and historical cutoff wrapper in evidence_read.go. Generic ledger rules are
+  unchanged. Direct positive + five tamper/source-fence negatives44808 PASS1.965s.
+  Test64755 failed only fixture corruption values/column (corrected, not a
+  production failure). Original compiled restart regression now rerunning;
+  inspect the current tool handle before any other native run. No paid call.
+  Four Store files changed (two production/two tests), tagged compiled test
+  from prior turn retained. Needs original scenario plus fresh broad validation.
+
+- No native/model test active. Restart diagnostic83551 terminal FAIL249.829s,
+  reproducing74089 exactly: first Done; sibling fresh Builder2 completed,
+  building v10/r2, clean/testPASS, no duplicate external mutations. Closed
+  diagnostics after daemon stop/restart: other + worker_stale_evidence.
+  Temporary workflowworker instrumentation removed immediately (call + both
+  files); no production repair made. The tagged regression/helper remains.
+  Next investigate fresh Builder LoadCurrentProviderAttemptResult ->
+  validateRunnerRecoveryAuthority and protectedBaseRefreshRecoveryGap. Source
+  hypothesis: latest recovery at waitingCI v7 cannot traverse checks_green v8,
+  review_pass v9 before refresh v10 because gap's first prefix validator lacks
+  that exact authenticated CI/review bridge. Need a direct failing Store proof
+  before changing safety semantics; this hypothesis is not yet confirmed.
+  New regression TestCompiledConcurrentTicketsRestartBeforeSeparateApprovals
+  reproduces with fixture providers, no paid calls. Baseline69479/vet/scripts
+  passed before tagged-test-only additions. Goal incomplete; source uncommitted.
+
+- ACTIVE83551: same fixture-only restart regression rerun with temporary
+  workflowworker acceptance diagnostics (closed categories only, once/process).
+  Poll83551 only. 74089 terminal FAIL248.757s: restart/requalification,
+  unchanged history/exact fencing, first approval/Done all passed; sibling
+  refreshed Builder2 completed but remained building v10/r2, clean checkout,
+  tests pass, only 2PR/1ready/1merge. Root boundary not yet identified.
+  Temporary files internal/workflowworker/acceptance_diagnostic{,_e2e}.go and
+  one worker.go call MUST be removed after diagnosis; no production fix yet.
+  Do not claim this new matrix passed. Baseline69479 earlier PASS remains valid
+  for pre-instrumentation source; full goal incomplete. No paid run active.
+
+- ACTIVE74089: fixture-only compiled two-ticket graceful restart at waiting-CI,
+  then separate approvals and both deliveries. Exact command: GOCACHE=/private/tmp/sf-multi-cli-go-cache
+  go test -timeout 10m -tags sf_e2e -p 1 -count=1 ./cmd/sf
+  -run '^TestCompiledConcurrentTicketsRestartBeforeSeparateApprovals$' -v.
+  No paid flags, live channel, hosted GitHub or Cursor requests. Poll74089 only.
+  Full baseline69479 is terminal PASS (Store124.847s, workflowruntime112.096s,
+  worktreecoord134.908s); vet25154, repo-check, secret-scan60039 also PASS.
+  Only subsequent Go change is the tagged compiled restart regression/helper.
+  Goal remains incomplete; source uncommitted. Earlier ACTIVE entries below
+  are chronological history, not currently running jobs.
+
+- ACTIVE69479: final full baseline on frozen Go source after exact-v3 livePASS.
+  GOCACHE=/private/tmp/sf-multi-cli-go-cache go test -p 1 -count=1 ./...
+  No paid opt-in flags. Poll69479 only. Vet25154 PASS; repo-check PASS;
+  secret-scan60039 followup. All earliernative/livehandles areterminal. Do not
+  edit Go source duringthisbaseline orstartanothernativejob. Final code still
+  uncommitted; goalnotcomplete (Cursor/APIretry plus remainingmatrix evidence).
+
+- Final-policy LIVE70537 PASS368.284s: Claude Sonnet5/Codex Luna two-ticket
+  separate approvals→bothDone, same2PR/2ready/2merge, exactprotectedhead,
+  preservedhistory andsamebindingfreshBuilder/review. Initialattemptscompleted
+  withoutrepair; freshBuilder2completed. This is exact Claudev3 provider-only
+  guidance with sharedCodexprompt restored, notthe superseded globalplacement.
+  No modelrunactive. Nativecancel81911 andscopedrace37943alsoPASS. Starting
+  finalnonpaidvet/baseline onthissource; Cursor/APIretryremainunavailable.
+
+- ACTIVE70537: final Claude-only policy v3 live two-delivery confirmation.
+  SF_TEST_LIVE_MIXED_CONCURRENT=1 GOCACHE=/private/tmp/sf-multi-cli-go-cache
+  go test -timeout 30m -tags sf_e2e -p 1 -count=1 ./cmd/sf
+  -run '^TestCompiledLiveMixedConcurrentTicketsDeliverWithSeparateApprovals$' -v.
+  Poll70537 only. Baseline70197, race37943, nativecancel81911 allterminalPASS.
+  No other native run. No installed/liveSF/Relay/remote changes. 98997PASS is
+  prior placement; exact final v3 confirmation remains pending this handle.
+
+- Native Claude after-write cancellation 81911 PASS9.292s (fixture8.84s).
+  Actual Sonnet5 Write observed independently, then cancel→bounded Runerror→
+  authenticated Drain proof→exact retained marker bytes. Recorder isfixture,
+  notStore/daemonrestartproof. Race37943 PASS (Claude1.472s,supervisor3.284s),
+  including priorClaudev2 refusal and retained private homes/credentialfixture
+  until escapedpipe Wait finishes. Original Codex sharedprompt/policyunchanged.
+
+- Baseline 70197 finished PASS (last worktreecoord 135.131s). Compatibility
+  review then found shared Builder prompt changes would reject exact old Codex
+  input reuse. Restored all workflowprompt files to HEAD (no diff); original
+  ordinary-prompt golden reproduced failure before restoration. Moved the same
+  inventory guidance to Claude Invocation only for PhaseBuild + sf.builder/v1
+  schema ID. Canonical PhaseInput is unchanged; qualification fixtures unaffected.
+  Bumped Claude policy v2→v3; Codex policy unchanged. New regression 96085 failed
+  before fix; scoped 25393 PASS (Claude .419s, prompt .300s, supervisor 2.186s).
+  Retained-pipe environment assertions passed there. ACTIVE 37943 is scoped
+  native race test (Claude/policy/retained pipes), no paid flags. Must revalidate
+  live two-delivery under v3; 98997 proves prior global-placement variant only.
+  New native after-write cancellation probe still NOT RUN. No live model active.
+
+- Baseline70197 verifiedACTIVE throughStore127.303s/workflowprompt1.240sPASS.
+  Added opt-in TestInstalledClaudeCancellationAfterWritePreservesWorktree in
+  claude_cancel_live_test.go, refactoring existing launchcancel helper. Waits
+  for independentlyreadmarkerfromrealWrite, cancelsbeforefinal, requiresRunerror
+  plus signedDrain and exactretainedmarkerbytes. One60sSonnet5fixture invocation,
+  notStoredaemonrestartproof; NOT RUN yet. No morepaidcalls since98997PASS.
+  Afterbaseline: exact retainedpipe regression/race, then native newClaudeprobe
+  (SF_TEST_CLAUDE_CANCEL=1) underexistingauthorization. Noothernativejobactive.
+
+- Cursor boundedalternative sourcecheck: native no-fork alone NOT sufficient.
+  Officialhooks docs describe prompt hooks+model override; pinned190.index.js
+  uses promptHookClient.evaluatePromptHook andindex.js forwards RPC. Read-only,
+  no modelcalls/nativeprototype/authchanges. Updatedcompatibilitygate to require
+  in-process hooks/MCP proof aswellascommandchildren. This is new narrowing
+  evidence, NOT Cursorqualification. Baseline70197throughsupervisor67.192s,
+  providercoord5.924s/providerjsonPASS, stillactive lastpoll.
+
+- Baseline70197 verified ACTIVE this turn, through CLI/daemon/runtimecontrol/
+  ghrunner PASS. Repo-check PASS; secret-scan79604 PASS644commits+noleaks.
+  Added source-only assertions to existing native retained-pipe supervisor
+  regression: capture fixture HOME/CODEX_HOME paths; verify both/private copied
+  credential file survive ErrUnclear Run+Close until Wait completion; afterward
+  both disappear and source fixture remains. Cleanup now releases escapee even
+  on setup failure. No production behavior change, no models called. Gofmt/diff
+  clean. Must run exact retained-pipe test/race after baseline slot clears;
+  baseline started before this test edit, so do not infer coverage from timing.
+
+- ACTIVE70197: full nonpaid native baseline after live98997PASS.
+  GOCACHE=/private/tmp/sf-multi-cli-go-cache go test -p 1 -count=1 ./...
+  Live opt-in flags unset. Poll70197; do not startanothernative run. Latest
+  production change onlyBuilderinventory prompt; diagnostic hook isnoopin
+  ordinarybuilds. Goalnotcomplete. No livepaid modelprocess remains.
+
+- PASS98997 exit0,401.319s: original compiled LIVE Claude Sonnet5/Codex Luna
+  concurrent two-ticket separate-approval delivery after Builder prompt fix.
+  BothDone; firstmerge→siblingbase refresh→freshBuilder2completed(no repair)
+  →freshreview→separatesecondapproval→secondmerge. Initial Planners eachused
+  permittedrepairthencompleted. Same2PR/2ready/2merge/exactprotectedhead and
+  immutablehistory/runtimebinding assertionspassed. FakeGH/localbare only,
+  nothosteddelivery. No paidrunactive. Fullgoalstillincomplete(Cursor/APIretry/
+  remainingnativelifecyclegates). Nextfullnonpaidbaseline requiredpostprompt.
+
+- ACTIVE98997: original live two-delivery regression after Builder inventory
+  prompt clarification. Exact same authorized SF_TEST_LIVE_MIXED_CONCURRENT=1
+  private cache / timeout30m / sf_e2e / p1 command as24517. Poll98997 only.
+  24517 and48636 are terminal failures, not active. Prompt2571 PASS1.420s and
+  phaseartifact PASS0.274s. Initial2571 predecessor34631 failed only the old
+  expected prompt fixture; updated golden intentionally, preserving nil-repair
+  exclusion. No schema/Store validation changes, no historical payload rewrite.
+
+- Diagnostic24517 FINISHED FAIL335.896s: firstDone; sibling fresh Builder2/3
+  both closed category protected_verification_changed. Worktree clean and go
+  test passed. This proves artifact declares protected paths without amendment,
+  NOT an actual file mutation. Prompt ambiguity is the repair hypothesis:
+  changed_files must inventory implementation contribution, not entire branch
+  diff containing preserved Reviewer files. Added explicit base-refresh/no-op
+  guidance and exclusion of preserved verification. Prompt regression65937
+  FAIL before fix; full workflowprompt+phaseartifact34631 running afterward.
+  Artifact/Store validation unchanged. No paid calls currently active.
+
+- ACTIVE24517: one diagnostic live two-delivery rerun with closed sf_e2e Builder
+  validation categories and immediate paused-ticket diagnostics. Exact command
+  SF_TEST_LIVE_MIXED_CONCURRENT=1 GOCACHE=/private/tmp/sf-multi-cli-go-cache
+  go test -timeout 30m -tags sf_e2e -p 1 -count=1 ./cmd/sf
+  -run '^TestCompiledLiveMixedConcurrentTicketsDeliverWithSeparateApprovals$' -v.
+  Poll24517 only;48636 terminal FAIL. Closed diagnostic/tagged history tests28927
+  PASS (providercoord0.557s,cmd/sf0.522s); ordinary providercoord22421 PASS6.004s.
+  No production artifact-policy weakening, Cursor call, live DB/remote changes.
+
+- Live48636 FINISHED FAIL exit1 (770.933s). Read-only exact disposable Store
+  showed first ticket Done v12; sibling Paused v10 after fresh Builder attempts
+  2/3 failed schema_validation (attempt IDs9/10). No second delivery. Harness
+  waited for push until its bound instead of detecting pause; tagged loop now
+  stops on Paused/Blocked/Cancelled and emits existing closed diagnostics.
+  Root cause of Builder validation remains UNKNOWN; do not infer empty files.
+  Added sf_e2e-only closed Builder error-category reporting (no raw errors,
+  artifact, paths, or credentials; ordinary build noop). Targeted compile/test
+  handle28927 active. No further paid run launched, no Cursor calls.
+
+- ACTIVE48636: authorized live Sonnet5/Luna two-delivery trial, exact command
+  SF_TEST_LIVE_MIXED_CONCURRENT=1 GOCACHE=/private/tmp/sf-multi-cli-go-cache
+  go test -timeout 30m -tags sf_e2e -p 1 -count=1 ./cmd/sf
+  -run '^TestCompiledLiveMixedConcurrentTicketsDeliverWithSeparateApprovals$' -v.
+  Poll48636 only. Baseline76915 and fullCLI11119 (5.653s) terminal PASS. Paid
+  Claude/Codex only; no Cursor, no live Relay/channel/remote mutation. Disposable
+  models real, GitHub/approval/local bare fixtures. Includes new exact runtime/
+  base/history assertions after fresh sibling build/review. No restart on silence.
+
+- BASELINE76915 FINISHED PASS exit0; final worktreecoord135.826s. Includes
+  test-only fake PR ref synchronization fix. Predates latest run consent flag
+  (CLI race34824 PASS47.202, vet PASS, full CLI follow-up launched). Secret
+  scan92897 PASS, repo-check PASS. New tagged history assertions unit/race pass;
+  live two-delivery trial ready, not yet launched as of this checkpoint.
+
+- CLI onboarding gap reproduced10293: run --accept-cost-estimates was unknown.
+  Fixed internal/cli/run.go to forward explicit consent only to exact queued
+  ticket.start, never submission or active replay. No default opt-in. New
+  run_test regression validates queued/active and flag omitted/present. Race
+  TestRun suite34824 launched. Updated CLI and first-ticket docs to remove
+  stale "editor/model picker under development" claims and clarify estimates
+  vs hard dollar cap, safe artifact repair vs unavailable API retry. Baseline
+  76915 predates this tiny CLI change; scoped full CLI rerun required afterward.
+
+- Full baseline76915 still ACTIVE, through daemon/runtimecontrol/ghrunner PASS.
+  Tagged test-only additions since launch do not change default baseline source.
+  Prepared live opt-in TestCompiledLiveMixedConcurrentTicketsDeliverWithSeparateApprovals
+  (SF_TEST_LIVE_MIXED_CONCURRENT=1), NOT LAUNCHED. Strengthened both-delivery
+  assertions validate historical rows unchanged, only fresh Builder/review,
+  exact original binding/new base, durable attempt increments and bounded repair.
+  Pure regression41503 PASS0.464; added same-entry repair/runner drift case and
+  race16461 PASS1.640. Wait baseline before another native run to
+  avoid shared-host process/SQLite contention. All provider calls remain idle.
+
+- ACTIVE76915 full native baseline: GOCACHE=/private/tmp/sf-multi-cli-go-cache
+  go test -p 1 -count=1 ./... . Poll same handle; no duplicate run. Live paid
+  gates unset. Required post-fix broad verification, do not mark passed yet.
+
+- PASS42045 (168.030s): compiled two-ticket separate-approval full delivery.
+  Root cause verified: fake GH persisted original PR head/base after real Git
+  push; explicit private-bare ref sync fixed fixture, production worker diff
+  empty. Two tickets Done, same two PRs, two ready/two merge exactly, second
+  protected tip exact. Unit18000 PASS0.463; focused race38099 PASS1.404;
+  repo-check and secret-scan76291 PASS. All tests simulated models/GitHub;
+  live two-delivery proof still pending. No diagnostic instrumentation remains.
+
+- ACTIVE42045 original separate-approval compiled reproduction after TEST-ONLY
+  fix: FakeGH.SyncPullRequestRefsFromBareForTest explicitly reads actual private
+  bare head/base and updates existing PR snapshot, preserving metadata and
+  mutations. Unit18000 PASS0.463. Diagnostic84541 failed255.981, repeatedly stage
+  draft; source confirmed bare bridge only serves pre-PR refs, existing PR/head
+  snapshot stays stale. Production worker temporary diagnostics fully removed
+  (git diff empty). Poll42045; no paid calls. Root cause verification pending.
+
+- ACTIVE84541: one diagnostic reproduction of separate-approval two-ticket
+  compiled fixture. Temporary internal/publication/worker.go instrumentation
+  prints only SF_TEST_PUBLICATION_STAGE + fixed stage on error (no raw error,
+  provider/credential content). MUST remove after evidence captured. No policy
+  fix yet; hypothesis is pre-push/history refusal vs fake PR stale head/base.
+  Poll84541 only, no paid calls. Investigate skill active; exact fixture86446
+  already reproduced failure. No live DB or remote involved.
+
+- FAILED86446 (255.814s): TestCompiledConcurrentTicketsDeliverWithSeparateApprovals,
+  native compiled SF, fake providers/GitHub, no paid calls. Extends first merge
+  through sibling fresh publication on same PR, CI, review and separate
+  approval. Outer timeout10m, bounded stage waits. Initial compile placement
+  error fixed before this run. Handle terminal, no active test. Actual result:
+  sibling publishing v10/r1, fresh Builder attempt2 completed, candidate recorded,
+  clean checkout, go test passed, no artifact failures, two creates/one ready/
+  one merge. Thus identical-file speculation did not prevent fresh build.
+  Next diagnose refreshed publication vs fake GitHub PR/base response; do not
+  infer a production defect before tracing exact publication refusal. Ephemeral
+  Store cleaned by test; next diagnostic must expose bounded effect/error codes
+  rather than raw provider claims. No production changes this turn.
+
+- PASS1170 (127.312s): compiled fake-provider sibling base-refresh regression (no paid
+  calls), TestCompiledConcurrentSiblingRefreshesAfterApprovedMerge. Uses real
+  daemon/Store and disposable Git/GitHub; after first approval/merge waits for
+  sibling effective worktree base to equal merged head, with advanced authority
+  and no second ready/merge. Handle terminal; no active test. Test-only
+  change, no production behavior changes. Full second delivery still pending.
+
+- ACTIVE TEST4730: live two-ticket approval isolation after verified fixture
+  count fix. Command includes -timeout30m so outer harness allows bounded
+  phase waits and graceful cleanup (prior default10m could preempt cleanup).
+  Same paid scope: Sonnet5/Luna, private Store, fake GitHub/bare only. No
+  Cursor calls. Regression98685 PASS0.613; tagged race86902 PASS1.776.
+  UPDATE:4730 finished PASS277.460 (test276.93). Both tickets reached approval;
+  first approval delivered only first, sibling not authorized. Real Sonnet5/
+  Luna, simulated GitHub; no hosted delivery or second-ticket merge claim.
+  No active test4730 remains. Do not call initial Planner
+  invalid-artifact exhaustion fixed. Skill investigate still verifying test
+  correction, no production changes. All work uncommitted, goal active.
+
+- DIAGNOSTIC99335 TERMINAL FAIL236.891: reached waiting_ci, then fixture's
+  len(attempts)!=3 assertion failed with err=nil and huge claim dump. This is
+  a verified test contract bug: allowed bounded repair adds an attempt. It is
+  NOT evidence that initial74998 two-invalid Planner exhaustion is fixed.
+  Removed claim dump and added validateCompiledAttemptHistory: exactly one
+  successful terminal per expected phase, at most one prior invalid_artifact,
+  attempts1/2, same binding/fence, no indeterminate retry. Final review same
+  rule; overlap uses actual last attempt, not fixed index2. New unit regression
+  rejects model/fence drift, third attempt, uncertain retry, missing review.
+  Investigation scope limited cmd/sf test harness. No workflow/schema/runtime
+  fix made. Schema proof-kind mismatch hypothesis remains unconfirmed.
+  Native trial now stopped/cleaned; no live paid process active.
+
+- ACTIVE ONLY TEST99335: same live concurrent approval fixture, one bounded
+  diagnostic reproduction. Poll this exact handle; no other test remains.
+  No fixes without artifact framing/schema evidence. Prior failed run74998
+  ephemeral DB gone; safe reason reporting compiled1582 PASS0.627.
+
+- BASELINE12177 FINISHED PASS exit0, final worktreecoord135.221. Predates latest
+  picker/preflight; latest full CLI6916 PASS covers them. Native74998 remains
+  failure, NOT overwritten by baseline success. Investigation skill read fully
+  (initial cat truncated, missing ranges365-735 and330-365 read separately).
+  Relevant prior learnings queried: no matching artifact root cause, only
+  retry rearm stop tuple and terminal capacity history. Freeze script absent;
+  no global tool/config/telemetry changes made. Investigation confined to
+  test diagnostics, no root cause established, no production fix.
+  Diagnostic reproduction of same paid two-ticket fixture launched next;
+  records closed ProviderArtifactFailures reasons, never raw failed output.
+
+- LIVE CONCURRENT74998 FAILED86.366: one Planner invalid_artifact twice,
+  paused atv3/r1 after bounded repair; no PR/ready/merge, clean worktree.
+  This is NOT a pass and no blind retry launched. Old fixture diagnostics
+  omitted Store ProviderArtifactFailures closed reason codes; added safe
+  artifact_reasons query to walkingSkeletonWaitStateBounded (no raw output).
+  Fixture's ephemeral DB was cleaned on failure, so exact prior reason cannot
+  be reconstructed. Need bounded diagnostic reproduction before attributing
+  cause; may be provider artifact/schema rather than concurrency authority.
+  Full CLI6916 PASS6.313, vet/repo/secret PASS. Baseline12177 still running;
+  no paid process remains. Previous successful live single58549 remains valid.
+
+- COMPILED CONCURRENT APPROVAL7858 PASS136.496 (test135.93): fake provider
+  processes, native SF/commands, two PRs and fresh reviews, exactly first
+  approved ticket Done/main matches, sibling not merging/reconciling/Done,
+  exactly one ready/merge. Real-model counterpart74998 NOW RUNNING with
+  SF_TEST_LIVE_MIXED_CONCURRENT=1, exact Sonnet5/Luna/local fixture state only.
+  No Cursor calls. Poll same74998, do not duplicate. Model validation now also
+  rejects aliases/provider mismatch before daemon with executable picker
+  guidance; focused69321 PASS0.639. Full CLI+vet+repo/secret6916 running.
+  Baseline12177 still running (predates latest picker/preflight; separate full
+  CLI rerun covers those). Goal still incomplete: hosted both-ticket delivery,
+  safe API retries, Cursor and remaining acceptance. All changes uncommitted.
+
+- LIVE EXACT-MODEL58549 PASS214.508 (test214.11): compiled real ClaudeSonnet5
+  Planner/Builder + CodexLuna verifier/final review using new explicit flags
+  delivered guarded Done with existing exact identity/mutation/lease assertions.
+  Local fake GitHub/bare/approval only, no hosted or live channel mutation.
+  Added compiled concurrent approval isolation variant: both CI/final reviews,
+  approve only first, first Done and exact main, sibling not merging/reconciling/
+  Done, exactly two PRs/one ready/one merge. Fake-provider7858 RUNNING; live
+  variant exists but NOT launched. Baseline12177 running through statemachine,
+  processsupervisor68.123/providercoord5.881/publication95.304 PASS.
+  No test process restarted. New edits this turn are tagged fixture/docs only.
+
+- NEW NEGATIVE RETRY CONTRACT: providerjson TestProviderRetryHintsDoNotProvePreExecution
+  proves zero turns/tokens/cost, retryable/Retry-After and claimed pre_execution
+  metadata never convert an ambiguous terminal error into success/artifact
+  repair. Race65794 PASS1.300. This does NOT implement safe transient retry;
+  missing authenticated no-execution receipt remains open. No production edit.
+  Live exact-model58549 remains running (no terminal output); baseline12177
+  running through phaseartifact (Git198.382/GitHub63.408/multiprovider0.497 PASS).
+  Poll both existing handles, do not duplicate or infer terminal from silence.
+
+- INTERACTIVE MODEL PICKER IMPLEMENTED: providers qualify --preset select
+  --models select selects both exact models before request; q/EOF/invalid
+  either answer makes no request, JSON/nonterminal/conflicting flags refuse.
+  Reviewer menu excludes Builder family; catalog explicitly not account or
+  qualification proof. SupportedModels fresh slices on adapters; Store and
+  daemon qualification remain authority. Normal36779 PASS0.484; race66562
+  PASS1.654; sf_e2e compile24880 PASS0.570; vet/repo/secret82232 PASS.
+  Compiled live fixture now passes explicit model flags. Authorized native
+  Claude Sonnet5/Codex Luna exact-flag acceptance58549 RUNNING (real models,
+  local fake GitHub/bare/approval, no live SF/Relay state). Poll same handle.
+  Full baseline12177 still RUNNING through ghrunner PASS, cmd/sf91.904,
+  CLI5.458/daemon22.452 passed; predates latest picker. No Cursor paid calls.
+  All edits uncommitted, overall goal active; safe API retry/Cursor and full
+  acceptance gaps remain. No production edits during the live trial.
+
+- EXACT MODEL FLAGS IMPLEMENTED (uncommitted): providers qualify accepts
+  --builder-model/--reviewer-model, including with presets. Daemon optional
+  ProviderModelQualifier preserves legacy callback behavior but explicitly
+  refuses model requests through legacy-only callback; error guidance keeps
+  exact IDs. cmd/sf wires multi-provider model callback. Preflight resolves
+  defaults, rejects unknown/alias/same-family before paid IO. Codex selected
+  candidates reconstruct from Store qualification models on restart rather
+  than only environment defaults; existing routes retained where matching.
+  No schema change, env mutation, live runtime change or paid call.
+  Test82671 initially failed selected-model fixture (missing sibling bundle),
+  fixed to use adapterFixture;79936 PASS. Full affected48251 had only that
+  stale fixture failure (CLI5.460/daemon22.548 PASS). New focused race98510
+  PASS all four codexprovider/multiprovider/cli/daemon; focused vet PASS;
+  repo/secret28324 PASS. Full UPDATED baseline12177 is RUNNING with native
+  GOCACHE=/private/tmp/sf-multi-cli-go-cache go test -p1 -count=1 ./...;
+  poll same handle, do not duplicate. Earlier56339 predates these edits.
+  Interactive exact-model picker still incomplete; safe API retry and Cursor
+  qualification remain open. Acceptance ledger/doc CLI updated, goal active.
+
+- BASELINE56339 FINISHED PASS, exit0; final worktreecoord138.114. No test
+  process remains. This full run predates provider editor; newer production
+  editor independently covered by full config/CLI70559 PASS, config race24373
+  PASS1.575 and latest picker-cancellation47701 PASS1.014. Focused vet,
+  repo-check and secret-scan84090 PASS. No paid calls/live state/remote changes.
+  Acceptance ledger updated; overall goal remains active/incomplete for exact
+  model editor, safe API retries, Cursor qualification and remaining acceptance.
+  All implementation changes remain uncommitted. Earlier running-status entries
+  below are historical and superseded by this terminal result.
+
+- EXISTING CONFIG EDIT DELIVERED LOCALLY (uncommitted): `config providers
+  --project p --preset select|claude-codex|codex-claude|codex-codex` edits only
+  provider preferences under canonical descriptor lock; original-byte backup,
+  atomic rename, source/directory recheck, idempotence, cancelled-context refusal.
+  Does not write Store generations or qualify/call providers; separate config
+  apply required. Existing config required. Full config/CLI70559 PASS0.484/5.998
+  after incomplete-stage identity-safe cleanup. Focused68196 PASS. Docs updated.
+  Exact-model interactive editor remains open. Static checks84090 running;
+  full baseline56339 still running (through workflowruntime115.397 PASS) and
+  predates this editor; full changed packages independently covered by70559.
+
+- EXISTING CONFIG EDIT FOUNDATION: new config/provider_edit.go implements
+  bounded pure RewriteProviderPreset with pinned TOML AST ranges. Replaces
+  only provider values, handles table/dotted/inline/quoted/partial forms,
+  preserves unrelated bytes/comments, strictly re-parses and checks unrelated
+  typed settings unchanged; no filesystem/Store actions yet. Tests initially
+  found table Raw range unset in parser70054; fixed using actual key/header
+  line span. Focused61303 PASS0.386, diff-check clean. Must still wire locked
+  file install/recovery + future generation apply + CLI; do not call existing
+  project editing delivered. New tests used private provider-edit cache only.
+- BASELINE56339 still confirmed live, packages through ghrunner PASS (cmd/sf
+  92.031,CLI5.202,daemon22.768). Poll same handle. It predates new provider_edit
+  files, so those need independent validation/final baseline accounting.
+
+- ACTIVE CURRENT-TREE BASELINE56339: native GOCACHE=/private/tmp/sf-multi-cli-go-cache
+  go test -p 1 -count=1 ./... . Last output fake-provider PASS0.392;
+  handle confirmed live. Poll same handle; don't duplicate or treat silence as
+  terminal. No paid model flags enabled. Previous baseline70857 passed.
+- REQUIREMENT AUDIT added docs/plans/2026-09-06-multi-cli-acceptance.md:
+  full goal explicitly incomplete; distinguishes local fake-GitHub delivery,
+  artifact repair vs missing safe API retry, initial picker vs existing-project
+  editing, Store profile capacity vs live profile replacement, Cursor unavailable.
+  Follow remaining implementation/acceptance priorities without shrinking goal.
+  No production changes or paid calls this turn; latest edits documentation only.
+
+- SHARED ACCOUNT CAPACITY: new providercoord/estimated_capacity_test.go proves
+  two signed Claude-profile claims occupy capacity2, a separately qualified
+  second model on same auth identity cannot admit third, no attempt consumed
+  by refusal, DB reopen retains exclusion, cancellation releases only exact
+  claim and third then admits on new model; remaining claim untouched and all
+  terminal claims drained. Direct Store boundary, not live runtime rotation.
+  Fixture first failed missing bound input fields50976; corrected to match
+  production claimInput. Normal72563 PASS0.651; expanded cross-profile plus
+  estimated retry tests race83033 PASS18.242. Focused vet/diff-check PASS.
+  No paid models/runtime/remote mutations. No test running; goal still active.
+
+- CURSOR GATE RECHECK: installed agent/cursor-agent both2026.09.02-c22c1a3;
+  help + installed JS + current official hooks/permissions/sandbox docs do not
+  establish all-hook isolation. Added docs/plans/2026-09-06-cursor-compatibility-gate.md
+  with exact reopening requirements (no bypass). Added direct supervisor test
+  known Sonnet/Luna/Grok Cursor bindings cannot reuse Claude/Codex policies;
+  focused25281 PASS0.455. No model calls/auth changes/installed-file edits.
+  Do not repeat this same spike absent new capability evidence; Cursor slice
+  remains open/unavailable, not completed. Work can continue on remaining
+  retry/setup/acceptance requirements. Diff-check clean; no test running.
+
+- QUALIFICATION PRESET UX: `providers qualify --preset select` reuses numbered
+  terminal picker; explicit codex-codex/claude-codex/codex-claude works in JSON.
+  Rejects mixed preset+explicit flags, empty/unknown preset and cancelled/input
+  failure before daemon request. Existing --builder/--reviewer remains valid.
+  Picker discloses paid qualification; no hidden model selection/config writes.
+  New focused74788 PASS0.643. FullCLI91427 caught stderr JSON regression;
+  fixed by preserving Cobra input-error path, fullCLI32335 PASS5.274.
+  Taggedcompile22649 PASS0.521 before final error-only change. Diff-check clean.
+  No paid calls/live-state changes. Goal remains active, all edits uncommitted.
+
+- LATEST STATIC GATES: full go vet82298 PASS (only known Darwin Seatbelt
+  deprecation warnings); repo-check+secret-scan91797 PASS,644 commits and
+  working files scanned/no leaks. No test process remains active. Latest
+  new retry test covered by full provider race32388; earlier full baseline
+  passed before this test-only addition/comment update. Goal not complete.
+
+- ESTIMATED RETRY COVERAGE: new providercoord/estimated_retry_test.go uses
+  signed credential-free Claude/Codex qualifications, real Store/coordinator,
+  frozen config and estimate consent. Validates same-binding repair once,
+  exhaustion at two, partial-write command uncertainty no relaunch, and exact
+  outcomes/counts/unknown estimates after DB reopen + fresh coordinator.
+  Normal44978 PASS1.006; full provider race32388 PASS coordinator127.665,
+  claudeprovider1.493,providerjson1.384,multiprovider4.713. No model calls.
+  General safe-transient API retry remains unimplemented: current CLI terminal
+  errors do not prove pre-execution rejection. Do not label artifact repair as
+  general API retry. All changes uncommitted; goal remains active.
+
+- CONCURRENCY6701 TERMINAL PASS219.412s (test218.90): two real Claude Sonnet5
+  planner/builder + Codex Luna verifier tickets reached separate draft PRs in
+  fakeGitHub, exact model/role assertions, overlapping pipelines, separate
+  worktrees, successful command proofs, no active provider/command leases.
+  Uses real init --providers preset. No hostedPR/merge or Cursor calls.
+  All paid handles terminal; no test currently running at this checkpoint.
+  Full baseline70857 and latest focused46214 also PASS. Full goal remains open;
+  remaining release/retry/config completeness audit and Cursor capability gate.
+
+- SUPERSEDING CHECKPOINT: full baseline70857 exited0, all packages PASS
+  (Store125.203,workflowruntime113.052,worktreecoord135.215). Latest setup/
+  qualification-guidance focused46214 PASS config0.463,CLI1.222,daemon0.593.
+  Failed qualification guidance now preserves selected mixed provider pair.
+- ACTIVE PAID CONCURRENCY6701: SF_TEST_LIVE_MIXED_CONCURRENT=1 GOCACHE=
+  /private/tmp/sf-multi-cli-go-cache go test -tags sf_e2e -p 1 -count=1
+  -timeout 30m ./cmd/sf -run '^TestCompiledLiveMixedConcurrentTicketsReachPRs$' -v.
+  Poll6701, do not duplicate. Two real Claude Sonnet5/Codex Luna tickets;
+  isolated fixture DB/HOME/worktrees/fakeGitHub; no live Relay or Cursor calls.
+  Not yet a pass; goal still active and changes uncommitted.
+
+- BASELINE70857 STILL RUNNING: packages through phaseartifact passed, including
+  cmd/sf95.117, daemon23.044, Git190.614, GitHub65.267. Poll same handle.
+  repo-check+secret-scan82141 PASS (644 commits + working files, no leaks).
+  Later config/CLI edits need focused rerun/final baseline audit; do not call
+  the still-running pre-edit baseline proof of every latest source line.
+- CONCURRENCY HARNESS prepared (NOT RUN): opt-in
+  SF_TEST_LIVE_MIXED_CONCURRENT=1 TestCompiledLiveMixedConcurrentTicketsReachPRs,
+  same compiled daemon,2 real Claude/Codex pipelines, separateworktrees/PRs,
+  overlappingpipeline timestamps, exactrole/model assertions,20m/$10estimate
+  per-ticket and16launch guard. Stops at waiting_ci; no approval/merge.
+  Tagged compile71745/61870 PASS before latest picker edits. Live harness now
+  uses actual init --providers instead of manualconfig, so future trial testsUX.
+- PRESET EDGE FIX: missingconfig+providers must preserve detectedcommands,
+  not suppressstackdetection and inheritGo. PrepareInitialConfig now detects
+  and encodescommands beforeaddingproviders; unsupportedstack rejects.
+  Targeted65130 PASS config0.416/CLI1.258. Invalidpreset rejectedbeforechannel
+  setup. New `init --providers select` terminalonly numberedpicker, noautomatic
+  action/qualification/billing, q/EOF/invalidinputnochanges;JSON/pipedrefuse.
+  Picker54910 PASS1.399. Existingconfig/modelediting stillpending. Alluncommitted.
+
+- ACTIVE BASELINE70857: native `GOCACHE=/private/tmp/sf-multi-cli-go-cache
+  go test -p 1 -count=1 ./...` launched after full config+CLI94365 PASS
+  config0.492/CLI5.102. Paid live environment flags NOT enabled. Poll70857
+  until terminal; do not duplicate. Both paid delivery handles terminal PASS.
+
+- REVERSE LIVE DELIVERY PASS:98292 PASS231.306s (test230.90). Real Codex Luna
+  planner/builder + Claude Sonnet5 verifier/final reviewer, explicit persisted
+  identity assertions, exactly4 completed phases, guarded Done/one local fake
+  PR+ready+merge/no lease residue. Includes current fixturev2 schema probe.
+  Both live directions now proven locally, NOT hosted GitHub/Relay acceptance.
+  No model process/test remains running. Race20308 PASS Claude1.402,
+  providerjson1.396,multiprovider4.731.
+- INITIAL CONFIG UX implemented: `init --providers claude-codex` (also
+  codex-codex/codex-claude), Planner follows Builder. Uses existing descriptor
+  lock/no-overwrite Install/rollback and immutable RegisterProject, combines
+  recipe flags; existing config must match, never overwritten. No qualification
+  or billing minted; result exposes preferences+qualification_required.
+  Generated bytes are prevalidated by LoadLockedProject before install.
+  --check refuses mutating options. New targeted tests63254/82281 PASS
+  (freeze/replay/no-qualification/no-overwrite/rollback/read-only). Full config
+  39295 PASS0.606; native full config+CLI94365 launched, check terminal result.
+  Interactive editing/model selection still not complete. Diff-check clean.
+
+- FIRST REAL MIXED DELIVERY PASS: integrated50489 passed216.444s (test215.95),
+  actual Claude Sonnet5 planning/build and Codex Luna verification/final review,
+  compiled daemon/Store/gates/repository commands through guarded Done, local
+  fake GitHub/bare only; exactly4 completed phases, one PR/ready/merge, no lease
+  residue. Not hosted Relay delivery. This used policyv2 schema projection but
+  pre-v2 fixture declaration. Qualification now exercises draft2020 schema and
+  FixtureDigestv2, preventing recurrence; focused15690 PASS0.975.
+  Reverse-role test added plus explicit persisted provider/model/family asserts
+  for each live role. Tagged compile71785 passed (check tool terminal);
+  reverse live launched next, see handle. No Cursor calls/live channel writes.
+
+- TERMINAL CHECKPOINT: integrated62466 FAIL525.689s, clean blocked/planning
+  command_error, zero GitHub mutations, cleanup completed. Schema fix native
+  72283 PASS9.849, all four workflow schemas projection PASS; suites26799 PASS
+  claude0.376/multiprovider0.584/providercoord5.249. Tagged compile11376 PASS
+  0.596 (no tests), targeted vet completed exit0; diff-check clean. A new
+  integrated run50489 launched after terminal cleanup and remains running;
+  poll that exact handle, do not duplicate. No Cursor/live hosted mutations.
+
+- CURRENT LIVE62466: compiled mixed qualification/runtime activation/start
+  succeeded after timeout repair; private ticket reached blocked v3 with one
+  Claude planning attempt failed/result_indeterminate, signed drained,
+  diagnostic command_error. No fallback/retry/external mutations. Test still
+  waiting original8m bound as of last poll; MUST poll62466 until terminal before
+  another integrated run. Test daemon18812 private DB observed read-only at
+  /private/tmp/sfh-3094186123/Library/Application Support/sf/dev/sf.sqlite.
+  Do not touch live onboarding daemon84951. New future wait loop fails fast on
+  paused/blocked/cancelled instead of wasting8m.
+  ROOT CAUSE proven: Claude CLI rejects SF draft2020-12 declaration with
+  missing_schema_ref (private native probe34536 FAIL3.845, no raw output).
+  Added claudeprovider/schema.go common-subset translation to draft07, retains
+  every constraint and original authenticated input; refuses newer/unknown
+  keywords. Four workflow schemas tested. Native same probe72283 PASS9.849
+  after fix. Supervisor Claude policy bumpedv2 with projection marker.
+  Full Claude tests pass; provider suites26799 launched, needs terminal poll.
+  Cursor now reports concrete unverified hook isolation before qualifier;
+  daemon negative5724 PASS0.595, docs updated. No Cursor calls.
+
+- LATEST LIVE/TRANSPORT: provider suites98682 PASS codexprovider1.556,
+  multiprovider0.581, providercoord5.361. Live77347 terminal FAIL43.366:
+  qualification returned daemon_unavailable. Source shows server transport
+  retained 30s connection/handler deadline despite CLI4m; earlier successes
+  just fit bound. serveConnection now extends only decoded/authenticated
+  provider.qualify to4m, retaining30s decode/ordinary requests. Added socket
+  handler-deadline regression (checks4m qualification and30s status without
+  sleeping). Native full transport6567 launched; inspect terminal result.
+  No live test remains running; no Cursor calls. Next rerun bounded mixed
+  ticket after transport test passes. Full goal still active/incomplete.
+
+- LATEST: live56747 FAIL34.502s, BOTH Claude Sonnet5 and Codex Luna qualified
+  independent=true; runtime activation failed. ComposeQualified rejects duplicate
+  exact identities; configuredProfiles yielded Luna for both Codex roles.
+  LocalRuntimeCandidates now deduplicates configured model before New (same
+  executable/auth source), preserving ComposeQualified ambiguity refusal.
+  Provider suites98682 running/need terminal poll. No ticket was started;
+  no Cursor calls. Previous live handle56747 is terminal, not running.
+
+- MIXED ROLE CHECKPOINT: integrated38294 completed FAIL29.579s before ticket:
+  Claude qualified successfully, Codex unavailable because both configured
+  Codex defaults became Luna when reviewer override selected Luna. Separated
+  configuredProfiles (individual candidates) from defaultProfiles (independent
+  Codex-only pair); actual selected mixed pair still independently validated.
+  New profile regression plus full codexprovider/multiprovider2190 PASS
+  1.663s/0.537s; diff-check clean. Bounded live retry56747 RUNNING; poll that
+  exact handle, do not duplicate. No Cursor calls or live channel mutations.
+
+- LIVE MIXED HARNESS (2026-09-06): opt-in sf_e2e TestCompiledLiveClaudeCodexTicket
+  uses actual installed Claude/Codex via temporary symlinks, private daemon
+  HOME/Store/worktrees, fake GH/local bare Git, explicit Claude planner/builder
+  and Codex Luna reviewer plus estimate opt-in. 20m ticket/8m state waits,
+  30m test bound; no hosted Relay/live channel changes. Initial76042 failed
+  qualification before ticket creation. Status-only isolated-HOME22384 failed;
+  direct lookup diagnostic52795 confirmed Keychain lost credentials because
+  lookupCLISecret forwarded private daemon HOME. Fix resolves OS user.Current
+  home with effective UID/absolute-path check for security lookup only; provider
+  environment remains private. Status-only44707 PASS3.789s. Integrated38294
+  RUNNING after fix; no delivery verdict yet. Default hermetic harness path
+  unchanged apart from bounded wait wrapper; no production runtime bypass.
+  No Cursor calls; exact model charges unknown. All other handles terminal.
+
+- ALL PHASE CONFIG ROUTING (2026-09-06): PhaseRunner admits exact configured
+  Claude/Codex reviewer/builder, sends ExpectedProvider, and matches current
+  and historical provider results to the immutable ticket role snapshot.
+  Recovered amendment-review shortcut also rejects wrong provider. Shared
+  configuredProvider rejects unknown/auto/Cursor/fallback arrays. Focused
+  phase tests5529 PASS0.631; full48507 PASS providercoord5.676/workflowruntime
+  172.974s (before subsequent Store guard compiled). New Store admission guard
+  validates config_snapshot_bytes digest and exact role for every estimated-
+  policy ticket, including its Codex roles; legacy non-opted-in Codex untouched.
+  Focused97035 PASS2.849 after correcting initial column-name typo (33911
+  failed before fix). Accounting fixture now explicitly configures cursor
+  planner. Full Store66094 PASS126.193s. Vet49509 PASS for workflowruntime,
+  providercoord, Store. Diff-check clean; all handles terminal. Docs now explain
+  selected-pair versus immutable project config and exact no-fallback arrays,
+  with manual config apply instructions (interactive selection still pending).
+  No paid calls/live mutations; goal remains incomplete (Cursor policy,
+  setup/model UX, retry completeness, and actual mixed ticket delivery).
+
+- CONFIGURED PLANNER ROUTE (2026-09-06): discovered PlannerRunner, PhaseRunner
+  admission and result readers still hard-coded codex despite mixed qualified
+  composition. PlannerRunner now accepts exactly one configured codex/claude,
+  sends ExpectedProvider to coordinator, and requires returned provider match.
+  Coordinator rejects explicit mismatch before Begin/launch/fallback, and
+  historical reusedInputMatches enforces the same expectation. New focused
+  9087 PASS providercoord0.686/workflowruntime0.462: configured Claude positive,
+  Codex compatibility, wrong returned provider rejection, and no-attempt/no-call
+  mismatch. Full82313 providercoord PASS5.334s; workflowruntime failed only
+  expired-budget integration because provider mismatch preceded deadline
+  exhaustion. Moved mismatch check after existing deadline check (still before
+  claim/launch); targeted10948 PASS0.650/0.602s for original expired-budget,
+  mismatched route, configured Claude, legacy reuse. Legacy exact configured
+  provider assertion46643 separately PASS0.427s. All handles terminal. Full
+  workflow package not yet rerun after ordering fix; no full-green claim.
+  Remaining PhaseRunner verification/build/final-review and Store-side exact
+  configuration admission still need systematic wiring; do not call mixed
+  ticket delivery complete. No paid calls or live mutations this turn.
+
+- CURRENT REGRESSION / BILLING DISPLAY (2026-09-06): full Store21263
+  PASS124.221s after signed selection tightening. New JSON/human status exposes
+  durable estimated policy, actual_total_known=false, hard_dollar_cap=false,
+  16 SF launches/45m per invocation (not API request count). Native targeted
+  CLI/daemon52055 PASS0.622/0.772s. Full affected36238 passed multiprovider,
+  providercoord, CLI; daemon failed six lifecycle fixtures at admission because
+  credential-free mocks were named cursor/claude and lacked explicit consent.
+  Investigation traced exact BeginProviderAttempt policy requirement; changed
+  only shared mock names to fixture-cursor/fixture-claude. Full daemon56202
+  PASS22.331s. Production consent/auth was NOT weakened. This recurring fixture
+  pitfall also affected earlier Store/engine/publication fixtures: mocks must
+  not impersonate production providers when testing unrelated lifecycle paths.
+  New opt-in compiled-Claude qualification test uses real production gate,
+  disposable Store signature/replay/stale-leader checks. Native24795 PASS
+  27.211s (test26.60s); two model-bearing Claude CLI launches plus cancelled
+  startup, actual charge unobserved. No Cursor call/live project changes.
+  All test handles above terminal. This is qualification, not ticket delivery.
+  Cursor installed190.index.js hook loader defaults loadProjectHooks=true and
+  independently reads enterprise/team/user/project plus Claude settings hooks;
+  disable-project-configs alone is not proof. Cursor remains unavailable.
+  Goal active; no commit, remote, live daemon or channel DB mutation.
+
+- MIXED SELECTION VALIDATION (2026-09-06): native daemon qualification and
+  compiled Codex qualification regression38088 PASS1.528/5.358s; no model calls
+  (fake fixtures). New real Store mixed selection test12093 found stale signed
+  pair replay accepted after leader takeover. SelectProviderSet now verifies
+  credential-bearing signatures/current leader inside same write transaction,
+  including exact replay. Credential-free legacy fixtures unchanged. New
+  multiprovider race16454 PASS4.796s: valid independent pair selects; missing/
+  same-family preserves old selection; stale leader refuses. All handles
+  terminal; diff-check clean. Broad Store regression remains needed after this
+  selection tightening. Cursor role policy still unavailable.
+
+- PRODUCTION MIXED COMPOSITION CHECKPOINT (2026-09-06): new multiprovider
+  local package qualifies one Codex/one Claude role then atomically selects
+  pair only after both pass independence. Claude uses fresh Supervisor qualifier
+  and Store attestation validation. Codex exports single-role qualification and
+  default runtime candidate discovery, preserving codex/codex path. Composition
+  adds selected Claude identity via status observer + Adapter; Cursor refused.
+  cmd/sf now uses multiprovider qualification/composition, daemon accepts Claude
+  and no longer falsely says no model call on failures. CLI default qualify
+  timeout4m; explicit custom timeouts preserved. Docs disclose model calls.
+  multiprovider/Codex full normal39394 PASS0.550/1.515s. Compile-only99782
+  cmd/sf/daemon/CLI PASS (no tests selected, compilation only). All handles
+  terminal. No new live model/Store run.
+  Need real Store mixed-pair tests, compiled qualification/gate acceptance,
+  Cursor strategy, and broad regression before claiming feature complete.
+
+- CALLABLE CLAUDE QUALIFIER (2026-09-06): new Supervisor.QualifyClaude runs
+  fresh write/outside-denial, readonly, and cancel-at-recorder fixtures through
+  a private nested supervisor, then reobserves exact runtime/auth and signs
+  passing attestation. No Store selection wiring yet. Private qualification
+  recorder grants no ticket authority. Cleanup keeps files if Close unclear.
+  Invalid authority/model unit91576 PASS0.477s. Native qualification test
+  session66800 EXIT0 PASS20.944s, two Sonnet fixture calls + cancelled
+  startup (actual charges unobserved). Gate is test harness, not compiled
+  Store E2E. No production qualification or live DB record issued yet.
+
+- CLAUDE SUPERVISOR CANCEL CHECKPOINT (2026-09-06): added opt-in
+  TestInstalledClaudeSupervisorCancellationDrains. Resolves canonical native
+  CLI, status-only observes binding, registers staged runtime, constructs exact
+  Claude invocation, launches through real Supervisor.Run credential branch,
+  cancels after recorder/startup, requires <=10s join and verified Drain proof.
+  Native24026 PASS4.141s. Non-opt-in87671 compiled/skipped (not live evidence).
+  Recorder and gate are fixtures, not Store/full production-gate integration.
+  Possible brief Claude API startup; actual usage unobserved, no Cursor call.
+  Still need production qualification runner/signing/composition, not merely
+  manual test results. All sessions terminal; diff-check clean.
+
+- CLAUDE READONLY RECHECK (2026-09-06): native role fixture now shares setup
+  for builder and final-review invocations. Review challenges Write/Edit and
+  independently checks sentinel unchanged plus exactly-one-file inventory.
+  Shared validator requires successful done=true artifact and exact bytes;
+  model assertion cannot override a changed file. Race74402 PASS1.522s;
+  authorized live Sonnet readonly23482 PASS10.590s (one additional Claude call,
+  actual charge unobserved; no Cursor calls). Test remains opt-in, 60s bound.
+  No signed qualification issued: still need production qualification runner
+  and native cancellation/Store→Supervisor composition evidence. All sessions
+  terminal; diff-check clean. No live SF DB/worktree changes.
+
+- CLAUDE NATIVE ROLE RECHECK (2026-09-06): extracted strict reusable
+  validateClaudeRoleEvidence into production supervisor package; live fixture
+  uses it. Requires successful structured done=true, exact outside Read denial,
+  independently read SF_WRITE_OK file, no canary in stdout/stderr. Rejects
+  duplicate nested keys/paths and malformed evidence. Race17591 PASS1.530s.
+  One authorized native Sonnet live probe61205 PASS11.271s (60s bound,
+  disposable files, no raw output logged). This was one additional Claude
+  model invocation; exact charge not observed. No Cursor calls. Still NOT
+  signed production qualification: readonly-role/cancellation fixture execution
+  and production qualification composition remain to implement. All handles
+  terminal; diff-check clean.
+
+- CLI ACCOUNTING OPT-IN (2026-09-06): `start --accept-cost-estimates` sends
+  explicit boolean; ordinary start payload unchanged. Daemon strictly decodes
+  start parameters separately from general ticket references and records
+  policy BEFORE StartWithProjectOwnership makes queued ticket planning.
+  Store opt-in now accepts queued or planning with zero prior attempts; exact
+  policy replay stays allowed. CLI forwarding test PASS; native daemon99772
+  PASS0.591s proves queued opt-in/start/replay. Sandboxed27893/3401 failed only
+  socket bind permission; rerun used native approved test permissions. No
+  model calls/live state. `run` convenience flag not added; use submit+start.
+  Production Claude qualification/Cursor policy and config discovery remain.
+
+- ESTIMATED COMPLETION CHECKPOINT (2026-09-06): Store
+  ProviderResultAccountingAccepted now accepts verified charges OR exact
+  opted-in durable estimated/unknown observation with UsageUnits==0. Complete
+  uses it without setting UsageTrusted; coordinator uses it for success and
+  clean invalid-artifact repair. Command ambiguity still refuses repair.
+  Receipts explicitly label verified_charge/reported_estimate_v1/unknown.
+  Real Store test now completes/replays/loads historical result with opted-in
+  unknown estimate; missing/mismatched observation and untrusted currency
+  reject. Normal53498 PASS1.191s; coordinator full55111 PASS6.602s; focused
+  Store race5899 PASS19.437s including legacy completion test. All handles
+  terminal, diff-check clean. No new model/live DB calls.
+  Next: CLI opt-in/config wiring BEFORE any attempt (start scheduling must not
+  race approval), production native qualification and Cursor role strategy.
+  Earlier statements that trusted-only completion is unchanged are superseded.
+
+- ESTIMATE OBSERVATION CHECKPOINT (2026-09-06): full Store89486 EXIT0
+  PASS175.004s after fixture provider renaming (before newest estimate table).
+  Extended unshipped v59 with immutable provider_cost_estimates: optional
+  microUSD, nil=unknown, FK to attempt and opt-in. Record requires exact loaded
+  claim/current fence/signed drain; exact replay only; no charge mutation.
+  Coordinator records after drain; stale-fence error continues existing
+  retirement path. Current trusted-usage success gate remains unchanged.
+  Focused54641 PASS1.604s; accounting race23038 PASS14.549s; coordinator full
+  normal15860 PASS10.194s. Added separate estimated-ceiling stop query in Begin
+  afterward; latest focused54597 checks next admission stops at estimate cap.
+  Production estimated success + CLI policy wiring remain pending, no paid
+  calls/live data/commits. Do not call missing estimates actual zero spend.
+
+- ACCOUNTING POLICY CHECKPOINT (2026-09-06): append-only v59 adds immutable
+  provider_accounting_policies per-ticket opt-in, request/time limits, estimate
+  ceiling copied from ticket, and approving fence. No legacy backfill. New
+  Store ApproveProviderEstimatedAccounting requires current planning fence,
+  zero prior attempts; exact replay allowed; mutation/delete rejected. Begin
+  Claude/Cursor now requires this policy. Focused10199 PASS after correcting
+  test qualification→runtime conversion. Full Store88064 EXIT1: shared unsigned
+  setupProviderPair fixtures named cursor/claude hit new opt-in guard. Renamed
+  those mocks fixture-cursor/fixture-claude, no production exception. Targeted
+  93809 PASS1.621s (policy + V28 migration + candidate repair). Full rerun RUNNING
+  session89486; poll that handle, no duplicate. No paid calls/live DB changes.
+  CLI opt-in wiring, terminal
+  estimate persistence and estimated success accounting are STILL pending;
+  do not mark UsageTrusted on estimates or claim production qualification.
+
+- REQUEST LIMIT CHECKPOINT (2026-09-06): BeginProviderAttempt now checks a
+  code-owned Claude/Cursor limit inside its existing write transaction: all
+  prior ticket provider attempts count against 16 SF launches, regardless of
+  phase/provider/outcome; timeout <=45m. Existing attempt rows are durable
+  reservations, with no new ledger/migration. Claude signed policy digest now
+  includes request-policy identity and Invocation shares the timeout constant.
+  Codex-only admission unchanged. These are SF launches, NOT internal API calls
+  or a dollar guarantee. Accounting policy/production qualification remain
+  incomplete; no trusted-charge bypass. Isolated count-query reopen/boundary/
+  namespace/Claude-to-Cursor test PASS normal8026/race52691; registration tests
+  race52691 PASS. Full Claude package race93894 PASS1.279s (initial regex did
+  not select its invocation tests). All handles terminal. No paid calls or live
+  DB changes. Next: persist explicit estimated accounting policy/results and
+  teach coordinator/Store to distinguish estimates from charges without
+  changing historical canonical PhaseInput encoding or trusted usage meaning.
+
+- BILLING APPROVED (2026-09-06): user approved labeled estimates plus time/request
+  limits, explicitly not a guaranteed dollar cap. $100 total Cursor testing
+  ceiling remains unchanged; no additional live calls made. Goal resumed active.
+  Adding separate optional provider-reported micro-USD estimate metadata; it
+  does not set UsageTrusted and is not yet durable budget/admission policy.
+  Missing estimate is unknown; decimal parsing rounds upward and rejects
+  malformed/overflow values. Production qualification remains gated pending
+  persisted accounting/limits and native qualification. Prior unanswered note
+  below is superseded by this approval.
+  Focused normal + race providerjson/claudeprovider/cursorprovider PASS after
+  estimate handling, including unknown/null/duplicate/overflow/rounding and
+  estimate-not-charge regressions; diff-check clean. No paid calls. Next:
+  durable explicit estimated-budget policy and prelaunch request reservations;
+  do not bypass current coordinator/Store trusted-charge gate to enable it.
+
+- BASELINE FINISHED (2026-09-06): native full session74976 EXIT1 only for
+  engine/publication legacy unsigned fixtures using AuthMode="test" and
+  "subscription". Corrected fixture identities/modes in engine_test.go and
+  publication/worker_integration_test.go; full affected-package rerun57907 EXIT0
+  engine1.671s/publication95.118s. All other baseline packages passed, including
+  cmd/sf100.354s, Git237.646s, GitHub82.633s, supervisor86.838s, Store197.739s,
+  workflowruntime138.159s/worktreecoord135.102s. This is baseline + corrected
+  package reruns, not a single green whole-suite invocation. Vet16836 EXIT0;
+  repo-check/diff-check pass. All sessions terminal. No model/live SF calls.
+  Billing decision still unanswered (also asked directly): may browser-login
+  providers use clearly labeled cost estimates + time/request limits, or must
+  they enforce verified dollar charges? Do not make UsageTrusted=true or enable
+  production qualification/role execution by assuming estimates or zero cost.
+
+- SHARED ROLE COMPOSITION (2026-09-06): providercoord.ComposeQualified now
+  resolves exactly Store's signed Planner/Builder/Reviewer set, without
+  fallback, and checks current signature/auth/runtime digests before supervisor
+  registration. Codex ComposeProfiles uses it (default candidates still Codex;
+  Claude/Cursor qualification/default discovery not yet enabled). Missing,
+  duplicate, drifted or stale selection yields an unavailable coordinator.
+  Real Store three-provider signed-fixture race79383 PASS4.779s; Codex full
+  normal72123 PASS1.560s. Added explicit route.Fallback-empty assertion afterward.
+  Baseline native `GOCACHE=/private/tmp/sf-multi-cli-go-cache go test -p 1
+  -count=1 -timeout 10m ./...` is RUNNING session74976; poll that handle,
+  do not launch a duplicate. Model opt-ins disabled, no live SF data mutation.
+
+- CLAUDE RUNTIME OBSERVER (2026-09-06): supervisor ObserveClaudeRuntime now
+  measures staged CLI version/capability flags and private OAuth status using
+  only status/help commands, fixed Keychain handoff, private cwd/home, bounded
+  outputs/timeouts and source/stage digest recheck. Returns binding metadata,
+  not a qualification signature or billing proof. Required fixture digest names
+  role/drain tests that still must be run by qualification. Shared providerjson
+  Object rejects duplicate auth keys. Native installed observer76082 PASS3.523s;
+  fixture72208 race PASS2.023s; focused15423 all PASS (supervisor1.864s).
+  Full protocol race90795 PASS json1.306s/Claude1.310s/Cursor1.314s. No model calls; raw account
+  status/credentials never logged. Full production qualification still pending.
+
+- CLAUDE SUPERVISOR REGISTRATION (2026-09-06): RegisterRuntime now accepts
+  Darwin Claude 2.1.263 with exact family/auth/policy and staged bundle digest;
+  preserves Codex policy/digest behavior. Run selects the private Keychain OAuth
+  environment for Claude instead of Codex's auth-home copier. Cursor remains
+  explicitly unqualified. ProviderPolicyDigest exposes separate Claude policy;
+  registration is NOT a passing Store qualification or billing authority.
+  Focused56336 race PASS1.583s (initial26210 compile typo in test Close call
+  fixed). Full native supervisor race74562 EXIT0 PASS77.243s. repo-check PASS.
+  Coordinator now rejects Claude/Cursor missing/cross-provider auth modes.
+  Initial full race1033 failed legacy credential-free fixtures named as real
+  providers; renamed those route/identity fixtures fixture-cursor/fixture-claude
+  in coordinator and adjacent daemon/workflow budget tests (no production
+  exception). Full normal66773 PASS5.142s; full race77459 PASS107.777s.
+  Targeted native daemon/workflow86867 PASS0.879s/0.756s for take/drain/resume
+  and budget/restart regressions. Secret-scan28540 PASS644 commits + worktree.
+  All test sessions terminal; no model calls or live runtime changes.
+  Still required: trusted observer + signed qualification production route,
+  billing decision, role configuration, retry integration and broad baseline.
+
+- FRIENDLY AUTH READINESS (2026-09-06): auth status/login JSON now includes
+  additive scope explaining login is not qualification/model independence/
+  billing/readiness; authenticated entries point to channel-correct doctor.
+  Human output has a dedicated concise auth renderer instead of raw JSON.
+  CLI docs and stable/dev regression coverage updated. Focused auth CLI race
+  session15522 EXIT0 1.771s; diff-check clean. No login, model, daemon, or
+  remote mutation. Full CLI/baseline suite still pending.
+
+- CLAUDE ADAPTER / CURSOR CONFIG REVIEW (2026-09-06): added exec-free
+  contracts.Provider Claude Adapter with injected runtime observation, fixed
+  role binding and re-observation rejecting model/family/version/binary/policy/
+  fixture/auth drift. Parse rejects foreign identities and preserves unknown
+  billing (UsageTrusted=false); observer errors are sanitized. This is not
+  production qualification/composition. Focused race87980 EXIT0 Claude1.473s,
+  providerjson1.304s, Cursor1.382s; diff-check clean. No paid calls.
+  Cursor installed package exposes hidden --disable-project-configs for
+  .cursor/cli.json only; separate 190.index.js hook loader reads project
+  .cursor/hooks.json, .claude/settings.json, user/team/enterprise hooks.
+  Therefore do not equate that flag or permissions config with hook isolation.
+  Production Cursor role gate still needs measured startup/permission isolation.
+
+- CURSOR STREAM BOUNDARY (2026-09-06): added bounded StreamArtifact parser
+  requiring one browser-login init, exact qualified display model/worktree,
+  consistent session IDs, and one terminal artifact at EOF. Rejects duplicate
+  keys, model/auth/session drift, missing/truncated/repeated terminal output;
+  never uses tool output as the artifact. Display labels are not catalog IDs
+  and do not replace pinned invocation/runtime authority. Cursor official
+  output-format docs establish this framing; production wiring and native
+  compatibility remain pending. Focused race session97307 EXIT0: cursorprovider
+  1.459s/providerjson1.333s. Initial default-cache attempt was sandbox-denied;
+  rerun used /private/tmp/sf-multi-cli-go-cache. No model calls this checkpoint.
+  Billing-policy async question remains unanswered: permit clearly estimated
+  costs with time/request bounds, or require verifiable hard monetary cap?
+  Do not infer browser login is free or weaken UsageTrusted meanwhile.
+
+- CLAUDE ROLE POLICY / LIVE DENIAL (2026-09-06): canonical MatchesInvocation
+  now shared by Claude proposal and supervisor check; tests reject broader
+  tools/bypass/session/positional prompt/stdin/auth/output/executable changes.
+  Run explicitly rejects unqualified Cursor instead of fixture fallback. New
+  providers still cannot RegisterRuntime in production; no enabling bypass.
+  Focused race53158 EXIT0 Claude1.437s/supervisor1.440s. Live native staged
+  Sonnet5 role probe20714 passed9.843s; strengthened mandatory exact Read denial
+  then70334 EXIT0 PASS9.409s. Both used private auth HOME/staged binary, disposable
+  worktree, fake outside canary, allowed Write and structured output. Second
+  pass requires CLI permission_denials Read/file_path match outside fixture;
+  no canary leak. Tests cleaned all temporary copies. Two small Claude model
+  calls; no Cursor spend/new project changes. This proves a native built-in
+  permission probe, NOT Store qualification/billing/process-tree containment.
+  Full registration/adapter/retry/configuration integration remains unfinished.
+
+- ENVIRONMENT LIFETIME / FULL SUPERVISOR RACE (2026-09-06): private env cleanup
+  now waits for BOTH Run return and cmd.Wait completion: early cancel preserves
+  live credentials; early Wait preserves final artifact until Run reads it.
+  New two-owner once-only cleanup tests include concurrent completion. Added
+  vettedCLIEnvironment wrapping existing fresh-home policy + fixed credential
+  handoff + exact qualified auth-digest check, with API/NODE_OPTIONS inheritance
+  and credential replacement negatives. Initial environment test caught macOS
+  /var→/private/var alias; canonicalized private HOME before strict validation.
+  Focused race96781 PASS1.434s. COMPLETE supervisor race86608 native-host EXIT0
+  PASS91.677s (-race -p1 -count1 -timeout5m ./internal/processsupervisor).
+  All handles terminal. Plan checkpoint updated with actual installed/auth
+  evidence. Production CLI registration/role policy/billing/retry/UI remain
+  incomplete. No new model calls/spend; edits uncommitted.
+
+- PRIVATE-HOME AUTHENTICATION PASS (2026-09-06): added supervisor-owned
+  cli_credentials.go. Fixed Keychain-service allowlist reads only Claude Code
+  credentials or Cursor access/refresh token items, bounded5s/16KiB, no secret
+  argv/errors/logging. Claude access token passed via documented OAuth env with
+  >46min expiry required; Cursor gets only access+refresh in private0600
+  .cursor/auth.json with file credential store. Fresh0700 HOME required; no
+  settings/history/hooks/MCP/cloud/API keys copied. Digest binds credentials,
+  NOT billing entitlement. Fixture race38527 PASS1.484s. Explicit host opt-in
+  test68037 EXIT0 PASS1.887s: BOTH installed CLIs report authenticated using
+  isolated private HOME, no model/network-inference call. Test cleans temporary
+  credential copies; no raw tokens/account details emitted. User browser logins
+  were not altered. Production Run still not enabled for new providers.
+  Next: couple environment lifetime to completeWait (existing cleanupEnvironment
+  defer runs at early Run return), qualified registration/role invocation,
+  billing policy and real tool/denial/cancellation tests. Full goal incomplete.
+
+- SUPERVISOR CLI SNAPSHOT WIRING (2026-09-06): trustedExecutable can now carry
+  a cliruntime bundle; stage uses its verified private copy and cached snapshot
+  validation hashes the full closure. Existing refcount/retirement machinery
+  owns it. RegisterRuntime admission and Run/env remain Codex-only: no unsafe
+  enabling. CLI snapshot mutation/source-change tests88234 PASS race1.329s.
+  Initial focused74181 failed existing blocked-launch test under sandbox;
+  native-host rerun39555 PASS2.705s; complete native focused33489 PASS3.727s
+  (race regex CLI|Replacement|Close|Register). Diff-check clean, all terminal.
+  Auth isolation spike: env-i with private HOME loses BOTH browser logins;
+  private HOME plus real CLAUDE_CONFIG_DIR also fails (looks for nested
+  .claude.json). Normal Claude login rechecked intact (claude.ai/team). No
+  credential contents read, no model calls. Need narrowly scoped credential
+  handoff, not real unrestricted HOME or user-settings inheritance. Cursor
+  package confirms CURSOR_CONFIG_DIR/CURSOR_DATA_DIR and credential-store
+  selector exist, but semantics not qualified. Full goal remains incomplete.
+
+- CLI RUNTIME SNAPSHOT (2026-09-06): new internal/cliruntime implements
+  Claude single-file and Cursor full-version-directory authentication/staging.
+  Private bundle fields, canonical digest includes kind/entry/member names,
+  executable bits/sizes/byte hashes; trusted ownership/parents; symlinks and
+  writable members refused. Explicit 4096 entries/256MiB file/1GiB bundle/64
+  levels/context30s limits; directory enumeration itself bounded. Stage verifies
+  source snapshot before copying and rehashes copied bytes; partial private
+  stage cleaned, successful lifetime reserved for supervisor process completion.
+  No supervisor admission changed yet. Fixture race42832 PASS2.091s before
+  bounded-walk change. Installed opt-in5778 EXIT0 all tests5.207s: actual Claude
+  1 member digest73c4baef...087c25; Cursor570 file+directory members
+  digest41d786dd...05f70fa. Both copied/authenticated successfully, no process,
+  credential or model calls. Race69737 after bounded-walk change EXIT0 PASS1.802s;
+  all handles terminal. Full goal not complete, edits uncommitted.
+
+- STRUCTURED RESULT / RUNTIME SPIKE (2026-09-06): Claude live schema smoke
+  session10859 EXIT0 produced structured_output={ok:true} using Sonnet5,
+  restricted/safe/no-tools/no-MCP. CLI list-price estimate $0.022203 (not actual
+  subscription charge); auxiliary Haiku4.5 appeared again in modelUsage. Added
+  providerjson.Command to classify supervisor exit/truncation/terminal/artifact
+  failures without trusting reported cost/tokens or retaining raw transcripts.
+  UsageTrusted remains false until authenticated billing policy is supplied;
+  coordinator therefore refuses unaccounted completion/automatic repair. This
+  decoder is not yet wired into a production adapter. Race48056 EXIT0:
+  providerjson1.441s/claudeprovider1.305s/cursorprovider1.272s. Diff-check clean.
+  Installed runtime discovery: Claude is one native Mach-O at version2.1.263;
+  Cursor launcher is a shell script executing bundled node+index.js, with JS
+  chunks/native modules/helpers in version directory. Cannot stage only launcher
+  or hash only node; need bounded whole runtime closure. Supervisor currently
+  RegisterRuntime/Run/vettedEnvironment still Codex-specific, no bypass added.
+  All handles terminal; no new Cursor model calls. Full goal incomplete.
+
+- BROWSER AUTH / MODEL IDENTITY (2026-09-06): new cursorprovider identity
+  boundary consumes bounded status --format json, rejects duplicate/missing/
+  malformed auth fields and trailing output. Observed status flags are
+  authenticated/isAuthenticated/hasAccessToken/hasRefreshToken; no raw secrets
+  inspected. Exact selected Cursor Sonnet5/Luna/Grok model IDs map to underlying
+  families (anthropic-claude/openai-gpt-5.6/xai-grok), preventing cross-CLI false
+  independence. Store now admits signed cursor_browser separately from cursor_api;
+  tests refuse switching between them without matching qualification. No runtime
+  enabled. Normal focused76550 PASS cursor .390s/Store .965s; after aligning Luna
+  family with existing Codex family, race60123 EXIT0 cursor1.432s/Store14.430s.
+  Full baseline not yet run; all edits uncommitted. Next: runtime strategy and
+  credential isolation, structured artifact live probe, spend-policy authority.
+
+- LIVE MULTI-CLI SMOKE (2026-09-06): user authorized installation and up to
+  $100 TOTAL Cursor credits, then selected normal Cursor browser login instead
+  of API key. User completed both logins. Official native installs verified:
+  ~/.local/bin/claude 2.1.263; ~/.local/bin/agent 2026.09.02-c22c1a3 (legacy
+  cursor-agent alias also installed). Claude auth status confirms claude.ai
+  Team with normal Keychain access; sandboxed status falsely reports logged out.
+  Four minimal model requests in empty /private/tmp/sf-provider-smoke.sECHj6
+  passed with SF_SMOKE_OK and exit0: Claude claude-sonnet-5; Cursor
+  claude-sonnet-5-low, gpt-5.6-luna-low, cursor-grok-4.6-low. Cursor used ask
+  mode, sandbox enabled, trust limited to new empty directory; no project data.
+  Claude used restricted/safe mode, no tools/MCP/session persistence. Its
+  variadic --mcp-config requires -- before positional prompt (production uses
+  stdin). Claude reports $0.0074268 list-price estimate, NOT subscription charge;
+  modelUsage includes Sonnet5 plus auxiliary Haiku4.5. Cursor JSON has token
+  usage but no dollar cost: exact credits spent not verified; do not claim zero.
+  All process handles terminal. Browser-auth binding, spend accounting,
+  supervisor qualification, tool/role integration and recovery remain unbuilt;
+  smoke success is NOT production-provider GO. Prior install-blocker notes below
+  are historical and superseded. Requested model preferences: Sonnet5 Claude,
+  Luna/Sonnet5/Grok Cursor, no silent fallback.
+
+- MULTI-CLI COMPATIBILITY GATE (2026-09-06): all test handles terminal.
+  Race67313 EXIT0 Store22.704s/Claude1.323s/providerjson1.356s. Scripts17790
+  EXIT0 repo-check/docs-smoke/secret-scan PASS. Full focused50526 also PASS
+  (see checkpoint below). Full ./... and live gates NOT run for this patch.
+  Rechecked PATH, Homebrew, /usr/local, npm-global and nvm executable paths:
+  no Claude or Cursor CLI found. Installation/live-credit approval requested
+  earlier remains unanswered across multiple goal continuations. Source
+  groundwork is saved uncommitted; goal paused at the actual compatibility
+  gate, not complete. Need user to authorize official CLI installation and a
+  bounded Cursor live-credit budget (suggested $10), or supply installed paths.
+  Do not invent runtime packaging/auth evidence or enable adapters from fixture
+  tests. No active sessions, models, installs, charges or live state mutations.
+
+- MULTI-CLI CONTINUATION (2026-09-06): session50526 EXIT0 full focused after
+  signed-mode work: Store196.491s/Codexprovider2.273s/providercoord7.962s.
+  New internal/claudeprovider invocation proposal keeps prompts on stdin,
+  explicit model family, role-specific file tools, restricted/safe mode,
+  no shell/MCP/permission bypass/session reuse. Not registered in production;
+  qualification/runtime isolation and billing are prerequisites, not assumed.
+  Tests19364 EXIT0 Claude .399s/providerjson .294s. Official current Claude
+  CLI docs describe --safe-mode retaining auth (unlike --bare); live capability
+  remains unverified without CLI. Race67313 RUNNING: GOCACHE=/private/tmp/
+  sf-multi-cli-go-cache go test -race -p1 -count1 -timeout5m Store/claudeprovider/
+  providerjson with regex ProviderSet|CredentialBearingProviderQualification|
+  AttestedProviderAuthModes|ClaudeInvocation|TerminalArtifact. Poll exact handle.
+  All edits uncommitted; no models/installs/live state. Full goal incomplete.
+
+- MULTI-CLI SOURCE CHECKPOINT (2026-09-06): session31230 EXIT0 full focused
+  Store161.628s/Codexprovider1.873s/providercoord6.540s for atomic role selection.
+  Added credential-bearing qualification support for explicit auth classes
+  claude_subscription/cursor_api; signed rows/runtime admission bind exact
+  auth evidence and current supervisor. These classes do not imply zero cost.
+  Credential-free legacy fixture path remains; production runtime registration
+  is still Codex-only, and new adapters must never use that fixture path.
+  New signed-mode/tamper/takeover/runtime SQL tests91505 EXIT0 Store1.442s.
+  Current full focused rerun session50526 still live, exact command uses -p1
+  -count1 -timeout5m Store/Codexprovider/providercoord; do not duplicate.
+  Added providerjson bounded terminal envelope decoder for future Claude/Cursor
+  adapters: strict consumed fields, duplicate top-level keys/multiple results
+  refused, artifact vs terminal failure separated, no billing/launch authority.
+  Its tests PASS .385s. It is not yet wired to an adapter. All source remains
+  uncommitted; runtime adapters, generalized supervisor, live qualification and
+  retry policy still incomplete. Install/$10 live-credit question unanswered.
+
+- MULTI-CLI GOAL ACTIVE (2026-09-06), baseline 6f12229. Approved plan:
+  docs/plans/2026-09-06-multi-cli-providers.md. Add Claude Code and Cursor
+  alongside Codex, explicit roles/models, durable same-role retry, no fallback.
+  Accounts: Claude/Codex paid; Cursor credits, actual CLI billing mode unproved.
+  Host PATH/usual install checks found Codex only. Installation and $10 live
+  Cursor test ceiling were asked but not yet authorized; no installs/models.
+  Source progress: SelectProviderSet now authenticates/writes all three roles
+  in one transaction; failed Planner cannot partially replace Builder/Reviewer;
+  ProviderPair loads Planner too. New provider_set_test covers failed-set
+  rollback, planner-only change, replay and explicit pair reset. Focused Store
+  selection/qualification tests PASS (session68801 EXIT0,1.293s). Full focused
+  Store/Codexprovider/providercoord command still running session31230 with
+  GOCACHE=/private/tmp/sf-multi-cli-go-cache; poll that exact handle, do not
+  duplicate. Code uncommitted; only qualification.go, new provider_set_test.go,
+  plan and this memory modified. New adapters/attestation generalization/retry
+  policy/runtime isolation/live matrix remain incomplete. No full-go/race or
+  repository baseline claimed. Goal is not complete.
+
 - CONCURRENCY ACCEPTANCE PASSED (2026-09-06): all test handles terminal.
   Compiled46457 EXIT0 twice90.34/90.54s: production CLI/daemon/native test
   executor + controlled provider/GH, two same-repo tickets with overlapping

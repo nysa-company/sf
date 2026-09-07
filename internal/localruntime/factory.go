@@ -125,6 +125,9 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 			gitRunner.CredentialHelper = publicationAssets.CredentialHelper
 			gitRunner.GHConfigDir = configuration.GHConfigDir
 		}
+		if err := coordinator.ConfigureRejectionCheckpoint(worktreecoord.Coordinator{Store: dependencies.Store, Git: gitRunner}); err != nil {
+			return daemon.WorkflowRuntimeComponents{}, errors.New("provider checkpoint inspection could not be configured")
+		}
 		repositorySupervisor := processsupervisor.RepositoryCommandSupervisor{
 			PythonSnapshots: configuration.PythonSnapshots,
 			Executable:      core.Executable,

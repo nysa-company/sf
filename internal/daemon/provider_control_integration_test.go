@@ -126,10 +126,10 @@ func recordProviderControlQualification(t *testing.T, database *store.Store, cha
 }
 
 func TestDaemonTakeDrainsActiveProviderAndResumeAdmitsSecondAttempt(t *testing.T) {
-	primary := testkit.NewScriptedProvider(domain.ProviderIdentity{Provider: "cursor", Model: "cursor-model", Family: "cursor-family", Version: "v1"})
+	primary := testkit.NewScriptedProvider(domain.ProviderIdentity{Provider: "fixture-cursor", Model: "cursor-model", Family: "cursor-family", Version: "v1"})
 	primary.Add(domain.PhasePlanning, testkit.ProviderStep{Behavior: testkit.ProviderHang})
 	primary.Add(domain.PhasePlanning, testkit.ProviderStep{Artifact: []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"provider control"},"paths":["main.go"],"commands":[["go","test"]],"risks":["none"]}`), UsageUnits: 1})
-	fallback := testkit.NewScriptedProvider(domain.ProviderIdentity{Provider: "claude", Model: "claude-model", Family: "claude-family", Version: "v1"})
+	fallback := testkit.NewScriptedProvider(domain.ProviderIdentity{Provider: "fixture-claude", Model: "claude-model", Family: "claude-family", Version: "v1"})
 	supervisor := &providerControlSupervisor{Supervisor: testkit.NewSupervisor(), entered: make(chan contracts.DrainRequest, 2)}
 	registry := providercoord.NewRegistry()
 	if err := registry.Register(t.Context(), primary); err != nil {

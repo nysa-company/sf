@@ -568,6 +568,12 @@ func validateReviewer(value *Reviewer, validation Validation) error {
 }
 
 func proofFor(ticketType domain.TicketType) ProofKind {
+	return RequiredProofKind(ticketType)
+}
+
+// RequiredProofKind is the controller's required proof for a ticket type.
+// Unknown ticket types have no admissible proof.
+func RequiredProofKind(ticketType domain.TicketType) ProofKind {
 	switch ticketType {
 	case domain.TicketBug:
 		return ProofRegression

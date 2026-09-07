@@ -369,6 +369,10 @@ func TestPhaseRunnerReplaysRecoveredAmendmentReviewer(t *testing.T) {
 	if coordinator.calls != 0 {
 		t.Fatalf("recovered amendment reviewer launched again: calls=%d", coordinator.calls)
 	}
+	evidence.reusable.Result.Claim.Binding.Identity.Provider = "claude"
+	if _, err := (PhaseRunner{Store: evidence, Coordinator: coordinator}).Run(context.Background(), request); !errors.Is(err, ErrProviderResultInvalid) || coordinator.calls != 0 {
+		t.Fatalf("recovered reviewer ignored configured provider: err=%v calls=%d", err, coordinator.calls)
+	}
 }
 
 func TestPhaseRunnerSourceResumeNeverRerunsFreshDurableVerification(t *testing.T) {

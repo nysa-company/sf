@@ -18,6 +18,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/api"
 	localauth "github.com/nysa-company/sf/internal/auth"
+	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/ticket"
 	"github.com/nysa-company/sf/internal/version"
@@ -265,9 +266,16 @@ func (a *app) submitCommand() *cobra.Command {
 }
 
 func (a *app) startCommand() *cobra.Command {
-	return &cobra.Command{Use: "start <ticket>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return a.emit(a.request("ticket.start", args[0], params(map[string]any{}, a.channel)))
+	var estimates bool
+	command := &cobra.Command{Use: "start <ticket>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		values := map[string]any{}
+		if estimates {
+			values["accept_cost_estimates"] = true
+		}
+		return a.emit(a.request("ticket.start", args[0], params(values, a.channel)))
 	}}
+	command.Flags().BoolVar(&estimates, "accept-cost-estimates", false, "accept estimated (not verified) costs with time/request limits; not a hard dollar cap")
+	return command
 }
 
 func (a *app) statusCommand() *cobra.Command {
@@ -519,15 +527,21 @@ func (a *app) authCommand() *cobra.Command {
 }
 
 func (a *app) initCommand() *cobra.Command {
-	var project, repo, profile, testPath string
+	var project, repo, profile, testPath, providerPreset string
 	var check bool
 	command := &cobra.Command{Use: "init [--project <name>] [--repo <path>] [--check]", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		request, err := resolveInitRequest(cmd.Context(), InitRequest{Channel: a.channel, Project: project, Repo: repo, Profile: profile, TestPath: testPath})
+		request, err := resolveInitRequest(cmd.Context(), InitRequest{Channel: a.channel, Project: project, Repo: repo, Profile: profile, TestPath: testPath, ProviderPreset: providerPreset})
 		if err != nil {
 			return a.emit(failure("invalid_repository", err.Error(), []string{binaryName(), "init", "--help"}))
 		}
 		if check {
 			return a.emit(RunInitCheck(cmd.Context(), request))
+		}
+		if providerPreset == "select" {
+			request.ProviderPreset, err = a.selectInitialProviderPreset(cmd.Context())
+			if err != nil {
+				return a.emit(failure("invalid_argument", err.Error(), []string{binaryName(), "init", "--help"}))
+			}
 		}
 		return a.emit(RunInit(cmd.Context(), request))
 	}}
@@ -536,6 +550,7 @@ func (a *app) initCommand() *cobra.Command {
 	command.Flags().BoolVar(&check, "check", false, "preview local compatibility without registering or changing files")
 	command.Flags().StringVar(&profile, "profile", "", "explicit project profile (for example nysa-api-pure-v1)")
 	command.Flags().StringVar(&testPath, "test", "", "repository-relative entrypoint: .test.ts for TypeScript, .py or tests directory for Python")
+	command.Flags().StringVar(&providerPreset, "providers", "", "initial preset: select (terminal picker) or builder-reviewer pair of codex, claude, cursor; never overwrites config")
 	return command
 }
 
@@ -548,19 +563,89 @@ func (a *app) configCommand() *cobra.Command {
 	apply.Flags().StringVar(&project, "project", "", "registered project name")
 	_ = apply.MarkFlagRequired("project")
 	root.AddCommand(apply)
+	var editProject, preset string
+	providers := &cobra.Command{Use: "providers --project <name> --preset <name>", Short: "edit provider preferences with a backup; apply separately for future tickets", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		if preset == "select" {
+			selected, err := a.selectInitialProviderPreset(cmd.Context())
+			if err != nil {
+				return err
+			}
+			preset = selected
+		}
+		return a.emit(RunConfigProviders(cmd.Context(), ConfigProvidersRequest{ConfigApplyRequest: ConfigApplyRequest{Channel: a.channel, Project: editProject}, Preset: preset}))
+	}}
+	providers.Flags().StringVar(&editProject, "project", "", "registered project name")
+	providers.Flags().StringVar(&preset, "preset", "", "select or builder-reviewer pair of codex, claude, cursor; independent models required")
+	_ = providers.MarkFlagRequired("project")
+	_ = providers.MarkFlagRequired("preset")
+	root.AddCommand(providers)
 	return root
 }
 
 func (a *app) providersCommand() *cobra.Command {
 	root := &cobra.Command{Use: "providers", Args: cobra.NoArgs}
-	var builder, reviewer string
-	qualify := &cobra.Command{Use: "qualify --builder <provider> --reviewer <provider>", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		return a.emit(a.request("provider.qualify", "", params(map[string]any{"builder": builder, "reviewer": reviewer}, a.channel)))
+	var builder, reviewer, preset string
+	var builderModel, reviewerModel string
+	var modelSelection string
+	qualify := &cobra.Command{Use: "qualify (--preset <name> | --builder <provider> --reviewer <provider>)", Short: "qualify a selected independent pair; may invoke paid models", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		if cmd.Flags().Changed("models") && (modelSelection != "select" || cmd.Flags().Changed("builder-model") || cmd.Flags().Changed("reviewer-model")) {
+			return fmt.Errorf("use --models select or explicit model flags, not both")
+		}
+		if cmd.Flags().Changed("preset") {
+			if preset == "" || cmd.Flags().Changed("builder") || cmd.Flags().Changed("reviewer") {
+				return fmt.Errorf("use either --preset or both --builder and --reviewer")
+			}
+			if preset == "select" {
+				selected, err := a.selectInitialProviderPreset(cmd.Context())
+				if err != nil {
+					return err
+				}
+				preset = selected
+			}
+			providers, err := config.ProviderPreset(preset)
+			if err != nil {
+				return err
+			}
+			builder, reviewer = providers.Builder[0], providers.Reviewer[0]
+		}
+		if builder == "" || reviewer == "" {
+			return fmt.Errorf("choose --preset select, an explicit preset, or both --builder and --reviewer")
+		}
+		values := map[string]any{"builder": builder, "reviewer": reviewer}
+		if modelSelection == "select" {
+			var err error
+			builderModel, reviewerModel, err = a.selectProviderModels(cmd.Context(), builder, reviewer)
+			if err != nil {
+				return err
+			}
+			values["builder_model"], values["reviewer_model"] = builderModel, reviewerModel
+		}
+		if cmd.Flags().Changed("builder-model") {
+			if strings.TrimSpace(builderModel) != builderModel || builderModel == "" {
+				return fmt.Errorf("--builder-model requires an exact model ID")
+			}
+			if err := validateExplicitModel(builder, builderModel); err != nil {
+				return err
+			}
+			values["builder_model"] = builderModel
+		}
+		if cmd.Flags().Changed("reviewer-model") {
+			if strings.TrimSpace(reviewerModel) != reviewerModel || reviewerModel == "" {
+				return fmt.Errorf("--reviewer-model requires an exact model ID")
+			}
+			if err := validateExplicitModel(reviewer, reviewerModel); err != nil {
+				return err
+			}
+			values["reviewer_model"] = reviewerModel
+		}
+		return a.emit(a.request("provider.qualify", "", params(values, a.channel)))
 	}}
+	qualify.Flags().StringVar(&preset, "preset", "", "select (terminal picker) or builder-reviewer pair of codex, claude, cursor; independent models required")
 	qualify.Flags().StringVar(&builder, "builder", "", "builder provider")
 	qualify.Flags().StringVar(&reviewer, "reviewer", "", "independent reviewer provider")
-	_ = qualify.MarkFlagRequired("builder")
-	_ = qualify.MarkFlagRequired("reviewer")
+	qualify.Flags().StringVar(&builderModel, "builder-model", "", "exact builder/planner model ID; no alias or fallback")
+	qualify.Flags().StringVar(&modelSelection, "models", "", "select exact models by number in a terminal; qualification may invoke paid models")
+	qualify.Flags().StringVar(&reviewerModel, "reviewer-model", "", "exact reviewer model ID; independently qualified family required")
 	root.AddCommand(qualify)
 	return root
 }

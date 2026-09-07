@@ -520,12 +520,21 @@ func walkingSkeletonSubmittedRef(t *testing.T, output []byte) domain.TicketRef {
 }
 
 func walkingSkeletonWaitState(t *testing.T, database *store.Store, ref domain.TicketRef, want domain.State, github *testkit.FakeGH, bare string, diagnostics ...fmt.Stringer) store.Ticket {
+	return walkingSkeletonWaitStateBounded(t, database, ref, want, github, bare, 2*time.Minute, diagnostics...)
+}
+
+func walkingSkeletonWaitStateBounded(t *testing.T, database *store.Store, ref domain.TicketRef, want domain.State, github *testkit.FakeGH, bare string, limit time.Duration, diagnostics ...fmt.Stringer) store.Ticket {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(limit)
 	for time.Now().Before(deadline) {
 		ticket, err := database.Ticket(context.Background(), ref)
 		if err == nil && ticket.State == want {
 			return ticket
+		}
+		if err == nil && (ticket.State == domain.StateBlocked || ticket.State == domain.StatePaused || ticket.State == domain.StateCancelled) {
+			// These acceptance scenarios have no operator recovery while waiting.
+			// Diagnose immediately rather than burning the entire live-test bound.
+			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -565,7 +574,14 @@ func walkingSkeletonWaitState(t *testing.T, database *store.Store, ref domain.Ti
 			diagnosticText = append(diagnosticText, diagnostic.String())
 		}
 	}
-	t.Fatalf("ticket did not reach %s: state=%s version=%d runner=%d err=%v attempts=%+v attempts_err=%v worktree_state=%s worktree_head=%s worktree_err=%v events=%v events_err=%v git_status=%q git_status_err=%v go_test=%q go_test_err=%v gh_mutations=create:%d ready:%d merge:%d remote_refs=%q diagnostics=%q", want, ticket.State, ticket.Version, ticket.RunnerEpoch, err, summaries, attemptsErr, worktree.State, worktree.HeadSHA, worktreeErr, eventTypes, eventsErr, statusOutput, statusErr, testOutput, testErr, github.MutationCount("pr_create"), github.MutationCount("pr_ready"), github.MutationCount("pr_merge"), remoteRefs, diagnosticText)
+	// Store-authenticated closed reason codes are safe to retain after this
+	// disposable fixture is removed. Never print failed raw artifacts/transcripts.
+	var artifactReasons []contracts.ArtifactFailureReason
+	failures, failuresErr := database.ProviderArtifactFailures(context.Background(), ref)
+	for _, failure := range failures {
+		artifactReasons = append(artifactReasons, failure.Reason)
+	}
+	t.Fatalf("ticket did not reach %s: state=%s version=%d runner=%d err=%v attempts=%+v attempts_err=%v artifact_reasons=%v artifact_reasons_err=%v worktree_state=%s worktree_head=%s worktree_err=%v events=%v events_err=%v git_status=%q git_status_err=%v go_test=%q go_test_err=%v gh_mutations=create:%d ready:%d merge:%d remote_refs=%q diagnostics=%q", want, ticket.State, ticket.Version, ticket.RunnerEpoch, err, summaries, attemptsErr, artifactReasons, failuresErr, worktree.State, worktree.HeadSHA, worktreeErr, eventTypes, eventsErr, statusOutput, statusErr, testOutput, testErr, github.MutationCount("pr_create"), github.MutationCount("pr_ready"), github.MutationCount("pr_merge"), remoteRefs, diagnosticText)
 	return store.Ticket{}
 }
 

@@ -50,7 +50,7 @@ func finalReviewLifecycleFixtureWithPending(t *testing.T, pending int) finalRevi
 	return finalReviewLifecycleFixtureForPending(t, domain.TicketFeature, domain.MergeGuarded, pending)
 }
 
-func finalReviewLifecycleFixtureForPending(t *testing.T, ticketType domain.TicketType, mergeMode domain.MergeMode, pending int) finalReviewFixture {
+func finalReviewLifecycleFixtureForPending(t *testing.T, ticketType domain.TicketType, mergeMode domain.MergeMode, pending int, restartWaitingCI ...bool) finalReviewFixture {
 	t.Helper()
 	if pending < 0 || pending > 4 {
 		t.Fatalf("invalid pending CI fixture count=%d", pending)
@@ -63,6 +63,27 @@ func finalReviewLifecycleFixtureForPending(t *testing.T, ticketType domain.Ticke
 	waiting, err := db.Ticket(ctx, publishing.Ref)
 	if err != nil {
 		t.Fatal(err)
+	}
+	restart := func() {
+		leader, err := db.AcquireLeader(ctx, waiting.Ref.Channel, "waiting-ci-before-refresh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := db.FenceRecoveredRunners(ctx, waiting.Ref.Channel, leader); err != nil || changed != 1 {
+			t.Fatalf("waiting CI recovery changed=%d err=%v", changed, err)
+		}
+		if err := db.RebindRecoveredPublishedCandidates(ctx, waiting.Ref.Channel, leader); err != nil {
+			t.Fatal(err)
+		}
+		waiting, err = db.Ticket(ctx, waiting.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: waiting.RunnerEpoch}
+	}
+	afterPending := len(restartWaitingCI) > 2 && restartWaitingCI[2]
+	if len(restartWaitingCI) > 0 && restartWaitingCI[0] && !afterPending {
+		restart()
 	}
 	candidate, err := db.RecoverableCandidate(ctx, waiting.Ref)
 	if err != nil {
@@ -114,6 +135,9 @@ func finalReviewLifecycleFixtureForPending(t *testing.T, ticketType domain.Ticke
 	}
 	for i := 0; i < pending; i++ {
 		record("pending", "pending")
+	}
+	if afterPending {
+		restart()
 	}
 	record("green", "success")
 	ticket := waiting
@@ -648,6 +672,34 @@ func TestReviewRepairBoundaryBridgesStartupBeforeFreshTargetClaim(t *testing.T) 
 				}
 			}
 		})
+	}
+}
+
+func TestReviewRepairVerificationCheckpointBindsReviewedCandidate(t *testing.T) {
+	f := finalReviewLifecycleFixture(t)
+	if _, found, err := f.db.ReviewRepairVerificationCheckpoint(f.ctx, f.ticket.Ref, f.ticket.Version, f.fence); err != nil || found {
+		t.Fatal("ordinary review minted repair checkpoint", err)
+	}
+	completeFinalReviewWith(t, f, phaseartifact.ReviewRepair, "reviewer")
+	if _, err := f.db.TransitionReviewRepair(f.ctx, Transition{Ref: f.ticket.Ref, ExpectedVersion: f.ticket.Version, From: domain.StateReviewing, To: domain.StateVerifying, Trigger: "review_repair", Fence: f.fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := f.db.Ticket(f.ctx, f.ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, found, err := f.db.ReviewRepairVerificationCheckpoint(f.ctx, current.Ref, current.Version, f.fence)
+	if err != nil || !found || proof.ParentOID != f.candidate.Snapshot.HeadSHA || len(proof.ProtectedPaths) == 0 {
+		t.Fatal("exact reviewed candidate unavailable", err)
+	}
+	if _, _, err := f.db.ReviewRepairVerificationCheckpoint(f.ctx, current.Ref, current.Version-1, f.fence); err == nil {
+		t.Fatal("stale version accepted")
+	}
+	if _, err := f.db.AcquireLeader(f.ctx, domain.ChannelDev, "repair-checkpoint-takeover"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.db.ReviewRepairVerificationCheckpoint(f.ctx, current.Ref, current.Version, f.fence); err == nil {
+		t.Fatal("old leader accepted")
 	}
 }
 

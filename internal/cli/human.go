@@ -19,6 +19,19 @@ func renderHumanData(writer io.Writer, value any) error {
 	if _, hasChecks := object["checks"]; hasChecks {
 		return renderDoctor(writer, object)
 	}
+	if stringField(object, "schema") == authSchema {
+		return renderAuthentication(writer, object)
+	}
+	if edit, ok := object["provider_configuration"].(map[string]any); ok {
+		if _, err := fmt.Fprintf(writer, "Project: %s\nProvider preset: %s\nFile changed: %t\n%s\n", safeSelectionLabel(stringField(edit, "project")), safeSelectionLabel(stringField(edit, "preset")), boolField(edit, "changed"), safeSelectionLabel(stringField(edit, "note"))); err != nil {
+			return err
+		}
+		if backup := stringField(edit, "backup_path"); backup != "" {
+			_, err := fmt.Fprintf(writer, "Original configuration backup: %s\n", safeSelectionLabel(backup))
+			return err
+		}
+		return nil
+	}
 	if preparation, ok := object["runtime_preparation"].(map[string]any); ok {
 		_, err := fmt.Fprintf(writer, "Runtime: %s\nPreparation: %s\nLocation: %s\nDownload: %s bytes\n%s\nNext: %s\n", safeSelectionLabel(stringField(preparation, "runtime")), safeSelectionLabel(stringField(preparation, "status")), safeSelectionLabel(stringField(preparation, "destination")), displayField(preparation, "download_bytes"), safeSelectionLabel(stringField(preparation, "note")), safeSelectionLabel(stringField(preparation, "next_command")))
 		return err
@@ -66,6 +79,41 @@ func renderHumanData(writer io.Writer, value any) error {
 	}
 	_, err := fmt.Fprintf(writer, "OK\n%s\n", stableJSON(value))
 	return err
+}
+
+func renderAuthentication(writer io.Writer, report map[string]any) error {
+	if _, err := fmt.Fprintf(writer, "Authentication (%s)\n%s\n", safeSelectionLabel(stringField(report, "channel")), authScope); err != nil {
+		return err
+	}
+	providers, _ := report["providers"].([]any)
+	for _, raw := range providers {
+		provider, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, err := fmt.Fprintf(writer, "- %s: %s", safeSelectionLabel(stringField(provider, "provider")), safeSelectionLabel(stringField(provider, "state"))); err != nil {
+			return err
+		}
+		if version := stringField(provider, "version"); version != "" {
+			if _, err := fmt.Fprintf(writer, " (%s)", safeSelectionLabel(version)); err != nil {
+				return err
+			}
+		}
+		if _, err := io.WriteString(writer, "\n"); err != nil {
+			return err
+		}
+		if reason := stringField(provider, "reason"); reason != "" {
+			if _, err := fmt.Fprintf(writer, "  %s\n", safeSelectionLabel(reason)); err != nil {
+				return err
+			}
+		}
+		if action, ok := provider["next_action"].(map[string]any); ok {
+			if err := renderAction(writer, "  Next", action); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func renderTickets(writer io.Writer, parent map[string]any, values []any) error {
@@ -258,6 +306,11 @@ func renderOperator(writer io.Writer, operator map[string]any) error {
 }
 
 func renderEvidence(writer io.Writer, evidence map[string]any) error {
+	if accounting, ok := evidence["provider_accounting"].(map[string]any); ok && stringField(accounting, "mode") == "reported_estimate_v1" {
+		if _, err := fmt.Fprintf(writer, "Provider billing: reported estimates; actual total unknown (not a hard dollar cap)\nProvider limits: %s SF launches per ticket; %s per invocation; CLI-internal calls may exceed launch count\n", displayField(accounting, "sf_launch_limit"), stringField(accounting, "request_timeout")); err != nil {
+			return err
+		}
+	}
 	if review, ok := evidence["review_diagnostic"].(map[string]any); ok {
 		if err := renderReviewDiagnostic(writer, review); err != nil {
 			return err

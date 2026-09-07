@@ -278,7 +278,10 @@ func New(config Config) (*Adapter, error) {
 // A route alias cannot claim independence from another route using the same
 // inference family. Additions require an explicit code and qualification
 // review with the provider's model-family evidence.
-func familyForModel(model string) (string, bool) {
+func familyForModel(model string) (string, bool) { return ModelFamily(model) }
+
+// ModelFamily exposes the same closed model catalog used at adapter admission.
+func ModelFamily(model string) (string, bool) {
 	switch model {
 	case "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol":
 		return "openai-gpt-5.6", true
@@ -287,6 +290,12 @@ func familyForModel(model string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// SupportedModels is a selection catalog, not an account-entitlement or
+// qualification verdict. A fresh slice prevents callers mutating the catalog.
+func SupportedModels() []string {
+	return []string{"gpt-5.6-luna", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-sol"}
 }
 
 func (a *Adapter) Name() string { return a.route }

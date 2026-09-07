@@ -314,6 +314,7 @@ func TestLifecycleVerbsForwardTheirMethodsChannelAndOperator(t *testing.T) {
 	}{
 		{name: "submit", args: []string{"submit", ticketPath, "--project", "demo"}, method: "ticket.submit"},
 		{name: "start", args: []string{"start", "SF-1"}, method: "ticket.start", ticket: "SF-1"},
+		{name: "start estimates", args: []string{"start", "SF-1", "--accept-cost-estimates"}, method: "ticket.start", ticket: "SF-1"},
 		{name: "status", args: []string{"status", "SF-1"}, method: "ticket.status", ticket: "SF-1"},
 		{name: "show", args: []string{"show", "SF-1"}, method: "ticket.show", ticket: "SF-1"},
 		{name: "logs", args: []string{"logs", "SF-1", "--phase", "build"}, method: "ticket.logs", ticket: "SF-1"},
@@ -346,6 +347,12 @@ func TestLifecycleVerbsForwardTheirMethodsChannelAndOperator(t *testing.T) {
 			var parameters map[string]any
 			if err := json.Unmarshal(got.Parameters, &parameters); err != nil {
 				t.Fatal(err)
+			}
+			if test.name == "start estimates" && parameters["accept_cost_estimates"] != true {
+				t.Fatal("explicit accounting choice lost")
+			}
+			if test.name == "start" && parameters["accept_cost_estimates"] != nil {
+				t.Fatal("ordinary start opted in")
 			}
 			if parameters["channel"] != string(domain.ChannelStable) {
 				t.Fatalf("channel=%v parameters=%s", parameters["channel"], got.Parameters)

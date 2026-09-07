@@ -13,6 +13,7 @@ import (
 func (a *app) runCommand() *cobra.Command {
 	var project string
 	var watch bool
+	var estimates bool
 	command := &cobra.Command{Use: "run <ticket.md> --project <name>", Short: "Submit a ticket and start it if queued, optionally watching progress", Args: cobra.ExactArgs(1),
 		Long: "Submit through the daemon, then start only its exact queued ticket. Repeated runs reuse the same source identity; active/paused tickets are not restarted or resumed. Uncertain responses stop without retry. --watch follows status; Ctrl-C stops watching, not the ticket. --json --watch emits response envelopes as NDJSON.",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -43,7 +44,11 @@ func (a *app) runCommand() *cobra.Command {
 				return a.emit(response)
 			}
 			if selected.State == domain.StateQueued {
-				result = a.request("ticket.start", selected.ID, params(map[string]any{}, a.channel))
+				values := map[string]any{}
+				if estimates {
+					values["accept_cost_estimates"] = true
+				}
+				result = a.request("ticket.start", selected.ID, params(values, a.channel))
 				if !result.OK {
 					// Submission is already durable even when start was refused.
 					result.Mutation = api.Mutation{Attempted: true, Kind: "ticket_run", Identity: selected.ID}
@@ -70,6 +75,7 @@ func (a *app) runCommand() *cobra.Command {
 	}
 	command.Flags().StringVar(&project, "project", "", "registered project name")
 	command.Flags().BoolVar(&watch, "watch", false, "follow the exact ticket after submission/start")
+	command.Flags().BoolVar(&estimates, "accept-cost-estimates", false, "accept estimated (not verified) costs for a queued ticket; not a hard dollar cap")
 	_ = command.MarkFlagRequired("project")
 	return command
 }

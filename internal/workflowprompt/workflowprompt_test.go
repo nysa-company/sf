@@ -40,6 +40,27 @@ func testTicket() Ticket {
 	}
 }
 
+func TestPlannerPromptBindsTicketProofKind(t *testing.T) {
+	for _, tc := range []struct {
+		kind  domain.TicketType
+		proof string
+	}{
+		{domain.TicketBug, "regression"}, {domain.TicketFeature, "acceptance"},
+		{domain.TicketRefactor, "characterization"}, {domain.TicketInfrastructure, "validation"},
+		{domain.TicketDocumentation, "documentation"}, {domain.TicketSpike, "report"},
+	} {
+		input := PlannerInput{Ticket: testTicket(), Workspace: testWorkspace(), Runtime: Runtime{Timeout: time.Minute, Profile: contracts.ProfileGuarded}}
+		input.Ticket.Type = tc.kind
+		result, err := Planner(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(result.Prompt, `OUTPUT_BINDING={"proof_kind":"`+tc.proof+`"}`) || !strings.Contains(result.Prompt, "Copy proof.kind") {
+			t.Fatal("planner must expose the required proof kind")
+		}
+	}
+}
+
 func testWorkspace() Workspace {
 	identity, err := MarshalCanonicalWorktreeIdentity(CanonicalWorktreeIdentity{
 		Repository: "/Users/sofia/nysa", RepositoryDev: 1, RepositoryIno: 2,

@@ -48,6 +48,43 @@ func TestOwnerOnlySocketRoundTrip(t *testing.T) {
 	}
 }
 
+func TestQualificationHandlerHasBoundedExtendedDeadline(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "sf.sock")
+	remaining := make(chan time.Duration, 2)
+	server, err := Listen(path, uint32(os.Getuid()), HandlerFunc(func(ctx context.Context, _ Peer, _ api.Request) api.Response {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			remaining <- 0
+		} else {
+			remaining <- time.Until(deadline)
+		}
+		return api.Response{OK: true, Mutation: api.Mutation{}, Data: json.RawMessage(`{}`)}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	t.Cleanup(func() { cancel(); _ = server.Close(); <-done })
+	for _, method := range []string{"provider.qualify", "status"} {
+		callCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := Call(callCtx, path, api.Request{Version: api.Version, RequestID: "deadline", Method: method})
+		stop()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := <-remaining
+		want := 30 * time.Second
+		if method == "provider.qualify" {
+			want = 4 * time.Minute
+		}
+		if got <= want-5*time.Second || got > want {
+			t.Fatalf("%s deadline=%s want near %s", method, got, want)
+		}
+	}
+}
+
 func TestListenRefusesExistingPath(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "sf.sock")
 	if err := os.WriteFile(path, []byte("not a socket"), 0o600); err != nil {

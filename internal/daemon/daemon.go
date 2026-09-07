@@ -222,6 +222,9 @@ type Config struct {
 	// ProviderQualifier is invoked only through this authenticated foreground
 	// daemon, after its supervisor key is current in SQLite.
 	ProviderQualifier func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
+	// ProviderModelQualifier accepts exact optional model IDs. Legacy callbacks
+	// never receive an explicit model request they cannot honor.
+	ProviderModelQualifier func(context.Context, *store.Store, domain.Channel, string, string, string, string) (any, error)
 	// WorkflowRuntimeFactory atomically composes an executable runtime and its
 	// exact controller after Store, Engine, and the optional provider
 	// coordinator exist. Nil intentionally means runtime execution is
@@ -260,6 +263,7 @@ type Daemon struct {
 	providerCoordinatorFactory func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error)
 	providerSupervisor         contracts.ProcessSupervisor
 	providerQualifier          func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
+	providerModelQualifier     func(context.Context, *store.Store, domain.Channel, string, string, string, string) (any, error)
 	runtimeFactory             WorkflowRuntimeFactory
 	runtime                    WorkflowRuntime
 	// mu protects daemon process state and handler admission only. It is never
@@ -399,6 +403,7 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
 		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, preparedCommitObserver: preparedCommitObserver, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinatorFactory: configuration.ProviderCoordinatorFactory, providerSupervisor: configuration.ProviderSupervisor, providerQualifier: configuration.ProviderQualifier, runtimeFactory: configuration.WorkflowRuntimeFactory, runtimeContext: ctx}
+	instance.providerModelQualifier = configuration.ProviderModelQualifier
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -854,15 +859,21 @@ func (daemon *Daemon) isClosed() bool {
 }
 
 func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) api.Response {
-	if daemon.providerQualifier == nil {
+	if daemon.providerQualifier == nil && daemon.providerModelQualifier == nil {
 		return daemon.failure(request, "provider_unavailable", "provider qualification is not configured for this daemon", false)
 	}
 	var parameters struct {
-		Builder  string `json:"builder"`
-		Reviewer string `json:"reviewer"`
+		Builder       string `json:"builder"`
+		Reviewer      string `json:"reviewer"`
+		BuilderModel  string `json:"builder_model"`
+		ReviewerModel string `json:"reviewer_model"`
 	}
-	if err := json.Unmarshal(request.Parameters, &parameters); err != nil || parameters.Builder != "codex" || parameters.Reviewer != "codex" {
-		return daemon.failure(request, "invalid_argument", "builder and reviewer must name the local Codex provider", false)
+	supported := func(name string) bool { return name == "codex" || name == "claude" || name == "cursor" }
+	if err := json.Unmarshal(request.Parameters, &parameters); err != nil || !supported(parameters.Builder) || !supported(parameters.Reviewer) {
+		return daemon.failure(request, "invalid_argument", "builder and reviewer must name codex, claude, or cursor", false)
+	}
+	if daemon.providerModelQualifier == nil && (parameters.BuilderModel != "" || parameters.ReviewerModel != "") {
+		return daemon.failure(request, "provider_unavailable", "this daemon cannot qualify explicit models; no provider was launched", false)
 	}
 	// Qualification changes the durable binding that a newly composed runtime
 	// would use. Serialize it with Close and controller replacement so neither
@@ -878,9 +889,22 @@ func (daemon *Daemon) qualifyProvider(ctx context.Context, request api.Request) 
 	if daemon.runtime != nil {
 		return daemon.failure(request, "runtime_already_active", "the qualified local workflow runtime is already active; inspect daemon status, then stop the foreground daemon before requalifying", false)
 	}
-	value, err := daemon.providerQualifier(ctx, daemon.store, daemon.channel, parameters.Builder, parameters.Reviewer)
+	var value any
+	var err error
+	if daemon.providerModelQualifier != nil {
+		value, err = daemon.providerModelQualifier(ctx, daemon.store, daemon.channel, parameters.Builder, parameters.Reviewer, parameters.BuilderModel, parameters.ReviewerModel)
+	} else {
+		value, err = daemon.providerQualifier(ctx, daemon.store, daemon.channel, parameters.Builder, parameters.Reviewer)
+	}
 	if err != nil {
-		response := daemon.failure(request, "unqualified_provider", "local Codex qualification failed without invoking a model: "+safeQualificationError(err), false)
+		response := daemon.failure(request, "unqualified_provider", "local provider qualification failed; CLI qualification may invoke models: "+safeQualificationError(err), false)
+		response.NextAction.Argv = []string{daemon.executable(), "providers", "qualify", "--builder", parameters.Builder, "--reviewer", parameters.Reviewer}
+		if parameters.BuilderModel != "" {
+			response.NextAction.Argv = append(response.NextAction.Argv, "--builder-model", parameters.BuilderModel)
+		}
+		if parameters.ReviewerModel != "" {
+			response.NextAction.Argv = append(response.NextAction.Argv, "--reviewer-model", parameters.ReviewerModel)
+		}
 		if encoded, encodeErr := json.Marshal(value); encodeErr == nil {
 			response.Data = encoded
 		}
@@ -1238,7 +1262,16 @@ func eventMatchesPhase(event store.Event, phase string) bool {
 }
 
 func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ domain.OperatorIdentity) api.Response {
-	ref, response := daemon.ticketRef(ctx, request)
+	var parameters struct {
+		ticketParameters
+		AcceptCostEstimates bool `json:"accept_cost_estimates"`
+	}
+	if err := decodeParameters(request.Parameters, &parameters); err != nil {
+		return daemon.failure(request, "invalid_ticket_reference", "start parameters are invalid", false)
+	}
+	refRequest := request
+	refRequest.Parameters, _ = json.Marshal(parameters.ticketParameters)
+	ref, response := daemon.ticketRef(ctx, refRequest)
 	if response != nil {
 		return *response
 	}
@@ -1283,6 +1316,13 @@ func (daemon *Daemon) startTicket(ctx context.Context, request api.Request, _ do
 		}
 	}
 	workflowID := fmt.Sprintf("%s/%s/%s/planning", daemon.channel, ref.Project, ref.Ticket)
+	if parameters.AcceptCostEstimates {
+		// Queued tickets cannot launch. Persist consent before making planning
+		// visible to the scheduler; failed starts may safely retain consent.
+		if err := daemon.store.ApproveProviderEstimatedAccounting(ctx, ref, stored.Version, domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}); err != nil {
+			return daemon.failure(request, "accounting_policy_refused", "estimated accounting must be selected before the first provider attempt", false)
+		}
+	}
 	var started store.Ticket
 	var observed bool
 	if checkedProject != nil {

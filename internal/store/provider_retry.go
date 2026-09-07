@@ -690,6 +690,7 @@ func authenticateProviderRetryAttemptPair(ctx context.Context, q rowQueryer, ref
 
 	claims := make([]ProviderAttemptClaim, 2)
 	invalid := make([]bool, 2)
+	serverRejected := make([]bool, 2)
 	recoveredCancellation := make([]bool, 2)
 	for i, value := range bound {
 		claim, err := loadAuthenticatedProviderAttemptClaim(ctx, q, value.id)
@@ -709,13 +710,19 @@ func authenticateProviderRetryAttemptPair(ctx context.Context, q rowQueryer, ref
 			return providerRetryAttemptPair{}, ErrEvidenceConflict
 		}
 		invalid[i] = attemptState == "failed" && attemptOutcome == providerExhaustionReasonInvalidArtifact
+		serverRejected[i] = attemptState == "failed" && attemptOutcome == providerServerRejected
+		if serverRejected[i] {
+			if _, _, err := loadServerRejectionFrom(ctx, q, claim); err != nil {
+				return providerRetryAttemptPair{}, err
+			}
+		}
 		recoveredCancellation[i] = attemptState == "cancelled" && attemptOutcome == "drained_recovery"
 		if recoveredCancellation[i] && claim.Input.Repair != nil {
 			// A recovery-drained Store-issued repair is non-recoverable; only a
 			// recovery-drained ordinary attempt may contribute to exhaustion.
 			return providerRetryAttemptPair{}, ErrEvidenceConflict
 		}
-		if !invalid[i] && !recoveredCancellation[i] && !((attemptState == "failed" && (attemptOutcome == "failed" || attemptOutcome == "invocation_failed")) || (attemptState == "cancelled" && attemptOutcome == "cancelled")) {
+		if !invalid[i] && !serverRejected[i] && !recoveredCancellation[i] && !((attemptState == "failed" && (attemptOutcome == "failed" || attemptOutcome == "invocation_failed")) || (attemptState == "cancelled" && attemptOutcome == "cancelled")) {
 			return providerRetryAttemptPair{}, ErrEvidenceConflict
 		}
 		claims[i] = claim
@@ -728,14 +735,16 @@ func authenticateProviderRetryAttemptPair(ctx context.Context, q rowQueryer, ref
 		return providerRetryAttemptPair{}, ErrEvidenceConflict
 	}
 	pair := providerRetryAttemptPair{Attempts: [2]int{first, last}, Claims: [2]ProviderAttemptClaim{claims[0], claims[1]}}
-	if invalid[0] && invalid[1] {
+	if invalid[0] && (invalid[1] || serverRejected[1]) {
 		if claims[0].Binding != claims[1].Binding || claims[0].BindingDigest != claims[1].BindingDigest || claims[0].Role != claims[1].Role || claims[0].Ref != claims[1].Ref || claims[0].Phase != claims[1].Phase || claims[0].Repository != claims[1].Repository || claims[0].Worktree != claims[1].Worktree || claims[0].WorktreeIdentity != claims[1].WorktreeIdentity || claims[0].BaseSHA != claims[1].BaseSHA || claims[0].Input.Repair != nil || claims[1].Input.Repair == nil || claims[1].Input.Repair.PriorAttempt != claims[0].Attempt || claims[1].Input.Repair.PriorRequestDigest != claims[0].RequestDigest {
 			return providerRetryAttemptPair{}, ErrEvidenceConflict
 		}
 		if err := validateProviderAttemptEndpointAdvance(ctx, q, ref, phase, providerAttemptEndpoint{version: claims[0].ExpectedVersion, runner: claims[0].RunnerEpoch, leader: claims[0].LeaderEpoch}, providerAttemptEndpoint{version: claims[1].ExpectedVersion, runner: claims[1].RunnerEpoch, leader: claims[1].LeaderEpoch}); err != nil {
 			return providerRetryAttemptPair{}, ErrEvidenceConflict
 		}
-		pair.Reason = providerExhaustionReasonInvalidArtifact
+		if invalid[1] {
+			pair.Reason = providerExhaustionReasonInvalidArtifact
+		}
 	} else if invalid[0] || invalid[1] {
 		// Any authenticated ordinary terminal endpoint may be followed by an
 		// ordinary invalid artifact fallback, but neither claim may carry a

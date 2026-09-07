@@ -25,7 +25,7 @@ func runTestResponse(state domain.State, kind string, observed bool) api.Respons
 	return api.Response{Version: api.Version, RequestID: "response", OK: true, Mutation: api.Mutation{Attempted: true, Kind: kind, Identity: identity, Observed: observed}, Data: data}
 }
 
-func executeRunTest(t *testing.T, client Client, watch bool) (api.Response, string) {
+func executeRunTest(t *testing.T, client Client, watch bool, extra ...string) (api.Response, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "ticket.md")
 	if err := os.WriteFile(path, []byte(ticketTemplate), 0600); err != nil {
@@ -36,6 +36,7 @@ func executeRunTest(t *testing.T, client Client, watch bool) (api.Response, stri
 	a.channel = domain.ChannelStable
 	command := a.command()
 	args := []string{"run", path, "--project", "app", "--json"}
+	args = append(args, extra...)
 	if watch {
 		args = append(args, "--watch")
 	}
@@ -49,6 +50,43 @@ func executeRunTest(t *testing.T, client Client, watch bool) (api.Response, stri
 		t.Fatal("no result")
 	}
 	return *a.last, output.String()
+}
+
+func TestRunEstimateConsentIsExplicitAndOnlySentToQueuedStart(t *testing.T) {
+	for _, state := range []domain.State{domain.StateQueued, domain.StatePlanning} {
+		for _, consent := range []bool{false, true} {
+			calls := 0
+			var extra []string
+			if consent {
+				extra = []string{"--accept-cost-estimates"}
+			}
+			response, _ := executeRunTest(t, fakeClient(func(_ context.Context, request api.Request) (api.Response, error) {
+				calls++
+				var parameters map[string]any
+				if err := json.Unmarshal(request.Parameters, &parameters); err != nil {
+					t.Fatal(err)
+				}
+				value, exists := parameters["accept_cost_estimates"]
+				if request.Method == "ticket.submit" {
+					if exists {
+						t.Fatal("consent applied at submission")
+					}
+					return runTestResponse(state, "ticket_submit", state != domain.StateQueued), nil
+				}
+				if request.Method != "ticket.start" || state != domain.StateQueued || request.Ticket != runTestID || exists != consent || consent && value != true {
+					t.Fatal("start consent or target mismatch")
+				}
+				return runTestResponse(domain.StatePlanning, "ticket_start", false), nil
+			}), false, extra...)
+			wantCalls := 1
+			if state == domain.StateQueued {
+				wantCalls = 2
+			}
+			if !response.OK || calls != wantCalls {
+				t.Fatalf("consent=%t state=%s calls=%d", consent, state, calls)
+			}
+		}
+	}
 }
 
 func TestRunComposesExactSubmitStartWatch(t *testing.T) {

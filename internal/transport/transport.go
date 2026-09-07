@@ -178,7 +178,14 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 	if err != nil {
 		return
 	}
-	handlerCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	limit := 30 * time.Second
+	if request.Method == "provider.qualify" {
+		// Native model-bearing qualification has its own bounded probes.
+		// Keep request decoding/peer authentication on the short deadline.
+		limit = 4 * time.Minute
+	}
+	_ = connection.SetDeadline(time.Now().Add(limit))
+	handlerCtx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	response := server.handler.Handle(handlerCtx, Peer{UID: uid}, request)
 	response.Version = api.Version

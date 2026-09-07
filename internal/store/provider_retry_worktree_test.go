@@ -37,10 +37,10 @@ type providerRetryWorktreeFixture struct {
 	verification      phaseartifact.Verification
 }
 
-func newProviderRetryWorktreeFixture(t *testing.T, id string, oidWidth int) *providerRetryWorktreeFixture {
+func newProviderRetryWorktreeFixture(t *testing.T, id string, oidWidth int, plannerProvider ...string) *providerRetryWorktreeFixture {
 	t.Helper()
 	db, ctx := openTestStore(t)
-	configDigest := setupProviderProject(t, db, ctx)
+	configDigest := setupProviderProject(t, db, ctx, plannerProvider...)
 	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "provider-retry-worktree-"+id)
 	if err != nil {
 		t.Fatal(err)

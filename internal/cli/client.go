@@ -27,6 +27,9 @@ func (c SocketClient) Call(ctx context.Context, request api.Request) (api.Respon
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = 30 * time.Second
+		if request.Method == "provider.qualify" {
+			c.Timeout = 4 * time.Minute
+		}
 	}
 	callCtx, cancel := context.WithTimeout(ctx, c.Timeout)
 	defer cancel()
