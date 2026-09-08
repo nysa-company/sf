@@ -54,6 +54,17 @@ var (
 	ErrTicketBudgetExhausted = errors.New("workflow ticket time or cost budget is exhausted")
 )
 
+// PostbuildFailure identifies immutable command evidence, not retry authority.
+// A consuming Store boundary must reload this key and authenticate its ticket,
+// Builder, verification and current fence before creating any repair entry.
+// Keep raw command output out of error/status strings.
+type PostbuildFailure struct {
+	CommandResult contracts.RepositoryCommandResultKey
+}
+
+func (e *PostbuildFailure) Error() string { return ErrPostbuildCommandFailed.Error() }
+func (e *PostbuildFailure) Unwrap() error { return ErrPostbuildCommandFailed }
+
 // Evidence is the deliberately small Store surface needed by the walking
 // skeleton. *store.Store implements it directly; tests and future daemon
 // compositions can provide an adapter without giving the worker SQL access.

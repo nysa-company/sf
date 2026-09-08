@@ -6,6 +6,8 @@ on:
       - internal/store/**
       - internal/worktreecoord/**
       - internal/workflowprompt/**
+      - internal/workflowruntime/**
+      - internal/workflowworker/**
       - internal/daemon/**
       - internal/cli/**
       - .github/workflows/recovery-candidate.yml
@@ -41,6 +43,8 @@ jobs:
         run: |
           go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
           go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|PostbuildCommandFailure)' -v
+          go test -p 1 -count=1 ./internal/workflowruntime -run '^TestPostbuildCommandError' -v
+          go test -p 1 -count=1 ./internal/workflowworker -run '^TestRealStoreCompletedBuilderPostbuildFailure' -v
       - name: Build exact native development candidate
         run: |
           set -eu

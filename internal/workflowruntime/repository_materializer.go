@@ -1084,7 +1084,13 @@ func postbuildCommandError(result store.RepositoryCommandResult, err error) erro
 		// authorizing a rerun or a verification amendment. Preserve the broad
 		// materialization classification for existing callers while exposing the
 		// narrower worker disposition.
-		return fmt.Errorf("candidate post-build command (exit=%d): %w", result.Result.ExitCode, errors.Join(ErrRepositoryMaterialization, workflowworker.ErrPostbuildCommandFailed))
+		failure := error(workflowworker.ErrPostbuildCommandFailed)
+		// Signal/cancellation exits remain blockers, not diagnostic-retry
+		// candidates. Only a normal observed failure carries the immutable key.
+		if result.Result.ExitCode > 0 && result.Result.ExitCode <= 255 {
+			failure = &workflowworker.PostbuildFailure{CommandResult: result.Key}
+		}
+		return fmt.Errorf("candidate post-build command (exit=%d): %w", result.Result.ExitCode, errors.Join(ErrRepositoryMaterialization, failure))
 	}
 	return nil
 }

@@ -88,6 +88,17 @@ lost-response replay and wrong-ticket/stale/forged evidence negatives.
 - SQLite is the sole authority. Add only the minimal append-only binding needed
   for a new retry attempt; no parallel log-based workflow and no counter guessing.
 - Immutable prompt changes affect new attempts, never rewrite stored inputs.
+- The first repair boundary is pre-publication only. Any candidate/publication/
+  CI history keeps the existing fail-closed disposition until a separately
+  authenticated invalidation protocol is implemented. Do not reinterpret old
+  `postbuild_command_failed` rows as repair permission.
+- Carry the exact terminal command-result key through the failure type. The
+  type is only a locator: Store must reload and bind it before any new entry.
+  Signal/cancellation results do not become diagnostic retry evidence.
+- A fresh Building entry must retire the predecessor from current result reuse,
+  not mutate its completed artifact. Reauthenticate retained physical edits,
+  including ignored-file refusal, before admitting a new writer. A registered
+  worktree or allowed path alone is not provenance or edit permission.
 - Real command output is untrusted and bounded/redacted before any diagnostic
   input. No command/URL execution derived from output.
 - Four-ticket admission uses supported start/retry semantics, not a new implicit
@@ -120,7 +131,7 @@ this document is a working design, not a completed automated-review verdict.
 | --- | --- | --- |
 | Engineering scope/source inspection | In progress | Existing amendment reusable; postbuild retry authority missing |
 | Independent review | Pending | Required before integration |
-| Hosted verification | Pending | No tests or builds run for this branch yet |
+| Hosted verification | First slice passed | [34271491625](https://github.com/nysa-company/sf/actions/runs/34271491625), exact 1b1b7e4; prompt/status tests, existing readmission tests, native build only; not full repair acceptance |
 
 VERDICT: implementation design in progress; not cleared for merge.
 

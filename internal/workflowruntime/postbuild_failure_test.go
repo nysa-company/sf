@@ -28,6 +28,18 @@ func TestPostbuildCommandErrorClassifiesOnlyObservedNonzeroResult(t *testing.T) 
 		if !errors.Is(err, workflowworker.ErrPostbuildCommandFailed) || !errors.Is(err, ErrRepositoryMaterialization) {
 			t.Fatalf("nonzero post-build command err=%v", err)
 		}
+		var failure *workflowworker.PostbuildFailure
+		if !errors.As(err, &failure) || failure.CommandResult != terminal(17).Key {
+			t.Fatalf("immutable result key was lost: %v", err)
+		}
+	})
+
+	t.Run("signal result is not diagnostic retry evidence", func(t *testing.T) {
+		err := postbuildCommandError(terminal(-1), nil)
+		var failure *workflowworker.PostbuildFailure
+		if !errors.Is(err, workflowworker.ErrPostbuildCommandFailed) || errors.As(err, &failure) {
+			t.Fatalf("signal exit exposed diagnostic retry evidence: %v", err)
+		}
 	})
 
 	t.Run("unobserved result is not a terminal failure", func(t *testing.T) {
@@ -36,6 +48,10 @@ func TestPostbuildCommandErrorClassifiesOnlyObservedNonzeroResult(t *testing.T) 
 		err := postbuildCommandError(result, nil)
 		if !errors.Is(err, ErrRepositoryMaterialization) || errors.Is(err, workflowworker.ErrPostbuildCommandFailed) {
 			t.Fatalf("unobserved post-build command err=%v", err)
+		}
+		var failure *workflowworker.PostbuildFailure
+		if errors.As(err, &failure) {
+			t.Fatal("unobserved result exposed immutable failure key")
 		}
 	})
 
