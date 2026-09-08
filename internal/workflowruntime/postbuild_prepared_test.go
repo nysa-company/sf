@@ -10,6 +10,8 @@ import (
 	"github.com/nysa-company/sf/internal/worktreecoord"
 )
 
+var _ preparedPostbuildSource = StoreTicketSource{}
+
 type preparedSchedulerSource struct {
 	rejectionSchedulerTickets
 	found       bool

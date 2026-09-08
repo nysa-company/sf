@@ -118,7 +118,7 @@ remove the observed ticket-recovery and first-use friction.
 ## Engineering review checkpoint
 
 Architecture: reuse amendment and next-action authorities; exact postbuild retry
-binding still to design. Code quality: keep projections separate from authority,
+binding is implemented through immutable V61 repair entries. Code quality: keep projections separate from authority,
 avoid duplicating status decisions. Tests: composition and model-eval gaps above
 must be covered before claiming recovery. Performance: bounded attempts and
 output; no provider calls on status reads and no transactions across execution.
@@ -129,14 +129,13 @@ this document is a working design, not a completed automated-review verdict.
 
 | Review | Status | Findings |
 | --- | --- | --- |
-| Engineering scope/source inspection | In progress | Existing amendment reusable; postbuild retry authority missing |
+| Engineering scope/source inspection | In progress | Bounded repair and amendment composition implemented; restart acceptance pending |
 | Independent review | Pending | Required before integration |
 | Hosted verification | First slice passed | [34271491625](https://github.com/nysa-company/sf/actions/runs/34271491625), exact 1b1b7e4; prompt/status tests, existing readmission tests, native build only; not full repair acceptance |
 
 VERDICT: implementation design in progress; not cleared for merge.
 
 **UNRESOLVED DECISIONS:**
-- Exact Store-bound diagnosis attempt and immutable failure evidence design.
 - Human unfamiliar-user availability; agent evidence must remain labeled.
 
 ## Execution checkpoint — bounded repair foundation
@@ -174,3 +173,21 @@ VERDICT: implementation design in progress; not cleared for merge.
 - Open acceptance blocker: protected checkpoint crash recovery must authenticate
   both ref and index completion. A prepared object alone does not prove index
   synchronization. Source work is not a passing hosted or native result.
+
+## Execution checkpoint — checkpoint crash completion
+
+- Commits through 21e7358 add the accepted/rejected real Store/Git workflow
+  fixtures, immutable post-Reviewer checkpoint receipt, exact prepared-operation
+  reclaim, and a dedicated resume path that cannot launch another Reviewer.
+- Hosted runs 34279182024 and 34279850246 failed. The first exposed an incorrect
+  late-result test expectation; the second exposed receipt authentication in the
+  accepted fixture. Neither is counted as acceptance. Run 34280718207 is pending
+  for the revised tests and stage-specific authentication diagnostics.
+- Source review found ordinary startup commit observation could confirm HEAD
+  before protected index synchronization. Startup now defers only an authenticated
+  checkpoint intent to its dedicated completion path. Dangling receipts and
+  malformed command evidence refuse generic fallback. New Store/daemon regression
+  tests are authored but not yet executed.
+- Still required: green hosted composition and full baseline on the final head,
+  independent final review, four-ticket native campaign, and an honest first-use
+  report. Existing live Relay data and other runtimes remain untouched.

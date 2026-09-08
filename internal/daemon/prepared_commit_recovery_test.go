@@ -39,7 +39,7 @@ func (f preparedCommitObserverFunc) ObservePreparedCommit(ctx context.Context, c
 // immutable intent has its commit/tree tuple, the lease is gone, and the
 // effect is still executing under the old runner. Start's recovery pass then
 // supplies the new leader/claim fence before asking the observer anything.
-func seedPreparedCommit(t *testing.T, daemon *Daemon, ticketID domain.TicketID) (store.GitMutationIntent, contracts.GitMutationClaim, string, string) {
+func seedPreparedCommit(t *testing.T, daemon *Daemon, ticketID domain.TicketID, recordPrepared ...bool) (store.GitMutationIntent, contracts.GitMutationClaim, string, string) {
 	t.Helper()
 	ctx := context.Background()
 	ref := domain.TicketRef{Channel: daemon.channel, Project: "demo", Ticket: ticketID}
@@ -94,8 +94,10 @@ func seedPreparedCommit(t *testing.T, daemon *Daemon, ticketID domain.TicketID) 
 	if !ok {
 		t.Fatal("Git lease does not expose prepared-commit recording")
 	}
-	if err := prepared.RecordPreparedCommit(ctx, commit, tree); err != nil {
-		t.Fatal(err)
+	if len(recordPrepared) == 0 || recordPrepared[0] {
+		if err := prepared.RecordPreparedCommit(ctx, commit, tree); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := lease.Release(); err != nil {
 		t.Fatal(err)

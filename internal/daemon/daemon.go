@@ -630,25 +630,44 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 // recovery leader/claim, while the ticket still carries the exact pre-fence
 // runner identity needed to prove the prepared commit's expected parent.
 func (daemon *Daemon) reconcilePreparedCommits(ctx context.Context, effects []store.Effect) error {
+	return reconcilePreparedCommits(ctx, effects, daemon.store, daemon.preparedCommitObserver)
+}
+
+type preparedCommitRecoveryStore interface {
+	GitMutationIntentFacts(context.Context, string) (store.GitMutationIntentFacts, error)
+	DeferPostbuildAmendmentCheckpointRecovery(context.Context, contracts.GitMutationClaim) (bool, error)
+	ConfirmRecoveredPreparedCommit(context.Context, contracts.GitMutationClaim, contracts.PreparedCommitObservation) (store.Effect, error)
+}
+
+func reconcilePreparedCommits(ctx context.Context, effects []store.Effect, database preparedCommitRecoveryStore, observer contracts.PreparedCommitObserver) error {
 	for _, effect := range effects {
 		if effect.Kind != "git/commit" {
 			continue
 		}
-		facts, err := daemon.store.GitMutationIntentFacts(ctx, effect.SemanticKey)
+		facts, err := database.GitMutationIntentFacts(ctx, effect.SemanticKey)
 		if err != nil {
 			return errors.Join(store.ErrPreparedCommitRecovery, err)
+		}
+		deferProtected, err := database.DeferPostbuildAmendmentCheckpointRecovery(ctx, facts.Claim)
+		if err != nil {
+			return errors.Join(store.ErrPreparedCommitRecovery, err)
+		}
+		if deferProtected {
+			// Keep the exact operation uncertain until the dedicated leased
+			// checkpoint path proves or finishes protected index synchronization.
+			continue
 		}
 		if facts.Claim.Operation != "commit" || facts.Effect.State != store.EffectUncertain || facts.PreparedCommitOID == "" || facts.PreparedTreeOID == "" {
 			return store.ErrPreparedCommitRecovery
 		}
-		if daemon.preparedCommitObserver == nil {
+		if observer == nil {
 			return errors.Join(store.ErrPreparedCommitRecovery, errors.New("prepared commit observer is not configured"))
 		}
-		observation, err := daemon.preparedCommitObserver.ObservePreparedCommit(ctx, facts.Claim)
+		observation, err := observer.ObservePreparedCommit(ctx, facts.Claim)
 		if err != nil {
 			return errors.Join(store.ErrPreparedCommitRecovery, err)
 		}
-		if _, err := daemon.store.ConfirmRecoveredPreparedCommit(ctx, facts.Claim, observation); err != nil {
+		if _, err := database.ConfirmRecoveredPreparedCommit(ctx, facts.Claim, observation); err != nil {
 			return err
 		}
 	}
