@@ -76,7 +76,8 @@ availability, provider qualification and GitHub publication remain separate
 requirements. Intel macOS, arbitrary Python flags, dependency installation and
 Rails execution are not admitted by this profile.
 
-Example explicit configuration:
+Example explicit configuration for a supported Go module (not a Python or
+Rails recipe):
 
 ```toml
 base_branch = "main"
@@ -88,8 +89,8 @@ ticket_timeout = "2h"
 max_ticket_cost_usd = 20
 
 [commands]
-verify = ["make", "test-focused"]
-review = ["make", "test"]
+verify = ["go", "test", "./..."]
+review = ["go", "test", "./..."]
 
 [providers]
 planner = ["codex"]
