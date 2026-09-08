@@ -1537,6 +1537,24 @@ func (s *Store) normalPostPublicationRecoveryPredecessor(ctx context.Context, co
 	}
 	current := normalRecoveryEndpoint{version: version, runner: runner}
 	switch state {
+	case domain.StateReviewing:
+		// Green CI enters reviewing before any final-review provider result
+		// exists. That authenticated entry, not an absent reviewer or an old
+		// worktree registration, anchors a no-control restart in this window.
+		candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
+		if err != nil {
+			return 0, false, err
+		}
+		observation, reviewVersion, err := s.authenticateHistoricalFinalReview(ctx, conn, ref, candidate)
+		if err != nil {
+			return 0, false, err
+		}
+		baseline := normalRecoveryEndpoint{version: reviewVersion, runner: observation.ObservedFence.RunnerEpoch, leader: observation.ObservedFence.LeaderEpoch}
+		current.leader, err = normalRecoveryLeaderAt(ctx, conn, ref, baseline, version, runner)
+		if err != nil || current.leader == 0 || current.leader >= newLeader {
+			return 0, false, ErrPublicationEvidence
+		}
+		return current.leader, true, nil
 	case domain.StateWaitingApproval, domain.StateWaitingManualMerge:
 		baseline, err := s.finalReviewRecoveryEndpoint(ctx, conn, ref, state)
 		if err != nil {
