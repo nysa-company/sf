@@ -28,10 +28,7 @@ func TestCompiledPythonPreparationAndInit(t *testing.T) {
 		t.Skip("pinned macOS ARM64 profile")
 	}
 	binary := buildDevRuntimeBundle(t)
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	root := shortOnboardingRoot(t)
 	home, repo := filepath.Join(root, "home"), filepath.Join(root, "python-app")
 	for _, p := range []string{home, repo, filepath.Join(repo, "tests")} {
 		if err := os.Mkdir(p, 0700); err != nil {

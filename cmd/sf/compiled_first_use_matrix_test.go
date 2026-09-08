@@ -40,10 +40,7 @@ func TestCompiledDevFirstUseStackMatrixIsLocalAndHonest(t *testing.T) {
 		{"mixed-rails-node", "", map[string]string{"Gemfile": "raise 'must not execute'\n", "package.json": `{}`}, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			root, err := filepath.EvalSymlinks(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
+			root := shortOnboardingRoot(t)
 			home, repository := filepath.Join(root, "home"), filepath.Join(root, "project")
 			for _, path := range []string{home, repository} {
 				if err := os.Mkdir(path, 0700); err != nil {
@@ -124,6 +121,40 @@ func TestCompiledDevFirstUseStackMatrixIsLocalAndHonest(t *testing.T) {
 			compiledOnboardingVisibleQueuedTicket(t, binary, home, repository, "first-use", environment)
 		})
 	}
+}
+
+// Darwin sockaddr_un has a 104-byte path buffer, including its trailing NUL.
+// Allocate the real root before registration: a later symlink alias would
+// change canonical project/HOME identities instead of fixing the fixture.
+func shortOnboardingRoot(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp("/private/tmp", "sf-onb-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(root) != "/private/tmp" || !strings.HasPrefix(filepath.Base(root), "sf-onb-") {
+		t.Fatalf("unexpected onboarding root %q", root)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("remove onboarding fixture: %v", err)
+		}
+	})
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil || canonical != root {
+		t.Fatalf("onboarding root is not canonical: %q %v", canonical, err)
+	}
+	info, err := os.Lstat(root)
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {
+		t.Fatalf("onboarding root must be private: %v", err)
+	}
+	for _, channel := range []domain.Channel{domain.ChannelDev, domain.ChannelStable} {
+		paths, err := config.PathsFor(filepath.Join(root, "home"), channel)
+		if err != nil || len(paths.Socket) >= 104 {
+			t.Fatalf("onboarding socket exceeds Darwin limit: bytes=%d path=%q err=%v", len(paths.Socket), paths.Socket, err)
+		}
+	}
+	return root
 }
 
 // Use an explicit clean environment, not inherited provider credentials.
@@ -209,6 +240,9 @@ func (b *onboardingDaemonOutput) String() string {
 
 func startOnboardingDaemon(t *testing.T, binary, repository, socket string, environment []string) func() {
 	t.Helper()
+	if len(socket) >= 104 {
+		t.Fatalf("onboarding socket exceeds Darwin limit: bytes=%d", len(socket))
+	}
 	command := exec.Command(binary, "daemon", "run")
 	command.Dir, command.Env = repository, append([]string(nil), environment...)
 	var output onboardingDaemonOutput
