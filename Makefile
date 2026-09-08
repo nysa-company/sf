@@ -90,10 +90,18 @@ test-compiled: test-compiled-e2e
 # test-race covers the complete suite; the remaining targets add named,
 # readable verification gates without running that complete suite again.
 # Static/repository/release checks are part of the same claimed final gate.
-# The 120-minute outer timeout bounds the complete local path; test-race keeps
-# its 60-minute package bound and the named Go targets keep 30-minute bounds.
+# Without SF_CI_LANE this is the complete serialized local path. Hosted CI
+# distributes the same gates across isolated runners, including all eight
+# disjoint Store race shards; one lane alone is NOT complete acceptance.
+# Each lane keeps the existing per-package bounds.
 test-all:
-	python3 scripts/run-bounded --timeout 120m -- $(MAKE) --no-print-directory -j1 test-race test-integration test-crash test-security test-upgrade test-compiled-e2e verify-static
+	@case "$${SF_CI_LANE:-}" in \
+	  '') python3 scripts/run-bounded --timeout 120m -- $(MAKE) --no-print-directory -j1 test-race test-integration test-crash test-security test-upgrade test-compiled-e2e verify-static ;; \
+	  race-other) python3 scripts/run-bounded --timeout 80m -- python3 scripts/ci-race.py other ;; \
+	  store-race) python3 scripts/run-bounded --timeout 65m -- python3 scripts/ci-race.py store --index "$$SHARD" --count 8 ;; \
+	  test-integration|test-crash|test-security|test-upgrade|test-compiled-e2e|verify-static) python3 scripts/run-bounded --timeout 80m -- $(MAKE) --no-print-directory "$$SF_CI_LANE" ;; \
+	  *) echo 'unknown CI acceptance lane' >&2; exit 2 ;; \
+	esac
 
 fmt-check:
 	@files="$$(git ls-files -co --exclude-standard -- '*.go')"; \
