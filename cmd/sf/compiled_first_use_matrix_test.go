@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,24 +126,16 @@ func TestCompiledDevFirstUseStackMatrixIsLocalAndHonest(t *testing.T) {
 	}
 }
 
-// Reuse the compiled daemon's lifecycle/wait helpers with an explicit clean
-// environment, not inherited provider credentials. Submission never starts work.
+// Use an explicit clean environment, not inherited provider credentials.
+// Submission never starts work. This helper must not depend on tagged E2E tests.
 func compiledOnboardingVisibleQueuedTicket(t *testing.T, binary, home, repository, project string, environment []string) {
 	t.Helper()
 	paths, err := config.PathsFor(home, domain.ChannelDev)
 	if err != nil {
 		t.Fatal(err)
 	}
-	daemon := &compiledChannelDaemon{t: t, name: "onboarding", socket: paths.Socket, done: make(chan error, 1)}
-	daemon.command = exec.Command(binary, "daemon", "run")
-	daemon.command.Dir, daemon.command.Env = repository, append([]string(nil), environment...)
-	daemon.command.Stdout, daemon.command.Stderr = &daemon.output, &daemon.output
-	if err := daemon.command.Start(); err != nil {
-		t.Fatal(err)
-	}
-	go func() { daemon.done <- daemon.command.Wait() }()
-	defer daemon.Stop()
-	compiledWalkingSkeletonWaitSocket(t, paths.Socket, daemon.done, &daemon.output, &daemon.stopped)
+	stop := startOnboardingDaemon(t, binary, repository, paths.Socket, environment)
+	defer stop()
 	run := func(args ...string) api.Response {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -186,5 +180,84 @@ func compiledOnboardingVisibleQueuedTicket(t *testing.T, binary, home, repositor
 	}
 	if attempts, err := database.ProviderAttempts(t.Context(), ref); err != nil || len(attempts) != 0 {
 		t.Fatalf("onboarding launched providers: count=%d err=%v", len(attempts), err)
+	}
+}
+
+type onboardingDaemonOutput struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *onboardingDaemonOutput) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := len(value)
+	if remaining := (64 << 10) - b.buffer.Len(); remaining > 0 {
+		if len(value) > remaining {
+			value = value[:remaining]
+		}
+		_, _ = b.buffer.Write(value)
+	}
+	return n, nil
+}
+
+func (b *onboardingDaemonOutput) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
+func startOnboardingDaemon(t *testing.T, binary, repository, socket string, environment []string) func() {
+	t.Helper()
+	command := exec.Command(binary, "daemon", "run")
+	command.Dir, command.Env = repository, append([]string(nil), environment...)
+	var output onboardingDaemonOutput
+	command.Stdout, command.Stderr = &output, &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	stopped := false
+	stop := func() {
+		if stopped {
+			return
+		}
+		stopped = true
+		_ = command.Process.Signal(os.Interrupt)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("onboarding daemon exit: %v\n%s", err, output.String())
+			}
+		case <-time.After(30 * time.Second):
+			_ = command.Process.Kill()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+			t.Errorf("onboarding daemon cleanup timed out\n%s", output.String())
+		}
+	}
+	// Register before readiness checks so Fatal also cleans up the process.
+	t.Cleanup(stop)
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case err := <-done:
+			stopped = true
+			t.Fatalf("onboarding daemon exited before readiness: %v\n%s", err, output.String())
+		case <-timeout.C:
+			t.Fatalf("onboarding daemon socket readiness timed out\n%s", output.String())
+		case <-t.Context().Done():
+			t.Fatal("onboarding daemon startup canceled")
+		case <-tick.C:
+			if info, err := os.Lstat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+				return stop
+			}
+		}
 	}
 }
