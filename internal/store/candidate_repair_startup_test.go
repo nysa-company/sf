@@ -129,6 +129,23 @@ func completedCandidateRepairReviewingFixtureWithRestart(t *testing.T, fixture c
 	if err != nil {
 		t.Fatal(err)
 	}
+	if restartWaiting {
+		leader, err := fixture.db.AcquireLeader(ctx, publishing.Ref.Channel, "repair-before-ci-restart")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := fixture.db.FenceRecoveredRunners(ctx, publishing.Ref.Channel, leader); err != nil || changed != 1 {
+			t.Fatalf("waiting restart: changed=%d err=%v", changed, err)
+		}
+		if err := fixture.db.RebindRecoveredPublishedCandidates(ctx, publishing.Ref.Channel, leader); err != nil {
+			t.Fatal(err)
+		}
+		publishing, err = fixture.db.Ticket(ctx, publishing.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.buildFence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: publishing.RunnerEpoch}
+	}
 	recordFixturePublication(t, fixture.db, ctx, publishing, fixture.buildFence)
 	if _, err := fixture.db.TransitionPublishedCandidate(ctx, Transition{
 		Ref: publishing.Ref, ExpectedVersion: publishing.Version, From: domain.StatePublishing,
@@ -139,23 +156,6 @@ func completedCandidateRepairReviewingFixtureWithRestart(t *testing.T, fixture c
 	waiting, err := fixture.db.Ticket(ctx, publishing.Ref)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if restartWaiting {
-		leader, err := fixture.db.AcquireLeader(ctx, waiting.Ref.Channel, "repair-waiting-ci-restart")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if changed, err := fixture.db.FenceRecoveredRunners(ctx, waiting.Ref.Channel, leader); err != nil || changed != 1 {
-			t.Fatalf("waiting restart: changed=%d err=%v", changed, err)
-		}
-		if err := fixture.db.RebindRecoveredPublishedCandidates(ctx, waiting.Ref.Channel, leader); err != nil {
-			t.Fatal(err)
-		}
-		waiting, err = fixture.db.Ticket(ctx, waiting.Ref)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fixture.buildFence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: waiting.RunnerEpoch}
 	}
 	candidate, err := fixture.db.RecoverableCandidate(ctx, waiting.Ref)
 	if err != nil {

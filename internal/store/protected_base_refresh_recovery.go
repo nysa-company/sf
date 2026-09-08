@@ -57,7 +57,10 @@ func protectedBaseRefreshReviewedPrefix(ctx context.Context, q candidateEvidence
 	// The CI validator authenticated every endpoint through green. Require
 	// this gap's source to be the exact recovery row within that chain.
 	step, found, err := loadRunnerRecoveryAt(ctx, q, ref, version)
-	if err != nil || !found || !validRunnerRecovery(step) || step.RunnerEpoch != runner || step.LeaderEpoch != leader || version <= publication.CurrentTicketVersion {
+	if err != nil || !found || !validRunnerRecovery(step) || step.RunnerEpoch != runner || step.LeaderEpoch != leader || version < publication.CurrentTicketVersion {
+		return ErrPublicationEvidence
+	}
+	if version == publication.CurrentTicketVersion && publication.CurrentFence != (domain.Fence{LeaderEpoch: leader, RunnerEpoch: runner}) {
 		return ErrPublicationEvidence
 	}
 	pass, err := protectedBaseRefreshPassEndpoint(ctx, q, value, initial)
