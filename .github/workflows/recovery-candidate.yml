@@ -58,7 +58,7 @@ jobs:
           go test -p 1 -count=1 ./internal/workflowruntime -run '^TestPostbuildCommandError' -v
           go test -p 1 -count=1 ./internal/workflowworker -run '^TestRealStoreCompletedBuilderPostbuildFailure' -v
           go test -p 1 -count=1 ./internal/workflowworker -run 'Test(OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment)' -v
-          go test -p 1 -count=1 ./internal/workflowruntime -run 'Test(SchedulerPostbuild|SchedulerCompletedPostbuildRepair|SchedulerReplaysRejectedAmendment|RepositoryMaterializerPreparePostbuildRepair|RepositoryMaterializerPostbuildRepair|ProtectedAmendment)' -v
+          go test -p 1 -count=1 ./internal/workflowruntime -run 'Test(SchedulerPostbuild|SchedulerCompletedPostbuildRepair|SchedulerReplaysRejectedAmendment|RepositoryMaterializerPreparePostbuildRepair|RepositoryMaterializerPostbuildRepair|RepositoryMaterializerPostbuildAmendment|ProtectedAmendment)' -v
           go test -p 1 -count=1 ./internal/localruntime -run '^TestPostbuildAmendmentDispatch' -v
       - name: Check first-use compatibility and documented command order
         run: |

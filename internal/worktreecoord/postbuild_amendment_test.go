@@ -117,7 +117,7 @@ func TestPostbuildAmendmentAdmissionSequencing(t *testing.T) {
 						f.completed.Parsed.Builder = &phaseartifact.Builder{ChangedFiles: []string{"src/main.go"}}
 					}
 				}
-				wantOK := mode == "valid" || mode == "implementation mutation" && lane == "builder completed" || mode == "old result" && (lane == "pending" || lane == "accepted") || mode == "late result" && (lane == "pending" || lane == "accepted") || mode == "late attempt" && (lane == "reviewer completed" || lane == "builder completed")
+				wantOK := mode == "valid" || mode == "implementation mutation" && lane == "builder completed" || mode == "old result" && (lane == "pending" || lane == "accepted") || mode == "late attempt" && (lane == "reviewer completed" || lane == "builder completed")
 				switch mode {
 				case "foreign head":
 					f.observed.Changes.Head = strings.Repeat("0", 40)
@@ -140,7 +140,7 @@ func TestPostbuildAmendmentAdmissionSequencing(t *testing.T) {
 				got, err := authenticatePostbuildVerificationAmendment(ctx, request, f, f)
 				if wantOK {
 					if err != nil || got.Path != original.Worktree.Path || f.loads != 2 || f.inspections != 2 || f.reuses != 2 || f.fences != 1 {
-						t.Fatalf("admission=%+v err=%v calls=%+v", got, err, f)
+						t.Fatalf("admission err=%v loads=%d inspections=%d reuses=%d fences=%d", err, f.loads, f.inspections, f.reuses, f.fences)
 					}
 				} else if err == nil {
 					t.Fatal("unsafe admission accepted")
@@ -183,7 +183,7 @@ func TestPostbuildAmendmentPreparedCheckpointAdmission(t *testing.T) {
 			got, err := authenticatePostbuildVerificationAmendment(context.Background(), request, f, f)
 			if mode == "valid" {
 				if err != nil || got.Path != original.Worktree.Path || f.preparedReads != 2 || f.implementationReads != 1 || f.inspections != 2 || f.fences != 1 {
-					t.Fatalf("prepared replay=%+v err=%v calls=%+v", got, err, f)
+					t.Fatalf("prepared replay err=%v prepared=%d implementation=%d inspections=%d fences=%d", err, f.preparedReads, f.implementationReads, f.inspections, f.fences)
 				}
 			} else if err == nil {
 				t.Fatal("unsafe prepared replay accepted")

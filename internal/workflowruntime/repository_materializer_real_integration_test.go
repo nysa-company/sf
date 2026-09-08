@@ -49,6 +49,13 @@ type materializerRealFixture struct {
 
 func newMaterializerRealFixture(t *testing.T, failBuild bool) materializerRealFixture {
 	t.Helper()
+	return newMaterializerRealFixtureWithProvider(t, func(t *testing.T) string {
+		return writeMaterializerProviderWithBuildFailure(t, failBuild)
+	})
+}
+
+func newMaterializerRealFixtureWithProvider(t *testing.T, provider func(*testing.T) string) materializerRealFixture {
+	t.Helper()
 	if runtime.GOOS != "darwin" {
 		t.Skip("guarded repository command execution is Darwin-only")
 	}
@@ -125,7 +132,7 @@ func newMaterializerRealFixture(t *testing.T, failBuild bool) materializerRealFi
 		t.Fatal(err)
 	}
 
-	providerScript := writeMaterializerProviderWithBuildFailure(t, failBuild)
+	providerScript := provider(t)
 	builderAuth := writeMaterializerAuthHome(t)
 	reviewerAuth := writeMaterializerAuthHome(t)
 	providerSupervisor, err := processsupervisor.New(nil)
