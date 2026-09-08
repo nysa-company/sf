@@ -111,6 +111,16 @@
       "invalidates": []
     },
     {
+      "id": "postbuild_repair",
+      "from": ["building"],
+      "trigger": "postbuild_repair",
+      "guards": ["failed_postbuild_evidence_exact", "prepublication_only", "retained_worktree_exact", "correction_available", "no_live_writer"],
+      "to": "building",
+      "phase_disposition": "start_bounded_build_diagnosis",
+      "allowed_effects": [],
+      "invalidates": []
+    },
+    {
       "id": "build_pass",
       "from": ["building"],
       "trigger": "phase_pass",

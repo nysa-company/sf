@@ -99,6 +99,8 @@ func phaseForProviderState(state domain.State) domain.Phase {
 
 func providerPhaseEntryForTransition(from, to domain.State, trigger string) (domain.Phase, bool) {
 	switch {
+	case from == domain.StateBuilding && to == domain.StateBuilding && trigger == "postbuild_repair":
+		return domain.PhaseBuild, true
 	case from == domain.StatePlanning && to == domain.StateVerifying && trigger == "phase_pass":
 		return domain.PhaseVerification, true
 	case from == domain.StateVerifying && to == domain.StateBuilding && trigger == "phase_pass":
@@ -381,6 +383,17 @@ func loadProviderPhaseEntryAt(ctx context.Context, q interface {
 	want, err := providerPhaseEntryDigest(ref, entry)
 	if err != nil || want != entry.Digest {
 		return providerPhaseEntry{}, ErrEvidenceConflict
+	}
+	if entry.Trigger == "postbuild_repair" {
+		// A self-transition cannot renew a Builder window using only an event
+		// digest. Authenticate its immutable failed-command and budget boundary.
+		reader, ok := q.(candidateEvidenceQuerier)
+		if !ok {
+			return providerPhaseEntry{}, ErrEvidenceConflict
+		}
+		if _, err := loadPostbuildRepairEntry(ctx, reader, ref, entry.Version); err != nil {
+			return providerPhaseEntry{}, ErrEvidenceConflict
+		}
 	}
 	return entry, nil
 }

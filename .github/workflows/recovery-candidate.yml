@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - internal/store/**
+      - internal/git/**
+      - internal/engine/**
+      - internal/statemachine/**
       - internal/worktreecoord/**
       - internal/workflowprompt/**
       - internal/workflowruntime/**
@@ -42,6 +45,11 @@ jobs:
         run: go test -p 1 -count=1 ./internal/store -run 'Test(ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)$' -v
       - name: Test bounded completed-Builder readmission
         run: go test -p 1 -count=1 ./internal/worktreecoord
+      - name: Test bounded repair authority and retained file identity
+        run: |
+          go test -p 1 -count=1 ./internal/statemachine ./internal/engine
+          go test -p 1 -count=1 ./internal/store -run 'Test(PostbuildRepair|TransitionPostbuildRepair)' -v
+          go test -p 1 -count=1 ./internal/git -run '^TestRetained' -v
       - name: Test proof consistency and actionable status
         run: |
           go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli

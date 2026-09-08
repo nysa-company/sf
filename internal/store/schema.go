@@ -68,6 +68,8 @@ func (s *Store) validateSchema(ctx context.Context) error {
 		}
 	}
 	for _, trigger := range []string{
+		"postbuild_repair_entries_immutable_update",
+		"postbuild_repair_entries_immutable_delete",
 		"provider_server_rejections_immutable_update",
 		"provider_server_rejections_immutable_delete",
 		"provider_accounting_policies_immutable_update",
@@ -199,6 +201,20 @@ func compositeForeignKey(table, target string, columns ...foreignKeyColumn) comp
 // insufficient: accepting a subset or differently ordered mapping would let a
 // valid value from another candidate, ticket, or fence satisfy the FK.
 var requiredCompositeForeignKeys = []compositeForeignKeyRequirement{
+	compositeForeignKey("postbuild_repair_entries", "tickets",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "id"}),
+	compositeForeignKey("postbuild_repair_entries", "provider_attempts",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"builder_result_phase", "phase"}, foreignKeyColumn{"builder_result_role", "role"}, foreignKeyColumn{"builder_result_attempt", "attempt"}, foreignKeyColumn{"builder_result_attempt_id", "id"}),
+	compositeForeignKey("postbuild_repair_entries", "provider_attempt_results",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"builder_result_phase", "phase"}, foreignKeyColumn{"builder_result_role", "role"}, foreignKeyColumn{"builder_result_attempt", "attempt"}, foreignKeyColumn{"builder_result_attempt_id", "provider_attempt_id"}),
+	compositeForeignKey("postbuild_repair_entries", "repository_command_results",
+		foreignKeyColumn{"failed_command_semantic_key", "semantic_key"}, foreignKeyColumn{"failed_command_claim_epoch", "claim_epoch"}),
+	compositeForeignKey("postbuild_repair_entries", "verification_revisions",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"verification_revision", "revision"}),
+	compositeForeignKey("postbuild_repair_entries", "ticket_budget_uses",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"correction_budget_kind", "kind"}, foreignKeyColumn{"correction_budget_request_id", "request_id"}, foreignKeyColumn{"consumed_ticket_version", "ticket_version"}, foreignKeyColumn{"consumed_leader_epoch", "leader_epoch"}, foreignKeyColumn{"consumed_runner_epoch", "runner_epoch"}),
+	compositeForeignKey("postbuild_repair_entries", "provider_phase_entries",
+		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"phase", "phase"}, foreignKeyColumn{"entry_ticket_version", "entry_ticket_version"}),
 	compositeForeignKey("provider_server_rejections", "provider_attempts",
 		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"phase", "phase"}, foreignKeyColumn{"role", "role"}, foreignKeyColumn{"attempt", "attempt"}, foreignKeyColumn{"provider_attempt_id", "id"}),
 	compositeForeignKey("provider_accounting_policies", "tickets",
@@ -457,6 +473,7 @@ func sameForeignKeyColumns(actual, expected []foreignKeyColumn) bool {
 }
 
 var requiredSchema = map[string][]string{
+	"postbuild_repair_entries":              {"channel", "project_id", "ticket_id", "entry_ticket_version", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "phase", "builder_result_attempt_id", "builder_result_attempt", "builder_result_phase", "builder_result_role", "failed_command_semantic_key", "failed_command_claim_epoch", "verification_revision", "original_checkpoint_oid", "retained_worktree_digest", "failed_result_digest", "builder_typed_digest", "correction_budget_kind", "correction_budget_request_id", "binding_digest", "created_at"},
 	"schema_migrations":                     {"version", "applied_at", "checksum"},
 	"ci_poll_schedules":                     {"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "publication_witness_digest", "first_polled_at", "deadline_at", "max_attempts"},
 	"ci_poll_attempts":                      {"channel", "project_id", "ticket_id", "candidate_generation", "candidate_head_sha", "candidate_tree_sha", "publication_witness_digest", "attempt", "polled_at"},
@@ -539,6 +556,9 @@ type indexRequirement struct {
 }
 
 var requiredIndexes = []indexRequirement{
+	{table: "postbuild_repair_entries", columns: []string{"channel", "project_id", "ticket_id", "entry_ticket_version"}},
+	{table: "postbuild_repair_entries", name: "postbuild_repair_entries_failed_command", columns: []string{"failed_command_semantic_key", "failed_command_claim_epoch"}},
+	{table: "postbuild_repair_entries", name: "postbuild_repair_entries_binding_digest", columns: []string{"binding_digest"}},
 	{table: "projects", columns: []string{"channel", "canonical_path"}},
 	{table: "project_configurations", columns: []string{"channel", "project_id", "digest"}},
 	{table: "tickets", name: "active_ticket_source_digest", columns: []string{"channel", "project_id", "source_digest"}, partial: true},
