@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/worktreecoord"
@@ -18,11 +19,12 @@ func TestRepositoryMaterializerPostbuildAmendmentPreparedIndexRecovery(t *testin
 		if restart {
 			name = "new_leader"
 		}
-		t.Run(name, func(t *testing.T) { testPostbuildAmendmentPreparedIndexRecovery(t, restart) })
+		t.Run(name, func(t *testing.T) { testPostbuildAmendmentPreparedIndexRecovery(t, restart, false) })
 	}
+	t.Run("synced_new_leader", func(t *testing.T) { testPostbuildAmendmentPreparedIndexRecovery(t, true, true) })
 }
 
-func testPostbuildAmendmentPreparedIndexRecovery(t *testing.T, restart bool) {
+func testPostbuildAmendmentPreparedIndexRecovery(t *testing.T, restart, synced bool) {
 	f := newMaterializerRealFixtureWithProvider(t, func(t *testing.T) string { return writeMaterializerAmendmentProvider(t, true) })
 	f.worker.Engine = f.state.StateMachine
 	for _, want := range []domain.State{domain.StateVerifying, domain.StateBuilding, domain.StateBuilding, domain.StateVerifying} {
@@ -49,7 +51,9 @@ func testPostbuildAmendmentPreparedIndexRecovery(t *testing.T, restart bool) {
 		// Commit already persisted its exact prepared tuple and crossed CAS.
 		// Recreate only the ordinary protected index's pre-sync state, retaining
 		// the accepted worktree bytes and all implementation index entries.
-		runMaterializerGit(t, f.worktree, "reset", proof.Binding.OriginalCheckpointOID, "--", "proof_test.go")
+		if !synced {
+			runMaterializerGit(t, f.worktree, "reset", proof.Binding.OriginalCheckpointOID, "--", "proof_test.go")
+		}
 		return crash
 	}
 	f.worker.CheckpointMaterializer = faulted
@@ -65,14 +69,26 @@ func testPostbuildAmendmentPreparedIndexRecovery(t *testing.T, restart bool) {
 	if err != nil || !found {
 		t.Fatalf("prepared=%+v found=%t err=%v", prepared, found, err)
 	}
-	if got := rawMaterializerGit(t, f.worktree, "diff", "--cached", "--name-only", "--", "proof_test.go"); got != "proof_test.go" {
-		t.Fatalf("fault did not leave protected index unsynced: %q", got)
+	wantIndexChange := "proof_test.go"
+	if synced {
+		wantIndexChange = ""
+	}
+	if got := rawMaterializerGit(t, f.worktree, "diff", "--cached", "--name-only", "--", "proof_test.go"); got != wantIndexChange {
+		t.Fatalf("fault index=%q want=%q", got, wantIndexChange)
 	}
 	observations, err := sql.Open("sqlite", "file:"+f.databasePath+"?mode=ro")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer observations.Close()
+	var semantic string
+	if err := observations.QueryRowContext(f.ctx, `SELECT semantic_key FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND kind='git/commit' AND state='uncertain'`, f.ref.Channel, f.ref.Project, f.ref.Ticket).Scan(&semantic); err != nil {
+		t.Fatal(err)
+	}
+	beforeFacts, err := f.db.GitMutationIntentFacts(f.ctx, semantic)
+	if err != nil {
+		t.Fatal(err)
+	}
 	counts := func() [2]int {
 		t.Helper()
 		var values [2]int
@@ -91,6 +107,16 @@ func testPostbuildAmendmentPreparedIndexRecovery(t *testing.T, restart bool) {
 		}
 		if err := f.db.SetRecoveryAuthority(f.ctx, domain.ChannelDev, leader, f.supervisor.PublicKey()); err != nil {
 			t.Fatal(err)
+		}
+		// Match startup order: effects are rebound before runner fencing. This
+		// specifically makes the pre-crash Git claim stale even if index sync
+		// already completed, so HEAD-only confirmation cannot succeed.
+		if _, err := f.db.ReconcileEffects(f.ctx, domain.ChannelDev, leader); err != nil {
+			t.Fatal(err)
+		}
+		rebound, err := f.db.GitMutationIntentFacts(f.ctx, semantic)
+		if err != nil || rebound.Claim != beforeFacts.Claim || rebound.Effect.LeaderEpoch != leader || rebound.Effect.ClaimEpoch <= beforeFacts.Effect.ClaimEpoch {
+			t.Fatalf("startup did not preserve old claim/rebind effect: %v", err)
 		}
 		if changed, err := f.db.FenceRecoveredRunners(f.ctx, domain.ChannelDev, leader); err != nil || changed != 1 {
 			t.Fatalf("restart changed=%d err=%v", changed, err)
@@ -118,6 +144,10 @@ func testPostbuildAmendmentPreparedIndexRecovery(t *testing.T, restart bool) {
 	if after := counts(); after != before {
 		t.Fatalf("resume added command/effect: before=%v after=%v", before, after)
 	}
+	afterFacts, err := f.db.GitMutationIntentFacts(f.ctx, semantic)
+	if err != nil || afterFacts.PreparedCommitOID != beforeFacts.PreparedCommitOID || afterFacts.PreparedTreeOID != beforeFacts.PreparedTreeOID || afterFacts.Claim.SemanticKey != beforeFacts.Claim.SemanticKey || afterFacts.Claim.RequestDigest != beforeFacts.Claim.RequestDigest {
+		t.Fatalf("resume replaced immutable Git target: %v", err)
+	}
 	current, err := f.db.CurrentVerification(f.ctx, f.ref)
 	if err != nil || current.Checkpoint != prepared || current.CommandBinding.Key != receipt.Command {
 		t.Fatalf("resume replaced checkpoint: %+v %v", current, err)
@@ -128,6 +158,20 @@ func testPostbuildAmendmentPreparedIndexRecovery(t *testing.T, restart bool) {
 	after, err := os.ReadFile(filepath.Join(f.worktree, "tracked_test.go"))
 	if err != nil || !reflect.DeepEqual(after, implementation) || rawMaterializerGit(t, f.worktree, "diff", "--cached", "--binary", "--", "tracked_test.go") != staging {
 		t.Fatalf("resume altered implementation bytes/staging: %v", err)
+	}
+	if restart {
+		// Immutable completion replay needs no new qualification. A subsequent
+		// fresh Builder does: attest the unchanged registered runtimes for this
+		// daemon epoch, just as normal startup qualification does.
+		reviewer, _, err := f.db.LoadHistoricalProviderAttemptResult(f.ctx, receipt.Reviewer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		builderQualification := materializerAttestedQualification(t, f.db, f.supervisor, proof.Builder.Claim.Binding, "55555555555555555555555555555555")
+		reviewerQualification := materializerAttestedQualification(t, f.db, f.supervisor, reviewer.Claim.Binding, "66666666666666666666666666666666")
+		if _, _, err := f.db.SelectProviderSet(f.ctx, domain.ChannelDev, builderQualification.ID, builderQualification.ID, reviewerQualification.ID, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if result, err := f.worker.Run(f.ctx, f.ref, f.fence); err != nil || result.State != domain.StatePublishing {
 		t.Fatalf("fresh Builder=%+v err=%v", result, err)

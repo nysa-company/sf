@@ -118,4 +118,8 @@ func TestCompiledPythonPreparationAndInit(t *testing.T) {
 	if _, err := os.Lstat(stable.Root); !os.IsNotExist(err) {
 		t.Fatal("stable channel changed", err)
 	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	compiledOnboardingVisibleQueuedTicket(t, binary, home, repo, "python-app", env)
 }

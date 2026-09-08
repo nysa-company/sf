@@ -86,6 +86,15 @@ func (m RepositoryMaterializer) materializePostbuildAmendmentCheckpoint(ctx cont
 				} else if observed, err := m.Git.ObserveCommit(ctx, worktree); err != nil || observed.CommitOID != prepared.CommitOID || observed.ParentOID != prepared.ParentOID || observed.TreeOID != prepared.TreeOID {
 					return empty, true, ErrRepositoryMaterialization
 				}
+			}
+			if facts.Effect.State == store.EffectConfirmed {
+				if !synced || facts.Effect.ObservedIdentity != prepared.CommitOID {
+					return empty, true, ErrRepositoryMaterialization
+				}
+			} else {
+				// Physical synchronization does not advance the immutable claim's
+				// fence. Startup may have rebound the uncertain effect, so even an
+				// already-synced child needs its exact scoped claim before confirming.
 				claim, err = m.Store.ReclaimPostbuildAmendmentCheckpoint(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
 				if err != nil {
 					return empty, true, err
@@ -93,19 +102,23 @@ func (m RepositoryMaterializer) materializePostbuildAmendmentCheckpoint(ctx cont
 				if claim.SemanticKey != facts.Claim.SemanticKey || claim.RequestDigest != evidence {
 					return empty, true, ErrRepositoryMaterialization
 				}
+			}
+			if !synced {
 				runner := m.Git
 				if runner.MutationAuthority == nil {
 					runner.MutationAuthority = m.Store
 				}
 				if _, err := runner.CommitProtectedCheckpoint(ctx, worktree, git.ProtectedCheckpointRequest{EvidenceDigest: evidence, Timestamp: time.Unix(0, 0).UTC(), OriginalCheckpoint: parent, ProtectedPaths: protected, FullSnapshotDigest: receipt.FullSnapshotDigest, ImplementationDigest: receipt.ImplementationDigest, MutationClaim: claim}); err != nil {
-					return empty, true, errors.Join(err, m.settleCommitFailure(ctx, claim))
+					return empty, true, errors.Join(err, m.settleProtectedCheckpointFailure(claim))
 				}
 				if err := m.proveProtectedCheckpointSynced(ctx, worktree, parent, protected, implementation, prepared); err != nil {
-					return empty, true, errors.Join(err, m.settleCommitFailure(ctx, claim))
+					return empty, true, errors.Join(err, m.settleProtectedCheckpointFailure(claim))
 				}
 			}
-			if _, err := m.Store.ConfirmPreparedCommit(ctx, claim, contracts.PreparedCommitObservation{CommitOID: prepared.CommitOID, ParentOID: prepared.ParentOID, TreeOID: prepared.TreeOID}); err != nil {
-				return empty, true, err
+			if facts.Effect.State != store.EffectConfirmed {
+				if _, err := m.Store.ConfirmPreparedCommit(ctx, claim, contracts.PreparedCommitObservation{CommitOID: prepared.CommitOID, ParentOID: prepared.ParentOID, TreeOID: prepared.TreeOID}); err != nil {
+					return empty, true, err
+				}
 			}
 			if err := m.proveProtectedCheckpointSynced(ctx, worktree, parent, protected, implementation, prepared); err != nil {
 				return empty, true, err
@@ -170,19 +183,19 @@ func (m RepositoryMaterializer) materializePostbuildAmendmentCheckpoint(ctx cont
 	}
 	_, err = runner.CommitProtectedCheckpoint(ctx, worktree, git.ProtectedCheckpointRequest{EvidenceDigest: evidence, Timestamp: time.Unix(0, 0).UTC(), OriginalCheckpoint: parent, ProtectedPaths: protected, FullSnapshotDigest: receipt.FullSnapshotDigest, ImplementationDigest: receipt.ImplementationDigest, MutationClaim: claim})
 	if err != nil {
-		return empty, true, errors.Join(err, m.settleCommitFailure(ctx, claim))
+		return empty, true, errors.Join(err, m.settleProtectedCheckpointFailure(claim))
 	}
 	if m.BeforePreparedCommitObservation != nil {
 		if err := m.BeforePreparedCommitObservation(); err != nil {
-			return empty, true, errors.Join(err, m.settleCommitFailure(ctx, claim))
+			return empty, true, errors.Join(err, m.settleProtectedCheckpointFailure(claim))
 		}
 	}
 	observed, err := runner.ObserveCommit(ctx, worktree)
 	if err != nil || observed.ParentOID != parent {
-		return empty, true, errors.Join(materializeErr(err), m.settleCommitFailure(ctx, claim))
+		return empty, true, errors.Join(materializeErr(err), m.settleProtectedCheckpointFailure(claim))
 	}
 	if _, err := m.Store.ConfirmPreparedCommit(ctx, claim, contracts.PreparedCommitObservation{CommitOID: observed.CommitOID, ParentOID: observed.ParentOID, TreeOID: observed.TreeOID}); err != nil {
-		return empty, true, errors.Join(err, m.settleCommitFailure(ctx, claim))
+		return empty, true, errors.Join(err, m.settleProtectedCheckpointFailure(claim))
 	}
 	checkpoint := workflowworker.VerificationCheckpoint{ID: observed.CommitOID, Commit: store.CommitObservation{CommitOID: observed.CommitOID, ParentOID: observed.ParentOID, TreeOID: observed.TreeOID}, CommandResult: command}
 	if m.AfterVerificationCheckpoint != nil {
@@ -191,6 +204,27 @@ func (m RepositoryMaterializer) materializePostbuildAmendmentCheckpoint(ctx cont
 		}
 	}
 	return checkpoint, true, nil
+}
+
+// Only this accepted-checkpoint lane may record the receipt-bound retirement
+// audit used by scoped reclaim. Ordinary commit settlement is unchanged.
+func (m RepositoryMaterializer) settleProtectedCheckpointFailure(claim contracts.GitMutationClaim) error {
+	ctx, cancel := materializerPersistenceContext()
+	defer cancel()
+	facts, err := m.Store.GitMutationIntentFacts(ctx, claim.SemanticKey)
+	if err != nil {
+		return err
+	}
+	if facts.Claim != claim {
+		return ErrRepositoryMaterialization
+	}
+	if facts.PreparedCommitOID == "" && facts.PreparedTreeOID == "" {
+		return m.Store.RetirePostbuildAmendmentCheckpoint(ctx, claim)
+	}
+	// Any prepared field means a visible CAS cannot be ruled out. Preserve
+	// the tuple; malformed partial tuples never become a fresh-operation retry.
+	_, err = m.Store.MarkEffectUncertain(ctx, store.EffectFence{SemanticKey: claim.SemanticKey, Ref: claim.TicketRef, TicketVersion: claim.TicketVersion, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}})
+	return err
 }
 
 func (m RepositoryMaterializer) proveProtectedCheckpointSynced(ctx context.Context, worktree git.Worktree, original string, protected []string, implementation string, prepared store.CommitObservation) error {

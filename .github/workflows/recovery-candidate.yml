@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [store, git, admission, behavior, runtime-repair, runtime-amendment, runtime-recovery, onboarding]
+        group: [store, git, admission, behavior, runtime-repair, runtime-amendment, runtime-recovery, onboarding, python-onboarding]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,6 +69,9 @@ jobs:
             onboarding)
               scripts/docs-smoke
               go test -p 1 -count=1 ./cmd/sf -run '^TestCompiledDevFirstUseStackMatrixIsLocalAndHonest$' -v
+              ;;
+            python-onboarding)
+              SF_TEST_PYTHON_CLI_DOWNLOAD=1 go test -p 1 -count=1 -timeout 8m ./cmd/sf -run '^TestCompiledPythonPreparationAndInit$' -v
               ;;
             *) echo "Unknown validation group" >&2; exit 1 ;;
           esac

@@ -45,13 +45,21 @@ func TestRepositoryMaterializerPostbuildRepairRealEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("repair context: %v", err)
 	}
-	// The repair deliberately freezes the earliest pre-consumption binding;
-	// CurrentVerification may project the same immutable proof at a later fence.
-	// Compare all immutable fields, and separately bound the historical tuple.
+	// BuildContext.Verification is the current live projection; the nested
+	// Repair.Verification retains the earliest consumed historical binding.
+	// Neither projection may change any immutable proof field.
 	retainedProjection := repair.Verification
 	retainedProjection.TicketVersion, retainedProjection.Fence = original.TicketVersion, original.Fence
-	if repair.Repair.OriginalCheckpointOID != original.Checkpoint.CommitOID || repair.Verification.TicketVersion == 0 || repair.Verification.TicketVersion > original.TicketVersion || repair.Verification.Fence != original.Fence || !reflect.DeepEqual(retainedProjection, original) {
-		t.Fatalf("repair changed immutable proof: revision_equal=%t checkpoint_equal=%t provider_equal=%t command_equal=%t historical_version=%d original_version=%d", reflect.DeepEqual(repair.Verification.Revision, original.Revision), repair.Verification.Checkpoint == original.Checkpoint, repair.Verification.ProviderResult == original.ProviderResult, repair.Verification.CommandBinding == original.CommandBinding, repair.Verification.TicketVersion, original.TicketVersion)
+	if repair.Repair.OriginalCheckpointOID != original.Checkpoint.CommitOID || repair.Verification.TicketVersion != failed.Version || repair.Verification.Fence != f.fence || !reflect.DeepEqual(retainedProjection, original) {
+		t.Fatalf("repair changed immutable proof: revision_equal=%t checkpoint_equal=%t provider_equal=%t command_equal=%t live_version=%d wanted_version=%d", reflect.DeepEqual(repair.Verification.Revision, original.Revision), repair.Verification.Checkpoint == original.Checkpoint, repair.Verification.ProviderResult == original.ProviderResult, repair.Verification.CommandBinding == original.CommandBinding, repair.Verification.TicketVersion, failed.Version)
+	}
+	historical := repair.Repair.Verification
+	if historical.TicketVersion == 0 || historical.TicketVersion > original.TicketVersion || historical.Fence != original.Fence {
+		t.Fatalf("invalid consumed verification fence: historical_version=%d original_version=%d", historical.TicketVersion, original.TicketVersion)
+	}
+	historical.TicketVersion, historical.Fence = original.TicketVersion, original.Fence
+	if !reflect.DeepEqual(historical, original) {
+		t.Fatal("historical repair proof changed immutable evidence")
 	}
 	coordinator := worktreecoord.Coordinator{Store: f.db, Git: f.materializer.Git}
 	admitted, err := coordinator.AuthenticatePostbuildRepair(f.ctx, worktreecoord.EnsureRequest{Ref: f.ref, Version: failed.Version, Fence: f.fence})

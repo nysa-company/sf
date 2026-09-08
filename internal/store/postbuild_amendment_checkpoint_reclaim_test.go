@@ -177,3 +177,74 @@ func TestPostbuildCheckpointReclaimRequiresSignedRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestPostbuildCheckpointFailedReclaimRequiresExactRetirement(t *testing.T) {
+	for _, audited := range []bool{false, true} {
+		t.Run(fmt.Sprintf("audited_%t", audited), func(t *testing.T) {
+			db, ctx, intent := postbuildCheckpointReclaimFixture(t)
+			claim, err := db.IssueGitMutationClaim(ctx, intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt, err := db.PostbuildAmendmentCheckpointSnapshot(ctx, intent.Ref, intent.TicketVersion, intent.Fence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if audited {
+				lease, err := db.AcquireGitMutation(ctx, claim)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := db.RetirePostbuildAmendmentCheckpoint(ctx, claim); err == nil {
+					t.Fatal("retired a live writer")
+				}
+				if err := lease.Release(); err != nil {
+					t.Fatal(err)
+				}
+				err = db.RetirePostbuildAmendmentCheckpoint(ctx, claim)
+			} else {
+				err = db.RetireUnpreparedGitCommit(ctx, claim)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			retry, err := db.ReclaimPostbuildAmendmentCheckpoint(ctx, intent.Ref, intent.TicketVersion, intent.Fence)
+			if !audited {
+				if !errors.Is(err, ErrGitMutationIntent) {
+					t.Fatalf("unaudited failed reclaim=%v", err)
+				}
+				return
+			}
+			if err != nil || retry.SemanticKey != claim.SemanticKey || retry.RequestDigest != claim.RequestDigest || retry.ExpectedHeadOID != claim.ExpectedHeadOID || retry.ClaimEpoch != claim.ClaimEpoch+1 {
+				t.Fatalf("retry=%+v err=%v", retry, err)
+			}
+			again, err := db.ReclaimPostbuildAmendmentCheckpoint(ctx, intent.Ref, intent.TicketVersion, intent.Fence)
+			if err != nil || again != retry {
+				t.Fatalf("retry duplicated=%+v err=%v", again, err)
+			}
+			after, err := db.PostbuildAmendmentCheckpointSnapshot(ctx, intent.Ref, intent.TicketVersion, intent.Fence)
+			if err != nil || after.BindingDigest != receipt.BindingDigest || after.Reviewer != receipt.Reviewer || after.Command != receipt.Command {
+				t.Fatalf("receipt changed=%+v err=%v", after, err)
+			}
+			lease, err := db.AcquireGitMutation(ctx, retry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			commit, tree := strings.Repeat("e", 40), strings.Repeat("f", 40)
+			if err := lease.(interface {
+				RecordPreparedCommit(context.Context, string, string) error
+			}).RecordPreparedCommit(ctx, commit, tree); err != nil {
+				t.Fatal(err)
+			}
+			if err := lease.Release(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.RetirePostbuildAmendmentCheckpoint(ctx, retry); err == nil {
+				t.Fatal("retired prepared checkpoint")
+			}
+			if _, err := db.ConfirmPreparedCommit(ctx, retry, contracts.PreparedCommitObservation{CommitOID: commit, ParentOID: intent.ExpectedHeadOID, TreeOID: tree}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

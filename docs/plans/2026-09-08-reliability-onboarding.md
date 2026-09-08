@@ -194,3 +194,21 @@ VERDICT: implementation design in progress; not cleared for merge.
 - Still required: green hosted composition and full baseline on the final head,
   independent final review, four-ticket native campaign, and an honest first-use
   report. Existing live Relay data and other runtimes remain untouched.
+
+## Execution checkpoint — isolated validation and review
+
+- Run [34282752323](https://github.com/nysa-company/sf/actions/runs/34282752323)
+  at e88323f passed Store, Git, admission, accepted/rejected runtime amendment,
+  CLI/behavior and registration-onboarding groups. It failed the remaining
+  runtime repair assertion (live versus historical projection) and restart's
+  fresh-Builder qualification setup. No native artifact was released.
+- Those fixture issues are corrected for the next run. Independent source
+  review also found synced-but-unconfirmed checkpoints needed exact claim
+  recovery, and failed-before-preparation retries needed an atomic retirement
+  audit. Both fixes and regressions are authored; ordinary Git recovery remains
+  unchanged. The previously alleged multiple-companion bug was retracted after
+  tracing the schema-enforced correction budget.
+- The onboarding fixtures now require a real compiled daemon to show an exact
+  submitted Queued ticket with zero provider attempts. Prepared Python is an
+  additional hosted group with explicitly enabled pinned public downloads.
+  This is still not live model delivery or a human usability trial.

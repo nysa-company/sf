@@ -12,6 +12,58 @@ import (
 
 const maxPostbuildAmendmentCheckpointReclaims = 8
 
+type postbuildCheckpointRetirement struct {
+	ReceiptDigest string
+	Claim         contracts.GitMutationClaim
+}
+
+// RetirePostbuildAmendmentCheckpoint records why an exact receipt's operation
+// can be retried. The absence of a prepared intent alone is never sufficient.
+func (s *Store) RetirePostbuildAmendmentCheckpoint(ctx context.Context, claim contracts.GitMutationClaim) error {
+	if s == nil || !validContractClaim(claim) || claim.Operation != "commit" {
+		return ErrGitMutationIntent
+	}
+	return s.write(ctx, func(conn *sql.Conn) error {
+		fence := domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch}
+		receipt, err := s.postbuildAmendmentCheckpointSnapshotFrom(ctx, conn, claim.TicketRef, claim.TicketVersion, fence)
+		if err != nil {
+			return err
+		}
+		amendment, binding, err := s.authenticateCheckpointSnapshotSource(ctx, conn, claim.TicketRef, claim.TicketVersion, fence, receipt.Reviewer, receipt.Command)
+		if err != nil {
+			return err
+		}
+		_, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, conn, receipt.Reviewer)
+		if err != nil || parsed.Verify == nil {
+			return ErrEvidenceConflict
+		}
+		command, found, err := loadRepositoryCommandResult(ctx, conn, receipt.Command, true)
+		if err != nil || !found {
+			return ErrEvidenceConflict
+		}
+		var worktree StoredWorktree
+		var repository, baseRef string
+		ref := claim.TicketRef
+		if conn.QueryRowContext(ctx, `SELECT w.path,w.branch_ref,w.state,w.identity_json,w.base_sha,p.canonical_path,p.base_ref FROM worktrees w JOIN projects p ON p.channel=w.channel AND p.id=w.project_id WHERE w.channel=? AND w.project_id=? AND w.ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&worktree.Path, &worktree.Branch, &worktree.State, &worktree.IdentityJSON, &worktree.BaseSHA, &repository, &baseRef) != nil || worktree.State != "registered" {
+			return ErrEvidenceConflict
+		}
+		digest := CanonicalVerificationAmendmentCheckpointDigest(amendment, worktree, receipt.Reviewer, receipt.Command, command.ResultDigest, *parsed.Verify)
+		intent := GitMutationIntent{EffectFence: EffectFence{Ref: ref, TicketVersion: claim.TicketVersion, Fence: fence}, RequestDigest: digest, Repository: repository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "commit", BaseRef: baseRef, ExpectedBaseOID: worktree.BaseSHA, ExpectedHeadOID: binding.OriginalCheckpointOID}
+		if claim.SemanticKey != CanonicalGitMutationSemanticKey(intent) || claim.RequestDigest != digest || claim.Repository != repository || claim.Worktree != worktree.Path || claim.Branch != worktree.Branch || claim.BaseRef != baseRef || claim.ExpectedBaseOID != worktree.BaseSHA || claim.ExpectedHeadOID != binding.OriginalCheckpointOID {
+			return ErrGitMutationIntent
+		}
+		if err := s.retireUnpreparedGitCommitFrom(ctx, conn, claim); err != nil {
+			return err
+		}
+		payload, err := json.Marshal(postbuildCheckpointRetirement{receipt.BindingDigest, claim})
+		if err != nil {
+			return err
+		}
+		_, err = conn.ExecContext(ctx, `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,'postbuild_amendment_checkpoint_retired','verifying','verifying',?,?)`, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.TicketVersion, string(payload), time.Now().UTC().Format(time.RFC3339Nano))
+		return err
+	})
+}
+
 // ReclaimPostbuildAmendmentCheckpoint can finish only the local protected
 // checkpoint selected by an immutable accepted Reviewer receipt. It never
 // creates a new semantic target, reruns a command, or reopens a confirmed effect.
@@ -54,7 +106,7 @@ func (s *Store) ReclaimPostbuildAmendmentCheckpoint(ctx context.Context, ref dom
 		if err != nil {
 			return err
 		}
-		if effect.Ref != ref || effect.Kind != "git/commit" || effect.RequestDigest != digest || effect.ObservedIdentity != "" || effect.ClaimEpoch == ^uint64(0) || (effect.State != EffectPlanned && effect.State != EffectExecuting && effect.State != EffectUncertain) {
+		if effect.Ref != ref || effect.Kind != "git/commit" || effect.RequestDigest != digest || effect.ObservedIdentity != "" || effect.ClaimEpoch == ^uint64(0) || (effect.State != EffectPlanned && effect.State != EffectExecuting && effect.State != EffectUncertain && effect.State != EffectFailed) {
 			return ErrGitMutationIntent
 		}
 		if effect.TicketVersion > version || effect.LeaderEpoch > fence.LeaderEpoch || effect.RunnerEpoch > fence.RunnerEpoch {
@@ -72,7 +124,22 @@ func (s *Store) ReclaimPostbuildAmendmentCheckpoint(ctx context.Context, ref dom
 			return ErrGitMutationIntent
 		}
 		var prior contracts.GitMutationClaim
-		if effect.State == EffectPlanned {
+		if effect.State == EffectFailed {
+			if intentCount != 0 || effect.ClaimEpoch == 0 {
+				return ErrGitMutationIntent
+			}
+			prior = contracts.GitMutationClaim{TicketRef: ref, SemanticKey: intent.SemanticKey, RequestDigest: digest, TicketVersion: effect.TicketVersion, LeaderEpoch: effect.LeaderEpoch, RunnerEpoch: effect.RunnerEpoch, ClaimEpoch: effect.ClaimEpoch, Repository: repository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "commit", BaseRef: baseRef, ExpectedBaseOID: worktree.BaseSHA, ExpectedHeadOID: binding.OriginalCheckpointOID}
+			payload, err := json.Marshal(postbuildCheckpointRetirement{receipt.BindingDigest, prior})
+			if err != nil {
+				return err
+			}
+			if conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='postbuild_amendment_checkpoint_retired' AND from_state='verifying' AND to_state='verifying' AND payload=?`, ref.Channel, ref.Project, ref.Ticket, prior.TicketVersion, string(payload)).Scan(&count) != nil || count != 1 {
+				return ErrGitMutationIntent
+			}
+			if validateRunnerRecoveryLedgerPrefix(ctx, conn, ref, receipt.Version, receipt.Fence.RunnerEpoch, receipt.Fence.LeaderEpoch, prior.TicketVersion, prior.RunnerEpoch, prior.LeaderEpoch) != nil || validateRunnerRecoveryLedgerPrefix(ctx, conn, ref, prior.TicketVersion, prior.RunnerEpoch, prior.LeaderEpoch, version, fence.RunnerEpoch, fence.LeaderEpoch) != nil {
+				return ErrStaleFence
+			}
+		} else if effect.State == EffectPlanned {
 			// No launch was issued. A planned row with an existing intent belongs
 			// to another recovery protocol and is not inferred safe here.
 			if intentCount != 0 || effect.ClaimEpoch != 0 {
@@ -118,7 +185,7 @@ func (s *Store) ReclaimPostbuildAmendmentCheckpoint(ctx context.Context, ref dom
 		if n, _ := changed.RowsAffected(); n != 1 {
 			return ErrStaleFence
 		}
-		if effect.State == EffectPlanned {
+		if effect.State == EffectPlanned || effect.State == EffectFailed {
 			_, err = conn.ExecContext(ctx, `INSERT INTO git_mutation_intents(semantic_key,channel,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'commit',?,?,?,?)`, intent.SemanticKey, ref.Channel, ref.Project, ref.Ticket, digest, version, fence.LeaderEpoch, fence.RunnerEpoch, claim.ClaimEpoch, repository, worktree.Path, worktree.Branch, baseRef, worktree.BaseSHA, binding.OriginalCheckpointOID, time.Now().UTC().Format(time.RFC3339Nano))
 		} else {
 			changed, err = conn.ExecContext(ctx, `UPDATE git_mutation_intents SET ticket_version=?,leader_epoch=?,runner_epoch=?,claim_epoch=? WHERE semantic_key=? AND request_digest=? AND operation='commit' AND ticket_version=? AND leader_epoch=? AND runner_epoch=? AND claim_epoch=?`, version, fence.LeaderEpoch, fence.RunnerEpoch, claim.ClaimEpoch, intent.SemanticKey, digest, prior.TicketVersion, prior.LeaderEpoch, prior.RunnerEpoch, prior.ClaimEpoch)
