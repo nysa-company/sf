@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [store, git, admission, behavior, runtime-repair, runtime-amendment, runtime-recovery, onboarding, python-onboarding]
+        group: [store, git, admission, behavior, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, onboarding, python-onboarding]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,8 +63,22 @@ jobs:
             runtime-amendment)
               go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run 'Test(RepositoryMaterializerPostbuildAmendmentRealEndToEnd|ProtectedAmendment)' -v
               ;;
-            runtime-recovery)
-              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run '^TestRepositoryMaterializerPostbuildAmendmentPreparedIndexRecovery$' -v
+            runtime-recovery-same|runtime-recovery-restart|runtime-recovery-synced)
+              case "$GROUP" in
+                runtime-recovery-same) selector='^same_fence$' ;;
+                runtime-recovery-restart) selector='^new_leader$' ;;
+                runtime-recovery-synced) selector='^synced_new_leader$' ;;
+              esac
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run "^TestRepositoryMaterializerPostbuildAmendmentPreparedIndexRecovery$/$selector" -v
+              ;;
+            candidate-unrecorded-same|candidate-unrecorded-restart|candidate-recorded-same|candidate-recorded-restart)
+              case "$GROUP" in
+                candidate-unrecorded-same) selector='^recorded_false$/^restart_false$' ;;
+                candidate-unrecorded-restart) selector='^recorded_false$/^restart_true$' ;;
+                candidate-recorded-same) selector='^recorded_true$/^restart_false$' ;;
+                candidate-recorded-restart) selector='^recorded_true$/^restart_true$' ;;
+              esac
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run "^TestPostbuildAmendmentCandidateFinalizationRecovery$/$selector" -v
               ;;
             onboarding)
               scripts/docs-smoke

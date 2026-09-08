@@ -20,6 +20,7 @@ type postbuildAmendmentSource interface {
 	LatestReusableProviderAttempt(context.Context, store.LatestReusableProviderAttemptRequest) (store.LatestReusableProviderAttemptResult, error)
 	CurrentVerification(context.Context, domain.TicketRef) (store.StoredVerification, error)
 	PostbuildAmendmentPreparedCheckpoint(context.Context, domain.TicketRef, uint64, domain.Fence) (store.CommitObservation, bool, error)
+	PostbuildAmendmentPreparedCandidateWitness(context.Context, domain.TicketRef, uint64, domain.Fence, store.ProviderAttemptResultKey) (store.PostbuildAmendmentPreparedCandidateWitness, bool, error)
 	AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error
 }
 
@@ -27,6 +28,12 @@ type postbuildAmendmentInspector interface {
 	InspectRetainedWorktree(context.Context, git.Worktree) (git.RetainedWorktreeInspection, error)
 	InspectRetainedImplementation(context.Context, git.Worktree, string, []string) (string, error)
 }
+
+// Admission composes three independently bounded 15-second Git inspections
+// (initial snapshot, implementation, final snapshot) and Store rechecks. Keep
+// those individual limits, with 15 seconds for the bounded Store/selection work.
+// context.WithTimeout still honors an earlier caller deadline or cancellation.
+const postbuildAmendmentAdmissionTimeout = 60 * time.Second
 
 // AuthenticatePostbuildVerificationAmendment is separate from pristine Ensure.
 // It preserves the bound implementation while an independent Reviewer changes
@@ -42,7 +49,7 @@ func authenticatePostbuildVerificationAmendment(ctx context.Context, request Ens
 	if request.Ref.Validate() != nil || request.Version == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 || request.Fence.ClaimEpoch != 0 {
 		return store.StoredWorktree{}, ErrAuthentication
 	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, postbuildAmendmentAdmissionTimeout)
 	defer cancel()
 	unready := func(stage string, cause error) error {
 		// Preserve typed diagnostics, never raw subprocess output.
@@ -81,6 +88,9 @@ func authenticatePostbuildVerificationAmendment(ctx context.Context, request Ens
 	if proof.Decision == store.VerificationAmendmentAccepted {
 		phase, role = domain.PhaseBuild, "builder"
 		head = proof.CurrentVerification.Checkpoint.CommitOID
+		if proof.Candidate != nil {
+			head = proof.Candidate.Snapshot.HeadSHA
+		}
 	}
 	reuseRequest := store.LatestReusableProviderAttemptRequest{Ref: request.Ref, Phase: phase, Role: role, ExpectedVersion: request.Version, Fence: request.Fence}
 	completed, completedErr := source.LatestReusableProviderAttempt(ctx, reuseRequest)
@@ -100,6 +110,19 @@ func authenticatePostbuildVerificationAmendment(ctx context.Context, request Ens
 	observed, err := inspector.InspectRetainedWorktree(ctx, worktree)
 	if err != nil {
 		return store.StoredWorktree{}, unready("initial physical snapshot", err)
+	}
+	// The Store-owned candidate handoff is only a clean finalization replay,
+	// never permission to retain another dirty delta or launch a provider.
+	if proof.Candidate != nil && (phase != domain.PhaseBuild || completedErr != nil || completed.Key != proof.Candidate.BuilderResult || observed.Changes.Head != proof.Candidate.Snapshot.HeadSHA || len(observed.Changes.Paths) != 0) {
+		return store.StoredWorktree{}, unready("persisted candidate handoff", nil)
+	}
+	var preparedCandidate *store.PostbuildAmendmentPreparedCandidateWitness
+	if phase == domain.PhaseBuild && proof.Candidate == nil && observed.Changes.Head != head && completedErr == nil {
+		child, found, err := source.PostbuildAmendmentPreparedCandidateWitness(ctx, request.Ref, request.Version, request.Fence, completed.Key)
+		if err != nil || !found || child.Builder != completed.Key || child.Commit.ParentOID != head || child.Commit.CommitOID != observed.Changes.Head || len(observed.Changes.Paths) != 0 {
+			return store.StoredWorktree{}, unready("prepared candidate handoff", err)
+		}
+		preparedCandidate, head = &child, child.Commit.CommitOID
 	}
 	var prepared *store.CommitObservation
 	if observed.Changes.Head != head && phase == domain.PhaseVerification && completedErr == nil && recorded == nil {
@@ -154,6 +177,12 @@ func authenticatePostbuildVerificationAmendment(ctx context.Context, request Ens
 	if prepared != nil {
 		again, found, err := source.PostbuildAmendmentPreparedCheckpoint(ctx, request.Ref, request.Version, request.Fence)
 		if err != nil || !found || again != *prepared {
+			return store.StoredWorktree{}, ErrAuthentication
+		}
+	}
+	if preparedCandidate != nil {
+		again, found, err := source.PostbuildAmendmentPreparedCandidateWitness(ctx, request.Ref, request.Version, request.Fence, completed.Key)
+		if err != nil || !found || !reflect.DeepEqual(again, *preparedCandidate) {
 			return store.StoredWorktree{}, ErrAuthentication
 		}
 	}

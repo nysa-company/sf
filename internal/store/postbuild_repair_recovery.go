@@ -156,6 +156,9 @@ func postbuildRepairSupersededAt(ctx context.Context, q candidateEvidenceQuerier
 	if entry.Version == repair.EntryVersion {
 		return false, nil
 	}
+	if superseded, err := (&Store{}).postbuildAmendmentSupersededAt(ctx, q, ref, version, fence, live); err != nil || superseded {
+		return superseded, err
+	}
 	switch entry.Trigger {
 	case "amendment_accepted", "amendment_rejected":
 		boundary, err := loadVerificationAmendmentBoundaryAt(ctx, q, ref, version, fence, live)

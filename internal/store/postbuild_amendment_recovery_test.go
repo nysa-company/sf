@@ -16,8 +16,9 @@ import (
 )
 
 func TestPostbuildPendingAmendmentTwoRecoveriesAndDecision(t *testing.T) {
-	for _, accepted := range []bool{false, true} {
-		t.Run(fmt.Sprintf("accepted_%t", accepted), func(t *testing.T) {
+	for _, scenario := range []struct{ accepted, refresh bool }{{false, false}, {true, false}, {true, true}} {
+		accepted := scenario.accepted
+		t.Run(fmt.Sprintf("accepted_%t_refresh_%t", accepted, scenario.refresh), func(t *testing.T) {
 			db, ctx, request, builderKey, snapshot := postbuildAmendmentFixture(t)
 			entry, err := db.TransitionPostbuildVerificationAmendmentRequest(ctx, request, builderKey, snapshot)
 			if err != nil {
@@ -157,6 +158,9 @@ func TestPostbuildPendingAmendmentTwoRecoveriesAndDecision(t *testing.T) {
 			bound, err := db.PostbuildVerificationAmendmentContext(ctx, request.Ref, decided.Version, fence)
 			if err != nil || bound.Decision != want || bound.Reviewer != key || bound.Snapshot != snapshot {
 				t.Fatalf("decision context=%+v err=%v", bound, err)
+			}
+			if accepted {
+				assertPostbuildAmendmentCandidateHandoff(t, db, ctx, request.Ref, decided.Version, fence, scenario.refresh)
 			}
 		})
 	}

@@ -246,6 +246,11 @@ func (m RepositoryMaterializer) MaterializeCandidate(ctx context.Context, reques
 		// repository command while Store has no historical-command rebind.
 		return m.replayCandidate(ctx, request, verification, builder, *request.Candidate, parent)
 	}
+	if !repair {
+		if witness, found, err := m.replayPostbuildAmendmentPreparedCandidate(ctx, request, plan, verification, builder, key); found || err != nil {
+			return witness, err
+		}
+	}
 	if repair {
 		// A correction has its own immutable prepared-successor boundary. A
 		// restart after the old-fence command and confirmed Git child must only

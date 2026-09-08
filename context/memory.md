@@ -5,10 +5,14 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Portable tests/builds run only on GitHub. Candidate 8619514 corrects two fixture
-  defects discovered at d955ef1 (tagged onboarding helpers and effects column).
-  Hosted focused run 34284505456 is pending; full baseline 34283760341 at d955ef1
-  has failures and cannot qualify a release. No native campaign has started.
+  Portable tests/builds run only on GitHub. Current pushed candidate42886f7 adds
+  safe diagnostic causes; run34285851847 proves the composed admission's 15s
+  deadline expires at the final snapshot. Bounded budget repair and exact
+  post-amendment candidate finalization/recovery fixes are in progress, untested.
+  Prior d13db95 compiled onboarding and three prepared-checkpoint recovery cases
+  pass, but its focused run34284912043 fails intermittent admission. Full baseline
+  34285053550 is diagnostic for that old head; not final release acceptance.
+  No native campaign has started.
   Current source implements bounded independent postbuild repair, immutable
   amendment/checkpoint receipts, exact restart completion, actionable status,
   and clean-room onboarding. Passing layers are not end-to-end acceptance.

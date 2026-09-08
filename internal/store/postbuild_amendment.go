@@ -52,6 +52,9 @@ type PostbuildVerificationAmendmentContext struct {
 	Decision            VerificationAmendmentDecision
 	Reviewer            ProviderAttemptResultKey
 	CurrentVerification StoredVerification
+	// Candidate is an exact completed first candidate awaiting build_pass.
+	// Its presence permits only candidate replay, never retained-dirty admission.
+	Candidate *StoredCandidate
 }
 
 func PostbuildAmendmentProtectedPathsDigest(paths []string) (string, error) {

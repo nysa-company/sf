@@ -227,3 +227,29 @@ VERDICT: implementation design in progress; not cleared for merge.
   if encountered; never fabricate provider output or edit the runtime database
   to manufacture a passing campaign. Any deliberate interruptions, extra
   attempts, or undemonstrated cases must remain visible in the final report.
+
+## Execution checkpoint — independently found finalization gaps
+
+- d13db95 passes Go/Node and prepared-Python compiled submission/Queued checks.
+  Its three prepared-checkpoint recovery cases all passed in run 34284912043,
+  but accepted-amendment admission failed intermittently. The whole run failed.
+- Diagnostic-only 42886f7 preserved closed stage names and typed error causes,
+  without raw subprocess output or weaker checks. Run 34285851847 identified
+  `final physical snapshot` plus `context deadline exceeded`: three separately
+  bounded physical inspections competed for one shared 15-second deadline.
+  The repair keeps individual inspection bounds/caller cancellation and gives
+  the composed operation its own finite budget. It still needs hosted validation.
+- Independent authorship-crossed review found amendment context could reject a
+  recorded candidate before `build_pass`, and the earlier committed-but-not-
+  recorded child lacked a dedicated replay witness. Exact authenticated handoff
+  fixes and four real-flow crash regressions are in progress. Replay must issue
+  no new model, command, or Git commit. Valid later CI/base-refresh authority must
+  supersede the old amendment without permitting malformed-evidence fallback.
+- Full run 34285053550 is diagnostic for d13db95, not the forthcoming fixes.
+  Final exact-head full validation, independent re-review and native campaign
+  remain required. No native campaign or unfamiliar-human trial has begun.
+- The diagnostic restart group also exhausted its shared package deadline at
+  470 seconds: two cases passed before the third inherited the remaining time.
+  The three cases now have separate hosted jobs, each retaining the existing
+  eight-minute bound. No individual Git inspection timeout was increased.
+  Four separate commit-before-record/record-before-transition cases are added.

@@ -3,7 +3,6 @@ package worktreecoord
 import (
 	"context"
 	"reflect"
-	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/store"
@@ -28,7 +27,7 @@ func authenticatePreparedPostbuildAmendment(ctx context.Context, request EnsureR
 	if request.Ref.Validate() != nil || request.Version == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 || request.Fence.ClaimEpoch != 0 {
 		return store.StoredWorktree{}, ErrAuthentication
 	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, postbuildAmendmentAdmissionTimeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return store.StoredWorktree{}, err

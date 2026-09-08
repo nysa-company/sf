@@ -13,6 +13,7 @@ import (
 // admission nor restoration/commit permission; those require physical witnesses.
 func (s *Store) PostbuildVerificationAmendmentContext(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (PostbuildVerificationAmendmentContext, error) {
 	var value PostbuildVerificationAmendmentContext
+	superseded := false
 	if s == nil || ref.Validate() != nil || version == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 || fence.ClaimEpoch != 0 {
 		return value, ErrEvidenceConflict
 	}
@@ -32,6 +33,14 @@ func (s *Store) PostbuildVerificationAmendmentContext(ctx context.Context, ref d
 			}
 			value.Amendment = amendment
 		case domain.StateBuilding:
+			var supersedeErr error
+			superseded, supersedeErr = s.postbuildAmendmentSupersededAt(ctx, conn, ref, version, fence, true)
+			if supersedeErr != nil {
+				return supersedeErr
+			}
+			if superseded {
+				return ErrNotFound
+			}
 			boundary, err := loadVerificationAmendmentBoundary(ctx, conn, ref, version, fence)
 			if err != nil {
 				return err
@@ -49,9 +58,11 @@ func (s *Store) PostbuildVerificationAmendmentContext(ctx context.Context, ref d
 		if err != nil {
 			return err
 		}
-		if err := assertNoVerificationAmendmentDownstream(ctx, conn, ref); err != nil {
+		candidate, err := s.postbuildAmendmentCandidateHandoffFrom(ctx, conn, ref, version, fence, value)
+		if err != nil {
 			return err
 		}
+		value.Candidate = candidate
 		var future int
 		if conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM postbuild_amendment_snapshots WHERE channel=? AND project_id=? AND ticket_id=? AND amendment_transition_version>?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&future) != nil || future != 0 {
 			return ErrEvidenceConflict
@@ -76,7 +87,7 @@ func (s *Store) PostbuildVerificationAmendmentContext(ctx context.Context, ref d
 	if err != nil {
 		// An existing companion must never disappear behind a generic missing
 		// amendment/decision result: that would select an ordinary pristine lane.
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, ErrNotFound) && !superseded {
 			var count int
 			if s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM postbuild_amendment_snapshots WHERE channel=? AND project_id=? AND ticket_id=? AND amendment_transition_version<=?`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&count) != nil {
 				return PostbuildVerificationAmendmentContext{}, ErrEvidenceConflict
