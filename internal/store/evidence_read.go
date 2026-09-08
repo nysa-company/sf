@@ -205,17 +205,21 @@ func (s *Store) authenticateCandidateVerificationParentFrom(ctx context.Context,
 	}
 	builder, _, builderErr := s.loadHistoricalProviderAttemptResult(ctx, q, candidate.BuilderResult)
 	if builderErr == nil {
+		// A pending base refresh must authenticate its existing predecessor.
+		// That predecessor may already be a completed CI repair; the mere
+		// presence of the new, incomplete refresh cannot invalidate its exact
+		// immutable repair/parent/verification chain.
+		repair, repairErr := completedCandidateRepairContextAt(ctx, q, candidate, builder)
+		if repairErr == nil && candidate.Commit.ParentOID == repair.PredecessorHeadSHA && reflect.DeepEqual(repair.Verification, verification) {
+			return nil
+		}
 		if _, refreshErr := protectedBaseRefreshCandidateAt(ctx, q, candidate, builder); refreshErr == nil {
 			return nil
 		} else if !errors.Is(refreshErr, ErrNotFound) {
 			return ErrEvidenceConflict
 		}
 	}
-	repair, repairErr := completedCandidateRepairContextAt(ctx, q, candidate, builder)
-	if builderErr != nil || repairErr != nil || candidate.Commit.ParentOID != repair.PredecessorHeadSHA || !reflect.DeepEqual(repair.Verification, verification) {
-		return ErrEvidenceConflict
-	}
-	return nil
+	return ErrEvidenceConflict
 }
 
 // finalReviewCIAuthorityFrom authenticates the complete v43 CI chain using
