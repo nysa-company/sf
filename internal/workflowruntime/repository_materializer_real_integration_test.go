@@ -60,16 +60,23 @@ func newMaterializerRealFixtureWithProvider(t *testing.T, provider func(*testing
 	if runtime.GOOS != "darwin" {
 		t.Skip("guarded repository command execution is Darwin-only")
 	}
-	ctx := context.Background()
+	// Bound Store busy retries and child setup independently of the package's
+	// timeout, so a failed fixture reports its own boundary before job teardown.
+	deadline := time.Now().Add(8 * time.Minute)
+	if testDeadline, ok := t.Deadline(); ok && testDeadline.Add(-10*time.Second).Before(deadline) {
+		deadline = testDeadline.Add(-10 * time.Second)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	t.Cleanup(cancel)
 	repository, worktree, base := newMaterializerGitFixture(t)
 	helper := filepath.Join(t.TempDir(), "sf-git-exec")
 	sfBinary := filepath.Join(t.TempDir(), "sf")
-	build := exec.Command("go", "build", "-o", helper, "./cmd/sf-git-exec")
+	build := exec.CommandContext(ctx, "go", "build", "-o", helper, "./cmd/sf-git-exec")
 	build.Dir = repoRoot(t)
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build git helper: %v: %s", err, output)
 	}
-	build = exec.Command("go", "build", "-o", sfBinary, "./cmd/sf")
+	build = exec.CommandContext(ctx, "go", "build", "-o", sfBinary, "./cmd/sf")
 	build.Dir = repoRoot(t)
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build sf gate: %v: %s", err, output)

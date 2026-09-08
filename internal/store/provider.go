@@ -1828,6 +1828,25 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if request.Phase == domain.PhaseBuild && live.State == domain.StateBuilding {
 		repair, repairErr := latestPostbuildRepairAt(ctx, s.db, request.Ref, request.ExpectedVersion)
 		if repairErr == nil {
+			entry, entryErr := loadProviderPhaseEntryAt(ctx, s.db, request.Ref, domain.PhaseBuild, request.ExpectedVersion)
+			if entryErr != nil {
+				return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+			}
+			if entry.Trigger == "amendment_accepted" {
+				boundary, boundaryErr := loadVerificationAmendmentBoundary(ctx, s.db, request.Ref, request.ExpectedVersion, request.Fence)
+				if boundaryErr != nil || boundary.Decision != VerificationAmendmentAccepted || boundary.DecisionVersion != entry.Version {
+					return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+				}
+				binding, _, bindingErr := loadPostbuildAmendmentBinding(ctx, s.db, boundary.Amendment)
+				if bindingErr != nil || binding.RepairEntryVersion != repair.EntryVersion {
+					return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+				}
+				// Acceptance starts a fresh Building entry. The requesting Builder
+				// is retained provenance, never work completed under the new proof.
+				if historical.Claim.ExpectedVersion < entry.Version {
+					return LatestReusableProviderAttemptResult{}, ErrNotFound
+				}
+			}
 			if historical.Claim.ExpectedVersion < repair.EntryVersion || historical.Claim.ID <= repair.BuilderResult.AttemptID || historical.Claim.Attempt <= repair.BuilderResult.Attempt {
 				return LatestReusableProviderAttemptResult{}, ErrNotFound
 			}

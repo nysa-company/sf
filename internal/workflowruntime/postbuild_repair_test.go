@@ -42,8 +42,16 @@ func TestRepositoryMaterializerPostbuildRepairRealEndToEnd(t *testing.T) {
 	}
 	assertMaterializerProviderAttempts(t, f.db, f.ref, 3)
 	repair, err := f.db.PostbuildRepairBuildContext(f.ctx, f.ref, failed.Version, f.fence)
-	if err != nil || repair.Repair.OriginalCheckpointOID != original.Checkpoint.CommitOID || !reflect.DeepEqual(repair.Verification, original) {
-		t.Fatalf("repair lost original verification: context=%+v err=%v", repair, err)
+	if err != nil {
+		t.Fatalf("repair context: %v", err)
+	}
+	// The repair deliberately freezes the earliest pre-consumption binding;
+	// CurrentVerification may project the same immutable proof at a later fence.
+	// Compare all immutable fields, and separately bound the historical tuple.
+	retainedProjection := repair.Verification
+	retainedProjection.TicketVersion, retainedProjection.Fence = original.TicketVersion, original.Fence
+	if repair.Repair.OriginalCheckpointOID != original.Checkpoint.CommitOID || repair.Verification.TicketVersion == 0 || repair.Verification.TicketVersion > original.TicketVersion || repair.Verification.Fence != original.Fence || !reflect.DeepEqual(retainedProjection, original) {
+		t.Fatalf("repair changed immutable proof: revision_equal=%t checkpoint_equal=%t provider_equal=%t command_equal=%t historical_version=%d original_version=%d", reflect.DeepEqual(repair.Verification.Revision, original.Revision), repair.Verification.Checkpoint == original.Checkpoint, repair.Verification.ProviderResult == original.ProviderResult, repair.Verification.CommandBinding == original.CommandBinding, repair.Verification.TicketVersion, original.TicketVersion)
 	}
 	coordinator := worktreecoord.Coordinator{Store: f.db, Git: f.materializer.Git}
 	admitted, err := coordinator.AuthenticatePostbuildRepair(f.ctx, worktreecoord.EnsureRequest{Ref: f.ref, Version: failed.Version, Fence: f.fence})

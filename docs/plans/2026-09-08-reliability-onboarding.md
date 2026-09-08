@@ -181,8 +181,11 @@ VERDICT: implementation design in progress; not cleared for merge.
   reclaim, and a dedicated resume path that cannot launch another Reviewer.
 - Hosted runs 34279182024 and 34279850246 failed. The first exposed an incorrect
   late-result test expectation; the second exposed receipt authentication in the
-  accepted fixture. Neither is counted as acceptance. Run 34280718207 is pending
-  for the revised tests and stage-specific authentication diagnostics.
+  accepted fixture. Neither is counted as acceptance. Run 34280718207 also failed:
+  snapshot fixtures passed raw instead of typed digests, retained-file fixtures
+  did not advance their local bare remote, and accepted amendment reused its
+  requesting Builder. The runtime package additionally exhausted its cumulative
+  ten-minute timeout. The next run separates isolated hosted validation groups.
 - Source review found ordinary startup commit observation could confirm HEAD
   before protected index synchronization. Startup now defers only an authenticated
   checkpoint intent to its dedicated completion path. Dangling receipts and

@@ -51,7 +51,7 @@ func postbuildCheckpointReclaimFixture(t *testing.T) (*Store, context.Context, G
 	intentBytes, _ := workflowprompt.CanonicalVerificationIntentBytes(artifact)
 	proofBytes, _ := workflowprompt.CanonicalVerificationProofBytes(artifact)
 	commandKey := completeEvidenceRepositoryCommand(t, db, ctx, RepositoryCommandPurposePrebuildVerification, request.Ref, entry.Version, request.Fence, key, sha256Digest(intentBytes), sha256Digest(proofBytes), "", "", 1)
-	if _, err := db.RecordPostbuildAmendmentCheckpointSnapshot(ctx, request.Ref, entry.Version, request.Fence, key, commandKey, sha256Digest([]byte("accepted-checkpoint"))); err != nil {
+	if _, err := db.RecordPostbuildAmendmentCheckpointSnapshot(ctx, request.Ref, entry.Version, request.Fence, key, commandKey, repositoryResultDigest([]byte("accepted-checkpoint"))); err != nil {
 		t.Fatal(err)
 	}
 	command, err := db.LoadRepositoryCommandResult(ctx, commandKey)

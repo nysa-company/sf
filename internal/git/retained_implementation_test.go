@@ -22,6 +22,9 @@ func TestRetainedImplementationSurvivesProtectedChangesAndCheckpointCommit(t *te
 	}
 	rawGit(t, repository, "add", ".")
 	rawGit(t, repository, "commit", "-m", "original checkpoint")
+	// CreateWorktree authenticates the remote base; publish this fixture-only
+	// checkpoint so createClaim's local main names that same exact object.
+	rawGit(t, repository, "push", "origin", "main:refs/heads/main")
 	branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-implementation")
 	if err != nil {
 		t.Fatal(err)
@@ -112,6 +115,7 @@ func TestRetainedImplementationRejectsUnsafeInventoryAndBaseline(t *testing.T) {
 				}
 				rawGit(t, repository, "add", ".")
 				rawGit(t, repository, "commit", "-m", "tracked symlink")
+				rawGit(t, repository, "push", "origin", "main:refs/heads/main")
 			}
 			branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-implementation-refusal")
 			if err != nil {

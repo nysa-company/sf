@@ -107,7 +107,7 @@ func TestPostbuildPendingAmendmentTwoRecoveriesAndDecision(t *testing.T) {
 				if _, err := db.RecordVerification(ctx, VerificationArtifact{Ref: request.Ref, ExpectedVersion: version, Fence: fence, Intent: intent, Proof: proofBytes, OwnedFiles: artifact.OwnedFiles, CheckpointID: checkpoint, ProviderResult: &key, Checkpoint: CommitObservation{CommitOID: checkpoint, ParentOID: original.Repair.OriginalCheckpointOID, TreeOID: strings.Repeat("f", 40)}, CommandResult: command}); !errors.Is(err, ErrEvidenceConflict) {
 					t.Fatalf("accepted checkpoint without snapshot = %v", err)
 				}
-				receipt, err := db.RecordPostbuildAmendmentCheckpointSnapshot(ctx, request.Ref, version, fence, key, command, sha256Digest([]byte("accepted-reviewer-snapshot")))
+				receipt, err := db.RecordPostbuildAmendmentCheckpointSnapshot(ctx, request.Ref, version, fence, key, command, repositoryResultDigest([]byte("accepted-reviewer-snapshot")))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -115,10 +115,10 @@ func TestPostbuildPendingAmendmentTwoRecoveriesAndDecision(t *testing.T) {
 				if err != nil || loaded != receipt || receipt.ImplementationDigest != snapshot.ImplementationDigest {
 					t.Fatalf("checkpoint receipt = %+v, %v", loaded, err)
 				}
-				if _, err := db.RecordPostbuildAmendmentCheckpointSnapshot(ctx, request.Ref, version, fence, key, command, sha256Digest([]byte("changed-reviewer-snapshot"))); !errors.Is(err, ErrEvidenceConflict) {
+				if _, err := db.RecordPostbuildAmendmentCheckpointSnapshot(ctx, request.Ref, version, fence, key, command, repositoryResultDigest([]byte("changed-reviewer-snapshot"))); !errors.Is(err, ErrEvidenceConflict) {
 					t.Fatalf("recapture changed bytes = %v", err)
 				}
-				if _, err := db.db.ExecContext(ctx, `UPDATE postbuild_amendment_checkpoint_snapshots SET full_snapshot_digest=? WHERE channel=? AND project_id=? AND ticket_id=?`, sha256Digest([]byte("tamper")), request.Ref.Channel, request.Ref.Project, request.Ref.Ticket); err == nil {
+				if _, err := db.db.ExecContext(ctx, `UPDATE postbuild_amendment_checkpoint_snapshots SET full_snapshot_digest=? WHERE channel=? AND project_id=? AND ticket_id=?`, repositoryResultDigest([]byte("tamper")), request.Ref.Channel, request.Ref.Project, request.Ref.Ticket); err == nil {
 					t.Fatal("mutable checkpoint receipt")
 				}
 				if _, err := db.RecordVerification(ctx, VerificationArtifact{Ref: request.Ref, ExpectedVersion: version, Fence: fence, Intent: intent, Proof: proofBytes, OwnedFiles: artifact.OwnedFiles, CheckpointID: checkpoint, ProviderResult: &key, Checkpoint: CommitObservation{CommitOID: checkpoint, ParentOID: original.Repair.OriginalCheckpointOID, TreeOID: strings.Repeat("f", 40)}, CommandResult: command}); err != nil {
@@ -148,6 +148,11 @@ func TestPostbuildPendingAmendmentTwoRecoveriesAndDecision(t *testing.T) {
 			}
 			if _, err := db.PostbuildRepairContext(ctx, request.Ref, decided.Version, fence); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("repair prompt not superseded: %v", err)
+			}
+			if accepted {
+				if _, err := db.LatestReusableProviderAttempt(ctx, LatestReusableProviderAttemptRequest{Ref: request.Ref, Phase: domain.PhaseBuild, Role: "builder", ExpectedVersion: decided.Version, Fence: fence}); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("requesting Builder reused after accepted fresh entry: %v", err)
+				}
 			}
 			bound, err := db.PostbuildVerificationAmendmentContext(ctx, request.Ref, decided.Version, fence)
 			if err != nil || bound.Decision != want || bound.Reviewer != key || bound.Snapshot != snapshot {

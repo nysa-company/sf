@@ -3,17 +3,7 @@ name: recovery-candidate
 on:
   pull_request:
     paths:
-      - internal/store/**
-      - internal/git/**
-      - internal/engine/**
-      - internal/statemachine/**
-      - internal/worktreecoord/**
-      - internal/workflowprompt/**
-      - internal/workflowruntime/**
-      - internal/workflowworker/**
-      - internal/daemon/**
-      - internal/cli/**
-      - internal/config/**
+      - internal/**
       - cmd/sf/compiled_first_use_matrix_test.go
       - docs/tutorials/first-ticket.md
       - .github/workflows/recovery-candidate.yml
@@ -23,9 +13,13 @@ permissions:
   contents: read
 
 jobs:
-  recovery-candidate:
+  validation:
     runs-on: macos-14
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [store, git, admission, behavior, runtime-repair, runtime-amendment, runtime-recovery, onboarding]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,51 +35,62 @@ jobs:
           setup_go=$(command -v go)
           sudo mkdir -p /usr/local/go/bin
           sudo ln -sfn "$setup_go" /usr/local/go/bin/go
-      - name: Test reservation and restart regressions
-        id: reservation
-        continue-on-error: true
-        run: go test -p 1 -count=1 ./internal/store -run 'Test(ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)$' -v
-      - name: Test bounded completed-Builder readmission
-        id: admission
-        continue-on-error: true
-        run: go test -p 1 -count=1 ./internal/worktreecoord
-      - name: Test bounded repair authority and retained file identity
-        id: authority
-        continue-on-error: true
-        run: |
-          failures=0
-          check() { "$@" || failures=1; }
-          check go test -p 1 -count=1 ./internal/statemachine ./internal/engine
-          check go test -p 1 -count=1 ./internal/store -run 'Test(Postbuild|TransitionPostbuild)' -v
-          check go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v
-          exit "$failures"
-      - name: Test proof consistency and actionable status
-        id: behavior
-        continue-on-error: true
-        run: |
-          failures=0
-          check() { "$@" || failures=1; }
-          check go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
-          check go test -p 1 -count=1 ./internal/store -run '^TestAuthenticatePostbuildFailure' -v
-          check go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|PostbuildCommandFailure|Daemon.*Prepared)' -v
-          check go test -p 1 -count=1 ./internal/workflowruntime -run '^TestPostbuildCommandError' -v
-          check go test -p 1 -count=1 ./internal/workflowworker -run '^TestRealStoreCompletedBuilderPostbuildFailure' -v
-          check go test -p 1 -count=1 ./internal/workflowworker -run 'Test(OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment|ResumePreparedPostbuild)' -v
-          check go test -p 1 -count=1 ./internal/workflowruntime -run 'Test(SchedulerPostbuild|SchedulerPreparedPostbuild|SchedulerCompletedPostbuildRepair|SchedulerReplaysRejectedAmendment|RepositoryMaterializerPreparePostbuildRepair|RepositoryMaterializerPostbuildRepair|RepositoryMaterializerPostbuildAmendment|ProtectedAmendment)' -v
-          check go test -p 1 -count=1 ./internal/localruntime -run '^TestPostbuildAmendmentDispatch' -v
-          exit "$failures"
-      - name: Check first-use compatibility and documented command order
-        id: onboarding
-        continue-on-error: true
-        run: |
-          scripts/docs-smoke
-          go test -p 1 -count=1 ./cmd/sf -run '^TestCompiledDevFirstUseStackMatrixIsLocalAndHonest$' -v
-      - name: Require every validation group
-        if: always()
+      - name: Run isolated validation group
         env:
-          VALIDATION: ${{ toJSON(steps) }}
+          GROUP: ${{ matrix.group }}
         run: |
-          jq -e '[.reservation.outcome, .admission.outcome, .authority.outcome, .behavior.outcome, .onboarding.outcome] | all(. == "success")' <<< "$VALIDATION"
+          set -eu
+          case "$GROUP" in
+            store)
+              go test -p 1 -count=1 ./internal/statemachine ./internal/engine
+              go test -p 1 -count=1 ./internal/store -run 'Test(Postbuild|TransitionPostbuild|AuthenticatePostbuildFailure|ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)' -v
+              ;;
+            git)
+              go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v
+              ;;
+            admission)
+              go test -p 1 -count=1 ./internal/worktreecoord
+              ;;
+            behavior)
+              go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
+              go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|PostbuildCommandFailure|Daemon.*Prepared)' -v
+              go test -p 1 -count=1 ./internal/workflowworker -run 'Test(RealStoreCompletedBuilderPostbuildFailure|OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment|ResumePreparedPostbuild)' -v
+              go test -p 1 -count=1 ./internal/localruntime -run '^TestPostbuildAmendmentDispatch' -v
+              ;;
+            runtime-repair)
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run 'Test(PostbuildCommandError|SchedulerPostbuild|SchedulerPreparedPostbuild|SchedulerCompletedPostbuildRepair|SchedulerReplaysRejectedAmendment|RepositoryMaterializerPreparePostbuildRepair|RepositoryMaterializerPostbuildRepair)' -v
+              ;;
+            runtime-amendment)
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run 'Test(RepositoryMaterializerPostbuildAmendmentRealEndToEnd|ProtectedAmendment)' -v
+              ;;
+            runtime-recovery)
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run '^TestRepositoryMaterializerPostbuildAmendmentPreparedIndexRecovery$' -v
+              ;;
+            onboarding)
+              scripts/docs-smoke
+              go test -p 1 -count=1 ./cmd/sf -run '^TestCompiledDevFirstUseStackMatrixIsLocalAndHonest$' -v
+              ;;
+            *) echo "Unknown validation group" >&2; exit 1 ;;
+          esac
+
+  candidate:
+    if: always()
+    needs: validation
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - name: Require every validation group
+        env:
+          VALIDATION_RESULT: ${{ needs.validation.result }}
+        run: test "$VALIDATION_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Build exact native development candidate
         run: |
           set -eu
