@@ -11,11 +11,38 @@ import (
 )
 
 func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *testing.T) {
-	for _, state := range []domain.State{domain.StateReviewing, domain.StateWaitingApproval} {
-		t.Run(string(state), func(t *testing.T) {
+	for _, tc := range []struct {
+		name                          string
+		state                         domain.State
+		restartWaiting, restartReview bool
+		pendingRestarts               int
+	}{
+		{"reviewing", domain.StateReviewing, false, false, 2},
+		{"waiting_approval", domain.StateWaitingApproval, true, false, 2},
+		{"reviewing_restart_then_fresh_pass", domain.StateWaitingApproval, false, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := tc.state
 			completed := newCompletedCandidateRepairTestFixture(t)
-			f := completedCandidateRepairReviewingFixtureWithRestart(t, completed, state == domain.StateWaitingApproval)
+			f := completedCandidateRepairReviewingFixtureWithRestart(t, completed, tc.restartWaiting)
 			defer f.db.Close()
+			if tc.restartReview {
+				leader, err := f.db.AcquireLeader(f.ctx, f.ticket.Ref.Channel, "review-before-refresh")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if changed, err := f.db.FenceRecoveredRunners(f.ctx, f.ticket.Ref.Channel, leader); err != nil || changed != 1 {
+					t.Fatalf("review restart: changed=%d err=%v", changed, err)
+				}
+				if err := f.db.RebindRecoveredPublishedCandidates(f.ctx, f.ticket.Ref.Channel, leader); err != nil {
+					t.Fatal(err)
+				}
+				f.ticket, err = f.db.Ticket(f.ctx, f.ticket.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: f.ticket.RunnerEpoch}
+			}
 			current := f.ticket
 			if state == domain.StateWaitingApproval {
 				completeFinalReview(t, f)
@@ -53,7 +80,7 @@ func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *test
 				t.Fatalf("reservation invalidated predecessor: found=%t err=%v", found, err)
 			}
 			currentFence := f.fence
-			for restart := 0; restart < 2; restart++ {
+			for restart := 0; restart < tc.pendingRestarts; restart++ {
 				prior := current
 				priorFence := currentFence
 				leader, err := f.db.AcquireLeader(f.ctx, current.Ref.Channel, "pending-ci-repair-refresh")
