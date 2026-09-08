@@ -1,10 +1,13 @@
 package store
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	gitboundary "github.com/nysa-company/sf/internal/git"
 )
 
 func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *testing.T) {
@@ -90,6 +93,10 @@ func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *test
 			if err != nil {
 				t.Fatal(err)
 			}
+			preparedHead := strings.Repeat("8", 40)
+			if err := lease.(contracts.GitBaseRefreshPreparationLease).RecordBaseRefreshPreparation(f.ctx, preparedHead, strings.Repeat("7", 40), [2]string{refreshClaim.ExpectedHeadOID, refreshClaim.ExpectedBaseOID}); err != nil {
+				t.Fatal(err)
+			}
 			if err := lease.Release(); err != nil {
 				t.Fatal(err)
 			}
@@ -101,6 +108,29 @@ func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *test
 			after, err := f.db.Ticket(f.ctx, current.Ref)
 			if err != nil || after.Version != current.Version || after.State != state {
 				t.Fatal("reservation changed lifecycle before completed refresh")
+			}
+			if _, err := f.db.ConfirmEffect(f.ctx, EffectFence{SemanticKey: refreshClaim.SemanticKey, Ref: current.Ref, TicketVersion: current.Version, Fence: domain.Fence{LeaderEpoch: currentFence.LeaderEpoch, RunnerEpoch: currentFence.RunnerEpoch, ClaimEpoch: refreshClaim.ClaimEpoch}}, preparedHead); err != nil {
+				t.Fatal(err)
+			}
+			worktree, err := f.db.Worktree(f.ctx, current.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var identity gitboundary.Identity
+			if err := json.Unmarshal(worktree.IdentityJSON, &identity); err != nil {
+				t.Fatal(err)
+			}
+			identity.BaseHead = base
+			encoded, err := json.Marshal(identity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			completion, err := f.db.CompleteProtectedBaseRefresh(f.ctx, refreshClaim, encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateRunnerRecoveryAuthority(f.ctx, f.db.db, current.Ref, completion.Version, completion.Fence); err != nil {
+				t.Fatalf("completed refresh invalidated fresh Builder recovery authority: %v", err)
 			}
 		})
 	}
