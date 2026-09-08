@@ -1728,6 +1728,7 @@ const (
 	providerRepairUnavailableCode           = "provider_repair_unavailable"
 	postbuildCommandFailedBlockerCode       = "postbuild_command_failed"
 	verificationAmendmentInvalidBlockerCode = "verification_amendment_invalid"
+	postbuildAmendmentRejectedBlockerCode   = "postbuild_amendment_rejected"
 	legacyCandidateRepairUnverifiableCode   = "legacy_candidate_repair_recovery_unverifiable"
 	providerTerminalBlockerSchema           = "sf.provider-terminal-blocker/v1"
 )
@@ -1773,7 +1774,7 @@ func nonRecoverableProviderBlockerCode(code string) bool {
 // command. Both remain on the generic typed-block writer while refusing every
 // recovery path.
 func nonRecoverableBlockedRecoveryCode(code string) bool {
-	return nonRecoverableProviderBlockerCode(code) || code == postbuildCommandFailedBlockerCode || code == verificationAmendmentInvalidBlockerCode || code == legacyCandidateRepairUnverifiableCode
+	return nonRecoverableProviderBlockerCode(code) || code == postbuildCommandFailedBlockerCode || code == verificationAmendmentInvalidBlockerCode || code == postbuildAmendmentRejectedBlockerCode || code == legacyCandidateRepairUnverifiableCode
 }
 
 func providerRoleForPhase(phase domain.Phase) string {

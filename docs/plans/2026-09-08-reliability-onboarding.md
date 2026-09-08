@@ -156,3 +156,21 @@ VERDICT: implementation design in progress; not cleared for merge.
 - Remaining acceptance: complete hosted composition/negative/restart checks,
   independent exact-head review, then four native Relay tickets at capacity two.
   Neither the four-ticket campaign nor an unfamiliar human setup trial has run.
+
+## Execution checkpoint — independent amendment handoff
+
+- Hosted [34275904089](https://github.com/nysa-company/sf/actions/runs/34275904089)
+  passed at 378072a for connected bounded repair, Store recovery, admission,
+  prompt/status and first-use checks. Its localruntime selection was incorrectly
+  named and selected no tests; the next workflow fixes that selection explicitly.
+- The next slice adds immutable amendment/physical-checkpoint receipts, retained
+  implementation fingerprints, protected-only commits, and independent rejection
+  disposition. Reviewer-written corrected tests must be authenticated after the
+  Reviewer and command complete; the earlier Builder snapshot is not substituted.
+- A rejected amendment retains the original proof and files, then stops with
+  `postbuild_amendment_rejected`. It does not grant another Builder admission or
+  silently restore files. Decision-before-block recovery must dispatch only this
+  narrow disposition, not a provider or worktree mutation.
+- Open acceptance blocker: protected checkpoint crash recovery must authenticate
+  both ref and index completion. A prepared object alone does not prove index
+  synchronization. Source work is not a passing hosted or native result.

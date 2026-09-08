@@ -1193,6 +1193,16 @@ func providerResultReachesFenceAt(ctx context.Context, q interface {
 	if key.Ref != claim.Ref || key.Phase != claim.Phase || key.AttemptID != claim.ID || key.Attempt != claim.Attempt || !providerRoleMatchesPhase(claim.Phase, claim.Role) || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
 		return ErrStaleFence
 	}
+	if claim.Phase == domain.PhaseVerification && claim.Role == "reviewer" {
+		amendment, amendmentErr := postbuildPendingAmendmentAt(ctx, q, key.Ref, expected, fence)
+		if amendmentErr == nil {
+			if claim.ExpectedVersion < amendment.TransitionTicketVersion {
+				return ErrStaleFence
+			}
+		} else if !errors.Is(amendmentErr, ErrNotFound) {
+			return ErrStaleFence
+		}
+	}
 	if claim.Phase == domain.PhaseBuild && claim.Role == "builder" {
 		repair, repairErr := latestPostbuildRepairAt(ctx, q, key.Ref, expected)
 		if repairErr == nil {

@@ -372,6 +372,57 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 				}
 			}
 		}
+		if ticket.State == domain.StateBuilding || ticket.State == domain.StateVerifying {
+			if source, ok := s.Tickets.(postbuildVerificationContextSource); ok {
+				amendment, amendmentErr := source.PostbuildVerificationAmendmentContext(runCtx, ticket.Ref, ticket.Version, candidateFence)
+				if amendmentErr == nil {
+					if amendment.Decision == store.VerificationAmendmentRejected {
+						stopper, supported := s.Worker.(rejectedPostbuildAmendmentStopper)
+						if !supported {
+							end()
+							return TickResult{Outcome: OutcomeReadiness, Ref: ticket.Ref, Ticket: ticket, Fence: candidateFence, Err: ErrReadiness}
+						}
+						result.Worker, amendmentErr = stopper.StopRejectedPostbuildAmendment(runCtx, ticket.Ref, ticket.Version, candidateFence)
+						end()
+						if amendmentErr != nil {
+							result.Outcome, result.Err = classifyWorker(amendmentErr)
+						} else {
+							result.Outcome = OutcomeInvoked
+						}
+						return result
+					}
+					authenticator, supported := s.Worktrees.(postbuildVerificationAuthenticator)
+					if !supported {
+						end()
+						return TickResult{Outcome: OutcomeReadiness, Ref: ticket.Ref, Ticket: ticket, Fence: candidateFence, Err: ErrReadiness}
+					}
+					worktree, authErr := authenticator.AuthenticatePostbuildVerificationAmendment(runCtx, worktreecoord.EnsureRequest{Ref: ticket.Ref, Version: ticket.Version, Fence: candidateFence})
+					if authErr != nil {
+						end()
+						result.Outcome, result.Err = classifyEnsure(authErr)
+						return result
+					}
+					if runCtx.Err() != nil {
+						end()
+						result.Outcome, result.Err = OutcomeCanceled, ErrCanceled
+						return result
+					}
+					result.Worktree = worktree
+					result.Worker, amendmentErr = s.Worker.Run(runCtx, ticket.Ref, candidateFence)
+					end()
+					if amendmentErr != nil {
+						result.Outcome, result.Err = classifyWorker(amendmentErr)
+					} else {
+						result.Outcome = OutcomeInvoked
+					}
+					return result
+				}
+				if !errors.Is(amendmentErr, store.ErrNotFound) {
+					end()
+					return classify(amendmentErr, candidateFence, ticket.Ref)
+				}
+			}
+		}
 		if ticket.State == domain.StateBuilding {
 			if source, ok := s.Tickets.(postbuildRepairContextSource); ok {
 				_, repairErr := source.PostbuildRepairContext(runCtx, ticket.Ref, ticket.Version, candidateFence)

@@ -35,6 +35,7 @@ import (
 // repository supervisor is Darwin-only and the test must not turn a Linux
 // fallback into evidence that the production composition is executable.
 type materializerRealFixture struct {
+	databasePath string
 	ctx          context.Context
 	db           *store.Store
 	worktree     string
@@ -69,17 +70,26 @@ func newMaterializerRealFixture(t *testing.T, failBuild bool) materializerRealFi
 	if err := os.MkdirAll(runner.Home, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	databasePath := filepath.Join(t.TempDir(), "workflow.sqlite")
+	db, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	canonicalPath, err := db.TicketWorktreePath(domain.TicketRef{Channel: domain.ChannelDev, Project: "real", Ticket: "SF-real-materializer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(canonicalPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runMaterializerGit(t, repository, "worktree", "move", worktree, canonicalPath)
+	worktree = canonicalPath
 	identity, err := runner.Snapshot(ctx, worktree, "main")
 	if err != nil {
 		t.Fatalf("snapshot worktree: %v", err)
 	}
 	base = identity.BaseHead
-
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
 	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("real", repository), config.TicketOverride{})
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +188,7 @@ func newMaterializerRealFixture(t *testing.T, failBuild bool) materializerRealFi
 	supervisor := processsupervisor.RepositoryCommandSupervisor{Executable: sfBinary, GitRunner: runner, SoftDrain: time.Second, HardDrain: time.Second}
 	materializer := workflowruntime.RepositoryMaterializer{Store: db, Git: git.Runner{Home: runner.Home, ExecHelper: helper, TestLocalTransport: true, MutationAuthority: db}, Executor: repositoryexec.Executor{Authority: materializerDiagnosticAuthority{Store: db, t: t}, Supervisor: supervisor}}
 	worker := workflowworker.Worker{Evidence: db, Engine: state, Runner: providers, Checkpoint: materializer, Candidate: materializer, CheckpointMaterializer: materializer, CandidateMaterializer: materializer}
-	return materializerRealFixture{ctx: ctx, db: db, worktree: worktree, ref: ref, fence: fence, leader: leader, materializer: materializer, worker: worker, state: state}
+	return materializerRealFixture{databasePath: databasePath, ctx: ctx, db: db, worktree: worktree, ref: ref, fence: fence, leader: leader, materializer: materializer, worker: worker, state: state}
 }
 
 func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
@@ -827,7 +837,10 @@ fi
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}'
 `
 	if failBuild {
-		script = strings.Replace(script, "func TestFeature(t *testing.T) {}", "func TestFeature(t *testing.T) { t.Fatal(\"postbuild regression remains\") }", 1)
+		// Only the authenticated repair context allows this fixture's next
+		// Builder to repair the regression; ordinary Builder calls stay red.
+		script = strings.Replace(script, "  printf '%s\\n' 'package example", "  feature='func TestFeature(t *testing.T) { t.Fatal(\"postbuild regression remains\") }'\n  if printf '%s' \"$prompt\" | grep -q 'sf.postbuild_repair/v1'; then feature='func TestFeature(t *testing.T) {}'; fi\n  printf '%s\\n' 'package example", 1)
+		script = strings.Replace(script, "func TestFeature(t *testing.T) {}\n' > tracked_test.go", "'\"$feature\"'\n' > tracked_test.go", 1)
 	}
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)

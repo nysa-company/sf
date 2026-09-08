@@ -3,7 +3,7 @@ package store
 // v61 records a new pre-publication Builder entry without changing the completed
 // predecessor. These structural bindings are not admission authority: the Store
 // transition must authenticate the command outcome, retained edits and fences.
-var migrationV61 = []string{
+var migrationV61 = append([]string{
 	`CREATE TABLE postbuild_repair_entries (
 		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
 		entry_ticket_version INTEGER NOT NULL CHECK(entry_ticket_version>0),
@@ -34,4 +34,4 @@ var migrationV61 = []string{
 	`CREATE UNIQUE INDEX postbuild_repair_entries_binding_digest ON postbuild_repair_entries(binding_digest)`,
 	`CREATE TRIGGER postbuild_repair_entries_immutable_update BEFORE UPDATE ON postbuild_repair_entries BEGIN SELECT RAISE(ABORT,'postbuild repair entry is immutable'); END`,
 	`CREATE TRIGGER postbuild_repair_entries_immutable_delete BEFORE DELETE ON postbuild_repair_entries BEGIN SELECT RAISE(ABORT,'postbuild repair entry is append-only'); END`,
-}
+}, postbuildAmendmentSchema...)

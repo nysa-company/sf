@@ -1,10 +1,12 @@
 package workflowruntime_test
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -13,7 +15,95 @@ import (
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/workflowprompt"
 	"github.com/nysa-company/sf/internal/workflowworker"
+	"github.com/nysa-company/sf/internal/worktreecoord"
 )
+
+func TestRepositoryMaterializerPostbuildRepairRealEndToEnd(t *testing.T) {
+	f := newMaterializerRealFixture(t, true)
+	// The fault wrapper intentionally exposes only the older engine contract.
+	// Exercise the concrete engine's optional postbuild transition here.
+	f.worker.Engine = f.state.StateMachine
+	for _, want := range []domain.State{domain.StateVerifying, domain.StateBuilding} {
+		if result, err := f.worker.Run(f.ctx, f.ref, f.fence); err != nil || result.State != want {
+			t.Fatalf("setup result=%+v want=%s err=%v", result, want, err)
+		}
+	}
+	original, err := f.db.CurrentVerification(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := f.db.Ticket(f.ctx, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err := f.worker.Run(f.ctx, f.ref, f.fence)
+	if err != nil || failed.State != domain.StateBuilding || failed.Version != before.Version+1 || !failed.Transitioned {
+		t.Fatalf("failed build must enter a new repair entry: result=%+v err=%v", failed, err)
+	}
+	assertMaterializerProviderAttempts(t, f.db, f.ref, 3)
+	repair, err := f.db.PostbuildRepairBuildContext(f.ctx, f.ref, failed.Version, f.fence)
+	if err != nil || repair.Repair.OriginalCheckpointOID != original.Checkpoint.CommitOID || !reflect.DeepEqual(repair.Verification, original) {
+		t.Fatalf("repair lost original verification: context=%+v err=%v", repair, err)
+	}
+	coordinator := worktreecoord.Coordinator{Store: f.db, Git: f.materializer.Git}
+	admitted, err := coordinator.AuthenticatePostbuildRepair(f.ctx, worktreecoord.EnsureRequest{Ref: f.ref, Version: failed.Version, Fence: f.fence})
+	if err != nil || admitted.Path != f.worktree {
+		t.Fatalf("exact retained checkout admission=%+v err=%v", admitted, err)
+	}
+	if _, err := f.db.LatestCandidate(f.ctx, f.ref); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("failed build created candidate: %v", err)
+	}
+	// Read-only observations of the real database, never fabricated evidence.
+	observations, err := sql.Open("sqlite", "file:"+f.databasePath+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observations.Close()
+	count := func(query string) int {
+		t.Helper()
+		var value int
+		if err := observations.QueryRowContext(f.ctx, query, f.ref.Channel, f.ref.Project, f.ref.Ticket).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	commandsSQL := `SELECT COUNT(*) FROM repository_command_results WHERE channel=? AND project_id=? AND ticket_id=?`
+	commandsBefore := count(commandsSQL)
+	result, err := f.worker.Run(f.ctx, f.ref, f.fence)
+	if err != nil || result.State != domain.StatePublishing || !result.Transitioned {
+		t.Fatalf("fresh repair Builder did not publish: result=%+v err=%v", result, err)
+	}
+	assertMaterializerProviderAttempts(t, f.db, f.ref, 4)
+	candidate, err := f.db.RecoverableCandidate(f.ctx, f.ref)
+	if err != nil || candidate.BuilderResult.AttemptID <= repair.Builder.AttemptID {
+		t.Fatalf("candidate reused failed Builder: candidate=%+v err=%v", candidate, err)
+	}
+	retained, err := f.db.RecoverableVerification(f.ctx, f.ref)
+	if err != nil || !reflect.DeepEqual(retained.Revision, original.Revision) || retained.Checkpoint != original.Checkpoint || retained.ProviderResult != original.ProviderResult || retained.CommandBinding != original.CommandBinding {
+		t.Fatalf("repair replaced frozen proof: verification=%+v err=%v", retained, err)
+	}
+	commandsAfter := count(commandsSQL)
+	if commandsAfter != commandsBefore+1 {
+		t.Fatalf("fresh repair command count before=%d after=%d", commandsBefore, commandsAfter)
+	}
+	// A later scheduler tick must not launch another provider or command.
+	if replay, err := f.worker.Run(f.ctx, f.ref, f.fence); err != nil || replay.State != domain.StatePublishing || replay.Transitioned {
+		t.Fatalf("publishing replay=%+v err=%v", replay, err)
+	}
+	assertMaterializerProviderAttempts(t, f.db, f.ref, 4)
+	if got := count(commandsSQL); got != commandsAfter {
+		t.Fatalf("replay duplicated repository command: before=%d after=%d", commandsAfter, got)
+	}
+	if got := count(`SELECT COUNT(*) FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=?`); got != 1 {
+		t.Fatalf("candidate count=%d want=1", got)
+	}
+	if got := count(`SELECT used FROM ticket_counters WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`); got != 1 {
+		t.Fatalf("correction count=%d want=1", got)
+	}
+	if got := count(`SELECT COUNT(*) FROM ticket_budget_uses WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction'`); got != 1 {
+		t.Fatalf("correction ledger count=%d want=1", got)
+	}
+}
 
 func TestRepositoryMaterializerPreparePostbuildRepairRealBoundary(t *testing.T) {
 	f := newMaterializerRealFixture(t, true)

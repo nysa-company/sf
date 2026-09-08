@@ -215,6 +215,7 @@ func validPostbuildRepairGap(ctx context.Context, q candidateEvidenceQuerier, re
 	}
 	fence := domain.Fence{LeaderEpoch: fromLeader, RunnerEpoch: fromRunner}
 	repaired := false
+	var repairVersion uint64
 	var priorState domain.State
 	for version := fromVersion + 1; version <= toVersion; version++ {
 		var count int
@@ -247,9 +248,41 @@ func validPostbuildRepairGap(ctx context.Context, q candidateEvidenceQuerier, re
 				return false
 			}
 			repaired = true
+			repairVersion = repair.EntryVersion
 			continue
 		}
-		if !errors.Is(err, ErrNotFound) || validateRunnerPhaseAdvance(ctx, q, ref, version-1, fence.RunnerEpoch, version, fence.RunnerEpoch) != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return false
+		}
+		if repaired && from == domain.StateBuilding && to == domain.StateVerifying {
+			amendment, err := (&Store{}).loadVerificationAmendment(ctx, q, ref, version, fence)
+			if err != nil {
+				return false
+			}
+			binding, _, err := loadPostbuildAmendmentBinding(ctx, q, amendment)
+			if err != nil || binding.RepairEntryVersion != repairVersion || binding.ConsumedVersion != version-1 || binding.ConsumedFence != fence {
+				return false
+			}
+			continue
+		}
+		if repaired && from == domain.StateVerifying && to == domain.StateBuilding {
+			var trigger string
+			if q.QueryRowContext(ctx, `SELECT trigger FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, version).Scan(&trigger) != nil {
+				return false
+			}
+			if trigger == "amendment_accepted" || trigger == "amendment_rejected" {
+				boundary, err := loadVerificationAmendmentBoundaryAt(ctx, q, ref, version, fence, false)
+				if err != nil || boundary.DecisionVersion != version {
+					return false
+				}
+				binding, _, err := loadPostbuildAmendmentBinding(ctx, q, boundary.Amendment)
+				if err != nil || binding.RepairEntryVersion != repairVersion {
+					return false
+				}
+				continue
+			}
+		}
+		if validateRunnerPhaseAdvance(ctx, q, ref, version-1, fence.RunnerEpoch, version, fence.RunnerEpoch) != nil {
 			return false
 		}
 	}
@@ -305,14 +338,21 @@ func postbuildRepairRecoveryPredecessor(ctx context.Context, q candidateEvidence
 	if leader == 0 || leader >= nextLeader || postbuildRepairSignedSourcePrefix(ctx, q, ref, repair.EntryVersion, repair.Fence, version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: runner}) != nil {
 		return 0, true, ErrPublicationEvidence
 	}
-	var firstVersion, firstRunner, firstLeader uint64
-	err = q.QueryRowContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY ticket_version LIMIT 1`, ref.Channel, ref.Project, ref.Ticket).Scan(&firstVersion, &firstRunner, &firstLeader)
-	if errors.Is(err, sql.ErrNoRows) {
-		if !validInitialPostbuildRepairTarget(ctx, q, ref, version, runner, leader) {
-			return 0, true, ErrPublicationEvidence
-		}
-	} else if err != nil || firstRunner != 1 || (validateInitialLifecycleAdvance(ctx, q, ref, firstVersion) != nil && !validInitialPostbuildRepairTarget(ctx, q, ref, firstVersion, firstRunner, firstLeader)) || validateRunnerRecoveryLedgerPrefix(ctx, q, ref, firstVersion, firstRunner, firstLeader, version, runner, leader) != nil {
+	if authenticatePostbuildRecoveryPrefix(ctx, q, ref, version, runner, leader) != nil {
 		return 0, true, ErrPublicationEvidence
 	}
 	return leader, true, nil
+}
+
+func authenticatePostbuildRecoveryPrefix(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, version, runner, leader uint64) error {
+	var firstVersion, firstRunner, firstLeader uint64
+	err := q.QueryRowContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY ticket_version LIMIT 1`, ref.Channel, ref.Project, ref.Ticket).Scan(&firstVersion, &firstRunner, &firstLeader)
+	if errors.Is(err, sql.ErrNoRows) {
+		if !validInitialPostbuildRepairTarget(ctx, q, ref, version, runner, leader) {
+			return ErrPublicationEvidence
+		}
+	} else if err != nil || firstRunner != 1 || (validateInitialLifecycleAdvance(ctx, q, ref, firstVersion) != nil && !validInitialPostbuildRepairTarget(ctx, q, ref, firstVersion, firstRunner, firstLeader)) || validateRunnerRecoveryLedgerPrefix(ctx, q, ref, firstVersion, firstRunner, firstLeader, version, runner, leader) != nil {
+		return ErrPublicationEvidence
+	}
+	return nil
 }

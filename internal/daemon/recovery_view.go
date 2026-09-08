@@ -31,6 +31,8 @@ func recoveryView(ticket store.Ticket, evidence map[string]any) map[string]any {
 			cause = "The ticket reached its execution budget. Status does not extend that budget or start another paid attempt."
 		case "verification_amendment_invalid":
 			cause = "SF could not authenticate the verification amendment. The proposed replacement is not permission to weaken the existing proof."
+		case "postbuild_amendment_rejected":
+			cause = "The independent Reviewer rejected the test amendment. The original proof and local work are retained; SF will not launch another Builder or silently restore files. Cancel this ticket before submitting clarified acceptance."
 		}
 	}
 	disposition := "No worktree registration is present in this status snapshot."

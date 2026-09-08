@@ -9,6 +9,20 @@ import (
 	"github.com/nysa-company/sf/internal/workflowworker"
 )
 
+func (w Worker) StopRejectedPostbuildAmendment(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (workflowworker.RunResult, error) {
+	if w.Store == nil {
+		return workflowworker.RunResult{Ref: ref}, workflowworker.ErrUnsupportedState
+	}
+	ready, err := w.Store.RuntimeAdmissionReady(ctx, ref, version, fence)
+	if err != nil {
+		return workflowworker.RunResult{Ref: ref}, err
+	}
+	if !ready {
+		return workflowworker.RunResult{Ref: ref}, store.ErrControlNotDrained
+	}
+	return w.Workflow.StopRejectedPostbuildAmendment(ctx, ref, version, fence)
+}
+
 // DispatchPostbuildRepairAmendment consumes only an exact already-completed
 // amendment request. It never invokes the general Worker, Git, or a provider;
 // the resulting Verifying entry requires its own physical admission.
@@ -16,7 +30,16 @@ func (w Worker) DispatchPostbuildRepairAmendment(ctx context.Context, ref domain
 	if w.Store == nil || w.Engine == nil {
 		return workflowworker.RunResult{Ref: ref}, workflowworker.ErrUnsupportedState
 	}
-	return dispatchPostbuildRepairAmendment(ctx, ref, version, fence, key, w.Store, w.Engine)
+	return dispatchPostbuildRepairAmendment(ctx, ref, version, fence, key, w.Store, postbuildPhysicalAmendmentDispatcher{worker: w.Workflow})
+}
+
+// The production adapter adds the retained-byte snapshot before the typed
+// Store transition. It never calls Workflow.Run or launches a provider.
+type postbuildPhysicalAmendmentDispatcher struct{ worker workflowworker.Worker }
+
+func (d postbuildPhysicalAmendmentDispatcher) SignalVerificationAmendmentRequest(ctx context.Context, request contracts.SignalRequest, key store.ProviderAttemptResultKey) (contracts.TransitionResult, error) {
+	result, err := d.worker.DispatchPostbuildRepairAmendment(ctx, request.Ticket, request.TicketVersion, request.Fence, key)
+	return contracts.TransitionResult{To: result.State, TicketVersion: result.Version}, err
 }
 
 type postbuildAmendmentStore interface {

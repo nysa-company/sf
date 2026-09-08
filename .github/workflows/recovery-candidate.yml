@@ -48,8 +48,8 @@ jobs:
       - name: Test bounded repair authority and retained file identity
         run: |
           go test -p 1 -count=1 ./internal/statemachine ./internal/engine
-          go test -p 1 -count=1 ./internal/store -run 'Test(PostbuildRepair|TransitionPostbuildRepair)' -v
-          go test -p 1 -count=1 ./internal/git -run '^TestRetained' -v
+          go test -p 1 -count=1 ./internal/store -run 'Test(Postbuild|TransitionPostbuild)' -v
+          go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v
       - name: Test proof consistency and actionable status
         run: |
           go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
@@ -57,9 +57,9 @@ jobs:
           go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|PostbuildCommandFailure)' -v
           go test -p 1 -count=1 ./internal/workflowruntime -run '^TestPostbuildCommandError' -v
           go test -p 1 -count=1 ./internal/workflowworker -run '^TestRealStoreCompletedBuilderPostbuildFailure' -v
-          go test -p 1 -count=1 ./internal/workflowworker -run 'Test(OptionalPostbuildRepair|WorkerPostbuildRepair)' -v
-          go test -p 1 -count=1 ./internal/workflowruntime -run 'Test(SchedulerPostbuildRepair|SchedulerCompletedPostbuildRepair|RepositoryMaterializerPreparePostbuildRepair)' -v
-          go test -p 1 -count=1 ./internal/localruntime -run '^TestDispatchPostbuildRepair' -v
+          go test -p 1 -count=1 ./internal/workflowworker -run 'Test(OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment)' -v
+          go test -p 1 -count=1 ./internal/workflowruntime -run 'Test(SchedulerPostbuild|SchedulerCompletedPostbuildRepair|SchedulerReplaysRejectedAmendment|RepositoryMaterializerPreparePostbuildRepair|RepositoryMaterializerPostbuildRepair|ProtectedAmendment)' -v
+          go test -p 1 -count=1 ./internal/localruntime -run '^TestPostbuildAmendmentDispatch' -v
       - name: Check first-use compatibility and documented command order
         run: |
           scripts/docs-smoke

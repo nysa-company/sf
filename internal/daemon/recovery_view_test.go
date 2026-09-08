@@ -41,3 +41,17 @@ func TestRecoveryViewDoesNotBlameTestsForEveryFailure(t *testing.T) {
 		t.Fatal("untrusted blocker copied into explanation")
 	}
 }
+
+func TestRecoveryViewRejectedAmendmentRetainsWorkAndRequiresCancel(t *testing.T) {
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "fixture", Ticket: "SF-rejected"}
+	ticket := store.Ticket{Ref: ref, State: domain.StateBlocked, BlockedCode: "postbuild_amendment_rejected"}
+	view := recoveryView(ticket, map[string]any{"worktree": map[string]any{"path": "/private/retained"}})
+	if view["writer_safety"] != "not_checked" || !strings.Contains(view["cause"].(string), "independent Reviewer rejected") || !strings.Contains(view["cause"].(string), "retained") {
+		t.Fatalf("misleading disposition: %+v", view)
+	}
+	d := &Daemon{channel: domain.ChannelDev}
+	action, ok := d.ticketBlockedNextAction(ticket)
+	if !ok || len(action.Argv) != 3 || action.Argv[0] != "sf-dev" || action.Argv[1] != "cancel" || action.Argv[2] != "SF-rejected" {
+		t.Fatalf("unsupported action: %+v", action)
+	}
+}

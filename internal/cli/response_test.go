@@ -48,6 +48,7 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 		"ticket_budget_exhausted": ExitAction, "provider_result_indeterminate": ExitAction,
 		"provider_repair_unavailable":                   ExitAction,
 		"verification_amendment_invalid":                ExitAction,
+		"postbuild_amendment_rejected":                  ExitAction,
 		"legacy_candidate_repair_recovery_unverifiable": ExitAction,
 		"daemon_unavailable":                            ExitWait, "daemon_stopping": ExitWait, "provider_waiting": ExitWait, "checks_pending": ExitWait,
 		"store_busy": ExitWait, "projection_unavailable": ExitWait, "external_state_unavailable": ExitWait,
@@ -84,6 +85,7 @@ func TestNonrecoverableSafetyBlockersRemainActionableWithDaemonCancelArgv(t *tes
 		{code: "provider_result_indeterminate", argv: []string{"sf-dev", "cancel", "SF-dev-provider-blocker"}},
 		{code: "provider_repair_unavailable", argv: []string{"sf", "cancel", "SF-stable-provider-blocker"}},
 		{code: "verification_amendment_invalid", argv: []string{"sf-dev", "cancel", "SF-dev-amendment-blocker"}},
+		{code: "postbuild_amendment_rejected", argv: []string{"sf-dev", "cancel", "SF-dev-rejected-amendment"}},
 		{code: "legacy_candidate_repair_recovery_unverifiable", argv: []string{"sf", "cancel", "SF-stable-repair-recovery-blocker"}},
 		{code: "provider_retry_resubmit_required", argv: []string{"sf-dev", "cancel", "SF-dev-provider-retry"}},
 	} {

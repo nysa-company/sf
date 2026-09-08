@@ -430,6 +430,19 @@ func (s *Store) RecordVerification(ctx context.Context, artifact VerificationArt
 			return pendingErr
 		}
 		pendingFound := pendingErr == nil
+		// The companion receipt is required before either automatic metadata
+		// projection or caller-supplied exact projection. Otherwise an accepted
+		// caller could skip the zero-metadata amendment helper and its receipt.
+		if pendingFound {
+			if _, repair, companionErr := loadPostbuildAmendmentBinding(ctx, conn, pendingAmendment); companionErr == nil {
+				snapshot, snapshotErr := s.postbuildAmendmentCheckpointSnapshotFrom(ctx, conn, artifact.Ref, artifact.ExpectedVersion, artifact.Fence)
+				if snapshotErr != nil || snapshot.Reviewer != *artifact.ProviderResult || snapshot.Command != artifact.CommandResult || artifact.Checkpoint.ParentOID != repair.OriginalCheckpointOID {
+					return ErrEvidenceConflict
+				}
+			} else if !errors.Is(companionErr, ErrNotFound) {
+				return companionErr
+			}
+		}
 		// Amendment metadata is a projection of an authenticated Store boundary,
 		// never a caller-provided switch.  Keep accepting exact replays that carry
 		// the projection, but reject a forged AmendsRevision/reason/requester

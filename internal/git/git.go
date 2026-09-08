@@ -234,6 +234,9 @@ func validRepoPath(path string) bool {
 // removed, system/global configuration disabled, and hooks disabled per call.
 // Run is replaceable only for exact-argv tests; production always uses git.
 type Runner struct {
+	// Only CommitProtectedCheckpoint creates this private-index capability.
+	privateCheckpointIndex *protectedCheckpointIndex
+
 	Binary string
 	Home   string
 	// Canonical GitHub HTTPS remotes use one packaged credential helper. Git
@@ -759,6 +762,8 @@ func secureExecutableParents(path string) bool {
 // own configuration hardening.
 func validExtraEnvironment(r Runner, key, value string) bool {
 	switch key {
+	case "GIT_INDEX_FILE":
+		return r.privateCheckpointIndex != nil && r.privateCheckpointIndex.valid(value)
 	case "GIT_SSH":
 		return value == r.SSHHelper
 	case "GIT_SSH_VARIANT":

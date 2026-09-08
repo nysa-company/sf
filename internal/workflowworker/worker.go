@@ -801,6 +801,23 @@ func (w Worker) resolveVerificationAmendment(ctx context.Context, ticket store.T
 	if err := w.signalVerificationAmendment(ctx, ticket, fence, decision, key); err != nil {
 		return false, replayed, err
 	}
+	if decision == store.VerificationAmendmentRejected {
+		if source, ok := w.Evidence.(interface {
+			PostbuildVerificationAmendmentContext(context.Context, domain.TicketRef, uint64, domain.Fence) (store.PostbuildVerificationAmendmentContext, error)
+		}); ok {
+			current, err := w.Evidence.Ticket(ctx, ticket.Ref)
+			if err != nil {
+				return false, replayed, err
+			}
+			_, err = source.PostbuildVerificationAmendmentContext(ctx, ticket.Ref, current.Version, fence)
+			if err == nil {
+				_, err = w.StopRejectedPostbuildAmendment(ctx, ticket.Ref, current.Version, fence)
+			}
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				return false, replayed, err
+			}
+		}
+	}
 	return true, replayed, nil
 }
 
@@ -1049,6 +1066,20 @@ func (w Worker) signalVerification(ctx context.Context, ticket store.Ticket, fen
 func (w Worker) signalVerificationAmendmentRequest(ctx context.Context, ticket store.Ticket, fence domain.Fence, key store.ProviderAttemptResultKey) error {
 	if fence.RunnerEpoch != ticket.RunnerEpoch {
 		return store.ErrStaleFence
+	}
+	if preparer, ok := w.CandidateMaterializer.(postbuildAmendmentPreparer); ok {
+		snapshot, found, err := preparer.PreparePostbuildVerificationAmendment(ctx, ticket.Ref, ticket.Version, fence, key)
+		if err != nil {
+			return err
+		}
+		if found {
+			engine, ok := w.Engine.(postbuildAmendmentEngine)
+			if !ok {
+				return store.ErrEvidenceConflict
+			}
+			_, err := engine.SignalPostbuildVerificationAmendmentRequest(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Fence: fence, EventPayload: "{}"}, key, snapshot)
+			return err
+		}
 	}
 	_, err := w.Engine.SignalVerificationAmendmentRequest(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Fence: fence, EventPayload: "{}"}, key)
 	return err

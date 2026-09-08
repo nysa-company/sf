@@ -544,6 +544,13 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				}
 			}
 			if priorLeader == 0 {
+				if amendmentLeader, amendmentFound, amendmentErr := postbuildAmendmentRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); amendmentErr != nil {
+					return amendmentErr
+				} else if amendmentFound {
+					priorLeader = amendmentLeader
+				}
+			}
+			if priorLeader == 0 {
 				if amendmentLeader, amendmentFound, amendmentErr := verificationAmendmentRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); amendmentErr != nil {
 					return amendmentErr
 				} else if amendmentFound {

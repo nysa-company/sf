@@ -58,6 +58,9 @@ func (m RepositoryMaterializer) MaterializeVerificationCheckpoint(ctx context.Co
 	if err != nil || !providerMatches(request, provider, key, domain.PhaseVerification, "reviewer") || m.Store.ProviderResultReachesFence(ctx, key, request.Ticket.Version, request.Fence) != nil || parsed.Verify == nil || !sameJSON(*parsed.Verify, artifact) {
 		return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
 	}
+	if checkpoint, handled, err := m.materializePostbuildAmendmentCheckpoint(ctx, request, key, artifact); handled || err != nil {
+		return checkpoint, err
+	}
 	if prior := request.RecoveryVerification; prior != nil {
 		if prior.ProviderResult != key || prior.Checkpoint.CommitOID != prior.Revision.CheckpointID || prior.CommandBinding.Key.SemanticKey == "" {
 			return workflowworker.VerificationCheckpoint{}, ErrRepositoryMaterialization
@@ -135,6 +138,18 @@ func (m RepositoryMaterializer) AuthenticateVerificationCheckpoint(ctx context.C
 func (m RepositoryMaterializer) verificationParent(ctx context.Context, request workflowworker.PhaseRequest) (string, error) {
 	if m.Store == nil || request.Ticket.Ref.Validate() != nil {
 		return "", ErrRepositoryMaterialization
+	}
+	if request.Amendment != nil {
+		value, err := m.Store.PostbuildVerificationAmendmentContext(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+		if err == nil {
+			if !reflect.DeepEqual(value.Amendment, *request.Amendment) {
+				return "", ErrRepositoryMaterialization
+			}
+			return value.Verification.Checkpoint.CommitOID, nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return "", err
+		}
 	}
 	parent := request.Worktree.BaseSHA
 	proof, found, err := m.Store.OperatorSourceResumeProof(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
@@ -1035,31 +1050,7 @@ func (m RepositoryMaterializer) verificationCheckpointCommitDigest(ctx context.C
 // durable amendment request and immutable Reviewer result identify the same
 // child commit; a new daemon fence must not manufacture another mutation.
 func verificationAmendmentCheckpointCommitDigest(request workflowworker.PhaseRequest, provider store.ProviderAttemptResultKey, command contracts.RepositoryCommandResultKey, resultDigest string, artifact phaseartifact.Verification) string {
-	amendment := request.Amendment
-	data, _ := json.Marshal(struct {
-		Kind              string
-		Ref               domain.TicketRef
-		TransitionVersion uint64
-		ConsumedVersion   uint64
-		Prior             store.VerificationRevision
-		Builder           store.ProviderAttemptResultKey
-		BuilderTypedSHA   string
-		ProposedDigest    string
-		ProposedCommand   []string
-		Reason            string
-		Requester         string
-		BudgetRequestID   string
-		WorktreePath      string
-		WorktreeBranch    string
-		WorktreeIdentity  []byte
-		BaseSHA           string
-		Provider          store.ProviderAttemptResultKey
-		Command           contracts.RepositoryCommandResultKey
-		ResultDigest      string
-		Artifact          phaseartifact.Verification
-	}{"verification-amendment-checkpoint/v1", request.Ticket.Ref, amendment.TransitionTicketVersion, amendment.ConsumedVersion, amendment.Prior, amendment.BuilderResult, amendment.BuilderTypedSHA256, amendment.ProposedDigest, amendment.ProposedCommand, amendment.Reason, amendment.Requester, amendment.BudgetRequestID, request.Worktree.Path, request.Worktree.Branch, request.Worktree.IdentityJSON, request.Worktree.BaseSHA, provider, command, resultDigest, artifact})
-	sum := sha256.Sum256(data)
-	return "sha256:" + hex.EncodeToString(sum[:])
+	return store.CanonicalVerificationAmendmentCheckpointDigest(*request.Amendment, request.Worktree, provider, command, resultDigest, artifact)
 }
 func materializeErr(err error) error {
 	if err != nil {

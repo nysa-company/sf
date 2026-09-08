@@ -23,3 +23,12 @@ func (e *Engine) SignalPostbuildRepair(ctx context.Context, request store.Postbu
 		return e.store.TransitionPostbuildRepair(ctx, request)
 	})
 }
+
+func (e *Engine) SignalPostbuildVerificationAmendmentRequest(ctx context.Context, request contracts.SignalRequest, key store.ProviderAttemptResultKey, snapshot store.PostbuildAmendmentSnapshot) (contracts.TransitionResult, error) {
+	if request.From != domain.StateBuilding || key.Ref != request.Ticket || key.Phase != domain.PhaseBuild || request.EventPayload != "{}" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
+	return e.transition(ctx, contracts.TransitionRequest{Ticket: request.Ticket, TicketVersion: request.TicketVersion, From: request.From, Trigger: "verification_amendment_requested", Fence: request.Fence, Attributes: map[string]string{"amendment_request_valid": "true", "correction_available": "true"}, EventPayload: "{}"}, func(ctx context.Context, transition store.Transition) (store.TransitionResult, error) {
+		return e.store.TransitionPostbuildVerificationAmendmentRequest(ctx, transition, key, snapshot)
+	})
+}

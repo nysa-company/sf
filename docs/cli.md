@@ -578,12 +578,21 @@ returns `provider_retry_resubmit_required` without consuming the retry and
 points to the executable `cancel` action. Cancel that ticket and submit a fresh
 ticket; repeating `retry` cannot make the ambiguous lineage valid.
 
-An authenticated nonzero post-build check produces `postbuild_command_failed`.
-The failed command and completed Builder result are retained, but no candidate
-is published. This is not a provider retry window: `resume`, `recover`, and
-`retry` cannot repair the same frozen proof. Use the channel-correct `cancel`
-action shown by `status`, then submit a fresh ticket with clarified acceptance
-criteria. sf does not silently edit Reviewer-owned tests or invent an amendment.
+An authenticated nonzero post-build check may enter one budgeted diagnosis
+entry when the Store can authenticate the completed Builder, failed command,
+original proof, retained files, and absence of active writers. This is not a
+blind provider retry: only an independent Reviewer can approve a proposed test
+amendment, and the original acceptance and command remain frozen. If that
+authority is unavailable, `postbuild_command_failed` retains the failed command
+and completed Builder without publishing a candidate. Follow the channel-correct
+`cancel` action shown by `status`; `resume`, `recover`, and `retry` cannot invent
+the missing authority.
+
+`postbuild_amendment_rejected` means the independent Reviewer refused the
+proposed test correction. SF retains the original proof and local implementation
+and stops without launching another Builder or silently restoring files. Use
+the reported `cancel <ticket>` action, then submit clarified acceptance if needed.
+Status is not a writer-drain proof or permission to edit retained files.
 
 `verification_amendment_invalid` is likewise nonrecoverable. A malformed
 Builder amendment request or independent Reviewer response is not an
