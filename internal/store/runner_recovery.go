@@ -864,11 +864,13 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// the next daemon recovery. The chain is accepted only when every
 			// intervening event is a contiguous canonical lifecycle phase_pass.
 			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
-				repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
-					previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
-					step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
-				if repairErr != nil || (!repairGap && !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)) {
-					return ErrPublicationEvidence
+				if !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
+					repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
+						previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
+						step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
+					if repairErr != nil || !repairGap {
+						return ErrPublicationEvidence
+					}
 				}
 			}
 		}
@@ -886,11 +888,16 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// changing the runner. It is current phase authority, not a control
 			// handoff; require the exact canonical phase event.
 			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, liveVersion, liveFence.RunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) {
-				repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
-					previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
-					liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch)
-				if repairErr != nil || (!repairGap && !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch)) {
-					return ErrPublicationEvidence
+				// A complete refresh owns its exact edge after CI repair. Prove
+				// it first; the retained repair intentionally cannot authorize a
+				// successor build on a different protected base.
+				if !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) {
+					repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
+						previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
+						liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch)
+					if repairErr != nil || !repairGap {
+						return ErrPublicationEvidence
+					}
 				}
 			}
 		}

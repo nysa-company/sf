@@ -14,7 +14,7 @@ func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *test
 	for _, state := range []domain.State{domain.StateReviewing, domain.StateWaitingApproval} {
 		t.Run(string(state), func(t *testing.T) {
 			completed := newCompletedCandidateRepairTestFixture(t)
-			f := completedCandidateRepairReviewingFixture(t, completed)
+			f := completedCandidateRepairReviewingFixtureWithRestart(t, completed, state == domain.StateWaitingApproval)
 			defer f.db.Close()
 			current := f.ticket
 			if state == domain.StateWaitingApproval {
@@ -131,6 +131,12 @@ func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *test
 			}
 			if err := validateRunnerRecoveryAuthority(f.ctx, f.db.db, current.Ref, completion.Version, completion.Fence); err != nil {
 				t.Fatalf("completed refresh invalidated fresh Builder recovery authority: %v", err)
+			}
+			if !protectedBaseRefreshRecoveryGap(f.ctx, f.db.db, current.Ref, current.Version, currentFence.RunnerEpoch, currentFence.LeaderEpoch, completion.Version, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) {
+				t.Fatal("exact refresh edge rejected")
+			}
+			if protectedBaseRefreshRecoveryGap(f.ctx, f.db.db, current.Ref, current.Version, currentFence.RunnerEpoch+1, currentFence.LeaderEpoch, completion.Version, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) || protectedBaseRefreshRecoveryGap(f.ctx, f.db.db, current.Ref, current.Version, currentFence.RunnerEpoch, currentFence.LeaderEpoch, completion.Version, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch+1) {
+				t.Fatal("forged refresh endpoint accepted")
 			}
 		})
 	}

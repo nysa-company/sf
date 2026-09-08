@@ -113,6 +113,10 @@ func reopenCandidateRepairStartupStore(t *testing.T, db *Store) *Store {
 }
 
 func completedCandidateRepairReviewingFixture(t *testing.T, fixture completedCandidateRepairTestFixture) finalReviewFixture {
+	return completedCandidateRepairReviewingFixtureWithRestart(t, fixture, false)
+}
+
+func completedCandidateRepairReviewingFixtureWithRestart(t *testing.T, fixture completedCandidateRepairTestFixture, restartWaiting bool) finalReviewFixture {
 	t.Helper()
 	ctx := t.Context()
 	if _, err := fixture.db.TransitionCandidate(ctx, Transition{
@@ -135,6 +139,23 @@ func completedCandidateRepairReviewingFixture(t *testing.T, fixture completedCan
 	waiting, err := fixture.db.Ticket(ctx, publishing.Ref)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if restartWaiting {
+		leader, err := fixture.db.AcquireLeader(ctx, waiting.Ref.Channel, "repair-waiting-ci-restart")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := fixture.db.FenceRecoveredRunners(ctx, waiting.Ref.Channel, leader); err != nil || changed != 1 {
+			t.Fatalf("waiting restart: changed=%d err=%v", changed, err)
+		}
+		if err := fixture.db.RebindRecoveredPublishedCandidates(ctx, waiting.Ref.Channel, leader); err != nil {
+			t.Fatal(err)
+		}
+		waiting, err = fixture.db.Ticket(ctx, waiting.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.buildFence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: waiting.RunnerEpoch}
 	}
 	candidate, err := fixture.db.RecoverableCandidate(ctx, waiting.Ref)
 	if err != nil {

@@ -16,8 +16,23 @@ const maxProtectedBaseRefreshReclaims = 8
 
 func protectedBaseRefreshRecoveryGap(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, fromVersion, fromRunner, fromLeader, toVersion, toRunner, toLeader uint64) bool {
 	value, completion, err := protectedBaseRefreshForTicketAt(ctx, q, ref)
-	if err != nil || fromVersion >= completion.Version || toVersion < completion.Version {
+	if err != nil || fromVersion >= completion.Version || fromVersion > toVersion {
 		return false
+	}
+	if toVersion < completion.Version {
+		// The completed refresh also authenticates its historical reviewed
+		// prefix. Only a target on the reservation's exact signed suffix may
+		// use this proof; arbitrary earlier lifecycle endpoints are not admitted.
+		if toVersion < value.TicketVersion {
+			return false
+		}
+		prefix := validateRunnerRecoveryLedgerPrefix(ctx, q, ref, fromVersion, fromRunner, fromLeader, value.TicketVersion, value.Fence.RunnerEpoch, value.Fence.LeaderEpoch) == nil
+		if !prefix {
+			prefix = protectedBaseRefreshReviewedPrefix(ctx, q, value, fromVersion, fromRunner, fromLeader) == nil
+		}
+		return prefix &&
+			validateRunnerRecoveryLedgerPrefix(ctx, q, ref, value.TicketVersion, value.Fence.RunnerEpoch, value.Fence.LeaderEpoch, toVersion, toRunner, toLeader) == nil &&
+			validateRunnerRecoveryLedgerPrefix(ctx, q, ref, toVersion, toRunner, toLeader, completion.Version-1, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) == nil
 	}
 	prefix := validateRunnerRecoveryLedgerPrefix(ctx, q, ref, fromVersion, fromRunner, fromLeader, completion.Version-1, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) == nil
 	if !prefix {
