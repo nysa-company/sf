@@ -35,6 +35,7 @@ import (
 // repository supervisor is Darwin-only and the test must not turn a Linux
 // fallback into evidence that the production composition is executable.
 type materializerRealFixture struct {
+	supervisor   *processsupervisor.Supervisor
 	databasePath string
 	ctx          context.Context
 	db           *store.Store
@@ -195,7 +196,7 @@ func newMaterializerRealFixtureWithProvider(t *testing.T, provider func(*testing
 	supervisor := processsupervisor.RepositoryCommandSupervisor{Executable: sfBinary, GitRunner: runner, SoftDrain: time.Second, HardDrain: time.Second}
 	materializer := workflowruntime.RepositoryMaterializer{Store: db, Git: git.Runner{Home: runner.Home, ExecHelper: helper, TestLocalTransport: true, MutationAuthority: db}, Executor: repositoryexec.Executor{Authority: materializerDiagnosticAuthority{Store: db, t: t}, Supervisor: supervisor}}
 	worker := workflowworker.Worker{Evidence: db, Engine: state, Runner: providers, Checkpoint: materializer, Candidate: materializer, CheckpointMaterializer: materializer, CandidateMaterializer: materializer}
-	return materializerRealFixture{databasePath: databasePath, ctx: ctx, db: db, worktree: worktree, ref: ref, fence: fence, leader: leader, materializer: materializer, worker: worker, state: state}
+	return materializerRealFixture{supervisor: providerSupervisor, databasePath: databasePath, ctx: ctx, db: db, worktree: worktree, ref: ref, fence: fence, leader: leader, materializer: materializer, worker: worker, state: state}
 }
 
 func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {

@@ -391,6 +391,12 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 						}
 						return result
 					}
+					if ticket.State == domain.StateVerifying {
+						if preparedResult, handled := s.resumePreparedPostbuild(runCtx, ticket, candidateFence); handled {
+							end()
+							return preparedResult
+						}
+					}
 					authenticator, supported := s.Worktrees.(postbuildVerificationAuthenticator)
 					if !supported {
 						end()

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/nysa-company/sf/internal/contracts"
@@ -103,37 +104,37 @@ func (s *Store) authenticateCheckpointSnapshotSource(ctx context.Context, q *sql
 	var a VerificationAmendment
 	var b PostbuildAmendmentBinding
 	if err := s.assertTicketFence(ctx, q, ref, version, fence); err != nil {
-		return a, b, err
+		return a, b, fmt.Errorf("checkpoint snapshot live fence: %w", err)
 	}
 	var state domain.State
 	if q.QueryRowContext(ctx, `SELECT state FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state) != nil || state != domain.StateVerifying {
-		return a, b, ErrEvidenceConflict
+		return a, b, fmt.Errorf("checkpoint snapshot verifying state: %w", ErrEvidenceConflict)
 	}
 	a, err := s.loadPendingVerificationAmendmentAtFence(ctx, q, ref, version, fence)
 	if err != nil {
-		return a, b, err
+		return a, b, fmt.Errorf("checkpoint snapshot pending request: %w", err)
 	}
 	b, _, err = loadPostbuildAmendmentBinding(ctx, q, a)
 	if err != nil {
-		return a, b, err
+		return a, b, fmt.Errorf("checkpoint snapshot companion: %w", err)
 	}
 	if err := assertNoVerificationAmendmentDownstream(ctx, q, ref); err != nil {
-		return a, b, err
+		return a, b, fmt.Errorf("checkpoint snapshot downstream: %w", err)
 	}
 	decision, err := s.verificationAmendmentDecisionFrom(ctx, q, a, ref, version, fence, reviewer)
 	if err != nil || decision != VerificationAmendmentAccepted {
-		return a, b, ErrEvidenceConflict
+		return a, b, fmt.Errorf("checkpoint snapshot accepted reviewer (decision=%s, cause=%v): %w", decision, err, ErrEvidenceConflict)
 	}
 	provider, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, q, reviewer)
 	if err != nil || parsed.Verify == nil {
-		return a, b, ErrEvidenceConflict
+		return a, b, fmt.Errorf("checkpoint snapshot reviewer artifact: %w", ErrEvidenceConflict)
 	}
 	result, found, err := loadRepositoryCommandResult(ctx, q, command, true)
 	if err != nil || !found || result.Claim.Repository != provider.Claim.Repository || result.Claim.Worktree != provider.Claim.Worktree || result.Claim.WorktreeIdentity != provider.Claim.WorktreeIdentity || result.Claim.BaseSHA != provider.Claim.BaseSHA {
-		return a, b, ErrEvidenceConflict
+		return a, b, fmt.Errorf("checkpoint snapshot command identity (found=%t, cause=%v): %w", found, err, ErrEvidenceConflict)
 	}
 	if validateRunnerRecoveryLedgerPrefix(ctx, q, ref, provider.Claim.ExpectedVersion, provider.Claim.RunnerEpoch, provider.Claim.LeaderEpoch, result.Claim.TicketVersion, result.Claim.RunnerEpoch, result.Claim.LeaderEpoch) != nil || validateRunnerRecoveryLedgerPrefix(ctx, q, ref, result.Claim.TicketVersion, result.Claim.RunnerEpoch, result.Claim.LeaderEpoch, version, fence.RunnerEpoch, fence.LeaderEpoch) != nil {
-		return a, b, ErrEvidenceConflict
+		return a, b, fmt.Errorf("checkpoint snapshot command recovery lineage: %w", ErrEvidenceConflict)
 	}
 	intent, err := workflowprompt.CanonicalVerificationIntentBytes(*parsed.Verify)
 	if err != nil {
@@ -145,7 +146,7 @@ func (s *Store) authenticateCheckpointSnapshotSource(ctx context.Context, q *sql
 	}
 	artifact := VerificationArtifact{Ref: ref, ExpectedVersion: version, Fence: fence, Intent: intent, Proof: proof, OwnedFiles: parsed.Verify.OwnedFiles, ProviderResult: &reviewer, CommandResult: command}
 	if _, _, err := authenticateVerificationCommandEvidence(ctx, q, artifact, parsed.Verify); err != nil {
-		return a, b, err
+		return a, b, fmt.Errorf("checkpoint snapshot command evidence: %w", err)
 	}
 	return a, b, nil
 }

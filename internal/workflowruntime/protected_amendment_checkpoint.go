@@ -55,12 +55,7 @@ func (m RepositoryMaterializer) materializePostbuildAmendmentCheckpoint(ctx cont
 			return empty, true, err
 		}
 		if found {
-			// A read-only replay may observe only an already-synchronized index.
-			// A crash before protected index sync needs a separate scoped writer;
-			// merely observing the prepared child is never proof of completion.
-			if err := m.proveProtectedCheckpointSynced(ctx, worktree, parent, protected, implementation, prepared); err != nil {
-				return empty, true, err
-			}
+			synced := m.proveProtectedCheckpointSynced(ctx, worktree, parent, protected, implementation, prepared) == nil
 			checked, err := m.Store.PostbuildAmendmentCheckpointSnapshot(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
 			if err != nil || !reflect.DeepEqual(checked, receipt) {
 				return empty, true, ErrRepositoryMaterialization
@@ -75,7 +70,41 @@ func (m RepositoryMaterializer) materializePostbuildAmendmentCheckpoint(ctx cont
 			if err != nil || facts.PreparedCommitOID != prepared.CommitOID || facts.PreparedTreeOID != prepared.TreeOID || facts.Claim.RequestDigest != evidence {
 				return empty, true, ErrRepositoryMaterialization
 			}
-			if _, err := m.Store.ConfirmPreparedCommit(ctx, facts.Claim, contracts.PreparedCommitObservation{CommitOID: prepared.CommitOID, ParentOID: prepared.ParentOID, TreeOID: prepared.TreeOID}); err != nil {
+			claim := facts.Claim
+			if !synced {
+				// A prepared object is not proof that the branch CAS or protected
+				// index sync finished. Admit only its exact parent/full snapshot or
+				// exact child; Git revalidates the deterministic tree under its lease.
+				physical, err := m.Git.InspectRetainedWorktree(ctx, worktree)
+				if err != nil {
+					return empty, true, err
+				}
+				if physical.Changes.Head == parent {
+					if physical.Digest != receipt.FullSnapshotDigest {
+						return empty, true, ErrRepositoryMaterialization
+					}
+				} else if observed, err := m.Git.ObserveCommit(ctx, worktree); err != nil || observed.CommitOID != prepared.CommitOID || observed.ParentOID != prepared.ParentOID || observed.TreeOID != prepared.TreeOID {
+					return empty, true, ErrRepositoryMaterialization
+				}
+				claim, err = m.Store.ReclaimPostbuildAmendmentCheckpoint(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+				if err != nil {
+					return empty, true, err
+				}
+				if claim.SemanticKey != facts.Claim.SemanticKey || claim.RequestDigest != evidence {
+					return empty, true, ErrRepositoryMaterialization
+				}
+				runner := m.Git
+				if runner.MutationAuthority == nil {
+					runner.MutationAuthority = m.Store
+				}
+				if _, err := runner.CommitProtectedCheckpoint(ctx, worktree, git.ProtectedCheckpointRequest{EvidenceDigest: evidence, Timestamp: time.Unix(0, 0).UTC(), OriginalCheckpoint: parent, ProtectedPaths: protected, FullSnapshotDigest: receipt.FullSnapshotDigest, ImplementationDigest: receipt.ImplementationDigest, MutationClaim: claim}); err != nil {
+					return empty, true, errors.Join(err, m.settleCommitFailure(ctx, claim))
+				}
+				if err := m.proveProtectedCheckpointSynced(ctx, worktree, parent, protected, implementation, prepared); err != nil {
+					return empty, true, errors.Join(err, m.settleCommitFailure(ctx, claim))
+				}
+			}
+			if _, err := m.Store.ConfirmPreparedCommit(ctx, claim, contracts.PreparedCommitObservation{CommitOID: prepared.CommitOID, ParentOID: prepared.ParentOID, TreeOID: prepared.TreeOID}); err != nil {
 				return empty, true, err
 			}
 			if err := m.proveProtectedCheckpointSynced(ctx, worktree, parent, protected, implementation, prepared); err != nil {
@@ -116,18 +145,24 @@ func (m RepositoryMaterializer) materializePostbuildAmendmentCheckpoint(ctx cont
 	evidence := verificationAmendmentCheckpointCommitDigest(request, reviewer, command, result.ResultDigest, artifact)
 	intent := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: request.Ticket.Ref, TicketVersion: request.Ticket.Version, Fence: request.Fence}, RequestDigest: evidence, Repository: worktree.Identity.Repository, Worktree: worktree.Path, Branch: worktree.Branch, Operation: "commit", BaseRef: worktree.Identity.BaseRef, ExpectedBaseOID: worktree.Identity.BaseHead, ExpectedHeadOID: parent}
 	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)
-	// Intent-facts intentionally conflates absent and malformed intent rows.
-	// Only a genuinely absent effect can start this fresh mutation; any existing
-	// effect must use the authenticated prepared replay path above.
-	if _, err := m.Store.Effect(ctx, intent.SemanticKey); !errors.Is(err, store.ErrNotFound) {
-		return empty, true, ErrRepositoryMaterialization
+	var claim contracts.GitMutationClaim
+	if _, effectErr := m.Store.Effect(ctx, intent.SemanticKey); errors.Is(effectErr, store.ErrNotFound) {
+		if _, err := m.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "git/commit", TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: evidence}); err != nil {
+			return empty, true, err
+		}
+		claim, err = m.Store.IssueGitMutationClaim(ctx, intent)
+	} else if effectErr != nil {
+		return empty, true, effectErr
+	} else {
+		// Resume the immutable receipt's existing operation. Never rerun its
+		// command, replace its receipt, or mint another semantic target.
+		claim, err = m.Store.ReclaimPostbuildAmendmentCheckpoint(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
 	}
-	if _, err := m.Store.PlanEffect(ctx, store.EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, Kind: "git/commit", TicketVersion: intent.TicketVersion, Fence: intent.Fence, RequestDigest: evidence}); err != nil {
-		return empty, true, err
-	}
-	claim, err := m.Store.IssueGitMutationClaim(ctx, intent)
 	if err != nil {
 		return empty, true, err
+	}
+	if claim.SemanticKey != intent.SemanticKey || claim.RequestDigest != evidence {
+		return empty, true, ErrRepositoryMaterialization
 	}
 	runner := m.Git
 	if runner.MutationAuthority == nil {

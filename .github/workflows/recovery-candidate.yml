@@ -42,28 +42,50 @@ jobs:
           sudo mkdir -p /usr/local/go/bin
           sudo ln -sfn "$setup_go" /usr/local/go/bin/go
       - name: Test reservation and restart regressions
+        id: reservation
+        continue-on-error: true
         run: go test -p 1 -count=1 ./internal/store -run 'Test(ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)$' -v
       - name: Test bounded completed-Builder readmission
+        id: admission
+        continue-on-error: true
         run: go test -p 1 -count=1 ./internal/worktreecoord
       - name: Test bounded repair authority and retained file identity
+        id: authority
+        continue-on-error: true
         run: |
-          go test -p 1 -count=1 ./internal/statemachine ./internal/engine
-          go test -p 1 -count=1 ./internal/store -run 'Test(Postbuild|TransitionPostbuild)' -v
-          go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v
+          failures=0
+          check() { "$@" || failures=1; }
+          check go test -p 1 -count=1 ./internal/statemachine ./internal/engine
+          check go test -p 1 -count=1 ./internal/store -run 'Test(Postbuild|TransitionPostbuild)' -v
+          check go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v
+          exit "$failures"
       - name: Test proof consistency and actionable status
+        id: behavior
+        continue-on-error: true
         run: |
-          go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
-          go test -p 1 -count=1 ./internal/store -run '^TestAuthenticatePostbuildFailure' -v
-          go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|PostbuildCommandFailure)' -v
-          go test -p 1 -count=1 ./internal/workflowruntime -run '^TestPostbuildCommandError' -v
-          go test -p 1 -count=1 ./internal/workflowworker -run '^TestRealStoreCompletedBuilderPostbuildFailure' -v
-          go test -p 1 -count=1 ./internal/workflowworker -run 'Test(OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment)' -v
-          go test -p 1 -count=1 ./internal/workflowruntime -run 'Test(SchedulerPostbuild|SchedulerCompletedPostbuildRepair|SchedulerReplaysRejectedAmendment|RepositoryMaterializerPreparePostbuildRepair|RepositoryMaterializerPostbuildRepair|RepositoryMaterializerPostbuildAmendment|ProtectedAmendment)' -v
-          go test -p 1 -count=1 ./internal/localruntime -run '^TestPostbuildAmendmentDispatch' -v
+          failures=0
+          check() { "$@" || failures=1; }
+          check go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
+          check go test -p 1 -count=1 ./internal/store -run '^TestAuthenticatePostbuildFailure' -v
+          check go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|PostbuildCommandFailure)' -v
+          check go test -p 1 -count=1 ./internal/workflowruntime -run '^TestPostbuildCommandError' -v
+          check go test -p 1 -count=1 ./internal/workflowworker -run '^TestRealStoreCompletedBuilderPostbuildFailure' -v
+          check go test -p 1 -count=1 ./internal/workflowworker -run 'Test(OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment|ResumePreparedPostbuild)' -v
+          check go test -p 1 -count=1 ./internal/workflowruntime -run 'Test(SchedulerPostbuild|SchedulerPreparedPostbuild|SchedulerCompletedPostbuildRepair|SchedulerReplaysRejectedAmendment|RepositoryMaterializerPreparePostbuildRepair|RepositoryMaterializerPostbuildRepair|RepositoryMaterializerPostbuildAmendment|ProtectedAmendment)' -v
+          check go test -p 1 -count=1 ./internal/localruntime -run '^TestPostbuildAmendmentDispatch' -v
+          exit "$failures"
       - name: Check first-use compatibility and documented command order
+        id: onboarding
+        continue-on-error: true
         run: |
           scripts/docs-smoke
           go test -p 1 -count=1 ./cmd/sf -run '^TestCompiledDevFirstUseStackMatrixIsLocalAndHonest$' -v
+      - name: Require every validation group
+        if: always()
+        env:
+          VALIDATION: ${{ toJSON(steps) }}
+        run: |
+          jq -e '[.reservation.outcome, .admission.outcome, .authority.outcome, .behavior.outcome, .onboarding.outcome] | all(. == "success")' <<< "$VALIDATION"
       - name: Build exact native development candidate
         run: |
           set -eu
