@@ -82,7 +82,7 @@ func testPostbuildAmendmentPreparedIndexRecovery(t *testing.T, restart, synced b
 	}
 	defer observations.Close()
 	var semantic string
-	if err := observations.QueryRowContext(f.ctx, `SELECT semantic_key FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND kind='git/commit' AND state='uncertain'`, f.ref.Channel, f.ref.Project, f.ref.Ticket).Scan(&semantic); err != nil {
+	if err := observations.QueryRowContext(f.ctx, `SELECT semantic_key FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND effect_kind='git/commit' AND state='uncertain'`, f.ref.Channel, f.ref.Project, f.ref.Ticket).Scan(&semantic); err != nil {
 		t.Fatal(err)
 	}
 	beforeFacts, err := f.db.GitMutationIntentFacts(f.ctx, semantic)
