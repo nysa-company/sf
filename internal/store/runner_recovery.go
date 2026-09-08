@@ -191,7 +191,7 @@ func validateRunnerRecoveryLedgerPrefix(ctx context.Context, q interface {
 			if phaseChain && (step.PriorRunnerEpoch != expectedRunner || step.PriorLeaderEpoch != expectedLeader) {
 				return ErrPublicationEvidence
 			}
-			if !phaseChain && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingControlGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
+			if !phaseChain && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingControlGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPostbuildRepairGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
 				return ErrPublicationEvidence
 			}
 		}
@@ -212,7 +212,7 @@ func validateRunnerRecoveryLedgerPrefix(ctx context.Context, q interface {
 		if phaseAdvance && (liveRunner != expectedRunner || liveLeader != expectedLeader) {
 			return ErrPublicationEvidence
 		}
-		if !phaseAdvance && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) != nil && !validProviderRetryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validProviderBlockedRecoveryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validPublishingResumeGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validPublishingControlGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) {
+		if !phaseAdvance && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) != nil && !validProviderRetryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validProviderBlockedRecoveryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validPublishingResumeGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validPublishingControlGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validPostbuildRepairGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) {
 			return ErrPublicationEvidence
 		}
 	}
@@ -845,6 +845,9 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 				firstAuthenticated = true
 			}
 			if !firstAuthenticated {
+				firstAuthenticated = validInitialPostbuildRepairTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
+			}
+			if !firstAuthenticated {
 				sourceBaseline, sourceErr := validateOperatorSourceResumeRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
 				if sourceErr != nil {
 					return ErrPublicationEvidence
@@ -865,7 +868,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// Several ordinary phase completions may occur under one runner before
 			// the next daemon recovery. The chain is accepted only when every
 			// intervening event is a contiguous canonical lifecycle phase_pass.
-			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
+			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPostbuildRepairGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
 				if !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
 					repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
 						previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
@@ -889,7 +892,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// A normal phase transition may follow the latest recovery row without
 			// changing the runner. It is current phase authority, not a control
 			// handoff; require the exact canonical phase event.
-			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, liveVersion, liveFence.RunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) {
+			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, liveVersion, liveFence.RunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validPostbuildRepairGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) {
 				// A complete refresh owns its exact edge after CI repair. Prove
 				// it first; the retained repair intentionally cannot authorize a
 				// successor build on a different protected base.
@@ -1189,6 +1192,16 @@ func providerResultReachesFenceAt(ctx context.Context, q interface {
 	claim := result.Claim
 	if key.Ref != claim.Ref || key.Phase != claim.Phase || key.AttemptID != claim.ID || key.Attempt != claim.Attempt || !providerRoleMatchesPhase(claim.Phase, claim.Role) || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
 		return ErrStaleFence
+	}
+	if claim.Phase == domain.PhaseBuild && claim.Role == "builder" {
+		repair, repairErr := latestPostbuildRepairAt(ctx, q, key.Ref, expected)
+		if repairErr == nil {
+			if claim.ExpectedVersion < repair.EntryVersion || claim.ID <= repair.BuilderResult.AttemptID || claim.Attempt <= repair.BuilderResult.Attempt {
+				return ErrStaleFence
+			}
+		} else if !errors.Is(repairErr, ErrNotFound) {
+			return ErrStaleFence
+		}
 	}
 	if requireLiveAuthority && claim.Phase == domain.PhaseBuild && claim.Role == "builder" {
 		if _, repairErr := (&Store{}).candidateRepairBuildContextAt(ctx, q, key.Ref, expected, fence); repairErr == nil {

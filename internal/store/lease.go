@@ -576,6 +576,13 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				}
 			}
 			if priorLeader == 0 && ticket.state == domain.StateBuilding {
+				if repairLeader, repairFound, repairErr := postbuildRepairRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); repairErr != nil {
+					return repairErr
+				} else if repairFound {
+					priorLeader = repairLeader
+				}
+			}
+			if priorLeader == 0 && ticket.state == domain.StateBuilding {
 				// ConsumeCIObservation creates the repair Build entry and binding in
 				// one transaction, before any fresh Builder claim or successor
 				// candidate is required to exist. Authenticate that Store-owned entry

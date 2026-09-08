@@ -138,3 +138,21 @@ VERDICT: implementation design in progress; not cleared for merge.
 **UNRESOLVED DECISIONS:**
 - Exact Store-bound diagnosis attempt and immutable failure evidence design.
 - Human unfamiliar-user availability; agent evidence must remain labeled.
+
+## Execution checkpoint — bounded repair foundation
+
+- Hosted run [34273314750](https://github.com/nysa-company/sf/actions/runs/34273314750)
+  passed at b521934: strict failed-command evidence, prompt/status tests,
+  first-use matrix (including honest unsupported/unprepared refusals), docs
+  checks, and native candidate build. No local tests were run.
+- Commit 41d8cf3 adds append-only V61 repair entries, exact consumed failure /
+  Builder / verification / budget binding, replay-once tests, a normative
+  Building-to-Building diagnosis entry, generic-entry refusal, and bounded
+  retained-byte fingerprints. Hosted run
+  [34274649199](https://github.com/nysa-company/sf/actions/runs/34274649199)
+  passed those foundation tests, onboarding, and exact candidate build.
+- Worker/phase admission, historical verification/restart bridges, and physical
+  readmission are in progress. This foundation is not yet end-to-end recovery.
+- Remaining acceptance: complete hosted composition/negative/restart checks,
+  independent exact-head review, then four native Relay tickets at capacity two.
+  Neither the four-ticket campaign nor an unfamiliar human setup trial has run.

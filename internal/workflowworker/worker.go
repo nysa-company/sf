@@ -936,6 +936,9 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 			return true, true, nil
 		}
 		if err := w.persistCandidate(ctx, ticket, fence, PhaseRequest{}, planIdentity, verificationIdentity, verification, nil, builder, reusable.Key); err != nil {
+			if errors.Is(err, errPostbuildRepairStarted) {
+				return true, true, nil
+			}
 			return false, true, err
 		}
 		candidate, err := w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
@@ -984,6 +987,9 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 		return true, false, nil
 	}
 	if err := w.persistCandidate(ctx, ticket, fence, request, planIdentity, verificationIdentity, verification, nil, builder, out.ProviderResult); err != nil {
+		if errors.Is(err, errPostbuildRepairStarted) {
+			return true, false, nil
+		}
 		return false, false, err
 	}
 	candidate, err = w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
@@ -1280,7 +1286,7 @@ func (w Worker) persistCandidate(ctx context.Context, ticket store.Ticket, fence
 	}
 	witness, err := w.CandidateMaterializer.MaterializeCandidate(ctx, request, plan, verification, builder, key)
 	if err != nil {
-		return err
+		return w.tryPostbuildRepair(ctx, request, key, err)
 	}
 	if witness.Reason == "" || witness.CommandPolicyDigest == "" || witness.Commit.CommitOID == "" || witness.Commit.TreeOID == "" {
 		return ErrCandidateRequired

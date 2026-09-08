@@ -408,6 +408,10 @@ func (s *Store) ValidateCurrentCandidateForBuildTransition(ctx context.Context, 
 }
 
 func (s *Store) Plan(ctx context.Context, ref domain.TicketRef) (StoredPlan, error) {
+	return s.planFrom(ctx, s.db, ref)
+}
+
+func (s *Store) planFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef) (StoredPlan, error) {
 	if err := ref.Validate(); err != nil {
 		return StoredPlan{}, err
 	}
@@ -415,7 +419,7 @@ func (s *Store) Plan(ctx context.Context, ref domain.TicketRef) (StoredPlan, err
 	var body string
 	var artifact []byte
 	var created string
-	err := s.db.QueryRowContext(ctx, `SELECT p.digest,p.body,p.artifact_bytes,
+	err := q.QueryRowContext(ctx, `SELECT p.digest,p.body,p.artifact_bytes,
 		COALESCE(b.binding_ticket_version,p.ticket_version),
 		COALESCE(b.leader_epoch,p.leader_epoch),
 		COALESCE(b.runner_epoch,p.runner_epoch),p.created_at
@@ -520,6 +524,7 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 	amendmentAuthenticated := false
 	repairAuthenticated := false
 	refreshAuthenticated := false
+	postbuildAuthenticated := false
 	if !exact {
 		boundaryPhase := domain.PhaseVerification
 		if ticketState == domain.StateBuilding {
@@ -597,6 +602,22 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 			return StoredVerification{}, fmt.Errorf("base refresh verification boundary: %w", refreshErr)
 		}
 	}
+	if !exact && ticketState == domain.StateBuilding {
+		repair, repairErr := postbuildRepairAtFence(ctx, q, ref, ticketVersion, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticketRunner})
+		if repairErr == nil {
+			current, retained := result, repair.Verification
+			current.CommandBinding = retained.CommandBinding // independently reloaded below
+			current.TicketVersion, retained.TicketVersion = 0, 0
+			current.Fence, retained.Fence = domain.Fence{}, domain.Fence{}
+			if !reflect.DeepEqual(current, retained) {
+				return StoredVerification{}, ErrEvidenceConflict
+			}
+			result = repair.Verification
+			exact, postbuildAuthenticated = true, true
+		} else if !errors.Is(repairErr, ErrNotFound) {
+			return StoredVerification{}, fmt.Errorf("postbuild repair verification boundary: %w", repairErr)
+		}
+	}
 	if !exact {
 		var transitions int
 		if ticketVersion != result.TicketVersion+1 || ticketRunner != result.Fence.RunnerEpoch || leader != result.Fence.LeaderEpoch || q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='verifying' AND to_state='building'`, ref.Channel, ref.Project, ref.Ticket, ticketVersion).Scan(&transitions) != nil || transitions != 1 {
@@ -609,7 +630,7 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 	}
 	result.CommandBinding = binding
 	var commandErr error
-	if amendmentAuthenticated || repairAuthenticated || refreshAuthenticated {
+	if amendmentAuthenticated || repairAuthenticated || refreshAuthenticated || postbuildAuthenticated {
 		commandErr = s.reauthenticateStoredVerificationCommandHistoricalFrom(ctx, q, ref, result)
 	} else {
 		commandErr = s.reauthenticateStoredVerificationCommandFrom(ctx, q, ref, result)
@@ -617,7 +638,7 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 	if commandErr != nil {
 		return StoredVerification{}, fmt.Errorf("verification command reauthentication: %w", ErrEvidenceConflict)
 	}
-	if amendmentAuthenticated || repairAuthenticated || refreshAuthenticated {
+	if amendmentAuthenticated || repairAuthenticated || refreshAuthenticated || postbuildAuthenticated {
 		// The amendment boundary and signed recovery suffix are themselves the
 		// live binding for this decision-specific transition. Project that exact
 		// current endpoint while retaining the immutable provider/command witnesses

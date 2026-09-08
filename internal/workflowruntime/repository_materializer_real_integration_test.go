@@ -34,7 +34,20 @@ import (
 // This is intentionally a real macOS integration boundary.  The guarded
 // repository supervisor is Darwin-only and the test must not turn a Linux
 // fallback into evidence that the production composition is executable.
-func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
+type materializerRealFixture struct {
+	ctx          context.Context
+	db           *store.Store
+	worktree     string
+	ref          domain.TicketRef
+	fence        domain.Fence
+	leader       uint64
+	materializer workflowruntime.RepositoryMaterializer
+	worker       workflowworker.Worker
+	state        *materializerFaultEngine
+}
+
+func newMaterializerRealFixture(t *testing.T, failBuild bool) materializerRealFixture {
+	t.Helper()
 	if runtime.GOOS != "darwin" {
 		t.Skip("guarded repository command execution is Darwin-only")
 	}
@@ -66,7 +79,7 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { _ = db.Close() })
 	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("real", repository), config.TicketOverride{})
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +115,7 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	providerScript := writeMaterializerProvider(t)
+	providerScript := writeMaterializerProviderWithBuildFailure(t, failBuild)
 	builderAuth := writeMaterializerAuthHome(t)
 	reviewerAuth := writeMaterializerAuthHome(t)
 	providerSupervisor, err := processsupervisor.New(nil)
@@ -165,6 +178,12 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	supervisor := processsupervisor.RepositoryCommandSupervisor{Executable: sfBinary, GitRunner: runner, SoftDrain: time.Second, HardDrain: time.Second}
 	materializer := workflowruntime.RepositoryMaterializer{Store: db, Git: git.Runner{Home: runner.Home, ExecHelper: helper, TestLocalTransport: true, MutationAuthority: db}, Executor: repositoryexec.Executor{Authority: materializerDiagnosticAuthority{Store: db, t: t}, Supervisor: supervisor}}
 	worker := workflowworker.Worker{Evidence: db, Engine: state, Runner: providers, Checkpoint: materializer, Candidate: materializer, CheckpointMaterializer: materializer, CandidateMaterializer: materializer}
+	return materializerRealFixture{ctx: ctx, db: db, worktree: worktree, ref: ref, fence: fence, leader: leader, materializer: materializer, worker: worker, state: state}
+}
+
+func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
+	f := newMaterializerRealFixture(t, false)
+	ctx, db, worktree, ref, fence, leader, materializer, worker := f.ctx, f.db, f.worktree, f.ref, f.fence, f.leader, f.materializer, f.worker
 
 	if _, err := worker.Run(ctx, ref, fence); err != nil {
 		t.Fatalf("planning: %v", err)
@@ -758,6 +777,11 @@ func writeMaterializerAuthHome(t *testing.T) string {
 
 func writeMaterializerProvider(t *testing.T) string {
 	t.Helper()
+	return writeMaterializerProviderWithBuildFailure(t, false)
+}
+
+func writeMaterializerProviderWithBuildFailure(t *testing.T, failBuild bool) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "codex-fixture")
 	script := `#!/bin/sh
 set -eu
@@ -802,6 +826,9 @@ else
 fi
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}'
 `
+	if failBuild {
+		script = strings.Replace(script, "func TestFeature(t *testing.T) {}", "func TestFeature(t *testing.T) { t.Fatal(\"postbuild regression remains\") }", 1)
+	}
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

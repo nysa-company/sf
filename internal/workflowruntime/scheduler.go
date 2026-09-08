@@ -372,6 +372,79 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 				}
 			}
 		}
+		if ticket.State == domain.StateBuilding {
+			if source, ok := s.Tickets.(postbuildRepairContextSource); ok {
+				_, repairErr := source.PostbuildRepairContext(runCtx, ticket.Ref, ticket.Version, candidateFence)
+				if repairErr == nil {
+					if pending, ok := s.Tickets.(pendingPostbuildAmendmentSource); ok {
+						key, pendingErr := pending.PostbuildRepairPendingAmendment(runCtx, ticket.Ref, ticket.Version, candidateFence)
+						if pendingErr == nil {
+							dispatcher, supported := s.Worker.(pendingPostbuildAmendmentDispatcher)
+							if !supported || runCtx.Err() != nil {
+								end()
+								return TickResult{Outcome: OutcomeReadiness, Ref: ticket.Ref, Ticket: ticket, Fence: candidateFence, Err: ErrReadiness}
+							}
+							result.Worker, pendingErr = dispatcher.DispatchPostbuildRepairAmendment(runCtx, ticket.Ref, ticket.Version, candidateFence, key)
+							end()
+							if pendingErr != nil {
+								result.Outcome, result.Err = classifyWorker(pendingErr)
+							} else {
+								result.Outcome = OutcomeInvoked
+							}
+							return result
+						}
+						if !errors.Is(pendingErr, store.ErrNotFound) {
+							end()
+							return classify(pendingErr, candidateFence, ticket.Ref)
+						}
+					}
+					authenticator, supported := s.Worktrees.(postbuildRepairAuthenticator)
+					if !supported {
+						end()
+						return TickResult{Outcome: OutcomeReadiness, Ref: ticket.Ref, Ticket: ticket, Fence: candidateFence, Err: ErrReadiness}
+					}
+					authenticate := authenticator.AuthenticatePostbuildRepair
+					if completed, ok := s.Tickets.(completedPostbuildRepairSource); ok {
+						_, completeErr := completed.PostbuildRepairCompletedBuildContext(runCtx, ticket.Ref, ticket.Version, candidateFence)
+						if completeErr == nil {
+							finalizer, supported := s.Worktrees.(completedPostbuildRepairAuthenticator)
+							if !supported {
+								end()
+								return TickResult{Outcome: OutcomeReadiness, Ref: ticket.Ref, Ticket: ticket, Fence: candidateFence, Err: ErrReadiness}
+							}
+							authenticate = finalizer.AuthenticateCompletedPostbuildRepair
+						} else if !errors.Is(completeErr, store.ErrNotFound) {
+							end()
+							return classify(completeErr, candidateFence, ticket.Ref)
+						}
+					}
+					worktree, authErr := authenticate(runCtx, worktreecoord.EnsureRequest{Ref: ticket.Ref, Version: ticket.Version, Fence: candidateFence})
+					if authErr != nil {
+						end()
+						result.Outcome, result.Err = classifyEnsure(authErr)
+						return result
+					}
+					if runCtx.Err() != nil {
+						end()
+						result.Outcome, result.Err = OutcomeCanceled, ErrCanceled
+						return result
+					}
+					result.Worktree = worktree
+					result.Worker, repairErr = s.Worker.Run(runCtx, ticket.Ref, candidateFence)
+					end()
+					if repairErr != nil {
+						result.Outcome, result.Err = classifyWorker(repairErr)
+					} else {
+						result.Outcome = OutcomeInvoked
+					}
+					return result
+				}
+				if !errors.Is(repairErr, store.ErrNotFound) {
+					end()
+					return classify(repairErr, candidateFence, ticket.Ref)
+				}
+			}
+		}
 		if ticket.State == domain.StateVerifying || ticket.State == domain.StateBuilding {
 			candidateRepair := false
 			if ticket.State == domain.StateBuilding {

@@ -1815,6 +1815,16 @@ func (s *Store) LatestReusableProviderAttempt(ctx context.Context, request Lates
 	if live.Version != request.ExpectedVersion || live.RunnerEpoch != request.Fence.RunnerEpoch || liveLeader != request.Fence.LeaderEpoch {
 		return LatestReusableProviderAttemptResult{}, ErrStaleFence
 	}
+	if request.Phase == domain.PhaseBuild && live.State == domain.StateBuilding {
+		repair, repairErr := latestPostbuildRepairAt(ctx, s.db, request.Ref, request.ExpectedVersion)
+		if repairErr == nil {
+			if historical.Claim.ExpectedVersion < repair.EntryVersion || historical.Claim.ID <= repair.BuilderResult.AttemptID || historical.Claim.Attempt <= repair.BuilderResult.Attempt {
+				return LatestReusableProviderAttemptResult{}, ErrNotFound
+			}
+		} else if !errors.Is(repairErr, ErrNotFound) {
+			return LatestReusableProviderAttemptResult{}, ErrEvidenceConflict
+		}
+	}
 	if request.Phase == domain.PhaseReview && live.State == domain.StateReviewing {
 		if superseded, err := s.reviewPredatesProtectedBaseRefresh(ctx, request, key); err != nil {
 			return LatestReusableProviderAttemptResult{}, err
