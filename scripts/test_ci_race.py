@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import re
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +21,28 @@ class RacePartitionTest(unittest.TestCase):
         self.assertEqual([int(i) for i in shards], list(range(8)))
         self.assertIn('--count 8', (root / "Makefile").read_text())
         self.assertNotIn("continue-on-error", workflow)
+
+    def test_required_acceptance_gate_is_fail_closed(self):
+        workflow = (Path(__file__).resolve().parent.parent /
+                    ".github/workflows/repository-baseline.yml").read_text()
+        gate = workflow.split("  acceptance:\n", 1)[1].split("  baseline:\n", 1)[0]
+        self.assertIn("name: SF acceptance", gate)
+        self.assertIn("if: ${{ always() }}", gate)
+        self.assertIn("needs: [baseline, store-race]", gate)
+        self.assertIn("${{ needs.baseline.result }}", gate)
+        self.assertIn("${{ needs.store-race.result }}", gate)
+        self.assertIn('test "$BASELINE_RESULT" = success', gate)
+        self.assertIn('test "$STORE_RACE_RESULT" = success', gate)
+        commands = gate.split("        run: |\n", 1)[1]
+        for baseline in ("success", "failure", "cancelled", "skipped", ""):
+            for store in ("success", "failure", "cancelled", "skipped", ""):
+                with self.subTest(baseline=baseline, store=store):
+                    result = subprocess.run(
+                        ["bash", "--noprofile", "--norc", "-e", "-c", commands],
+                        env={"BASELINE_RESULT": baseline, "STORE_RACE_RESULT": store},
+                        capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode == 0,
+                                     baseline == store == "success")
 
     def test_complete_disjoint_stable_partition(self):
         names = [f"TestCase{i}" for i in range(541)] + ["ExampleStore", "FuzzDecode"]

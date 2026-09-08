@@ -10,6 +10,21 @@ permissions:
   contents: read
 
 jobs:
+  acceptance:
+    name: SF acceptance
+    if: ${{ always() }}
+    needs: [baseline, store-race]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every mandatory job to succeed
+        env:
+          BASELINE_RESULT: ${{ needs.baseline.result }}
+          STORE_RACE_RESULT: ${{ needs.store-race.result }}
+        run: |
+          test "$BASELINE_RESULT" = success
+          test "$STORE_RACE_RESULT" = success
+
   baseline:
     # v1's production execution and compiled acceptance boundary is macOS.
     runs-on: macos-14
