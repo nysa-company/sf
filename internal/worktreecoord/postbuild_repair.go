@@ -30,7 +30,13 @@ func (c Coordinator) authenticatePostbuildRepairMode(ctx context.Context, reques
 	if c.Store == nil || request.Ref.Validate() != nil || request.Version == 0 || request.Fence.LeaderEpoch == 0 || request.Fence.RunnerEpoch == 0 || request.Fence.ClaimEpoch != 0 {
 		return store.StoredWorktree{}, ErrAuthentication
 	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// Completed admission composes two independently bounded 15s physical
+	// inspections plus Store reloads. Earlier caller deadlines still prevail.
+	budget := 15 * time.Second
+	if completed {
+		budget = 45 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	project, err := c.Store.Project(ctx, request.Ref.Channel, request.Ref.Project)
 	if err != nil {
@@ -49,7 +55,10 @@ func (c Coordinator) authenticatePostbuildRepairMode(ctx context.Context, reques
 	assert := func(ctx context.Context) error {
 		return c.Store.AssertTicketFence(ctx, request.Ref, request.Version, request.Fence)
 	}
-	return authenticatePostbuildRepair(ctx, request, project, path, load, c.Git.InspectRetainedWorktree, assert, completed)
+	prepared := func(ctx context.Context, key store.ProviderAttemptResultKey) (store.PostbuildAmendmentPreparedCandidateWitness, bool, error) {
+		return c.Store.PostbuildRepairPreparedCandidateWitness(ctx, request.Ref, request.Version, request.Fence, key)
+	}
+	return authenticatePostbuildRepair(ctx, request, project, path, load, c.Git.InspectRetainedWorktree, assert, completed, prepared)
 }
 
 // The private seams exercise ordering and late revocation without constructing
@@ -59,6 +68,7 @@ func authenticatePostbuildRepair(ctx context.Context, request EnsureRequest, pro
 	inspect func(context.Context, git.Worktree) (git.RetainedWorktreeInspection, error),
 	assert func(context.Context) error,
 	completed bool,
+	prepared func(context.Context, store.ProviderAttemptResultKey) (store.PostbuildAmendmentPreparedCandidateWitness, bool, error),
 ) (store.StoredWorktree, error) {
 	if err := ctx.Err(); err != nil {
 		return store.StoredWorktree{}, err
@@ -75,7 +85,25 @@ func authenticatePostbuildRepair(ctx context.Context, request EnsureRequest, pro
 	if err != nil {
 		return store.StoredWorktree{}, err
 	}
-	if (!completed && observed.Digest != proof.Repair.RetainedWorktreeDigest) || observed.Digest == "" || !refreshBuilderChangesMatch(observed.Changes, proof.Repair.OriginalCheckpointOID, proof.BuilderArtifact.ChangedFiles, proof.Plan.Document.Planner.Paths, proof.Verification.Revision.OwnedFiles) {
+	head := proof.Repair.OriginalCheckpointOID
+	key := store.ProviderAttemptResultKey{Ref: request.Ref, Phase: domain.PhaseBuild, AttemptID: proof.Builder.AttemptID, Attempt: proof.Builder.Claim.Attempt}
+	var witness *store.PostbuildAmendmentPreparedCandidateWitness
+	if proof.Candidate != nil {
+		if !completed || proof.Candidate.BuilderResult != key || proof.Candidate.Commit.ParentOID != head || len(observed.Changes.Paths) != 0 {
+			return store.StoredWorktree{}, ErrUnready
+		}
+		head = proof.Candidate.Commit.CommitOID
+	} else if completed && observed.Changes.Head != head {
+		if prepared == nil {
+			return store.StoredWorktree{}, ErrUnready
+		}
+		value, found, err := prepared(ctx, key)
+		if err != nil || !found || value.Ref != request.Ref || value.Version != request.Version || value.Fence != request.Fence || value.Builder != key || value.Commit.ParentOID != head || value.Commit.CommitOID != observed.Changes.Head || !reflect.DeepEqual(value.Worktree, proof.Worktree) || len(observed.Changes.Paths) != 0 {
+			return store.StoredWorktree{}, ErrUnready
+		}
+		head, witness = value.Commit.CommitOID, &value
+	}
+	if (!completed && observed.Digest != proof.Repair.RetainedWorktreeDigest) || observed.Digest == "" || !refreshBuilderChangesMatch(observed.Changes, head, proof.BuilderArtifact.ChangedFiles, proof.Plan.Document.Planner.Paths, proof.Verification.Revision.OwnedFiles) {
 		return store.StoredWorktree{}, ErrUnready
 	}
 	checked, err := load(ctx)
@@ -101,6 +129,12 @@ func authenticatePostbuildRepair(ctx context.Context, request EnsureRequest, pro
 		}
 		if !reflect.DeepEqual(proof, checked) {
 			return store.StoredWorktree{}, ErrAuthentication
+		}
+		if witness != nil {
+			value, found, err := prepared(ctx, key)
+			if err != nil || !found || !reflect.DeepEqual(value, *witness) {
+				return store.StoredWorktree{}, ErrAuthentication
+			}
 		}
 	}
 	if err := ctx.Err(); err != nil {

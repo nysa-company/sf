@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [store, git, admission, behavior, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, onboarding, python-onboarding]
+        group: [store, git, admission, behavior, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, repair-candidate-unrecorded-same, repair-candidate-unrecorded-restart, repair-candidate-recorded-same, repair-candidate-recorded-restart, onboarding, python-onboarding]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,6 +79,15 @@ jobs:
                 candidate-recorded-restart) selector='^recorded_true$/^restart_true$' ;;
               esac
               go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run "^TestPostbuildAmendmentCandidateFinalizationRecovery$/$selector" -v
+              ;;
+            repair-candidate-unrecorded-same|repair-candidate-unrecorded-restart|repair-candidate-recorded-same|repair-candidate-recorded-restart)
+              case "$GROUP" in
+                repair-candidate-unrecorded-same) selector='^recorded_false$/^restart_false$' ;;
+                repair-candidate-unrecorded-restart) selector='^recorded_false$/^restart_true$' ;;
+                repair-candidate-recorded-same) selector='^recorded_true$/^restart_false$' ;;
+                repair-candidate-recorded-restart) selector='^recorded_true$/^restart_true$' ;;
+              esac
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run "^TestPostbuildRepairCandidateFinalizationRecovery$/$selector" -v
               ;;
             onboarding)
               scripts/docs-smoke

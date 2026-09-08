@@ -253,3 +253,17 @@ VERDICT: implementation design in progress; not cleared for merge.
   The three cases now have separate hosted jobs, each retaining the existing
   eight-minute bound. No individual Git inspection timeout was increased.
   Four separate commit-before-record/record-before-transition cases are added.
+
+## Execution checkpoint — direct repair completion
+
+- Exact c9d300b focused run34287852415 passed all 15 groups and built its native
+  artifact. Full run34288028645 is still pending. It is not release clearance.
+- Final independent cross-review found the direct implementation-repair path
+  (without a test amendment) still rejects committed/persisted candidates after
+  a crash. The accepted-amendment cases do not cover this distinct outcome.
+  Add equivalent exact clean-candidate admission and historical command replay,
+  plus four direct-repair crash cases. Never rerun a model/command/commit to
+  compensate for a lost candidate response.
+- Native acceptance remains gated. The campaign will explicitly distinguish
+  deliberate Planner cancellation-exhaustion/retry from natural model failure;
+  pause/resume alone does not prove provider retry.

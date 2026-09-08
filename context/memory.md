@@ -5,10 +5,11 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Portable tests/builds run only on GitHub. Current pushed candidate42886f7 adds
-  safe diagnostic causes; run34285851847 proves the composed admission's 15s
-  deadline expires at the final snapshot. Bounded budget repair and exact
-  post-amendment candidate finalization/recovery fixes are in progress, untested.
+  Portable tests/builds run only on GitHub. Current pushed candidate c9d300b
+  passed all15 focused groups in34287852415. Full34288028645 pending. Independent
+  cross-review found direct implementation-repair (without amendment) still
+  rejects candidate crash completion; equivalent exact handoff fixes and4cases
+  are now being added. Do not use c9's artifact for native acceptance yet.
   Prior d13db95 compiled onboarding and three prepared-checkpoint recovery cases
   pass, but its focused run34284912043 fails intermittent admission. Full baseline
   34285053550 is diagnostic for that old head; not final release acceptance.

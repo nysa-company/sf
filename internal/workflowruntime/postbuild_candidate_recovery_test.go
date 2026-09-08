@@ -27,12 +27,28 @@ func (s lostPostbuildCandidateResponse) RecordCandidate(ctx context.Context, evi
 }
 
 func TestPostbuildAmendmentCandidateFinalizationRecovery(t *testing.T) {
+	testPostbuildCandidateFinalizationRecovery(t, true)
+}
+
+func TestPostbuildRepairCandidateFinalizationRecovery(t *testing.T) {
+	testPostbuildCandidateFinalizationRecovery(t, false)
+}
+
+func testPostbuildCandidateFinalizationRecovery(t *testing.T, amendment bool) {
 	for _, recorded := range []bool{false, true} {
 		for _, restart := range []bool{false, true} {
 			t.Run(fmt.Sprintf("recorded_%t/restart_%t", recorded, restart), func(t *testing.T) {
-				f := newMaterializerRealFixtureWithProvider(t, func(t *testing.T) string { return writeMaterializerAmendmentProvider(t, true) })
+				provider := func(t *testing.T) string { return writeMaterializerAmendmentProvider(t, true) }
+				states := []domain.State{domain.StateVerifying, domain.StateBuilding, domain.StateBuilding, domain.StateVerifying, domain.StateBuilding}
+				attempts := 6
+				if !amendment {
+					provider = func(t *testing.T) string { return writeMaterializerProviderWithBuildFailure(t, true) }
+					states = []domain.State{domain.StateVerifying, domain.StateBuilding, domain.StateBuilding}
+					attempts = 4
+				}
+				f := newMaterializerRealFixtureWithProvider(t, provider)
 				f.worker.Engine = f.state.StateMachine
-				for _, want := range []domain.State{domain.StateVerifying, domain.StateBuilding, domain.StateBuilding, domain.StateVerifying, domain.StateBuilding} {
+				for _, want := range states {
 					if got, err := f.worker.Run(f.ctx, f.ref, f.fence); err != nil || got.State != want {
 						t.Fatalf("setup=%+v want=%s err=%v", got, want, err)
 					}
@@ -48,7 +64,7 @@ func TestPostbuildAmendmentCandidateFinalizationRecovery(t *testing.T) {
 				if _, err := f.worker.Run(f.ctx, f.ref, f.fence); !errors.Is(err, crash) {
 					t.Fatalf("candidate response loss: %v", err)
 				}
-				assertMaterializerProviderAttempts(t, f.db, f.ref, 6)
+				assertMaterializerProviderAttempts(t, f.db, f.ref, attempts)
 				head := rawMaterializerGit(t, f.worktree, "rev-parse", "HEAD")
 				if dirty := rawMaterializerGit(t, f.worktree, "status", "--porcelain=v1", "--untracked-files=all"); dirty != "" {
 					t.Fatal("candidate was not fully committed")
@@ -89,8 +105,22 @@ func TestPostbuildAmendmentCandidateFinalizationRecovery(t *testing.T) {
 					t.Fatalf("retained Building: %v", err)
 				}
 				f.fence.RunnerEpoch = pending.RunnerEpoch
+				if !amendment {
+					// Scheduler selects the logical lane and probes amendment
+					// dispatch before asking for completed physical admission.
+					if _, err := f.db.PostbuildRepairContext(f.ctx, f.ref, pending.Version, f.fence); err != nil {
+						t.Fatalf("scheduler repair selection: %v", err)
+					}
+					if _, err := f.db.PostbuildRepairPendingAmendment(f.ctx, f.ref, pending.Version, f.fence); !errors.Is(err, store.ErrNotFound) {
+						t.Fatalf("normal candidate selected amendment dispatch: %v", err)
+					}
+				}
 				coordinator := worktreecoord.Coordinator{Store: f.db, Git: f.materializer.Git}
-				if _, err := coordinator.AuthenticatePostbuildVerificationAmendment(f.ctx, worktreecoord.EnsureRequest{Ref: f.ref, Version: pending.Version, Fence: f.fence}); err != nil {
+				admit := coordinator.AuthenticateCompletedPostbuildRepair
+				if amendment {
+					admit = coordinator.AuthenticatePostbuildVerificationAmendment
+				}
+				if _, err := admit(f.ctx, worktreecoord.EnsureRequest{Ref: f.ref, Version: pending.Version, Fence: f.fence}); err != nil {
 					t.Fatalf("candidate finalization admission: %v", err)
 				}
 				f.worker.Evidence = f.db
@@ -99,7 +129,7 @@ func TestPostbuildAmendmentCandidateFinalizationRecovery(t *testing.T) {
 				if got, err := f.worker.Run(f.ctx, f.ref, f.fence); err != nil || got.State != domain.StatePublishing || !got.Replayed {
 					t.Fatalf("candidate finalization=%+v err=%v", got, err)
 				}
-				assertMaterializerProviderAttempts(t, f.db, f.ref, 6)
+				assertMaterializerProviderAttempts(t, f.db, f.ref, attempts)
 				if after := counts(); after != before || rawMaterializerGit(t, f.worktree, "rev-parse", "HEAD") != head {
 					t.Fatal("candidate recovery replaced commit or issued a command/effect")
 				}

@@ -43,8 +43,48 @@ func (s *Store) PostbuildAmendmentPreparedCandidateWitness(ctx context.Context, 
 	if value.Decision != VerificationAmendmentAccepted || value.Candidate != nil || builderKey.Ref != ref || builderKey.Phase != domain.PhaseBuild {
 		return result, false, ErrEvidenceConflict
 	}
+	return s.postbuildPreparedCandidateWitness(ctx, ref, version, fence, builderKey, func(q *sql.Conn) (postbuildCandidateSource, error) {
+		boundary, err := loadVerificationAmendmentBoundary(ctx, q, ref, version, fence)
+		if err != nil || boundary.Decision != VerificationAmendmentAccepted || !reflect.DeepEqual(boundary.Amendment, value.Amendment) {
+			return postbuildCandidateSource{}, ErrEvidenceConflict
+		}
+		binding, _, err := loadPostbuildAmendmentBinding(ctx, q, boundary.Amendment)
+		if err != nil || !reflect.DeepEqual(binding, value.Binding) {
+			return postbuildCandidateSource{}, ErrEvidenceConflict
+		}
+		verification, err := s.verificationEvidenceForIdentityFrom(ctx, q, ref, "", "", "")
+		if err != nil || !reflect.DeepEqual(verification, value.CurrentVerification) {
+			return postbuildCandidateSource{}, ErrEvidenceConflict
+		}
+		return postbuildCandidateSource{EntryVersion: boundary.DecisionVersion, Verification: verification, Worktree: value.Worktree, Plan: value.Plan}, nil
+	})
+}
+
+type postbuildCandidateSource struct {
+	EntryVersion uint64
+	Verification StoredVerification
+	Worktree     StoredWorktree
+	Plan         StoredPlan
+}
+
+func (s *Store) postbuildPreparedCandidateWitness(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence, builderKey ProviderAttemptResultKey, load func(*sql.Conn) (postbuildCandidateSource, error)) (PostbuildAmendmentPreparedCandidateWitness, bool, error) {
+	var result PostbuildAmendmentPreparedCandidateWitness
 	found := false
-	err = s.readProtectedBaseRefreshSnapshot(ctx, func(q *sql.Conn) error {
+	err := s.readProtectedBaseRefreshSnapshot(ctx, func(q *sql.Conn) error {
+		value, err := load(q)
+		if err != nil {
+			return err
+		}
+		result, found, err = s.postbuildPreparedCandidateWitnessFrom(ctx, q, ref, version, fence, builderKey, value)
+		return err
+	})
+	return result, found && err == nil, err
+}
+
+func (s *Store) postbuildPreparedCandidateWitnessFrom(ctx context.Context, q *sql.Conn, ref domain.TicketRef, version uint64, fence domain.Fence, builderKey ProviderAttemptResultKey, value postbuildCandidateSource) (PostbuildAmendmentPreparedCandidateWitness, bool, error) {
+	var result PostbuildAmendmentPreparedCandidateWitness
+	found := false
+	err := func() error {
 		if err := s.assertTicketFence(ctx, q, ref, version, fence); err != nil {
 			return err
 		}
@@ -52,18 +92,10 @@ func (s *Store) PostbuildAmendmentPreparedCandidateWitness(ctx context.Context, 
 		if q.QueryRowContext(ctx, `SELECT state FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state) != nil || state != domain.StateBuilding || assertNoVerificationAmendmentDownstream(ctx, q, ref) != nil {
 			return ErrEvidenceConflict
 		}
-		boundary, err := loadVerificationAmendmentBoundary(ctx, q, ref, version, fence)
-		if err != nil || boundary.Decision != VerificationAmendmentAccepted || !reflect.DeepEqual(boundary.Amendment, value.Amendment) {
+		if value.EntryVersion == 0 || value.EntryVersion > version || builderKey.Ref != ref || builderKey.Phase != domain.PhaseBuild {
 			return ErrEvidenceConflict
 		}
-		binding, _, err := loadPostbuildAmendmentBinding(ctx, q, boundary.Amendment)
-		if err != nil || !reflect.DeepEqual(binding, value.Binding) {
-			return ErrEvidenceConflict
-		}
-		verification, err := s.verificationEvidenceForIdentityFrom(ctx, q, ref, "", "", "")
-		if err != nil || !reflect.DeepEqual(verification, value.CurrentVerification) {
-			return ErrEvidenceConflict
-		}
+		verification := value.Verification
 		worktree, project, err := operatorSourceWorktreeFrom(ctx, q, ref)
 		if err != nil || worktree.Path != value.Worktree.Path || worktree.Branch != value.Worktree.Branch || worktree.BaseSHA != value.Worktree.BaseSHA || string(worktree.IdentityJSON) != string(value.Worktree.IdentityJSON) {
 			return ErrEvidenceConflict
@@ -89,14 +121,14 @@ func (s *Store) PostbuildAmendmentPreparedCandidateWitness(ctx context.Context, 
 			return ErrEvidenceConflict
 		}
 		builder, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, q, builderKey)
-		if err != nil || parsed.Builder == nil || parsed.Builder.AmendmentRequest != nil || builder.Claim.ExpectedVersion < boundary.DecisionVersion || builder.Claim.Repository != project.Path || builder.Claim.Worktree != worktree.Path || builder.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || builder.Claim.BaseSHA != worktree.BaseSHA || assertNewestBoundResult(ctx, q, ref, domain.PhaseBuild, "builder", builderKey) != nil || providerResultReachesFence(ctx, q, builderKey, builder, version, fence) != nil {
+		if err != nil || parsed.Builder == nil || parsed.Builder.AmendmentRequest != nil || builder.Claim.ExpectedVersion < value.EntryVersion || builder.Claim.Repository != project.Path || builder.Claim.Worktree != worktree.Path || builder.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || builder.Claim.BaseSHA != worktree.BaseSHA || assertNewestBoundResult(ctx, q, ref, domain.PhaseBuild, "builder", builderKey) != nil || providerResultReachesFence(ctx, q, builderKey, builder, version, fence) != nil {
 			return ErrEvidenceConflict
 		}
 		var count int
-		if q.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='build' AND role='builder' AND provider_attempt_id=? AND attempt=? AND entry_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, builderKey.AttemptID, builderKey.Attempt, boundary.DecisionVersion).Scan(&count) != nil || count != 1 {
+		if q.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='build' AND role='builder' AND provider_attempt_id=? AND attempt=? AND entry_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, builderKey.AttemptID, builderKey.Attempt, value.EntryVersion).Scan(&count) != nil || count != 1 {
 			return ErrEvidenceConflict
 		}
-		rows, err := q.QueryContext(ctx, `SELECT semantic_key FROM git_mutation_intents WHERE channel=? AND project_id=? AND ticket_id=? AND operation='commit' AND ticket_version>=? ORDER BY semantic_key LIMIT 2`, ref.Channel, ref.Project, ref.Ticket, boundary.DecisionVersion)
+		rows, err := q.QueryContext(ctx, `SELECT semantic_key FROM git_mutation_intents WHERE channel=? AND project_id=? AND ticket_id=? AND operation='commit' AND ticket_version>=? ORDER BY semantic_key LIMIT 2`, ref.Channel, ref.Project, ref.Ticket, value.EntryVersion)
 		if err != nil {
 			return err
 		}
@@ -141,7 +173,7 @@ func (s *Store) PostbuildAmendmentPreparedCandidateWitness(ctx context.Context, 
 		if postbuildRepairSignedSourcePrefix(ctx, q, ref, builder.Claim.ExpectedVersion, domain.Fence{LeaderEpoch: builder.Claim.LeaderEpoch, RunnerEpoch: builder.Claim.RunnerEpoch}, facts.Claim.TicketVersion, claimFence) != nil || postbuildRepairSignedSourcePrefix(ctx, q, ref, facts.Claim.TicketVersion, claimFence, version, fence) != nil {
 			return ErrEvidenceConflict
 		}
-		rows, err = q.QueryContext(ctx, `SELECT semantic_key,claim_epoch FROM repository_command_results WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>=? AND semantic_key LIKE ? ORDER BY semantic_key,claim_epoch LIMIT 65`, ref.Channel, ref.Project, ref.Ticket, boundary.DecisionVersion, "repository-command-evidence/"+RepositoryCommandPurposePostbuildCandidate+"/%")
+		rows, err = q.QueryContext(ctx, `SELECT semantic_key,claim_epoch FROM repository_command_results WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>=? AND semantic_key LIKE ? ORDER BY semantic_key,claim_epoch LIMIT 65`, ref.Channel, ref.Project, ref.Ticket, value.EntryVersion, "repository-command-evidence/"+RepositoryCommandPurposePostbuildCandidate+"/%")
 		if err != nil {
 			return err
 		}
@@ -196,6 +228,6 @@ func (s *Store) PostbuildAmendmentPreparedCandidateWitness(ctx context.Context, 
 		result = PostbuildAmendmentPreparedCandidateWitness{Ref: ref, Version: version, Fence: fence, Project: project, Worktree: worktree, Verification: verification, Plan: plan, Builder: builderKey, BuilderArtifact: *parsed.Builder, Command: *matched, Commit: CommitObservation{CommitOID: facts.PreparedCommitOID, ParentOID: verification.Checkpoint.CommitOID, TreeOID: facts.PreparedTreeOID}, Claim: facts.Claim, EffectState: facts.Effect.State}
 		found = true
 		return nil
-	})
+	}()
 	return result, found && err == nil, err
 }

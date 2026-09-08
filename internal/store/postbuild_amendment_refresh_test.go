@@ -94,7 +94,7 @@ func assertPostbuildAmendmentPublishedRefreshRestart(t *testing.T, db *Store, ct
 		if err != nil {
 			t.Fatal(err)
 		}
-		if superseded, err := db.postbuildAmendmentSupersededAt(ctx, db.db, ref, version, fence, false); err != nil || !superseded {
+		if superseded, err := postbuildRepairSupersededAt(ctx, db.db, ref, version, fence, false); err != nil || !superseded {
 			t.Fatalf("historical refresh after leader acquisition: %t %v", superseded, err)
 		}
 		if changed, err := db.FenceRecoveredRunners(ctx, ref.Channel, leader); err != nil || changed != 1 {

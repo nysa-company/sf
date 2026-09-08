@@ -12,13 +12,22 @@ import (
 	"github.com/nysa-company/sf/internal/workflowworker"
 )
 
-// An already committed post-amendment candidate is observation-only replay.
+// An already committed postbuild-repair candidate is observation-only replay.
 // In particular its historical command must not be reissued at a new fence.
-func (m RepositoryMaterializer) replayPostbuildAmendmentPreparedCandidate(ctx context.Context, request workflowworker.PhaseRequest, plan workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, key store.ProviderAttemptResultKey) (workflowworker.CandidateWitness, bool, error) {
+func (m RepositoryMaterializer) replayPostbuildPreparedCandidate(ctx context.Context, request workflowworker.PhaseRequest, plan workflowprompt.PlanIdentity, verification workflowprompt.VerificationIdentity, builder phaseartifact.Builder, key store.ProviderAttemptResultKey) (workflowworker.CandidateWitness, bool, error) {
 	var empty workflowworker.CandidateWitness
-	// Store selects the exact current accepted-amendment entry. Historical
-	// companions cannot shadow a separately authenticated later lifecycle.
-	recovered, found, err := m.Store.PostbuildAmendmentPreparedCandidateWitness(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence, key)
+	// Each Store selector distinguishes genuine absence from malformed current
+	// authority. Only absence permits consulting the other semantic lane.
+	load := func(ctx context.Context) (store.PostbuildAmendmentPreparedCandidateWitness, bool, error) {
+		return m.Store.PostbuildRepairPreparedCandidateWitness(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence, key)
+	}
+	recovered, found, err := load(ctx)
+	if err == nil && !found {
+		load = func(ctx context.Context) (store.PostbuildAmendmentPreparedCandidateWitness, bool, error) {
+			return m.Store.PostbuildAmendmentPreparedCandidateWitness(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence, key)
+		}
+		recovered, found, err = load(ctx)
+	}
 	if err != nil || !found {
 		return empty, found, err
 	}
@@ -51,12 +60,12 @@ func (m RepositoryMaterializer) replayPostbuildAmendmentPreparedCandidate(ctx co
 		}
 		recovered.EffectState = store.EffectConfirmed
 	}
-	checked, found, err := m.Store.PostbuildAmendmentPreparedCandidateWitness(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence, key)
+	checked, found, err := load(ctx)
 	if err != nil || !found || !reflect.DeepEqual(checked, recovered) {
 		return empty, true, ErrRepositoryMaterialization
 	}
 	if head, err := m.Git.StrictCleanWorktreeHead(ctx, worktree); err != nil || head != recovered.Commit.CommitOID {
 		return empty, true, ErrRepositoryMaterialization
 	}
-	return workflowworker.CandidateWitness{Commit: recovered.Commit, CommandPolicyDigest: strings.TrimPrefix(command.Claim.PolicyDigest, "sha256:"), Reason: "recovered authenticated postbuild amendment candidate", CommandResult: command.Key}, true, nil
+	return workflowworker.CandidateWitness{Commit: recovered.Commit, CommandPolicyDigest: strings.TrimPrefix(command.Claim.PolicyDigest, "sha256:"), Reason: "recovered authenticated postbuild candidate", CommandResult: command.Key}, true, nil
 }

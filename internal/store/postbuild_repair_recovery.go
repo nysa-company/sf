@@ -17,6 +17,7 @@ type PostbuildRepairBuildContext struct {
 	Builder         ProviderAttemptResult
 	BuilderArtifact phaseartifact.Builder
 	FailedCommand   RepositoryCommandResult
+	Candidate       *StoredCandidate
 }
 
 // PostbuildRepairBuildContext is initial admission evidence only. Once a new
@@ -68,7 +69,7 @@ func (s *Store) readPostbuildRepairContext(ctx context.Context, ref domain.Ticke
 			return ErrEvidenceConflict
 		}
 		var state domain.State
-		if conn.QueryRowContext(ctx, `SELECT state FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state) != nil || state != domain.StateBuilding || assertNoVerificationAmendmentDownstream(ctx, conn, ref) != nil {
+		if conn.QueryRowContext(ctx, `SELECT state FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&state) != nil || state != domain.StateBuilding {
 			return ErrEvidenceConflict
 		}
 		if mode == "initial" {
@@ -102,6 +103,7 @@ func (s *Store) readPostbuildRepairContext(ctx context.Context, ref domain.Ticke
 				return ErrEvidenceConflict
 			}
 		}
+		var activeEffects int
 		if mode != "logical" {
 			if repositoryHasProviderWriter(ctx, conn, builder.Claim.Repository) != nil || repositoryHasCommandWriter(ctx, conn, builder.Claim.Repository) != nil {
 				return ErrControlNotDrained
@@ -110,7 +112,7 @@ func (s *Store) readPostbuildRepairContext(ctx context.Context, ref domain.Ticke
 			if conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM git_mutation_leases WHERE repository_path=?`, builder.Claim.Repository).Scan(&active) != nil || active != 0 {
 				return ErrControlNotDrained
 			}
-			if conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('planned','executing','uncertain')`, ref.Channel, ref.Project, ref.Ticket).Scan(&active) != nil || active != 0 {
+			if conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND state IN ('planned','executing','uncertain')`, ref.Channel, ref.Project, ref.Ticket).Scan(&activeEffects) != nil {
 				return ErrControlNotDrained
 			}
 		}
@@ -119,7 +121,7 @@ func (s *Store) readPostbuildRepairContext(ctx context.Context, ref domain.Ticke
 			return ErrEvidenceConflict
 		}
 		verification, err := s.currentVerificationFrom(ctx, conn, ref)
-		if err != nil {
+		if err != nil || verification.ProviderResult != repair.Verification.ProviderResult || verification.Checkpoint != repair.Verification.Checkpoint {
 			return ErrEvidenceConflict
 		}
 		plan, err := s.planFrom(ctx, conn, ref)
@@ -130,10 +132,24 @@ func (s *Store) readPostbuildRepairContext(ctx context.Context, ref domain.Ticke
 		if err != nil || !found || failed.ResultDigest != repair.FailedResultDigest {
 			return ErrEvidenceConflict
 		}
+		result = PostbuildRepairBuildContext{Repair: repair, Worktree: worktree, Plan: plan, Verification: verification, Builder: builder, BuilderArtifact: *parsed.Builder, FailedCommand: failed}
+		candidate, err := s.postbuildCandidateHandoffFrom(ctx, conn, ref, version, fence, repair.EntryVersion, verification)
+		if err != nil {
+			return err
+		}
+		result.Candidate = candidate
+		if activeEffects != 0 {
+			if mode == "initial" || candidate != nil || parsed.Builder.AmendmentRequest != nil {
+				return ErrControlNotDrained
+			}
+			key := ProviderAttemptResultKey{Ref: ref, Phase: domain.PhaseBuild, AttemptID: builder.Claim.ID, Attempt: builder.Claim.Attempt}
+			if _, found, err := s.postbuildPreparedCandidateWitnessFrom(ctx, conn, ref, version, fence, key, postbuildCandidateSource{EntryVersion: repair.EntryVersion, Verification: verification, Worktree: worktree, Plan: plan}); err != nil || !found {
+				return ErrControlNotDrained
+			}
+		}
 		if mode == "amendment" && parsed.Builder.AmendmentRequest == nil {
 			return ErrNotFound
 		}
-		result = PostbuildRepairBuildContext{Repair: repair, Worktree: worktree, Plan: plan, Verification: verification, Builder: builder, BuilderArtifact: *parsed.Builder, FailedCommand: failed}
 		return nil
 	})
 	return result, err
@@ -152,6 +168,9 @@ func postbuildRepairSupersededAt(ctx context.Context, q candidateEvidenceQuerier
 	entry, err := loadProviderPhaseEntryAt(ctx, q, ref, domain.PhaseBuild, version)
 	if err != nil || entry.Version < repair.EntryVersion {
 		return false, ErrEvidenceConflict
+	}
+	if superseded, err := postbuildRepairCandidateSupersededAt(ctx, q, ref, version, fence, repair, live); err != nil || superseded {
+		return superseded, err
 	}
 	if entry.Version == repair.EntryVersion {
 		return false, nil

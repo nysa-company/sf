@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -83,7 +84,7 @@ func TestPostbuildRepairAdmissionRequiresExactSnapshotAndAuthority(t *testing.T)
 				}
 				return nil
 			}
-			got, err := authenticatePostbuildRepair(ctx, request, project, proof.Worktree.Path, load, inspect, assert, false)
+			got, err := authenticatePostbuildRepair(ctx, request, project, proof.Worktree.Path, load, inspect, assert, false, nil)
 			if mode == "valid" {
 				if err != nil || got.Path != proof.Worktree.Path || loads != 2 || inspections != 1 || fences != 1 {
 					t.Fatalf("valid admission failed: %+v %v loads=%d inspections=%d fences=%d", got, err, loads, inspections, fences)
@@ -174,7 +175,7 @@ func TestCompletedPostbuildRepairRequiresFreshResultAndStableSnapshot(t *testing
 				}
 				return value, nil
 			}
-			got, err := authenticatePostbuildRepair(context.Background(), request, project, proof.Worktree.Path, load, inspect, func(context.Context) error { return nil }, true)
+			got, err := authenticatePostbuildRepair(context.Background(), request, project, proof.Worktree.Path, load, inspect, func(context.Context) error { return nil }, true, nil)
 			if mode == "valid" {
 				if err != nil || got.Path != proof.Worktree.Path || loads != 3 || inspections != 2 {
 					t.Fatalf("completed result refused: %+v %v loads=%d inspections=%d", got, err, loads, inspections)
@@ -183,5 +184,77 @@ func TestCompletedPostbuildRepairRequiresFreshResultAndStableSnapshot(t *testing
 				t.Fatalf("invalid completed result accepted: %+v %v", got, err)
 			}
 		})
+	}
+}
+
+func TestCompletedPostbuildRepairCandidateAdmission(t *testing.T) {
+	for _, persisted := range []bool{false, true} {
+		for _, mode := range []string{"valid", "dirty", "foreign head", "wrong builder", "late authority", "late bytes"} {
+			t.Run(fmt.Sprintf("persisted_%t/%s", persisted, mode), func(t *testing.T) {
+				request, project, proof, observed := postbuildRepairAdmissionFixture(t)
+				proof.Builder.AttemptID++
+				proof.Builder.Claim.ID = proof.Builder.AttemptID
+				proof.Builder.Claim.Attempt = proof.Repair.BuilderResult.Attempt + 1
+				proof.Builder.Claim.ExpectedVersion = proof.Repair.EntryVersion
+				key := store.ProviderAttemptResultKey{Ref: request.Ref, Phase: domain.PhaseBuild, AttemptID: proof.Builder.AttemptID, Attempt: proof.Builder.Claim.Attempt}
+				commit := store.CommitObservation{CommitOID: strings.Repeat("d", 40), ParentOID: proof.Repair.OriginalCheckpointOID, TreeOID: strings.Repeat("e", 40)}
+				observed.Changes.Head, observed.Changes.Paths = commit.CommitOID, nil
+				witness := store.PostbuildAmendmentPreparedCandidateWitness{Ref: request.Ref, Version: request.Version, Fence: request.Fence, Builder: key, Worktree: proof.Worktree, Commit: commit, EffectState: store.EffectConfirmed}
+				if mode == "wrong builder" {
+					witness.Builder.AttemptID++
+				}
+				if persisted {
+					proof.Candidate = &store.StoredCandidate{BuilderResult: witness.Builder, Commit: commit}
+				}
+				if mode == "dirty" {
+					observed.Changes.Paths = []string{"src/main.go"}
+				}
+				if mode == "foreign head" {
+					observed.Changes.Head = strings.Repeat("f", 40)
+				}
+				loads, inspections, reads := 0, 0, 0
+				load := func(context.Context) (store.PostbuildRepairBuildContext, error) {
+					loads++
+					if mode == "late authority" && loads > 1 {
+						return store.PostbuildRepairBuildContext{}, store.ErrStaleFence
+					}
+					return proof, nil
+				}
+				inspect := func(context.Context, git.Worktree) (git.RetainedWorktreeInspection, error) {
+					inspections++
+					value := observed
+					if mode == "late bytes" && inspections > 1 {
+						value.Digest = "changed"
+					}
+					return value, nil
+				}
+				prepared := func(context.Context, store.ProviderAttemptResultKey) (store.PostbuildAmendmentPreparedCandidateWitness, bool, error) {
+					reads++
+					return witness, true, nil
+				}
+				got, err := authenticatePostbuildRepair(context.Background(), request, project, proof.Worktree.Path, load, inspect, func(context.Context) error { return nil }, true, prepared)
+				if mode == "valid" {
+					if err != nil || got.Path != proof.Worktree.Path || inspections != 2 || (!persisted && reads != 2) || (persisted && reads != 0) {
+						t.Fatalf("candidate admission=%+v err=%v inspections=%d reads=%d", got, err, inspections, reads)
+					}
+				} else if err == nil {
+					t.Fatal("uncertain candidate accepted")
+				}
+			})
+		}
+	}
+}
+
+func TestCompletedPostbuildRepairPreservesCallerCancellation(t *testing.T) {
+	request, project, proof, _ := postbuildRepairAdmissionFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	load := func(context.Context) (store.PostbuildRepairBuildContext, error) {
+		called = true
+		return proof, nil
+	}
+	if _, err := authenticatePostbuildRepair(ctx, request, project, proof.Worktree.Path, load, nil, nil, true, nil); !errors.Is(err, context.Canceled) || called {
+		t.Fatalf("canceled admission performed work: called=%t err=%v", called, err)
 	}
 }
