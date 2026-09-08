@@ -508,6 +508,14 @@ func (c Coordinator) authenticateRegistered(ctx context.Context, request EnsureR
 		return store.StoredWorktree{}, fmt.Errorf("%w: registered identity does not bind its stored repository/base: %v", ErrAuthentication, err)
 	}
 	if _, err := c.Git.CleanWorktreeHead(ctx, worktree); err != nil {
+		// Preserve normal clean candidate/commit replay. Only a non-pristine
+		// checkout needs the narrower completed-Builder materialization proof.
+		if handled, proofErr := c.authenticateCompletedRefreshBuilder(ctx, request, stored, worktree); handled || proofErr != nil {
+			if proofErr != nil {
+				return store.StoredWorktree{}, proofErr
+			}
+			return stored, nil
+		}
 		return store.StoredWorktree{}, fmt.Errorf("%w: registered worktree changed, is dirty, or no longer authenticates: %v", ErrQuarantined, err)
 	}
 	return stored, nil

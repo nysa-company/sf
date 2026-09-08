@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - internal/store/**
+      - internal/worktreecoord/**
       - .github/workflows/recovery-candidate.yml
   workflow_dispatch:
 
@@ -31,6 +32,8 @@ jobs:
           sudo ln -sfn "$setup_go" /usr/local/go/bin/go
       - name: Test reservation and restart regressions
         run: go test -p 1 -count=1 ./internal/store -run 'Test(ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)$' -v
+      - name: Test bounded completed-Builder readmission
+        run: go test -p 1 -count=1 ./internal/worktreecoord
       - name: Build exact native development candidate
         run: |
           set -eu
