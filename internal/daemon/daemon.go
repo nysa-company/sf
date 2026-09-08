@@ -1156,6 +1156,9 @@ func (daemon *Daemon) show(ctx context.Context, request api.Request, identity do
 		return daemon.failure(request, evidenceErrorCode(err), "durable workflow evidence could not be authenticated", errors.Is(err, store.ErrBusy))
 	}
 	view["evidence"] = evidence
+	if recovery := recoveryView(stored, evidence); recovery != nil {
+		view["recovery"] = recovery
+	}
 	view["operator"] = operatorView(identity)
 	return daemon.success(request, api.Mutation{}, view)
 }
@@ -2269,6 +2272,9 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, id
 		view := map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "current_version": stored.Version, "operator": operatorView(identity), "ticket": ticketView(stored), "evidence": evidence}
 		view["budget_clock"] = ticketTiming(stored, daemon.clock.Now())
 		view["runtime_activity"] = daemon.runtimeActivity(&stored.Ref)
+		if recovery := recoveryView(stored, evidence); recovery != nil {
+			view["recovery"] = recovery
+		}
 		if action, ok := daemon.ticketBlockedNextAction(stored); ok {
 			view["next_action"] = action
 		}

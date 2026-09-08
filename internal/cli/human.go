@@ -220,6 +220,15 @@ func renderTicket(writer io.Writer, ticket map[string]any, evidence any, context
 			}
 		}
 	}
+	if recovery, ok := context["recovery"].(map[string]any); ok {
+		for _, field := range []struct{ label, key string }{{"What happened", "cause"}, {"Retained work", "work_disposition"}, {"Writer safety", "writer_safety"}, {"Safety", "safety_note"}} {
+			if value := stringField(recovery, field.key); value != "" {
+				if _, err := fmt.Fprintf(writer, "%s: %s\n", field.label, safeSelectionLabel(value)); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	if action, ok := context["next_action"].(map[string]any); ok {
 		if err := renderAction(writer, "Next", action); err != nil {
 			return err
