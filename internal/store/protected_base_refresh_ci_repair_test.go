@@ -130,6 +130,28 @@ func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *test
 				t.Fatal(err)
 			}
 			if err := validateRunnerRecoveryAuthority(f.ctx, f.db.db, current.Ref, completion.Version, completion.Fence); err != nil {
+				rows, queryErr := f.db.db.QueryContext(f.ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY ticket_version`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket)
+				if queryErr != nil {
+					t.Fatal(queryErr)
+				}
+				var steps [][6]uint64
+				for rows.Next() {
+					var step [6]uint64
+					if err := rows.Scan(&step[0], &step[1], &step[2], &step[3], &step[4], &step[5]); err != nil {
+						t.Fatal(err)
+					}
+					steps = append(steps, step)
+				}
+				rows.Close()
+				for index, step := range steps {
+					repair, repairErr := validateCandidateRepairRecoveryTarget(f.ctx, f.db.db, current.Ref, step[0], step[1], step[2])
+					t.Logf("step %v repair-target=%t/%v refresh-target=%t", step, repair, repairErr, protectedBaseRefreshRecoveryTarget(f.ctx, f.db.db, current.Ref, step[0], step[1], step[2]))
+					if index > 0 {
+						p := steps[index-1]
+						t.Logf("refresh-gap=%t", protectedBaseRefreshRecoveryGap(f.ctx, f.db.db, current.Ref, p[3], p[4], p[5], step[0], step[1], step[2]))
+					}
+				}
+				t.Logf("final-refresh-gap=%t", protectedBaseRefreshRecoveryGap(f.ctx, f.db.db, current.Ref, current.Version, currentFence.RunnerEpoch, currentFence.LeaderEpoch, completion.Version, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch))
 				t.Fatalf("completed refresh invalidated fresh Builder recovery authority: %v", err)
 			}
 			if !protectedBaseRefreshRecoveryGap(f.ctx, f.db.db, current.Ref, current.Version, currentFence.RunnerEpoch, currentFence.LeaderEpoch, completion.Version, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) {
