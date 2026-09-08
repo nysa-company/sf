@@ -81,8 +81,28 @@ func (s *Store) protectedBaseRefreshContextAt(ctx context.Context, conn *sql.Con
 	// never to a rewrite. Manual-mode external merge races are likewise outside
 	// this first guarded refresh authority.
 	switch state {
-	case domain.StatePublishing, domain.StateReviewing, domain.StateWaitingApproval:
+	case domain.StatePublishing:
 		if err := s.authenticatePostPublicationState(ctx, conn, ref, state, version, fence); err != nil {
+			return protectedBaseRefreshIntent{}, ErrPublicationEvidence
+		}
+	case domain.StateReviewing:
+		candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
+		if err != nil {
+			return protectedBaseRefreshIntent{}, ErrPublicationEvidence
+		}
+		observation, reviewVersion, err := s.authenticateHistoricalFinalReview(ctx, conn, ref, candidate)
+		if err != nil || authenticateCurrentPostPublicationEndpointBridge(ctx, conn, ref, state,
+			normalRecoveryEndpoint{version: reviewVersion, runner: observation.ObservedFence.RunnerEpoch, leader: observation.ObservedFence.LeaderEpoch},
+			normalRecoveryEndpoint{version: version, runner: fence.RunnerEpoch, leader: fence.LeaderEpoch}) != nil {
+			return protectedBaseRefreshIntent{}, ErrPublicationEvidence
+		}
+	case domain.StateWaitingApproval:
+		// Recovery advances the live endpoint without minting another review
+		// pass. Authenticate the immutable completion and its exact signed
+		// suffix instead of requiring a review event at the recovered version.
+		prior, err := s.finalReviewRecoveryEndpoint(ctx, conn, ref, state)
+		if err != nil || authenticateCurrentPostPublicationEndpointBridge(ctx, conn, ref, state, prior,
+			normalRecoveryEndpoint{version: version, runner: fence.RunnerEpoch, leader: fence.LeaderEpoch}) != nil {
 			return protectedBaseRefreshIntent{}, ErrPublicationEvidence
 		}
 	case domain.StateWaitingCI:

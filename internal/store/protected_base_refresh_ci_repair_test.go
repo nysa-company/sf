@@ -49,7 +49,40 @@ func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *test
 			if err != nil || !found || pending.ID != reservation.ID {
 				t.Fatalf("reservation invalidated predecessor: found=%t err=%v", found, err)
 			}
-			refreshClaim, err := f.db.IssueGitMutationClaim(f.ctx, reservation.Mutation)
+			currentFence := f.fence
+			for restart := 0; restart < 2; restart++ {
+				prior := current
+				priorFence := currentFence
+				leader, err := f.db.AcquireLeader(f.ctx, current.Ref.Channel, "pending-ci-repair-refresh")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if changed, err := f.db.FenceRecoveredRunners(f.ctx, current.Ref.Channel, leader); err != nil || changed != 1 {
+					t.Fatalf("restart %d: changed=%d err=%v", restart, changed, err)
+				}
+				if err := f.db.RebindRecoveredPublishedCandidates(f.ctx, current.Ref.Channel, leader); err != nil {
+					t.Fatal(err)
+				}
+				current, err = f.db.Ticket(f.ctx, current.Ref)
+				if err != nil || current.Version != prior.Version+1 || current.RunnerEpoch != prior.RunnerEpoch+1 || current.State != state {
+					t.Fatalf("restart did not preserve exact lifecycle: %v", err)
+				}
+				currentFence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: current.RunnerEpoch}
+				if _, _, err := f.db.PendingProtectedBaseRefresh(f.ctx, current.Ref, prior.Version, priorFence); err == nil {
+					t.Fatal("stale pre-recovery endpoint accepted")
+				}
+				pending, found, err = f.db.PendingProtectedBaseRefresh(f.ctx, current.Ref, current.Version, currentFence)
+				if err != nil || !found || pending.ID != reservation.ID || pending.IntentDigest != reservation.IntentDigest || string(pending.IntentPayload) != string(reservation.IntentPayload) {
+					t.Fatalf("restart %d invalidated immutable reservation: found=%t err=%v", restart, found, err)
+				}
+			}
+			// Mirror the coordinator's no-launch planned-effect rebind before
+			// issuing the first refresh mutation at the recovered endpoint.
+			intent := pending.Mutation
+			if _, err := f.db.PlanEffect(f.ctx, EffectPlan{SemanticKey: intent.SemanticKey, Ref: intent.Ref, TicketVersion: intent.TicketVersion, Fence: intent.Fence, Kind: "git/refresh-base", RequestDigest: intent.RequestDigest}); err != nil {
+				t.Fatal(err)
+			}
+			refreshClaim, err := f.db.IssueGitMutationClaim(f.ctx, intent)
 			if err != nil {
 				t.Fatalf("exact refresh claim rejected after reservation: %v", err)
 			}
@@ -60,7 +93,7 @@ func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *test
 			if err := lease.Release(); err != nil {
 				t.Fatal(err)
 			}
-			bad := reservation.Mutation
+			bad := intent
 			bad.ExpectedHeadOID = strings.Repeat("7", 40)
 			if _, err := f.db.IssueGitMutationClaim(f.ctx, bad); err == nil {
 				t.Fatal("retargeted predecessor accepted")
