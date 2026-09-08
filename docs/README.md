@@ -3,6 +3,8 @@
 - [First ticket](tutorials/first-ticket.md): supported projects, setup, and a
   complete ticket example.
 - [Source build and foreground setup](tutorials/source-build-foreground.md).
+- [Local bundle installation](tutorials/local-bundle.md): verify and install a
+  source-built bundle without replacing a running daemon or existing files.
 - [`cli.md`](cli.md): commands, errors, and operator recovery.
 - [`configuration.md`](configuration.md): supported recipes and project policy.
 - [`product-brief.md`](product-brief.md): user, outcome, and scope.

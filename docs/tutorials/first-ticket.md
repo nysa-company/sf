@@ -22,8 +22,10 @@ Node project. SF refuses to guess which tests represent the project.
 Codex remains supported. The current multi-CLI source also supports qualified
 Claude/Codex pairs in either direction; native model trials have passed with
 local simulated GitHub. Login alone is not qualification. Cursor's experimental
-trusted-hooks path has a passing Luna Low native qualification, but full-ticket
-acceptance is still pending; use the tested Claude/Codex pair for this guide.
+trusted-hooks path passed local full-ticket tests in both Cursor/Claude role
+directions, plus a two-ticket restart run with Cursor Luna Low Builder and
+Claude Sonnet 5 Reviewer. Those runs used local GitHub fixtures, not hosted
+Relay; use the tested Claude/Codex pair for this guide.
 See the [provider setup and model picker](../cli.md#overview)
 and [acceptance ledger](../plans/2026-09-06-multi-cli-acceptance.md) for exact
 tested scope and remaining gates.
@@ -128,7 +130,7 @@ dependency-free. Add verification in `test/count-items.test.js` using node:test.
 ```
 
 Ticket duration starts at submission, not at execution. Submit when ready to
-start; queue time consumes the same deadline. Claude tickets require explicit
+start; queue time consumes the same deadline. Claude/Cursor tickets require explicit
 `--accept-cost-estimates` when starting. Their reported estimates can stop
 further launches but do not guarantee a hard-dollar ceiling on actual charges;
 missing cost stays unknown. Read [estimated accounting](../cli.md#estimated-provider-accounting-multi-cli)

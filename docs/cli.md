@@ -29,7 +29,9 @@ an experimental trusted-hooks path: ambient hooks are trusted dependencies,
 not claimed to be disabled or contained. SF applies its own role filesystem
 profile and requires a signed native qualification. Luna Low and Sonnet Low have
 passed qualification; disposable full-ticket tests passed in both Cursor/Claude
-role directions. Cursor concurrency/restart acceptance remains pending. The model picker offers
+role directions. A two-ticket Cursor Luna Low Builder/Claude Sonnet 5 Reviewer
+run also passed restart, separate approvals, and delivery with local GitHub
+fixtures. Hosted Relay acceptance remains a separate gate. The model picker offers
 exact Cursor IDs and filters same-family reviewers across CLIs; each model still
 requires its own qualification. Cursor qualification may invoke paid models and never treats
 login as execution authority. New Claude/Cursor tickets
@@ -122,7 +124,7 @@ selection, separately from the project preference editor.
 | --- | --- | --- |
 | Claude Code | Defaults to `claude-sonnet-5`; explicit supported IDs through qualification | Native qualification required; subscription OAuth, estimated cost only |
 | Codex | Builder defaults to `gpt-5.6-luna`; Reviewer defaults to `gpt-5.5` | Existing native qualification and subscription accounting |
-| Cursor | Experimental exact-model qualifier; default Builder Luna Low, Reviewer Sonnet 5 Low | Trusted hooks; signed native qualification required. Luna Low and Sonnet Low passed native qualification; disposable Cursor/Claude ticket tests passed in both role directions. Concurrency/restart acceptance remains incomplete |
+| Cursor | Experimental exact-model qualifier; default Builder Luna Low, Reviewer Sonnet 5 Low | Trusted hooks; signed native qualification required. Luna Low and Sonnet Low passed native qualification; disposable Cursor/Claude ticket tests passed in both role directions. Two-ticket Cursor Builder/Claude Reviewer restart acceptance passed with local GitHub fixtures; hosted Relay remains separate |
 
 The pinned Cursor CLI's explicit Luna Low selection reports 272K context,
 despite its catalog's 1M label. Sonnet Low reports 300K with thinking disabled,
