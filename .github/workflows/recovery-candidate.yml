@@ -1,0 +1,50 @@
+name: recovery-candidate
+
+on:
+  pull_request:
+    paths:
+      - internal/store/**
+      - internal/worktreecoord/**
+      - .github/workflows/recovery-candidate.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recovery-candidate:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Expose approved repository-test toolchain
+        run: |
+          set -eu
+          setup_go=$(command -v go)
+          sudo mkdir -p /usr/local/go/bin
+          sudo ln -sfn "$setup_go" /usr/local/go/bin/go
+      - name: Test reservation and restart regressions
+        run: go test -p 1 -count=1 ./internal/store -run 'Test(ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)$' -v
+      - name: Test bounded completed-Builder readmission
+        run: go test -p 1 -count=1 ./internal/worktreecoord
+      - name: Build exact native development candidate
+        run: |
+          set -eu
+          candidate_sha=$(git rev-parse HEAD)
+          uname -m
+          make build-dev DEV_VERSION=0.1.0-dev.ci-recovery COMMIT="$candidate_sha" BIN_DIR=.context/recovery-candidate/bin
+          .context/recovery-candidate/bin/sf-dev version --json
+          tar -czf .context/recovery-candidate.tgz -C .context/recovery-candidate bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sf-recovery-candidate-${{ runner.arch }}
+          path: .context/recovery-candidate.tgz
+          if-no-files-found: error
+          retention-days: 7

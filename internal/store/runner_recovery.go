@@ -852,9 +852,11 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 				firstAuthenticated = sourceBaseline
 			}
 			if !firstAuthenticated {
-				repairBaseline, repairErr := validateCandidateRepairRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
-				if repairErr != nil || (!repairBaseline && !protectedBaseRefreshRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)) {
-					return ErrPublicationEvidence
+				if !protectedBaseRefreshRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
+					repairBaseline, repairErr := validateCandidateRepairRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
+					if repairErr != nil || !repairBaseline {
+						return ErrPublicationEvidence
+					}
 				}
 			}
 		} else if !step.CreatedAt.After(previous.CreatedAt) || step.PriorTicketVersion < previous.TicketVersion || step.PriorLeaderEpoch < previous.LeaderEpoch {
@@ -864,11 +866,13 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// the next daemon recovery. The chain is accepted only when every
 			// intervening event is a contiguous canonical lifecycle phase_pass.
 			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
-				repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
-					previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
-					step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
-				if repairErr != nil || (!repairGap && !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)) {
-					return ErrPublicationEvidence
+				if !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
+					repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
+						previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
+						step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
+					if repairErr != nil || !repairGap {
+						return ErrPublicationEvidence
+					}
 				}
 			}
 		}
@@ -886,11 +890,16 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// changing the runner. It is current phase authority, not a control
 			// handoff; require the exact canonical phase event.
 			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, liveVersion, liveFence.RunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) {
-				repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
-					previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
-					liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch)
-				if repairErr != nil || (!repairGap && !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch)) {
-					return ErrPublicationEvidence
+				// A complete refresh owns its exact edge after CI repair. Prove
+				// it first; the retained repair intentionally cannot authorize a
+				// successor build on a different protected base.
+				if !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) {
+					repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
+						previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
+						liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch)
+					if repairErr != nil || !repairGap {
+						return ErrPublicationEvidence
+					}
 				}
 			}
 		}
@@ -1537,6 +1546,24 @@ func (s *Store) normalPostPublicationRecoveryPredecessor(ctx context.Context, co
 	}
 	current := normalRecoveryEndpoint{version: version, runner: runner}
 	switch state {
+	case domain.StateReviewing:
+		// Green CI enters reviewing before any final-review provider result
+		// exists. That authenticated entry, not an absent reviewer or an old
+		// worktree registration, anchors a no-control restart in this window.
+		candidate, err := s.latestCandidateFrom(ctx, conn, ref, false)
+		if err != nil {
+			return 0, false, err
+		}
+		observation, reviewVersion, err := s.authenticateHistoricalFinalReview(ctx, conn, ref, candidate)
+		if err != nil {
+			return 0, false, err
+		}
+		baseline := normalRecoveryEndpoint{version: reviewVersion, runner: observation.ObservedFence.RunnerEpoch, leader: observation.ObservedFence.LeaderEpoch}
+		current.leader, err = normalRecoveryLeaderAt(ctx, conn, ref, baseline, version, runner)
+		if err != nil || current.leader == 0 || current.leader >= newLeader {
+			return 0, false, ErrPublicationEvidence
+		}
+		return current.leader, true, nil
 	case domain.StateWaitingApproval, domain.StateWaitingManualMerge:
 		baseline, err := s.finalReviewRecoveryEndpoint(ctx, conn, ref, state)
 		if err != nil {
