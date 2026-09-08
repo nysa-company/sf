@@ -2,6 +2,7 @@ package worktreecoord
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -69,11 +70,27 @@ func (f *amendmentAdmissionFixture) AssertTicketFence(context.Context, domain.Ti
 }
 func (f *amendmentAdmissionFixture) InspectRetainedWorktree(context.Context, git.Worktree) (git.RetainedWorktreeInspection, error) {
 	f.inspections++
+	if f.mode == "snapshot deadline" {
+		return git.RetainedWorktreeInspection{}, errors.Join(context.DeadlineExceeded, errors.New("private subprocess output"))
+	}
 	value := f.observed
 	if f.mode == "late bytes" && f.inspections == 2 {
 		value.Digest += "changed"
 	}
 	return value, nil
+}
+
+func TestPostbuildAmendmentAdmissionPreservesSafeDeadline(t *testing.T) {
+	request, project, original, observed := postbuildRepairAdmissionFixture(t)
+	request.Version = 8
+	f := &amendmentAdmissionFixture{project: project, observed: observed, mode: "snapshot deadline", completedErr: store.ErrNotFound}
+	f.proof = store.PostbuildVerificationAmendmentContext{Worktree: original.Worktree, Plan: original.Plan, Verification: original.Verification, Builder: original.Builder}
+	f.proof.Amendment.TransitionTicketVersion = 6
+	f.proof.Binding.OriginalCheckpointOID = observed.Changes.Head
+	_, err := authenticatePostbuildVerificationAmendment(context.Background(), request, f, f)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrUnready) || strings.Contains(err.Error(), "private subprocess output") || !strings.Contains(err.Error(), "initial physical snapshot") {
+		t.Fatalf("unsafe or missing typed diagnostic: %v", err)
+	}
 }
 func (f *amendmentAdmissionFixture) InspectRetainedImplementation(_ context.Context, _ git.Worktree, baseline string, protected []string) (string, error) {
 	f.implementationReads++

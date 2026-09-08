@@ -3,6 +3,7 @@ package worktreecoord
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"time"
@@ -43,6 +44,16 @@ func authenticatePostbuildVerificationAmendment(ctx context.Context, request Ens
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	unready := func(stage string, cause error) error {
+		// Preserve typed diagnostics, never raw subprocess output.
+		causes := []error{ErrUnready, ctx.Err()}
+		for _, safe := range []error{context.DeadlineExceeded, context.Canceled, git.ErrUnsafeWorktree, git.ErrIdentityMismatch, git.ErrOutputBound} {
+			if errors.Is(cause, safe) {
+				causes = append(causes, safe)
+			}
+		}
+		return fmt.Errorf("postbuild amendment %s: %w", stage, errors.Join(causes...))
+	}
 	if err := ctx.Err(); err != nil {
 		return store.StoredWorktree{}, err
 	}
@@ -88,7 +99,7 @@ func authenticatePostbuildVerificationAmendment(ctx context.Context, request Ens
 	}
 	observed, err := inspector.InspectRetainedWorktree(ctx, worktree)
 	if err != nil {
-		return store.StoredWorktree{}, ErrUnready
+		return store.StoredWorktree{}, unready("initial physical snapshot", err)
 	}
 	var prepared *store.CommitObservation
 	if observed.Changes.Head != head && phase == domain.PhaseVerification && completedErr == nil && recorded == nil {
@@ -99,7 +110,7 @@ func authenticatePostbuildVerificationAmendment(ctx context.Context, request Ens
 		prepared, head = &child, child.CommitOID
 	}
 	if observed.Changes.Head != head {
-		return store.StoredWorktree{}, ErrUnready
+		return store.StoredWorktree{}, unready("physical head mismatch", nil)
 	}
 	if phase == domain.PhaseBuild || head != proof.Binding.OriginalCheckpointOID {
 		protectedPaths := proof.Verification.Revision.OwnedFiles
@@ -109,7 +120,7 @@ func authenticatePostbuildVerificationAmendment(ctx context.Context, request Ens
 		for _, path := range observed.Changes.Paths {
 			for _, protected := range protectedPaths {
 				if path == protected || strings.HasPrefix(path, strings.TrimSuffix(protected, "/")+"/") {
-					return store.StoredWorktree{}, ErrUnready
+					return store.StoredWorktree{}, unready("protected path changed", nil)
 				}
 			}
 		}
@@ -121,10 +132,10 @@ func authenticatePostbuildVerificationAmendment(ctx context.Context, request Ens
 	} else {
 		implementation, err := inspector.InspectRetainedImplementation(ctx, worktree, proof.Binding.OriginalCheckpointOID, proof.Verification.Revision.OwnedFiles)
 		if err != nil || implementation != proof.Snapshot.ImplementationDigest {
-			return store.StoredWorktree{}, ErrUnready
+			return store.StoredWorktree{}, unready("retained implementation", err)
 		}
 		if phase == domain.PhaseVerification && errors.Is(completedErr, store.ErrNotFound) && observed.Digest != proof.Snapshot.FullSnapshotDigest {
-			return store.StoredWorktree{}, ErrUnready
+			return store.StoredWorktree{}, unready("initial snapshot digest mismatch", nil)
 		}
 	}
 	checked, err := source.PostbuildVerificationAmendmentContext(ctx, request.Ref, request.Version, request.Fence)
@@ -154,7 +165,7 @@ func authenticatePostbuildVerificationAmendment(ctx context.Context, request Ens
 	}
 	again, err := inspector.InspectRetainedWorktree(ctx, worktree)
 	if err != nil || again.Digest != observed.Digest {
-		return store.StoredWorktree{}, ErrUnready
+		return store.StoredWorktree{}, unready("final physical snapshot", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return store.StoredWorktree{}, err

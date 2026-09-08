@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -81,24 +82,34 @@ func (r Runner) CommitProtectedCheckpoint(ctx context.Context, worktree Worktree
 		}
 	}()
 	ctx = withMutationLease(ctx, lease)
+	unsafe := func(stage string, cause error) error {
+		// Do not expose raw Git stderr through the diagnostic wrapper.
+		causes := []error{ErrUnsafeWorktree, ctx.Err()}
+		for _, safe := range []error{context.DeadlineExceeded, context.Canceled, ErrIdentityMismatch, ErrOutputBound} {
+			if errors.Is(cause, safe) {
+				causes = append(causes, safe)
+			}
+		}
+		return fmt.Errorf("protected checkpoint %s: %w", stage, errors.Join(causes...))
+	}
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return "", err
 	}
 	observed, replay, err := r.reconcileCommit(ctx, worktree, commit)
 	if err != nil || !replay && observed != request.OriginalCheckpoint {
-		return "", ErrUnsafeWorktree
+		return "", unsafe("reconcile parent", err)
 	}
 	checkImplementation := func() error {
 		got, err := r.InspectRetainedImplementation(ctx, worktree, request.OriginalCheckpoint, request.ProtectedPaths)
 		if err != nil || got != request.ImplementationDigest {
-			return ErrUnsafeWorktree
+			return unsafe("retained implementation", err)
 		}
 		return nil
 	}
 	checkFull := func() error {
 		got, err := r.InspectRetainedWorktree(ctx, worktree)
 		if err != nil || got.Changes.Head != request.OriginalCheckpoint || got.Digest != request.FullSnapshotDigest {
-			return ErrUnsafeWorktree
+			return unsafe("full snapshot", err)
 		}
 		return nil
 	}
@@ -149,7 +160,7 @@ func (r Runner) CommitProtectedCheckpoint(ctx context.Context, worktree Worktree
 	}
 	tree, err := private.oneEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, env, "write-tree")
 	if err != nil || !validOID(tree) {
-		return "", ErrUnsafeWorktree
+		return "", unsafe("private tree", err)
 	}
 	if err := r.validateImmutableTree(ctx, worktree.Path, request.OriginalCheckpoint, tree, DiffPolicy{AllowedPaths: request.ProtectedPaths, ExpectedHead: request.OriginalCheckpoint}); err != nil {
 		return "", err
@@ -164,7 +175,7 @@ func (r Runner) CommitProtectedCheckpoint(ctx context.Context, worktree Worktree
 	}
 	newHead, err := r.oneEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, deterministicCommitEnv(request.Timestamp.UTC().Format(time.RFC3339)), "commit-tree", tree, "-p", request.OriginalCheckpoint, "-m", candidateMessage(commit))
 	if err != nil || !validOID(newHead) || replay && newHead != observed {
-		return "", ErrUnsafeWorktree
+		return "", unsafe("deterministic commit", err)
 	}
 	if err := recordPreparedCommit(ctx, lease, newHead, tree); err != nil {
 		return "", err
@@ -193,7 +204,7 @@ func (r Runner) CommitProtectedCheckpoint(ctx context.Context, worktree Worktree
 	}
 	checkedTree, err := private.oneEnvExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, env, "write-tree")
 	if err != nil || checkedTree != tree {
-		return "", ErrUnsafeWorktree
+		return "", unsafe("pre-sync tree", err)
 	}
 	if err := checkImplementation(); err != nil {
 		return "", err
@@ -211,12 +222,12 @@ func (r Runner) CommitProtectedCheckpoint(ctx context.Context, worktree Worktree
 		return "", err
 	}
 	if head, err = r.oneExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "rev-parse", "HEAD"); err != nil || head != newHead {
-		return "", ErrUnsafeWorktree
+		return "", unsafe("final head", err)
 	}
 	for _, prefix := range [][]string{{"diff", "--name-only", "-z", newHead, "--"}, {"diff", "--cached", "--name-only", "-z", newHead, "--"}} {
 		changed, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, append(prefix, paths...)...)
 		if err != nil || len(changed) != 0 {
-			return "", ErrUnsafeWorktree
+			return "", unsafe("protected index synchronization", err)
 		}
 	}
 	return head, nil
