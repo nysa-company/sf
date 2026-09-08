@@ -124,10 +124,22 @@ func protectedBaseRefreshRecoveryTarget(ctx context.Context, q candidateEvidence
 		if err != nil || !found || !validRunnerRecovery(step) || step.PriorTicketVersion != version || step.PriorRunnerEpoch != runner || step.PriorLeaderEpoch != leader {
 			return false
 		}
+		if protectedBaseRefreshPostCITarget(ctx, q, value, completion, version, runner, leader) {
+			return true
+		}
 		var publicationVersion uint64
 		var count int
-		if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0) FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND candidate_tree_sha=?`, ref.Channel, ref.Project, ref.Ticket, value.Candidate.Snapshot.Generation, value.Candidate.Snapshot.HeadSHA, value.Candidate.Snapshot.TreeSHA).Scan(&count, &publicationVersion); err != nil || count != 1 || publicationVersion == 0 || publicationVersion >= version || validateInitialLifecycleAdvance(ctx, q, ref, publicationVersion+1) != nil {
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0) FROM publication_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND candidate_tree_sha=?`, ref.Channel, ref.Project, ref.Ticket, value.Candidate.Snapshot.Generation, value.Candidate.Snapshot.HeadSHA, value.Candidate.Snapshot.TreeSHA).Scan(&count, &publicationVersion); err != nil || count != 1 || publicationVersion == 0 || publicationVersion >= version {
 			return false
+		}
+		if validateInitialLifecycleAdvance(ctx, q, ref, publicationVersion+1) != nil {
+			// The completed refresh authenticates its exact immutable candidate
+			// and publication. A repaired candidate has a checks_red source, not
+			// an ordinary initial lifecycle; prove that source independently.
+			candidate := value.Candidate
+			if ok, err := validateCandidateRepairRecoveryTarget(ctx, q, ref, candidate.TicketVersion, candidate.Fence.RunnerEpoch, candidate.Fence.LeaderEpoch); err != nil || !ok {
+				return false
+			}
 		}
 		return protectedBaseRefreshReviewedPrefix(ctx, q, value, step.TicketVersion, step.RunnerEpoch, step.LeaderEpoch) == nil
 	}
@@ -135,6 +147,56 @@ func protectedBaseRefreshRecoveryTarget(ctx context.Context, q candidateEvidence
 		return false
 	}
 	return validateRunnerRecoveryLedgerPrefix(ctx, q, ref, completion.Version, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch, version, runner, leader) == nil
+}
+
+// A first restart may already be at green CI or final review. Authenticate
+// that exact endpoint against the completed refresh's retained candidate;
+// the generic initial lifecycle cannot represent these typed CI transitions.
+func protectedBaseRefreshPostCITarget(ctx context.Context, q candidateEvidenceQuerier, value protectedBaseRefreshIntent, completion ProtectedBaseRefreshCompletion, version, runner, leader uint64) bool {
+	var conn *sql.Conn
+	switch source := q.(type) {
+	case *sql.Conn:
+		conn = source
+	case *sql.DB:
+		var err error
+		conn, err = source.Conn(ctx)
+		if err != nil {
+			return false
+		}
+		defer conn.Close()
+	default:
+		return false
+	}
+	candidate := value.Candidate
+	if validateInitialLifecycleAdvance(ctx, conn, value.Ref, candidate.TicketVersion) != nil {
+		if ok, err := validateCandidateRepairRecoveryTarget(ctx, conn, value.Ref, candidate.TicketVersion, candidate.Fence.RunnerEpoch, candidate.Fence.LeaderEpoch); err != nil || !ok {
+			return false
+		}
+	}
+	s := &Store{}
+	green, reviewVersion, err := s.authenticateHistoricalFinalReview(ctx, conn, value.Ref, candidate)
+	if err != nil || version < reviewVersion || version >= completion.Version {
+		return false
+	}
+	target := normalRecoveryEndpoint{version: version, runner: runner, leader: leader}
+	reserved := normalRecoveryEndpoint{version: value.TicketVersion, runner: value.Fence.RunnerEpoch, leader: value.Fence.LeaderEpoch}
+	for _, state := range []domain.State{domain.StateReviewing, domain.StateWaitingApproval} {
+		initial := normalRecoveryEndpoint{version: reviewVersion, runner: green.ObservedFence.RunnerEpoch, leader: green.ObservedFence.LeaderEpoch}
+		if state == domain.StateWaitingApproval {
+			initial, err = s.finalReviewRecoveryEndpoint(ctx, conn, value.Ref, state)
+			if err != nil {
+				continue
+			}
+		}
+		if version <= value.TicketVersion {
+			if validatePostPublicationEndpointAdvance(ctx, conn, value.Ref, state, initial, target) == nil && validatePostPublicationEndpointAdvance(ctx, conn, value.Ref, state, target, reserved) == nil {
+				return true
+			}
+		} else if validatePostPublicationEndpointAdvance(ctx, conn, value.Ref, state, initial, reserved) == nil && validateRunnerRecoveryLedgerPrefix(ctx, conn, value.Ref, value.TicketVersion, value.Fence.RunnerEpoch, value.Fence.LeaderEpoch, version, runner, leader) == nil && validateRunnerRecoveryLedgerPrefix(ctx, conn, value.Ref, version, runner, leader, completion.Version-1, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) protectedBaseRefreshRecoveryPredecessor(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64, latest RunnerRecoveryLedger, latestFound bool) (uint64, bool, error) {

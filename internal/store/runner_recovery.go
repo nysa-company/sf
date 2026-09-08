@@ -852,9 +852,11 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 				firstAuthenticated = sourceBaseline
 			}
 			if !firstAuthenticated {
-				repairBaseline, repairErr := validateCandidateRepairRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
-				if repairErr != nil || (!repairBaseline && !protectedBaseRefreshRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)) {
-					return ErrPublicationEvidence
+				if !protectedBaseRefreshRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
+					repairBaseline, repairErr := validateCandidateRepairRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
+					if repairErr != nil || !repairBaseline {
+						return ErrPublicationEvidence
+					}
 				}
 			}
 		} else if !step.CreatedAt.After(previous.CreatedAt) || step.PriorTicketVersion < previous.TicketVersion || step.PriorLeaderEpoch < previous.LeaderEpoch {
