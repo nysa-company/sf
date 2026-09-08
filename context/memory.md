@@ -2,6 +2,21 @@
 
 ## Current truth
 
+- Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
+  in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
+  `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
+  Portable tests/builds run only on GitHub. Candidate 8619514 corrects two fixture
+  defects discovered at d955ef1 (tagged onboarding helpers and effects column).
+  Hosted focused run 34284505456 is pending; full baseline 34283760341 at d955ef1
+  has failures and cannot qualify a release. No native campaign has started.
+  Current source implements bounded independent postbuild repair, immutable
+  amendment/checkpoint receipts, exact restart completion, actionable status,
+  and clean-room onboarding. Passing layers are not end-to-end acceptance.
+  Remaining: final hosted full/race gates, exact-head independent review,
+  four native Relay deliveries at capacity two with recovery/base movement and
+  separate guarded approvals. Do not claim an unfamiliar-human usability trial.
+  Existing runtimes/private databases/worktrees remain untouched by this goal.
+
 - Active consolidation goal (2026-09-07): repair the two PR #2 review findings,
   validate and update the PR, merge through its required independent review,
   then run two concurrent hosted Relay tickets with CI-failure/restart recovery

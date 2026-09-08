@@ -212,3 +212,18 @@ VERDICT: implementation design in progress; not cleared for merge.
   submitted Queued ticket with zero provider attempts. Prepared Python is an
   additional hosted group with explicitly enabled pinned public downloads.
   This is still not live model delivery or a human usability trial.
+
+## Execution checkpoint — release validation
+
+- At d955ef1, hosted focused run 34283758068 passed repair, amendment, Store,
+  Git, admission and behavior. Onboarding failed to compile because its new
+  helper depended on tagged tests; all three restart cases failed on the new
+  assertion's `kind` column instead of `effect_kind`. Commits 8871045 and
+  8619514 correct these test defects. No production assertion was weakened.
+- The full baseline 34283760341 also contains these failures. It is diagnostic,
+  not release acceptance. Focused run 34284505456 validates the corrected tree.
+- Native failure/retry needs real authenticated eligibility. Ordinary pause /
+  resume proves interruption, not retry. Prefer a genuine eligible exhaustion
+  if encountered; never fabricate provider output or edit the runtime database
+  to manufacture a passing campaign. Any deliberate interruptions, extra
+  attempts, or undemonstrated cases must remain visible in the final report.
