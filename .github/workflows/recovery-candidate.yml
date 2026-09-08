@@ -10,6 +10,7 @@ on:
       - internal/workflowworker/**
       - internal/daemon/**
       - internal/cli/**
+      - internal/config/**
       - cmd/sf/compiled_first_use_matrix_test.go
       - docs/tutorials/first-ticket.md
       - .github/workflows/recovery-candidate.yml
@@ -44,6 +45,7 @@ jobs:
       - name: Test proof consistency and actionable status
         run: |
           go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
+          go test -p 1 -count=1 ./internal/store -run '^TestAuthenticatePostbuildFailure' -v
           go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|PostbuildCommandFailure)' -v
           go test -p 1 -count=1 ./internal/workflowruntime -run '^TestPostbuildCommandError' -v
           go test -p 1 -count=1 ./internal/workflowworker -run '^TestRealStoreCompletedBuilderPostbuildFailure' -v

@@ -9,7 +9,7 @@ general-purpose runner for every project or provider.
 | Project | Current local execution |
 |---|---|
 | Go | Dependency-free module or compatible checked-in vendor closure |
-| JavaScript | Dependency-free Node project using `node --test` |
+| JavaScript | Dependency-free Node project using `node --test`, with an existing discoverable JavaScript test |
 | TypeScript | Only the configured bounded Nysa pure-test recipe |
 | Python | Experimental pinned Python/pytest profile on Apple Silicon; no additional dependencies; automated workflow passes, live-model delivery pending |
 | Ruby on Rails | Not yet supported locally |
@@ -72,6 +72,10 @@ Use a committed checkout with its configured base branch (normally `main`)
 available locally and a GitHub origin for eventual publication. From the
 product repository root, preview Go or dependency-free Node configuration,
 then register it with the pair used in this guide:
+
+For Node, commit a meaningful baseline test (for example `test/smoke.test.js`)
+before setup; an empty package with no discoverable tests is refused. This
+baseline does not replace the independent verification for your new ticket.
 
 ```sh
 sf-dev init --check

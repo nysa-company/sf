@@ -30,7 +30,8 @@ func TestCompiledDevFirstUseStackMatrixIsLocalAndHonest(t *testing.T) {
 		accepted     bool
 	}{
 		{"go", "", map[string]string{"go.mod": "module example.test/firstuse\n\ngo 1.25\n"}, true},
-		{"node", "", map[string]string{"package.json": `{"name":"first-use","private":true,"type":"module"}`}, true},
+		{"node", "", map[string]string{"package.json": `{"name":"first-use","private":true,"type":"module"}`, "smoke.test.js": "import test from 'node:test'; test('baseline', () => {});\n"}, true},
+		{"node-without-tests", "existing discoverable JavaScript test", map[string]string{"package.json": `{"name":"first-use","private":true}`}, false},
 		{"typescript-dependencies", "dependency-free Node", map[string]string{"package.json": `{"devDependencies":{"typescript":"5.0.0"}}`}, false},
 		{"python-unprepared", "Python requires the prepared", map[string]string{"pyproject.toml": "[project]\nname='first-use'\n"}, false},
 		{"rails", "Ruby/Rails local execution is not supported", map[string]string{"Gemfile": "raise 'must not execute'\n"}, false},
