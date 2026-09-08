@@ -200,7 +200,11 @@ func runCodexExec(argv []string) error {
 		return err
 	}
 	if role == "builder" {
-		if strings.Contains(string(prompt), "SF_E2E_TAKEOVER") {
+		if _, python := pythonFixtureCommand(string(prompt)); python {
+			if err := writeCodexWorktreeFile(parsed.worktree, pythonBuilderFile, []byte(pythonBuilderSource)); err != nil {
+				return err
+			}
+		} else if strings.Contains(string(prompt), "SF_E2E_TAKEOVER") {
 			if err := validateTakeoverBuilderFile(parsed.worktree); err != nil {
 				return err
 			}
@@ -235,6 +239,10 @@ func SoftwareFactoryFixture() string { return "ready" }
 }
 
 func writeCodexVerificationFixture(worktree, prompt string) ([]byte, error) {
+	if _, python := pythonFixtureCommand(prompt); python {
+		content := []byte(pythonVerificationSource)
+		return content, writeCodexWorktreeFile(worktree, pythonVerificationFile, content)
+	}
 	content := []byte(`package app
 
 import "testing"
@@ -271,6 +279,13 @@ func TestSoftwareFactoryTakeoverReviewed(t *testing.T) {
 	}
 }
 `)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	if strings.Contains(prompt, "SF_E2E_REVIEW_REPAIR") {
+		if _, err := os.Lstat(filepath.Join(worktree, verificationFixtureFile)); err == nil {
+			content = append(content, []byte("\nfunc TestIndependentRepair(t *testing.T) { t.Fatal(\"fresh repair not implemented\") }\n")...)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
@@ -367,6 +382,11 @@ func codexRole(prompt string) string {
 }
 
 func codexArtifact(role, prompt string, verificationFixture []byte) ([]byte, error) {
+	if command, python := pythonFixtureCommand(prompt); python {
+		if data, handled, err := pythonFixtureArtifact(role, prompt, command); handled {
+			return data, err
+		}
+	}
 	ticket := map[string]any{}
 	_ = decodePromptObject(prompt, "TICKET=", &ticket)
 	ticketType, _ := ticket["type"].(string)
@@ -405,6 +425,9 @@ func codexArtifact(role, prompt string, verificationFixture []byte) ([]byte, err
 		_ = decodePromptObject(prompt, "CANDIDATE=", &candidate)
 		head, _ := candidate["head_sha"].(string)
 		proofDigest, _ := verification["proof_digest"].(string)
+		if strings.Contains(prompt, "SF_E2E_REVIEW_REPAIR") {
+			return json.Marshal(phaseartifact.Reviewer{Schema: "sf.reviewer/v1", Decision: phaseartifact.ReviewRepair, RepairOwner: "reviewer", Findings: []string{"replace verification fixture"}, ReviewedHead: head, ProofDigest: proofDigest})
+		}
 		return json.Marshal(phaseartifact.Reviewer{Schema: "sf.reviewer/v1", Decision: phaseartifact.ReviewPass, Findings: []string{}, ReviewedHead: head, ProofDigest: proofDigest})
 	default:
 		return nil, errors.New("unsupported workflow role")

@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -601,6 +602,44 @@ func TestAuthStatusAcceptsOfficialHostsStateShape(t *testing.T) {
 	}
 }
 
+func TestPreflightUsesPositionalRepositoryArg(t *testing.T) {
+	var calls [][]string
+	client := Client{
+		binaryPath: "/bin/echo",
+		home:       t.TempDir(),
+		configDir:  t.TempDir(),
+		runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+			calls = append(calls, append([]string(nil), args...))
+			switch len(calls) {
+			case 1:
+				return []byte(`{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"sf-test"}]}}`), nil
+			case 2:
+				return []byte(`{"nameWithOwner":"example/app","url":"https://github.com/example/app"}`), nil
+			default:
+				return nil, errors.New("unexpected extra invocation")
+			}
+		}),
+		quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil }),
+	}
+	repository := contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}
+	principal, err := client.Preflight(context.Background(), repository)
+	if err != nil || principal.Login != "sf-test" {
+		t.Fatalf("preflight=%+v err=%v", principal, err)
+	}
+	want := [][]string{
+		{"auth", "status", "--json", "hosts"},
+		{"repo", "view", "example/app", "--json", "nameWithOwner,url"},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("argv=%#v want %#v", calls, want)
+	}
+	for _, arg := range calls[1] {
+		if arg == "--repo" {
+			t.Fatal("repo view must not use --repo")
+		}
+	}
+}
+
 func TestMergeQueueGraphQLFailsClosedBeforeMerge(t *testing.T) {
 	client, _, identity := fixture(t)
 	identity.Number = 7
@@ -706,6 +745,44 @@ func TestPublicationInventoryRejectsForeignAndAmbiguousOpenSourceBase(t *testing
 				t.Fatal("foreign or ambiguous PR permitted create")
 			}
 		})
+	}
+}
+
+func TestPublicationInventoryAcceptsDocumentedRepositoryObjectFields(t *testing.T) {
+	identity := contracts.PullRequestIdentity{
+		Repository:     contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"},
+		HeadOwner:      "example",
+		HeadRepository: "app",
+		HeadRef:        "sf/dev/example/SF-44-random",
+		HeadOID:        strings.Repeat("a", 40),
+		BaseRef:        "main",
+		BaseOID:        strings.Repeat("c", 40),
+		FactoryOwned:   true,
+	}
+	payload, err := json.Marshal([]map[string]any{{
+		"number":              7,
+		"title":               "title",
+		"body":                ownershipMarker(identity),
+		"headRepositoryOwner": map[string]any{"id": "O_example", "login": identity.HeadOwner},
+		"headRepository":      map[string]any{"id": "R_example", "name": identity.HeadRepository, "nameWithOwner": identity.HeadOwner + "/" + identity.HeadRepository},
+		"headRefName":         identity.HeadRef,
+		"headRefOid":          identity.HeadOID,
+		"baseRefName":         identity.BaseRef,
+		"baseRefOid":          identity.BaseOID,
+		"isDraft":             true,
+		"mergedAt":            nil,
+		"mergeCommit":         nil,
+		"state":               "OPEN",
+		"mergeStateStatus":    "CLEAN",
+		"autoMergeRequest":    nil,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	match, found, err := refreshTestClient(t, payload, &calls).ObservePublicationCandidate(context.Background(), identity)
+	if err != nil || !found || match.Identity.Number != 7 || !sameExact(match.Identity, identity) {
+		t.Fatalf("live-shaped publication inventory match=%+v found=%v err=%v", match, found, err)
 	}
 }
 
@@ -1112,6 +1189,74 @@ func TestChecksRejectsHeadDriftBetweenCheckObservations(t *testing.T) {
 	}
 }
 
+func TestChecksCanonicalizesProductionExternalIdentityForStore(t *testing.T) {
+	repository := contracts.RepositoryIdentity{Host: "github.com", Owner: "example", Name: "app"}
+	identity := contracts.PullRequestIdentity{
+		Repository:     repository,
+		Number:         7,
+		HeadOwner:      "example",
+		HeadRepository: "app",
+		HeadRef:        "sf/dev/example/SF-44-random",
+		HeadOID:        strings.Repeat("a", 40),
+		BaseRef:        "main",
+		BaseOID:        strings.Repeat("c", 40),
+		FactoryOwned:   true,
+	}
+	observed, err := json.Marshal([]map[string]any{mergeWire(identity, "OPEN", "CLEAN", nil, nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := checkWire{Name: "unit", State: "SUCCESS", Workflow: "ci", Link: "https://example.test/actions/runs/1/jobs/2", Bucket: "pass"}
+	longLinkPrefix := "https://example.test/"
+	longWire := checkWire{Name: "lint", State: "PENDING", Link: longLinkPrefix + strings.Repeat("x", 2048-len(longLinkPrefix))}
+	wireJSON, err := json.Marshal([]checkWire{wire, longWire})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := Client{binaryPath: "/bin/echo", home: t.TempDir(), configDir: t.TempDir(), runner: commandRunnerFunc(func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		if args[0] == "pr" && args[1] == "list" {
+			return observed, nil
+		}
+		if args[0] == "pr" && args[1] == "checks" {
+			return wireJSON, nil
+		}
+		return nil, errors.New("unexpected command")
+	}), quarantiner: cleanupQuarantinerFunc(func(context.Context) error { return nil })}
+
+	checks, err := client.RequiredChecks(context.Background(), identity)
+	if err != nil || len(checks) != 2 {
+		t.Fatalf("checks=%+v err=%v", checks, err)
+	}
+	expected := canonicalCheckExternalID(wire)
+	if checks[0].ExternalID != expected || len(expected) != len("sha256:")+sha256.Size*2 || strings.ContainsRune(expected, '\x00') {
+		t.Fatalf("external identity=%q expected=%q", checks[0].ExternalID, expected)
+	}
+	if _, err := store.NormalizeCIObservationChecks(checks); err != nil {
+		t.Fatalf("Store rejected canonical GitHub check identity: %v", err)
+	}
+	if len(longWire.Link) != 2048 || checks[1].ExternalID != canonicalCheckExternalID(longWire) {
+		t.Fatalf("long link identity=%q link-length=%d", checks[1].ExternalID, len(longWire.Link))
+	}
+	stateChanged := wire
+	stateChanged.State = "PENDING"
+	if canonicalCheckExternalID(stateChanged) != expected {
+		t.Fatal("check state changed stable external identity")
+	}
+	bucketChanged := wire
+	bucketChanged.Bucket = "pending"
+	if canonicalCheckExternalID(bucketChanged) != expected {
+		t.Fatal("state-derived bucket changed stable external identity")
+	}
+	for name, changed := range map[string]checkWire{
+		"workflow": {Name: wire.Name, State: wire.State, Workflow: "other", Link: wire.Link, Bucket: wire.Bucket},
+		"link":     {Name: wire.Name, State: wire.State, Workflow: wire.Workflow, Link: wire.Link + "/3", Bucket: wire.Bucket},
+	} {
+		if canonicalCheckExternalID(changed) == expected {
+			t.Fatalf("%s change retained external identity", name)
+		}
+	}
+}
+
 func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	client, fake, identity := fixture(t)
 	pr := createDraft(t, client, identity, "title", "body")
@@ -1122,14 +1267,15 @@ func TestChecksMergeAndApprovalPolicies(t *testing.T) {
 	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "1", State: "SUCCESS"}); err != nil {
 		t.Fatal(err)
 	}
-	checks, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "1"}}, time.Millisecond, time.Millisecond)
+	checkID := canonicalCheckExternalID(checkWire{Link: "1"})
+	checks, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: checkID}}, time.Millisecond, time.Millisecond)
 	if err != nil || len(checks) != 1 {
 		t.Fatalf("checks=%+v err=%v", checks, err)
 	}
 	if err := fake.SetChecks(pr.Identity.Number, contracts.RequiredCheck{Name: "unit", ExternalID: "wrong", State: "SUCCESS"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "1"}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksFailed) {
+	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: checkID}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksFailed) {
 		t.Fatalf("strict checks=%v", err)
 	}
 	if err := client.MarkReady(context.Background(), testClaim("pr_ready", pr.Identity), pr.Identity); err != nil {
@@ -2201,7 +2347,8 @@ func TestWaitChecksBoundsBackgroundContext(t *testing.T) {
 	old := maxGHDeadline
 	maxGHDeadline = 300 * time.Millisecond
 	t.Cleanup(func() { maxGHDeadline = old })
-	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: "one"}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksPending) {
+	checkID := canonicalCheckExternalID(checkWire{Link: "one"})
+	if _, err := client.WaitChecks(context.Background(), pr.Identity, []CheckIdentity{{Name: "unit", ExternalID: checkID}}, time.Millisecond, time.Millisecond); !errors.Is(err, ErrChecksPending) {
 		t.Fatalf("bounded background polling=%v", err)
 	}
 }
@@ -2250,9 +2397,8 @@ func TestRunBoundedKillsProcessGroupOnDeadline(t *testing.T) {
 func TestRunBoundedClosesRetainedPipeFromEscapedDescendant(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	started := time.Now()
 	ready := filepath.Join(t.TempDir(), "escaped-child-ready")
-	script := "import os,time\nif os.fork()==0:\n if os.fork()==0:\n  os.setsid(); print('escaped-child-pid='+str(os.getpid()), flush=True); open(os.environ['SF_TEST_READY'],'w').close(); time.sleep(5)\n os._exit(0)\ntime.sleep(5)"
+	script := "import os,time\nif os.fork()==0:\n if os.fork()==0:\n  os.setsid(); print('escaped-child-pid='+str(os.getpid()), flush=True); ready=os.environ['SF_TEST_READY']; open(ready+'.tmp','w').write(str(os.getpid())); os.replace(ready+'.tmp',ready); time.sleep(5)\n os._exit(0)\ntime.sleep(5)"
 	type boundedResult struct {
 		output []byte
 		err    error
@@ -2279,17 +2425,35 @@ func TestRunBoundedClosesRetainedPipeFromEscapedDescendant(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	cancel()
-	result := <-done
-	output, err := result.output, result.err
-	if !errors.Is(err, ErrProcessCleanup) || time.Since(started) > 2*time.Second {
-		t.Fatalf("escaped retained pipe err=%v elapsed=%s output=%q", err, time.Since(started), output)
+	readyPID, err := os.ReadFile(ready)
+	if err != nil {
+		cancel()
+		result := <-done
+		t.Fatalf("read escaped child pid: %v; fixture err=%v output=%q", err, result.err, result.output)
 	}
-	for _, field := range strings.Fields(string(output)) {
-		if strings.HasPrefix(field, "escaped-child-pid=") {
-			if pid, parseErr := strconv.Atoi(strings.TrimPrefix(field, "escaped-child-pid=")); parseErr == nil && pid > 0 {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}
+	escapedPID, err := strconv.Atoi(strings.TrimSpace(string(readyPID)))
+	if err != nil || escapedPID <= 0 {
+		cancel()
+		result := <-done
+		t.Fatalf("parse escaped child pid %q: %v; fixture err=%v output=%q", readyPID, err, result.err, result.output)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(escapedPID, syscall.SIGKILL)
+	})
+	cleanupDeadline := time.NewTimer(2 * time.Second)
+	defer cleanupDeadline.Stop()
+	cancel()
+	var result boundedResult
+	select {
+	case result = <-done:
+	case <-cleanupDeadline.C:
+		t.Fatal("escaped retained pipe cleanup exceeded 2 seconds after cancellation")
+	}
+	output, err := result.output, result.err
+	if !errors.Is(err, ErrProcessCleanup) {
+		t.Fatalf("escaped retained pipe err=%v output=%q", err, output)
+	}
+	if !strings.Contains(string(output), "escaped-child-pid="+strconv.Itoa(escapedPID)) {
+		t.Fatalf("escaped child pid missing from output: pid=%d output=%q", escapedPID, output)
 	}
 }

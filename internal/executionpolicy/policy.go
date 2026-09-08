@@ -18,6 +18,7 @@ import (
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/nysapure"
+	"github.com/nysa-company/sf/internal/pythonclosure"
 )
 
 var (
@@ -185,6 +186,11 @@ func EvaluateRepositoryCommand(argv []string) CommandDecision {
 		return evaluateGoVerification(argv)
 	case "node":
 		return evaluateNodeVerification(argv)
+	case "python3":
+		if _, err := pythonclosure.ParseRecipe(argv); err == nil {
+			return CommandDecision{Allowed: true, Code: "allowed_prepared_pytest_v1_recipe", Reason: "exact digest-bound prepared Python recipe; runtime readiness is separately required"}
+		}
+		return deny("python_recipe_forbidden", "Python requires the exact factory prepared pytest recipe; PATH interpreters and arbitrary scripts are not eligible")
 	default:
 		return deny("repository_command_not_allowlisted", "only the exact guarded Go or dependency-free Node 22 test verification recipes are eligible")
 	}

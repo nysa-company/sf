@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Partition the complete race suite without omitting Store tests.
+
+CI runs `other` plus every Store shard on isolated macOS runners. Local
+`make test-race` remains the unpartitioned reference command.
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+
+STORE = "github.com/nysa-company/sf/internal/store"
+FLAGS = ["-race", "-count=1", "-shuffle=off", "-p", "1", "-timeout", "60m"]
+
+
+def partition(names, index, count):
+    if not 1 <= count <= 64 or not 0 <= index < count:
+        raise ValueError("invalid shard index/count")
+    if not names or len(set(names)) != len(names):
+        raise ValueError("empty or duplicate test inventory")
+    selected = sorted(names)[index::count]
+    if not selected:
+        raise ValueError("empty shard")
+    return selected
+
+
+def inventory(output):
+    # go test -list also emits its package summary. Benchmarks are not run by
+    # ordinary go test; examples and fuzz seeds are, so include both here.
+    names = []
+    for line in output.splitlines():
+        if re.fullmatch(r"(?:Test|Example|Fuzz)\w*", line):
+            names.append(line)
+        elif re.match(r"^(?:ok|\?)\s+", line) or line.startswith("Benchmark") or not line:
+            continue
+        else:
+            raise ValueError("unexpected test inventory output: " + line)
+    return names
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=["other", "store"])
+    parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--count", type=int, default=8)
+    parser.add_argument("--list-only", action="store_true")
+    args = parser.parse_args()
+    if args.mode == "other":
+        packages = subprocess.check_output(["go", "list", "./..."], text=True).splitlines()
+        if packages.count(STORE) != 1:
+            raise ValueError("Store missing or duplicated in package inventory")
+        selected = [p for p in packages if p != STORE]
+        if not selected:
+            raise ValueError("empty non-Store inventory")
+        command = ["go", "test", *FLAGS, *selected]
+    else:
+        output = subprocess.check_output(
+            ["go", "test", "-race", "-list", ".", STORE], text=True
+        )
+        names = inventory(output)
+        selected = partition(names, args.index, args.count)
+        print(f"Store shard {args.index + 1}/{args.count}: {len(selected)}/{len(names)} tests", flush=True)
+        command = ["go", "test", *FLAGS, "-v", STORE,
+                   "-run", "^(?:" + "|".join(re.escape(n) for n in selected) + ")$"]
+    if args.list_only:
+        print("\n".join(selected))
+        return 0
+    return subprocess.call(command)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (ValueError, subprocess.CalledProcessError) as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

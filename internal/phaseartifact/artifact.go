@@ -122,12 +122,18 @@ type Parsed struct {
 }
 
 type Validation struct {
-	TicketType              domain.TicketType
-	AcceptanceDigest        string
-	ProtectedVerification   []string
-	ApprovedAmendmentDigest string
-	ExpectedReviewedHead    string
-	ExpectedProofDigest     string
+	TicketType       domain.TicketType
+	AcceptanceDigest string
+	// ExpectedVerificationCommand is the exact configuration-snapshot argv
+	// issued to a pre-build Reviewer and retained by any Builder amendment.
+	// It is intentionally optional on the durable wire so validation records
+	// written before this fence remain readable and authenticate as their
+	// original canonical bytes.
+	ExpectedVerificationCommand []string `json:"ExpectedVerificationCommand,omitempty"`
+	ProtectedVerification       []string
+	ApprovedAmendmentDigest     string
+	ExpectedReviewedHead        string
+	ExpectedProofDigest         string
 }
 
 // CanonicalArtifact is the durable, transcript-free representation of a
@@ -266,6 +272,11 @@ func allowedMutationPrefixes(values []string) bool {
 
 // CanonicalValidation persists all semantic fences Parse needs after restart.
 func CanonicalValidation(validation Validation) ([]byte, string, error) {
+	if validation.ExpectedVerificationCommand != nil {
+		if err := argv("expected verification command", validation.ExpectedVerificationCommand); err != nil {
+			return nil, "", err
+		}
+	}
 	b, err := json.Marshal(validation)
 	if err != nil || len(b) == 0 || len(b) > 64<<10 {
 		return nil, "", errors.New("invalid validation")
@@ -426,6 +437,9 @@ func validateVerification(value *Verification, validation Validation) error {
 	if err := argv("verification command", value.Command); err != nil {
 		return err
 	}
+	if validation.ExpectedVerificationCommand != nil && !reflect.DeepEqual(value.Command, validation.ExpectedVerificationCommand) {
+		return errors.New("verification command does not match the configuration snapshot")
+	}
 	if value.EvidenceDigest == "" {
 		return errors.New("verification evidence digest is required")
 	}
@@ -499,6 +513,9 @@ func validateBuilder(value *Builder, validation Validation) error {
 		if !lowerSHA256(request.OldProofDigest) || !lowerSHA256(request.ProposedDigest) || request.OldProofDigest == request.ProposedDigest || strings.TrimSpace(request.Reason) == "" || argv("verification amendment proposed command", request.ProposedCommand) != nil {
 			return errors.New("verification amendment request is incomplete")
 		}
+		if validation.ExpectedVerificationCommand != nil && !reflect.DeepEqual(request.ProposedCommand, validation.ExpectedVerificationCommand) {
+			return errors.New("verification amendment command does not match the configuration snapshot")
+		}
 		// A Builder request is not an approval. The Store records it before a
 		// fresh Reviewer may create a replacement checkpoint. When this field is
 		// non-empty it is an additional exact replay check, never a way to skip
@@ -551,6 +568,12 @@ func validateReviewer(value *Reviewer, validation Validation) error {
 }
 
 func proofFor(ticketType domain.TicketType) ProofKind {
+	return RequiredProofKind(ticketType)
+}
+
+// RequiredProofKind is the controller's required proof for a ticket type.
+// Unknown ticket types have no admissible proof.
+func RequiredProofKind(ticketType domain.TicketType) ProofKind {
 	switch ticketType {
 	case domain.TicketBug:
 		return ProofRegression

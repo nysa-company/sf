@@ -261,11 +261,11 @@ func TestProviderExhaustionAndRetryUseTypedEngineRoundTrip(t *testing.T) {
 	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, Path: worktree, Branch: "sf/dev/nysa/engine-provider", IdentityJSON: []byte(`{}`), BaseSHA: base, HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
-	planner, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: strings.Repeat("1", 32), Provider: domain.ProviderIdentity{Provider: "cursor", Model: "cursor-model", Family: "cursor-family", Version: "1"}, BinaryDigest: strings.Repeat("a", 64), PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()})
+	planner, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: strings.Repeat("1", 32), Provider: domain.ProviderIdentity{Provider: "fixture-cursor", Model: "cursor-model", Family: "cursor-family", Version: "1"}, BinaryDigest: strings.Repeat("a", 64), PolicyDigest: strings.Repeat("b", 64), FixtureDigest: strings.Repeat("c", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	reviewer, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: strings.Repeat("2", 32), Provider: domain.ProviderIdentity{Provider: "claude", Model: "claude-model", Family: "claude-family", Version: "1"}, BinaryDigest: strings.Repeat("d", 64), PolicyDigest: strings.Repeat("e", 64), FixtureDigest: strings.Repeat("f", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()})
+	reviewer, _, err := database.RecordProviderQualification(ctx, store.ProviderQualification{Channel: domain.ChannelDev, RunID: strings.Repeat("2", 32), Provider: domain.ProviderIdentity{Provider: "fixture-claude", Model: "claude-model", Family: "claude-family", Version: "1"}, BinaryDigest: strings.Repeat("d", 64), PolicyDigest: strings.Repeat("e", 64), FixtureDigest: strings.Repeat("f", 64), Profile: store.QualificationGuarded, CreatedAt: time.Now().UTC()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +276,7 @@ func TestProviderExhaustionAndRetryUseTypedEngineRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding := contracts.RuntimeBinding{Identity: planner.Provider, BinaryDigest: planner.BinaryDigest, PolicyDigest: planner.PolicyDigest, FixtureDigest: planner.FixtureDigest, AuthDigest: strings.Repeat("d", 64), AuthMode: "test"}
+	binding := contracts.RuntimeBinding{Identity: planner.Provider, BinaryDigest: planner.BinaryDigest, PolicyDigest: planner.PolicyDigest, FixtureDigest: planner.FixtureDigest, AuthDigest: strings.Repeat("d", 64)}
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}
 	for range 2 {
 		request := store.ProviderAttemptRequest{Ref: ref, ExpectedVersion: started.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: binding, ConfigDigest: started.ConfigDigest, Capacity: 1, At: time.Now().UTC(), Repository: repository, Worktree: worktree, WorktreeIdentity: "{}", BaseSHA: base, SupervisorKey: signer.PublicKey(), Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch, ExpectedVersion: started.Version, Prompt: "engine provider retry fixture", Repository: repository, Worktree: worktree, WorktreeIdentity: "{}", BaseSHA: base, AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)}}
@@ -303,6 +303,9 @@ func TestProviderExhaustionAndRetryUseTypedEngineRoundTrip(t *testing.T) {
 	paused, err := runtime.SignalProviderExhausted(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: started.Version, From: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence})
 	if err != nil || paused.To != domain.StatePaused {
 		t.Fatalf("provider exhaustion result=%+v err=%v", paused, err)
+	}
+	if err := database.SealRuntimeControl(ctx, ref); err != nil {
+		t.Fatal(err)
 	}
 	retried, err := runtime.SignalProviderRetry(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: paused.TicketVersion, From: domain.StatePaused, Trigger: "operator_retry", Fence: fence})
 	if err != nil || retried.To != domain.StatePlanning {
@@ -349,6 +352,44 @@ func TestEngineTypedProviderBlockAndRecoverPreservesPhase(t *testing.T) {
 	recovered, err := runtime.Signal(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: blocked.TicketVersion, From: domain.StateBlocked, Trigger: "operator_recover", Fence: fence, Attributes: map[string]string{"operator_identity_authenticated": "true", "typed_prerequisites_satisfied": "true", "no_live_writer": "true", "runner_epoch_current": "true"}, EventPayload: `{"intent":"recover"}`})
 	if err != nil || recovered.To != domain.StatePlanning {
 		t.Fatalf("typed recovery result=%+v err=%v", recovered, err)
+	}
+}
+
+func TestEngineVerificationAmendmentInvalidPersistsGenericBlocker(t *testing.T) {
+	ctx := t.Context()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "verification-amendment-invalid.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.CreateProject(ctx, store.Project{Channel: domain.ChannelDev, ID: "nysa", Path: "/tmp/nysa", BaseRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: "SF-engine-verification-amendment-invalid"}
+	if err := database.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "engine-verification-amendment-invalid", Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, State: domain.StateVerifying}); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "engine-verification-amendment-invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := statemachine.LoadEmbeddedApproved()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := New(database, spec)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	result, err := runtime.SignalVerificationAmendmentBlocked(ctx, contracts.SignalRequest{Ticket: ref, TicketVersion: ticket.Version, From: domain.StateVerifying, Fence: fence})
+	if err != nil || result.To != domain.StateBlocked {
+		t.Fatalf("amendment-invalid block result=%+v err=%v", result, err)
+	}
+	blocked, err := database.Ticket(ctx, ref)
+	if err != nil || blocked.State != domain.StateBlocked || blocked.ResumeState != domain.StateVerifying || blocked.BlockedCode != "verification_amendment_invalid" || blocked.Version != result.TicketVersion {
+		t.Fatalf("amendment-invalid ticket=%+v err=%v", blocked, err)
 	}
 }
 

@@ -38,7 +38,7 @@ type ProviderQualification struct {
 	FailedProbes  []string
 	ReasonCode    string
 	CreatedAt     time.Time
-	// Codex guarded records are admitted only through the daemon's current
+	// Credential-bearing guarded records are admitted through the daemon's current
 	// supervisor key. These values are non-secret audit evidence, never a
 	// provider transcript or credential.
 	ProbeDigest          string
@@ -54,27 +54,6 @@ type ProviderPair struct {
 	SelectedAt time.Time
 }
 
-// SelectProviderSet records the exact qualified planner/builder/reviewer set.
-// Planner may intentionally equal Builder; Reviewer must remain independent.
-func (s *Store) SelectProviderSet(ctx context.Context, channel domain.Channel, plannerID, builderID, reviewerID int64, selectedAt time.Time) (ProviderPair, bool, error) {
-	pair, created, err := s.SelectProviderPair(ctx, channel, builderID, reviewerID, selectedAt)
-	if err != nil {
-		return ProviderPair{}, false, err
-	}
-	err = s.write(ctx, func(conn *sql.Conn) error {
-		planner, err := currentQualificationByID(ctx, conn, channel, plannerID)
-		if err != nil || planner.Profile == QualificationDisabled {
-			return ErrProviderPairRefused
-		}
-		if _, err = conn.ExecContext(ctx, `UPDATE provider_pair_selections SET planner_qualification_id=? WHERE channel=?`, plannerID, channel); err != nil {
-			return err
-		}
-		pair.Planner = planner
-		return nil
-	})
-	return pair, created, err
-}
-
 var (
 	qualificationName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,47}$`)
 	probeName         = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
@@ -82,18 +61,18 @@ var (
 )
 
 func (s *Store) RecordProviderQualification(ctx context.Context, input ProviderQualification) (ProviderQualification, bool, error) {
-	if input.Provider.Provider == "codex" && input.Profile == QualificationGuarded {
-		return ProviderQualification{}, false, errors.New("Codex guarded qualification requires a supervisor attestation")
+	if (input.Provider.Provider == "codex" || input.AuthMode != "") && input.Profile == QualificationGuarded {
+		return ProviderQualification{}, false, errors.New("guarded qualification requires a supervisor attestation")
 	}
 	return s.recordProviderQualification(ctx, input, nil)
 }
 
 // RecordAttestedProviderQualification is the sole production entrypoint for
-// a passing Codex qualification. It verifies an exact signature from the
+// a passing credential-bearing qualification. It verifies an exact signature from the
 // currently fenced daemon supervisor before SQLite admits the row.
 func (s *Store) RecordAttestedProviderQualification(ctx context.Context, input ProviderQualification, attestation contracts.QualificationAttestation) (ProviderQualification, bool, error) {
-	if input.Provider.Provider != "codex" || input.Profile != QualificationGuarded || !sameQualificationAttestation(input, attestation) {
-		return ProviderQualification{}, false, errors.New("invalid Codex qualification attestation")
+	if !attestedProviderAuthMode(input.Provider.Provider, input.AuthMode) || input.Profile != QualificationGuarded || !sameQualificationAttestation(input, attestation) {
+		return ProviderQualification{}, false, errors.New("invalid provider qualification attestation")
 	}
 	input.ProbeDigest = attestation.ProbeDigest
 	input.AuthDigest = attestation.AuthDigest
@@ -122,7 +101,7 @@ func (s *Store) recordProviderQualification(ctx context.Context, input ProviderQ
 			var leader uint64
 			var key []byte
 			if err := conn.QueryRowContext(ctx, `SELECT leader_epoch,recovery_public_key FROM daemon_instances WHERE channel=?`, normalized.Channel).Scan(&leader, &key); err != nil || leader == 0 || attestation.LeaderEpoch != leader || !contracts.VerifyQualificationAttestation(key, *attestation) {
-				return errors.New("Codex qualification attestation is not signed by the current supervisor")
+				return errors.New("provider qualification attestation is not signed by the current supervisor")
 			}
 			normalized.AttestedLeaderEpoch = leader
 		}
@@ -197,12 +176,23 @@ func (s *Store) LatestProviderQualification(ctx context.Context, channel domain.
 }
 
 func (s *Store) SelectProviderPair(ctx context.Context, channel domain.Channel, builderID, reviewerID int64, selectedAt time.Time) (ProviderPair, bool, error) {
-	if !channel.Valid() || builderID <= 0 || reviewerID <= 0 || builderID == reviewerID || selectedAt.IsZero() {
+	return s.SelectProviderSet(ctx, channel, builderID, builderID, reviewerID, selectedAt)
+}
+
+// SelectProviderSet authenticates and records all three roles in one write
+// transaction. A refused role cannot partially replace an existing selection.
+// Planner may equal Builder; Reviewer must remain independent from Builder.
+func (s *Store) SelectProviderSet(ctx context.Context, channel domain.Channel, plannerID, builderID, reviewerID int64, selectedAt time.Time) (ProviderPair, bool, error) {
+	if !channel.Valid() || plannerID <= 0 || builderID <= 0 || reviewerID <= 0 || builderID == reviewerID || selectedAt.IsZero() {
 		return ProviderPair{}, false, ErrProviderPairRefused
 	}
 	var pair ProviderPair
 	created := false
 	err := s.write(ctx, func(conn *sql.Conn) error {
+		planner, err := currentQualificationByID(ctx, conn, channel, plannerID)
+		if err != nil || planner.Profile == QualificationDisabled {
+			return ErrProviderPairRefused
+		}
 		builder, err := currentQualificationByID(ctx, conn, channel, builderID)
 		if err != nil {
 			return ErrProviderPairRefused
@@ -214,10 +204,20 @@ func (s *Store) SelectProviderPair(ctx context.Context, channel domain.Channel, 
 		if builder.Profile == QualificationDisabled || reviewer.Profile == QualificationDisabled || builder.Provider.Family == reviewer.Provider.Family {
 			return ErrProviderPairRefused
 		}
-		var oldBuilder, oldReviewer int64
-		err = conn.QueryRowContext(ctx, `SELECT builder_qualification_id, reviewer_qualification_id FROM provider_pair_selections WHERE channel=?`, channel).Scan(&oldBuilder, &oldReviewer)
-		if err == nil && oldBuilder == builderID && oldReviewer == reviewerID {
-			pair = ProviderPair{Channel: channel, Builder: builder, Reviewer: reviewer}
+		for _, q := range []ProviderQualification{planner, builder, reviewer} {
+			if q.AuthMode == "" {
+				continue
+			} // credential-free historical fixtures
+			var epoch uint64
+			var key []byte
+			if err := conn.QueryRowContext(ctx, `SELECT leader_epoch,recovery_public_key FROM daemon_instances WHERE channel=?`, channel).Scan(&epoch, &key); err != nil || q.AttestedLeaderEpoch != epoch || !attestedProviderAuthMode(q.Provider.Provider, q.AuthMode) || !contracts.VerifyQualificationAttestation(key, contracts.QualificationAttestation{Channel: q.Channel, RunID: q.RunID, Identity: q.Provider, BinaryDigest: q.BinaryDigest, PolicyDigest: q.PolicyDigest, FixtureDigest: q.FixtureDigest, AuthDigest: q.AuthDigest, AuthMode: q.AuthMode, ProbeDigest: q.ProbeDigest, Profile: contracts.ProfileGuarded, CreatedUnixNanos: q.CreatedAt.UnixNano(), LeaderEpoch: q.AttestedLeaderEpoch, Nonce: q.RunID, Signature: q.AttestationSignature}) {
+				return ErrProviderPairRefused
+			}
+		}
+		var oldPlanner, oldBuilder, oldReviewer int64
+		err = conn.QueryRowContext(ctx, `SELECT planner_qualification_id, builder_qualification_id, reviewer_qualification_id FROM provider_pair_selections WHERE channel=?`, channel).Scan(&oldPlanner, &oldBuilder, &oldReviewer)
+		if err == nil && oldPlanner == plannerID && oldBuilder == builderID && oldReviewer == reviewerID {
+			pair = ProviderPair{Channel: channel, Planner: planner, Builder: builder, Reviewer: reviewer}
 			var selected string
 			if scanErr := conn.QueryRowContext(ctx, `SELECT selected_at FROM provider_pair_selections WHERE channel=?`, channel).Scan(&selected); scanErr != nil {
 				return scanErr
@@ -234,10 +234,10 @@ func (s *Store) SelectProviderPair(ctx context.Context, channel domain.Channel, 
 		stamp := selectedAt.UTC().Format(time.RFC3339Nano)
 		if _, err := conn.ExecContext(ctx, `INSERT INTO provider_pair_selections(channel, planner_qualification_id, builder_qualification_id, reviewer_qualification_id, selected_at)
 			VALUES (?, ?, ?, ?, ?) ON CONFLICT(channel) DO UPDATE SET planner_qualification_id=excluded.planner_qualification_id, builder_qualification_id=excluded.builder_qualification_id,
-			reviewer_qualification_id=excluded.reviewer_qualification_id, selected_at=excluded.selected_at`, channel, builderID, builderID, reviewerID, stamp); err != nil {
+			reviewer_qualification_id=excluded.reviewer_qualification_id, selected_at=excluded.selected_at`, channel, plannerID, builderID, reviewerID, stamp); err != nil {
 			return err
 		}
-		pair = ProviderPair{Channel: channel, Planner: builder, Builder: builder, Reviewer: reviewer, SelectedAt: selectedAt.UTC()}
+		pair = ProviderPair{Channel: channel, Planner: planner, Builder: builder, Reviewer: reviewer, SelectedAt: selectedAt.UTC()}
 		created = true
 		return nil
 	})
@@ -251,10 +251,14 @@ func (s *Store) ProviderPair(ctx context.Context, channel domain.Channel) (Provi
 	if !channel.Valid() {
 		return ProviderPair{}, ErrNotFound
 	}
-	var builderID, reviewerID int64
+	var plannerID, builderID, reviewerID int64
 	var selected string
-	if err := s.db.QueryRowContext(ctx, `SELECT builder_qualification_id, reviewer_qualification_id, selected_at FROM provider_pair_selections WHERE channel=?`, channel).Scan(&builderID, &reviewerID, &selected); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT planner_qualification_id, builder_qualification_id, reviewer_qualification_id, selected_at FROM provider_pair_selections WHERE channel=?`, channel).Scan(&plannerID, &builderID, &reviewerID, &selected); err != nil {
 		return ProviderPair{}, normalizeNotFound(ctx, err)
+	}
+	planner, err := currentQualificationByID(ctx, s.db, channel, plannerID)
+	if err != nil {
+		return ProviderPair{}, err
 	}
 	builder, err := currentQualificationByID(ctx, s.db, channel, builderID)
 	if err != nil {
@@ -268,7 +272,7 @@ func (s *Store) ProviderPair(ctx context.Context, channel domain.Channel) (Provi
 	if err != nil {
 		return ProviderPair{}, err
 	}
-	return ProviderPair{Channel: channel, Builder: builder, Reviewer: reviewer, SelectedAt: selectedAt}, nil
+	return ProviderPair{Channel: channel, Planner: planner, Builder: builder, Reviewer: reviewer, SelectedAt: selectedAt}, nil
 }
 
 func normalizeQualification(input ProviderQualification) (ProviderQualification, []byte, error) {
@@ -280,9 +284,9 @@ func normalizeQualification(input ProviderQualification) (ProviderQualification,
 	if input.AttestationSignature == nil {
 		input.AttestationSignature = []byte{}
 	}
-	if input.Provider.Provider == "codex" && input.Profile == QualificationGuarded {
-		if input.AuthMode != "chatgpt_subscription" || !lowerHex(input.AuthDigest, 32) || !lowerHex(input.ProbeDigest, 32) || input.AttestedLeaderEpoch == 0 || len(input.AttestationSignature) != 64 {
-			return ProviderQualification{}, nil, errors.New("Codex qualification attestation evidence is invalid")
+	if (input.Provider.Provider == "codex" || input.AuthMode != "") && input.Profile == QualificationGuarded {
+		if !attestedProviderAuthMode(input.Provider.Provider, input.AuthMode) || !lowerHex(input.AuthDigest, 32) || !lowerHex(input.ProbeDigest, 32) || input.AttestedLeaderEpoch == 0 || len(input.AttestationSignature) != 64 {
+			return ProviderQualification{}, nil, errors.New("provider qualification attestation evidence is invalid")
 		}
 	} else if input.AuthDigest != "" || input.AuthMode != "" || input.ProbeDigest != "" || input.AttestedLeaderEpoch != 0 || len(input.AttestationSignature) != 0 {
 		return ProviderQualification{}, nil, errors.New("unexpected qualification attestation evidence")
@@ -332,12 +336,15 @@ func (s *Store) LeaderEpoch(ctx context.Context, channel domain.Channel) (uint64
 	return epoch, nil
 }
 
-// QualificationCurrent verifies that a Codex qualification is still signed by
+// QualificationCurrent verifies that a credential-bearing qualification is signed by
 // the daemon leader currently recorded for this channel. It is deliberately
 // rechecked at composition and paid-attempt admission, not merely at insert.
 func (s *Store) QualificationCurrent(ctx context.Context, channel domain.Channel, value ProviderQualification) bool {
-	if value.Provider.Provider != "codex" {
+	if value.Provider.Provider != "codex" && value.AuthMode == "" {
 		return true
+	}
+	if !attestedProviderAuthMode(value.Provider.Provider, value.AuthMode) {
+		return false
 	}
 	var epoch uint64
 	var key []byte
@@ -351,6 +358,22 @@ func (s *Store) QualificationCurrent(ctx context.Context, channel domain.Channel
 		Profile: contracts.ProfileGuarded, CreatedUnixNanos: value.CreatedAt.UnixNano(), LeaderEpoch: value.AttestedLeaderEpoch,
 		Nonce: value.RunID, Signature: value.AttestationSignature,
 	})
+}
+
+// These are authentication classes, not assertions of free usage. Runtime
+// policies still have to prove isolation and trustworthy monetary accounting.
+// Credential-free legacy fixtures remain separate from executable admission.
+func attestedProviderAuthMode(provider, mode string) bool {
+	switch provider {
+	case "codex":
+		return mode == "chatgpt_subscription"
+	case "claude":
+		return mode == "claude_subscription"
+	case "cursor":
+		return mode == "cursor_api" || mode == "cursor_browser"
+	default:
+		return false
+	}
 }
 
 func validateProviderIdentity(identity domain.ProviderIdentity) error {

@@ -12,10 +12,12 @@ permissions:
 jobs:
   baseline:
     # v1's production execution and compiled acceptance boundary is macOS.
-    if: github.event_name != 'workflow_dispatch'
     runs-on: macos-14
-    # make test-all has a 90-minute local bound; leave setup/teardown headroom.
-    timeout-minutes: 100
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [race-other, test-integration, test-crash, test-security, test-upgrade, test-compiled-e2e, verify-static]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,17 +26,33 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Expose the setup toolchain at the approved repository-test path
+        run: |
+          set -eu
+          setup_go=$(command -v go)
+          sudo mkdir -p /usr/local/go/bin
+          sudo ln -sfn "$setup_go" /usr/local/go/bin/go
+          test "$(readlink /usr/local/go/bin/go)" = "$setup_go"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: scripts/artifact-check --base origin/main
-      - run: make test-all
+      - run: python3 -B -m unittest discover -s scripts -p 'test_ci_race.py'
+      - name: Run acceptance lane
+        env:
+          SF_CI_LANE: ${{ matrix.target }}
+        run: make test-all
 
-  credential-free-local-acceptance:
-    # This is credential-free local evidence, not stable-promotion approval.
-    if: github.event_name == 'workflow_dispatch'
+  store-race:
+    # modernc SQLite migration fixtures under -race exceed one package's hour
+    # on hosted macOS. Disjoint shards keep every test and each test's subtests.
+    # Together with baseline/race-other this is the full race suite.
     runs-on: macos-14
-    timeout-minutes: 100
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,7 +61,18 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Expose the setup toolchain at the approved repository-test path
+        run: |
+          set -eu
+          setup_go=$(command -v go)
+          sudo mkdir -p /usr/local/go/bin
+          sudo ln -sfn "$setup_go" /usr/local/go/bin/go
+          test "$(readlink /usr/local/go/bin/go)" = "$setup_go"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: make test-all
+      - name: Run Store race shard
+        env:
+          SHARD: ${{ matrix.shard }}
+          SF_CI_LANE: store-race
+        run: make test-all

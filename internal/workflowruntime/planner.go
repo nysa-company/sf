@@ -27,7 +27,7 @@ var (
 	ErrConfigDigestMismatch     = errors.New("ticket configuration digest is invalid")
 	ErrIdentityMismatch         = errors.New("durable ticket/worktree identity mismatch")
 	ErrUnsupportedMode          = errors.New("workflow mode is not supported by this runtime")
-	ErrProviderOrder            = errors.New("planner provider order is not the exact codex route")
+	ErrProviderOrder            = errors.New("provider configuration must name one supported route without fallback")
 	ErrPlannerNotReady          = errors.New("qualified planner provider is not ready")
 	ErrProviderResultInvalid    = errors.New("provider result is not Store-authenticated")
 )
@@ -118,7 +118,7 @@ func (r PlannerRunner) RunArtifact(ctx context.Context, request workflowworker.P
 	if !permittedMode(request.Ticket.MergeMode) || !permittedMode(effective.MergeMode) {
 		return PlannerResult{}, ErrUnsupportedMode
 	}
-	if len(effective.Providers.Planner) != 1 || effective.Providers.Planner[0] != "codex" {
+	if _, err := configuredProvider(effective, providercoord.RolePlanner); err != nil {
 		return PlannerResult{}, ErrProviderOrder
 	}
 
@@ -136,7 +136,7 @@ func (r PlannerRunner) RunArtifact(ctx context.Context, request workflowworker.P
 	if err != nil {
 		return PlannerResult{}, ErrConfigSnapshotInvalid
 	}
-	coordResult := r.Coordinator.Run(ctx, providercoord.Request{Role: providercoord.RolePlanner, Input: input, Validation: phaseartifact.Validation{TicketType: request.Ticket.Type}, ExpectedVersion: request.Ticket.Version, Fence: request.Fence, ConfigDigest: request.Ticket.ConfigDigest})
+	coordResult := r.Coordinator.Run(ctx, providercoord.Request{Role: providercoord.RolePlanner, ExpectedProvider: effective.Providers.Planner[0], Input: input, Validation: phaseartifact.Validation{TicketType: request.Ticket.Type}, ExpectedVersion: request.Ticket.Version, Fence: request.Fence, ConfigDigest: request.Ticket.ConfigDigest})
 	if coordResult.Code != providercoord.Completed || coordResult.ProviderResult.AttemptID <= 0 {
 		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) || coordResult.Code == providercoord.Canceled {
 			return PlannerResult{}, ErrCanceled
@@ -161,7 +161,7 @@ func (r PlannerRunner) RunArtifact(ctx context.Context, request workflowworker.P
 	if err != nil || key.Ref != request.Ticket.Ref || key.Phase != domain.PhasePlanning || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.Ref != request.Ticket.Ref || result.Claim.Phase != domain.PhasePlanning || result.Claim.Role != string(workflowprompt.RolePlanner) || result.Claim.ExpectedVersion != request.Ticket.Version || result.Claim.LeaderEpoch != request.Fence.LeaderEpoch || result.Claim.RunnerEpoch != request.Fence.RunnerEpoch || result.Claim.Repository != project.Path || result.Claim.Worktree != request.Worktree.Path || result.Claim.WorktreeIdentity != string(request.Worktree.IdentityJSON) || result.Claim.BaseSHA != request.Worktree.BaseSHA || !matchesLaunchInput(result.Claim, key, input) || !matchesValidation(result.Validation, validation) || parsed.Phase != domain.PhasePlanning || parsed.Planner == nil || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes {
 		return PlannerResult{}, ErrProviderResultInvalid
 	}
-	if parsed.Provider != result.Claim.Binding.Identity || parsed.Provider.Provider != "codex" {
+	if parsed.Provider != result.Claim.Binding.Identity || parsed.Provider.Provider != effective.Providers.Planner[0] {
 		return PlannerResult{}, ErrProviderResultInvalid
 	}
 	return PlannerResult{Key: key, RawArtifact: append([]byte(nil), result.RawArtifact...)}, nil

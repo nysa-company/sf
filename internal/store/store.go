@@ -51,6 +51,12 @@ var (
 	// runtime binding. Callers may fail closed to an operator blocker; they must
 	// not reinterpret this as provider availability and launch a fallback.
 	ErrProviderRepairUnavailable = errors.New("provider repair requires the prior runtime binding")
+	// ErrProviderRetryRequiresResubmission identifies the two authenticated
+	// provider lineages whose retained physical checkout cannot be derived
+	// exactly: an operator source resume and a pending verification amendment.
+	// The caller must cancel and submit a fresh ticket; retrying cannot change
+	// this proof outcome.
+	ErrProviderRetryRequiresResubmission = errors.New("provider retry requires ticket resubmission")
 	// ErrProviderResultIndeterminate means the newest current phase attempt is
 	// terminal without a durable provider result. A new provider launch would
 	// turn that ambiguity into an unauthenticated retry, so only the typed
@@ -75,7 +81,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 53
+const schemaVersion = 60
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -131,6 +137,13 @@ var migrationChecksums = map[int]string{
 	51: migrationChecksum(migrationV51),
 	52: migrationChecksum(migrationV52),
 	53: migrationChecksum(migrationV53),
+	54: migrationChecksum(migrationV54),
+	55: migrationChecksum(migrationV55),
+	56: migrationChecksum(migrationV56),
+	57: migrationChecksum(migrationV57),
+	58: migrationChecksum(migrationV58),
+	59: migrationChecksum(migrationV59),
+	60: migrationChecksum(migrationV60),
 }
 
 func migrationChecksum(statements []string) string {
@@ -312,6 +325,16 @@ func open(ctx context.Context, path string, policy openPolicy) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("database schema %d is newer than supported %d", storedVersion, schemaVersion)
 	}
+	if recognized {
+		if err := validateStoredMigrationHistory(ctx, db, storedVersion); err != nil {
+			db.Close()
+			return nil, normalizeBusy(ctx, err)
+		}
+		if err := validateCandidateRepairCompatibility(ctx, db, storedVersion); err != nil {
+			db.Close()
+			return nil, normalizeBusy(ctx, err)
+		}
+	}
 	if existed && recognized && storedVersion < schemaVersion && policy.backupBeforeMigration {
 		if err := s.backupBeforeMigration(ctx, policy.backupDir, storedVersion, schemaVersion, policy.now); err != nil {
 			db.Close()
@@ -427,6 +450,13 @@ func (s *Store) migrate(ctx context.Context) error {
 	for version := current + 1; version <= schemaVersion; version++ {
 		version := version
 		if err := s.write(ctx, func(conn *sql.Conn) error {
+			// Recheck under BEGIN IMMEDIATE so a pre-v55 writer cannot add a
+			// legacy binding in the gap after the read-only open preflight.
+			if version == 55 {
+				if err := validateCandidateRepairCompatibility(ctx, conn, 54); err != nil {
+					return err
+				}
+			}
 			statements := migrationV1
 			if version == 2 {
 				statements = migrationV2
@@ -532,6 +562,20 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV52
 			} else if version == 53 {
 				statements = migrationV53
+			} else if version == 54 {
+				statements = migrationV54
+			} else if version == 55 {
+				statements = migrationV55
+			} else if version == 56 {
+				statements = migrationV56
+			} else if version == 57 {
+				statements = migrationV57
+			} else if version == 58 {
+				statements = migrationV58
+			} else if version == 59 {
+				statements = migrationV59
+			} else if version == 60 {
+				statements = migrationV60
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1562,11 +1606,11 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 		if persistedBlockedCode == ticketBudgetExhaustedCode && transition.Trigger == "operator_recover" {
 			return ErrBudgetExhausted
 		}
-		// These provider blockers are terminal in the Store authority, not only
-		// through the normative Engine selector.  Keep the exported generic
-		// transition path from becoming an alternate recovery API: cancellation
-		// remains available through TransitionAndInvalidateRunner.
-		if actual == domain.StateBlocked && nonRecoverableProviderBlockerCode(persistedBlockedCode) && transition.To != domain.StateBlocked {
+		// These blockers are terminal in the Store authority, not only through
+		// the normative Engine selector. Keep the exported generic transition
+		// path from becoming an alternate recovery API: cancellation remains
+		// available through TransitionAndInvalidateRunner.
+		if actual == domain.StateBlocked && nonRecoverableBlockedRecoveryCode(persistedBlockedCode) {
 			return ErrEvidenceConflict
 		}
 		if transition.Trigger == "operator_resume" && actual == domain.StatePaused && providerStateForPhaseTransition(transition.To) {
@@ -1628,6 +1672,18 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 			if err := validateProviderBlockedRecoveryPrefix(ctx, conn, transition.Ref, phaseForProviderState(transition.To), version, runner, transition.Fence.LeaderEpoch, transition.To, persistedBlockedCode); err != nil {
 				return err
 			}
+			prior, err := providerBlockedEndpointLeader(ctx, conn, transition.Ref, phaseForProviderState(transition.To), version-1, runner)
+			if err != nil {
+				return err
+			}
+			payload, err := json.Marshal(providerBlockedLeaderBridge{providerBlockedBridgeSchema, "recover", version + 1, runner, prior, transition.Fence.LeaderEpoch, json.RawMessage(transition.EventPayload)})
+			if err != nil {
+				return err
+			}
+			if len(payload) > maxEvidenceJSON {
+				return ErrEvidenceConflict
+			}
+			transition.EventPayload = string(payload)
 		}
 		query := `UPDATE tickets SET state=?, resume_state=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`
 		args := []any{transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner}
@@ -1659,9 +1715,12 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 }
 
 const (
-	providerResultIndeterminateCode = "provider_result_indeterminate"
-	providerRepairUnavailableCode   = "provider_repair_unavailable"
-	providerTerminalBlockerSchema   = "sf.provider-terminal-blocker/v1"
+	providerResultIndeterminateCode         = "provider_result_indeterminate"
+	providerRepairUnavailableCode           = "provider_repair_unavailable"
+	postbuildCommandFailedBlockerCode       = "postbuild_command_failed"
+	verificationAmendmentInvalidBlockerCode = "verification_amendment_invalid"
+	legacyCandidateRepairUnverifiableCode   = "legacy_candidate_repair_recovery_unverifiable"
+	providerTerminalBlockerSchema           = "sf.provider-terminal-blocker/v1"
 )
 
 type providerTerminalBlockerPayload struct {
@@ -1695,6 +1754,17 @@ func providerTerminalBlockerTransition(transition Transition) bool {
 
 func nonRecoverableProviderBlockerCode(code string) bool {
 	return code == providerResultIndeterminateCode || code == providerRepairUnavailableCode
+}
+
+// nonRecoverableBlockedRecoveryCode is deliberately separate from
+// nonRecoverableProviderBlockerCode. The provider helper selects the
+// attempt-backed canonical blocker writer. verification_amendment_invalid and
+// postbuild_command_failed have no terminal provider failure to consume: the
+// latter retains a completed Builder plus an immutable failed repository
+// command. Both remain on the generic typed-block writer while refusing every
+// recovery path.
+func nonRecoverableBlockedRecoveryCode(code string) bool {
+	return nonRecoverableProviderBlockerCode(code) || code == postbuildCommandFailedBlockerCode || code == verificationAmendmentInvalidBlockerCode || code == legacyCandidateRepairUnverifiableCode
 }
 
 func providerRoleForPhase(phase domain.Phase) string {
@@ -2357,11 +2427,23 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 		var bindingVersion, bindingLeader, bindingRunner uint64
 		var parent string
 		var phase, role, state, outcome string
+		if repairPending > 0 {
+			// The completion names the one immutable source binding for this
+			// repaired generation. Never select an arbitrary later recovery binding:
+			// workflow replay may already have appended one at the current fence.
+			if err := conn.QueryRowContext(ctx, `SELECT builder_result_attempt_id,builder_result_attempt,builder_binding_ticket_version,builder_binding_leader_epoch,builder_binding_runner_epoch
+				FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=? AND final_candidate_head_sha=? AND final_candidate_tree_sha=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, candidate.HeadSHA, candidate.TreeSHA).Scan(&attemptID, &attempt, &bindingVersion, &bindingLeader, &bindingRunner); err != nil {
+				return ErrEvidenceConflict
+			}
+		}
 		bindingQuery := `SELECT b.provider_attempt_id,b.provider_attempt,b.binding_ticket_version,b.leader_epoch,b.runner_epoch,b.commit_parent_oid,r.phase,a.role,a.state,a.outcome
 			FROM candidate_result_bindings b JOIN provider_attempt_results r ON r.provider_attempt_id=b.provider_attempt_id JOIN provider_attempts a ON a.id=r.provider_attempt_id
 			WHERE b.channel=? AND b.project_id=? AND b.ticket_id=? AND b.generation=?`
 		bindingArgs := []any{transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation}
-		if repairPending == 0 {
+		if repairPending > 0 {
+			bindingQuery += ` AND b.binding_ticket_version=? AND b.leader_epoch=? AND b.runner_epoch=? AND b.provider_attempt_id=? AND b.provider_attempt=?`
+			bindingArgs = append(bindingArgs, bindingVersion, bindingLeader, bindingRunner, attemptID, attempt)
+		} else {
 			bindingQuery += ` AND b.binding_ticket_version=? AND b.leader_epoch=? AND b.runner_epoch=?`
 			bindingArgs = append(bindingArgs, version, transition.Fence.LeaderEpoch, transition.Fence.RunnerEpoch)
 		}
@@ -2375,25 +2457,36 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 			// A repaired candidate remains bound to its original Builder fence.
 			// It may cross a restart only through this immutable completion and a
 			// contiguous signed runner-recovery ledger.
-			var completionAttemptID int64
-			var completionAttempt int
-			var completionVersion, completionLeader, completionRunner uint64
-			if err := conn.QueryRowContext(ctx, `SELECT builder_result_attempt_id,builder_result_attempt,builder_binding_ticket_version,builder_binding_leader_epoch,builder_binding_runner_epoch
-				FROM candidate_repair_completions WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=? AND final_candidate_head_sha=? AND final_candidate_tree_sha=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, candidate.HeadSHA, candidate.TreeSHA).Scan(&completionAttemptID, &completionAttempt, &completionVersion, &completionLeader, &completionRunner); err != nil || completionAttemptID != attemptID || completionAttempt != attempt || completionVersion != bindingVersion || completionLeader != bindingLeader || completionRunner != bindingRunner || validateRunnerRecoveryLedger(ctx, conn, transition.Ref, bindingVersion, bindingRunner, bindingLeader, version, runner, transition.Fence.LeaderEpoch) != nil {
+			if validateRunnerRecoveryLedger(ctx, conn, transition.Ref, bindingVersion, bindingRunner, bindingLeader, version, runner, transition.Fence.LeaderEpoch) != nil {
 				return ErrEvidenceConflict
 			}
 		} else if bindingVersion != version || bindingLeader != transition.Fence.LeaderEpoch || bindingRunner != transition.Fence.RunnerEpoch {
 			return ErrEvidenceConflict
 		}
-		// Re-authenticate on the transaction connection. A repaired candidate is
-		// the one narrow historical-fence case: its completion+ledger above bind
-		// it to the recovered owner without relaxing normal candidates.
-		authenticated, err := s.latestCandidateFrom(ctx, conn, transition.Ref, repairPending == 0)
-		if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != bindingVersion || authenticated.Fence.LeaderEpoch != bindingLeader || authenticated.Fence.RunnerEpoch != bindingRunner || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {
+		commandBinding, err := loadCandidateCommandBinding(ctx, conn, transition.Ref, candidate.Generation)
+		if err != nil || !candidatePolicyMatches(candidate.CommandPolicyDigest, commandBinding.PolicyDigest) {
 			return ErrEvidenceConflict
 		}
-		if repairPending > 0 && s.reauthenticateStoredCandidateCommandHistoricalFrom(ctx, conn, transition.Ref, authenticated) != nil {
-			return ErrEvidenceConflict
+		if repairPending > 0 {
+			original := StoredCandidate{
+				Snapshot: candidate, TicketVersion: bindingVersion,
+				Fence:          domain.Fence{LeaderEpoch: bindingLeader, RunnerEpoch: bindingRunner},
+				BuilderResult:  ProviderAttemptResultKey{AttemptID: attemptID, Ref: transition.Ref, Phase: domain.PhaseBuild, Attempt: attempt},
+				Commit:         CommitObservation{CommitOID: candidate.HeadSHA, ParentOID: parent, TreeOID: candidate.TreeSHA},
+				CommandBinding: commandBinding,
+			}
+			if s.reauthenticateStoredCandidateCommandHistoricalFrom(ctx, conn, transition.Ref, original) != nil {
+				return ErrEvidenceConflict
+			}
+			latest, err := s.latestCandidateFrom(ctx, conn, transition.Ref, false)
+			if err != nil || latest.Snapshot != candidate || latest.BuilderResult != original.BuilderResult || latest.Commit != original.Commit || latest.TicketVersion > version || latest.Fence.LeaderEpoch == 0 || latest.Fence.RunnerEpoch == 0 || validateRunnerRecoveryLedgerPrefix(ctx, conn, transition.Ref, bindingVersion, bindingRunner, bindingLeader, latest.TicketVersion, latest.Fence.RunnerEpoch, latest.Fence.LeaderEpoch) != nil || s.reauthenticateStoredCandidateCheckpointFrom(ctx, conn, transition.Ref, latest) != nil {
+				return ErrEvidenceConflict
+			}
+		} else {
+			authenticated, err := s.latestCandidateFrom(ctx, conn, transition.Ref, true)
+			if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != bindingVersion || authenticated.Fence.LeaderEpoch != bindingLeader || authenticated.Fence.RunnerEpoch != bindingRunner || authenticated.BuilderResult.AttemptID != attemptID || authenticated.BuilderResult.Attempt != attempt || authenticated.Commit.ParentOID != parent || !candidatePolicyMatches(candidate.CommandPolicyDigest, authenticated.CommandBinding.PolicyDigest) {
+				return ErrEvidenceConflict
+			}
 		}
 		if err := assertNewestBoundResult(ctx, conn, transition.Ref, domain.PhaseBuild, "builder", ProviderAttemptResultKey{AttemptID: attemptID, Ref: transition.Ref, Phase: domain.PhaseBuild, Attempt: attempt}); err != nil {
 			return err
@@ -2403,11 +2496,56 @@ func (s *Store) TransitionCandidate(ctx context.Context, transition Transition, 
 			return ErrEvidenceConflict
 		}
 		var checkpoint string
-		if err := conn.QueryRowContext(ctx, `SELECT r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&checkpoint); err != nil || checkpoint != parent {
+		if err := conn.QueryRowContext(ctx, `SELECT r.checkpoint_id FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket).Scan(&checkpoint); err != nil || !validOID(checkpoint) {
 			return ErrEvidenceConflict
+		}
+		if repairPending > 0 {
+			var predecessorHead string
+			if err := conn.QueryRowContext(ctx, `SELECT predecessor_head_sha FROM candidate_repair_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND target_generation=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation).Scan(&predecessorHead); err != nil || predecessorHead != parent {
+				return ErrEvidenceConflict
+			}
+		} else if checkpoint != parent {
+			// A protected-base refresh has its own immutable two-parent anchor.
+			// Reuse the same full authority check as candidate recording; a
+			// different parent alone is never sufficient to admit publication.
+			authenticated, candidateErr := s.latestCandidateFrom(ctx, conn, transition.Ref, true)
+			builder, _, builderErr := s.loadHistoricalProviderAttemptResult(ctx, conn, authenticated.BuilderResult)
+			if candidateErr != nil || builderErr != nil || authenticated.Snapshot != candidate || authenticated.Commit.ParentOID != parent {
+				return ErrEvidenceConflict
+			}
+			if _, err := protectedBaseRefreshCandidateAt(ctx, conn, authenticated, builder); err != nil {
+				return ErrEvidenceConflict
+			}
 		}
 		if source != candidate.SourceDigest || base != candidate.BaseSHA || intent != candidate.VerificationIntentDigest || proof != candidate.ProofDigest {
 			return ErrEvidenceConflict
+		}
+		if repairPending > 0 && (bindingVersion != version || bindingLeader != transition.Fence.LeaderEpoch || bindingRunner != runner) {
+			// A repair completion authenticates the immutable Builder result at its
+			// original fence and the recovery/control chain above authenticates the
+			// current Building owner. Seal that exact pre-transition endpoint before
+			// phase_pass. Publication can then split candidate history at a durable
+			// fence instead of projecting a later Publishing runner backwards across
+			// this transition.
+			var existingID int64
+			var existingAttempt int
+			var existingParent string
+			err := conn.QueryRowContext(ctx, `SELECT provider_attempt_id,provider_attempt,commit_parent_oid FROM candidate_result_bindings WHERE channel=? AND project_id=? AND ticket_id=? AND generation=? AND binding_ticket_version=? AND leader_epoch=? AND runner_epoch=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, version, transition.Fence.LeaderEpoch, runner).Scan(&existingID, &existingAttempt, &existingParent)
+			if err == nil {
+				if existingID != attemptID || existingAttempt != attempt || existingParent != parent {
+					return ErrEvidenceConflict
+				}
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			} else if _, err := conn.ExecContext(ctx, `INSERT INTO candidate_result_bindings(channel,project_id,ticket_id,generation,binding_ticket_version,leader_epoch,runner_epoch,provider_attempt_id,provider_attempt,commit_parent_oid) VALUES(?,?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, candidate.Generation, version, transition.Fence.LeaderEpoch, runner, attemptID, attempt, parent); err != nil {
+				return err
+			}
+		}
+		if repairPending > 0 {
+			authenticated, err := s.latestCandidateFrom(ctx, conn, transition.Ref, false)
+			if err != nil || authenticated.Snapshot != candidate || authenticated.TicketVersion != version || authenticated.Fence.LeaderEpoch != transition.Fence.LeaderEpoch || authenticated.Fence.RunnerEpoch != runner || authenticated.BuilderResult.AttemptID != attemptID || authenticated.BuilderResult.Attempt != attempt || authenticated.Commit.ParentOID != parent || s.reauthenticateStoredCandidateCheckpointFrom(ctx, conn, transition.Ref, authenticated) != nil {
+				return ErrEvidenceConflict
+			}
 		}
 		// Candidate publication is an evidence-backed lifecycle transition just
 		// like plan, verification, and final review. Carry an already-open

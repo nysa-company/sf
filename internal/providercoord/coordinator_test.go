@@ -1,8 +1,10 @@
 package providercoord
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -17,6 +19,36 @@ import (
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/testkit"
 )
+
+func TestReusedInputMatchesExactLegacyPhaseInput(t *testing.T) {
+	input := contracts.PhaseInput{
+		Ticket: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "SF-legacy-reuse"}, Phase: domain.PhasePlanning,
+		Attempt: 1, LeaderEpoch: 4, RunnerEpoch: 1, ExpectedVersion: 2, Prompt: "plan", Repository: "/repo", Worktree: "/repo/.sf/worktree", WorktreeIdentity: "identity", BaseSHA: strings.Repeat("a", 40), AllowedPaths: []string{"."}, Provider: domain.ProviderIdentity{Provider: "codex", Model: "model", Family: "openai", Version: "1"}, AuthMode: "chatgpt_subscription", Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`),
+	}
+	payload, _, err := contracts.CanonicalPhaseInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := bytes.TrimSuffix(payload, []byte(`,"Repair":null}`))
+	if len(legacy) == len(payload) {
+		t.Fatalf("current payload has no v53 repair suffix: %s", payload)
+	}
+	legacy = append(append([]byte(nil), legacy...), '}')
+	sum := sha256.Sum256(legacy)
+	digest := fmt.Sprintf("%x", sum)
+	decoded, err := contracts.DecodeCanonicalPhaseInput(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ProviderAttemptClaim{Attempt: 1, Binding: contracts.RuntimeBinding{Identity: input.Provider, AuthMode: input.AuthMode}, LeaderEpoch: 4, RunnerEpoch: 1, ExpectedVersion: 2, Input: decoded, RequestDigest: digest, RequestPayload: legacy}
+	input.Provider, input.AuthMode, input.Attempt, input.LeaderEpoch, input.RunnerEpoch, input.ExpectedVersion = domain.ProviderIdentity{}, "", 0, 0, 0, 0
+	if !reusedInputMatches(Request{Input: input}, claim) {
+		t.Fatal("logical request did not reuse exact legacy claim input")
+	}
+	if !reusedInputMatches(Request{Input: input, ExpectedProvider: "codex"}, claim) || reusedInputMatches(Request{Input: input, ExpectedProvider: "claude"}, claim) {
+		t.Fatal("legacy reuse ignored configured provider identity")
+	}
+}
 
 func TestMalformedOutputIsIndeterminateAndNeverRepairsOrPersistsSecrets(t *testing.T) {
 	ctx := context.Background()
@@ -45,17 +77,17 @@ func TestMalformedOutputIsIndeterminateAndNeverRepairsOrPersistsSecrets(t *testi
 	if err := db.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Path: root, Branch: "dev/p/SF-1", IdentityJSON: []byte(identity), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
-	primary := testkit.NewScriptedProvider(id("cursor", "cursor-family"))
+	primary := testkit.NewScriptedProvider(id("fixture-cursor", "cursor-family"))
 	secret := strings.Join([]string{"token", "must-not-persist"}, "=")
 	// A provider transcript that cannot establish trusted usage is
 	// indeterminate, even though it contains malformed/untrusted output.
 	primary.Add(domain.PhasePlanning, testkit.ProviderStep{Behavior: testkit.ProviderSecret, Transcript: secret})
-	fallback := testkit.NewScriptedProvider(id("claude", "claude-family"))
+	fallback := testkit.NewScriptedProvider(id("fixture-claude", "claude-family"))
 	fallback.Add(domain.PhasePlanning, testkit.ProviderStep{Artifact: plannerArtifact()})
 	recordQual(t, db, primary)
 	recordQual(t, db, fallback)
-	primaryQualification, _ := db.LatestProviderQualification(ctx, domain.ChannelDev, id("cursor", "cursor-family"))
-	fallbackQualification, _ := db.LatestProviderQualification(ctx, domain.ChannelDev, id("claude", "claude-family"))
+	primaryQualification, _ := db.LatestProviderQualification(ctx, domain.ChannelDev, id("fixture-cursor", "cursor-family"))
+	fallbackQualification, _ := db.LatestProviderQualification(ctx, domain.ChannelDev, id("fixture-claude", "claude-family"))
 	if _, _, err := db.SelectProviderSet(ctx, domain.ChannelDev, primaryQualification.ID, primaryQualification.ID, fallbackQualification.ID, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +98,7 @@ func TestMalformedOutputIsIndeterminateAndNeverRepairsOrPersistsSecrets(t *testi
 	if err := registry.Register(ctx, fallback); err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(registry, map[Role]Route{RolePlanner: {Primary: "cursor", Fallback: "claude"}}, db, nil, testkit.NewSupervisor())
+	c, err := New(registry, map[Role]Route{RolePlanner: {Primary: "fixture-cursor", Fallback: "fixture-claude"}}, db, nil, testkit.NewSupervisor())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +125,30 @@ func TestMalformedOutputIsIndeterminateAndNeverRepairsOrPersistsSecrets(t *testi
 	if result.Attempts[0].TranscriptDigest == "" || result.Attempts[0].TranscriptDigest == "sha256:"+fmt.Sprintf("%x", rawSecret) {
 		t.Fatalf("unsafe digest=%+v", result.Attempts[0])
 	}
+	assertIndeterminateDiagnostic(t, db, ref, string(contracts.ProviderFailureBinding), secret)
+}
+
+// assertIndeterminateDiagnostic checks the durable, closed diagnostic only;
+// provider-controlled output must never be copied into the event payload.
+func assertIndeterminateDiagnostic(t *testing.T, db *store.Store, ref domain.TicketRef, reason, forbidden string) {
+	t.Helper()
+	events, err := db.Events(context.Background(), ref.Channel, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Ref != ref || event.Trigger != "provider_result_diagnostic" {
+			continue
+		}
+		if event.From != event.To || !strings.Contains(event.Payload, `"reason":"`+reason+`"`) {
+			t.Fatalf("invalid provider diagnostic event=%+v", event)
+		}
+		if forbidden != "" && strings.Contains(event.Payload, forbidden) {
+			t.Fatalf("provider diagnostic persisted raw output: %q", event.Payload)
+		}
+		return
+	}
+	t.Fatalf("provider diagnostic event not found for %s", ref.Ticket)
 }
 
 func TestCompletedResultExposesOnlyTheDurableAttemptKey(t *testing.T) {
@@ -114,7 +170,7 @@ func TestCompletedResultExposesOnlyTheDurableAttemptKey(t *testing.T) {
 
 func TestSingleRouteRetriesInvalidArtifactWithinOneAdmission(t *testing.T) {
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
-	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	coordinator.routes[RolePlanner] = Route{Primary: "fixture-cursor", Capacity: 1}
 	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
 		{Artifact: []byte(`{"schema":"not-a-planner"}`)},
 		{Artifact: plannerArtifact()},
@@ -142,7 +198,7 @@ func TestSingleRouteRetriesInvalidArtifactWithinOneAdmission(t *testing.T) {
 
 func TestSingleRoutePausesAfterOneInvalidArtifactRepair(t *testing.T) {
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
-	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	coordinator.routes[RolePlanner] = Route{Primary: "fixture-cursor", Capacity: 1}
 	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
 		{Artifact: []byte(`{"schema":"not-a-planner"}`)},
 		{Artifact: []byte(`{"schema":"still-not-a-planner"}`)},
@@ -163,13 +219,132 @@ func TestSingleRoutePausesAfterOneInvalidArtifactRepair(t *testing.T) {
 	}
 }
 
+// TestReviewerCommandMismatchIsInvalidArtifactAndRepairedBeforeCompletion
+// keeps a narrowed reviewer command inside the coordinator's bounded repair
+// loop. A rejected result must never reach the later repository materializer,
+// where provider-written files would otherwise strand the worktree.
+func TestReviewerCommandMismatchIsInvalidArtifactAndRepairedBeforeCompletion(t *testing.T) {
+	ctx := context.Background()
+	database, planning, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
+	planningResult := coordinator.Run(ctx, planning)
+	if planningResult.Code != Completed {
+		t.Fatalf("planning=%+v", planningResult)
+	}
+	_, planner, err := database.LoadCurrentProviderAttemptResult(ctx, planningResult.ProviderResult, planning.ExpectedVersion, planning.Fence)
+	if err != nil || planner.Planner == nil {
+		t.Fatalf("planner result=%+v parsed=%+v err=%v", planningResult, planner, err)
+	}
+	if _, err := database.RecordPlan(ctx, store.PlanArtifact{Ref: ref, ExpectedVersion: planning.ExpectedVersion, Fence: planning.Fence, Document: store.PlanDocument{
+		Planner: planner.Planner, ProviderResult: &planningResult.ProviderResult,
+		Acceptance: planner.Planner.Acceptance, ProofKind: string(planner.Planner.Proof.Kind), Paths: planner.Planner.Paths, Commands: planner.Planner.Commands, Risks: planner.Planner.Risks,
+	}}); err != nil {
+		t.Fatalf("record plan: %v", err)
+	}
+	if _, err := database.TransitionPlan(ctx, store.Transition{Ref: ref, ExpectedVersion: planning.ExpectedVersion, Fence: planning.Fence, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass"}); err != nil {
+		t.Fatalf("transition plan: %v", err)
+	}
+	verifying, err := database.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer := planning
+	reviewer.Role = RoleReviewer
+	reviewer.ExpectedVersion = verifying.Version
+	reviewer.Fence = domain.Fence{LeaderEpoch: planning.Fence.LeaderEpoch, RunnerEpoch: verifying.RunnerEpoch}
+	reviewer.Input.Phase = domain.PhaseVerification
+	reviewer.Input.Prompt = "review"
+	reviewer.Input.AllowedPaths = append([]string(nil), planner.Planner.Paths...)
+	reviewer.Validation = phaseartifact.Validation{
+		TicketType:                  verifying.Type,
+		AcceptanceDigest:            planner.Digest,
+		ExpectedVerificationCommand: []string{"node", "--test"},
+	}
+
+	provider, ok := coordinator.registry.providers["fixture-claude"].(*testkit.ScriptedProvider)
+	if !ok {
+		t.Fatal("fixture reviewer provider changed type")
+	}
+	provider.Steps[domain.PhaseVerification] = []testkit.ProviderStep{
+		{Artifact: reviewerArtifactWithCommand(planner.Digest, "x/reviewer_test.go", []string{"node", "--test", "app/tests/job-count.test.js"})},
+		{Artifact: reviewerArtifactWithCommand(planner.Digest, "x/reviewer_test.go", []string{"node", "--test"})},
+	}
+	coordinator.routes[RoleReviewer] = Route{Primary: "fixture-claude", Capacity: 1}
+
+	result := coordinator.Run(ctx, reviewer)
+	if result.Code != Completed || result.ProviderResult.Attempt != 2 || len(result.Attempts) != 2 {
+		t.Fatalf("reviewer repair result=%+v", result)
+	}
+	if result.Attempts[0].ErrorCode != "invalid_artifact" || result.Attempts[0].ArtifactFailureReason != contracts.ArtifactFailureSchema {
+		t.Fatalf("narrowed command was not rejected as a schema artifact failure: %+v", result.Attempts[0])
+	}
+	if result.Parsed == nil || result.Parsed.Verify == nil || len(result.Parsed.Verify.Command) != 2 || result.Parsed.Verify.Command[0] != "node" || result.Parsed.Verify.Command[1] != "--test" {
+		t.Fatalf("completed reviewer command=%+v", result.Parsed)
+	}
+	attempts, err := database.ProviderAttempts(ctx, ref)
+	if err != nil || len(attempts) != 3 || attempts[1].Outcome != "invalid_artifact" || attempts[2].Outcome != "completed" {
+		t.Fatalf("reviewer attempts=%+v err=%v", attempts, err)
+	}
+}
+
+type explicitArtifactFailureProvider struct {
+	*testkit.ScriptedProvider
+	reason contracts.ArtifactFailureReason
+}
+
+func (p *explicitArtifactFailureProvider) Parse(context.Context, contracts.PhaseInput, contracts.CommandResult) (contracts.PhaseResult, error) {
+	return contracts.PhaseResult{Outcome: contracts.PhaseResultInvalidArtifact, ArtifactFailureReason: p.reason, Provider: p.Identity, UsageTrusted: true, UsageUnits: 0}, nil
+}
+
+func TestInvalidArtifactFailureReasonsAreDurableAndBounded(t *testing.T) {
+	for name, configure := range map[string]func(*Coordinator, *testkit.ScriptedProvider){
+		"final_message_missing_or_malformed": func(c *Coordinator, primary *testkit.ScriptedProvider) {
+			c.registry.providers["fixture-cursor"] = &explicitArtifactFailureProvider{ScriptedProvider: primary, reason: contracts.ArtifactFailureFinalMessage}
+		},
+		"schema_validation": func(_ *Coordinator, primary *testkit.ScriptedProvider) {
+			primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: []byte(`{"schema":"wrong"}`)}}
+		},
+		"mutation_path": func(_ *Coordinator, primary *testkit.ScriptedProvider) {
+			primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
+				{Artifact: plannerArtifact(), ChangedFiles: []string{"untrusted.txt"}},
+				{Artifact: plannerArtifact(), ChangedFiles: []string{"untrusted.txt"}},
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
+			coordinator.routes[RolePlanner] = Route{Primary: "fixture-cursor", Capacity: 1}
+			configure(coordinator, primary)
+			result := coordinator.Run(context.Background(), request)
+			if result.Code != AttemptExhausted || len(result.Attempts) != 2 {
+				t.Fatalf("result=%+v", result)
+			}
+			want := contracts.ArtifactFailureReason(name)
+			for _, receipt := range result.Attempts {
+				if receipt.ErrorCode != "invalid_artifact" || receipt.ArtifactFailureReason != want {
+					t.Fatalf("receipt=%+v want reason=%s", receipt, want)
+				}
+			}
+			failures, err := database.ProviderArtifactFailures(context.Background(), ref)
+			if err != nil || len(failures) != 2 {
+				t.Fatalf("durable failures=%+v err=%v", failures, err)
+			}
+			for _, failure := range failures {
+				if failure.Reason != want || failure.RequestDigest == "" || failure.Digest == "" {
+					t.Fatalf("failure=%+v want reason=%s", failure, want)
+				}
+			}
+		})
+	}
+}
+
 func TestInvalidArtifactRepairsSameRouteBeforeAvailabilityFallback(t *testing.T) {
 	_, request, coordinator, _, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
 	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
 		{Artifact: []byte(`{"schema":"not-a-planner"}`)},
 		{Artifact: plannerArtifact()},
 	}
-	fallback, ok := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	fallback, ok := coordinator.registry.providers["fixture-claude"].(*testkit.ScriptedProvider)
 	if !ok {
 		t.Fatal("fixture fallback provider changed type")
 	}
@@ -186,7 +361,7 @@ func TestInvalidArtifactRepairsSameRouteBeforeAvailabilityFallback(t *testing.T)
 func TestRestartedInvalidArtifactRepairBlocksWhenRuntimeBindingRotated(t *testing.T) {
 	supervisor := testkit.NewSupervisor()
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, supervisor)
-	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Fallback: "claude", Capacity: 1}
+	coordinator.routes[RolePlanner] = Route{Primary: "fixture-cursor", Fallback: "fixture-claude", Capacity: 1}
 	claim, binding := seedInvalidProviderAttempt(t, database, request, primary, supervisor)
 	request = recoverProviderRequest(t, database, request)
 	if pending, found, err := database.PendingProviderRepair(context.Background(), ref, domain.PhasePlanning, string(RolePlanner), request.ExpectedVersion, request.Fence); err != nil || !found || pending.ID != claim.ID {
@@ -195,14 +370,14 @@ func TestRestartedInvalidArtifactRepairBlocksWhenRuntimeBindingRotated(t *testin
 	rotated := binding
 	rotated.AuthDigest = strings.Repeat("f", 64)
 	coordinator.registry.mu.Lock()
-	coordinator.registry.providers["cursor"] = &bindingOverrideProvider{Provider: primary, binding: rotated}
+	coordinator.registry.providers["fixture-cursor"] = &bindingOverrideProvider{Provider: primary, binding: rotated}
 	coordinator.registry.mu.Unlock()
 
 	result := coordinator.Run(context.Background(), request)
 	if result.Code != RepairUnavailable || !result.NeedsOperator || len(result.Attempts) != 0 {
 		t.Fatalf("rotated repair result=%+v", result)
 	}
-	fallback := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	fallback := coordinator.registry.providers["fixture-claude"].(*testkit.ScriptedProvider)
 	if calls := fallback.CallsSnapshot(); len(calls) != 0 {
 		t.Fatalf("rotated repair launched fallback: %v", calls)
 	}
@@ -215,7 +390,7 @@ func TestRestartedInvalidArtifactRepairBlocksWhenRuntimeBindingRotated(t *testin
 func TestRestartedInvalidArtifactRepairUsesSameBindingExactlyOnce(t *testing.T) {
 	supervisor := testkit.NewSupervisor()
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, supervisor)
-	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	coordinator.routes[RolePlanner] = Route{Primary: "fixture-cursor", Capacity: 1}
 	claim, _ := seedInvalidProviderAttempt(t, database, request, primary, supervisor)
 	request = recoverProviderRequest(t, database, request)
 	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
@@ -254,9 +429,9 @@ func (p *interruptedRepairProvider) Invocation(ctx context.Context, input contra
 
 func TestInterruptedRepairIsUnavailableBeforeBindingAndStableAcrossReplay(t *testing.T) {
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
-	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Fallback: "claude", Capacity: 1}
+	coordinator.routes[RolePlanner] = Route{Primary: "fixture-cursor", Fallback: "fixture-claude", Capacity: 1}
 	interrupted := &interruptedRepairProvider{ScriptedProvider: primary}
-	coordinator.registry.providers["cursor"] = interrupted
+	coordinator.registry.providers["fixture-cursor"] = interrupted
 	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: []byte(`{"schema":"not-a-planner"}`)}}
 
 	first := coordinator.Run(context.Background(), request)
@@ -270,7 +445,7 @@ func TestInterruptedRepairIsUnavailableBeforeBindingAndStableAcrossReplay(t *tes
 	if len(primary.CallsSnapshot()) != 1 {
 		t.Fatalf("repair invocation unexpectedly parsed provider output: %v", primary.CallsSnapshot())
 	}
-	fallback := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	fallback := coordinator.registry.providers["fixture-claude"].(*testkit.ScriptedProvider)
 	if len(fallback.CallsSnapshot()) != 0 {
 		t.Fatalf("interrupted repair used fallback: %v", fallback.CallsSnapshot())
 	}
@@ -315,7 +490,7 @@ func TestTimedOutSameBindingRepairIsUnavailableAcrossReplay(t *testing.T) {
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
 
 	tracked := &repairTimeoutProvider{ScriptedProvider: primary}
-	coordinator.registry.providers["cursor"] = tracked
+	coordinator.registry.providers["fixture-cursor"] = tracked
 	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{
 		{Artifact: []byte(`{"schema":"not-a-planner"}`)},
 		{Behavior: testkit.ProviderHang},
@@ -334,7 +509,7 @@ func TestTimedOutSameBindingRepairIsUnavailableAcrossReplay(t *testing.T) {
 		t.Fatalf("timed-out repair launch counts bindings=%d invocations=%d calls=%v", bindings, invocations, primary.CallsSnapshot())
 	}
 
-	fallback := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	fallback := coordinator.registry.providers["fixture-claude"].(*testkit.ScriptedProvider)
 	replay := coordinator.Run(context.Background(), request)
 	if replay.Code != RepairUnavailable || !replay.NeedsOperator || len(replay.Attempts) != 0 {
 		t.Fatalf("timed-out repair replay=%+v", replay)
@@ -349,7 +524,7 @@ func TestIndeterminateBeginRaceDoesNotLaunchSecondProviderAttempt(t *testing.T) 
 	supervisor := testkit.NewSupervisor()
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, supervisor)
 	blocked := &blockingBindingProvider{ScriptedProvider: primary, entered: make(chan struct{}, 1), release: make(chan struct{})}
-	coordinator.registry.providers["cursor"] = blocked
+	coordinator.registry.providers["fixture-cursor"] = blocked
 	resultB := make(chan Result, 1)
 	go func() { resultB <- coordinator.Run(context.Background(), request) }()
 	select {
@@ -477,8 +652,8 @@ func TestPrePublishingReadinessRequiresAllRoutesAndNoFatalLatch(t *testing.T) {
 	if err := coordinator.ReadyForPrePublishing(); !errors.Is(err, ErrPrePublishingNotReady) {
 		t.Fatalf("incomplete route set readiness=%v", err)
 	}
-	coordinator.routes[RoleBuilder] = Route{Primary: "cursor", Fallback: "claude"}
-	coordinator.routes[RoleReviewer] = Route{Primary: "claude", Fallback: "cursor"}
+	coordinator.routes[RoleBuilder] = Route{Primary: "fixture-cursor", Fallback: "fixture-claude"}
+	coordinator.routes[RoleReviewer] = Route{Primary: "fixture-claude", Fallback: "fixture-cursor"}
 	if err := coordinator.ReadyForPrePublishing(); err != nil {
 		t.Fatalf("complete route set readiness=%v", err)
 	}
@@ -543,7 +718,7 @@ func (s *countingSupervisor) RunCount() int {
 
 func TestCoordinatorBeginRaceReusesCompletionWithoutSecondLaunch(t *testing.T) {
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
-	plain := testkit.NewScriptedProvider(id("cursor", "cursor-family"))
+	plain := testkit.NewScriptedProvider(id("fixture-cursor", "cursor-family"))
 	plain.Add(domain.PhasePlanning, testkit.ProviderStep{Artifact: plannerArtifact()})
 	registry := NewRegistry()
 	if err := registry.Register(context.Background(), plain); err != nil {
@@ -551,12 +726,12 @@ func TestCoordinatorBeginRaceReusesCompletionWithoutSecondLaunch(t *testing.T) {
 	}
 	// Use a separate production coordinator for A so B can be held after its
 	// early Store reuse check but before BeginProviderAttempt.
-	a, err := New(registry, map[Role]Route{RolePlanner: {Primary: "cursor"}}, database, nil, testkit.NewSupervisor())
+	a, err := New(registry, map[Role]Route{RolePlanner: {Primary: "fixture-cursor"}}, database, nil, testkit.NewSupervisor())
 	if err != nil {
 		t.Fatal(err)
 	}
 	blocked := &blockingBindingProvider{ScriptedProvider: primary, entered: make(chan struct{}, 1), release: make(chan struct{})}
-	coordinator.registry.providers["cursor"] = blocked
+	coordinator.registry.providers["fixture-cursor"] = blocked
 	resultB := make(chan Result, 1)
 	go func() { resultB <- coordinator.Run(context.Background(), request) }()
 	select {
@@ -622,26 +797,26 @@ func TestCoordinatorReviewerBeginRaceReusesCompletionWithoutSecondLaunch(t *test
 	reviewer.Input.AllowedPaths = append([]string(nil), planner.Planner.Paths...)
 	reviewer.Validation = phaseartifact.Validation{TicketType: verifying.Type, AcceptanceDigest: planner.Digest}
 
-	plain := testkit.NewScriptedProvider(id("claude", "claude-family"))
+	plain := testkit.NewScriptedProvider(id("fixture-claude", "claude-family"))
 	plain.Add(domain.PhaseVerification, testkit.ProviderStep{Artifact: reviewerArtifact(planner.Digest, "x/reviewer_test.go"), ChangedFiles: nil})
 	registry := NewRegistry()
 	if err := registry.Register(ctx, plain); err != nil {
 		t.Fatal(err)
 	}
-	a, err := New(registry, map[Role]Route{RoleReviewer: {Primary: "claude"}}, database, nil, testkit.NewSupervisor())
+	a, err := New(registry, map[Role]Route{RoleReviewer: {Primary: "fixture-claude"}}, database, nil, testkit.NewSupervisor())
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The selected reviewer qualification is claude in newCoordinatorFixture.
 	// Share its immutable binding with B while counting only B's potential
 	// external execution.
-	base, ok := coordinator.registry.providers["claude"].(*testkit.ScriptedProvider)
+	base, ok := coordinator.registry.providers["fixture-claude"].(*testkit.ScriptedProvider)
 	if !ok {
 		t.Fatal("fixture reviewer provider changed type")
 	}
 	blocked := &blockingBindingProvider{ScriptedProvider: base, entered: make(chan struct{}, 1), release: make(chan struct{})}
-	coordinator.registry.providers["claude"] = blocked
-	coordinator.routes[RoleReviewer] = Route{Primary: "claude", Capacity: 1}
+	coordinator.registry.providers["fixture-claude"] = blocked
+	coordinator.routes[RoleReviewer] = Route{Primary: "fixture-claude", Capacity: 1}
 	runsBeforeB := supervisorB.RunCount()
 
 	resultB := make(chan Result, 1)
@@ -684,9 +859,9 @@ func TestFallbackCompletionExposesFallbackAttemptKey(t *testing.T) {
 	// The Store-selected planner qualification is the primary identity. Keep
 	// that durable identity while using a distinct route alias to exercise the
 	// coordinator's fallback path without weakening provider qualification.
-	fallback := &aliasedProvider{ScriptedProvider: testkit.NewScriptedProvider(id("cursor", "cursor-family"))}
+	fallback := &aliasedProvider{ScriptedProvider: testkit.NewScriptedProvider(id("fixture-cursor", "cursor-family"))}
 	fallback.Add(domain.PhasePlanning, testkit.ProviderStep{Artifact: plannerArtifact()})
-	coordinator.registry.providers["claude"] = fallback
+	coordinator.registry.providers["fixture-claude"] = fallback
 	result := coordinator.Run(context.Background(), request)
 	if result.Code != Completed {
 		t.Fatalf("fallback result=%+v", result)
@@ -698,7 +873,7 @@ func TestFallbackCompletionExposesFallbackAttemptKey(t *testing.T) {
 	if err != nil || len(attempts) != 2 {
 		t.Fatalf("attempts=%+v err=%v", attempts, err)
 	}
-	if attempts[0].Binding.Identity.Provider != "cursor" || attempts[1].Binding.Identity.Provider != "cursor" {
+	if attempts[0].Binding.Identity.Provider != "fixture-cursor" || attempts[1].Binding.Identity.Provider != "fixture-cursor" {
 		t.Fatalf("attempt providers=%q,%q", attempts[0].Binding.Identity.Provider, attempts[1].Binding.Identity.Provider)
 	}
 	if _, _, err := database.LoadHistoricalProviderAttemptResult(context.Background(), result.ProviderResult); err != nil {
@@ -709,9 +884,9 @@ func TestFallbackCompletionExposesFallbackAttemptKey(t *testing.T) {
 func TestFallbackInvalidArtifactExhaustionIsStableAcrossRestart(t *testing.T) {
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
 	primary.InvocationErr = errors.New("primary provider unavailable before launch")
-	fallback := &aliasedProvider{ScriptedProvider: testkit.NewScriptedProvider(id("cursor", "cursor-family"))}
+	fallback := &aliasedProvider{ScriptedProvider: testkit.NewScriptedProvider(id("fixture-cursor", "cursor-family"))}
 	fallback.Add(domain.PhasePlanning, testkit.ProviderStep{Artifact: []byte(`{"schema":"not-a-planner"}`)})
-	coordinator.registry.providers["claude"] = fallback
+	coordinator.registry.providers["fixture-claude"] = fallback
 
 	first := coordinator.Run(context.Background(), request)
 	if first.Code != AttemptExhausted || !first.NeedsOperator || len(first.Attempts) != 2 {
@@ -737,7 +912,7 @@ func TestFallbackInvalidArtifactExhaustionIsStableAcrossRestart(t *testing.T) {
 
 type aliasedProvider struct{ *testkit.ScriptedProvider }
 
-func (p *aliasedProvider) Name() string { return "claude" }
+func (p *aliasedProvider) Name() string { return "fixture-claude" }
 
 type untrustedUsageProvider struct {
 	*testkit.ScriptedProvider
@@ -916,8 +1091,8 @@ func TestBudgetExhaustionDoesNotExposeProviderResultKey(t *testing.T) {
 func TestUntrustedUsageCannotChargeOrExhaustTicketBudget(t *testing.T) {
 	database, request, coordinator, ref, primary := newCoordinatorFixture(t, testkit.NewSupervisor())
 	primary.Steps[domain.PhasePlanning] = []testkit.ProviderStep{{Artifact: plannerArtifact()}}
-	coordinator.registry.providers["cursor"] = &untrustedUsageProvider{ScriptedProvider: primary, usage: 10_000}
-	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	coordinator.registry.providers["fixture-cursor"] = &untrustedUsageProvider{ScriptedProvider: primary, usage: 10_000}
+	coordinator.routes[RolePlanner] = Route{Primary: "fixture-cursor", Capacity: 1}
 
 	result := coordinator.Run(context.Background(), request)
 	if result.Code != ResultIndeterminate || result.CostUsed != 0 || result.ProviderResult != (store.ProviderAttemptResultKey{}) || len(result.Attempts) != 1 || result.Attempts[0].UsageUnits != 0 {
@@ -962,6 +1137,7 @@ func TestSupervisorCommandAmbiguityIsIndeterminateAndStableAcrossReplay(t *testi
 	if err != nil || len(attempts) != 1 || attempts[0].State != "failed" || attempts[0].Outcome != "result_indeterminate" {
 		t.Fatalf("ambiguous command durable attempts=%+v err=%v", attempts, err)
 	}
+	assertIndeterminateDiagnostic(t, database, ref, string(contracts.ProviderFailureCommand), "supervisor command observation is ambiguous")
 	replay := coordinator.Run(context.Background(), request)
 	if replay.Code != ResultIndeterminate || len(replay.Attempts) != 0 || supervisor.runs != 1 || supervisor.drains != 1 {
 		t.Fatalf("ambiguous command replay=%+v runs=%d drains=%d", replay, supervisor.runs, supervisor.drains)
@@ -1011,7 +1187,7 @@ func TestCoordinatorMapsStoreDeadlineRaceToTicketBudgetExhausted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	coordinator.routes[RolePlanner] = Route{Primary: "fixture-cursor", Capacity: 1}
 	coordinator.clock = &providerSequenceClock{values: []time.Time{
 		ticket.CreatedAt.Add(ticket.MaxDuration - time.Second),
 		ticket.CreatedAt.Add(ticket.MaxDuration + time.Nanosecond),
@@ -1032,7 +1208,7 @@ func TestCoordinatorReportsAttemptExhaustedBeforeThirdProviderInvocation(t *test
 	// Consume the two bounded initial attempts with one explicit route. The
 	// next coordinator pass must surface Store's admission refusal without
 	// launching the adapter again.
-	coordinator.routes[RolePlanner] = Route{Primary: "cursor", Capacity: 1}
+	coordinator.routes[RolePlanner] = Route{Primary: "fixture-cursor", Capacity: 1}
 	primary.InvocationErr = errors.New("definite adapter failure before launch")
 	first := coordinator.Run(context.Background(), request)
 	if first.Code != Failed || len(first.Attempts) != 1 {
@@ -1083,17 +1259,17 @@ func newCoordinatorFixture(t *testing.T, supervisor contracts.ProcessSupervisor)
 	if err := database.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Path: root, Branch: "dev/p/SF-persistence", IdentityJSON: []byte(`{"repository":"/tmp/p"}`), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
-	primary := testkit.NewScriptedProvider(id("cursor", "cursor-family"))
+	primary := testkit.NewScriptedProvider(id("fixture-cursor", "cursor-family"))
 	primary.Add(domain.PhasePlanning, testkit.ProviderStep{Behavior: testkit.ProviderHang})
-	fallback := testkit.NewScriptedProvider(id("claude", "claude-family"))
+	fallback := testkit.NewScriptedProvider(id("fixture-claude", "claude-family"))
 	if err := recordQualForFixture(database, primary); err != nil {
 		t.Fatal(err)
 	}
 	if err := recordQualForFixture(database, fallback); err != nil {
 		t.Fatal(err)
 	}
-	primaryQualification, _ := database.LatestProviderQualification(ctx, domain.ChannelDev, id("cursor", "cursor-family"))
-	fallbackQualification, _ := database.LatestProviderQualification(ctx, domain.ChannelDev, id("claude", "claude-family"))
+	primaryQualification, _ := database.LatestProviderQualification(ctx, domain.ChannelDev, id("fixture-cursor", "cursor-family"))
+	fallbackQualification, _ := database.LatestProviderQualification(ctx, domain.ChannelDev, id("fixture-claude", "claude-family"))
 	if _, _, err := database.SelectProviderSet(ctx, domain.ChannelDev, primaryQualification.ID, primaryQualification.ID, fallbackQualification.ID, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -1104,7 +1280,7 @@ func newCoordinatorFixture(t *testing.T, supervisor contracts.ProcessSupervisor)
 	if err := registry.Register(ctx, fallback); err != nil {
 		t.Fatal(err)
 	}
-	coordinator, err := New(registry, map[Role]Route{RolePlanner: {Primary: "cursor", Fallback: "claude"}}, database, nil, supervisor)
+	coordinator, err := New(registry, map[Role]Route{RolePlanner: {Primary: "fixture-cursor", Fallback: "fixture-claude"}}, database, nil, supervisor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1179,13 +1355,13 @@ func TestCancellationQuarantinesWhenProviderDoesNotDrain(t *testing.T) {
 	if err := db.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Path: root, Branch: "dev/p/SF-cancel", IdentityJSON: []byte(identity), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
 		t.Fatal(err)
 	}
-	primary := &undrainedProvider{ScriptedProvider: testkit.NewScriptedProvider(id("cursor", "cursor-family")), drained: false}
+	primary := &undrainedProvider{ScriptedProvider: testkit.NewScriptedProvider(id("fixture-cursor", "cursor-family")), drained: false}
 	primary.Add(domain.PhasePlanning, testkit.ProviderStep{Behavior: testkit.ProviderHang})
-	fallback := testkit.NewScriptedProvider(id("claude", "claude-family"))
+	fallback := testkit.NewScriptedProvider(id("fixture-claude", "claude-family"))
 	recordQual(t, db, primary.ScriptedProvider)
 	recordQual(t, db, fallback)
-	primaryQualification, _ := db.LatestProviderQualification(ctx, domain.ChannelDev, id("cursor", "cursor-family"))
-	fallbackQualification, _ := db.LatestProviderQualification(ctx, domain.ChannelDev, id("claude", "claude-family"))
+	primaryQualification, _ := db.LatestProviderQualification(ctx, domain.ChannelDev, id("fixture-cursor", "cursor-family"))
+	fallbackQualification, _ := db.LatestProviderQualification(ctx, domain.ChannelDev, id("fixture-claude", "claude-family"))
 	if _, _, err := db.SelectProviderSet(ctx, domain.ChannelDev, primaryQualification.ID, primaryQualification.ID, fallbackQualification.ID, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -1196,7 +1372,7 @@ func TestCancellationQuarantinesWhenProviderDoesNotDrain(t *testing.T) {
 	if err := registry.Register(ctx, fallback); err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(registry, map[Role]Route{RolePlanner: {Primary: "cursor", Fallback: "claude"}}, db, nil, refusingSupervisor{testkit.NewSupervisor()})
+	c, err := New(registry, map[Role]Route{RolePlanner: {Primary: "fixture-cursor", Fallback: "fixture-claude"}}, db, nil, refusingSupervisor{testkit.NewSupervisor()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1224,8 +1400,16 @@ func plannerArtifact() []byte {
 }
 
 func reviewerArtifact(acceptanceDigest, ownedFile string) []byte {
-	return []byte(fmt.Sprintf(`{"schema":"sf.verification/v1","acceptance_digest":%q,"proof_kind":"acceptance","owned_files":[%q],"command":["go","test","./..."],"prebuild_outcome":"red","evidence_digest":"%s"}`,
-		acceptanceDigest, ownedFile, strings.Repeat("e", 64)))
+	return reviewerArtifactWithCommand(acceptanceDigest, ownedFile, []string{"go", "test", "./..."})
+}
+
+func reviewerArtifactWithCommand(acceptanceDigest, ownedFile string, command []string) []byte {
+	encodedCommand, err := json.Marshal(command)
+	if err != nil {
+		panic(err)
+	}
+	return []byte(fmt.Sprintf(`{"schema":"sf.verification/v1","acceptance_digest":%q,"proof_kind":"acceptance","owned_files":[%q],"command":%s,"prebuild_outcome":"red","evidence_digest":"%s"}`,
+		acceptanceDigest, ownedFile, encodedCommand, strings.Repeat("e", 64)))
 }
 func recordQual(t *testing.T, db *store.Store, p *testkit.ScriptedProvider) {
 	t.Helper()

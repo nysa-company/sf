@@ -33,6 +33,21 @@ func PrepareChannel(paths ChannelPaths) error {
 	return nil
 }
 
+// PreparePythonSnapshots creates private channel directories only. It does not
+// open a database, write machine/project configuration or start a service.
+func PreparePythonSnapshots(paths ChannelPaths) (string, error) {
+	if err := PrepareChannel(paths); err != nil {
+		return "", err
+	}
+	root := PythonSnapshotsPath(paths)
+	for _, directory := range []string{filepath.Dir(root), root} {
+		if err := ensurePrivateDirectory(directory); err != nil {
+			return "", err
+		}
+	}
+	return filepath.EvalSymlinks(root)
+}
+
 func pathWithin(root, candidate string) bool {
 	relative, err := filepath.Rel(root, candidate)
 	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))

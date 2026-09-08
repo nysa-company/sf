@@ -189,7 +189,7 @@ func (manager Manager) Status(ctx context.Context, provider Provider) Status {
 	}
 	status.Installed = true
 	status.binary = binary
-	environment, err := manager.environment(binary.path)
+	environment, err := manager.environment(binary.path, provider)
 	if err != nil {
 		status.State = StateProbeFailed
 		status.Reason = "authentication environment is unsafe"
@@ -277,7 +277,7 @@ func (manager Manager) Login(ctx context.Context, provider Provider, terminal Te
 	if err := manager.validate(before.binary); err != nil {
 		return before, false, ErrBinaryChanged
 	}
-	environment, err := manager.environment(before.binary.path)
+	environment, err := manager.environment(before.binary.path, provider)
 	if err != nil {
 		return before, false, fmt.Errorf("%w: unsafe environment", ErrLoginFailed)
 	}
@@ -377,7 +377,7 @@ func (manager Manager) validate(binary binaryIdentity) error {
 	return protectedFile(info, manager.CurrentUID())
 }
 
-func (manager Manager) environment(executable string) ([]string, error) {
+func (manager Manager) environment(executable string, provider Provider) ([]string, error) {
 	home, err := manager.Home()
 	if err != nil || !filepath.IsAbs(home) || filepath.Clean(home) != home {
 		return nil, errors.New("home directory is unavailable")
@@ -396,6 +396,30 @@ func (manager Manager) environment(executable string) ([]string, error) {
 	}
 	path := strings.Join(uniqueStrings([]string{filepath.Dir(executable), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}), string(os.PathListSeparator))
 	environment := []string{"HOME=" + home, "PATH=" + path, "LC_ALL=C", "LANG=C"}
+	if provider == GitHub {
+		explicit, xdg := manager.Getenv("GH_CONFIG_DIR"), manager.Getenv("XDG_CONFIG_HOME")
+		selected, err := GitHubConfigPath(home, explicit, xdg)
+		if err != nil {
+			return nil, err
+		}
+		existing, err := ExistingGitHubConfigDirectory(home, explicit, xdg)
+		if err != nil {
+			return nil, err
+		}
+		if existing != "" {
+			selected = existing
+		}
+		// Keep a missing selected path for official interactive login rather
+		// than omitting it and accidentally selecting a default account.
+		environment = append(environment, "GH_CONFIG_DIR="+selected)
+	}
+	if provider == Codex {
+		selected, err := codexConfigDirectory(home, manager.Getenv("CODEX_HOME"))
+		if err != nil {
+			return nil, err
+		}
+		environment = append(environment, "CODEX_HOME="+selected)
+	}
 	for _, key := range []string{"USER", "LOGNAME", "TERM"} {
 		if value := manager.Getenv(key); safeEnvironmentValue(value) {
 			environment = append(environment, key+"="+value)

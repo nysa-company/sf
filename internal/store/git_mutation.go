@@ -45,6 +45,7 @@ type gitMutationLease struct {
 // GitMutationRecovery is the exact persisted repository child that must be
 // drained before startup can admit any writer for its repository.
 type GitMutationRecovery struct {
+	ObservationOnly     bool
 	Claim               contracts.GitMutationClaim
 	Nonce               []byte
 	State               string
@@ -97,7 +98,7 @@ func validGitIntent(i GitMutationIntent) bool {
 
 func validGitOperation(operation string) bool {
 	switch operation {
-	case "create-worktree", "remove-worktree", "commit", "push", "protected-ref-fetch":
+	case "create-worktree", "remove-worktree", "commit", "push", "protected-ref-fetch", "refresh-base":
 		return true
 	default:
 		return false
@@ -207,6 +208,11 @@ func (s *Store) IssueGitMutationClaim(ctx context.Context, intent GitMutationInt
 		// protected base are likewise prerequisites for minting a Git claim.
 		if repository != intent.Repository || worktree != intent.Worktree || branch != intent.Branch || baseRef != intent.BaseRef {
 			return ErrGitMutationIntent
+		}
+		if intent.Operation == "refresh-base" {
+			if err := s.authenticateProtectedBaseRefreshMutationAt(ctx, conn, intent); err != nil {
+				return err
+			}
 		}
 		effect, err := effectFrom(ctx, conn, intent.SemanticKey)
 		if err != nil {
@@ -369,11 +375,21 @@ func (s *Store) AcquireGitMutation(ctx context.Context, claim contracts.GitMutat
 		if err := s.assertGitIntentCurrent(ctx, conn, claim); err != nil {
 			return err
 		}
-		if err := repositoryHasProviderWriter(ctx, conn, claim.Repository); err != nil {
+		if err := repositoryHasProviderWriterForGitClaim(ctx, conn, claim.Repository); err != nil {
 			return err
 		}
-		if err := repositoryHasCommandWriter(ctx, conn, claim.Repository); err != nil {
+		if err := repositoryHasCommandWriterForGitClaim(ctx, conn, claim.Repository); err != nil {
 			return err
+		}
+		var otherGit, quarantinedGit int
+		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN state='active' AND observation_only=0 AND semantic_key<>? THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END),0) FROM git_mutation_leases WHERE repository_path=?`, claim.SemanticKey, claim.Repository).Scan(&otherGit, &quarantinedGit); err != nil {
+			return err
+		}
+		if quarantinedGit != 0 {
+			return ErrGitMutationLease
+		}
+		if otherGit != 0 {
+			return errors.Join(contracts.ErrGitMutationContended, ErrGitMutationLease)
 		}
 		result, err := conn.ExecContext(ctx, `INSERT INTO git_mutation_leases(repository_path,semantic_key,nonce,channel,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,state,launch_state,acquired_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active','unrecorded',?) ON CONFLICT(repository_path) DO NOTHING`, claim.Repository, claim.SemanticKey, nonce, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch, claim.Worktree, claim.Branch, claim.Operation, claim.BaseRef, claim.ExpectedBaseOID, claim.ExpectedHeadOID, time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
@@ -381,6 +397,15 @@ func (s *Store) AcquireGitMutation(ctx context.Context, claim contracts.GitMutat
 		}
 		if n, _ := result.RowsAffected(); n != 1 {
 			return ErrGitMutationLease
+		}
+		if claim.Operation == "refresh-base" {
+			facts, err := gitMutationIntentFactsFrom(ctx, conn, claim.SemanticKey)
+			if err != nil {
+				return ErrGitMutationLease
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET prepared_commit_oid=?,prepared_tree_oid=? WHERE repository_path=? AND semantic_key=? AND nonce=?`, facts.PreparedCommitOID, facts.PreparedTreeOID, claim.Repository, claim.SemanticKey, nonce); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -395,7 +420,7 @@ func (l *gitMutationLease) Check(ctx context.Context) error {
 		return ErrGitMutationLease
 	}
 	var found int
-	err := l.store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active'`, l.claim.Repository, l.claim.SemanticKey, l.nonce).Scan(&found)
+	err := l.store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND observation_only=0`, l.claim.Repository, l.claim.SemanticKey, l.nonce).Scan(&found)
 	if err != nil || found != 1 {
 		return ErrGitMutationLease
 	}
@@ -418,7 +443,7 @@ func (l *gitMutationLease) RecordPreparedCommit(ctx context.Context, commit, tre
 		if err := conn.QueryRowContext(ctx, `SELECT prepared_commit_oid,prepared_tree_oid FROM git_mutation_intents WHERE semantic_key=? AND operation='commit'`, l.claim.SemanticKey).Scan(&intentCommit, &intentTree); err != nil {
 			return ErrGitMutationLease
 		}
-		if err := conn.QueryRowContext(ctx, `SELECT prepared_commit_oid,prepared_tree_oid FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND operation='commit'`, l.claim.Repository, l.claim.SemanticKey, l.nonce).Scan(&leaseCommit, &leaseTree); err != nil {
+		if err := conn.QueryRowContext(ctx, `SELECT prepared_commit_oid,prepared_tree_oid FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND observation_only=0 AND operation='commit'`, l.claim.Repository, l.claim.SemanticKey, l.nonce).Scan(&leaseCommit, &leaseTree); err != nil {
 			return ErrGitMutationLease
 		}
 		if intentCommit == commit && intentTree == tree && leaseCommit == commit && leaseTree == tree {
@@ -475,7 +500,7 @@ func (l *gitMutationLease) RecordPushPriorRemote(ctx context.Context, oid string
 		if err := conn.QueryRowContext(ctx, `SELECT prior_remote_observed,prior_remote_oid FROM git_mutation_intents WHERE semantic_key=? AND operation='push'`, l.claim.SemanticKey).Scan(&intentObserved, &intentOID); err != nil {
 			return ErrGitMutationLease
 		}
-		if err := conn.QueryRowContext(ctx, `SELECT prior_remote_observed,prior_remote_oid FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND operation='push'`, l.claim.Repository, l.claim.SemanticKey, l.nonce).Scan(&leaseObserved, &leaseOID); err != nil {
+		if err := conn.QueryRowContext(ctx, `SELECT prior_remote_observed,prior_remote_oid FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND observation_only=0 AND operation='push'`, l.claim.Repository, l.claim.SemanticKey, l.nonce).Scan(&leaseObserved, &leaseOID); err != nil {
 			return ErrGitMutationLease
 		}
 		if intentObserved == 1 && intentOID == oid && leaseObserved == 1 && leaseOID == oid {
@@ -548,7 +573,7 @@ func (l *gitMutationLease) RecordGitMutationLaunch(ctx context.Context, launch c
 		if err := l.store.assertGitIntentCurrent(ctx, conn, l.claim); err != nil {
 			return ErrGitMutationLease
 		}
-		row, err := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET launch_state='released',process_pid=?,process_pgid=?,process_boot_identity=?,process_start_identity=?,launched_at=? WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND launch_state IN ('unrecorded','drained')`, launch.PID, launch.PGID, launch.BootIdentity, launch.ProcessStartIdentity, time.Now().UTC().Format(time.RFC3339Nano), l.claim.Repository, l.claim.SemanticKey, l.nonce)
+		row, err := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET launch_state='released',process_pid=?,process_pgid=?,process_boot_identity=?,process_start_identity=?,launched_at=? WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND observation_only=0 AND launch_state IN ('unrecorded','drained')`, launch.PID, launch.PGID, launch.BootIdentity, launch.ProcessStartIdentity, time.Now().UTC().Format(time.RFC3339Nano), l.claim.Repository, l.claim.SemanticKey, l.nonce)
 		if err != nil {
 			return err
 		}
@@ -563,7 +588,7 @@ func (l *gitMutationLease) FinishGitMutationLaunch(ctx context.Context, launch c
 		return ErrGitMutationLease
 	}
 	return l.store.write(ctx, func(conn *sql.Conn) error {
-		row, err := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET launch_state='drained' WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND launch_state='released' AND process_pid=? AND process_pgid=? AND process_boot_identity=? AND process_start_identity=?`, l.claim.Repository, l.claim.SemanticKey, l.nonce, launch.PID, launch.PGID, launch.BootIdentity, launch.ProcessStartIdentity)
+		row, err := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET launch_state='drained' WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active' AND observation_only=0 AND launch_state='released' AND process_pid=? AND process_pgid=? AND process_boot_identity=? AND process_start_identity=?`, l.claim.Repository, l.claim.SemanticKey, l.nonce, launch.PID, launch.PGID, launch.BootIdentity, launch.ProcessStartIdentity)
 		if err != nil {
 			return err
 		}
@@ -581,7 +606,7 @@ func (s *Store) ActiveGitMutationLeases(ctx context.Context, channel domain.Chan
 	if !channel.Valid() {
 		return nil, ErrGitMutationLease
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT semantic_key,nonce,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,state,launch_state,process_pid,process_pgid,process_boot_identity,process_start_identity,prepared_commit_oid,prepared_tree_oid,prior_remote_observed,prior_remote_oid FROM git_mutation_leases WHERE channel=? ORDER BY repository_path`, channel)
+	rows, err := s.db.QueryContext(ctx, `SELECT semantic_key,nonce,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,repository_path,worktree_path,branch_ref,operation,base_ref,expected_base_oid,expected_head_oid,state,launch_state,process_pid,process_pgid,process_boot_identity,process_start_identity,prepared_commit_oid,prepared_tree_oid,prior_remote_observed,prior_remote_oid,observation_only FROM git_mutation_leases WHERE channel=? ORDER BY repository_path`, channel)
 	if err != nil {
 		return nil, normalizeBusy(ctx, err)
 	}
@@ -589,7 +614,7 @@ func (s *Store) ActiveGitMutationLeases(ctx context.Context, channel domain.Chan
 	for rows.Next() {
 		var r GitMutationRecovery
 		var project, ticket string
-		if err := rows.Scan(&r.Claim.SemanticKey, &r.Nonce, &project, &ticket, &r.Claim.RequestDigest, &r.Claim.TicketVersion, &r.Claim.LeaderEpoch, &r.Claim.RunnerEpoch, &r.Claim.ClaimEpoch, &r.Claim.Repository, &r.Claim.Worktree, &r.Claim.Branch, &r.Claim.Operation, &r.Claim.BaseRef, &r.Claim.ExpectedBaseOID, &r.Claim.ExpectedHeadOID, &r.State, &r.LaunchState, &r.Launch.PID, &r.Launch.PGID, &r.Launch.BootIdentity, &r.Launch.ProcessStartIdentity, &r.PreparedCommitOID, &r.PreparedTreeOID, &r.PriorRemoteObserved, &r.PriorRemoteOID); err != nil {
+		if err := rows.Scan(&r.Claim.SemanticKey, &r.Nonce, &project, &ticket, &r.Claim.RequestDigest, &r.Claim.TicketVersion, &r.Claim.LeaderEpoch, &r.Claim.RunnerEpoch, &r.Claim.ClaimEpoch, &r.Claim.Repository, &r.Claim.Worktree, &r.Claim.Branch, &r.Claim.Operation, &r.Claim.BaseRef, &r.Claim.ExpectedBaseOID, &r.Claim.ExpectedHeadOID, &r.State, &r.LaunchState, &r.Launch.PID, &r.Launch.PGID, &r.Launch.BootIdentity, &r.Launch.ProcessStartIdentity, &r.PreparedCommitOID, &r.PreparedTreeOID, &r.PriorRemoteObserved, &r.PriorRemoteOID, &r.ObservationOnly); err != nil {
 			return nil, err
 		}
 		r.Claim.TicketRef = domain.TicketRef{Channel: channel, Project: domain.ProjectID(project), Ticket: domain.TicketID(ticket)}
@@ -603,6 +628,13 @@ func (s *Store) ActiveGitMutationLeases(ctx context.Context, channel domain.Chan
 		return nil, err
 	}
 	for _, r := range candidates {
+		if r.ObservationOnly {
+			h := &WorktreeCreationAbsence{store: s, claim: r.Claim, nonce: r.Nonce}
+			if err := s.write(ctx, func(conn *sql.Conn) error { return h.checkFrom(ctx, conn, false) }); err != nil {
+				return nil, ErrGitMutationLease
+			}
+			continue
+		}
 		facts, err := s.GitMutationIntentFacts(ctx, r.Claim.SemanticKey)
 		prior := 0
 		if facts.PriorRemoteObserved {
@@ -666,6 +698,15 @@ func gitMutationIntentFactsFrom(ctx context.Context, query interface {
 	}
 	if !validGitMutationFacts(out.Claim.Operation, out.Claim.ExpectedBaseOID, out.Claim.ExpectedHeadOID, out.PreparedCommitOID, out.PreparedTreeOID, prior, out.PriorRemoteOID) {
 		return GitMutationIntentFacts{}, ErrGitMutationIntent
+	}
+	if out.Claim.Operation == "refresh-base" {
+		id, value, mutation, err := loadProtectedBaseRefreshReservationAt(ctx, query, semanticKey)
+		if err != nil || !sameGitMutationBinding(mutation, out.Claim) || validateProtectedBaseRefreshPreparationAt(ctx, query, id, value, mutation.RequestDigest, out.PreparedCommitOID, out.PreparedTreeOID) != nil {
+			return GitMutationIntentFacts{}, ErrGitMutationIntent
+		}
+		if out.Effect.State == EffectConfirmed && (out.PreparedCommitOID == "" || out.ObservedIdentity != out.PreparedCommitOID) {
+			return GitMutationIntentFacts{}, ErrGitMutationIntent
+		}
 	}
 	if out.Claim.Operation == "commit" && out.Effect.State == EffectConfirmed && out.Effect.ObservedIdentity != out.PreparedCommitOID {
 		// A confirmed commit is only linked to this immutable intent when the
@@ -874,6 +915,34 @@ func (s *Store) RecoverGitMutationLeases(ctx context.Context, channel domain.Cha
 		return err
 	}
 	for _, lease := range leases {
+		if lease.ObservationOnly {
+			// This durable lease cannot launch a child. A new leader may abandon
+			// the read-only observation, but never settle the uncertain effect.
+			h := &WorktreeCreationAbsence{store: s, claim: lease.Claim, nonce: lease.Nonce}
+			if err := s.write(ctx, func(conn *sql.Conn) error {
+				var current uint64
+				if err := conn.QueryRowContext(ctx, `SELECT leader_epoch FROM daemon_instances WHERE channel=?`, channel).Scan(&current); err != nil {
+					return err
+				}
+				if current != leader || leader <= lease.Claim.LeaderEpoch {
+					return ErrStaleFence
+				}
+				if err := h.checkFrom(ctx, conn, false); err != nil {
+					return err
+				}
+				deleted, err := conn.ExecContext(ctx, `DELETE FROM git_mutation_leases WHERE repository_path=? AND semantic_key=? AND nonce=? AND observation_only=1 AND state='active' AND launch_state='unrecorded'`, lease.Claim.Repository, lease.Claim.SemanticKey, lease.Nonce)
+				if err != nil {
+					return err
+				}
+				if n, _ := deleted.RowsAffected(); n != 1 {
+					return ErrGitMutationLease
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			continue
+		}
 		if !validGitLaunch(lease.Launch) || drainer == nil || drainer.DrainGitMutation(ctx, lease.Launch) != nil {
 			_ = s.write(ctx, func(conn *sql.Conn) error {
 				_, e := conn.ExecContext(ctx, `UPDATE git_mutation_leases SET state='quarantined',launch_state='quarantined' WHERE repository_path=? AND semantic_key=? AND nonce=? AND state='active'`, lease.Claim.Repository, lease.Claim.SemanticKey, lease.Nonce)
@@ -963,7 +1032,7 @@ func validGitMutationFacts(operation, base, expectedHead, preparedCommit, prepar
 		return false
 	}
 	switch operation {
-	case "commit":
+	case "commit", "refresh-base":
 		// OIDs are individually optional to support other fact shapes, but a
 		// prepared commit is an inseparable commit/tree tuple. Never let the
 		// optional-width helper turn a partial tuple into a valid fact.
@@ -988,6 +1057,12 @@ func (s *Store) assertGitIntentCurrent(ctx context.Context, conn *sql.Conn, c co
 	}
 	if n != 1 {
 		return ErrGitMutationIntent
+	}
+	if c.Operation == "refresh-base" {
+		intent := GitMutationIntent{EffectFence: EffectFence{SemanticKey: c.SemanticKey, Ref: c.TicketRef, TicketVersion: c.TicketVersion, Fence: domain.Fence{LeaderEpoch: c.LeaderEpoch, RunnerEpoch: c.RunnerEpoch}}, RequestDigest: c.RequestDigest, Repository: c.Repository, Worktree: c.Worktree, Branch: c.Branch, Operation: c.Operation, BaseRef: c.BaseRef, ExpectedBaseOID: c.ExpectedBaseOID, ExpectedHeadOID: c.ExpectedHeadOID}
+		if err := s.authenticateProtectedBaseRefreshMutationAt(ctx, conn, intent); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1015,3 +1090,31 @@ func repositoryHasCommandWriter(ctx context.Context, conn *sql.Conn, repository 
 }
 
 var _ contracts.GitMutationAuthority = (*Store)(nil)
+
+func repositoryHasProviderWriterForGitClaim(ctx context.Context, conn *sql.Conn, repository string) error {
+	var active, quarantined int
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN state='active' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END),0) FROM provider_attempts WHERE repository_path=?`, repository).Scan(&active, &quarantined); err != nil {
+		return err
+	}
+	if quarantined != 0 {
+		return ErrProviderAttempt
+	}
+	if active != 0 {
+		return errors.Join(contracts.ErrGitMutationContended, ErrProviderAttempt)
+	}
+	return nil
+}
+
+func repositoryHasCommandWriterForGitClaim(ctx context.Context, conn *sql.Conn, repository string) error {
+	var active, quarantined int
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN state='active' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END),0) FROM repository_command_leases WHERE repository_path=?`, repository).Scan(&active, &quarantined); err != nil {
+		return err
+	}
+	if quarantined != 0 {
+		return ErrRepositoryCommandLease
+	}
+	if active != 0 {
+		return errors.Join(contracts.ErrGitMutationContended, ErrRepositoryCommandLease)
+	}
+	return nil
+}

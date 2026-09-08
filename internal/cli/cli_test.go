@@ -314,6 +314,7 @@ func TestLifecycleVerbsForwardTheirMethodsChannelAndOperator(t *testing.T) {
 	}{
 		{name: "submit", args: []string{"submit", ticketPath, "--project", "demo"}, method: "ticket.submit"},
 		{name: "start", args: []string{"start", "SF-1"}, method: "ticket.start", ticket: "SF-1"},
+		{name: "start estimates", args: []string{"start", "SF-1", "--accept-cost-estimates"}, method: "ticket.start", ticket: "SF-1"},
 		{name: "status", args: []string{"status", "SF-1"}, method: "ticket.status", ticket: "SF-1"},
 		{name: "show", args: []string{"show", "SF-1"}, method: "ticket.show", ticket: "SF-1"},
 		{name: "logs", args: []string{"logs", "SF-1", "--phase", "build"}, method: "ticket.logs", ticket: "SF-1"},
@@ -327,6 +328,8 @@ func TestLifecycleVerbsForwardTheirMethodsChannelAndOperator(t *testing.T) {
 		{name: "reject", args: []string{"reject", "SF-1", "--operator", "sofia", "--reason", "needs tests"}, method: "ticket.reject", ticket: "SF-1"},
 		{name: "providers qualify", args: []string{"providers", "qualify", "--builder", "cursor", "--reviewer", "claude"}, method: "provider.qualify"},
 		{name: "daemon status", args: []string{"daemon", "status"}, method: "daemon.status"},
+		{name: "cleanup prepare", args: []string{"daemon", "cleanup", "prepare"}, method: "daemon.cleanup.prepare"},
+		{name: "cleanup recover", args: []string{"daemon", "cleanup", "recover"}, method: "daemon.cleanup.recover"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -344,6 +347,12 @@ func TestLifecycleVerbsForwardTheirMethodsChannelAndOperator(t *testing.T) {
 			var parameters map[string]any
 			if err := json.Unmarshal(got.Parameters, &parameters); err != nil {
 				t.Fatal(err)
+			}
+			if test.name == "start estimates" && parameters["accept_cost_estimates"] != true {
+				t.Fatal("explicit accounting choice lost")
+			}
+			if test.name == "start" && parameters["accept_cost_estimates"] != nil {
+				t.Fatal("ordinary start opted in")
 			}
 			if parameters["channel"] != string(domain.ChannelStable) {
 				t.Fatalf("channel=%v parameters=%s", parameters["channel"], got.Parameters)
@@ -380,12 +389,15 @@ func TestHumanRendererProjectsKnownTicketAndLogShapes(t *testing.T) {
 		data string
 		want []string
 	}{
+		{name: "recovered_review", data: `{"ticket":"SF-8","state":"waiting_approval","blocked_code":"review_needs_operator"}`, want: []string{"State: waiting_approval", "Recorded blocker: review_needs_operator"}},
 		{name: "ticket", data: `{"channel":"dev","project":"nysa","ticket":"SF-1","state":"waiting_approval","merge_mode":"guarded"}`, want: []string{"SF-1", "Channel: dev", "State: waiting_approval", "Merge mode: guarded"}},
 		{name: "detail", data: `{"channel":"stable","project":"nysa","ticket":"SF-2","state":"done","title":"Fix reminders","problem":"A bounded problem.","acceptance":["one"]}`, want: []string{"SF-2  Fix reminders", "Problem: A bounded problem.", "Acceptance: 1 item(s)"}},
 		{name: "takeover", data: `{"channel":"dev","project":"nysa","ticket":"SF-4","state":"paused","resume_state":"building","takeover":{"registered":true,"path":"/private/tmp/SF-4","branch":"sf/SF-4","repository":"/private/tmp/repo","base_sha":"base","head_sha":"head","clean":true,"change_kind":"none","changed_files":[],"source_resumable":false}}`, want: []string{"SF-4", "State: paused", "Resume state: building", "Takeover worktree: /private/tmp/SF-4", "Branch: sf/SF-4", "Repository: /private/tmp/repo", "Local base: base", "Local head: head", "Change kind: none"}},
 		{name: "early_takeover", data: `{"channel":"dev","project":"nysa","ticket":"SF-5","state":"paused","resume_state":"planning","takeover":{"registered":false,"path":"","clean":true,"change_kind":"no_worktree","changed_files":[],"source_resumable":false},"next_action":{"code":"resume","argv":["sf-dev","resume","SF-5"]}}`, want: []string{"SF-5", "State: paused", "Resume state: planning", "Takeover worktree: not created yet", "Next: sf-dev resume SF-5"}},
 		{name: "ticket_budget", data: `{"channel":"dev","ticket":{"channel":"dev","project":"relay","ticket":"SF-6","state":"blocked","resume_state":"planning","blocked_code":"ticket_budget_exhausted"},"next_action":{"code":"ticket_budget_exhausted","argv":["sf-dev","cancel","SF-6"]}}`, want: []string{"SF-6", "State: blocked", "Resume state: planning", "Blocker: ticket_budget_exhausted", "Next: sf-dev cancel SF-6"}},
 		{name: "ticket_budget_list", data: `{"channel":"dev","tickets":[{"channel":"dev","project":"relay","ticket":"SF-6","state":"blocked","blocked_code":"ticket_budget_exhausted","next_action":{"code":"ticket_budget_exhausted","argv":["sf-dev","cancel","SF-6"]}}]}`, want: []string{"Tickets (dev)", "- SF-6  blocked", "Next: sf-dev cancel SF-6"}},
+		{name: "verification_amendment_invalid", data: `{"channel":"dev","ticket":{"channel":"dev","project":"relay","ticket":"SF-7","state":"blocked","resume_state":"verifying","blocked_code":"verification_amendment_invalid"},"next_action":{"code":"verification_amendment_invalid","argv":["sf-dev","cancel","SF-7"]}}`, want: []string{"SF-7", "State: blocked", "Resume state: verifying", "Blocker: verification_amendment_invalid", "Next: sf-dev cancel SF-7"}},
+		{name: "verification_amendment_invalid_list", data: `{"channel":"dev","tickets":[{"channel":"dev","project":"relay","ticket":"SF-7","state":"blocked","blocked_code":"verification_amendment_invalid","next_action":{"code":"verification_amendment_invalid","argv":["sf-dev","cancel","SF-7"]}}]}`, want: []string{"Tickets (dev)", "- SF-7  blocked", "Next: sf-dev cancel SF-7"}},
 		{name: "logs", data: `{"channel":"dev","ticket":"SF-3","events":[{"id":4,"from":"planning","to":"verifying"}]}`, want: []string{"Logs: SF-3", "#4 planning -> verifying"}},
 	}
 	for _, test := range tests {

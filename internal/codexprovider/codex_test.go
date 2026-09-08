@@ -194,6 +194,8 @@ func TestCodexParseRejectsMalformedOversizedAndNonzeroOutput(t *testing.T) {
 		outcome string
 	}{
 		{name: "nonzero exit", command: contracts.CommandResult{ExitCode: 1, Stdout: valid}, outcome: contracts.PhaseResultIndeterminate},
+		{name: "empty jsonl", command: contracts.CommandResult{ExitCode: 0}, outcome: contracts.PhaseResultIndeterminate},
+		{name: "terminal failure", command: contracts.CommandResult{Stdout: []byte("{\"type\":\"turn.failed\",\"error\":{\"message\":\"password=never-persist-this\"}}\n")}, outcome: contracts.PhaseResultIndeterminate},
 		{name: "missing artifact", command: contracts.CommandResult{ExitCode: 0, Stdout: valid}, outcome: contracts.PhaseResultInvalidArtifact},
 		{name: "malformed jsonl", command: contracts.CommandResult{ExitCode: 0, Stdout: []byte("not-json\n"), OutputLastMessage: []byte(`{}`)}, outcome: contracts.PhaseResultIndeterminate},
 		{name: "incomplete jsonl", command: contracts.CommandResult{ExitCode: 0, Stdout: []byte(`{"type":"item.completed","item":{"type":"agent_message","text":"not json"}}` + "\n"), OutputLastMessage: []byte(`{}`)}, outcome: contracts.PhaseResultIndeterminate},
@@ -209,6 +211,22 @@ func TestCodexParseRejectsMalformedOversizedAndNonzeroOutput(t *testing.T) {
 		}
 		if invalid.Outcome != bad.outcome || invalid.Provider != identity || !invalid.UsageTrusted || invalid.UsageUnits != 0 {
 			t.Fatalf("bad result %s classification/result=%+v err=%v", bad.name, invalid, err)
+		}
+		wantReason := map[string]contracts.ProviderFailureReason{
+			"empty jsonl":      contracts.ProviderFailureProtocol,
+			"nonzero exit":     contracts.ProviderFailureExit,
+			"terminal failure": contracts.ProviderFailureTerminal,
+			"malformed jsonl":  contracts.ProviderFailureProtocol,
+			"incomplete jsonl": contracts.ProviderFailureProtocol,
+			"truncated stdout": contracts.ProviderFailureOutput,
+			"truncated stderr": contracts.ProviderFailureOutput,
+			"oversized stdout": contracts.ProviderFailureOutput,
+		}[bad.name]
+		if invalid.FailureReason != wantReason {
+			t.Fatalf("%s diagnostic=%q want=%q", bad.name, invalid.FailureReason, wantReason)
+		}
+		if bad.outcome == contracts.PhaseResultIndeterminate && (len(invalid.Artifact) != 0 || invalid.Transcript != "") {
+			t.Fatalf("%s retained indeterminate output", bad.name)
 		}
 	}
 	for name, malformed := range map[string][]byte{

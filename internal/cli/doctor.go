@@ -43,6 +43,7 @@ type DoctorCheck struct {
 
 type DoctorReport struct {
 	Schema             string              `json:"schema"`
+	ReadinessScope     string              `json:"readiness_scope,omitempty"`
 	Channel            domain.Channel      `json:"channel"`
 	Checks             []DoctorCheck       `json:"checks"`
 	Authentication     []authStatusView    `json:"authentication"`
@@ -80,9 +81,15 @@ type DoctorDeps struct {
 	StatFS     func(string) (*syscall.Statfs_t, error)
 	CurrentUID func() uint32
 	Worktree   func(context.Context, string) error
+	// Recipe previews local configuration/closure only; it is not persisted
+	// ticket configuration or executable/provider launch authority.
+	Recipe     func(context.Context, string) error
 	AuthStatus func(context.Context) []localauth.Status
 	Pair       func(context.Context, domain.Channel) (store.ProviderPair, error)
 	Attempts   func(context.Context, domain.Channel) ([]store.ProviderAttempt, error)
+	// ExternalQuarantine inspects the channel database's durable GitHub
+	// cleanup latch. This read never clears or repairs it.
+	ExternalQuarantine func(context.Context) (bool, error)
 	// DaemonStatus is an optional read-only protocol handshake. It is called
 	// only when the socket passed the filesystem checks, so a fresh install
 	// remains usable without a running daemon.
@@ -136,6 +143,13 @@ func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
 	deps := (DoctorDeps{Channel: channel, Repo: repo}).defaults()
 	manager := localauth.NewManager()
 	deps.AuthStatus = manager.StatusAll
+	deps.Recipe = func(ctx context.Context, repository string) error {
+		response := RunInitCheck(ctx, InitRequest{Channel: channel, Repo: repository, Paths: deps.Paths})
+		if !response.OK {
+			return errors.New("local recipe preview refused")
+		}
+		return nil
+	}
 	databasePath := deps.Paths.Database
 	deps.Pair = func(ctx context.Context, selected domain.Channel) (store.ProviderPair, error) {
 		database, err := store.OpenReadOnly(ctx, databasePath)
@@ -152,6 +166,14 @@ func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
 		}
 		defer database.Close()
 		return database.ActiveProviderAttempts(ctx, selected)
+	}
+	deps.ExternalQuarantine = func(ctx context.Context) (bool, error) {
+		database, err := store.OpenReadOnly(ctx, databasePath)
+		if err != nil {
+			return false, err
+		}
+		defer database.Close()
+		return database.ExternalMutationsQuarantined(ctx)
 	}
 	deps.DaemonStatus = func(ctx context.Context, paths config.ChannelPaths) error {
 		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -184,6 +206,7 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	deps = deps.defaults()
 	report := DoctorReport{
 		Schema: doctorSchema, Channel: deps.Channel, Checks: []DoctorCheck{},
+		ReadinessScope: "Host and provider qualification, plus optional working-tree recipe preview; not ticket execution or merge approval.",
 		Authentication: []authStatusView{}, GuardedEligible: false, AutonomousEligible: false, CredentialsStored: false,
 	}
 	if !deps.Channel.Valid() {
@@ -217,14 +240,36 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	} else {
 		report.Checks = append(report.Checks, DoctorCheck{ID: "repository_worktree", Status: CheckPass, Summary: "selected repository is a Git worktree"})
 	}
+	if deps.Repo == "" || deps.Recipe == nil || !doctorChecksPass(report, "repository_worktree") {
+		report.Checks = append(report.Checks, DoctorCheck{ID: "repository_recipe", Status: CheckNotRun, Summary: "local configuration and dependency recipe were not previewed"})
+	} else if err := deps.Recipe(ctx, deps.Repo); err != nil {
+		report.Checks = append(report.Checks, failedCheck("repository_recipe", "local recipe preview did not pass; inspect init --check for the selected repository", deps.Binary, "init", "--help"))
+	} else {
+		report.Checks = append(report.Checks, DoctorCheck{ID: "repository_recipe", Status: CheckPass, Summary: "working-tree configuration and local test closure preview accepted; stored configuration and executable versions are checked separately"})
+	}
 	report.Checks = append(report.Checks, checkExecutable(deps, "gh", "gh executable is available"))
 	pair, pairAvailable := checkProviderPair(ctx, deps, &report)
 	checkQuarantinedProviders(ctx, deps, &report)
+	checkExternalQuarantine(ctx, deps, &report)
 	checkAuthentication(ctx, deps, pair, pairAvailable, &report)
 	report.GuardedEligible = pairAvailable && guardedEligibilityChecksPass(report)
 	report.Checks = append(report.Checks, DoctorCheck{ID: "container_runtime", Status: CheckNotRun, Summary: "Docker and Colima are not required"})
 	report.Checks = append(report.Checks, DoctorCheck{ID: "autonomous_mode", Status: CheckPass, Summary: "autonomous mode is disabled by policy"})
 	return report
+}
+
+func checkExternalQuarantine(ctx context.Context, deps DoctorDeps, report *DoctorReport) {
+	check := DoctorCheck{ID: "external_mutation_recovery", Status: CheckNotRun, Summary: "external process cleanup quarantine could not be inspected"}
+	if deps.ExternalQuarantine != nil {
+		quarantined, err := deps.ExternalQuarantine(ctx)
+		if err == nil && quarantined {
+			check = failedCheck("external_mutation_recovery", "GitHub commands are blocked by persistent process-cleanup quarantine; prepare a host recovery checkpoint, then reboot before recovery; no automatic clear is performed", deps.Binary, "daemon", "cleanup", "prepare")
+		} else if err == nil {
+			check.Status = CheckPass
+			check.Summary = "no persistent external process cleanup quarantine was found"
+		}
+	}
+	report.Checks = append(report.Checks, check)
 }
 
 func checkQuarantinedProviders(ctx context.Context, deps DoctorDeps, report *DoctorReport) {
@@ -324,8 +369,11 @@ func doctorQualification(role string, value store.ProviderQualification) DoctorP
 }
 
 func guardedEligibilityChecksPass(report DoctorReport) bool {
-	mandatory := []string{"channel_root", "disk_space", "git_executable", "gh_executable", "authority_database", "provider_recovery", "authentication", "provider_pair", "github_auth", "builder_auth", "reviewer_auth"}
+	mandatory := []string{"channel_root", "disk_space", "git_executable", "gh_executable", "authority_database", "provider_recovery", "external_mutation_recovery", "authentication", "provider_pair", "github_auth", "builder_auth", "reviewer_auth"}
 	for _, check := range report.Checks {
+		if check.ID == "repository_recipe" && check.Status != CheckNotRun {
+			mandatory = append(mandatory, check.ID)
+		}
 		if check.ID == "repository_worktree" && check.Status != CheckNotRun {
 			mandatory = append(mandatory, check.ID)
 		}

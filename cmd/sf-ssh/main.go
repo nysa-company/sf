@@ -3,6 +3,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/nysa-company/sf/internal/version"
 	"os"
 	"os/exec"
 
@@ -10,6 +11,9 @@ import (
 )
 
 func main() {
+	if version.PrintHelperBuildInfo(os.Args, os.Stdout) {
+		return
+	}
 	req := gitssh.Request{SSHBinary: os.Getenv("SF_GIT_SSH_BINARY"), KnownHosts: os.Getenv("SF_GIT_SSH_KNOWN_HOSTS"), AgentSocket: os.Getenv("SSH_AUTH_SOCK"), Repository: os.Getenv("SF_GIT_SSH_REPOSITORY")}
 	args, env, err := gitssh.Command(req, os.Args[1:])
 	if err != nil {

@@ -94,6 +94,9 @@ func TestTransitionCandidateRefusesReplacementGenerationAtomically(t *testing.T)
 	// Removing the competing generation leaves an otherwise valid immutable
 	// snapshot, but no v34 current-fence result binding.  Transition authority
 	// must fail closed rather than infer recovery from the snapshot's old claim.
+	if _, err := database.db.ExecContext(ctx, `DROP TRIGGER candidate_snapshots_immutable_delete`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := database.db.ExecContext(ctx, `DELETE FROM candidate_snapshots WHERE channel=? AND project_id=? AND ticket_id=? AND generation=2`, ref.Channel, ref.Project, ref.Ticket); err != nil {
 		t.Fatal(err)
 	}

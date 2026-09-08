@@ -124,12 +124,12 @@ func TestTicketBudgetRejectionSurvivesStoreRestartAndBlocksExactlyOnce(t *testin
 		t.Fatal(err)
 	}
 
-	provider := testkit.NewScriptedProvider(domain.ProviderIdentity{Provider: "cursor", Model: "restart-budget", Family: "restart-budget-family", Version: "1"})
+	provider := testkit.NewScriptedProvider(domain.ProviderIdentity{Provider: "fixture-cursor", Model: "restart-budget", Family: "restart-budget-family", Version: "1"})
 	binding, err := provider.Binding(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reviewer := testkit.NewScriptedProvider(domain.ProviderIdentity{Provider: "claude", Model: "restart-review", Family: "restart-review-family", Version: "1"})
+	reviewer := testkit.NewScriptedProvider(domain.ProviderIdentity{Provider: "fixture-claude", Model: "restart-review", Family: "restart-review-family", Version: "1"})
 	reviewerBinding, err := reviewer.Binding(ctx)
 	if err != nil {
 		t.Fatal(err)

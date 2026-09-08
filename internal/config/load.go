@@ -19,6 +19,8 @@ import (
 	"github.com/nysa-company/sf/internal/goclosure"
 	"github.com/nysa-company/sf/internal/nodeclosure"
 	"github.com/nysa-company/sf/internal/nysapure"
+	"github.com/nysa-company/sf/internal/pythonclosure"
+	"github.com/nysa-company/sf/internal/pythonprepare"
 )
 
 const MaxFileBytes = 64 * 1024
@@ -29,8 +31,10 @@ const MaxFileBytes = 64 * 1024
 // the project owner and frozen into the registered configuration snapshot.
 const NysaPureAPIV1Profile = "nysa-api-pure-v1"
 
-// ErrCommandDetection identifies a repository whose command contract needs an
-// explicit .sf/config.toml. The CLI turns it into a channel-correct next
+const PythonPytestV1Profile = "python-pytest-v1"
+
+// ErrCommandDetection identifies a repository whose command contract cannot
+// be inferred safely. Explicit config does not grant runtime support. The CLI turns it into a channel-correct next
 // action; callers can still distinguish it from malformed explicit config.
 var ErrCommandDetection = errors.New("project command detection failed")
 
@@ -230,11 +234,18 @@ func PrepareNysaPureConfig(repository, profile, testPath string) (NysaPureConfig
 // PrepareNysaPureConfigContext is the cancellation-aware form used by the
 // init CLI. Its lock is retained by the returned plan through registration.
 func PrepareNysaPureConfigContext(ctx context.Context, repository, profile, testPath string) (NysaPureConfigPlan, error) {
+	return PrepareInitialConfigContext(ctx, repository, profile, testPath, "")
+}
+
+// PrepareInitialConfigContext combines an optional command recipe and explicit
+// provider preset in one no-overwrite, descriptor-locked initialization plan.
+// A preset names preferences only; it grants no runtime or billing authority.
+func PrepareInitialConfigContext(ctx context.Context, repository, profile, testPath, preset string) (NysaPureConfigPlan, error) {
 	identity, err := CaptureRepositoryIdentity(repository)
 	if err != nil {
 		return NysaPureConfigPlan{}, err
 	}
-	return prepareNysaPureConfigWithIdentityContext(ctx, repository, identity, profile, testPath)
+	return prepareInitialConfigWithIdentityContext(ctx, repository, identity, profile, testPath, preset)
 }
 
 func prepareNysaPureConfigWithIdentity(repository string, identity RepositoryIdentity, profile, testPath string) (NysaPureConfigPlan, error) {
@@ -242,17 +253,28 @@ func prepareNysaPureConfigWithIdentity(repository string, identity RepositoryIde
 }
 
 func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository string, identity RepositoryIdentity, profile, testPath string) (NysaPureConfigPlan, error) {
+	return prepareInitialConfigWithIdentityContext(ctx, repository, identity, profile, testPath, "")
+}
+
+func prepareInitialConfigWithIdentityContext(ctx context.Context, repository string, identity RepositoryIdentity, profile, testPath, preset string) (NysaPureConfigPlan, error) {
 	plan := NysaPureConfigPlan{Repository: repository, Path: filepath.Join(repository, ".sf", "config.toml"), identity: identity}
+	providers, err := ProviderPreset(preset)
+	if err != nil {
+		return plan, err
+	}
 	if (profile == "") != (testPath == "") {
 		return NysaPureConfigPlan{}, errors.New("profile and test path must be provided together")
 	}
-	if profile != "" && profile != NysaPureAPIV1Profile {
-		return NysaPureConfigPlan{}, fmt.Errorf("unsupported project profile %q; supported profile is %s", profile, NysaPureAPIV1Profile)
+	if profile != "" && profile != NysaPureAPIV1Profile && profile != PythonPytestV1Profile {
+		return NysaPureConfigPlan{}, fmt.Errorf("unsupported project profile %q; supported profiles are %s and %s", profile, NysaPureAPIV1Profile, PythonPytestV1Profile)
 	}
-	if profile != "" && !nysapure.ValidTestPath(testPath) {
+	if profile == NysaPureAPIV1Profile && !nysapure.ValidTestPath(testPath) {
 		return NysaPureConfigPlan{}, fmt.Errorf("profile %s requires a canonical repository-relative .test.ts path", profile)
 	}
-	lock, err := acquireProjectConfigLockContext(ctx, repository, profile != "")
+	if profile == PythonPytestV1Profile && !pythonclosure.ValidTestPath(testPath) {
+		return NysaPureConfigPlan{}, fmt.Errorf("profile %s requires a canonical repository-relative .py file or tests directory", profile)
+	}
+	lock, err := acquireProjectConfigLockContext(ctx, repository, profile != "" || preset != "")
 	if err != nil {
 		return NysaPureConfigPlan{}, err
 	}
@@ -264,8 +286,13 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 	if err := lock.validateRepositoryIdentity(repository, identity); err != nil {
 		return fail(err)
 	}
-	if profile != "" {
+	if profile == NysaPureAPIV1Profile {
 		if err := nysapure.Validate(repository, testPath); err != nil {
+			return fail(fmt.Errorf("validate %s test entrypoint: %w", profile, err))
+		}
+	}
+	if profile == PythonPytestV1Profile {
+		if err := pythonclosure.ValidateTestPath(repository, testPath); err != nil {
 			return fail(fmt.Errorf("validate %s test entrypoint: %w", profile, err))
 		}
 	}
@@ -284,9 +311,34 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 		}
 	}
 	if profile == "" {
+		if preset != "" && !exists {
+			// A providers-only file must not suppress normal recipe detection
+			// and accidentally give a Node/Python/Ruby project Go defaults.
+			detected, detectErr := detectRepositoryCommands(repository)
+			if detectErr != nil {
+				return fail(detectErr)
+			}
+			plan.Commands = detected
+			encoded, encodeErr := toml.Marshal(struct {
+				Commands nysaPureCommandsDocument `toml:"commands"`
+			}{Commands: nysaPureCommandsDocument{Verify: detected.Verify.Argv, Review: detected.Review.Argv}})
+			if encodeErr != nil {
+				return fail(encodeErr)
+			}
+			plan.Encoded = encoded
+		}
+		if err := plan.addProviderPreset(preset, providers); err != nil {
+			return fail(err)
+		}
 		return plan, nil
 	}
 	verify := []string{"node", nysapure.RecipeFlag, testPath}
+	if profile == PythonPytestV1Profile {
+		verify, err = pythonprepare.RecipeArgv(testPath)
+		if err != nil {
+			return fail(err)
+		}
+	}
 	plan.Commands = Commands{Verify: Command{Argv: append([]string(nil), verify...)}, Review: Command{Argv: append([]string(nil), verify...)}}
 	if exists {
 		var document projectDocument
@@ -295,6 +347,9 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 		}
 		if document.Commands == nil || !sameStrings(document.Commands.Verify, verify) || !sameStrings(document.Commands.Review, verify) {
 			return fail(fmt.Errorf("existing .sf/config.toml has different commands; edit or remove it before selecting profile %s", profile))
+		}
+		if err := plan.addProviderPreset(preset, providers); err != nil {
+			return fail(err)
 		}
 		return plan, nil
 	}
@@ -307,6 +362,9 @@ func prepareNysaPureConfigWithIdentityContext(ctx context.Context, repository st
 		return fail(fmt.Errorf("encode profile configuration: %w", err))
 	}
 	plan.Encoded = encoded
+	if err := plan.addProviderPreset(preset, providers); err != nil {
+		return fail(err)
+	}
 	return plan, nil
 }
 
@@ -506,6 +564,9 @@ func (plan *NysaPureConfigPlan) LoadLockedProject(name string, machine MachineLi
 	if err != nil {
 		return Effective{}, nil, "", err
 	}
+	if !exists && !plan.Existing && plan.installed == nil && len(plan.Encoded) > 0 {
+		data, exists = plan.Encoded, true
+	}
 	return loadProjectData(plan.Repository, name, machine, commandsOverride, data, exists)
 }
 
@@ -606,8 +667,8 @@ func loadProjectData(repository, name string, machine MachineLimits, commandsOve
 
 // detectRepositoryCommands selects only a small, typed walking-skeleton
 // default. It intentionally refuses to guess for repositories whose build
-// contract is not obvious; an explicit .sf/config.toml can opt into another
-// argv-only command without adding shell interpretation.
+// contract is not obvious. Explicit argv configuration remains subject to
+// the independent repository execution policy and runtime admission.
 func detectRepositoryCommands(repository string) (Commands, error) {
 	goMod, err := regularRepositoryFile(filepath.Join(repository, "go.mod"), "go.mod")
 	if err != nil {
@@ -619,6 +680,29 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 	}
 	if goMod && packageJSON {
 		return Commands{}, detectionError("repository contains both go.mod and package.json; add explicit commands to .sf/config.toml")
+	}
+	// Inspect every known stack before choosing a default. Rails commonly
+	// includes package.json; that alone does not make its verification Node.
+	otherStack := ""
+	for _, marker := range []struct{ path, stack string }{
+		{"Gemfile", "Ruby/Rails"}, {"pyproject.toml", "Python"}, {"requirements.txt", "Python"}, {"setup.py", "Python"},
+	} {
+		present, err := regularRepositoryFile(filepath.Join(repository, marker.path), marker.path)
+		if err != nil {
+			return Commands{}, err
+		}
+		if present && otherStack == "" {
+			otherStack = marker.stack
+		}
+	}
+	if otherStack != "" {
+		if goMod || packageJSON {
+			return Commands{}, detectionError("repository contains multiple stack markers; choose an explicit supported profile or verification/review commands in .sf/config.toml. Ruby/Rails execution remains unsupported")
+		}
+		if otherStack == "Python" {
+			return Commands{}, detectionError("Python requires the prepared python-pytest-v1 profile: run runtimes prepare python, then init --profile python-pytest-v1 --test tests (or select a .py test file). Only standard-library, local modules and bundled pytest are supported; dependencies are not installed")
+		}
+		return Commands{}, detectionError(otherStack + " local execution is not supported yet; an explicit command does not enable it. Use a supported Go or dependency-free Node project for this beta")
 	}
 	if goMod {
 		if _, err := goclosure.Validate(repository); err != nil {
@@ -637,7 +721,7 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 		command := Command{Argv: []string{"node", "--test"}}
 		return Commands{Verify: command, Review: command}, nil
 	}
-	return Commands{}, detectionError("repository type is unsupported; add explicit commands to .sf/config.toml")
+	return Commands{}, detectionError("repository type has no supported detected local recipe; use a supported Go or dependency-free Node project, or consult the explicit bounded TypeScript profile in docs/configuration.md")
 }
 
 func regularRepositoryFile(path, name string) (bool, error) {

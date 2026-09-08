@@ -38,6 +38,47 @@ func TestFakeGHBareSourceWitnessSupportsPackedRefs(t *testing.T) {
 	}
 }
 
+func TestFakeGHExplicitPRRefSyncReadsBareWithoutMutatingApproval(t *testing.T) {
+	base, head := strings.Repeat("1", 40), strings.Repeat("2", 40)
+	bare := fakeBareRepository(t, base)
+	if err := os.WriteFile(filepath.Join(bare, "refs", "heads", "feature"), []byte(head+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity := fakePRIdentity()
+	identity.Number, identity.HeadRef = 1, "feature"
+	identity.HeadOID, identity.BaseOID = strings.Repeat("a", 40), strings.Repeat("b", 40)
+	remote, err := NewFakeGH(filepath.Join(t.TempDir(), "remote.json"), identity.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.UseBareRepositoryForTest(bare); err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.InjectPullRequestForTest(PullRequest{Identity: identity, Title: "retained", Body: "marker", Draft: true}); err != nil {
+		t.Fatal(err)
+	}
+	if remote.Snapshot().PRs[0].Identity != identity {
+		t.Fatal("bare setup silently changed recorded PR")
+	}
+	observed, err := remote.SyncPullRequestRefsFromBareForTest(1)
+	if err != nil || observed.HeadOID != head || observed.BaseOID != base {
+		t.Fatalf("explicit source/base refresh failed: %v", err)
+	}
+	pr := remote.Snapshot().PRs[0]
+	if pr.Ready || pr.Merged || !pr.Draft || pr.Title != "retained" || pr.Body != "marker" || remote.MutationCount("pr_edit") != 0 {
+		t.Fatal("ref sync changed PR metadata or mutation history")
+	}
+	if _, err := remote.SyncPullRequestRefsFromBareForTest(99); err == nil {
+		t.Fatal("missing PR accepted")
+	}
+	if err := remote.withState(func() (bool, error) { remote.state.PRs[0].Merged = true; return true, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := remote.SyncPullRequestRefsFromBareForTest(1); err == nil {
+		t.Fatal("merged PR history rewritten")
+	}
+}
+
 func TestFakeGHRealAllASourceOIDIsNotAReadThroughSentinel(t *testing.T) {
 	bare := fakeBareRepository(t, strings.Repeat("1", 40))
 	if err := os.MkdirAll(filepath.Join(bare, "refs", "heads", "sf"), 0o700); err != nil {

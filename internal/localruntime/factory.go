@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nysa-company/sf/internal/baserefresh"
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
 	"github.com/nysa-company/sf/internal/daemon/runtimecontrol"
 	"github.com/nysa-company/sf/internal/domain"
@@ -35,11 +37,12 @@ const defaultWorkers = 2
 // Config contains only process-local composition choices. Ticket limits,
 // commands, providers, and merge policy remain frozen Store configuration.
 type Config struct {
-	Channel     domain.Channel
-	GitHome     string
-	OwnerHome   string
-	GHConfigDir string
-	GHBinary    string
+	Channel         domain.Channel
+	GitHome         string
+	PythonSnapshots string
+	OwnerHome       string
+	GHConfigDir     string
+	GHBinary        string
 	// GHAuthenticated is a sanitized result of the explicit, read-only
 	// `gh auth status` preflight performed by cmd/sf. It is never a credential.
 	GHAuthenticated bool
@@ -122,11 +125,15 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 			gitRunner.CredentialHelper = publicationAssets.CredentialHelper
 			gitRunner.GHConfigDir = configuration.GHConfigDir
 		}
+		if err := coordinator.ConfigureRejectionCheckpoint(worktreecoord.Coordinator{Store: dependencies.Store, Git: gitRunner}); err != nil {
+			return daemon.WorkflowRuntimeComponents{}, errors.New("provider checkpoint inspection could not be configured")
+		}
 		repositorySupervisor := processsupervisor.RepositoryCommandSupervisor{
-			Executable: core.Executable,
-			GitRunner:  gitRunner,
-			SoftDrain:  2 * time.Second,
-			HardDrain:  2 * time.Second,
+			PythonSnapshots: configuration.PythonSnapshots,
+			Executable:      core.Executable,
+			GitRunner:       gitRunner,
+			SoftDrain:       2 * time.Second,
+			HardDrain:       2 * time.Second,
 		}
 		materializer := workflowruntime.RepositoryMaterializer{
 			Store: dependencies.Store,
@@ -172,7 +179,7 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 			if clientErr != nil {
 				return daemon.WorkflowRuntimeComponents{}, fmt.Errorf("compose GitHub client: %w", errors.Join(clientErr, gh.Close()))
 			}
-			runtimeWorker = Worker{Store: dependencies.Store, Engine: dependencies.Engine, Workflow: worker, Publication: publication.Worker{Store: dependencies.Store, Git: gitRunner, GitHub: githubClient}, CI: CIWorker{Store: dependencies.Store, Observer: githubClient}, PublicationEnabled: true}
+			runtimeWorker = Worker{Store: dependencies.Store, Engine: dependencies.Engine, Workflow: worker, Publication: publication.Worker{Store: dependencies.Store, Git: gitRunner, GitHub: githubClient}, CI: CIWorker{Store: dependencies.Store, Observer: githubClient}, PublicationEnabled: true, BaseRefreshEnabled: true, BaseRefresh: baserefresh.Coordinator{Store: dependencies.Store, Git: gitRunner}}
 			mergeObserver = publishedMergeObserver{Store: dependencies.Store, GitHub: githubClient}
 		}
 		scheduler := workflowruntime.NewScheduler(
@@ -212,6 +219,13 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 type managedRuntime struct {
 	runtime *workflowruntime.Runtime
 	gh      *ghrunner.Runner
+}
+
+func (r *managedRuntime) RuntimeDiagnostics() []contracts.RuntimeDiagnostic {
+	if r == nil {
+		return nil
+	}
+	return r.runtime.RuntimeDiagnostics()
 }
 
 func (r *managedRuntime) Start(ctx context.Context, fence domain.Fence) error {

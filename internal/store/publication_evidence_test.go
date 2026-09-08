@@ -30,6 +30,52 @@ func TestPublicationEvidenceSchemaAndNarrowAbsence(t *testing.T) {
 	}
 }
 
+func TestTransitionPublishedBlockRetainsNarrowLegacyAbsencePath(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		withEffect bool
+	}{
+		{name: "no external authority"},
+		{name: "unreconciled publication effect", withEffect: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, ctx := openTestStore(t)
+			ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "nysa", Ticket: domain.TicketID("SF-prepublishing-" + strings.ReplaceAll(tc.name, " ", "-"))}
+			if err := db.CreateTicket(ctx, Ticket{Ref: ref, State: domain.StatePublishing, SourceDigest: strings.Repeat("a", 64), Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			leader, err := db.AcquireLeader(ctx, ref.Channel, "prepublishing-block")
+			if err != nil {
+				t.Fatal(err)
+			}
+			fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1}
+			if tc.withEffect {
+				if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: "effect", Ref: ref, Kind: PublicationPushEffectKind, TicketVersion: 1, Fence: fence, RequestDigest: evidenceDigest("prepublishing-block")}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := db.TransitionPublishedBlock(ctx, Transition{
+				Ref: ref, ExpectedVersion: 1, From: domain.StatePublishing, To: domain.StateBlocked,
+				ResumeState: domain.StatePublishing, Trigger: "typed_blocker", Fence: fence,
+				EventPayload: `{"code":"publication_runtime_unavailable"}`,
+			})
+			current, ticketErr := db.Ticket(ctx, ref)
+			if ticketErr != nil {
+				t.Fatal(ticketErr)
+			}
+			if tc.withEffect {
+				if !errors.Is(err, ErrPublicationBlockUnsafe) || result != (TransitionResult{}) || current.State != domain.StatePublishing || current.Version != 1 {
+					t.Fatalf("unsafe legacy block result=%+v ticket=%+v err=%v", result, current, err)
+				}
+				return
+			}
+			if err != nil || result.Version != 2 || current.State != domain.StateBlocked || current.ResumeState != domain.StatePublishing || current.BlockedCode != "publication_runtime_unavailable" {
+				t.Fatalf("narrow legacy block result=%+v ticket=%+v err=%v", result, current, err)
+			}
+		})
+	}
+}
+
 func TestPublicationObservationIdentitiesAreExactAndDistinct(t *testing.T) {
 	pr := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: "github.com", Owner: "o", Name: "r"}, Number: 1, HeadOwner: "o", HeadRepository: "r", HeadRef: "sf/dev/branch", HeadOID: strings.Repeat("a", 40), BaseRef: "main", BaseOID: strings.Repeat("b", 40), FactoryOwned: true}
 	push := CanonicalPublicationPushObservation(pr.HeadRef, pr.HeadOID)
@@ -259,18 +305,18 @@ func recordFixturePublication(t *testing.T, db *Store, ctx context.Context, tick
 	value.PRCreateOrUpdateEffect = PublicationEffectEvidence{SemanticKey: "fixture-pr-" + string(ticket.Ref.Ticket), Kind: PublicationPRCreateEffectKind, RequestDigest: "sha256:" + strings.Repeat("2", 64), ClaimEpoch: 1, ObservedIdentity: CanonicalPublicationPRObservation(pr, "OPEN", true)}
 	for _, effect := range []PublicationEffectEvidence{value.PushEffect, value.PRCreateOrUpdateEffect} {
 		if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: effect.SemanticKey, Ref: ticket.Ref, Kind: effect.Kind, TicketVersion: ticket.Version, Fence: fence, RequestDigest: effect.RequestDigest}); err != nil {
-			t.Fatal(err)
+			t.Fatalf("plan publication effect %s: %v", effect.Kind, err)
 		}
 		claim, err := db.ClaimEffect(ctx, EffectFence{SemanticKey: effect.SemanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: fence})
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("claim publication effect %s: %v", effect.Kind, err)
 		}
 		if _, err := db.ConfirmEffect(ctx, EffectFence{SemanticKey: effect.SemanticKey, Ref: ticket.Ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.Effect.LeaderEpoch, RunnerEpoch: claim.Effect.RunnerEpoch, ClaimEpoch: claim.Effect.ClaimEpoch}}, effect.ObservedIdentity); err != nil {
-			t.Fatal(err)
+			t.Fatalf("confirm publication effect %s: %v", effect.Kind, err)
 		}
 	}
 	if err := db.RecordPublishedCandidate(ctx, value); err != nil {
-		t.Fatal(err)
+		t.Fatalf("record publication evidence: %v", err)
 	}
 }
 
@@ -421,6 +467,12 @@ func TestBlockedPublishingRecoverRequiresTypedBlockerAndRebindsPublication(t *te
 	loaded, err := db.LoadPublishedCandidate(ctx, ticket.Ref)
 	if err != nil || loaded.CurrentTicketVersion != ticket.Version {
 		t.Fatalf("recovered publication=%+v err=%v", loaded, err)
+	}
+}
+
+func TestBlockedResumePayloadRejectsVerificationAmendmentInvalid(t *testing.T) {
+	if _, err := blockedResumeEventPayload(verificationAmendmentInvalidBlockerCode); !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("amendment-invalid publication resume payload=%v, want publication evidence", err)
 	}
 }
 
@@ -684,6 +736,13 @@ func TestBuilderPublishingRecoveryRebindsOnlyTheLatestCandidate(t *testing.T) {
 	current, err := db.LatestCandidate(ctx, ticket.Ref)
 	if err != nil || current.Snapshot.Generation != candidate.Snapshot.Generation || current.BuilderResult != candidate.BuilderResult || current.TicketVersion != live.Version || current.Fence != fence {
 		t.Fatalf("current candidate=%+v err=%v", current, err)
+	}
+	recordFixturePublication(t, db, ctx, live, fence)
+	if _, err := db.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
+		t.Fatalf("publication from recovered candidate binding=%v", err)
+	}
+	if _, err := db.TransitionPublishedCandidate(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: live.Version, From: domain.StatePublishing, To: domain.StateWaitingCI, Trigger: "effects_confirmed", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatalf("transition from recovered candidate binding=%v", err)
 	}
 
 	t.Run("wrong builder role is not bridged", func(t *testing.T) {
@@ -1296,8 +1355,9 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		}
 		mutant.Close()
 	}
-	// A prior generation's state transition is historical context, not the
-	// transition that consumed this witness. It must not poison current replay.
+	// A second state-changing event at the candidate's building->publishing
+	// version contradicts the unique Store transition that sealed publication.
+	// Replay must fail closed rather than choose one row by trigger alone.
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -1314,9 +1374,9 @@ func TestPublicationEvidenceLifecycleReplayRecoveryAndBackup(t *testing.T) {
 		historical.Close()
 		t.Fatal(err)
 	}
-	if _, err := historical.LoadPublishedCandidate(ctx, ticket.Ref); err != nil {
+	if _, err := historical.LoadPublishedCandidate(ctx, ticket.Ref); !errors.Is(err, ErrPublicationEvidence) {
 		historical.Close()
-		t.Fatalf("historical extra transition poisoned current replay: %v", err)
+		t.Fatalf("duplicate state transition was accepted: %v", err)
 	}
 	historical.Close()
 	// Tamper tests use independent backups so the good lifecycle fixture remains

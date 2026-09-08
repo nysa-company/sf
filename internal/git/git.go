@@ -3,6 +3,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -30,8 +31,17 @@ import (
 var (
 	ErrIdentityMismatch = errors.New("git repository identity mismatch")
 	ErrUnsafeWorktree   = errors.New("git worktree is unsafe")
+	// ErrWorktreeDirty is a read-only classification: the registered checkout
+	// still proved its filesystem identity, but its visible status is not an
+	// exact pristine retry input. Callers must retain it rather than create or
+	// replace a worktree.
+	ErrWorktreeDirty    = errors.New("git worktree is not pristine")
 	ErrUnexpectedRemote = errors.New("remote branch head is unexpected")
 	ErrPushBeforeStart  = errors.New("git candidate push failed before mutation handoff")
+	// ErrCreateBeforeStart proves this CreateWorktree invocation did not acquire
+	// its mutation lease or launch a mutating command. It never describes an
+	// ambiguous prior invocation, an existing path, or a failed lease release.
+	ErrCreateBeforeStart = errors.New("git worktree creation refused before mutation handoff")
 	// ErrPushUncertain means the candidate-ref push crossed the command handoff
 	// but the authenticated candidate and protected-base witnesses did not both
 	// converge. The caller must durably reconcile, never blindly replay it.
@@ -46,6 +56,10 @@ var (
 	// The accepted path is one packaged helper configured from code-owned argv;
 	// no ticket, provider, repository config, or caller text may choose it.
 	ErrHTTPSCredentialBoundary = errors.New("HTTPS git publication requires the packaged credential boundary")
+	// ErrPublicationRemoteUnavailable identifies the intentional absence of
+	// every HTTPS publication capability input in a pre-publishing runtime.
+	// It never covers a partial or malformed publication configuration.
+	ErrPublicationRemoteUnavailable = errors.New("GitHub publication remote capability is disabled")
 	// ErrGitHubRefCASUnavailable is returned before any gh command starts. The
 	// GitHub Git Data ref APIs expose create and force/fast-forward update, but
 	// no expected-old-SHA precondition. A read followed by either mutation would
@@ -54,6 +68,12 @@ var (
 )
 
 const maxGitOutput = 1 << 20
+
+const (
+	gitCommitContentionInitialBackoff = 100 * time.Millisecond
+	gitCommitContentionMaxBackoff     = 500 * time.Millisecond
+	gitCommitContentionMaxWait        = 2 * time.Minute
+)
 
 // BranchAuthority is implemented by the daemon's SQLite-backed store. Git
 // never creates a second persistence authority for ticket branch identity;
@@ -392,6 +412,15 @@ func (r Runner) commandEnvExpected(ctx context.Context, directory string, expect
 }
 
 func (r Runner) commandEnvExpectedWithHandoff(ctx context.Context, directory string, expectedDev, expectedIno uint64, extra []string, handedOff *bool, args ...string) ([]byte, error) {
+	return r.commandEnvInputExpectedWithHandoff(ctx, directory, expectedDev, expectedIno, extra, nil, handedOff, args...)
+}
+
+// Only fixed code-owned ref transactions use stdin. Bound the already-built
+// bytes before opening a process; never accept a potentially blocking Reader.
+func (r Runner) commandEnvInputExpectedWithHandoff(ctx context.Context, directory string, expectedDev, expectedIno uint64, extra []string, input []byte, handedOff *bool, args ...string) ([]byte, error) {
+	if len(input) > 4096 || (len(input) > 0 && r.Run != nil) {
+		return nil, ErrIdentityMismatch
+	}
 	if directory == "" {
 		return nil, fmt.Errorf("git directory is required")
 	}
@@ -447,7 +476,7 @@ func (r Runner) commandEnvExpectedWithHandoff(ctx context.Context, directory str
 	if handedOff != nil {
 		*handedOff = true
 	}
-	output, err := runBounded(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file, caps.gitDir.file, caps.commonDir.file})
+	output, err := runBoundedInput(ctx, r.execHelper(), r.binary(), argv, env, []*os.File{pinned.file, caps.gitDir.file, caps.commonDir.file}, input)
 	if verifyErr := pinned.verify(); verifyErr != nil {
 		return output, verifyErr
 	}
@@ -518,9 +547,40 @@ func (r Runner) acquireMutation(ctx context.Context, claim contracts.GitMutation
 	if !validMutationClaim(claim) || claim.Repository != repository || claim.Worktree != worktree || claim.Branch != branch || claim.Operation != operation || claim.BaseRef != baseRef || claim.ExpectedBaseOID != baseOID || claim.ExpectedHeadOID != headOID {
 		return nil, fmt.Errorf("%w: caller mutation claim does not bind %s", ErrIdentityMismatch, operation)
 	}
-	lease, err := r.MutationAuthority.AcquireGitMutation(ctx, claim)
+	acquireCtx := ctx
+	var cancel context.CancelFunc
+	waitForContention := operation == "commit" || operation == "protected-ref-fetch"
+	if waitForContention {
+		acquireCtx, cancel = context.WithTimeout(ctx, gitCommitContentionMaxWait)
+		defer cancel()
+	}
+	backoff := gitCommitContentionInitialBackoff
+	var lease contracts.GitMutationLease
+	var err error
+	for {
+		lease, err = r.MutationAuthority.AcquireGitMutation(acquireCtx, claim)
+		if !waitForContention || lease != nil || !errors.Is(err, contracts.ErrGitMutationContended) {
+			break
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-acquireCtx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("%w: mutation authority refused %s: %w", ErrIdentityMismatch, operation, errors.Join(err, acquireCtx.Err()))
+		case <-timer.C:
+		}
+		if ctxErr := acquireCtx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("%w: mutation authority refused %s: %w", ErrIdentityMismatch, operation, errors.Join(err, ctxErr))
+		}
+		if backoff < gitCommitContentionMaxBackoff {
+			backoff *= 2
+			if backoff > gitCommitContentionMaxBackoff {
+				backoff = gitCommitContentionMaxBackoff
+			}
+		}
+	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: mutation authority refused %s: %v", ErrIdentityMismatch, operation, err)
+		return nil, fmt.Errorf("%w: mutation authority refused %s: %w", ErrIdentityMismatch, operation, err)
 	}
 	if lease == nil {
 		return nil, fmt.Errorf("%w: mutation authority returned no lease", ErrIdentityMismatch)
@@ -622,7 +682,13 @@ func (r Runner) environment(extra []string) ([]string, error) {
 	if err := os.MkdirAll(r.Home, 0o700); err != nil {
 		return nil, err
 	}
-	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
+	// Apple Git consults DARWIN_USER_TEMP_DIR during startup. With a stripped
+	// child environment, confstr can emit a warning to stderr; runBounded
+	// intentionally combines stdout and stderr, so that warning would corrupt
+	// machine-readable Git output (for example rev-parse --show-toplevel).
+	// Keep the temp root private and deterministic rather than inheriting the
+	// caller's potentially shared TMPDIR.
+	env := []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "HOME=" + r.Home, "TMPDIR=" + r.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}
 	seen := map[string]bool{}
 	for _, entry := range extra {
 		key, value, found := strings.Cut(entry, "=")
@@ -892,6 +958,13 @@ func openGitCapabilities(directory string) (*gitCapabilities, error) {
 }
 
 func runBounded(ctx context.Context, helper, binary string, argv, env []string, directories []*os.File) ([]byte, error) {
+	return runBoundedInput(ctx, helper, binary, argv, env, directories, nil)
+}
+
+func runBoundedInput(ctx context.Context, helper, binary string, argv, env []string, directories []*os.File, input []byte) ([]byte, error) {
+	if len(input) > 4096 {
+		return nil, ErrIdentityMismatch
+	}
 	if len(directories) != 3 || directories[0] == nil || directories[1] == nil || directories[2] == nil {
 		return nil, fmt.Errorf("pinned command directory is required")
 	}
@@ -935,6 +1008,9 @@ func runBounded(ctx context.Context, helper, binary string, argv, env []string, 
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.WaitDelay = 750 * time.Millisecond
 	command.Env = env
+	if len(input) > 0 {
+		command.Stdin = bytes.NewReader(input)
+	}
 	runDone := make(chan struct{})
 	defer close(runDone)
 	killGroup := func(signal syscall.Signal) {
@@ -1270,11 +1346,11 @@ func (r Runner) snapshotExpected(ctx context.Context, expectedRepository, worktr
 	if err != nil {
 		return Identity{}, err
 	}
-	baseHead, err := r.one(ctx, worktree, "rev-parse", "--verify", baseRef+"^{commit}")
+	headRef, err := r.one(ctx, worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if err != nil {
 		return Identity{}, err
 	}
-	headRef, err := r.one(ctx, worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
+	baseHead, err := r.worktreeBaseHead(ctx, worktree, headRef, baseRef)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -1660,9 +1736,8 @@ func (r Runner) PreflightRepository(ctx context.Context, repository, baseRef str
 
 // ObserveRepositoryBase proves the primary-checkout identity and returns the
 // exact protected-base object that a caller may bind into a durable mutation
-// claim. It intentionally remains read-only: creation re-observes the same
-// object immediately before it acquires the claim, so a moving base fails
-// closed instead of being silently retried.
+// claim. It intentionally remains read-only: creation re-observes and fetches
+// the same object under its durable lease, so a moving base fails closed.
 func (r Runner) ObserveRepositoryBase(ctx context.Context, repository, baseRef string) (string, string, error) {
 	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
 		return "", "", err
@@ -1671,11 +1746,76 @@ func (r Runner) ObserveRepositoryBase(ctx context.Context, repository, baseRef s
 	if err != nil {
 		return "", "", err
 	}
-	base, err := r.one(ctx, canonical, "rev-parse", "--verify", baseRef+"^{commit}")
+	base, _, _, err := r.creationBase(ctx, canonical, baseRef)
 	if err != nil || !validOID(base) {
 		return "", "", fmt.Errorf("%w: invalid repository base", ErrIdentityMismatch)
 	}
 	return canonical, base, nil
+}
+
+// creationBase observes the hosted branch when the explicit transport is
+// available. The credential-free pre-publication mode retains its local-only
+// contract; malformed/partial transport or a failed remote read never falls
+// back to a stale local branch.
+func (r Runner) creationBase(ctx context.Context, repository, baseRef string) (string, string, []string, error) {
+	origin, err := r.one(ctx, repository, "remote", "get-url", "origin")
+	if err != nil {
+		return "", "", nil, err
+	}
+	extra, _, err := r.githubTransportEnvironment(origin)
+	if errors.Is(err, ErrPublicationRemoteUnavailable) {
+		base, localErr := r.one(ctx, repository, "rev-parse", "--verify", baseRef+"^{commit}")
+		return base, "", nil, localErr
+	}
+	if err != nil {
+		return "", "", nil, err
+	}
+	dev, ino, err := directoryIdentity(repository)
+	if err != nil {
+		return "", "", nil, err
+	}
+	base, err := r.remoteHeadEnv(ctx, repository, dev, ino, origin, baseRef, extra)
+	if err != nil || !validOID(base) {
+		return "", "", nil, fmt.Errorf("%w: protected creation base is unavailable", ErrUnexpectedRemote)
+	}
+	return base, origin, extra, nil
+}
+
+func worktreeBaseRef(branch string) string {
+	sum := sha256.Sum256([]byte(branch))
+	return fmt.Sprintf("refs/sf/worktree-base/%x", sum)
+}
+
+func (r Runner) pinnedWorktreeBase(ctx context.Context, directory, branch string) (string, error) {
+	ref := worktreeBaseRef(branch)
+	output, err := r.command(ctx, directory, "for-each-ref", "--format=%(refname) %(objectname)", ref)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) == 0 {
+		return "", nil
+	}
+	if len(fields) != 2 || fields[0] != ref || !validOID(fields[1]) {
+		return "", ErrIdentityMismatch
+	}
+	return fields[1], nil
+}
+
+// Each new hosted worktree has its own pinned base. Updating a remote tracking
+// ref for another ticket must not change this ticket's authenticated identity.
+// Old/offline worktrees retain the original named-local-base interpretation.
+func (r Runner) worktreeBaseHead(ctx context.Context, worktree, branch, baseRef string) (string, error) {
+	if strings.HasPrefix(branch, "sf/") {
+		pinned, err := r.pinnedWorktreeBase(ctx, worktree, branch)
+		if err != nil {
+			return "", err
+		}
+		if pinned != "" {
+			return pinned, nil
+		}
+	}
+	return r.one(ctx, worktree, "rev-parse", "--verify", baseRef+"^{commit}")
 }
 
 func canonicalExistingRepository(path string) (string, error) {
@@ -1738,13 +1878,16 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	if dev, ino, identityErr := directoryIdentity(repository); identityErr != nil || dev != repositoryDev || ino != repositoryIno {
 		return Worktree{}, fmt.Errorf("%w: primary repository changed before worktree creation", ErrIdentityMismatch)
 	}
-	baseHead, err := r.one(ctx, repository, "rev-parse", "--verify", baseRef+"^{commit}")
+	baseHead, origin, transportEnv, err := r.creationBase(ctx, repository, baseRef)
 	if err != nil || !validOID(baseHead) {
 		return Worktree{}, fmt.Errorf("%w: invalid creation base", ErrIdentityMismatch)
 	}
 	lease, err := r.acquireSuppliedMutation(ctx, claim, contracts.GitMutationClaim{Repository: repository, Worktree: path, Branch: branch, Operation: "create-worktree", BaseRef: baseRef, ExpectedBaseOID: baseHead, ExpectedHeadOID: baseHead})
 	if err != nil {
-		return Worktree{}, err
+		if errors.Is(err, ErrMutationLeaseRelease) {
+			return Worktree{}, err
+		}
+		return Worktree{}, errors.Join(ErrCreateBeforeStart, err)
 	}
 	defer func() {
 		returnedErr = mergeMutationLeaseRelease(returnedErr, lease)
@@ -1762,7 +1905,28 @@ func (r Runner) CreateWorktree(ctx context.Context, repository, path, branch, ba
 	if err := requireMutationLease(ctx, lease); err != nil {
 		return Worktree{}, err
 	}
-	if _, err := r.commandExpected(ctx, repository, repositoryDev, repositoryIno, "worktree", "add", "-b", branch, path, "--", baseRef); err != nil {
+	if origin != "" {
+		// Fetch only the exact protected branch into this ticket's namespace,
+		// under the same durable repository lease as worktree creation. Never
+		// update the operator's main branch, index, or checkout.
+		ref := worktreeBaseRef(branch)
+		existing, err := r.pinnedWorktreeBase(ctx, repository, branch)
+		if err != nil || (existing != "" && existing != baseHead) {
+			return Worktree{}, ErrIdentityMismatch
+		}
+		if _, err := r.commandEnvExpected(ctx, repository, repositoryDev, repositoryIno, transportEnv, "fetch", "--no-write-fetch-head", "--no-tags", origin, "refs/heads/"+baseRef+":"+ref); err != nil {
+			return Worktree{}, err
+		}
+		fetched, err := r.oneExpected(ctx, repository, repositoryDev, repositoryIno, "rev-parse", "--verify", ref+"^{commit}")
+		if err != nil || fetched != baseHead {
+			return Worktree{}, ErrUnexpectedRemote
+		}
+		current, err := r.remoteHeadEnv(ctx, repository, repositoryDev, repositoryIno, origin, baseRef, transportEnv)
+		if err != nil || current != baseHead {
+			return Worktree{}, ErrUnexpectedRemote
+		}
+	}
+	if _, err := r.commandExpected(ctx, repository, repositoryDev, repositoryIno, "worktree", "add", "-b", branch, path, "--", baseHead); err != nil {
 		return Worktree{}, err
 	}
 	createdPath, err := openPinnedDirectory(path)
@@ -2009,6 +2173,39 @@ func (r Runner) CleanWorktreeHead(ctx context.Context, worktree Worktree) (strin
 	return head, nil
 }
 
+// StrictCleanWorktreeHead is the retry-admission variant of
+// CleanWorktreeHead. In addition to staged, unstaged, and untracked files it
+// fails closed on ignored files, because provider output can be hidden by a
+// repository ignore rule. It performs no mutation and preserves identity,
+// command, and context errors so callers do not misclassify them as ordinary
+// retry unready state.
+func (r Runner) StrictCleanWorktreeHead(ctx context.Context, worktree Worktree) (string, error) {
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	status, err := r.commandExpected(ctx, worktree.Path, worktree.Identity.WorktreeDev, worktree.Identity.WorktreeIno, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(string(status)) != "" {
+		return "", fmt.Errorf("%w: staged, unstaged, untracked, or ignored paths are present", ErrWorktreeDirty)
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	head, err := r.one(ctx, worktree.Path, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return "", err
+	}
+	if !validOID(head) {
+		return "", fmt.Errorf("%w: worktree head is invalid", ErrIdentityMismatch)
+	}
+	if err := r.InspectWorktree(ctx, worktree); err != nil {
+		return "", err
+	}
+	return head, nil
+}
+
 // WorktreeChanges is a bounded, read-only observation of uncommitted paths.
 // It is suitable for an operator handback classification only after the
 // worktree's registered identity has been reauthenticated. It is not a diff
@@ -2166,6 +2363,17 @@ type DiffPolicy struct {
 func (r Runner) ValidateDiff(ctx context.Context, worktree, baseRef string, policy DiffPolicy) error {
 	if !validAbsolutePath(worktree) || !validRef(baseRef) || len(policy.AllowedPaths) == 0 {
 		return fmt.Errorf("allowed paths are required")
+	}
+	if !validOID(baseRef) {
+		branch, err := r.one(ctx, worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
+		if err != nil {
+			return err
+		}
+		base, err := r.worktreeBaseHead(ctx, worktree, branch, baseRef)
+		if err != nil {
+			return err
+		}
+		baseRef = base
 	}
 	if _, err := canonicalExistingWorktree(worktree); err != nil {
 		return err
@@ -2499,7 +2707,7 @@ func (r Runner) Commit(ctx context.Context, worktree Worktree, request CommitReq
 	}
 	treePolicy := request.Policy
 	treePolicy.ExpectedHead = request.ExpectedParent
-	if err := r.validateImmutableTree(ctx, worktree.Path, request.BaseRef, tree, treePolicy); err != nil {
+	if err := r.validateImmutableTree(ctx, worktree.Path, worktree.Identity.BaseHead, tree, treePolicy); err != nil {
 		return "", err
 	}
 	// The tree is immutable, but the control plane and parent are not. Prove
@@ -2673,7 +2881,7 @@ func (r Runner) PushWithRequest(ctx context.Context, worktree Worktree, request 
 		if err != nil {
 			return "", beforeStart(err)
 		}
-		return "", beforeStart(fmt.Errorf("%w: remote base moved", ErrUnexpectedRemote))
+		return "", beforeStart(protectedBaseChange(worktree.Identity.BaseHead, remoteBase))
 	}
 	// Use the strict observer for the candidate ref. Unlike the generic remote
 	// helper, it rejects whitespace/duplicate ls-remote output and rechecks the
@@ -2741,6 +2949,9 @@ func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error
 		canonical, canonicalErr := safeOrigin(origin)
 		if canonicalErr != nil || canonical != origin {
 			return nil, false, fmt.Errorf("%w: canonical GitHub HTTPS transport is required", ErrIdentityMismatch)
+		}
+		if r.CredentialHelper == "" && r.GHBinary == "" && r.GHBinaryDigest == "" && r.GHConfigDir == "" {
+			return nil, false, ErrPublicationRemoteUnavailable
 		}
 		for _, item := range []struct{ path, name string }{{r.CredentialHelper, "credential helper"}, {r.GHBinary, "gh snapshot"}, {r.GHConfigDir, "gh config directory"}} {
 			if !validAbsolutePath(item.path) {
@@ -2858,7 +3069,7 @@ func (r Runner) PublishGitHub(ctx context.Context, request GitHubPublicationRequ
 	}
 	policy := request.Policy
 	policy.ExpectedHead = request.ExpectedHead
-	if err := r.validateImmutableTree(ctx, request.Worktree.Path, request.Worktree.Identity.BaseRef, tree, policy); err != nil {
+	if err := r.validateImmutableTree(ctx, request.Worktree.Path, request.Worktree.Identity.BaseHead, tree, policy); err != nil {
 		return "", err
 	}
 	if err := authority.ValidateGitHubPublication(ctx, request.Claim); err != nil {
@@ -2911,6 +3122,22 @@ func (r Runner) remoteHeadEnv(ctx context.Context, directory string, expectedDev
 // caller's durable lease; no FETCH_HEAD is written and the retained proof ref
 // is collision-safe (derived from the full durable witness).
 func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.ProtectedBranchWitness) (returnedErr error) {
+	return r.verifyProtectedBranch(ctx, witness, false)
+}
+
+// VerifyExactProtectedBase uses the same fenced, private-ref fetch as merge
+// proof, but proves an exact tip rather than mere containment. A refresh must
+// not accept B1 just because the protected ref has already advanced to B2.
+// The caller must supply a distinct Store-issued proof intent and still
+// reobserve the tip under the eventual refresh mutation lease.
+func (r Runner) VerifyExactProtectedBase(ctx context.Context, witness contracts.ProtectedBranchWitness) error {
+	if witness.OriginalBaseOID == witness.MergeOID {
+		return fmt.Errorf("%w: refreshed base must differ from original base", ErrUnexpectedRemote)
+	}
+	return r.verifyProtectedBranch(ctx, witness, true)
+}
+
+func (r Runner) verifyProtectedBranch(ctx context.Context, witness contracts.ProtectedBranchWitness, exactTip bool) (returnedErr error) {
 	if !validAbsolutePath(witness.Repository) || !validAbsolutePath(witness.Worktree) || !validRef(witness.ProtectedRef) || !validOID(witness.OriginalBaseOID) || !validOID(witness.MergeOID) {
 		return fmt.Errorf("%w: invalid protected-branch witness", ErrIdentityMismatch)
 	}
@@ -2938,6 +3165,9 @@ func (r Runner) VerifyProtectedBranch(ctx context.Context, witness contracts.Pro
 			return err
 		}
 		return fmt.Errorf("%w: protected ref is absent", ErrUnexpectedRemote)
+	}
+	if exactTip && remote != witness.MergeOID {
+		return fmt.Errorf("%w: protected base changed before refresh proof", ErrUnexpectedRemote)
 	}
 	ticket := witness.MutationClaim.TicketRef
 	proofKey := sha256.Sum256([]byte(string(ticket.Channel) + "\x00" + string(ticket.Project) + "\x00" + string(ticket.Ticket) + "\x00" + witness.MutationClaim.SemanticKey + "\x00" + witness.ProtectedRef + "\x00" + witness.OriginalBaseOID + "\x00" + witness.MergeOID))

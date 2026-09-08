@@ -47,6 +47,7 @@ var (
 	ErrUnsupportedAuthMode = errors.New("codex authentication mode is not the supported ChatGPT subscription")
 	ErrCapability          = errors.New("codex executable lacks required exec capabilities")
 	ErrMalformedJSONL      = errors.New("codex JSONL output is malformed")
+	ErrTerminalFailure     = errors.New("codex returned a structured terminal failure")
 	ErrNoFinalArtifact     = errors.New("codex did not return a final structured artifact")
 	ErrOutputTooLarge      = errors.New("codex output exceeded the bounded contract")
 	ErrUnsafeConfiguration = errors.New("codex adapter configuration is unsafe")
@@ -277,7 +278,10 @@ func New(config Config) (*Adapter, error) {
 // A route alias cannot claim independence from another route using the same
 // inference family. Additions require an explicit code and qualification
 // review with the provider's model-family evidence.
-func familyForModel(model string) (string, bool) {
+func familyForModel(model string) (string, bool) { return ModelFamily(model) }
+
+// ModelFamily exposes the same closed model catalog used at adapter admission.
+func ModelFamily(model string) (string, bool) {
 	switch model {
 	case "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol":
 		return "openai-gpt-5.6", true
@@ -286,6 +290,12 @@ func familyForModel(model string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// SupportedModels is a selection catalog, not an account-entitlement or
+// qualification verdict. A fresh slice prevents callers mutating the catalog.
+func SupportedModels() []string {
+	return []string{"gpt-5.6-luna", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-sol"}
 }
 
 func (a *Adapter) Name() string { return a.route }
@@ -396,13 +406,21 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	// never trusted unless the complete JSONL protocol was parsed.
 	indeterminate := contracts.PhaseResult{Outcome: contracts.PhaseResultIndeterminate, Provider: input.Provider, UsageTrusted: input.AuthMode == authModeChatGPTSubscription, UsageUnits: 0}
 	if result.StdoutTruncated || result.StderrTruncated || len(result.Stdout) > maxJSONL || len(result.Stderr) > maxJSONL {
+		indeterminate.FailureReason = contracts.ProviderFailureOutput
 		return indeterminate, ErrOutputTooLarge
 	}
 	if result.ExitCode != 0 {
+		indeterminate.FailureReason = contracts.ProviderFailureExit
 		return indeterminate, fmt.Errorf("codex exec exited %d", result.ExitCode)
 	}
 	transcript, usage, usageTrusted, usageDetail, err := parseJSONL(result.Stdout, result.Stderr)
 	if err != nil {
+		indeterminate.FailureReason = contracts.ProviderFailureProtocol
+		if errors.Is(err, ErrTerminalFailure) {
+			indeterminate.FailureReason = contracts.ProviderFailureTerminal
+		} else if errors.Is(err, ErrOutputTooLarge) && len(result.Stdout) != 0 {
+			indeterminate.FailureReason = contracts.ProviderFailureOutput
+		}
 		return indeterminate, err
 	}
 	artifact := bytes.TrimSpace(result.OutputLastMessage)
@@ -410,7 +428,7 @@ func (a *Adapter) Parse(ctx context.Context, input contracts.PhaseInput, result 
 	// artifact failure, including an absent, truncated, malformed, or oversized
 	// final message. It is the only adapter outcome eligible for repair.
 	if result.OutputLastMessageTruncated || len(artifact) == 0 || !json.Valid(artifact) || len(artifact) > 1<<20 {
-		return contracts.PhaseResult{Outcome: contracts.PhaseResultInvalidArtifact, Transcript: transcript, Provider: input.Provider, UsageTrusted: input.AuthMode == authModeChatGPTSubscription, UsageUnits: 0}, ErrNoFinalArtifact
+		return contracts.PhaseResult{Outcome: contracts.PhaseResultInvalidArtifact, ArtifactFailureReason: contracts.ArtifactFailureFinalMessage, Transcript: transcript, Provider: input.Provider, UsageTrusted: input.AuthMode == authModeChatGPTSubscription, UsageUnits: 0}, ErrNoFinalArtifact
 	}
 	if input.AuthMode != authModeChatGPTSubscription {
 		return contracts.PhaseResult{}, ErrUnsupportedAuthMode
@@ -733,7 +751,7 @@ func parseJSONL(stdout, stderr []byte) (string, int64, bool, tokenUsage, error) 
 			return "", 0, false, tokenUsage{}, ErrMalformedJSONL
 		}
 		if event.Type == "error" || strings.HasSuffix(event.Type, ".failed") || strings.HasSuffix(event.Type, ".error") || strings.HasSuffix(event.Type, ".cancelled") || strings.HasSuffix(event.Type, ".canceled") || strings.HasSuffix(event.Type, ".aborted") || event.Status == "failed" || event.Status == "error" || event.Status == "cancelled" || event.Status == "canceled" || event.Status == "aborted" || (len(event.Error) != 0 && string(event.Error) != "null") {
-			return "", 0, false, tokenUsage{}, errors.New("codex returned a structured terminal failure")
+			return "", 0, false, tokenUsage{}, ErrTerminalFailure
 		}
 		if event.Type == "turn.completed" {
 			completed++

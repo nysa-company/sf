@@ -153,14 +153,27 @@ func (s *Store) AcquireRepositoryCommand(ctx context.Context, claim contracts.Re
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
+	var definiteContention error
 	err := s.write(ctx, func(conn *sql.Conn) error {
 		if err := s.assertRepositoryCommandCurrent(ctx, conn, claim); err != nil {
 			return err
 		}
-		if err := repositoryHasProviderWriter(ctx, conn, claim.Repository); err != nil {
+		if err := repositoryCommandAcquireProviderConflict(ctx, conn, claim.Repository); err != nil {
+			if errors.Is(err, contracts.ErrRepositoryCommandContended) {
+				definiteContention = err
+			}
 			return err
 		}
-		if err := repositoryHasGitWriter(ctx, conn, claim.Repository); err != nil {
+		if err := repositoryCommandAcquireGitConflict(ctx, conn, claim.Repository); err != nil {
+			if errors.Is(err, contracts.ErrRepositoryCommandContended) {
+				definiteContention = err
+			}
+			return err
+		}
+		if err := repositoryCommandAcquireLeaseConflict(ctx, conn, claim.Repository, claim.SemanticKey); err != nil {
+			if errors.Is(err, contracts.ErrRepositoryCommandContended) {
+				definiteContention = err
+			}
 			return err
 		}
 		result, err := conn.ExecContext(ctx, `INSERT INTO repository_command_leases(repository_path,semantic_key,nonce,channel,project_id,ticket_id,request_digest,ticket_version,leader_epoch,runner_epoch,claim_epoch,worktree_path,worktree_identity,branch_ref,base_ref,base_sha,command_digest,spec_digest,policy_digest,executable_path,executable_digest,state,launch_state,acquired_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active','unrecorded',?) ON CONFLICT(repository_path) DO NOTHING`, claim.Repository, claim.SemanticKey, nonce, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket, claim.RequestDigest, claim.TicketVersion, claim.LeaderEpoch, claim.RunnerEpoch, claim.ClaimEpoch, claim.Worktree, claim.WorktreeIdentity, claim.Branch, claim.BaseRef, claim.BaseSHA, claim.CommandDigest, claim.SpecDigest, claim.PolicyDigest, claim.ExecutablePath, claim.ExecutableDigest, time.Now().UTC().Format(time.RFC3339Nano))
@@ -173,9 +186,63 @@ func (s *Store) AcquireRepositoryCommand(ctx context.Context, claim contracts.Re
 		return nil
 	})
 	if err != nil {
+		// Store.write may normalize an expired context after the closure has
+		// already proved pre-insert contention. Preserve that stronger outcome:
+		// the transaction never reached the only lease INSERT.
+		if definiteContention != nil {
+			return nil, errors.Join(definiteContention, err)
+		}
 		return nil, err
 	}
 	return &repositoryCommandLease{store: s, claim: claim, nonce: nonce}, nil
+}
+
+// The acquire-only conflict readers distinguish a definitely-unacquired
+// native contention response from an ambiguous authority failure. They run
+// after the exact current claim proof and inside the same IMMEDIATE write
+// transaction as the lease insert. Quarantine and same-semantic leases remain
+// ordinary fail-closed errors: neither is safe for blind in-call retry.
+func repositoryCommandAcquireProviderConflict(ctx context.Context, conn *sql.Conn, repository string) error {
+	var active, quarantined int
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN state='active' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END),0) FROM provider_attempts WHERE repository_path=?`, repository).Scan(&active, &quarantined); err != nil {
+		return err
+	}
+	if quarantined != 0 {
+		return ErrProviderAttempt
+	}
+	if active != 0 {
+		return errors.Join(contracts.ErrRepositoryCommandContended, ErrProviderAttempt)
+	}
+	return nil
+}
+
+func repositoryCommandAcquireGitConflict(ctx context.Context, conn *sql.Conn, repository string) error {
+	var active, quarantined int
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN state='active' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END),0) FROM git_mutation_leases WHERE repository_path=?`, repository).Scan(&active, &quarantined); err != nil {
+		return err
+	}
+	if quarantined != 0 {
+		return ErrGitMutationLease
+	}
+	if active != 0 {
+		return errors.Join(contracts.ErrRepositoryCommandContended, ErrGitMutationLease)
+	}
+	return nil
+}
+
+func repositoryCommandAcquireLeaseConflict(ctx context.Context, conn *sql.Conn, repository, semanticKey string) error {
+	var existingKey, state string
+	err := conn.QueryRowContext(ctx, `SELECT semantic_key,state FROM repository_command_leases WHERE repository_path=?`, repository).Scan(&existingKey, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if state != "active" || existingKey == semanticKey {
+		return ErrRepositoryCommandLease
+	}
+	return errors.Join(contracts.ErrRepositoryCommandContended, ErrRepositoryCommandLease)
 }
 
 func (l *repositoryCommandLease) Check(ctx context.Context) error {

@@ -24,9 +24,15 @@ var (
 	ErrCandidateRequired     = errors.New("builder did not provide a Store-authenticated candidate witness")
 	ErrCheckpointRequired    = errors.New("verification did not provide an authenticated checkpoint witness")
 	ErrCommandResultRequired = errors.New("phase did not provide an authenticated repository command result")
-	ErrAmendmentUnsupported  = errors.New("verification amendment requires an authenticated Store amendment request")
-	ErrStaleEvidence         = errors.New("phase evidence is not current for this ticket fence")
-	ErrUnsupportedState      = errors.New("workflow worker cannot execute this ticket state")
+	// ErrPostbuildCommandFailed is emitted only after the repository boundary
+	// has loaded a durable, terminal post-build command result with a non-zero
+	// exit. Worker turns it into a non-recoverable blocker: the failed proof and
+	// completed Builder remain evidence, but v1 does not invent a repair or rerun
+	// the same Builder. The operator must cancel and submit a fresh ticket.
+	ErrPostbuildCommandFailed = errors.New("authenticated post-build repository command failed")
+	ErrAmendmentUnsupported   = errors.New("verification amendment requires an authenticated Store amendment request")
+	ErrStaleEvidence          = errors.New("phase evidence is not current for this ticket fence")
+	ErrUnsupportedState       = errors.New("workflow worker cannot execute this ticket state")
 	// ErrProviderAttemptExhausted is a typed coordinator outcome. It is not a
 	// ticket time/cost budget: Worker converts only this attempt-window limit
 	// through Store's authenticated provider-exhaustion pause boundary.
@@ -37,6 +43,11 @@ var (
 	// scheduler cannot spin or inherit unaudited local changes.
 	ErrProviderResultIndeterminate = errors.New("workflow provider result is indeterminate")
 	ErrProviderRepairUnavailable   = errors.New("workflow provider repair binding is unavailable")
+	// ErrVerificationAmendmentInvalid lets a phase runner fail closed when a
+	// durable pre-upgrade amendment cannot satisfy the current frozen-command
+	// contract. Worker converts it to the existing typed amendment blocker
+	// instead of leaving the ticket active in verifying forever.
+	ErrVerificationAmendmentInvalid = errors.New("workflow verification amendment is invalid")
 	// ErrTicketBudgetExhausted is the immutable ticket-wide time/cost ceiling.
 	// It is never retryable: Worker asks Store to prove and block it so the
 	// operator can cancel and submit a fresh ticket without widening policy.
@@ -268,6 +279,8 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 		}
 		blockCode := ""
 		switch {
+		case errors.Is(err, ErrPostbuildCommandFailed):
+			blockCode = "postbuild_command_failed"
 		case errors.Is(err, ErrProviderResultIndeterminate):
 			blockCode = "provider_result_indeterminate"
 		case errors.Is(err, ErrProviderRepairUnavailable):
@@ -711,6 +724,9 @@ func (w Worker) verifyingAmendment(ctx context.Context, ticket store.Ticket, fen
 		if ctx.Err() != nil {
 			return false, false, fmt.Errorf("%w: %v", ErrCanceled, ctx.Err())
 		}
+		if errors.Is(err, ErrVerificationAmendmentInvalid) {
+			return w.blockInvalidVerificationAmendment(ctx, ticket, fence, false, err)
+		}
 		return false, false, err
 	}
 	result, parsed, err := w.Evidence.LoadCurrentProviderAttemptResult(ctx, out.ProviderResult, ticket.Version, fence)
@@ -864,6 +880,13 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 			// An authenticated final-review repair boundary deliberately makes
 			// the old candidate's Builder result unavailable. Continue below to
 			// launch the fresh Builder cycle instead of trying to rebind it.
+			err = store.ErrNotFound
+		} else if reuseErr == nil && reusable.Key != old.BuilderResult {
+			// A red-CI repair retains the immutable predecessor candidate while
+			// admitting exactly one fresh Builder result for the successor
+			// generation. Store authenticated that result against the current
+			// repair entry; it must be materialized below, never used to rebind
+			// or reinterpret the predecessor generation.
 			err = store.ErrNotFound
 		} else if reuseErr != nil || !reusable.Recovered || reusable.Key != old.BuilderResult {
 			return false, false, ErrStaleEvidence

@@ -6,6 +6,7 @@ package github
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -461,11 +463,16 @@ func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contr
 	if err != nil {
 		return contracts.CIRequiredCheckPolicyObservation{}, err
 	}
-	checks, err := c.checks(ctx, observed.Identity)
+	var apps map[string]int64
+	checks, err := c.checksBound(ctx, observed.Identity, func(wire []checkWire) error {
+		var authErr error
+		apps, authErr = c.authenticateCheckApps(ctx, observed.Identity, protection, wire)
+		return authErr
+	})
 	if err != nil {
 		return contracts.CIRequiredCheckPolicyObservation{}, err
 	}
-	if !requiredChecksMatchProtection(checks, protection) {
+	if !requiredChecksMatchProtection(checks, protection, apps) {
 		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
 	}
 	// Required-check observation is a separate GitHub read from protected
@@ -479,7 +486,7 @@ func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contr
 	if !sameProtectionWitness(protection, protectionAfter) {
 		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
 	}
-	if !requiredChecksMatchProtection(checks, protectionAfter) {
+	if !requiredChecksMatchProtection(checks, protectionAfter, apps) {
 		return contracts.CIRequiredCheckPolicyObservation{}, ErrChecksFailed
 	}
 	// A required context is stable policy identity; the run/check URL emitted by
@@ -508,7 +515,7 @@ func (c Client) ObserveCIRequiredCheckPolicy(ctx context.Context, identity contr
 // requiredChecksMatchProtection binds the live `gh pr checks --required`
 // rows to the complete status-check set configured on the exact protected
 // branch/ruleset witness. Extras or a subset are not a policy observation.
-func requiredChecksMatchProtection(checks []contracts.RequiredCheck, protection strictProtectionWitness) bool {
+func requiredChecksMatchProtection(checks []contracts.RequiredCheck, protection strictProtectionWitness, authenticatedApps ...map[string]int64) bool {
 	if len(protection.Checks) == 0 || len(checks) != len(protection.Checks) {
 		return false
 	}
@@ -523,11 +530,14 @@ func requiredChecksMatchProtection(checks []contracts.RequiredCheck, protection 
 				return false
 			}
 		} else if protection.Kind == "ruleset" {
-			// `gh pr checks --required` exposes run URL/external identity, not a
-			// ruleset integration id. A nonzero integration requirement therefore
-			// cannot be proven by this observer and must fail closed.
-			if len(parts) != 2 || (parts[1] != "-" && parts[1] != "0") {
+			if len(parts) != 2 {
 				return false
+			}
+			if parts[1] != "-" && parts[1] != "0" {
+				id, err := strconv.ParseInt(parts[1], 10, 64)
+				if err != nil || id <= 0 || len(authenticatedApps) != 1 || authenticatedApps[0][name] != id {
+					return false
+				}
 			}
 		} else {
 			return false
@@ -830,7 +840,7 @@ func (c Client) Preflight(ctx context.Context, repository contracts.RepositoryId
 		NameWithOwner string `json:"nameWithOwner"`
 		URL           string `json:"url"`
 	}
-	if err := c.json(ctx, &repo, "repo", "view", "--repo", repoArg(repository), "--json", "nameWithOwner,url"); err != nil {
+	if err := c.json(ctx, &repo, "repo", "view", repoArg(repository), "--json", "nameWithOwner,url"); err != nil {
 		return Principal{}, err
 	}
 	if repo.NameWithOwner != repository.Owner+"/"+repository.Name || repo.URL == "" {
@@ -1169,6 +1179,10 @@ func (c Client) WaitChecks(ctx context.Context, identity contracts.PullRequestId
 }
 
 func (c Client) checks(ctx context.Context, identity contracts.PullRequestIdentity) ([]contracts.RequiredCheck, error) {
+	return c.checksBound(ctx, identity, nil)
+}
+
+func (c Client) checksBound(ctx context.Context, identity contracts.PullRequestIdentity, authenticate func([]checkWire) error) ([]contracts.RequiredCheck, error) {
 	if !validIdentity(identity) {
 		return nil, ErrPolicyRefusal
 	}
@@ -1189,6 +1203,11 @@ func (c Client) checks(ctx context.Context, identity contracts.PullRequestIdenti
 	if err := c.json(ctx, &wire, "pr", "checks", fmt.Sprint(identity.Number), "--repo", repoArg(identity.Repository), "--required", "--json", "name,state,workflow,link,bucket"); err != nil {
 		return nil, err
 	}
+	if authenticate != nil {
+		if err := authenticate(wire); err != nil {
+			return nil, err
+		}
+	}
 	after, err := c.Observe(ctx, identity)
 	if err != nil || !sameExact(after.Identity, identity) || after.State != "OPEN" || after.Merged {
 		return nil, ErrChecksFailed
@@ -1201,11 +1220,7 @@ func (c Client) checks(ctx context.Context, identity contracts.PullRequestIdenti
 		if !validCheck(check.Name, check.Link, check.Workflow, check.Bucket) {
 			return nil, ErrMalformedResponse
 		}
-		identity := check.Link
-		if check.Workflow != "" || check.Bucket != "" {
-			identity = check.Workflow + "\x00" + check.Link + "\x00" + check.Bucket
-		}
-		checks = append(checks, contracts.RequiredCheck{Name: check.Name, State: check.State, ExternalID: identity})
+		checks = append(checks, contracts.RequiredCheck{Name: check.Name, State: check.State, ExternalID: canonicalCheckExternalID(check)})
 	}
 	return checks, nil
 }
@@ -1216,6 +1231,24 @@ type checkWire struct {
 	Workflow string `json:"workflow"`
 	Link     string `json:"link"`
 	Bucket   string `json:"bucket"`
+}
+
+// canonicalCheckExternalID converts GitHub's potentially long workflow and
+// link tuple into the small printable identity accepted by the Store and
+// prompt boundaries. Length prefixes preserve empty optional fields without
+// introducing control characters into the persisted value. State is excluded
+// because the same check changes state while it is being polled; bucket is
+// excluded for the same reason because gh derives it from the current state.
+func canonicalCheckExternalID(check checkWire) string {
+	digest := sha256.New()
+	_, _ = io.WriteString(digest, "sf.github.required-check/v1")
+	var size [4]byte
+	for _, value := range []string{check.Workflow, check.Link} {
+		binary.BigEndian.PutUint32(size[:], uint32(len(value)))
+		_, _ = digest.Write(size[:])
+		_, _ = io.WriteString(digest, value)
+	}
+	return "sha256:" + hex.EncodeToString(digest.Sum(nil))
 }
 
 func evaluateChecks(actual []contracts.RequiredCheck, required []CheckIdentity) error {
@@ -1757,7 +1790,12 @@ func (c Client) ObserveMergeIntent(ctx context.Context, intent domain.MergeInten
 	}
 	identity := contracts.PullRequestIdentity{Repository: contracts.RepositoryIdentity{Host: intent.RepositoryHost, Owner: intent.RepositoryOwner, Name: intent.RepositoryName}, Number: intent.PullRequestNumber, HeadOwner: intent.HeadOwner, HeadRepository: intent.HeadRepository, HeadRef: intent.HeadRef, HeadOID: intent.HeadOID, BaseRef: intent.BaseRef, FactoryOwned: true}
 	observed, err := c.viewNumber(ctx, identity.Repository, identity.Number)
-	if err != nil || !observed.Merged || !sameMergeIdentity(observed.Identity, identity) || observed.Identity.HeadOID != intent.HeadOID || observed.Identity.BaseRef != intent.BaseRef || observed.MergeCommit == "" {
+	if err != nil {
+		// A failed read supplies no evidence about who merged the PR. Keep
+		// cleanup and transport failures actionable without confirming a merge.
+		return "", err
+	}
+	if !observed.Merged || !sameMergeIdentity(observed.Identity, identity) || observed.Identity.HeadOID != intent.HeadOID || observed.Identity.BaseRef != intent.BaseRef || observed.MergeCommit == "" {
 		return "", ErrExternalMerged
 	}
 	if err := c.reconcileStrictMerge(ctx, observed.Identity, intent.HeadOID, intent.OriginalBaseOID, intent); err != nil {
@@ -1844,9 +1882,12 @@ const prFields = "number,title,body,headRepositoryOwner,headRepository,headRefNa
 type prWire struct {
 	Number         int `json:"number"`
 	HeadRepository struct {
+		ID            string `json:"id"`
+		Name          string `json:"name"`
 		NameWithOwner string `json:"nameWithOwner"`
 	} `json:"headRepository"`
 	HeadRepositoryOwner struct {
+		ID    string `json:"id"`
 		Login string `json:"login"`
 	} `json:"headRepositoryOwner"`
 	HeadRef     string  `json:"headRefName"`
@@ -2030,7 +2071,14 @@ func (c Client) runWithHandoff(ctx context.Context, handedOff *bool, args ...str
 		if errors.Is(runErr, ErrRunnerBusy) {
 			return nil, runErr
 		}
-		proof, cleanupErr := c.runner.Cleanup(ctx)
+		// A cancelled request still owes an OS-backed drain proof. Reusing its
+		// cancelled context can turn an ordinary shutdown into a permanent
+		// cleanup quarantine without allowing the runner to inspect its child.
+		// Detach cancellation only for this bounded cleanup, never for Run or
+		// for any subsequent external command.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		proof, cleanupErr := c.runner.Cleanup(cleanupCtx)
+		cleanupCancel()
 		if cleanupErr != nil || !proof.valid() || errors.Is(runErr, ErrProcessCleanup) {
 			return nil, c.quarantineCleanup()
 		}

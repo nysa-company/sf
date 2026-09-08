@@ -40,6 +40,27 @@ func testTicket() Ticket {
 	}
 }
 
+func TestPlannerPromptBindsTicketProofKind(t *testing.T) {
+	for _, tc := range []struct {
+		kind  domain.TicketType
+		proof string
+	}{
+		{domain.TicketBug, "regression"}, {domain.TicketFeature, "acceptance"},
+		{domain.TicketRefactor, "characterization"}, {domain.TicketInfrastructure, "validation"},
+		{domain.TicketDocumentation, "documentation"}, {domain.TicketSpike, "report"},
+	} {
+		input := PlannerInput{Ticket: testTicket(), Workspace: testWorkspace(), Runtime: Runtime{Timeout: time.Minute, Profile: contracts.ProfileGuarded}}
+		input.Ticket.Type = tc.kind
+		result, err := Planner(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(result.Prompt, `OUTPUT_BINDING={"proof_kind":"`+tc.proof+`"}`) || !strings.Contains(result.Prompt, "Copy proof.kind") {
+			t.Fatal("planner must expose the required proof kind")
+		}
+	}
+}
+
 func testWorkspace() Workspace {
 	identity, err := MarshalCanonicalWorktreeIdentity(CanonicalWorktreeIdentity{
 		Repository: "/Users/sofia/nysa", RepositoryDev: 1, RepositoryIno: 2,
@@ -291,16 +312,19 @@ func TestPromptsAreDeterministicAndRoleBound(t *testing.T) {
 	}{
 		{"planner", func() (contracts.PhaseInput, error) { return Planner(PlannerInput{ticket, workspace, runtime}) }, []string{"read-only", "Planner", "workflow states"}},
 		{"verification", func() (contracts.PhaseInput, error) {
-			return Verification(VerificationInput{ticket, workspace, plan, runtime, nil})
-		}, []string{"writes the tests or proof", "red", "missing", "baseline", "canonical_artifact"}},
+			return Verification(VerificationInput{Ticket: ticket, Workspace: workspace, Plan: plan, Runtime: runtime, Command: []string{"go", "test", "./..."}})
+		}, []string{"writes the tests or proof", "red", "missing", "baseline", "canonical_artifact", "OUTPUT_BINDING=", `"acceptance_digest":"` + plan.Digest + `"`, `"proof_kind":"regression"`, `"allowed_prebuild_outcomes":["red"]`, `"command":["go","test","./..."]`, "Always emit the final object"}},
 		{"builder", func() (contracts.PhaseInput, error) {
-			return Builder(BuilderInput{ticket, workspace, plan, verification, runtime})
+			return Builder(BuilderInput{Ticket: ticket, Workspace: workspace, Plan: plan, Verification: verification, Runtime: runtime})
 		}, []string{"Preserve every verification-owned file", "amendment_request", "canonical_artifact"}},
 		{"final-reviewer", func() (contracts.PhaseInput, error) {
 			return FinalReviewer(FinalReviewerInput{ticket, workspace, plan, verification, candidate, checks, runtime})
-		}, []string{"read-only review", "exact candidate head", "exact proof digest", "required-check set", "canonical_artifact"}},
+		}, []string{"read-only review", "exact candidate head", "exact proof digest", "required-check set", "canonical_artifact", "not required to independently run Git", "Read the actual source and tests", "not the whole PR diff", "successful controller-run post-build proof", "do not invent successful command output", "PATH is intentionally limited to /usr/bin:/bin", "command not found is not a sandbox denial", "Do not request permission overrides"}},
 	}
 	for _, tc := range inputs {
+		if tc.name == "final-reviewer" {
+			tc.want = append(tc.want, "schema applies only to your final response, not to tool calls", "Do not emit a provisional reviewer decision")
+		}
 		t.Run(tc.name, func(t *testing.T) {
 			one, err := tc.make()
 			if err != nil {
@@ -322,6 +346,29 @@ func TestPromptsAreDeterministicAndRoleBound(t *testing.T) {
 				t.Error("prompt exposes model-selectable lifecycle fields")
 			}
 		})
+	}
+}
+
+func TestVerificationPromptBindsFeatureOutputWithoutWeakeningSchema(t *testing.T) {
+	ticket := testTicket()
+	ticket.Type = domain.TicketFeature
+	plan := testPlan()
+	plan.Plan.Proof.Kind = phaseartifact.ProofAcceptance
+	var err error
+	plan, err = NewPlanIdentity(plan.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := Verification(VerificationInput{Ticket: ticket, Workspace: testWorkspace(), Plan: plan, Runtime: testRuntime(), Command: []string{"node", "--test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `OUTPUT_BINDING={"acceptance_digest":"` + plan.Digest + `","proof_kind":"acceptance","allowed_prebuild_outcomes":["red","missing"],"command":["node","--test"]}`
+	if !strings.Contains(input.Prompt, want) || !strings.Contains(input.Prompt, "one argv token array") {
+		t.Fatalf("verification output binding missing from prompt: %q", input.Prompt)
+	}
+	if !bytes.Equal(input.Schema, VerificationSchema()) {
+		t.Fatal("verification output binding changed the strict provider schema")
 	}
 }
 

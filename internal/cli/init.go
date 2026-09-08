@@ -15,30 +15,34 @@ import (
 	"github.com/nysa-company/sf/internal/api"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/pythonprepare"
 	"github.com/nysa-company/sf/internal/store"
 )
 
 type InitRequest struct {
-	Channel  domain.Channel
-	Project  string
-	Repo     string
-	Home     string
-	Paths    config.ChannelPaths
-	Profile  string
-	TestPath string
+	Channel        domain.Channel
+	Project        string
+	Repo           string
+	Home           string
+	Paths          config.ChannelPaths
+	Profile        string
+	TestPath       string
+	ProviderPreset string
 }
 
 type initResult struct {
-	Channel       domain.Channel   `json:"channel"`
-	Project       string           `json:"project"`
-	Repository    string           `json:"repository"`
-	BaseBranch    string           `json:"base_branch"`
-	MergeMode     domain.MergeMode `json:"merge_mode"`
-	ConfigDigest  string           `json:"config_digest"`
-	Profile       string           `json:"profile,omitempty"`
-	TestPath      string           `json:"test_path,omitempty"`
-	ConfigCreated bool             `json:"config_created,omitempty"`
-	Created       bool             `json:"created"`
+	Channel               domain.Channel       `json:"channel"`
+	Project               string               `json:"project"`
+	Repository            string               `json:"repository"`
+	BaseBranch            string               `json:"base_branch"`
+	MergeMode             domain.MergeMode     `json:"merge_mode"`
+	ConfigDigest          string               `json:"config_digest"`
+	Profile               string               `json:"profile,omitempty"`
+	TestPath              string               `json:"test_path,omitempty"`
+	ConfigCreated         bool                 `json:"config_created,omitempty"`
+	Created               bool                 `json:"created"`
+	ProviderPreferences   config.ProviderOrder `json:"provider_preferences"`
+	QualificationRequired bool                 `json:"qualification_required"`
 }
 
 // afterInitConfigLockAcquired is test-only coordination after configuration
@@ -53,6 +57,9 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 	initHelp := []string{binary, "init", "--help"}
 	if !request.Channel.Valid() || request.Project == "" || request.Repo == "" {
 		return failure("invalid_argument", "channel, project, and repository are required", initHelp)
+	}
+	if _, err := config.ProviderPreset(request.ProviderPreset); err != nil {
+		return failure("invalid_argument", err.Error(), initHelp)
 	}
 	repository, err := canonicalGitRepository(ctx, request.Repo)
 	if err != nil {
@@ -72,10 +79,19 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 			return failure("init_failed", "channel paths could not be resolved", initHelp)
 		}
 	}
+	if request.Profile == config.PythonPytestV1Profile {
+		argv, recipeErr := pythonprepare.RecipeArgv(request.TestPath)
+		if recipeErr != nil {
+			return failure("invalid_argument", "select a repository-relative .py file or tests directory", initHelp)
+		}
+		if err := checkPythonRecipeReady(ctx, paths, repository, argv); err != nil {
+			return failure("not_ready", "the selected Python test path or prepared runtime is unavailable; prepare the pinned runtime and verify the test path before registration", []string{binary, "runtimes", "prepare", "python"})
+		}
+	}
 	if err := config.PrepareChannel(paths); err != nil {
 		return initFailure("init_failed", "channel state could not be prepared: "+err.Error(), []string{binary, "doctor"}, false)
 	}
-	configPlan, err := config.PrepareNysaPureConfigContext(ctx, repository, request.Profile, request.TestPath)
+	configPlan, err := config.PrepareInitialConfigContext(ctx, repository, request.Profile, request.TestPath, request.ProviderPreset)
 	if err != nil {
 		return initFailure("invalid_configuration", err.Error(), initHelp, false)
 	}
@@ -88,7 +104,7 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 		return initFailure("invalid_configuration", err.Error(), initHelp, false)
 	}
 	loadLocked := func() (config.Effective, []byte, string, error) {
-		if len(configPlan.Encoded) > 0 && !configPlan.Existing {
+		if len(configPlan.Encoded) > 0 && !configPlan.Existing && len(configPlan.Commands.Verify.Argv) > 0 {
 			return configPlan.LoadLockedProject(request.Project, machine, &configPlan.Commands)
 		}
 		return configPlan.LoadLockedProject(request.Project, machine, nil)
@@ -103,6 +119,9 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 			next = []string{binary, "config", "--help"}
 		}
 		return initFailure("invalid_configuration", err.Error(), next, false)
+	}
+	if err := checkConfiguredPython(ctx, paths, repository, effective); err != nil {
+		return initFailure("not_ready", "configured Python commands require the current prepared runtime and a real selected test path; no project was registered", []string{binary, "runtimes", "prepare", "python"}, false)
 	}
 	if err := verifyBaseRef(ctx, repository, effective.BaseBranch); err != nil {
 		return initFailure("invalid_repository", "configured base branch is unavailable in the local repository", []string{binary, "doctor", "--repo", repository}, false)
@@ -150,7 +169,7 @@ func RunInit(ctx context.Context, request InitRequest) api.Response {
 		return initFailure("init_failed", "project registration was not committed", []string{binary, "doctor"}, true)
 	}
 	registrationConfirmed = true
-	data, err := json.Marshal(initResult{Channel: request.Channel, Project: request.Project, Repository: repository, BaseBranch: effective.BaseBranch, MergeMode: effective.MergeMode, ConfigDigest: digest, Profile: request.Profile, TestPath: request.TestPath, ConfigCreated: configCreated, Created: created})
+	data, err := json.Marshal(initResult{Channel: request.Channel, Project: request.Project, Repository: repository, BaseBranch: effective.BaseBranch, MergeMode: effective.MergeMode, ConfigDigest: digest, Profile: request.Profile, TestPath: request.TestPath, ConfigCreated: configCreated, Created: created, ProviderPreferences: effective.Providers, QualificationRequired: true})
 	if err != nil {
 		return initFailure("init_failed", "registration succeeded but its response could not be encoded", []string{binary, "doctor"}, true)
 	}

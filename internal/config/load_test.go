@@ -56,6 +56,45 @@ func TestLoadProjectAutoDetectsGoRepository(t *testing.T) {
 	}
 }
 
+func TestDetectionDoesNotHideOtherStacksBehindGoOrNode(t *testing.T) {
+	for _, primary := range []struct{ name, contents string }{
+		{"go.mod", "module example.test/mixed\n\ngo 1.25\n"},
+		{"package.json", `{"name":"mixed","scripts":{"test":"node --test"}}`},
+	} {
+		for _, other := range []string{"Gemfile", "pyproject.toml", "requirements.txt", "setup.py"} {
+			t.Run(primary.name+"+"+other, func(t *testing.T) {
+				repository := t.TempDir()
+				if err := os.WriteFile(filepath.Join(repository, "smoke.test.js"), []byte("// discovery fixture; never executed\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				for name, contents := range map[string]string{primary.name: primary.contents, other: "must never execute"} {
+					if err := os.WriteFile(filepath.Join(repository, name), []byte(contents), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				_, _, _, err := LoadProject(repository, "mixed", DefaultMachineLimits())
+				if !errors.Is(err, ErrCommandDetection) || !strings.Contains(err.Error(), "multiple stack markers") {
+					t.Fatalf("mixed stack silently selected or misreported: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestDetectionInspectsOtherStackMarkersBeforeChoosingGo(t *testing.T) {
+	repository := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repository, "go.mod"), []byte("module example.test/mixed\n\ngo 1.25\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "missing"), filepath.Join(repository, "Gemfile")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err := LoadProject(repository, "mixed", DefaultMachineLimits())
+	if !errors.Is(err, ErrCommandDetection) || !strings.Contains(err.Error(), "Gemfile must be a regular non-symlink file") {
+		t.Fatalf("ambiguous symlink was ignored: %v", err)
+	}
+}
+
 func TestLoadProjectAutoDetectsDependencyFreeNode22Recipe(t *testing.T) {
 	repository := t.TempDir()
 	if err := os.Mkdir(filepath.Join(repository, "test"), 0o700); err != nil {

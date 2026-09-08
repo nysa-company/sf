@@ -178,10 +178,12 @@ func loadCIPollAttempts(ctx context.Context, conn *sql.Conn, ref domain.TicketRe
 	return count, last, nil
 }
 
-func loadCIPollRetryEpoch(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, publication PublishedCandidateEvidence) (ciPollRetryEpoch, bool, error) {
+func loadCIPollRetryEpoch(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref domain.TicketRef, publication PublishedCandidateEvidence) (ciPollRetryEpoch, bool, error) {
 	var value ciPollRetryEpoch
 	var resumedRaw, deadlineRaw string
-	err := conn.QueryRowContext(ctx, `SELECT initial_attempts,exhaustion_ticket_version,resume_ticket_version,resume_leader_epoch,resume_runner_epoch,resumed_at,deadline_at,retry_digest FROM ci_poll_retry_epochs WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND candidate_tree_sha=? AND publication_witness_digest=?`, ref.Channel, ref.Project, ref.Ticket, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA, publication.Candidate.Snapshot.TreeSHA, publication.WitnessDigest).Scan(&value.initialAttempts, &value.exhaustedVersion, &value.resumeVersion, &value.leader, &value.runner, &resumedRaw, &deadlineRaw, &value.digest)
+	err := q.QueryRowContext(ctx, `SELECT initial_attempts,exhaustion_ticket_version,resume_ticket_version,resume_leader_epoch,resume_runner_epoch,resumed_at,deadline_at,retry_digest FROM ci_poll_retry_epochs WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND candidate_tree_sha=? AND publication_witness_digest=?`, ref.Channel, ref.Project, ref.Ticket, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA, publication.Candidate.Snapshot.TreeSHA, publication.WitnessDigest).Scan(&value.initialAttempts, &value.exhaustedVersion, &value.resumeVersion, &value.leader, &value.runner, &resumedRaw, &deadlineRaw, &value.digest)
 	if err == sql.ErrNoRows {
 		return ciPollRetryEpoch{}, false, nil
 	}

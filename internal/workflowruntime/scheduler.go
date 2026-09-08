@@ -42,6 +42,13 @@ type MergeReconciliationReadiness interface {
 	MergeReconciliationReady(context.Context, domain.TicketRef, uint64, domain.Fence) (bool, error)
 }
 
+// PendingBaseRefreshSource authenticates a reserved Git transformation that
+// may already have changed the physical checkout. Only its dedicated worker
+// may resume it; ordinary pristine Ensure must not reinterpret that state.
+type PendingBaseRefreshSource interface {
+	PendingProtectedBaseRefresh(context.Context, domain.TicketRef, uint64, domain.Fence) (store.ProtectedBaseRefresh, bool, error)
+}
+
 // OperatorSourceResumeProofSource loads the typed Store proof for one exact
 // source takeover handback. It is necessary but insufficient: Worktrees must also
 // implement OperatorSourceResumeAuthenticator and physically reauthenticate
@@ -56,6 +63,14 @@ type OperatorSourceResumeProofSource interface {
 // discard the authenticated operator checkout after a restart.
 type OperatorSourceResumeFreshnessSource interface {
 	OperatorSourceResumeRequiresFreshVerification(context.Context, domain.TicketRef, uint64) (bool, error)
+}
+
+// CandidateRepairBuildContextSource distinguishes a Store-owned red-CI repair
+// from the initial Building suffix of an operator source resume. The repair
+// boundary is checked first: clean absence preserves the ordinary source proof,
+// while malformed repair evidence must fail closed instead of falling through.
+type CandidateRepairBuildContextSource interface {
+	CandidateRepairBuildContext(context.Context, domain.TicketRef, uint64, domain.Fence) (store.CandidateRepairBuildContext, error)
 }
 
 // StoreTicketSource adapts Store.Tickets without exposing SQL to the runtime.
@@ -89,6 +104,13 @@ func (s StoreTicketSource) MergeReconciliationReady(ctx context.Context, ref dom
 	return s.Store.MergeReconciliationReady(ctx, ref, version, fence)
 }
 
+func (s StoreTicketSource) PendingProtectedBaseRefresh(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (store.ProtectedBaseRefresh, bool, error) {
+	if s.Store == nil {
+		return store.ProtectedBaseRefresh{}, false, ErrInvalidScheduler
+	}
+	return s.Store.PendingProtectedBaseRefresh(ctx, ref, version, fence)
+}
+
 func (s StoreTicketSource) OperatorSourceResumeProof(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (store.OperatorSourceResumeProof, bool, error) {
 	if s.Store == nil {
 		return store.OperatorSourceResumeProof{}, false, ErrInvalidScheduler
@@ -101,6 +123,13 @@ func (s StoreTicketSource) OperatorSourceResumeRequiresFreshVerification(ctx con
 		return false, ErrInvalidScheduler
 	}
 	return s.Store.OperatorSourceResumeRequiresFreshVerification(ctx, ref, version)
+}
+
+func (s StoreTicketSource) CandidateRepairBuildContext(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (store.CandidateRepairBuildContext, error) {
+	if s.Store == nil {
+		return store.CandidateRepairBuildContext{}, ErrInvalidScheduler
+	}
+	return s.Store.CandidateRepairBuildContext(ctx, ref, version, fence)
 }
 
 func (s StoreTicketSource) RuntimeAdmissionReady(ctx context.Context, ref domain.TicketRef, version uint64, fence domain.Fence) (bool, error) {
@@ -263,6 +292,24 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 			lastBenign = &TickResult{Outcome: OutcomeCanceled, Ref: ticket.Ref, Ticket: current, Fence: candidateFence, Err: ErrCanceled}
 			continue
 		}
+		if pendingSource, ok := s.Tickets.(PendingBaseRefreshSource); ok && s.AdmitPublishing {
+			_, pending, pendingErr := pendingSource.PendingProtectedBaseRefresh(runCtx, ticket.Ref, ticket.Version, candidateFence)
+			if pendingErr != nil {
+				end()
+				return classify(pendingErr, candidateFence, ticket.Ref)
+			}
+			if pending {
+				workerResult, workerErr := s.Worker.Run(runCtx, ticket.Ref, candidateFence)
+				end()
+				result.Worker = workerResult
+				if workerErr != nil {
+					result.Outcome, result.Err = classifyWorker(workerErr)
+					return result
+				}
+				result.Outcome = OutcomeInvoked
+				return result
+			}
+		}
 		if ticket.State == domain.StatePublishing && !s.AdmitPublishing {
 			// The explicit pre-publishing composition must block before it asks
 			// for a worktree. This keeps a missing local checkout from stranding
@@ -326,19 +373,37 @@ func (s Scheduler) Tick(ctx context.Context, fence domain.Fence) TickResult {
 			}
 		}
 		if ticket.State == domain.StateVerifying || ticket.State == domain.StateBuilding {
-			freshSource := false
-			if freshness, ok := s.Tickets.(OperatorSourceResumeFreshnessSource); ok {
-				fresh, freshnessErr := freshness.OperatorSourceResumeRequiresFreshVerification(runCtx, ticket.Ref, ticket.Version)
-				if freshnessErr != nil {
-					end()
-					return classify(freshnessErr, candidateFence, ticket.Ref)
+			candidateRepair := false
+			if ticket.State == domain.StateBuilding {
+				if repairSource, ok := s.Tickets.(CandidateRepairBuildContextSource); ok {
+					_, repairErr := repairSource.CandidateRepairBuildContext(runCtx, ticket.Ref, ticket.Version, candidateFence)
+					switch {
+					case repairErr == nil:
+						candidateRepair = true
+					case errors.Is(repairErr, store.ErrNotFound):
+						// This is an ordinary build or the initial source-resume
+						// build. Continue to the source authority below.
+					default:
+						end()
+						return classify(repairErr, candidateFence, ticket.Ref)
+					}
 				}
-				freshSource = fresh
+			}
+			freshSource := false
+			if !candidateRepair {
+				if freshness, ok := s.Tickets.(OperatorSourceResumeFreshnessSource); ok {
+					fresh, freshnessErr := freshness.OperatorSourceResumeRequiresFreshVerification(runCtx, ticket.Ref, ticket.Version)
+					if freshnessErr != nil {
+						end()
+						return classify(freshnessErr, candidateFence, ticket.Ref)
+					}
+					freshSource = fresh
+				}
 			}
 			// A Store proof alone cannot authorize a dirty worktree. The optional
 			// coordinator path re-observes its physical identity, checkpoint head,
 			// and exact path set before this Scheduler reaches Worker.
-			if source, ok := s.Tickets.(OperatorSourceResumeProofSource); ok {
+			if source, ok := s.Tickets.(OperatorSourceResumeProofSource); ok && !candidateRepair {
 				proof, found, proofErr := source.OperatorSourceResumeProof(runCtx, ticket.Ref, ticket.Version, candidateFence)
 				if proofErr != nil {
 					end()
@@ -425,7 +490,7 @@ func (s Scheduler) activeState(state domain.State) bool {
 }
 
 func classify(err error, fence domain.Fence, ref domain.TicketRef) TickResult {
-	result := TickResult{Ref: ref, Fence: fence, Err: ErrReadiness}
+	result := TickResult{Outcome: OutcomeReadiness, Ref: ref, Fence: fence, Err: ErrReadiness}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		result.Outcome, result.Err = OutcomeCanceled, ErrCanceled
 	} else if errors.Is(err, store.ErrStaleFence) {

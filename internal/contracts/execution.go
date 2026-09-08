@@ -2,6 +2,7 @@ package contracts
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -93,6 +94,27 @@ type GitMutationRecoveryFactsLease interface {
 	RecordPushPriorRemote(context.Context, string) error
 }
 
+// GitBaseRefreshPreparationLease is deliberately separate from ordinary
+// single-parent commit facts. Its two ordered parents are [candidate,new base].
+// The production lease durably binds them before either branch/base ref moves.
+type GitBaseRefreshPreparationLease interface {
+	GitMutationLease
+	RecordBaseRefreshPreparation(context.Context, string, string, [2]string) error
+}
+
+type GitBaseRefreshPreparation struct {
+	CommitOID string
+	TreeOID   string
+	Parents   [2]string
+}
+
+// GitBaseRefreshPreparedReader authenticates a recorded object under the
+// current live nonce. A caller-supplied commit is not ref-update authority.
+type GitBaseRefreshPreparedReader interface {
+	GitMutationLease
+	PreparedBaseRefresh(context.Context) (GitBaseRefreshPreparation, bool, error)
+}
+
 // GitMutationLaunchLease is implemented by the production SQLite lease.  A
 // Git child remains behind its supervisor gate until RecordGitMutationLaunch
 // commits; FinishGitMutationLaunch is permitted only after the parent has
@@ -174,6 +196,26 @@ type RepositoryCommandGroupRecorder interface {
 }
 type RepositoryCommandAuthority interface {
 	AcquireRepositoryCommand(context.Context, RepositoryCommandClaim) (RepositoryCommandLease, error)
+}
+
+// ErrRepositoryCommandContended means the authority authenticated the exact
+// current claim and proved that another, different repository writer held the
+// exclusion before this acquire could insert a lease. It is safe to retry only
+// while the same caller and command scope remain live. Authorities must never
+// use it for a same-claim lease, quarantined writer, SQL/commit failure, or any
+// other response whose acquisition outcome is ambiguous.
+var ErrRepositoryCommandContended = errors.New("repository command is waiting for another authenticated repository writer")
+
+// ErrRepositoryCommandResourceLimit is a supervisor-enforced resource abort,
+// never a test assertion outcome. Observed still independently requires proven
+// process drain; this error alone must not authorize lease release.
+var ErrRepositoryCommandResourceLimit = errors.New("repository command exceeded a factory resource limit")
+
+// RepositoryCommandResourceRetirer retires a current, exactly drained launch
+// without creating reusable command evidence. Kept separate from cancellation
+// so a factory fault cannot be mislabeled as operator control.
+type RepositoryCommandResourceRetirer interface {
+	RetireObservedResourceLimitedRepositoryCommand(context.Context, RepositoryCommandClaim) error
 }
 
 type RepositoryCommandResultRecorder interface {

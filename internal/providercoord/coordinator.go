@@ -53,21 +53,28 @@ const (
 )
 
 type Request struct {
-	Role            Role
-	Input           contracts.PhaseInput
-	Validation      phaseartifact.Validation
-	ExpectedVersion uint64
-	Fence           domain.Fence
-	ConfigDigest    string
+	Role Role
+	// ExpectedProvider comes from the immutable ticket role configuration.
+	// An explicit mismatch refuses before launch; it never selects a fallback.
+	ExpectedProvider string
+	Input            contracts.PhaseInput
+	Validation       phaseartifact.Validation
+	ExpectedVersion  uint64
+	Fence            domain.Fence
+	ConfigDigest     string
 }
 type Receipt struct {
 	AttemptID                        int64
 	Attempt                          int
 	Provider                         domain.ProviderIdentity
 	ArtifactDigest, TranscriptDigest string
+	ArtifactFailureReason            contracts.ArtifactFailureReason
 	UsageUnits                       int64
-	TokenUsage                       int64
-	ErrorCode                        string
+	// AccountingMode keeps an unverified estimate distinct from charges.
+	AccountingMode               string
+	ReportedCostEstimateMicroUSD *int64
+	TokenUsage                   int64
+	ErrorCode                    string
 }
 type Result struct {
 	Code   Outcome
@@ -84,6 +91,27 @@ type Result struct {
 	PersistenceFailure bool
 }
 type Clock interface{ Now() time.Time }
+
+// ConfigureRejectionCheckpoint is a pre-start runtime-composition operation.
+// Supervisors without the optional capability cannot produce rejection
+// receipts and retain ordinary conservative drain behavior.
+func (c *Coordinator) ConfigureRejectionCheckpoint(inspector contracts.RejectionCheckpointInspector) error {
+	if c == nil || inspector == nil {
+		return errors.New("provider checkpoint inspector required")
+	}
+	if configurable, ok := c.supervisor.(interface {
+		ConfigureRejectionCheckpoint(contracts.RejectionCheckpointInspector) error
+	}); ok {
+		if err := configurable.ConfigureRejectionCheckpoint(inspector); err != nil {
+			return err
+		}
+		c.checkpointMu.Lock()
+		c.checkpoint = inspector
+		c.checkpointMu.Unlock()
+	}
+	return nil
+}
+
 type wallClock struct{}
 
 func (wallClock) Now() time.Time { return time.Now().UTC() }
@@ -127,8 +155,19 @@ func validBinding(binding contracts.RuntimeBinding) bool {
 			return false
 		}
 	}
-	if binding.Identity.Provider == "codex" && binding.AuthMode != "chatgpt_subscription" {
-		return false
+	switch binding.Identity.Provider {
+	case "codex":
+		if binding.AuthMode != "chatgpt_subscription" {
+			return false
+		}
+	case "claude":
+		if binding.AuthMode != "claude_subscription" {
+			return false
+		}
+	case "cursor":
+		if binding.AuthMode != "cursor_browser" && binding.AuthMode != "cursor_api" {
+			return false
+		}
 	}
 	return binding.Identity.Provider != "" && binding.Identity.Model != "" && binding.Identity.Family != "" && binding.Identity.Version != ""
 }
@@ -140,14 +179,16 @@ func (r *Registry) get(name string) (contracts.Provider, bool) {
 }
 
 type Coordinator struct {
-	registry   *Registry
-	routes     map[Role]Route
-	store      *store.Store
-	clock      Clock
-	supervisor contracts.ProcessSupervisor
-	fatal      atomic.Bool
-	fatalMu    sync.Mutex
-	fatalErr   error
+	registry     *Registry
+	routes       map[Role]Route
+	store        *store.Store
+	clock        Clock
+	supervisor   contracts.ProcessSupervisor
+	fatal        atomic.Bool
+	fatalMu      sync.Mutex
+	fatalErr     error
+	checkpointMu sync.RWMutex
+	checkpoint   contracts.RejectionCheckpointInspector
 }
 
 // Close is the lifecycle hook used by the foreground daemon. Provider
@@ -262,6 +303,10 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 	if repairErr != nil {
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	}
+	pendingRejection, rejectionPending, rejectionErr := c.store.PendingProviderServerRejection(ctx, r.Input.Ticket, r.Input.Phase, string(r.Role), r.ExpectedVersion, r.Fence)
+	if rejectionErr != nil {
+		return Result{Code: NeedsOperator, NeedsOperator: true}
+	}
 	if _, repairUnavailable, repairUnavailableErr := c.store.PendingProviderRepairUnavailable(ctx, r.Input.Ticket, r.Input.Phase, string(r.Role), r.ExpectedVersion, r.Fence); repairUnavailableErr != nil {
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	} else if repairUnavailable {
@@ -277,6 +322,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 	}
 	var receipts []Receipt
 	var spent int64
+	backoffWaits := 0
 	repairRouteIndex := -1
 	for routeIndex := 0; routeIndex < len(names); routeIndex++ {
 		name := names[routeIndex]
@@ -286,6 +332,9 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		}
 		p, ok := c.registry.get(name)
 		if !ok {
+			if rejectionPending {
+				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			}
 			if repairRequired {
 				return Result{Code: RepairUnavailable, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
@@ -297,10 +346,16 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		// in binding.Identity and is validated by Store; do not compare it to
 		// the local registry route alias.
 		if err != nil || p.Name() != name {
+			if rejectionPending {
+				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			}
 			if repairRequired {
 				return Result{Code: RepairUnavailable, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
 			continue
+		}
+		if rejectionPending && binding != pendingRejection.Binding {
+			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 		if repairPending {
 			if binding != pendingRepair.Binding {
@@ -312,6 +367,9 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		remaining := ticket.CreatedAt.Add(ticket.MaxDuration).Sub(c.clock.Now())
 		if remaining <= 0 {
 			return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+		}
+		if r.ExpectedProvider != "" && binding.Identity.Provider != r.ExpectedProvider {
+			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 		timeout := r.Input.Timeout
 		if timeout > remaining {
@@ -325,6 +383,23 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest, Repository: r.Input.Repository, Worktree: r.Input.Worktree, WorktreeIdentity: r.Input.WorktreeIdentity, BaseSHA: r.Input.BaseSHA, SupervisorKey: c.supervisor.PublicKey(), Input: claimInput})
 		if err != nil {
 			cancel()
+			var backoff *store.ProviderRetryBackoffError
+			if errors.As(err, &backoff) {
+				// This deadline is read from authenticated durable evidence.
+				// Bound repeats even if an injected/frozen clock does not advance.
+				if backoffWaits >= 2 || waitServerRejectionBackoff(ctx, c.clock, backoff.NotBefore) != nil {
+					if ctx.Err() != nil {
+						return Result{Code: Canceled, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+					}
+					return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+				}
+				backoffWaits++
+				routeIndex--
+				continue
+			}
+			if errors.Is(err, store.ErrProviderServerRejection) {
+				return Result{Code: ResultIndeterminate, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			}
 			if errors.Is(err, store.ErrProviderResultIndeterminate) {
 				return Result{Code: ResultIndeterminate, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
@@ -377,6 +452,11 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		}
 		input = claim.Input
 		invocation, invokeErr := p.Invocation(attemptCtx, input)
+		checkpointRefused := false
+		if invokeErr == nil {
+			invokeErr = c.inspectRejectionRetryBeforeLaunch(attemptCtx, claim)
+			checkpointRefused = invokeErr != nil
+		}
 		if invokeErr != nil {
 			// Invocation is adapter-only and occurs before the supervisor owns a
 			// child. This is the sole definite no-process failure path; every
@@ -404,6 +484,9 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			if retiredForControl || ctx.Err() != nil {
 				return Result{Code: Canceled, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
+			if checkpointRefused {
+				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+			}
 			if repairRequired {
 				return Result{Code: RepairUnavailable, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
@@ -417,13 +500,16 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		} else {
 			raw, runErr = p.Parse(attemptCtx, input, commandResult)
 		}
+		if runErr != nil {
+			reportProviderRunFailure(commandResult, commandErr != nil, runErr)
+		}
 		cancel()
 		cancelled := ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
 		// Returning from Run, including a provider error, is not proof that its
 		// process group drained. Every terminal path must obtain an explicit
 		// supervisor proof before releasing the durable claim and lease.
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		drain, drainErr := c.supervisor.Drain(drainCtx, drainRequest(claim))
+		drain, serverReceipt, drainErr := drainWithServerRejection(drainCtx, c.supervisor, claim, commandErr != nil && !cancelled)
 		drainCancel()
 		if drainErr != nil {
 			quarantineCtx, quarantineCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -434,25 +520,49 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			}
 			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: quarantineErr != nil}
 		}
+		if contracts.UsesMultiCLIRequestLimit(binding.Identity.Provider) {
+			// Persist optional estimates without assigning monetary authority.
+			// A failure/binding mismatch has unknown cost, never verified zero.
+			estimate := raw.ReportedCostEstimateMicroUSD
+			if commandErr != nil || raw.Provider != binding.Identity {
+				estimate = nil
+			}
+			accountingCtx, accountingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			accountingErr := c.store.RecordProviderCostEstimate(accountingCtx, claim, drain, estimate)
+			accountingCancel()
+			// Revoked attempts must still reach the existing signed-drain
+			// retirement path below; they cannot append a current observation.
+			if accountingErr != nil && !errors.Is(accountingErr, store.ErrStaleFence) {
+				c.markPersistenceFailure(accountingErr)
+				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent, PersistenceFailure: true}
+			}
+		}
 		state, outcome := "failed", "failed"
 		if cancelled {
 			state, outcome = "cancelled", "cancelled"
 		}
-		valid := !cancelled && runErr == nil && raw.Outcome == contracts.PhaseResultCompleted && raw.Provider == binding.Identity && raw.UsageTrusted && raw.UsageUnits >= 0
+		accountingAccepted := c.store.ProviderResultAccountingAccepted(ctx, claim, raw)
+		valid := !cancelled && runErr == nil && raw.Outcome == contracts.PhaseResultCompleted && raw.Provider == binding.Identity && accountingAccepted
 		trustedUsage := int64(0)
 		if raw.UsageTrusted && raw.UsageUnits >= 0 {
 			trustedUsage = raw.UsageUnits
 		}
 		var parsed phaseartifact.Parsed
-		// An adapter's explicit invalid-artifact outcome is repairable only when
-		// its monetary usage is trusted. Every supervisor/command error, usage
-		// ambiguity, and explicit indeterminate outcome is terminal and must not
-		// enter fallback or repair.
-		indeterminateResult := !cancelled && (commandErr != nil || runErr != nil && raw.Outcome != contracts.PhaseResultInvalidArtifact || !raw.UsageTrusted || raw.UsageUnits < 0 || raw.Provider != binding.Identity || (raw.Outcome != contracts.PhaseResultCompleted && raw.Outcome != contracts.PhaseResultInvalidArtifact))
-		if indeterminateResult {
+		var artifactFailureReason contracts.ArtifactFailureReason
+		// Repair requires accepted accounting: verified usage or explicit
+		// estimate policy plus a durable observation. Command ambiguity still
+		// cannot enter repair, regardless of accounting mode.
+		indeterminateResult := !cancelled && (commandErr != nil || runErr != nil && raw.Outcome != contracts.PhaseResultInvalidArtifact || !accountingAccepted || raw.Provider != binding.Identity || (raw.Outcome != contracts.PhaseResultCompleted && raw.Outcome != contracts.PhaseResultInvalidArtifact))
+		if serverReceipt != nil && !cancelled {
+			outcome = "server_rejected"
+		} else if indeterminateResult {
 			outcome = "result_indeterminate"
 		} else if !cancelled && raw.Outcome == contracts.PhaseResultInvalidArtifact {
 			outcome = contracts.PhaseResultInvalidArtifact
+			artifactFailureReason = raw.ArtifactFailureReason
+			if !contracts.ValidArtifactFailureReason(artifactFailureReason) {
+				artifactFailureReason = contracts.ArtifactFailureAdapterDeclared
+			}
 		} else if valid {
 			parsed, err = phaseartifact.Parse(input.Phase, raw, r.Validation)
 			if err == nil {
@@ -460,16 +570,35 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 					state, outcome = "completed", contracts.PhaseResultCompleted
 				} else {
 					outcome = contracts.PhaseResultInvalidArtifact
+					artifactFailureReason = contracts.ArtifactFailureMutationPath
 				}
 			} else {
 				outcome = contracts.PhaseResultInvalidArtifact
+				artifactFailureReason = contracts.ArtifactFailureSchema
+				if input.Phase == domain.PhaseBuild {
+					reportBuilderValidationFailure(err)
+				}
+				if input.Phase == domain.PhasePlanning {
+					reportPlannerValidationFailure(err)
+				}
 			}
 		}
-		receipt := Receipt{AttemptID: claim.ID, Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), UsageUnits: trustedUsage}
+		receipt := Receipt{AttemptID: claim.ID, Attempt: claim.Attempt, Provider: binding.Identity, ArtifactDigest: safeDigest(raw.Artifact), TranscriptDigest: safeDigest([]byte(raw.Transcript)), ArtifactFailureReason: artifactFailureReason, UsageUnits: trustedUsage}
+		if raw.UsageTrusted {
+			receipt.AccountingMode = "verified_charge"
+		} else if accountingAccepted {
+			receipt.AccountingMode = "reported_estimate_v1"
+			receipt.ReportedCostEstimateMicroUSD = raw.ReportedCostEstimateMicroUSD
+		} else {
+			receipt.AccountingMode = "unknown"
+		}
 		if raw.TokenUsageTrusted {
 			receipt.TokenUsage = max(raw.TokenUsage, 0)
 		}
-		if outcome == "result_indeterminate" {
+		if outcome == "server_rejected" {
+			receipt.ErrorCode = "server_rejected"
+			receipt.TranscriptDigest = serverReceipt.Evidence.StreamDigest
+		} else if outcome == "result_indeterminate" {
 			receipt.ErrorCode = "result_indeterminate"
 		} else if outcome == contracts.PhaseResultInvalidArtifact {
 			receipt.ErrorCode = "invalid_artifact"
@@ -483,8 +612,22 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		finishedAt := c.clock.Now()
 		var finishErr error
 		var durableResult store.ProviderAttemptResult
-		if state == "completed" {
+		if outcome == "server_rejected" {
+			finishErr = c.store.FinishProviderAttemptWithServerRejection(finishCtx, claim, drain, *serverReceipt, finishedAt)
+		} else if state == "completed" {
 			durableResult, finishErr = c.store.CompleteProviderAttemptSuccess(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, raw, r.Validation, finishedAt)
+		} else if outcome == contracts.PhaseResultInvalidArtifact {
+			finishErr = c.store.FinishProviderAttemptWithArtifactFailure(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, artifactFailureReason, trustedUsage, finishedAt)
+		} else if outcome == "result_indeterminate" {
+			reason := raw.FailureReason
+			if commandErr != nil {
+				reason = contracts.ProviderFailureCommand
+			} else if !accountingAccepted || raw.Provider != binding.Identity {
+				reason = contracts.ProviderFailureBinding
+			} else if !contracts.ValidProviderFailureReason(reason) {
+				reason = contracts.ProviderFailureAdapter
+			}
+			finishErr = c.store.FinishProviderAttemptWithIndeterminateFailure(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, reason, trustedUsage, finishedAt)
 		} else {
 			finishErr = c.store.FinishProviderAttempt(finishCtx, claim, drain, r.ExpectedVersion, r.Fence, state, outcome, trustedUsage, finishedAt)
 		}
@@ -535,6 +678,13 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		}
 		if outcome == "result_indeterminate" {
 			return Result{Code: ResultIndeterminate, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
+		}
+		if outcome == "server_rejected" {
+			// Repeat this exact route only. Store owns the remaining shared
+			// attempt budget and deadline, including after daemon restart.
+			pendingRejection, rejectionPending = claim, true
+			routeIndex--
+			continue
 		}
 		if state == "completed" {
 			return Result{Code: Completed, Parsed: &parsed, ProviderResult: store.ProviderAttemptResultKey{AttemptID: durableResult.AttemptID, Ref: durableResult.Claim.Ref, Phase: durableResult.Claim.Phase, Attempt: durableResult.Claim.Attempt}, Attempts: receipts, CostUsed: spent}
@@ -645,6 +795,9 @@ func (c *Coordinator) reusedResult(ctx context.Context, request Request, key sto
 }
 
 func reusedInputMatches(request Request, claim store.ProviderAttemptClaim) bool {
+	if request.ExpectedProvider != "" && claim.Binding.Identity.Provider != request.ExpectedProvider {
+		return false
+	}
 	input := request.Input
 	input.Provider, input.AuthMode, input.Attempt = claim.Binding.Identity, claim.Binding.AuthMode, claim.Attempt
 	input.LeaderEpoch, input.RunnerEpoch, input.ExpectedVersion = claim.LeaderEpoch, claim.RunnerEpoch, claim.ExpectedVersion
@@ -656,8 +809,7 @@ func reusedInputMatches(request Request, claim store.ProviderAttemptClaim) bool 
 		return false
 	}
 	input.Timeout = claim.Input.Timeout
-	_, digest, err := contracts.CanonicalPhaseInput(input)
-	return err == nil && digest == claim.RequestDigest && contracts.PhaseInputDigestMatches(claim.Input, claim.RequestDigest)
+	return contracts.PhaseInputMatchesAuthenticatedClaim(input, claim.Input, claim.RequestDigest)
 }
 
 // bindClaimToInput is the last coordinator-side authentication point before
@@ -690,8 +842,7 @@ func bindClaimToInput(input *contracts.PhaseInput, claim store.ProviderAttemptCl
 		expected.ExpectedVersion = claim.ExpectedVersion
 	}
 	expected.Repair = claim.Input.Repair
-	_, expectedDigest, err := contracts.CanonicalPhaseInput(expected)
-	if err != nil || expectedDigest != claim.RequestDigest {
+	if !contracts.PhaseInputMatchesAuthenticatedClaim(expected, claim.Input, claim.RequestDigest) {
 		return false
 	}
 	*input = claim.Input

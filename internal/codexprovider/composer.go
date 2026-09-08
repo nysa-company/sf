@@ -27,6 +27,95 @@ type QualificationResult struct {
 	ModelCallMade bool                        `json:"model_call_made"`
 }
 
+// QualifyLocalRole measures one configured Codex role without changing the
+// selected pair. Multi-provider composition commits selection only at the end.
+func QualifyLocalRole(ctx context.Context, database *store.Store, channel domain.Channel, role string, attestor QualificationAttestor) (store.ProviderQualification, error) {
+	return QualifyLocalRoleModel(ctx, database, channel, role, "", attestor)
+}
+
+// QualifyLocalRoleModel pins an explicit model without changing process-wide
+// environment. An empty model preserves the existing role default.
+func QualifyLocalRoleModel(ctx context.Context, database *store.Store, channel domain.Channel, role, model string, attestor QualificationAttestor) (store.ProviderQualification, error) {
+	profiles := configuredProfiles()
+	index := 0
+	if role == "reviewer" {
+		index = 1
+	} else if role != "builder" {
+		return store.ProviderQualification{}, ErrUnsafeConfiguration
+	}
+	if len(profiles) != 2 {
+		return store.ProviderQualification{}, ErrUnavailable
+	}
+	profile := profiles[index]
+	if model != "" {
+		if _, ok := familyForModel(model); !ok {
+			return store.ProviderQualification{}, ErrUnsafeConfiguration
+		}
+		profile.Model = model
+	}
+	runner, err := newOuterQualificationRunner(auth.OSRunner{}, profile.AuthHome)
+	if err != nil {
+		return store.ProviderQualification{}, err
+	}
+	profile.Runner = runner
+	adapter, err := New(profile)
+	if err != nil {
+		return store.ProviderQualification{}, err
+	}
+	return Qualify(ctx, database, channel, adapter, LocalQualificationFixture(), attestor)
+}
+
+func LocalRuntimeCandidates() ([]providercoord.RuntimeCandidate, int, error) {
+	return LocalRuntimeCandidatesForModels(nil)
+}
+
+// LocalRuntimeCandidatesForModels reconstructs exact selected identities after
+// restart; selection and signed qualification remain Store authority.
+func LocalRuntimeCandidatesForModels(models []string) ([]providercoord.RuntimeCandidate, int, error) {
+	capacity, err := configuredProviderCapacity()
+	if err != nil {
+		return nil, 0, err
+	}
+	var candidates []providercoord.RuntimeCandidate
+	seenModels := map[string]bool{}
+	profiles := configuredProfiles()
+	if len(models) > 0 {
+		if len(models) > 3 || len(profiles) == 0 {
+			return nil, capacity, ErrUnavailable
+		}
+		base := profiles[0]
+		configured := profiles
+		profiles = nil
+		for _, model := range models {
+			if _, ok := familyForModel(model); !ok {
+				return nil, capacity, ErrUnsafeConfiguration
+			}
+			profile := base
+			profile.Model, profile.Route = model, "codex-"+model
+			for _, existing := range configured {
+				if existing.Model == model {
+					profile = existing
+					break
+				}
+			}
+			profiles = append(profiles, profile)
+		}
+	}
+	for _, profile := range profiles {
+		// Both role defaults may name the same installed model in a mixed
+		// pair. Publish one candidate, not two aliases for one identity.
+		if seenModels[profile.Model] {
+			continue
+		}
+		seenModels[profile.Model] = true
+		adapter, err := New(profile)
+		if err == nil {
+			candidates = append(candidates, providercoord.RuntimeCandidate{Provider: adapter, Executable: adapter.executable, AuthHome: adapter.authHome})
+		}
+	}
+	return candidates, capacity, nil
+}
+
 // QualifyLocalPair runs only under a daemon-owned supervisor. A direct CLI
 // cannot produce an attestation and therefore cannot manufacture readiness.
 func QualifyLocalPair(ctx context.Context, database *store.Store, channel domain.Channel, builderName, reviewerName string, attestor QualificationAttestor) (QualificationResult, error) {
@@ -69,15 +158,15 @@ func QualifyLocalPair(ctx context.Context, database *store.Store, channel domain
 	return result, nil
 }
 
-type executableRegistrar interface {
-	RegisterRuntime(contracts.RuntimeBinding, string, string) (string, error)
-}
-
 // Compose constructs no routes unless a current, exact guarded qualification
 // can be re-probed in this daemon environment. This deliberately leaves the
 // daemon usable for Doctor and operator repair when Codex is absent or stale.
 func Compose(ctx context.Context, channel domain.Channel, database *store.Store, process contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
-	return ComposeProfiles(ctx, channel, database, process, defaultProfiles())
+	capacity, err := configuredProviderCapacity()
+	if err != nil {
+		return nil, err
+	}
+	return ComposeProfilesWithCapacity(ctx, channel, database, process, defaultProfiles(), capacity)
 }
 
 // ComposeProfiles is the explicit production configuration boundary. Each
@@ -85,47 +174,48 @@ func Compose(ctx context.Context, channel domain.Channel, database *store.Store,
 // profiles are independent only when their recorded families differ. No route
 // is synthesized from an alias or a duplicate family.
 func ComposeProfiles(ctx context.Context, channel domain.Channel, database *store.Store, process contracts.ProcessSupervisor, profiles []Config) (*providercoord.Coordinator, error) {
-	registry := providercoord.NewRegistry()
-	routes := map[providercoord.Role]providercoord.Route{}
+	return ComposeProfilesWithCapacity(ctx, channel, database, process, profiles, 1)
+}
+
+// ComposeProfilesWithCapacity applies an explicit, tightly bounded capacity
+// to the shared provider/auth lease. Store remains the authority for machine,
+// project, and provider admission; this only permits the caller to opt into
+// the already-supported two-worker ceiling.
+func ComposeProfilesWithCapacity(ctx context.Context, channel domain.Channel, database *store.Store, process contracts.ProcessSupervisor, profiles []Config, capacity int) (*providercoord.Coordinator, error) {
+	if capacity < 1 || capacity > 2 {
+		return nil, errors.New("invalid Codex provider capacity")
+	}
 	if !channel.Valid() || database == nil || process == nil {
 		return nil, errors.New("valid channel, store, and process supervisor are required")
 	}
-	pair, err := database.ProviderPair(ctx, channel)
-	if err != nil || pair.Builder.Provider.Provider != "codex" || pair.Reviewer.Provider.Provider != "codex" || pair.Builder.Provider.Family == pair.Reviewer.Provider.Family {
-		return providercoord.New(registry, routes, database, nil, process)
-	}
-	registrar, ok := process.(executableRegistrar)
-	if !ok {
-		return providercoord.New(registry, routes, database, nil, process)
-	}
-	byIdentity := map[domain.ProviderIdentity]*Adapter{}
+	candidates := make([]providercoord.RuntimeCandidate, 0, len(profiles))
 	for _, profile := range profiles {
 		adapter, adapterErr := New(profile)
 		if adapterErr != nil {
 			continue
 		}
-		binding, bindingErr := adapter.Binding(ctx)
-		if bindingErr != nil || !qualificationMatches(database, ctx, channel, binding) {
-			continue
-		}
-		if _, exists := byIdentity[binding.Identity]; exists {
-			continue
-		}
-		registeredDigest, registerErr := registrar.RegisterRuntime(binding, adapter.executable, adapter.authHome)
-		if registerErr != nil || registeredDigest != binding.BinaryDigest || registry.Register(ctx, adapter) != nil {
-			continue
-		}
-		byIdentity[binding.Identity] = adapter
+		candidates = append(candidates, providercoord.RuntimeCandidate{Provider: adapter, Executable: adapter.executable, AuthHome: adapter.authHome})
 	}
-	builder, builderOK := byIdentity[pair.Builder.Provider]
-	reviewer, reviewerOK := byIdentity[pair.Reviewer.Provider]
-	if !builderOK || !reviewerOK || builder.Name() == reviewer.Name() {
-		return providercoord.New(providercoord.NewRegistry(), routes, database, nil, process)
+	return providercoord.ComposeQualified(ctx, channel, database, process, candidates, capacity)
+}
+
+func composeRoutes(builder, reviewer string, capacity int) map[providercoord.Role]providercoord.Route {
+	return map[providercoord.Role]providercoord.Route{
+		providercoord.RolePlanner:  {Primary: builder, Capacity: capacity},
+		providercoord.RoleBuilder:  {Primary: builder, Capacity: capacity},
+		providercoord.RoleReviewer: {Primary: reviewer, Capacity: capacity},
 	}
-	routes[providercoord.RolePlanner] = providercoord.Route{Primary: builder.Name()}
-	routes[providercoord.RoleBuilder] = providercoord.Route{Primary: builder.Name()}
-	routes[providercoord.RoleReviewer] = providercoord.Route{Primary: reviewer.Name()}
-	return providercoord.New(registry, routes, database, nil, process)
+}
+
+func configuredProviderCapacity() (int, error) {
+	switch os.Getenv("SF_CODEX_PROVIDER_CAPACITY") {
+	case "", "1":
+		return 1, nil
+	case "2":
+		return 2, nil
+	default:
+		return 0, errors.New("invalid SF_CODEX_PROVIDER_CAPACITY: expected 1 or 2")
+	}
 }
 
 func qualificationMatches(database *store.Store, ctx context.Context, channel domain.Channel, binding contracts.RuntimeBinding) bool {
@@ -134,6 +224,21 @@ func qualificationMatches(database *store.Store, ctx context.Context, channel do
 }
 
 func defaultProfiles() []Config {
+	profiles := configuredProfiles()
+	if len(profiles) != 2 {
+		return nil
+	}
+	builderFamily, _ := familyForModel(profiles[0].Model)
+	reviewerFamily, _ := familyForModel(profiles[1].Model)
+	if builderFamily == reviewerFamily {
+		return nil
+	}
+	return profiles
+}
+
+// Individual candidates need not be independent of an unused Codex role.
+// Independence is enforced on the selected pair, including mixed CLI pairs.
+func configuredProfiles() []Config {
 	executable, err := exec.LookPath("codex")
 	if err != nil || !filepath.IsAbs(executable) {
 		return nil
@@ -154,13 +259,37 @@ func defaultProfiles() []Config {
 	if reviewerModel == "" {
 		reviewerModel = "gpt-5.5"
 	}
-	builderFamily, builderOK := familyForModel(builderModel)
-	reviewerFamily, reviewerOK := familyForModel(reviewerModel)
-	if !builderOK || !reviewerOK || builderFamily == reviewerFamily {
+	_, builderOK := familyForModel(builderModel)
+	_, reviewerOK := familyForModel(reviewerModel)
+	if !builderOK || !reviewerOK {
 		return nil
 	}
 	return []Config{
 		{Route: "codex-builder", Executable: executable, AuthHome: authHome, Model: builderModel},
 		{Route: "codex-reviewer", Executable: executable, AuthHome: authHome, Model: reviewerModel},
 	}
+}
+
+// DefaultRoleModel reports the configured exact role model without probing or
+// invoking a provider. Invalid local configuration never selects a fallback.
+func DefaultRoleModel(role string) (string, error) {
+	var model string
+	switch role {
+	case "builder":
+		model = os.Getenv("SF_CODEX_BUILDER_MODEL")
+		if model == "" {
+			model = "gpt-5.6-luna"
+		}
+	case "reviewer":
+		model = os.Getenv("SF_CODEX_REVIEWER_MODEL")
+		if model == "" {
+			model = "gpt-5.5"
+		}
+	default:
+		return "", ErrUnsafeConfiguration
+	}
+	if _, ok := ModelFamily(model); !ok {
+		return "", ErrUnsafeConfiguration
+	}
+	return model, nil
 }

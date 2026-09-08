@@ -20,6 +20,10 @@ The approved normative design is in
   records the base and protection witnesses; reconciliation proves ancestry
   from the original base rather than expecting the protected branch tip to
   remain old.
+  App-specific required checks are authenticated against GitHub's exact-head
+  check-run response: app ID, name, run URL and result must agree with the
+  required-check observation. Incomplete or ambiguous inventories fail closed;
+  a successful check with the same name from a different app is not evidence.
 - Project configuration is parsed strictly, resolved beneath machine policy,
   and stored as immutable canonical bytes plus a digest. A queued ticket copies
   the exact current generation when it first enters planning, so a later file
@@ -27,6 +31,14 @@ The approved normative design is in
 - Each ticket's unguessable channel-prefixed branch is allocated once through
   SQLite and protected by ticket and channel uniqueness. Git does not own a
   second branch-name ledger.
+  With authenticated publication transport, worktree creation observes the
+  current hosted base and fetches it under the durable creation lease into a
+  ticket-specific `refs/sf/worktree-base/` ref. The primary checkout and its
+  branch are not advanced. Registration, later identity checks, and diff
+  validation use that pinned object, so later tickets include prior hosted
+  merges without changing an existing ticket's base. The explicitly
+  pre-publication-only runtime still uses its local base; remote failures in
+  a configured publication runtime never silently select that local fallback.
 - GitHub publication preserves the exact local candidate SHA through an
   ordinary fast-forward Git push. Canonical
   `https://github.com/<owner>/<repository>.git` remotes use the packaged
@@ -65,6 +77,19 @@ The approved normative design is in
   uncertain effect and is never blindly retried; explicit exact reconciliation
   is required before another mutation.
 
+Protected-base refresh is a single guarded operation per ticket. Store first
+authenticates the exact remote tip, then appends an immutable reservation and
+prepared ordered two-parent anchor (old candidate head, new protected base).
+Git applies that anchor only under an exclusive repository lease and paired
+ref CAS; foreign heads, conflicts, and identity drift fail closed. The
+original verification-owned files and historical provider/PR evidence remain
+immutable. Completion projects the effective worktree to the new base, after
+which a fresh Builder, post-build proof, CI, final review, and approval are
+required while retaining the same PR when one exists. Pending Apply recovery
+reuses only the authenticated reservation. Unreserved exact-proof recovery is
+limited to eight same-fence retries of the private proof ref; it cannot move
+the ticket or refresh a different base.
+
 The DBOS proof gate failed its bounded SQLite contention requirement. v1 uses
 one custom Go state engine over the application schema; DBOS is retained only
 as a reproducible rejected spike. See
@@ -77,6 +102,11 @@ setup and diagnostic commands. Each ticket has one channel-prefixed branch and
 worktree. Planner, Builder, and Reviewer are logical roles; Reviewer runs once
 before build to author verification and again fresh after the candidate and CI
 checks exist.
+The final-review prompt distinguishes the verification checkpoint's protected
+files from the Builder's later file delta. SF supplies the authenticated
+checkout identity and independently runs the post-build proof; provider-reported
+command attempts are not that proof. The Reviewer must still inspect source and
+tests, report genuine inconsistencies, and return its own verdict.
 
 Manual and guarded modes use an explicit trusted-provider/repository baseline.
 Autonomous selection and merge are unavailable in v1 pending the guarded pilot

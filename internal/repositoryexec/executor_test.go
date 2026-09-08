@@ -59,6 +59,30 @@ type lifecycleAuthority struct {
 	activeClaims map[string]bool
 }
 
+type contentionAuthority struct {
+	contentions  int
+	acquireCalls int
+	retireCalls  int
+	cancel       context.CancelFunc
+	lease        contracts.RepositoryCommandLease
+}
+
+func (a *contentionAuthority) AcquireRepositoryCommand(context.Context, contracts.RepositoryCommandClaim) (contracts.RepositoryCommandLease, error) {
+	a.acquireCalls++
+	if a.acquireCalls <= a.contentions {
+		if a.cancel != nil {
+			a.cancel()
+		}
+		return nil, contracts.ErrRepositoryCommandContended
+	}
+	return a.lease, nil
+}
+
+func (a *contentionAuthority) RetireUnleasedRepositoryCommand(ctx context.Context, _ contracts.RepositoryCommandClaim) error {
+	a.retireCalls++
+	return ctx.Err()
+}
+
 func (a *lifecycleAuthority) AcquireRepositoryCommand(_ context.Context, claim contracts.RepositoryCommandClaim) (contracts.RepositoryCommandLease, error) {
 	a.acquireCalls++
 	if a.activeClaims == nil {
@@ -150,7 +174,7 @@ func TestNPMRecipeNeverAcquiresRepositoryLease(t *testing.T) {
 	}
 }
 
-func TestNodeRecipeIsTheOnlyNonGoRepositoryPolicyAlternative(t *testing.T) {
+func TestNodeRecipeRemainsExact(t *testing.T) {
 	if _, err := executionpolicy.NewCommandSnapshot([]string{"node", "--test"}); err != nil {
 		t.Fatalf("exact Node recipe rejected: %v", err)
 	}
@@ -295,6 +319,51 @@ func TestRunPreservesAmbiguousNilLeaseAcquire(t *testing.T) {
 	claim := contracts.RepositoryCommandClaim{SemanticKey: "persisted-ambiguous-claim", TicketRef: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "t"}, Repository: directory, Worktree: directory, CommandDigest: commandDigest, SpecDigest: specDigest, PolicyDigest: policy.Digest()}
 	_, runErr := (Executor{Authority: authority}).Run(context.Background(), Request{Claim: claim, Spec: spec, Policy: policy})
 	if runErr == nil || authority.acquireCalls != 1 || authority.retireCalls != 0 || !authority.active || !authority.activeClaims[claim.SemanticKey] {
+		t.Fatalf("err=%v acquire=%d retire=%d", runErr, authority.acquireCalls, authority.retireCalls)
+	}
+}
+
+func TestAcquireRepositoryCommandRetriesOnlyDefiniteContention(t *testing.T) {
+	lease := &cancellationLease{}
+	authority := &contentionAuthority{contentions: 1, lease: lease}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := acquireRepositoryCommand(ctx, authority, contracts.RepositoryCommandClaim{SemanticKey: "wait-for-writer"})
+	if err != nil || got != lease || authority.acquireCalls != 2 {
+		t.Fatalf("lease=%T err=%v acquire calls=%d", got, err, authority.acquireCalls)
+	}
+
+	lost := errors.New("acquire response lost")
+	ambiguous := &lifecycleAuthority{acquireErr: lost, returnNil: true}
+	got, err = acquireRepositoryCommand(ctx, ambiguous, contracts.RepositoryCommandClaim{SemanticKey: "ambiguous"})
+	if got != nil || !errors.Is(err, lost) || ambiguous.acquireCalls != 1 {
+		t.Fatalf("ambiguous lease=%T err=%v acquire calls=%d", got, err, ambiguous.acquireCalls)
+	}
+}
+
+func TestRunRetiresTypedContentionWhenBoundedWaitIsCanceled(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("repository supervisor is Darwin-only")
+	}
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "go.mod"), []byte("module example.test\n\ngo 1.23\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := executionpolicy.NewCommandSnapshot([]string{"go", "test", "./..."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := contracts.CommandSpec{Argv: []string{"go", "test", "./..."}, Directory: directory, Timeout: time.Second, Profile: contracts.ProfileGuarded}
+	commandDigest, _ := CommandDigest(spec.Argv)
+	specDigest, _ := SpecDigest(spec, "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	claim := contracts.RepositoryCommandClaim{SemanticKey: "typed-contention", TicketRef: domain.TicketRef{Channel: domain.ChannelDev, Project: "p", Ticket: "t"}, Repository: directory, Worktree: directory, CommandDigest: commandDigest, SpecDigest: specDigest, PolicyDigest: policy.Digest()}
+	ctx, cancel := context.WithCancel(context.Background())
+	authority := &contentionAuthority{contentions: 1, cancel: cancel}
+	_, runErr := (Executor{Authority: authority}).Run(ctx, Request{Claim: claim, Spec: spec, Policy: policy})
+	if !errors.Is(runErr, contracts.ErrRepositoryCommandContended) || !errors.Is(runErr, context.Canceled) || authority.acquireCalls != 1 || authority.retireCalls != 1 {
 		t.Fatalf("err=%v acquire=%d retire=%d", runErr, authority.acquireCalls, authority.retireCalls)
 	}
 }

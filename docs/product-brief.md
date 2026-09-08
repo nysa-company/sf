@@ -13,11 +13,20 @@ after the human merges the pull request, and a guarded exact-head merge that
 selection and merge remain deliberately unavailable pending a stronger native
 containment proof and the guarded pilot.
 
-## v1 user
+## v1 user and self-serve beta
 
-Sofia building Nysa from a trusted local macOS machine. The project is intended
-to become open source, but v1 does not claim safe execution of untrusted
-repositories.
+The initial operator is Sofia building Nysa from a trusted local macOS machine.
+The next audience is open-source developers already using Claude or Codex who
+want to delegate a bounded ticket through the CLI. They should be able to
+preview project compatibility, create and select tickets without copying long
+IDs, and understand the next action without author assistance.
+
+The [self-serve beta plan](plans/2026-09-05-self-serve-cli-beta.md) targets Go,
+Node/TypeScript, Python, and Rails. This is an expansion target, not a claim
+that all four stacks or both provider runtimes work today. The
+[first-ticket guide](tutorials/first-ticket.md) lists the actual supported
+combinations. External beta validation remains pending. SF does not claim
+safe execution of untrusted repositories.
 
 ## Success
 

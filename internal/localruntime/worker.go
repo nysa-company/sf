@@ -34,6 +34,10 @@ type Worker struct {
 	// PublicationEnabled is explicit so a pre-publishing composition cannot
 	// accidentally treat a zero publication worker as a successful phase.
 	PublicationEnabled bool
+	// Enabled only by the complete production composition. Injected legacy
+	// workers retain their explicit test capabilities rather than gaining Git.
+	BaseRefreshEnabled bool
+	BaseRefresh        BaseRefreshCoordinator
 }
 
 // NewWorker constructs the runtime dispatcher while retaining concrete phase
@@ -60,6 +64,9 @@ func (w Worker) Run(ctx context.Context, ref domain.TicketRef, fence domain.Fenc
 	}
 	if !ready {
 		return workflowworker.RunResult{Ref: ref, State: ticket.State, Version: ticket.Version}, store.ErrStaleFence
+	}
+	if result, handled, err := w.refreshProtectedBase(ctx, ticket, fence); handled || err != nil {
+		return result, err
 	}
 	switch ticket.State {
 	case domain.StatePlanning, domain.StateVerifying, domain.StateBuilding, domain.StateReviewing:

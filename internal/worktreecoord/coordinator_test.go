@@ -127,6 +127,139 @@ func mustGit(t *testing.T, directory string, args ...string) string {
 }
 func coordinatorFor(f coordinatorFixture) Coordinator { return Coordinator{Store: f.db, Git: f.runner} }
 
+func TestAuthenticateExistingRegisteredWorktreeNeverCreatesAndRequiresStrictPristineHead(t *testing.T) {
+	t.Run("missing registration never allocates", func(t *testing.T) {
+		f := setupCoordinator(t, "SF-provider-retry-no-create")
+		ctx := context.Background()
+		path, err := f.db.TicketWorktreePath(f.ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := mustGit(t, f.project.Path, "rev-parse", "main")
+		if _, err := coordinatorFor(f).AuthenticateExistingRegisteredWorktree(ctx, f.ref, expected); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("missing registration=%v, want ErrNotFound", err)
+		}
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read-only authentication created worktree path: %v", err)
+		}
+	})
+
+	t.Run("dirty ignored and clean foreign heads are unready", func(t *testing.T) {
+		f := setupCoordinator(t, "SF-provider-retry-strict")
+		ctx := context.Background()
+		c := coordinatorFor(f)
+		registered, err := c.Ensure(ctx, f.request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := mustGit(t, registered.Path, "rev-parse", "HEAD")
+		if got, err := c.AuthenticateExistingRegisteredWorktree(ctx, f.ref, expected); err != nil || got.Path != registered.Path {
+			t.Fatalf("pristine registered worktree=%+v err=%v", got, err)
+		}
+
+		dirty := filepath.Join(registered.Path, "provider-output.test.js")
+		if err := os.WriteFile(dirty, []byte("untrusted provider output\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.AuthenticateExistingRegisteredWorktree(ctx, f.ref, expected); !errors.Is(err, ErrUnready) {
+			t.Fatalf("dirty worktree=%v, want ErrUnready", err)
+		}
+		if err := os.Remove(dirty); err != nil {
+			t.Fatal(err)
+		}
+
+		exclude := mustGit(t, registered.Path, "rev-parse", "--git-path", "info/exclude")
+		if !filepath.IsAbs(exclude) {
+			exclude = filepath.Join(registered.Path, exclude)
+		}
+		if err := os.MkdirAll(filepath.Dir(exclude), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(exclude, []byte("provider-ignored-output\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ignored := filepath.Join(registered.Path, "provider-ignored-output")
+		if err := os.WriteFile(ignored, []byte("untrusted ignored provider output\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.AuthenticateExistingRegisteredWorktree(ctx, f.ref, expected); !errors.Is(err, ErrUnready) {
+			t.Fatalf("ignored worktree=%v, want ErrUnready", err)
+		}
+		if err := os.Remove(ignored); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(exclude); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+
+		if err := os.WriteFile(filepath.Join(registered.Path, "src", "foreign.txt"), []byte("foreign commit\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, registered.Path, "add", "src/foreign.txt")
+		mustGit(t, registered.Path, "commit", "-m", "foreign clean commit")
+		if _, err := c.AuthenticateExistingRegisteredWorktree(ctx, f.ref, expected); !errors.Is(err, ErrUnready) {
+			t.Fatalf("clean foreign head=%v, want ErrUnready", err)
+		}
+	})
+}
+
+func TestAuthenticateExistingRegisteredWorktreeRejectsReplacementAndPropagatesCancellation(t *testing.T) {
+	t.Run("path replacement is identity failure", func(t *testing.T) {
+		f := setupCoordinator(t, "SF-provider-retry-replacement")
+		ctx := context.Background()
+		c := coordinatorFor(f)
+		registered, err := c.Ensure(ctx, f.request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := mustGit(t, registered.Path, "rev-parse", "HEAD")
+		if err := os.Rename(registered.Path, registered.Path+"-foreign"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(registered.Path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.AuthenticateExistingRegisteredWorktree(ctx, f.ref, expected); !errors.Is(err, git.ErrIdentityMismatch) {
+			t.Fatalf("replaced registration=%v, want identity mismatch", err)
+		}
+	})
+
+	t.Run("context cancellation is not unready", func(t *testing.T) {
+		f := setupCoordinator(t, "SF-provider-retry-cancel")
+		registered, err := coordinatorFor(f).Ensure(context.Background(), f.request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := mustGit(t, registered.Path, "rev-parse", "HEAD")
+		started := make(chan struct{}, 1)
+		blocked := f.runner
+		blocked.Run = func(ctx context.Context, _ string, _ []string, _ []string) ([]byte, error) {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, err := (Coordinator{Store: f.db, Git: blocked}).AuthenticateExistingRegisteredWorktree(ctx, f.ref, expected)
+			done <- err
+		}()
+		select {
+		case <-started:
+			cancel()
+		case <-time.After(time.Second):
+			t.Fatal("authentication never reached Git observer")
+		}
+		if err := <-done; !errors.Is(err, context.Canceled) || errors.Is(err, ErrUnready) {
+			t.Fatalf("cancelled authentication=%v", err)
+		}
+	})
+}
+
 func TestEnsureFreshAndIdempotent(t *testing.T) {
 	f := setupCoordinator(t, "SF-fresh")
 	ctx := context.Background()
@@ -156,6 +289,26 @@ func TestEnsureFreshAndIdempotent(t *testing.T) {
 	third, err := c.Ensure(ctx, f.request)
 	if err != nil || third.Path != first.Path {
 		t.Fatalf("clean candidate head was rejected: worktree=%+v err=%v", third, err)
+	}
+}
+
+func TestEnsureRetainsDirtyRegisteredWorktreeForOperatorRecovery(t *testing.T) {
+	f := setupCoordinator(t, "SF-dirty-provider-retry")
+	ctx := context.Background()
+	c := coordinatorFor(f)
+	registered, err := c.Ensure(ctx, f.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirty := filepath.Join(registered.Path, "src", "provider-output.test.js")
+	if err := os.WriteFile(dirty, []byte("untrusted provider output\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Ensure(ctx, f.request); !errors.Is(err, ErrQuarantined) {
+		t.Fatalf("dirty registered worktree was admitted: %v", err)
+	}
+	if _, err := os.Stat(dirty); err != nil {
+		t.Fatalf("dirty provider output was not retained: %v", err)
 	}
 }
 
@@ -358,6 +511,90 @@ func TestEnsureQuarantinePersistenceFailureIsFailClosed(t *testing.T) {
 	path, _ := f.db.TicketWorktreePath(f.ref)
 	if got := mustGit(t, f.project.Path, "worktree", "list", "--porcelain"); strings.Count(got, "worktree "+path) != 1 {
 		t.Fatalf("duplicate worktree after persistence failure:\n%s", got)
+	}
+}
+
+func TestEnsureCreationClaimContendsWithRepositoryMutationLease(t *testing.T) {
+	f := setupCoordinator(t, "SF-create-contended")
+	ctx := context.Background()
+	// Establish a second, valid Git mutation claim against the same repository
+	// without touching its filesystem. The hook acquires it after the target's
+	// create claim is issued, reproducing the narrow repository-mutex race.
+	other := domain.TicketRef{Channel: domain.ChannelDev, Project: f.project.ID, Ticket: "SF-create-contender"}
+	if err := f.db.CreateTicket(ctx, store.Ticket{Ref: other, SourceDigest: "source-contender", Type: domain.TicketBug, MergeMode: domain.MergeGuarded}); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := f.db.Ticket(ctx, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := f.db.StartOrAdopt(ctx, other, queued.Version, "dev/nysa/SF-create-contender/worktree", f.request.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := f.db.TicketWorktreePath(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := (git.Allocator{Authority: f.db}).Allocate(ctx, other.Channel, other.Project, other.Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, base, err := f.runner.ObserveRepositoryBase(ctx, f.project.Path, f.project.BaseRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := store.GitMutationIntent{
+		EffectFence:   store.EffectFence{Ref: other, TicketVersion: started.Version, Fence: f.request.Fence},
+		RequestDigest: ensureDigest(other, repository, path, branch, f.project.BaseRef, base),
+		Repository:    repository, Worktree: path, Branch: branch, Operation: "create-worktree",
+		BaseRef: f.project.BaseRef, ExpectedBaseOID: base, ExpectedHeadOID: base,
+	}
+	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)
+	if _, err := f.db.PlanEffect(ctx, store.EffectPlan{SemanticKey: intent.SemanticKey, Ref: other, Kind: "git/create-worktree", TicketVersion: started.Version, Fence: f.request.Fence, RequestDigest: intent.RequestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	contender, err := f.db.IssueGitMutationClaim(ctx, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var held contracts.GitMutationLease
+	c := coordinatorFor(f)
+	c.afterCreationClaim = func(contracts.GitMutationClaim) {
+		var acquireErr error
+		held, acquireErr = f.db.AcquireGitMutation(ctx, contender)
+		if acquireErr != nil {
+			t.Fatalf("acquire competing repository lease: %v", acquireErr)
+		}
+	}
+	_, err = c.Ensure(ctx, f.request)
+	if !errors.Is(err, ErrInProgress) || !errors.Is(err, git.ErrCreateBeforeStart) {
+		t.Fatalf("contended creation error=%v, want proven unlaunched retry", err)
+	}
+	if held == nil {
+		t.Fatal("competing repository lease was not acquired")
+	}
+	if err := held.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Worktree(ctx, f.ref); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("contended creation registered worktree: %v", err)
+	}
+	if _, err := f.db.WorktreeCreationIntent(ctx, f.ref); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unlaunched creation still has unresolved intent: %v", err)
+	}
+	c.afterCreationClaim = nil
+	created, err := c.Ensure(ctx, f.request)
+	if err != nil {
+		t.Fatalf("creation retry after contention: %v", err)
+	}
+	facts, err := f.db.WorktreeCreationIntent(ctx, f.ref)
+	if err != nil || facts.Effect.State != store.EffectConfirmed || facts.Claim.ClaimEpoch != 2 {
+		t.Fatalf("retry did not confirm exactly the second claim: %+v %v", facts, err)
+	}
+	replayed, err := c.Ensure(ctx, f.request)
+	if err != nil || replayed.Path != created.Path {
+		t.Fatalf("creation replay: %+v %v", replayed, err)
 	}
 }
 
@@ -601,11 +838,31 @@ func TestEnsureExcludesActiveRepositoryCommandWriter(t *testing.T) {
 	}
 	blocked := EnsureRequest{Ref: ref, Version: started.Version, Fence: domain.Fence{LeaderEpoch: f.request.Fence.LeaderEpoch, RunnerEpoch: started.RunnerEpoch}}
 	path, _ := f.db.TicketWorktreePath(ref)
-	if _, err := coordinatorFor(f).Ensure(ctx, blocked); !errors.Is(err, ErrQuarantined) {
+	if _, err := coordinatorFor(f).Ensure(ctx, blocked); !errors.Is(err, ErrInProgress) || !errors.Is(err, git.ErrCreateBeforeStart) {
 		t.Fatalf("repository command writer did not exclude Git: %v", err)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("blocked ensure created %s: %v", path, err)
+	}
+	// Releasing the exact unlaunched command lease must unblock the sibling,
+	// without replacing the first ticket's registered worktree or duplicating
+	// the previously refused creation on replay.
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		created, err := coordinatorFor(f).Ensure(ctx, blocked)
+		if err != nil || created.Path != path || created.Path == owner.Path {
+			t.Fatalf("sibling ensure after release: %+v err=%v", created, err)
+		}
+	}
+	unchanged, err := f.db.Worktree(ctx, f.ref)
+	if err != nil || unchanged.Path != owner.Path || string(unchanged.IdentityJSON) != string(owner.IdentityJSON) {
+		t.Fatalf("sibling creation changed holder identity: %+v err=%v", unchanged, err)
+	}
+	listed := mustGit(t, f.project.Path, "worktree", "list", "--porcelain")
+	if strings.Count(listed, "worktree "+path+"\n") != 1 || strings.Count(listed, "worktree "+owner.Path+"\n") != 1 {
+		t.Fatalf("expected exactly one linked worktree per ticket:\n%s", listed)
 	}
 }
 

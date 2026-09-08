@@ -19,6 +19,52 @@ func renderHumanData(writer io.Writer, value any) error {
 	if _, hasChecks := object["checks"]; hasChecks {
 		return renderDoctor(writer, object)
 	}
+	if stringField(object, "schema") == authSchema {
+		return renderAuthentication(writer, object)
+	}
+	if edit, ok := object["provider_configuration"].(map[string]any); ok {
+		if _, err := fmt.Fprintf(writer, "Project: %s\nProvider preset: %s\nFile changed: %t\n%s\n", safeSelectionLabel(stringField(edit, "project")), safeSelectionLabel(stringField(edit, "preset")), boolField(edit, "changed"), safeSelectionLabel(stringField(edit, "note"))); err != nil {
+			return err
+		}
+		if backup := stringField(edit, "backup_path"); backup != "" {
+			_, err := fmt.Fprintf(writer, "Original configuration backup: %s\n", safeSelectionLabel(backup))
+			return err
+		}
+		return nil
+	}
+	if preparation, ok := object["runtime_preparation"].(map[string]any); ok {
+		_, err := fmt.Fprintf(writer, "Runtime: %s\nPreparation: %s\nLocation: %s\nDownload: %s bytes\n%s\nNext: %s\n", safeSelectionLabel(stringField(preparation, "runtime")), safeSelectionLabel(stringField(preparation, "status")), safeSelectionLabel(stringField(preparation, "destination")), displayField(preparation, "download_bytes"), safeSelectionLabel(stringField(preparation, "note")), safeSelectionLabel(stringField(preparation, "next_command")))
+		return err
+	}
+	if source, ok := object["ticket_template"].(string); ok {
+		_, err := io.WriteString(writer, source)
+		return err
+	}
+	if draft, ok := object["ticket_draft"].(map[string]any); ok {
+		_, err := fmt.Fprintf(writer, "Saved draft: %s\n%s\n", safeSelectionLabel(stringField(draft, "path")), stringField(draft, "note"))
+		return err
+	}
+	if validation, ok := object["ticket_validation"].(map[string]any); ok {
+		if _, err := fmt.Fprintf(writer, "Valid ticket syntax: %s\nAcceptance criteria: %s\n%s\n", safeSelectionLabel(stringField(validation, "title")), displayField(validation, "acceptance_count"), stringField(validation, "note")); err != nil {
+			return err
+		}
+		if warnings, ok := validation["warnings"].([]any); ok {
+			for _, warning := range warnings {
+				if _, err := fmt.Fprintf(writer, "Note: %s\n", warning); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if setup, ok := object["setup"].(map[string]any); ok {
+		for _, field := range []struct{ label, key string }{{"Project", "project"}, {"Repository", "repository"}, {"Configuration", "configuration"}, {"Local recipe", "local_recipe"}, {"Runtime", "runtime"}, {"Providers", "providers"}, {"Publication", "publication"}, {"Note", "reason"}} {
+			if _, err := fmt.Fprintf(writer, "%s: %s\n", field.label, safeSelectionLabel(stringField(setup, field.key))); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if events, ok := object["events"].([]any); ok {
 		return renderEvents(writer, object, events)
 	}
@@ -33,6 +79,41 @@ func renderHumanData(writer io.Writer, value any) error {
 	}
 	_, err := fmt.Fprintf(writer, "OK\n%s\n", stableJSON(value))
 	return err
+}
+
+func renderAuthentication(writer io.Writer, report map[string]any) error {
+	if _, err := fmt.Fprintf(writer, "Authentication (%s)\n%s\n", safeSelectionLabel(stringField(report, "channel")), authScope); err != nil {
+		return err
+	}
+	providers, _ := report["providers"].([]any)
+	for _, raw := range providers {
+		provider, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, err := fmt.Fprintf(writer, "- %s: %s", safeSelectionLabel(stringField(provider, "provider")), safeSelectionLabel(stringField(provider, "state"))); err != nil {
+			return err
+		}
+		if version := stringField(provider, "version"); version != "" {
+			if _, err := fmt.Fprintf(writer, " (%s)", safeSelectionLabel(version)); err != nil {
+				return err
+			}
+		}
+		if _, err := io.WriteString(writer, "\n"); err != nil {
+			return err
+		}
+		if reason := stringField(provider, "reason"); reason != "" {
+			if _, err := fmt.Fprintf(writer, "  %s\n", safeSelectionLabel(reason)); err != nil {
+				return err
+			}
+		}
+		if action, ok := provider["next_action"].(map[string]any); ok {
+			if err := renderAction(writer, "  Next", action); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func renderTickets(writer io.Writer, parent map[string]any, values []any) error {
@@ -50,6 +131,18 @@ func renderTickets(writer io.Writer, parent map[string]any, values []any) error 
 		}
 		if _, err := fmt.Fprintf(writer, "- %s  %s\n", stringField(item, "ticket"), stringField(item, "state")); err != nil {
 			return err
+		}
+		if title := stringField(item, "title"); title != "" {
+			if _, err := fmt.Fprintf(writer, "  %s\n", safeSelectionLabel(title)); err != nil {
+				return err
+			}
+		}
+		if budget, ok := item["budget_clock"].(map[string]any); ok && boolField(budget, "available") {
+			if remaining := stringField(budget, "remaining"); remaining != "" {
+				if _, err := fmt.Fprintf(writer, "  Deadline remaining: %s (includes queue/pause time)\n", remaining); err != nil {
+					return err
+				}
+			}
 		}
 		if action, ok := item["next_action"].(map[string]any); ok {
 			if err := renderAction(writer, "  Next", action); err != nil {
@@ -80,13 +173,33 @@ func renderTicket(writer io.Writer, ticket map[string]any, evidence any, context
 		{"Version", "version"}, {"Runner epoch", "runner_epoch"}, {"Blocker", "blocked_code"},
 	} {
 		if text := displayField(ticket, field.key); text != "" {
+			if field.key == "blocked_code" && stringField(ticket, "state") != "blocked" {
+				// Store can retain the reason across authenticated recovery. It
+				// remains diagnostic history, not a second lifecycle state.
+				field.label = "Recorded blocker"
+			}
 			if _, err := fmt.Fprintf(writer, "%s: %s\n", field.label, text); err != nil {
+				return err
+			}
+		}
+	}
+	if budget, ok := context["budget_clock"].(map[string]any); ok && boolField(budget, "available") {
+		if _, err := fmt.Fprintf(writer, "Age since submission: %s\nDeadline: %s\n", stringField(budget, "age"), stringField(budget, "deadline_at")); err != nil {
+			return err
+		}
+		if remaining := stringField(budget, "remaining"); remaining != "" {
+			if _, err := fmt.Fprintf(writer, "Deadline remaining: %s (includes queue/pause time)\n", remaining); err != nil {
 				return err
 			}
 		}
 	}
 	if operator, ok := context["operator"].(map[string]any); ok {
 		if err := renderOperator(writer, operator); err != nil {
+			return err
+		}
+	}
+	if activity, ok := context["runtime_activity"].(map[string]any); ok {
+		if err := renderRuntimeActivity(writer, activity); err != nil {
 			return err
 		}
 	}
@@ -193,6 +306,16 @@ func renderOperator(writer io.Writer, operator map[string]any) error {
 }
 
 func renderEvidence(writer io.Writer, evidence map[string]any) error {
+	if accounting, ok := evidence["provider_accounting"].(map[string]any); ok && stringField(accounting, "mode") == "reported_estimate_v1" {
+		if _, err := fmt.Fprintf(writer, "Provider billing: reported estimates; actual total unknown (not a hard dollar cap)\nProvider limits: %s SF launches per ticket; %s per invocation; CLI-internal calls may exceed launch count\n", displayField(accounting, "sf_launch_limit"), stringField(accounting, "request_timeout")); err != nil {
+			return err
+		}
+	}
+	if review, ok := evidence["review_diagnostic"].(map[string]any); ok {
+		if err := renderReviewDiagnostic(writer, review); err != nil {
+			return err
+		}
+	}
 	if plan, ok := evidence["plan"].(map[string]any); ok {
 		parts := []string{}
 		for _, field := range []struct{ label, key string }{{"digest", "digest"}, {"proof", "proof_kind"}, {"acceptance", "acceptance_count"}, {"paths", "path_count"}, {"commands", "command_count"}, {"risks", "risk_count"}} {
@@ -328,6 +451,11 @@ func renderEvents(writer io.Writer, parent map[string]any, events []any) error {
 func renderDoctor(writer io.Writer, report map[string]any) error {
 	if _, err := fmt.Fprintf(writer, "Doctor (channel: %s)\n", stringField(report, "channel")); err != nil {
 		return err
+	}
+	if scope := stringField(report, "readiness_scope"); scope != "" {
+		if _, err := fmt.Fprintf(writer, "Scope: %s\n", scope); err != nil {
+			return err
+		}
 	}
 	if value, ok := report["guarded_eligible"].(bool); ok {
 		if _, err := fmt.Fprintf(writer, "Guarded eligible: %t\n", value); err != nil {

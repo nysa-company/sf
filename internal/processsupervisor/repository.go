@@ -48,6 +48,10 @@ const repositoryTestGroupLimit = 64
 // until its Store lease has durably recorded the process identity.
 type RepositoryCommandSupervisor struct {
 	Executable string
+	// PythonSnapshots is an explicitly composed channel-private prepared-cache
+	// directory. Empty means unavailable; there is no ambient discovery.
+	// Identity resolution does not enable Python execution admission.
+	PythonSnapshots string
 	// GitRunner is the prequalified, credential-free Git observer used to
 	// reauthenticate the persisted worktree identity immediately before
 	// launch. It is injected by composition; a zero-value Runner is not a
@@ -74,6 +78,8 @@ func (s RepositoryCommandSupervisor) Preflight(spec contracts.CommandSpec) error
 	switch filepath.Base(spec.Argv[0]) {
 	case "go", "node":
 		return nil
+	case "python3":
+		return s.pythonPreflight(spec)
 	case "npm":
 		return ErrSubprocessRecipeUnsupported
 	default:
@@ -89,6 +95,9 @@ func (s RepositoryCommandSupervisor) Run(ctx context.Context, claim contracts.Re
 	}
 	if filepath.Base(spec.Argv[0]) == "node" {
 		return s.runNode(ctx, claim, spec, policy, lease)
+	}
+	if spec.Argv[0] == "python3" {
+		return s.runPython(ctx, claim, spec, policy, lease)
 	}
 	if lease == nil || spec.Profile != contracts.ProfileGuarded || len(spec.Argv) == 0 || spec.Directory != claim.Worktree || spec.Timeout <= 0 || spec.Timeout > 45*time.Minute || s.SoftDrain > 30*time.Second || s.HardDrain > 30*time.Second || policy.Authorize(spec.Argv) != nil || policy.Digest() != claim.PolicyDigest {
 		return contracts.CommandResult{}, ErrUnclear

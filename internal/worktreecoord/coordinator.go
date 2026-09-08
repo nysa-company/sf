@@ -38,6 +38,11 @@ var (
 	// is deliberately distinct from ErrQuarantined: callers must not treat it
 	// as a normal retryable recovery state.
 	ErrQuarantinePersistence = errors.New("worktree effect quarantine persistence failed")
+	// ErrUnready means an otherwise authenticated existing registration is not
+	// a pristine input for provider retry. It is returned only for observed
+	// dirtiness or a clean HEAD that differs from the caller's authenticated
+	// expected head; identity, I/O, and context errors remain distinct.
+	ErrUnready = errors.New("registered worktree is not ready for provider retry")
 )
 
 // EnsureRequest is a daemon-acquired ticket identity. The coordinator never
@@ -153,6 +158,17 @@ func (c Coordinator) Ensure(ctx context.Context, request EnsureRequest) (store.S
 			// writer, so neither confirmation nor an assumed release is safe.
 			return store.StoredWorktree{}, fmt.Errorf("%w: Git writer lease release was not durable: %w", ErrQuarantined, createErr)
 		}
+		if errors.Is(createErr, git.ErrCreateBeforeStart) {
+			// Only the runner's current-invocation, pre-mutation proof allows
+			// retry. A missing directory or lease is never such a proof for an
+			// already uncertain historical claim.
+			recordCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if _, err := c.Store.ObserveEffect(recordCtx, store.EffectObservation{EffectFence: effectFence(claim), Present: false}); err != nil {
+				return store.StoredWorktree{}, fmt.Errorf("%w: record unlaunched creation: %w", ErrQuarantinePersistence, err)
+			}
+			return store.StoredWorktree{}, fmt.Errorf("%w: creation was not launched: %w", ErrInProgress, createErr)
+		}
 		return c.postClaimFailure(request, project, path, claim, createErr)
 	}
 	if c.afterCreate != nil {
@@ -161,6 +177,61 @@ func (c Coordinator) Ensure(ctx context.Context, request EnsureRequest) (store.S
 	registered, err = c.confirmAndRegister(ctx, request, project, created, claim, "", nil)
 	if err != nil {
 		return c.postClaimFailure(request, project, path, claim, err)
+	}
+	return registered, nil
+}
+
+// AuthenticateExistingRegisteredWorktree is the read-only retry-admission
+// boundary for a retained checkout. It never calls Ensure, allocator, effect,
+// or registration APIs: absence is propagated as Store's ErrNotFound rather
+// than creating a replacement path. expectedHead comes from the caller's
+// authenticated retry proof and may legitimately differ from registration's
+// original HeadSHA after sf has created a clean checkpoint or candidate.
+//
+// Ignored files deliberately make this boundary unready. A provider can write
+// output to a repository-ignored path, so treating ignored status as clean
+// would admit untrusted filesystem state to a retry.
+func (c Coordinator) AuthenticateExistingRegisteredWorktree(ctx context.Context, ref domain.TicketRef, expectedHead string) (store.StoredWorktree, error) {
+	if err := ctx.Err(); err != nil {
+		return store.StoredWorktree{}, err
+	}
+	if c.Store == nil || ref.Validate() != nil || !validFullOID(expectedHead) {
+		return store.StoredWorktree{}, fmt.Errorf("%w: store, ticket reference, and authenticated expected head are required", ErrAuthentication)
+	}
+	project, err := c.Store.Project(ctx, ref.Channel, ref.Project)
+	if err != nil {
+		return store.StoredWorktree{}, err
+	}
+	expectedPath, err := c.Store.TicketWorktreePath(ref)
+	if err != nil {
+		return store.StoredWorktree{}, err
+	}
+	registered, err := c.Store.Worktree(ctx, ref)
+	if err != nil {
+		return store.StoredWorktree{}, err
+	}
+	if registered.State != "registered" || registered.Path != expectedPath || registered.Branch == "" || !validFullOID(registered.BaseSHA) || !validFullOID(registered.HeadSHA) {
+		return store.StoredWorktree{}, fmt.Errorf("%w: registered row has an unexpected path, state, branch, or creation witness", ErrAuthentication)
+	}
+	worktree, identity, err := decodeWorktree(registered.Path, registered.Branch, registered.IdentityJSON)
+	if err != nil || !sameIdentityJSON(registered.IdentityJSON, identity) || identity.Repository != project.Path || identity.Worktree != expectedPath || identity.HeadRef != registered.Branch || identity.BaseRef != project.BaseRef || identity.BaseHead != registered.BaseSHA {
+		return store.StoredWorktree{}, fmt.Errorf("%w: registered identity does not bind the exact project/worktree/base: %v", ErrAuthentication, err)
+	}
+	head, err := c.Git.StrictCleanWorktreeHead(ctx, worktree)
+	if errors.Is(err, git.ErrWorktreeDirty) {
+		return registered, fmt.Errorf("%w: %v", ErrUnready, err)
+	}
+	if err != nil {
+		// A vanished registered path or .git pointer is a replacement/deletion
+		// of the identity we were asked to prove, not an ordinary retry-unready
+		// status. Keep other I/O and context errors unchanged for callers.
+		if errors.Is(err, os.ErrNotExist) {
+			return store.StoredWorktree{}, fmt.Errorf("%w: registered worktree disappeared during identity authentication: %v", git.ErrIdentityMismatch, err)
+		}
+		return store.StoredWorktree{}, err
+	}
+	if head != expectedHead {
+		return registered, fmt.Errorf("%w: clean worktree head does not match authenticated expected head", ErrUnready)
 	}
 	return registered, nil
 }
@@ -514,6 +585,8 @@ func (c Coordinator) waitForCreation(ctx context.Context, request EnsureRequest,
 		if facts.Effect.State != store.EffectExecuting {
 			if info, err := os.Lstat(path); err == nil && info.IsDir() {
 				return c.reconcileCreation(ctx, request, project, path, facts)
+			} else if errors.Is(err, os.ErrNotExist) && facts.Effect.State == store.EffectUncertain {
+				return c.reconcileAbsentCreation(ctx, request, project, path, facts)
 			} else {
 				// An old result that is no longer executing must either prove the
 				// exact visible directory or remain quarantined.  Treating a
@@ -552,6 +625,39 @@ func (c Coordinator) waitForCreation(ctx context.Context, request EnsureRequest,
 			return store.StoredWorktree{}, fmt.Errorf("%w: creation effect changed while waiting: %v", ErrQuarantined, err)
 		}
 	}
+}
+
+// A negative recovery result is admissible only while a Store-issued,
+// non-launchable observation lease excludes all repository writers and the
+// original claim has been revoked. Native Git must prove every artifact absent.
+func (c Coordinator) reconcileAbsentCreation(ctx context.Context, request EnsureRequest, project store.Project, path string, facts store.GitMutationIntentFacts) (store.StoredWorktree, error) {
+	claim := facts.Claim
+	if claim.TicketRef != request.Ref || claim.Repository != project.Path || claim.Worktree != path || claim.BaseRef != project.BaseRef || claim.ExpectedBaseOID != claim.ExpectedHeadOID {
+		return store.StoredWorktree{}, ErrQuarantined
+	}
+	proofCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	fence := request.Fence
+	fence.ClaimEpoch = facts.Effect.ClaimEpoch
+	handle, err := c.Store.BeginWorktreeCreationAbsence(proofCtx, claim, store.EffectFence{SemanticKey: claim.SemanticKey, Ref: request.Ref, TicketVersion: request.Version, Fence: fence})
+	if err != nil {
+		return store.StoredWorktree{}, fmt.Errorf("%w: exclusive creation observation unavailable: %w", ErrQuarantined, err)
+	}
+	if err = handle.Check(proofCtx); err == nil {
+		err = c.Git.ObserveWorktreeCreationAbsent(proofCtx, claim)
+	}
+	if err == nil {
+		err = handle.CompleteAbsent(proofCtx)
+	}
+	if err != nil {
+		if releaseErr := handle.Release(); releaseErr != nil {
+			return store.StoredWorktree{}, errors.Join(ErrQuarantinePersistence, err, releaseErr)
+		}
+		return store.StoredWorktree{}, fmt.Errorf("%w: creation absence not proven: %w", ErrQuarantined, err)
+	}
+	// Return to the scheduler, not recursive Ensure: creation needs a fresh
+	// current claim and another capacity/admission check on the next tick.
+	return store.StoredWorktree{}, ErrInProgress
 }
 
 func effectFence(claim contracts.GitMutationClaim) store.EffectFence {
@@ -601,4 +707,12 @@ func decodeWorktree(path, branch string, raw []byte) (git.Worktree, git.Identity
 func sameIdentityJSON(raw []byte, identity git.Identity) bool {
 	canonical, err := json.Marshal(identity)
 	return err == nil && bytes.Equal(raw, canonical)
+}
+
+func validFullOID(value string) bool {
+	if (len(value) != 40 && len(value) != 64) || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }

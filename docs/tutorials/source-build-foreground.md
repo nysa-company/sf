@@ -43,8 +43,8 @@ configuration under the same project name is refused rather than silently
 replacing the registration.
 
 For the dependency-bearing Nysa monorepo, explicitly select the bounded pure
-API test recipe. This is the only `init` form that may create the missing
-project config, and it never overwrites an existing file:
+API test recipe. Explicit profile setup may create the missing project config;
+it never overwrites an existing file:
 
 ```text
 ./bin/sf-dev init --project nysa --repo /absolute/path/to/nysa-app \
@@ -55,6 +55,20 @@ project config, and it never overwrites an existing file:
 The selected entrypoint and its relative `.js`-to-`.ts` closure are validated
 before the config is installed. The resulting command uses no npm, package
 scripts, network, or `node_modules`.
+
+For the experimental pinned Python/pytest profile, follow the separate
+[first-ticket guide](first-ticket.md). It requires explicit runtime download
+consent on macOS ARM64; the ordinary `init` command does not download runtimes.
+
+When validating SF from source, check available disk space before starting
+the full native suite. Go command fixtures compile inside isolated caches in
+addition to the outer Go build cache. Runs on this development host with less
+than 1 GiB free exhausted disk space and correctly blocked their fixture
+tickets, obscuring the intended recovery assertions. Keep several GiB free
+and serialize broad suites with `go test -p 1 ./...`. If space is exhausted,
+inspect obsolete build caches and use Go's cache-clean command only for an
+identified, unused cache. Do not delete SF databases, worktrees, or retained
+runtime snapshots to make a test pass.
 
 `auth login` starts the official interactive login flow in your terminal. It
 does not send a displayed token to the daemon. `auth status` reports only a
@@ -69,6 +83,28 @@ cd /absolute/path/to/sf-source
 ./bin/sf-dev daemon run
 ```
 
+`sf auth status/login` and the daemon select GitHub CLI configuration in this order:
+`GH_CONFIG_DIR`, then `$XDG_CONFIG_HOME/gh`, then `$HOME/.config/gh`.
+Overrides must be clean absolute paths to real owner-controlled directories
+(not symlinks or group/world-writable directories). A missing selected
+directory or inactive authentication disables publication; SF never silently
+falls back to another account. Set overrides in the daemon's terminal before
+starting it. Use the same overrides in the terminal running `sf auth`.
+Official interactive login can create its selected missing configuration;
+SF itself does not create it or fall back to the default account.
+Credentials are referenced in place, not copied into SF's state.
+Changing the GitHub configuration location does not change SF's HOME-based
+stable/dev state directories. This follows the
+[GitHub CLI configuration precedence](https://cli.github.com/manual/gh_help_environment),
+with SF's additional directory safety checks.
+
+For Codex, set `CODEX_HOME` consistently in both terminals if you use a custom
+location. SF's authentication commands and runtime select that directory,
+defaulting to `$HOME/.codex`; SF validates the directory without reading or
+copying credentials. This follows the documented
+[Codex configuration location](https://learn.chatgpt.com/docs/config-file/config-advanced#config-and-state-locations).
+Authentication alone does not qualify the runtime or authorize a ticket.
+
 Return to the first terminal and qualify the two Codex-backed logical roles,
 then run the read-only diagnostic:
 
@@ -77,6 +113,12 @@ cd /absolute/path/to/sf-source
 ./bin/sf-dev providers qualify --builder codex --reviewer codex
 ./bin/sf-dev doctor --repo /absolute/path/to/nysa-app
 ```
+
+The foreground runtime keeps the shared Codex provider/auth lease at capacity
+one by default. For an explicit two-ticket local campaign, set
+`SF_CODEX_PROVIDER_CAPACITY=2` before starting the daemon. Only the exact
+values `1` and `2` are accepted; Store still enforces the machine, project,
+and provider lease limits.
 
 Qualification is served by the running foreground daemon: its current local
 supervisor signs the exact provider/version/family, two-file Codex runtime

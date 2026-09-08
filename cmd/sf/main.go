@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/cli"
-	"github.com/nysa-company/sf/internal/codexprovider"
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/daemon"
@@ -21,6 +20,7 @@ import (
 	"github.com/nysa-company/sf/internal/ghrunner"
 	"github.com/nysa-company/sf/internal/git"
 	"github.com/nysa-company/sf/internal/localruntime"
+	"github.com/nysa-company/sf/internal/multiprovider"
 	"github.com/nysa-company/sf/internal/processsupervisor"
 	"github.com/nysa-company/sf/internal/providercoord"
 	"github.com/nysa-company/sf/internal/store"
@@ -28,6 +28,9 @@ import (
 )
 
 func main() {
+	if handled, code := repositoryPythonGate(os.Args); handled {
+		os.Exit(code)
+	}
 	if target, argv, ok := providerGateCommand(os.Args); ok {
 		// FD 3 is held by the supervisor until the launch PID/PGID is durably
 		// recorded. EOF means the parent died before authority was published.
@@ -171,6 +174,7 @@ func main() {
 		}
 		runErr := daemon.Run(runCtx, daemon.Config{
 			Channel: channel, Paths: paths,
+			Doctor:                   localruntime.ProjectStartChecker(config.PythonSnapshotsPath(paths)),
 			DaemonIdentity:           fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
 			RecoveryAuthorityKey:     supervisor.PublicKey(),
 			ProviderSupervisor:       supervisor,
@@ -178,14 +182,15 @@ func main() {
 			GitMutationDrainer:       git.MutationDrainer{},
 			RepositoryCommandDrainer: processsupervisor.RepositoryCommandDrainer{},
 			ProviderCoordinatorFactory: func(database *store.Store, process contracts.ProcessSupervisor) (*providercoord.Coordinator, error) {
-				return codexprovider.Compose(context.Background(), channel, database, process)
+				return multiprovider.Compose(context.Background(), channel, database, process)
 			},
-			ProviderQualifier: func(qualifyCtx context.Context, database *store.Store, value domain.Channel, builder, reviewer string) (any, error) {
-				return codexprovider.QualifyLocalPair(qualifyCtx, database, value, builder, reviewer, supervisor)
+			ProviderModelQualifier: func(qualifyCtx context.Context, database *store.Store, value domain.Channel, builder, reviewer, builderModel, reviewerModel string) (any, error) {
+				return multiprovider.QualifyLocalModels(qualifyCtx, database, value, builder, reviewer, builderModel, reviewerModel, supervisor)
 			},
 			WorkflowRuntimeFactory: localruntime.Factory(localruntime.Config{
 				Channel:           channel,
 				GitHome:           filepath.Join(filepath.Dir(paths.Socket), "git-home"),
+				PythonSnapshots:   config.PythonSnapshotsPath(paths),
 				OwnerHome:         ownerHome,
 				GHConfigDir:       ghConfigDir,
 				GHBinary:          ghBinary,
@@ -218,15 +223,22 @@ func existingDirectory(path string) bool {
 // requested. Direct commands such as doctor, version, and init must remain
 // usable on a host without gh or GitHub authentication.
 func publicationCapability(home string, channel domain.Channel) (ownerHome, ghBinary, ghConfigDir string, prePublishingOnly bool, err error) {
+	return publicationCapabilityWith(home, channel, os.Getenv("GH_CONFIG_DIR"), os.Getenv("XDG_CONFIG_HOME"), exec.LookPath, githubAuthenticated)
+}
+
+func publicationCapabilityWith(home string, channel domain.Channel, explicit, xdg string, lookup func(string) (string, error), authenticate func(string, string, string) (bool, error)) (ownerHome, ghBinary, ghConfigDir string, prePublishingOnly bool, err error) {
 	ghBinary = ""
-	if resolved, lookErr := exec.LookPath("gh"); lookErr == nil {
+	if resolved, lookErr := lookup("gh"); lookErr == nil {
 		ghBinary = resolved
 	}
-	ghConfigDir = filepath.Join(home, ".config", "gh")
-	prePublishingOnly = home == "" || ghBinary == "" || !existingDirectory(ghConfigDir)
+	ghConfigDir, err = selectedGitHubConfigDirectory(home, explicit, xdg)
+	if err != nil {
+		return "", "", "", false, err
+	}
+	prePublishingOnly = home == "" || ghBinary == "" || ghConfigDir == ""
 	if !prePublishingOnly {
 		var authenticated bool
-		authenticated, err = githubAuthenticated(ghBinary, home, ghConfigDir)
+		authenticated, err = authenticate(ghBinary, home, ghConfigDir)
 		if err != nil {
 			return "", "", "", false, fmt.Errorf("GitHub capability preflight failed safely; run sf-%s doctor, install/repair gh, and authenticate GitHub: %w", channel, err)
 		}

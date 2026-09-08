@@ -97,6 +97,8 @@ func observerInjectedRunner(t *testing.T, worktree Worktree, commit, parent, tre
 			return []byte(worktree.Identity.PushOrigin + "\n"), nil
 		case suffix("rev-parse", "--verify", worktree.Identity.BaseRef+"^{commit}"):
 			return []byte(worktree.Identity.BaseHead + "\n"), nil
+		case suffix("for-each-ref", "--format=%(refname) %(objectname)", worktreeBaseRef(worktree.Branch)):
+			return []byte(worktreeBaseRef(worktree.Branch) + " " + worktree.Identity.BaseHead + "\n"), nil
 		case suffix("symbolic-ref", "--quiet", "--short", "HEAD"):
 			return []byte(worktree.Branch + "\n"), nil
 		case suffix("config", "--null", "--list", "--show-origin"):
@@ -321,6 +323,8 @@ func TestObserveRemoteBranchRejectsOriginDriftDuringRemoteRead(t *testing.T) {
 				return []byte("https://github.com/other/repository.git\n"), nil
 			}
 			return []byte(worktree.Identity.Origin + "\n"), nil
+		case suffix("for-each-ref", "--format=%(refname) %(objectname)", worktreeBaseRef(worktree.Branch)):
+			return []byte(worktreeBaseRef(worktree.Branch) + " " + worktree.Identity.BaseHead + "\n"), nil
 		case suffix("remote", "get-url", "--all", "--push", "origin"):
 			return []byte(worktree.Identity.PushOrigin + "\n"), nil
 		case suffix("rev-parse", "--verify", worktree.Identity.BaseRef+"^{commit}"):

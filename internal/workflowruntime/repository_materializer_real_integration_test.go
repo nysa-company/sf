@@ -163,7 +163,7 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	}
 	state := &materializerFaultEngine{StateMachine: engine.New(db, baseEngine), failVerification: true, failCandidate: true}
 	supervisor := processsupervisor.RepositoryCommandSupervisor{Executable: sfBinary, GitRunner: runner, SoftDrain: time.Second, HardDrain: time.Second}
-	materializer := workflowruntime.RepositoryMaterializer{Store: db, Git: git.Runner{Home: runner.Home, ExecHelper: helper, TestLocalTransport: true, MutationAuthority: db}, Executor: repositoryexec.Executor{Authority: db, Supervisor: supervisor}}
+	materializer := workflowruntime.RepositoryMaterializer{Store: db, Git: git.Runner{Home: runner.Home, ExecHelper: helper, TestLocalTransport: true, MutationAuthority: db}, Executor: repositoryexec.Executor{Authority: materializerDiagnosticAuthority{Store: db, t: t}, Supervisor: supervisor}}
 	worker := workflowworker.Worker{Evidence: db, Engine: state, Runner: providers, Checkpoint: materializer, Candidate: materializer, CheckpointMaterializer: materializer, CandidateMaterializer: materializer}
 
 	if _, err := worker.Run(ctx, ref, fence); err != nil {
@@ -236,8 +236,8 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	}
 	assertMaterializerProviderAttempts(t, db, ref, 2)
 
-	if _, err := worker.Run(ctx, ref, fence); err == nil {
-		t.Fatal("expected injected response loss after candidate evidence")
+	if result, err := worker.Run(ctx, ref, fence); err == nil {
+		t.Fatalf("expected injected response loss after candidate evidence: state=%s version=%d transitioned=%t", result.State, result.Version, result.Transitioned)
 	}
 	candidateBefore, err := db.LatestCandidate(ctx, ref)
 	if err != nil || candidateBefore.Commit.CommitOID == "" || candidateBefore.CommandBinding.Key.SemanticKey == "" {
@@ -282,6 +282,11 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	staleCandidate.Fence.RunnerEpoch++
 	if _, err := materializer.MaterializeCandidate(ctx, workflowworker.PhaseRequest{Ticket: buildingTicket, Worktree: storedWorktree, Phase: domain.PhaseBuild, Fence: fence, Plan: &storedPlan, Verification: &storedVerification, Candidate: &staleCandidate}, planIdentity, verificationIdentity, *builderParsed.Builder, candidateBefore.BuilderResult); !errors.Is(err, workflowruntime.ErrRepositoryMaterialization) {
 		t.Fatalf("stale candidate fence accepted: %v", err)
+	}
+	tamperedVerification := verificationIdentity
+	tamperedVerification.OwnedFiles = nil
+	if _, err := materializer.MaterializeCandidate(ctx, workflowworker.PhaseRequest{Ticket: buildingTicket, Worktree: storedWorktree, Phase: domain.PhaseBuild, Fence: fence, Plan: &storedPlan, Verification: &storedVerification, Candidate: &candidateBefore}, planIdentity, tamperedVerification, *builderParsed.Builder, candidateBefore.BuilderResult); !errors.Is(err, workflowruntime.ErrRepositoryMaterialization) {
+		t.Fatalf("verification scope tamper accepted on candidate replay: %v", err)
 	}
 	verificationBefore, err := db.CurrentVerification(ctx, ref)
 	if err != nil {
@@ -483,7 +488,7 @@ func TestRepositoryMaterializerRealSourceResumePreparedObservationLoss(t *testin
 	}
 	state := engine.New(db, baseEngine)
 	supervisor := processsupervisor.RepositoryCommandSupervisor{Executable: sfBinary, GitRunner: runner, SoftDrain: time.Second, HardDrain: time.Second}
-	materializer := workflowruntime.RepositoryMaterializer{Store: db, Git: git.Runner{Home: runner.Home, ExecHelper: helper, TestLocalTransport: true, MutationAuthority: db}, Executor: repositoryexec.Executor{Authority: db, Supervisor: supervisor}}
+	materializer := workflowruntime.RepositoryMaterializer{Store: db, Git: git.Runner{Home: runner.Home, ExecHelper: helper, TestLocalTransport: true, MutationAuthority: db}, Executor: repositoryexec.Executor{Authority: materializerDiagnosticAuthority{Store: db, t: t}, Supervisor: supervisor}}
 	worker := workflowworker.Worker{Evidence: db, Engine: state, Runner: providers, Checkpoint: materializer, Candidate: materializer, CheckpointMaterializer: materializer, CandidateMaterializer: materializer}
 
 	if _, err := worker.Run(ctx, ref, fence); err != nil {
@@ -561,8 +566,8 @@ func TestRepositoryMaterializerRealSourceResumePreparedObservationLoss(t *testin
 	worker.CheckpointMaterializer = failing
 	worker.Candidate = failing
 	worker.CandidateMaterializer = failing
-	if _, err := worker.Run(ctx, ref, resumeFence); !errors.Is(err, loss) {
-		t.Fatalf("source-resume G observation loss err=%v", err)
+	if result, err := worker.Run(ctx, ref, resumeFence); !errors.Is(err, loss) {
+		t.Fatalf("source-resume G observation loss err=%v state=%s version=%d transitioned=%t", err, result.State, result.Version, result.Transitioned)
 	}
 	uncertain, err := db.ReconcileEffects(ctx, domain.ChannelDev, leader)
 	if err != nil || len(uncertain) != 1 || uncertain[0].Kind != "git/commit" || uncertain[0].State != store.EffectUncertain {
@@ -828,6 +833,26 @@ func assertMaterializerProviderAttempts(t *testing.T, db *store.Store, ref domai
 		t.Fatalf("active provider attempts=%+v", active)
 	}
 }
+
+// Preserve real Store recording while exposing only fixed diagnostic categories.
+// Never log raw child output, even from an isolated integration fixture.
+type materializerDiagnosticAuthority struct {
+	*store.Store
+	t *testing.T
+}
+
+func (a materializerDiagnosticAuthority) CompleteRepositoryCommand(ctx context.Context, claim contracts.RepositoryCommandClaim, result contracts.CommandResult) error {
+	output := string(result.Stdout) + string(result.Stderr)
+	var categories []string
+	for _, category := range []string{"no space left on device", "operation not permitted", "permission denied", "resource temporarily unavailable", "cannot allocate memory", "signal: killed", "timed out", "undefined:", "FAIL"} {
+		if strings.Contains(strings.ToLower(output), strings.ToLower(category)) {
+			categories = append(categories, category)
+		}
+	}
+	a.t.Logf("repository result exit=%d duration=%s categories=%v", result.ExitCode, result.Duration, categories)
+	return a.Store.CompleteRepositoryCommand(ctx, claim, result)
+}
+
 func materializerDigest(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])

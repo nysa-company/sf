@@ -1,0 +1,428 @@
+# CLI onboarding acceptance checkpoint
+
+Status: local CLI implementation and automated acceptance gates passed on
+macOS ARM64. PR #2 is merged and its SF ticket is durably `done`. External
+beta adoption, unassisted reliability and public release are not established.
+The executed-path notes below retain historical observations. The September 6
+checkpoint supersedes their earlier approval-pending and open-PR status.
+
+## Final requirement audit — September 6
+
+This audits the self-serve CLI objective, not a universal four-stack runner or
+a public/stable release. Unsupported combinations and external validation are
+reported explicitly, as required by the objective.
+
+| Requirement | Inspected evidence and verdict |
+| --- | --- |
+| Verified install bundle | Clean commit `b79166a4ea965b70914b0c460d191aaefa53d769`, version `0.1.0-dev.beta-check.2`; build, six-payload manifest including LICENSE, verification, exclusive installation, installed identity, exact license copy and release-build smoke passed in 67867. Artifact root: `.context/beta-licensed.fC5WjT/{bundle,installed}`. Integrity is not publisher authentication. |
+| Discoverable help and complete quickstart | README links `docs/tutorials/first-ticket.md`, including prerequisites, actual support matrix, complete ticket, validation, run/watch and exact-head approval. CLI help/input-error tests and docs-smoke pass. |
+| Clean local onboarding | `TestCompiledDevOnboardingUsesPrivateHomeAndLocalCommands` builds helpers, proves non-mutating preview, registration replay, no stable/socket mutation, valid template, PTY preview/save/cancel and no implicit submission. Full Go run 41791 passed. Bundle tests additionally execute the installed copy and refuse inventory, ancestry, symlink and overwrite faults. |
+| Explicit stack/provider readiness | `TestInitCheckIsReadOnlyAndDoesNotClaimFullReadiness` and unsupported-stack cases distinguish local recipe from untested provider/publication readiness. Native Go, dependency-free Node and restricted TypeScript gate tests all executed and passed in 4537. Pinned Python cold preparation/init/workflow passed with explicit download opt-in. Rails, general dependency-bearing Node/TS, extra Python dependencies and actual Claude execution remain unsupported. |
+| Simple ticket selection and safe run/watch | Real-PTY compiled picker tests prove duplicate-title disambiguation, cancellation and full-head decision binding. CLI run tests prove exact submit/start/watch, no implicit resume, and no blind retry after a lost mutation response; real Store/socket composition tests passed in the integrated suite. |
+| Actionable timing and diagnostics | Stored-budget tests cover queue/pause time, elapsed/future clocks, terminal countdown omission and JSON/human rendering. Runtime observations are scoped historical diagnostics. New immutable review projection tests cover tamper refusal, redaction, bounds, historical labels and unavailable results. Existing recovery actions remain the only mutation routes. |
+| Fault and recovery acceptance | Compiled operator takeover passed in 4537. Explicit `TestPreparedPythonStoreExecution` passed all eight cases in 44741 (28.578s): pass, red, timeout, cancellation, quota, file limit, restart and restart-unclear. The latter proves a surviving child, quarantine, competing-writer refusal, no fabricated result, later group disappearance and zero lease residue. |
+| SQLite authority and approval invariants | Diagnostics add only snapshot-scoped reads. Full Store/daemon/workflow regressions pass. Guarded/manual compiled workflows passed in 4537; manual never requests merge, guarded requires the fixture's exact approval. Real PR #2 has one approval and one merge intent, not duplicate retries. |
+| Stable/dev isolation and capacity two | Compiled coexistence passes while replacing dev and retaining the stable PID/socket/authority. `TestLeaseCapacityIsBoundedUnderConcurrency` admits exactly two of three contenders; configured provider capacity rejects values outside one/two. No production capacity setting was changed for this checkpoint. |
+| Fresh CLI-led delivery | Fresh read-only SQLite check confirms `SF-bf816eaad3a060153d28c99b3a3be7ef` is `done` v18/r5, one approval, one merge intent, zero capacity leases. GitHub PR #2 is merged at `f6e2afc9117bf5b101742314ff9736335f417b0b`. This required source repairs and is not an unassisted success. |
+| External limits and no unauthorized rollout | No existing project or installed daemon was replaced for final validation; no public release, PATH change or service installation. Three unfamiliar users, <=10-minute setup and ten-ticket >=9 unassisted delivery targets remain unobserved. Public signing/distribution, third-party notice review and universal rollback remain pending, not passed gates. |
+
+The final bundle's installed CLI prepared the explicit fault-test cache under
+its new private `fault-home` (71948, exit 0), with code-owned environment
+digest `sha256:e65fcb836e0f19815114cf5a06349ef7260e03f60d4a62cce63b7406f4cf8b1a`
+and lock digest `sha256:a9b45fd1379d4d31cd7765c0a8b53b547b42762ba359d6aaaf0af949e726f428`.
+Preparation created no project, database or daemon. Those values were supplied
+explicitly to 44741; skipped tests were not counted as execution evidence.
+
+The final audit found a missing source license. The standard
+[MIT license](https://opensource.org/license/mit) was selected under the
+operator's open-source direction and added as `LICENSE`, with an SF contributors
+notice. Current builds include it as a sixth authenticated payload; missing or
+changed notices refuse verification, and installation preserves the notice.
+Focused native bundle tests pass. Packaging validation 15839 passed bundle
+race, full Go, vet, repository/secret/docs/artifact and diff checks (exit 0).
+A replacement licensed bundle passed build/verify/install and release-build
+smoke in 67867 (exit 0), as recorded in the requirement map. Its license hash is
+`fffa17f02b5aba29ecdc96e4336464417b5349a12b3cffe60e5339d9476623c8`.
+The five-payload `3f6179a` build in `.context/beta-final.rYUXD6` is an earlier
+internal artifact; use the licensed successor above for this checkpoint.
+Third-party notices and publisher authentication still need public-release
+review. Final validation published no public repository or release.
+The original lost-environment trial and all author repair interventions remain
+in the history below; do not remove them from future reliability reporting.
+
+## Review diagnostic checkpoint
+
+Single-ticket status now projects the newest final-review attempt's
+authenticated immutable result as historical evidence, including its reviewed
+head, source version and bounded findings. It does not expose raw artifacts or
+transcripts or grant approval/recovery authority. Findings are redacted,
+terminal-control sanitized and truncated explicitly. A newer incomplete/failed
+attempt suppresses older findings; invalid evidence reports the diagnostic
+unavailable without hiding the durable ticket state.
+
+Focused Store/daemon/CLI tests and targeted race tests pass. Integrated
+validation 41791 completed with exit 0: full Go suite, vet, repo-check,
+secret-scan, docs-smoke and diff-check. This closes the source diagnostic gap
+observed during PR #2's final review. The installed acceptance daemon has not
+been replaced for this change. Tagged workflow/isolation and explicit prepared
+Python acceptance remain separately accounted gates, not implied by this run.
+
+Explicit acceptance 4537 subsequently passed (exit 0) on the diagnostics
+checkpoint: Go gate 18.87s, dependency-free Node gate 13.45s, restricted
+TypeScript gate 13.17s, all executed rather than skipped. `make test-compiled-e2e`
+passed in 241.088s, covering guarded/manual workflows, operator takeover and
+stable/dev coexistence. `SF_TEST_PYTHON_CLI_DOWNLOAD=1 make test-python-e2e`
+passed in 68.240s, covering cold preparation/registration and the compiled
+Python workflow with controlled provider/GitHub fixtures. Explicit Store
+Python fault inputs and a fresh final bundle remain the next checks; these
+results do not claim live-model Python delivery or unfamiliar-user adoption.
+
+## September 6 durable-storage trial: delivered through repaired recovery
+
+At `2026-09-06T20:49:36Z`, the installed onboarding11 bundle (`5216d13`)
+completed PR #2's ticket as durable `done`, version 18 / runner 5. Startup
+recovered the retained review-control and merge evidence; normal CLI `resume`
+installed runtime admission without another lifecycle transition. SF then
+recorded `merge_observed` and `reconcile_pass`. Read-only SQLite checks show
+one approval, one merge intent, zero capacity leases, and unchanged provider
+attempt counts (one planner, verifier and builder; two final reviews).
+GitHub confirms merge `f6e2afc9117bf5b101742314ff9736335f417b0b` of reviewed
+head `e9d40f0922130e72edc6d439f7ce6b78d71862bc`.
+
+Validation38718 passed targeted race, full Go, repository/secret and diff
+checks; bundle90250 passed manifest, verification and installation. This is
+real terminal delivery using the new CLI, but required factory repairs and
+therefore is not an unassisted acceptance success. The history below preserves
+those failures rather than removing them from the result.
+
+A separately identified trial uses an owner-private directory under `Projects`,
+not temporary storage. Installed onboarding5 registered `onboarding-durable`;
+a clean daemon stop/start preserved that registration before submission. This
+is daemon-restart evidence, not an OS-reboot test.
+
+Normal CLI `run` started ticket `SF-bf816eaad3a060153d28c99b3a3be7ef`,
+“Count distinct nonempty values”, at `2026-09-06T14:32:16Z`, with a four-hour
+deadline and $20 ceiling. Planning, independent verification and implementation
+each completed their first attempt. SF committed candidate
+`e9d40f0922130e72edc6d439f7ce6b78d71862bc`, published draft PR #2 in the private
+acceptance repository, and observed passing required CI (run `34039674698`).
+
+The final reviewer returned `needs_operator` at `14:37:06Z`, claiming that its
+read-only tool environment prevented inspection. Live CLI status subsequently
+confirmed `blocked`, version 9, `review_needs_operator`, with no approval.
+Read-only production-shaped probes could read the files. Exact-prompt probes
+exposed confusion about missing optional `rg` and whether the final JSON schema
+prohibited tool calls. A prompt-only clarification preserves the read-only,
+no-escalation boundary; its amended diagnostic completed inspection and returned
+pass, but that diagnostic is not a Store review and does not authorize delivery.
+Full integrated validation of the clarification passed (session 81372, exit 0):
+serialized Go suite, vet, repository checks, secret scan, docs smoke and diff
+checks. The verified onboarding6 bundle was subsequently installed in the
+isolated trial. Ordinary recovery committed `reviewing` version 10, but runtime
+rearming failed because it expected a pause/drain/resume triplet rather than
+the authenticated typed-block/recover pair. Runtime remains sealed; no fresh
+review or approval has occurred.
+
+A local recovery repair now has passing Store/daemon regression coverage for
+same-leader recovery, replacement leadership, and reopen after the committed
+transition. A further regression reproduced reuse of the consumed blocked
+verdict; the repaired selector permits a fresh attempt 2 without resetting the
+budget and preserves replay of that new result. Full integrated validation
+passed (session 10632, exit 0): Go suite, vet, repository/secret/docs/diff checks.
+The verified onboarding7 bundle installed that repair. Live recovery then
+reached capability installation but failed because the replacement scheduler
+had no in-memory stop latch. The compensating seal kept execution closed, but
+its advanced authority endpoint was not accepted on another recovery attempt.
+
+Both failures now have reproducing tests. A follow-up restores the volatile
+stop before capability installation and authenticates the compensated endpoint
+through the signed recovery chain. A daemon test uses the real controller and
+scheduler to prove the exact first Begin opens Store and admits the worker.
+Targeted race checks and full follow-up validation pass (38621, exit 0):
+Go suite, vet, repository/secret/docs/diff checks.
+The verified onboarding8 bundle then restarted the same durable trial and
+qualified the independent provider pair. Normal CLI recovery succeeded at
+reviewing version 12 / runner 3, reporting the already-committed recovery
+without another transition. CLI status confirms a fresh GPT-5.5 review attempt
+2 started at `2026-09-06T16:08:19Z` and completed with `pass`, no findings, at
+`16:08:56Z`. The ticket remained reviewing because current-result readers used
+the generic initial-lifecycle recovery check, which rejected the earlier pending
+CI observation after restart. The final-review authority itself authenticated
+the exact candidate, CI, recovery and verdict. A regression with pending CI,
+blocked recovery and reopened Store reproduces the stale-reader refusal. The
+reader repair uses the existing strict final-review authority and exact
+head/proof binding; its regression and read-only live-database probe pass.
+Full validation passed (98415, exit 0): targeted recovery race, full Go suite,
+vet, repository/secret/docs/diff checks. No new model call, budget reset or manual
+database/worktree repair was used.
+
+The verified onboarding9 bundle (`746216a`) was installed into the isolated
+trial. After clean replacement startup and normal qualification/recovery, SF
+reused the passing review and recorded `review_pass` into `waiting_approval`,
+version 14 / runner 4, at approximately `16:37Z`. SQLite still contains exactly
+two review attempts and zero approvals. Fresh GitHub inspection confirms PR #2
+is open/draft at the reviewed candidate and its required `test` check passed.
+This proves the repaired real recovery-to-approval path, not terminal delivery.
+
+The user explicitly approved PR #2. On September 6 at 20:18Z, the installed
+CLI recorded that approval for the unchanged reviewed head, and SF merged
+the PR at `f6e2afc9117bf5b101742314ff9736335f417b0b` (20:18:35Z). The original
+deadline had elapsed; approval was accepted without changing that budget.
+The ticket remains `merging` v15/r4 rather than `done`. Its merge, ready and
+protected-ref-fetch effects are confirmed. A read-only diagnostic traced the
+handoff refusal to the historical review-completion reader: it required a
+result issued at reviewing v13, while the passing result was issued at v12
+and legitimately reused through signed recovery to v13. A regression now
+reproduces that completion-reader failure. The targeted repair and missing
+recovery-record negative pass race validation. Full validation passed
+(57535, exit 0): targeted race, full Go suite, repository and secret scans,
+and diff check. Real installed reconciliation remains pending.
+At that historical checkpoint terminal reconciliation was still pending; the
+September 6 durable-storage result above closes it. At that checkpoint CLI
+status omitted the review finding, requiring a read-only typed-result query;
+the review diagnostic checkpoint above repairs that source gap. Neither this repaired
+trial nor the earlier failed persistence trial counts as unassisted acceptance.
+
+## Post-reboot result: acceptance environment lost
+
+After the operator reboot, `/private/tmp/sf-onboarding-acceptance.R2QvPm`
+no longer existed. The installed onboarding5 bundle and private SQLite backup
+survived in the SF checkout; `PRAGMA quick_check` on that backup returned `ok`.
+The OS boot differs from the recorded checkpoint. The backup still records
+one quarantine, one checkpoint, zero recoveries, and ticket `merging` v15/r6.
+No backup was installed as a new runtime and no recovery or second merge ran.
+
+This is a failed persistence setup for the real acceptance trial, not a passing
+post-reboot recovery. Only the database was preserved before reboot; the
+registered repository and linked worktree were not. The merge-proof coordinator
+requires a snapshot of that worktree even before reusing a confirmed proof;
+ordinary worktree authentication also validates its persisted identity.
+Recreating the path or cloning the remote is therefore not a supported way to
+complete this ticket. The delivered GitHub change remains recorded separately
+from the unproved terminal outcome.
+
+Future live and reboot acceptance must start in a durable owner-only directory
+and retain the registered directories in place. Temporary fixtures remain
+appropriate for single-process automated tests, not cross-reboot acceptance.
+Keep this trial in the reliability denominator; do not reset or relabel it as
+successful. A fresh trial must be separately identified and cannot repair this
+trial's evidence. Supported lost-checkout recovery is not established.
+
+## Requirement evidence map
+
+Test names identify the scope to preserve. The fixture extension's integrated
+verdict is below; fixture success does not prove live delivery.
+
+| Gate | Evidence and limit |
+| --- | --- |
+| Local install bundle | `internal/bundle` inventory/install tests and the clean installed-binary repeat below. Public publisher authentication/signing is not proved by checksums. |
+| Clean local onboarding | `TestCompiledDevOnboardingUsesPrivateHomeAndLocalCommands` uses the full helper bundle, isolated HOME, real registration/replay and no stable-channel writes. It deliberately does not launch a provider. |
+| Explicit stack readiness | `TestInitCheckExplainsUnsupportedStacksWithoutRunningThem` refuses unprepared Python, Rails and dependency-bearing Node before writes/execution. Prepared Python has separate compiled acceptance; refusal is not language support. |
+| Ticket selection and run/watch | CLI selection tests cover exact resolved identity, ambiguity, stale state and terminal-control sanitization; run tests cover submit/start/watch, replay and uncertain mutation refusal. Real-PTY tests exercise the interactive path separately. |
+| Human decision | Decision picker tests bind confirmation to the displayed full head. The user approved the real ticket's exact head, and SF recorded the approval; see September 6 below. |
+| Python workflow and faults | Real interpreter execution, Store/executor cancellation/recovery and compiled workflow fixtures pass as described below and in the beta plan. Controlled model/GitHub fixtures are not live-model delivery. |
+| Isolation and capacity | Existing channel-coexistence and capacity suites remain required. The Python extension does not change their production settings or replace those tests with its single-ticket fixture. |
+| Fresh delivered ticket | PR #2 reached durable `done` through the installed CLI and authenticated recovery on September 6. PR #1 lost its temporary environment. Both failures and repair interventions remain in acceptance history. |
+| External beta | Three unfamiliar users and the ten-ticket reliability target remain unobserved; no success rate or onboarding-time claim. |
+
+## Executed path
+
+The isolated macOS acceptance used a fresh HOME, a separate dev database,
+and a new private dependency-free Go project. It did not change the existing
+factory's database, runtime, or worktrees. Authentication referenced existing
+operator-owned GitHub and Codex configuration; credentials were not copied.
+
+The installed full helper bundle was built from SF commit
+`70c507281c7493d01528a3eeb945417feb7e7db9`. Both independent Codex model
+families qualified, and doctor passed its required host/recipe checks.
+`run ticket.md --project onboarding-counter --json` submitted and started
+ticket `SF-543bc4cd3b9a9a6291c2bbc7ca20b3b1` at
+2026-09-05T21:48:45Z. Its deadline is 23:48:45Z and cost ceiling is $20.
+
+The factory produced an implementation and independent tests, published a
+draft PR, passed required CI, and reached `waiting_approval`. The observed
+PR head is `ee35025e60092cfd25480121537acec4e4f33a1d`; only
+`count_nonempty.go` and `count_nonempty_test.go` changed. CI run 33994270868
+passed. Human approval remains pending, so merge/reconciliation/done are not
+proven by this checkpoint.
+
+A later live CLI read after 23:48:45Z reported `waiting_approval` with
+`deadline_elapsed=true` and `remaining=0s`. No approval was supplied and no
+budget extension or merge was performed. The status clock does not itself
+transition the ticket; this is an elapsed-budget approval wait, not evidence
+of completed delivery or a terminal cancellation. Do not count this trial as
+delivered, and do not reset it to manufacture a passing acceptance result.
+
+Short-ID status lookup (`SF-543bc4`) succeeded. A live status watcher was
+interrupted with Ctrl-C and exited successfully; a separate status call
+confirmed the ticket remained waiting for approval rather than cancelled.
+Numbered picker behavior is separately covered by real-PTY compiled tests,
+including duplicate titles, exact dispatch and cancellation without mutation.
+
+## Failures retained in the result
+
+The initial isolated setup required author intervention and code repairs:
+
+- GitHub authentication selection and daemon publication selection disagreed
+  about explicit configuration directories. Commit `5d36c8d` aligned them.
+- Codex authentication status ignored `CODEX_HOME` while runtime composition
+  honored it. Commit `70c5072` aligned the paths without copying credentials.
+- The installer accepted a private leaf beneath a shared writable ancestor,
+  but runtime activation correctly refused that location. Commit `67f718f`
+  makes installation enforce the runtime's existing ancestry requirements
+  before creating the destination and authenticate installed helpers afterward.
+  The unchanged acceptance binary activated successfully from trusted ancestry.
+
+The installer regression failed before the fix and passed afterward. The
+host race tests for bundle/runtime assets passed. The integrated normal suite,
+vet, repository, secret, docs and artifact checks passed. A sandbox-only run
+could not preserve special-mode fixture bits; the exact host rerun passed.
+
+This is not an unassisted clean onboarding success, and no <=10-minute setup
+claim is made.
+
+A subsequent clean build at `8fed9d407fd6e62c677ac95d4d4e0d9ead678382`
+produced onboarding3. Installation beneath trusted ancestry passed, including
+the new runtime helper checks, installed version identity and ticket template.
+The same binary refused a private leaf below `/private/tmp` before creating
+the destination. Installed `init --check` passed against the Go fixture with
+a fresh HOME and reported providers/runtime/publication as not checked.
+This repeat proves local installation and preview, not an independent user's
+complete setup or a second provider delivery. The active acceptance daemon
+was not replaced during its approval wait.
+
+A further clean build at `87c61724a9b1a3a561dfdd8af4c7e44f1fccb377`
+produced onboarding4 after the Python workflow checkpoint. Full helper-bundle
+manifest verification and exclusive installation beneath trusted ancestry
+passed. The installed binary reported that exact commit and dev channel;
+`start --help` documented title selection and short IDs. With a fresh, empty
+HOME, installed `init --check` accepted a disposable Go repository while
+labeling runtime/provider/publication checks as not checked. Ticket validation
+accepted the sample and reported omitted budget fields; Python preparation
+preview reported the pinned runtime and explicit download next action.
+HOME remained empty after these commands. No provider, daemon, download, PR,
+or existing project was touched. This is installation/local-readiness evidence,
+not a replacement for the real delivered-ticket gate.
+
+## Remaining acceptance
+
+- Terminal reconciliation of PR #2 is complete; PR #1's lost-environment
+  trial remains a failure, not a fabricated terminal success.
+- Complete clean onboarding without author intervention beyond the passing
+  repeat installation/local-preview checks above.
+- Dependency-bearing Node/TypeScript and Rails support; actual Claude execution
+  composition. Python now has a narrow pinned runtime and passing compiled
+  setup/workflow fixtures, separately described below; live-model Python
+  delivery remains unproven.
+- Three unfamiliar external users and the ten-ticket reliability target.
+- Public signing/distribution and upgrade experience, where separately
+  authorized; no public release has been published by this checkpoint.
+
+Passing the current Go path must not be presented as evidence that the other
+stacks/providers or the complete self-serve beta are ready.
+
+## Subsequent isolated Python acceptance
+
+The Python preparation/setup implementation is committed at `86bf334` with
+full normal Go, vet, repository/secret/docs/artifact and release-build checks
+passing. A subsequent test-only workflow extension has passed its first run,
+two repetitions, and the explicit `make test-python-e2e` target. The target
+requires macOS ARM64 and `SF_TEST_PYTHON_CLI_DOWNLOAD=1`; it refuses missing
+consent or an unsupported host instead of counting skipped tests as coverage.
+
+This acceptance uses the compiled CLI and daemon, pinned public Python/pytest
+artifacts, real repository commands, Store evidence and ordinary transitions.
+It observes a nonzero pre-build test, a passing post-build command, publication
+of the actual Python implementation, exact guarded fixture approval and merge,
+and terminal reconciliation. Provider and GitHub processes are controlled
+fixtures, with a disposable local bare remote. No real PR was approved or
+merged by this test. Existing Go guarded acceptance also passed after the
+shared fixture extension; fixture race tests passed. The extension's full run
+failed two Go workflow fixtures with explicit disk-exhaustion diagnostics;
+all other packages passed, but chained static checks did not run. After
+clearing verified obsolete Go build caches (not project or runtime data),
+the exact regressions passed, followed by a fresh full Go suite, vet,
+repo-check, secret-scan, docs-smoke and artifact-check (terminal exit 0).
+These results do not complete the real
+Go acceptance ticket above or establish unattended live-model Python delivery.
+
+## September 6 real merge checkpoint
+
+The user explicitly approved PR #1 at
+`ee35025e60092cfd25480121537acec4e4f33a1d`. The installed onboarding4 CLI
+recorded that exact approval through SF. After normal provider qualification
+activated the restarted runtime, SF marked the PR ready and merged it.
+GitHub reports `MERGED`, at `2026-09-06T05:03:08Z`, with merge commit
+`00860455167278a63b17ad40d5599b74aae5f636`. No direct `gh pr merge` or database
+mutation was used to substitute for SF's workflow.
+
+This is a delivered GitHub change, but not yet a passing terminal acceptance.
+SF remains in `merging`; its merge and child protected-ref-fetch effects are
+uncertain. Restart recovery advanced the ticket to version 13 / runner 4.
+The restarted daemon required fresh leader-bound provider qualification.
+Ownerless sockets were preserved under inode-specific names after process
+and listener checks, rather than deleted. These are author interventions,
+not evidence of unattended self-service.
+
+A read-only diagnostic using the production Git runner, authenticated helper
+and an authority stub that always refuses acquisition successfully reached
+the mutation boundary. Checkout authentication and protected remote lookup
+therefore passed in that probe; no fetch was permitted by the stub. The
+subsequent local proof failure remains under investigation. Do not count the
+ticket as `done`, or this run as intervention-free, until Store confirms it.
+
+### Diagnosed launch and shutdown failures
+
+The protected-ref proof succeeded in a disposable checkout with both a test
+lease and the real launch recorder backed by a copied Store. The same binary
+failed under the daemon's manually scrubbed environment without `TMPDIR`,
+then passed when the trusted macOS per-user temp directory was supplied.
+The GitHub runner's snapshot can be placed beneath sticky `/private/tmp`,
+but Git's executable-parent validation rejects that shared writable ancestor.
+This is a composition/readiness mismatch, not a reason to relax validation.
+
+Stopping the retrying daemon during a GitHub check then recorded persistent
+`cleanup_uncertain` quarantine. A regression reproduced that a canceled
+request context was passed into cleanup, preventing a drain proof even when
+the runner could supply one. A bounded independent cleanup-context fix passes
+focused GitHub and real-process runner suites. Full serialized Go tests, vet,
+repository checks, secret scan, docs smoke and diff checks passed (session
+43135, terminal exit 0).
+The original command is still canceled, and uncertain cleanup still refuses.
+
+The existing quarantine is preserved. The installed acceptance binary has no
+supported command to clear this latch. New source adds explicit host-checkpoint
+and post-reboot recovery commands through Store. Focused CLI/daemon/Store tests,
+targeted race tests, full Go tests, vet, repository/secret/docs checks and diff
+checks pass on the final source (session 50924, exit 0). Reboot and host-inspection
+requirements return operator-action exit 3; rejected recovery evidence returns
+policy exit 5, with regression coverage. Real recovery is still pending.
+The generic ticket recovery command is not a substitute for that host proof.
+The ticket's nonterminal state remains an acceptance blocker; passing
+prevention or simulated-reboot tests does not resolve the live evidence.
+
+### Validated recovery bundle and live checkpoint
+
+Recovery source is committed at `3f36eb799cf6a4f3a40941ab26ddac5b3cfa82e8`.
+The private onboarding5 macOS ARM64 bundle passed manifest creation,
+verification, exclusive installation, installed identity and cleanup-help
+checks. No release, PATH change, or background-service installation occurred.
+
+The old isolated acceptance daemon was identified by its exact executable and
+open database/socket descriptors, then stopped gracefully (exit 0). The new
+installed dev daemon started normally against the same acceptance HOME,
+including ordinary schema migration and runner recovery. Stable and existing
+project runtimes were not changed.
+
+Installed `daemon cleanup prepare --json` saved one checkpoint. Repeating it
+returned `observed=true`, `attempted=false`. Installed `daemon cleanup recover`
+on the same boot returned `host_reboot_required`, exit 3, with no mutation.
+A read-only database check confirmed one quarantine, one checkpoint, zero
+recovery audits, and the ticket still `merging` at version 15 / runner 6.
+No effect was confirmed by these commands. This proves the real checkpoint
+and refusal paths, not post-reboot recovery or terminal delivery.
+
+The remaining real prerequisite is a manual reboot of the original host after
+saving other work. After restarting the same isolated channel/HOME, explicit
+cleanup recovery may inspect the new boot; normal exact-merge reconciliation
+must still finish independently. A daemon restart alone is insufficient.

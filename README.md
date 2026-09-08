@@ -1,5 +1,9 @@
 # sf
 
+SF source is available under the [MIT License](LICENSE). Third-party
+dependencies retain their own licenses. Public release packaging and publisher
+verification remain separate from this local source-build beta.
+
 `sf` is a local, operator-controlled software factory. It turns a Markdown
 ticket into a planned, independently verified implementation and a reviewed
 GitHub pull request. v1 supports manual external merge observation and a
@@ -10,6 +14,13 @@ The first implementation target is Sofia building Nysa on a trusted macOS
 machine. Docker and Colima are not required and are never silently installed.
 Autonomous selection or merge is deliberately unavailable in v1 pending a
 stronger native containment proof and a guarded pilot.
+
+## Try a first ticket
+
+Start with the [first-ticket guide](docs/tutorials/first-ticket.md). It includes
+the current supported-project matrix, setup path, a complete ticket example,
+and the submit/start/watch/approve workflow. This is a macOS source-build beta,
+not yet a packaged general-purpose installer for every language or provider.
 
 ## Development
 

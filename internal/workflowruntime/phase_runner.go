@@ -31,6 +31,7 @@ type PhaseEvidence interface {
 	OperatorSourceResumeRequiresFreshVerification(context.Context, domain.TicketRef, uint64) (bool, error)
 	OperatorSourceResumeProof(context.Context, domain.TicketRef, uint64, domain.Fence) (store.OperatorSourceResumeProof, bool, error)
 	PendingVerificationAmendment(context.Context, domain.TicketRef, uint64, domain.Fence) (store.VerificationAmendment, error)
+	CandidateRepairBuildContext(context.Context, domain.TicketRef, uint64, domain.Fence) (store.CandidateRepairBuildContext, error)
 	FinalReviewAuthority(context.Context, domain.TicketRef, uint64, domain.Fence) (store.FinalReviewAuthority, error)
 	AssertTicketFence(context.Context, domain.TicketRef, uint64, domain.Fence) error
 	LoadCurrentProviderAttemptResult(context.Context, store.ProviderAttemptResultKey, uint64, domain.Fence) (store.ProviderAttemptResult, phaseartifact.Parsed, error)
@@ -96,7 +97,7 @@ func (r PhaseRunner) finalReview(ctx context.Context, request workflowworker.Pha
 	if err != nil {
 		return workflowworker.PhaseResult{}, err
 	}
-	_, parsed, err := r.loadHistorical(ctx, authority.Candidate.BuilderResult, request.Ticket.Ref, project, worktree, domain.PhaseBuild, providercoord.RoleBuilder)
+	_, parsed, err := r.loadHistorical(ctx, authority.Candidate.BuilderResult, request.Ticket, project, worktree, domain.PhaseBuild, providercoord.RoleBuilder)
 	if err != nil || parsed.Builder == nil {
 		return workflowworker.PhaseResult{}, ErrProviderResultInvalid
 	}
@@ -177,6 +178,9 @@ func (r PhaseRunner) verification(ctx context.Context, request workflowworker.Ph
 		// to the live fence. In particular, an earlier ordinary verification result
 		// is not amendment authority and does not suppress the required review.
 		if reusable, reusableErr := r.Store.LatestReusableProviderAttempt(ctx, store.LatestReusableProviderAttemptRequest{Ref: request.Ticket.Ref, Phase: domain.PhaseVerification, Role: "reviewer", ExpectedVersion: request.Ticket.Version, Fence: request.Fence}); reusableErr == nil {
+			if reusable.Result.Claim.Binding.Identity.Provider != effective.Providers.Reviewer[0] {
+				return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+			}
 			if stored.TransitionTicketVersion != 0 && reusable.Result.Claim.ExpectedVersion >= stored.TransitionTicketVersion {
 				return workflowworker.PhaseResult{ProviderResult: reusable.Key}, nil
 			}
@@ -193,12 +197,16 @@ func (r PhaseRunner) verification(ctx context.Context, request workflowworker.Ph
 		Workspace: phaseWorkspace(project, worktree, identity.Plan.Paths),
 		Plan:      identity,
 		Runtime:   phaseRuntime(effective.PhaseTimeout),
+		Command:   append([]string(nil), effective.Commands.Verify.Argv...),
 		Amendment: amendmentPrompt(request.Amendment),
 	})
 	if err != nil {
+		if request.Amendment != nil {
+			return workflowworker.PhaseResult{}, workflowworker.ErrVerificationAmendmentInvalid
+		}
 		return workflowworker.PhaseResult{}, ErrConfigSnapshotInvalid
 	}
-	return r.run(ctx, request, project, worktree, providercoord.RoleReviewer, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: identity.Digest})
+	return r.run(ctx, request, project, worktree, providercoord.RoleReviewer, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: identity.Digest, ExpectedVerificationCommand: append([]string(nil), effective.Commands.Verify.Argv...)})
 }
 
 func amendmentPrompt(value *store.VerificationAmendment) *workflowprompt.AmendmentReview {
@@ -206,6 +214,34 @@ func amendmentPrompt(value *store.VerificationAmendment) *workflowprompt.Amendme
 		return nil
 	}
 	return &workflowprompt.AmendmentReview{PriorProofDigest: value.Prior.ProofDigest, ProposedDigest: value.ProposedDigest, ProposedCommand: append([]string(nil), value.ProposedCommand...), Reason: value.Reason, Requester: value.Requester}
+}
+
+func candidateRepairPrompt(value store.CandidateRepairBuildContext, verification workflowprompt.VerificationIdentity) (*workflowprompt.BuilderRepair, error) {
+	if value.Ref.Validate() != nil || value.Verification.Revision.IntentDigest != verification.IntentDigest || value.Verification.Revision.ProofDigest != verification.ProofDigest || value.Verification.Revision.CheckpointID != verification.CheckpointID || !reflect.DeepEqual(value.Verification.Revision.OwnedFiles, verification.OwnedFiles) {
+		return nil, ErrProviderResultInvalid
+	}
+	checks := make([]workflowprompt.BuilderRepairCheck, len(value.Diagnostic.FailingChecks))
+	for index, check := range value.Diagnostic.FailingChecks {
+		checks[index] = workflowprompt.BuilderRepairCheck{
+			Name:             check.CanonicalName,
+			ExternalID:       check.ExternalID,
+			State:            check.NormalizedState,
+			DiagnosticDigest: check.FailingDiagnosticDigest,
+		}
+	}
+	return &workflowprompt.BuilderRepair{
+		Schema:                   workflowprompt.BuilderRepairSchema,
+		TargetGeneration:         value.TargetGeneration,
+		PredecessorGeneration:    value.PredecessorGeneration,
+		PredecessorHeadSHA:       value.PredecessorHeadSHA,
+		PredecessorTreeSHA:       value.PredecessorTreeSHA,
+		PublicationWitnessDigest: value.PublicationWitnessDigest,
+		ObservationDigest:        value.Diagnostic.ObservationDigest,
+		RequiredSetDigest:        value.Diagnostic.RequiredSetDigest,
+		DiagnosticDigest:         value.Diagnostic.DiagnosticDigest,
+		TotalFailingChecks:       value.Diagnostic.TotalFailingChecks,
+		FailingChecks:            checks,
+	}, nil
 }
 
 func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequest) (workflowworker.PhaseResult, error) {
@@ -224,12 +260,26 @@ func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequ
 	if err != nil {
 		return workflowworker.PhaseResult{}, err
 	}
+	var repair *workflowprompt.BuilderRepair
+	repairContext, repairErr := r.Store.CandidateRepairBuildContext(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+	if repairErr == nil {
+		if repairContext.Ref != request.Ticket.Ref {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
+		repair, err = candidateRepairPrompt(repairContext, verification)
+		if err != nil {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
+	} else if !errors.Is(repairErr, store.ErrNotFound) {
+		return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+	}
 	input, err := workflowprompt.Builder(workflowprompt.BuilderInput{
 		Ticket:       phaseTicket(request.Ticket),
 		Workspace:    phaseWorkspace(project, worktree, plan.Plan.Paths),
 		Plan:         plan,
 		Verification: verification,
 		Runtime:      phaseRuntime(effective.PhaseTimeout),
+		CIRepair:     repair,
 	})
 	if err != nil {
 		return workflowworker.PhaseResult{}, ErrConfigSnapshotInvalid
@@ -237,7 +287,7 @@ func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequ
 	// A protected verification change is admissible only as a bounded Builder
 	// amendment request. The Store records and charges that request before a
 	// fresh independent Reviewer may accept the exact proposed proof.
-	return r.run(ctx, request, project, worktree, providercoord.RoleBuilder, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ProtectedVerification: append([]string(nil), verification.OwnedFiles...)})
+	return r.run(ctx, request, project, worktree, providercoord.RoleBuilder, input, phaseartifact.Validation{TicketType: request.Ticket.Type, AcceptanceDigest: plan.Digest, ExpectedVerificationCommand: append([]string(nil), effective.Commands.Verify.Argv...), ProtectedVerification: append([]string(nil), verification.OwnedFiles...)})
 }
 
 func (r PhaseRunner) admit(ctx context.Context, request workflowworker.PhaseRequest, state domain.State, route string) (store.Project, config.Effective, store.StoredWorktree, error) {
@@ -266,16 +316,10 @@ func (r PhaseRunner) admit(ctx context.Context, request workflowworker.PhaseRequ
 	if !permittedMode(request.Ticket.MergeMode) || !permittedMode(effective.MergeMode) {
 		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrUnsupportedMode
 	}
-	var providers []string
-	switch route {
-	case "reviewer":
-		providers = effective.Providers.Reviewer
-	case "builder":
-		providers = effective.Providers.Builder
-	default:
+	if route != "reviewer" && route != "builder" {
 		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrPhaseBoundaryUnavailable
 	}
-	if len(providers) != 1 || providers[0] != "codex" {
+	if _, err := configuredProvider(effective, providercoord.Role(route)); err != nil {
 		return store.Project{}, config.Effective{}, store.StoredWorktree{}, ErrProviderOrder
 	}
 	return project, effective, worktree, nil
@@ -308,7 +352,7 @@ func (r PhaseRunner) planIdentity(ctx context.Context, request workflowworker.Ph
 	if err != nil || request.Plan != nil && !reflect.DeepEqual(*request.Plan, plan) || plan.Document.Planner == nil || plan.Document.ProviderResult == nil {
 		return store.StoredPlan{}, workflowprompt.PlanIdentity{}, ErrProviderResultInvalid
 	}
-	_, parsed, err := r.loadHistorical(ctx, *plan.Document.ProviderResult, request.Ticket.Ref, project, worktree, domain.PhasePlanning, providercoord.RolePlanner)
+	_, parsed, err := r.loadHistorical(ctx, *plan.Document.ProviderResult, request.Ticket, project, worktree, domain.PhasePlanning, providercoord.RolePlanner)
 	if err != nil || parsed.Planner == nil {
 		return store.StoredPlan{}, workflowprompt.PlanIdentity{}, ErrProviderResultInvalid
 	}
@@ -339,7 +383,7 @@ func (r PhaseRunner) verificationIdentity(ctx context.Context, request workfloww
 	if err != nil || request.Verification != nil && !reflect.DeepEqual(*request.Verification, verification) || verification.ProviderResult.AttemptID <= 0 || verification.ProviderResult.Ref != request.Ticket.Ref || verification.ProviderResult.Phase != domain.PhaseVerification || verification.Checkpoint.CommitOID != verification.Revision.CheckpointID || verification.Checkpoint.ParentOID == "" || verification.Checkpoint.TreeOID == "" {
 		return workflowprompt.VerificationIdentity{}, ErrProviderResultInvalid
 	}
-	_, parsed, err := r.loadHistorical(ctx, verification.ProviderResult, request.Ticket.Ref, project, worktree, domain.PhaseVerification, providercoord.RoleReviewer)
+	_, parsed, err := r.loadHistorical(ctx, verification.ProviderResult, request.Ticket, project, worktree, domain.PhaseVerification, providercoord.RoleReviewer)
 	if err != nil || parsed.Verify == nil {
 		return workflowprompt.VerificationIdentity{}, ErrProviderResultInvalid
 	}
@@ -357,7 +401,7 @@ func (r PhaseRunner) finalVerificationIdentity(ctx context.Context, request work
 	if verification.ProviderResult.AttemptID <= 0 || verification.ProviderResult.Ref != request.Ticket.Ref || verification.ProviderResult.Phase != domain.PhaseVerification || verification.Checkpoint.CommitOID != verification.Revision.CheckpointID || verification.Checkpoint.ParentOID == "" || verification.Checkpoint.TreeOID == "" {
 		return workflowprompt.VerificationIdentity{}, ErrProviderResultInvalid
 	}
-	_, parsed, err := r.loadHistorical(ctx, verification.ProviderResult, request.Ticket.Ref, project, worktree, domain.PhaseVerification, providercoord.RoleReviewer)
+	_, parsed, err := r.loadHistorical(ctx, verification.ProviderResult, request.Ticket, project, worktree, domain.PhaseVerification, providercoord.RoleReviewer)
 	if err != nil || parsed.Verify == nil {
 		return workflowprompt.VerificationIdentity{}, ErrProviderResultInvalid
 	}
@@ -372,13 +416,21 @@ func (r PhaseRunner) finalVerificationIdentity(ctx context.Context, request work
 }
 
 func (r PhaseRunner) run(ctx context.Context, request workflowworker.PhaseRequest, project store.Project, worktree store.StoredWorktree, role providercoord.Role, input contracts.PhaseInput, validation phaseartifact.Validation) (workflowworker.PhaseResult, error) {
+	effective, err := decodeTicketConfig(request.Ticket)
+	if err != nil {
+		return workflowworker.PhaseResult{}, err
+	}
+	provider, err := configuredProvider(effective, role)
+	if err != nil {
+		return workflowworker.PhaseResult{}, err
+	}
 	// This is intentionally the last operation before entering the coordinator.
 	// Historical predecessor evidence may have old fences; the newly launched
 	// attempt never may.
 	if err := r.Store.AssertTicketFence(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence); err != nil {
 		return workflowworker.PhaseResult{}, ErrIdentityMismatch
 	}
-	result := r.Coordinator.Run(ctx, providercoord.Request{Role: role, Input: input, Validation: validation, ExpectedVersion: request.Ticket.Version, Fence: request.Fence, ConfigDigest: request.Ticket.ConfigDigest})
+	result := r.Coordinator.Run(ctx, providercoord.Request{Role: role, ExpectedProvider: provider, Input: input, Validation: validation, ExpectedVersion: request.Ticket.Version, Fence: request.Fence, ConfigDigest: request.Ticket.ConfigDigest})
 	if result.Code != providercoord.Completed || result.ProviderResult.AttemptID <= 0 {
 		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) || result.Code == providercoord.Canceled {
 			return workflowworker.PhaseResult{}, ErrCanceled
@@ -405,17 +457,39 @@ func (r PhaseRunner) run(ctx context.Context, request workflowworker.PhaseReques
 	return workflowworker.PhaseResult{ProviderResult: key}, nil
 }
 
-func (r PhaseRunner) loadHistorical(ctx context.Context, key store.ProviderAttemptResultKey, ref domain.TicketRef, project store.Project, worktree store.StoredWorktree, phase domain.Phase, role providercoord.Role) (store.ProviderAttemptResult, phaseartifact.Parsed, error) {
+func (r PhaseRunner) loadHistorical(ctx context.Context, key store.ProviderAttemptResultKey, ticket store.Ticket, project store.Project, worktree store.StoredWorktree, phase domain.Phase, role providercoord.Role) (store.ProviderAttemptResult, phaseartifact.Parsed, error) {
+	ref := ticket.Ref
+	provider, routeErr := ticketProvider(ticket, role)
+	if routeErr != nil {
+		return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, routeErr
+	}
 	result, parsed, err := r.Store.LoadHistoricalProviderAttemptResult(ctx, key)
-	if err != nil || key.AttemptID <= 0 || key.Ref != ref || key.Phase != phase || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || result.Claim.Ref != ref || result.Claim.Phase != phase || result.Claim.Role != string(role) || result.Claim.ExpectedVersion == 0 || result.Claim.LeaderEpoch == 0 || result.Claim.RunnerEpoch == 0 || result.Claim.Repository != project.Path || result.Claim.Worktree != worktree.Path || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || result.Claim.BaseSHA != worktree.BaseSHA || result.Claim.Binding.Identity.Provider != "codex" || parsed.Phase != phase || parsed.Provider != result.Claim.Binding.Identity || parsed.Provider.Provider != "codex" || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes {
+	if err == nil && (result.Claim.BaseSHA != worktree.BaseSHA || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON)) {
+		reader, ok := r.Store.(interface {
+			HistoricalProviderWorktree(context.Context, store.ProviderAttemptResultKey) (store.StoredWorktree, error)
+		})
+		if !ok {
+			return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
+		}
+		prior, historyErr := reader.HistoricalProviderWorktree(ctx, key)
+		if historyErr != nil || prior.Path != worktree.Path || prior.Branch != worktree.Branch {
+			return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
+		}
+		worktree = prior // comparison only; new phaseWorkspace still uses the live registration
+	}
+	if err != nil || key.AttemptID <= 0 || key.Ref != ref || key.Phase != phase || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || result.Claim.Ref != ref || result.Claim.Phase != phase || result.Claim.Role != string(role) || result.Claim.ExpectedVersion == 0 || result.Claim.LeaderEpoch == 0 || result.Claim.RunnerEpoch == 0 || result.Claim.Repository != project.Path || result.Claim.Worktree != worktree.Path || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || result.Claim.BaseSHA != worktree.BaseSHA || result.Claim.Binding.Identity.Provider != provider || parsed.Phase != phase || parsed.Provider != result.Claim.Binding.Identity || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes {
 		return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
 	}
 	return result, parsed, nil
 }
 
 func (r PhaseRunner) loadCurrent(ctx context.Context, key store.ProviderAttemptResultKey, request workflowworker.PhaseRequest, project store.Project, worktree store.StoredWorktree, role providercoord.Role, input contracts.PhaseInput, validation phaseartifact.Validation) (store.ProviderAttemptResult, phaseartifact.Parsed, error) {
+	provider, routeErr := ticketProvider(request.Ticket, role)
+	if routeErr != nil {
+		return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, routeErr
+	}
 	result, parsed, err := r.Store.LoadCurrentProviderAttemptResult(ctx, key, request.Ticket.Version, request.Fence)
-	if err != nil || key.AttemptID <= 0 || key.Ref != request.Ticket.Ref || key.Phase != request.Phase || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || result.Claim.Ref != request.Ticket.Ref || result.Claim.Phase != request.Phase || result.Claim.Role != string(role) || result.Claim.ExpectedVersion != request.Ticket.Version || result.Claim.LeaderEpoch != request.Fence.LeaderEpoch || result.Claim.RunnerEpoch != request.Fence.RunnerEpoch || result.Claim.Repository != project.Path || result.Claim.Worktree != worktree.Path || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || result.Claim.BaseSHA != worktree.BaseSHA || result.Claim.Binding.Identity.Provider != "codex" || parsed.Phase != request.Phase || parsed.Provider != result.Claim.Binding.Identity || parsed.Provider.Provider != "codex" || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes || !matchesLaunchInput(result.Claim, key, input) || !matchesValidation(result.Validation, validation) {
+	if err != nil || key.AttemptID <= 0 || key.Ref != request.Ticket.Ref || key.Phase != request.Phase || key.Attempt <= 0 || result.AttemptID != key.AttemptID || result.Claim.ID != key.AttemptID || result.Claim.Attempt != key.Attempt || result.Claim.Ref != request.Ticket.Ref || result.Claim.Phase != request.Phase || result.Claim.Role != string(role) || result.Claim.ExpectedVersion != request.Ticket.Version || result.Claim.LeaderEpoch != request.Fence.LeaderEpoch || result.Claim.RunnerEpoch != request.Fence.RunnerEpoch || result.Claim.Repository != project.Path || result.Claim.Worktree != worktree.Path || result.Claim.WorktreeIdentity != string(worktree.IdentityJSON) || result.Claim.BaseSHA != worktree.BaseSHA || result.Claim.Binding.Identity.Provider != provider || parsed.Phase != request.Phase || parsed.Provider != result.Claim.Binding.Identity || len(result.RawArtifact) == 0 || len(result.RawArtifact) > phaseartifact.MaxBytes || !matchesLaunchInput(result.Claim, key, input) || !matchesValidation(result.Validation, validation) {
 		return store.ProviderAttemptResult{}, phaseartifact.Parsed{}, ErrProviderResultInvalid
 	}
 	return result, parsed, nil
@@ -447,12 +521,11 @@ func matchesLaunchInput(claim store.ProviderAttemptClaim, key store.ProviderAtte
 		return false
 	}
 	input.Timeout = claim.Input.Timeout
-	payload, digest, err := contracts.CanonicalPhaseInput(input)
+	payload, digest, err := contracts.CanonicalPhaseInput(claim.Input)
 	if err != nil {
 		return false
 	}
-	input.RequestDigest = digest
-	return digest == claim.RequestDigest && bytes.Equal(payload, claim.RequestPayload) && reflect.DeepEqual(input, claim.Input)
+	return digest == claim.RequestDigest && bytes.Equal(payload, claim.RequestPayload) && contracts.PhaseInputMatchesAuthenticatedClaim(input, claim.Input, claim.RequestDigest)
 }
 
 func parsedForPhase(parsed phaseartifact.Parsed, phase domain.Phase) bool {

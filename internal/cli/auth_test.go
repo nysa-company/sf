@@ -74,6 +74,37 @@ func TestAuthLoginReportsOnlyConfirmedOfficialState(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedCLIsDoNotImplyExecutionReadiness(t *testing.T) {
+	for _, channel := range []domain.Channel{domain.ChannelStable, domain.ChannelDev} {
+		service := &fakeAuthentication{}
+		for _, provider := range []localauth.Provider{localauth.Claude, localauth.Cursor, localauth.Codex} {
+			service.statuses = append(service.statuses, localauth.Status{Provider: provider, Installed: true, Authenticated: true, State: localauth.StateAuthenticated})
+		}
+		response := RunAuthStatus(context.Background(), channel, service)
+		var report authReport
+		if err := json.Unmarshal(response.Data, &report); err != nil {
+			t.Fatal(err)
+		}
+		if report.Scope != authScope {
+			t.Fatal("missing qualification boundary")
+		}
+		for _, provider := range report.Providers {
+			if provider.NextAction == nil || len(provider.NextAction.Argv) != 2 || provider.NextAction.Argv[0] != binaryForChannel(channel) || provider.NextAction.Argv[1] != "doctor" {
+				t.Fatal("wrong readiness action")
+			}
+		}
+		var output bytes.Buffer
+		if err := Render(&output, response, false); err != nil {
+			t.Fatal(err)
+		}
+		for _, expected := range []string{authScope, "claude: authenticated", "cursor: authenticated", "codex: authenticated", binaryForChannel(channel) + " doctor"} {
+			if !bytes.Contains(output.Bytes(), []byte(expected)) {
+				t.Fatalf("missing %q in %s", expected, output.String())
+			}
+		}
+	}
+}
+
 func TestAuthLoginFailuresHaveOneExecutableActionAndTruthfulMutation(t *testing.T) {
 	tests := []struct {
 		name      string

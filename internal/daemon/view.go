@@ -3,9 +3,12 @@ package daemon
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/redact"
 	"github.com/nysa-company/sf/internal/store"
 )
 
@@ -16,6 +19,16 @@ const maxStatusHistory = 100
 // deliberately excluded from the operator/status response.
 func (daemon *Daemon) evidenceView(ctx context.Context, ref domain.TicketRef) (map[string]any, error) {
 	view := map[string]any{}
+	accounting, err := daemon.store.ProviderAccountingPolicy(ctx, ref)
+	if err == nil {
+		view["provider_accounting"] = map[string]any{
+			"mode": accounting.Policy, "actual_total_known": false, "hard_dollar_cap": false,
+			"sf_launch_limit": accounting.RequestLimit, "request_timeout": accounting.RequestTimeout.String(),
+			"estimate_limit_micro_usd": accounting.EstimateLimitMicroUSD,
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
 	plan, err := daemon.store.Plan(ctx, ref)
 	if err == nil {
 		view["plan"] = map[string]any{
@@ -28,7 +41,7 @@ func (daemon *Daemon) evidenceView(ctx context.Context, ref domain.TicketRef) (m
 		return nil, err
 	}
 
-	verification, err := daemon.store.CurrentVerification(ctx, ref)
+	verification, err := daemon.store.HistoricalVerification(ctx, ref)
 	if err == nil {
 		view["verification"] = map[string]any{
 			"revision": verification.Revision.Revision, "intent_digest": verification.Revision.IntentDigest,
@@ -40,7 +53,7 @@ func (daemon *Daemon) evidenceView(ctx context.Context, ref domain.TicketRef) (m
 		return nil, err
 	}
 
-	candidate, err := daemon.store.LatestCandidate(ctx, ref)
+	candidate, err := daemon.store.HistoricalCandidate(ctx, ref)
 	if err == nil {
 		view["candidate"] = map[string]any{
 			"generation": candidate.Snapshot.Generation, "base_sha": candidate.Snapshot.BaseSHA,
@@ -82,6 +95,14 @@ func (daemon *Daemon) evidenceView(ctx context.Context, ref domain.TicketRef) (m
 	}
 	view["phase_attempts"] = attemptViews
 	view["phase_attempts_truncated"] = truncatedAttempts
+	review, err := daemon.store.LatestReviewDiagnostic(ctx, ref)
+	if err == nil {
+		view["review_diagnostic"] = reviewDiagnosticView(review, daemon.projector.Policy)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		// Unavailable diagnostics must not hide the durable ticket state or
+		// display an older verdict as if it authenticated successfully.
+		view["review_diagnostic"] = map[string]any{"available": false, "error_code": evidenceErrorCode(err)}
+	}
 
 	decisions, err := daemon.store.OperatorDecisions(ctx, ref)
 	if err != nil {
@@ -102,6 +123,35 @@ func (daemon *Daemon) evidenceView(ctx context.Context, ref domain.TicketRef) (m
 	view["operator_decisions"] = decisionViews
 	view["operator_decisions_truncated"] = truncatedDecisions
 	return view, nil
+}
+
+func reviewDiagnosticView(value store.HistoricalReviewDiagnostic, policy redact.Policy) map[string]any {
+	const maxFindings = 5
+	findings := make([]string, 0, maxFindings)
+	truncated := len(value.Review.Findings) > maxFindings
+	for i, finding := range value.Review.Findings {
+		if i == maxFindings {
+			break
+		}
+		text := policy.String(finding)
+		text = strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+				return ' '
+			}
+			return r
+		}, text)
+		// Redact before truncation so a cut credential cannot evade matching.
+		runes := []rune(policy.String(text))
+		if len(runes) > 512 {
+			runes = runes[:512]
+			truncated = true
+		}
+		findings = append(findings, string(runes))
+	}
+	return map[string]any{"available": true, "historical": true,
+		"attempt": value.Attempt, "ticket_version": value.TicketVersion,
+		"decision": value.Review.Decision, "reviewed_head": value.Review.ReviewedHead,
+		"findings": findings, "truncated": truncated}
 }
 
 func timeView(value time.Time) string {

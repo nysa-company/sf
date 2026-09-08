@@ -1,15 +1,16 @@
 package processsupervisor
 
 import (
+	"errors"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // This is intentionally an OS-backed fixture, not a string-only profile
@@ -20,28 +21,69 @@ func TestRepositoryStrictSandboxBlocksDoubleForkAndSetsid(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("repository command product boundary is macOS")
 	}
-	perl, err := exec.LookPath("perl")
+	self, err := os.Executable()
 	if err != nil {
-		t.Skip("perl fixture unavailable")
+		t.Fatal(err)
+	}
+	self, err = filepath.EvalSymlinks(self)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if os.Getenv("SF_REPOSITORY_STRICT_HELPER") == "1" {
-		if err := syscall.Setpgid(0, 0); err != nil {
+		pgid, err := syscall.Getpgid(0)
+		if err != nil {
 			t.Fatal(err)
 		}
-		profile, err := repositoryStrictSandboxProfile(os.Getenv("SF_REPOSITORY_STRICT_ROOT"), perl)
+		if pgid != os.Getpid() {
+			if err := syscall.Setpgid(0, 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if pgid, err = syscall.Getpgid(0); err != nil || pgid != os.Getpid() {
+			t.Fatalf("sandbox helper is not a process-group leader: pgid=%d pid=%d err=%v", pgid, os.Getpid(), err)
+		}
+		profile, err := repositoryStrictSandboxProfile(os.Getenv("SF_REPOSITORY_STRICT_ROOT"), self)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := ApplyRepositoryTestSandbox(profile); err != nil {
 			t.Fatal(err)
 		}
-		fixture := `use POSIX qw(setsid); use Socket qw(AF_INET SOCK_STREAM sockaddr_in inet_aton); my $session=setsid(); print defined($session) && $session >= 0 ? "setsid-ok\n" : "setsid-denied\n"; my $pid=fork(); print defined($pid) ? "fork-ok\n" : "fork-denied\n"; socket(my $sock, AF_INET, SOCK_STREAM, 0) or die; my $network=connect($sock, sockaddr_in($ENV{SF_REPOSITORY_STRICT_PORT}, inet_aton("127.0.0.1"))); print $network ? "network-ok\n" : "network-denied\n"; exit 0;`
-		if err := syscall.Exec(perl, []string{perl, "-e", fixture}, os.Environ()); err != nil {
-			t.Fatal(err)
+		if _, err := syscall.Setsid(); err == nil {
+			_, _ = os.Stdout.WriteString("setsid-ok\n")
+		} else if errors.Is(err, syscall.EPERM) {
+			_, _ = os.Stdout.WriteString("setsid-denied\n")
+		} else {
+			t.Fatalf("setsid failed for an unexpected reason: %v", err)
+		}
+		// Execute the already allowlisted test binary so the only remaining
+		// forbidden operation is process-fork itself. Using /usr/bin/true here
+		// would let process-exec denial mask a missing process-fork rule.
+		pid, err := syscall.ForkExec(self, []string{self, "-test.run=^$"}, &syscall.ProcAttr{
+			Env:   os.Environ(),
+			Files: []uintptr{0, 1, 2},
+		})
+		if err == nil {
+			var status syscall.WaitStatus
+			_, _ = syscall.Wait4(pid, &status, 0, nil)
+			_, _ = os.Stdout.WriteString("fork-ok\n")
+		} else if errors.Is(err, syscall.EPERM) {
+			_, _ = os.Stdout.WriteString("fork-denied\n")
+		} else {
+			t.Fatalf("fork failed for an unexpected reason: %v", err)
+		}
+		connection, err := net.DialTimeout("tcp", os.Getenv("SF_REPOSITORY_STRICT_ADDR"), time.Second)
+		if err == nil {
+			_ = connection.Close()
+			_, _ = os.Stdout.WriteString("network-ok\n")
+		} else if errors.Is(err, syscall.EPERM) {
+			_, _ = os.Stdout.WriteString("network-denied\n")
+		} else {
+			t.Fatalf("network probe failed for an unexpected reason: %v", err)
 		}
 		return
 	}
-	profile, err := repositoryStrictSandboxProfile(t.TempDir(), perl)
+	profile, err := repositoryStrictSandboxProfile(t.TempDir(), self)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +94,7 @@ func TestRepositoryStrictSandboxBlocksDoubleForkAndSetsid(t *testing.T) {
 	}
 	defer listener.Close()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestRepositoryStrictSandboxBlocksDoubleForkAndSetsid$")
-	cmd.Env = append(os.Environ(), "SF_REPOSITORY_STRICT_HELPER=1", "SF_REPOSITORY_STRICT_ROOT="+t.TempDir(), "SF_REPOSITORY_STRICT_PORT="+strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))
+	cmd.Env = append(os.Environ(), "SF_REPOSITORY_STRICT_HELPER=1", "SF_REPOSITORY_STRICT_ROOT="+t.TempDir(), "SF_REPOSITORY_STRICT_ADDR="+listener.Addr().String())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("sandbox fixture failed: %v: %s", err, out)
@@ -112,9 +154,49 @@ func TestRepositoryStrictSandboxDeniesSeparateWorktreeAndHostWrites(t *testing.T
 	if runtime.GOOS != "darwin" {
 		t.Skip("repository command product boundary is macOS")
 	}
-	perl, err := exec.LookPath("perl")
+	self, err := os.Executable()
 	if err != nil {
-		t.Skip("perl fixture unavailable")
+		t.Fatal(err)
+	}
+	self, err = filepath.EvalSymlinks(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("SF_REPOSITORY_STRICT_WRITE_HELPER") == "1" {
+		repository := os.Getenv("SF_REPOSITORY_STRICT_WRITE_REPOSITORY")
+		worktree := os.Getenv("SF_REPOSITORY_STRICT_WRITE_WORKTREE")
+		host := os.Getenv("SF_REPOSITORY_STRICT_WRITE_HOST")
+		sentinel := os.Getenv("SF_REPOSITORY_STRICT_WRITE_SENTINEL")
+		private := os.Getenv("SF_REPOSITORY_STRICT_WRITE_PRIVATE")
+		profile, err := repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: repository, Worktree: worktree, GitFile: worktree + "/.git", CommonDir: repository + "/.git", Home: private, Temporary: private, Executable: self})
+		if err != nil || ApplyRepositoryTestSandbox(profile) != nil {
+			t.Fatal("initialize strict write sandbox")
+		}
+		probeDeniedWrite := func(name, path string) {
+			if err := os.WriteFile(path, []byte("probe"), 0o600); err == nil {
+				_, _ = os.Stdout.WriteString(name + "-ok\n")
+			} else if errors.Is(err, syscall.EPERM) {
+				_, _ = os.Stdout.WriteString(name + "-denied\n")
+			} else {
+				t.Fatalf("%s failed for an unexpected reason: %v", name, err)
+			}
+		}
+		probeDeniedWrite("source-write", repository+"/source")
+		probeDeniedWrite("worktree-write", worktree+"/source")
+		probeDeniedWrite("git-write", worktree+"/.git/config")
+		probeDeniedWrite("outside-write", host+"/outside")
+		if err := os.WriteFile(private+"/allowed", []byte("probe"), 0o600); err != nil {
+			t.Fatalf("private write denied: %v", err)
+		}
+		_, _ = os.Stdout.WriteString("private-write-ok\n")
+		if _, err := os.ReadFile(sentinel); err == nil {
+			_, _ = os.Stdout.WriteString("credential-read-ok\n")
+		} else if errors.Is(err, syscall.EPERM) {
+			_, _ = os.Stdout.WriteString("credential-read-denied\n")
+		} else {
+			t.Fatalf("credential read failed for an unexpected reason: %v", err)
+		}
+		return
 	}
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -133,18 +215,26 @@ func TestRepositoryStrictSandboxDeniesSeparateWorktreeAndHostWrites(t *testing.T
 	if err := os.WriteFile(sentinel, []byte("non-secret sentinel"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	profile, err := repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: repository, Worktree: worktree, GitFile: worktree + "/.git", CommonDir: repository + "/.git", Home: private, Temporary: private, Executable: perl})
+	profile, err := repositoryStrictSandboxProfileFor(repositorySandboxPaths{Repository: repository, Worktree: worktree, GitFile: worktree + "/.git", CommonDir: repository + "/.git", Home: private, Temporary: private, Executable: self})
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := `sub probe { my ($name,$mode,$path)=@_; if (open(my $f,$mode,$path)) { close($f); print "$name-ok\n" } else { print "$name-denied\n" } } probe("source-write",">",$ARGV[0]."/source"); probe("worktree-write",">",$ARGV[1]."/source"); probe("git-write",">",$ARGV[1]."/.git/config"); probe("outside-write",">",$ARGV[2]."/outside"); probe("credential-read","<",$ARGV[3]);`
-	cmd := exec.Command(repositorySandboxExec, "-p", profile, perl, "-e", fixture, repository, worktree, host, sentinel)
+	_ = profile // Constructing this first also proves the fixture host supports the strict profile.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRepositoryStrictSandboxDeniesSeparateWorktreeAndHostWrites$")
+	cmd.Env = append(os.Environ(),
+		"SF_REPOSITORY_STRICT_WRITE_HELPER=1",
+		"SF_REPOSITORY_STRICT_WRITE_REPOSITORY="+repository,
+		"SF_REPOSITORY_STRICT_WRITE_WORKTREE="+worktree,
+		"SF_REPOSITORY_STRICT_WRITE_HOST="+host,
+		"SF_REPOSITORY_STRICT_WRITE_SENTINEL="+sentinel,
+		"SF_REPOSITORY_STRICT_WRITE_PRIVATE="+private,
+	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("strict fixture failed: %v: %s", err, out)
 	}
 	text := string(out)
-	for _, want := range []string{"source-write-denied", "worktree-write-denied", "git-write-denied", "outside-write-denied", "credential-read-denied"} {
+	for _, want := range []string{"source-write-denied", "worktree-write-denied", "git-write-denied", "outside-write-denied", "credential-read-denied", "private-write-ok"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("strict profile allowed prohibited operation %q: %s", want, text)
 		}

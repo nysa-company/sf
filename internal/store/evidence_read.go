@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
@@ -152,7 +153,7 @@ func (s *Store) finalReviewAuthorityFrom(ctx context.Context, q candidateEvidenc
 		return FinalReviewAuthority{}, ErrEvidenceConflict
 	}
 	verification, err := s.verificationEvidenceForCandidateFrom(ctx, q, ref)
-	if err != nil || candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest || candidate.Commit.ParentOID != verification.Checkpoint.CommitOID {
+	if err != nil || s.authenticateCandidateVerificationParentFrom(ctx, q, candidate, verification) != nil {
 		return FinalReviewAuthority{}, ErrEvidenceConflict
 	}
 	if ticketType == domain.TicketSpike {
@@ -189,6 +190,32 @@ func (s *Store) finalReviewAuthorityFrom(ctx context.Context, q candidateEvidenc
 		}
 	}
 	return FinalReviewAuthority{Candidate: candidate, Verification: verification, Checks: checks}, nil
+}
+
+// authenticateCandidateVerificationParentFrom keeps the ordinary candidate
+// parent invariant and the sole CI-repair exception in one proof. A repaired
+// candidate may be a child of its predecessor candidate only after the exact
+// repair binding, Builder result, candidate, and completion authenticate.
+func (s *Store) authenticateCandidateVerificationParentFrom(ctx context.Context, q candidateEvidenceQuerier, candidate StoredCandidate, verification StoredVerification) error {
+	if candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest {
+		return ErrEvidenceConflict
+	}
+	if candidate.Commit.ParentOID == verification.Checkpoint.CommitOID {
+		return nil
+	}
+	builder, _, builderErr := s.loadHistoricalProviderAttemptResult(ctx, q, candidate.BuilderResult)
+	if builderErr == nil {
+		if _, refreshErr := protectedBaseRefreshCandidateAt(ctx, q, candidate, builder); refreshErr == nil {
+			return nil
+		} else if !errors.Is(refreshErr, ErrNotFound) {
+			return ErrEvidenceConflict
+		}
+	}
+	repair, repairErr := completedCandidateRepairContextAt(ctx, q, candidate, builder)
+	if builderErr != nil || repairErr != nil || candidate.Commit.ParentOID != repair.PredecessorHeadSHA || !reflect.DeepEqual(repair.Verification, verification) {
+		return ErrEvidenceConflict
+	}
+	return nil
 }
 
 // finalReviewCIAuthorityFrom authenticates the complete v43 CI chain using
@@ -235,6 +262,12 @@ func finalReviewCIAuthorityFrom(ctx context.Context, q candidateEvidenceQuerier,
 // dispensable prelude to green: each must be contiguous, policy-matched, and
 // bound to its exact event and digest.
 func finalReviewCIPendingChainFrom(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, publication PublishedCandidateEvidence, policy CIRequiredCheckPolicy) (CIObservation, uint64, error) {
+	return finalReviewCIPendingChainThrough(ctx, q, ref, publication, policy, ^uint64(0)>>1)
+}
+
+// Historical refresh provenance stops at its immutable reservation endpoint.
+// Later generations' CI cannot invalidate that already-consumed segment.
+func finalReviewCIPendingChainThrough(ctx context.Context, q candidateEvidenceQuerier, ref domain.TicketRef, publication PublishedCandidateEvidence, policy CIRequiredCheckPolicy, through uint64) (CIObservation, uint64, error) {
 	waitingVersion := publication.CurrentTicketVersion + 1
 	payload, err := json.Marshal(struct {
 		WitnessDigest    string `json:"witness_digest"`
@@ -252,7 +285,7 @@ func finalReviewCIPendingChainFrom(ctx context.Context, q candidateEvidenceQueri
 	}
 	var greenCount int
 	var reviewVersion uint64
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND candidate_tree_sha=? AND observation_classification='green' AND resulting_state='reviewing' AND resulting_trigger='checks_green'`, ref.Channel, ref.Project, ref.Ticket, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA, publication.Candidate.Snapshot.TreeSHA).Scan(&greenCount, &reviewVersion); err != nil || greenCount != 1 || reviewVersion <= waitingVersion {
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(ticket_version),0) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND candidate_generation=? AND candidate_head_sha=? AND candidate_tree_sha=? AND observation_classification='green' AND resulting_state='reviewing' AND resulting_trigger='checks_green' AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, publication.Candidate.Snapshot.Generation, publication.Candidate.Snapshot.HeadSHA, publication.Candidate.Snapshot.TreeSHA, through).Scan(&greenCount, &reviewVersion); err != nil || greenCount != 1 || reviewVersion <= waitingVersion {
 		return CIObservation{}, 0, fmt.Errorf("%w: final review CI green cardinality", ErrEvidenceConflict)
 	}
 	if err := validateRunnerRecoveryCardinality(ctx, q, ref); err != nil {
@@ -311,7 +344,7 @@ func finalReviewCIPendingChainFrom(ctx context.Context, q candidateEvidenceQueri
 		return CIObservation{}, 0, fmt.Errorf("%w: final review CI missing green endpoint", ErrEvidenceConflict)
 	}
 	var afterGreen int
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>?`, ref.Channel, ref.Project, ref.Ticket, reviewVersion).Scan(&afterGreen); err != nil || afterGreen != 0 {
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ci_transition_evidence WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version>? AND ticket_version<=?`, ref.Channel, ref.Project, ref.Ticket, reviewVersion, through).Scan(&afterGreen); err != nil || afterGreen != 0 {
 		return CIObservation{}, 0, fmt.Errorf("%w: final review CI trailing transition", ErrEvidenceConflict)
 	}
 	return green, reviewVersion, nil
@@ -361,10 +394,10 @@ func (s *Store) ValidateCurrentCandidateForBuildTransition(ctx context.Context, 
 	if err != nil {
 		return StoredCandidate{}, err
 	}
-	if candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest {
+	if verification.Checkpoint.CommitOID != verification.Revision.CheckpointID || !validOID(verification.Checkpoint.ParentOID) || !validOID(verification.Checkpoint.TreeOID) {
 		return StoredCandidate{}, ErrEvidenceConflict
 	}
-	if verification.Checkpoint.CommitOID != verification.Revision.CheckpointID || !validOID(verification.Checkpoint.ParentOID) || !validOID(verification.Checkpoint.TreeOID) || candidate.Commit.ParentOID != verification.Checkpoint.CommitOID {
+	if err := s.authenticateCandidateVerificationParentFrom(ctx, s.db, candidate, verification); err != nil {
 		return StoredCandidate{}, ErrEvidenceConflict
 	}
 	return candidate, nil
@@ -481,6 +514,8 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 	}
 	exact := ticketVersion == result.TicketVersion && ticketRunner == result.Fence.RunnerEpoch && leader == result.Fence.LeaderEpoch
 	amendmentAuthenticated := false
+	repairAuthenticated := false
+	refreshAuthenticated := false
 	if !exact {
 		boundaryPhase := domain.PhaseVerification
 		if ticketState == domain.StateBuilding {
@@ -502,6 +537,19 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 			// prior Builder result. The final-review transition authenticated this
 			// verification when it consumed the repair decision.
 			exact = true
+		}
+	}
+	if !exact && ticketState == domain.StateBuilding {
+		repair, repairErr := s.candidateRepairBuildContextAt(ctx, q, ref, ticketVersion, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticketRunner})
+		if repairErr == nil {
+			retained := repair.Verification
+			if result.Revision.Revision != retained.Revision.Revision || result.Revision.IntentDigest != retained.Revision.IntentDigest || result.Revision.ProofDigest != retained.Revision.ProofDigest || result.Revision.CheckpointID != retained.Revision.CheckpointID || result.Revision.Amends != retained.Revision.Amends || !equalStringSlices(result.Revision.OwnedFiles, retained.Revision.OwnedFiles) || !bytes.Equal(result.Intent, retained.Intent) || !bytes.Equal(result.Proof, retained.Proof) || result.AmendmentReason != retained.AmendmentReason || result.Requester != retained.Requester || result.ProviderResult != retained.ProviderResult || result.Checkpoint != retained.Checkpoint {
+				return StoredVerification{}, fmt.Errorf("candidate repair verification binding: %w", ErrEvidenceConflict)
+			}
+			exact = true
+			repairAuthenticated = true
+		} else if !errors.Is(repairErr, ErrNotFound) {
+			return StoredVerification{}, fmt.Errorf("candidate repair verification boundary: %w", repairErr)
 		}
 	}
 	if !exact && ticketState == domain.StateBuilding {
@@ -530,6 +578,21 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 			return StoredVerification{}, fmt.Errorf("verification amendment boundary: %w", amendmentErr)
 		}
 	}
+	if !exact && ticketState == domain.StateBuilding {
+		refresh, refreshErr := s.protectedBaseRefreshBuildContextAt(ctx, q, ref, ticketVersion, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticketRunner})
+		if refreshErr == nil {
+			retained, current := refresh.Verification, result
+			current.CommandBinding = retained.CommandBinding // authenticated below from this revision
+			current.TicketVersion, retained.TicketVersion = 0, 0
+			current.Fence, retained.Fence = domain.Fence{}, domain.Fence{}
+			if !reflect.DeepEqual(current, retained) {
+				return StoredVerification{}, ErrEvidenceConflict
+			}
+			exact, refreshAuthenticated = true, true
+		} else if !errors.Is(refreshErr, ErrNotFound) {
+			return StoredVerification{}, fmt.Errorf("base refresh verification boundary: %w", refreshErr)
+		}
+	}
 	if !exact {
 		var transitions int
 		if ticketVersion != result.TicketVersion+1 || ticketRunner != result.Fence.RunnerEpoch || leader != result.Fence.LeaderEpoch || q.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='phase_pass' AND from_state='verifying' AND to_state='building'`, ref.Channel, ref.Project, ref.Ticket, ticketVersion).Scan(&transitions) != nil || transitions != 1 {
@@ -542,7 +605,7 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 	}
 	result.CommandBinding = binding
 	var commandErr error
-	if amendmentAuthenticated {
+	if amendmentAuthenticated || repairAuthenticated || refreshAuthenticated {
 		commandErr = s.reauthenticateStoredVerificationCommandHistoricalFrom(ctx, q, ref, result)
 	} else {
 		commandErr = s.reauthenticateStoredVerificationCommandFrom(ctx, q, ref, result)
@@ -550,7 +613,7 @@ func (s *Store) currentVerificationFrom(ctx context.Context, q candidateEvidence
 	if commandErr != nil {
 		return StoredVerification{}, fmt.Errorf("verification command reauthentication: %w", ErrEvidenceConflict)
 	}
-	if amendmentAuthenticated {
+	if amendmentAuthenticated || repairAuthenticated || refreshAuthenticated {
 		// The amendment boundary and signed recovery suffix are themselves the
 		// live binding for this decision-specific transition. Project that exact
 		// current endpoint while retaining the immutable provider/command witnesses
@@ -574,6 +637,21 @@ func (s *Store) RecoverableVerification(ctx context.Context, ref domain.TicketRe
 	return s.verificationEvidenceForCandidate(ctx, ref)
 }
 
+// HistoricalVerification authenticates the immutable verification checkpoint
+// at the fence where it was recorded. It is for read-only status projections;
+// it deliberately does not make that historical checkpoint current transition
+// authority.
+func (s *Store) HistoricalVerification(ctx context.Context, ref domain.TicketRef) (StoredVerification, error) {
+	verification, err := s.RecoverableVerification(ctx, ref)
+	if err != nil {
+		return StoredVerification{}, err
+	}
+	if err := s.reauthenticateStoredVerificationCommandHistoricalFrom(ctx, s.db, ref, verification); err != nil {
+		return StoredVerification{}, ErrEvidenceConflict
+	}
+	return verification, nil
+}
+
 func (s *Store) LatestCandidate(ctx context.Context, ref domain.TicketRef) (StoredCandidate, error) {
 	return s.latestCandidate(ctx, ref, true)
 }
@@ -584,6 +662,20 @@ func (s *Store) LatestCandidate(ctx context.Context, ref domain.TicketRef) (Stor
 // use LatestCandidate, which rejects a stale historical binding.
 func (s *Store) RecoverableCandidate(ctx context.Context, ref domain.TicketRef) (StoredCandidate, error) {
 	return s.latestCandidate(ctx, ref, false)
+}
+
+// HistoricalCandidate authenticates the immutable candidate checkpoint at the
+// fence where it was recorded. It is for read-only status projections; callers
+// that need current transition authority must continue to use LatestCandidate.
+func (s *Store) HistoricalCandidate(ctx context.Context, ref domain.TicketRef) (StoredCandidate, error) {
+	candidate, err := s.RecoverableCandidate(ctx, ref)
+	if err != nil {
+		return StoredCandidate{}, err
+	}
+	if err := s.reauthenticateStoredCandidateCommandHistoricalFrom(ctx, s.db, ref, candidate); err != nil {
+		return StoredCandidate{}, ErrEvidenceConflict
+	}
+	return candidate, nil
 }
 
 func (s *Store) latestCandidate(ctx context.Context, ref domain.TicketRef, authenticateFence bool) (StoredCandidate, error) {

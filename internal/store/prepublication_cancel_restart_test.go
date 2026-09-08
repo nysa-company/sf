@@ -4,9 +4,260 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/phaseartifact"
 )
+
+func TestStoppingRecoveryWithFailedVerificationAttemptWithoutArtifact(t *testing.T) {
+	database, ctx := openTestStore(t)
+	digest := setupProviderProject(t, database, ctx)
+	leader, err := database.AcquireLeader(ctx, domain.ChannelDev, "stopping-failed-verification")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := setupProviderTicket(t, database, ctx, "SF-stopping-failed-verification", leader)
+	planner, reviewer := setupProviderPair(t, database, ctx)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	planning, err := database.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence,
+		Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner),
+		ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plannerDocument := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"works"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofAcceptance, Command: []string{"go", "test"}, Details: "proof"}, Paths: []string{"main.go"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"risk"}}
+	planRaw := []byte(`{"schema":"sf.planner/v1","acceptance":["works"],"proof":{"kind":"acceptance","command":["go","test"],"details":"proof"},"paths":["main.go"],"commands":[["go","test"]],"risks":["risk"]}`)
+	if _, err := database.CompleteProviderAttemptSuccess(ctx, planning, proof(t, planning), ticket.Version, fence, contracts.PhaseResult{Provider: planning.Binding.Identity, Artifact: planRaw, UsageTrusted: true, UsageUnits: 1}, phaseartifact.Validation{TicketType: ticket.Type}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	planKey := ProviderAttemptResultKey{AttemptID: planning.ID, Ref: ticket.Ref, Phase: domain.PhasePlanning, Attempt: planning.Attempt}
+	if _, err := database.RecordPlan(ctx, PlanArtifact{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Document: PlanDocument{Planner: &plannerDocument, ProviderResult: &planKey, Acceptance: plannerDocument.Acceptance, ProofKind: string(plannerDocument.Proof.Kind), Paths: plannerDocument.Paths, Commands: plannerDocument.Commands, Risks: plannerDocument.Risks}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.TransitionPlan(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence, EventPayload: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err = database.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.State != domain.StateVerifying || ticket.Version != 3 || ticket.RunnerEpoch != 1 {
+		t.Fatalf("verification entry=%+v err=%v", ticket, err)
+	}
+	fence.RunnerEpoch = ticket.RunnerEpoch
+	claim, err := database.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence,
+		Phase: domain.PhaseVerification, Role: "reviewer", Binding: runtime(reviewer),
+		ConfigDigest: digest, Capacity: 1, At: time.Now().UTC(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.FinishProviderAttempt(ctx, claim, proof(t, claim), ticket.Version, fence, "failed", "invalid_artifact", 1, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var attemptState, outcome, launchState string
+	if err := database.db.QueryRowContext(ctx, `SELECT state,outcome,launch_state FROM provider_attempts WHERE id=?`, claim.ID).Scan(&attemptState, &outcome, &launchState); err != nil || attemptState != "failed" || outcome != "invalid_artifact" || launchState != "drained" {
+		t.Fatalf("failed verifier state=%s/%s/%s err=%v", attemptState, outcome, launchState, err)
+	}
+	var artifacts int
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&artifacts); err != nil || artifacts != 0 {
+		t.Fatalf("failed verifier artifacts=%d err=%v", artifacts, err)
+	}
+	secondLeader, err := database.AcquireLeader(ctx, ticket.Ref.Channel, "stopping-failed-verification-pre-stop-first-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := database.FenceRecoveredRunners(ctx, ticket.Ref.Channel, secondLeader); err != nil || changed != 1 {
+		t.Fatalf("first pre-stop recovery changed=%d err=%v", changed, err)
+	}
+	ticket, err = database.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.State != domain.StateVerifying || ticket.Version != 4 || ticket.RunnerEpoch != 2 {
+		t.Fatalf("first pre-stop recovery ticket=%+v err=%v", ticket, err)
+	}
+	thirdLeader, err := database.AcquireLeader(ctx, ticket.Ref.Channel, "stopping-failed-verification-pre-stop-second-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := database.FenceRecoveredRunners(ctx, ticket.Ref.Channel, thirdLeader); err != nil || changed != 1 {
+		t.Fatalf("second pre-stop recovery changed=%d err=%v", changed, err)
+	}
+	ticket, err = database.Ticket(ctx, ticket.Ref)
+	if err != nil || ticket.State != domain.StateVerifying || ticket.Version != 5 || ticket.RunnerEpoch != 3 {
+		t.Fatalf("second pre-stop recovery ticket=%+v err=%v", ticket, err)
+	}
+	fence = domain.Fence{LeaderEpoch: thirdLeader, RunnerEpoch: ticket.RunnerEpoch}
+
+	stoppedResult, err := database.TransitionAndInvalidateRunner(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateVerifying,
+		To: domain.StateStopping, ResumeState: domain.StateVerifying,
+		Trigger: "operator_pause_or_take", Fence: fence, EventPayload: `{"intent":"take"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopping, err := database.Ticket(ctx, ticket.Ref)
+	if err != nil || stopping.State != domain.StateStopping || stopping.Version != stoppedResult.Version || stopping.RunnerEpoch != ticket.RunnerEpoch+1 {
+		t.Fatalf("stopping=%+v result=%+v err=%v", stopping, stoppedResult, err)
+	}
+
+	var sequence int
+	var name, path string
+	if err := database.db.QueryRowContext(ctx, `PRAGMA database_list`).Scan(&sequence, &name, &path); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	fourthLeader, err := reopened.AcquireLeader(ctx, ticket.Ref.Channel, "stopping-failed-verification-post-stop-first-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := reopened.FenceRecoveredRunners(ctx, ticket.Ref.Channel, fourthLeader); err != nil || changed != 1 {
+		t.Fatalf("first stopping recovery changed=%d err=%v", changed, err)
+	}
+	firstRecovered, err := reopened.Ticket(ctx, ticket.Ref)
+	if err != nil || firstRecovered.State != domain.StateStopping || firstRecovered.Version != stopping.Version+1 || firstRecovered.RunnerEpoch != stopping.RunnerEpoch+1 {
+		t.Fatalf("first recovered=%+v stopping=%+v err=%v", firstRecovered, stopping, err)
+	}
+	var priorVersion, priorRunner, priorLeader, recoveredVersion, recoveredRunner, recoveredLeader uint64
+	if err := reopened.db.QueryRowContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY ticket_version DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&priorVersion, &priorRunner, &priorLeader, &recoveredVersion, &recoveredRunner, &recoveredLeader); err != nil || priorVersion != stopping.Version || priorRunner != stopping.RunnerEpoch || priorLeader != thirdLeader || recoveredVersion != firstRecovered.Version || recoveredRunner != firstRecovered.RunnerEpoch || recoveredLeader != fourthLeader {
+		t.Fatalf("first stopping recovery ledger prior=%d/%d/%d recovered=%d/%d/%d err=%v", priorVersion, priorRunner, priorLeader, recoveredVersion, recoveredRunner, recoveredLeader, err)
+	}
+
+	fifthLeader, err := reopened.AcquireLeader(ctx, ticket.Ref.Channel, "stopping-failed-verification-post-stop-second-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := reopened.FenceRecoveredRunners(ctx, ticket.Ref.Channel, fifthLeader); err != nil || changed != 1 {
+		t.Fatalf("second stopping recovery changed=%d err=%v", changed, err)
+	}
+	secondRecovered, err := reopened.Ticket(ctx, ticket.Ref)
+	if err != nil || secondRecovered.State != domain.StateStopping || secondRecovered.Version != firstRecovered.Version+1 || secondRecovered.RunnerEpoch != firstRecovered.RunnerEpoch+1 {
+		t.Fatalf("second recovered=%+v first=%+v err=%v", secondRecovered, firstRecovered, err)
+	}
+	if err := reopened.db.QueryRowContext(ctx, `SELECT prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? ORDER BY ticket_version DESC LIMIT 1`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&priorVersion, &priorRunner, &priorLeader, &recoveredVersion, &recoveredRunner, &recoveredLeader); err != nil || priorVersion != firstRecovered.Version || priorRunner != firstRecovered.RunnerEpoch || priorLeader != fourthLeader || recoveredVersion != secondRecovered.Version || recoveredRunner != secondRecovered.RunnerEpoch || recoveredLeader != fifthLeader {
+		t.Fatalf("second stopping recovery ledger prior=%d/%d/%d recovered=%d/%d/%d err=%v", priorVersion, priorRunner, priorLeader, recoveredVersion, recoveredRunner, recoveredLeader, err)
+	}
+	if _, err := reopened.CompleteControlTransition(ctx, Transition{
+		Ref: ticket.Ref, ExpectedVersion: secondRecovered.Version, From: domain.StateStopping,
+		To: domain.StatePaused, ResumeState: domain.StateVerifying,
+		Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: fifthLeader, RunnerEpoch: secondRecovered.RunnerEpoch}, EventPayload: `{"drained":true}`,
+	}); err != nil {
+		t.Fatalf("complete recovered stopping control: %v", err)
+	}
+	paused, err := reopened.Ticket(ctx, ticket.Ref)
+	if err != nil || paused.State != domain.StatePaused || paused.ResumeState != domain.StateVerifying || paused.Version != secondRecovered.Version+1 || paused.RunnerEpoch != secondRecovered.RunnerEpoch {
+		t.Fatalf("paused=%+v recovered=%+v err=%v", paused, secondRecovered, err)
+	}
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_attempt_results WHERE provider_attempt_id=?`, claim.ID).Scan(&artifacts); err != nil || artifacts != 0 {
+		t.Fatalf("recovery fabricated verifier artifact count=%d err=%v", artifacts, err)
+	}
+	var stops int
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='operator_pause_or_take' AND from_state='verifying' AND to_state='stopping'`, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket).Scan(&stops); err != nil || stops != 1 {
+		t.Fatalf("operator pause/take event count=%d err=%v", stops, err)
+	}
+}
+
+func TestStoppingRecoveryRejectsTamperedControlEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, *Store, Ticket)
+	}{
+		{
+			name: "missing-control",
+			mutate: func(t *testing.T, database *Store, stopping Ticket) {
+				if _, err := database.db.ExecContext(t.Context(), `DELETE FROM runtime_ticket_controls WHERE channel=? AND project_id=? AND ticket_id=?`, stopping.Ref.Channel, stopping.Ref.Project, stopping.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "opened-control",
+			mutate: func(t *testing.T, database *Store, stopping Ticket) {
+				if _, err := database.db.ExecContext(t.Context(), `UPDATE runtime_ticket_controls SET state='open' WHERE channel=? AND project_id=? AND ticket_id=?`, stopping.Ref.Channel, stopping.Ref.Project, stopping.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "mismatched-authority",
+			mutate: func(t *testing.T, database *Store, stopping Ticket) {
+				if _, err := database.db.ExecContext(t.Context(), `UPDATE runtime_ticket_controls SET authority_runner_epoch=authority_runner_epoch+1 WHERE channel=? AND project_id=? AND ticket_id=?`, stopping.Ref.Channel, stopping.Ref.Project, stopping.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "duplicate-state-change",
+			mutate: func(t *testing.T, database *Store, stopping Ticket) {
+				if _, err := database.db.ExecContext(t.Context(), `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, stopping.Ref.Channel, stopping.Ref.Project, stopping.Ref.Ticket, stopping.Version, "typed_blocker", domain.StatePlanning, domain.StateBlocked, `{}`, "2026-09-02T00:00:00Z"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, ref, leader, started := runtimeControlTicket(t)
+			_, err := database.TransitionAndInvalidateRunner(t.Context(), Transition{
+				Ref: ref, ExpectedVersion: started.Version, From: started.State,
+				To: domain.StateStopping, ResumeState: started.State, Trigger: "operator_pause_or_take",
+				Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: `{}`,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stopping, err := database.Ticket(t.Context(), ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(t, database, stopping)
+			newLeader, err := database.AcquireLeader(t.Context(), ref.Channel, "stopping-tampered-"+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.FenceRecoveredRunners(t.Context(), ref.Channel, newLeader); !errors.Is(err, ErrPublicationEvidence) {
+				t.Fatalf("tampered stopping control startup fence err=%v, want publication evidence", err)
+			}
+		})
+	}
+}
+
+func TestStoppingRecoveryRejectsMismatchedResumeState(t *testing.T) {
+	database, ref, leader, started := runtimeControlTicket(t)
+	_, err := database.TransitionAndInvalidateRunner(t.Context(), Transition{
+		Ref: ref, ExpectedVersion: started.Version, From: started.State,
+		To: domain.StateStopping, ResumeState: started.State, Trigger: "operator_pause_or_take",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: `{}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stoppingTicket, err := database.Ticket(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.ExecContext(t.Context(), `UPDATE tickets SET resume_state=? WHERE channel=? AND project_id=? AND id=?`, domain.StateBuilding, ref.Channel, ref.Project, ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	newLeader, err := database.AcquireLeader(t.Context(), ref.Channel, "stopping-resume-tampered-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.FenceRecoveredRunners(t.Context(), ref.Channel, newLeader); !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("resume-tampered stopping control startup fence err=%v, want publication evidence", err)
+	}
+	if current, err := database.Ticket(t.Context(), ref); err != nil || current.Version != stoppingTicket.Version || current.RunnerEpoch != stoppingTicket.RunnerEpoch {
+		t.Fatalf("tampered stopping ticket advanced=%+v stopping=%+v err=%v", current, stoppingTicket, err)
+	}
+}
 
 // Cancellation is still a pre-publication disposition.  In particular, a
 // merge observer must not turn an operator cancellation into a proof request
@@ -115,6 +366,406 @@ func TestMergeObservationPrePublicationRemainsTrueAfterOperatorCancelRestart(t *
 	}
 	if cancelEvents != 1 {
 		t.Fatalf("operator cancel event count=%d events=%+v", cancelEvents, events)
+	}
+}
+
+type recoveredStoppingCancellationFixture struct {
+	database        *Store
+	ref             domain.TicketRef
+	leader          uint64
+	stoppingVersion uint64
+	stoppingRunner  uint64
+	stoppingLeader  uint64
+	pausedVersion   uint64
+	cancelling      Ticket
+}
+
+func recoveredStoppingCancellation(t *testing.T) recoveredStoppingCancellationFixture {
+	t.Helper()
+	database, ref, leader, current := runtimeControlTicket(t)
+	ctx := t.Context()
+	for index := 0; index < 3; index++ {
+		var err error
+		leader, err = database.AcquireLeader(ctx, ref.Channel, "pre-stop-recovery")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := database.FenceRecoveredRunners(ctx, ref.Channel, leader); err != nil || changed != 1 {
+			t.Fatalf("pre-stop recovery changed=%d err=%v", changed, err)
+		}
+		current = databaseTicket(t, database, ctx, ref)
+	}
+	stoppingLeader := leader
+	stopped, err := database.TransitionAndInvalidateRunner(ctx, Transition{
+		Ref: ref, ExpectedVersion: current.Version, From: domain.StatePlanning,
+		To: domain.StateStopping, ResumeState: domain.StatePlanning,
+		Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: current.RunnerEpoch}, EventPayload: `{"intent":"take"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopping := databaseTicket(t, database, ctx, ref)
+	if stopping.State != domain.StateStopping || stopping.Version != stopped.Version || stopping.RunnerEpoch != current.RunnerEpoch+1 {
+		t.Fatalf("stopping=%+v stop=%+v current=%+v", stopping, stopped, current)
+	}
+	stoppingVersion := stopping.Version
+	for index := 0; index < 6; index++ {
+		leader, err = database.AcquireLeader(ctx, ref.Channel, "stopping-recovery")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := database.FenceRecoveredRunners(ctx, ref.Channel, leader); err != nil || changed != 1 {
+			t.Fatalf("stopping recovery changed=%d err=%v", changed, err)
+		}
+		stopping = databaseTicket(t, database, ctx, ref)
+	}
+	if _, err := database.CompleteControlTransition(ctx, Transition{
+		Ref: ref, ExpectedVersion: stopping.Version, From: domain.StateStopping,
+		To: domain.StatePaused, ResumeState: domain.StatePlanning,
+		Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: `{"drained":true,"intent":"take"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	paused := databaseTicket(t, database, ctx, ref)
+	if paused.State != domain.StatePaused || paused.Version != stopping.Version+1 || paused.RunnerEpoch != stopping.RunnerEpoch {
+		t.Fatalf("paused=%+v stopping=%+v", paused, stopping)
+	}
+	if _, err := database.TransitionAndInvalidateRunner(ctx, Transition{
+		Ref: ref, ExpectedVersion: paused.Version, From: domain.StatePaused,
+		To: domain.StateCancelling, Trigger: "operator_cancel",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: paused.RunnerEpoch}, EventPayload: `{"operator":"test"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cancelling := databaseTicket(t, database, ctx, ref)
+	if cancelling.State != domain.StateCancelling || cancelling.Version != paused.Version+1 || cancelling.RunnerEpoch != paused.RunnerEpoch+1 {
+		t.Fatalf("cancelling=%+v paused=%+v", cancelling, paused)
+	}
+	return recoveredStoppingCancellationFixture{database: database, ref: ref, leader: leader, stoppingVersion: stoppingVersion, stoppingRunner: current.RunnerEpoch + 1, stoppingLeader: stoppingLeader, pausedVersion: paused.Version, cancelling: cancelling}
+}
+
+func TestMergeObservationPrePublicationAcceptsCancelledRecoveredStoppingLineage(t *testing.T) {
+	fixture := recoveredStoppingCancellation(t)
+	pre, err := fixture.database.MergeObservationPrePublication(t.Context(), fixture.ref)
+	if err != nil || !pre {
+		t.Fatalf("cancelled recovered stopping classified pre-publication=%v err=%v ticket=%+v", pre, err, fixture.cancelling)
+	}
+	fixture = resealRecoveredStoppingCancellation(t, fixture)
+	pre, err = fixture.database.MergeObservationPrePublication(t.Context(), fixture.ref)
+	if err != nil || !pre {
+		t.Fatalf("recovered cancellation classified pre-publication=%v err=%v", pre, err)
+	}
+	var cancelEvents int
+	if err := fixture.database.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='operator_cancel'`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket).Scan(&cancelEvents); err != nil || cancelEvents != 1 {
+		t.Fatalf("operator_cancel events=%d err=%v", cancelEvents, err)
+	}
+}
+
+// resealRecoveredStoppingCancellation reproduces Drain's post-recovery
+// SealRuntimeControl then ControlProof sequence. Two restart rows move the
+// durable authority past the one operator_cancel event without adding any
+// publication or merge evidence.
+func resealRecoveredStoppingCancellation(t *testing.T, fixture recoveredStoppingCancellationFixture) recoveredStoppingCancellationFixture {
+	t.Helper()
+	for index := 0; index < 2; index++ {
+		leader, err := fixture.database.AcquireLeader(t.Context(), fixture.ref.Channel, "resealed-cancel-recovery")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := fixture.database.FenceRecoveredRunners(t.Context(), fixture.ref.Channel, leader); err != nil || changed != 1 {
+			t.Fatalf("resealed cancel recovery changed=%d err=%v", changed, err)
+		}
+		fixture.leader = leader
+	}
+	if err := fixture.database.SealRuntimeControl(t.Context(), fixture.ref); err != nil {
+		t.Fatalf("reseal recovered cancellation: %v", err)
+	}
+	proof, err := fixture.database.ControlProof(t.Context(), fixture.ref)
+	if err != nil {
+		t.Fatalf("recovered cancellation control proof: %v", err)
+	}
+	if proof.PublicationOrMergeEffects != 0 || proof.MergeIntents != 0 || proof.OutstandingPublicationOrMergeEffects != 0 || proof.OutstandingMergeIntents != 0 {
+		t.Fatalf("recovered cancellation publication/merge evidence=%+v", proof)
+	}
+	fixture.cancelling = databaseTicket(t, fixture.database, t.Context(), fixture.ref)
+	return fixture
+}
+
+func resealedRecoveredStoppingCancellation(t *testing.T) recoveredStoppingCancellationFixture {
+	t.Helper()
+	return resealRecoveredStoppingCancellation(t, recoveredStoppingCancellation(t))
+}
+
+func insertRecoveredStoppingForgery(t *testing.T, fixture recoveredStoppingCancellationFixture, value RunnerRecoveryLedger) {
+	t.Helper()
+	value.Ref = fixture.ref
+	value.CreatedAt = time.Now().UTC()
+	value.RecoveryDigest = runnerRecoveryDigest(value)
+	if _, err := fixture.database.db.ExecContext(t.Context(), `INSERT INTO runner_recovery_ledger(channel,project_id,ticket_id,prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, value.Ref.Channel, value.Ref.Project, value.Ref.Ticket, value.PriorTicketVersion, value.PriorRunnerEpoch, value.PriorLeaderEpoch, value.TicketVersion, value.RunnerEpoch, value.LeaderEpoch, value.RecoveryDigest, value.CreatedAt.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func recoveredCancellationCurrentLedger(t *testing.T, fixture recoveredStoppingCancellationFixture) RunnerRecoveryLedger {
+	t.Helper()
+	value, found, err := loadRunnerRecoveryAt(t.Context(), fixture.database.db, fixture.ref, fixture.cancelling.Version)
+	if err != nil || !found {
+		t.Fatalf("load resealed cancellation recovery found=%v err=%v", found, err)
+	}
+	return value
+}
+
+func TestMergeObservationPrePublicationRejectsTamperedResealedCancellationRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, recoveredStoppingCancellationFixture)
+	}{
+		{
+			name: "missing-current-recovery",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `DROP TRIGGER runner_recovery_ledger_immutable_delete`); err != nil {
+					t.Fatal(err)
+				}
+				changed, err := fixture.database.db.ExecContext(t.Context(), `DELETE FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.cancelling.Version)
+				if err != nil {
+					t.Fatalf("delete resealed cancellation recovery: %v", err)
+				}
+				if count, _ := changed.RowsAffected(); count != 1 {
+					t.Fatalf("delete resealed cancellation recovery count=%d", count)
+				}
+			},
+		},
+		{
+			name: "endpoint-leader-mismatch",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `DROP TRIGGER runner_recovery_ledger_immutable_update`); err != nil {
+					t.Fatal(err)
+				}
+				changed, err := fixture.database.db.ExecContext(t.Context(), `UPDATE runner_recovery_ledger SET leader_epoch=leader_epoch+1 WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.cancelling.Version)
+				if err != nil {
+					t.Fatalf("modify resealed cancellation recovery: %v", err)
+				}
+				if count, _ := changed.RowsAffected(); count != 1 {
+					t.Fatalf("modify resealed cancellation recovery count=%d", count)
+				}
+			},
+		},
+		{
+			name: "broken-recovery-chain",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `DROP TRIGGER runner_recovery_ledger_immutable_delete`); err != nil {
+					t.Fatal(err)
+				}
+				changed, err := fixture.database.db.ExecContext(t.Context(), `DELETE FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.cancelling.Version-1)
+				if err != nil {
+					t.Fatalf("delete linked cancellation recovery: %v", err)
+				}
+				if count, _ := changed.RowsAffected(); count != 1 {
+					t.Fatalf("delete linked cancellation recovery count=%d", count)
+				}
+			},
+		},
+		{
+			name: "lifecycle-event-at-current-recovery-endpoint",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.cancelling.Version, "forged_recovery_state", domain.StateCancelling, domain.StatePaused, `{}`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "recovery-at-original-cancel-baseline",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				current := recoveredCancellationCurrentLedger(t, fixture)
+				prior, found, err := loadRunnerRecoveryAt(t.Context(), fixture.database.db, fixture.ref, current.PriorTicketVersion)
+				if err != nil || !found {
+					t.Fatalf("load original cancellation recovery found=%v err=%v", found, err)
+				}
+				insertRecoveredStoppingForgery(t, fixture, RunnerRecoveryLedger{
+					PriorTicketVersion: prior.PriorTicketVersion - 1,
+					PriorRunnerEpoch:   prior.PriorRunnerEpoch - 1,
+					PriorLeaderEpoch:   prior.PriorLeaderEpoch,
+					TicketVersion:      prior.PriorTicketVersion,
+					RunnerEpoch:        prior.PriorRunnerEpoch,
+					LeaderEpoch:        prior.PriorLeaderEpoch + 1,
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := resealedRecoveredStoppingCancellation(t)
+			tc.mutate(t, fixture)
+			if pre, err := fixture.database.MergeObservationPrePublication(t.Context(), fixture.ref); err != nil || pre {
+				t.Fatalf("tampered resealed cancellation classified pre-publication=%v err=%v", pre, err)
+			}
+		})
+	}
+}
+
+func TestMergeObservationPrePublicationRejectsTamperedRecoveredStoppingCancellationLineage(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, recoveredStoppingCancellationFixture)
+	}{
+		{
+			name: "missing-stopping-recovery-ledger",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `DROP TRIGGER runner_recovery_ledger_immutable_delete`); err != nil {
+					t.Fatal(err)
+				}
+				changed, err := fixture.database.db.ExecContext(t.Context(), `DELETE FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.stoppingVersion+1)
+				if err != nil {
+					t.Fatalf("delete stopping recovery err=%v", err)
+				}
+				count, _ := changed.RowsAffected()
+				if count != 1 {
+					t.Fatalf("delete stopping recovery err=%v", err)
+				}
+			},
+		},
+		{
+			name: "modified-stopping-recovery-ledger",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `DROP TRIGGER runner_recovery_ledger_immutable_update`); err != nil {
+					t.Fatal(err)
+				}
+				changed, err := fixture.database.db.ExecContext(t.Context(), `UPDATE runner_recovery_ledger SET leader_epoch=leader_epoch+1 WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=?`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.pausedVersion-1)
+				if err != nil {
+					t.Fatalf("modify stopping recovery err=%v", err)
+				}
+				count, _ := changed.RowsAffected()
+				if count != 1 {
+					t.Fatalf("modify stopping recovery err=%v", err)
+				}
+			},
+		},
+		{
+			name: "missing-drained-event",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				changed, err := fixture.database.db.ExecContext(t.Context(), `DELETE FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='process_and_effects_drained'`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.pausedVersion)
+				if err != nil {
+					t.Fatalf("delete drained event err=%v", err)
+				}
+				count, _ := changed.RowsAffected()
+				if count != 1 {
+					t.Fatalf("delete drained event err=%v", err)
+				}
+			},
+		},
+		{
+			name: "post-publication-stop-source",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				changed, err := fixture.database.db.ExecContext(t.Context(), `UPDATE events SET from_state='publishing' WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_pause_or_take'`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.stoppingVersion)
+				if err != nil {
+					t.Fatalf("change stopping source err=%v", err)
+				}
+				count, _ := changed.RowsAffected()
+				if count != 1 {
+					t.Fatalf("change stopping source err=%v", err)
+				}
+			},
+		},
+		{
+			name: "recovery-at-stop-baseline",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				insertRecoveredStoppingForgery(t, fixture, RunnerRecoveryLedger{PriorTicketVersion: fixture.stoppingVersion - 1, PriorRunnerEpoch: fixture.stoppingRunner - 1, PriorLeaderEpoch: fixture.stoppingLeader, TicketVersion: fixture.stoppingVersion, RunnerEpoch: fixture.stoppingRunner, LeaderEpoch: fixture.stoppingLeader + 1})
+			},
+		},
+		{
+			name: "recovery-at-drained-endpoint",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				pausedRunner := fixture.cancelling.RunnerEpoch - 1
+				insertRecoveredStoppingForgery(t, fixture, RunnerRecoveryLedger{PriorTicketVersion: fixture.pausedVersion - 1, PriorRunnerEpoch: pausedRunner - 1, PriorLeaderEpoch: fixture.leader - 1, TicketVersion: fixture.pausedVersion, RunnerEpoch: pausedRunner, LeaderEpoch: fixture.leader})
+			},
+		},
+		{
+			name: "recovery-at-cancel-endpoint",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				insertRecoveredStoppingForgery(t, fixture, RunnerRecoveryLedger{PriorTicketVersion: fixture.cancelling.Version - 1, PriorRunnerEpoch: fixture.cancelling.RunnerEpoch - 1, PriorLeaderEpoch: fixture.leader, TicketVersion: fixture.cancelling.Version, RunnerEpoch: fixture.cancelling.RunnerEpoch, LeaderEpoch: fixture.leader + 1})
+			},
+		},
+		{
+			name: "state-event-at-recovery-version",
+			mutate: func(t *testing.T, fixture recoveredStoppingCancellationFixture) {
+				if _, err := fixture.database.db.ExecContext(t.Context(), `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, fixture.ref.Channel, fixture.ref.Project, fixture.ref.Ticket, fixture.stoppingVersion+1, "forged_recovery_state", domain.StateStopping, domain.StatePaused, `{}`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := recoveredStoppingCancellation(t)
+			tc.mutate(t, fixture)
+			if pre, err := fixture.database.MergeObservationPrePublication(t.Context(), fixture.ref); err != nil || pre {
+				t.Fatalf("tampered recovered stopping cancellation classified pre-publication=%v err=%v", pre, err)
+			}
+		})
+	}
+}
+
+func directPausedCancellation(t *testing.T) recoveredStoppingCancellationFixture {
+	t.Helper()
+	database, ref, leader, started := runtimeControlTicket(t)
+	stopping, err := database.TransitionAndInvalidateRunner(t.Context(), Transition{
+		Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning,
+		To: domain.StateStopping, ResumeState: domain.StatePlanning,
+		Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: started.RunnerEpoch}, EventPayload: `{"intent":"take"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := databaseTicket(t, database, t.Context(), ref)
+	if _, err := database.CompleteControlTransition(t.Context(), Transition{
+		Ref: ref, ExpectedVersion: stopped.Version, From: domain.StateStopping,
+		To: domain.StatePaused, ResumeState: domain.StatePlanning,
+		Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopped.RunnerEpoch}, EventPayload: `{"drained":true,"intent":"take"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	paused := databaseTicket(t, database, t.Context(), ref)
+	if _, err := database.TransitionAndInvalidateRunner(t.Context(), Transition{
+		Ref: ref, ExpectedVersion: paused.Version, From: domain.StatePaused,
+		To: domain.StateCancelling, Trigger: "operator_cancel",
+		Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: paused.RunnerEpoch}, EventPayload: `{"operator":"test"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cancelling := databaseTicket(t, database, t.Context(), ref)
+	return recoveredStoppingCancellationFixture{database: database, ref: ref, leader: leader, stoppingVersion: stopping.Version, stoppingRunner: stopped.RunnerEpoch, stoppingLeader: leader, pausedVersion: paused.Version, cancelling: cancelling}
+}
+
+func TestMergeObservationPrePublicationRejectsRecoveryAtDirectPauseLifecycleEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		forge func(recoveredStoppingCancellationFixture) RunnerRecoveryLedger
+	}{
+		{
+			name: "stop",
+			forge: func(fixture recoveredStoppingCancellationFixture) RunnerRecoveryLedger {
+				return RunnerRecoveryLedger{PriorTicketVersion: fixture.stoppingVersion - 1, PriorRunnerEpoch: fixture.stoppingRunner - 1, PriorLeaderEpoch: fixture.stoppingLeader, TicketVersion: fixture.stoppingVersion, RunnerEpoch: fixture.stoppingRunner, LeaderEpoch: fixture.stoppingLeader + 1}
+			},
+		},
+		{
+			name: "drain",
+			forge: func(fixture recoveredStoppingCancellationFixture) RunnerRecoveryLedger {
+				pausedRunner := fixture.cancelling.RunnerEpoch - 1
+				return RunnerRecoveryLedger{PriorTicketVersion: fixture.pausedVersion - 1, PriorRunnerEpoch: pausedRunner - 1, PriorLeaderEpoch: fixture.leader, TicketVersion: fixture.pausedVersion, RunnerEpoch: pausedRunner, LeaderEpoch: fixture.leader + 1}
+			},
+		},
+		{
+			name: "cancel",
+			forge: func(fixture recoveredStoppingCancellationFixture) RunnerRecoveryLedger {
+				return RunnerRecoveryLedger{PriorTicketVersion: fixture.cancelling.Version - 1, PriorRunnerEpoch: fixture.cancelling.RunnerEpoch - 1, PriorLeaderEpoch: fixture.leader, TicketVersion: fixture.cancelling.Version, RunnerEpoch: fixture.cancelling.RunnerEpoch, LeaderEpoch: fixture.leader + 1}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := directPausedCancellation(t)
+			insertRecoveredStoppingForgery(t, fixture, tc.forge(fixture))
+			if pre, err := fixture.database.MergeObservationPrePublication(t.Context(), fixture.ref); err != nil || pre {
+				t.Fatalf("direct pause lifecycle recovery classified pre-publication=%v err=%v", pre, err)
+			}
+		})
 	}
 }
 

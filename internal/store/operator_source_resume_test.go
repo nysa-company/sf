@@ -23,6 +23,18 @@ func sameJSON(left, right any) bool {
 	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
 }
 
+func supervisedOperatorSource(t *testing.T, database *Store, ctx context.Context, request ProviderAttemptRequest) ProviderAttemptRequest {
+	t.Helper()
+	request = supervised(t, request)
+	worktree, err := database.Worktree(ctx, request.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.WorktreeIdentity = string(worktree.IdentityJSON)
+	request.Input.WorktreeIdentity = request.WorktreeIdentity
+	return request
+}
+
 func TestOperatorSourceResumeEventRequiresCanonicalBoundedPaths(t *testing.T) {
 	for _, paths := range [][]string{
 		nil,
@@ -333,6 +345,60 @@ func TestOperatorSourceResumeRecoveryRejectsTamperedEventOrLedger(t *testing.T) 
 	}
 }
 
+func TestOperatorSourceResumeHistoryRejectsMalformedPayloadAfterControlReplacement(t *testing.T) {
+	database, ctx, leader, resumed, _ := operatorSourceResumeResumedFixture(t)
+	openExactRuntimeAdmission(t, database, resumed.Ref)
+
+	// Replace the source handoff's runtime-control row through a second real
+	// take/drain cycle. Historical source detection must not depend on the current
+	// control pointer continuing to name the first take.
+	take, err := json.Marshal(map[string]any{"intent": "take", "operator": "sofia", "operator_uid": uint32(501)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.TransitionAndInvalidateRunner(ctx, Transition{
+		Ref: resumed.Ref, ExpectedVersion: resumed.Version,
+		From: domain.StateVerifying, To: domain.StateStopping, ResumeState: domain.StateVerifying,
+		Trigger: "operator_pause_or_take", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: resumed.RunnerEpoch}, EventPayload: string(take),
+	}); err != nil {
+		t.Fatalf("replace source runtime control: %v", err)
+	}
+	stopping, err := database.Ticket(ctx, resumed.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := database.Worktree(ctx, resumed.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := TakeoverRemoteBaseline{Registered: true, WorktreePath: worktree.Path, WorktreeBranch: worktree.Branch, WorktreeIdentity: sha256Digest(worktree.IdentityJSON), BaseOID: worktree.BaseSHA}
+	drain, err := json.Marshal(map[string]any{"drained": true, "intent": "take", "remote": remote})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CompleteControlTransition(ctx, Transition{
+		Ref: resumed.Ref, ExpectedVersion: stopping.Version,
+		From: domain.StateStopping, To: domain.StatePaused, ResumeState: domain.StateVerifying,
+		Trigger: "process_and_effects_drained", Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: stopping.RunnerEpoch}, EventPayload: string(drain),
+	}); err != nil {
+		t.Fatalf("complete replacement control: %v", err)
+	}
+
+	// Simulate privileged durable corruption of the original source payload.
+	// Its unique Building -> stopping -> paused -> Verifying shape remains, so it
+	// is malformed authority rather than clean absence.
+	if _, err := database.db.ExecContext(ctx, `UPDATE events SET payload='{}' WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_resume' AND from_state='paused' AND to_state='verifying'`, resumed.Ref.Channel, resumed.Ref.Project, resumed.Ref.Ticket, resumed.Version); err != nil {
+		t.Fatal(err)
+	}
+	if present, err := operatorSourceResumeHistoryPresent(ctx, database.db, resumed.Ref); err != nil || !present {
+		t.Fatalf("structural source history present=%v err=%v", present, err)
+	}
+	found, err := validateOperatorSourceResumeRecoveryTarget(ctx, database.db, resumed.Ref, resumed.Version, resumed.RunnerEpoch, leader)
+	if !found || !errors.Is(err, ErrPublicationEvidence) {
+		t.Fatalf("malformed historical source target found=%v err=%v", found, err)
+	}
+}
+
 func TestOperatorSourceResumePreparedCheckpointRejectsUnboundDigest(t *testing.T) {
 	database, ctx, leader, resumed, source := operatorSourceResumeResumedFixture(t)
 	// The source-resume proof becomes a runnable scheduler capability only after
@@ -413,7 +479,7 @@ func TestOperatorSourceResumePreparedCandidateWitnessBindsSFG(t *testing.T) {
 		t.Fatal(err)
 	}
 	verificationFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: resumed.RunnerEpoch}
-	reviewer, err := database.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: resumed.Ref, ExpectedVersion: resumed.Version, Fence: verificationFence, Phase: domain.PhaseVerification, Role: "reviewer", Binding: runtime(pair.Reviewer), ConfigDigest: resumed.ConfigDigest, Capacity: 1, At: time.Now().UTC()}))
+	reviewer, err := database.BeginProviderAttempt(ctx, supervisedOperatorSource(t, database, ctx, ProviderAttemptRequest{Ref: resumed.Ref, ExpectedVersion: resumed.Version, Fence: verificationFence, Phase: domain.PhaseVerification, Role: "reviewer", Binding: runtime(pair.Reviewer), ConfigDigest: resumed.ConfigDigest, Capacity: 1, At: time.Now().UTC()}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +603,7 @@ func TestOperatorSourceResumePreparedCandidateWitnessBindsSFG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	builder, err := database.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: building.Ref, ExpectedVersion: building.Version, Fence: buildFence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(pair.Builder), ConfigDigest: building.ConfigDigest, Capacity: 1, At: time.Now().UTC()}))
+	builder, err := database.BeginProviderAttempt(ctx, supervisedOperatorSource(t, database, ctx, ProviderAttemptRequest{Ref: building.Ref, ExpectedVersion: building.Version, Fence: buildFence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(pair.Builder), ConfigDigest: building.ConfigDigest, Capacity: 1, At: time.Now().UTC()}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,6 +757,9 @@ func TestOperatorSourceResumePreparedCandidateWitnessBindsSFG(t *testing.T) {
 	if err != nil || publishing.State != domain.StatePublishing || publishing.Version != recoveredTicket.Version+1 {
 		t.Fatalf("publishing ticket=%+v err=%v", publishing, err)
 	}
+	if err := database.AuthenticatePublishingRecovery(ctx, publishing.Ref, candidate, publishing.Version, recoveredFence); err != nil {
+		t.Fatalf("source-resume candidate publication authority: %v", err)
+	}
 	if got := openRuntimeAuthorityVersion(t, database, publishing.Ref); got != publishing.Version {
 		t.Fatalf("candidate transition authority version=%d want=%d", got, publishing.Version)
 	}
@@ -757,6 +826,132 @@ func TestOperatorSourceResumePreparedCandidateWitnessBindsSFG(t *testing.T) {
 	if err != nil || capability == nil {
 		t.Fatalf("rearm recovered candidate-only publication capability=%+v err=%v", capability, err)
 	}
+	var admission *RuntimeAdmissionCapability
+	if err := database.ActivateRearm(ctx, capability, func(value *RuntimeAdmissionCapability) error {
+		_, _, _, _ = value.ConsumeRuntimeAdmission()
+		admission = value
+		return nil
+	}); err != nil {
+		t.Fatalf("activate recovered publication runtime: %v", err)
+	}
+	if admission == nil || admission.OpenStoreAdmission(ctx) != nil {
+		t.Fatal("open recovered publication runtime admission")
+	}
+
+	// Carry the source-resumed candidate through publication and one diagnosed
+	// red-CI correction. The repair Builder must use the published candidate as
+	// its Git parent while retaining the original source-resume handoff only as
+	// authenticated predecessor provenance.
+	recoveredPublishingFence := domain.Fence{LeaderEpoch: publicationLeader, RunnerEpoch: recoveredPublishing.RunnerEpoch}
+	recoveredCandidate, err := database.RecoverableCandidate(ctx, recoveredPublishing.Ref)
+	if err != nil {
+		t.Fatalf("load recovered source-resume candidate before publication: %v", err)
+	}
+	if err := database.authenticateCandidateOnlyPublishingRecoveryAt(ctx, database.db, recoveredPublishing.Ref, recoveredCandidate, recoveredPublishing.Version, recoveredPublishingFence, false); err != nil {
+		t.Fatalf("authenticate recovered source-resume candidate before publication: %v", err)
+	}
+	recordFixturePublication(t, database, ctx, recoveredPublishing, recoveredPublishingFence)
+	if _, err := database.TransitionPublishedCandidate(ctx, Transition{
+		Ref: recoveredPublishing.Ref, ExpectedVersion: recoveredPublishing.Version,
+		From: domain.StatePublishing, To: domain.StateWaitingCI,
+		Trigger: "effects_confirmed", Fence: recoveredPublishingFence, EventPayload: `{}`,
+	}); err != nil {
+		t.Fatalf("source-resume publication to waiting CI: %v", err)
+	}
+	waiting, err := database.Ticket(ctx, recoveredPublishing.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := database.LoadPublishedCandidate(ctx, waiting.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordCIAuthorityPolicy(database, ctx, publication, waiting, ciAuthorityLintPolicy()); err != nil {
+		t.Fatal(err)
+	}
+	red := ciAuthorityObservationFor(publication, waiting, recoveredPublishingFence, "red", time.Now().UTC(), []CIObservationCheck{{CanonicalName: "lint", ExternalID: "source-resume-repair-lint", NormalizedState: "failure", FailingDiagnosticText: "source-resume candidate needs one repair"}})
+	if err := database.recordCIObservation(ctx, red); err != nil {
+		t.Fatal(err)
+	}
+	red, err = database.LoadCurrentCIObservation(ctx, waiting.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	correction := redCICorrectionAuthority(t, waiting, red)
+	if _, err := database.ConsumeCIObservation(ctx, CIObservationTransition{
+		Ref: waiting.Ref, ObservationDigest: red.ObservationDigest,
+		ExpectedVersion: waiting.Version, Fence: red.ObservedFence,
+		CorrectionBudget: &correction,
+	}); err != nil {
+		t.Fatalf("enter source-resume candidate repair: %v", err)
+	}
+	repairBuilding, err := database.Ticket(ctx, waiting.Ref)
+	if err != nil || repairBuilding.State != domain.StateBuilding {
+		t.Fatalf("source-resume repair building=%+v err=%v", repairBuilding, err)
+	}
+	repairFence := domain.Fence{LeaderEpoch: publicationLeader, RunnerEpoch: repairBuilding.RunnerEpoch}
+	repairContext, err := database.CandidateRepairBuildContext(ctx, repairBuilding.Ref, repairBuilding.Version, repairFence)
+	if err != nil || repairContext.PredecessorGeneration != candidate.Snapshot.Generation || repairContext.PredecessorHeadSHA != candidate.Snapshot.HeadSHA {
+		t.Fatalf("source-resume repair context=%+v err=%v", repairContext, err)
+	}
+	repairVerification, err := database.CurrentVerification(ctx, repairBuilding.Ref)
+	if err != nil || repairVerification.TicketVersion != repairBuilding.Version || repairVerification.Fence != repairFence {
+		t.Fatalf("source-resume repair verification=%+v err=%v", repairVerification, err)
+	}
+	repairBuilderArtifact := phaseartifact.Builder{Schema: "sf.builder/v1", Summary: "repair source-resume candidate", ChangedFiles: []string{"src/feature.go"}, Commands: [][]string{{"go", "test", "./..."}}}
+	repairBuilderRaw, err := json.Marshal(repairBuilderArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairBuilder, err := database.BeginProviderAttempt(ctx, supervisedOperatorSource(t, database, ctx, ProviderAttemptRequest{Ref: repairBuilding.Ref, ExpectedVersion: repairBuilding.Version, Fence: repairFence, Phase: domain.PhaseBuild, Role: "builder", Binding: runtime(pair.Builder), ConfigDigest: repairBuilding.ConfigDigest, Capacity: 1, At: time.Now().UTC()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RecordProviderLaunch(ctx, repairBuilder, contracts.ProviderLaunch{PID: int(repairBuilder.ID), PGID: int(repairBuilder.ID), BootIdentity: "source-resume", ProcessStartIdentity: "ci-repair-builder", Worktree: repairBuilder.Worktree}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CompleteProviderAttemptSuccess(ctx, repairBuilder, proof(t, repairBuilder), repairBuilding.Version, repairFence, contracts.PhaseResult{Provider: repairBuilder.Binding.Identity, Artifact: repairBuilderRaw, UsageTrusted: true, UsageUnits: 1}, phaseartifact.Validation{TicketType: repairBuilding.Type}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	repairBuilderKey := ProviderAttemptResultKey{AttemptID: repairBuilder.ID, Ref: repairBuilding.Ref, Phase: domain.PhaseBuild, Attempt: repairBuilder.Attempt}
+	repairBuilderDigest, err := phaseartifact.BuilderEvidenceDigest(repairBuilderArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairPolicyDigest := sha256Digest([]byte("source-resume-ci-repair-policy"))
+	repairCommand := completeEvidenceRepositoryCommand(t, database, ctx, RepositoryCommandPurposePostbuildCandidate,
+		repairBuilding.Ref, repairBuilding.Version, repairFence, repairBuilderKey,
+		repairVerification.Revision.IntentDigest, repairVerification.Revision.ProofDigest,
+		repairVerification.Checkpoint.CommitOID, "sha256:"+repairPolicyDigest, 0)
+	repairSnapshot := domain.CandidateSnapshot{
+		BaseSHA: candidate.Snapshot.BaseSHA, HeadSHA: strings.Repeat("5", 40), TreeSHA: strings.Repeat("6", 40),
+		SourceDigest: repairBuilding.SourceDigest, VerificationIntentDigest: repairVerification.Revision.IntentDigest,
+		ProofDigest: repairVerification.Revision.ProofDigest, CommandPolicyDigest: repairPolicyDigest,
+		BuilderEvidenceDigest: repairBuilderDigest,
+	}
+	repairEvidence := CandidateEvidence{
+		Ref: repairBuilding.Ref, ExpectedVersion: repairBuilding.Version, Fence: repairFence,
+		Snapshot: repairSnapshot, BuilderResult: repairBuilderKey,
+		Commit: CommitObservation{CommitOID: repairSnapshot.HeadSHA, ParentOID: candidate.Snapshot.HeadSHA, TreeOID: repairSnapshot.TreeSHA},
+		Reason: "authenticated source-resume CI repair", CommandResult: repairCommand,
+	}
+	if _, err := database.RecordCandidate(ctx, repairEvidence); err != nil {
+		t.Fatalf("record source-resume repair candidate: %v", err)
+	}
+	repaired, err := database.LatestCandidate(ctx, repairBuilding.Ref)
+	if err != nil || repaired.Snapshot.Generation != candidate.Snapshot.Generation+1 || repaired.Commit.ParentOID != candidate.Snapshot.HeadSHA {
+		t.Fatalf("load source-resume repair candidate=%+v err=%v", repaired, err)
+	}
+
+	// A later repair must not make the original source provenance optional.
+	// Corrupt the immutable source-resume payload in this isolated database and
+	// prove an otherwise exact lost-response replay fails closed.
+	if _, err := database.db.ExecContext(ctx, `UPDATE events SET payload='{}' WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_resume' AND from_state='paused' AND to_state='verifying'`, resumed.Ref.Channel, resumed.Ref.Project, resumed.Ref.Ticket, resumed.Version); err != nil {
+		t.Fatal(err)
+	}
+	if replay, err := database.RecordCandidate(ctx, repairEvidence); !errors.Is(err, ErrEvidenceConflict) || len(replay) != 0 {
+		t.Fatalf("repair replay accepted malformed source provenance candidate=%+v err=%v", replay, err)
+	}
 }
 
 func recordOperatorSourceFreshVerificationAtEndpoint(t *testing.T, database *Store, ctx context.Context, leader uint64, resumed Ticket, source contracts.OperatorSourceCommit) VerificationArtifact {
@@ -783,7 +978,7 @@ func recordOperatorSourceFreshVerificationAtEndpoint(t *testing.T, database *Sto
 	if err != nil {
 		t.Fatal(err)
 	}
-	reviewer, err := database.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: resumed.Ref, ExpectedVersion: resumed.Version, Fence: fence, Phase: domain.PhaseVerification, Role: "reviewer", Binding: runtime(pair.Reviewer), ConfigDigest: resumed.ConfigDigest, Capacity: 1, At: time.Now().UTC()}))
+	reviewer, err := database.BeginProviderAttempt(ctx, supervisedOperatorSource(t, database, ctx, ProviderAttemptRequest{Ref: resumed.Ref, ExpectedVersion: resumed.Version, Fence: fence, Phase: domain.PhaseVerification, Role: "reviewer", Binding: runtime(pair.Reviewer), ConfigDigest: resumed.ConfigDigest, Capacity: 1, At: time.Now().UTC()}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -854,11 +1049,28 @@ func operatorSourceResumeBuildingFixture(t *testing.T) (*Store, context.Context,
 	if err != nil {
 		t.Fatal(err)
 	}
-	ticket := setupProviderTicket(t, db, ctx, "SF-operator-source-resume", leader)
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "provider", Ticket: "SF-operator-source-resume"}
+	if err := db.CreateTicket(ctx, Ticket{Ref: ref, SourceDigest: sha256Digest([]byte("digest-SF-operator-source-resume")), Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	branch := testAllocatedBranch(ref, strings.Repeat("ab", 16))
+	ticket, err := db.StartOrAdopt(ctx, ref, 1, branch, domain.Fence{LeaderEpoch: leader, RunnerEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/provider/SF-operator-source-resume"
+	identity := strings.ReplaceAll(strings.ReplaceAll(repositoryCommandIdentity(t, "/tmp/provider", worktree, branch, "main"), "git@example.test:nysa.git", "https://github.com/acme/app.git"), "/tmp/nysa-origin", "git@github.com:acme/app.git")
+	branchKey := string(ref.Channel) + "\x00" + string(ref.Project) + "\x00" + string(ref.Ticket)
+	if _, err := db.LoadOrStoreBranchUnderFence(ctx, branchKey, branch, ticket.Version, domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}, Path: worktree, Branch: branch, IdentityJSON: []byte(identity), BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)}); err != nil {
+		t.Fatal(err)
+	}
 	builder, reviewer := setupProviderPair(t, db, ctx)
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
 	launch := func(phase domain.Phase, role string, binding contracts.RuntimeBinding, artifact []byte, validation phaseartifact.Validation) ProviderAttemptClaim {
-		claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: phase, Role: role, Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		claim, err := db.BeginProviderAttempt(ctx, supervisedOperatorSource(t, db, ctx, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: phase, Role: role, Binding: binding, ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1351,6 +1351,39 @@ func (f *FakeGH) UseBareRepositoryForTest(bare string) error {
 	return nil
 }
 
+// SyncPullRequestRefsFromBareForTest explicitly simulates GitHub refreshing an
+// open same-repository PR after a Git push. Read the actual private bare refs;
+// never accept caller-supplied OIDs. Ordinary fixtures retain their recorded
+// snapshots so intentional stale/foreign-identity tests remain meaningful.
+func (f *FakeGH) SyncPullRequestRefsFromBareForTest(number int) (contracts.PullRequestIdentity, error) {
+	var result contracts.PullRequestIdentity
+	err := f.withState(func() (bool, error) {
+		for index := range f.state.PRs {
+			pr := &f.state.PRs[index]
+			if pr.Identity.Number != number {
+				continue
+			}
+			if number <= 0 || pr.Merged || pr.Identity.HeadOwner != f.state.Repository.Owner || pr.Identity.HeadRepository != f.state.Repository.Name || pr.Identity.Repository != f.state.Repository {
+				return false, errors.New("fake-gh: only open same-repository PR refs can sync")
+			}
+			head, headFound, err := readFakeBareRef(f.bare, pr.Identity.HeadRef)
+			if err != nil || !headFound {
+				return false, errors.New("fake-gh: missing private source ref")
+			}
+			base, baseFound, err := readFakeBareRef(f.bare, pr.Identity.BaseRef)
+			if err != nil || !baseFound {
+				return false, errors.New("fake-gh: missing private base ref")
+			}
+			changed := pr.Identity.HeadOID != head || pr.Identity.BaseOID != base
+			pr.Identity.HeadOID, pr.Identity.BaseOID = head, base
+			result = pr.Identity
+			return changed, nil
+		}
+		return false, errors.New("fake-gh: pull request not found")
+	})
+	return result, err
+}
+
 func fakeBareFromMarker(configDir string) (string, bool, error) {
 	if configDir == "" || !filepath.IsAbs(configDir) || filepath.Clean(configDir) != configDir || configDir == string(filepath.Separator) {
 		return "", false, errors.New("fake-gh: invalid GH_CONFIG_DIR")
@@ -1678,7 +1711,10 @@ func validateOfficialArgv(argv []string) error {
 			return err
 		}
 	case "repo view":
-		allowed["--repo"], allowed["--json"] = true, true
+		allowed["--json"] = true
+		if len(argv) < 3 || strings.HasPrefix(argv[2], "--") || !validFakeRepositoryArg(argv[2]) {
+			return fmt.Errorf("fake-gh: %s requires a positional owner/name", key)
+		}
 		if err := require("--json", "nameWithOwner,url"); err != nil {
 			return err
 		}
@@ -1833,7 +1869,7 @@ func prNumber(argv []string) int {
 
 func (f *FakeGH) runRepoView(argv []string) ([]byte, error) {
 	identity := contracts.RepositoryIdentity{Host: "github.com"}
-	value := option(argv, "--repo")
+	value := argv[2]
 	parts := strings.Split(value, "/")
 	if len(parts) == 2 {
 		identity.Owner, identity.Name = parts[0], parts[1]
@@ -1843,6 +1879,23 @@ func (f *FakeGH) runRepoView(argv []string) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(map[string]string{"nameWithOwner": result.Owner + "/" + result.Name, "url": "https://" + result.Host + "/" + result.Owner + "/" + result.Name})
+}
+
+func validFakeRepositoryArg(value string) bool {
+	parts := strings.Split(value, "/")
+	return len(parts) == 2 && validFakeRepositoryPart(parts[0]) && validFakeRepositoryPart(parts[1])
+}
+
+func validFakeRepositoryPart(value string) bool {
+	if value == "" || len(value) > 100 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 func identityFromArgs(argv []string, number int) contracts.PullRequestIdentity {

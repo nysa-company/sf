@@ -1330,3 +1330,104 @@ var migrationV53 = []string{
 	`CREATE TRIGGER phase_run_state_outcome_insert BEFORE INSERT ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome IN ('completed','passed')) OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable','invocation_failed','result_indeterminate'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
 	`CREATE TRIGGER phase_run_state_outcome_update BEFORE UPDATE OF state,outcome ON phase_runs WHEN NOT ((NEW.state='active' AND NEW.outcome='running') OR (NEW.state='completed' AND NEW.outcome IN ('completed','passed')) OR (NEW.state='cancelled' AND NEW.outcome IN ('cancelled','drained_recovery')) OR (NEW.state='failed' AND NEW.outcome IN ('failed','invalid_artifact','budget_exhausted','legacy_unverifiable','invocation_failed','result_indeterminate'))) BEGIN SELECT RAISE(ABORT,'invalid phase state/outcome'); END`,
 }
+
+// v54 records a closed, transcript-free reason for new repairable invalid
+// artifacts. Older invalid-artifact rows intentionally remain reasonless:
+// guessing a reason from raw provider output would create a second, unsafe
+// interpretation of historical evidence.
+var migrationV54 = []string{
+	`CREATE TABLE provider_artifact_failures (
+		provider_attempt_id INTEGER PRIMARY KEY CHECK(provider_attempt_id>0),
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		phase TEXT NOT NULL CHECK(phase IN ('planning','verification','build','review')), role TEXT NOT NULL CHECK(role IN ('planner','builder','reviewer')), attempt INTEGER NOT NULL CHECK(attempt>0),
+		request_digest TEXT NOT NULL CHECK(length(request_digest)=64), leader_epoch INTEGER NOT NULL CHECK(leader_epoch>0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch>0), expected_ticket_version INTEGER NOT NULL CHECK(expected_ticket_version>0),
+		failure_reason TEXT NOT NULL CHECK(failure_reason IN ('final_message_missing_or_malformed','schema_validation','mutation_path','adapter_declared_invalid_artifact')),
+		failure_digest TEXT NOT NULL UNIQUE CHECK(length(failure_digest)=64), created_at TEXT NOT NULL CHECK(length(created_at) BETWEEN 1 AND 128),
+		FOREIGN KEY(provider_attempt_id) REFERENCES provider_attempts(id),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(channel,project_id,ticket_id,phase,role,attempt,provider_attempt_id) REFERENCES provider_attempts(channel,project_id,ticket_id,phase,role,attempt,id)
+	)`,
+	`CREATE INDEX provider_artifact_failures_ticket ON provider_artifact_failures(channel,project_id,ticket_id,provider_attempt_id)`,
+	`CREATE TRIGGER provider_artifact_failures_immutable_update BEFORE UPDATE ON provider_artifact_failures BEGIN SELECT RAISE(ABORT,'provider artifact failure is immutable'); END`,
+	`CREATE TRIGGER provider_artifact_failures_immutable_delete BEFORE DELETE ON provider_artifact_failures BEGIN SELECT RAISE(ABORT,'provider artifact failure is append-only'); END`,
+}
+
+// v55 makes the candidate snapshot match its Store contract and seals the
+// runner-recovery prefix consumed by the single v1 CI-repair loop. The
+// read-only open preflight refuses every nonterminal pre-v55 repair binding:
+// its immutable context digest did not cover that prefix, and its publication
+// evidence may name a remotely merged PR. Terminal history is retained with
+// an empty compatibility value; every new binding must carry the digest.
+var migrationV55 = []string{
+	`ALTER TABLE candidate_repair_bindings ADD COLUMN consumed_recovery_prefix_digest TEXT NOT NULL DEFAULT '' CHECK(length(consumed_recovery_prefix_digest) IN (0,71))`,
+	`CREATE TRIGGER candidate_snapshots_immutable_update BEFORE UPDATE ON candidate_snapshots BEGIN SELECT RAISE(ABORT,'candidate snapshot is immutable'); END`,
+	`CREATE TRIGGER candidate_snapshots_immutable_delete BEFORE DELETE ON candidate_snapshots BEGIN SELECT RAISE(ABORT,'candidate snapshot is append-only'); END`,
+	`CREATE TRIGGER candidate_repair_bindings_prefix_required BEFORE INSERT ON candidate_repair_bindings WHEN NEW.consumed_recovery_prefix_digest='' BEGIN SELECT RAISE(ABORT,'candidate repair recovery prefix is required'); END`,
+	`CREATE TRIGGER candidate_repair_bindings_single_ticket BEFORE INSERT ON candidate_repair_bindings WHEN EXISTS(SELECT 1 FROM candidate_repair_bindings b WHERE b.channel=NEW.channel AND b.project_id=NEW.project_id AND b.ticket_id=NEW.ticket_id) BEGIN SELECT RAISE(ABORT,'only one candidate repair loop is supported'); END`,
+}
+
+// v56 supplies storage for a single authenticated protected-base refresh.
+// Intent, prepared Git object, and completion are separate immutable rows;
+// their presence alone grants neither a Git lease nor a state transition.
+// A dedicated Store boundary must authenticate the referenced evidence and
+// atomically update the current worktrees projection when it is implemented.
+var migrationV56 = []string{
+	`CREATE UNIQUE INDEX effects_refresh_ticket_identity ON effects(semantic_key,channel,project_id,ticket_id)`,
+	`CREATE TABLE protected_base_refresh_intents (
+		refresh_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		ticket_version INTEGER NOT NULL CHECK(ticket_version>0), leader_epoch INTEGER NOT NULL CHECK(leader_epoch>0), runner_epoch INTEGER NOT NULL CHECK(runner_epoch>0),
+		source_digest TEXT NOT NULL, config_generation INTEGER NOT NULL CHECK(config_generation>0), config_digest TEXT NOT NULL, config_snapshot_digest TEXT NOT NULL,
+		intent_json BLOB NOT NULL CHECK(length(intent_json) BETWEEN 1 AND 131072 AND json_valid(intent_json)=1), intent_digest TEXT NOT NULL CHECK(length(intent_digest)=71),
+		old_candidate_generation INTEGER NOT NULL CHECK(old_candidate_generation>0), old_candidate_head_sha TEXT NOT NULL CHECK(length(old_candidate_head_sha) IN (40,64)), old_candidate_tree_sha TEXT NOT NULL CHECK(length(old_candidate_tree_sha) IN (40,64)), old_candidate_base_sha TEXT NOT NULL CHECK(length(old_candidate_base_sha) IN (40,64)),
+		worktree_path TEXT NOT NULL, worktree_identity_json BLOB NOT NULL CHECK(length(worktree_identity_json) BETWEEN 1 AND 131072 AND json_valid(worktree_identity_json)=1), worktree_identity_digest TEXT NOT NULL CHECK(length(worktree_identity_digest)=71),
+		new_base_sha TEXT NOT NULL CHECK(length(new_base_sha) IN (40,64)), base_proof_digest TEXT NOT NULL CHECK(length(base_proof_digest)=71),
+		base_proof_semantic_key TEXT NOT NULL, refresh_effect_semantic_key TEXT NOT NULL, refresh_effect_request_digest TEXT NOT NULL CHECK(length(refresh_effect_request_digest)=71),
+		created_at TEXT NOT NULL,
+		UNIQUE(channel,project_id,ticket_id), UNIQUE(channel,project_id,ticket_id,refresh_id,old_candidate_head_sha,new_base_sha),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		FOREIGN KEY(channel,project_id,ticket_id,old_candidate_generation,old_candidate_head_sha,old_candidate_tree_sha) REFERENCES candidate_snapshots(channel,project_id,ticket_id,generation,head_sha,tree_sha),
+		FOREIGN KEY(channel,project_id,config_generation) REFERENCES project_configurations(channel,project_id,generation),
+		FOREIGN KEY(base_proof_semantic_key,channel,project_id,ticket_id) REFERENCES effects(semantic_key,channel,project_id,ticket_id),
+		FOREIGN KEY(refresh_effect_semantic_key,channel,project_id,ticket_id) REFERENCES effects(semantic_key,channel,project_id,ticket_id),
+		CHECK(length(old_candidate_head_sha)=length(old_candidate_tree_sha) AND length(old_candidate_head_sha)=length(old_candidate_base_sha) AND length(old_candidate_head_sha)=length(new_base_sha) AND new_base_sha<>old_candidate_base_sha AND new_base_sha<>old_candidate_head_sha)
+	)`,
+	`CREATE TABLE protected_base_refresh_preparations (
+		refresh_id INTEGER PRIMARY KEY CHECK(refresh_id>0), channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		old_candidate_head_sha TEXT NOT NULL CHECK(length(old_candidate_head_sha) IN (40,64)), new_base_sha TEXT NOT NULL CHECK(length(new_base_sha) IN (40,64)),
+		prepared_commit_oid TEXT NOT NULL CHECK(length(prepared_commit_oid) IN (40,64)), prepared_tree_oid TEXT NOT NULL CHECK(length(prepared_tree_oid) IN (40,64)),
+		prepared_parent_1_oid TEXT NOT NULL CHECK(length(prepared_parent_1_oid) IN (40,64)), prepared_parent_2_oid TEXT NOT NULL CHECK(length(prepared_parent_2_oid) IN (40,64)),
+		prepared_digest TEXT NOT NULL CHECK(length(prepared_digest)=71), prepared_at TEXT NOT NULL,
+		UNIQUE(channel,project_id,ticket_id,refresh_id,prepared_commit_oid,prepared_tree_oid,prepared_parent_1_oid,prepared_parent_2_oid),
+		FOREIGN KEY(channel,project_id,ticket_id,refresh_id,old_candidate_head_sha,new_base_sha) REFERENCES protected_base_refresh_intents(channel,project_id,ticket_id,refresh_id,old_candidate_head_sha,new_base_sha),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		CHECK(prepared_parent_1_oid=old_candidate_head_sha AND prepared_parent_2_oid=new_base_sha AND length(old_candidate_head_sha)=length(new_base_sha) AND length(prepared_commit_oid)=length(old_candidate_head_sha) AND length(prepared_tree_oid)=length(old_candidate_head_sha))
+	)`,
+	`CREATE TABLE protected_base_refresh_completions (
+		refresh_id INTEGER PRIMARY KEY CHECK(refresh_id>0), channel TEXT NOT NULL CHECK(channel IN ('stable','dev')), project_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+		prepared_commit_oid TEXT NOT NULL CHECK(length(prepared_commit_oid) IN (40,64)), prepared_tree_oid TEXT NOT NULL CHECK(length(prepared_tree_oid) IN (40,64)), prepared_parent_1_oid TEXT NOT NULL CHECK(length(prepared_parent_1_oid) IN (40,64)), prepared_parent_2_oid TEXT NOT NULL CHECK(length(prepared_parent_2_oid) IN (40,64)),
+		effective_base_sha TEXT NOT NULL CHECK(length(effective_base_sha) IN (40,64)), effective_worktree_identity_json BLOB NOT NULL CHECK(length(effective_worktree_identity_json) BETWEEN 1 AND 131072 AND json_valid(effective_worktree_identity_json)=1), effective_worktree_identity_digest TEXT NOT NULL CHECK(length(effective_worktree_identity_digest)=71),
+		completion_ticket_version INTEGER NOT NULL CHECK(completion_ticket_version>0), completion_leader_epoch INTEGER NOT NULL CHECK(completion_leader_epoch>0), completion_runner_epoch INTEGER NOT NULL CHECK(completion_runner_epoch>0), completion_digest TEXT NOT NULL CHECK(length(completion_digest)=71), completed_at TEXT NOT NULL,
+		UNIQUE(completion_digest),
+		FOREIGN KEY(channel,project_id,ticket_id,refresh_id,prepared_commit_oid,prepared_tree_oid,prepared_parent_1_oid,prepared_parent_2_oid) REFERENCES protected_base_refresh_preparations(channel,project_id,ticket_id,refresh_id,prepared_commit_oid,prepared_tree_oid,prepared_parent_1_oid,prepared_parent_2_oid),
+		FOREIGN KEY(channel,project_id,ticket_id) REFERENCES tickets(channel,project_id,id),
+		CHECK(length(prepared_commit_oid)=length(prepared_tree_oid) AND length(prepared_commit_oid)=length(prepared_parent_1_oid) AND length(prepared_commit_oid)=length(prepared_parent_2_oid) AND effective_base_sha=prepared_parent_2_oid)
+	)`,
+	`CREATE UNIQUE INDEX protected_base_refresh_intents_ticket ON protected_base_refresh_intents(channel,project_id,ticket_id)`,
+	`CREATE UNIQUE INDEX protected_base_refresh_intents_candidate ON protected_base_refresh_intents(refresh_id,old_candidate_head_sha,new_base_sha)`,
+	`CREATE UNIQUE INDEX protected_base_refresh_preparations_identity ON protected_base_refresh_preparations(channel,project_id,ticket_id,refresh_id,prepared_commit_oid,prepared_tree_oid,prepared_parent_1_oid,prepared_parent_2_oid)`,
+	`CREATE UNIQUE INDEX protected_base_refresh_completions_digest ON protected_base_refresh_completions(completion_digest)`,
+	`CREATE TRIGGER protected_base_refresh_intents_immutable_update BEFORE UPDATE ON protected_base_refresh_intents BEGIN SELECT RAISE(ABORT,'protected base refresh intent is immutable'); END`,
+	`CREATE TRIGGER protected_base_refresh_intents_immutable_delete BEFORE DELETE ON protected_base_refresh_intents BEGIN SELECT RAISE(ABORT,'protected base refresh intent is append-only'); END`,
+	`CREATE TRIGGER protected_base_refresh_preparations_immutable_update BEFORE UPDATE ON protected_base_refresh_preparations BEGIN SELECT RAISE(ABORT,'protected base refresh preparation is immutable'); END`,
+	`CREATE TRIGGER protected_base_refresh_preparations_immutable_delete BEFORE DELETE ON protected_base_refresh_preparations BEGIN SELECT RAISE(ABORT,'protected base refresh preparation is append-only'); END`,
+	`CREATE TRIGGER protected_base_refresh_completions_immutable_update BEFORE UPDATE ON protected_base_refresh_completions BEGIN SELECT RAISE(ABORT,'protected base refresh completion is immutable'); END`,
+	`CREATE TRIGGER protected_base_refresh_completions_immutable_delete BEFORE DELETE ON protected_base_refresh_completions BEGIN SELECT RAISE(ABORT,'protected base refresh completion is append-only'); END`,
+}
+
+// v57 distinguishes a repository-exclusive, read-only absence observation
+// lease from a mutation lease. It is additive so existing mutation rows retain
+// their launch-capable default.
+var migrationV57 = []string{
+	`ALTER TABLE git_mutation_leases ADD COLUMN observation_only INTEGER NOT NULL DEFAULT 0 CHECK(observation_only IN (0,1))`,
+}
