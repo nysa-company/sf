@@ -1788,8 +1788,8 @@ func (s *Store) candidateRepairBuildAuthorityAtMode(ctx context.Context, q ciQue
 	verification, err := s.verificationEvidenceForIdentityFrom(ctx, q, ref,
 		publication.Candidate.Snapshot.VerificationIntentDigest,
 		publication.Candidate.Snapshot.ProofDigest,
-		publication.Candidate.Commit.ParentOID)
-	if err != nil || publication.Candidate.Snapshot.VerificationIntentDigest != verification.Revision.IntentDigest || publication.Candidate.Snapshot.ProofDigest != verification.Revision.ProofDigest || publication.Candidate.Commit.ParentOID != verification.Checkpoint.CommitOID {
+		"")
+	if err != nil || s.authenticateCandidateVerificationParentFrom(ctx, q, publication.Candidate, verification) != nil {
 		return candidateRepairBindingAuthority{}, ErrEvidenceConflict
 	}
 	value.context.Verification = verification

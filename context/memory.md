@@ -2,6 +2,21 @@
 
 ## Current truth
 
+- Active consolidation goal (2026-09-07): repair the two PR #2 review findings,
+  validate and update the PR, merge through its required independent review,
+  then run two concurrent hosted Relay tickets with CI-failure/restart recovery
+  on that exact version before tagging. Main/tag/hosted acceptance are not done.
+  The multiCLI tree is committed in fa8ad1d and already included in PR #2;
+  older "uncommitted/not in PR" entries below are historical.
+  New mixed app-check/legacy-status and refreshed-base/red-CI regressions both
+  reproduced failure before the fixes. Focused Store/GitHub tests pass (11.610s,
+  3.697s), including refreshed repair after leader recovery. Full native suite
+  33888 PASS exit0 (Store130.386s, workflowruntime112.251s,
+  worktreecoord135.755s). Vet, repo-check, docs-smoke, diff-check and secret-scan
+  PASS. Focused race validation39933 PASS (Store288.375s, GitHub4.726s).
+  No live daemon or Relay data changed. PR author/current gh
+  login is javieraldape; required independent approval cannot be self-issued.
+
 - User authorized consolidating the validated multiCLI tree and Codex beta
   through sf PR #2 into main. Preparing one commit and updating the PR;
   main's ruleset requires one approving review and squash merge. Do not

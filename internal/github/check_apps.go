@@ -11,16 +11,16 @@ import (
 // exact run URLs returned by gh's required-check query. Names alone cannot
 // distinguish a trusted integration from another app reporting the same name.
 func (c Client) authenticateCheckApps(ctx context.Context, identity contracts.PullRequestIdentity, protection strictProtectionWitness, checks []checkWire) (map[string]int64, error) {
-	needed := false
+	appBound := make(map[string]bool)
 	if protection.Kind == "ruleset" {
 		for _, configured := range protection.Checks {
 			parts := strings.SplitN(configured, "\x00", 2)
 			if len(parts) == 2 && parts[1] != "-" && parts[1] != "0" {
-				needed = true
+				appBound[parts[0]] = true
 			}
 		}
 	}
-	if !needed {
+	if len(appBound) == 0 {
 		return nil, nil
 	}
 	var response struct {
@@ -54,6 +54,12 @@ func (c Client) authenticateCheckApps(ctx context.Context, identity contracts.Pu
 		ids[run.ID] = true
 	}
 	for _, check := range checks {
+		// Unbound contexts may be legacy commit statuses, which have no
+		// check-run entry. The caller still validates the complete required
+		// context set; only positive integration IDs need this app proof.
+		if !appBound[check.Name] {
+			continue
+		}
 		if _, duplicate := apps[check.Name]; duplicate {
 			return nil, ErrChecksFailed
 		}

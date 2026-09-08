@@ -13,6 +13,34 @@ import (
 	"github.com/nysa-company/sf/internal/phaseartifact"
 )
 
+func TestProtectedBaseRefreshRedCIAdmitsRepairAfterRecovery(t *testing.T) {
+	fixture, _ := protectedBaseRefreshLifecycleFixture(t, true)
+	defer fixture.db.Close()
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			leader, err := fixture.db.AcquireLeader(fixture.ctx, fixture.ticket.Ref.Channel, "refreshed-red-recovery")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed, err := fixture.db.FenceRecoveredRunners(fixture.ctx, fixture.ticket.Ref.Channel, leader); err != nil || changed != 1 {
+				t.Fatalf("recovery changed=%d err=%v", changed, err)
+			}
+			fixture.ticket, err = fixture.db.Ticket(fixture.ctx, fixture.ticket.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: fixture.ticket.RunnerEpoch}
+		}
+		repair, err := fixture.db.CandidateRepairBuildContext(fixture.ctx, fixture.ticket.Ref, fixture.ticket.Version, fixture.fence)
+		if err != nil {
+			t.Fatalf("repair after refresh (recovery=%d): %v", attempt, err)
+		}
+		if repair.PredecessorHeadSHA != fixture.candidate.Snapshot.HeadSHA || repair.Verification.Revision.IntentDigest != fixture.candidate.Snapshot.VerificationIntentDigest {
+			t.Fatalf("repair lost refreshed candidate/original verification: %+v", repair)
+		}
+	}
+}
+
 func TestProtectedBaseRefreshRequiresFreshFinalReview(t *testing.T) {
 	t.Run("predecessor review becomes absence and fresh review succeeds", func(t *testing.T) {
 		fixture, predecessor := protectedBaseRefreshReviewFixture(t)
@@ -136,6 +164,11 @@ func TestProtectedBaseRefreshReviewedRecoveryRejectsTamperedHistory(t *testing.T
 }
 
 func protectedBaseRefreshReviewFixture(t *testing.T, restartWaitingCI ...bool) (finalReviewFixture, ProviderAttemptClaim) {
+	t.Helper()
+	return protectedBaseRefreshLifecycleFixture(t, false, restartWaitingCI...)
+}
+
+func protectedBaseRefreshLifecycleFixture(t *testing.T, redCI bool, restartWaitingCI ...bool) (finalReviewFixture, ProviderAttemptClaim) {
 	t.Helper()
 	pending := 0
 	if len(restartWaitingCI) > 1 && restartWaitingCI[1] {
@@ -361,6 +394,11 @@ func protectedBaseRefreshReviewFixture(t *testing.T, restartWaitingCI ...bool) (
 		RequiredChecks: []CIObservationCheck{{CanonicalName: "unit", ExternalID: "run-refresh-review", NormalizedState: "success"}},
 		Classification: "green",
 	}
+	if redCI {
+		observation.Classification = "red"
+		observation.RequiredChecks[0].NormalizedState = "failure"
+		observation.RequiredChecks[0].FailingDiagnosticText = "unit failed after base refresh"
+	}
 	canonicalObservation, err := canonicalCIObservation(observation)
 	if err != nil {
 		fixture.db.Close()
@@ -370,15 +408,24 @@ func protectedBaseRefreshReviewFixture(t *testing.T, restartWaitingCI ...bool) (
 		fixture.db.Close()
 		t.Fatal(err)
 	}
-	if _, err := fixture.db.ConsumeCIObservation(fixture.ctx, CIObservationTransition{
+	transition := CIObservationTransition{
 		Ref: waiting.Ref, ObservationDigest: canonicalObservation.ObservationDigest,
 		ExpectedVersion: waitingCI.Version, Fence: buildFence,
-	}); err != nil {
+	}
+	if redCI {
+		authority := redCICorrectionAuthority(t, waitingCI, canonicalObservation)
+		transition.CorrectionBudget = &authority
+	}
+	if _, err := fixture.db.ConsumeCIObservation(fixture.ctx, transition); err != nil {
 		fixture.db.Close()
 		t.Fatal(err)
 	}
 	reviewing, err := fixture.db.Ticket(fixture.ctx, waiting.Ref)
-	if err != nil || reviewing.State != domain.StateReviewing {
+	wantState := domain.StateReviewing
+	if redCI {
+		wantState = domain.StateBuilding
+	}
+	if err != nil || reviewing.State != wantState {
 		fixture.db.Close()
 		t.Fatalf("second-generation review ticket=%+v err=%v", reviewing, err)
 	}

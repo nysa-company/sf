@@ -70,3 +70,45 @@ func TestCIRequiredPolicyAuthenticatesExactCheckApp(t *testing.T) {
 		})
 	}
 }
+
+func TestCIRequiredPolicyAcceptsMixedAppChecksAndLegacyStatuses(t *testing.T) {
+	for _, appRunPresent := range []bool{true, false} {
+		t.Run(map[bool]string{true: "mixed", false: "missing-app-run"}[appRunPresent], func(t *testing.T) {
+			c, fake, identity := fixture(t)
+			rules := exactRepositoryRuleset()
+			rules.Rules[1].Parameters["required_status_checks"] = []any{
+				map[string]any{"context": "test", "integration_id": 15368},
+				map[string]any{"context": "external-ci"},
+			}
+			if err := fake.SetRulesetsForTest(rules); err != nil {
+				t.Fatal(err)
+			}
+			pr := createDraft(t, c, identity, "mixed CI", "body")
+			const link = "https://github.com/example/app/actions/runs/9/job/11"
+			if err := fake.SetChecks(pr.Identity.Number,
+				contracts.RequiredCheck{Name: "test", ExternalID: link, State: "SUCCESS"},
+				contracts.RequiredCheck{Name: "external-ci", ExternalID: "https://ci.example/build/12", State: "SUCCESS"}); err != nil {
+				t.Fatal(err)
+			}
+			original := c.runner
+			c.runner = commandRunnerFunc(func(ctx context.Context, binary string, args, env []string) ([]byte, error) {
+				if len(args) > 1 && args[0] == "api" && strings.Contains(args[1], "/check-runs?") {
+					runs := []any{}
+					if appRunPresent {
+						runs = append(runs, map[string]any{"id": 11, "name": "test", "head_sha": pr.Identity.HeadOID, "details_url": link, "status": "completed", "conclusion": "success", "app_id": 15368})
+					}
+					return json.Marshal(map[string]any{"total_count": len(runs), "check_runs": runs})
+				}
+				return original.Run(ctx, binary, args, env)
+			})
+			policy, err := c.ObserveCIRequiredCheckPolicy(context.Background(), pr.Identity)
+			if appRunPresent {
+				if err != nil || len(policy.RequiredChecks) != 2 {
+					t.Fatalf("mixed policy=%+v err=%v", policy, err)
+				}
+			} else if err == nil {
+				t.Fatal("accepted missing app-bound check run")
+			}
+		})
+	}
+}
