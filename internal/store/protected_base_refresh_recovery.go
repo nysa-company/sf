@@ -30,6 +30,9 @@ func protectedBaseRefreshRecoveryGap(ctx context.Context, q candidateEvidenceQue
 		if !prefix {
 			prefix = protectedBaseRefreshReviewedPrefix(ctx, q, value, fromVersion, fromRunner, fromLeader) == nil
 		}
+		if !prefix {
+			prefix = protectedBaseRefreshPostCISourceToReservation(ctx, q, value, normalRecoveryEndpoint{version: fromVersion, runner: fromRunner, leader: fromLeader}) == nil
+		}
 		return prefix &&
 			validateRunnerRecoveryLedgerPrefix(ctx, q, ref, value.TicketVersion, value.Fence.RunnerEpoch, value.Fence.LeaderEpoch, toVersion, toRunner, toLeader) == nil &&
 			validateRunnerRecoveryLedgerPrefix(ctx, q, ref, toVersion, toRunner, toLeader, completion.Version-1, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) == nil
@@ -37,6 +40,10 @@ func protectedBaseRefreshRecoveryGap(ctx context.Context, q candidateEvidenceQue
 	prefix := validateRunnerRecoveryLedgerPrefix(ctx, q, ref, fromVersion, fromRunner, fromLeader, completion.Version-1, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) == nil
 	if !prefix {
 		prefix = protectedBaseRefreshReviewedPrefix(ctx, q, value, fromVersion, fromRunner, fromLeader) == nil
+	}
+	if !prefix {
+		prefix = protectedBaseRefreshPostCISourceToReservation(ctx, q, value, normalRecoveryEndpoint{version: fromVersion, runner: fromRunner, leader: fromLeader}) == nil &&
+			validateRunnerRecoveryLedgerPrefix(ctx, q, ref, value.TicketVersion, value.Fence.RunnerEpoch, value.Fence.LeaderEpoch, completion.Version-1, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) == nil
 	}
 	return prefix && validateRunnerRecoveryLedgerPrefix(ctx, q, ref, completion.Version, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch, toVersion, toRunner, toLeader) == nil
 }
@@ -190,29 +197,48 @@ func protectedBaseRefreshPostCITarget(ctx context.Context, q candidateEvidenceQu
 			return false
 		}
 	}
-	_, green, err := protectedBaseRefreshGreenEndpoint(ctx, q, value)
-	if err != nil || version < green.version || version >= completion.Version {
+	if version >= completion.Version {
 		return false
 	}
 	target := normalRecoveryEndpoint{version: version, runner: runner, leader: leader}
 	reserved := normalRecoveryEndpoint{version: value.TicketVersion, runner: value.Fence.RunnerEpoch, leader: value.Fence.LeaderEpoch}
-	for _, state := range []domain.State{domain.StateReviewing, domain.StateWaitingApproval} {
-		initial := green
-		if state == domain.StateWaitingApproval {
-			initial, err = protectedBaseRefreshPassEndpoint(ctx, q, value, green)
-			if err != nil {
-				continue
-			}
-		}
-		if version <= value.TicketVersion {
-			if validatePostPublicationEndpointAdvance(ctx, q, value.Ref, state, initial, target) == nil && validatePostPublicationEndpointAdvance(ctx, q, value.Ref, state, target, reserved) == nil {
-				return true
-			}
-		} else if validatePostPublicationEndpointAdvance(ctx, q, value.Ref, state, initial, reserved) == nil && validateRunnerRecoveryLedgerPrefix(ctx, q, value.Ref, value.TicketVersion, value.Fence.RunnerEpoch, value.Fence.LeaderEpoch, version, runner, leader) == nil && validateRunnerRecoveryLedgerPrefix(ctx, q, value.Ref, version, runner, leader, completion.Version-1, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) == nil {
-			return true
-		}
+	if version <= value.TicketVersion {
+		return protectedBaseRefreshPostCISourceToReservation(ctx, q, value, target) == nil
 	}
-	return false
+	return protectedBaseRefreshPostCISourceToReservation(ctx, q, value, reserved) == nil &&
+		validateRunnerRecoveryLedgerPrefix(ctx, q, value.Ref, reserved.version, reserved.runner, reserved.leader, version, runner, leader) == nil &&
+		validateRunnerRecoveryLedgerPrefix(ctx, q, value.Ref, version, runner, leader, completion.Version-1, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) == nil
+}
+
+// A recovery source can precede the final review pass while the reservation
+// follows it. Cross only that authenticated pass; the segments on either side
+// must independently prove their exact same-state endpoints.
+func protectedBaseRefreshPostCISourceToReservation(ctx context.Context, q candidateEvidenceQuerier, value protectedBaseRefreshIntent, source normalRecoveryEndpoint) error {
+	reserved := normalRecoveryEndpoint{version: value.TicketVersion, runner: value.Fence.RunnerEpoch, leader: value.Fence.LeaderEpoch}
+	_, green, err := protectedBaseRefreshGreenEndpoint(ctx, q, value)
+	if err != nil || source.version < green.version || source.version > reserved.version || reserved.version-green.version > 64 {
+		return ErrPublicationEvidence
+	}
+	if validatePostPublicationEndpointAdvance(ctx, q, value.Ref, domain.StateReviewing, green, source) == nil &&
+		validatePostPublicationEndpointAdvance(ctx, q, value.Ref, domain.StateReviewing, source, reserved) == nil {
+		return nil
+	}
+	pass, err := protectedBaseRefreshPassEndpoint(ctx, q, value, green)
+	if err != nil {
+		return ErrPublicationEvidence
+	}
+	if source.version < pass.version {
+		beforePass := normalRecoveryEndpoint{version: pass.version - 1, runner: pass.runner, leader: pass.leader}
+		if validatePostPublicationEndpointAdvance(ctx, q, value.Ref, domain.StateReviewing, green, source) != nil ||
+			validatePostPublicationEndpointAdvance(ctx, q, value.Ref, domain.StateReviewing, source, beforePass) != nil {
+			return ErrPublicationEvidence
+		}
+		return validatePostPublicationEndpointAdvance(ctx, q, value.Ref, domain.StateWaitingApproval, pass, reserved)
+	}
+	if validatePostPublicationEndpointAdvance(ctx, q, value.Ref, domain.StateWaitingApproval, pass, source) != nil {
+		return ErrPublicationEvidence
+	}
+	return validatePostPublicationEndpointAdvance(ctx, q, value.Ref, domain.StateWaitingApproval, source, reserved)
 }
 
 func (s *Store) protectedBaseRefreshRecoveryPredecessor(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64, latest RunnerRecoveryLedger, latestFound bool) (uint64, bool, error) {

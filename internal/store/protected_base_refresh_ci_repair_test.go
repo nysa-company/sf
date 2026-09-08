@@ -187,6 +187,27 @@ func TestProtectedBaseRefreshReservationPreservesCompletedCIRepairParent(t *test
 			if protectedBaseRefreshRecoveryGap(f.ctx, f.db.db, current.Ref, current.Version, currentFence.RunnerEpoch+1, currentFence.LeaderEpoch, completion.Version, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch) || protectedBaseRefreshRecoveryGap(f.ctx, f.db.db, current.Ref, current.Version, currentFence.RunnerEpoch, currentFence.LeaderEpoch, completion.Version, completion.Fence.RunnerEpoch, completion.Fence.LeaderEpoch+1) {
 				t.Fatal("forged refresh endpoint accepted")
 			}
+			if tc.restartReview {
+				value, _, err := protectedBaseRefreshForTicketAt(f.ctx, f.db.db, current.Ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				source := normalRecoveryEndpoint{version: f.ticket.Version, runner: f.fence.RunnerEpoch, leader: f.fence.LeaderEpoch}
+				if err := protectedBaseRefreshPostCISourceToReservation(f.ctx, f.db.db, value, source); err != nil {
+					t.Fatalf("review source to reservation: %v", err)
+				}
+				bad := source
+				bad.leader++
+				if protectedBaseRefreshPostCISourceToReservation(f.ctx, f.db.db, value, bad) == nil {
+					t.Fatal("wrong reviewing source fence accepted")
+				}
+				if _, err := f.db.db.ExecContext(f.ctx, `UPDATE events SET payload='{"tampered":true}' WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='review_pass'`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
+				if protectedBaseRefreshPostCISourceToReservation(f.ctx, f.db.db, value, source) == nil {
+					t.Fatal("tampered review pass accepted")
+				}
+			}
 		})
 	}
 }
