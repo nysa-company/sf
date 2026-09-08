@@ -31,7 +31,7 @@ func (s *Store) postbuildAmendmentCandidateHandoffFrom(ctx context.Context, q *s
 		return nil, ErrEvidenceConflict
 	}
 	candidate, err := s.latestCandidateFrom(ctx, q, ref, false)
-	if err != nil || candidate.Snapshot.Generation != 1 || candidate.TicketVersion < entry.Version || candidate.TicketVersion > version || candidate.Commit.ParentOID != value.CurrentVerification.Checkpoint.CommitOID || s.authenticateCandidateVerificationParentFrom(ctx, q, candidate, value.CurrentVerification) != nil || s.reauthenticateStoredCandidateCommandHistoricalFrom(ctx, q, ref, candidate) != nil {
+	if err != nil || candidate.Snapshot.Generation != 1 || candidate.TicketVersion < entry.Version || candidate.TicketVersion > version || candidate.Commit.ParentOID != value.CurrentVerification.Checkpoint.CommitOID || s.authenticateCandidateVerificationParentFrom(ctx, q, candidate, value.CurrentVerification) != nil || s.reauthenticateStoredCandidateCheckpointFrom(ctx, q, ref, candidate) != nil {
 		return nil, ErrEvidenceConflict
 	}
 	var source, base string
@@ -40,6 +40,14 @@ func (s *Store) postbuildAmendmentCandidateHandoffFrom(ctx context.Context, q *s
 	}
 	builder, parsed, err := s.loadHistoricalProviderAttemptResult(ctx, q, candidate.BuilderResult)
 	if err != nil || parsed.Builder == nil || parsed.Builder.AmendmentRequest != nil || builder.Claim.ExpectedVersion < entry.Version || assertNewestBoundResult(ctx, q, ref, domain.PhaseBuild, "builder", candidate.BuilderResult) != nil || providerResultReachesFence(ctx, q, candidate.BuilderResult, builder, version, fence) != nil {
+		return nil, ErrEvidenceConflict
+	}
+	// The candidate binding is historical after a later restart. Authenticate
+	// both bounded segments explicitly: the generic historical provider reader
+	// deliberately rejects ledger rows beyond its target and therefore cannot
+	// be used at this intermediate binding. The checkpoint reader above checks
+	// all immutable material evidence, but grants no recovery authority itself.
+	if postbuildRepairSignedSourcePrefix(ctx, q, ref, builder.Claim.ExpectedVersion, domain.Fence{LeaderEpoch: builder.Claim.LeaderEpoch, RunnerEpoch: builder.Claim.RunnerEpoch}, candidate.TicketVersion, candidate.Fence) != nil {
 		return nil, ErrEvidenceConflict
 	}
 	if q.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_phase_attempt_entries WHERE channel=? AND project_id=? AND ticket_id=? AND phase='build' AND role='builder' AND provider_attempt_id=? AND attempt=? AND entry_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, candidate.BuilderResult.AttemptID, candidate.BuilderResult.Attempt, entry.Version).Scan(&count) != nil || count != 1 {

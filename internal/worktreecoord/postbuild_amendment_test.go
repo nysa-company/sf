@@ -173,7 +173,10 @@ func TestPostbuildAmendmentPreparedCandidateAdmission(t *testing.T) {
 			case "missing":
 				f.preparedCandidateFound = false
 			case "wrong parent":
-				f.preparedCandidate.Commit.ParentOID = strings.Repeat("b", 40)
+				f.preparedCandidate.Commit.ParentOID = strings.Repeat("c", 40)
+				if f.preparedCandidate.Commit.ParentOID == original.Verification.Checkpoint.CommitOID {
+					t.Fatal("wrong-parent fixture must differ from the authenticated checkpoint")
+				}
 			case "wrong builder":
 				f.preparedCandidate.Builder.AttemptID++
 			case "dirty":

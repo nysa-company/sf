@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -152,6 +153,27 @@ func assertPostbuildAmendmentCandidateHandoff(t *testing.T, db *Store, ctx conte
 	}
 	version++
 	fence = domain.Fence{LeaderEpoch: leader, RunnerEpoch: fence.RunnerEpoch + 1}
+	// The immutable candidate still names its pre-restart binding. Authenticate
+	// that historical material independently from the signed suffix; treating
+	// it as a current endpoint would reject the newly appended recovery row.
+	if err := db.readProtectedBaseRefreshSnapshot(ctx, func(conn *sql.Conn) error {
+		stored, err := db.latestCandidateFrom(ctx, conn, ref, false)
+		if err != nil {
+			return fmt.Errorf("historical candidate: %w", err)
+		}
+		if stored.TicketVersion != value.Candidate.TicketVersion || stored.Fence != value.Candidate.Fence || stored.TicketVersion >= version {
+			return fmt.Errorf("candidate binding unexpectedly changed across recovery")
+		}
+		if err := db.reauthenticateStoredCandidateCheckpointFrom(ctx, conn, ref, stored); err != nil {
+			return fmt.Errorf("candidate material: %w", err)
+		}
+		if err := postbuildRepairSignedSourcePrefix(ctx, conn, ref, stored.TicketVersion, stored.Fence, version, fence); err != nil {
+			return fmt.Errorf("candidate recovery suffix: %w", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	recovered, err := db.PostbuildVerificationAmendmentContext(ctx, ref, version, fence)
 	if err != nil || recovered.Candidate == nil || recovered.Candidate.BuilderResult != key || recovered.Candidate.Commit != value.Candidate.Commit || recovered.Candidate.CommandBinding != value.Candidate.CommandBinding {
 		t.Fatalf("recovered candidate handoff=%+v err=%v", recovered.Candidate, err)
