@@ -134,7 +134,7 @@ func retryActivationFixture(t *testing.T) (*store.Store, store.Ticket, domain.Fe
 		t.Fatal(err)
 	}
 	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "retry", Ticket: "SF-retry-activation"}
-	if err := db.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: fmt.Sprintf("%x", sha256.Sum256([]byte("source"))), Type: domain.TicketFeature, MergeMode: domain.MergeGuarded}); err != nil {
+	if err := db.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: fmt.Sprintf("%x", sha256.Sum256([]byte("source"))), Type: domain.TicketFeature, MergeMode: domain.MergeGuarded, MaxDuration: time.Hour, MaxCostMicroUSD: 10_000_000}); err != nil {
 		t.Fatal(err)
 	}
 	leader, err := db.AcquireLeader(ctx, ref.Channel, "retry-activation")

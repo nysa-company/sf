@@ -5,7 +5,12 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Newest checkpoint (2026-09-09): exact9cee067 focused34327249098 passed all
+  Latest hosted activation checkpoint:4371941 focused34329961042 compiled but
+  the new fixture failed before activation because CreateTicket omitted its
+  positive duration/cost budget. Set explicit one-hour/$10 fixture budget;
+  production six-line repair is unchanged. Preserve the failed run; rerun
+  focused before any native upgrade. Full43734330117245 is superseded.
+  Prior checkpoint (2026-09-09): exact9cee067 focused34327249098 passed all
   22 groups/artifact, including paused-takeover CurrentVerification/two-restart
   normal/race tests, six negatives and meaningful old646 failure gate. Full
   34327346267 is pending with no failures. Diagnostic-only upgrade of retained
