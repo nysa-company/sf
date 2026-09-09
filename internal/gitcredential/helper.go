@@ -46,7 +46,7 @@ func (check *ResponseCheck) Valid() bool {
 	if check.failed {
 		return false
 	}
-	username, password := false, false
+	username, password, protocol, host := false, false, false, false
 	for _, line := range bytes.Split(check.data, []byte{'\n'}) {
 		line = bytes.TrimSuffix(line, []byte{'\r'})
 		if len(line) == 0 {
@@ -57,6 +57,16 @@ func (check *ResponseCheck) Valid() bool {
 			return false
 		}
 		switch string(key) {
+		case "protocol":
+			if protocol || !bytes.Equal(value, []byte("https")) {
+				return false
+			}
+			protocol = true
+		case "host":
+			if host || !bytes.Equal(value, []byte("github.com")) {
+				return false
+			}
+			host = true
 		case "username":
 			if username {
 				return false
@@ -71,7 +81,9 @@ func (check *ResponseCheck) Valid() bool {
 			return false
 		}
 	}
-	return username && password
+	// gh echoes the requested protocol and host before its credential fields.
+	// Accept only that exact pair (or neither), never arbitrary routing data.
+	return username && password && protocol == host
 }
 
 func (check *ResponseCheck) Clear() {

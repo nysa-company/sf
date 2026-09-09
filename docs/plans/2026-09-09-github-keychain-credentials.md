@@ -48,8 +48,18 @@ and repository preflight failures cannot masquerade as stale ticket fences.
 ## Delivery boundaries
 
 Branch `fix/github-keychain-credentials` starts at main `ab1d760`. The user
-explicitly approved pushing the fix branch and running GitHub CI. Merge
-and installed-binary rollout are not implied. No schema or state-machine change.
+explicitly approved pushing, GitHub CI, and merging PR #9 into main once
+validated. Installed-binary rollout is not implied. No schema or state-machine change.
+
+## Production-path verification finding
+
+The CI-built helper successfully retrieved credentials from the existing local
+gh login. Its response includes `protocol=https` and `host=github.com` alongside
+username/password. Doctor's response validator must accept that exact paired
+metadata while refusing duplicates, mismatches, unknown fields, and unpaired
+metadata. Regression coverage includes the real response shape. This Mac's
+gh status reports file-backed authentication; it does not establish a native
+Keychain-backed login test.
 
 ## Corroboration
 

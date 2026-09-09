@@ -126,6 +126,13 @@ func TestResponseCheck(t *testing.T) {
 	}{
 		{"username=fixture\npassword=fake-value\n\n", true},
 		{"username=fixture\r\npassword=fake-value\r\n\r\n", true},
+		{"protocol=https\nhost=github.com\nusername=fixture\npassword=fake-value\n\n", true},
+		{"protocol=http\nhost=github.com\nusername=fixture\npassword=fake-value\n\n", false},
+		{"protocol=https\nhost=example.test\nusername=fixture\npassword=fake-value\n\n", false},
+		{"protocol=https\nprotocol=https\nhost=github.com\nusername=fixture\npassword=fake-value\n\n", false},
+		{"protocol=https\nhost=github.com\nhost=github.com\nusername=fixture\npassword=fake-value\n\n", false},
+		{"protocol=https\nusername=fixture\npassword=fake-value\n\n", false},
+		{"host=github.com\nusername=fixture\npassword=fake-value\n\n", false},
 		{"username=fixture\n", false}, {"password=fake-value\n", false},
 		{"username=fixture\npassword=\n", false},
 		{"username=fixture\npassword=fake-value\npassword=duplicate\n", false},

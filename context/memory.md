@@ -2,6 +2,17 @@
 
 ## Current truth
 
+- PR #9 follow-up (2026-09-09): user authorized merge into main after CI.
+  Initial hosted failure was missing GHHome in publication fixtures; c1e4d23
+  fixes that without weakening production checks. Its focused GitHub transport
+  run 34414435970 passed; full 34414435949 still had race/crash jobs running.
+  CI-built Doctor on this Mac exposed a second issue: the helper successfully
+  returns username/password plus protocol/host, but ResponseCheck rejected the
+  extra routing fields. A reviewed follow-up accepts only the exact optional
+  https/github.com pair and adds hostile/real-response regressions. Fresh CI
+  and Doctor verification are required before merge. The installed gh reports
+  file-backed auth, so this is not evidence of a native Keychain-backed login.
+
 - In progress (2026-09-09): `fix/github-keychain-credentials` starts at merged
   main `ab1d760` (SSH PR #8). Plan: `docs/plans/2026-09-09-github-keychain-credentials.md`.
   Scoped operator HOME for HTTPS gh credential child, production-path Doctor

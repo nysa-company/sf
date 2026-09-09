@@ -136,6 +136,8 @@ func TestDoctorHTTPSProbeConsumesOnlyValidBoundedCredentials(t *testing.T) {
 		pass, cancel bool
 	}{
 		{"valid", "printf 'username=fixture\\npassword=synthetic-secret\\n\\n'", true, false},
+		{"valid gh response", "printf 'protocol=https\\nhost=github.com\\nusername=fixture\\npassword=synthetic-secret\\n\\n'", true, false},
+		{"wrong gh host", "printf 'protocol=https\\nhost=example.test\\nusername=fixture\\npassword=synthetic-secret\\n\\n'", false, false},
 		{"empty", "exit 0", false, false},
 		{"malformed", "printf 'password=synthetic-secret\\n\\n'", false, false},
 		{"oversize", "printf '%s' '" + strings.Repeat("x", 17000) + "'", false, false},
