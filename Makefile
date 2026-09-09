@@ -64,6 +64,12 @@ test-concurrency:
 test-integration:
 	go test -count=1 -shuffle=off -p 1 -timeout 30m ./cmd/sf ./internal/daemon ./internal/github ./internal/localruntime ./internal/publication ./internal/workflowruntime ./internal/workflowworker
 
+# Hosted integration runs every workflowruntime test in disjoint shards so
+# cumulative real-Git fixtures do not exhaust one package's 30-minute bound.
+.PHONY: test-integration-other
+test-integration-other:
+	go test -count=1 -shuffle=off -p 1 -timeout 30m ./cmd/sf ./internal/daemon ./internal/github ./internal/localruntime ./internal/publication ./internal/workflowworker
+
 test-crash:
 	go test -count=1 -shuffle=off -p 1 -timeout 30m ./... -run '(^Test.*Crash|Crash|Recovery|Recover|Rearm|Quarantine)'
 
@@ -99,7 +105,8 @@ test-all:
 	  '') python3 scripts/run-bounded --timeout 120m -- $(MAKE) --no-print-directory -j1 test-race test-integration test-crash test-security test-upgrade test-compiled-e2e verify-static ;; \
 	  race-other) python3 scripts/run-bounded --timeout 80m -- python3 scripts/ci-race.py other ;; \
 	  store-race) python3 scripts/run-bounded --timeout 65m -- python3 scripts/ci-race.py store --index "$$SHARD" --count 8 ;; \
-	  test-integration|test-crash|test-security|test-upgrade|test-compiled-e2e|verify-static) python3 scripts/run-bounded --timeout 80m -- $(MAKE) --no-print-directory "$$SF_CI_LANE" ;; \
+	  runtime-integration) python3 scripts/run-bounded --timeout 40m -- python3 scripts/ci-race.py runtime-integration --index "$$SHARD" --count 4 ;; \
+	  test-integration|test-integration-other|test-crash|test-security|test-upgrade|test-compiled-e2e|verify-static) python3 scripts/run-bounded --timeout 80m -- $(MAKE) --no-print-directory "$$SF_CI_LANE" ;; \
 	  *) echo 'unknown CI acceptance lane' >&2; exit 2 ;; \
 	esac
 

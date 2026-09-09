@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Partition the complete race suite without omitting Store tests.
+"""Partition hosted acceptance suites without omitting tests.
 
 CI runs `other` plus every Store shard on isolated macOS runners. Local
 `make test-race` remains the unpartitioned reference command.
+Normal workflow-runtime integration has separate disjoint shards; the other
+integration packages remain in the Makefile's integration-other lane.
 """
 
 import argparse
@@ -11,7 +13,9 @@ import subprocess
 import sys
 
 STORE = "github.com/nysa-company/sf/internal/store"
+RUNTIME = "github.com/nysa-company/sf/internal/workflowruntime"
 FLAGS = ["-race", "-count=1", "-shuffle=off", "-p", "1", "-timeout", "60m"]
+INTEGRATION_FLAGS = ["-count=1", "-shuffle=off", "-p", "1", "-timeout", "30m"]
 
 
 def partition(names, index, count):
@@ -41,7 +45,7 @@ def inventory(output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["other", "store"])
+    parser.add_argument("mode", choices=["other", "store", "runtime-integration"])
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--count", type=int, default=8)
     parser.add_argument("--list-only", action="store_true")
@@ -55,13 +59,16 @@ def main():
             raise ValueError("empty non-Store inventory")
         command = ["go", "test", *FLAGS, *selected]
     else:
+        package = STORE if args.mode == "store" else RUNTIME
+        flags = FLAGS if args.mode == "store" else INTEGRATION_FLAGS
+        inventory_flags = ["-race"] if args.mode == "store" else []
         output = subprocess.check_output(
-            ["go", "test", "-race", "-list", ".", STORE], text=True
+            ["go", "test", *inventory_flags, "-list", ".", package], text=True
         )
         names = inventory(output)
         selected = partition(names, args.index, args.count)
-        print(f"Store shard {args.index + 1}/{args.count}: {len(selected)}/{len(names)} tests", flush=True)
-        command = ["go", "test", *FLAGS, "-v", STORE,
+        print(f"{package} shard {args.index + 1}/{args.count}: {len(selected)}/{len(names)} tests", flush=True)
+        command = ["go", "test", *flags, "-v", package,
                    "-run", "^(?:" + "|".join(re.escape(n) for n in selected) + ")$"]
     if args.list_only:
         print("\n".join(selected))

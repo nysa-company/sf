@@ -295,3 +295,33 @@ VERDICT: implementation design in progress; not cleared for merge.
   phase/triplet/no-writer checks. An invented authority version still refuses.
   Full34296599899 was cancelled as superseded, not counted as passing. Native
   state remains unchanged while the new exact candidate is validated.
+
+## Execution checkpoint — retry capacity and hosted integration
+
+- Exact f7231a4 focused34297082600 passed all20groups. Full34297084568 failed
+  normal workflowruntime integration on its cumulative30m package deadline,
+  while the current test had run49seconds. Other normal packages passed;
+  the race-other lane was still pending at this checkpoint. This is not green.
+- Split the complete hosted normal workflowruntime inventory into four disjoint
+  shards, retaining Test/Example/Fuzz and subtests, with the other integration
+  packages unchanged. Every shard is required by the fail-closed aggregate.
+  Full race coverage and per-package bounds remain unchanged. Source review
+  passed; hosted execution of the partition changes is still pending.
+- The fresh native trial used the exact focused-passing/reviewed artifact while
+  remaining full CI ran in parallel. Merge remained gated on both. It recorded
+  real overlap, two deliberate Planner cancellations/drains, typed exhaustion,
+  and successful `sf retry`. However retry executed without global/project
+  ticket-capacity leases while two other tickets retained them. Provider-level
+  limits are not a substitute. This is a release blocker, not a campaign pass.
+- Add one shared atomic capacity acquisition to every affected paused-to-active
+  boundary, authenticated against the frozen ticket configuration. Refusal must
+  roll back the transition and retry epoch; replay must not duplicate leases.
+  Also project authenticated provider-retry disposition in status/show/list;
+  a generic stopped message is not the actionable next-step acceptance.
+- Native daemon is stopped with evidence retained. No PR approval or merge was
+  dispatched. Earlier trial tickets are diagnostic and must not be combined
+  with another binary to claim one final-candidate four-delivery campaign.
+- First-use coverage is agent/hosted evidence, not an unfamiliar-human trial.
+  Separate setup clocks were not precisely recorded, so under-ten-minute setup
+  remains a target rather than a certified result. Narrow TypeScript has positive
+  CLI registration coverage, not an exhaustive compiled delivery matrix.

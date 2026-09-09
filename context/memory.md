@@ -5,21 +5,24 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Portable tests/builds run only on GitHub. Pushed candidate d9e9786 passed
-  focused34288973873 (19groups) and full34289176386 (all required lanes), plus
-  independent Store/runtime source cross-review. Its hosted arm64 artifact
-  began the isolated native Relay campaign; two Planner runs overlapped and
-  a third start was refused at capacity two. Job-exists reached CI-green PR24
-  and WaitingApproval; no approval/merge dispatched. Event-exists is Verifying
-  after two recorded pause/resume interventions, with a clean worktree but
-  readiness_failed: ordinary verification resume is incorrectly selected as
-  a source-only Building takeover. Narrow selector/regression repair is in
-  progress; the repaired head requires fresh hosted gates/native continuation.
-  fc2fbb3 fixes same-fence selection, but focused34296598360 exposed restored
-  open-control restart rejection; narrow exact resumed-authority support and
-  tamper coverage follow. Full34296599899 cancelled as superseded, not passed.
-  Actual provider retry is not yet demonstrated. Inputs, exact ticket IDs,
-  artifact identity and live state are in ignored .context/reliable-campaign.
+  Portable tests/builds run only on GitHub. d9e9786 passed focused34288973873
+  and full34289176386; its native trial exposed ordinary-resume selection and
+  restart defects repaired through f7231a4. Exact f723 focused34297082600
+  passed20groups; full34297084568 integration exhausted workflowruntime's
+  cumulative30m package deadline (current test49s), race-other still pending.
+  Hosted normal-runtime sharding is under review; no tests will be omitted.
+  The fresh f723 native trial proved real Planner overlap, two cancelled/drained
+  attempts and actual sf retry, but exposed missing global/project capacity
+  reacquisition: the retried ticket executed without a ticket slot. This is a
+  release blocker; shared atomic paused-to-active capacity repair is in progress.
+  Also status/show omit authenticated provider retry next-actions; projection
+  repair is in progress. Do not count this trial as final capacity acceptance.
+  Isolated daemon33665 stopped normally, session57571 exited0. PR25(event) and
+  PR26(approval) remain unapproved; Job has an exact clean prepared checkpoint
+  with uncertain confirmation, a supported recovery shape, not manually edited.
+  Old d9 tickets cancelled; PR24 closed recoverably with its branch retained.
+  OldPRs1/2/10/14 and other runtimes are untouched. Exact inputs/IDs/artifact
+  evidence are in ignored .context/reliable-campaign/LIVE.md. No SF PR/merge yet.
   Current source implements bounded independent postbuild repair, immutable
   amendment/checkpoint receipts, exact restart completion, actionable status,
   and clean-room onboarding. Passing layers are not end-to-end acceptance.

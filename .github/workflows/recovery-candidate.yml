@@ -46,7 +46,7 @@ jobs:
               go test -p 1 -count=1 ./internal/store -run 'Test(Postbuild|TransitionPostbuild|AuthenticatePostbuildFailure|ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)' -v
               ;;
             source-resume)
-              go test -p 1 -count=1 ./internal/store -run '^Test(OperatorSourceResume|ProviderRetry)' -v
+              go test -p 1 -count=1 ./internal/store -run '^Test(OperatorSourceResume|ProviderRetry|ResumeCapacity|OrdinaryVerifyingResume)' -v
               ;;
             git)
               go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v
@@ -56,7 +56,7 @@ jobs:
               ;;
             behavior)
               go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
-              go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|PostbuildCommandFailure|Daemon.*Prepared)' -v
+              go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|ProviderRetryView|PostbuildCommandFailure|Daemon.*Prepared)' -v
               go test -p 1 -count=1 ./internal/workflowworker -run 'Test(RealStoreCompletedBuilderPostbuildFailure|OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment|ResumePreparedPostbuild)' -v
               go test -p 1 -count=1 ./internal/localruntime -run '^TestPostbuildAmendmentDispatch' -v
               ;;
