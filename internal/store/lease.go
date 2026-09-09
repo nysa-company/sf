@@ -703,6 +703,28 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					}
 				}
 			}
+			if ticket.state == domain.StateMerging {
+				// A signed recovery row authenticates a counter handoff, not the
+				// continued validity of a retry-controlled approval or merge
+				// intent. Revalidate that narrow lineage before the exact-latest
+				// shortcut below can reuse its leader on a subsequent restart.
+				control, controlErr := runtimeControlFrom(ctx, conn, ref)
+				if controlErr != nil && !errors.Is(controlErr, ErrStaleFence) {
+					return ErrPublicationEvidence
+				}
+				if controlErr == nil {
+					postLeader, matched, err := s.providerRetryPostPublicationPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch, control)
+					if err != nil {
+						return err
+					}
+					if matched {
+						if priorLeader != 0 && priorLeader != postLeader {
+							return ErrPublicationEvidence
+						}
+						priorLeader = postLeader
+					}
+				}
+			}
 			if priorLeader == 0 && ciWaitingPriorLeader != 0 {
 				priorLeader = ciWaitingPriorLeader
 			} else if priorLeader == 0 && found && latest.TicketVersion == ticket.version && latest.RunnerEpoch == ticket.runner {
