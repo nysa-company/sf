@@ -417,3 +417,18 @@ VERDICT: implementation design in progress; not cleared for merge.
   Native283 work remains retained, with one interrupted ticket paused, one at
   approval, and two queued. Further paid retries/approvals are held. The next
   final campaign waits for exact-head full CI as well as independent review.
+
+## Execution checkpoint — complete race-suite scheduling
+
+- Exact37c4a44 focused34311298818 passed all21groups, including both original
+  compiled approval failures and semantic merge retry positive/tamper cases.
+  Its full34311300533 remains running; no full pass is claimed.
+- Older eb0 full34306878975 terminated at its cumulative80m race-other bound.
+  All completed packages passed, including workflowruntime2357.921s, but the
+  final worktree coordinator package had not finished. This is direct timeout
+  evidence, not a speculative flake attribution or an individual test pass.
+- Split the complete workflowruntime race package into its own required
+  baseline lane. All other non-Store packages remain in race-other; the eight
+  Store shards and full unpartitioned reference remain unchanged. Strict
+  inventory tests must prove the partition is complete and disjoint. Keep
+  individual package bounds and the fail-closed aggregate unchanged.

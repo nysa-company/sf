@@ -5,7 +5,19 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Newest checkpoint (2026-09-09, supersedes runtime facts below): exact283cec0
+  Newest checkpoint (2026-09-09): exact37c4a44 focused34311298818 passed
+  all21groups, including both original compiled approval regressions and exact
+  semantic retry positive/tamper cases. Independent source GO; hosted artifact
+  verified, not installed. Full34311300533 remains running with no failures.
+  Earlier eb0 full34306878975 is now terminal FAILURE: race-other's cumulative
+  80m wrapper expired after workflowruntime passed2357.921s and workflowworker
+  passed48.202s, before worktreecoord finished. No individual test failure was
+  reported. Add a disjoint whole workflowruntime race lane, retaining every
+  package/test, unchanged60m per-package bounds, and required baseline aggregate.
+  This CI packaging change requires fresh exact-head validation; no native
+  runtime change or paid attempts while waiting. Live isolated283 facts below
+  remain current. Detailed receipts/artifact hashes are in ignored LIVE.md.
+  Prior checkpoint (superseded validation): exact283cec0
   focused34309705107 passed all20groups and produced the authenticated artifact.
   Full34309826165 failed compiled guarded/takeover approvals and Store race4's
   semantic merge retry; crash/race-other were still running. Source-confirmed

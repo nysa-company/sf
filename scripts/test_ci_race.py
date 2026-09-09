@@ -16,7 +16,7 @@ class RacePartitionTest(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         workflow = (root / ".github/workflows/repository-baseline.yml").read_text()
         targets = re.search(r"target: \[([^]]+)\]", workflow).group(1).split(", ")
-        self.assertEqual(set(targets), {"race-other", "test-integration-other", "test-crash",
+        self.assertEqual(set(targets), {"race-other", "runtime-race", "test-integration-other", "test-crash",
                                       "test-security", "test-upgrade", "test-compiled-e2e", "verify-static"})
         shards = re.search(r"shard: \[([^]]+)\]", workflow).group(1).split(", ")
         self.assertEqual([int(i) for i in shards], list(range(8)))
@@ -25,6 +25,7 @@ class RacePartitionTest(unittest.TestCase):
         runtime_shards = re.search(r"shard: \[([^]]+)\]", runtime).group(1).split(", ")
         self.assertEqual([int(i) for i in runtime_shards], list(range(4)))
         makefile = (root / "Makefile").read_text()
+        self.assertIn('runtime-race) python3 scripts/run-bounded --timeout 65m -- python3 scripts/ci-race.py runtime-race', makefile)
         self.assertIn('runtime-integration --index "$$SHARD" --count 4', makefile)
         reference = re.search(r"\ntest-integration:\n\t([^\n]+)", makefile).group(1).split()
         other = re.search(r"\ntest-integration-other:\n\t([^\n]+)", makefile).group(1).split()
@@ -84,13 +85,44 @@ class RacePartitionTest(unittest.TestCase):
             self.assertEqual(run.call_args.args[0][-1], "^(?:TestA|TestAB)$")
             self.assertIn("-race", run.call_args.args[0])
 
-    def test_other_runs_every_non_store_package(self):
+    def test_other_runs_every_package_outside_store_and_runtime(self):
         with patch("sys.argv", ["ci-race.py", "other"]), \
-             patch.object(ci.subprocess, "check_output", return_value=f"first\n{ci.STORE}\nlast\n"), \
+             patch.object(ci.subprocess, "check_output", return_value=f"first\n{ci.STORE}\n{ci.RUNTIME}\nlast\n"), \
              patch.object(ci.subprocess, "call", return_value=0) as run:
             self.assertEqual(ci.main(), 0)
             self.assertEqual(run.call_args.args[0][-2:], ["first", "last"])
             self.assertNotIn(ci.STORE, run.call_args.args[0])
+            self.assertNotIn(ci.RUNTIME, run.call_args.args[0])
+
+    def test_runtime_race_runs_whole_package_with_unchanged_flags(self):
+        with patch("sys.argv", ["ci-race.py", "runtime-race"]), \
+             patch.object(ci.subprocess, "check_output", return_value=f"first\n{ci.STORE}\n{ci.RUNTIME}\nlast\n"), \
+             patch.object(ci.subprocess, "call", return_value=1) as run:
+            self.assertEqual(ci.main(), 1)
+            self.assertEqual(run.call_args.args[0], ["go", "test", *ci.FLAGS, ci.RUNTIME])
+            self.assertNotIn("-run", run.call_args.args[0])
+
+    def test_race_package_lanes_are_complete_and_disjoint(self):
+        packages = ["first", ci.STORE, ci.RUNTIME, "last"]
+        other = ci.race_packages(packages, "other")
+        runtime = ci.race_packages(packages, "runtime-race")
+        self.assertEqual(set(other + runtime + [ci.STORE]), set(packages))
+        self.assertEqual(len(other + runtime + [ci.STORE]), len(packages))
+        self.assertEqual(runtime, [ci.RUNTIME])
+
+    def test_race_package_lanes_refuse_malformed_inventory(self):
+        for packages in ([], ["first", ci.STORE], ["first", ci.RUNTIME],
+                         ["first", ci.STORE, ci.RUNTIME, ci.STORE],
+                         ["first", ci.STORE, ci.RUNTIME, ci.RUNTIME],
+                         ["first", "first", ci.STORE, ci.RUNTIME],
+                         ["", ci.STORE, ci.RUNTIME],
+                         [" bad", ci.STORE, ci.RUNTIME],
+                         ["bad package", ci.STORE, ci.RUNTIME]):
+            for mode in ("other", "runtime-race"):
+                with self.subTest(packages=packages, mode=mode), self.assertRaises(ValueError):
+                    ci.race_packages(packages, mode)
+        with self.assertRaises(ValueError):
+            ci.race_packages([ci.STORE, ci.RUNTIME], "other")
 
     def test_runtime_integration_keeps_normal_flags_and_all_seed_kinds(self):
         with patch("sys.argv", ["ci-race.py", "runtime-integration", "--count", "1"]), \

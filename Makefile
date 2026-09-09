@@ -98,12 +98,14 @@ test-compiled: test-compiled-e2e
 # Static/repository/release checks are part of the same claimed final gate.
 # Without SF_CI_LANE this is the complete serialized local path. Hosted CI
 # distributes the same gates across isolated runners, including all eight
-# disjoint Store race shards; one lane alone is NOT complete acceptance.
+# disjoint Store race shards and the complete workflowruntime race package;
+# one lane alone is NOT complete acceptance.
 # Each lane keeps the existing per-package bounds.
 test-all:
 	@case "$${SF_CI_LANE:-}" in \
 	  '') python3 scripts/run-bounded --timeout 120m -- $(MAKE) --no-print-directory -j1 test-race test-integration test-crash test-security test-upgrade test-compiled-e2e verify-static ;; \
 	  race-other) python3 scripts/run-bounded --timeout 80m -- python3 scripts/ci-race.py other ;; \
+	  runtime-race) python3 scripts/run-bounded --timeout 65m -- python3 scripts/ci-race.py runtime-race ;; \
 	  store-race) python3 scripts/run-bounded --timeout 65m -- python3 scripts/ci-race.py store --index "$$SHARD" --count 8 ;; \
 	  runtime-integration) python3 scripts/run-bounded --timeout 40m -- python3 scripts/ci-race.py runtime-integration --index "$$SHARD" --count 4 ;; \
 	  test-integration|test-integration-other|test-crash|test-security|test-upgrade|test-compiled-e2e|verify-static) python3 scripts/run-bounded --timeout 80m -- $(MAKE) --no-print-directory "$$SF_CI_LANE" ;; \

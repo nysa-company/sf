@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [race-other, test-integration-other, test-crash, test-security, test-upgrade, test-compiled-e2e, verify-static]
+        target: [race-other, runtime-race, test-integration-other, test-crash, test-security, test-upgrade, test-compiled-e2e, verify-static]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,7 +63,7 @@ jobs:
   store-race:
     # modernc SQLite migration fixtures under -race exceed one package's hour
     # on hosted macOS. Disjoint shards keep every test and each test's subtests.
-    # Together with baseline/race-other this is the full race suite.
+    # Together with baseline/race-other and runtime-race this is the full race suite.
     runs-on: macos-14
     timeout-minutes: 75
     strategy:
