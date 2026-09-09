@@ -5,7 +5,14 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Newest checkpoint (2026-09-09): exact e8f4068 focused34315835527 and
+  Newest checkpoint (2026-09-09): 4f092a2 focused34321406069 exposes a second
+  restart defect in the new regression: retry predecessor accepted only the
+  immutable retry version, rejecting its later signed recovery endpoint. Normal
+  and race runs agree; five malformed-refresh negatives pass. Keep the complete
+  regression, extend predecessor only through bounded contiguous signed rows,
+  and add missing/tampered-ledger refusal with unchanged ticket counters. No
+  native upgrade or full CI dispatch for this known-failing candidate.
+  Prior checkpoint: exact e8f4068 focused34315835527 and
   full34316230178 both passed. Native capacity-two campaign delivered one Relay
   ticket through guarded approval/merge (PR30); overlap, bounded retry and
   same-binary restart passed. Second ticket paused after completed protected-base

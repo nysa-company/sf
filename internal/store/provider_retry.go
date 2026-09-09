@@ -1298,10 +1298,9 @@ func validateProviderRetryAdvance(ctx context.Context, q interface {
 // providerRetryRecoveryPredecessor supplies the exact pre-fence leader for a
 // ticket resumed from provider exhaustion before it has produced a reusable
 // completed result. This is deliberately narrower than a worktree fallback:
-// it accepts only the immutable epoch's v→v+2 pause/retry pair.
-func providerRetryRecoveryPredecessor(ctx context.Context, q interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64) (uint64, bool, error) {
+// it accepts only the immutable epoch's v→v+2 pause/retry pair and its
+// contiguous signed startup handoffs, never intervening business transitions.
+func providerRetryRecoveryPredecessor(ctx context.Context, q *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64) (uint64, bool, error) {
 	phase, ok := providerPhaseForState(state)
 	if !ok {
 		return 0, false, nil
@@ -1314,13 +1313,20 @@ func providerRetryRecoveryPredecessor(ctx context.Context, q interface {
 	if err != nil || !found {
 		return 0, false, err
 	}
-	if epoch.ExhaustionVersion < 2 || epoch.RetryVersion != version || epoch.RetryRunner != runner || epoch.RetryLeader == 0 || epoch.RetryLeader >= newLeader {
+	if epoch.ExhaustionVersion < 2 || epoch.RetryVersion > version || epoch.RetryRunner > runner || epoch.RetryLeader == 0 || epoch.RetryLeader >= newLeader {
 		return 0, false, ErrPublicationEvidence
 	}
 	if err := validateProviderRetryAdvance(ctx, q, ref, phase, epoch.ExhaustionVersion-1, epoch.ExhaustionRunner, epoch.ExhaustionLeader, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader); err != nil {
 		return 0, false, err
 	}
-	return epoch.RetryLeader, true, nil
+	// The entry and retry epoch remain immutable across repeated startups.
+	// Only contiguous signed runner handoffs may extend this predecessor;
+	// business transitions or another control/resume gap are not retry proof.
+	prior, err := normalRecoveryLeaderAt(ctx, q, ref, normalRecoveryEndpoint{version: epoch.RetryVersion, runner: epoch.RetryRunner, leader: epoch.RetryLeader}, version, runner)
+	if err != nil || prior == 0 || prior >= newLeader {
+		return 0, false, ErrPublicationEvidence
+	}
+	return prior, true, nil
 }
 
 // providerPausedRecoveryPredecessor supplies the retained pre-fence leader

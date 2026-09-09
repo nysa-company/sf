@@ -85,6 +85,16 @@ func providerRetryRefreshFixture(t *testing.T) (*providerRetryWorktreeFixture, s
 }
 
 func TestProviderRetryProtectedBaseRefreshLifecycle(t *testing.T) {
+	providerRetryProtectedBaseRefreshLifecycle(t, "")
+}
+
+func TestProviderRetryProtectedBaseRefreshRejectsRecoveryLedgerTampering(t *testing.T) {
+	for _, mode := range []string{"digest", "missing"} {
+		t.Run(mode, func(t *testing.T) { providerRetryProtectedBaseRefreshLifecycle(t, mode) })
+	}
+}
+
+func providerRetryProtectedBaseRefreshLifecycle(t *testing.T, tamper string) {
 	f, head := providerRetryRefreshFixture(t)
 	paused := f.exhaust(t, "invalid_artifact")
 	proof, err := f.db.ProviderRetryWorktreeProof(f.ctx, paused.Ref, paused.Version, f.fence)
@@ -103,9 +113,35 @@ func TestProviderRetryProtectedBaseRefreshLifecycle(t *testing.T) {
 			if err := f.db.restoreRuntimeControls(f.ctx); err != nil {
 				t.Fatal(err)
 			}
+			if restart == 2 && tamper != "" {
+				trigger, query := "runner_recovery_ledger_immutable_update", `UPDATE runner_recovery_ledger SET recovery_digest='sha256:`+strings.Repeat("f", 64)+`' WHERE channel=? AND project_id=? AND ticket_id=?`
+				if tamper == "missing" {
+					trigger, query = "runner_recovery_ledger_immutable_delete", `DELETE FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=?`
+				}
+				if _, err := f.db.db.ExecContext(f.ctx, "DROP TRIGGER "+trigger); err != nil {
+					t.Fatal(err)
+				}
+				result, err := f.db.db.ExecContext(f.ctx, query, paused.Ref.Channel, paused.Ref.Project, paused.Ref.Ticket)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n, err := result.RowsAffected(); err != nil || n != 1 {
+					t.Fatalf("tamper ledger %s rows=%d err=%v", tamper, n, err)
+				}
+			}
 			leader, err := f.db.AcquireLeader(f.ctx, paused.Ref.Channel, "refresh-provider-retry-restart")
 			if err != nil {
 				t.Fatal(err)
+			}
+			if restart == 2 && tamper != "" {
+				if _, err := f.db.FenceRecoveredRunners(f.ctx, paused.Ref.Channel, leader); !errors.Is(err, ErrPublicationEvidence) {
+					t.Fatalf("tampered %s ledger recovered: %v", tamper, err)
+				}
+				current, err := f.db.Ticket(f.ctx, paused.Ref)
+				if err != nil || current.Version != f.ticket.Version || current.RunnerEpoch != f.ticket.RunnerEpoch {
+					t.Fatalf("refused recovery changed ticket: %+v %v", current, err)
+				}
+				return
 			}
 			if changed, err := f.db.FenceRecoveredRunners(f.ctx, paused.Ref.Channel, leader); err != nil || changed != 1 {
 				t.Fatalf("restart %d changed=%d err=%v", restart, changed, err)
