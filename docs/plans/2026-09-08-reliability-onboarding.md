@@ -378,3 +378,25 @@ VERDICT: implementation design in progress; not cleared for merge.
   original retry epoch and normal publication/review chain, not ignore controls.
 - The database remains unedited, no replacement commit was made, and all pilot
   worktrees remain retained. The final four-ticket campaign and merge are pending.
+
+## Execution checkpoint — approval after native restart
+
+- Exact eb0bf0b focused34306877416 passed all twenty groups and its artifact
+  build. Full34306878975 remains pending its final race job; not a full pass.
+- Fresh native tickets on that artifact proved capacity-two refusal, concurrent
+  verification, two deliberate Planner cancellations with drain evidence, and
+  the supported bounded retry with both capacity reservations reacquired.
+  A separate ticket automatically retried one invalid Planner artifact.
+- Both first-wave tickets reached waiting approval with passing PR checks and
+  independent exact-head review. Same-binary restart preserved both heads and
+  completed reviews, but approving the retry-controlled ticket refused without
+  mutation. The runtime control remained sealed at the previous authority;
+  recovery had advanced the ticket but had not opened decision admission.
+- Repair must use the existing runtime drain/join and capability machinery,
+  including explicit activity admission before the decision and authenticated
+  crash-after-decision recovery. Do not permit sealed authority directly in the
+  generic decision transaction. The displayed failure must distinguish admission
+  failure from a genuinely changed reviewed head.
+- No campaign approval or merge occurred. The two PRs/worktrees remain intact,
+  and the other two tickets remain queued. This is not final native acceptance;
+  the exact-final-candidate campaign requirement remains unchanged.

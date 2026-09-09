@@ -1568,20 +1568,37 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 // a historical control authority may reach the live endpoint only by the
 // existing signed recovery/phase validators, never by a counter comparison.
 func (s *Store) providerRetryPostPublicationPredecessor(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64, control durableRuntimeControl) (uint64, bool, error) {
-	if state != domain.StateWaitingApproval && state != domain.StateWaitingManualMerge {
-		return 0, false, nil
+	current, matched, err := s.providerRetryPostPublicationEndpoint(ctx, conn, ref, state, version, runner, control)
+	if err != nil || !matched {
+		return 0, matched, err
+	}
+	prior, found, err := s.normalPostPublicationRecoveryPredecessor(ctx, conn, ref, state, version, runner, newLeader)
+	if err != nil || !found || prior == 0 || prior >= newLeader || prior != current.leader {
+		return 0, true, ErrPublicationEvidence
+	}
+	return prior, true, nil
+}
+
+// providerRetryPostPublicationEndpoint authenticates an existing endpoint; it
+// neither invents a successor leader nor grants admission. Startup and live
+// rearm independently bind this proof to their respective leader authority.
+func (s *Store) providerRetryPostPublicationEndpoint(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner uint64, control durableRuntimeControl) (normalRecoveryEndpoint, bool, error) {
+	if state != domain.StateWaitingApproval && state != domain.StateWaitingManualMerge && state != domain.StateMerging {
+		return normalRecoveryEndpoint{}, false, nil
 	}
 	var stops, epochs int
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='retry_or_correction_exhausted'`, ref.Channel, ref.Project, ref.Ticket, control.stop.version).Scan(&stops); err != nil {
-		return 0, false, err
+		return normalRecoveryEndpoint{}, false, err
 	}
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_retry_epochs WHERE channel=? AND project_id=? AND ticket_id=? AND exhaustion_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, control.stop.version).Scan(&epochs); err != nil {
-		return 0, false, err
+		return normalRecoveryEndpoint{}, false, err
 	}
 	if stops == 0 && epochs == 0 {
-		return 0, false, nil
+		return normalRecoveryEndpoint{}, false, nil
 	}
-	fail := func() (uint64, bool, error) { return 0, true, ErrPublicationEvidence }
+	fail := func() (normalRecoveryEndpoint, bool, error) {
+		return normalRecoveryEndpoint{}, true, ErrPublicationEvidence
+	}
 	if stops != 1 || epochs != 1 || control.state != "sealed" {
 		return fail()
 	}
@@ -1591,10 +1608,6 @@ func (s *Store) providerRetryPostPublicationPredecessor(ctx context.Context, con
 	}
 	var exhaustion providerExhaustionPayload
 	if len(raw) > maxEvidenceJSON || json.Unmarshal([]byte(raw), &exhaustion) != nil || exhaustion.Schema != providerExhaustionSchema || !validProviderPhase(exhaustion.Phase) {
-		return fail()
-	}
-	prior, found, err := s.normalPostPublicationRecoveryPredecessor(ctx, conn, ref, state, version, runner, newLeader)
-	if err != nil || !found || prior == 0 || prior >= newLeader {
 		return fail()
 	}
 	epoch, found, err := loadProviderRetryEpoch(ctx, conn, ref, exhaustion.Phase)
@@ -1608,7 +1621,11 @@ func (s *Store) providerRetryPostPublicationPredecessor(ctx context.Context, con
 	// operator stop/resume. Keep it separate from the generic ledger prefix:
 	// initial lifecycle transitions end at reviewing; the typed final-review
 	// reader independently authenticates the last review_pass and its evidence.
-	completion, err := s.finalReviewRecoveryEndpoint(ctx, conn, ref, state)
+	waitingState := state
+	if state == domain.StateMerging {
+		waitingState = domain.StateWaitingApproval
+	}
+	completion, err := s.finalReviewRecoveryEndpoint(ctx, conn, ref, waitingState)
 	if err != nil || completion.version < 2 || completion.version-1 < epoch.RetryVersion || completion.runner != epoch.RetryRunner || completion.leader != epoch.RetryLeader {
 		return fail()
 	}
@@ -1630,16 +1647,30 @@ func (s *Store) providerRetryPostPublicationPredecessor(ctx context.Context, con
 	// Startup can seal at completion, or at a later signed recovery endpoint.
 	// On another restart that sealed authority remains historical. Prove both
 	// sides explicitly rather than accepting monotonic counters as authority.
-	authorityLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, completion, control.authority.version, control.authority.runner)
+	baseline := completion
+	if state == domain.StateMerging {
+		// Approval is the sole business transition allowed after final review.
+		// Its reader binds the exact reviewed candidate and any signed waiting
+		// recovery before approval; subsequent movement is signed recovery only.
+		baseline, err = s.approvalRecoveryEndpoint(ctx, conn, ref)
+		if err != nil || baseline.version == 0 {
+			return fail()
+		}
+		waitingLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, completion, baseline.version-1, baseline.runner)
+		if err != nil || waitingLeader != baseline.leader {
+			return fail()
+		}
+	}
+	authorityLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, baseline, control.authority.version, control.authority.runner)
 	if err != nil || authorityLeader != control.authority.leader {
 		return fail()
 	}
 	authority := normalRecoveryEndpoint{version: control.authority.version, runner: control.authority.runner, leader: control.authority.leader}
 	currentLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, authority, version, runner)
-	if err != nil || currentLeader != prior {
+	if err != nil || currentLeader == 0 {
 		return fail()
 	}
-	return prior, true, nil
+	return normalRecoveryEndpoint{version: version, runner: runner, leader: currentLeader}, true, nil
 }
 
 // normalPostPublicationRecoveryPredecessor is the no-control restart bridge

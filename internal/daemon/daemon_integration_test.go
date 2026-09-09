@@ -378,7 +378,7 @@ func prepareDaemonPublishingStatusFixture(t *testing.T, daemon *Daemon, ticketID
 	return prepareDaemonGuardedLifecycle(t, daemon, ticketID, domain.StatePublishing)
 }
 
-func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain.TicketID, stopAt domain.State) store.Ticket {
+func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain.TicketID, stopAt domain.State, beforePlanner ...func(*testing.T, *Daemon, store.Ticket, domain.Fence, contracts.RuntimeBinding, *contracts.DrainSigner) store.Ticket) store.Ticket {
 	t.Helper()
 	ctx := t.Context()
 	ref := domain.TicketRef{Channel: daemon.channel, Project: "demo", Ticket: ticketID}
@@ -400,11 +400,31 @@ func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain
 	branch := "sf/" + string(ref.Channel) + "/" + daemonFixtureDigest(string(ref.Project))[:16] + "/" + daemonFixtureDigest(string(ref.Ticket))[:16] + "-" + strings.Repeat("b", 32)
 	base := strings.Repeat("a", 40)
 	worktreePath := filepath.Join(project.Path, string(ticketID))
+	if len(beforePlanner) != 0 {
+		worktreePath, err = daemon.store.TicketWorktreePath(ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	identity := daemonFixtureIdentity(t, project.Path, worktreePath, branch, project.BaseRef)
 	fence := domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: ticket.RunnerEpoch}
 	branchKey := string(ref.Channel) + "\x00" + string(ref.Project) + "\x00" + string(ref.Ticket)
 	if _, err := daemon.store.LoadOrStoreBranchUnderFence(ctx, branchKey, branch, ticket.Version, fence); err != nil {
 		t.Fatal(err)
+	}
+	if len(beforePlanner) != 0 {
+		creation := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: ref, TicketVersion: ticket.Version, Fence: fence}, RequestDigest: "sha256:" + daemonFixtureDigest("fixture-create"), Repository: project.Path, Worktree: worktreePath, Branch: branch, Operation: "create-worktree", BaseRef: project.BaseRef, ExpectedBaseOID: base, ExpectedHeadOID: base}
+		creation.SemanticKey = store.CanonicalGitMutationSemanticKey(creation)
+		if _, err := daemon.store.PlanEffect(ctx, store.EffectPlan{SemanticKey: creation.SemanticKey, Ref: ref, Kind: "git/create-worktree", TicketVersion: ticket.Version, Fence: fence, RequestDigest: creation.RequestDigest}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := daemon.store.IssueGitMutationClaim(ctx, creation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := daemon.store.ConfirmEffect(ctx, store.EffectFence{SemanticKey: claim.SemanticKey, Ref: ref, TicketVersion: ticket.Version, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}, string(identity)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := daemon.store.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: fence, Path: worktreePath, Branch: branch, IdentityJSON: identity, BaseSHA: base, HeadSHA: base}); err != nil {
 		t.Fatal(err)
@@ -424,6 +444,10 @@ func prepareDaemonGuardedLifecycle(t *testing.T, daemon *Daemon, ticketID domain
 	signer, err := contracts.NewDrainSigner()
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, prepare := range beforePlanner {
+		ticket = prepare(t, daemon, ticket, fence, daemonFixtureBinding(builder), signer)
+		fence.RunnerEpoch = ticket.RunnerEpoch
 	}
 	launch := func(phase domain.Phase, role string, binding contracts.RuntimeBinding, raw []byte, validation phaseartifact.Validation, expectedHead, expectedProof string) store.ProviderAttemptClaim {
 		request := store.ProviderAttemptRequest{

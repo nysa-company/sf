@@ -2090,6 +2090,7 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 	semanticReconcile := false
 	controlledApprovalMerge := false
 	sourceCandidateOnlyPublishing := false
+	providerRetryCompletion := false
 	proof, leader, err := s.controlProof(ctx, ref, g, func(txCtx context.Context, conn *sql.Conn, proof TicketControlProof, leader uint64) error {
 		_, latched := g.control(ref)
 		control, err := runtimeControlFrom(txCtx, conn, ref)
@@ -2110,6 +2111,15 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 		}
 		if !stopMatches {
 			return ErrStaleFence
+		}
+		if endpoint, matched, err := s.providerRetryPostPublicationEndpoint(txCtx, conn, ref, proof.Ticket.State, proof.Ticket.Version, proof.Ticket.RunnerEpoch, control); err != nil {
+			return err
+		} else if matched {
+			if !latched || endpoint.leader != leader {
+				return ErrStaleFence
+			}
+			providerRetryCompletion = true
+			return nil
 		}
 		if endpoint, matched, err := s.recoveredReviewMergeControlFrom(txCtx, conn, ref, control, proof.Ticket); err != nil {
 			return err
@@ -2220,6 +2230,30 @@ func (s *Store) PostPublicationRearmProof(ctx context.Context, ref domain.Ticket
 		control, controlErr := runtimeControlFrom(txCtx, conn, ref)
 		if controlErr != nil {
 			return ErrControlNotDrained
+		}
+		if providerRetryCompletion {
+			endpoint, matched, err := s.providerRetryPostPublicationEndpoint(txCtx, conn, ref, proof.Ticket.State, proof.Ticket.Version, proof.Ticket.RunnerEpoch, control)
+			if err != nil || !matched || endpoint.leader != leader {
+				return ErrControlNotDrained
+			}
+			if proof.Ticket.State == domain.StateMerging {
+				_, found, err := singleRecoveryMergeIntent(txCtx, conn, ref)
+				if err != nil {
+					return ErrControlNotDrained
+				}
+				if !found {
+					// Approval can commit before the first merge intent/effect.
+					// This branch grants no effect replay: require complete merge
+					// effect absence as well as the drained control proof above.
+					var effects int
+					if err := conn.QueryRowContext(txCtx, `SELECT COUNT(*) FROM effects WHERE channel=? AND project_id=? AND ticket_id=? AND effect_kind='merge'`, ref.Channel, ref.Project, ref.Ticket).Scan(&effects); err != nil || effects != 0 {
+						return ErrControlNotDrained
+					}
+					return nil
+				}
+				return s.authenticatePostPublicationMergeState(txCtx, conn, ref, proof.Ticket.Version, proof.Fence)
+			}
+			return nil
 		}
 		if reviewBlockedResume {
 			matched, err := s.reviewBlockedRearmFrom(txCtx, conn, ref, control, proof.Ticket, leader)

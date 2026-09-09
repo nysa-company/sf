@@ -79,6 +79,13 @@ type RuntimeRearmController interface {
 	Rearm(context.Context, domain.TicketRef) error
 }
 
+// RuntimeOperatorDecisionController owns the join/rearm/activity boundary for
+// a human decision. admitted is false only when runtime admission failed,
+// before Store could record the decision.
+type RuntimeOperatorDecisionController interface {
+	ApplyOperatorDecision(context.Context, store.OperatorDecisionRequest) (store.TransitionResult, bool, error)
+}
+
 // RuntimeRearmStateController lets a concrete runtime expose the sole safe
 // retry window for a resume whose durable transition committed before runtime
 // admission was installed.
@@ -1388,6 +1395,11 @@ type operatorDecisionParameters struct {
 // path. The displayed operator label is only a comparison value: the UID used
 // by Store comes from the peer-authenticated identity above.
 func (daemon *Daemon) operatorDecision(ctx context.Context, request api.Request, identity domain.OperatorIdentity, decision string) api.Response {
+	daemon.runtimeMu.Lock()
+	defer daemon.runtimeMu.Unlock()
+	if daemon.isClosed() || daemon.runtimeStopped {
+		return daemon.failure(request, "daemon_stopping", "ticket decisions are unavailable while the daemon is stopping", true)
+	}
 	var parameters operatorDecisionParameters
 	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) || (decision != "approved" && decision != "rejected") {
 		return daemon.failure(request, "invalid_decision", "approval or rejection requires the authenticated operator and daemon channel", false)
@@ -1427,9 +1439,27 @@ func (daemon *Daemon) operatorDecision(ctx context.Context, request api.Request,
 		sum := sha256.Sum256([]byte(parameters.Reason))
 		reasonDigest = fmt.Sprintf("%x", sum[:])
 	}
-	result, err := daemon.store.ApplyOperatorDecision(ctx, store.OperatorDecisionRequest{OperatorDecision: store.OperatorDecision{
+	decisionRequest := store.OperatorDecisionRequest{OperatorDecision: store.OperatorDecision{
 		Ref: ref, ExpectedVersion: stored.Version, Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, ReviewedHead: candidate.Snapshot.HeadSHA, OperatorUID: identity.UID, Decision: decision,
-	}, ReasonDigest: reasonDigest})
+	}, ReasonDigest: reasonDigest}
+	var result store.TransitionResult
+	if controller, ok := daemon.control.(RuntimeOperatorDecisionController); ok {
+		var admitted bool
+		result, admitted, err = controller.ApplyOperatorDecision(ctx, decisionRequest)
+		if err != nil && !admitted {
+			return daemon.failure(request, "decision_recovery_unavailable", "the decision was not recorded because exact runtime recovery could not be admitted; inspect ticket status and retry the same decision after recovery is available", true)
+		}
+	} else {
+		needed, admissionErr := daemon.store.RuntimeRearmNeeded(ctx, ref)
+		if admissionErr != nil || needed {
+			return daemon.failure(request, "decision_recovery_unavailable", "the decision was not recorded because its runtime recovery controller is unavailable; inspect ticket status before deciding again", true)
+		}
+		ready, admissionErr := daemon.store.RuntimeAdmissionReady(ctx, ref, stored.Version, decisionRequest.Fence)
+		if admissionErr != nil || !ready {
+			return daemon.failure(request, "decision_recovery_unavailable", "the decision was not recorded because its runtime admission is not ready; inspect ticket status before deciding again", true)
+		}
+		result, err = daemon.store.ApplyOperatorDecision(ctx, decisionRequest)
+	}
 	if err != nil {
 		code, message := "decision_refused", "the decision is not valid for the current reviewed head"
 		if errors.Is(err, store.ErrStaleFence) {
@@ -2462,7 +2492,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	}
 	if request.Ticket != "" {
 		switch code {
-		case "ticket_not_found", "invalid_transition", "external_state_unavailable", "external_merge_observed", "control_state_unavailable", "control_drain_failed", "blocked_process", "uncertain_effect", "control_completion_failed":
+		case "ticket_not_found", "invalid_transition", "external_state_unavailable", "external_merge_observed", "control_state_unavailable", "control_drain_failed", "blocked_process", "uncertain_effect", "control_completion_failed", "decision_recovery_unavailable":
 			argv = []string{binary, "status", request.Ticket}
 		}
 	}

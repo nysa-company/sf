@@ -5,7 +5,26 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Newest checkpoint (2026-09-09): ef3f6b4 focused34304070521 passed all groups.
+  Newest checkpoint (2026-09-09): eb0bf0b focused34306877416 passed all20
+  groups and built the exact ARM64 artifact. Full34306878975 last had only
+  race-other pending; all other jobs including crash passed, not full green yet.
+  Native eb0 campaign recovered old tickets, cancelled diagnostics through SF,
+  closed PR25/26 separately with branches retained, and submitted four fresh
+  bounded tickets. Capacity-two refusal, real overlap, two deliberate drained
+  Planner interruptions, actual bounded retry and capacity reacquisition passed.
+  A(event) and B(job) reached waiting approval; C/D remain queued. A/B PR28/27
+  passed CI and independent acceptance review. Same-binary restart preserved
+  exact PR heads and reviewed results, but A approval safely rolled back:
+  runtime control is sealed at old authority while the ticket has signed new
+  leader recovery. advanceOpenRuntimeAuthority returns ErrStaleFence, misleadingly
+  projected as approval_head_changed. No approval or merge was recorded.
+  Complete typed rearm/activity/decision recovery fix is implemented and source
+  cross-reviewed, awaiting hosted validation; generic authority checks remain
+  unchanged. Composed regression covers retry, two restarts, approval, and
+  restart/replay before merge intent. This campaign is not final acceptance.
+  Isolated daemon session88662 leader7 is live; do not restart/admit/retry blindly.
+  Full exact identities and receipts are in ignored campaign LIVE.md.
+  Earlier checkpoint (superseded): ef3f6b4 focused34304070521 passed all groups.
   Full34304075207 has17 passing jobs, crash/race-other still running. Native
   session67973 exited7 before socket: prepared Job commit was correctly
   confirmed at leader5; subsequent FenceRecoveredRunners transaction refused.

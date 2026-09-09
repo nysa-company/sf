@@ -56,7 +56,7 @@ func TestEveryCurrentErrorCodeHasAnExplicitStableExitCategory(t *testing.T) {
 		"status_unavailable": ExitWait, "capacity_unavailable": ExitWait, "leader_lost": ExitWait,
 		"ticket_id_unavailable": ExitWait, "runtime_rearm_failed": ExitWait, "resume_state_unavailable": ExitWait,
 		"retry_state_unavailable": ExitWait, "provider_retry_worktree_unavailable": ExitWait, "approval_evidence_unavailable": ExitWait,
-		"decision_unavailable": ExitWait, "decision_state_unavailable": ExitWait,
+		"decision_unavailable": ExitWait, "decision_state_unavailable": ExitWait, "decision_recovery_unavailable": ExitWait,
 		"policy_refusal": ExitPolicy, "safety_blocked": ExitPolicy, "unqualified_provider": ExitPolicy,
 		"evidence_conflict": ExitPolicy, "autonomous_unavailable": ExitPolicy,
 		"takeover_inspection_failed": ExitPolicy, "takeover_changes_unadopted": ExitPolicy,

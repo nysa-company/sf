@@ -33,6 +33,8 @@ func exitCode(response api.Response) ExitCode {
 	switch response.Error.Code {
 	case "unsupported_runtime":
 		return ExitCompatibility
+	case "decision_recovery_unavailable":
+		return ExitWait
 	case "runtime_preparation_failed", "runtime_cache_unverified", "host_reboot_required", "host_identity_unavailable":
 		return ExitAction
 	case "external_cleanup_recovery_refused":
