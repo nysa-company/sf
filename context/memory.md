@@ -5,7 +5,21 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Newest checkpoint (2026-09-09): 4f092a2 focused34321406069 exposes a second
+  Newest checkpoint (2026-09-09): exact646fcf0 focused34321890331 (22 groups)
+  and full34322063807 (21 jobs) passed, including the old-e8 baseline failure
+  gate. Verified hosted artifact activated only in the isolated Relay home.
+  Supported retry now succeeds (paused11 -> building12), but native paused
+  takeover exposes a distinct retained-verification gap: refresh completion
+  belongs to old leader10, retry epoch to new leader11. CurrentVerification
+  refuses before Builder launch. Narrow typed proof binds the old endpoint to
+  the exact exhausted claim and new endpoint to immutable retry epoch/events;
+  general same-leader checks stay intact. Add paused-takeover, CurrentVerification,
+  two later restarts and malformed-evidence regressions, with old646 meaningful
+  failure gate in GitHub. Source review GO; new tests not yet run. Live second
+  ticket remains building12 with retained work, no active provider/unsettled
+  effect; two queued. One prior-e8 delivery is not final-candidate acceptance.
+  Fresh exact-head CI and all four fresh final tickets remain required.
+  Prior checkpoint (2026-09-09): 4f092a2 focused34321406069 exposes a second
   restart defect in the new regression: retry predecessor accepted only the
   immutable retry version, rejecting its later signed recovery endpoint. Normal
   and race runs agree; five malformed-refresh negatives pass. Keep the complete
@@ -3817,6 +3831,14 @@ The terminal validation and remaining work above supersede their pending notes.
   implemented and covered by crash/restart and race tests.
 
 ## Log
+
+- 2026-09-09: Native retry after paused daemon takeover exposed a missing
+  evidence bridge despite exact646 full/focused CI passing. Retained refresh
+  completion leader10 differs from retry consumer leader11. Preserve immutable
+  epoch semantics; authenticate the older failed-claim endpoint separately.
+  Regression must include takeover before retry and CurrentVerification, not
+  merely retry followed by restart. New proof and hosted baseline gate pending
+  validation; no local tests/builds or live database edits.
 
 - 2026-09-05: Relay30 confirmation delivered PR12 (attempts-since-retry),
   merge37bc539209819ed7b7075611c8dd79a8c8d4fc94, localdonev11. Its prepared

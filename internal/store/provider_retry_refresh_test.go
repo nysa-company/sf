@@ -85,18 +85,38 @@ func providerRetryRefreshFixture(t *testing.T) (*providerRetryWorktreeFixture, s
 }
 
 func TestProviderRetryProtectedBaseRefreshLifecycle(t *testing.T) {
-	providerRetryProtectedBaseRefreshLifecycle(t, "")
+	providerRetryProtectedBaseRefreshLifecycle(t, "", false)
+}
+
+func TestProviderRetryProtectedBaseRefreshPausedTakeover(t *testing.T) {
+	providerRetryProtectedBaseRefreshLifecycle(t, "", true)
 }
 
 func TestProviderRetryProtectedBaseRefreshRejectsRecoveryLedgerTampering(t *testing.T) {
 	for _, mode := range []string{"digest", "missing"} {
-		t.Run(mode, func(t *testing.T) { providerRetryProtectedBaseRefreshLifecycle(t, mode) })
+		t.Run(mode, func(t *testing.T) { providerRetryProtectedBaseRefreshLifecycle(t, mode, false) })
 	}
 }
 
-func providerRetryProtectedBaseRefreshLifecycle(t *testing.T, tamper string) {
+func providerRetryProtectedBaseRefreshLifecycle(t *testing.T, tamper string, pausedTakeover bool) {
 	f, head := providerRetryRefreshFixture(t)
 	paused := f.exhaust(t, "invalid_artifact")
+	if pausedTakeover {
+		// Real startup does not fence paused tickets. The retained completion
+		// therefore belongs to the old leader when the new daemon retries.
+		leader, err := f.db.AcquireLeader(f.ctx, paused.Ref.Channel, "refresh-paused-takeover")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := f.db.FenceRecoveredRunners(f.ctx, paused.Ref.Channel, leader); err != nil || changed != 0 {
+			t.Fatalf("paused takeover changed=%d err=%v", changed, err)
+		}
+		f.fence.LeaderEpoch = leader
+		f.reload(t)
+		if f.ticket.Version != paused.Version || f.ticket.RunnerEpoch != paused.RunnerEpoch {
+			t.Fatal("paused takeover changed ticket counters")
+		}
+	}
 	proof, err := f.db.ProviderRetryWorktreeProof(f.ctx, paused.Ref, paused.Version, f.fence)
 	if err != nil || proof.ExpectedHead != head || proof.ExpectedHead == f.candidateHead || !reflect.DeepEqual(proof.Worktree, f.worktree) {
 		t.Fatalf("paused refresh proof=%+v err=%v", proof, err)
@@ -155,6 +175,11 @@ func providerRetryProtectedBaseRefreshLifecycle(t *testing.T, tamper string) {
 		}
 		if context, err := f.db.ProtectedBaseRefreshBuildContext(f.ctx, paused.Ref, f.ticket.Version, f.fence); err != nil || context.Completion.Preparation.CommitOID != head {
 			t.Fatalf("refresh build context restart=%d err=%v", restart, err)
+		}
+		// Worker.building reads CurrentVerification before launching Builder.
+		// A successful retry/worktree proof alone cannot prove this admission.
+		if _, err := f.db.CurrentVerification(f.ctx, paused.Ref); err != nil {
+			t.Fatalf("refresh current verification restart=%d err=%v", restart, err)
 		}
 		stopped, err := f.db.StoppedRuntimeTicket(f.ctx, paused.Ref)
 		if err != nil {

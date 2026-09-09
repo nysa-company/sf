@@ -71,6 +71,25 @@ jobs:
               test "$baseline_status" -ne 0
               grep -q '^--- FAIL: TestProviderRetryProtectedBaseRefreshLifecycle ' "$baseline_log"
               grep -q 'paused refresh proof=.*err=evidence conflicts with durable record' "$baseline_log"
+              # Independently prove the paused-before-upgrade ordering fails
+              # on the previously green candidate, after retry itself succeeds.
+              source_file=internal/store/provider_retry.go
+              saved_source="$RUNNER_TEMP/provider-retry-takeover-fixed.go"
+              baseline_log="$RUNNER_TEMP/provider-retry-takeover-baseline.log"
+              cp "$source_file" "$saved_source"
+              trap 'cp "$saved_source" "$source_file"' EXIT
+              git fetch --no-tags --depth=1 origin 646fcf0746224404bfc385541afebe2b47ee4169
+              git show 646fcf0746224404bfc385541afebe2b47ee4169:"$source_file" > "$source_file"
+              set +e
+              go test -p 1 -count=1 ./internal/store -run '^TestProviderRetryProtectedBaseRefreshPausedTakeover$' -v > "$baseline_log" 2>&1
+              baseline_status=$?
+              set -e
+              cp "$saved_source" "$source_file"
+              trap - EXIT
+              cat "$baseline_log"
+              test "$baseline_status" -ne 0
+              grep -q '^--- FAIL: TestProviderRetryProtectedBaseRefreshPausedTakeover ' "$baseline_log"
+              grep -q 'refresh build context restart=0 err=' "$baseline_log"
               ;;
             git)
               go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v
