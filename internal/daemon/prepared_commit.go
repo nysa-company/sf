@@ -12,6 +12,19 @@ import (
 	"github.com/nysa-company/sf/internal/store"
 )
 
+type lazyPreparedCommitObserver struct {
+	runner  func() (git.Runner, error)
+	resolve git.RegisteredWorktreeResolver
+}
+
+func (observer lazyPreparedCommitObserver) ObservePreparedCommit(ctx context.Context, claim contracts.GitMutationClaim) (contracts.PreparedCommitObservation, error) {
+	runner, err := observer.runner()
+	if err != nil {
+		return contracts.PreparedCommitObservation{}, err
+	}
+	return (git.PreparedCommitObserver{Runner: runner, Resolve: observer.resolve}).ObservePreparedCommit(ctx, claim)
+}
+
 // registeredWorktreeResolver is the production composition for the
 // read-only Git observer. It derives every path/branch/base field from the
 // immutable claim and accepts only the exact canonical identity JSON already

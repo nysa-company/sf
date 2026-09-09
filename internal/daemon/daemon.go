@@ -210,8 +210,11 @@ type Config struct {
 	PreparedCommitObserver contracts.PreparedCommitObserver
 	// GitRunner supplies the read-only Runner used by the default registered
 	// worktree adapter. A nil runner is acceptable only when there are no
-	// uncertain prepared commits or an explicit observer is supplied.
+	// uncertain prepared commits, or an observer/lazy runner factory is supplied.
 	GitRunner *git.Runner
+	// PreparedCommitRunnerFactory resolves the read-only recovery runner lazily.
+	// Idle startup must not require workflow assets when no prepared commit exists.
+	PreparedCommitRunnerFactory func() (git.Runner, error)
 	// RepositoryCommandDrainer proves persisted credential-free command
 	// identities before effects, runners, or the socket are exposed.
 	RepositoryCommandDrainer contracts.RepositoryCommandDrainer
@@ -400,6 +403,9 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	preparedCommitObserver := configuration.PreparedCommitObserver
 	if preparedCommitObserver == nil && configuration.GitRunner != nil {
 		preparedCommitObserver = git.PreparedCommitObserver{Runner: *configuration.GitRunner, Resolve: registeredWorktreeResolver(database)}
+	}
+	if preparedCommitObserver == nil && configuration.PreparedCommitRunnerFactory != nil {
+		preparedCommitObserver = lazyPreparedCommitObserver{runner: configuration.PreparedCommitRunnerFactory, resolve: registeredWorktreeResolver(database)}
 	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
 		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, preparedCommitObserver: preparedCommitObserver, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinatorFactory: configuration.ProviderCoordinatorFactory, providerSupervisor: configuration.ProviderSupervisor, providerQualifier: configuration.ProviderQualifier, runtimeFactory: configuration.WorkflowRuntimeFactory, runtimeContext: ctx}

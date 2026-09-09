@@ -4,7 +4,9 @@ on:
   pull_request:
     paths:
       - internal/**
-      - cmd/sf/compiled_first_use_matrix_test.go
+      - cmd/sf/**
+      - scripts/*eval*proof*consistency.py
+      - docs/evals/**
       - docs/tutorials/first-ticket.md
       - .github/workflows/recovery-candidate.yml
   workflow_dispatch:
@@ -55,6 +57,9 @@ jobs:
               go test -p 1 -count=1 ./internal/worktreecoord
               ;;
             behavior)
+              python3 -m unittest discover -s scripts -p test_eval_proof_consistency.py
+              python3 scripts/eval-proof-consistency.py validate
+              go test -p 1 -count=1 ./cmd/sf -run '^TestProductionDaemonPreparedRecoveryConfiguration$' -v
               go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
               go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|ProviderRetryView|PostbuildCommandFailure|Daemon.*Prepared)' -v
               go test -p 1 -count=1 ./internal/workflowworker -run 'Test(RealStoreCompletedBuilderPostbuildFailure|OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment|ResumePreparedPostbuild)' -v

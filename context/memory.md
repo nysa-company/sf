@@ -5,6 +5,19 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
+  Latest checkpoint (2026-09-09): bc7bae5 focused34301205015 passed all20
+  groups. Full34301206752 passed all four runtime shards and eight Store race
+  shards; crash/race-other remain pending, not a full green verdict. Capacity
+  and actionable retry-status repairs are committed. Native cleanup startup
+  exposed a new production wiring gap: prepared commit recovery had no observer
+  before workflow runtime construction. Lazy read-only core-bundle observer
+  wiring and regression tests are under review/hosted validation, not deployed.
+  Required three-case model-decision eval harness/corpus also awaits hosted
+  scorer tests and bounded native authenticated execution; it is not Store/E2E
+  authority. No final native tickets, approvals or SF PR have been created.
+  The isolated runtime is stopped; retain its uncertain prepared commit and all
+  worktrees. Do not manually repair the DB or manufacture a replacement commit.
+  Following trial details are historical diagnostics, not final acceptance.
   Portable tests/builds run only on GitHub. d9e9786 passed focused34288973873
   and full34289176386; its native trial exposed ordinary-resume selection and
   restart defects repaired through f7231a4. Exact f723 focused34297082600

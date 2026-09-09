@@ -23,6 +23,7 @@ import (
 	"github.com/nysa-company/sf/internal/multiprovider"
 	"github.com/nysa-company/sf/internal/processsupervisor"
 	"github.com/nysa-company/sf/internal/providercoord"
+	"github.com/nysa-company/sf/internal/runtimeassets"
 	"github.com/nysa-company/sf/internal/store"
 	"github.com/nysa-company/sf/internal/version"
 )
@@ -164,6 +165,10 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	runDaemon := func(runCtx context.Context) error {
+		executable, err := os.Executable()
+		if err != nil {
+			return err
+		}
 		ownerHome, ghBinary, ghConfigDir, prePublishingOnly, err := publicationCapability(home, channel)
 		if err != nil {
 			return err
@@ -172,7 +177,7 @@ func main() {
 		if err != nil {
 			return err
 		}
-		runErr := daemon.Run(runCtx, daemon.Config{
+		runErr := daemon.Run(runCtx, productionDaemonConfig(daemon.Config{
 			Channel: channel, Paths: paths,
 			Doctor:                   localruntime.ProjectStartChecker(config.PythonSnapshotsPath(paths)),
 			DaemonIdentity:           fmt.Sprintf("sf/%s/%s", version.Version, version.Commit),
@@ -198,10 +203,23 @@ func main() {
 				PrePublishingOnly: prePublishingOnly,
 				Workers:           2,
 			}),
-		})
+		}, executable))
 		return errors.Join(runErr, supervisor.Close())
 	}
 	os.Exit(cli.ExecuteWithDaemon(ctx, os.Args[1:], os.Stdout, os.Stderr, cli.SocketClient{Path: paths.Socket}, runDaemon))
+}
+
+// Recovery precedes WorkflowRuntimeFactory. Supply its read-only Git boundary
+// independently, resolving the trusted bundle only if a prepared fact needs it.
+func productionDaemonConfig(configuration daemon.Config, executable string) daemon.Config {
+	configuration.PreparedCommitRunnerFactory = func() (git.Runner, error) {
+		core, err := runtimeassets.ResolveCore(configuration.Channel, executable)
+		if err != nil {
+			return git.Runner{}, err
+		}
+		return git.Runner{Binary: "/usr/bin/git", Home: filepath.Join(filepath.Dir(configuration.Paths.Socket), "git-home"), ExecHelper: core.GitExec}, nil
+	}
+	return configuration
 }
 
 // providerGateCommand keeps the target used by exec separate from the child

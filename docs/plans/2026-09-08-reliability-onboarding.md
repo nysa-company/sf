@@ -325,3 +325,25 @@ VERDICT: implementation design in progress; not cleared for merge.
   Separate setup clocks were not precisely recorded, so under-ten-minute setup
   remains a target rather than a certified result. Narrow TypeScript has positive
   CLI registration coverage, not an exhaustive compiled delivery matrix.
+
+## Execution checkpoint — startup composition and decision-quality eval
+
+- Capacity and retry-status repairs are committed in the bc7bae5 candidate.
+  Focused34301205015 passed every group; full34301206752 has passed all four
+  normal runtime shards and eight Store race shards, with two broad jobs pending.
+  This is not final full-CI or native acceptance.
+- Cleanup startup found the production daemon did not supply the read-only
+  prepared-commit observer before recovery. Its workflow Git runner is created
+  later. Add lazy trusted-core resolution independent of provider qualification;
+  missing or unsafe assets still refuse before runtime/socket exposure. Never
+  create a replacement commit or manually repair durable evidence.
+- Add the previously missing three-case decision-quality corpus and strict
+  scorer: one genuine proof contradiction and two implementation-defect cases.
+  Prompts bind the production amendment instruction; expected decisions stay
+  outside the prompt. Portable scorer tests run on GitHub. Native authenticated
+  Reviewer execution is separately bounded to one attempt per case and120s,
+  with a requested (not enforced)2048-token response budget and16KiB scoring cap.
+  External receipts and independent rationale review are required; this small
+  synthetic eval is neither Store amendment authority nor end-to-end acceptance.
+- All four final native deliveries, separate approvals, exact-head broad CI
+  and final SF PR remain outstanding. Earlier runs stay diagnostic evidence.
