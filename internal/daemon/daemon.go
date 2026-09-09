@@ -1179,6 +1179,7 @@ func (daemon *Daemon) show(ctx context.Context, request api.Request, identity do
 		view["recovery"] = recovery
 	}
 	view["operator"] = operatorView(identity)
+	daemon.projectProviderRetry(ctx, stored, view)
 	return daemon.success(request, api.Mutation{}, view)
 }
 
@@ -2297,6 +2298,7 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, id
 		if action, ok := daemon.ticketBlockedNextAction(stored); ok {
 			view["next_action"] = action
 		}
+		daemon.projectProviderRetry(ctx, stored, view)
 		return daemon.success(request, api.Mutation{}, view)
 	}
 	items, err := daemon.store.Tickets(ctx, daemon.channel, domain.ProjectID(parameters.Project), 1000)
@@ -2311,6 +2313,7 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, id
 		if action, ok := daemon.ticketBlockedNextAction(item); ok {
 			view["next_action"] = action
 		}
+		daemon.projectProviderRetry(ctx, item, view)
 		views = append(views, view)
 	}
 	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "leader_epoch": daemon.epoch, "operator": operatorView(identity), "tickets": views})

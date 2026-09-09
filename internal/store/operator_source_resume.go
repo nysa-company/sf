@@ -645,6 +645,9 @@ func (s *Store) TransitionOperatorSourceResume(ctx context.Context, request Oper
 		if err != nil {
 			return ErrEvidenceConflict
 		}
+		if err := reacquireTicketCapacity(ctx, conn, request.Ref, request.Fence.RunnerEpoch); err != nil {
+			return err
+		}
 		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state='verifying',resume_state=NULL,version=version+1
 			WHERE channel=? AND project_id=? AND id=? AND state='paused' AND version=? AND runner_epoch=?`, request.Ref.Channel, request.Ref.Project, request.Ref.Ticket, request.ExpectedVersion, request.Fence.RunnerEpoch)
 		if err != nil {

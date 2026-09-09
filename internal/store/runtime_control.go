@@ -1607,6 +1607,9 @@ func (s *Store) TransitionGuardedMergeResume(ctx context.Context, transition Tra
 			return ErrEvidenceConflict
 		}
 
+		if err := reacquireTicketCapacity(txCtx, conn, transition.Ref, proof.Ticket.RunnerEpoch); err != nil {
+			return err
+		}
 		updated, err := conn.ExecContext(txCtx, `UPDATE tickets SET state='merging',resume_state=NULL,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state='paused' AND resume_state='merging' AND version=? AND runner_epoch=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, proof.Ticket.Version, proof.Ticket.RunnerEpoch)
 		if err != nil {
 			return err
@@ -1708,6 +1711,9 @@ func (s *Store) TransitionPostPublicationReconcileResume(ctx context.Context, tr
 			return ErrEvidenceConflict
 		}
 
+		if err := reacquireTicketCapacity(txCtx, conn, transition.Ref, proof.Ticket.RunnerEpoch); err != nil {
+			return err
+		}
 		updated, err := conn.ExecContext(txCtx, `UPDATE tickets SET state='reconciling',resume_state=NULL,version=version+1 WHERE channel=? AND project_id=? AND id=? AND state='paused' AND resume_state='reconciling' AND version=? AND runner_epoch=?`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, proof.Ticket.Version, proof.Ticket.RunnerEpoch)
 		if err != nil {
 			return err

@@ -1694,6 +1694,11 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 			}
 			transition.EventPayload = string(payload)
 		}
+		if actual == domain.StatePaused && (transition.Trigger == "operator_resume" || transition.Trigger == "operator_retry") {
+			if err := reacquireTicketCapacity(ctx, conn, transition.Ref, runner); err != nil {
+				return err
+			}
+		}
 		query := `UPDATE tickets SET state=?, resume_state=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`
 		args := []any{transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner}
 		if transition.Trigger == "typed_blocker" {

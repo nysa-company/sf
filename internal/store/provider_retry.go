@@ -861,7 +861,9 @@ func (s *Store) ProviderRetryDisposition(ctx context.Context, ticket Ticket) (Pr
 	}
 	var proof providerExhaustionPayload
 	if trigger != "retry_or_correction_exhausted" || from != ticket.ResumeState || to != domain.StatePaused || len(payload) > maxEvidenceJSON || json.Unmarshal([]byte(payload), &proof) != nil || proof.Schema != providerExhaustionSchema {
-		return ProviderRetryNotProvider, nil
+		// An exact exhaustion event was found above. Malformed evidence is
+		// unknown eligibility, not proof that this is an ordinary pause.
+		return ProviderRetryNotProvider, ErrEvidenceConflict
 	}
 	if proof.Phase != phase || proof.EntryTicketVersion == 0 || len(proof.Attempts) != 2 || proof.Attempts[1] != proof.Attempts[0]+1 {
 		return ProviderRetryNotProvider, ErrEvidenceConflict
@@ -1112,6 +1114,9 @@ func (s *Store) TransitionProviderRetry(ctx context.Context, transition Transiti
 			return err
 		}
 		epoch.Digest = digest
+		if err := reacquireTicketCapacity(ctx, conn, transition.Ref, runner); err != nil {
+			return err
+		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO provider_retry_epochs(channel,project_id,ticket_id,phase,entry_ticket_version,epoch,initial_first_attempt,initial_last_attempt,retry_first_attempt,retry_last_attempt,exhaustion_ticket_version,exhaustion_leader_epoch,exhaustion_runner_epoch,retry_ticket_version,retry_leader_epoch,retry_runner_epoch,retry_digest,created_at) VALUES(?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, phase, entry.Version, epoch.InitialFirst, epoch.InitialLast, epoch.RetryFirst, epoch.RetryLast, epoch.ExhaustionVersion, epoch.ExhaustionLeader, epoch.ExhaustionRunner, epoch.RetryVersion, epoch.RetryLeader, epoch.RetryRunner, epoch.Digest, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
