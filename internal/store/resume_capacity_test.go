@@ -13,20 +13,17 @@ import (
 )
 
 func TestProviderRetryReacquiresFrozenTicketCapacityAtomically(t *testing.T) {
-	db, ctx := openTestStore(t)
-	digest := setupProviderProject(t, db, ctx)
-	leader, err := db.AcquireLeader(ctx, domain.ChannelDev, "retry-capacity")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ticket := setupProviderTicket(t, db, ctx, "SF-retry-capacity", leader)
-	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	// Runtime replay requires confirmed creation authority, not merely a
+	// mutable worktree registration. Reuse the authenticated retry fixture.
+	fixture := newProviderRetryWorktreeFixture(t, "SF-retry-capacity", 40)
+	db, ctx := fixture.db, fixture.ctx
+	ticket, fence := fixture.ticket, fixture.fence
+	leader := fence.LeaderEpoch
 	if _, err := db.AcquireLeases(ctx, ticket.Ref, ticket.Version, fence, []LeaseRequest{{Scope: "global", Resource: "machine", Capacity: 2}, {Scope: "project", Resource: "provider", Capacity: 2}}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	planner, _ := setupProviderPair(t, db, ctx)
 	for range 2 {
-		claim, err := db.BeginProviderAttempt(ctx, supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: runtime(planner), ConfigDigest: digest, Capacity: 1, At: time.Now().UTC()}))
+		claim, err := db.BeginProviderAttempt(ctx, fixture.request(t, domain.PhasePlanning, "planner", runtime(fixture.builder)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -37,7 +34,7 @@ func TestProviderRetryReacquiresFrozenTicketCapacityAtomically(t *testing.T) {
 	if _, err := db.TransitionProviderExhausted(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StatePlanning, To: domain.StatePaused, ResumeState: domain.StatePlanning, Trigger: "retry_or_correction_exhausted", Fence: fence}); err != nil {
 		t.Fatal(err)
 	}
-	ticket, err = db.Ticket(ctx, ticket.Ref)
+	ticket, err := db.Ticket(ctx, ticket.Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +92,9 @@ func TestProviderRetryReacquiresFrozenTicketCapacityAtomically(t *testing.T) {
 	}
 	if replay, err := db.ProviderRetryReplay(ctx, resumed); err != nil || !replay {
 		t.Fatalf("retry replay=%v err=%v", replay, err)
+	}
+	if replay, err := db.ProviderRetryRuntimeReplay(ctx, resumed); err != nil || replay != ProviderRetryNeedsRearm {
+		t.Fatalf("sealed runtime replay=%v err=%v", replay, err)
 	}
 	if _, err := db.TransitionProviderRetry(ctx, transition); !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("duplicate transition=%v", err)
