@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [store, source-resume, git, admission, behavior, compiled-approval, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, repair-candidate-unrecorded-same, repair-candidate-unrecorded-restart, repair-candidate-recorded-same, repair-candidate-recorded-restart, onboarding, python-onboarding]
+        group: [store, source-resume, retry-refresh, git, admission, behavior, compiled-approval, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, repair-candidate-unrecorded-same, repair-candidate-unrecorded-restart, repair-candidate-recorded-same, repair-candidate-recorded-restart, onboarding, python-onboarding]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,6 +49,28 @@ jobs:
               ;;
             source-resume)
               go test -p 1 -count=1 ./internal/store -run '^Test(OperatorSourceResume|ProviderRetry|ResumeCapacity|OrdinaryVerifyingResume|SemanticGuardedMergeRetry)' -v
+              ;;
+            retry-refresh)
+              go test -race -p 1 -count=1 ./internal/store -run '^TestProviderRetryProtectedBaseRefresh' -v
+              # Prove the native-shape regression fails against the exact
+              # pre-fix implementation, not merely that the repaired tree passes.
+              source_file=internal/store/provider_retry_worktree.go
+              saved_source="$RUNNER_TEMP/provider-retry-worktree-fixed.go"
+              baseline_log="$RUNNER_TEMP/provider-retry-refresh-baseline.log"
+              cp "$source_file" "$saved_source"
+              trap 'cp "$saved_source" "$source_file"' EXIT
+              git fetch --no-tags --depth=1 origin e8f4068f16cbb0583316531028dbe44eea30298e
+              git show e8f4068f16cbb0583316531028dbe44eea30298e:"$source_file" > "$source_file"
+              set +e
+              go test -p 1 -count=1 ./internal/store -run '^TestProviderRetryProtectedBaseRefreshLifecycle$' -v > "$baseline_log" 2>&1
+              baseline_status=$?
+              set -e
+              cp "$saved_source" "$source_file"
+              trap - EXIT
+              cat "$baseline_log"
+              test "$baseline_status" -ne 0
+              grep -q '^--- FAIL: TestProviderRetryProtectedBaseRefreshLifecycle ' "$baseline_log"
+              grep -q 'paused refresh proof=.*err=evidence conflicts with durable record' "$baseline_log"
               ;;
             git)
               go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v

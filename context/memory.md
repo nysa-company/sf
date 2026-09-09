@@ -5,7 +5,20 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Newest checkpoint (2026-09-09): exact662d3a6 focused34312316847 passed
+  Newest checkpoint (2026-09-09): exact e8f4068 focused34315835527 and
+  full34316230178 both passed. Native capacity-two campaign delivered one Relay
+  ticket through guarded approval/merge (PR30); overlap, bounded retry and
+  same-binary restart passed. Second ticket paused after completed protected-base
+  refresh; supported retry refused without consuming retry because creation
+  authentication compared refreshed registration with original creation. Narrow
+  repair authenticates both immutable original creation and refresh completion,
+  exact live registration, and frozen verification. Independent source review GO;
+  Store proof/retry/capability/two-recovery and five tamper regressions authored,
+  not yet run. Hosted regression must fail on e8 at the paused proof boundary.
+  No local tests/builds. Native second ticket remains paused with work retained;
+  two tickets queued. New production candidate requires fresh exact-head CI and
+  final four-ticket acceptance. No SF merge or goal completion claimed.
+  Prior checkpoint (2026-09-09): exact662d3a6 focused34312316847 passed
   all21groups/build. Full34312318628 failed only race-other plus its required
   aggregate: prepared_commit_factory_test.go156 initial fresh Start exhausted
   the default5s startup context under race instrumentation (test6.95s), before
