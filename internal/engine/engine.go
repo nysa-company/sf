@@ -54,6 +54,9 @@ func (e *Engine) StartOrAdopt(ctx context.Context, ref domain.TicketRef, expecte
 }
 
 func (e *Engine) Transition(ctx context.Context, request contracts.TransitionRequest) (contracts.TransitionResult, error) {
+	if request.Trigger == "postbuild_repair" {
+		return contracts.TransitionResult{}, store.ErrEvidenceConflict
+	}
 	// External merge observations are evidence-bearing boundaries, not generic
 	// state-machine transitions. Dedicated Store paths authenticate manual and
 	// guarded observations before changing durable lifecycle state.

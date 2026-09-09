@@ -544,6 +544,13 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 				}
 			}
 			if priorLeader == 0 {
+				if amendmentLeader, amendmentFound, amendmentErr := postbuildAmendmentRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); amendmentErr != nil {
+					return amendmentErr
+				} else if amendmentFound {
+					priorLeader = amendmentLeader
+				}
+			}
+			if priorLeader == 0 {
 				if amendmentLeader, amendmentFound, amendmentErr := verificationAmendmentRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); amendmentErr != nil {
 					return amendmentErr
 				} else if amendmentFound {
@@ -573,6 +580,13 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 					return pausedErr
 				} else if pausedFound {
 					priorLeader = pausedLeader
+				}
+			}
+			if priorLeader == 0 && ticket.state == domain.StateBuilding {
+				if repairLeader, repairFound, repairErr := postbuildRepairRecoveryPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch); repairErr != nil {
+					return repairErr
+				} else if repairFound {
+					priorLeader = repairLeader
 				}
 			}
 			if priorLeader == 0 && ticket.state == domain.StateBuilding {
@@ -686,6 +700,28 @@ func (s *Store) FenceRecoveredRunners(ctx context.Context, channel domain.Channe
 						if err := validateRunnerRecoveryLedger(ctx, conn, ref, planning.version, planning.runner, planning.leader, ticket.version, ticket.runner, priorLeader); err != nil {
 							return ErrPublicationEvidence
 						}
+					}
+				}
+			}
+			if ticket.state == domain.StateMerging {
+				// A signed recovery row authenticates a counter handoff, not the
+				// continued validity of a retry-controlled approval or merge
+				// intent. Revalidate that narrow lineage before the exact-latest
+				// shortcut below can reuse its leader on a subsequent restart.
+				control, controlErr := runtimeControlFrom(ctx, conn, ref)
+				if controlErr != nil && !errors.Is(controlErr, ErrStaleFence) {
+					return ErrPublicationEvidence
+				}
+				if controlErr == nil {
+					postLeader, matched, err := s.providerRetryPostPublicationPredecessor(ctx, conn, ref, ticket.state, ticket.version, ticket.runner, leaderEpoch, control)
+					if err != nil {
+						return err
+					}
+					if matched {
+						if priorLeader != 0 && priorLeader != postLeader {
+							return ErrPublicationEvidence
+						}
+						priorLeader = postLeader
 					}
 				}
 			}

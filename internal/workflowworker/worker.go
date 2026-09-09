@@ -54,6 +54,17 @@ var (
 	ErrTicketBudgetExhausted = errors.New("workflow ticket time or cost budget is exhausted")
 )
 
+// PostbuildFailure identifies immutable command evidence, not retry authority.
+// A consuming Store boundary must reload this key and authenticate its ticket,
+// Builder, verification and current fence before creating any repair entry.
+// Keep raw command output out of error/status strings.
+type PostbuildFailure struct {
+	CommandResult contracts.RepositoryCommandResultKey
+}
+
+func (e *PostbuildFailure) Error() string { return ErrPostbuildCommandFailed.Error() }
+func (e *PostbuildFailure) Unwrap() error { return ErrPostbuildCommandFailed }
+
 // Evidence is the deliberately small Store surface needed by the walking
 // skeleton. *store.Store implements it directly; tests and future daemon
 // compositions can provide an adapter without giving the worker SQL access.
@@ -790,6 +801,23 @@ func (w Worker) resolveVerificationAmendment(ctx context.Context, ticket store.T
 	if err := w.signalVerificationAmendment(ctx, ticket, fence, decision, key); err != nil {
 		return false, replayed, err
 	}
+	if decision == store.VerificationAmendmentRejected {
+		if source, ok := w.Evidence.(interface {
+			PostbuildVerificationAmendmentContext(context.Context, domain.TicketRef, uint64, domain.Fence) (store.PostbuildVerificationAmendmentContext, error)
+		}); ok {
+			current, err := w.Evidence.Ticket(ctx, ticket.Ref)
+			if err != nil {
+				return false, replayed, err
+			}
+			_, err = source.PostbuildVerificationAmendmentContext(ctx, ticket.Ref, current.Version, fence)
+			if err == nil {
+				_, err = w.StopRejectedPostbuildAmendment(ctx, ticket.Ref, current.Version, fence)
+			}
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				return false, replayed, err
+			}
+		}
+	}
 	return true, replayed, nil
 }
 
@@ -925,6 +953,9 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 			return true, true, nil
 		}
 		if err := w.persistCandidate(ctx, ticket, fence, PhaseRequest{}, planIdentity, verificationIdentity, verification, nil, builder, reusable.Key); err != nil {
+			if errors.Is(err, errPostbuildRepairStarted) {
+				return true, true, nil
+			}
 			return false, true, err
 		}
 		candidate, err := w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
@@ -973,6 +1004,9 @@ func (w Worker) building(ctx context.Context, ticket store.Ticket, fence domain.
 		return true, false, nil
 	}
 	if err := w.persistCandidate(ctx, ticket, fence, request, planIdentity, verificationIdentity, verification, nil, builder, out.ProviderResult); err != nil {
+		if errors.Is(err, errPostbuildRepairStarted) {
+			return true, false, nil
+		}
 		return false, false, err
 	}
 	candidate, err = w.Evidence.ValidateCurrentCandidateForBuildTransition(ctx, ticket.Ref, ticket.Version, fence)
@@ -1032,6 +1066,20 @@ func (w Worker) signalVerification(ctx context.Context, ticket store.Ticket, fen
 func (w Worker) signalVerificationAmendmentRequest(ctx context.Context, ticket store.Ticket, fence domain.Fence, key store.ProviderAttemptResultKey) error {
 	if fence.RunnerEpoch != ticket.RunnerEpoch {
 		return store.ErrStaleFence
+	}
+	if preparer, ok := w.CandidateMaterializer.(postbuildAmendmentPreparer); ok {
+		snapshot, found, err := preparer.PreparePostbuildVerificationAmendment(ctx, ticket.Ref, ticket.Version, fence, key)
+		if err != nil {
+			return err
+		}
+		if found {
+			engine, ok := w.Engine.(postbuildAmendmentEngine)
+			if !ok {
+				return store.ErrEvidenceConflict
+			}
+			_, err := engine.SignalPostbuildVerificationAmendmentRequest(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Fence: fence, EventPayload: "{}"}, key, snapshot)
+			return err
+		}
 	}
 	_, err := w.Engine.SignalVerificationAmendmentRequest(ctx, contracts.SignalRequest{Ticket: ticket.Ref, TicketVersion: ticket.Version, From: ticket.State, Fence: fence, EventPayload: "{}"}, key)
 	return err
@@ -1269,7 +1317,7 @@ func (w Worker) persistCandidate(ctx context.Context, ticket store.Ticket, fence
 	}
 	witness, err := w.CandidateMaterializer.MaterializeCandidate(ctx, request, plan, verification, builder, key)
 	if err != nil {
-		return err
+		return w.tryPostbuildRepair(ctx, request, key, err)
 	}
 	if witness.Reason == "" || witness.CommandPolicyDigest == "" || witness.Commit.CommitOID == "" || witness.Commit.TreeOID == "" {
 		return ErrCandidateRequired

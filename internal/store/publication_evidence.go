@@ -698,6 +698,11 @@ func (s *Store) TransitionPublishedResume(ctx context.Context, transition Transi
 			}
 			transition.EventPayload = payload
 		}
+		if pausedResume {
+			if err := reacquireTicketCapacity(ctx, conn, transition.Ref, runner); err != nil {
+				return err
+			}
+		}
 		updated, err := conn.ExecContext(ctx, `UPDATE tickets SET state=?,resume_state=NULL,blocked_code='',version=? WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`, transition.To, newVersion, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner)
 		if err != nil {
 			return err

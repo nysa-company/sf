@@ -3,8 +3,11 @@ name: recovery-candidate
 on:
   pull_request:
     paths:
-      - internal/store/**
-      - internal/worktreecoord/**
+      - internal/**
+      - cmd/sf/**
+      - scripts/*eval*proof*consistency.py
+      - docs/evals/**
+      - docs/tutorials/first-ticket.md
       - .github/workflows/recovery-candidate.yml
   workflow_dispatch:
 
@@ -12,9 +15,13 @@ permissions:
   contents: read
 
 jobs:
-  recovery-candidate:
+  validation:
     runs-on: macos-14
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [store, source-resume, retry-refresh, retry-activation, git, admission, behavior, compiled-approval, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, repair-candidate-unrecorded-same, repair-candidate-unrecorded-restart, repair-candidate-recorded-same, repair-candidate-recorded-restart, onboarding, python-onboarding]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,10 +37,161 @@ jobs:
           setup_go=$(command -v go)
           sudo mkdir -p /usr/local/go/bin
           sudo ln -sfn "$setup_go" /usr/local/go/bin/go
-      - name: Test reservation and restart regressions
-        run: go test -p 1 -count=1 ./internal/store -run 'Test(ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)$' -v
-      - name: Test bounded completed-Builder readmission
-        run: go test -p 1 -count=1 ./internal/worktreecoord
+      - name: Run isolated validation group
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          set -eu
+          case "$GROUP" in
+            store)
+              go test -p 1 -count=1 ./internal/statemachine ./internal/engine
+              go test -p 1 -count=1 ./internal/store -run 'Test(Postbuild|TransitionPostbuild|AuthenticatePostbuildFailure|ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)' -v
+              ;;
+            source-resume)
+              go test -p 1 -count=1 ./internal/store -run '^Test(OperatorSourceResume|ProviderRetry|ResumeCapacity|OrdinaryVerifyingResume|SemanticGuardedMergeRetry)' -v
+              ;;
+            retry-refresh)
+              go test -race -p 1 -count=1 ./internal/store -run '^TestProviderRetryProtectedBaseRefresh' -v
+              # Prove the native-shape regression fails against the exact
+              # pre-fix implementation, not merely that the repaired tree passes.
+              source_file=internal/store/provider_retry_worktree.go
+              saved_source="$RUNNER_TEMP/provider-retry-worktree-fixed.go"
+              baseline_log="$RUNNER_TEMP/provider-retry-refresh-baseline.log"
+              cp "$source_file" "$saved_source"
+              trap 'cp "$saved_source" "$source_file"' EXIT
+              git fetch --no-tags --depth=1 origin e8f4068f16cbb0583316531028dbe44eea30298e
+              git show e8f4068f16cbb0583316531028dbe44eea30298e:"$source_file" > "$source_file"
+              set +e
+              go test -p 1 -count=1 ./internal/store -run '^TestProviderRetryProtectedBaseRefreshLifecycle$' -v > "$baseline_log" 2>&1
+              baseline_status=$?
+              set -e
+              cp "$saved_source" "$source_file"
+              trap - EXIT
+              cat "$baseline_log"
+              test "$baseline_status" -ne 0
+              grep -q '^--- FAIL: TestProviderRetryProtectedBaseRefreshLifecycle ' "$baseline_log"
+              grep -q 'paused refresh proof=.*err=evidence conflicts with durable record' "$baseline_log"
+              # Independently prove the paused-before-upgrade ordering fails
+              # on the previously green candidate, after retry itself succeeds.
+              source_file=internal/store/provider_retry.go
+              saved_source="$RUNNER_TEMP/provider-retry-takeover-fixed.go"
+              baseline_log="$RUNNER_TEMP/provider-retry-takeover-baseline.log"
+              cp "$source_file" "$saved_source"
+              trap 'cp "$saved_source" "$source_file"' EXIT
+              git fetch --no-tags --depth=1 origin 646fcf0746224404bfc385541afebe2b47ee4169
+              git show 646fcf0746224404bfc385541afebe2b47ee4169:"$source_file" > "$source_file"
+              set +e
+              go test -p 1 -count=1 ./internal/store -run '^TestProviderRetryProtectedBaseRefreshPausedTakeover$' -v > "$baseline_log" 2>&1
+              baseline_status=$?
+              set -e
+              cp "$saved_source" "$source_file"
+              trap - EXIT
+              cat "$baseline_log"
+              test "$baseline_status" -ne 0
+              grep -q '^--- FAIL: TestProviderRetryProtectedBaseRefreshPausedTakeover ' "$baseline_log"
+              grep -q 'refresh build context restart=0 err=' "$baseline_log"
+              ;;
+            retry-activation)
+              go test -race -p 1 -count=1 ./internal/daemon/runtimecontrol -run '^TestProviderRetryRestoredController' -v
+              source_file=internal/daemon/runtimecontrol/controller.go
+              saved_source="$RUNNER_TEMP/provider-retry-controller-fixed.go"
+              baseline_log="$RUNNER_TEMP/provider-retry-controller-baseline.log"
+              cp "$source_file" "$saved_source"
+              trap 'cp "$saved_source" "$source_file"' EXIT
+              git fetch --no-tags --depth=1 origin 9cee06722405a485f1f27c80f76047594a283da8
+              git show 9cee06722405a485f1f27c80f76047594a283da8:"$source_file" > "$source_file"
+              set +e
+              go test -p 1 -count=1 ./internal/daemon/runtimecontrol -run '^TestProviderRetryRestoredControllerActivatesRuntime$' -v > "$baseline_log" 2>&1
+              baseline_status=$?
+              set -e
+              cp "$saved_source" "$source_file"
+              trap - EXIT
+              cat "$baseline_log"
+              test "$baseline_status" -ne 0
+              grep -q '^--- FAIL: TestProviderRetryRestoredControllerActivatesRuntime ' "$baseline_log"
+              grep -q 'restored provider retry activation ready=false err=' "$baseline_log"
+              ;;
+            git)
+              go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v
+              ;;
+            admission)
+              go test -p 1 -count=1 ./internal/worktreecoord
+              ;;
+            behavior)
+              python3 -B -m unittest discover -s scripts -p test_ci_race.py
+              python3 -m unittest discover -s scripts -p test_eval_proof_consistency.py
+              python3 scripts/eval-proof-consistency.py validate
+              go test -p 1 -count=1 ./cmd/sf -run '^TestProductionDaemonPreparedRecoveryConfiguration$' -v
+              go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
+              go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|ProviderRetryView|PostbuildCommandFailure|Daemon.*Prepared|.*OperatorDecision)' -v
+              go test -race -p 1 -count=3 -timeout 10m ./internal/daemon -run '^Test(DaemonPreparedCommitRunnerFactoryRecoversRealGitBeforeRuntime|StartupBusyHonorsConfiguredDeadline)$' -v
+              go test -p 1 -count=1 ./internal/daemon/runtimecontrol ./internal/workflowruntime -run '^Test.*OperatorDecision' -v
+              go test -p 1 -count=1 ./internal/workflowworker -run 'Test(RealStoreCompletedBuilderPostbuildFailure|OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment|ResumePreparedPostbuild)' -v
+              go test -p 1 -count=1 ./internal/localruntime -run '^TestPostbuildAmendmentDispatch' -v
+              ;;
+            compiled-approval)
+              go test -count=1 -shuffle=off -p 1 -timeout 15m -tags sf_e2e ./cmd/sf -run '^TestCompiledDev(GuardedWalkingSkeleton|FriendlyOperatorTakeover)$' -v
+              ;;
+            runtime-repair)
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run 'Test(PostbuildCommandError|SchedulerPostbuild|SchedulerPreparedPostbuild|SchedulerCompletedPostbuildRepair|SchedulerReplaysRejectedAmendment|RepositoryMaterializerPreparePostbuildRepair|RepositoryMaterializerPostbuildRepair)' -v
+              ;;
+            runtime-amendment)
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run 'Test(RepositoryMaterializerPostbuildAmendmentRealEndToEnd|ProtectedAmendment)' -v
+              ;;
+            runtime-recovery-same|runtime-recovery-restart|runtime-recovery-synced)
+              case "$GROUP" in
+                runtime-recovery-same) selector='^same_fence$' ;;
+                runtime-recovery-restart) selector='^new_leader$' ;;
+                runtime-recovery-synced) selector='^synced_new_leader$' ;;
+              esac
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run "^TestRepositoryMaterializerPostbuildAmendmentPreparedIndexRecovery$/$selector" -v
+              ;;
+            candidate-unrecorded-same|candidate-unrecorded-restart|candidate-recorded-same|candidate-recorded-restart)
+              case "$GROUP" in
+                candidate-unrecorded-same) selector='^recorded_false$/^restart_false$' ;;
+                candidate-unrecorded-restart) selector='^recorded_false$/^restart_true$' ;;
+                candidate-recorded-same) selector='^recorded_true$/^restart_false$' ;;
+                candidate-recorded-restart) selector='^recorded_true$/^restart_true$' ;;
+              esac
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run "^TestPostbuildAmendmentCandidateFinalizationRecovery$/$selector" -v
+              ;;
+            repair-candidate-unrecorded-same|repair-candidate-unrecorded-restart|repair-candidate-recorded-same|repair-candidate-recorded-restart)
+              case "$GROUP" in
+                repair-candidate-unrecorded-same) selector='^recorded_false$/^restart_false$' ;;
+                repair-candidate-unrecorded-restart) selector='^recorded_false$/^restart_true$' ;;
+                repair-candidate-recorded-same) selector='^recorded_true$/^restart_false$' ;;
+                repair-candidate-recorded-restart) selector='^recorded_true$/^restart_true$' ;;
+              esac
+              go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run "^TestPostbuildRepairCandidateFinalizationRecovery$/$selector" -v
+              ;;
+            onboarding)
+              scripts/docs-smoke
+              go test -p 1 -count=1 ./cmd/sf -run '^TestCompiledDevFirstUseStackMatrixIsLocalAndHonest$' -v
+              ;;
+            python-onboarding)
+              SF_TEST_PYTHON_CLI_DOWNLOAD=1 go test -p 1 -count=1 -timeout 8m ./cmd/sf -run '^TestCompiledPythonPreparationAndInit$' -v
+              ;;
+            *) echo "Unknown validation group" >&2; exit 1 ;;
+          esac
+
+  candidate:
+    if: always()
+    needs: validation
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - name: Require every validation group
+        env:
+          VALIDATION_RESULT: ${{ needs.validation.result }}
+        run: test "$VALIDATION_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Build exact native development candidate
         run: |
           set -eu

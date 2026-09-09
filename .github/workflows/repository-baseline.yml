@@ -13,7 +13,7 @@ jobs:
   acceptance:
     name: SF acceptance
     if: ${{ always() }}
-    needs: [baseline, store-race]
+    needs: [baseline, store-race, runtime-integration]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -21,9 +21,11 @@ jobs:
         env:
           BASELINE_RESULT: ${{ needs.baseline.result }}
           STORE_RACE_RESULT: ${{ needs.store-race.result }}
+          RUNTIME_INTEGRATION_RESULT: ${{ needs.runtime-integration.result }}
         run: |
           test "$BASELINE_RESULT" = success
           test "$STORE_RACE_RESULT" = success
+          test "$RUNTIME_INTEGRATION_RESULT" = success
 
   baseline:
     # v1's production execution and compiled acceptance boundary is macOS.
@@ -32,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [race-other, test-integration, test-crash, test-security, test-upgrade, test-compiled-e2e, verify-static]
+        target: [race-other, runtime-race, test-integration-other, test-crash, test-security, test-upgrade, test-compiled-e2e, verify-static]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,7 +63,7 @@ jobs:
   store-race:
     # modernc SQLite migration fixtures under -race exceed one package's hour
     # on hosted macOS. Disjoint shards keep every test and each test's subtests.
-    # Together with baseline/race-other this is the full race suite.
+    # Together with baseline/race-other and runtime-race this is the full race suite.
     runs-on: macos-14
     timeout-minutes: 75
     strategy:
@@ -90,4 +92,38 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           SF_CI_LANE: store-race
+        run: make test-all
+
+  runtime-integration:
+    # Complete normal integration inventory, including examples/fuzz seeds.
+    # Every shard is required; no test-name hand-picked subset replaces it.
+    runs-on: macos-14
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Expose the setup toolchain at the approved repository-test path
+        run: |
+          set -eu
+          setup_go=$(command -v go)
+          sudo mkdir -p /usr/local/go/bin
+          sudo ln -sfn "$setup_go" /usr/local/go/bin/go
+          test "$(readlink /usr/local/go/bin/go)" = "$setup_go"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -B -m unittest discover -s scripts -p 'test_ci_race.py'
+      - name: Run workflow runtime integration shard
+        env:
+          SHARD: ${{ matrix.shard }}
+          SF_CI_LANE: runtime-integration
         run: make test-all

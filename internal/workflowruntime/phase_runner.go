@@ -273,13 +273,28 @@ func (r PhaseRunner) build(ctx context.Context, request workflowworker.PhaseRequ
 	} else if !errors.Is(repairErr, store.ErrNotFound) {
 		return workflowworker.PhaseResult{}, ErrProviderResultInvalid
 	}
+	var postbuild *workflowprompt.BuilderPostbuildRepair
+	if source, ok := r.Store.(interface {
+		PostbuildRepairContext(context.Context, domain.TicketRef, uint64, domain.Fence) (store.PostbuildRepairBuildContext, error)
+	}); ok {
+		value, contextErr := source.PostbuildRepairContext(ctx, request.Ticket.Ref, request.Ticket.Version, request.Fence)
+		if contextErr == nil {
+			if repair != nil || value.Repair.Ref != request.Ticket.Ref || value.Verification.Revision.ProofDigest != verification.ProofDigest || value.Verification.Checkpoint.CommitOID != verification.CheckpointID {
+				return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+			}
+			postbuild = &workflowprompt.BuilderPostbuildRepair{Schema: workflowprompt.BuilderPostbuildRepairSchema, EntryTicketVersion: value.Repair.EntryVersion, FailedResultDigest: value.Repair.FailedResultDigest, BuilderTypedSHA256: value.Repair.BuilderTypedDigest, ExitCode: value.FailedCommand.Result.ExitCode, ProofDigest: verification.ProofDigest, CheckpointID: verification.CheckpointID}
+		} else if !errors.Is(contextErr, store.ErrNotFound) {
+			return workflowworker.PhaseResult{}, ErrProviderResultInvalid
+		}
+	}
 	input, err := workflowprompt.Builder(workflowprompt.BuilderInput{
-		Ticket:       phaseTicket(request.Ticket),
-		Workspace:    phaseWorkspace(project, worktree, plan.Plan.Paths),
-		Plan:         plan,
-		Verification: verification,
-		Runtime:      phaseRuntime(effective.PhaseTimeout),
-		CIRepair:     repair,
+		Ticket:          phaseTicket(request.Ticket),
+		Workspace:       phaseWorkspace(project, worktree, plan.Plan.Paths),
+		Plan:            plan,
+		Verification:    verification,
+		Runtime:         phaseRuntime(effective.PhaseTimeout),
+		CIRepair:        repair,
+		PostbuildRepair: postbuild,
 	})
 	if err != nil {
 		return workflowworker.PhaseResult{}, ErrConfigSnapshotInvalid

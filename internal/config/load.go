@@ -716,6 +716,9 @@ func detectRepositoryCommands(repository string) (Commands, error) {
 	}
 	if packageJSON {
 		if err := nodeclosure.Validate(repository); err != nil {
+			if errors.Is(err, nodeclosure.ErrNoTests) {
+				return Commands{}, detectionError("Node local verification requires an existing discoverable JavaScript test, such as test/smoke.test.js; add and commit the intended baseline test, then run init --check again")
+			}
 			return Commands{}, detectionError("package.json is not the bounded dependency-free Node 22 local verification recipe; a configured nysa_api_pure_v1 path, npm/dependency-bearing project, or other recipe requires operator or credential-free CI takeover")
 		}
 		command := Command{Argv: []string{"node", "--test"}}

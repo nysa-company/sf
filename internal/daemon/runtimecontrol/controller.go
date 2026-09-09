@@ -121,6 +121,12 @@ func (c *Controller) RearmProviderRetry(ctx context.Context, ref domain.TicketRe
 		if err != nil {
 			return false, errors.New("provider retry has not completed a controller drain")
 		}
+		// Restoring a durable stop does not restore the scheduler's volatile
+		// latch. Join it before caching the stop or installing admission. Do
+		// not reseal Store: the original exhaustion is retry evidence.
+		if err := c.runtime.Drain(ctx, ref); err != nil {
+			return false, err
+		}
 		entry.stopped, entry.hasStop = stopped, true
 	}
 	ready, err := c.authenticateProviderRetryWorktree(ctx, ref, version, fence)

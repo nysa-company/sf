@@ -2,6 +2,174 @@
 
 ## Current truth
 
+- Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
+  in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
+  `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
+  Latest hosted activation checkpoint:4371941 focused34329961042 compiled but
+  the new fixture failed before activation because CreateTicket omitted its
+  positive duration/cost budget. Set explicit one-hour/$10 fixture budget;
+  production six-line repair is unchanged. Preserve the failed run; rerun
+  focused before any native upgrade. Full43734330117245 is superseded.
+  Prior checkpoint (2026-09-09): exact9cee067 focused34327249098 passed all
+  22 groups/artifact, including paused-takeover CurrentVerification/two-restart
+  normal/race tests, six negatives and meaningful old646 failure gate. Full
+  34327346267 is pending with no failures. Diagnostic-only upgrade of retained
+  B (not final four-ticket acceptance) revealed provider-specific runtime rearm
+  restores a durable stop but omits the volatile runtime drain used by ordinary
+  Rearm. Physical proof succeeds; ActivateRearm compensates back to sealed when
+  fresh scheduler rejects the missing stop latch. Supported replay consumes no
+  new epoch. Six-line controller repair plus actual scheduler activation/replay
+  regression and old9cee baseline gate passed independent source review; hosted
+  validation is next. The fixture exercises actual ControlBundle activation and
+  Scheduler Begin, including replay after a failed capability installation.
+  At 08:34 full9cee has 18 jobs passed and two race jobs still active. No local
+  tests/builds, manual database edits, fresh campaign admissions or SF merge.
+  Prior checkpoint (2026-09-09): exact646fcf0 focused34321890331 (22 groups)
+  and full34322063807 (21 jobs) passed, including the old-e8 baseline failure
+  gate. Verified hosted artifact activated only in the isolated Relay home.
+  Supported retry now succeeds (paused11 -> building12), but native paused
+  takeover exposes a distinct retained-verification gap: refresh completion
+  belongs to old leader10, retry epoch to new leader11. CurrentVerification
+  refuses before Builder launch. Narrow typed proof binds the old endpoint to
+  the exact exhausted claim and new endpoint to immutable retry epoch/events;
+  general same-leader checks stay intact. Add paused-takeover, CurrentVerification,
+  two later restarts and malformed-evidence regressions, with old646 meaningful
+  failure gate in GitHub. Source review GO; new tests not yet run. Live second
+  ticket remains building12 with retained work, no active provider/unsettled
+  effect; two queued. One prior-e8 delivery is not final-candidate acceptance.
+  Fresh exact-head CI and all four fresh final tickets remain required.
+  Prior checkpoint (2026-09-09): 4f092a2 focused34321406069 exposes a second
+  restart defect in the new regression: retry predecessor accepted only the
+  immutable retry version, rejecting its later signed recovery endpoint. Normal
+  and race runs agree; five malformed-refresh negatives pass. Keep the complete
+  regression, extend predecessor only through bounded contiguous signed rows,
+  and add missing/tampered-ledger refusal with unchanged ticket counters. No
+  native upgrade or full CI dispatch for this known-failing candidate.
+  Prior checkpoint: exact e8f4068 focused34315835527 and
+  full34316230178 both passed. Native capacity-two campaign delivered one Relay
+  ticket through guarded approval/merge (PR30); overlap, bounded retry and
+  same-binary restart passed. Second ticket paused after completed protected-base
+  refresh; supported retry refused without consuming retry because creation
+  authentication compared refreshed registration with original creation. Narrow
+  repair authenticates both immutable original creation and refresh completion,
+  exact live registration, and frozen verification. Independent source review GO;
+  Store proof/retry/capability/two-recovery and five tamper regressions authored,
+  not yet run. Hosted regression must fail on e8 at the paused proof boundary.
+  No local tests/builds. Native second ticket remains paused with work retained;
+  two tickets queued. New production candidate requires fresh exact-head CI and
+  final four-ticket acceptance. No SF merge or goal completion claimed.
+  Prior checkpoint (2026-09-09): exact662d3a6 focused34312316847 passed
+  all21groups/build. Full34312318628 failed only race-other plus its required
+  aggregate: prepared_commit_factory_test.go156 initial fresh Start exhausted
+  the default5s startup context under race instrumentation (test6.95s), before
+  prepared recovery. All other lanes including runtime-race passed. Match this
+  recovery-order fixture to the shared integration fixture's explicit30s startup
+  bound; production5s and the40ms busy-deadline regression stay unchanged. Add
+  hosted race-count3 coverage for both cases before another full run. No local
+  tests/builds. Isolated283 PID28660/session22667 is idle: all16 prior trial tickets
+  cancelled, zero leases/active providers, PR29 closed without branch deletion.
+  No final campaign deliveries on662, no SF merge. Earlier live facts below are
+  historical; ignored LIVE.md contains current receipts.
+  Prior checkpoint: exact37c4a44 focused34311298818 passed
+  all21groups, including both original compiled approval regressions and exact
+  semantic retry positive/tamper cases. Independent source GO; hosted artifact
+  verified, not installed. Full34311300533 remains running with no failures.
+  Earlier eb0 full34306878975 is now terminal FAILURE: race-other's cumulative
+  80m wrapper expired after workflowruntime passed2357.921s and workflowworker
+  passed48.202s, before worktreecoord finished. No individual test failure was
+  reported. Add a disjoint whole workflowruntime race lane, retaining every
+  package/test, unchanged60m per-package bounds, and required baseline aggregate.
+  This CI packaging change requires fresh exact-head validation; no native
+  runtime change or paid attempts while waiting. Live isolated283 facts below
+  remain current. Detailed receipts/artifact hashes are in ignored LIVE.md.
+  Prior checkpoint (superseded validation): exact283cec0
+  focused34309705107 passed all20groups and produced the authenticated artifact.
+  Full34309826165 failed compiled guarded/takeover approvals and Store race4's
+  semantic merge retry; crash/race-other were still running. Source-confirmed
+  causes: the new decision Begin collides with an existing scheduler poll, and
+  provider retry selection misclassifies a valid merge-budget exhaustion event.
+  Narrow fixes reserve/join the poll before exact decision admission and require
+  authenticated semantic-merge authority before selecting that distinct lane.
+  Generic Store decision/open-authority checks remain unchanged. Hosted
+  regression validation is pending; no local tests/builds have been run.
+  Isolated native283 daemon PID28660/session22667/leader8 remains live. Earlier
+  eb0 tickets are cancelled and PR27/28 closed with branches retained. Fresh283
+  A is safely paused after two deliberate drained Planner interruptions; B is
+  waiting approval; C/D are queued. No paid retry or approval on this known-failing
+  candidate. Preserve all four, and wait for full exact-head CI before the next
+  final acceptance campaign. Exact IDs and evidence are in ignored LIVE.md.
+  Prior checkpoint (superseded): eb0bf0b focused34306877416 passed all20
+  groups and built the exact ARM64 artifact. Full34306878975 last had only
+  race-other pending; all other jobs including crash passed, not full green yet.
+  Native eb0 campaign recovered old tickets, cancelled diagnostics through SF,
+  closed PR25/26 separately with branches retained, and submitted four fresh
+  bounded tickets. Capacity-two refusal, real overlap, two deliberate drained
+  Planner interruptions, actual bounded retry and capacity reacquisition passed.
+  A(event) and B(job) reached waiting approval; C/D remain queued. A/B PR28/27
+  passed CI and independent acceptance review. Same-binary restart preserved
+  exact PR heads and reviewed results, but A approval safely rolled back:
+  runtime control is sealed at old authority while the ticket has signed new
+  leader recovery. advanceOpenRuntimeAuthority returns ErrStaleFence, misleadingly
+  projected as approval_head_changed. No approval or merge was recorded.
+  Complete typed rearm/activity/decision recovery fix is implemented and source
+  cross-reviewed, awaiting hosted validation; generic authority checks remain
+  unchanged. Composed regression covers retry, two restarts, approval, and
+  restart/replay before merge intent. This campaign is not final acceptance.
+  Isolated daemon session88662 leader7 is live; do not restart/admit/retry blindly.
+  Full exact identities and receipts are in ignored campaign LIVE.md.
+  Earlier checkpoint (superseded): ef3f6b4 focused34304070521 passed all groups.
+  Full34304075207 has17 passing jobs, crash/race-other still running. Native
+  session67973 exited7 before socket: prepared Job commit was correctly
+  confirmed at leader5; subsequent FenceRecoveredRunners transaction refused.
+  Exact root cause: event ticket waiting_approval v16/r3 retains provider retry
+  control stop v9/L2/r3, authority v16/L2/r3. Generic post-publication recovery
+  mistakes that successful retry/lifecycle for a pause/resume recovery chain.
+  Narrow authenticated Store repair/regression in progress; no DB mutation.
+  V2 selected-proof eval passed3/3 once per case after hosted scorer tests,
+  independently reviewed. Preserve original v1 strict2/3FAIL, CLI skill-error
+  caveat, public synthetic payload receipts, and no broad model-quality claim.
+  No fresh final four, native approval or SF PR. Isolated runtime stopped.
+  Following checkpoints are historical, superseded where stated above.
+  Latest checkpoint (2026-09-09): bc7bae5 focused34301205015 passed all20
+  groups. Full34301206752 passed all four runtime shards and eight Store race
+  shards; crash/race-other remain pending, not a full green verdict. Capacity
+  and actionable retry-status repairs are committed. Native cleanup startup
+  exposed a new production wiring gap: prepared commit recovery had no observer
+  before workflow runtime construction. Lazy read-only core-bundle observer
+  wiring and regression tests are under review/hosted validation, not deployed.
+  Required three-case model-decision eval harness/corpus also awaits hosted
+  scorer tests and bounded native authenticated execution; it is not Store/E2E
+  authority. No final native tickets, approvals or SF PR have been created.
+  The isolated runtime is stopped; retain its uncertain prepared commit and all
+  worktrees. Do not manually repair the DB or manufacture a replacement commit.
+  Following trial details are historical diagnostics, not final acceptance.
+  Portable tests/builds run only on GitHub. d9e9786 passed focused34288973873
+  and full34289176386; its native trial exposed ordinary-resume selection and
+  restart defects repaired through f7231a4. Exact f723 focused34297082600
+  passed20groups; full34297084568 integration exhausted workflowruntime's
+  cumulative30m package deadline (current test49s), race-other still pending.
+  Hosted normal-runtime sharding is under review; no tests will be omitted.
+  The fresh f723 native trial proved real Planner overlap, two cancelled/drained
+  attempts and actual sf retry, but exposed missing global/project capacity
+  reacquisition: the retried ticket executed without a ticket slot. This is a
+  release blocker; shared atomic paused-to-active capacity repair is in progress.
+  Also status/show omit authenticated provider retry next-actions; projection
+  repair is in progress. Do not count this trial as final capacity acceptance.
+  Isolated daemon33665 stopped normally, session57571 exited0. PR25(event) and
+  PR26(approval) remain unapproved; Job has an exact clean prepared checkpoint
+  with uncertain confirmation, a supported recovery shape, not manually edited.
+  Old d9 tickets cancelled; PR24 closed recoverably with its branch retained.
+  OldPRs1/2/10/14 and other runtimes are untouched. Exact inputs/IDs/artifact
+  evidence are in ignored .context/reliable-campaign/LIVE.md. No SF PR/merge yet.
+  Current source implements bounded independent postbuild repair, immutable
+  amendment/checkpoint receipts, exact restart completion, actionable status,
+  and clean-room onboarding. Passing layers are not end-to-end acceptance.
+  Remaining: final hosted full/race gates, exact-head independent review,
+  four native Relay deliveries at capacity two with recovery/base movement and
+  separate guarded approvals. Do not claim an unfamiliar-human usability trial.
+  Existing runtimes/private databases/worktrees remain untouched; only the
+  explicitly isolated campaign runtime/repository is active for this goal.
+
 - Active consolidation goal (2026-09-07): repair the two PR #2 review findings,
   validate and update the PR, merge through its required independent review,
   then run two concurrent hosted Relay tickets with CI-failure/restart recovery
@@ -3682,6 +3850,14 @@ The terminal validation and remaining work above supersede their pending notes.
   implemented and covered by crash/restart and race tests.
 
 ## Log
+
+- 2026-09-09: Native retry after paused daemon takeover exposed a missing
+  evidence bridge despite exact646 full/focused CI passing. Retained refresh
+  completion leader10 differs from retry consumer leader11. Preserve immutable
+  epoch semantics; authenticate the older failed-claim endpoint separately.
+  Regression must include takeover before retry and CurrentVerification, not
+  merely retry followed by restart. New proof and hosted baseline gate pending
+  validation; no local tests/builds or live database edits.
 
 - 2026-09-05: Relay30 confirmation delivered PR12 (attempts-since-retry),
   merge37bc539209819ed7b7075611c8dd79a8c8d4fc94, localdonev11. Its prepared

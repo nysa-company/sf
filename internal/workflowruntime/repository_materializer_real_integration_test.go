@@ -34,20 +34,49 @@ import (
 // This is intentionally a real macOS integration boundary.  The guarded
 // repository supervisor is Darwin-only and the test must not turn a Linux
 // fallback into evidence that the production composition is executable.
-func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
+type materializerRealFixture struct {
+	supervisor   *processsupervisor.Supervisor
+	databasePath string
+	ctx          context.Context
+	db           *store.Store
+	worktree     string
+	ref          domain.TicketRef
+	fence        domain.Fence
+	leader       uint64
+	materializer workflowruntime.RepositoryMaterializer
+	worker       workflowworker.Worker
+	state        *materializerFaultEngine
+}
+
+func newMaterializerRealFixture(t *testing.T, failBuild bool) materializerRealFixture {
+	t.Helper()
+	return newMaterializerRealFixtureWithProvider(t, func(t *testing.T) string {
+		return writeMaterializerProviderWithBuildFailure(t, failBuild)
+	})
+}
+
+func newMaterializerRealFixtureWithProvider(t *testing.T, provider func(*testing.T) string) materializerRealFixture {
+	t.Helper()
 	if runtime.GOOS != "darwin" {
 		t.Skip("guarded repository command execution is Darwin-only")
 	}
-	ctx := context.Background()
+	// Bound Store busy retries and child setup independently of the package's
+	// timeout, so a failed fixture reports its own boundary before job teardown.
+	deadline := time.Now().Add(8 * time.Minute)
+	if testDeadline, ok := t.Deadline(); ok && testDeadline.Add(-10*time.Second).Before(deadline) {
+		deadline = testDeadline.Add(-10 * time.Second)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	t.Cleanup(cancel)
 	repository, worktree, base := newMaterializerGitFixture(t)
 	helper := filepath.Join(t.TempDir(), "sf-git-exec")
 	sfBinary := filepath.Join(t.TempDir(), "sf")
-	build := exec.Command("go", "build", "-o", helper, "./cmd/sf-git-exec")
+	build := exec.CommandContext(ctx, "go", "build", "-o", helper, "./cmd/sf-git-exec")
 	build.Dir = repoRoot(t)
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build git helper: %v: %s", err, output)
 	}
-	build = exec.Command("go", "build", "-o", sfBinary, "./cmd/sf")
+	build = exec.CommandContext(ctx, "go", "build", "-o", sfBinary, "./cmd/sf")
 	build.Dir = repoRoot(t)
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build sf gate: %v: %s", err, output)
@@ -56,17 +85,26 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	if err := os.MkdirAll(runner.Home, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	databasePath := filepath.Join(t.TempDir(), "workflow.sqlite")
+	db, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	canonicalPath, err := db.TicketWorktreePath(domain.TicketRef{Channel: domain.ChannelDev, Project: "real", Ticket: "SF-real-materializer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(canonicalPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runMaterializerGit(t, repository, "worktree", "move", worktree, canonicalPath)
+	worktree = canonicalPath
 	identity, err := runner.Snapshot(ctx, worktree, "main")
 	if err != nil {
 		t.Fatalf("snapshot worktree: %v", err)
 	}
 	base = identity.BaseHead
-
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
 	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("real", repository), config.TicketOverride{})
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +140,7 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	providerScript := writeMaterializerProvider(t)
+	providerScript := provider(t)
 	builderAuth := writeMaterializerAuthHome(t)
 	reviewerAuth := writeMaterializerAuthHome(t)
 	providerSupervisor, err := processsupervisor.New(nil)
@@ -165,6 +203,12 @@ func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
 	supervisor := processsupervisor.RepositoryCommandSupervisor{Executable: sfBinary, GitRunner: runner, SoftDrain: time.Second, HardDrain: time.Second}
 	materializer := workflowruntime.RepositoryMaterializer{Store: db, Git: git.Runner{Home: runner.Home, ExecHelper: helper, TestLocalTransport: true, MutationAuthority: db}, Executor: repositoryexec.Executor{Authority: materializerDiagnosticAuthority{Store: db, t: t}, Supervisor: supervisor}}
 	worker := workflowworker.Worker{Evidence: db, Engine: state, Runner: providers, Checkpoint: materializer, Candidate: materializer, CheckpointMaterializer: materializer, CandidateMaterializer: materializer}
+	return materializerRealFixture{supervisor: providerSupervisor, databasePath: databasePath, ctx: ctx, db: db, worktree: worktree, ref: ref, fence: fence, leader: leader, materializer: materializer, worker: worker, state: state}
+}
+
+func TestRepositoryMaterializerRealStoreGitReplay(t *testing.T) {
+	f := newMaterializerRealFixture(t, false)
+	ctx, db, worktree, ref, fence, leader, materializer, worker := f.ctx, f.db, f.worktree, f.ref, f.fence, f.leader, f.materializer, f.worker
 
 	if _, err := worker.Run(ctx, ref, fence); err != nil {
 		t.Fatalf("planning: %v", err)
@@ -758,6 +802,11 @@ func writeMaterializerAuthHome(t *testing.T) string {
 
 func writeMaterializerProvider(t *testing.T) string {
 	t.Helper()
+	return writeMaterializerProviderWithBuildFailure(t, false)
+}
+
+func writeMaterializerProviderWithBuildFailure(t *testing.T, failBuild bool) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "codex-fixture")
 	script := `#!/bin/sh
 set -eu
@@ -802,6 +851,12 @@ else
 fi
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}'
 `
+	if failBuild {
+		// Only the authenticated repair context allows this fixture's next
+		// Builder to repair the regression; ordinary Builder calls stay red.
+		script = strings.Replace(script, "  printf '%s\\n' 'package example", "  feature='func TestFeature(t *testing.T) { t.Fatal(\"postbuild regression remains\") }'\n  if printf '%s' \"$prompt\" | grep -q 'sf.postbuild_repair/v1'; then feature='func TestFeature(t *testing.T) {}'; fi\n  printf '%s\\n' 'package example", 1)
+		script = strings.Replace(script, "func TestFeature(t *testing.T) {}\n' > tracked_test.go", "'\"$feature\"'\n' > tracked_test.go", 1)
+	}
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

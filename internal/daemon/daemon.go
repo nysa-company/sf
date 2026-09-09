@@ -79,6 +79,13 @@ type RuntimeRearmController interface {
 	Rearm(context.Context, domain.TicketRef) error
 }
 
+// RuntimeOperatorDecisionController owns the join/rearm/activity boundary for
+// a human decision. admitted is false only when runtime admission failed,
+// before Store could record the decision.
+type RuntimeOperatorDecisionController interface {
+	ApplyOperatorDecision(context.Context, store.OperatorDecisionRequest) (store.TransitionResult, bool, error)
+}
+
 // RuntimeRearmStateController lets a concrete runtime expose the sole safe
 // retry window for a resume whose durable transition committed before runtime
 // admission was installed.
@@ -210,8 +217,11 @@ type Config struct {
 	PreparedCommitObserver contracts.PreparedCommitObserver
 	// GitRunner supplies the read-only Runner used by the default registered
 	// worktree adapter. A nil runner is acceptable only when there are no
-	// uncertain prepared commits or an explicit observer is supplied.
+	// uncertain prepared commits, or an observer/lazy runner factory is supplied.
 	GitRunner *git.Runner
+	// PreparedCommitRunnerFactory resolves the read-only recovery runner lazily.
+	// Idle startup must not require workflow assets when no prepared commit exists.
+	PreparedCommitRunnerFactory func() (git.Runner, error)
 	// RepositoryCommandDrainer proves persisted credential-free command
 	// identities before effects, runners, or the socket are exposed.
 	RepositoryCommandDrainer contracts.RepositoryCommandDrainer
@@ -400,6 +410,9 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	preparedCommitObserver := configuration.PreparedCommitObserver
 	if preparedCommitObserver == nil && configuration.GitRunner != nil {
 		preparedCommitObserver = git.PreparedCommitObserver{Runner: *configuration.GitRunner, Resolve: registeredWorktreeResolver(database)}
+	}
+	if preparedCommitObserver == nil && configuration.PreparedCommitRunnerFactory != nil {
+		preparedCommitObserver = lazyPreparedCommitObserver{runner: configuration.PreparedCommitRunnerFactory, resolve: registeredWorktreeResolver(database)}
 	}
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
 		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, preparedCommitObserver: preparedCommitObserver, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinatorFactory: configuration.ProviderCoordinatorFactory, providerSupervisor: configuration.ProviderSupervisor, providerQualifier: configuration.ProviderQualifier, runtimeFactory: configuration.WorkflowRuntimeFactory, runtimeContext: ctx}
@@ -630,25 +643,44 @@ func (daemon *Daemon) Recover(ctx context.Context) error {
 // recovery leader/claim, while the ticket still carries the exact pre-fence
 // runner identity needed to prove the prepared commit's expected parent.
 func (daemon *Daemon) reconcilePreparedCommits(ctx context.Context, effects []store.Effect) error {
+	return reconcilePreparedCommits(ctx, effects, daemon.store, daemon.preparedCommitObserver)
+}
+
+type preparedCommitRecoveryStore interface {
+	GitMutationIntentFacts(context.Context, string) (store.GitMutationIntentFacts, error)
+	DeferPostbuildAmendmentCheckpointRecovery(context.Context, contracts.GitMutationClaim) (bool, error)
+	ConfirmRecoveredPreparedCommit(context.Context, contracts.GitMutationClaim, contracts.PreparedCommitObservation) (store.Effect, error)
+}
+
+func reconcilePreparedCommits(ctx context.Context, effects []store.Effect, database preparedCommitRecoveryStore, observer contracts.PreparedCommitObserver) error {
 	for _, effect := range effects {
 		if effect.Kind != "git/commit" {
 			continue
 		}
-		facts, err := daemon.store.GitMutationIntentFacts(ctx, effect.SemanticKey)
+		facts, err := database.GitMutationIntentFacts(ctx, effect.SemanticKey)
 		if err != nil {
 			return errors.Join(store.ErrPreparedCommitRecovery, err)
+		}
+		deferProtected, err := database.DeferPostbuildAmendmentCheckpointRecovery(ctx, facts.Claim)
+		if err != nil {
+			return errors.Join(store.ErrPreparedCommitRecovery, err)
+		}
+		if deferProtected {
+			// Keep the exact operation uncertain until the dedicated leased
+			// checkpoint path proves or finishes protected index synchronization.
+			continue
 		}
 		if facts.Claim.Operation != "commit" || facts.Effect.State != store.EffectUncertain || facts.PreparedCommitOID == "" || facts.PreparedTreeOID == "" {
 			return store.ErrPreparedCommitRecovery
 		}
-		if daemon.preparedCommitObserver == nil {
+		if observer == nil {
 			return errors.Join(store.ErrPreparedCommitRecovery, errors.New("prepared commit observer is not configured"))
 		}
-		observation, err := daemon.preparedCommitObserver.ObservePreparedCommit(ctx, facts.Claim)
+		observation, err := observer.ObservePreparedCommit(ctx, facts.Claim)
 		if err != nil {
 			return errors.Join(store.ErrPreparedCommitRecovery, err)
 		}
-		if _, err := daemon.store.ConfirmRecoveredPreparedCommit(ctx, facts.Claim, observation); err != nil {
+		if _, err := database.ConfirmRecoveredPreparedCommit(ctx, facts.Claim, observation); err != nil {
 			return err
 		}
 	}
@@ -1156,7 +1188,11 @@ func (daemon *Daemon) show(ctx context.Context, request api.Request, identity do
 		return daemon.failure(request, evidenceErrorCode(err), "durable workflow evidence could not be authenticated", errors.Is(err, store.ErrBusy))
 	}
 	view["evidence"] = evidence
+	if recovery := recoveryView(stored, evidence); recovery != nil {
+		view["recovery"] = recovery
+	}
 	view["operator"] = operatorView(identity)
+	daemon.projectProviderRetry(ctx, stored, view)
 	return daemon.success(request, api.Mutation{}, view)
 }
 
@@ -1359,6 +1395,11 @@ type operatorDecisionParameters struct {
 // path. The displayed operator label is only a comparison value: the UID used
 // by Store comes from the peer-authenticated identity above.
 func (daemon *Daemon) operatorDecision(ctx context.Context, request api.Request, identity domain.OperatorIdentity, decision string) api.Response {
+	daemon.runtimeMu.Lock()
+	defer daemon.runtimeMu.Unlock()
+	if daemon.isClosed() || daemon.runtimeStopped {
+		return daemon.failure(request, "daemon_stopping", "ticket decisions are unavailable while the daemon is stopping", true)
+	}
 	var parameters operatorDecisionParameters
 	if err := decodeParameters(request.Parameters, &parameters); err != nil || parameters.Channel != daemon.channel || (parameters.Operator != "" && parameters.Operator != identity.Label) || (decision != "approved" && decision != "rejected") {
 		return daemon.failure(request, "invalid_decision", "approval or rejection requires the authenticated operator and daemon channel", false)
@@ -1398,9 +1439,27 @@ func (daemon *Daemon) operatorDecision(ctx context.Context, request api.Request,
 		sum := sha256.Sum256([]byte(parameters.Reason))
 		reasonDigest = fmt.Sprintf("%x", sum[:])
 	}
-	result, err := daemon.store.ApplyOperatorDecision(ctx, store.OperatorDecisionRequest{OperatorDecision: store.OperatorDecision{
+	decisionRequest := store.OperatorDecisionRequest{OperatorDecision: store.OperatorDecision{
 		Ref: ref, ExpectedVersion: stored.Version, Fence: domain.Fence{LeaderEpoch: daemon.epoch, RunnerEpoch: stored.RunnerEpoch}, ReviewedHead: candidate.Snapshot.HeadSHA, OperatorUID: identity.UID, Decision: decision,
-	}, ReasonDigest: reasonDigest})
+	}, ReasonDigest: reasonDigest}
+	var result store.TransitionResult
+	if controller, ok := daemon.control.(RuntimeOperatorDecisionController); ok {
+		var admitted bool
+		result, admitted, err = controller.ApplyOperatorDecision(ctx, decisionRequest)
+		if err != nil && !admitted {
+			return daemon.failure(request, "decision_recovery_unavailable", "the decision was not recorded because exact runtime recovery could not be admitted; inspect ticket status and retry the same decision after recovery is available", true)
+		}
+	} else {
+		needed, admissionErr := daemon.store.RuntimeRearmNeeded(ctx, ref)
+		if admissionErr != nil || needed {
+			return daemon.failure(request, "decision_recovery_unavailable", "the decision was not recorded because its runtime recovery controller is unavailable; inspect ticket status before deciding again", true)
+		}
+		ready, admissionErr := daemon.store.RuntimeAdmissionReady(ctx, ref, stored.Version, decisionRequest.Fence)
+		if admissionErr != nil || !ready {
+			return daemon.failure(request, "decision_recovery_unavailable", "the decision was not recorded because its runtime admission is not ready; inspect ticket status before deciding again", true)
+		}
+		result, err = daemon.store.ApplyOperatorDecision(ctx, decisionRequest)
+	}
 	if err != nil {
 		code, message := "decision_refused", "the decision is not valid for the current reviewed head"
 		if errors.Is(err, store.ErrStaleFence) {
@@ -2269,9 +2328,13 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, id
 		view := map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "current_version": stored.Version, "operator": operatorView(identity), "ticket": ticketView(stored), "evidence": evidence}
 		view["budget_clock"] = ticketTiming(stored, daemon.clock.Now())
 		view["runtime_activity"] = daemon.runtimeActivity(&stored.Ref)
+		if recovery := recoveryView(stored, evidence); recovery != nil {
+			view["recovery"] = recovery
+		}
 		if action, ok := daemon.ticketBlockedNextAction(stored); ok {
 			view["next_action"] = action
 		}
+		daemon.projectProviderRetry(ctx, stored, view)
 		return daemon.success(request, api.Mutation{}, view)
 	}
 	items, err := daemon.store.Tickets(ctx, daemon.channel, domain.ProjectID(parameters.Project), 1000)
@@ -2286,6 +2349,7 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, id
 		if action, ok := daemon.ticketBlockedNextAction(item); ok {
 			view["next_action"] = action
 		}
+		daemon.projectProviderRetry(ctx, item, view)
 		views = append(views, view)
 	}
 	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "leader_epoch": daemon.epoch, "operator": operatorView(identity), "tickets": views})
@@ -2357,7 +2421,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	switch code {
 	case "legacy_provider_entry_unverifiable":
 		argv = []string{binary, "cancel", "--help"}
-	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "postbuild_command_failed", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
+	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "postbuild_command_failed", "verification_amendment_invalid", "postbuild_amendment_rejected", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
 		argv = []string{binary, "cancel", "--help"}
 	case "takeover_inspection_failed", "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 		argv = []string{binary, "take", "--help"}
@@ -2393,7 +2457,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 		switch code {
 		case "legacy_provider_entry_unverifiable":
 			argv = []string{binary, "cancel", request.Ticket}
-		case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "postbuild_command_failed", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
+		case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "postbuild_command_failed", "verification_amendment_invalid", "postbuild_amendment_rejected", "legacy_candidate_repair_recovery_unverifiable", "provider_retry_exhausted", "provider_retry_resubmit_required":
 			argv = []string{binary, "cancel", request.Ticket}
 		case "takeover_changes_unadopted", "takeover_source_out_of_scope", "takeover_remote_drift", "takeover_remote_evidence_unavailable":
 			// `take` is intentionally idempotent and prints the authenticated
@@ -2428,7 +2492,7 @@ func (daemon *Daemon) failure(request api.Request, code, message string, retryab
 	}
 	if request.Ticket != "" {
 		switch code {
-		case "ticket_not_found", "invalid_transition", "external_state_unavailable", "external_merge_observed", "control_state_unavailable", "control_drain_failed", "blocked_process", "uncertain_effect", "control_completion_failed":
+		case "ticket_not_found", "invalid_transition", "external_state_unavailable", "external_merge_observed", "control_state_unavailable", "control_drain_failed", "blocked_process", "uncertain_effect", "control_completion_failed", "decision_recovery_unavailable":
 			argv = []string{binary, "status", request.Ticket}
 		}
 	}
@@ -2450,7 +2514,7 @@ func (daemon *Daemon) executable() string {
 
 func nonRecoverableTicketBlocker(code string) bool {
 	switch code {
-	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "postbuild_command_failed", "verification_amendment_invalid", "legacy_candidate_repair_recovery_unverifiable":
+	case "ticket_budget_exhausted", "provider_result_indeterminate", "provider_repair_unavailable", "postbuild_command_failed", "verification_amendment_invalid", "postbuild_amendment_rejected", "legacy_candidate_repair_recovery_unverifiable":
 		return true
 	default:
 		return false

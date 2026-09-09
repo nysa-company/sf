@@ -42,6 +42,10 @@ const (
 // pre-amendment verification revision, and the bounded correction charge in
 // one transaction with building -> verifying.
 func (s *Store) TransitionVerificationAmendmentRequest(ctx context.Context, transition Transition, key ProviderAttemptResultKey) (TransitionResult, error) {
+	return s.transitionVerificationAmendmentRequest(ctx, transition, key, nil)
+}
+
+func (s *Store) transitionVerificationAmendmentRequest(ctx context.Context, transition Transition, key ProviderAttemptResultKey, snapshot *PostbuildAmendmentSnapshot) (TransitionResult, error) {
 	if transition.From != domain.StateBuilding || transition.To != domain.StateVerifying || transition.Trigger != "verification_amendment_requested" || transition.EventPayload != "{}" || key.Ref != transition.Ref || key.Phase != domain.PhaseBuild || key.AttemptID <= 0 || key.Attempt <= 0 {
 		return TransitionResult{}, ErrEvidenceConflict
 	}
@@ -86,13 +90,23 @@ func (s *Store) TransitionVerificationAmendmentRequest(ctx context.Context, tran
 		if err := assertNoVerificationAmendmentDownstream(ctx, conn, transition.Ref); err != nil {
 			return err
 		}
+		companion, err := s.preparePostbuildAmendmentBinding(ctx, conn, transition, result, prior, snapshot)
+		if err != nil {
+			return err
+		}
 		requestID := fmt.Sprintf("verification-amendment/%d/%s", key.AttemptID, result.TypedSHA256)
 		if _, err := s.consumeBudgetDuringTransition(ctx, conn, BudgetUse{Ref: transition.Ref, ExpectedVersion: version, Fence: transition.Fence, Kind: "correction", RequestID: requestID}); err != nil {
 			return err
 		}
 		_, err = conn.ExecContext(ctx, `INSERT INTO verification_amendment_requests(channel,project_id,ticket_id,transition_ticket_version,prior_verification_revision,prior_intent_digest,prior_proof_digest,prior_checkpoint_id,builder_attempt_id,builder_attempt,builder_result_phase,builder_result_role,builder_typed_sha256,proposed_digest,proposed_command_json,amendment_reason,requester,consumed_ticket_version,consumed_leader_epoch,consumed_runner_epoch,correction_budget_kind,correction_budget_request_id,created_at)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, version+1, prior.Revision, prior.IntentDigest, prior.ProofDigest, prior.CheckpointID, key.AttemptID, key.Attempt, domain.PhaseBuild, "builder", result.TypedSHA256, request.ProposedDigest, string(proposedCommand), request.Reason, "builder", version, transition.Fence.LeaderEpoch, runner, "correction", requestID, now())
-		return err
+		if err != nil {
+			return err
+		}
+		if companion != nil {
+			return insertPostbuildAmendmentBinding(ctx, conn, *companion)
+		}
+		return nil
 	})
 }
 
@@ -279,6 +293,9 @@ func (s *Store) loadVerificationAmendment(ctx context.Context, q rowQueryer, ref
 		WHERE channel=? AND project_id=? AND ticket_id=? AND kind='correction' AND request_id=? AND ticket_version=? AND leader_epoch=? AND runner_epoch=?`, ref.Channel, ref.Project, ref.Ticket, value.BudgetRequestID, value.ConsumedVersion, value.Fence.LeaderEpoch, value.Fence.RunnerEpoch).Scan(&budgetCount); err != nil || budgetCount != 1 {
 		return VerificationAmendment{}, ErrEvidenceConflict
 	}
+	if _, _, err := loadPostbuildAmendmentBinding(ctx, q, value); err != nil && !errors.Is(err, ErrNotFound) {
+		return VerificationAmendment{}, ErrEvidenceConflict
+	}
 	return value, nil
 }
 
@@ -400,6 +417,14 @@ func (s *Store) builderVerificationAmendmentForRecord(ctx context.Context, conn 
 	decision, err := s.verificationAmendmentDecisionFrom(ctx, conn, value, artifact.Ref, artifact.ExpectedVersion, artifact.Fence, *artifact.ProviderResult)
 	if err != nil || decision != VerificationAmendmentAccepted {
 		return VerificationAmendment{}, false, ErrEvidenceConflict
+	}
+	if _, repair, err := loadPostbuildAmendmentBinding(ctx, conn, value); err == nil {
+		snapshot, err := s.postbuildAmendmentCheckpointSnapshotFrom(ctx, conn, artifact.Ref, artifact.ExpectedVersion, artifact.Fence)
+		if err != nil || snapshot.Reviewer != *artifact.ProviderResult || snapshot.Command != artifact.CommandResult || artifact.Checkpoint.ParentOID != repair.OriginalCheckpointOID {
+			return VerificationAmendment{}, false, ErrEvidenceConflict
+		}
+	} else if !errors.Is(err, ErrNotFound) {
+		return VerificationAmendment{}, false, err
 	}
 	return value, true, nil
 }

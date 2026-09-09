@@ -81,7 +81,7 @@ var (
 	ErrCIObservation           = errors.New("CI observation is missing, malformed, stale, or conflicts with durable evidence")
 )
 
-const schemaVersion = 60
+const schemaVersion = 61
 
 var migrationChecksums = map[int]string{
 	1:  migrationChecksum(migrationV1),
@@ -144,6 +144,7 @@ var migrationChecksums = map[int]string{
 	58: migrationChecksum(migrationV58),
 	59: migrationChecksum(migrationV59),
 	60: migrationChecksum(migrationV60),
+	61: migrationChecksum(migrationV61),
 }
 
 func migrationChecksum(statements []string) string {
@@ -576,6 +577,8 @@ func (s *Store) migrate(ctx context.Context) error {
 				statements = migrationV59
 			} else if version == 60 {
 				statements = migrationV60
+			} else if version == 61 {
+				statements = migrationV61
 			}
 			for _, statement := range statements {
 				if _, err := conn.ExecContext(ctx, statement); err != nil {
@@ -1479,6 +1482,12 @@ func (s *Store) BlockOrphanedWorkflows(ctx context.Context, channel domain.Chann
 }
 
 func (s *Store) Transition(ctx context.Context, transition Transition) (TransitionResult, error) {
+	// An observed nonzero exit is not caller-authored retry authority. Only
+	// the dedicated proof, retained-worktree and budget transaction may create
+	// a new Building entry; generic guard strings cannot substitute for it.
+	if transition.Trigger == "postbuild_repair" {
+		return TransitionResult{}, ErrEvidenceConflict
+	}
 	// External merge observations carry publication and merge authority that
 	// generic lifecycle persistence cannot construct. Manual observations must
 	// use RecordManualMergeObservation; guarded observations use the distinct
@@ -1685,6 +1694,11 @@ func (s *Store) Transition(ctx context.Context, transition Transition) (Transiti
 			}
 			transition.EventPayload = string(payload)
 		}
+		if actual == domain.StatePaused && (transition.Trigger == "operator_resume" || transition.Trigger == "operator_retry") {
+			if err := reacquireTicketCapacity(ctx, conn, transition.Ref, runner); err != nil {
+				return err
+			}
+		}
 		query := `UPDATE tickets SET state=?, resume_state=?, version=version+1 WHERE channel=? AND project_id=? AND id=? AND state=? AND version=? AND runner_epoch=?`
 		args := []any{transition.To, nullableState(transition.ResumeState), transition.Ref.Channel, transition.Ref.Project, transition.Ref.Ticket, transition.From, version, runner}
 		if transition.Trigger == "typed_blocker" {
@@ -1719,6 +1733,7 @@ const (
 	providerRepairUnavailableCode           = "provider_repair_unavailable"
 	postbuildCommandFailedBlockerCode       = "postbuild_command_failed"
 	verificationAmendmentInvalidBlockerCode = "verification_amendment_invalid"
+	postbuildAmendmentRejectedBlockerCode   = "postbuild_amendment_rejected"
 	legacyCandidateRepairUnverifiableCode   = "legacy_candidate_repair_recovery_unverifiable"
 	providerTerminalBlockerSchema           = "sf.provider-terminal-blocker/v1"
 )
@@ -1764,7 +1779,7 @@ func nonRecoverableProviderBlockerCode(code string) bool {
 // command. Both remain on the generic typed-block writer while refusing every
 // recovery path.
 func nonRecoverableBlockedRecoveryCode(code string) bool {
-	return nonRecoverableProviderBlockerCode(code) || code == postbuildCommandFailedBlockerCode || code == verificationAmendmentInvalidBlockerCode || code == legacyCandidateRepairUnverifiableCode
+	return nonRecoverableProviderBlockerCode(code) || code == postbuildCommandFailedBlockerCode || code == verificationAmendmentInvalidBlockerCode || code == postbuildAmendmentRejectedBlockerCode || code == legacyCandidateRepairUnverifiableCode
 }
 
 func providerRoleForPhase(phase domain.Phase) string {

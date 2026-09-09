@@ -191,7 +191,7 @@ func validateRunnerRecoveryLedgerPrefix(ctx context.Context, q interface {
 			if phaseChain && (step.PriorRunnerEpoch != expectedRunner || step.PriorLeaderEpoch != expectedLeader) {
 				return ErrPublicationEvidence
 			}
-			if !phaseChain && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingControlGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
+			if !phaseChain && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingControlGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPostbuildRepairGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
 				return ErrPublicationEvidence
 			}
 		}
@@ -212,7 +212,7 @@ func validateRunnerRecoveryLedgerPrefix(ctx context.Context, q interface {
 		if phaseAdvance && (liveRunner != expectedRunner || liveLeader != expectedLeader) {
 			return ErrPublicationEvidence
 		}
-		if !phaseAdvance && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) != nil && !validProviderRetryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validProviderBlockedRecoveryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validPublishingResumeGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validPublishingControlGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) {
+		if !phaseAdvance && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) != nil && !validProviderRetryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validProviderBlockedRecoveryGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validPublishingResumeGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validPublishingControlGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) && !validPostbuildRepairGap(ctx, q, ref, expectedVersion, expectedRunner, expectedLeader, liveVersion, liveRunner, liveLeader) {
 			return ErrPublicationEvidence
 		}
 	}
@@ -845,6 +845,9 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 				firstAuthenticated = true
 			}
 			if !firstAuthenticated {
+				firstAuthenticated = validInitialPostbuildRepairTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
+			}
+			if !firstAuthenticated {
 				sourceBaseline, sourceErr := validateOperatorSourceResumeRecoveryTarget(ctx, q, ref, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch)
 				if sourceErr != nil {
 					return ErrPublicationEvidence
@@ -865,7 +868,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// Several ordinary phase completions may occur under one runner before
 			// the next daemon recovery. The chain is accepted only when every
 			// intervening event is a contiguous canonical lifecycle phase_pass.
-			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
+			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) && !validPostbuildRepairGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
 				if !protectedBaseRefreshRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch) {
 					repairGap, repairErr := validateCandidateRepairRecoveryGap(ctx, q, ref,
 						previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch,
@@ -889,7 +892,7 @@ func validateRunnerRecoveryAuthority(ctx context.Context, q interface {
 			// A normal phase transition may follow the latest recovery row without
 			// changing the runner. It is current phase authority, not a control
 			// handoff; require the exact canonical phase event.
-			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, liveVersion, liveFence.RunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) {
+			if err := validateRunnerPhaseChain(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, liveVersion, liveFence.RunnerEpoch); err != nil && validateRunnerVerificationAmendmentAdvance(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) != nil && !validProviderRetryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validProviderBlockedRecoveryGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validPublishingResumeGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) && !validPostbuildRepairGap(ctx, q, ref, previous.TicketVersion, previous.RunnerEpoch, previous.LeaderEpoch, liveVersion, liveFence.RunnerEpoch, liveFence.LeaderEpoch) {
 				// A complete refresh owns its exact edge after CI repair. Prove
 				// it first; the retained repair intentionally cannot authorize a
 				// successor build on a different protected base.
@@ -1190,6 +1193,26 @@ func providerResultReachesFenceAt(ctx context.Context, q interface {
 	if key.Ref != claim.Ref || key.Phase != claim.Phase || key.AttemptID != claim.ID || key.Attempt != claim.Attempt || !providerRoleMatchesPhase(claim.Phase, claim.Role) || expected == 0 || fence.LeaderEpoch == 0 || fence.RunnerEpoch == 0 {
 		return ErrStaleFence
 	}
+	if claim.Phase == domain.PhaseVerification && claim.Role == "reviewer" {
+		amendment, amendmentErr := postbuildPendingAmendmentAt(ctx, q, key.Ref, expected, fence)
+		if amendmentErr == nil {
+			if claim.ExpectedVersion < amendment.TransitionTicketVersion {
+				return ErrStaleFence
+			}
+		} else if !errors.Is(amendmentErr, ErrNotFound) {
+			return ErrStaleFence
+		}
+	}
+	if claim.Phase == domain.PhaseBuild && claim.Role == "builder" {
+		repair, repairErr := latestPostbuildRepairAt(ctx, q, key.Ref, expected)
+		if repairErr == nil {
+			if claim.ExpectedVersion < repair.EntryVersion || claim.ID <= repair.BuilderResult.AttemptID || claim.Attempt <= repair.BuilderResult.Attempt {
+				return ErrStaleFence
+			}
+		} else if !errors.Is(repairErr, ErrNotFound) {
+			return ErrStaleFence
+		}
+	}
 	if requireLiveAuthority && claim.Phase == domain.PhaseBuild && claim.Role == "builder" {
 		if _, repairErr := (&Store{}).candidateRepairBuildContextAt(ctx, q, key.Ref, expected, fence); repairErr == nil {
 			if candidateRepairBuilderEntryResultReachesFence(ctx, q, key, result, expected, fence) != nil {
@@ -1369,6 +1392,9 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 	if err != nil {
 		return 0, false, ErrPublicationEvidence
 	}
+	if prior, matched, err := s.providerRetryPostPublicationPredecessor(ctx, conn, ref, state, version, runner, newLeader, control); matched || err != nil {
+		return prior, matched, err
+	}
 	if endpoint, matched, err := s.recoveredReviewMergeControlFrom(ctx, conn, ref, control, Ticket{Ref: ref, State: state, Version: version, RunnerEpoch: runner}); err != nil {
 		return 0, false, err
 	} else if matched {
@@ -1534,6 +1560,127 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 		return 0, false, ErrPublicationEvidence
 	}
 	return currentLeader, true, nil
+}
+
+// A provider retry keeps its exhaustion stop while ordinary successful phases
+// advance its open authority. That is not a post-publication pause triplet.
+// Authenticate both the original retry and the independent final-review origin;
+// a historical control authority may reach the live endpoint only by the
+// existing signed recovery/phase validators, never by a counter comparison.
+func (s *Store) providerRetryPostPublicationPredecessor(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64, control durableRuntimeControl) (uint64, bool, error) {
+	current, matched, err := s.providerRetryPostPublicationEndpoint(ctx, conn, ref, state, version, runner, control)
+	if err != nil || !matched {
+		return 0, matched, err
+	}
+	prior, found, err := s.normalPostPublicationRecoveryPredecessor(ctx, conn, ref, state, version, runner, newLeader)
+	if err != nil || !found || prior == 0 || prior >= newLeader || prior != current.leader {
+		return 0, true, ErrPublicationEvidence
+	}
+	return prior, true, nil
+}
+
+// providerRetryPostPublicationEndpoint authenticates an existing endpoint; it
+// neither invents a successor leader nor grants admission. Startup and live
+// rearm independently bind this proof to their respective leader authority.
+func (s *Store) providerRetryPostPublicationEndpoint(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner uint64, control durableRuntimeControl) (normalRecoveryEndpoint, bool, error) {
+	if state != domain.StateWaitingApproval && state != domain.StateWaitingManualMerge && state != domain.StateMerging {
+		return normalRecoveryEndpoint{}, false, nil
+	}
+	var stops, epochs int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='retry_or_correction_exhausted'`, ref.Channel, ref.Project, ref.Ticket, control.stop.version).Scan(&stops); err != nil {
+		return normalRecoveryEndpoint{}, false, err
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_retry_epochs WHERE channel=? AND project_id=? AND ticket_id=? AND exhaustion_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, control.stop.version).Scan(&epochs); err != nil {
+		return normalRecoveryEndpoint{}, false, err
+	}
+	if stops == 0 && epochs == 0 {
+		return normalRecoveryEndpoint{}, false, nil
+	}
+	if state == domain.StateMerging && stops == 1 && epochs == 0 && semanticMergeRetryControl(control) {
+		// Merge-budget exhaustion shares this trigger with provider exhaustion,
+		// but has no provider retry epoch. Only its independently authenticated
+		// merging->paused authority may select the existing semantic retry lane;
+		// a missing or malformed provider epoch is never absence by itself.
+		baseline, err := s.authenticateGuardedMergeSemanticPause(ctx, conn, ref, control.stop.version, control.stop.runner, true)
+		if err == nil && baseline.leader == control.stop.leader {
+			return normalRecoveryEndpoint{}, false, nil
+		}
+	}
+	fail := func() (normalRecoveryEndpoint, bool, error) {
+		return normalRecoveryEndpoint{}, true, ErrPublicationEvidence
+	}
+	if stops != 1 || epochs != 1 || control.state != "sealed" {
+		return fail()
+	}
+	var raw string
+	if err := conn.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='retry_or_correction_exhausted'`, ref.Channel, ref.Project, ref.Ticket, control.stop.version).Scan(&raw); err != nil {
+		return fail()
+	}
+	var exhaustion providerExhaustionPayload
+	if len(raw) > maxEvidenceJSON || json.Unmarshal([]byte(raw), &exhaustion) != nil || exhaustion.Schema != providerExhaustionSchema || !validProviderPhase(exhaustion.Phase) {
+		return fail()
+	}
+	epoch, found, err := loadProviderRetryEpoch(ctx, conn, ref, exhaustion.Phase)
+	if err != nil || !found || control.generation == 0 || epoch.ExhaustionVersion < 2 || epoch.EntryVersion != exhaustion.EntryTicketVersion || control.stop != (mutationRevocation{version: epoch.ExhaustionVersion, runner: epoch.ExhaustionRunner, leader: epoch.ExhaustionLeader}) {
+		return fail()
+	}
+	if err := validateProviderRetryAdvance(ctx, conn, ref, epoch.Phase, epoch.ExhaustionVersion-1, epoch.ExhaustionRunner, epoch.ExhaustionLeader, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader); err != nil {
+		return fail()
+	}
+	// This is a business-phase suffix of the original retry, not another
+	// operator stop/resume. Keep it separate from the generic ledger prefix:
+	// initial lifecycle transitions end at reviewing; the typed final-review
+	// reader independently authenticates the last review_pass and its evidence.
+	waitingState := state
+	if state == domain.StateMerging {
+		waitingState = domain.StateWaitingApproval
+	}
+	completion, err := s.finalReviewRecoveryEndpoint(ctx, conn, ref, waitingState)
+	if err != nil || completion.version < 2 || completion.version-1 < epoch.RetryVersion || completion.runner != epoch.RetryRunner || completion.leader != epoch.RetryLeader {
+		return fail()
+	}
+	reviewVersion := completion.version - 1
+	var hiddenRows int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ((ticket_version>=? AND ticket_version<=?) OR ticket_version>?)`, ref.Channel, ref.Project, ref.Ticket, epoch.RetryVersion, completion.version, version).Scan(&hiddenRows); err != nil || hiddenRows != 0 {
+		return fail()
+	}
+	if reviewVersion == epoch.RetryVersion {
+		if epoch.Phase != domain.PhaseReview {
+			return fail()
+		}
+	} else {
+		var start domain.State
+		if err := conn.QueryRowContext(ctx, `SELECT from_state FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, epoch.RetryVersion+1).Scan(&start); err != nil || start != providerStateForPhase(epoch.Phase) || validateRunnerPhaseChain(ctx, conn, ref, epoch.RetryVersion, epoch.RetryRunner, reviewVersion, completion.runner) != nil {
+			return fail()
+		}
+	}
+	// Startup can seal at completion, or at a later signed recovery endpoint.
+	// On another restart that sealed authority remains historical. Prove both
+	// sides explicitly rather than accepting monotonic counters as authority.
+	baseline := completion
+	if state == domain.StateMerging {
+		// Approval is the sole business transition allowed after final review.
+		// Its reader binds the exact reviewed candidate and any signed waiting
+		// recovery before approval; subsequent movement is signed recovery only.
+		baseline, err = s.approvalRecoveryEndpoint(ctx, conn, ref)
+		if err != nil || baseline.version == 0 {
+			return fail()
+		}
+		waitingLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, completion, baseline.version-1, baseline.runner)
+		if err != nil || waitingLeader != baseline.leader {
+			return fail()
+		}
+	}
+	authorityLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, baseline, control.authority.version, control.authority.runner)
+	if err != nil || authorityLeader != control.authority.leader {
+		return fail()
+	}
+	authority := normalRecoveryEndpoint{version: control.authority.version, runner: control.authority.runner, leader: control.authority.leader}
+	currentLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, authority, version, runner)
+	if err != nil || currentLeader == 0 {
+		return fail()
+	}
+	return normalRecoveryEndpoint{version: version, runner: runner, leader: currentLeader}, true, nil
 }
 
 // normalPostPublicationRecoveryPredecessor is the no-control restart bridge

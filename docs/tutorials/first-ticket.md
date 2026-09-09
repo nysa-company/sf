@@ -9,7 +9,7 @@ general-purpose runner for every project or provider.
 | Project | Current local execution |
 |---|---|
 | Go | Dependency-free module or compatible checked-in vendor closure |
-| JavaScript | Dependency-free Node project using `node --test` |
+| JavaScript | Dependency-free Node project using `node --test`, with an existing discoverable JavaScript test |
 | TypeScript | Only the configured bounded Nysa pure-test recipe |
 | Python | Experimental pinned Python/pytest profile on Apple Silicon; no additional dependencies; automated workflow passes, live-model delivery pending |
 | Ruby on Rails | Not yet supported locally |
@@ -32,6 +32,33 @@ tested scope and remaining gates.
 
 ## Prepare once
 
+### Get the CLI before running setup
+
+Public installation and automatic updates are not shipped yet. From an SF
+source checkout, build the development bundle and put that bundle on PATH in
+**both terminals** used below. Replace the absolute path with your checkout:
+
+```sh
+cd /absolute/path/to/sf-source
+make build-dev
+export PATH="/absolute/path/to/sf-source/bin:$PATH"
+sf-dev version --json
+sf-dev auth status
+sf-dev auth login github
+sf-dev auth login claude
+sf-dev auth login codex
+```
+
+Login uses the official interactive provider flow; do not paste credentials
+into tickets. These examples use a Claude Builder and Codex Reviewer. For
+Codex-only use, choose `codex-codex` instead at registration and qualification
+and omit Claude login and estimated-cost consent. See
+[source-build details](source-build-foreground.md) for prerequisites and custom
+authentication directories, or [local bundle install](local-bundle.md) for an
+explicit verified install. Do not repeat that tutorial's example registration.
+
+### Register a supported project
+
 Keep the project in a durable directory, such as your normal projects folder.
 Use your normal HOME for a real run. If you deliberately isolate HOME, put that
 directory in durable owner-only storage too. Do not use `/tmp`, `/private/tmp`,
@@ -41,16 +68,22 @@ file copy is not an authenticated replacement for a lost checkout. A SQLite
 backup alone does not preserve the repository, linked worktrees, or runtime
 snapshots needed to finish an in-flight ticket.
 
-From the repository root, preview the local configuration without registering
-anything:
+Use a committed checkout with its configured base branch (normally `main`)
+available locally and a GitHub origin for eventual publication. From the
+product repository root, preview Go or dependency-free Node configuration,
+then register it with the pair used in this guide:
+
+For Node, commit a meaningful baseline test (for example `test/smoke.test.js`)
+before setup; an empty package with no discoverable tests is refused. This
+baseline does not replace the independent verification for your new ticket.
 
 ```sh
 sf-dev init --check
-sf-dev init
+sf-dev init --providers claude-codex
 ```
 
 The project name defaults to the directory name (normalized to a valid name).
-For a new Claude/Codex project, replace plain `init` above with
+To choose a different pair by number, replace the registration command with
 `sf-dev init --providers select` to choose by number. Existing projects use
 `sf-dev config providers --project <name> --preset select`, followed by
 `sf-dev config apply --project <name>` for future tickets. Provider preferences
@@ -60,6 +93,19 @@ different repository root. `--check` does not execute tests, contact providers
 or GitHub, or prove full runtime readiness; those checks remain separate.
 It currently previews existing configuration, not `--profile`/`--test` setup.
 
+For the narrow TypeScript recipe, use explicit setup instead of plain init:
+
+```sh
+sf-dev init --profile nysa-api-pure-v1 --test path/to/existing.test.ts --providers claude-codex
+sf-dev init --check
+```
+
+Replace the test path with an existing entrypoint satisfying the bounded
+relative-import closure. This is not general TypeScript/npm support. Consult
+the [exact runtime and closure requirements](../configuration.md) first.
+Rails users should stop at the compatibility refusal: changing providers or
+adding an arbitrary command does not enable Rails execution.
+
 For the experimental Python profile, use the explicit setup instead of plain
 `init`. Start with an existing dependency-free Python project and a `tests`
 directory (or substitute an existing `.py` test path):
@@ -67,7 +113,7 @@ directory (or substitute an existing `.py` test path):
 ```sh
 sf-dev runtimes prepare python
 sf-dev runtimes prepare python --download
-sf-dev init --profile python-pytest-v1 --test tests
+sf-dev init --profile python-pytest-v1 --test tests --providers claude-codex
 sf-dev init --check
 ```
 
@@ -83,11 +129,29 @@ dependency-free Node path for the established first-ticket workflow. See
 [the acceptance plan](../plans/2026-09-05-self-serve-cli-beta.md) for remaining
 validation. Provider qualification and publication readiness remain separate.
 
-Follow [source build and foreground setup](source-build-foreground.md) to build
-the dev bundle, authenticate, register your repository, start the daemon in a
-second terminal, qualify the provider pair, and run doctor. Public installation
-and automatic updates are not shipped yet. A verified explicit
-[local bundle install](local-bundle.md) is available from a clean source build.
+Review any generated `.sf/config.toml` and commit intended configuration and
+test sources to your project before starting: linked execution worktrees do
+not inherit arbitrary uncommitted files from your checkout. Do not blindly add
+other files or credentials. The examples below use `my-app`; replace it with
+the registered project name printed by init.
+
+### Start the daemon and qualify the same pair
+
+In a second terminal, with the same bundle on PATH, HOME and authentication
+directory settings, leave this running:
+
+```sh
+sf-dev daemon run
+```
+
+Back in the first terminal, from your product repository:
+
+```sh
+sf-dev providers qualify --preset claude-codex
+sf-dev doctor --repo .
+```
+
+Qualification may invoke paid models; login alone is not qualification.
 Doctor's host/provider checks do
 not prove your GitHub protection and required checks are merge-ready.
 From the repository root, `sf-dev doctor --repo .` also previews the local
@@ -163,23 +227,24 @@ exists and its deadline is running; follow the reported action. Paused/blocked
 tickets are never implicitly resumed. The separate commands below remain
 available when you want to inspect submission before starting.
 
-From the SF source directory, replace `my-app` with the registered name:
+From your product directory, replace `my-app` with the registered name:
 
 ```sh
-./bin/sf-dev submit /absolute/path/to/ticket.md --project my-app
+sf-dev submit /absolute/path/to/ticket.md --project my-app
 ```
 
 Submission does not start work. In a terminal, select the ticket by its title
 and state instead of copying its full ID:
 
 ```text
-./bin/sf-dev start --project my-app
-./bin/sf-dev status --select --project my-app --watch
+sf-dev start --project my-app --accept-cost-estimates
+sf-dev status --select --project my-app --watch
 ```
 
 Find existing tickets by title and state with
-`./bin/sf-dev tickets --project my-app`. In an interactive terminal,
-`./bin/sf-dev start --project my-app` offers a numbered picker; `q` cancels.
+`sf-dev tickets --project my-app`. In an interactive terminal,
+`sf-dev start --project my-app --accept-cost-estimates` offers a numbered picker;
+`q` cancels. Omit estimated-cost consent for a Codex-only project.
 The picker never chooses a ticket implicitly. Unique six-character hex ID
 prefixes work too, for example `status 543bc4 --project my-app`. Scripts must
 provide an unambiguous ID and never prompt. Approval/rejection use a separate
@@ -190,11 +255,11 @@ draft PR, checks CI, and performs independent final review. When it requests
 approval, inspect the actual PR diff and reviewed head before approving:
 
 ```text
-./bin/sf-dev approve <ticket-id> --head <full-reviewed-commit>
+sf-dev approve <ticket-id> --head <full-reviewed-commit>
 ```
 
 Use the full commit ID from the PR you inspected, not an abbreviated hash.
-Alternatively, `./bin/sf-dev approve --project my-app` opens a ticket picker
+Alternatively, `sf-dev approve --project my-app` opens a ticket picker
 and displays its reviewed head. Inspect that commit, then type `approve` to
 confirm it; any other answer cancels without a decision.
 The supplied head must still match when the daemon records the decision.
@@ -213,3 +278,13 @@ unattended recovery from every failure.
 Use `--help` on any command and `--json` for automation. Stop a foreground
 daemon with Ctrl-C in its terminal. Stable and dev are separate channels;
 always use the same binary/channel for a ticket.
+
+## Measure first use honestly
+
+Record prerequisite time (build/install, login, downloads and qualification)
+separately from hands-on setup and ticket drafting. Our target is under ten
+minutes of hands-on setup once prerequisites are ready, not a promise of a
+ten-minute delivered PR. Record model, local-proof and GitHub/CI waits separately.
+After submission, queueing, pauses, remediation and approval waits all consume
+the ticket's wall-clock deadline. Automated clean-environment tests and an
+agent walkthrough are not evidence that an unfamiliar human met this target.

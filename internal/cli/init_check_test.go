@@ -86,6 +86,7 @@ func TestInitCheckExplainsUnsupportedStacksWithoutRunningThem(t *testing.T) {
 		{"pyproject.toml", "[project]\nname='example'\n", "Python requires the prepared python-pytest-v1 profile"},
 		{"Gemfile", "raise 'must never execute'\n", "Ruby/Rails local execution is not supported"},
 		{"package.json", `{"dependencies":{"typescript":"5.0.0"}}`, "dependency-free Node"},
+		{"package.json", `{"name":"no-tests"}`, "existing discoverable JavaScript test"},
 	} {
 		t.Run(test.marker, func(t *testing.T) {
 			repository, home := initializedRepository(t), t.TempDir()

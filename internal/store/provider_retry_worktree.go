@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -355,6 +356,21 @@ func (s *Store) providerRetryPhaseExpectedHead(ctx context.Context, q candidateE
 		}
 	case domain.PhaseBuild:
 		switch {
+		case entry.Trigger == "base_or_candidate_head_changed":
+			value, completion, err := providerRetryRefreshWorktreeBinding(ctx, q, ref, project, worktree)
+			if err != nil || completion.Version != entry.Version || completion.Fence.LeaderEpoch != entry.Leader || completion.Fence.RunnerEpoch != entry.Runner {
+				return "", ErrEvidenceConflict
+			}
+			verification, err := s.verificationEvidenceForIdentityFrom(ctx, q, ref, value.Candidate.Snapshot.VerificationIntentDigest, value.Candidate.Snapshot.ProofDigest, "")
+			if err != nil || !equalStringSlices(verification.Revision.OwnedFiles, value.ProtectedPaths) {
+				return "", ErrEvidenceConflict
+			}
+			var revision uint64
+			var intent, proof []byte
+			if err := q.QueryRowContext(ctx, `SELECT r.revision,r.intent_bytes,r.proof_bytes FROM verifications v JOIN verification_revisions r ON r.channel=v.channel AND r.project_id=v.project_id AND r.ticket_id=v.ticket_id AND r.revision=v.current_revision WHERE v.channel=? AND v.project_id=? AND v.ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&revision, &intent, &proof); err != nil || revision != verification.Revision.Revision || !bytes.Equal(intent, verification.Intent) || !bytes.Equal(proof, verification.Proof) {
+				return "", ErrEvidenceConflict
+			}
+			return completion.Preparation.CommitOID, nil
 		case entry.From == domain.StateVerifying && entry.Trigger == "phase_pass":
 			return verificationHead()
 		case entry.From == domain.StateVerifying && (entry.Trigger == "amendment_accepted" || entry.Trigger == "amendment_rejected"):
@@ -427,6 +443,34 @@ func providerRetryWorktreeFrom(ctx context.Context, q rowQueryer, ref domain.Tic
 // from becoming head authority by itself. The exact path, branch, base, head,
 // and identity must be the sole confirmed Store-owned create-worktree intent.
 func providerRetryWorktreeCreationBinding(ctx context.Context, q rowQueryer, ref domain.TicketRef, project Project, worktree StoredWorktree) error {
+	var refreshes int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM protected_base_refresh_intents WHERE channel=? AND project_id=? AND ticket_id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&refreshes); err != nil {
+		return err
+	}
+	if refreshes != 0 {
+		_, _, err := providerRetryRefreshWorktreeBinding(ctx, q, ref, project, worktree)
+		return err
+	}
+	return providerRetryOriginalWorktreeCreationBinding(ctx, q, ref, project, worktree)
+}
+
+// A refresh may replace the effective registration, but never the original
+// creation authority. Authenticate both immutable sides and their exact live
+// projection; a partial or malformed refresh cannot select ordinary fallback.
+func providerRetryRefreshWorktreeBinding(ctx context.Context, q rowQueryer, ref domain.TicketRef, project Project, worktree StoredWorktree) (protectedBaseRefreshIntent, ProtectedBaseRefreshCompletion, error) {
+	value, completion, err := protectedBaseRefreshForTicketAt(ctx, q, ref)
+	if err != nil || providerRetryOriginalWorktreeCreationBinding(ctx, q, ref, project, value.Worktree) != nil {
+		return protectedBaseRefreshIntent{}, ProtectedBaseRefreshCompletion{}, ErrEvidenceConflict
+	}
+	var source string
+	if err := q.QueryRowContext(ctx, `SELECT source_digest FROM tickets WHERE channel=? AND project_id=? AND id=?`, ref.Channel, ref.Project, ref.Ticket).Scan(&source); err != nil || source != value.SourceDigest ||
+		worktree.Path != completion.Worktree.Path || worktree.Branch != completion.Worktree.Branch || worktree.State != completion.Worktree.State || worktree.BaseSHA != completion.Worktree.BaseSHA || worktree.HeadSHA != completion.Worktree.HeadSHA || worktree.TicketVersion != completion.Worktree.TicketVersion || worktree.Fence != completion.Worktree.Fence || !bytes.Equal(worktree.IdentityJSON, completion.Worktree.IdentityJSON) {
+		return protectedBaseRefreshIntent{}, ProtectedBaseRefreshCompletion{}, ErrEvidenceConflict
+	}
+	return value, completion, nil
+}
+
+func providerRetryOriginalWorktreeCreationBinding(ctx context.Context, q rowQueryer, ref domain.TicketRef, project Project, worktree StoredWorktree) error {
 	rows, err := q.QueryContext(ctx, `SELECT i.semantic_key FROM git_mutation_intents i
 		JOIN effects e ON e.semantic_key=i.semantic_key
 		WHERE i.channel=? AND i.project_id=? AND i.ticket_id=?

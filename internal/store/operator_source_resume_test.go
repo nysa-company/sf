@@ -1041,7 +1041,111 @@ func recordOperatorSourceFreshVerificationAtEndpoint(t *testing.T, database *Sto
 	return artifact
 }
 
+func TestOperatorSourceResumeOrdinaryVerifyingPauseIsNotSourceAuthority(t *testing.T) {
+	db, ctx, leader, ticket := operatorSourceResumePhaseFixture(t, true)
+	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	if _, err := db.TransitionAndInvalidateRunner(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: ticket.Version, From: domain.StateVerifying, To: domain.StateStopping, ResumeState: domain.StateVerifying, Trigger: "operator_pause_or_take", Fence: fence, EventPayload: `{"intent":"pause","operator":"sofia","operator_uid":501}`}); err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.RunnerEpoch = stopped.RunnerEpoch
+	worktree, err := db.Worktree(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := TakeoverRemoteBaseline{Registered: true, WorktreePath: worktree.Path, WorktreeBranch: worktree.Branch, WorktreeIdentity: sha256Digest(worktree.IdentityJSON), BaseOID: worktree.BaseSHA}
+	drain, err := json.Marshal(map[string]any{"drained": true, "intent": "pause", "remote": baseline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CompleteControlTransition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: stopped.Version, From: domain.StateStopping, To: domain.StatePaused, ResumeState: domain.StateVerifying, Trigger: "process_and_effects_drained", Fence: fence, EventPayload: string(drain)}); err != nil {
+		t.Fatal(err)
+	}
+	paused, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ordinary = `{"change_kind":"none","changed_files":null,"intent":"resume","operator":"sofia"}`
+	if _, err := db.Transition(ctx, Transition{Ref: ticket.Ref, ExpectedVersion: paused.Version, From: domain.StatePaused, To: domain.StateVerifying, Trigger: "operator_resume", Fence: fence, EventPayload: ordinary}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openExactRuntimeAdmission(t, db, ticket.Ref)
+	if fresh, err := db.OperatorSourceResumeRequiresFreshVerification(ctx, ticket.Ref, resumed.Version); err != nil || fresh {
+		t.Fatalf("ordinary resume fresh=%v err=%v", fresh, err)
+	}
+	if _, found, err := db.OperatorSourceResumeProof(ctx, ticket.Ref, resumed.Version, fence); err != nil || found {
+		t.Fatalf("ordinary resume source proof found=%v err=%v", found, err)
+	}
+	if err := db.restoreRuntimeControls(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recoveredLeader, err := db.AcquireLeader(ctx, ticket.Ref.Channel, "ordinary-verifying-resume-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A restored open admission must name precisely the resumed endpoint, not
+	// an invented later version. Failed fencing must leave the real chain usable.
+	if _, err := db.db.ExecContext(ctx, `UPDATE runtime_ticket_controls SET authority_version=? WHERE channel=? AND project_id=? AND ticket_id=?`, resumed.Version+1, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, ticket.Ref.Channel, recoveredLeader); !errors.Is(err, ErrPublicationEvidence) || changed != 0 {
+		t.Fatalf("malformed restored authority recovery changed=%d err=%v", changed, err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE runtime_ticket_controls SET authority_version=? WHERE channel=? AND project_id=? AND ticket_id=?`, resumed.Version, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, ticket.Ref.Channel, recoveredLeader); err != nil || changed != 1 {
+		t.Fatalf("ordinary resume recovery changed=%d err=%v", changed, err)
+	}
+	recovered, err := db.Ticket(ctx, ticket.Ref)
+	if err != nil || recovered.State != domain.StateVerifying {
+		t.Fatalf("ordinary recovered ticket=%+v err=%v", recovered, err)
+	}
+	if fresh, err := db.OperatorSourceResumeRequiresFreshVerification(ctx, ticket.Ref, recovered.Version); err != nil || fresh {
+		t.Fatalf("recovered ordinary resume fresh=%v err=%v", fresh, err)
+	}
+	if _, found, err := db.OperatorSourceResumeProof(ctx, ticket.Ref, recovered.Version, domain.Fence{LeaderEpoch: recoveredLeader, RunnerEpoch: recovered.RunnerEpoch}); err != nil || found {
+		t.Fatalf("recovered ordinary source proof found=%v err=%v", found, err)
+	}
+	for _, malformed := range []string{
+		`{"change_kind":"none","changed_files":["src/feature.go"],"intent":"resume","operator":"sofia"}`,
+		`{"change_kind":"source_commit","changed_files":null,"intent":"resume","operator":"sofia"}`,
+	} {
+		if _, err := db.db.ExecContext(ctx, `UPDATE events SET payload=? WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_resume'`, malformed, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket, resumed.Version); err != nil {
+			t.Fatal(err)
+		}
+		if fresh, err := db.OperatorSourceResumeRequiresFreshVerification(ctx, ticket.Ref, recovered.Version); !errors.Is(err, ErrEvidenceConflict) || fresh {
+			t.Fatalf("malformed ordinary resume fresh=%v err=%v", fresh, err)
+		}
+	}
+}
+
+func TestOperatorSourceResumeTakeCannotMasqueradeAsOrdinaryResume(t *testing.T) {
+	db, ctx, _, resumed, _ := operatorSourceResumeResumedFixture(t)
+	if fresh, err := db.OperatorSourceResumeRequiresFreshVerification(ctx, resumed.Ref, resumed.Version); err != nil || !fresh {
+		t.Fatalf("genuine source resume fresh=%v err=%v", fresh, err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE events SET payload=? WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_resume'`, `{"change_kind":"none","changed_files":null,"intent":"resume","operator":"sofia"}`, resumed.Ref.Channel, resumed.Ref.Project, resumed.Ref.Ticket, resumed.Version); err != nil {
+		t.Fatal(err)
+	}
+	if fresh, err := db.OperatorSourceResumeRequiresFreshVerification(ctx, resumed.Ref, resumed.Version); !errors.Is(err, ErrEvidenceConflict) || fresh {
+		t.Fatalf("damaged source resume fresh=%v err=%v", fresh, err)
+	}
+}
+
 func operatorSourceResumeBuildingFixture(t *testing.T) (*Store, context.Context, uint64, Ticket) {
+	t.Helper()
+	return operatorSourceResumePhaseFixture(t, false)
+}
+
+func operatorSourceResumePhaseFixture(t *testing.T, stopAtVerifying bool) (*Store, context.Context, uint64, Ticket) {
 	t.Helper()
 	db, ctx := openTestStore(t)
 	digest := setupProviderProject(t, db, ctx)
@@ -1094,6 +1198,9 @@ func operatorSourceResumeBuildingFixture(t *testing.T) (*Store, context.Context,
 	}
 	ticket, _ = db.Ticket(ctx, ticket.Ref)
 	fence.RunnerEpoch = ticket.RunnerEpoch
+	if stopAtVerifying {
+		return db, ctx, leader, ticket
+	}
 	planIdentity, _ := workflowprompt.NewPlanIdentity(planner)
 	verification := phaseartifact.Verification{Schema: "sf.verification/v1", AcceptanceDigest: planIdentity.Digest, ProofKind: phaseartifact.ProofAcceptance, OwnedFiles: []string{"verify"}, Command: []string{"go", "test", "./..."}, PrebuildOutcome: "red", EvidenceDigest: sha256Digest([]byte("source-resume-verification"))}
 	verificationRaw, _ := json.Marshal(verification)
