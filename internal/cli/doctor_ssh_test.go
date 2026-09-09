@@ -203,3 +203,25 @@ func TestDoctorSSHBundleErrorIsSanitized(t *testing.T) {
 		t.Fatalf("assets=%+v", check)
 	}
 }
+
+func TestDoctorHTTPSRetainsExistingNamePolicy(t *testing.T) {
+	for _, name := range []string{".github", "_repo", "-repo", "repo", strings.Repeat("a", 100)} {
+		origin := "https://github.com/owner/" + name + ".git"
+		if doctorGitProtocol(origin) != "HTTPS" || doctorGitRepository(origin) != "owner/"+name {
+			t.Fatalf("valid HTTPS origin rejected: %q", origin)
+		}
+	}
+	for _, invalidURL := range []string{
+		"https://github.com/owner/.git", "https://github.com//repo.git",
+		"https://github.com/owner/" + strings.Repeat("a", 101) + ".git",
+		"https://github.com/owner/repo", "https://github.com/owner/repo.git/extra",
+		"https://github.com/owner/repo.git?token=secret", "https://github.com/owner/repo.git#fragment",
+		"https://token@github.com/owner/repo.git", "https://github.com:443/owner/repo.git",
+		"https://github.com/owner/%2egithub.git", "https://github.com/owner/répo.git",
+		"https://github.com/owner/repo.git\n", "https://github.com/owner/repo.git\x00",
+	} {
+		if doctorGitProtocol(invalidURL) != "" || doctorGitRepository(invalidURL) != "" {
+			t.Fatalf("invalid HTTPS URL admitted: %q", invalidURL)
+		}
+	}
+}

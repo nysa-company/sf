@@ -165,20 +165,44 @@ func doctorGitProtocol(origin string) string {
 	if _, ok := gitssh.RepositoryFromOrigin(origin); ok {
 		return "SSH"
 	}
-	if strings.HasPrefix(origin, "https://github.com/") {
-		if _, ok := gitssh.RepositoryFromOrigin("git@github.com:" + strings.TrimPrefix(origin, "https://github.com/")); ok {
-			return "HTTPS"
-		}
+	if _, ok := doctorHTTPSRepository(origin); ok {
+		return "HTTPS"
 	}
 	return ""
 }
 
 func doctorGitRepository(origin string) string {
-	if strings.HasPrefix(origin, "https://github.com/") {
-		origin = "git@github.com:" + strings.TrimPrefix(origin, "https://github.com/")
+	if repository, ok := doctorHTTPSRepository(origin); ok {
+		return repository
 	}
 	repository, _ := gitssh.RepositoryFromOrigin(origin)
 	return repository
+}
+
+// Keep the existing Git HTTPS path policy: names may start with '.', '_',
+// or '-'. The SSH helper intentionally has a narrower repository grammar.
+// Validate the literal URL; no decoded or normalized URL becomes evidence.
+func doctorHTTPSRepository(origin string) (string, bool) {
+	const prefix = "https://github.com/"
+	if !strings.HasPrefix(origin, prefix) {
+		return "", false
+	}
+	path := strings.TrimPrefix(origin, prefix)
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || !strings.HasSuffix(parts[1], ".git") {
+		return "", false
+	}
+	for _, name := range []string{parts[0], strings.TrimSuffix(parts[1], ".git")} {
+		if name == "" || len(name) > 100 {
+			return "", false
+		}
+		for _, ch := range name {
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '.' || ch == '_' || ch == '-') {
+				return "", false
+			}
+		}
+	}
+	return strings.TrimSuffix(path, ".git"), true
 }
 
 func doctorRepositoryURL(ctx context.Context, repo, key string, optional bool) (string, error) {

@@ -1262,13 +1262,15 @@ func TestGitHubSSHTransportDoesNotFallbackWhenPublicationIsConfigured(t *testing
 }
 
 func TestRealRunnerDispatchesCommonSSHOriginsToExplicitHelper(t *testing.T) {
-	ctx, runner, repository, _ := fixture(t)
+	ctx, runner, repository, remote := fixture(t)
 	root := t.TempDir()
 	capture := filepath.Join(root, "argv")
 	// Exercise spaces and shell metacharacters in the authenticated helper
 	// path. The fixed core.sshCommand override must quote this as one path.
 	helper := filepath.Join(root, "sf ssh'helper")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + strings.ReplaceAll(capture, "'", "'\\''") + "'\nprintf '0000'\n"
+	// A real local server completes Git's packet exchange without networking;
+	// a flush packet followed by exit can race Git's protocol negotiation.
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + strings.ReplaceAll(capture, "'", "'\\''") + "'\nexec /usr/bin/git upload-pack '" + strings.ReplaceAll(remote, "'", "'\\''") + "'\n"
 	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
