@@ -1320,7 +1320,7 @@ func validateProviderRetryPausedTakeover(ctx context.Context, q interface {
 		return err
 	}
 	entry, err := loadProviderPhaseEntryAt(ctx, q, ref, phase, fromVersion)
-	if err != nil || authenticateProviderRetryPhaseEntryEvent(ctx, q, ref, entry) != nil {
+	if err != nil || authenticateProviderRetryPhaseEntryEvent(ctx, query, ref, entry) != nil {
 		return ErrPublicationEvidence
 	}
 	epoch, found, err := loadProviderRetryEpochForEntry(ctx, q, ref, phase, entry.Version)
