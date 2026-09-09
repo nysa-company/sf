@@ -32,6 +32,15 @@ tested scope and remaining gates.
 
 ## Prepare once
 
+Already configured? Use `sf home --project YOUR_PROJECT` to create a draft,
+start a saved draft, inspect work or review an approval candidate. For direct
+offline drafting, run `sf ticket new --multiline`, paste the description and
+finish it with a line containing only `.`. Supply observable acceptance criteria,
+review the suggested filename and full contents, then type `yes` to save.
+Nothing starts until you explicitly submit/run it. Existing GitHub Issues can
+be imported with `sf ticket import https://github.com/OWNER/REPO/issues/NUMBER`;
+the issue is read-only reference material and is never changed by import.
+
 ### Get the CLI before running setup
 
 Public installation and automatic updates are not shipped yet. From an SF
@@ -41,13 +50,20 @@ source checkout, build the development bundle and put that bundle on PATH in
 ```sh
 cd /absolute/path/to/sf-source
 make build-dev
-export PATH="/absolute/path/to/sf-source/bin:$PATH"
-sf-dev version --json
-sf-dev auth status
-sf-dev auth login github
-sf-dev auth login claude
-sf-dev auth login codex
+export PATH="/absolute/path/to/sf-source/scripts:/absolute/path/to/sf-source/bin:$PATH"
+sf version --json
+sf auth status
+sf auth login github
+sf auth login claude
+sf auth login codex
 ```
+
+The `scripts/sf` launcher always invokes this checkout's `bin/sf-dev`; it keeps
+all development state and helper identities unchanged. Keep both directories
+on PATH so channel-explicit recovery commands still work. Help and recovery
+output may say `sf-dev` to make that channel visible. An installed stable `sf`
+remains separate: remove the source PATH prefix to use it. No alias or global
+installation is modified automatically.
 
 Login uses the official interactive provider flow; do not paste credentials
 into tickets. These examples use a Claude Builder and Codex Reviewer. For
@@ -78,15 +94,15 @@ before setup; an empty package with no discoverable tests is refused. This
 baseline does not replace the independent verification for your new ticket.
 
 ```sh
-sf-dev init --check
-sf-dev init --providers claude-codex
+sf init --check
+sf init --providers claude-codex
 ```
 
 The project name defaults to the directory name (normalized to a valid name).
 To choose a different pair by number, replace the registration command with
-`sf-dev init --providers select` to choose by number. Existing projects use
-`sf-dev config providers --project <name> --preset select`, followed by
-`sf-dev config apply --project <name>` for future tickets. Provider preferences
+`sf init --providers select` to choose by number. Existing projects use
+`sf config providers --project <name> --preset select`, followed by
+`sf config apply --project <name>` for future tickets. Provider preferences
 do not install, log in, or qualify models.
 Use `--project my-app` to override it and `--repo /absolute/path` to select a
 different repository root. `--check` does not execute tests, contact providers
@@ -96,8 +112,8 @@ It currently previews existing configuration, not `--profile`/`--test` setup.
 For the narrow TypeScript recipe, use explicit setup instead of plain init:
 
 ```sh
-sf-dev init --profile nysa-api-pure-v1 --test path/to/existing.test.ts --providers claude-codex
-sf-dev init --check
+sf init --profile nysa-api-pure-v1 --test path/to/existing.test.ts --providers claude-codex
+sf init --check
 ```
 
 Replace the test path with an existing entrypoint satisfying the bounded
@@ -111,10 +127,10 @@ For the experimental Python profile, use the explicit setup instead of plain
 directory (or substitute an existing `.py` test path):
 
 ```sh
-sf-dev runtimes prepare python
-sf-dev runtimes prepare python --download
-sf-dev init --profile python-pytest-v1 --test tests --providers claude-codex
-sf-dev init --check
+sf runtimes prepare python
+sf runtimes prepare python --download
+sf init --profile python-pytest-v1 --test tests --providers claude-codex
+sf init --check
 ```
 
 The first command previews without writing or downloading. `--download` fetches
@@ -141,22 +157,22 @@ In a second terminal, with the same bundle on PATH, HOME and authentication
 directory settings, leave this running:
 
 ```sh
-sf-dev daemon run
+sf daemon run
 ```
 
 Back in the first terminal, from your product repository:
 
 ```sh
-sf-dev providers qualify --preset claude-codex
-sf-dev doctor --repo .
+sf providers qualify --preset claude-codex
+sf doctor --repo .
 ```
 
 Qualification may invoke paid models; login alone is not qualification.
 Doctor's host/provider checks do
 not prove your GitHub protection and required checks are merge-ready.
-From the repository root, `sf-dev doctor --repo .` also previews the local
+From the repository root, `sf doctor --repo .` also previews the local
 configuration/test recipe. A failed `repository_recipe` check points back to
-`sf-dev init --check`; it does not modify your configuration. The report labels
+`sf init --check`; it does not modify your configuration. The report labels
 its scope so a green host/provider verdict is not mistaken for launch approval.
 
 Use a disposable supported project for your first run. Keep your real project
@@ -165,8 +181,8 @@ refusal. The initial supported path uses GitHub and guarded merge.
 
 ## Write one small ticket
 
-Run `sf-dev ticket new ticket.md` in a terminal for guided creation and a full
-preview before saving. Alternatively, use `sf-dev ticket template` and save its
+Run `sf ticket new ticket.md` in a terminal for guided creation and a full
+preview before saving. Alternatively, use `sf ticket template` and save its
 output to a new `ticket.md`, then replace the sample requirements. Do not
 overwrite an existing ticket. Creation does not submit anything.
 For a dependency-free Node repository, this is a complete format example
@@ -203,7 +219,7 @@ before opting in. Codex-only accounting remains unchanged.
 Before submitting, check the format without starting that deadline:
 
 ```sh
-sf-dev ticket validate ticket.md
+sf ticket validate ticket.md
 ```
 
 This checks syntax and highlights omitted acceptance/budget fields; project
@@ -214,9 +230,9 @@ policy and runtime readiness are still checked at submission and execution.
 For the composed path, use:
 
 ```sh
-sf-dev run ticket.md --project my-app --watch
+sf run ticket.md --project my-app --watch
 # For a qualified Claude/Codex project, explicitly accept estimated accounting:
-sf-dev run ticket.md --project my-app --accept-cost-estimates --watch
+sf run ticket.md --project my-app --accept-cost-estimates --watch
 ```
 
 This submits and starts the exact queued ticket, then follows its status.
@@ -230,20 +246,20 @@ available when you want to inspect submission before starting.
 From your product directory, replace `my-app` with the registered name:
 
 ```sh
-sf-dev submit /absolute/path/to/ticket.md --project my-app
+sf submit /absolute/path/to/ticket.md --project my-app
 ```
 
 Submission does not start work. In a terminal, select the ticket by its title
 and state instead of copying its full ID:
 
 ```text
-sf-dev start --project my-app --accept-cost-estimates
-sf-dev status --select --project my-app --watch
+sf start --project my-app --accept-cost-estimates
+sf status --select --project my-app --watch
 ```
 
 Find existing tickets by title and state with
-`sf-dev tickets --project my-app`. In an interactive terminal,
-`sf-dev start --project my-app --accept-cost-estimates` offers a numbered picker;
+`sf tickets --project my-app`. In an interactive terminal,
+`sf start --project my-app --accept-cost-estimates` offers a numbered picker;
 `q` cancels. Omit estimated-cost consent for a Codex-only project.
 The picker never chooses a ticket implicitly. Unique six-character hex ID
 prefixes work too, for example `status 543bc4 --project my-app`. Scripts must
@@ -255,11 +271,11 @@ draft PR, checks CI, and performs independent final review. When it requests
 approval, inspect the actual PR diff and reviewed head before approving:
 
 ```text
-sf-dev approve <ticket-id> --head <full-reviewed-commit>
+sf approve <ticket-id> --head <full-reviewed-commit>
 ```
 
 Use the full commit ID from the PR you inspected, not an abbreviated hash.
-Alternatively, `sf-dev approve --project my-app` opens a ticket picker
+Alternatively, `sf approve --project my-app` opens a ticket picker
 and displays its reviewed head. Inspect that commit, then type `approve` to
 confirm it; any other answer cancels without a decision.
 The supplied head must still match when the daemon records the decision.

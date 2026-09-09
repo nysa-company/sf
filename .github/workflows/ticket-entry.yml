@@ -1,0 +1,45 @@
+name: ticket-entry
+
+on:
+  push:
+    branches: [feat/ticket-entry-experience]
+  pull_request:
+    paths:
+      - internal/cli/**
+      - scripts/sf
+      - .github/workflows/ticket-entry.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cli:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Ticket entry regression and scripted journey
+        run: go test -p 1 -count=1 ./internal/cli -run '^TestTicketEntry' -v
+      - name: Entire CLI normal and race regression
+        run: |
+          go test -p 1 -count=1 ./internal/cli
+          go test -race -p 1 -count=1 ./internal/cli
+          go vet ./internal/cli
+      - name: Source sf launcher preserves development identity
+        run: |
+          make build-dev
+          scripts/sf version --json | jq -eS '.data | select(.channel == "dev")' > "$RUNNER_TEMP/sf-short.json"
+          bin/sf-dev version --json | jq -eS '.data | select(.channel == "dev")' > "$RUNNER_TEMP/sf-dev.json"
+          cmp "$RUNNER_TEMP/sf-short.json" "$RUNNER_TEMP/sf-dev.json"
+      - name: Repository and documentation checks
+        run: |
+          scripts/repo-check
+          scripts/docs-smoke
+          scripts/secret-scan

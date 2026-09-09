@@ -43,7 +43,7 @@ safe execution of untrusted repositories.
 ## Not v1
 
 Remote workers, laptop-off execution, containers as a prerequisite, issue
-trackers, generic forge support, deployment, a web dashboard, legacy workflow
+tracker synchronization (read-only GitHub Issue draft import is supported), generic forge support, deployment, a web dashboard, legacy workflow
 migration, autonomous selection/merge, or untrusted repository execution.
 
 Docker and Colima are not prerequisites and `sf` does not install them

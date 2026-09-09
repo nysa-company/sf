@@ -2,7 +2,29 @@
 
 ## Current truth
 
-- Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
+- Validated implementation (2026-09-09): three ticket-entry initiatives in
+  `docs/plans/2026-09-09-ticket-entry-experience.md`, branch
+  `feat/ticket-entry-experience`, pushed candidate `c41345b640e00ff4ee5fff2f7cc982db0de77784`.
+  Offline optional-filename/multiline drafting, terminal project-scoped home,
+  and bounded read-only GitHub issue import are implemented with tests/docs.
+  No local tests/builds/model calls or live pilot changes. Final focused run
+  `34357643516` passed new entry regressions, whole CLI normal/race/vet and
+  repository/docs/secrets checks. Final full acceptance `34358150167` PASSED
+  all 21 required jobs on exact c41345b. Final documentation-only follow-up
+  records evidence in `docs/reports/2026-09-09-ticket-entry-acceptance.md`.
+  No main merge or installed binary upgrade was part of this goal.
+  Previous source83 full `34356121903` had 17 jobs passed and three active,
+  none failed. Final c413 adds explicit `run estimates` home consent using the
+  existing flag, keeping plain run verified-only. Initial `40709b8` focused `34355905158`
+  failed: 128-byte menu path bound plus two inaccurate test response shapes;
+  fixes and actual gh adapter timeout test are in `83c31ef`. Superseded full
+  `34355910397` was cancelled, not passed. Bounded source self-review completed;
+  it is not an independent audit. Scripted draft/validate measured 8.039792ms,
+  not human onboarding. Prior goal
+  completed via SF PR #6/main `64c5414`, all 21 pre/post acceptance checks and
+  four native Relay deliveries; the long entries below are historical.
+
+- Historical checkpoint (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
   Latest hosted activation checkpoint:4371941 focused34329961042 compiled but

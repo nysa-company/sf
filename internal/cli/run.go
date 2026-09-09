@@ -21,6 +21,9 @@ func (a *app) runCommand() *cobra.Command {
 			if err != nil {
 				return a.emit(failure("invalid_ticket", err.Error(), commandHelpAction(cmd)))
 			}
+			if a.expectedDraftDigest != "" && parsed.Digest != a.expectedDraftDigest {
+				return a.emit(failure("invalid_ticket", "draft changed after preview; inspect it before submitting", commandHelpAction(cmd)))
+			}
 			submitted := a.request("ticket.submit", "", params(map[string]any{"source": string(parsed.Source), "project": project, "new": false}, a.channel))
 			if !submitted.OK {
 				if uncertainCLIResponse(submitted) {

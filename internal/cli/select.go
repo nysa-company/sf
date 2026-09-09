@@ -177,9 +177,13 @@ func (a *app) selectTicket(cmd *cobra.Command, input, project string) (string, *
 // Do not read ahead into a later confirmation prompt. A new Scanner per
 // prompt can otherwise consume and discard the next answer from buffered input.
 func readSelectionAnswer(reader io.Reader) (string, error) {
+	return readBoundedAnswer(reader, 128)
+}
+
+func readBoundedAnswer(reader io.Reader, limit int) (string, error) {
 	var value strings.Builder
 	var one [1]byte
-	for value.Len() <= 128 {
+	for value.Len() <= limit {
 		n, err := reader.Read(one[:])
 		if n == 1 {
 			if one[0] == '\n' {
@@ -188,7 +192,7 @@ func readSelectionAnswer(reader io.Reader) (string, error) {
 			value.WriteByte(one[0])
 		}
 		if err != nil {
-			if err == io.EOF && value.Len() > 0 && value.Len() <= 128 {
+			if err == io.EOF && value.Len() > 0 && value.Len() <= limit {
 				return value.String(), nil
 			}
 			return "", err
