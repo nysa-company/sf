@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/nysa-company/sf/internal/api"
@@ -18,6 +19,49 @@ type fakeAuthentication struct {
 	attempted bool
 	err       error
 	provider  localauth.Provider
+}
+
+type fakeConfigurableAuthentication struct {
+	fakeAuthentication
+	options localauth.LoginOptions
+}
+
+func (service *fakeConfigurableAuthentication) LoginWithOptions(ctx context.Context, provider localauth.Provider, terminal localauth.Terminal, options localauth.LoginOptions) (localauth.Status, bool, error) {
+	service.options = options
+	return service.Login(ctx, provider, terminal)
+}
+
+func TestAuthLoginExplicitProtocolDispatchAndValidation(t *testing.T) {
+	for _, protocol := range []string{"ssh", "https"} {
+		service := &fakeConfigurableAuthentication{fakeAuthentication: fakeAuthentication{login: localauth.Status{Provider: localauth.GitHub, Authenticated: true, State: localauth.StateAuthenticated}, attempted: true}}
+		response := RunAuthLoginWithOptions(context.Background(), domain.ChannelDev, "github", localauth.Terminal{}, service, localauth.LoginOptions{GitProtocol: protocol})
+		if !response.OK || service.options.GitProtocol != protocol || service.provider != localauth.GitHub || !response.Mutation.Attempted {
+			t.Fatalf("response=%+v options=%+v", response, service.options)
+		}
+	}
+	for _, test := range []struct{ provider, protocol string }{{"codex", "ssh"}, {"claude", "https"}, {"cursor", "ssh"}, {"github", "SSH"}, {"github", "git"}} {
+		service := &fakeConfigurableAuthentication{}
+		response := RunAuthLoginWithOptions(context.Background(), domain.ChannelStable, test.provider, localauth.Terminal{}, service, localauth.LoginOptions{GitProtocol: test.protocol})
+		if response.OK || response.Error == nil || response.Error.Code != "invalid_argument" || response.Mutation.Attempted || service.provider != "" {
+			t.Fatalf("test=%+v response=%+v", test, response)
+		}
+	}
+}
+
+func TestAuthLoginExplicitProtocolRequiresSupportingService(t *testing.T) {
+	service := &fakeAuthentication{}
+	response := RunAuthLoginWithOptions(context.Background(), domain.ChannelStable, "github", localauth.Terminal{}, service, localauth.LoginOptions{GitProtocol: "ssh"})
+	if response.OK || response.Error == nil || response.Error.Code != "invalid_argument" || service.provider != "" {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestAuthLoginExplicitProtocolFailurePreservesRetrySelection(t *testing.T) {
+	service := &fakeConfigurableAuthentication{fakeAuthentication: fakeAuthentication{attempted: true, err: localauth.ErrLoginFailed}}
+	response := RunAuthLoginWithOptions(context.Background(), domain.ChannelDev, "github", localauth.Terminal{}, service, localauth.LoginOptions{GitProtocol: "ssh"})
+	if response.OK || !response.Mutation.Attempted || response.NextAction == nil || !reflect.DeepEqual(response.NextAction.Argv, []string{"sf-dev", "auth", "login", "github", "--git-protocol", "ssh"}) {
+		t.Fatalf("response=%+v", response)
+	}
 }
 
 func (service *fakeAuthentication) StatusAll(context.Context) []localauth.Status {

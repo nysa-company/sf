@@ -81,6 +81,13 @@ type DoctorDeps struct {
 	StatFS     func(string) (*syscall.Statfs_t, error)
 	CurrentUID func() uint32
 	Worktree   func(context.Context, string) error
+	// Origin and SSHAgent are local-only diagnostics, installed in production
+	// composition rather than defaults to avoid ambient probes in callers.
+	Origin func(context.Context, string) (string, error)
+	// PushOrigin returns an empty value when no explicit push URL is set.
+	PushOrigin func(context.Context, string) (string, error)
+	SSHAgent   func(context.Context) DoctorSSHAgentState
+	SSHAssets  func() error
 	// Recipe previews local configuration/closure only; it is not persisted
 	// ticket configuration or executable/provider launch authority.
 	Recipe     func(context.Context, string) error
@@ -143,6 +150,10 @@ func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
 	deps := (DoctorDeps{Channel: channel, Repo: repo}).defaults()
 	manager := localauth.NewManager()
 	deps.AuthStatus = manager.StatusAll
+	deps.Origin = doctorRepositoryOrigin
+	deps.PushOrigin = doctorRepositoryPushOrigin
+	deps.SSHAgent = productionDoctorSSHAgent(os.Getenv("SSH_AUTH_SOCK"))
+	deps.SSHAssets = productionDoctorSSHAssets(channel)
 	deps.Recipe = func(ctx context.Context, repository string) error {
 		response := RunInitCheck(ctx, InitRequest{Channel: channel, Repo: repository, Paths: deps.Paths})
 		if !response.OK {
@@ -247,6 +258,7 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 	} else {
 		report.Checks = append(report.Checks, DoctorCheck{ID: "repository_recipe", Status: CheckPass, Summary: "working-tree configuration and local test closure preview accepted; stored configuration and executable versions are checked separately"})
 	}
+	checkDoctorGitTransport(ctx, deps, &report)
 	report.Checks = append(report.Checks, checkExecutable(deps, "gh", "gh executable is available"))
 	pair, pairAvailable := checkProviderPair(ctx, deps, &report)
 	checkQuarantinedProviders(ctx, deps, &report)
@@ -371,6 +383,9 @@ func doctorQualification(role string, value store.ProviderQualification) DoctorP
 func guardedEligibilityChecksPass(report DoctorReport) bool {
 	mandatory := []string{"channel_root", "disk_space", "git_executable", "gh_executable", "authority_database", "provider_recovery", "external_mutation_recovery", "authentication", "provider_pair", "github_auth", "builder_auth", "reviewer_auth"}
 	for _, check := range report.Checks {
+		if (check.ID == "git_transport" || check.ID == "ssh_agent" || check.ID == "ssh_assets") && check.Status == CheckFail {
+			mandatory = append(mandatory, check.ID)
+		}
 		if check.ID == "repository_recipe" && check.Status != CheckNotRun {
 			mandatory = append(mandatory, check.ID)
 		}
@@ -417,7 +432,7 @@ func checkAuthentication(ctx context.Context, deps DoctorDeps, pair store.Provid
 	} else {
 		report.Checks = append(report.Checks, DoctorCheck{ID: "authentication", Status: CheckPass, Summary: "authentication inventory is complete and safely verified"})
 	}
-	report.Checks = append(report.Checks, requiredAuthCheck(deps.Binary, "github_auth", "GitHub", localauth.GitHub, byProvider))
+	report.Checks = append(report.Checks, requiredAuthCheck(deps.Binary, "github_auth", "GitHub API", localauth.GitHub, byProvider))
 	if !pairAvailable {
 		return
 	}

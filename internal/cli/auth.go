@@ -18,6 +18,10 @@ type authenticationService interface {
 	Login(context.Context, localauth.Provider, localauth.Terminal) (localauth.Status, bool, error)
 }
 
+type authenticationOptionsService interface {
+	LoginWithOptions(context.Context, localauth.Provider, localauth.Terminal, localauth.LoginOptions) (localauth.Status, bool, error)
+}
+
 type authStatusView struct {
 	Provider      localauth.Provider `json:"provider"`
 	Executable    string             `json:"executable"`
@@ -37,7 +41,7 @@ type authReport struct {
 	Providers             []authStatusView `json:"providers"`
 }
 
-const authScope = "Login status only; runtime qualification, model independence, billing limits, and ticket readiness are not assessed."
+const authScope = "Login status only; GitHub API authentication does not confirm SSH readiness. Runtime qualification, model independence, billing limits, and ticket readiness are not assessed."
 
 func RunAuthStatus(ctx context.Context, channel domain.Channel, service authenticationService) api.Response {
 	if !channel.Valid() || service == nil {
@@ -55,6 +59,10 @@ func RunAuthStatus(ctx context.Context, channel domain.Channel, service authenti
 }
 
 func RunAuthLogin(ctx context.Context, channel domain.Channel, providerName string, terminal localauth.Terminal, service authenticationService) api.Response {
+	return RunAuthLoginWithOptions(ctx, channel, providerName, terminal, service, localauth.LoginOptions{})
+}
+
+func RunAuthLoginWithOptions(ctx context.Context, channel domain.Channel, providerName string, terminal localauth.Terminal, service authenticationService, options localauth.LoginOptions) api.Response {
 	binary := binaryForChannel(channel)
 	if !channel.Valid() || service == nil {
 		return failure("invalid_argument", "authentication login requires a valid channel", []string{binary, "auth", "login", "--help"})
@@ -63,9 +71,23 @@ func RunAuthLogin(ctx context.Context, channel domain.Channel, providerName stri
 	if err != nil {
 		return failure("invalid_argument", "provider must be one of github, cursor, claude, or codex", []string{binary, "auth", "login", "--help"})
 	}
-	status, attempted, err := service.Login(ctx, provider, terminal)
+	if err := options.Validate(provider); err != nil {
+		return failure("invalid_argument", err.Error(), []string{binary, "auth", "login", "--help"})
+	}
+	var status localauth.Status
+	var attempted bool
+	if options.GitProtocol == "" {
+		status, attempted, err = service.Login(ctx, provider, terminal)
+	} else if configurable, ok := service.(authenticationOptionsService); ok {
+		status, attempted, err = configurable.LoginWithOptions(ctx, provider, terminal, options)
+	} else {
+		return failure("invalid_argument", "authentication service does not support explicit Git protocol selection", []string{binary, "auth", "login", "--help"})
+	}
 	if err != nil {
 		response := authLoginFailure(binary, provider, err)
+		if options.GitProtocol != "" && response.NextAction != nil && len(response.NextAction.Argv) == 4 && response.NextAction.Argv[1] == "auth" && response.NextAction.Argv[2] == "login" {
+			response.NextAction.Argv = append(response.NextAction.Argv, "--git-protocol", options.GitProtocol)
+		}
 		response.Mutation = api.Mutation{Attempted: attempted, Kind: "credential.login", Identity: string(provider)}
 		return response
 	}

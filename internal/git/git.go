@@ -457,6 +457,16 @@ func (r Runner) commandEnvInputExpectedWithHandoff(ctx context.Context, director
 	if helper := credentialHelperFromEnvironment(extra); helper != "" {
 		argv = append(argv, "-c", "credential.useHttpPath=true", "-c", "credential.helper="+helper)
 	}
+	for _, entry := range extra {
+		if entry == "GIT_SSH="+r.SSHHelper && r.SSHHelper != "" {
+			// core.sshCommand takes precedence over GIT_SSH, including the
+			// empty hardening default above. Override it only for our explicit
+			// authenticated transport capability. Git interprets this setting
+			// through a shell, so quote the entire executable path literally.
+			argv = append(argv, "-c", "core.sshCommand='"+strings.ReplaceAll(r.SSHHelper, "'", "'\\''")+"'")
+			break
+		}
+	}
 	argv = append(argv, commandArguments...)
 	if r.Run != nil {
 		if handedOff != nil {
@@ -1548,6 +1558,9 @@ func rejectGitEnvironment(env []string) error {
 }
 
 func safeOrigin(raw string) (string, error) {
+	if _, ok := gitssh.RepositoryFromOrigin(raw); ok {
+		return raw, nil
+	}
 	if validAbsolutePath(raw) {
 		resolved, err := filepath.EvalSymlinks(raw)
 		if err != nil {
@@ -1563,13 +1576,7 @@ func safeOrigin(raw string) (string, error) {
 		return "", fmt.Errorf("%w: noncanonical origin refused", ErrIdentityMismatch)
 	}
 	if parsed.Scheme == "ssh" {
-		if parsed.User == nil || parsed.User.Username() != "git" || parsed.Hostname() != "ssh.github.com" || parsed.Port() != "443" || !validGitHubRepoPath(strings.TrimPrefix(parsed.Path, "/")) {
-			return "", fmt.Errorf("%w: noncanonical github ssh origin refused", ErrIdentityMismatch)
-		}
-		if _, hasPassword := parsed.User.Password(); hasPassword {
-			return "", fmt.Errorf("%w: noncanonical github ssh origin refused", ErrIdentityMismatch)
-		}
-		return parsed.String(), nil
+		return "", fmt.Errorf("%w: noncanonical github ssh origin refused", ErrIdentityMismatch)
 	}
 	if parsed.User != nil {
 		if _, hasPassword := parsed.User.Password(); hasPassword {
@@ -2946,11 +2953,12 @@ func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error
 		}
 		return nil, false, nil
 	}
+	sshRepository, isSSH := gitssh.RepositoryFromOrigin(origin)
 	parsed, err := url.Parse(origin)
-	if err != nil {
+	if err != nil && !isSSH {
 		return nil, false, fmt.Errorf("%w: canonical GitHub transport is required", ErrIdentityMismatch)
 	}
-	if parsed.Scheme == "https" {
+	if !isSSH && parsed.Scheme == "https" {
 		canonical, canonicalErr := safeOrigin(origin)
 		if canonicalErr != nil || canonical != origin {
 			return nil, false, fmt.Errorf("%w: canonical GitHub HTTPS transport is required", ErrIdentityMismatch)
@@ -2990,8 +2998,11 @@ func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error
 		repository := strings.TrimSuffix(strings.TrimPrefix(parsed.Path, "/"), ".git")
 		return []string{"SF_GIT_CREDENTIAL_HELPER=" + r.CredentialHelper, "SF_GIT_GH_BINARY=" + r.GHBinary, "SF_GIT_GH_BINARY_DIGEST=" + r.GHBinaryDigest, "SF_GIT_GH_CONFIG_DIR=" + r.GHConfigDir, "SF_GIT_HTTPS_REPOSITORY=" + repository}, true, nil
 	}
-	if parsed.Scheme != "ssh" || parsed.User == nil || parsed.User.Username() != "git" || parsed.Hostname() != "ssh.github.com" || parsed.Port() != "443" || !validGitHubRepoPath(strings.TrimPrefix(parsed.Path, "/")) {
+	if !isSSH {
 		return nil, false, fmt.Errorf("%w: only canonical GitHub HTTPS or SSH publication is supported", ErrIdentityMismatch)
+	}
+	if r.SSHHelper == "" && r.SSHBinary == "" && r.SSHKnownHosts == "" && r.SSHAgentSock == "" && r.CredentialHelper == "" && r.GHBinary == "" && r.GHBinaryDigest == "" && r.GHConfigDir == "" {
+		return nil, false, ErrPublicationRemoteUnavailable
 	}
 	for _, item := range []struct{ path, name string }{{r.SSHHelper, "ssh helper"}, {r.SSHBinary, "ssh binary"}, {r.SSHKnownHosts, "known hosts"}, {r.SSHAgentSock, "agent socket"}} {
 		if !validAbsolutePath(item.path) {
@@ -3012,7 +3023,7 @@ func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error
 			return nil, false, fmt.Errorf("%w: github known-hosts asset is not pinned", ErrIdentityMismatch)
 		}
 	}
-	return []string{"GIT_SSH=" + r.SSHHelper, "GIT_SSH_VARIANT=ssh", "SF_GIT_SSH_BINARY=" + r.SSHBinary, "SF_GIT_SSH_KNOWN_HOSTS=" + r.SSHKnownHosts, "SF_GIT_SSH_REPOSITORY=" + strings.TrimSuffix(strings.TrimPrefix(parsed.Path, "/"), ".git"), "SSH_AUTH_SOCK=" + r.SSHAgentSock}, true, nil
+	return []string{"GIT_SSH=" + r.SSHHelper, "GIT_SSH_VARIANT=ssh", "SF_GIT_SSH_BINARY=" + r.SSHBinary, "SF_GIT_SSH_KNOWN_HOSTS=" + r.SSHKnownHosts, "SF_GIT_SSH_REPOSITORY=" + sshRepository, "SSH_AUTH_SOCK=" + r.SSHAgentSock}, true, nil
 }
 
 func trustedGitDirectory(path string) bool {

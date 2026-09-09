@@ -52,13 +52,43 @@ func TestCommandPinsGitHubReceivePackAndSanitizesEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(args, "\x00")
-	for _, want := range []string{"-F\x00/dev/null", "StrictHostKeyChecking=yes", "ProxyCommand=none", "PasswordAuthentication=no", "git-receive-pack '/owner/repo.git'"} {
+	for _, want := range []string{"-F\x00/dev/null", "StrictHostKeyChecking=yes", "IdentityFile=none", "IdentityAgent=SSH_AUTH_SOCK", "ProxyCommand=none", "PasswordAuthentication=no", "git-receive-pack '/owner/repo.git'"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q: %q", want, joined)
 		}
 	}
 	if strings.Join(env, "\x00") != "PATH=/usr/bin:/bin:/usr/sbin:/sbin\x00LANG=C\x00SSH_AUTH_SOCK="+req.AgentSocket {
 		t.Fatalf("unsafe env %q", env)
+	}
+}
+
+func TestCommonGitHubOriginsAreLiteralAndBounded(t *testing.T) {
+	for _, origin := range []string{"git@github.com:owner/repo.git", "ssh://git@github.com/owner/repo.git", "ssh://git@github.com:22/owner/repo.git", "ssh://git@ssh.github.com:443/owner/repo.git"} {
+		if repository, ok := RepositoryFromOrigin(origin); !ok || repository != "owner/repo" {
+			t.Fatalf("origin rejected: %q", origin)
+		}
+	}
+	for _, origin := range []string{"git@alias:owner/repo.git", "user@github.com:owner/repo.git", "git@github.com:/owner/repo.git", "ssh://git@github.com:443/owner/repo.git", "ssh://git@ssh.github.com/owner/repo.git", "ssh://git:password@github.com/owner/repo.git", "ssh://git@github.com/owner/repo.git?x", "ssh://git@github.com/owner/repo.git#x", "ssh://git@github.com/owner/%72epo.git", "git@github.com:owner/../repo.git", "git@github.com:owner/repo.git\n", "git@github.com:owner/repo", "git@github.com:-owner/repo.git"} {
+		if _, ok := RepositoryFromOrigin(origin); ok {
+			t.Fatalf("unsafe origin accepted: %q", origin)
+		}
+	}
+}
+
+func TestCommonGitArgvUsesSamePinnedCommand(t *testing.T) {
+	req := fixture(t)
+	for _, argv := range [][]string{
+		{"git@github.com", "git-upload-pack 'owner/repo.git'"},
+		{"git@github.com", "git-upload-pack '/owner/repo.git'"},
+		{"-p", "22", "git@github.com", "git-upload-pack '/owner/repo.git'"},
+	} {
+		args, _, err := Command(req, argv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(args[len(args)-4:], "\x00"); got != "-p\x00443\x00git@ssh.github.com\x00git-upload-pack '/owner/repo.git'" {
+			t.Fatalf("unpinned command: %q", got)
+		}
 	}
 }
 func TestCommandRejectsEscapesHostsAndCommands(t *testing.T) {
@@ -87,31 +117,33 @@ func TestCompiledHelperAcceptsRealGitUploadPackArgv(t *testing.T) {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build helper: %v\n%s", err, output)
 	}
-	command := exec.Command("git", "ls-remote", "ssh://git@ssh.github.com:443/owner/repo.git")
-	command.Env = []string{"PATH=/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_SSH=" + helper, "GIT_SSH_VARIANT=ssh", "SF_GIT_SSH_BINARY=" + fakeSSH, "SF_GIT_SSH_KNOWN_HOSTS=" + req.KnownHosts, "SF_GIT_SSH_REPOSITORY=owner/repo", "SSH_AUTH_SOCK=" + req.AgentSocket}
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("real git ls-remote: %v\n%s", err, output)
-	}
-	got, err := os.ReadFile(capture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(got), "git-upload-pack '/owner/repo.git'") {
-		t.Fatalf("git did not generate canonical upload-pack argv: %q", got)
-	}
-	// A real push reaches the receive-pack form before the intentionally tiny
-	// fake server declines the protocol. This guards the exact argv spelling
-	// Git generates for the mutating transport as well as upload-pack above.
-	push := exec.Command("git", "push", "ssh://git@ssh.github.com:443/owner/repo.git", "HEAD:refs/heads/main")
-	push.Dir = moduleRoot(t)
-	push.Env = command.Env
-	_ = push.Run() // the fake server has no receive-pack implementation
-	got, err = os.ReadFile(capture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(got), "git-receive-pack '/owner/repo.git'") {
-		t.Fatalf("git did not generate canonical receive-pack argv: %q", got)
+	for _, origin := range []string{"ssh://git@ssh.github.com:443/owner/repo.git", "git@github.com:owner/repo.git", "ssh://git@github.com/owner/repo.git", "ssh://git@github.com:22/owner/repo.git"} {
+		command := exec.Command("git", "ls-remote", origin)
+		command.Env = []string{"PATH=/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_SSH=" + helper, "GIT_SSH_VARIANT=ssh", "SF_GIT_SSH_BINARY=" + fakeSSH, "SF_GIT_SSH_KNOWN_HOSTS=" + req.KnownHosts, "SF_GIT_SSH_REPOSITORY=owner/repo", "SSH_AUTH_SOCK=" + req.AgentSocket}
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("real git ls-remote: %v\n%s", err, output)
+		}
+		got, err := os.ReadFile(capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(got), "git-upload-pack '/owner/repo.git'") {
+			t.Fatalf("git did not generate canonical upload-pack argv: %q", got)
+		}
+		// A real push reaches the receive-pack form before the intentionally tiny
+		// fake server declines the protocol. This guards the exact argv spelling
+		// Git generates for the mutating transport as well as upload-pack above.
+		push := exec.Command("git", "push", origin, "HEAD:refs/heads/main")
+		push.Dir = moduleRoot(t)
+		push.Env = command.Env
+		_ = push.Run() // the fake server has no receive-pack implementation
+		got, err = os.ReadFile(capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(got), "git-receive-pack '/owner/repo.git'") {
+			t.Fatalf("git did not generate canonical receive-pack argv: %q", got)
+		}
 	}
 }
 

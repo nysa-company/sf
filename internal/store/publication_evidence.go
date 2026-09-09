@@ -20,6 +20,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/gitssh"
 )
 
 type PublicationEffectEvidence struct {
@@ -202,10 +203,9 @@ func publicationGitHubRepo(raw string) (string, string, bool) {
 	if raw == "" || strings.HasPrefix(raw, "/") {
 		return "", "", false
 	}
-	if strings.HasPrefix(raw, "git@github.com:") {
-		raw = "https://github.com/" + strings.TrimPrefix(raw, "git@github.com:")
-	} else if strings.HasPrefix(raw, "ssh://git@github.com/") {
-		raw = "https://github.com/" + strings.TrimPrefix(raw, "ssh://git@github.com/")
+	if name, ok := gitssh.RepositoryFromOrigin(raw); ok {
+		owner, repository, _ := strings.Cut(name, "/")
+		return owner, repository, true
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {

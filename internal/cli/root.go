@@ -514,18 +514,24 @@ func (a *app) doctorCommand() *cobra.Command {
 }
 
 func (a *app) authCommand() *cobra.Command {
+	var gitProtocol string
 	root := &cobra.Command{Use: "auth", Args: cobra.NoArgs}
 	root.AddCommand(&cobra.Command{Use: "status", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		manager := localauth.NewManager()
 		return a.emit(RunAuthStatus(cmd.Context(), a.channel, manager))
 	}})
-	root.AddCommand(&cobra.Command{Use: "login <provider>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	login := &cobra.Command{Use: "login <provider>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if cmd.Flags().Changed("git-protocol") && gitProtocol == "" {
+			return a.emit(failure("invalid_argument", "git protocol must be ssh or https", []string{binaryForChannel(a.channel), "auth", "login", "--help"}))
+		}
 		manager := localauth.NewManager()
 		// Provider interaction is deliberately on stderr so --json retains one
 		// machine-readable response on stdout. The exchange is never captured.
 		terminal := localauth.Terminal{In: os.Stdin, Out: a.errOut, Err: a.errOut}
-		return a.emit(RunAuthLogin(cmd.Context(), a.channel, args[0], terminal, manager))
-	}})
+		return a.emit(RunAuthLoginWithOptions(cmd.Context(), a.channel, args[0], terminal, manager, localauth.LoginOptions{GitProtocol: gitProtocol}))
+	}}
+	login.Flags().StringVar(&gitProtocol, "git-protocol", "", "GitHub only: ssh or https; changes gh's github.com preference for all accounts, without generating or uploading SSH keys")
+	root.AddCommand(login)
 	return root
 }
 

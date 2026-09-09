@@ -199,6 +199,7 @@ func main() {
 				OwnerHome:         ownerHome,
 				GHConfigDir:       ghConfigDir,
 				GHBinary:          ghBinary,
+				SSHAgentSock:      os.Getenv("SSH_AUTH_SOCK"),
 				GHAuthenticated:   !prePublishingOnly,
 				PrePublishingOnly: prePublishingOnly,
 				Workers:           2,

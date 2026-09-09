@@ -1,0 +1,56 @@
+name: github-ssh
+
+on:
+  push:
+    branches: [feat/github-ssh]
+  pull_request:
+    paths:
+      - internal/git/**
+      - internal/gitssh/**
+      - internal/auth/**
+      - internal/cli/**
+      - internal/runtimeassets/**
+      - internal/localruntime/**
+      - internal/publication/**
+      - internal/store/publication*
+      - cmd/sf/**
+      - .github/workflows/github-ssh.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transport:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: SSH transport, auth, and composition tests
+        run: go test -p 1 -count=1 ./internal/auth ./internal/cli ./internal/gitssh ./internal/git ./internal/runtimeassets ./internal/localruntime ./internal/publication
+      - name: Store transport identity regression
+        run: go test -p 1 -count=1 ./internal/store -run '^TestPublicationGitHubRepoSSH$'
+      - name: SSH and auth race tests
+        run: go test -race -p 1 -count=1 ./internal/auth ./internal/gitssh ./internal/runtimeassets
+      - name: Static validation
+        run: |
+          go vet ./...
+          scripts/repo-check
+          scripts/docs-smoke
+          scripts/secret-scan
+      - name: Complete development bundle
+        run: |
+          make build-dev DEV_VERSION=0.1.0-dev.ssh COMMIT="$GITHUB_SHA"
+          tar -czf "$RUNNER_TEMP/sf-ssh-dev.tar.gz" -C bin .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sf-ssh-dev
+          path: ${{ runner.temp }}/sf-ssh-dev.tar.gz
+          retention-days: 7

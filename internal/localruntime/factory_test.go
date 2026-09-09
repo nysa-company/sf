@@ -120,7 +120,7 @@ func TestFactoryPrePublishingModeDisablesPublicationAdmission(t *testing.T) {
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	compose := factory(Config{Channel: domain.ChannelDev, GitHome: filepath.Join(root, "git-home"), PrePublishingOnly: true}, func(domain.Channel) (runtimeassets.Core, error) {
+	compose := factory(Config{Channel: domain.ChannelDev, GitHome: filepath.Join(root, "git-home"), PrePublishingOnly: true, SSHAgentSock: filepath.Join(root, "agent.sock")}, func(domain.Channel) (runtimeassets.Core, error) {
 		return runtimeassets.Core{Executable: executable(t, root, "sf-dev"), GitExec: executable(t, root, "sf-git-exec-dev")}, nil
 	})
 	components, err := compose(daemon.RuntimeDependencies{Store: database, Engine: engine.New(database, statemachine.Spec{}), ProviderCoordinator: coordinator})
@@ -130,6 +130,9 @@ func TestFactoryPrePublishingModeDisablesPublicationAdmission(t *testing.T) {
 	managed, ok := components.Runtime.(*managedRuntime)
 	if !ok || managed.runtime.Scheduler.AdmitPublishing {
 		t.Fatalf("pre-publishing runtime admitted publication: runtime=%T", components.Runtime)
+	}
+	if dispatcher, ok := managed.runtime.Scheduler.Worker.(Worker); ok && (dispatcher.PublicationEnabled || dispatcher.Publication.Git.SSHAgentSock != "") {
+		t.Fatal("pre-publishing runtime exposed SSH publication capability")
 	}
 	if err := components.Runtime.Close(); err != nil {
 		t.Fatal(err)
@@ -206,7 +209,7 @@ func TestFactoryComposesSnapshotBoundPublicationCapability(t *testing.T) {
 	if err := os.Mkdir(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	compose := factoryWithResolvers(Config{Channel: domain.ChannelDev, GitHome: filepath.Join(root, "git-home"), OwnerHome: root, GHConfigDir: configDir, GHBinary: gh, GHAuthenticated: true}, func(domain.Channel) (runtimeassets.Core, error) {
+	compose := factoryWithResolvers(Config{Channel: domain.ChannelDev, GitHome: filepath.Join(root, "git-home"), OwnerHome: root, GHConfigDir: configDir, GHBinary: gh, GHAuthenticated: true, SSHAgentSock: filepath.Join(root, "agent.sock")}, func(domain.Channel) (runtimeassets.Core, error) {
 		return runtimeassets.Core{Executable: primary, GitExec: gitExec}, nil
 	}, func(domain.Channel, string) (runtimeassets.Publication, error) {
 		return runtimeassets.Publication{CredentialHelper: credential}, nil
@@ -226,6 +229,10 @@ func TestFactoryComposesSnapshotBoundPublicationCapability(t *testing.T) {
 	dispatcher, ok := managed.runtime.Scheduler.Worker.(Worker)
 	if !ok || dispatcher.Publication.Git.GHBinary != capability.Path || dispatcher.Publication.Git.GHBinaryDigest != capability.Digest || dispatcher.CI.Observer == nil {
 		t.Fatalf("worker does not use gh snapshot: worker=%T capability=%+v", managed.runtime.Scheduler.Worker, capability)
+	}
+	ssh := dispatcher.Publication.Git
+	if ssh.SSHHelper != filepath.Join(root, "sf-ssh-dev") || ssh.SSHKnownHosts != filepath.Join(root, "github_known_hosts") || ssh.SSHAgentSock != filepath.Join(root, "agent.sock") || ssh.SSHBinary != "/usr/bin/ssh" {
+		t.Fatal("publication SSH capability is not bound to the dev bundle and explicit agent")
 	}
 	if err := components.Runtime.Close(); err != nil {
 		t.Fatal(err)
