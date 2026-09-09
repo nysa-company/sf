@@ -5,22 +5,26 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Portable tests/builds run only on GitHub. Current pushed candidate c9d300b
-  passed all15 focused groups in34287852415. Full34288028645 pending. Independent
-  cross-review found direct implementation-repair (without amendment) still
-  rejects candidate crash completion; equivalent exact handoff fixes and4cases
-  are now being added. Do not use c9's artifact for native acceptance yet.
-  Prior d13db95 compiled onboarding and three prepared-checkpoint recovery cases
-  pass, but its focused run34284912043 fails intermittent admission. Full baseline
-  34285053550 is diagnostic for that old head; not final release acceptance.
-  No native campaign has started.
+  Portable tests/builds run only on GitHub. Pushed candidate d9e9786 passed
+  focused34288973873 (19groups) and full34289176386 (all required lanes), plus
+  independent Store/runtime source cross-review. Its hosted arm64 artifact
+  began the isolated native Relay campaign; two Planner runs overlapped and
+  a third start was refused at capacity two. Job-exists reached CI-green PR24
+  and WaitingApproval; no approval/merge dispatched. Event-exists is Verifying
+  after two recorded pause/resume interventions, with a clean worktree but
+  readiness_failed: ordinary verification resume is incorrectly selected as
+  a source-only Building takeover. Narrow selector/regression repair is in
+  progress; the repaired head requires fresh hosted gates/native continuation.
+  Actual provider retry is not yet demonstrated. Inputs, exact ticket IDs,
+  artifact identity and live state are in ignored .context/reliable-campaign.
   Current source implements bounded independent postbuild repair, immutable
   amendment/checkpoint receipts, exact restart completion, actionable status,
   and clean-room onboarding. Passing layers are not end-to-end acceptance.
   Remaining: final hosted full/race gates, exact-head independent review,
   four native Relay deliveries at capacity two with recovery/base movement and
   separate guarded approvals. Do not claim an unfamiliar-human usability trial.
-  Existing runtimes/private databases/worktrees remain untouched by this goal.
+  Existing runtimes/private databases/worktrees remain untouched; only the
+  explicitly isolated campaign runtime/repository is active for this goal.
 
 - Active consolidation goal (2026-09-07): repair the two PR #2 review findings,
   validate and update the PR, merge through its required independent review,

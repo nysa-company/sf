@@ -792,6 +792,18 @@ func (s *Store) operatorSourceResumeEndpointAtMode(ctx context.Context, conn *sq
 	if count == 0 {
 		return operatorSourceResumeEndpoint{}, false, nil
 	}
+	// An ordinary Verifying pause resumes to the same state; it carries no
+	// source-commit authority. Authenticate that complete control triplet before
+	// classifying it as absence, and never let it hide an older source handoff.
+	if count == 1 && stateChanges == 1 && s.exactOrdinaryVerificationResumeAt(ctx, conn, ref, control.stop.version, raw) {
+		history, historyErr := operatorSourceResumeHistoryPresent(ctx, conn, ref)
+		if historyErr != nil {
+			return operatorSourceResumeEndpoint{}, false, historyErr
+		}
+		if !history {
+			return operatorSourceResumeEndpoint{}, false, nil
+		}
+	}
 	if count != 1 || stateChanges != 1 || !s.exactSourceResumeEventSetAt(ctx, conn, ref, resumeVersion) || !exactOperatorTake(ctx, conn, ref, control.stop.version, domain.StateBuilding) || !exactTakeDrain(ctx, conn, ref, control.stop.version+1) {
 		return operatorSourceResumeEndpoint{}, false, ErrEvidenceConflict
 	}
@@ -1772,6 +1784,33 @@ func (s *Store) exactSourceResumeEventSetAt(ctx context.Context, conn *sql.Conn,
 		projection.RepositoryCommandClaimEpoch == verification.CommandBinding.Key.ClaimEpoch &&
 		projection.RepositoryCommandPolicyDigest == verification.CommandBinding.PolicyDigest &&
 		projection.PrebuildOutcome == verification.CommandBinding.ExpectedOutcome
+}
+
+func (s *Store) exactOrdinaryVerificationResumeAt(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, stopVersion uint64, raw string) bool {
+	var resume struct {
+		ChangeKind   string   `json:"change_kind"`
+		ChangedFiles []string `json:"changed_files"`
+		Intent       string   `json:"intent"`
+		Operator     string   `json:"operator"`
+	}
+	if !canonicalOperatorJSON(raw, &resume) || resume.ChangeKind != "none" || len(resume.ChangedFiles) != 0 || resume.Intent != "resume" || !boundedText(resume.Operator, 300) || !s.exactSourceResumeEventSetAt(ctx, conn, ref, stopVersion+2) {
+		return false
+	}
+	var stop struct {
+		Intent      string `json:"intent"`
+		Operator    string `json:"operator"`
+		OperatorUID uint32 `json:"operator_uid"`
+	}
+	var payload string
+	var count int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(payload),'') FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='operator_pause_or_take' AND from_state='verifying' AND to_state='stopping'`, ref.Channel, ref.Project, ref.Ticket, stopVersion).Scan(&count, &payload); err != nil || count != 1 || !exactStateChangeAt(ctx, conn, ref, stopVersion) || !canonicalOperatorJSON(payload, &stop) || stop.Intent != "pause" || !boundedText(stop.Operator, 300) || stop.OperatorUID == 0 {
+		return false
+	}
+	var drain operatorTakeDrainEvent
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(payload),'') FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='process_and_effects_drained' AND from_state='stopping' AND to_state='paused'`, ref.Channel, ref.Project, ref.Ticket, stopVersion+1).Scan(&count, &payload); err != nil || count != 1 || !exactStateChangeAt(ctx, conn, ref, stopVersion+1) || !canonicalOperatorJSON(payload, &drain) || !drain.Drained || drain.Intent != "pause" || !validTakeoverRemoteBaseline(drain.Remote) {
+		return false
+	}
+	return true
 }
 
 func exactOperatorTake(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, version uint64, from domain.State) bool {

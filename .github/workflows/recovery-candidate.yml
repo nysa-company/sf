@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [store, git, admission, behavior, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, repair-candidate-unrecorded-same, repair-candidate-unrecorded-restart, repair-candidate-recorded-same, repair-candidate-recorded-restart, onboarding, python-onboarding]
+        group: [store, source-resume, git, admission, behavior, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, repair-candidate-unrecorded-same, repair-candidate-unrecorded-restart, repair-candidate-recorded-same, repair-candidate-recorded-restart, onboarding, python-onboarding]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,6 +44,9 @@ jobs:
             store)
               go test -p 1 -count=1 ./internal/statemachine ./internal/engine
               go test -p 1 -count=1 ./internal/store -run 'Test(Postbuild|TransitionPostbuild|AuthenticatePostbuildFailure|ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)' -v
+              ;;
+            source-resume)
+              go test -p 1 -count=1 ./internal/store -run '^TestOperatorSourceResume' -v
               ;;
             git)
               go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v

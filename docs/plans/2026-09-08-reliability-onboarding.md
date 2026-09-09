@@ -267,3 +267,23 @@ VERDICT: implementation design in progress; not cleared for merge.
 - Native acceptance remains gated. The campaign will explicitly distinguish
   deliberate Planner cancellation-exhaustion/retry from natural model failure;
   pause/resume alone does not prove provider retry.
+
+## Execution checkpoint — native concurrency and ordinary resume
+
+- Exact d9e9786 passed focused run34288973873 and full run34289176386,
+  including every required acceptance lane. Independent Store and runtime
+  source reviews passed. The hosted arm64 artifact began an isolated native
+  four-ticket Relay campaign; no local portable test or build was run.
+- Two real Planner attempts overlapped and a third start was refused at
+  capacity two. One ticket reached a CI-green draft PR and WaitingApproval.
+  No approval or merge has been dispatched yet.
+- Two deliberate pause/resume interventions were recorded. The second pause
+  crossed from Planner completion into verification, so it is not evidence of
+  Planner exhaustion or the provider `retry` command. No additional forced
+  interruptions are planned to manufacture eligibility.
+- Native verification resume exposed a selector defect: an ordinary clean
+  pause/resume was mistaken for a source-only Building takeover. Its valid
+  resume committed, but scheduler admission refused before another provider
+  launch. Add exact ordinary-control classification and a regression without
+  weakening genuine takeover authentication. The repaired head needs fresh
+  hosted checks and native continuation. The campaign remains incomplete.
