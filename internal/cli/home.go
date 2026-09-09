@@ -77,13 +77,17 @@ func (a *app) homeCommand() *cobra.Command {
 				if _, err := fmt.Fprintf(a.errOut, "Review source before submission (deadline starts at submission):\n%s\nProvider pair/readiness are checked by the daemon. No estimated-cost consent is implied.\n", safeDraftPreview(string(parsed.Source))); err != nil {
 					return fail("could not display draft; no action taken")
 				}
-				confirm, err := read("Submit and start this draft? Type run; anything else cancels: ")
-				if err != nil || confirm != "run" {
+				confirm, err := read("Submit and start this draft? Type run for verified-cost accounting, or run estimates to accept estimated costs (NOT a hard billing cap). Anything else cancels: ")
+				if err != nil || confirm != "run" && confirm != "run estimates" {
 					return fail("start cancelled; nothing submitted")
 				}
 				a.expectedDraftDigest = parsed.Digest
 				defer func() { a.expectedDraftDigest = "" }()
-				return a.dispatchHome(cmd, []string{"run", path, "--project", project})
+				args := []string{"run", path, "--project", project}
+				if confirm == "run estimates" {
+					args = append(args, "--accept-cost-estimates")
+				}
+				return a.dispatchHome(cmd, args)
 			case "3":
 				return a.dispatchHome(cmd, []string{"tickets", "--project", project})
 			default:

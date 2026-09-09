@@ -317,8 +317,10 @@ approval picker. Without `--project`, project actions ask for the registered
 name; SF does not guess registration from a directory name. Starting previews
 the source and requires `run`; a changed draft refuses before submission.
 Approval still requires selecting the ticket and confirming the exact reviewed
-head. The menu does not consent to estimated costs: use the explicit `run`
-command with `--accept-cost-estimates` if required. `q`/EOF cancels prompts;
+head. At the start confirmation, plain `run` retains verified-cost accounting;
+type `run estimates` to explicitly accept estimated costs, equivalent to the
+direct command's `--accept-cost-estimates`. Estimates are not a hard billing cap.
+The menu never supplies that consent from project/provider defaults. `q`/EOF cancels prompts;
 `--json` and nonterminal home calls refuse without dispatch. Existing explicit
 commands remain available to scripts and agents.
 

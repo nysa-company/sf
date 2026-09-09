@@ -253,13 +253,16 @@ func TestTicketEntryIssueOutputBufferBound(t *testing.T) {
 }
 
 func TestTicketEntryHomeRunRequiresExactPreviewAndDoesNotRetry(t *testing.T) {
-	for _, mode := range []string{"cancel", "run", "uncertain", "changed"} {
+	for _, mode := range []string{"cancel", "run", "estimates", "uncertain", "changed"} {
 		t.Run(mode, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "draft.md")
 			if err := os.WriteFile(path, []byte(ticketTemplate), 0600); err != nil {
 				t.Fatal(err)
 			}
 			answer := "run"
+			if mode == "estimates" {
+				answer = "run estimates"
+			}
 			if mode == "cancel" {
 				answer = "no"
 			}
@@ -282,17 +285,25 @@ func TestTicketEntryHomeRunRequiresExactPreviewAndDoesNotRetry(t *testing.T) {
 				if calls != 2 || r.Method != "ticket.start" {
 					t.Fatal("unexpected retry")
 				}
+				var parameters map[string]any
+				if json.Unmarshal(r.Parameters, &parameters) != nil {
+					t.Fatal("bad parameters")
+				}
+				consent, present := parameters["accept_cost_estimates"]
+				if present != (mode == "estimates") || present && consent != true {
+					t.Fatal("cost consent was implied or lost")
+				}
 				return runTestResponse(domain.StatePlanning, "ticket_start", false), nil
 			})
 			executeEntry(t, a, "home", "--project", "app")
 			want := 0
-			if mode == "run" {
+			if mode == "run" || mode == "estimates" {
 				want = 2
 			}
 			if mode == "uncertain" {
 				want = 1
 			}
-			if calls != want || a.last.OK != (mode == "run") {
+			if calls != want || a.last.OK != (mode == "run" || mode == "estimates") {
 				t.Fatalf("mode=%s calls=%d response=%+v", mode, calls, a.last)
 			}
 		})

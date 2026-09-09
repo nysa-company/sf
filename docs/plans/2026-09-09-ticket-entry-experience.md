@@ -17,6 +17,8 @@ model latency, or end-to-end delivery time.
    Reuse existing run, status, and candidate-bound approval commands. Require an
    explicit project where needed, show it before dispatch, and never infer a
    project solely from a directory basename. No new lifecycle authority.
+   The start confirmation offers plain `run` (verified costs) or explicit
+   `run estimates` (existing estimated-cost consent, never a hard billing cap).
 3. `ticket import <https://github.com/owner/repo/issues/number>`: bounded
    authenticated read through the installed `gh` CLI; validate returned URL and
    number; reject PRs, malformed URLs and oversized/control-bearing content.
