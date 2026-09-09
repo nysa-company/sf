@@ -150,6 +150,7 @@ func TestProviderRetryWaitingApprovalRecoversTwice(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		assertProviderRetryWaitingPredecessor(t, fixture, leader, restart)
 		if changed, err := fixture.db.FenceRecoveredRunners(fixture.ctx, fixture.ticket.Ref.Channel, leader); err != nil || changed != 1 {
 			t.Fatalf("restart %d: changed=%d err=%v", restart, changed, err)
 		}
@@ -158,6 +159,41 @@ func TestProviderRetryWaitingApprovalRecoversTwice(t *testing.T) {
 			t.Fatalf("restart %d ticket=%+v err=%v", restart, current, err)
 		}
 		fixture.ticket = current
+	}
+}
+
+func assertProviderRetryWaitingPredecessor(t *testing.T, fixture finalReviewFixture, leader uint64, restart int) {
+	t.Helper()
+	conn, err := fixture.db.db.Conn(fixture.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ref := fixture.ticket.Ref
+	control, err := runtimeControlFrom(fixture.ctx, conn, ref)
+	if err != nil {
+		t.Fatalf("restart %d stage runtime-control: %v", restart, err)
+	}
+	t.Logf("restart %d control state=%s stop=%+v authority=%+v live=%d/%d newleader=%d", restart, control.state, control.stop, control.authority, fixture.ticket.Version, fixture.ticket.RunnerEpoch, leader)
+	prior, found, err := fixture.db.normalPostPublicationRecoveryPredecessor(fixture.ctx, conn, ref, fixture.ticket.State, fixture.ticket.Version, fixture.ticket.RunnerEpoch, leader)
+	if err != nil || !found {
+		t.Fatalf("restart %d stage normal-post-publication: prior=%d found=%v err=%v", restart, prior, found, err)
+	}
+	epoch, found, err := loadProviderRetryEpoch(fixture.ctx, conn, ref, domain.PhasePlanning)
+	if err != nil || !found {
+		t.Fatalf("restart %d stage retry-epoch: found=%v err=%v", restart, found, err)
+	}
+	if err := validateProviderRetryAdvance(fixture.ctx, conn, ref, epoch.Phase, epoch.ExhaustionVersion-1, epoch.ExhaustionRunner, epoch.ExhaustionLeader, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader); err != nil {
+		t.Fatalf("restart %d stage original-retry-advance: %v", restart, err)
+	}
+	current := mutationRevocation{version: fixture.ticket.Version, runner: fixture.ticket.RunnerEpoch, leader: prior}
+	if _, _, err := providerRetryRuntimeControlFrom(fixture.ctx, conn, ref, domain.PhasePlanning, current); err != nil {
+		prefixErr := validateRunnerRecoveryLedgerPrefix(fixture.ctx, conn, ref, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader, current.version, current.runner, current.leader)
+		phaseErr := validateRunnerPhaseChain(fixture.ctx, conn, ref, epoch.RetryVersion, epoch.RetryRunner, current.version, current.runner)
+		t.Fatalf("restart %d stage retry-runtime-control: %v retry=%d/%d/%d current=%+v prefix=%v phase-chain=%v", restart, err, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader, current, prefixErr, phaseErr)
+	}
+	if got, matched, err := fixture.db.providerRetryPostPublicationPredecessor(fixture.ctx, conn, ref, fixture.ticket.State, fixture.ticket.Version, fixture.ticket.RunnerEpoch, leader, control); err != nil || !matched || got != prior {
+		t.Fatalf("restart %d stage composed-retry-predecessor: prior=%d matched=%v err=%v", restart, got, matched, err)
 	}
 }
 
