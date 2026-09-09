@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"unicode"
 
-	"github.com/nysa-company/sf/internal/domain"
 	"github.com/spf13/cobra"
 )
+
+var homeProjectPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,47}$`)
 
 // Home is navigation, not a new lifecycle controller. Every selected action
 // passes through the same public command and daemon checks as direct usage.
@@ -34,7 +36,7 @@ func (a *app) homeCommand() *cobra.Command {
 				if cmd.Context().Err() != nil {
 					return "", cmd.Context().Err()
 				}
-				answer, err := readSelectionAnswer(reader)
+				answer, err := readBoundedAnswer(reader, 4096)
 				if cmd.Context().Err() != nil {
 					return "", cmd.Context().Err()
 				}
@@ -56,8 +58,7 @@ func (a *app) homeCommand() *cobra.Command {
 					return fail("home cancelled; no action taken")
 				}
 			}
-			ref := domain.TicketRef{Channel: a.channel, Project: domain.ProjectID(project), Ticket: "SF-selection"}
-			if ref.Validate() != nil {
+			if !homeProjectPattern.MatchString(project) {
 				return fail("supply a valid registered project name; no action taken")
 			}
 			if _, err := fmt.Fprintf(a.errOut, "Project: %s  Channel: %s\n", safeSelectionLabel(project), a.channel); err != nil {

@@ -113,11 +113,37 @@ func TestTicketEntryHomeDraftAndScopedView(t *testing.T) {
 		if json.Unmarshal(r.Parameters, &values) != nil || r.Method != "ticket.status" || values["project"] != "app" {
 			t.Fatalf("%+v", r)
 		}
-		return api.Response{Version: api.Version, OK: true, Data: json.RawMessage(`{"channel":"stable","tickets":[]}`)}, nil
+		return api.Response{Version: api.Version, RequestID: "response", OK: true, Data: json.RawMessage(`{"channel":"stable","tickets":[]}`)}, nil
 	})
 	executeEntry(t, a, "home", "--project", "app")
 	if calls != 1 || !a.last.OK {
 		t.Fatalf("calls=%d response=%+v", calls, a.last)
+	}
+}
+
+func TestTicketEntryGitHubAdapterIsReadOnlyAndBounded(t *testing.T) {
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "gh")
+	script := "#!/bin/sh\n[ \"$*\" = 'api --hostname github.com --method GET repos/example/app/issues/42' ] || exit 9\n[ \"$GH_PROMPT_DISABLED\" = 1 ] || exit 10\nprintf '%s' '" + string(issueFixture()) + "'\n"
+	if err := os.WriteFile(executable, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+":/usr/bin:/bin")
+	data, err := fetchGitHubIssue(context.Background(), "repos/example/app/issues/42")
+	if err != nil || !bytes.Equal(data, issueFixture()) {
+		t.Fatalf("adapter output mismatch: %v", err)
+	}
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexec /bin/sleep 5\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	began := time.Now()
+	if _, err := fetchGitHubIssue(ctx, "repos/example/app/issues/42"); err == nil {
+		t.Fatal("deadline ignored")
+	}
+	if time.Since(began) > 3*time.Second {
+		t.Fatal("adapter deadline unbounded")
 	}
 }
 

@@ -32,7 +32,7 @@ type importedIssue struct {
 	Title       string          `json:"title"`
 	Body        string          `json:"body"`
 	State       string          `json:"state"`
-	PullRequest json.RawMessage `json:"pull_request"`
+	PullRequest json.RawMessage `json:"pull_request,omitempty"`
 }
 
 func parseIssueURL(value string) (string, string, int64, error) {
