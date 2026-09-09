@@ -58,3 +58,14 @@ import, and interrupted submission without automatic replay.
 
 Human usability trials remain a follow-up requiring external participants; do
 not manufacture timings or claim the scripted journey is a human trial.
+
+## Implementation acceptance
+
+All three initiatives are implemented at `c41345b640e00ff4ee5fff2f7cc982db0de77784`.
+Focused GitHub validation `34357643516` passed all entry, normal/race CLI, vet,
+repository, documentation and secret checks. Full factory run `34358150167`
+passed all 21 required jobs. The scripted offline draft/validate journey took
+8.039792ms with predefined answers; this is not a human usability measurement.
+See the [acceptance report](../reports/2026-09-09-ticket-entry-acceptance.md)
+for per-requirement evidence, preserved failures, and limitations. Main has not
+been changed by this goal; implementation is on `feat/ticket-entry-experience`.
