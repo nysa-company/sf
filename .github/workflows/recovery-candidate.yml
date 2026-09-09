@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [store, source-resume, retry-refresh, git, admission, behavior, compiled-approval, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, repair-candidate-unrecorded-same, repair-candidate-unrecorded-restart, repair-candidate-recorded-same, repair-candidate-recorded-restart, onboarding, python-onboarding]
+        group: [store, source-resume, retry-refresh, retry-activation, git, admission, behavior, compiled-approval, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, repair-candidate-unrecorded-same, repair-candidate-unrecorded-restart, repair-candidate-recorded-same, repair-candidate-recorded-restart, onboarding, python-onboarding]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,6 +90,26 @@ jobs:
               test "$baseline_status" -ne 0
               grep -q '^--- FAIL: TestProviderRetryProtectedBaseRefreshPausedTakeover ' "$baseline_log"
               grep -q 'refresh build context restart=0 err=' "$baseline_log"
+              ;;
+            retry-activation)
+              go test -race -p 1 -count=1 ./internal/daemon/runtimecontrol -run '^TestProviderRetryRestoredController' -v
+              source_file=internal/daemon/runtimecontrol/controller.go
+              saved_source="$RUNNER_TEMP/provider-retry-controller-fixed.go"
+              baseline_log="$RUNNER_TEMP/provider-retry-controller-baseline.log"
+              cp "$source_file" "$saved_source"
+              trap 'cp "$saved_source" "$source_file"' EXIT
+              git fetch --no-tags --depth=1 origin 9cee06722405a485f1f27c80f76047594a283da8
+              git show 9cee06722405a485f1f27c80f76047594a283da8:"$source_file" > "$source_file"
+              set +e
+              go test -p 1 -count=1 ./internal/daemon/runtimecontrol -run '^TestProviderRetryRestoredControllerActivatesRuntime$' -v > "$baseline_log" 2>&1
+              baseline_status=$?
+              set -e
+              cp "$saved_source" "$source_file"
+              trap - EXIT
+              cat "$baseline_log"
+              test "$baseline_status" -ne 0
+              grep -q '^--- FAIL: TestProviderRetryRestoredControllerActivatesRuntime ' "$baseline_log"
+              grep -q 'restored provider retry activation ready=false err=' "$baseline_log"
               ;;
             git)
               go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v

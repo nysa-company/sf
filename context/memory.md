@@ -5,7 +5,21 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Newest checkpoint (2026-09-09): exact646fcf0 focused34321890331 (22 groups)
+  Newest checkpoint (2026-09-09): exact9cee067 focused34327249098 passed all
+  22 groups/artifact, including paused-takeover CurrentVerification/two-restart
+  normal/race tests, six negatives and meaningful old646 failure gate. Full
+  34327346267 is pending with no failures. Diagnostic-only upgrade of retained
+  B (not final four-ticket acceptance) revealed provider-specific runtime rearm
+  restores a durable stop but omits the volatile runtime drain used by ordinary
+  Rearm. Physical proof succeeds; ActivateRearm compensates back to sealed when
+  fresh scheduler rejects the missing stop latch. Supported replay consumes no
+  new epoch. Six-line controller repair plus actual scheduler activation/replay
+  regression and old9cee baseline gate passed independent source review; hosted
+  validation is next. The fixture exercises actual ControlBundle activation and
+  Scheduler Begin, including replay after a failed capability installation.
+  At 08:34 full9cee has 18 jobs passed and two race jobs still active. No local
+  tests/builds, manual database edits, fresh campaign admissions or SF merge.
+  Prior checkpoint (2026-09-09): exact646fcf0 focused34321890331 (22 groups)
   and full34322063807 (21 jobs) passed, including the old-e8 baseline failure
   gate. Verified hosted artifact activated only in the isolated Relay home.
   Supported retry now succeeds (paused11 -> building12), but native paused
