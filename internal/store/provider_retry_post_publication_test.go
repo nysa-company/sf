@@ -190,7 +190,10 @@ func TestProviderRetryWaitingApprovalRejectsTamperedAuthority(t *testing.T) {
 			case "final_review":
 				statement = `UPDATE events SET trigger='forged_pass' WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='review_pass'`
 			case "phase_event":
-				statement = `UPDATE events SET trigger='forged_pass' WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='phase_pass' AND from_state='planning'`
+				// Preserve the phase-entry foreign key while injecting an
+				// ambiguous lifecycle event at the same version. Recovery must
+				// reject the contradiction, not merely rely on SQL rejecting it.
+				statement = `INSERT INTO events(channel,project_id,ticket_id,ticket_version,trigger,from_state,to_state,payload,created_at) SELECT channel,project_id,ticket_id,ticket_version,'forged_pass',from_state,to_state,payload,created_at FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='phase_pass' AND from_state='planning'`
 			case "hidden_ledger":
 				// Corruption only: a ledger row cannot coexist with the normal
 				// same-fence phase transition at this version, even if well signed.
@@ -201,8 +204,14 @@ func TestProviderRetryWaitingApprovalRejectsTamperedAuthority(t *testing.T) {
 				}
 			}
 			if statement != "" {
-				if _, err := db.db.ExecContext(ctx, statement, ref.Channel, ref.Project, ref.Ticket); err != nil {
+				result, err := db.db.ExecContext(ctx, statement, ref.Channel, ref.Project, ref.Ticket)
+				if err != nil {
 					t.Fatal(err)
+				}
+				if mode == "phase_event" {
+					if count, err := result.RowsAffected(); err != nil || count != 1 {
+						t.Fatalf("inject exactly one conflicting phase event: rows=%d err=%v", count, err)
+					}
 				}
 			}
 			leader, err := db.AcquireLeader(ctx, ref.Channel, "tampered-provider-retry-waiting")
