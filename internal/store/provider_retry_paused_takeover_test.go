@@ -46,7 +46,7 @@ func TestProviderRetryProtectedBaseRefreshPausedTakeoverRejectsUnboundEvidence(t
 			case "source_version":
 				sourceVersion--
 			case "terminal_pair":
-				query = `UPDATE phase_runs SET outcome='cancelled' WHERE channel=? AND project_id=? AND ticket_id=? AND phase='build' AND attempt=(SELECT MAX(attempt) FROM provider_attempts WHERE channel=phase_runs.channel AND project_id=phase_runs.project_id AND ticket_id=phase_runs.ticket_id AND phase='build')`
+				query = `UPDATE phase_runs SET outcome='failed' WHERE channel=? AND project_id=? AND ticket_id=? AND phase='build' AND attempt=(SELECT MAX(attempt) FROM provider_attempts WHERE channel=phase_runs.channel AND project_id=phase_runs.project_id AND ticket_id=phase_runs.ticket_id AND phase='build')`
 			case "retry_event":
 				query = `UPDATE events SET payload='{}' WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='operator_retry'`
 			case "epoch_digest":
