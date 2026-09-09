@@ -1,5 +1,15 @@
 # `sf` CLI
 
+## GitHub SSH
+
+`sf auth login github --git-protocol ssh` explicitly selects SSH in the official
+GitHub login flow; `--git-protocol https` selects HTTPS. The preference applies
+to all accounts in the selected gh host configuration, not just one SF project.
+SF skips automatic SSH key generation/upload and never rewrites repository
+remotes. API login remains necessary for PRs/checks even when Git uses SSH.
+Use `sf doctor --repo /absolute/project` to distinguish local SSH readiness from
+API login. See [existing-key SSH setup](how-to/github-ssh.md).
+
 ## Estimated provider accounting (multi-CLI)
 
 `sf start <ticket> --accept-cost-estimates` explicitly opts a ticket into

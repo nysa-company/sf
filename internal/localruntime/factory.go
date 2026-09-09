@@ -43,6 +43,9 @@ type Config struct {
 	OwnerHome       string
 	GHConfigDir     string
 	GHBinary        string
+	// SSHAgentSock is captured only by the foreground daemon. It is never
+	// inherited by provider or repository-command environments.
+	SSHAgentSock string
 	// GHAuthenticated is a sanitized result of the explicit, read-only
 	// `gh auth status` preflight performed by cmd/sf. It is never a credential.
 	GHAuthenticated bool
@@ -124,6 +127,19 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 		if publicationEnabled {
 			gitRunner.CredentialHelper = publicationAssets.CredentialHelper
 			gitRunner.GHConfigDir = configuration.GHConfigDir
+			if configuration.SSHAgentSock != "" {
+				// ResolveCore authenticated the bundle directory. Git's SSH
+				// boundary authenticates these exact assets when actually used;
+				// an absent SSH asset must not disable an HTTPS-only project.
+				name := "sf-ssh"
+				if configuration.Channel == domain.ChannelDev {
+					name += "-dev"
+				}
+				gitRunner.SSHHelper = filepath.Join(filepath.Dir(core.Executable), name)
+				gitRunner.SSHKnownHosts = filepath.Join(filepath.Dir(core.Executable), "github_known_hosts")
+				gitRunner.SSHBinary = "/usr/bin/ssh"
+				gitRunner.SSHAgentSock = configuration.SSHAgentSock
+			}
 		}
 		if err := coordinator.ConfigureRejectionCheckpoint(worktreecoord.Coordinator{Store: dependencies.Store, Git: gitRunner}); err != nil {
 			return daemon.WorkflowRuntimeComponents{}, errors.New("provider checkpoint inspection could not be configured")

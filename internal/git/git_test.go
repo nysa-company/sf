@@ -1238,8 +1238,59 @@ func TestGitHubSSHTransportUsesOnlyExactHelperEnvironment(t *testing.T) {
 	if strings.Contains(joined, "COMMAND") || strings.Contains(joined, "github.com") {
 		t.Fatalf("unconstrained ssh transport: %q", joined)
 	}
-	if _, _, err := runner.githubTransportEnvironment("ssh://git@github.com:22/owner/repository.git"); err == nil {
-		t.Fatal("non-pinned SSH host accepted")
+	for _, origin := range []string{"git@github.com:owner/repository.git", "ssh://git@github.com/owner/repository.git", "ssh://git@github.com:22/owner/repository.git"} {
+		got, enabled, err := runner.githubTransportEnvironment(origin)
+		if err != nil || !enabled || strings.Join(got, "\x00") != joined {
+			t.Fatalf("common SSH origin environment differs: enabled=%v err=%v", enabled, err)
+		}
+		if certified, err := safeOrigin(origin); err != nil || certified != origin {
+			t.Fatalf("SSH identity spelling changed: %q err=%v", certified, err)
+		}
+	}
+}
+
+func TestGitHubSSHTransportDoesNotFallbackWhenPublicationIsConfigured(t *testing.T) {
+	origin := "git@github.com:owner/repository.git"
+	if _, _, err := (Runner{}).githubTransportEnvironment(origin); !errors.Is(err, ErrPublicationRemoteUnavailable) {
+		t.Fatalf("prepublication SSH origin: %v", err)
+	}
+	for _, runner := range []Runner{{CredentialHelper: "/private/helper"}, {SSHHelper: "/private/ssh-helper"}} {
+		if _, _, err := runner.githubTransportEnvironment(origin); err == nil || errors.Is(err, ErrPublicationRemoteUnavailable) {
+			t.Fatalf("configured publication must not fall back with missing SSH capability: %v", err)
+		}
+	}
+}
+
+func TestRealRunnerDispatchesCommonSSHOriginsToExplicitHelper(t *testing.T) {
+	ctx, runner, repository, _ := fixture(t)
+	root := t.TempDir()
+	capture := filepath.Join(root, "argv")
+	// Exercise spaces and shell metacharacters in the authenticated helper
+	// path. The fixed core.sshCommand override must quote this as one path.
+	helper := filepath.Join(root, "sf ssh'helper")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + strings.ReplaceAll(capture, "'", "'\\''") + "'\nprintf '0000'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner.SSHHelper = helper
+	runner.SSHBinary = "/usr/bin/ssh"
+	runner.SSHKnownHosts = filepath.Join(root, "known-hosts")
+	runner.SSHAgentSock = filepath.Join(root, "agent.sock")
+	for _, origin := range []string{"git@github.com:owner/repository.git", "ssh://git@github.com/owner/repository.git", "ssh://git@github.com:22/owner/repository.git", "ssh://git@ssh.github.com:443/owner/repository.git"} {
+		env, enabled, err := runner.githubTransportEnvironment(origin)
+		if err != nil || !enabled {
+			t.Fatalf("transport enabled=%v err=%v", enabled, err)
+		}
+		if output, err := runner.commandEnv(ctx, repository, env, "ls-remote", origin); err != nil {
+			t.Fatalf("Runner SSH dispatch: %v output=%q", err, output)
+		}
+		got, err := os.ReadFile(capture)
+		if err != nil || !strings.Contains(string(got), "git-upload-pack '") || !strings.Contains(string(got), "owner/repository.git'") {
+			t.Fatalf("helper was not dispatched: %q err=%v", got, err)
+		}
+		if err := os.Remove(capture); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -1963,6 +2014,30 @@ func TestAuthenticationAcceptsCanonicalGitHubHTTPSWithoutContactingRemote(t *tes
 	worktree, err := runner.CreateWorktree(ctx, repository, path, branch, "main", createClaim(t, repository, path, branch, "main"))
 	if err != nil || worktree.Identity.Origin != "https://github.com/owner/repository.git" || worktree.Identity.PushOrigin != worktree.Identity.Origin {
 		t.Fatalf("HTTPS create=%+v err=%v", worktree, err)
+	}
+}
+
+func TestAuthenticationPreservesCommonSSHWorktreeOriginWithoutContactingRemote(t *testing.T) {
+	for _, origin := range []string{"git@github.com:owner/repository.git", "ssh://git@github.com/owner/repository.git", "ssh://git@github.com:22/owner/repository.git", "ssh://git@ssh.github.com:443/owner/repository.git"} {
+		t.Run(origin, func(t *testing.T) {
+			ctx, runner, repository, _ := fixture(t)
+			rawGit(t, repository, "remote", "set-url", "origin", origin)
+			branch, err := allocatorForTest().Allocate(ctx, domain.ChannelDev, "project", "SF-ssh-origin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			worktreePath := filepath.Join(t.TempDir(), "worktree")
+			worktree, err := runner.CreateWorktree(ctx, repository, worktreePath, branch, "main", createClaim(t, repository, worktreePath, branch, "main"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if worktree.Identity.Origin != origin || worktree.Identity.PushOrigin != origin {
+				t.Fatalf("certified origin spelling changed: %+v", worktree.Identity)
+			}
+			if err := runner.Reauthenticate(ctx, worktree.Identity); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

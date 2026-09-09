@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/gitssh"
 )
 
 var ErrUnsafeBundle = errors.New("runtime executable bundle is unsafe")
@@ -28,6 +29,46 @@ type Core struct {
 // remote-free until an explicit publication runtime is assembled.
 type Publication struct {
 	CredentialHelper string
+}
+
+// SSH is resolved separately so an HTTPS-only installation does not gain an
+// agent capability or depend on SSH assets being present.
+type SSH struct {
+	Helper     string
+	KnownHosts string
+}
+
+func ResolveSSH(channel domain.Channel, executable string) (SSH, error) {
+	primaryName, _, err := names(channel)
+	if err != nil || !filepath.IsAbs(executable) || filepath.Clean(executable) != executable || filepath.Base(executable) != primaryName {
+		return SSH{}, fmt.Errorf("%w: SSH primary channel", ErrUnsafeBundle)
+	}
+	primary, err := authenticate(executable)
+	if err != nil {
+		return SSH{}, err
+	}
+	name := "sf-ssh"
+	if channel == domain.ChannelDev {
+		name += "-dev"
+	}
+	helper, err := authenticate(filepath.Join(filepath.Dir(primary), name))
+	if err != nil {
+		return SSH{}, err
+	}
+	known := filepath.Join(filepath.Dir(primary), "github_known_hosts")
+	info, err := os.Lstat(known)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 {
+		return SSH{}, fmt.Errorf("%w: SSH host-key metadata", ErrUnsafeBundle)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || (int(stat.Uid) != os.Getuid() && stat.Uid != 0) || stat.Nlink != 1 || info.Size() != int64(len(gitssh.PinnedKnownHosts)) {
+		return SSH{}, fmt.Errorf("%w: SSH host-key identity", ErrUnsafeBundle)
+	}
+	data, err := os.ReadFile(known)
+	if err != nil || string(data) != gitssh.PinnedKnownHosts {
+		return SSH{}, fmt.Errorf("%w: SSH host keys are not pinned", ErrUnsafeBundle)
+	}
+	return SSH{Helper: helper, KnownHosts: known}, nil
 }
 
 // CurrentCore resolves the currently running executable and its exact

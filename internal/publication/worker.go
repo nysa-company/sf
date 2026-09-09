@@ -22,6 +22,7 @@ import (
 	"github.com/nysa-company/sf/internal/domain"
 	gitboundary "github.com/nysa-company/sf/internal/git"
 	githubboundary "github.com/nysa-company/sf/internal/github"
+	"github.com/nysa-company/sf/internal/gitssh"
 	"github.com/nysa-company/sf/internal/store"
 )
 
@@ -614,6 +615,10 @@ func (w Worker) validatePublished(ctx context.Context, observer contracts.DraftP
 }
 
 func githubRepository(raw string) (contracts.RepositoryIdentity, bool) {
+	if name, ok := gitssh.RepositoryFromOrigin(raw); ok {
+		owner, repository, _ := strings.Cut(name, "/")
+		return contracts.RepositoryIdentity{Host: "github.com", Owner: owner, Name: repository}, true
+	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil {
 		return contracts.RepositoryIdentity{}, false

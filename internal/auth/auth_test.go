@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -25,6 +26,7 @@ type fakeRunner struct {
 	interactive            int
 	interactiveErr         error
 	interactiveEnvironment []string
+	interactiveArguments   []string
 	versionOutput          []byte
 	statusOutput           []byte
 }
@@ -49,8 +51,9 @@ func (runner *fakeRunner) Probe(_ context.Context, executable string, arguments,
 	return ProbeResult{ExitCode: exit, Output: output}, nil
 }
 
-func (runner *fakeRunner) Interactive(_ context.Context, _ string, _ []string, environment []string, terminal Terminal) (int, error) {
+func (runner *fakeRunner) Interactive(_ context.Context, _ string, arguments []string, environment []string, terminal Terminal) (int, error) {
 	runner.interactive++
+	runner.interactiveArguments = append([]string(nil), arguments...)
 	runner.interactiveEnvironment = append([]string(nil), environment...)
 	if terminal.In == nil || terminal.Out == nil || terminal.Err == nil {
 		return -1, errors.New("terminal missing")
@@ -152,6 +155,81 @@ func TestLoginIsInteractiveThenReprobesAndAlreadyAuthenticatedIsObserved(t *test
 	status, attempted, err = manager.Login(context.Background(), Cursor, terminal)
 	if err != nil || attempted || !status.Authenticated || runner.interactive != 1 {
 		t.Fatalf("replay status=%+v attempted=%v interactive=%d err=%v", status, attempted, runner.interactive, err)
+	}
+}
+
+func TestGitHubExplicitProtocolUsesOfficialLoginEvenWhenAuthenticated(t *testing.T) {
+	for _, protocol := range []string{"ssh", "https"} {
+		for _, authenticated := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/authenticated=%t", protocol, authenticated), func(t *testing.T) {
+				manager, runner := managerFixture(t)
+				runner.versionOutput = []byte("gh version 2.98.0")
+				runner.authenticated = authenticated
+				originalGetenv := manager.Getenv
+				manager.Getenv = func(key string) string {
+					if key == "SSH_AUTH_SOCK" {
+						return "/tmp/agent-secret"
+					}
+					return originalGetenv(key)
+				}
+				var output bytes.Buffer
+				status, attempted, err := manager.LoginWithOptions(context.Background(), GitHub, Terminal{In: strings.NewReader(""), Out: &output, Err: &output}, LoginOptions{GitProtocol: protocol})
+				want := []string{"auth", "login", "--hostname", "github.com", "--git-protocol", protocol, "--web", "--skip-ssh-key"}
+				if err != nil || !attempted || !status.Authenticated || runner.interactive != 1 || !reflect.DeepEqual(runner.interactiveArguments, want) || len(runner.calls) != 4 {
+					t.Fatalf("status=%+v attempted=%t err=%v arguments=%v probes=%d", status, attempted, err, runner.interactiveArguments, len(runner.calls))
+				}
+				for _, expected := range []string{"all accounts", "will not generate or upload SSH keys", "does not confirm SSH readiness"} {
+					if !strings.Contains(output.String(), expected) {
+						t.Fatalf("missing %q in %q", expected, output.String())
+					}
+				}
+				for _, env := range runner.interactiveEnvironment {
+					if strings.HasPrefix(env, "SSH_AUTH_SOCK=") {
+						t.Fatal("SSH agent forwarded to auth login")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestGitHubDefaultLoginRetainsAuthenticatedShortcutAndNoNotice(t *testing.T) {
+	manager, runner := managerFixture(t)
+	runner.versionOutput = []byte("gh version 2.98.0")
+	runner.authenticated = true
+	var output bytes.Buffer
+	status, attempted, err := manager.Login(context.Background(), GitHub, Terminal{In: strings.NewReader(""), Out: &output, Err: &output})
+	if err != nil || attempted || !status.Authenticated || runner.interactive != 0 || output.Len() != 0 {
+		t.Fatalf("status=%+v attempted=%t err=%v output=%q", status, attempted, err, output.String())
+	}
+}
+
+func TestInvalidLoginProtocolDoesNotProbeOrLaunch(t *testing.T) {
+	for _, provider := range Providers() {
+		for _, protocol := range []string{"ssh", "https", "SSH", "http", "ssh\n", "--web"} {
+			if provider == GitHub && (protocol == "ssh" || protocol == "https") {
+				continue
+			}
+			manager, runner := managerFixture(t)
+			_, attempted, err := manager.LoginWithOptions(context.Background(), provider, Terminal{}, LoginOptions{GitProtocol: protocol})
+			if !errors.Is(err, ErrInvalidOptions) || attempted || len(runner.calls) != 0 || runner.interactive != 0 {
+				t.Fatalf("provider=%s protocol=%q attempted=%t err=%v", provider, protocol, attempted, err)
+			}
+		}
+	}
+}
+
+type rejectedAuthNotice struct{}
+
+func (rejectedAuthNotice) Write([]byte) (int, error) { return 0, errors.New("terminal closed") }
+
+func TestGitHubProtocolNoticeMustSucceedBeforeLogin(t *testing.T) {
+	manager, runner := managerFixture(t)
+	runner.versionOutput = []byte("gh version 2.98.0")
+	runner.authenticated = true
+	_, attempted, err := manager.LoginWithOptions(context.Background(), GitHub, Terminal{In: strings.NewReader(""), Out: &bytes.Buffer{}, Err: rejectedAuthNotice{}}, LoginOptions{GitProtocol: "ssh"})
+	if !errors.Is(err, ErrLoginFailed) || attempted || runner.interactive != 0 {
+		t.Fatalf("attempted=%t err=%v interactive=%d", attempted, err, runner.interactive)
 	}
 }
 

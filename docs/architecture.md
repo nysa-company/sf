@@ -45,7 +45,11 @@ The approved normative design is in
   `sf-git-credential` bridge, which delegates only Git credential `get` to
   `gh auth git-credential`; it never displays or stores a token. The optional
   port-443 SSH path uses the packaged `sf-ssh` helper, a pinned GitHub host-key
-  asset, and an explicitly supplied SSH agent socket. `make build` packages
+  asset, and an explicitly supplied SSH agent socket. Common GitHub SCP and
+  port-22 SSH origins retain their certified spelling but execute through that
+  same fixed port-443 helper; user SSH configuration is never forwarded. The
+  daemon captures the agent socket at startup only for factory Git operations.
+  GitHub API authentication remains separately required. `make build` packages
   these helpers with `bin/github_known_hosts` and `bin/sf-git-exec`.
   The transport boundary and local production composition are implemented and
   hermetically tested. The local runtime supplies the absolute helper and gh

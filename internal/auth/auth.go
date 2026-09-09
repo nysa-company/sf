@@ -43,6 +43,7 @@ var (
 	ErrProbeFailed     = errors.New("authentication probe failed")
 	ErrLoginFailed     = errors.New("interactive authentication failed")
 	ErrBinaryChanged   = errors.New("authentication executable changed during probe")
+	ErrInvalidOptions  = errors.New("git protocol must be ssh or https and is only supported for github")
 )
 
 const (
@@ -92,6 +93,19 @@ type Terminal struct {
 	In  io.Reader
 	Out io.Writer
 	Err io.Writer
+}
+
+// LoginOptions leaves existing login behavior unchanged when GitProtocol is empty.
+// An explicit GitHub protocol applies gh's host-wide preference via official login.
+type LoginOptions struct {
+	GitProtocol string
+}
+
+func (options LoginOptions) Validate(provider Provider) error {
+	if options.GitProtocol != "" && (provider != GitHub || options.GitProtocol != "ssh" && options.GitProtocol != "https") {
+		return ErrInvalidOptions
+	}
+	return nil
 }
 
 type ProbeResult struct {
@@ -256,10 +270,17 @@ func (manager Manager) Status(ctx context.Context, provider Provider) Status {
 // It does not capture the login exchange and it re-probes authentication before
 // reporting success. The bool reports whether a login process was started.
 func (manager Manager) Login(ctx context.Context, provider Provider, terminal Terminal) (Status, bool, error) {
+	return manager.LoginWithOptions(ctx, provider, terminal, LoginOptions{})
+}
+
+func (manager Manager) LoginWithOptions(ctx context.Context, provider Provider, terminal Terminal, options LoginOptions) (Status, bool, error) {
 	manager = manager.defaults()
 	item, ok := find(provider)
 	if !ok {
 		return Status{}, false, fmt.Errorf("%w: %q", ErrUnknownProvider, provider)
+	}
+	if err := options.Validate(provider); err != nil {
+		return Status{}, false, err
 	}
 	before := manager.Status(ctx, provider)
 	if !before.Installed {
@@ -268,11 +289,17 @@ func (manager Manager) Login(ctx context.Context, provider Provider, terminal Te
 	if before.State == StateProbeFailed {
 		return before, false, ErrProbeFailed
 	}
-	if before.Authenticated {
+	if before.Authenticated && options.GitProtocol == "" {
 		return before, false, nil
 	}
 	if terminal.In == nil || terminal.Out == nil || terminal.Err == nil {
 		return before, false, fmt.Errorf("%w: terminal streams are required", ErrLoginFailed)
+	}
+	if options.GitProtocol != "" {
+		if _, err := fmt.Fprintf(terminal.Err, "GitHub CLI login will set the github.com Git protocol preference to %s for all accounts in the selected gh configuration. SF will not generate or upload SSH keys. API authentication does not confirm SSH readiness; check your repository with the SF doctor command afterward.\n", options.GitProtocol); err != nil {
+			return before, false, ErrLoginFailed
+		}
+		item.LoginArgs = []string{"auth", "login", "--hostname", "github.com", "--git-protocol", options.GitProtocol, "--web", "--skip-ssh-key"}
 	}
 	if err := manager.validate(before.binary); err != nil {
 		return before, false, ErrBinaryChanged
