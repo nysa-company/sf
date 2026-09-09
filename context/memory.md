@@ -5,6 +5,15 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
+  Newest checkpoint: bb99d86 focused34302552992 passed all20groups/artifact.
+  Cleanup startup9617 invoked the observer but refused registrationv2 versus
+  Verifying commitv3 (same leader/runner/base). No socket was exposed. Exact
+  immutable Store-facts authentication replaces mistaken creation-fence
+  equality, with a typed later-phase fixture; source review passed, CI pending.
+  V1 decision eval strict2/3FAIL is retained (decisions/proof/command3/3correct;
+  undefined boolean referent). Explicit selected-proof v2 schema is frozen for
+  hosted validation/new single-attempt eval. No v2 model call yet, no new
+  native ticket/approval. Isolated runtime remains stopped, no manual repair.
   Latest checkpoint (2026-09-09): bc7bae5 focused34301205015 passed all20
   groups. Full34301206752 passed all four runtime shards and eight Store race
   shards; crash/race-other remain pending, not a full green verdict. Capacity

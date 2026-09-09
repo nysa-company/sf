@@ -24,7 +24,7 @@ class ProofConsistencyEvalTest(unittest.TestCase):
         proof = case["proposed_proof"] if case["expected_decision"] == "accept" else case["original_proof"]
         return {"case_id": case["id"], "decision": case["expected_decision"],
                 "selected_proof_sha256": ev.digest(proof.encode()),
-                "acceptance_preserved": True, "frozen_command": case["frozen_command"],
+                "selected_proof_preserves_acceptance": True, "frozen_command": case["frozen_command"],
                 "rationale": "Synthetic scorer fixture only, not a model decision."}
 
     def test_corpus_and_production_instruction_are_bound(self):
@@ -36,6 +36,20 @@ class ProofConsistencyEvalTest(unittest.TestCase):
             self.assertNotIn("expected_decision", prompt)
             self.assertNotIn("immutable_sha256", prompt)
             self.assertNotIn("sf.proof-consistency-score", prompt)
+
+    def test_v2_defines_selected_proof_referent_and_rejects_v1_answers(self):
+        self.assertEqual(ev.ANSWER_SCHEMA["title"], "sf.proof-consistency-answer/v2")
+        self.assertEqual(ev.manifest(self.corpus, self.instruction)["schema"], "sf.proof-consistency-prepared/v2")
+        description = ev.ANSWER_SCHEMA["properties"]["selected_proof_preserves_acceptance"]["description"]
+        self.assertIn("original proof when rejecting", description)
+        self.assertIn("proposed proof when accepting", description)
+        for case in self.corpus["cases"]:
+            text = ev.prompt(case, self.instruction)
+            self.assertIn("SELECTED proof: the original proof when rejecting", text)
+            self.assertIn("It does not describe a rejected proposal", text)
+            answer = self.answer(case)
+            answer["acceptance_preserved"] = answer.pop("selected_proof_preserves_acceptance")
+            with self.assertRaises(ValueError): ev.score_answer(case, ev.canonical(answer))
 
     def test_corpus_count_schema_unknown_and_immutable_tamper_refuse(self):
         for kind in ("count", "schema", "unknown", "input", "label", "large"):
@@ -70,7 +84,7 @@ class ProofConsistencyEvalTest(unittest.TestCase):
         bad.append(ev.canonical(valid)[:-1] + b',"decision":"accept"}')
         bad.append(b" " * (ev.MAX_ANSWER + 1))
         bad.append(ev.canonical(dict(valid, case_id="unknown")))
-        bad.append(ev.canonical(dict(valid, acceptance_preserved=1)))
+        bad.append(ev.canonical(dict(valid, selected_proof_preserves_acceptance=1)))
         bad.append(ev.canonical(dict(valid, rationale="")))
         bad.append(b'{"rationale":NaN}')
         for raw in bad:
@@ -82,7 +96,7 @@ class ProofConsistencyEvalTest(unittest.TestCase):
         answer = self.answer(case)
         self.assertTrue(ev.score_answer(case, ev.canonical(answer))["passed"])
         for field, value in (("decision", "reject"), ("selected_proof_sha256", "0" * 64),
-                             ("frozen_command", ["true"]), ("acceptance_preserved", False)):
+                             ("frozen_command", ["true"]), ("selected_proof_preserves_acceptance", False)):
             with self.subTest(field=field):
                 self.assertFalse(ev.score_answer(case, ev.canonical(dict(answer, **{field: value})))["passed"])
 
@@ -96,6 +110,7 @@ class ProofConsistencyEvalTest(unittest.TestCase):
         for case in self.corpus["cases"]:
             (results / (case["id"] + ".answer.json")).write_bytes(ev.canonical(self.answer(case)))
         report = ev.score(results, self.corpus, self.instruction)
+        self.assertEqual(report["schema"], "sf.proof-consistency-score/v2")
         self.assertTrue(report["passed"])
         self.assertEqual(len(report["cases"]), 3)
         self.assertNotIn("Synthetic scorer fixture", json.dumps(report))

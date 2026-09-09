@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -9,11 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nysa-company/sf/internal/config"
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
 	"github.com/nysa-company/sf/internal/git"
+	"github.com/nysa-company/sf/internal/phaseartifact"
 	"github.com/nysa-company/sf/internal/store"
 )
 
@@ -54,6 +57,45 @@ func TestDaemonPreparedCommitRunnerFactoryIsLazyAndPrecedesRuntime(t *testing.T)
 				}
 			} else if err != nil || calls != 0 || runtimeCalls != 1 {
 				t.Fatalf("idle startup err=%v asset calls=%d runtime calls=%d", err, calls, runtimeCalls)
+			}
+		})
+	}
+}
+
+func TestDaemonPreparedCommitResolverRejectsForgedAndFutureRegistration(t *testing.T) {
+	for _, mode := range []string{"forged_claim", "missing_prepared", "future_version", "future_leader", "future_runner", "identity"} {
+		t.Run(mode, func(t *testing.T) {
+			daemon, paths, _ := testDaemon(t)
+			_, claim, _, _ := seedPreparedCommit(t, daemon, "SF-resolver-negative", mode != "missing_prepared")
+			if mode == "forged_claim" {
+				claim.TicketVersion++
+			} else if mode != "missing_prepared" {
+				// No normal API can move immutable registration provenance into
+				// the future or replace its identity. Corrupt only negative fixtures.
+				assignment := "ticket_version=ticket_version+1"
+				switch mode {
+				case "future_leader":
+					assignment = "leader_epoch=leader_epoch+1"
+				case "future_runner":
+					assignment = "runner_epoch=runner_epoch+1"
+				case "identity":
+					assignment = "identity_json=json_set(identity_json,'$.Repository','/foreign')"
+				}
+				writer, err := sql.Open("sqlite", paths.Database)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, err := writer.ExecContext(t.Context(), `UPDATE worktrees SET `+assignment+` WHERE channel=? AND project_id=? AND ticket_id=?`, claim.TicketRef.Channel, claim.TicketRef.Project, claim.TicketRef.Ticket)
+				closeErr := writer.Close()
+				if err != nil || closeErr != nil {
+					t.Fatalf("negative fixture: %v %v", err, closeErr)
+				}
+				if count, err := result.RowsAffected(); err != nil || count != 1 {
+					t.Fatalf("negative fixture rows=%d err=%v", count, err)
+				}
+			}
+			if _, err := registeredWorktreeResolver(daemon.store)(t.Context(), claim); !errors.Is(err, git.ErrIdentityMismatch) {
+				t.Fatalf("%s accepted: %v", mode, err)
 			}
 		})
 	}
@@ -100,14 +142,22 @@ func TestDaemonPreparedCommitRunnerFactoryRecoversRealGitBeforeRuntime(t *testin
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build trusted Git gate: %v: %s", err, output)
 	}
-	configuration := Config{Channel: domain.ChannelStable, Paths: paths, DaemonIdentity: "real-prepared-initial", Projects: []store.Project{{Channel: domain.ChannelStable, ID: "demo", Path: repository, BaseRef: "main"}}}
+	effective, err := config.Resolve(config.DefaultMachineLimits(), config.DefaultProject("demo", repository), config.TicketOverride{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, configDigest, err := config.Snapshot(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration := Config{Channel: domain.ChannelStable, Paths: paths, DaemonIdentity: "real-prepared-initial", Projects: []store.Project{{Channel: domain.ChannelStable, ID: "demo", Path: repository, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: configDigest, ConfigSnapshot: snapshot}}}
 	initial, err := Start(ctx, configuration)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = initial.Close() })
 	ref := domain.TicketRef{Channel: domain.ChannelStable, Project: "demo", Ticket: "SF-real-prepared"}
-	if err := initial.store.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "real-prepared", Type: domain.TicketBug, MergeMode: domain.MergeGuarded}); err != nil {
+	if err := initial.store.CreateTicket(ctx, store.Ticket{Ref: ref, SourceDigest: "real-prepared", Type: domain.TicketBug, MergeMode: domain.MergeGuarded, CreatedAt: time.Now().UTC(), MaxDuration: time.Hour, MaxCostMicroUSD: 100}); err != nil {
 		t.Fatal(err)
 	}
 	queued, err := initial.store.Ticket(ctx, ref)
@@ -133,6 +183,60 @@ func TestDaemonPreparedCommitRunnerFactoryRecoversRealGitBeforeRuntime(t *testin
 	}
 	if err := initial.store.RegisterWorktree(ctx, store.WorktreeRegistration{Ref: ref, ExpectedVersion: started.Version, Fence: fence, Path: worktree, Branch: branch, IdentityJSON: identityJSON, BaseSHA: base, HeadSHA: base}); err != nil {
 		t.Fatal(err)
+	}
+	// Match production: registration belongs to Planning, but the prepared
+	// checkpoint belongs to the later Verifying phase. Advance using the
+	// typed Planner result and TransitionPlan, never a fabricated event row.
+	builder, _, err := initial.store.RecordProviderQualification(ctx, daemonFixtureQualification(initial.channel, strings.Repeat("a", 32), "fixture-cursor", "cursor-family"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer, _, err := initial.store.RecordProviderQualification(ctx, daemonFixtureQualification(initial.channel, strings.Repeat("b", 32), "fixture-claude", "claude-family"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := initial.store.SelectProviderPair(ctx, initial.channel, builder.ID, reviewer.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	signer, err := contracts.NewDrainSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := daemonFixtureBinding(builder)
+	planner, err := initial.store.BeginProviderAttempt(ctx, store.ProviderAttemptRequest{
+		Ref: ref, ExpectedVersion: started.Version, Fence: fence, Phase: domain.PhasePlanning, Role: "planner", Binding: binding, ConfigDigest: started.ConfigDigest, Capacity: 1, At: time.Now().UTC(),
+		Repository: repository, Worktree: worktree, WorktreeIdentity: string(identityJSON), BaseSHA: base, SupervisorKey: signer.PublicKey(),
+		Input: contracts.PhaseInput{Ticket: ref, Phase: domain.PhasePlanning, LeaderEpoch: fence.LeaderEpoch, RunnerEpoch: fence.RunnerEpoch, ExpectedVersion: started.Version, Prompt: "prepared checkpoint fixture", Repository: repository, Worktree: worktree, WorktreeIdentity: string(identityJSON), BaseSHA: base, AllowedPaths: []string{"."}, Provider: binding.Identity, AuthMode: binding.AuthMode, Timeout: time.Minute, Profile: contracts.ProfileGuarded, Schema: []byte(`{"type":"object"}`)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.store.RecordProviderLaunch(ctx, planner, contracts.ProviderLaunch{PID: int(planner.ID), PGID: int(planner.ID), BootIdentity: "fixture", ProcessStartIdentity: "fixture-planner", Worktree: worktree}); err != nil {
+		t.Fatal(err)
+	}
+	plan := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"fixture acceptance"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofAcceptance, Command: []string{"go", "test"}, Details: "fixture proof"}, Paths: []string{"internal"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"fixture"}}
+	planRaw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := initial.store.CompleteProviderAttemptSuccess(ctx, planner, daemonFixtureDrainProof(t, signer, planner), started.Version, fence, contracts.PhaseResult{Provider: binding.Identity, Artifact: planRaw, UsageTrusted: true, UsageUnits: 1}, phaseartifact.Validation{TicketType: started.Type}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	planKey := store.ProviderAttemptResultKey{AttemptID: planner.ID, Ref: ref, Phase: domain.PhasePlanning, Attempt: planner.Attempt}
+	if _, err := initial.store.RecordPlan(ctx, store.PlanArtifact{Ref: ref, ExpectedVersion: started.Version, Fence: fence, Document: store.PlanDocument{Planner: &plan, ProviderResult: &planKey, Acceptance: plan.Acceptance, ProofKind: string(plan.Proof.Kind), Paths: plan.Paths, Commands: plan.Commands, Risks: plan.Risks}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := initial.store.TransitionPlan(ctx, store.Transition{Ref: ref, ExpectedVersion: started.Version, From: domain.StatePlanning, To: domain.StateVerifying, Trigger: "phase_pass", Fence: fence, EventPayload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	started, err = initial.store.Ticket(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.RunnerEpoch = started.RunnerEpoch
+	registered, err := initial.store.Worktree(ctx, ref)
+	if err != nil || registered.TicketVersion+1 != started.Version || started.State != domain.StateVerifying {
+		t.Fatalf("fixture did not cross registration/commit phase boundary: %v", err)
 	}
 	intent := store.GitMutationIntent{EffectFence: store.EffectFence{Ref: ref, TicketVersion: started.Version, Fence: fence}, RequestDigest: "sha256:" + strings.Repeat("d", 64), Repository: repository, Worktree: worktree, Branch: branch, Operation: "commit", BaseRef: "main", ExpectedBaseOID: base, ExpectedHeadOID: base}
 	intent.SemanticKey = store.CanonicalGitMutationSemanticKey(intent)

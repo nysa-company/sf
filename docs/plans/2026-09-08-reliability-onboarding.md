@@ -347,3 +347,16 @@ VERDICT: implementation design in progress; not cleared for merge.
   synthetic eval is neither Store amendment authority nor end-to-end acceptance.
 - All four final native deliveries, separate approvals, exact-head broad CI
   and final SF PR remain outstanding. Earlier runs stay diagnostic evidence.
+
+- Exact bb99d86 focused34302552992 passed all groups, including real-Git
+  recovery and scorer tests. Native cleanup reached the observer but rejected
+  creation registration v2 against a legitimate Verifying commit claim v3.
+  Authenticate the exact immutable Store claim/prepared facts independently
+  from registration provenance; retain identity/base checks and final Store CAS.
+  Add later-phase registration/commit coverage. Native state remains stopped.
+- V1 decision eval ran once per case: decisions, selected proofs and commands
+  were correct3/3, but strict scoring was2/3 because acceptance_preserved did
+  not specify proposal versus selected proof. Keep that failed result. V2
+  explicitly names selected_proof_preserves_acceptance, versions the schema,
+  and freezes its scorer before a new single-attempt three-case run. This is
+  an evaluation clarification, not a production policy change or retroactive pass.

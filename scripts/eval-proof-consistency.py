@@ -34,17 +34,21 @@ CASE_IDS = ("case-01", "case-02", "case-03")
 CASE_INPUT = {"id", "acceptance", "frozen_command", "implementation",
               "original_proof", "proposed_proof", "builder_reason"}
 ANSWER_SCHEMA = {
+    "title": "sf.proof-consistency-answer/v2",
     "type": "object", "additionalProperties": False,
     "properties": {
         "case_id": {"type": "string", "enum": list(CASE_IDS)},
         "decision": {"type": "string", "enum": ["accept", "reject"]},
         "selected_proof_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-        "acceptance_preserved": {"type": "boolean"},
+        "selected_proof_preserves_acceptance": {
+            "type": "boolean",
+            "description": "Whether the SELECTED proof preserves every original acceptance criterion: the original proof when rejecting, the proposed proof when accepting. This does not ask whether a rejected proposal preserves acceptance.",
+        },
         "frozen_command": {"type": "array", "items": {"type": "string"}},
         "rationale": {"type": "string", "minLength": 1, "maxLength": 2000},
     },
     "required": ["case_id", "decision", "selected_proof_sha256",
-                 "acceptance_preserved", "frozen_command", "rationale"],
+                 "selected_proof_preserves_acceptance", "frozen_command", "rationale"],
 }
 
 
@@ -131,7 +135,9 @@ def prompt(case, instruction):
             "decision policy; its writing/validation steps are NOT performed in this eval. "
             "No Store authority is issued. Read the supplied evidence independently. "
             "Return only the required JSON: accept selects the proposed proof hash; reject "
-            "selects the original hash. Explain the specific assertions and acceptance in "
+            "selects the original hash. selected_proof_preserves_acceptance refers to the "
+            "SELECTED proof: the original proof when rejecting, the proposed proof when "
+            "accepting. It does not describe a rejected proposal. Explain the specific assertions and acceptance in "
             "rationale. Be concise: keep the response within 2048 tokens (requested "
             "budget, not an enforced token cap). Preserve the frozen command. "
             "Do not implement product behavior.\n\n"
@@ -140,7 +146,7 @@ def prompt(case, instruction):
 
 
 def manifest(corpus, instruction):
-    return {"schema": "sf.proof-consistency-prepared/v1", "model": corpus["model"],
+    return {"schema": "sf.proof-consistency-prepared/v2", "model": corpus["model"],
             "corpus_sha256": digest(canonical(corpus)),
             "instruction_sha256": digest(instruction.encode()),
             "output_schema_sha256": digest(canonical(ANSWER_SCHEMA)),
@@ -185,7 +191,7 @@ def score_answer(case, raw):
     if not isinstance(answer, dict) or set(answer) != set(ANSWER_SCHEMA["required"]):
         raise ValueError("invalid answer fields")
     if (answer["case_id"] != case["id"] or answer["decision"] not in ("accept", "reject") or
-            type(answer["acceptance_preserved"]) is not bool or
+            type(answer["selected_proof_preserves_acceptance"]) is not bool or
             not isinstance(answer["selected_proof_sha256"], str) or
             not re.fullmatch(r"[a-f0-9]{64}", answer["selected_proof_sha256"]) or
             not isinstance(answer["rationale"], str) or
@@ -196,7 +202,7 @@ def score_answer(case, raw):
     expected_proof = case["proposed_proof"] if case["expected_decision"] == "accept" else case["original_proof"]
     passed = (answer["decision"] == case["expected_decision"] and
               answer["selected_proof_sha256"] == digest(expected_proof.encode()) and
-              answer["acceptance_preserved"] is True and
+              answer["selected_proof_preserves_acceptance"] is True and
               answer["frozen_command"] == case["frozen_command"])
     return {"case_id": case["id"], "passed": passed, "decision": answer["decision"],
             "answer_sha256": digest(raw), "rationale_sha256": digest(answer["rationale"].encode())}
@@ -215,7 +221,7 @@ def score(path, corpus, instruction):
         if digest(raw_prompt) != expected["prompts"][case["id"]]:
             raise ValueError("prepared prompt changed")
         rows.append(score_answer(case, bounded_read(path / (case["id"] + ".answer.json"), MAX_ANSWER)))
-    return {"schema": "sf.proof-consistency-score/v1", "passed": all(r["passed"] for r in rows),
+    return {"schema": "sf.proof-consistency-score/v2", "passed": all(r["passed"] for r in rows),
             "corpus_sha256": expected["corpus_sha256"],
             "instruction_sha256": expected["instruction_sha256"], "cases": rows,
             "limit": "Three synthetic decisions only; model identity/attempt/time policy requires external execution receipts; rationale needs independent review; not Store or E2E authority."}
