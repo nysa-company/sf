@@ -18,6 +18,9 @@ type admission struct {
 	stopped map[domain.TicketRef]activityIdentity
 	allowed map[domain.TicketRef]admissionPermission
 	active  map[domain.TicketRef]*activity
+	// decisions reserves the next activity for an operator decision while an
+	// existing read-only wait-state poll finishes. It grants no Store authority.
+	decisions map[domain.TicketRef]*decisionReservation
 	// faults records a durable-seal failure. A memory stop is retained and
 	// Controller.Drain observes this instead of completing on a volatile seal.
 	faults map[domain.TicketRef]error
@@ -26,6 +29,8 @@ type admission struct {
 	afterOpen func()
 	// afterStop is the matching package-test-only stop-race hook.
 	afterStop func()
+	// afterDecisionReserve is test-only synchronization; production leaves nil.
+	afterDecisionReserve func()
 }
 
 type activity struct {
@@ -38,6 +43,12 @@ type activity struct {
 }
 
 type activityIdentity struct{ version, leader, runner uint64 }
+
+type decisionReservation struct{ identity activityIdentity }
+
+// A missing caller deadline must not turn a decision into an unbounded wait.
+// This bounds only the natural join; it never cancels the existing poll.
+const operatorDecisionJoinTimeout = 30 * time.Second
 
 type admissionPermission struct {
 	identity activityIdentity
@@ -53,13 +64,14 @@ type admissionPermission struct {
 }
 
 func newAdmission() *admission {
-	return &admission{stopped: make(map[domain.TicketRef]activityIdentity), allowed: make(map[domain.TicketRef]admissionPermission), active: make(map[domain.TicketRef]*activity), faults: make(map[domain.TicketRef]error)}
+	return &admission{stopped: make(map[domain.TicketRef]activityIdentity), allowed: make(map[domain.TicketRef]admissionPermission), active: make(map[domain.TicketRef]*activity), decisions: make(map[domain.TicketRef]*decisionReservation), faults: make(map[domain.TicketRef]error)}
 }
 
-// Begin atomically checks the stop latch and publishes activity before the
-// caller can enter an external boundary.  admitted false is a benign stop or
-// duplicate admission; it deliberately starts no goroutine.
-func (a *admission) Begin(ctx context.Context, ref domain.TicketRef, version, leader, runner uint64) (run context.Context, end func(), admitted bool) {
+// BeginDecision joins an existing poll without cancelling it or changing its
+// durable control. Reserving the next activity prevents a new scheduler tick
+// from winning the handoff. A real Stop remains authoritative, and the usual
+// exact-capability Begin checks still run after the join.
+func (a *admission) BeginDecision(ctx context.Context, ref domain.TicketRef, version, leader, runner uint64) (context.Context, func(), bool) {
 	if a == nil {
 		return nil, nil, false
 	}
@@ -67,6 +79,58 @@ func (a *admission) Begin(ctx context.Context, ref domain.TicketRef, version, le
 		ctx = context.Background()
 	}
 	a.mu.Lock()
+	if a.decisions[ref] != nil {
+		a.mu.Unlock()
+		return nil, nil, false
+	}
+	reservation := &decisionReservation{identity: activityIdentity{version: version, leader: leader, runner: runner}}
+	a.decisions[ref] = reservation
+	prior := a.active[ref]
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		if a.decisions[ref] == reservation {
+			delete(a.decisions, ref)
+		}
+		a.mu.Unlock()
+	}()
+	if a.afterDecisionReserve != nil {
+		a.afterDecisionReserve()
+	}
+	joinCtx, cancelJoin := context.WithTimeout(ctx, operatorDecisionJoinTimeout)
+	defer cancelJoin()
+	if prior != nil {
+		select {
+		case <-prior.done:
+		case <-joinCtx.Done():
+			return nil, nil, false
+		}
+	}
+	if joinCtx.Err() != nil {
+		return nil, nil, false
+	}
+	return a.begin(ctx, ref, version, leader, runner, reservation)
+}
+
+// Begin atomically checks the stop latch and publishes activity before the
+// caller can enter an external boundary.  admitted false is a benign stop or
+// duplicate admission; it deliberately starts no goroutine.
+func (a *admission) Begin(ctx context.Context, ref domain.TicketRef, version, leader, runner uint64) (run context.Context, end func(), admitted bool) {
+	return a.begin(ctx, ref, version, leader, runner, nil)
+}
+
+func (a *admission) begin(ctx context.Context, ref domain.TicketRef, version, leader, runner uint64, decision *decisionReservation) (run context.Context, end func(), admitted bool) {
+	if a == nil {
+		return nil, nil, false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.mu.Lock()
+	if a.decisions[ref] != decision {
+		a.mu.Unlock()
+		return nil, nil, false
+	}
 	if _, stopped := a.stopped[ref]; stopped {
 		permission, ok := a.allowed[ref]
 		identity := activityIdentity{version: version, leader: leader, runner: runner}

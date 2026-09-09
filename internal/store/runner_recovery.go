@@ -1596,6 +1596,16 @@ func (s *Store) providerRetryPostPublicationEndpoint(ctx context.Context, conn *
 	if stops == 0 && epochs == 0 {
 		return normalRecoveryEndpoint{}, false, nil
 	}
+	if state == domain.StateMerging && stops == 1 && epochs == 0 && semanticMergeRetryControl(control) {
+		// Merge-budget exhaustion shares this trigger with provider exhaustion,
+		// but has no provider retry epoch. Only its independently authenticated
+		// merging->paused authority may select the existing semantic retry lane;
+		// a missing or malformed provider epoch is never absence by itself.
+		baseline, err := s.authenticateGuardedMergeSemanticPause(ctx, conn, ref, control.stop.version, control.stop.runner, true)
+		if err == nil && baseline.leader == control.stop.leader {
+			return normalRecoveryEndpoint{}, false, nil
+		}
+	}
 	fail := func() (normalRecoveryEndpoint, bool, error) {
 		return normalRecoveryEndpoint{}, true, ErrPublicationEvidence
 	}

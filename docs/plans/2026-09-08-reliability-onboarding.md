@@ -400,3 +400,20 @@ VERDICT: implementation design in progress; not cleared for merge.
 - No campaign approval or merge occurred. The two PRs/worktrees remain intact,
   and the other two tickets remain queued. This is not final native acceptance;
   the exact-final-candidate campaign requirement remains unchanged.
+
+## Execution checkpoint — concurrent decision admission
+
+- Exact283cec0 passed focused34309705107. Full34309826165 then exposed two
+  regressions: compiled approval collided with a running scheduler observation,
+  and provider retry selection rejected a valid semantic merge-budget retry.
+  Full CI is not passing; these failures are retained, not rerun as flakes.
+- The decision repair reserves the next exact-ticket activity and boundedly
+  joins the existing poll, without cancelling it or resealing durable authority.
+  It repeats current-fence/readiness checks before the unchanged Store decision.
+  Stop and cancellation still win. The Store repair distinguishes a merge-budget
+  stop only after authenticating its immutable merge/approval boundary.
+- Focused validation now includes the actual compiled guarded/takeover paths
+  and semantic merge retry. Positive and adversarial regressions are required.
+  Native283 work remains retained, with one interrupted ticket paused, one at
+  approval, and two queued. Further paid retries/approvals are held. The next
+  final campaign waits for exact-head full CI as well as independent review.

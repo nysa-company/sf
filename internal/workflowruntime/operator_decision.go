@@ -37,11 +37,15 @@ func (b *ControlBundle) ApplyOperatorDecision(ctx context.Context, database *sto
 	if err != nil || version != decision.ExpectedVersion || fence != decision.Fence {
 		return result, false, ErrRuntimeRearm
 	}
-	run, end, admitted := b.runtime.Scheduler.admission.Begin(ctx, decision.Ref, decision.ExpectedVersion, decision.Fence.LeaderEpoch, decision.Fence.RunnerEpoch)
+	run, end, admitted := b.runtime.Scheduler.admission.BeginDecision(ctx, decision.Ref, decision.ExpectedVersion, decision.Fence.LeaderEpoch, decision.Fence.RunnerEpoch)
 	if !admitted {
 		return result, false, ErrRuntimeRearm
 	}
 	defer end()
+	version, fence, err = database.CurrentTicketFence(run, decision.Ref)
+	if err != nil || version != decision.ExpectedVersion || fence != decision.Fence {
+		return result, false, ErrRuntimeRearm
+	}
 	ready, err := database.RuntimeAdmissionReady(run, decision.Ref, decision.ExpectedVersion, decision.Fence)
 	if err != nil || !ready {
 		return result, false, ErrRuntimeRearm

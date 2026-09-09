@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -701,6 +702,14 @@ func TestTransitionGuardedMergeResumeRejectsTamperedAuthorityBeforeCommit(t *tes
 }
 
 func TestSemanticGuardedMergeRetryRecoversBeforeRearm(t *testing.T) {
+	for _, tamper := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tampered_pause_%t", tamper), func(t *testing.T) {
+			testSemanticGuardedMergeRetryRecoversBeforeRearm(t, tamper)
+		})
+	}
+}
+
+func testSemanticGuardedMergeRetryRecoversBeforeRearm(t *testing.T, tamper bool) {
 	fixture, current, fence := preparePostPublicationRearmState(t, domain.StateMerging)
 	pausedResult, err := fixture.db.Transition(fixture.ctx, Transition{
 		Ref: current.Ref, ExpectedVersion: current.Version, From: domain.StateMerging,
@@ -720,6 +729,18 @@ func TestSemanticGuardedMergeRetryRecoversBeforeRearm(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if tamper {
+		// Keep the shared trigger and runtime counters while destroying the
+		// exact semantic merging->paused boundary. Zero provider epochs must
+		// not turn this malformed authority into an unrelated-control fallback.
+		result, err := fixture.db.db.ExecContext(fixture.ctx, `UPDATE events SET from_state='reviewing' WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='retry_or_correction_exhausted'`, current.Ref.Channel, current.Ref.Project, current.Ref.Ticket, pausedResult.Version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+			t.Fatalf("corrupt semantic stop: rows=%d err=%v", rows, err)
+		}
+	}
 	var path string
 	if err := fixture.db.db.QueryRowContext(fixture.ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil || path == "" {
 		t.Fatalf("database path=%q err=%v", path, err)
@@ -735,6 +756,16 @@ func TestSemanticGuardedMergeRetryRecoversBeforeRearm(t *testing.T) {
 	leader, err := reopened.AcquireLeader(fixture.ctx, domain.ChannelDev, "semantic-merge-retry-recovery")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if tamper {
+		if _, err := reopened.FenceRecoveredRunners(fixture.ctx, domain.ChannelDev, leader); !errors.Is(err, ErrPublicationEvidence) {
+			t.Fatalf("malformed semantic stop recovered: %v", err)
+		}
+		live, err := reopened.Ticket(fixture.ctx, current.Ref)
+		if err != nil || live.Version != resumed.Version || live.RunnerEpoch != resumed.RunnerEpoch || live.State != resumed.State {
+			t.Fatalf("refused semantic recovery changed ticket: %+v %v", live, err)
+		}
+		return
 	}
 	if changed, err := reopened.FenceRecoveredRunners(fixture.ctx, domain.ChannelDev, leader); err != nil || changed != 1 {
 		t.Fatalf("semantic retry fence changed=%d err=%v", changed, err)

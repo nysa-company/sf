@@ -74,3 +74,99 @@ func TestOperatorDecisionActivityConsumesOnlyExactPendingAdmission(t *testing.T)
 		t.Fatal("exact activity did not consume pending admission")
 	}
 }
+
+func TestOperatorDecisionReservationJoinsPollAndExcludesTicks(t *testing.T) {
+	for _, outcome := range []string{"join", "cancel", "stop"} {
+		t.Run(outcome, func(t *testing.T) {
+			a := newAdmission()
+			ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-decision-poll"}
+			poll, endPoll, ok := a.Begin(t.Context(), ref, 12, 2, 3)
+			if !ok {
+				t.Fatal("poll admission")
+			}
+			defer endPoll()
+			reserved := make(chan struct{})
+			a.afterDecisionReserve = func() { close(reserved) }
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan bool, 1)
+			go func() {
+				_, end, admitted := a.BeginDecision(ctx, ref, 13, 2, 3)
+				if admitted {
+					end()
+				}
+				result <- admitted
+			}()
+			select {
+			case <-reserved:
+			case <-time.After(time.Second):
+				t.Fatal("reservation timeout")
+			}
+			if _, end, ok := a.Begin(t.Context(), ref, 13, 2, 3); ok {
+				end()
+				t.Fatal("poll stole reserved activity")
+			}
+			if _, end, ok := a.BeginDecision(t.Context(), ref, 13, 2, 3); ok {
+				end()
+				t.Fatal("duplicate decision admitted")
+			}
+			select {
+			case <-result:
+				t.Fatal("decision did not join poll")
+			default:
+			}
+			switch outcome {
+			case "join":
+				endPoll()
+			case "cancel":
+				cancel()
+			case "stop":
+				stopCtx, stopCancel := context.WithCancel(t.Context())
+				stopCancel()
+				_ = a.Stop(stopCtx, ref)
+				endPoll()
+			}
+			select {
+			case admitted := <-result:
+				if admitted != (outcome == "join") {
+					t.Fatalf("outcome %s admitted=%v", outcome, admitted)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("decision join did not finish")
+			}
+			if outcome == "cancel" {
+				if poll.Err() != nil {
+					t.Fatal("decision timeout canceled existing poll")
+				}
+			}
+			a.mu.Lock()
+			remaining := len(a.decisions)
+			a.mu.Unlock()
+			if remaining != 0 {
+				t.Fatal("decision reservation leaked")
+			}
+		})
+	}
+}
+
+func TestOperatorDecisionJoinPreservesEarlierDeadline(t *testing.T) {
+	a := newAdmission()
+	ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-decision-deadline"}
+	poll, endPoll, ok := a.Begin(t.Context(), ref, 12, 2, 3)
+	if !ok {
+		t.Fatal("poll admission")
+	}
+	defer endPoll()
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	if _, end, admitted := a.BeginDecision(ctx, ref, 13, 2, 3); admitted {
+		end()
+		t.Fatal("expired deadline admitted")
+	}
+	if poll.Err() != nil {
+		t.Fatal("expired decision canceled poll")
+	}
+	if len(a.decisions) != 0 {
+		t.Fatal("expired decision retained reservation")
+	}
+}

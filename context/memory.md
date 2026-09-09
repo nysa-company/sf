@@ -5,7 +5,23 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Newest checkpoint (2026-09-09): eb0bf0b focused34306877416 passed all20
+  Newest checkpoint (2026-09-09, supersedes runtime facts below): exact283cec0
+  focused34309705107 passed all20groups and produced the authenticated artifact.
+  Full34309826165 failed compiled guarded/takeover approvals and Store race4's
+  semantic merge retry; crash/race-other were still running. Source-confirmed
+  causes: the new decision Begin collides with an existing scheduler poll, and
+  provider retry selection misclassifies a valid merge-budget exhaustion event.
+  Narrow fixes reserve/join the poll before exact decision admission and require
+  authenticated semantic-merge authority before selecting that distinct lane.
+  Generic Store decision/open-authority checks remain unchanged. Hosted
+  regression validation is pending; no local tests/builds have been run.
+  Isolated native283 daemon PID28660/session22667/leader8 remains live. Earlier
+  eb0 tickets are cancelled and PR27/28 closed with branches retained. Fresh283
+  A is safely paused after two deliberate drained Planner interruptions; B is
+  waiting approval; C/D are queued. No paid retry or approval on this known-failing
+  candidate. Preserve all four, and wait for full exact-head CI before the next
+  final acceptance campaign. Exact IDs and evidence are in ignored LIVE.md.
+  Prior checkpoint (superseded): eb0bf0b focused34306877416 passed all20
   groups and built the exact ARM64 artifact. Full34306878975 last had only
   race-other pending; all other jobs including crash passed, not full green yet.
   Native eb0 campaign recovered old tickets, cancelled diagnostics through SF,

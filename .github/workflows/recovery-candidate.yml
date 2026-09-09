@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [store, source-resume, git, admission, behavior, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, repair-candidate-unrecorded-same, repair-candidate-unrecorded-restart, repair-candidate-recorded-same, repair-candidate-recorded-restart, onboarding, python-onboarding]
+        group: [store, source-resume, git, admission, behavior, compiled-approval, runtime-repair, runtime-amendment, runtime-recovery-same, runtime-recovery-restart, runtime-recovery-synced, candidate-unrecorded-same, candidate-unrecorded-restart, candidate-recorded-same, candidate-recorded-restart, repair-candidate-unrecorded-same, repair-candidate-unrecorded-restart, repair-candidate-recorded-same, repair-candidate-recorded-restart, onboarding, python-onboarding]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,7 +48,7 @@ jobs:
               go test -p 1 -count=1 ./internal/store -run 'Test(Postbuild|TransitionPostbuild|AuthenticatePostbuildFailure|ProtectedBaseRefreshReservationPreservesCompletedCIRepairParent|PendingProtectedBaseRefreshReclaimsPreparedTupleAfterRestart)' -v
               ;;
             source-resume)
-              go test -p 1 -count=1 ./internal/store -run '^Test(OperatorSourceResume|ProviderRetry|ResumeCapacity|OrdinaryVerifyingResume)' -v
+              go test -p 1 -count=1 ./internal/store -run '^Test(OperatorSourceResume|ProviderRetry|ResumeCapacity|OrdinaryVerifyingResume|SemanticGuardedMergeRetry)' -v
               ;;
             git)
               go test -p 1 -count=1 ./internal/git -run '^Test(Retained|ProtectedCheckpoint|PrivateCheckpointIndex)' -v
@@ -65,6 +65,9 @@ jobs:
               go test -p 1 -count=1 ./internal/daemon/runtimecontrol ./internal/workflowruntime -run '^Test.*OperatorDecision' -v
               go test -p 1 -count=1 ./internal/workflowworker -run 'Test(RealStoreCompletedBuilderPostbuildFailure|OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment|ResumePreparedPostbuild)' -v
               go test -p 1 -count=1 ./internal/localruntime -run '^TestPostbuildAmendmentDispatch' -v
+              ;;
+            compiled-approval)
+              go test -count=1 -shuffle=off -p 1 -timeout 15m -tags sf_e2e ./cmd/sf -run '^TestCompiledDev(GuardedWalkingSkeleton|FriendlyOperatorTakeover)$' -v
               ;;
             runtime-repair)
               go test -p 1 -count=1 -timeout 8m ./internal/workflowruntime -run 'Test(PostbuildCommandError|SchedulerPostbuild|SchedulerPreparedPostbuild|SchedulerCompletedPostbuildRepair|SchedulerReplaysRejectedAmendment|RepositoryMaterializerPreparePostbuildRepair|RepositoryMaterializerPostbuildRepair)' -v
