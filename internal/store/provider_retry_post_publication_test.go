@@ -150,7 +150,6 @@ func TestProviderRetryWaitingApprovalRecoversTwice(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertProviderRetryWaitingPredecessor(t, fixture, leader, restart)
 		if changed, err := fixture.db.FenceRecoveredRunners(fixture.ctx, fixture.ticket.Ref.Channel, leader); err != nil || changed != 1 {
 			t.Fatalf("restart %d: changed=%d err=%v", restart, changed, err)
 		}
@@ -162,43 +161,8 @@ func TestProviderRetryWaitingApprovalRecoversTwice(t *testing.T) {
 	}
 }
 
-func assertProviderRetryWaitingPredecessor(t *testing.T, fixture finalReviewFixture, leader uint64, restart int) {
-	t.Helper()
-	conn, err := fixture.db.db.Conn(fixture.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	ref := fixture.ticket.Ref
-	control, err := runtimeControlFrom(fixture.ctx, conn, ref)
-	if err != nil {
-		t.Fatalf("restart %d stage runtime-control: %v", restart, err)
-	}
-	t.Logf("restart %d control state=%s stop=%+v authority=%+v live=%d/%d newleader=%d", restart, control.state, control.stop, control.authority, fixture.ticket.Version, fixture.ticket.RunnerEpoch, leader)
-	prior, found, err := fixture.db.normalPostPublicationRecoveryPredecessor(fixture.ctx, conn, ref, fixture.ticket.State, fixture.ticket.Version, fixture.ticket.RunnerEpoch, leader)
-	if err != nil || !found {
-		t.Fatalf("restart %d stage normal-post-publication: prior=%d found=%v err=%v", restart, prior, found, err)
-	}
-	epoch, found, err := loadProviderRetryEpoch(fixture.ctx, conn, ref, domain.PhasePlanning)
-	if err != nil || !found {
-		t.Fatalf("restart %d stage retry-epoch: found=%v err=%v", restart, found, err)
-	}
-	if err := validateProviderRetryAdvance(fixture.ctx, conn, ref, epoch.Phase, epoch.ExhaustionVersion-1, epoch.ExhaustionRunner, epoch.ExhaustionLeader, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader); err != nil {
-		t.Fatalf("restart %d stage original-retry-advance: %v", restart, err)
-	}
-	current := mutationRevocation{version: fixture.ticket.Version, runner: fixture.ticket.RunnerEpoch, leader: prior}
-	if _, _, err := providerRetryRuntimeControlFrom(fixture.ctx, conn, ref, domain.PhasePlanning, current); err != nil {
-		prefixErr := validateRunnerRecoveryLedgerPrefix(fixture.ctx, conn, ref, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader, current.version, current.runner, current.leader)
-		phaseErr := validateRunnerPhaseChain(fixture.ctx, conn, ref, epoch.RetryVersion, epoch.RetryRunner, current.version, current.runner)
-		t.Fatalf("restart %d stage retry-runtime-control: %v retry=%d/%d/%d current=%+v prefix=%v phase-chain=%v", restart, err, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader, current, prefixErr, phaseErr)
-	}
-	if got, matched, err := fixture.db.providerRetryPostPublicationPredecessor(fixture.ctx, conn, ref, fixture.ticket.State, fixture.ticket.Version, fixture.ticket.RunnerEpoch, leader, control); err != nil || !matched || got != prior {
-		t.Fatalf("restart %d stage composed-retry-predecessor: prior=%d matched=%v err=%v", restart, got, matched, err)
-	}
-}
-
 func TestProviderRetryWaitingApprovalRejectsTamperedAuthority(t *testing.T) {
-	for _, mode := range []string{"stop", "authority", "payload", "epoch_digest", "missing_epoch", "final_review"} {
+	for _, mode := range []string{"stop", "authority", "payload", "epoch_digest", "missing_epoch", "final_review", "phase_event", "hidden_ledger"} {
 		t.Run(mode, func(t *testing.T) {
 			fixture := providerRetryWaitingFixture(t)
 			db, ctx, ref := fixture.db, fixture.ctx, fixture.ticket.Ref
@@ -225,13 +189,33 @@ func TestProviderRetryWaitingApprovalRejectsTamperedAuthority(t *testing.T) {
 				statement = `DELETE FROM provider_retry_epochs WHERE channel=? AND project_id=? AND ticket_id=?`
 			case "final_review":
 				statement = `UPDATE events SET trigger='forged_pass' WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='review_pass'`
+			case "phase_event":
+				statement = `UPDATE events SET trigger='forged_pass' WHERE channel=? AND project_id=? AND ticket_id=? AND trigger='phase_pass' AND from_state='planning'`
+			case "hidden_ledger":
+				// Corruption only: a ledger row cannot coexist with the normal
+				// same-fence phase transition at this version, even if well signed.
+				step := RunnerRecoveryLedger{Ref: ref, PriorTicketVersion: fixture.ticket.Version - 3, PriorRunnerEpoch: fixture.ticket.RunnerEpoch - 1, PriorLeaderEpoch: 1, TicketVersion: fixture.ticket.Version - 2, RunnerEpoch: fixture.ticket.RunnerEpoch, LeaderEpoch: 2, CreatedAt: time.Now().UTC()}
+				step.RecoveryDigest = runnerRecoveryDigest(step)
+				if _, err := db.db.ExecContext(ctx, `INSERT INTO runner_recovery_ledger(channel,project_id,ticket_id,prior_ticket_version,prior_runner_epoch,prior_leader_epoch,ticket_version,runner_epoch,leader_epoch,recovery_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, ref.Channel, ref.Project, ref.Ticket, step.PriorTicketVersion, step.PriorRunnerEpoch, step.PriorLeaderEpoch, step.TicketVersion, step.RunnerEpoch, step.LeaderEpoch, step.RecoveryDigest, step.CreatedAt.Format(time.RFC3339Nano)); err != nil {
+					t.Fatal(err)
+				}
 			}
-			if _, err := db.db.ExecContext(ctx, statement, ref.Channel, ref.Project, ref.Ticket); err != nil {
-				t.Fatal(err)
+			if statement != "" {
+				if _, err := db.db.ExecContext(ctx, statement, ref.Channel, ref.Project, ref.Ticket); err != nil {
+					t.Fatal(err)
+				}
 			}
 			leader, err := db.AcquireLeader(ctx, ref.Channel, "tampered-provider-retry-waiting")
 			if err != nil {
 				t.Fatal(err)
+			}
+			if mode == "hidden_ledger" {
+				// Fence after the forged row's leader so rejection exercises
+				// recovery evidence, not the generic future-leader guard.
+				leader, err = db.AcquireLeader(ctx, ref.Channel, "tampered-provider-retry-waiting-next")
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			if _, err := db.FenceRecoveredRunners(ctx, ref.Channel, leader); !errors.Is(err, ErrPublicationEvidence) {
 				t.Fatalf("tamper %s: err=%v", mode, err)

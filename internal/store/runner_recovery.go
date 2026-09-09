@@ -1597,12 +1597,46 @@ func (s *Store) providerRetryPostPublicationPredecessor(ctx context.Context, con
 	if err != nil || !found || prior == 0 || prior >= newLeader {
 		return fail()
 	}
-	current := mutationRevocation{version: version, runner: runner, leader: prior}
-	_, epoch, err := providerRetryRuntimeControlFrom(ctx, conn, ref, exhaustion.Phase, current)
-	if err != nil || epoch.ExhaustionVersion < 2 || epoch.ExhaustionVersion != control.stop.version || epoch.EntryVersion != exhaustion.EntryTicketVersion {
+	epoch, found, err := loadProviderRetryEpoch(ctx, conn, ref, exhaustion.Phase)
+	if err != nil || !found || control.generation == 0 || epoch.ExhaustionVersion < 2 || epoch.EntryVersion != exhaustion.EntryTicketVersion || control.stop != (mutationRevocation{version: epoch.ExhaustionVersion, runner: epoch.ExhaustionRunner, leader: epoch.ExhaustionLeader}) {
 		return fail()
 	}
 	if err := validateProviderRetryAdvance(ctx, conn, ref, epoch.Phase, epoch.ExhaustionVersion-1, epoch.ExhaustionRunner, epoch.ExhaustionLeader, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader); err != nil {
+		return fail()
+	}
+	// This is a business-phase suffix of the original retry, not another
+	// operator stop/resume. Keep it separate from the generic ledger prefix:
+	// initial lifecycle transitions end at reviewing; the typed final-review
+	// reader independently authenticates the last review_pass and its evidence.
+	completion, err := s.finalReviewRecoveryEndpoint(ctx, conn, ref, state)
+	if err != nil || completion.version < 2 || completion.version-1 < epoch.RetryVersion || completion.runner != epoch.RetryRunner || completion.leader != epoch.RetryLeader {
+		return fail()
+	}
+	reviewVersion := completion.version - 1
+	var hiddenRows int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM runner_recovery_ledger WHERE channel=? AND project_id=? AND ticket_id=? AND ((ticket_version>=? AND ticket_version<=?) OR ticket_version>?)`, ref.Channel, ref.Project, ref.Ticket, epoch.RetryVersion, completion.version, version).Scan(&hiddenRows); err != nil || hiddenRows != 0 {
+		return fail()
+	}
+	if reviewVersion == epoch.RetryVersion {
+		if epoch.Phase != domain.PhaseReview {
+			return fail()
+		}
+	} else {
+		var start domain.State
+		if err := conn.QueryRowContext(ctx, `SELECT from_state FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND from_state<>to_state`, ref.Channel, ref.Project, ref.Ticket, epoch.RetryVersion+1).Scan(&start); err != nil || start != providerStateForPhase(epoch.Phase) || validateRunnerPhaseChain(ctx, conn, ref, epoch.RetryVersion, epoch.RetryRunner, reviewVersion, completion.runner) != nil {
+			return fail()
+		}
+	}
+	// Startup can seal at completion, or at a later signed recovery endpoint.
+	// On another restart that sealed authority remains historical. Prove both
+	// sides explicitly rather than accepting monotonic counters as authority.
+	authorityLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, completion, control.authority.version, control.authority.runner)
+	if err != nil || authorityLeader != control.authority.leader {
+		return fail()
+	}
+	authority := normalRecoveryEndpoint{version: control.authority.version, runner: control.authority.runner, leader: control.authority.leader}
+	currentLeader, err := normalRecoveryLeaderAt(ctx, conn, ref, authority, version, runner)
+	if err != nil || currentLeader != prior {
 		return fail()
 	}
 	return prior, true, nil
