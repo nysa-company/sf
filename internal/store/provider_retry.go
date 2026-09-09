@@ -1375,7 +1375,12 @@ func providerPausedRecoveryPredecessor(ctx context.Context, conn *sql.Conn, ref 
 	if control.state == "open" || control.state == "armed" {
 		return 0, false, nil
 	}
-	if control.state != "sealed" || control.authority != control.stop ||
+	// Open restores an admitted control as sealed without moving its exact
+	// resumed authority back to the stop. Both crash windows retain the same
+	// immutable stop/triplet and phase binding; no other authority advance may
+	// borrow this predecessor.
+	resumedAuthority := control.authority.version == version && control.authority.runner == runner && control.authority.leader == control.stop.leader
+	if control.state != "sealed" || (control.authority != control.stop && !resumedAuthority) ||
 		control.stop.version == 0 || control.stop.runner < 2 || control.stop.leader == 0 ||
 		control.stop.version+2 != version || control.stop.runner != runner ||
 		control.stop.leader >= newLeader {

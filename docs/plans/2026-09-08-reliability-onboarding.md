@@ -287,3 +287,11 @@ VERDICT: implementation design in progress; not cleared for merge.
   launch. Add exact ordinary-control classification and a regression without
   weakening genuine takeover authentication. The repaired head needs fresh
   hosted checks and native continuation. The campaign remains incomplete.
+
+- Focused34296598360 at fc2fbb3 confirmed the ordinary selector fix but failed
+  the new restart assertion. Restoring an open runtime seals its exact resumed
+  authority; pause recovery incorrectly required authority still at the stop.
+  The next patch accepts only that exact resumed endpoint with the original
+  phase/triplet/no-writer checks. An invented authority version still refuses.
+  Full34296599899 was cancelled as superseded, not counted as passing. Native
+  state remains unchanged while the new exact candidate is validated.

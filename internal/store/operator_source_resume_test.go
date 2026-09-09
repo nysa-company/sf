@@ -1090,6 +1090,17 @@ func TestOperatorSourceResumeOrdinaryVerifyingPauseIsNotSourceAuthority(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A restored open admission must name precisely the resumed endpoint, not
+	// an invented later version. Failed fencing must leave the real chain usable.
+	if _, err := db.db.ExecContext(ctx, `UPDATE runtime_ticket_controls SET authority_version=? WHERE channel=? AND project_id=? AND ticket_id=?`, resumed.Version+1, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.FenceRecoveredRunners(ctx, ticket.Ref.Channel, recoveredLeader); !errors.Is(err, ErrPublicationEvidence) || changed != 0 {
+		t.Fatalf("malformed restored authority recovery changed=%d err=%v", changed, err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE runtime_ticket_controls SET authority_version=? WHERE channel=? AND project_id=? AND ticket_id=?`, resumed.Version, ticket.Ref.Channel, ticket.Ref.Project, ticket.Ref.Ticket); err != nil {
+		t.Fatal(err)
+	}
 	if changed, err := db.FenceRecoveredRunners(ctx, ticket.Ref.Channel, recoveredLeader); err != nil || changed != 1 {
 		t.Fatalf("ordinary resume recovery changed=%d err=%v", changed, err)
 	}

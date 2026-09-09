@@ -15,6 +15,9 @@
   readiness_failed: ordinary verification resume is incorrectly selected as
   a source-only Building takeover. Narrow selector/regression repair is in
   progress; the repaired head requires fresh hosted gates/native continuation.
+  fc2fbb3 fixes same-fence selection, but focused34296598360 exposed restored
+  open-control restart rejection; narrow exact resumed-authority support and
+  tamper coverage follow. Full34296599899 cancelled as superseded, not passed.
   Actual provider retry is not yet demonstrated. Inputs, exact ticket IDs,
   artifact identity and live state are in ignored .context/reliable-campaign.
   Current source implements bounded independent postbuild repair, immutable
