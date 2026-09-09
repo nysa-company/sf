@@ -150,7 +150,10 @@ func TestDaemonPreparedCommitRunnerFactoryRecoversRealGitBeforeRuntime(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	configuration := Config{Channel: domain.ChannelStable, Paths: paths, DaemonIdentity: "real-prepared-initial", Projects: []store.Project{{Channel: domain.ChannelStable, ID: "demo", Path: repository, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: configDigest, ConfigSnapshot: snapshot}}}
+	// This fixture checks recovery ordering, not startup latency. Match the
+	// shared daemon integration fixture's bounded allowance for race-instrumented
+	// fresh schema creation; the production default and deadline tests stay exact.
+	configuration := Config{Channel: domain.ChannelStable, Paths: paths, DaemonIdentity: "real-prepared-initial", StartupTimeout: 30 * time.Second, Projects: []store.Project{{Channel: domain.ChannelStable, ID: "demo", Path: repository, BaseRef: "main", ConfigGeneration: 1, ConfigDigest: configDigest, ConfigSnapshot: snapshot}}}
 	initial, err := Start(ctx, configuration)
 	if err != nil {
 		t.Fatal(err)

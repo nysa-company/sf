@@ -63,6 +63,7 @@ jobs:
               go test -p 1 -count=1 ./cmd/sf -run '^TestProductionDaemonPreparedRecoveryConfiguration$' -v
               go test -p 1 -count=1 ./internal/workflowprompt ./internal/cli
               go test -p 1 -count=1 ./internal/daemon -run 'Test(RecoveryView|ProviderRetryView|PostbuildCommandFailure|Daemon.*Prepared|.*OperatorDecision)' -v
+              go test -race -p 1 -count=3 -timeout 10m ./internal/daemon -run '^Test(DaemonPreparedCommitRunnerFactoryRecoversRealGitBeforeRuntime|StartupBusyHonorsConfiguredDeadline)$' -v
               go test -p 1 -count=1 ./internal/daemon/runtimecontrol ./internal/workflowruntime -run '^Test.*OperatorDecision' -v
               go test -p 1 -count=1 ./internal/workflowworker -run 'Test(RealStoreCompletedBuilderPostbuildFailure|OptionalPostbuildRepair|WorkerPostbuildRepair|StopRejectedPostbuildAmendment|ResumePreparedPostbuild)' -v
               go test -p 1 -count=1 ./internal/localruntime -run '^TestPostbuildAmendmentDispatch' -v

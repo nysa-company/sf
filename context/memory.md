@@ -5,7 +5,19 @@
 - Active goal (2026-09-08): four reliability/onboarding recommendations, tracked
   in `docs/plans/2026-09-08-reliability-onboarding.md`. Work is on
   `feat/reliable-ticket-recovery`, not merged. Older entries below are historical.
-  Newest checkpoint (2026-09-09): exact37c4a44 focused34311298818 passed
+  Newest checkpoint (2026-09-09): exact662d3a6 focused34312316847 passed
+  all21groups/build. Full34312318628 failed only race-other plus its required
+  aggregate: prepared_commit_factory_test.go156 initial fresh Start exhausted
+  the default5s startup context under race instrumentation (test6.95s), before
+  prepared recovery. All other lanes including runtime-race passed. Match this
+  recovery-order fixture to the shared integration fixture's explicit30s startup
+  bound; production5s and the40ms busy-deadline regression stay unchanged. Add
+  hosted race-count3 coverage for both cases before another full run. No local
+  tests/builds. Isolated283 PID28660/session22667 is idle: all16 prior trial tickets
+  cancelled, zero leases/active providers, PR29 closed without branch deletion.
+  No final campaign deliveries on662, no SF merge. Earlier live facts below are
+  historical; ignored LIVE.md contains current receipts.
+  Prior checkpoint: exact37c4a44 focused34311298818 passed
   all21groups, including both original compiled approval regressions and exact
   semantic retry positive/tamper cases. Independent source GO; hosted artifact
   verified, not installed. Full34311300533 remains running with no failures.
