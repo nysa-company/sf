@@ -173,7 +173,9 @@ sf bundle manifest <directory>
 sf bundle verify <directory>
 sf bundle install <directory> --to <new-directory>
 sf ticket template
-sf ticket new <ticket.md>
+sf ticket new [ticket.md] [--multiline]
+sf ticket import <github-issue-url> [--json]
+sf home [--project <name>]
 sf ticket validate <ticket.md>
 sf submit <ticket.md> --project <name>
 sf run <ticket.md> --project <name> [--watch]
@@ -280,13 +282,45 @@ checks syntax only, not feasibility, project limits, provider qualification or
 readiness. Missing acceptance criteria and omitted budget limits produce notes.
 Files must be regular, non-symlink files of at most 1 MiB.
 
-In a terminal, `ticket new <file>` collects a title, a one-line problem/scope,
+In a terminal, `ticket new [file]` collects a title, a one-line problem/scope,
 and up to 32 acceptance criteria. It previews the complete guarded ticket with
 explicit 1h/$10 ceilings, then saves only if you type `yes`. The output is a
 new private file; existing files are never overwritten. Edit the saved Markdown
 to change its limits or add detail. JSON and piped calls do not prompt or create
 a file; use the template and validation commands instead. Creation never
 submits work or starts the deadline.
+
+Omit the filename to use a bounded title-derived name in the current directory.
+The absolute destination is previewed before saving; a collision refuses rather
+than overwriting or inventing another identity. Use `--multiline` to paste the
+problem description, ending with a line containing only `.`. Descriptions are
+limited to 256 lines/64 KiB; each input line is at most 16 KiB. Acceptance entries
+remain one observable criterion per prompt. This wizard is offline, not an AI
+feasibility assessment.
+
+`ticket import https://github.com/OWNER/REPO/issues/NUMBER` reads that exact issue
+using your installed, authenticated `gh` CLI (20-second deadline, 128 KiB response
+limit). It quotes the issue body as untrusted reference material and asks for your
+acceptance criteria before showing the full draft. Saving requires `yes`; the
+source-named `github-owner-repo-number.md` file is private and never overwritten.
+Repeated import to the same directory refuses an existing file. This is local
+collision protection, not global deduplication across copied/renamed drafts.
+No GitHub issue is created, edited or closed. PR URLs, URL queries/fragments,
+response identity mismatches and control-bearing text refuse. `--json` is a
+read-only preview, even if a local draft already exists; piped non-JSON input
+refuses. Imported titles are limited to 512 bytes and bodies to 64 KiB, also
+subject to the drafting line/count bounds.
+
+`home --project app` opens a terminal-only menu to create a multiline draft,
+start a saved draft, view project tickets, or enter the existing exact-head
+approval picker. Without `--project`, project actions ask for the registered
+name; SF does not guess registration from a directory name. Starting previews
+the source and requires `run`; a changed draft refuses before submission.
+Approval still requires selecting the ticket and confirming the exact reviewed
+head. The menu does not consent to estimated costs: use the explicit `run`
+command with `--accept-cost-estimates` if required. `q`/EOF cancels prompts;
+`--json` and nonterminal home calls refuse without dispatch. Existing explicit
+commands remain available to scripts and agents.
 
 `run` composes submission and start through the existing daemon. It starts only
 the exact queued ticket returned for that source/project/channel. Repeating it

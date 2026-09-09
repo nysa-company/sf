@@ -32,6 +32,15 @@ tested scope and remaining gates.
 
 ## Prepare once
 
+Already configured? Use `sf-dev home --project YOUR_PROJECT` to create a draft,
+start a saved draft, inspect work or review an approval candidate. For direct
+offline drafting, run `sf-dev ticket new --multiline`, paste the description and
+finish it with a line containing only `.`. Supply observable acceptance criteria,
+review the suggested filename and full contents, then type `yes` to save.
+Nothing starts until you explicitly submit/run it. Existing GitHub Issues can
+be imported with `sf-dev ticket import https://github.com/OWNER/REPO/issues/NUMBER`;
+the issue is read-only reference material and is never changed by import.
+
 ### Get the CLI before running setup
 
 Public installation and automatic updates are not shipped yet. From an SF

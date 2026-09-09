@@ -33,6 +33,7 @@ include credentials. Keep unrelated changes and new dependencies out of scope.
 func (a *app) ticketDraftCommand() *cobra.Command {
 	command := &cobra.Command{Use: "ticket", Short: "Prepare and validate Markdown tickets locally"}
 	command.AddCommand(a.newTicketDraftCommand())
+	command.AddCommand(a.importTicketCommand())
 	command.AddCommand(&cobra.Command{
 		Use: "template", Short: "Print an editable ticket template without submitting it", Args: cobra.NoArgs,
 		Example: "  " + binaryForChannel(a.channel) + " ticket template > ticket.md",

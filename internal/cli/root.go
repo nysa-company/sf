@@ -25,16 +25,18 @@ import (
 )
 
 type app struct {
-	client      Client
-	out         io.Writer
-	errOut      io.Writer
-	json        bool
-	channel     domain.Channel
-	last        *api.Response
-	ctx         context.Context
-	runDaemon   func(context.Context) error
-	input       io.Reader
-	interactive func() bool
+	client              Client
+	out                 io.Writer
+	errOut              io.Writer
+	json                bool
+	channel             domain.Channel
+	last                *api.Response
+	ctx                 context.Context
+	runDaemon           func(context.Context) error
+	input               io.Reader
+	interactive         func() bool
+	fetchIssue          func(context.Context, string) ([]byte, error)
+	expectedDraftDigest string
 }
 
 // NewCommand returns the public CLI. The client is injected so command tests
@@ -80,6 +82,7 @@ func (a *app) command() *cobra.Command {
 	root.AddCommand(a.runCommand())
 	root.AddCommand(a.bundleCommand())
 	root.AddCommand(a.runtimesCommand())
+	root.AddCommand(a.homeCommand())
 	a.configureTicketSelection(root)
 	a.configureDecisionSelection(root)
 	return root
