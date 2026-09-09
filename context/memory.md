@@ -2,6 +2,19 @@
 
 ## Current truth
 
+- Validated SSH implementation (2026-09-09): `feat/github-ssh` source candidate
+  `fcb44195afbca4a3e81cd4d286ff58437d8142c4` implements the approved plan in
+  `docs/plans/2026-09-09-github-ssh.md`. Independent corroboration and source
+  review completed; focused hosted run `34379839983` passed tests/race/vet,
+  repository/docs/secrets checks and bundle build. Full hosted acceptance
+  `34379860551` PASSED all 21 jobs on that exact source commit, including both
+  broad race lanes. Evidence: `docs/reports/2026-09-09-github-ssh-acceptance.md`.
+  Exact CI-built SSH helper authenticated the user's agent, read private Relay
+  main and passed push dry-run; no remote ref, PR or merge was changed. No local
+  automated tests/build, installed binary/daemon update or main merge occurred.
+  This is a source candidate, not an installed release. Setup and limitations:
+  `docs/how-to/github-ssh.md`. Earlier entries below describe separate work.
+
 - Validated implementation (2026-09-09): three ticket-entry initiatives in
   `docs/plans/2026-09-09-ticket-entry-experience.md`, branch
   `feat/ticket-entry-experience`, pushed candidate `c41345b640e00ff4ee5fff2f7cc982db0de77784`.
@@ -3872,6 +3885,12 @@ The terminal validation and remaining work above supersede their pending notes.
   implemented and covered by crash/restart and race tests.
 
 ## Log
+
+- 2026-09-09: Completed first-class GitHub SSH implementation acceptance on
+  `feat/github-ssh`, source fcb4419. Focused run34379839983 and full21-job
+  run34379860551 passed. Exact CI helper passed personal-agent private Relay
+  read and push dry-run; no remote mutation, install or main merge. Final
+  evidence is in `docs/reports/2026-09-09-github-ssh-acceptance.md`.
 
 - 2026-09-09: Native retry after paused daemon takeover exposed a missing
   evidence bridge despite exact646 full/focused CI passing. Retained refresh
