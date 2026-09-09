@@ -214,13 +214,18 @@ func TestDaemonPreparedCommitRunnerFactoryRecoversRealGitBeforeRuntime(t *testin
 	if err := initial.store.RecordProviderLaunch(ctx, planner, contracts.ProviderLaunch{PID: int(planner.ID), PGID: int(planner.ID), BootIdentity: "fixture", ProcessStartIdentity: "fixture-planner", Worktree: worktree}); err != nil {
 		t.Fatal(err)
 	}
-	plan := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"fixture acceptance"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofAcceptance, Command: []string{"go", "test"}, Details: "fixture proof"}, Paths: []string{"internal"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"fixture"}}
+	plan := phaseartifact.Planner{Schema: "sf.planner/v1", Acceptance: []string{"fixture acceptance"}, Proof: phaseartifact.ProofPlan{Kind: phaseartifact.ProofRegression, Command: []string{"go", "test"}, Details: "fixture regression proof"}, Paths: []string{"internal"}, Commands: [][]string{{"go", "test"}}, Risks: []string{"fixture"}}
 	planRaw, err := json.Marshal(plan)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := initial.store.CompleteProviderAttemptSuccess(ctx, planner, daemonFixtureDrainProof(t, signer, planner), started.Version, fence, contracts.PhaseResult{Provider: binding.Identity, Artifact: planRaw, UsageTrusted: true, UsageUnits: 1}, phaseartifact.Validation{TicketType: started.Type}, time.Now().UTC()); err != nil {
-		t.Fatal(err)
+	planResult := contracts.PhaseResult{Provider: binding.Identity, Artifact: planRaw, UsageTrusted: true, UsageUnits: 1}
+	planValidation := phaseartifact.Validation{TicketType: started.Type}
+	if _, err := phaseartifact.Parse(domain.PhasePlanning, planResult, planValidation); err != nil {
+		t.Fatalf("fixture Planner artifact: %v", err)
+	}
+	if _, err := initial.store.CompleteProviderAttemptSuccess(ctx, planner, daemonFixtureDrainProof(t, signer, planner), started.Version, fence, planResult, planValidation, time.Now().UTC()); err != nil {
+		t.Fatalf("complete fixture Planner: %v", err)
 	}
 	planKey := store.ProviderAttemptResultKey{AttemptID: planner.ID, Ref: ref, Phase: domain.PhasePlanning, Attempt: planner.Attempt}
 	if _, err := initial.store.RecordPlan(ctx, store.PlanArtifact{Ref: ref, ExpectedVersion: started.Version, Fence: fence, Document: store.PlanDocument{Planner: &plan, ProviderResult: &planKey, Acceptance: plan.Acceptance, ProofKind: string(plan.Proof.Kind), Paths: plan.Paths, Commands: plan.Commands, Risks: plan.Risks}}); err != nil {
