@@ -11,7 +11,49 @@ import (
 	"time"
 
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/store"
+	"github.com/nysa-company/sf/internal/worktreecoord"
 )
+
+func TestEnsureFailuresRemainDistinctAndNeverInvokeWorker(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cause   error
+		outcome Outcome
+	}{
+		{"preflight", worktreecoord.ErrRepositoryPreflight, OutcomeRepositoryPreflight},
+		{"identity", worktreecoord.ErrAuthentication, OutcomeWorktreeIdentity},
+		{"stale", store.ErrStaleFence, OutcomeStale},
+		{"canceled preflight", errors.Join(worktreecoord.ErrRepositoryPreflight, context.Canceled), OutcomeCanceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := domain.TicketRef{Channel: domain.ChannelDev, Project: "demo", Ticket: "SF-preflight"}
+			ensurer := &fakeEnsure{err: errors.Join(tc.cause, errors.New("untrusted-secret-value"))}
+			worker := &fakeWorker{}
+			scheduler := NewScheduler(domain.ChannelDev, fakeTickets{tickets: []store.Ticket{ticket(ref, domain.StatePlanning)}}, ensurer, worker)
+			result := scheduler.Tick(context.Background(), domain.Fence{LeaderEpoch: 9, RunnerEpoch: 7})
+			if result.Outcome != tc.outcome || len(ensurer.calls) != 1 || len(worker.calls) != 0 || strings.Contains(result.Err.Error(), "untrusted-secret-value") {
+				t.Fatalf("unsafe failure result: %+v worker=%v", result, worker.calls)
+			}
+			runtime := &Runtime{}
+			runtime.recordDiagnostic(result, time.Unix(1, 0))
+			values := runtime.RuntimeDiagnostics()
+			if tc.outcome == OutcomeCanceled {
+				if len(values) != 0 {
+					t.Fatal(values)
+				}
+				return
+			}
+			if len(values) != 1 || values[0].Outcome != string(tc.outcome) {
+				t.Fatal(values)
+			}
+			payload, err := json.Marshal(values)
+			if err != nil || strings.Contains(string(payload), "untrusted-secret-value") {
+				t.Fatalf("unsafe diagnostics: %s %v", payload, err)
+			}
+		})
+	}
+}
 
 func TestRuntimeDiagnosticsAreBoundedOwnedAndSanitized(t *testing.T) {
 	r := &Runtime{}

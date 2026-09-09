@@ -1160,6 +1160,10 @@ func slicesContainPrefix(values []string, prefix string) bool {
 
 func TestGitHubHTTPSTransportUsesOnlyPackagedCredentialBridge(t *testing.T) {
 	root := t.TempDir()
+	ownerHome, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ghPath := filepath.Join(root, "gh")
 	ghBytes := []byte("staged gh fixture")
 	if err := os.WriteFile(ghPath, ghBytes, 0o700); err != nil {
@@ -1174,6 +1178,7 @@ func TestGitHubHTTPSTransportUsesOnlyPackagedCredentialBridge(t *testing.T) {
 		GHBinary:           ghPath,
 		GHBinaryDigest:     "sha256:" + hex.EncodeToString(ghSum[:]),
 		GHConfigDir:        filepath.Join(root, "gh-config"),
+		GHHome:             ownerHome,
 		TestLocalTransport: true,
 		Run: func(_ context.Context, _ string, argv, environment []string) ([]byte, error) {
 			gotArgv = append([]string(nil), argv...)
@@ -1199,6 +1204,16 @@ func TestGitHubHTTPSTransportUsesOnlyPackagedCredentialBridge(t *testing.T) {
 	}
 	if !slicesContain(gotEnv, "SF_GIT_HTTPS_REPOSITORY=owner/repository") || slicesContainPrefix(gotEnv, "GITHUB_TOKEN=") || slicesContainPrefix(gotEnv, "GH_TOKEN=") {
 		t.Fatalf("credential helper environment=%q", gotEnv)
+	}
+	if !slicesContain(gotEnv, "HOME="+runner.Home) || !slicesContain(gotEnv, "SF_GIT_GH_HOME="+ownerHome) || slicesContain(gotEnv, "HOME="+ownerHome) {
+		t.Fatal("operator HOME escaped HTTPS helper scope")
+	}
+	ordinary, err := runner.environment(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slicesContainPrefix(ordinary, "SF_GIT_GH_HOME=") {
+		t.Fatal("ordinary Git inherited gh home capability")
 	}
 	for _, origin := range []string{"https://example.test/owner/repository.git", "https://github.com/owner/repository", "https://token@github.com/owner/repository.git"} {
 		if _, _, err := runner.githubTransportEnvironment(origin); err == nil {

@@ -30,7 +30,7 @@ func (d *Daemon) runtimeActivity(ref *domain.TicketRef) map[string]any {
 			continue
 		}
 		switch observation.Outcome {
-		case "invoked", "readiness_failed", "worker_failed", "busy", "stale":
+		case "invoked", "readiness_failed", "worker_failed", "busy", "stale", "repository_preflight_failed", "worktree_identity_failed":
 		default:
 			continue
 		}

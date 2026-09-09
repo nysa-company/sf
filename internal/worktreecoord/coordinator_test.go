@@ -127,6 +127,28 @@ func mustGit(t *testing.T, directory string, args ...string) string {
 }
 func coordinatorFor(f coordinatorFixture) Coordinator { return Coordinator{Store: f.db, Git: f.runner} }
 
+func TestEnsurePreservesRepositoryPreflightCauseWithoutCreatingWorktree(t *testing.T) {
+	f := setupCoordinator(t, "SF-preflight-failure")
+	cause := errors.New("untrusted remote failure")
+	f.runner.Run = func(context.Context, string, []string, []string) ([]byte, error) {
+		return nil, cause
+	}
+	_, err := coordinatorFor(f).Ensure(context.Background(), f.request)
+	if !errors.Is(err, ErrRepositoryPreflight) || !errors.Is(err, cause) || errors.Is(err, ErrAuthentication) || errors.Is(err, store.ErrStaleFence) {
+		t.Fatalf("preflight classification lost: %v", err)
+	}
+	if _, err := f.db.Worktree(context.Background(), f.ref); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("failed preflight registered a worktree: %v", err)
+	}
+	path, err := f.db.TicketWorktreePath(f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("failed preflight created a worktree: %v", err)
+	}
+}
+
 func TestAuthenticateExistingRegisteredWorktreeNeverCreatesAndRequiresStrictPristineHead(t *testing.T) {
 	t.Run("missing registration never allocates", func(t *testing.T) {
 		f := setupCoordinator(t, "SF-provider-retry-no-create")

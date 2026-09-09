@@ -20,3 +20,14 @@ func TestHumanRuntimeActivityIsHistoricalAndActionable(t *testing.T) {
 		t.Fatalf("unavailable invented history: %s err=%v", output.String(), err)
 	}
 }
+
+func TestHumanRepositoryFailureHasSafeAction(t *testing.T) {
+	var output bytes.Buffer
+	activity := map[string]any{"available": true, "observations": []any{map[string]any{"outcome": "repository_preflight_failed", "observed_at": "2026-09-09T12:00:00Z", "observed_ticket_version": float64(7), "error": "untrusted-secret-value"}}}
+	if err := renderRuntimeActivity(&output, activity); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "doctor --repo") || !strings.Contains(output.String(), "historical, not current state") || strings.Contains(output.String(), "untrusted-secret-value") {
+		t.Fatal(output.String())
+	}
+}

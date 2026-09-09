@@ -407,6 +407,10 @@ func walkingSkeletonRunner(t *testing.T, bare string) gitboundary.Runner {
 	if err := os.Mkdir(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	home, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
 	runner := gitboundary.Runner{
 		Binary:             "/usr/bin/git",
 		Home:               home,
@@ -415,6 +419,7 @@ func walkingSkeletonRunner(t *testing.T, bare string) gitboundary.Runner {
 		GHBinary:           "/usr/bin/true",
 		GHBinaryDigest:     "sha256:" + strings.Repeat("a", 64),
 		GHConfigDir:        home,
+		GHHome:             home,
 	}
 	runner.Run = func(ctx context.Context, binary string, args []string, env []string) ([]byte, error) {
 		for i := range args {

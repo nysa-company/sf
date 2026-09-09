@@ -2,6 +2,15 @@
 
 ## Current truth
 
+- In progress (2026-09-09): `fix/github-keychain-credentials` starts at merged
+  main `ab1d760` (SSH PR #8). Plan: `docs/plans/2026-09-09-github-keychain-credentials.md`.
+  Scoped operator HOME for HTTPS gh credential child, production-path Doctor
+  probe, and distinct repository-preflight/identity/stale diagnostics are
+  implemented with regression tests. Two agents corroborated the design and
+  source review found no remaining blocker. Formatting/diff checks only;
+  no tests/builds or real credential probe run yet. The user authorized pushing
+  the fix branch and running GitHub CI; no merge, installation, daemon or live DB changes.
+
 - Validated SSH implementation (2026-09-09): `feat/github-ssh` source candidate
   `fcb44195afbca4a3e81cd4d286ff58437d8142c4` implements the approved plan in
   `docs/plans/2026-09-09-github-ssh.md`. Independent corroboration and source

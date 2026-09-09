@@ -43,7 +43,17 @@ The approved normative design is in
   ordinary fast-forward Git push. Canonical
   `https://github.com/<owner>/<repository>.git` remotes use the packaged
   `sf-git-credential` bridge, which delegates only Git credential `get` to
-  `gh auth git-credential`; it never displays or stores a token. The optional
+  `gh auth git-credential`; it never displays or stores a token.
+
+  HTTPS credential retrieval uses the authenticated operator HOME only inside
+  the trusted gh credential child so macOS Keychain-backed login remains
+  usable. Git retains its private HOME, and provider/test environments receive
+  neither that home capability nor GitHub credentials. Doctor probes the exact
+  packaged bridge separately from API login; successful retrieval is not proof
+  of repository permissions. Repository-base preflight failures are distinct
+  from stale fences in runtime diagnostics.
+
+  The optional
   port-443 SSH path uses the packaged `sf-ssh` helper, a pinned GitHub host-key
   asset, and an explicitly supplied SSH agent socket. Common GitHub SCP and
   port-22 SSH origins retain their certified spelling but execute through that

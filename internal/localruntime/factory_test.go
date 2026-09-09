@@ -231,6 +231,9 @@ func TestFactoryComposesSnapshotBoundPublicationCapability(t *testing.T) {
 		t.Fatalf("worker does not use gh snapshot: worker=%T capability=%+v", managed.runtime.Scheduler.Worker, capability)
 	}
 	ssh := dispatcher.Publication.Git
+	if ssh.GHHome != root || ssh.Home != filepath.Join(root, "git-home") {
+		t.Fatal("publication HOME scopes are not independently bound")
+	}
 	if ssh.SSHHelper != filepath.Join(root, "sf-ssh-dev") || ssh.SSHKnownHosts != filepath.Join(root, "github_known_hosts") || ssh.SSHAgentSock != filepath.Join(root, "agent.sock") || ssh.SSHBinary != "/usr/bin/ssh" {
 		t.Fatal("publication SSH capability is not bound to the dev bundle and explicit agent")
 	}

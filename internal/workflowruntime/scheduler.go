@@ -16,13 +16,15 @@ import (
 )
 
 var (
-	ErrInvalidScheduler = errors.New("workflow scheduler is not configured")
-	ErrCanceled         = errors.New("workflow scheduler canceled")
-	ErrStale            = errors.New("workflow scheduler observed stale authority")
-	ErrBusy             = errors.New("workflow scheduler observed a busy authority")
-	ErrInProgress       = errors.New("workflow scheduler observed work already in progress")
-	ErrReadiness        = errors.New("workflow scheduler readiness failed")
-	ErrWorker           = errors.New("workflow scheduler worker failed")
+	ErrInvalidScheduler    = errors.New("workflow scheduler is not configured")
+	ErrCanceled            = errors.New("workflow scheduler canceled")
+	ErrStale               = errors.New("workflow scheduler observed stale authority")
+	ErrBusy                = errors.New("workflow scheduler observed a busy authority")
+	ErrInProgress          = errors.New("workflow scheduler observed work already in progress")
+	ErrReadiness           = errors.New("workflow scheduler readiness failed")
+	ErrRepositoryPreflight = errors.New("workflow scheduler repository preflight failed")
+	ErrWorktreeIdentity    = errors.New("workflow scheduler worktree identity check failed")
+	ErrWorker              = errors.New("workflow scheduler worker failed")
 )
 
 // TicketSource is intentionally narrower than Store. Implementations return a
@@ -160,14 +162,16 @@ type Worker interface {
 type Outcome string
 
 const (
-	OutcomeIdle       Outcome = "idle"
-	OutcomeInvoked    Outcome = "invoked"
-	OutcomeCanceled   Outcome = "canceled"
-	OutcomeStale      Outcome = "stale"
-	OutcomeBusy       Outcome = "busy"
-	OutcomeInProgress Outcome = "in_progress"
-	OutcomeReadiness  Outcome = "readiness_failed"
-	OutcomeWorker     Outcome = "worker_failed"
+	OutcomeIdle                Outcome = "idle"
+	OutcomeInvoked             Outcome = "invoked"
+	OutcomeCanceled            Outcome = "canceled"
+	OutcomeStale               Outcome = "stale"
+	OutcomeBusy                Outcome = "busy"
+	OutcomeInProgress          Outcome = "in_progress"
+	OutcomeReadiness           Outcome = "readiness_failed"
+	OutcomeRepositoryPreflight Outcome = "repository_preflight_failed"
+	OutcomeWorktreeIdentity    Outcome = "worktree_identity_failed"
+	OutcomeWorker              Outcome = "worker_failed"
 )
 
 // TickResult intentionally carries no provider error or transcript. Err is a
@@ -635,8 +639,12 @@ func classifyEnsure(err error) (Outcome, error) {
 	switch {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return OutcomeCanceled, ErrCanceled
-	case errors.Is(err, store.ErrStaleFence), errors.Is(err, worktreecoord.ErrAuthentication):
+	case errors.Is(err, store.ErrStaleFence):
 		return OutcomeStale, ErrStale
+	case errors.Is(err, worktreecoord.ErrRepositoryPreflight):
+		return OutcomeRepositoryPreflight, ErrRepositoryPreflight
+	case errors.Is(err, worktreecoord.ErrAuthentication):
+		return OutcomeWorktreeIdentity, ErrWorktreeIdentity
 	case errors.Is(err, store.ErrBusy):
 		return OutcomeBusy, ErrBusy
 	case errors.Is(err, worktreecoord.ErrInProgress):

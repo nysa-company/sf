@@ -41,7 +41,11 @@ func TestRunDelegatesOnlyCanonicalGet(t *testing.T) {
 	if err := os.Mkdir(config, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	environment := map[string]string{"SF_GIT_HTTPS_REPOSITORY": "nysa-company/nysa-app", "SF_GIT_GH_BINARY": gh, "SF_GIT_GH_BINARY_DIGEST": fileDigest(gh), "SF_GIT_GH_CONFIG_DIR": config}
+	home, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := map[string]string{"SF_GIT_HTTPS_REPOSITORY": "nysa-company/nysa-app", "SF_GIT_GH_BINARY": gh, "SF_GIT_GH_BINARY_DIGEST": fileDigest(gh), "SF_GIT_GH_CONFIG_DIR": config, "SF_GIT_GH_HOME": home, "HOME": "/hostile", "GH_TOKEN": "ambient-secret", "PATH": "/hostile/bin"}
 	lookup := func(key string) (string, bool) { value, ok := environment[key]; return value, ok }
 	runner := &recordingRunner{}
 	var output bytes.Buffer
@@ -56,6 +60,117 @@ func TestRunDelegatesOnlyCanonicalGet(t *testing.T) {
 		if strings.Contains(entry, "test-secret") {
 			t.Fatal("credential entered child environment")
 		}
+	}
+	wantEnv := []string{"HOME=" + home, "LANG=C", "LC_ALL=C", "GH_CONFIG_DIR=" + config, "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "GH_PROMPT_DISABLED=1", "GIT_TERMINAL_PROMPT=0"}
+	if strings.Join(runner.env, "\x00") != strings.Join(wantEnv, "\x00") {
+		t.Fatal("unexpected gh child environment")
+	}
+}
+
+func TestTrustedHomeRefusesUnsafePaths(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !TrustedHome(root) {
+		t.Fatal("private canonical home refused")
+	}
+	file := filepath.Join(root, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatal(err)
+	}
+	broad := filepath.Join(root, "broad")
+	if err := os.Mkdir(broad, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(broad, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(broad, "child")
+	if err := os.Mkdir(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"", "/", "relative", root + "/../home", root + "\n", filepath.Join(root, "missing"), file, link, broad, child, filepath.Join(link, "missing")} {
+		if TrustedHome(path) {
+			t.Fatalf("unsafe home accepted: %q", path)
+		}
+	}
+}
+
+func TestRunMissingHomeFailsBeforeCredentialAccess(t *testing.T) {
+	root := t.TempDir()
+	gh := filepath.Join(root, "gh")
+	if err := os.WriteFile(gh, []byte("fixture"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	environment := map[string]string{"SF_GIT_HTTPS_REPOSITORY": "owner/repo", "SF_GIT_GH_BINARY": gh, "SF_GIT_GH_BINARY_DIGEST": fileDigest(gh), "SF_GIT_GH_CONFIG_DIR": root}
+	for _, home := range []string{"", "/", "/missing/home"} {
+		environment["SF_GIT_GH_HOME"] = home
+		runner := &recordingRunner{}
+		var output bytes.Buffer
+		err := Run(context.Background(), []string{"get"}, strings.NewReader("protocol=https\nhost=github.com\npath=owner/repo.git\n\n"), &output, func(key string) (string, bool) { value, ok := environment[key]; return value, ok }, runner)
+		if err == nil || runner.runs != 0 || output.Len() != 0 {
+			t.Fatal("unsafe home reached gh")
+		}
+	}
+}
+
+func TestResponseCheck(t *testing.T) {
+	for _, test := range []struct {
+		response string
+		valid    bool
+	}{
+		{"username=fixture\npassword=fake-value\n\n", true},
+		{"username=fixture\r\npassword=fake-value\r\n\r\n", true},
+		{"username=fixture\n", false}, {"password=fake-value\n", false},
+		{"username=fixture\npassword=\n", false},
+		{"username=fixture\npassword=fake-value\npassword=duplicate\n", false},
+		{"username=fixture\npassword=fake-value\nother=value\n", false},
+		{strings.Repeat("x", maxCredentialBytes+1), false},
+	} {
+		check := NewResponseCheck()
+		_, _ = io.WriteString(check, test.response)
+		if check.Valid() != test.valid {
+			t.Fatal("incorrect credential response verdict")
+		}
+		backing := check.data
+		check.Clear()
+		if check.Valid() {
+			t.Fatal("cleared response remains valid")
+		}
+		for _, value := range backing {
+			if value != 0 {
+				t.Fatal("response was not erased")
+			}
+		}
+	}
+}
+
+func TestRunSimulatedKeychainRequiresAuthenticatedHome(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gh := filepath.Join(root, "gh")
+	// This hermetic stand-in refuses the old /var/empty behavior, without
+	// accessing Keychain, authentication files, or the network.
+	script := "#!/bin/sh\n[ \"$HOME\" = \"$GH_CONFIG_DIR\" ] || exit 1\n[ \"$1 $2 $3\" = \"auth git-credential get\" ] || exit 1\n[ -z \"$GH_TOKEN$GITHUB_TOKEN$SSH_AUTH_SOCK\" ] || exit 1\nprintf 'username=fixture\\npassword=fake-value\\n\\n'\n"
+	if err := os.WriteFile(gh, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GH_TOKEN", "ambient-fixture")
+	t.Setenv("GITHUB_TOKEN", "ambient-fixture")
+	t.Setenv("SSH_AUTH_SOCK", "/ambient/socket")
+	environment := map[string]string{"SF_GIT_HTTPS_REPOSITORY": "owner/repo", "SF_GIT_GH_BINARY": gh, "SF_GIT_GH_BINARY_DIGEST": fileDigest(gh), "SF_GIT_GH_CONFIG_DIR": root, "SF_GIT_GH_HOME": root}
+	check := NewResponseCheck()
+	defer check.Clear()
+	err = Run(context.Background(), []string{"get"}, strings.NewReader("protocol=https\nhost=github.com\npath=owner/repo.git\n\n"), check, func(key string) (string, bool) { value, ok := environment[key]; return value, ok }, OSRunner{})
+	if err != nil || !check.Valid() {
+		t.Fatal("authenticated home was not supplied to the isolated gh child")
 	}
 }
 

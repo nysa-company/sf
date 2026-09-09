@@ -73,6 +73,18 @@ func checkDoctorGitTransport(ctx context.Context, deps DoctorDeps, report *Docto
 	}
 	transport.Status = CheckPass
 	transport.Summary = "selected local Git transport: fetch " + fetchProtocol + "; push " + pushProtocol + "; URL rewrites are not applied; GitHub API authentication is checked separately"
+	if fetchProtocol == "HTTPS" || pushProtocol == "HTTPS" {
+		check := DoctorCheck{ID: "https_credentials", Status: CheckNotRun, Summary: "production HTTPS credential bridge probe was not configured; API login alone does not prove Git credential availability"}
+		if deps.HTTPSCredentials != nil {
+			if err := deps.HTTPSCredentials(ctx, doctorGitRepository(origin)); err != nil {
+				check = failedCheck("https_credentials", "HTTPS credential bridge could not retrieve credentials; unlock the macOS login Keychain and authenticate gh in the same operator session, then rerun Doctor; plaintext token storage is not required", deps.Binary, "auth", "login", "github")
+			} else {
+				check.Status = CheckPass
+				check.Summary = "packaged HTTPS bridge retrieved credentials in its execution environment; repository permissions are not verified"
+			}
+		}
+		report.Checks = append(report.Checks, check)
+	}
 	if fetchProtocol != "SSH" && pushProtocol != "SSH" {
 		return
 	}
