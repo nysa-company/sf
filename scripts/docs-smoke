@@ -60,17 +60,17 @@ grep -F -- 'does not invoke `gh`, a provider, a daemon, a network' "$doc" >/dev/
 doc="$root/docs/tutorials/first-ticket.md"
 [ -f "$doc" ] || fail "missing $doc"
 for required in \
-	'export PATH="/absolute/path/to/sf-source/bin:$PATH"' \
-	'sf-dev auth login claude' \
-	'sf-dev init --providers claude-codex' \
-	'sf-dev providers qualify --preset claude-codex' \
-	'sf-dev start --project my-app --accept-cost-estimates' \
+	'export PATH="/absolute/path/to/sf-source/scripts:/absolute/path/to/sf-source/bin:$PATH"' \
+	'sf auth login claude' \
+	'sf init --providers claude-codex' \
+	'sf providers qualify --preset claude-codex' \
+	'sf start --project my-app --accept-cost-estimates' \
 	'Automated clean-environment tests and an' ; do
 	grep -F -- "$required" "$doc" >/dev/null || fail "missing first-use contract: $required"
 done
-[ "$(line 'make build-dev')" -lt "$(line 'sf-dev init --check')" ] || fail 'first-use build must precede preview'
-[ "$(line 'sf-dev init --providers claude-codex')" -lt "$(line 'sf-dev daemon run')" ] || fail 'first-use registration must precede daemon'
-[ "$(line 'sf-dev daemon run')" -lt "$(line 'sf-dev providers qualify --preset claude-codex')" ] || fail 'first-use daemon must precede qualification'
-[ "$(line 'sf-dev providers qualify --preset claude-codex')" -lt "$(line 'sf-dev run ticket.md')" ] || fail 'first-use qualification must precede run'
-grep -F -- './bin/sf-dev' "$doc" >/dev/null && fail 'first-use guide switches binary location after PATH setup'
+[ "$(line 'make build-dev')" -lt "$(line 'sf init --check')" ] || fail 'first-use build must precede preview'
+[ "$(line 'sf init --providers claude-codex')" -lt "$(line 'sf daemon run')" ] || fail 'first-use registration must precede daemon'
+[ "$(line 'sf daemon run')" -lt "$(line 'sf providers qualify --preset claude-codex')" ] || fail 'first-use daemon must precede qualification'
+[ "$(line 'sf providers qualify --preset claude-codex')" -lt "$(line 'sf run ticket.md')" ] || fail 'first-use qualification must precede run'
+grep -F -- './bin/sf' "$doc" >/dev/null && fail 'first-use guide switches binary location after PATH setup'
 echo 'docs-smoke: PASS (read-only, credential-free, network-free)'

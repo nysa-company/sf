@@ -29,7 +29,8 @@ provider CLIs.
 
 ```sh
 make build-dev
-./bin/sf-dev version
+export PATH="$PWD/scripts:$PWD/bin:$PATH"
+sf version
 make test
 # Explicit compiled macOS process-boundary acceptance.
 make test-compiled
@@ -38,6 +39,12 @@ make test-all
 ```
 
 `make build-dev` embeds the development channel and exact source commit.
+The source-checkout `scripts/sf` launcher lets you type `sf` for everyday
+commands. It always invokes this checkout's `bin/sf-dev`, preserving the dev
+channel and its helpers; it never selects a different binary based on your
+product directory. Help and recovery actions may retain the explicit `sf-dev`
+name. Set the same PATH in both terminals. This does not install or overwrite
+an existing stable `sf`; remove the source PATH prefix to select stable again.
 Stable artifacts are intentionally explicit: `make build VERSION=<semver>`
 embeds the stable channel and refuses to create an unversioned stable binary.
 Neither command copies state between the isolated channels.

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Source-checkout convenience command. Never infer a channel from the cwd.
+set -eu
+root=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")/.." && pwd -P)
+binary="$root/bin/sf-dev"
+if [ ! -x "$binary" ]; then
+    printf '%s\n' 'sf: development bundle missing. Run make build-dev in the SF source checkout.' >&2
+    exit 127
+fi
+exec "$binary" "$@"
