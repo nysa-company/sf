@@ -1392,6 +1392,9 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 	if err != nil {
 		return 0, false, ErrPublicationEvidence
 	}
+	if prior, matched, err := s.providerRetryPostPublicationPredecessor(ctx, conn, ref, state, version, runner, newLeader, control); matched || err != nil {
+		return prior, matched, err
+	}
 	if endpoint, matched, err := s.recoveredReviewMergeControlFrom(ctx, conn, ref, control, Ticket{Ref: ref, State: state, Version: version, RunnerEpoch: runner}); err != nil {
 		return 0, false, err
 	} else if matched {
@@ -1557,6 +1560,52 @@ func (s *Store) postPublicationRecoveryBaseline(ctx context.Context, conn *sql.C
 		return 0, false, ErrPublicationEvidence
 	}
 	return currentLeader, true, nil
+}
+
+// A provider retry keeps its exhaustion stop while ordinary successful phases
+// advance its open authority. That is not a post-publication pause triplet.
+// Authenticate both the original retry and the independent final-review origin;
+// a historical control authority may reach the live endpoint only by the
+// existing signed recovery/phase validators, never by a counter comparison.
+func (s *Store) providerRetryPostPublicationPredecessor(ctx context.Context, conn *sql.Conn, ref domain.TicketRef, state domain.State, version, runner, newLeader uint64, control durableRuntimeControl) (uint64, bool, error) {
+	if state != domain.StateWaitingApproval && state != domain.StateWaitingManualMerge {
+		return 0, false, nil
+	}
+	var stops, epochs int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='retry_or_correction_exhausted'`, ref.Channel, ref.Project, ref.Ticket, control.stop.version).Scan(&stops); err != nil {
+		return 0, false, err
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_retry_epochs WHERE channel=? AND project_id=? AND ticket_id=? AND exhaustion_ticket_version=?`, ref.Channel, ref.Project, ref.Ticket, control.stop.version).Scan(&epochs); err != nil {
+		return 0, false, err
+	}
+	if stops == 0 && epochs == 0 {
+		return 0, false, nil
+	}
+	fail := func() (uint64, bool, error) { return 0, true, ErrPublicationEvidence }
+	if stops != 1 || epochs != 1 || control.state != "sealed" {
+		return fail()
+	}
+	var raw string
+	if err := conn.QueryRowContext(ctx, `SELECT payload FROM events WHERE channel=? AND project_id=? AND ticket_id=? AND ticket_version=? AND trigger='retry_or_correction_exhausted'`, ref.Channel, ref.Project, ref.Ticket, control.stop.version).Scan(&raw); err != nil {
+		return fail()
+	}
+	var exhaustion providerExhaustionPayload
+	if len(raw) > maxEvidenceJSON || json.Unmarshal([]byte(raw), &exhaustion) != nil || exhaustion.Schema != providerExhaustionSchema || !validProviderPhase(exhaustion.Phase) {
+		return fail()
+	}
+	prior, found, err := s.normalPostPublicationRecoveryPredecessor(ctx, conn, ref, state, version, runner, newLeader)
+	if err != nil || !found || prior == 0 || prior >= newLeader {
+		return fail()
+	}
+	current := mutationRevocation{version: version, runner: runner, leader: prior}
+	_, epoch, err := providerRetryRuntimeControlFrom(ctx, conn, ref, exhaustion.Phase, current)
+	if err != nil || epoch.ExhaustionVersion < 2 || epoch.ExhaustionVersion != control.stop.version || epoch.EntryVersion != exhaustion.EntryTicketVersion {
+		return fail()
+	}
+	if err := validateProviderRetryAdvance(ctx, conn, ref, epoch.Phase, epoch.ExhaustionVersion-1, epoch.ExhaustionRunner, epoch.ExhaustionLeader, epoch.RetryVersion, epoch.RetryRunner, epoch.RetryLeader); err != nil {
+		return fail()
+	}
+	return prior, true, nil
 }
 
 // normalPostPublicationRecoveryPredecessor is the no-control restart bridge

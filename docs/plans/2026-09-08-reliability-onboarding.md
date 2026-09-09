@@ -360,3 +360,21 @@ VERDICT: implementation design in progress; not cleared for merge.
   explicitly names selected_proof_preserves_acceptance, versions the schema,
   and freezes its scorer before a new single-attempt three-case run. This is
   an evaluation clarification, not a production policy change or retroactive pass.
+
+## Execution checkpoint — retained retry after successful publication
+
+- Exact ef3f6b4 focused34304070521 passed all groups. Full34304075207 has
+  seventeen passing jobs; crash and race-other are still running. No final
+  exact-head full-CI verdict is claimed.
+- V2 selected-proof decision eval passed all three cases, one invocation each,
+  with independent rationale review. The original v1 strict failure remains.
+  Receipts disclose requested model, timing/tokens and nonfatal CLI skill errors;
+  this synthetic test does not replace native delivery or amendment evidence.
+- Native startup now confirms the existing prepared Job commit correctly, but
+  refuses runner fencing for an earlier successful Planner retry carried through
+  to waiting_approval. A sealed control retains exhaustion v9 while authority
+  advances to v16 at the same runner/leader. The post-publication recovery reader
+  wrongly demands a post-publication pause/resume sequence. Repair must bind the
+  original retry epoch and normal publication/review chain, not ignore controls.
+- The database remains unedited, no replacement commit was made, and all pilot
+  worktrees remain retained. The final four-ticket campaign and merge are pending.

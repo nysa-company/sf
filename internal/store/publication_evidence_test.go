@@ -155,7 +155,7 @@ func publicationLifecycleFixture(t *testing.T) (*Store, context.Context, Ticket,
 	return publicationLifecycleFixtureFor(t, domain.TicketFeature, domain.MergeGuarded)
 }
 
-func publicationLifecycleFixtureFor(t *testing.T, ticketType domain.TicketType, mergeMode domain.MergeMode) (*Store, context.Context, Ticket, domain.Fence) {
+func publicationLifecycleFixtureFor(t *testing.T, ticketType domain.TicketType, mergeMode domain.MergeMode, beforePlanner ...func(*Store, context.Context, Ticket, domain.Fence) Ticket) (*Store, context.Context, Ticket, domain.Fence) {
 	t.Helper()
 	db, ctx := openTestStore(t)
 	configDigest := setupProviderProject(t, db, ctx)
@@ -174,19 +174,47 @@ func publicationLifecycleFixtureFor(t *testing.T, ticketType domain.TicketType, 
 	}
 	branch := testAllocatedBranch(ref, strings.Repeat("ab", 16))
 	base := strings.Repeat("a", 40)
-	identity := []byte(strings.ReplaceAll(strings.ReplaceAll(repositoryCommandIdentity(t, "/tmp/provider", "/tmp/provider/SF-publication-lifecycle", branch, "main"), "git@example.test:nysa.git", "https://github.com/acme/app.git"), "/tmp/nysa-origin", "git@github.com:acme/app.git"))
+	worktreePath := "/tmp/provider/SF-publication-lifecycle"
+	if len(beforePlanner) != 0 {
+		worktreePath, err = db.TicketWorktreePath(ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	identity := []byte(strings.ReplaceAll(strings.ReplaceAll(repositoryCommandIdentity(t, "/tmp/provider", worktreePath, branch, "main"), "git@example.test:nysa.git", "https://github.com/acme/app.git"), "/tmp/nysa-origin", "git@github.com:acme/app.git"))
 	registrationFence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
 	branchKey := string(ref.Channel) + "\x00" + string(ref.Project) + "\x00" + string(ref.Ticket)
 	if _, err := db.LoadOrStoreBranchUnderFence(ctx, branchKey, branch, ticket.Version, registrationFence); err != nil {
 		t.Fatalf("publication fixture register branch: %v", err)
 	}
-	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: registrationFence, Path: "/tmp/provider/SF-publication-lifecycle", Branch: branch, IdentityJSON: identity, BaseSHA: base, HeadSHA: base}); err != nil {
+	if len(beforePlanner) != 0 {
+		// The optional control/retry path needs creation authority, not merely
+		// a registration row. Preserve the historical fixture for other callers.
+		creation := GitMutationIntent{EffectFence: EffectFence{Ref: ref, TicketVersion: ticket.Version, Fence: registrationFence}, RequestDigest: "sha256:" + strings.Repeat("0", 64), Repository: "/tmp/provider", Worktree: worktreePath, Branch: branch, Operation: "create-worktree", BaseRef: "main", ExpectedBaseOID: base, ExpectedHeadOID: base}
+		creation.SemanticKey = CanonicalGitMutationSemanticKey(creation)
+		if _, err := db.PlanEffect(ctx, EffectPlan{SemanticKey: creation.SemanticKey, Ref: ref, Kind: "git/create-worktree", TicketVersion: ticket.Version, Fence: registrationFence, RequestDigest: creation.RequestDigest}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := db.IssueGitMutationClaim(ctx, creation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ConfirmEffect(ctx, EffectFence{SemanticKey: claim.SemanticKey, Ref: ref, TicketVersion: claim.TicketVersion, Fence: domain.Fence{LeaderEpoch: claim.LeaderEpoch, RunnerEpoch: claim.RunnerEpoch, ClaimEpoch: claim.ClaimEpoch}}, string(identity)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.RegisterWorktree(ctx, WorktreeRegistration{Ref: ref, ExpectedVersion: ticket.Version, Fence: registrationFence, Path: worktreePath, Branch: branch, IdentityJSON: identity, BaseSHA: base, HeadSHA: base}); err != nil {
 		t.Fatalf("publication fixture register worktree: %v", err)
 	}
 	builder, reviewerQual := setupProviderPair(t, db, ctx)
 	fence := domain.Fence{LeaderEpoch: leader, RunnerEpoch: ticket.RunnerEpoch}
+	for _, prepare := range beforePlanner {
+		ticket = prepare(db, ctx, ticket, fence)
+		fence.RunnerEpoch = ticket.RunnerEpoch
+	}
 	launch := func(phase domain.Phase, role string, binding contracts.RuntimeBinding, raw []byte, validation phaseartifact.Validation) ProviderAttemptClaim {
 		request := supervised(t, ProviderAttemptRequest{Ref: ticket.Ref, ExpectedVersion: ticket.Version, Fence: fence, Phase: phase, Role: role, Binding: binding, ConfigDigest: configDigest, Capacity: 1, At: time.Now().UTC()})
+		request.Worktree, request.Input.Worktree = worktreePath, worktreePath
 		request.WorktreeIdentity = string(identity)
 		request.Input.WorktreeIdentity = string(identity)
 		claim, err := db.BeginProviderAttempt(ctx, request)
