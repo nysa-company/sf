@@ -38,6 +38,11 @@ func TestObserveRepositoryBaseSafeStageDiagnostics(t *testing.T) {
 			// directory is not itself the isolated Git HOME contract.
 			runner := Runner{Home: filepath.Join(t.TempDir(), "home"), TestLocalTransport: true, MutationAuthority: authority}
 			origin := filepath.Join(repository, "remote.git")
+			// Local test origins still pass safeOrigin's real-path check before
+			// the injected remote read. Do not bypass that production guard.
+			if err := os.Mkdir(origin, 0700); err != nil {
+				t.Fatal(err)
+			}
 			if test.name == "transport" {
 				origin = "https://github.com/example/repository.git"
 				runner.CredentialHelper = "partial"
@@ -82,8 +87,12 @@ func TestObserveRepositoryBaseSafeStageDiagnostics(t *testing.T) {
 			if path != "" || base != "" || authority.acquisitions != 0 {
 				t.Fatal("failed observation returned authority or a base")
 			}
-			if (test.name == "identity" || test.name == "transport" || test.name == "local_missing") && remoteReads != 0 {
-				t.Fatal("remote read after failed local preflight")
+			wantRemoteReads := 1
+			if test.name == "identity" || test.name == "transport" || test.name == "local_missing" {
+				wantRemoteReads = 0
+			}
+			if remoteReads != wantRemoteReads {
+				t.Fatalf("remote reads=%d want=%d", remoteReads, wantRemoteReads)
 			}
 		})
 	}
