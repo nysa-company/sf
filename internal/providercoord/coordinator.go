@@ -77,8 +77,9 @@ type Receipt struct {
 	ErrorCode                    string
 }
 type Result struct {
-	Code   Outcome
-	Parsed *phaseartifact.Parsed
+	Code       Outcome
+	Parsed     *phaseartifact.Parsed
+	Diagnostic AdmissionDiagnostic
 	// ProviderResult is populated only after Store has durably committed the
 	// completed attempt. A zero key means that no immutable result was
 	// persisted; callers must never derive one from receipts.
@@ -266,19 +267,38 @@ func (role Role) valid() bool {
 	return role == RolePlanner || role == RoleBuilder || role == RoleReviewer
 }
 
-func (c *Coordinator) Run(ctx context.Context, r Request) Result {
+func (c *Coordinator) Run(ctx context.Context, r Request) (result Result) {
+	// Preserve the last refused admission across existing fallback routing.
+	// A successful claim clears it, so later execution failures are not
+	// incorrectly described as pre-attempt failures.
+	var diagnostic AdmissionDiagnostic
+	defer func() {
+		if result.Code != Completed {
+			if diagnostic != "" && result.Code == Canceled {
+				diagnostic = DiagnosticCanceled
+			}
+			result.Diagnostic = diagnostic
+		}
+	}()
 	if c.persistenceFailure() != nil {
+		diagnostic = DiagnosticPersistenceUnavailable
 		return Result{Code: NeedsOperator, NeedsOperator: true, PersistenceFailure: true}
 	}
 	if err := validate(r); err != nil {
+		diagnostic = DiagnosticRequestInvalid
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	}
 	ticket, err := c.store.Ticket(ctx, r.Input.Ticket)
 	if err != nil || ticket.Version != r.ExpectedVersion || ticket.RunnerEpoch != r.Fence.RunnerEpoch || ticket.ConfigDigest == "" || ticket.ConfigDigest != r.ConfigDigest {
+		diagnostic = DiagnosticTicketMismatch
+		if err != nil {
+			diagnostic = admissionErrorDiagnostic(err)
+		}
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	}
 	if r.Input.Phase == domain.PhaseReview {
 		if err := c.store.ValidateFinalReviewEvidence(ctx, r.Input.Ticket, r.ExpectedVersion, r.Fence, r.Validation.ExpectedReviewedHead, r.Validation.ExpectedProofDigest); err != nil {
+			diagnostic = admissionErrorDiagnostic(err)
 			return Result{Code: NeedsOperator, NeedsOperator: true}
 		}
 	}
@@ -287,13 +307,17 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 	// so replay after restart cannot turn an uncertain observation into a
 	// fallback or a second paid attempt.
 	if _, indeterminate, indeterminateErr := c.store.PendingProviderResultIndeterminate(ctx, r.Input.Ticket, r.Input.Phase, string(r.Role), r.ExpectedVersion, r.Fence); indeterminateErr != nil {
+		diagnostic = admissionErrorDiagnostic(indeterminateErr)
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	} else if indeterminate {
+		diagnostic = DiagnosticResultIndeterminate
 		return Result{Code: ResultIndeterminate, NeedsOperator: true}
 	}
 	if key, reusable, reuseErr := c.store.ReuseCurrentCompletedProviderAttempt(ctx, r.Input.Ticket, r.Input.Phase, string(r.Role), r.ExpectedVersion, r.Fence); reuseErr != nil {
+		diagnostic = admissionErrorDiagnostic(reuseErr)
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	} else if reusable {
+		diagnostic = DiagnosticEvidenceUnavailable
 		if result, ok := c.reusedResult(ctx, r, key); ok {
 			return result
 		}
@@ -301,19 +325,24 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 	}
 	pendingRepair, repairPending, repairErr := c.store.PendingProviderRepair(ctx, r.Input.Ticket, r.Input.Phase, string(r.Role), r.ExpectedVersion, r.Fence)
 	if repairErr != nil {
+		diagnostic = admissionErrorDiagnostic(repairErr)
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	}
 	pendingRejection, rejectionPending, rejectionErr := c.store.PendingProviderServerRejection(ctx, r.Input.Ticket, r.Input.Phase, string(r.Role), r.ExpectedVersion, r.Fence)
 	if rejectionErr != nil {
+		diagnostic = admissionErrorDiagnostic(rejectionErr)
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	}
 	if _, repairUnavailable, repairUnavailableErr := c.store.PendingProviderRepairUnavailable(ctx, r.Input.Ticket, r.Input.Phase, string(r.Role), r.ExpectedVersion, r.Fence); repairUnavailableErr != nil {
+		diagnostic = admissionErrorDiagnostic(repairUnavailableErr)
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	} else if repairUnavailable {
+		diagnostic = DiagnosticRepairUnavailable
 		return Result{Code: RepairUnavailable, NeedsOperator: true}
 	}
 	route, ok := c.routes[r.Role]
 	if !ok {
+		diagnostic = DiagnosticRouteUnavailable
 		return Result{Code: NeedsOperator, NeedsOperator: true}
 	}
 	names := []string{route.Primary}
@@ -328,10 +357,12 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		name := names[routeIndex]
 		repairRequired := routeIndex == repairRouteIndex
 		if ctx.Err() != nil {
+			diagnostic = DiagnosticCanceled
 			return Result{Code: Canceled, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 		p, ok := c.registry.get(name)
 		if !ok {
+			diagnostic = DiagnosticRouteUnavailable
 			if rejectionPending {
 				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
@@ -346,6 +377,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		// in binding.Identity and is validated by Store; do not compare it to
 		// the local registry route alias.
 		if err != nil || p.Name() != name {
+			diagnostic = DiagnosticBindingUnavailable
 			if rejectionPending {
 				return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 			}
@@ -355,10 +387,12 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			continue
 		}
 		if rejectionPending && binding != pendingRejection.Binding {
+			diagnostic = DiagnosticBindingUnavailable
 			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 		if repairPending {
 			if binding != pendingRepair.Binding {
+				diagnostic = DiagnosticBindingUnavailable
 				continue
 			}
 			repairRouteIndex = routeIndex
@@ -366,9 +400,11 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		}
 		remaining := ticket.CreatedAt.Add(ticket.MaxDuration).Sub(c.clock.Now())
 		if remaining <= 0 {
+			diagnostic = DiagnosticBudgetExhausted
 			return Result{Code: BudgetExhausted, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 		if r.ExpectedProvider != "" && binding.Identity.Provider != r.ExpectedProvider {
+			diagnostic = DiagnosticProviderMismatch
 			return Result{Code: NeedsOperator, Attempts: receipts, NeedsOperator: true, CostUsed: spent}
 		}
 		timeout := r.Input.Timeout
@@ -383,6 +419,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 		claim, err := c.store.BeginProviderAttempt(attemptCtx, store.ProviderAttemptRequest{Ref: r.Input.Ticket, ExpectedVersion: r.ExpectedVersion, Fence: r.Fence, Phase: r.Input.Phase, Role: string(r.Role), Binding: binding, ConfigDigest: r.ConfigDigest, Capacity: route.Capacity, At: c.clock.Now(), ExpectedHead: r.Validation.ExpectedReviewedHead, ExpectedProof: r.Validation.ExpectedProofDigest, Repository: r.Input.Repository, Worktree: r.Input.Worktree, WorktreeIdentity: r.Input.WorktreeIdentity, BaseSHA: r.Input.BaseSHA, SupervisorKey: c.supervisor.PublicKey(), Input: claimInput})
 		if err != nil {
 			cancel()
+			diagnostic = admissionErrorDiagnostic(err)
 			var backoff *store.ProviderRetryBackoffError
 			if errors.As(err, &backoff) {
 				// This deadline is read from authenticated durable evidence.
@@ -436,6 +473,7 @@ func (c *Coordinator) Run(ctx context.Context, r Request) Result {
 			}
 			continue
 		}
+		diagnostic = ""
 		input := r.Input
 		input.Timeout = timeout
 		if !bindClaimToInput(&input, claim, r, binding.Identity) {

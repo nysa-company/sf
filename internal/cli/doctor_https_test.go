@@ -155,6 +155,7 @@ func TestDoctorHTTPSProbeConsumesOnlyValidBoundedCredentials(t *testing.T) {
 				ctx, cancel = context.WithTimeout(ctx, 50*time.Millisecond)
 				defer cancel()
 			}
+			started := time.Now()
 			err := probeDoctorHTTPSCredentials(ctx, helper, ghrunner.CredentialCapability{Path: "/fixture/gh", Digest: "sha256:fixture"}, "/operator", "/selected/gh", "owner/repo")
 			if tc.pass {
 				if err != nil {
@@ -162,8 +163,15 @@ func TestDoctorHTTPSProbeConsumesOnlyValidBoundedCredentials(t *testing.T) {
 				}
 				return
 			}
-			if err != errDoctorHTTPSCredentials || strings.Contains(err.Error(), "synthetic-secret") || strings.Contains(err.Error(), helper) {
+			// Cancellation may conservatively report unproven process cleanup.
+			// That is a bounded refusal, not proof of a successful drain; the
+			// production adapter retains the snapshot for this exact outcome.
+			validFailure := err == errDoctorHTTPSCredentials || (tc.cancel && err == errDoctorHTTPSCleanup)
+			if !validFailure || strings.Contains(err.Error(), "synthetic-secret") || strings.Contains(err.Error(), helper) {
 				t.Fatalf("unsafe probe error: %v", err)
+			}
+			if tc.cancel && time.Since(started) > 5*time.Second {
+				t.Fatal("cancelled probe exceeded its bounded return allowance")
 			}
 			if tc.cancel && ctx.Err() == nil {
 				t.Fatal("cancellation case did not exercise context deadline")

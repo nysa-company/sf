@@ -16,6 +16,10 @@ func (d *Daemon) runtimeActivity(ref *domain.TicketRef) map[string]any {
 	})
 	view := map[string]any{"available": ok, "scope": "Recent completed scheduler checks in this daemon only; not current ticket state or execution authority. Restart clears this history."}
 	if !ok {
+		if runtime == nil {
+			view["reason"] = "runtime_not_composed"
+			view["summary"] = "The daemon is running without a workflow runtime. Check Doctor and qualify the selected providers for this daemon; historical qualification does not survive a leader restart."
+		}
 		return view
 	}
 	items := make([]map[string]any, 0)
@@ -34,12 +38,16 @@ func (d *Daemon) runtimeActivity(ref *domain.TicketRef) map[string]any {
 		default:
 			continue
 		}
-		items = append(items, map[string]any{
+		item := map[string]any{
 			"ticket": observation.Ref.Ticket, "project": observation.Ref.Project,
 			"outcome": observation.Outcome, "observed_at": observation.ObservedAt,
 			"observed_ticket_version": observation.TicketVersion,
 			"leader_epoch":            observation.Fence.LeaderEpoch, "runner_epoch": observation.Fence.RunnerEpoch,
-		})
+		}
+		if summary := contracts.RuntimeDiagnosticSummary(observation.Reason); summary != "" {
+			item["reason"], item["summary"] = observation.Reason, summary
+		}
+		items = append(items, item)
 	}
 	view["observations"] = items
 	return view

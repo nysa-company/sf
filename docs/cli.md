@@ -462,6 +462,37 @@ its stored configuration. A refused preview prevents a green guarded
 eligibility report. The report explicitly labels its scope: host/provider
 qualification and optional recipe preview are not ticket execution or merge
 approval, and do not certify the runtime dependency/executable launch checks.
+For a registered project, `repository_access` performs a bounded remote-base
+read using the packaged Git transport and the registered configuration. It does
+not fetch, push, or prove write permission. An unregistered repository has no
+authenticated base for this probe and reports `not_run`. Credential-helper
+success alone is not repository access. Doctor checks current-leader
+attestation for Planner, Builder and Reviewer; historical selection after a
+daemon restart is not a passing qualification.
+
+If status shows `runtime_not_composed`, the socket is alive but workflow
+execution is unavailable. Run Doctor and qualify the selected provider set in
+the current foreground daemon (`sf providers qualify --help` lists the options).
+SF does not reuse an old leader's qualification signature or silently run paid
+qualification after restart.
+
+Recent scheduler observations may include a closed `reason`, such as
+`provider_binding_unavailable`, `provider_qualification_refused`,
+`provider_admission_refused`, `git_transport_setup`, or `git_remote_read`.
+These are historical diagnostics, not state transitions or permission to retry.
+Raw provider errors, command output and credentials are never included. Capture
+`sf status <ticket> --json` when reporting a stall before the first attempt.
+
+Planning also checks Go dependency markers in the actual execution worktree
+against the frozen command configuration. `execution_base_dependencies` means
+those markers are unavailable there, even if the primary checkout has local
+uncommitted vendor files. SF copies neither those files nor ambient module
+caches into the ticket. Commit the required closure to the configured base and
+use the normal ticket recovery flow. This check does not prove a complete vendor
+graph or the presence of arbitrary generated sources; compiler admission still
+checks execution. A worktree `.sf/config.toml` is not required when configuration
+has already been frozen in SQLite.
+
 Doctor also reads the channel database's persistent external-process cleanup
 quarantine. A quarantine, unavailable database, or unconfigured inspection
 prevents a green guarded-eligibility report. The `external_mutation_recovery`

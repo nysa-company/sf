@@ -17,6 +17,7 @@ func (r *Runtime) recordDiagnostic(result TickResult, at time.Time) {
 		return
 	}
 	value := contracts.RuntimeDiagnostic{Ref: result.Ref, TicketVersion: result.Ticket.Version, Fence: result.Fence, Outcome: string(result.Outcome), ObservedAt: at.UTC()}
+	value.Reason = diagnosticReason(result.Err)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for i, old := range r.diagnostics {

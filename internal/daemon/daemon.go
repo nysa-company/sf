@@ -2352,7 +2352,13 @@ func (daemon *Daemon) statusTickets(ctx context.Context, request api.Request, id
 		daemon.projectProviderRetry(ctx, item, view)
 		views = append(views, view)
 	}
-	return daemon.success(request, api.Mutation{}, map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "leader_epoch": daemon.epoch, "operator": operatorView(identity), "tickets": views})
+	result := map[string]any{"channel": daemon.channel, "watch": parameters.Watch, "leader_epoch": daemon.epoch, "operator": operatorView(identity), "tickets": views}
+	// List status also explains an idle daemon, without including observations
+	// from tickets outside the caller's optional project filter.
+	if activity := daemon.runtimeActivity(nil); activity["available"] == false {
+		result["runtime_activity"] = activity
+	}
+	return daemon.success(request, api.Mutation{}, result)
 }
 
 func (daemon *Daemon) status(request api.Request, identity domain.OperatorIdentity) api.Response {

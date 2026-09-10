@@ -70,6 +70,22 @@ var (
 
 const maxGitOutput = 1 << 20
 
+// repositoryDiagnostic retains error identity without exposing subprocess text,
+// paths, or transport inputs through Error or an unwrap chain. Its codes are a
+// closed vocabulary for runtime diagnostics, never a claim about authentication.
+type repositoryDiagnostic struct {
+	code  string
+	cause error
+}
+
+func (e *repositoryDiagnostic) Error() string                 { return "git repository preflight failed: " + e.code }
+func (e *repositoryDiagnostic) Is(target error) bool          { return errors.Is(e.cause, target) }
+func (e *repositoryDiagnostic) RuntimeDiagnosticCode() string { return e.code }
+
+func repositoryFailure(code string, cause error) error {
+	return &repositoryDiagnostic{code: code, cause: cause}
+}
+
 const (
 	gitCommitContentionInitialBackoff = 100 * time.Millisecond
 	gitCommitContentionMaxBackoff     = 500 * time.Millisecond
@@ -1749,6 +1765,9 @@ func (r Runner) PreflightRepository(ctx context.Context, repository, baseRef str
 		return fmt.Errorf("%w: non-hermetic local origins are refused", ErrIdentityMismatch)
 	}
 	_, err = r.one(ctx, repository, "rev-parse", "--verify", baseRef+"^{commit}")
+	if err != nil {
+		return repositoryFailure("git_missing_base", errors.Join(err, ctx.Err()))
+	}
 	return err
 }
 
@@ -1758,15 +1777,25 @@ func (r Runner) PreflightRepository(ctx context.Context, repository, baseRef str
 // the same object under its durable lease, so a moving base fails closed.
 func (r Runner) ObserveRepositoryBase(ctx context.Context, repository, baseRef string) (string, string, error) {
 	if err := r.PreflightRepository(ctx, repository, baseRef); err != nil {
-		return "", "", err
+		if _, ok := err.(*repositoryDiagnostic); ok {
+			return "", "", err
+		}
+		return "", "", repositoryFailure("git_local_identity", errors.Join(err, ctx.Err()))
 	}
 	canonical, err := canonicalExistingRepository(repository)
 	if err != nil {
-		return "", "", err
+		return "", "", repositoryFailure("git_local_identity", err)
 	}
 	base, _, _, err := r.creationBase(ctx, canonical, baseRef)
-	if err != nil || !validOID(base) {
-		return "", "", fmt.Errorf("%w: invalid repository base", ErrIdentityMismatch)
+	if err != nil {
+		code := "git_local_identity"
+		if diagnostic, ok := err.(*repositoryDiagnostic); ok {
+			code = diagnostic.code
+		}
+		return "", "", repositoryFailure(code, errors.Join(ErrIdentityMismatch, err))
+	}
+	if !validOID(base) {
+		return "", "", repositoryFailure("git_missing_base", ErrIdentityMismatch)
 	}
 	return canonical, base, nil
 }
@@ -1778,23 +1807,33 @@ func (r Runner) ObserveRepositoryBase(ctx context.Context, repository, baseRef s
 func (r Runner) creationBase(ctx context.Context, repository, baseRef string) (string, string, []string, error) {
 	origin, err := r.one(ctx, repository, "remote", "get-url", "origin")
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, repositoryFailure("git_local_identity", errors.Join(err, ctx.Err()))
 	}
 	extra, _, err := r.githubTransportEnvironment(origin)
 	if errors.Is(err, ErrPublicationRemoteUnavailable) {
 		base, localErr := r.one(ctx, repository, "rev-parse", "--verify", baseRef+"^{commit}")
+		if localErr != nil {
+			return "", "", nil, repositoryFailure("git_missing_base", errors.Join(localErr, ctx.Err()))
+		}
 		return base, "", nil, localErr
 	}
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, repositoryFailure("git_transport_setup", err)
 	}
 	dev, ino, err := directoryIdentity(repository)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, repositoryFailure("git_local_identity", err)
 	}
 	base, err := r.remoteHeadEnv(ctx, repository, dev, ino, origin, baseRef, extra)
-	if err != nil || !validOID(base) {
-		return "", "", nil, fmt.Errorf("%w: protected creation base is unavailable", ErrUnexpectedRemote)
+	if err != nil {
+		code := "git_remote_read"
+		if diagnostic, ok := err.(*repositoryDiagnostic); ok {
+			code = diagnostic.code
+		}
+		return "", "", nil, repositoryFailure(code, errors.Join(ErrUnexpectedRemote, err, ctx.Err()))
+	}
+	if !validOID(base) {
+		return "", "", nil, repositoryFailure("git_missing_base", ErrUnexpectedRemote)
 	}
 	return base, origin, extra, nil
 }
@@ -3134,10 +3173,10 @@ func (r Runner) remoteHeadEnv(ctx context.Context, directory string, expectedDev
 		return "", nil
 	}
 	if len(fields) != 2 || fields[1] != "refs/heads/"+branch {
-		return "", fmt.Errorf("%w: ambiguous remote observation", ErrUnexpectedRemote)
+		return "", repositoryFailure("git_malformed_remote_response", ErrUnexpectedRemote)
 	}
 	if !validOID(fields[0]) {
-		return "", fmt.Errorf("%w: invalid remote object id", ErrUnexpectedRemote)
+		return "", repositoryFailure("git_malformed_remote_response", ErrUnexpectedRemote)
 	}
 	return fields[0], nil
 }

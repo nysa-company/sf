@@ -577,6 +577,10 @@ func qualifiedDoctorPair() store.ProviderPair {
 	created := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
 	return store.ProviderPair{
 		Channel: domain.ChannelDev, SelectedAt: created,
+		Planner: store.ProviderQualification{
+			ID: 1, Channel: domain.ChannelDev, Provider: domain.ProviderIdentity{Provider: "cursor", Model: "cursor-model", Family: "cursor-family", Version: "1.7.0"},
+			Profile: store.QualificationGuarded, CreatedAt: created,
+		},
 		Builder: store.ProviderQualification{
 			ID: 1, Channel: domain.ChannelDev, Provider: domain.ProviderIdentity{Provider: "cursor", Model: "cursor-model", Family: "cursor-family", Version: "1.7.0"},
 			Profile: store.QualificationGuarded, CreatedAt: created,
@@ -601,4 +605,43 @@ func doctorCheckByID(t *testing.T, report DoctorReport, id string) DoctorCheck {
 	}
 	t.Fatalf("doctor check %q was absent: %+v", id, report.Checks)
 	return DoctorCheck{}
+}
+
+func TestDoctorDistinguishesStaleAttestationFromUnreadableDatabase(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		err            error
+		databaseStatus CheckStatus
+	}{
+		{"stale", store.ErrProviderQualificationNotCurrent, CheckPass},
+		{"unreadable", errors.New("unreadable"), CheckFail},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := healthyDoctorDeps(t)
+			deps.Pair = func(context.Context, domain.Channel) (store.ProviderPair, error) {
+				return qualifiedDoctorPair(), tc.err
+			}
+			report := RunDoctor(context.Background(), deps)
+			if check := doctorCheckByID(t, report, "authority_database"); check.Status != tc.databaseStatus {
+				t.Fatalf("database=%+v", check)
+			}
+			if tc.name == "stale" {
+				check := doctorCheckByID(t, report, "provider_pair")
+				if check.Status != CheckFail || !strings.Contains(check.Summary, "current daemon supervisor") {
+					t.Fatalf("pair=%+v", check)
+				}
+			}
+			if report.GuardedEligible {
+				t.Fatal("unavailable qualifications reported guarded eligibility")
+			}
+		})
+	}
+}
+
+func TestDoctorRejectsMissingPlannerQualification(t *testing.T) {
+	pair := qualifiedDoctorPair()
+	pair.Planner = store.ProviderQualification{}
+	if validDoctorPair(pair, domain.ChannelDev) {
+		t.Fatal("missing planner accepted")
+	}
 }
