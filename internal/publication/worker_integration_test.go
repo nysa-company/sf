@@ -1553,6 +1553,7 @@ func newPublicationFixtureMode(t *testing.T, mergeMode domain.MergeMode) *public
 	ghDigest := sha256.Sum256(ghBytes)
 	runner.GHBinaryDigest = "sha256:" + hex.EncodeToString(ghDigest[:])
 	runner.GHConfigDir = filepath.Join(runner.Home, "gh-config")
+	runner.GHHome = runner.Home
 	runner.MutationAuthority = db
 	identity, err := runner.Snapshot(ctx, worktree, "main")
 	if err != nil {
@@ -1742,6 +1743,10 @@ func newFixtureRunner(t *testing.T, bare string) gitboundary.Runner {
 	t.Helper()
 	home := filepath.Join(t.TempDir(), "home")
 	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	home, err := filepath.EvalSymlinks(home)
+	if err != nil {
 		t.Fatal(err)
 	}
 	r := gitboundary.Runner{Binary: "/usr/bin/git", Home: home, TestLocalTransport: true}

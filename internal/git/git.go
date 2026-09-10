@@ -24,6 +24,7 @@ import (
 
 	"github.com/nysa-company/sf/internal/contracts"
 	"github.com/nysa-company/sf/internal/domain"
+	"github.com/nysa-company/sf/internal/gitcredential"
 	"github.com/nysa-company/sf/internal/gitssh"
 	"golang.org/x/sys/unix"
 )
@@ -248,6 +249,9 @@ type Runner struct {
 	// handed to the credential helper. A raw configured gh path is refused.
 	GHBinaryDigest string
 	GHConfigDir    string
+	// GHHome is the authenticated operator HOME, scoped to the HTTPS helper.
+	// Git itself always uses Home, its isolated directory.
+	GHHome string
 	// SSH fields enable only the fixed sf-ssh helper for the port-443 GitHub
 	// SSH URL. They are not passed to ordinary repository commands.
 	SSHHelper     string
@@ -794,6 +798,8 @@ func validExtraEnvironment(r Runner, key, value string) bool {
 		return value == r.GHBinaryDigest && validEvidenceDigest(value)
 	case "SF_GIT_GH_CONFIG_DIR":
 		return value == r.GHConfigDir
+	case "SF_GIT_GH_HOME":
+		return value == r.GHHome && gitcredential.TrustedHome(value)
 	case "SF_GIT_HTTPS_REPOSITORY":
 		return repoNameForSSH(value)
 	case "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME":
@@ -2963,7 +2969,7 @@ func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error
 		if canonicalErr != nil || canonical != origin {
 			return nil, false, fmt.Errorf("%w: canonical GitHub HTTPS transport is required", ErrIdentityMismatch)
 		}
-		if r.CredentialHelper == "" && r.GHBinary == "" && r.GHBinaryDigest == "" && r.GHConfigDir == "" {
+		if r.CredentialHelper == "" && r.GHBinary == "" && r.GHBinaryDigest == "" && r.GHConfigDir == "" && r.GHHome == "" {
 			return nil, false, ErrPublicationRemoteUnavailable
 		}
 		for _, item := range []struct{ path, name string }{{r.CredentialHelper, "credential helper"}, {r.GHBinary, "gh snapshot"}, {r.GHConfigDir, "gh config directory"}} {
@@ -2973,6 +2979,9 @@ func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error
 		}
 		if !validEvidenceDigest(r.GHBinaryDigest) {
 			return nil, false, fmt.Errorf("%w: gh snapshot digest is required", ErrHTTPSCredentialBoundary)
+		}
+		if !gitcredential.TrustedHome(r.GHHome) {
+			return nil, false, fmt.Errorf("%w: gh HOME is unsafe", ErrHTTPSCredentialBoundary)
 		}
 		// Git's credential-helper protocol evaluates the configured helper via
 		// its command runner. A strict path alphabet makes the otherwise static
@@ -2996,12 +3005,12 @@ func (r Runner) githubTransportEnvironment(origin string) ([]string, bool, error
 			}
 		}
 		repository := strings.TrimSuffix(strings.TrimPrefix(parsed.Path, "/"), ".git")
-		return []string{"SF_GIT_CREDENTIAL_HELPER=" + r.CredentialHelper, "SF_GIT_GH_BINARY=" + r.GHBinary, "SF_GIT_GH_BINARY_DIGEST=" + r.GHBinaryDigest, "SF_GIT_GH_CONFIG_DIR=" + r.GHConfigDir, "SF_GIT_HTTPS_REPOSITORY=" + repository}, true, nil
+		return []string{"SF_GIT_CREDENTIAL_HELPER=" + r.CredentialHelper, "SF_GIT_GH_BINARY=" + r.GHBinary, "SF_GIT_GH_BINARY_DIGEST=" + r.GHBinaryDigest, "SF_GIT_GH_CONFIG_DIR=" + r.GHConfigDir, "SF_GIT_GH_HOME=" + r.GHHome, "SF_GIT_HTTPS_REPOSITORY=" + repository}, true, nil
 	}
 	if !isSSH {
 		return nil, false, fmt.Errorf("%w: only canonical GitHub HTTPS or SSH publication is supported", ErrIdentityMismatch)
 	}
-	if r.SSHHelper == "" && r.SSHBinary == "" && r.SSHKnownHosts == "" && r.SSHAgentSock == "" && r.CredentialHelper == "" && r.GHBinary == "" && r.GHBinaryDigest == "" && r.GHConfigDir == "" {
+	if r.SSHHelper == "" && r.SSHBinary == "" && r.SSHKnownHosts == "" && r.SSHAgentSock == "" && r.CredentialHelper == "" && r.GHBinary == "" && r.GHBinaryDigest == "" && r.GHConfigDir == "" && r.GHHome == "" {
 		return nil, false, ErrPublicationRemoteUnavailable
 	}
 	for _, item := range []struct{ path, name string }{{r.SSHHelper, "ssh helper"}, {r.SSHBinary, "ssh binary"}, {r.SSHKnownHosts, "known hosts"}, {r.SSHAgentSock, "agent socket"}} {

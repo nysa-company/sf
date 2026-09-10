@@ -9,6 +9,9 @@ SF skips automatic SSH key generation/upload and never rewrites repository
 remotes. API login remains necessary for PRs/checks even when Git uses SSH.
 Use `sf doctor --repo /absolute/project` to distinguish local SSH readiness from
 API login. See [existing-key SSH setup](how-to/github-ssh.md).
+For HTTPS, Doctor separately checks the packaged credential bridge using the
+operator's Keychain context. API login alone is not transport readiness. See
+[HTTPS credentials and troubleshooting](how-to/github-https-credentials.md).
 
 ## Estimated provider accounting (multi-CLI)
 

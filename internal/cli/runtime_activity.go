@@ -19,6 +19,14 @@ func renderRuntimeActivity(writer io.Writer, activity map[string]any) error {
 			return err
 		}
 		switch stringField(item, "outcome") {
+		case "repository_preflight_failed":
+			if _, err := fmt.Fprintf(writer, "Repository/base readiness could not be established. Run %s doctor --repo <repository-path> to inspect Git transport readiness; this observation does not establish a credential failure.\n", binaryName()); err != nil {
+				return err
+			}
+		case "worktree_identity_failed":
+			if _, err := io.WriteString(writer, "The registered worktree identity could not be verified. Inspect the repository and retained worktree before retrying; no cleanup or replay is authorized by this observation.\n"); err != nil {
+				return err
+			}
 		case "readiness_failed":
 			if _, err := io.WriteString(writer, "Inspect doctor for the repository and ticket logs; this check did not establish runtime readiness.\n"); err != nil {
 				return err

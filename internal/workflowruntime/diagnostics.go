@@ -12,7 +12,7 @@ func (r *Runtime) recordDiagnostic(result TickResult, at time.Time) {
 	// Ignore pool contention/idle ticks: another loop failing to acquire a
 	// busy ticket must not erase that ticket's meaningful last observation.
 	switch result.Outcome {
-	case OutcomeInvoked, OutcomeReadiness, OutcomeWorker, OutcomeBusy, OutcomeStale:
+	case OutcomeInvoked, OutcomeReadiness, OutcomeWorker, OutcomeBusy, OutcomeStale, OutcomeRepositoryPreflight, OutcomeWorktreeIdentity:
 	default:
 		return
 	}

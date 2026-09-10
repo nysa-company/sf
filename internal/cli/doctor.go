@@ -88,6 +88,9 @@ type DoctorDeps struct {
 	PushOrigin func(context.Context, string) (string, error)
 	SSHAgent   func(context.Context) DoctorSSHAgentState
 	SSHAssets  func() error
+	// HTTPSCredentials exercises the packaged bridge, not gh API login.
+	// The argument is a canonical owner/repository identity, never a URL.
+	HTTPSCredentials func(context.Context, string) error
 	// Recipe previews local configuration/closure only; it is not persisted
 	// ticket configuration or executable/provider launch authority.
 	Recipe     func(context.Context, string) error
@@ -154,6 +157,7 @@ func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
 	deps.PushOrigin = doctorRepositoryPushOrigin
 	deps.SSHAgent = productionDoctorSSHAgent(os.Getenv("SSH_AUTH_SOCK"))
 	deps.SSHAssets = productionDoctorSSHAssets(channel)
+	deps.HTTPSCredentials = productionDoctorHTTPSCredentials(channel)
 	deps.Recipe = func(ctx context.Context, repository string) error {
 		response := RunInitCheck(ctx, InitRequest{Channel: channel, Repo: repository, Paths: deps.Paths})
 		if !response.OK {
@@ -383,6 +387,9 @@ func doctorQualification(role string, value store.ProviderQualification) DoctorP
 func guardedEligibilityChecksPass(report DoctorReport) bool {
 	mandatory := []string{"channel_root", "disk_space", "git_executable", "gh_executable", "authority_database", "provider_recovery", "external_mutation_recovery", "authentication", "provider_pair", "github_auth", "builder_auth", "reviewer_auth"}
 	for _, check := range report.Checks {
+		if check.ID == "https_credentials" {
+			mandatory = append(mandatory, check.ID)
+		}
 		if (check.ID == "git_transport" || check.ID == "ssh_agent" || check.ID == "ssh_assets") && check.Status == CheckFail {
 			mandatory = append(mandatory, check.ID)
 		}

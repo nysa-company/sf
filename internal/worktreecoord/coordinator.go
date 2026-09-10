@@ -23,6 +23,9 @@ import (
 )
 
 var (
+	// ErrRepositoryPreflight means repository/base readiness could not be
+	// established. It does not identify a credential failure or stale fence.
+	ErrRepositoryPreflight = errors.New("repository preflight failed")
 	// ErrAuthentication means the path did not re-prove the exact registered
 	// repository/worktree/branch/base identity. It is safe only for an operator
 	// to inspect; this coordinator never deletes it.
@@ -115,7 +118,7 @@ func (c Coordinator) Ensure(ctx context.Context, request EnsureRequest) (store.S
 	}
 	repository, base, err := c.Git.ObserveRepositoryBase(ctx, project.Path, project.BaseRef)
 	if err != nil {
-		return store.StoredWorktree{}, fmt.Errorf("%w: registered repository preflight failed: %v", ErrAuthentication, err)
+		return store.StoredWorktree{}, fmt.Errorf("%w: %w", ErrRepositoryPreflight, err)
 	}
 	intent := store.GitMutationIntent{
 		EffectFence:     store.EffectFence{Ref: request.Ref, TicketVersion: request.Version, Fence: request.Fence},

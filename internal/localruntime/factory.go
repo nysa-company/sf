@@ -127,6 +127,7 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 		if publicationEnabled {
 			gitRunner.CredentialHelper = publicationAssets.CredentialHelper
 			gitRunner.GHConfigDir = configuration.GHConfigDir
+			gitRunner.GHHome = configuration.OwnerHome
 			if configuration.SSHAgentSock != "" {
 				// ResolveCore authenticated the bundle directory. Git's SSH
 				// boundary authenticates these exact assets when actually used;

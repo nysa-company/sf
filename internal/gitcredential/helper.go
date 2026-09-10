@@ -21,6 +21,76 @@ import (
 
 const maxCredentialBytes = 16 << 10
 
+// ResponseCheck consumes a bounded credential response without exposing it.
+// Call Clear immediately after checking Valid to erase the transient buffer.
+type ResponseCheck struct {
+	data   []byte
+	failed bool
+}
+
+func NewResponseCheck() *ResponseCheck {
+	return &ResponseCheck{data: make([]byte, 0, maxCredentialBytes)}
+}
+
+func (check *ResponseCheck) Write(value []byte) (int, error) {
+	if check.failed || len(check.data)+len(value) > maxCredentialBytes {
+		check.Clear()
+		check.failed = true
+		return 0, ErrRefused
+	}
+	check.data = append(check.data, value...)
+	return len(value), nil
+}
+
+func (check *ResponseCheck) Valid() bool {
+	if check.failed {
+		return false
+	}
+	username, password, protocol, host := false, false, false, false
+	for _, line := range bytes.Split(check.data, []byte{'\n'}) {
+		line = bytes.TrimSuffix(line, []byte{'\r'})
+		if len(line) == 0 {
+			continue
+		}
+		key, value, ok := bytes.Cut(line, []byte{'='})
+		if !ok || len(value) == 0 || bytes.ContainsAny(value, "\x00\r\n") {
+			return false
+		}
+		switch string(key) {
+		case "protocol":
+			if protocol || !bytes.Equal(value, []byte("https")) {
+				return false
+			}
+			protocol = true
+		case "host":
+			if host || !bytes.Equal(value, []byte("github.com")) {
+				return false
+			}
+			host = true
+		case "username":
+			if username {
+				return false
+			}
+			username = true
+		case "password":
+			if password {
+				return false
+			}
+			password = true
+		default:
+			return false
+		}
+	}
+	// gh echoes the requested protocol and host before its credential fields.
+	// Accept only that exact pair (or neither), never arbitrary routing data.
+	return username && password && protocol == host
+}
+
+func (check *ResponseCheck) Clear() {
+	clear(check.data)
+	check.data = nil
+}
+
 var ErrRefused = errors.New("GitHub credential request refused")
 
 type LookupEnv func(string) (string, bool)
@@ -79,12 +149,41 @@ func Run(ctx context.Context, args []string, input io.Reader, output io.Writer, 
 	if !ok || !trustedDirectory(configDir) {
 		return ErrRefused
 	}
+	home, ok := lookup("SF_GIT_GH_HOME")
+	if !ok || !TrustedHome(home) {
+		return ErrRefused
+	}
 	canonical := []byte("protocol=https\nhost=github.com\npath=" + repository + ".git\n\n")
 	bounded := &boundedWriter{destination: output, remaining: maxCredentialBytes}
-	if err := runner.Run(ctx, gh, []string{"auth", "git-credential", "get"}, []string{"HOME=/var/empty", "LANG=C", "LC_ALL=C", "GH_CONFIG_DIR=" + configDir}, bytes.NewReader(canonical), bounded); err != nil || bounded.exceeded {
+	if err := runner.Run(ctx, gh, []string{"auth", "git-credential", "get"}, []string{"HOME=" + home, "LANG=C", "LC_ALL=C", "GH_CONFIG_DIR=" + configDir, "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "GH_PROMPT_DISABLED=1", "GIT_TERMINAL_PROMPT=0"}, bytes.NewReader(canonical), bounded); err != nil || bounded.exceeded {
 		return ErrRefused
 	}
 	return nil
+}
+
+// TrustedHome authenticates the operator directory used only by the gh child.
+// It never creates directories or changes permissions. Ancestors must be real,
+// owner-controlled directories; root-owned sticky temporary roots are allowed.
+func TrustedHome(path string) bool {
+	if !cleanAbsolute(path) || path == string(filepath.Separator) {
+		return false
+	}
+	for current := path; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !trustedOwner(info) {
+			return false
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || (current == path && stat.Uid != uint32(os.Getuid())) {
+			return false
+		}
+		if info.Mode().Perm()&0o022 != 0 && !(current != path && stat.Uid == 0 && info.Mode()&os.ModeSticky != 0) {
+			return false
+		}
+		if current == string(filepath.Separator) {
+			return true
+		}
+	}
 }
 
 func parseRequest(raw []byte) (map[string]string, error) {
