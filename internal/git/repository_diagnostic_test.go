@@ -34,7 +34,9 @@ func TestObserveRepositoryBaseSafeStageDiagnostics(t *testing.T) {
 				t.Fatal(err)
 			}
 			authority := &countingMutationAuthority{}
-			runner := Runner{Home: t.TempDir(), TestLocalTransport: true, MutationAuthority: authority}
+			// Let Runner create its private 0700 HOME. testing.TempDir's child
+			// directory is not itself the isolated Git HOME contract.
+			runner := Runner{Home: filepath.Join(t.TempDir(), "home"), TestLocalTransport: true, MutationAuthority: authority}
 			origin := filepath.Join(repository, "remote.git")
 			if test.name == "transport" {
 				origin = "https://github.com/example/repository.git"
