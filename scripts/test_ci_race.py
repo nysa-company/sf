@@ -16,7 +16,7 @@ class RacePartitionTest(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         workflow = (root / ".github/workflows/repository-baseline.yml").read_text()
         targets = re.search(r"target: \[([^]]+)\]", workflow).group(1).split(", ")
-        self.assertEqual(set(targets), {"race-other", "runtime-race", "test-integration-other", "test-crash",
+        self.assertEqual(set(targets), {"test-integration-other", "crash-other",
                                       "test-security", "test-upgrade", "test-compiled-e2e", "verify-static"})
         shards = re.search(r"shard: \[([^]]+)\]", workflow).group(1).split(", ")
         self.assertEqual([int(i) for i in shards], list(range(8)))
@@ -24,9 +24,14 @@ class RacePartitionTest(unittest.TestCase):
         runtime = workflow.split("  runtime-integration:\n", 1)[1]
         runtime_shards = re.search(r"shard: \[([^]]+)\]", runtime).group(1).split(", ")
         self.assertEqual([int(i) for i in runtime_shards], list(range(4)))
+        balanced = workflow.split("  balanced:\n", 1)[1].split("  runtime-integration:\n", 1)[0]
+        self.assertIn("lane: [race-other, runtime-race, crash-runtime]", balanced)
+        self.assertIn("shard: [0, 1, 2, 3]", balanced)
         makefile = (root / "Makefile").read_text()
         self.assertIn('runtime-race) python3 scripts/run-bounded --timeout 65m -- python3 scripts/ci-race.py runtime-race', makefile)
         self.assertIn('runtime-integration --index "$$SHARD" --count 4', makefile)
+        for mode in ("other", "runtime-race", "crash-runtime"):
+            self.assertIn(f'{mode} --index "$$SHARD" --count 4', makefile)
         reference = re.search(r"\ntest-integration:\n\t([^\n]+)", makefile).group(1).split()
         other = re.search(r"\ntest-integration-other:\n\t([^\n]+)", makefile).group(1).split()
         self.assertEqual([part for part in reference if part != "./internal/workflowruntime"], other)
@@ -38,23 +43,25 @@ class RacePartitionTest(unittest.TestCase):
         gate = workflow.split("  acceptance:\n", 1)[1].split("  baseline:\n", 1)[0]
         self.assertIn("name: SF acceptance", gate)
         self.assertIn("if: ${{ always() }}", gate)
-        self.assertIn("needs: [baseline, store-race, runtime-integration]", gate)
+        self.assertIn("needs: [baseline, store-race, runtime-integration, balanced]", gate)
         self.assertIn("${{ needs.baseline.result }}", gate)
         self.assertIn("${{ needs.store-race.result }}", gate)
         self.assertIn("${{ needs.runtime-integration.result }}", gate)
         self.assertIn('test "$BASELINE_RESULT" = success', gate)
         self.assertIn('test "$STORE_RACE_RESULT" = success', gate)
         self.assertIn('test "$RUNTIME_INTEGRATION_RESULT" = success', gate)
+        self.assertIn("${{ needs.balanced.result }}", gate)
+        self.assertIn('test "$BALANCED_RESULT" = success', gate)
         commands = gate.split("        run: |\n", 1)[1]
-        for baseline, store, runtime in itertools.product(("success", "failure", "cancelled", "skipped", ""), repeat=3):
-            with self.subTest(baseline=baseline, store=store, runtime=runtime):
+        for baseline, store, runtime, balanced in itertools.product(("success", "failure", "cancelled", "skipped", ""), repeat=4):
+            with self.subTest(baseline=baseline, store=store, runtime=runtime, balanced=balanced):
                 result = subprocess.run(
                     ["bash", "--noprofile", "--norc", "-e", "-c", commands],
                     env={"BASELINE_RESULT": baseline, "STORE_RACE_RESULT": store,
-                         "RUNTIME_INTEGRATION_RESULT": runtime},
+                         "RUNTIME_INTEGRATION_RESULT": runtime, "BALANCED_RESULT": balanced},
                     capture_output=True, timeout=5)
                 self.assertEqual(result.returncode == 0,
-                                 baseline == store == runtime == "success")
+                                 baseline == store == runtime == balanced == "success")
 
     def test_complete_disjoint_stable_partition(self):
         names = [f"TestCase{i}" for i in range(541)] + ["ExampleStore", "FuzzDecode"]
@@ -72,6 +79,20 @@ class RacePartitionTest(unittest.TestCase):
                 ci.partition(names, index, count)
         with self.assertRaises(ValueError):
             ci.inventory("unexpected fixture output")
+
+    def test_weighted_partition_is_complete_disjoint_and_balanced(self):
+        names = ["heavy", "medium", "new", "ExampleSeed", "FuzzSeed", "old"]
+        weights = {"heavy": 100, "medium": 60, "old": 40, "removed": 999}
+        shards = [ci.balanced_partition(names, i, 3, weights) for i in range(3)]
+        flat = [n for shard in shards for n in shard]
+        self.assertEqual(sorted(flat), sorted(names))
+        self.assertEqual(len(flat), len(set(flat)))
+        self.assertEqual(shards, [ci.balanced_partition(list(reversed(names)), i, 3, weights)
+                                 for i in range(3)])
+        self.assertEqual(shards[0], ["heavy"])
+        for weight in (0, -1, float("inf"), float("nan"), "bad"):
+            with self.assertRaises(ValueError):
+                ci.balanced_partition(names, 0, 3, {"heavy": weight})
 
     def test_inventory_keeps_examples_and_fuzz_seeds(self):
         self.assertEqual(ci.inventory("TestA\nExampleB\nFuzzC\nBenchmarkD\nok  \tpackage 1s\n"),
@@ -94,13 +115,49 @@ class RacePartitionTest(unittest.TestCase):
             self.assertNotIn(ci.STORE, run.call_args.args[0])
             self.assertNotIn(ci.RUNTIME, run.call_args.args[0])
 
-    def test_runtime_race_runs_whole_package_with_unchanged_flags(self):
+    def test_runtime_race_partitions_inventory_with_unchanged_flags(self):
         with patch("sys.argv", ["ci-race.py", "runtime-race"]), \
-             patch.object(ci.subprocess, "check_output", return_value=f"first\n{ci.STORE}\n{ci.RUNTIME}\nlast\n"), \
+             patch.object(ci.subprocess, "check_output", return_value="TestA\nExampleB\nFuzzC\n") as listing, \
              patch.object(ci.subprocess, "call", return_value=1) as run:
             self.assertEqual(ci.main(), 1)
-            self.assertEqual(run.call_args.args[0], ["go", "test", *ci.FLAGS, ci.RUNTIME])
-            self.assertNotIn("-run", run.call_args.args[0])
+            self.assertEqual(listing.call_args.args[0], ["go", "test", "-race", "-list", ".", ci.RUNTIME])
+            self.assertEqual(run.call_args.args[0], ["go", "test", *ci.FLAGS, "-v", ci.RUNTIME,
+                                                   "-run", "^(?:ExampleB|FuzzC|TestA)$"])
+
+    def test_other_package_shards_keep_new_packages_and_propagate_failure(self):
+        packages = ["first", ci.STORE, ci.RUNTIME, "last", "new", "fourth"]
+        commands = []
+        for index in range(4):
+            with patch("sys.argv", ["ci-race.py", "other", "--index", str(index), "--count", "4"]), \
+                 patch.object(ci.subprocess, "check_output", return_value="\n".join(packages)), \
+                 patch.object(ci.subprocess, "call", return_value=1) as run:
+                self.assertEqual(ci.main(), 1)
+                commands.extend(run.call_args.args[0][2 + len(ci.FLAGS):])
+        self.assertEqual(sorted(commands), ["first", "fourth", "last", "new"])
+
+    def test_crash_partition_keeps_exact_original_selection(self):
+        makefile = (Path(__file__).resolve().parent.parent / "Makefile").read_text()
+        original = re.search(r"\ntest-crash:\n\t[^\n]*-run '([^']+)'", makefile).group(1)
+        self.assertEqual(ci.CRASH_PATTERN, original)
+        names = ["TestCrashA", "TestRecovery", "TestRecover", "TestRearm", "TestQuarantine",
+                 "TestOrdinary", "ExampleOther", "FuzzDecode"]
+        selected = []
+        for index in range(4):
+            with patch("sys.argv", ["ci-race.py", "crash-runtime", "--index", str(index), "--count", "4"]), \
+                 patch.object(ci.subprocess, "check_output", return_value="\n".join(names)), \
+                 patch.object(ci.subprocess, "call", return_value=1) as run:
+                self.assertEqual(ci.main(), 1)
+                command = run.call_args.args[0]
+                self.assertNotIn("-race", command)
+                selected.extend(n for n in names if re.search(command[-1], n))
+        self.assertEqual(sorted(selected), sorted(n for n in names if re.search(original, n)))
+        self.assertEqual(len(selected), len(set(selected)))
+        with patch("sys.argv", ["ci-race.py", "crash-other"]), \
+             patch.object(ci.subprocess, "check_output", return_value=f"first\n{ci.STORE}\n{ci.RUNTIME}\n"), \
+             patch.object(ci.subprocess, "call", return_value=1) as run:
+            self.assertEqual(ci.main(), 1)
+            self.assertEqual(run.call_args.args[0], ["go", "test", *ci.INTEGRATION_FLAGS,
+                                                   "first", ci.STORE, "-run", ci.CRASH_PATTERN])
 
     def test_race_package_lanes_are_complete_and_disjoint(self):
         packages = ["first", ci.STORE, ci.RUNTIME, "last"]
