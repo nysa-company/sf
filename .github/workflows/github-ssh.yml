@@ -33,6 +33,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Preflight diagnostic regression (fast feedback)
+        run: go test -p 1 -count=1 ./internal/git -run '^TestObserveRepositoryBaseSafeStageDiagnostics$'
       - name: SSH transport, auth, and composition tests
         run: go test -p 1 -count=1 ./internal/auth ./internal/cli ./internal/gitssh ./internal/git ./internal/runtimeassets ./internal/localruntime ./internal/publication
       - name: Store transport identity regression
