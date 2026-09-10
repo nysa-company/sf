@@ -120,6 +120,11 @@ func renderTickets(writer io.Writer, parent map[string]any, values []any) error 
 	if _, err := fmt.Fprintf(writer, "Tickets (%s)\n", stringField(parent, "channel")); err != nil {
 		return err
 	}
+	if activity, ok := parent["runtime_activity"].(map[string]any); ok {
+		if err := renderRuntimeActivity(writer, activity); err != nil {
+			return err
+		}
+	}
 	if len(values) == 0 {
 		_, err := io.WriteString(writer, "No tickets.\n")
 		return err

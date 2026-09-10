@@ -41,8 +41,9 @@ type PhaseEvidence interface {
 // provider phase that has Store-authenticated evidence. Publication remains
 // outside this boundary; review is admitted only from FinalReviewAuthority.
 type PhaseRunner struct {
-	Store       PhaseEvidence
-	Coordinator PlannerCoordinator
+	Store                  PhaseEvidence
+	Coordinator            PlannerCoordinator
+	ExecutionBaseReadiness func(context.Context, config.Effective, string) error
 }
 
 func NewPhaseRunner(evidence PhaseEvidence, coordinator PlannerCoordinator) *PhaseRunner {
@@ -53,7 +54,7 @@ func NewPhaseRunner(evidence PhaseEvidence, coordinator PlannerCoordinator) *Pha
 // never exposes Coordinator.Parsed or any coordinator-owned raw bytes.
 func (r PhaseRunner) Run(ctx context.Context, request workflowworker.PhaseRequest) (workflowworker.PhaseResult, error) {
 	if request.Phase == domain.PhasePlanning {
-		return PlannerRunner{Store: r.Store, Coordinator: r.Coordinator}.Run(ctx, request)
+		return PlannerRunner{Store: r.Store, Coordinator: r.Coordinator, ExecutionBaseReadiness: r.ExecutionBaseReadiness}.Run(ctx, request)
 	}
 	if ctx == nil {
 		ctx = context.Background()

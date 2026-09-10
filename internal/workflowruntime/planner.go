@@ -52,6 +52,9 @@ type PlannerCoordinator interface {
 type PlannerRunner struct {
 	Store       PlannerEvidence
 	Coordinator PlannerCoordinator
+	// ExecutionBaseReadiness is a production-local, read-only prerequisite.
+	// It is not provider evidence or permission to execute commands.
+	ExecutionBaseReadiness func(context.Context, config.Effective, string) error
 }
 
 // PlannerAdapter is a descriptive alias for callers that prefer adapter
@@ -115,6 +118,11 @@ func (r PlannerRunner) RunArtifact(ctx context.Context, request workflowworker.P
 	if err := validateWorktree(request, project); err != nil {
 		return PlannerResult{}, err
 	}
+	if r.ExecutionBaseReadiness != nil {
+		if err := r.ExecutionBaseReadiness(ctx, effective, request.Worktree.Path); err != nil {
+			return PlannerResult{}, err
+		}
+	}
 	if !permittedMode(request.Ticket.MergeMode) || !permittedMode(effective.MergeMode) {
 		return PlannerResult{}, ErrUnsupportedMode
 	}
@@ -152,6 +160,9 @@ func (r PlannerRunner) RunArtifact(ctx context.Context, request workflowworker.P
 			return PlannerResult{}, workflowworker.ErrProviderResultIndeterminate
 		case providercoord.RepairUnavailable:
 			return PlannerResult{}, workflowworker.ErrProviderRepairUnavailable
+		}
+		if coordResult.Diagnostic.Valid() {
+			return PlannerResult{}, diagnosticError{code: string(coordResult.Diagnostic), err: ErrPlannerNotReady}
 		}
 		return PlannerResult{}, ErrPlannerNotReady
 	}

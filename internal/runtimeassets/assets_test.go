@@ -46,6 +46,33 @@ func TestResolveCoreExactChannelBundle(t *testing.T) {
 	}
 }
 
+func TestBundleRepeatedSeparatorsDoNotWeakenPathChecks(t *testing.T) {
+	root := privateDirectory(t)
+	primary := executable(t, root, "sf-dev", 0o700)
+	executable(t, root, "sf-git-exec-dev", 0o700)
+	executable(t, root, "sf-git-credential-dev", 0o700)
+	input := root + "///sf-dev"
+	core, err := ResolveCore(domain.ChannelDev, input)
+	canonical, _ := filepath.EvalSymlinks(primary)
+	if err != nil || core.Executable != canonical {
+		t.Fatalf("core=%+v err=%v", core, err)
+	}
+	if _, err := ResolvePublication(domain.ChannelDev, input); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{root + "/./sf-dev", root + "/../" + filepath.Base(root) + "/sf-dev"} {
+		if _, err := ResolveCore(domain.ChannelDev, bad); !errors.Is(err, ErrUnsafeBundle) {
+			t.Fatalf("accepted dot component: %q", bad)
+		}
+	}
+	if err := os.Chmod(primary, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveCore(domain.ChannelDev, input); !errors.Is(err, ErrUnsafeBundle) {
+		t.Fatal("accepted unsafe executable")
+	}
+}
+
 func TestResolveCoreRejectsUnsafeExecutableFacts(t *testing.T) {
 	t.Run("invalid-channel", func(t *testing.T) {
 		if _, err := ResolveCore(domain.Channel("other"), "/tmp/sf"); !errors.Is(err, ErrUnsafeBundle) {

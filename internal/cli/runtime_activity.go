@@ -3,10 +3,16 @@ package cli
 import (
 	"fmt"
 	"io"
+
+	"github.com/nysa-company/sf/internal/contracts"
 )
 
 func renderRuntimeActivity(writer io.Writer, activity map[string]any) error {
 	if !boolField(activity, "available") {
+		if stringField(activity, "reason") == "runtime_not_composed" {
+			_, err := fmt.Fprintf(writer, "Workflow runtime: unavailable. Run %s doctor; after restart, qualify the selected providers for this daemon (%s providers qualify --help). This diagnostic does not change ticket state.\n", binaryName(), binaryName())
+			return err
+		}
 		return nil
 	}
 	items, _ := activity["observations"].([]any)
@@ -17,6 +23,11 @@ func renderRuntimeActivity(writer io.Writer, activity map[string]any) error {
 		}
 		if _, err := fmt.Fprintf(writer, "Last scheduler observation: %s at %s (ticket version %s; historical, not current state)\n", safeSelectionLabel(stringField(item, "outcome")), safeSelectionLabel(stringField(item, "observed_at")), displayField(item, "observed_ticket_version")); err != nil {
 			return err
+		}
+		if reason := stringField(item, "reason"); contracts.RuntimeDiagnosticSummary(reason) != "" {
+			if _, err := fmt.Fprintf(writer, "Reason: %s — %s\n", reason, contracts.RuntimeDiagnosticSummary(reason)); err != nil {
+				return err
+			}
 		}
 		switch stringField(item, "outcome") {
 		case "repository_preflight_failed":

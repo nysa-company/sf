@@ -31,8 +31,7 @@ func checkDoctorGitTransport(ctx context.Context, deps DoctorDeps, report *Docto
 	agent := DoctorCheck{ID: "ssh_agent", Status: CheckNotRun, Summary: "SSH agent inspection requires a supported SSH origin"}
 	assets := DoctorCheck{ID: "ssh_assets", Status: CheckNotRun, Summary: "SSH bundle inspection requires a supported SSH origin"}
 	defer func() {
-		report.Checks = append(report.Checks, transport, agent, assets,
-			DoctorCheck{ID: "repository_access", Status: CheckNotRun, Summary: "remote repository read/write access was not tested; local transport and API readiness do not prove repository access"})
+		report.Checks = append(report.Checks, transport, agent, assets)
 	}()
 	if deps.Repo == "" || !doctorChecksPass(*report, "repository_worktree") {
 		return

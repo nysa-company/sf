@@ -91,6 +91,10 @@ type DoctorDeps struct {
 	// HTTPSCredentials exercises the packaged bridge, not gh API login.
 	// The argument is a canonical owner/repository identity, never a URL.
 	HTTPSCredentials func(context.Context, string) error
+	// RepositoryBase reads the registered project base; RepositoryAccess uses
+	// production Git transport to observe that base without fetching it.
+	RepositoryBase   func(context.Context, string) (string, error)
+	RepositoryAccess func(context.Context, string, string) error
 	// Recipe previews local configuration/closure only; it is not persisted
 	// ticket configuration or executable/provider launch authority.
 	Recipe     func(context.Context, string) error
@@ -166,13 +170,15 @@ func productionDoctorDeps(channel domain.Channel, repo string) DoctorDeps {
 		return nil
 	}
 	databasePath := deps.Paths.Database
+	deps.RepositoryBase = productionDoctorRepositoryBase(channel, databasePath)
+	deps.RepositoryAccess = productionDoctorRepositoryAccess(channel)
 	deps.Pair = func(ctx context.Context, selected domain.Channel) (store.ProviderPair, error) {
 		database, err := store.OpenReadOnly(ctx, databasePath)
 		if err != nil {
 			return store.ProviderPair{}, err
 		}
 		defer database.Close()
-		return database.ProviderPair(ctx, selected)
+		return database.CurrentAttestedProviderPair(ctx, selected)
 	}
 	deps.Attempts = func(ctx context.Context, selected domain.Channel) ([]store.ProviderAttempt, error) {
 		database, err := store.OpenReadOnly(ctx, databasePath)
@@ -263,6 +269,7 @@ func RunDoctor(ctx context.Context, deps DoctorDeps) DoctorReport {
 		report.Checks = append(report.Checks, DoctorCheck{ID: "repository_recipe", Status: CheckPass, Summary: "working-tree configuration and local test closure preview accepted; stored configuration and executable versions are checked separately"})
 	}
 	checkDoctorGitTransport(ctx, deps, &report)
+	checkDoctorRepositoryAccess(ctx, deps, &report)
 	report.Checks = append(report.Checks, checkExecutable(deps, "gh", "gh executable is available"))
 	pair, pairAvailable := checkProviderPair(ctx, deps, &report)
 	checkQuarantinedProviders(ctx, deps, &report)
@@ -316,6 +323,13 @@ func checkProviderPair(ctx context.Context, deps DoctorDeps, report *DoctorRepor
 		return store.ProviderPair{}, false
 	}
 	pair, err := deps.Pair(ctx, deps.Channel)
+	if errors.Is(err, store.ErrProviderQualificationNotCurrent) {
+		report.Checks = append(report.Checks,
+			DoctorCheck{ID: "authority_database", Status: CheckPass, Summary: "authority database is readable and schema-compatible"},
+			failedCheck("provider_pair", "selected provider qualifications are not attested by the current daemon supervisor; rerun provider qualification in this daemon session", deps.Binary, "providers", "qualify", "--help"),
+		)
+		return store.ProviderPair{}, false
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		report.Checks = append(report.Checks,
 			DoctorCheck{ID: "authority_database", Status: CheckPass, Summary: "authority database is readable and schema-compatible"},
@@ -344,7 +358,7 @@ func checkProviderPair(ctx context.Context, deps DoctorDeps, report *DoctorRepor
 	}
 	report.Checks = append(report.Checks,
 		DoctorCheck{ID: "authority_database", Status: CheckPass, Summary: "authority database is readable and schema-compatible"},
-		DoctorCheck{ID: "provider_pair", Status: CheckPass, Summary: "selected provider pair is current, qualified, and independent"},
+		DoctorCheck{ID: "provider_pair", Status: CheckPass, Summary: "selected provider qualifications are current and independent; runtime binding and ticket admission remain separate checks"},
 	)
 	return pair, true
 }
@@ -354,6 +368,9 @@ func validDoctorPair(pair store.ProviderPair, channel domain.Channel) bool {
 		return false
 	}
 	if pair.Builder.Channel != channel || pair.Reviewer.Channel != channel || pair.Builder.Provider.Family == pair.Reviewer.Provider.Family {
+		return false
+	}
+	if pair.Planner.ID <= 0 || pair.Planner.Channel != channel || !safeDoctorProvider(pair.Planner.Provider) || !safeDoctorAuthMode(pair.Planner.AuthMode) || !passingQualification(pair.Planner.Profile) {
 		return false
 	}
 	return safeDoctorProvider(pair.Builder.Provider) && safeDoctorProvider(pair.Reviewer.Provider) &&
@@ -390,7 +407,7 @@ func guardedEligibilityChecksPass(report DoctorReport) bool {
 		if check.ID == "https_credentials" {
 			mandatory = append(mandatory, check.ID)
 		}
-		if (check.ID == "git_transport" || check.ID == "ssh_agent" || check.ID == "ssh_assets") && check.Status == CheckFail {
+		if (check.ID == "git_transport" || check.ID == "ssh_agent" || check.ID == "ssh_assets" || check.ID == "repository_access") && check.Status == CheckFail {
 			mandatory = append(mandatory, check.ID)
 		}
 		if check.ID == "repository_recipe" && check.Status != CheckNotRun {

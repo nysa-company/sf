@@ -31,7 +31,7 @@ func TestStatusRuntimeDiagnosticsAreScopedAndNotAuthority(t *testing.T) {
 	foreign.Channel = domain.ChannelDev
 	d.runtimeMu.Lock()
 	d.runtime = &diagnosticRuntime{values: []contracts.RuntimeDiagnostic{
-		{Ref: ref, Outcome: "repository_preflight_failed", TicketVersion: 7, ObservedAt: time.Unix(100, 0)},
+		{Ref: ref, Outcome: "repository_preflight_failed", Reason: "git_remote_read", TicketVersion: 7, ObservedAt: time.Unix(100, 0)},
 		{Ref: other, Outcome: "worker_failed"}, {Ref: foreign, Outcome: "busy"},
 		{Ref: ref, Outcome: "untrusted-secret-value"},
 	}}
@@ -49,6 +49,9 @@ func TestStatusRuntimeDiagnosticsAreScopedAndNotAuthority(t *testing.T) {
 	}
 	if code != 0 || json.Unmarshal([]byte(output), &response) != nil || json.Unmarshal(response.Data, &data) != nil {
 		t.Fatalf("status=%s", output)
+	}
+	if !strings.Contains(output, "git_remote_read") {
+		t.Fatal("safe cause missing from status")
 	}
 	if !data.Activity.Available || len(data.Activity.Observations) != 1 || data.Activity.Observations[0].Ticket != string(ref.Ticket) || data.Activity.Observations[0].Outcome != "repository_preflight_failed" || strings.Contains(output, "untrusted-secret-value") || response.Mutation.Attempted {
 		t.Fatalf("status=%s", output)

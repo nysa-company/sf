@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/nysa-company/sf/internal/domain"
@@ -39,6 +40,7 @@ type SSH struct {
 }
 
 func ResolveSSH(channel domain.Channel, executable string) (SSH, error) {
+	executable = normalizeExecutableSeparators(executable)
 	primaryName, _, err := names(channel)
 	if err != nil || !filepath.IsAbs(executable) || filepath.Clean(executable) != executable || filepath.Base(executable) != primaryName {
 		return SSH{}, fmt.Errorf("%w: SSH primary channel", ErrUnsafeBundle)
@@ -85,6 +87,7 @@ func CurrentCore(channel domain.Channel) (Core, error) {
 // It rejects a renamed primary, a cross-channel helper, symlink leaf, unsafe
 // ownership/mode/link count, and any lookup outside the primary's directory.
 func ResolveCore(channel domain.Channel, executable string) (Core, error) {
+	executable = normalizeExecutableSeparators(executable)
 	primaryName, helperName, err := names(channel)
 	if err != nil {
 		return Core{}, err
@@ -121,6 +124,7 @@ func CurrentPublication(channel domain.Channel) (Publication, error) {
 // credential helper. It requires the same trusted bundle directory and leaf
 // metadata as ResolveCore, and rejects a cross-channel or escaped helper.
 func ResolvePublication(channel domain.Channel, executable string) (Publication, error) {
+	executable = normalizeExecutableSeparators(executable)
 	primaryName, _, err := names(channel)
 	if err != nil {
 		return Publication{}, err
@@ -141,6 +145,16 @@ func ResolvePublication(channel domain.Channel, executable string) (Publication,
 		return Publication{}, fmt.Errorf("%w: credential helper escaped executable bundle", ErrUnsafeBundle)
 	}
 	return Publication{CredentialHelper: helper}, nil
+}
+
+// The OS may retain repeated separators in os.Executable. Collapse only empty
+// path components, not dot/dot-dot or symlinks: every existing trust check still
+// applies to the same absolute executable and sibling bundle.
+func normalizeExecutableSeparators(path string) string {
+	for strings.Contains(path, "//") {
+		path = strings.ReplaceAll(path, "//", "/")
+	}
+	return path
 }
 
 func credentialName(channel domain.Channel) string {

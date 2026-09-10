@@ -161,6 +161,7 @@ func factoryWithResolvers(configuration Config, resolve coreResolver, resolvePub
 			},
 		}
 		phaseRunner := workflowruntime.NewPhaseRunner(dependencies.Store, coordinator)
+		phaseRunner.ExecutionBaseReadiness = workflowruntime.CheckExecutionBaseDependencies
 		worker := workflowworker.Worker{
 			Evidence:               dependencies.Store,
 			Engine:                 dependencies.Engine,

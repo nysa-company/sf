@@ -2,6 +2,19 @@
 
 ## Current truth
 
+- 2026-09-10: PR #9 is merged at `808f8aa` (the earlier pending notes below are
+  historical). New user-approved repair goal is active on `fix/planning-readiness`;
+  plan `docs/plans/2026-09-10-planning-readiness.md`. Independent reviews confirm
+  lost pre-planner diagnostics and stale-qualification Doctor PASS. Source and
+  regression tests are being implemented; only formatting/diff checks run.
+  The user approved push, PR and merge after CI, plus balancing slow CI lanes;
+  no local automated
+  tests/builds, installation, daemon restart or live database changes.
+  Exact failure on the affected other Mac remains unproven until instrumented
+  status is collected. Missing vendor is not established as the original
+  zero-attempt planning cause. Restart attestation remains explicitly renewed,
+  never weakened. Goal is not complete.
+
 - PR #9 follow-up (2026-09-09): user authorized merge into main after CI.
   Initial hosted failure was missing GHHome in publication fixtures; c1e4d23
   fixes that without weakening production checks. Its focused GitHub transport

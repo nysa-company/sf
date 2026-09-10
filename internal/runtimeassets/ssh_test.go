@@ -29,6 +29,9 @@ func TestResolveSSHExactBundle(t *testing.T) {
 			if err != nil || got.Helper != canonicalHelper || got.KnownHosts != canonicalKnown {
 				t.Fatalf("bundle=%+v err=%v", got, err)
 			}
+			if repeated, err := ResolveSSH(channel, root+"///sf"+suffix); err != nil || repeated != got {
+				t.Fatalf("repeated separators changed bundle: %+v %v", repeated, err)
+			}
 			if err := os.WriteFile(known, []byte("untrusted"), 0o600); err != nil {
 				t.Fatal(err)
 			}

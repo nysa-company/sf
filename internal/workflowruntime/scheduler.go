@@ -642,7 +642,7 @@ func classifyEnsure(err error) (Outcome, error) {
 	case errors.Is(err, store.ErrStaleFence):
 		return OutcomeStale, ErrStale
 	case errors.Is(err, worktreecoord.ErrRepositoryPreflight):
-		return OutcomeRepositoryPreflight, ErrRepositoryPreflight
+		return OutcomeRepositoryPreflight, preserveDiagnostic(err, ErrRepositoryPreflight)
 	case errors.Is(err, worktreecoord.ErrAuthentication):
 		return OutcomeWorktreeIdentity, ErrWorktreeIdentity
 	case errors.Is(err, store.ErrBusy):
@@ -661,7 +661,7 @@ func classifyWorker(err error) (Outcome, error) {
 	if errors.Is(err, store.ErrStaleFence) {
 		return OutcomeStale, ErrStale
 	}
-	return OutcomeWorker, ErrWorker
+	return OutcomeWorker, preserveDiagnostic(err, ErrWorker)
 }
 
 // Compile-time documentation that the concrete coordinator remains usable by
