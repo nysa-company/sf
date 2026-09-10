@@ -30,6 +30,7 @@ func TestCurrentAttestedProviderPairChecksEveryRoleAndRestart(t *testing.T) {
 			for i, provider := range []string{"cursor", "codex", "claude"} {
 				q := qualificationValue(strings.Repeat(string(rune('a'+i)), 32), provider, provider+"-family", QualificationGuarded)
 				q.AuthMode = []string{"cursor_browser", "chatgpt_subscription", "claude_subscription"}[i]
+				q.ProbeDigest = strings.Repeat("d", 64)
 				proof, err := supervisor.AttestQualification(contracts.QualificationAttestation{Channel: q.Channel, RunID: q.RunID, Identity: q.Provider, BinaryDigest: q.BinaryDigest, PolicyDigest: q.PolicyDigest, FixtureDigest: q.FixtureDigest, AuthDigest: strings.Repeat("e", 64), AuthMode: q.AuthMode, ProbeDigest: strings.Repeat("d", 64), Profile: contracts.ProfileGuarded, CreatedUnixNanos: q.CreatedAt.UnixNano(), LeaderEpoch: leader, Nonce: q.RunID})
 				if err != nil {
 					t.Fatal(err)
