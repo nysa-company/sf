@@ -26,7 +26,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Ticket entry regression and scripted journey
-        run: go test -p 1 -count=1 ./internal/cli -run '^TestTicketEntry' -v
+        run: go test -p 1 -count=1 ./internal/cli -run '^Test(TicketEntry|HomeIntent|Authoring)' -v
       - name: Entire CLI normal and race regression
         run: |
           go test -p 1 -count=1 ./internal/cli
@@ -38,6 +38,30 @@ jobs:
           scripts/sf version --json | jq -eS '.data | select(.channel == "dev")' > "$RUNNER_TEMP/sf-short.json"
           bin/sf-dev version --json | jq -eS '.data | select(.channel == "dev")' > "$RUNNER_TEMP/sf-dev.json"
           cmp "$RUNNER_TEMP/sf-short.json" "$RUNNER_TEMP/sf-dev.json"
+      - name: Fast no-model authoring regression
+        run: go test -p 1 -count=1 ./internal/authoring ./internal/processsupervisor ./internal/daemon ./internal/store -run '^TestAuthoring' -v
+      - name: Build opt-in authoring acceptance artifact
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          artifact_dir="$RUNNER_TEMP/authoring-acceptance"
+          mkdir -p "$artifact_dir"
+          go test -c -o "$artifact_dir/processsupervisor.test" ./internal/processsupervisor
+          cp bin/sf-dev "$artifact_dir/sf-dev"
+          checkout_sha=$(git rev-parse HEAD)
+          {
+            printf 'github_sha=%s\n' "$GITHUB_SHA"
+            printf 'checkout_sha=%s\n' "$checkout_sha"
+            printf 'pr_head_sha=%s\n' "$PR_HEAD_SHA"
+            (cd "$artifact_dir" && shasum -a 256 processsupervisor.test sf-dev)
+          } > "$artifact_dir/MANIFEST"
+      - name: Upload opt-in authoring acceptance artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: authoring-acceptance-macos-arm64
+          path: ${{ runner.temp }}/authoring-acceptance
+          if-no-files-found: error
       - name: Repository and documentation checks
         run: |
           scripts/repo-check

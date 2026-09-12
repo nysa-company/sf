@@ -49,8 +49,11 @@ type Identity struct {
 }
 
 type Supervisor struct {
-	Signer   *contracts.DrainSigner
-	Recorder LaunchRecorder
+	authoringStages map[string]trustedExecutable
+	authoringRuns   map[string]*run
+	activity        activityRegistry
+	Signer          *contracts.DrainSigner
+	Recorder        LaunchRecorder
 	// rejectionCheckpoint is installed only by trusted runtime composition before
 	// runs start. Provider adapters never supply physical checkpoint evidence.
 	rejectionCheckpoint contracts.RejectionCheckpointInspector
@@ -73,6 +76,11 @@ type Supervisor struct {
 	// stageRuntime is test-only fault injection for the all-or-nothing staging
 	// boundary. Nil uses trustedExecutable.stage in production.
 	stageRuntime func(*trustedExecutable) error
+	// Package-private compiled-boundary fixtures substitute credentials and
+	// sandbox launch only; production leaves these nil and uses pinned policy.
+	authoringEnvironment func(context.Context, string, string, cliSecretLookup) ([]string, string, func(), error)
+	authoringCommand     func(trustedExecutable, string, string) ([]string, error)
+	authoringIdentity    func(int) (string, error)
 }
 type trustedExecutable struct {
 	path         string // immutable source spelling selected during qualification
@@ -100,6 +108,7 @@ type stagedExecutable struct {
 	cleaning                    bool
 }
 type run struct {
+	activity        *activityRecord
 	identity        Identity
 	worktree        string
 	done            chan struct{}
@@ -322,6 +331,14 @@ func (s *Supervisor) Close() error {
 		return err
 	}
 	s.closing, s.closeDone = true, make(chan struct{})
+	authoringRuns := make(map[string]*run, len(s.authoringRuns))
+	for key, active := range s.authoringRuns {
+		authoringRuns[key] = active
+	}
+	for key, trusted := range s.authoringStages {
+		delete(s.authoringStages, key)
+		s.retireLocked(trusted)
+	}
 	runs := make(map[requestKey]*run, len(s.runs))
 	for request, active := range s.runs {
 		runs[request] = active
@@ -333,6 +350,26 @@ func (s *Supervisor) Close() error {
 	s.mu.Unlock()
 
 	var result error
+	for key, active := range authoringRuns {
+		ctx, cancel, err := s.drainContext(context.Background())
+		if err == nil {
+			err = s.terminateContext(ctx, active)
+			if err == nil {
+				err = s.proveGoneContext(ctx, active)
+			}
+			cancel()
+		}
+		if err == nil {
+			err = s.waitForRunReturn(active)
+		}
+		if err != nil {
+			result = errors.Join(result, fmt.Errorf("drain authoring run: %w", err))
+			continue
+		}
+		s.mu.Lock()
+		delete(s.authoringRuns, key)
+		s.mu.Unlock()
+	}
 	for request, active := range runs {
 		drainCtx, cancel, err := s.drainContext(context.Background())
 		if err == nil {
@@ -813,7 +850,15 @@ func (s *Supervisor) runWithCLISecrets(ctx context.Context, request contracts.Dr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr limitedBuffer
 	stdout.limit, stderr.limit = 64<<10, 64<<10
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	observation := s.beginActivity(request)
+	publishedActivity := false
+	defer func() {
+		if !publishedActivity {
+			observation.abandon()
+		}
+	}()
+	cmd.Stdout = &activityWriter{capture: &stdout, record: observation, decoder: activityDecoder{provider: request.Identity.Provider, model: request.Identity.Model}}
+	cmd.Stderr = &activityWriter{capture: &stderr, record: observation, stderr: true}
 	requestKey := key(request)
 	if s.beforeStart != nil {
 		s.beforeStart()
@@ -853,6 +898,7 @@ func (s *Supervisor) runWithCLISecrets(ctx context.Context, request contracts.Dr
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	r := &run{identity: Identity{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, BootIdentity: bootIdentity, ProcessStartIdentity: startIdentity}, worktree: input.Worktree, done: make(chan struct{}), streams: make(chan struct{}), finished: make(chan struct{}), releaseSnapshot: func() { processCompleted(); release() }}
+	r.activity = observation
 	// Once a process exists, its staged runtime remains referenced until the
 	// single cmd.Wait path has observed both process exit and stream closure.
 	// The deferred release above remains the prelaunch/startup failure fallback.
@@ -870,6 +916,7 @@ func (s *Supervisor) runWithCLISecrets(ctx context.Context, request contracts.Dr
 		return contracts.CommandResult{}, ErrUnclear
 	}
 	// Durable identity exists; the only release is closing the inherited gate.
+	observation.releasingGate()
 	if _, err := gateWrite.Write([]byte{1}); err != nil {
 		_ = signalGroup(r.identity.PGID, syscall.SIGKILL)
 		_ = waitProcess(cmd, r)
@@ -880,12 +927,15 @@ func (s *Supervisor) runWithCLISecrets(ctx context.Context, request contracts.Dr
 		_ = waitProcess(cmd, r)
 		return contracts.CommandResult{}, ErrUnclear
 	}
+	observation.publish()
+	publishedActivity = true
 	wait := make(chan error, 1)
 	go func() { wait <- waitProcess(cmd, r) }()
 	var runErr error
 	select {
 	case runErr = <-wait:
 	case <-ctx.Done():
+		observation.lifecycle("cancellation_requested")
 		runErr = ctx.Err()
 		if terminateErr := s.terminate(r); terminateErr != nil {
 			return contracts.CommandResult{}, terminateErr
@@ -932,6 +982,7 @@ func (s *Supervisor) removeRun(request contracts.DrainRequest, target *run) {
 
 func waitProcess(cmd *exec.Cmd, r *run) error {
 	err := cmd.Wait()
+	r.activity.lifecycle("process_exited")
 	r.completeWait()
 	return err
 }
@@ -1175,6 +1226,11 @@ func (s *Supervisor) Drain(ctx context.Context, request contracts.DrainRequest) 
 	if r == nil {
 		return contracts.DrainProof{}, ErrUnclear
 	}
+	select {
+	case <-r.done:
+	default:
+		r.activity.lifecycle("cancellation_requested")
+	}
 	if err := s.terminateContext(drainCtx, r); err != nil {
 		return contracts.DrainProof{}, err
 	}
@@ -1182,7 +1238,11 @@ func (s *Supervisor) Drain(ctx context.Context, request contracts.DrainRequest) 
 		return contracts.DrainProof{}, err
 	}
 	s.removeRun(request, r)
-	return s.Signer.ProveDrained(request)
+	proof, err := s.Signer.ProveDrained(request)
+	if err == nil {
+		r.activity.lifecycle("drain_proven")
+	}
+	return proof, err
 }
 
 // DrainPersisted is restart recovery for a qualified local provider. It

@@ -38,30 +38,34 @@ func (a *app) canSelectInteractively() bool {
 // daemon rechecks state and authority for the resulting full ticket ID.
 // Approval/rejection use a separate candidate-bound confirmation flow.
 func (a *app) configureTicketSelection(root *cobra.Command) {
-	allowed := map[string]bool{"start": true, "status": true, "show": true, "logs": true, "pause": true, "resume": true, "recover": true, "cancel": true, "retry": true, "take": true}
-	for _, command := range root.Commands() {
-		if !allowed[command.Name()] {
-			continue
-		}
+	for _, command := range ticketSelectionCommands(root, false) {
 		command.Use = strings.Replace(command.Use, "<ticket>", "[ticket]", 1)
-		command.Long = command.Short + ".\n\nUse a full ticket ID or a unique 6–31 character lowercase hex prefix.\nOmit the ID in a terminal to choose by title; q cancels without an action.\nPiped input and --json require an explicit ID or unique prefix.\nApproval and rejection use a separate candidate-bound confirmation flow."
+		command.Long += "\n\nUse a full ticket ID or a unique 6–31 character lowercase hex prefix.\nOmit the ID in a terminal to choose by title; q cancels without an action.\nPiped input and --json require an explicit ID or unique prefix.\nApproval and rejection use a separate candidate-bound confirmation flow."
 		if command.Name() == "status" {
 			command.Long += "\nPlain status lists all tickets; use --select for the interactive picker."
 		}
-		var project string
 		var selectFlag bool
-		command.Flags().StringVar(&project, "project", "", "scope ticket selection to a registered project")
+		if command.Flags().Lookup("project") == nil {
+			command.Flags().String("project", "", "scope ticket selection to a registered project")
+		}
 		if command.Name() == "status" {
 			command.Flags().BoolVar(&selectFlag, "select", false, "select a ticket interactively instead of listing all tickets")
 		}
 		originalArgs, originalRun := command.Args, command.RunE
 		command.Args = func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Lookup("file") != nil && cmd.Flags().Changed("file") {
+				return originalArgs(cmd, args)
+			}
 			if len(args) == 0 && a.canSelectInteractively() {
 				return nil
 			}
 			return originalArgs(cmd, args)
 		}
 		command.RunE = func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Lookup("file") != nil && cmd.Flags().Changed("file") {
+				return originalRun(cmd, args)
+			}
+			project, _ := cmd.Flags().GetString("project")
 			// Keep the established no-argument status list behavior.
 			if cmd.Name() == "status" && len(args) == 0 && !selectFlag {
 				if project != "" {

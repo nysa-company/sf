@@ -17,13 +17,18 @@ var homeProjectPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,47}$`)
 // passes through the same public command and daemon checks as direct usage.
 func (a *app) homeCommand() *cobra.Command {
 	var project string
+	var model string
+	var noAI bool
 	command := &cobra.Command{Use: "home", Short: "Choose a project-scoped task in an interactive terminal", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			fail := func(message string) error {
 				return a.emit(failure("invalid_argument", message, commandHelpAction(cmd)))
 			}
 			if !a.canSelectInteractively() {
-				return fail("home requires a terminal; use ticket new, run, tickets or approve explicitly")
+				return fail("home requires a terminal; use ticket new, ticket start, ticket list or ticket approve explicitly")
+			}
+			if !noAI {
+				return a.homeIntent(cmd, project, model)
 			}
 			reader := a.input
 			if reader == nil {
@@ -50,7 +55,11 @@ func (a *app) homeCommand() *cobra.Command {
 				return fail("choose one listed action; no action taken")
 			}
 			if answer == "1" {
-				return a.dispatchHome(cmd, []string{"ticket", "new", "--multiline"})
+				args := []string{"ticket", "new", "--multiline", "--no-ai"}
+				if project != "" {
+					args = append(args, "--project", project)
+				}
+				return a.dispatchHome(cmd, args)
 			}
 			if project == "" {
 				project, err = read("Registered project name (q cancels): ")
@@ -83,18 +92,20 @@ func (a *app) homeCommand() *cobra.Command {
 				}
 				a.expectedDraftDigest = parsed.Digest
 				defer func() { a.expectedDraftDigest = "" }()
-				args := []string{"run", path, "--project", project}
+				args := []string{"ticket", "start", "--file", path, "--project", project}
 				if confirm == "run estimates" {
 					args = append(args, "--accept-cost-estimates")
 				}
 				return a.dispatchHome(cmd, args)
 			case "3":
-				return a.dispatchHome(cmd, []string{"tickets", "--project", project})
+				return a.dispatchHome(cmd, []string{"ticket", "list", "--project", project})
 			default:
-				return a.dispatchHome(cmd, []string{"approve", "--project", project})
+				return a.dispatchHome(cmd, []string{"ticket", "approve", "--project", project})
 			}
 		}}
 	command.Flags().StringVar(&project, "project", "", "registered project to use; never guessed from directory name")
+	command.Flags().StringVar(&model, "model", "", "explicit Claude model for intent interpretation")
+	command.Flags().BoolVar(&noAI, "no-ai", false, "use deterministic numbered navigation without inference")
 	return command
 }
 

@@ -12,10 +12,7 @@ import (
 )
 
 func (a *app) configureDecisionSelection(root *cobra.Command) {
-	for _, command := range root.Commands() {
-		if command.Name() != "approve" && command.Name() != "reject" {
-			continue
-		}
+	for _, command := range ticketSelectionCommands(root, true) {
 		command.Use = strings.Replace(command.Use, "<ticket>", "[ticket]", 1)
 		var project string
 		var selectFlag bool

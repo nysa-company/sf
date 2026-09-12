@@ -2,6 +2,56 @@
 
 ## Current truth
 
+- 2026-09-12 hosted acceptance: draft PR #11 is open, source HEAD
+  `a9d3491078c2f8840a33c93fe34e3053185d2b2d`; all 61 GitHub checks PASS.
+  Runs: repository-baseline `34703071966`, ticket-entry `34703071941`,
+  recovery-candidate `34703071973`, github-ssh `34703071934`.
+  CI repairs fixed non-success authoring SQL NULL binding (empty BLOB with
+  exact drain proof), native loader literal-root permission, and offline/docs
+  fixtures for the new canonical commands. No local builds or broad test suites
+  ran. Installed Claude version-only check reports
+  `2.1.263`. CI-built acceptance binaries were downloaded to ignored
+  `.context/authoring-acceptance-a9d3491` and SHA256-verified, not executed.
+  User authorized the two isolated real Claude authoring turns. The exact
+  CI-built opt-in test ran once and failed at PrepareAuthoring (test line 95,
+  0.76 seconds), before RunAuthoring/model inference. Neither paid turn was
+  sent. Host-only sanitized status confirmed authenticated OAuth and parser
+  support for hidden `--max-turns 3` despite absent help text. The authoring-only
+  observer now proves that exact bound through status, preserving version and
+  visible safety guards; source regressions await fresh GitHub CI. Default
+  ambient sandbox status falsely reported logged out, so do not instruct login
+  based on that environment. No merge/install/live daemon
+  or live DB changes authorized or performed. Goal is not complete from CI
+  mocks alone. This evidence update is uncommitted to preserve the tested SHA.
+
+- 2026-09-12: user approved implementing the ticket-first CLI/AI authoring/live
+  activity/natural-language home plan. Active goal and short branch
+  `feat/ticket-first-cli` begin at main `f632e81` (merged PR #10, all 61 checks
+  passed; prior pending repair notes below are historical). Approved plan:
+  `docs/plans/2026-09-12-ticket-first-cli.md`. User chose draft first, then a
+  separate Start offer. Root orchestrates; implementation lead delegates coding
+  to child agents; Luna handles bounded research and tests. Packages 1–2 have
+  source/tests/docs (namespace, rich view, real bounded activity/watch), with
+  source review only. Package 3 now has source across contracts/helpers, v62
+  Store bookkeeping, a separate Claude no-tools supervisor boundary, async
+  daemon sessions and draft-first CLI. Package 4 now has closed typed Home
+  intent dispatch through existing scoped selectors and public handlers.
+  Read-only `ticket new --status SESSION --turn KEY` inspects interrupted
+  authoring without inference or action. Independent Luna tests/docs and
+  child-owned integration/regression tests are present; source review only.
+  No capability is claimed validated or released.
+  No local automated tests/builds, live provider calls, binary
+  installation, daemon restart or DB mutation; GitHub validation still required.
+  User authorized push and draft PR: source `e1b3114` is pushed and draft PR #11
+  is open at https://github.com/nysa-company/sf/pull/11. Initial GitHub runs:
+  repository-baseline `34702381335`, ticket-entry `34702381338`, recovery-candidate
+  `34702381321`, github-ssh `34702381318`; initial failures identify stale manual
+  draft/docs fixtures, native authoring sandbox startup abort, and cancelled
+  authoring completion retaining uncertainty. Repairs are under validation,
+  not a passing verdict. No merge authorization
+  exists for this branch. Actual pinned Claude authoring compatibility is still
+  required beyond mocked/OS sandbox regression evidence.
+
 - 2026-09-10: PR #9 is merged at `808f8aa` (the earlier pending notes below are
   historical). New user-approved repair goal is active on `fix/planning-readiness`;
   plan `docs/plans/2026-09-10-planning-readiness.md`. Independent reviews confirm

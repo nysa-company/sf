@@ -37,6 +37,7 @@ type app struct {
 	interactive         func() bool
 	fetchIssue          func(context.Context, string) ([]byte, error)
 	expectedDraftDigest string
+	canonical           bool
 }
 
 // NewCommand returns the public CLI. The client is injected so command tests
@@ -73,18 +74,31 @@ func (a *app) command() *cobra.Command {
 	}
 	root.SetOut(a.out)
 	root.SetErr(a.errOut)
-	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) { a.ctx = cmd.Context() }
+	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) {
+		a.ctx = cmd.Context()
+		a.canonical = false
+		for parent := cmd; parent != nil; parent = parent.Parent() {
+			if parent.Name() == "ticket" || parent.Name() == "factory" {
+				a.canonical = true
+			}
+		}
+	}
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "render the versioned JSON response")
 	root.AddCommand(a.submitCommand(), a.startCommand(), a.statusCommand(), a.showCommand(), a.logsCommand(), a.controlCommand("pause"), a.controlCommand("resume"), a.recoverCommand(), a.controlCommand("cancel"), a.retryCommand(), a.controlCommand("take"), a.approveCommand(), a.rejectCommand(), a.doctorCommand(), a.authCommand(), a.initCommand(), a.providersCommand(), a.daemonCommand(), a.configCommand(), a.simpleSetupCommand("update"), a.simpleSetupCommand("rollback"), a.versionCommand())
 	configureCommandHelp(root)
 	root.AddCommand(a.ticketsCommand())
-	root.AddCommand(a.ticketDraftCommand())
+	root.AddCommand(a.ticketCommand())
+	factory := a.daemonCommand()
+	factory.Use = "factory"
+	factory.Short = "Run or inspect this channel's foreground factory"
+	root.AddCommand(factory)
 	root.AddCommand(a.runCommand())
 	root.AddCommand(a.bundleCommand())
 	root.AddCommand(a.runtimesCommand())
 	root.AddCommand(a.homeCommand())
 	a.configureTicketSelection(root)
 	a.configureDecisionSelection(root)
+	configureCanonicalHelp(root)
 	return root
 }
 
@@ -194,6 +208,9 @@ func (a *app) context() context.Context {
 }
 
 func (a *app) emit(response api.Response) error {
+	if a.canonical {
+		response = canonicalResponse(response)
+	}
 	copy := response
 	a.last = &copy
 	if err := Render(a.out, response, a.json); err == nil {

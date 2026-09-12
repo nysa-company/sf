@@ -75,5 +75,6 @@ func (s *Supervisor) DrainServerRejection(ctx context.Context, request contracts
 		return contracts.DrainProof{}, contracts.ServerRejectionAttestation{}, ErrUnclear
 	}
 	delete(s.runs, key(request))
+	r.activity.lifecycle("drain_proven")
 	return drain, receipt, nil
 }

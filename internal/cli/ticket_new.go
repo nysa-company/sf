@@ -20,12 +20,25 @@ import (
 
 func (a *app) newTicketDraftCommand() *cobra.Command {
 	var multiline bool
+	var noAI bool
+	var project, model string
+	var contextFiles []string
+	var statusSession, statusTurn string
 	command := &cobra.Command{Use: "new [ticket.md]", Short: "Create a ticket interactively after reviewing its full contents", Args: cobra.MaximumNArgs(1),
-		Long: "Collect a title, problem and acceptance criteria, then preview a guarded ticket with a 1h/$10 ceiling. Explicit confirmation saves a new private file; existing files are never overwritten. No submission occurs. Noninteractive callers can use ticket template and ticket validate.",
+		Long: "Draft interactively with explicitly consented Claude authoring turns, or use --no-ai for the offline manual form. Preview a guarded ticket with a 1h duration and $10 policy budget, not a hard billing cap. Save requires confirmation and never overwrites; Start is a separate explicit action. Scripts use ticket template and ticket validate without inference.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fail := func(message string) error { return a.emit(failure("invalid_ticket", message, commandHelpAction(cmd))) }
+			if cmd.Flags().Changed("status") || cmd.Flags().Changed("turn") {
+				if len(args) > 0 || noAI || multiline || project != "" || model != "" || len(contextFiles) > 0 {
+					return fail("authoring status cannot create, save, refine or start a draft")
+				}
+				return a.readAuthoringStatus(cmd, statusSession, statusTurn)
+			}
 			if !a.canSelectInteractively() {
 				return fail("ticket new requires an interactive terminal; use ticket template and ticket validate for scripts")
+			}
+			if !noAI {
+				return a.authorTicketDraft(cmd, args, project, model, contextFiles)
 			}
 			path := ""
 			if len(args) != 0 {
@@ -57,6 +70,12 @@ func (a *app) newTicketDraftCommand() *cobra.Command {
 		},
 	}
 	command.Flags().BoolVar(&multiline, "multiline", false, "paste a multiline problem; finish with a line containing only a dot")
+	command.Flags().BoolVar(&noAI, "no-ai", false, "use the offline manual form without provider calls")
+	command.Flags().StringVar(&project, "project", "", "registered project for authoring")
+	command.Flags().StringVar(&model, "model", "", "explicit Claude authoring model")
+	command.Flags().StringSliceVar(&contextFiles, "context", nil, "opt-in project-relative reference files (no tools or repository access)")
+	command.Flags().StringVar(&statusSession, "status", "", "read an existing authoring session turn without inference")
+	command.Flags().StringVar(&statusTurn, "turn", "", "exact existing turn key to inspect with --status")
 	return command
 }
 

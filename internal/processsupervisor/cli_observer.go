@@ -32,24 +32,34 @@ func (s *Supervisor) ObserveClaudeRuntime(ctx context.Context, executable, model
 }
 
 func (s *Supervisor) observeClaudeRuntime(ctx context.Context, executable, model string, lookup cliSecretLookup) (contracts.RuntimeBinding, error) {
+	return s.observeClaudeOperation(ctx, executable, model, lookup, false)
+}
+
+func (s *Supervisor) observeClaudeOperation(ctx context.Context, executable, model string, lookup cliSecretLookup, authoring bool) (contracts.RuntimeBinding, error) {
+	fail := func(stage string, cause error) (contracts.RuntimeBinding, error) {
+		if authoring {
+			return contracts.RuntimeBinding{}, preparationFailure(stage, cause)
+		}
+		return contracts.RuntimeBinding{}, cause
+	}
 	family, ok := claudeprovider.ModelFamily(model)
 	if s == nil || runtime.GOOS != "darwin" || !ok {
-		return contracts.RuntimeBinding{}, errCLIObservation
+		return fail("unsupported", errCLIObservation)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	bundle, err := cliruntime.Resolve(ctx, "claude", executable)
 	if err != nil {
-		return contracts.RuntimeBinding{}, errCLIObservation
+		return fail("resolve", errCLIObservation)
 	}
 	trusted := trustedExecutable{path: bundle.Executable(), digest: bundle.Digest(), cliBundle: &bundle}
 	if trusted.stage() != nil {
-		return contracts.RuntimeBinding{}, errCLIObservation
+		return fail("staging", errCLIObservation)
 	}
 	defer os.RemoveAll(trusted.stagedDir)
 	env, _, cleanup, err := vettedEnvironment("")
 	if err != nil {
-		return contracts.RuntimeBinding{}, errCLIObservation
+		return fail("staging", errCLIObservation)
 	}
 	defer cleanup()
 	var home string
@@ -57,7 +67,7 @@ func (s *Supervisor) observeClaudeRuntime(ctx context.Context, executable, model
 		if strings.HasPrefix(item, "HOME=") {
 			home, err = filepath.EvalSymlinks(strings.TrimPrefix(item, "HOME="))
 			if err != nil {
-				return contracts.RuntimeBinding{}, errCLIObservation
+				return fail("staging", errCLIObservation)
 			}
 			env[i] = "HOME=" + home
 		}
@@ -65,9 +75,9 @@ func (s *Supervisor) observeClaudeRuntime(ctx context.Context, executable, model
 	extra, authDigest, err := prepareCLICredentials(ctx, "claude", home, lookup)
 	if err != nil {
 		if errors.Is(err, errClaudeAuthRenewal) {
-			return contracts.RuntimeBinding{}, errClaudeAuthRenewal
+			return fail("authrenewal", errClaudeAuthRenewal)
 		}
-		return contracts.RuntimeBinding{}, errCLIObservation
+		return fail("authlookup", errCLIObservation)
 	}
 	env = append(env, extra...)
 	probe := func(args ...string) ([]byte, error) {
@@ -88,24 +98,38 @@ func (s *Supervisor) observeClaudeRuntime(ctx context.Context, executable, model
 	}
 	version, err := probe("--version")
 	if err != nil || strings.TrimSpace(string(version)) != "2.1.263 (Claude Code)" {
-		return contracts.RuntimeBinding{}, errCLIObservation
+		return fail("version", errCLIObservation)
 	}
 	help, err := probe("--help")
 	if err != nil {
-		return contracts.RuntimeBinding{}, errCLIObservation
+		return fail("help", errCLIObservation)
 	}
 	for _, flag := range []string{"--restricted", "--safe-mode", "--no-session-persistence", "--strict-mcp-config", "--json-schema"} {
 		if !bytes.Contains(help, []byte(flag)) {
-			return contracts.RuntimeBinding{}, errCLIObservation
+			return fail("help", errCLIObservation)
 		}
 	}
-	status, err := probe("--safe-mode", "--restricted", "auth", "status")
+	if authoring {
+		for _, flag := range []string{"--bare", "--tools", "--permission-mode", "--allowedTools", "--disallowedTools"} {
+			if !bytes.Contains(help, []byte(flag)) {
+				return fail("help", errCLIObservation)
+			}
+		}
+	}
+	statusArgs := []string{"--safe-mode", "--restricted", "auth", "status"}
+	if authoring {
+		// The pinned 2.1.263 runtime accepts --max-turns but omits it from
+		// help. Validate the exact bound through authenticated status only;
+		// never send a prompt or relax the production authoring argv.
+		statusArgs = append([]string{"--max-turns", "3"}, statusArgs...)
+	}
+	status, err := probe(statusArgs...)
 	if err != nil || !validObservedClaudeAuth(status) {
-		return contracts.RuntimeBinding{}, errCLIObservation
+		return fail("authstatus", errCLIObservation)
 	}
 	current, err := cliruntime.Resolve(ctx, "claude", executable)
 	if err != nil || current.Digest() != bundle.Digest() || current.Executable() != bundle.Executable() || !stagedRuntimeMatches(trusted.snapshot, bundle.Digest()) {
-		return contracts.RuntimeBinding{}, errCLIObservation
+		return fail("binding", errCLIObservation)
 	}
 	// This identifies the required qualification suite, not a passing verdict.
 	fixture := sha256.Sum256([]byte("sf-claude-fixture-v3:version,flags,oauth,complete-stream-json-v1,draft2020-projection,role-write,outside-read-denied,no-shell,no-mcp,cancel-drain"))

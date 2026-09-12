@@ -53,6 +53,39 @@ func TestStableChannelBacksUpBeforeSchemaMigration(t *testing.T) {
 	}
 }
 
+func TestAuthoringV61MigrationReopensWithPrivateBackup(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "stable.sqlite")
+	createDatabaseAtVersion(t, path, 61)
+	backups := filepath.Join(root, "backups")
+	if err := os.Mkdir(backups, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		db, err := OpenChannel(context.Background(), path, backups, domain.ChannelStable)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		if err := db.db.QueryRow(`SELECT COUNT(*) FROM authoring_sessions`).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("new sessions=%d err=%v", count, err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files, err := filepath.Glob(filepath.Join(backups, "sf-schema-v061-to-v062*.sqlite"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("backups=%v err=%v", files, err)
+	}
+	if rawSchemaVersion(t, files[0]) != 61 || rawSchemaVersion(t, path) != 62 {
+		t.Fatal("migration or backup version changed")
+	}
+}
+
 func TestStoredMigrationHistoryPreflightRefusesBeforeAnyMutation(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -1190,6 +1223,8 @@ func testMigration(version int) []string {
 		return migrationV60
 	case 61:
 		return migrationV61
+	case 62:
+		return migrationV62
 	default:
 		return nil
 	}

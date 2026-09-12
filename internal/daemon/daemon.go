@@ -204,7 +204,10 @@ type Config struct {
 	// the coordinator may install the same recorder when it is composed on its
 	// own in tests or future worker entrypoints.
 	ProviderSupervisor contracts.ProcessSupervisor
-	RecoveryDrainer    interface {
+	// AuthoringSupervisor optionally supplies the dedicated pre-ticket boundary.
+	// Production reuses ProviderSupervisor when it implements that boundary.
+	AuthoringSupervisor contracts.AuthoringSupervisor
+	RecoveryDrainer     interface {
 		DrainPersisted(context.Context, contracts.DrainRequest, contracts.ProviderLaunch) (contracts.DrainProof, error)
 	}
 	// GitMutationDrainer is the startup-only verifier for persisted Git helper
@@ -272,10 +275,20 @@ type Daemon struct {
 	closeProviderCoordinator   func(*providercoord.Coordinator) error
 	providerCoordinatorFactory func(*store.Store, contracts.ProcessSupervisor) (*providercoord.Coordinator, error)
 	providerSupervisor         contracts.ProcessSupervisor
-	providerQualifier          func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
-	providerModelQualifier     func(context.Context, *store.Store, domain.Channel, string, string, string, string) (any, error)
-	runtimeFactory             WorkflowRuntimeFactory
-	runtime                    WorkflowRuntime
+	authoringSupervisor        contracts.AuthoringSupervisor
+	authoringMu                sync.Mutex
+	authoringSessions          map[string]*authoringSnapshot
+	authoringWorkers           map[string]context.CancelFunc
+	authoringWG                sync.WaitGroup
+	authoringQuarantined       bool
+	authoringStopping          bool
+	authoringCreating          int
+	// Zero uses the production drain grace; tests can exercise late joins.
+	authoringShutdownTimeout time.Duration
+	providerQualifier        func(context.Context, *store.Store, domain.Channel, string, string) (any, error)
+	providerModelQualifier   func(context.Context, *store.Store, domain.Channel, string, string, string, string) (any, error)
+	runtimeFactory           WorkflowRuntimeFactory
+	runtime                  WorkflowRuntime
 	// mu protects daemon process state and handler admission only. It is never
 	// held while waiting for socket handlers, runtime shutdown, Store close, or
 	// any other external I/O.
@@ -417,6 +430,10 @@ func Start(ctx context.Context, configuration Config) (*Daemon, error) {
 	instance := &Daemon{channel: configuration.Channel, paths: configuration.Paths, lease: lease, store: database,
 		engine: engine.New(database, specification), spec: specification, doctor: configuration.Doctor, epoch: epoch, clock: configuration.Clock, ids: configuration.TicketIDs, auth: configuration.Operator, control: configuration.Controller, recoverProvider: configuration.RecoverProvider, recoveryDrainer: configuration.RecoveryDrainer, gitMutationDrainer: configuration.GitMutationDrainer, preparedCommitObserver: preparedCommitObserver, repositoryCommandDrainer: configuration.RepositoryCommandDrainer, providerCoordinatorFactory: configuration.ProviderCoordinatorFactory, providerSupervisor: configuration.ProviderSupervisor, providerQualifier: configuration.ProviderQualifier, runtimeFactory: configuration.WorkflowRuntimeFactory, runtimeContext: ctx}
 	instance.providerModelQualifier = configuration.ProviderModelQualifier
+	instance.authoringSupervisor = configuration.AuthoringSupervisor
+	if instance.authoringSupervisor == nil {
+		instance.authoringSupervisor, _ = configuration.ProviderSupervisor.(contracts.AuthoringSupervisor)
+	}
 	home, _ := os.UserHomeDir()
 	instance.projector = events.Projector{Policy: redact.NewPolicy(home, map[string]string{
 		configuration.Paths.Root:      "$CHANNEL_ROOT",
@@ -544,6 +561,9 @@ func (daemon *Daemon) Epoch() uint64 { return daemon.epoch }
 func (daemon *Daemon) Recover(ctx context.Context) error {
 	if err := daemon.lease.Validate(); err != nil {
 		return err
+	}
+	if err := daemon.recoverAuthoring(ctx); err != nil {
+		return fmt.Errorf("recover authoring bookkeeping: %w", err)
 	}
 	// Git helper children can have crossed a mutable repository boundary. Drain
 	// their exact persisted identity before effects are reconciled/fenced and
@@ -740,6 +760,7 @@ func (daemon *Daemon) Close() error {
 	// Handle also covers direct in-process callers, which are not counted by
 	// transport.Server. Handler admission is sealed before this wait.
 	daemon.handlers.Wait()
+	authoringErr := daemon.closeAuthoring()
 	// Every caller joins the one shared runtime shutdown result. Serve may have
 	// initiated it first, but Close still owns authority teardown and therefore
 	// must report the same runtime failure to its caller and cache it for later
@@ -747,6 +768,39 @@ func (daemon *Daemon) Close() error {
 	if runtimeErr, _ := daemon.shutdownRuntime(); runtimeErr != nil {
 		result = errors.Join(result, fmt.Errorf("close workflow runtime: %w", runtimeErr))
 	}
+	if authoringErr != nil {
+		// Unknown workers retain Store and leader ownership. Closing either
+		// would allow a new daemon to race a still-owned launch or completion.
+		result = errors.Join(result, authoringErr)
+		daemon.mu.Lock()
+		daemon.closeErr = result
+		close(daemon.closeDone)
+		daemon.mu.Unlock()
+		// The first Close is bounded, but ownership is not leaked forever if
+		// the worker eventually drains. This is the sole deferred teardown;
+		// later Close callers only read its recorded outcome.
+		go func() {
+			daemon.authoringWG.Wait()
+			cleanupErr := daemon.closeOwnedResources(nil)
+			daemon.mu.Lock()
+			daemon.closeErr = errors.Join(daemon.closeErr, cleanupErr)
+			daemon.mu.Unlock()
+		}()
+		return result
+	}
+	result = daemon.closeOwnedResources(result)
+	daemon.mu.Lock()
+	daemon.closeErr = result
+	close(daemon.closeDone)
+	daemon.mu.Unlock()
+	return result
+}
+
+// Called once after all authoring workers and the workflow runtime have joined.
+func (daemon *Daemon) closeOwnedResources(result error) error {
+	daemon.authoringMu.Lock()
+	daemon.authoringSessions = nil
+	daemon.authoringMu.Unlock()
 	// shutdownRuntime has joined the runtime's Close before this detaches the
 	// exact paired coordinator. Store teardown remains strictly after both.
 	daemon.runtimeMu.Lock()
@@ -758,10 +812,6 @@ func (daemon *Daemon) Close() error {
 	}
 	result = joinCloseError(result, "close store", daemon.engine.Close)
 	result = joinCloseError(result, "close leader lease", daemon.lease.Close)
-	daemon.mu.Lock()
-	daemon.closeErr = result
-	close(daemon.closeDone)
-	daemon.mu.Unlock()
 	return result
 }
 
@@ -831,12 +881,20 @@ func (daemon *Daemon) Handle(ctx context.Context, peer transport.Peer, request a
 	}
 	var response api.Response
 	switch request.Method {
+	case "authoring.create":
+		response = daemon.createAuthoring(ctx, request)
+	case "authoring.turn":
+		response = daemon.turnAuthoring(ctx, request)
+	case "authoring.status", "authoring.cancel":
+		response = daemon.statusAuthoring(ctx, request)
 	case "ticket.submit":
 		response = daemon.submit(ctx, request, identity)
 	case "ticket.status":
 		response = daemon.statusTickets(ctx, request, identity)
 	case "ticket.show":
 		response = daemon.show(ctx, request, identity)
+	case "ticket.activity":
+		response = daemon.ticketActivity(ctx, request, identity)
 	case "ticket.logs":
 		response = daemon.logs(ctx, request, identity)
 	case "ticket.start":
@@ -1168,6 +1226,23 @@ type ticketParameters struct {
 }
 
 func (daemon *Daemon) show(ctx context.Context, request api.Request, identity domain.OperatorIdentity) api.Response {
+	// Artifact projection is opt-in; compatibility show/status retain their
+	// exact established response shape and parameter interpretation.
+	section := ""
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(request.Parameters, &fields) == nil {
+		if _, present := fields["section"]; present {
+			var parameters struct {
+				ticketParameters
+				Section string `json:"section"`
+			}
+			if decodeParameters(request.Parameters, &parameters) != nil || !validArtifactSection(parameters.Section) {
+				return daemon.failure(request, "invalid_argument", "unsupported ticket artifact section", false)
+			}
+			section = parameters.Section
+			request.Parameters, _ = json.Marshal(parameters.ticketParameters)
+		}
+	}
 	ref, response := daemon.ticketRef(ctx, request)
 	if response != nil {
 		return *response
@@ -1193,6 +1268,19 @@ func (daemon *Daemon) show(ctx context.Context, request api.Request, identity do
 	}
 	view["operator"] = operatorView(identity)
 	daemon.projectProviderRetry(ctx, stored, view)
+	if section != "" {
+		artifacts, err := daemon.ticketArtifacts(ctx, stored, section)
+		if err != nil {
+			return daemon.failure(request, evidenceErrorCode(err), "ticket artifacts could not be authenticated", errors.Is(err, store.ErrBusy))
+		}
+		// The canonical view avoids duplicating raw source fields outside the
+		// bounded artifact display. Legacy show retains those fields.
+		delete(view, "source")
+		delete(view, "problem")
+		delete(view, "acceptance")
+		view["artifacts"] = artifacts
+		view = sanitizeArtifactObject(view, daemon.projector.Policy)
+	}
 	return daemon.success(request, api.Mutation{}, view)
 }
 
