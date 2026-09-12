@@ -122,7 +122,7 @@ func TestCompiledDevOnboardingUsesPrivateHomeAndLocalCommands(t *testing.T) {
 	for _, answer := range []string{"no", "yes"} {
 		path := filepath.Join(repository, "interactive-"+answer+".md")
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		command := exec.CommandContext(ctx, "/usr/bin/script", "-q", "/dev/null", binary, "ticket", "new", path)
+		command := exec.CommandContext(ctx, "/usr/bin/script", "-q", "/dev/null", binary, "ticket", "new", "--no-ai", path)
 		command.Dir, command.Env = repository, environment
 		// Keep stdin open until the child exits: BSD script otherwise sends
 		// terminal EOF before the child has consumed the supplied answers.

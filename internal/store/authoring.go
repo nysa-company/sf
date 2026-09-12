@@ -224,7 +224,9 @@ func (s *Store) FinishAuthoringTurn(ctx context.Context, claim contracts.Authori
 	if outcome != "success" && outcome != "cancelled" && outcome != "failed" && outcome != "interrupted" {
 		return ErrAuthoring
 	}
-	var raw []byte
+	// A no-result outcome is the canonical empty BLOB, not SQL NULL. The
+	// SQLite driver binds nil []byte as NULL, which violates this column.
+	raw := []byte{}
 	if result != nil {
 		if outcome != "success" || authoring.ValidatePurpose(claim.Purpose, *result) != nil {
 			return ErrAuthoring

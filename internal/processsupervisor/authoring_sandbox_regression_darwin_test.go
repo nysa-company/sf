@@ -51,6 +51,9 @@ func TestAuthoringSandboxNativeHelperBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(profile, `(allow file-read* (literal "/"))`) || strings.Contains(profile, `(subpath "/")`) || strings.Contains(profile, "(allow process-fork)") {
+		t.Fatal("native-loader baseline must grant only literal root, never descendants or child creation")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/usr/bin/sandbox-exec", "-p", profile, self, "-test.run", "^TestAuthoringSandboxNativeHelperBoundary$")

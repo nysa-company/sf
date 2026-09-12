@@ -22,6 +22,9 @@ func authoringSandbox(stage, executable, home, temporary string) (string, error)
 		return "", ErrUnclear
 	}
 	profile := "(version 1)\n(deny default)\n(allow sysctl-read)\n(allow mach-lookup)\n(allow process-info*)\n(allow signal (target self))\n(allow network*)\n(allow file-read-metadata)\n"
+	// Match the existing native-loader baseline: dyld reads the root
+	// directory itself. A literal grants no reads beneath the root.
+	profile += "(allow file-read* (literal \"/\"))\n"
 	for _, path := range []string{"/System", "/usr/lib", "/usr/share", "/Library/Apple", "/private/etc", "/dev", stage, home, temporary} {
 		profile += "(allow file-read* (subpath " + seatbeltString(path) + "))\n"
 	}

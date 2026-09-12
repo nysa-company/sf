@@ -44,7 +44,7 @@ func TestTicketEntryMultilineSuggestedFilenameJourney(t *testing.T) {
 	t.Chdir(t.TempDir())
 	began := time.Now()
 	a, prompts := entryApp(t, "Count jobs\nCurrent count is missing.\n\nAdd a read-only count.\n.\nEmpty returns zero.\nUnknown status returns an error.\n\nyes\n")
-	executeEntry(t, a, "ticket", "new", "--multiline")
+	executeEntry(t, a, "ticket", "new", "--no-ai", "--multiline")
 	if !a.last.OK {
 		t.Fatalf("%+v", a.last)
 	}
