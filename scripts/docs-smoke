@@ -24,9 +24,9 @@ for required in \
 	'./bin/sf-dev factory run' \
 	'./bin/sf-dev providers qualify --builder codex --reviewer codex' \
 	'./bin/sf-dev doctor --repo /absolute/path/to/nysa-app' \
-	'./bin/sf-dev submit ./tickets/fix-duplicate-reminders.md --project nysa' \
-	'./bin/sf-dev start SF-00000001' \
-	'./bin/sf-dev status SF-00000001 --watch'; do
+	'./bin/sf-dev ticket submit ./tickets/fix-duplicate-reminders.md --project nysa' \
+	'./bin/sf-dev ticket start SF-00000001' \
+	'./bin/sf-dev ticket watch SF-00000001'; do
 	grep -F -- "$required" "$doc" >/dev/null || fail "missing approved command: $required"
 done
 
@@ -37,8 +37,9 @@ init_line=$(line './bin/sf-dev init --project nysa --repo /absolute/path/to/nysa
 daemon_line=$(line './bin/sf-dev factory run')
 qualify_line=$(line './bin/sf-dev providers qualify --builder codex --reviewer codex')
 doctor_line=$(line './bin/sf-dev doctor --repo /absolute/path/to/nysa-app')
-submit_line=$(line './bin/sf-dev submit ./tickets/fix-duplicate-reminders.md --project nysa')
-start_line=$(line './bin/sf-dev start SF-00000001')
+submit_line=$(line './bin/sf-dev ticket submit ./tickets/fix-duplicate-reminders.md --project nysa')
+start_line=$(line './bin/sf-dev ticket start SF-00000001')
+watch_line=$(line './bin/sf-dev ticket watch SF-00000001')
 [ "$build_line" -lt "$auth_line" ] || fail 'build must precede auth'
 [ "$auth_line" -lt "$init_line" ] || fail 'auth must precede init'
 [ "$init_line" -lt "$daemon_line" ] || fail 'init must precede daemon startup'
@@ -46,6 +47,7 @@ start_line=$(line './bin/sf-dev start SF-00000001')
 [ "$qualify_line" -lt "$doctor_line" ] || fail 'qualification must precede doctor'
 [ "$doctor_line" -lt "$submit_line" ] || fail 'doctor must precede submit'
 [ "$submit_line" -lt "$start_line" ] || fail 'submit must precede start'
+[ "$start_line" -lt "$watch_line" ] || fail 'start must precede watch'
 
 for forbidden in 'gh auth token' 'Authorization:' 'curl ' 'wget ' 'git clone ' '--danger-full-access'; do
 	grep -F -- "$forbidden" "$doc" >/dev/null && fail "unsafe or network-bearing text: $forbidden"
