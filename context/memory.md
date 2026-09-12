@@ -2,6 +2,27 @@
 
 ## Current truth
 
+- 2026-09-12: user approved implementing the ticket-first CLI/AI authoring/live
+  activity/natural-language home plan. Active goal and short branch
+  `feat/ticket-first-cli` begin at main `f632e81` (merged PR #10, all 61 checks
+  passed; prior pending repair notes below are historical). Approved plan:
+  `docs/plans/2026-09-12-ticket-first-cli.md`. User chose draft first, then a
+  separate Start offer. Root orchestrates; implementation lead delegates coding
+  to child agents; Luna handles bounded research and tests. Packages 1–2 have
+  source/tests/docs (namespace, rich view, real bounded activity/watch), with
+  source review only. Package 3 now has source across contracts/helpers, v62
+  Store bookkeeping, a separate Claude no-tools supervisor boundary, async
+  daemon sessions and draft-first CLI. Package 4 now has closed typed Home
+  intent dispatch through existing scoped selectors and public handlers.
+  Read-only `ticket new --status SESSION --turn KEY` inspects interrupted
+  authoring without inference or action. Independent Luna tests/docs and
+  child-owned integration/regression tests are present; source review only.
+  No capability is claimed validated or released.
+  No local automated tests/builds, live provider calls, binary
+  installation, daemon restart or DB mutation; GitHub validation still required.
+  Push plus draft-PR permission has been requested asynchronously and is still
+  pending; no merge authorization exists for this branch.
+
 - 2026-09-10: PR #9 is merged at `808f8aa` (the earlier pending notes below are
   historical). New user-approved repair goal is active on `fix/planning-readiness`;
   plan `docs/plans/2026-09-10-planning-readiness.md`. Independent reviews confirm

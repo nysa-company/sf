@@ -68,6 +68,8 @@ func (s *Store) validateSchema(ctx context.Context) error {
 		}
 	}
 	for _, trigger := range []string{
+		"authoring_session_immutable",
+		"authoring_turn_identity_immutable",
 		"postbuild_amendment_snapshots_immutable_update",
 		"postbuild_amendment_snapshots_immutable_delete",
 		"postbuild_amendment_checkpoint_snapshots_immutable_update",
@@ -205,6 +207,8 @@ func compositeForeignKey(table, target string, columns ...foreignKeyColumn) comp
 // insufficient: accepting a subset or differently ordered mapping would let a
 // valid value from another candidate, ticket, or fence satisfy the FK.
 var requiredCompositeForeignKeys = []compositeForeignKeyRequirement{
+	compositeForeignKey("authoring_sessions", "projects", foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "id"}),
+	compositeForeignKey("authoring_turns", "authoring_sessions", foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"session_id", "id"}),
 	compositeForeignKey("postbuild_amendment_checkpoint_snapshots", "postbuild_amendment_snapshots",
 		foreignKeyColumn{"channel", "channel"}, foreignKeyColumn{"project_id", "project_id"}, foreignKeyColumn{"ticket_id", "ticket_id"}, foreignKeyColumn{"amendment_transition_version", "amendment_transition_version"}),
 	compositeForeignKey("postbuild_amendment_checkpoint_snapshots", "provider_attempt_results",
@@ -493,6 +497,8 @@ func sameForeignKeyColumns(actual, expected []foreignKeyColumn) bool {
 }
 
 var requiredSchema = map[string][]string{
+	"authoring_sessions":                       {"channel", "id", "purpose", "project_id", "capability", "auth_digest", "context_digest", "created_at"},
+	"authoring_turns":                          {"channel", "session_id", "turn_key", "turn", "claim", "state", "launch", "outcome", "result", "created_at", "finished_at"},
 	"postbuild_amendment_checkpoint_snapshots": {"channel", "project_id", "ticket_id", "amendment_transition_version", "ticket_version", "leader_epoch", "runner_epoch", "reviewer_attempt_id", "reviewer_attempt", "reviewer_phase", "reviewer_role", "command_semantic_key", "command_claim_epoch", "full_snapshot_digest", "implementation_digest", "companion_binding_digest", "binding_digest", "created_at"},
 	"postbuild_amendment_snapshots":            {"channel", "project_id", "ticket_id", "amendment_transition_version", "repair_entry_version", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "builder_attempt_id", "builder_attempt", "builder_phase", "builder_role", "builder_typed_digest", "verification_revision", "original_checkpoint_oid", "full_snapshot_digest", "implementation_digest", "protected_paths_digest", "binding_digest", "created_at"},
 	"postbuild_repair_entries":                 {"channel", "project_id", "ticket_id", "entry_ticket_version", "consumed_ticket_version", "consumed_leader_epoch", "consumed_runner_epoch", "phase", "builder_result_attempt_id", "builder_result_attempt", "builder_result_phase", "builder_result_role", "failed_command_semantic_key", "failed_command_claim_epoch", "verification_revision", "original_checkpoint_oid", "retained_worktree_digest", "failed_result_digest", "builder_typed_digest", "correction_budget_kind", "correction_budget_request_id", "binding_digest", "created_at"},
@@ -578,6 +584,10 @@ type indexRequirement struct {
 }
 
 var requiredIndexes = []indexRequirement{
+	{table: "authoring_sessions", columns: []string{"channel", "id"}},
+	{table: "authoring_turns", columns: []string{"channel", "session_id", "turn_key"}},
+	{table: "authoring_turns", columns: []string{"channel", "session_id", "turn"}},
+	{table: "authoring_turns", name: "authoring_one_undrained_channel", columns: []string{"channel"}, partial: true},
 	{table: "postbuild_amendment_checkpoint_snapshots", columns: []string{"channel", "project_id", "ticket_id", "amendment_transition_version"}},
 	{table: "postbuild_amendment_snapshots", columns: []string{"channel", "project_id", "ticket_id", "amendment_transition_version"}},
 	{table: "postbuild_amendment_snapshots", name: "postbuild_amendment_snapshots_builder", columns: []string{"channel", "project_id", "ticket_id", "builder_attempt_id"}},

@@ -45,6 +45,9 @@ func TestTicketSelectionOnlyDispatchesChosenFullIdentity(t *testing.T) {
 		{"picker", []string{"start"}, true, "2\n", "SF-fedcba12345678901234567890123456", ""},
 		{"scope", []string{"start", "abcdef1", "--project", "app"}, false, "", selectedID, "app"},
 		{"status picker", []string{"status", "--select"}, true, "1\n", selectedID, ""},
+		{"nested prefix", []string{"ticket", "start", "abcdef1"}, false, "", selectedID, ""},
+		{"nested picker", []string{"ticket", "start"}, true, "2\n", "SF-fedcba12345678901234567890123456", ""},
+		{"nested scope", []string{"ticket", "start", "abcdef1", "--project", "app"}, false, "", selectedID, "app"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var output, prompt bytes.Buffer

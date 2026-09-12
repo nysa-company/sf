@@ -83,7 +83,7 @@ func TestTicketEntryFilenameAndPasteBounds(t *testing.T) {
 func TestTicketEntryHomeCancellationAndJSON(t *testing.T) {
 	for _, input := range []string{"q\n", "", "0\n", "2\nq\n", "2\napp\nq\n"} {
 		a, _ := entryApp(t, input)
-		executeEntry(t, a, "home")
+		executeEntry(t, a, "home", "--no-ai")
 		if a.last.OK || a.last.Mutation.Attempted {
 			t.Fatalf("%+v", a.last)
 		}
@@ -98,7 +98,7 @@ func TestTicketEntryHomeCancellationAndJSON(t *testing.T) {
 func TestTicketEntryHomeDraftAndScopedView(t *testing.T) {
 	t.Chdir(t.TempDir())
 	a, _ := entryApp(t, "1\nTitle\nProblem\n.\nSuccess\n\nyes\n")
-	executeEntry(t, a, "home")
+	executeEntry(t, a, "home", "--no-ai")
 	if !a.last.OK {
 		t.Fatalf("%+v", a.last)
 	}
@@ -115,7 +115,7 @@ func TestTicketEntryHomeDraftAndScopedView(t *testing.T) {
 		}
 		return api.Response{Version: api.Version, RequestID: "response", OK: true, Data: json.RawMessage(`{"channel":"stable","tickets":[]}`)}, nil
 	})
-	executeEntry(t, a, "home", "--project", "app")
+	executeEntry(t, a, "home", "--no-ai", "--project", "app")
 	if calls != 1 || !a.last.OK {
 		t.Fatalf("calls=%d response=%+v", calls, a.last)
 	}
@@ -295,7 +295,7 @@ func TestTicketEntryHomeRunRequiresExactPreviewAndDoesNotRetry(t *testing.T) {
 				}
 				return runTestResponse(domain.StatePlanning, "ticket_start", false), nil
 			})
-			executeEntry(t, a, "home", "--project", "app")
+			executeEntry(t, a, "home", "--no-ai", "--project", "app")
 			want := 0
 			if mode == "run" || mode == "estimates" {
 				want = 2
@@ -345,7 +345,7 @@ func TestTicketEntryHomeApprovalStillBindsHead(t *testing.T) {
 			}
 			return responseOK(), nil
 		})
-		executeEntry(t, a, "home", "--project", "app")
+		executeEntry(t, a, "home", "--no-ai", "--project", "app")
 		want := 2
 		if answer == "approve" {
 			want = 3

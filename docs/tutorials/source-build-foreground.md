@@ -80,7 +80,7 @@ Leave this command running in a second terminal:
 
 ```text
 cd /absolute/path/to/sf-source
-./bin/sf-dev daemon run
+./bin/sf-dev factory run
 ```
 
 `sf auth status/login` and the daemon select GitHub CLI configuration in this order:
@@ -114,6 +114,22 @@ cd /absolute/path/to/sf-source
 ./bin/sf-dev doctor --repo /absolute/path/to/nysa-app
 ```
 
+The canonical foreground process command is `sf-dev factory run`; `daemon run`
+remains a compatibility alias. Factory lifecycle service commands such as
+`factory start`, `factory stop`, and `factory restart` are not available.
+
+Ticket work uses the noun-first form. For example, submit a draft with
+`sf-dev ticket submit ticket.md --project nysa`, start its returned ID with
+`sf-dev ticket start <ticket-id>`, or explicitly submit and start a saved file
+with `sf-dev ticket start --file ticket.md --project nysa`. Inspect with
+`sf-dev ticket list`, `sf-dev ticket view <ticket-id>`, and
+`sf-dev ticket watch <ticket-id>`. The existing root forms remain compatible:
+`submit`, `start`, `run` (submit plus start), `status`, and the other lifecycle
+verbs retain their prior behavior. AI-assisted drafting and the new
+natural-language Home flow are present in the current source but remain
+pending release and validation; `ticket watch` is the supported lifecycle
+observation path described below.
+
 The foreground runtime keeps the shared Codex provider/auth lease at capacity
 one by default. For an explicit two-ticket local campaign, set
 `SF_CODEX_PROVIDER_CAPACITY=2` before starting the daemon. Only the exact
@@ -132,7 +148,7 @@ Doctor never prints provider output or credential bytes.
 
 ```text
 cd /absolute/path/to/sf-source
-./bin/sf-dev submit ./tickets/fix-duplicate-reminders.md --project nysa
+./bin/sf-dev ticket submit ./tickets/fix-duplicate-reminders.md --project nysa
 ```
 
 The command prints a channel-scoped ID and confirms that no work has started,
@@ -140,14 +156,53 @@ for example `Submitted SF-00000001 to dev/nysa. No work has started.` Start the
 ticket explicitly, then follow its durable status:
 
 ```text
-./bin/sf-dev start SF-00000001
-./bin/sf-dev status SF-00000001 --watch
+./bin/sf-dev ticket start SF-00000001
+./bin/sf-dev ticket watch SF-00000001
 ```
 
 Every pause or error explains what changed and prints exactly one executable
 next action. Use that action as the next command; do not edit the database or
 event files. The stable and dev channels have separate roots and may each
 contain the same generated ticket ID safely.
+
+`ticket watch` reports supervised process lifecycle, byte arrival, the last
+validated provider frame, and bounded provider-reported activity categories
+when supported. It never exposes private reasoning or raw transcripts, and
+provider-reported activity is not proof of a completed change. Cursor currently
+provides session/byte observations only, so detailed tool activity is
+unavailable. Bounded or malformed detail may stop event reporting while byte
+counters continue. A restart or observation gap is shown explicitly; a
+disconnect is retried as a read with state reported unknown. Ctrl-C detaches
+the monitor and does not cancel the ticket.
+
+## Optional interactive authoring
+
+To draft a ticket with the bounded AI flow, choose a registered project and an
+exact Claude model explicitly. Context is opt-in and project-relative; pass
+each approved reference with `--context`. SF exposes no repository tools to the
+authoring process.
+
+```text
+./bin/sf-dev ticket new --project nysa --model claude-sonnet-5 --context docs/brief.md
+```
+
+The flow allows at most four SF authoring turns, each bounded to 90 seconds;
+internal turns or retries can make one SF turn more than one provider request,
+and cost remains unknown. For offline drafting with no provider call, use:
+
+```text
+./bin/sf-dev ticket new --no-ai ./tickets/fix-duplicate-reminders.md
+```
+
+The full draft is previewed and must be separately confirmed for saving. Save
+only creates a new local file; it does not submit or start work. Review and
+validate the file, submit it, and then start the returned ticket ID (or use
+`ticket start --file ...` explicitly). If the daemon restarts or a turn outcome
+is unknown, do not resend the prompt: inspect its session/status and continue
+manually with `--no-ai`. If the daemon has quarantined authoring, wait for the
+drain/recovery outcome; do not attempt another AI turn. Home natural-language
+actions are present in the current source but remain pending Phase 4 validation
+and release.
 
 ## Hermetic documentation check
 

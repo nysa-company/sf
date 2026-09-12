@@ -71,6 +71,9 @@ func renderHumanData(writer io.Writer, value any) error {
 	if tickets, ok := object["tickets"].([]any); ok {
 		return renderTickets(writer, object, tickets)
 	}
+	if _, ok := object["artifacts"]; ok {
+		return renderTicketArtifacts(writer, object)
+	}
 	if nested, ok := object["ticket"].(map[string]any); ok {
 		return renderTicket(writer, nested, object["evidence"], object)
 	}

@@ -145,11 +145,11 @@ also despite the catalog's 1M label. SF binds those measured session identities;
 it does not claim the catalog context or thinking capability. Other selections
 still require their own native qualification; Grok Low has not passed it.
 
-For Claude Builder with Codex Luna Reviewer, start the foreground daemon,
+For Claude Builder with Codex Luna Reviewer, start the foreground factory,
 then qualify exact models from another terminal:
 
 ```sh
-sf-dev daemon run
+sf-dev factory run
 # In another terminal, using the same channel:
 sf-dev providers qualify --preset claude-codex --builder-model claude-sonnet-5 --reviewer-model gpt-5.6-luna
 ```
@@ -180,6 +180,11 @@ are never installed silently.
 
 ## Primary verbs
 
+Ticket lifecycle commands are available under the noun-first `ticket` command.
+The foreground local process is named `factory`; `factory run` is the supported
+foreground entry point and `factory status` is its read-only status check. There
+are no `factory start`, `factory stop`, or `factory restart` service commands.
+
 ```text
 sf init [--project <name>] [--repo <path>] [--check]
 sf bundle manifest <directory>
@@ -190,6 +195,16 @@ sf ticket new [ticket.md] [--multiline]
 sf ticket import <github-issue-url> [--json]
 sf home [--project <name>]
 sf ticket validate <ticket.md>
+sf ticket submit <ticket.md> --project <name>
+sf ticket start [ticket] [--file <ticket.md> --project <name>] [--watch]
+sf ticket list [--project <name>]
+sf ticket view <ticket> [--section <name>]
+sf ticket watch [ticket]
+sf ticket logs <ticket> [--follow] [--phase <name>]
+sf ticket pause|resume|cancel|retry|take <ticket> --operator <identity>
+sf ticket recover <ticket> [--mode guarded] [--operator <identity>]
+sf ticket approve <ticket> --operator <identity> [--head <full-reviewed-commit>]
+sf ticket reject <ticket> --operator <identity> --reason <text> [--head <full-reviewed-commit>]
 sf submit <ticket.md> --project <name>
 sf run <ticket.md> --project <name> [--watch]
 sf tickets [--project <name>]
@@ -208,7 +223,78 @@ sf reject <ticket> --operator <identity> --reason <text> [--head <full-reviewed-
 sf doctor [--repo <path>]
 sf daemon cleanup prepare
 sf daemon cleanup recover
+sf factory run
+sf factory status
 ```
+
+The root lifecycle verbs remain compatibility routes with the same request,
+flags, exit codes, and JSON semantics: root `start` starts an existing ticket,
+root `run` composes submit plus start, and root `status` with no ID lists
+tickets. The canonical `ticket start --file <ticket.md> --project <name>` is
+the explicit submit-and-start composition; an ID and `--file` cannot be used
+together. `ticket watch` follows durable status and Ctrl-C detaches without
+cancelling the ticket.
+
+### Interactive ticket authoring
+
+`sf ticket new` is interactive. By default it uses the explicitly selected
+Claude model and registered project for bounded drafting; supply both
+`--project <name>` and `--model <exact-claude-model>`. Reference material is
+never read implicitly: pass project-relative files explicitly with repeated
+`--context <path>` (up to 8 files, 16 KiB each and 64 KiB total). No repository
+tools are exposed to the authoring process.
+
+```sh
+sf ticket new --project app --model claude-sonnet-5 --context docs/brief.md
+```
+
+Each session permits at most 4 SF authoring turns, with a 90-second timeout per
+turn. Internal provider turns or retries may mean that one SF turn is more than
+one API request; cost is reported as unknown. Use `--no-ai` for the offline
+manual form, which makes no provider call:
+
+```sh
+sf ticket new --no-ai ticket.md
+```
+
+The complete draft is previewed before the separate save confirmation. Saving
+creates a new file without overwriting an existing path; it does not submit or
+start a ticket. Review, validate, and then run `ticket submit` followed by the
+explicit `ticket start` (or use the canonical `ticket start --file ...` route).
+
+If a daemon restarts or a turn's outcome is unknown, do not resend the same
+prompt. Before sending a turn, SF displays its read-only recovery command:
+
+```sh
+sf ticket new --status SESSION --turn KEY
+```
+
+This works without an interactive terminal, supports `--json`, and only reads
+the saved outcome. It never saves a file, starts a ticket, executes a recovered
+Home proposal, or resends a provider request. For an uncertain or quarantined
+turn, wait for the drain/recovery outcome rather than attempting another AI
+turn; manual drafting remains available through `ticket new --no-ai`.
+Authoring is Claude-only in this flow. Home
+natural-language actions are present in the current source but remain pending
+Phase 4 validation and release.
+
+### Home navigation and intent
+
+`sf home` is interactive and requires a terminal. The default flow asks for a
+registered `--project` and explicit Claude `--model`, obtains one bounded
+natural-language intent, and requires confirmation before any ticket action.
+It supports creating a draft, listing tickets, viewing a selected ticket,
+watching a selected ticket, starting a selected ticket, pausing, and
+cancelling. Selection is resolved from a fresh channel/project-scoped
+inventory; foreign-channel, foreign-project, duplicate, incomplete, or
+invalid-state inventory is refused. Approval and arbitrary shell actions are
+not Home actions.
+
+Use `--no-ai` for deterministic numbered navigation (create draft, start a
+saved draft, view tickets, or review a ticket awaiting approval). Non-TTY and
+`--json` invocations refuse inference; use the explicit ticket commands for
+scripts. The source implementation is pending Phase 4 validation/release, so
+these Home routes should not yet be treated as a shipped automation contract.
 
 Use `--head` with the full lowercase 40- or 64-character commit ID you inspected
 for approval or rejection. The daemon refuses a different current candidate;
@@ -324,7 +410,7 @@ read-only preview, even if a local draft already exists; piped non-JSON input
 refuses. Imported titles are limited to 512 bytes and bodies to 64 KiB, also
 subject to the drafting line/count bounds.
 
-`home --project app` opens a terminal-only menu to create a multiline draft,
+`home --no-ai --project app` opens a terminal-only menu to create a multiline draft,
 start a saved draft, view project tickets, or enter the existing exact-head
 approval picker. Without `--project`, project actions ask for the registered
 name; SF does not guess registration from a directory name. Starting previews
@@ -555,11 +641,12 @@ It assumes the database has remained on the host where the quarantine arose.
 Moving an uncheckpointed legacy database to another machine is unsupported:
 rebooting that other machine cannot prove the original host's processes died.
 
-`daemon run` is the foreground entry point for development and tests (for
-example, `sf-dev daemon run`). Its socket-backed lifecycle commands use the
-channel-specific owner-only socket.
+`factory run` is the canonical foreground entry point for development and
+tests (for example, `sf-dev factory run`). The compatibility command
+`daemon run` has the same behavior. Its socket-backed lifecycle commands use
+the channel-specific owner-only socket.
 
-The foreground daemon enables `take`, `resume`, `retry`, and `recover` in
+The foreground factory enables `take`, `resume`, `retry`, and `recover` in
 addition to the basic lifecycle commands. `take` follows the same fenced
 stop/drain authority as pause, then returns the authenticated absolute
 worktree path, branch, repository, base, and head. It never opens an editor or
@@ -692,6 +779,22 @@ product labels when those fields are present; `--json` remains the versioned
 response envelope. `logs` reads bounded redacted durable events and `--follow`
 polls with an event cursor. Provider transcripts and credentials are never
 returned by the logs API.
+
+`ticket watch` observes a ticket's current supervised attempt when available.
+It reports SF process lifecycle events, stdout/stderr byte counts and last byte
+arrival, the last validated provider frame, and a bounded allowlist of
+provider-reported categories such as reads, edits, commands, retries, and
+permission notices. These are observations, not private reasoning, transcripts,
+or proof of a provider claim. The attempt's elapsed time ends at the observed
+process exit; drain and final workflow state remain separate.
+
+Activity is bounded. If detail is unavailable, dropped, malformed, or an
+overlong frame disables the decoder, byte counters continue while detailed
+events stop. Cursor exposes session and byte observations only; detailed tool
+activity is unavailable. A daemon restart or retained-cursor gap is shown as a
+new epoch/gap, never as uninterrupted activity from the old attempt. If the
+monitor disconnects, watch retries the read and reports ticket state as
+unknown; Ctrl-C detaches without cancelling the ticket.
 
 Single-ticket `status` and `show` authenticate durable plan, verification,
 candidate, worktree, phase-attempt, and operator-decision checkpoints before

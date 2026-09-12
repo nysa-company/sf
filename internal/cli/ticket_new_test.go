@@ -24,7 +24,7 @@ func TestNewTicketRequiresPreviewConfirmationAndNeverSubmits(t *testing.T) {
 			a.interactive = func() bool { return true }
 			a.input = strings.NewReader("Count jobs\nImplement a read-only count in src/jobs.js.\nEmpty list returns zero.\n\n" + confirmation + "\n")
 			cmd := a.command()
-			cmd.SetArgs([]string{"ticket", "new", path})
+			cmd.SetArgs([]string{"ticket", "new", "--no-ai", path})
 			if err := cmd.ExecuteContext(context.Background()); err != nil {
 				t.Fatal(err)
 			}
@@ -70,7 +70,7 @@ func TestNewTicketRefusesExistingFilesAndNoninteractiveInput(t *testing.T) {
 			a.interactive = func() bool { return kind != "piped" }
 			a.input = strings.NewReader("should never read\n")
 			cmd := a.command()
-			args := []string{"ticket", "new", path}
+			args := []string{"ticket", "new", "--no-ai", path}
 			if kind == "json" {
 				args = append(args, "--json")
 			}
@@ -122,7 +122,7 @@ func TestNewTicketDoesNotOverwriteFileCreatedDuringPreview(t *testing.T) {
 	a.interactive = func() bool { return true }
 	a.input = strings.NewReader("Title\nProblem\nSuccess\n\nyes\n")
 	cmd := a.command()
-	cmd.SetArgs([]string{"ticket", "new", path})
+	cmd.SetArgs([]string{"ticket", "new", "--no-ai", path})
 	if err := cmd.ExecuteContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}

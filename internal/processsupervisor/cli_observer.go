@@ -32,6 +32,10 @@ func (s *Supervisor) ObserveClaudeRuntime(ctx context.Context, executable, model
 }
 
 func (s *Supervisor) observeClaudeRuntime(ctx context.Context, executable, model string, lookup cliSecretLookup) (contracts.RuntimeBinding, error) {
+	return s.observeClaudeOperation(ctx, executable, model, lookup, false)
+}
+
+func (s *Supervisor) observeClaudeOperation(ctx context.Context, executable, model string, lookup cliSecretLookup, authoring bool) (contracts.RuntimeBinding, error) {
 	family, ok := claudeprovider.ModelFamily(model)
 	if s == nil || runtime.GOOS != "darwin" || !ok {
 		return contracts.RuntimeBinding{}, errCLIObservation
@@ -97,6 +101,13 @@ func (s *Supervisor) observeClaudeRuntime(ctx context.Context, executable, model
 	for _, flag := range []string{"--restricted", "--safe-mode", "--no-session-persistence", "--strict-mcp-config", "--json-schema"} {
 		if !bytes.Contains(help, []byte(flag)) {
 			return contracts.RuntimeBinding{}, errCLIObservation
+		}
+	}
+	if authoring {
+		for _, flag := range []string{"--bare", "--tools", "--max-turns", "--permission-mode", "--allowedTools", "--disallowedTools"} {
+			if !bytes.Contains(help, []byte(flag)) {
+				return contracts.RuntimeBinding{}, errCLIObservation
+			}
 		}
 	}
 	status, err := probe("--safe-mode", "--restricted", "auth", "status")

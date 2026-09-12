@@ -68,3 +68,42 @@ func commandHelpAction(command *cobra.Command) []string {
 	}
 	return append(append([]string{binaryName()}, path...), "--help")
 }
+
+func configureCanonicalHelp(root *cobra.Command) {
+	root.AddGroup(&cobra.Group{ID: "primary", Title: "Ticket workflow:"}, &cobra.Group{ID: "setup", Title: "Setup and diagnostics:"}, &cobra.Group{ID: "compatibility", Title: "Compatibility commands:"})
+	root.SetHelpCommandGroupID("setup")
+	root.SetCompletionCommandGroupID("setup")
+	for _, command := range root.Commands() {
+		switch command.Name() {
+		case "ticket", "factory", "home":
+			command.GroupID = "primary"
+		case "auth", "init", "providers", "config", "doctor", "version", "bundle", "runtimes", "update", "rollback":
+			command.GroupID = "setup"
+		default:
+			command.GroupID = "compatibility"
+		}
+	}
+	root.Long = "Delegate a Markdown ticket to a local, operator-controlled software factory.\n\nUse factory for the foreground process and ticket for drafting and lifecycle actions.\nStart with init, factory run, and provider qualification; then ticket start --file.\nGuarded merge requires approval of the exact reviewed head.\nCurrent runtime support is macOS-only and limited to supported trusted repositories.\nLegacy root ticket verbs and daemon remain compatible."
+	for _, group := range root.Commands() {
+		if group.Name() != "ticket" {
+			continue
+		}
+		for _, command := range group.Commands() {
+			if command.Short == "" {
+				for _, legacy := range root.Commands() {
+					if legacy.Name() == command.Name() {
+						command.Short = legacy.Short
+					}
+				}
+			}
+			switch command.Name() {
+			case "start":
+				command.Example = "  " + root.Name() + " ticket start SF-<ticket-id>\n  " + root.Name() + " ticket start --file ticket.md --project my-app"
+			case "submit":
+				command.Example = "  " + root.Name() + " ticket submit ticket.md --project my-app"
+			case "view":
+				command.Example = "  " + root.Name() + " ticket view SF-<ticket-id> --section plan"
+			}
+		}
+	}
+}
