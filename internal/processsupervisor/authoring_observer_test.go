@@ -65,6 +65,18 @@ esac
 			if (err == nil) != test.wantOK {
 				t.Fatal("unexpected authoring observation outcome")
 			}
+			if !test.wantOK {
+				wantStage := "authstatus"
+				if test.name == "unsupported version" {
+					wantStage = "version"
+				}
+				if strings.HasPrefix(test.name, "missing ") {
+					wantStage = "help"
+				}
+				if AuthoringPreparationCategory(err) != wantStage {
+					t.Fatal("incorrect first failing preparation stage")
+				}
+			}
 			if test.wantOK && (binding.Identity.Version != "2.1.263" || len(binding.AuthDigest) != 64) {
 				t.Fatal("missing authenticated pinned binding")
 			}

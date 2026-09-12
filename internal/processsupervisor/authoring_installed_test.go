@@ -34,7 +34,13 @@ import (
 // trusted CI artifact for the same reviewed commit as this test binary. A
 // caller-supplied checksum does not itself attest artifact provenance. This
 // harness never builds or downloads a gate and has no compilation fallback.
+// SF_TEST_CLAUDE_AUTHORING_PREPARE_ONLY=1 overrides the spend flag: only local
+// preparation/status probes run, with no gate, Store, session or model turn.
 func TestInstalledClaudeAuthoringPurposes(t *testing.T) {
+	if os.Getenv("SF_TEST_CLAUDE_AUTHORING_PREPARE_ONLY") == "1" {
+		installedClaudeAuthoringPreparationOnly(t)
+		return
+	}
 	if os.Getenv("SF_TEST_CLAUDE_AUTHORING") != "1" {
 		t.Skip("real Claude authoring requires explicit SF_TEST_CLAUDE_AUTHORING=1; cost unknown")
 	}
@@ -91,8 +97,11 @@ func TestInstalledClaudeAuthoringPurposes(t *testing.T) {
 		t.Fatal("could not install isolated authoring recovery authority")
 	}
 	capability, err := supervisor.PrepareAuthoring(ctx, model)
-	if err != nil || capability.Identity.Provider != "claude" || capability.Identity.Model != model {
-		t.Fatal("installed Claude does not provide the required pinned authoring capability")
+	if err != nil {
+		t.Fatal("authoring preparation category:", processsupervisor.AuthoringPreparationCategory(err))
+	}
+	if capability.Identity.Provider != "claude" || capability.Identity.Model != model {
+		t.Fatal("authoring preparation category: binding")
 	}
 	t.Logf("installed authoring capability: model=%s version=%s binary_digest=%s policy_digest=%s", capability.Identity.Model, capability.Identity.Version, capability.BinaryDigest, capability.PolicyDigest)
 	for _, test := range []struct{ purpose, prompt string }{
@@ -170,6 +179,32 @@ func TestInstalledClaudeAuthoringPurposes(t *testing.T) {
 	if err != nil || len(tickets) != 0 {
 		t.Fatal("authoring acceptance unexpectedly mutated ticket inventory")
 	}
+}
+
+func installedClaudeAuthoringPreparationOnly(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "darwin" {
+		t.Fatal("authoring preparation category: unsupported")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	supervisor, err := processsupervisor.New(nil)
+	if err != nil {
+		t.Fatal("authoring preparation category: supervisor_state")
+	}
+	defer func() {
+		if supervisor.Close() != nil {
+			t.Error("authoring preparation category: supervisor_state")
+		}
+	}()
+	capability, err := supervisor.PrepareAuthoring(ctx, "claude-sonnet-4-6")
+	if err != nil {
+		t.Fatal("authoring preparation category:", processsupervisor.AuthoringPreparationCategory(err))
+	}
+	if capability.Identity.Provider != "claude" || capability.Identity.Model != "claude-sonnet-4-6" {
+		t.Fatal("authoring preparation category: binding")
+	}
+	t.Log("authoring preparation category: success; model turns: zero")
 }
 
 func installedAuthoringGate(t *testing.T, root string) string {

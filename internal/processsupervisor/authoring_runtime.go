@@ -2,7 +2,6 @@ package processsupervisor
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"runtime"
@@ -22,13 +21,13 @@ func authoringPolicyDigest() string {
 // execution role, create a ticket, or require an independent provider pair.
 func (s *Supervisor) PrepareAuthoring(ctx context.Context, model string) (contracts.AuthoringCapability, error) {
 	if s == nil || runtime.GOOS != "darwin" {
-		return contracts.AuthoringCapability{}, errors.New("authoring requires the supported macOS Claude runtime")
+		return contracts.AuthoringCapability{}, preparationFailure("unsupported", errCLIObservation)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 	executable, err := exec.LookPath("claude")
 	if err != nil {
-		return contracts.AuthoringCapability{}, errCLIObservation
+		return contracts.AuthoringCapability{}, preparationFailure("resolve", errCLIObservation)
 	}
 	binding, err := s.observeClaudeOperation(ctx, executable, model, lookupCLISecret, true)
 	if err != nil {
@@ -36,17 +35,17 @@ func (s *Supervisor) PrepareAuthoring(ctx context.Context, model string) (contra
 	}
 	bundle, err := cliruntime.Resolve(ctx, "claude", executable)
 	if err != nil || bundle.Digest() != binding.BinaryDigest {
-		return contracts.AuthoringCapability{}, errCLIObservation
+		return contracts.AuthoringCapability{}, preparationFailure("binding", errCLIObservation)
 	}
 	trusted := trustedExecutable{path: bundle.Executable(), digest: bundle.Digest(), cliBundle: &bundle, authDigest: binding.AuthDigest, authMode: binding.AuthMode, policyDigest: authoringPolicyDigest()}
 	if err := trusted.stage(); err != nil {
-		return contracts.AuthoringCapability{}, errCLIObservation
+		return contracts.AuthoringCapability{}, preparationFailure("staging", errCLIObservation)
 	}
 	s.mu.Lock()
 	if s.closing || s.closed {
 		s.mu.Unlock()
 		os.RemoveAll(trusted.stagedDir)
-		return contracts.AuthoringCapability{}, ErrUnclear
+		return contracts.AuthoringCapability{}, preparationFailure("supervisor_state", ErrUnclear)
 	}
 	if s.authoringStages == nil {
 		s.authoringStages = map[string]trustedExecutable{}
