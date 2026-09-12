@@ -38,6 +38,8 @@ jobs:
           scripts/sf version --json | jq -eS '.data | select(.channel == "dev")' > "$RUNNER_TEMP/sf-short.json"
           bin/sf-dev version --json | jq -eS '.data | select(.channel == "dev")' > "$RUNNER_TEMP/sf-dev.json"
           cmp "$RUNNER_TEMP/sf-short.json" "$RUNNER_TEMP/sf-dev.json"
+      - name: Fast no-model authoring regression
+        run: go test -p 1 -count=1 ./internal/authoring ./internal/processsupervisor ./internal/daemon ./internal/store -run '^TestAuthoring' -v
       - name: Build opt-in authoring acceptance artifact
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
