@@ -20,8 +20,15 @@
   No capability is claimed validated or released.
   No local automated tests/builds, live provider calls, binary
   installation, daemon restart or DB mutation; GitHub validation still required.
-  Push plus draft-PR permission has been requested asynchronously and is still
-  pending; no merge authorization exists for this branch.
+  User authorized push and draft PR: source `e1b3114` is pushed and draft PR #11
+  is open at https://github.com/nysa-company/sf/pull/11. Initial GitHub runs:
+  repository-baseline `34702381335`, ticket-entry `34702381338`, recovery-candidate
+  `34702381321`, github-ssh `34702381318`; initial failures identify stale manual
+  draft/docs fixtures, native authoring sandbox startup abort, and cancelled
+  authoring completion retaining uncertainty. Repairs are under validation,
+  not a passing verdict. No merge authorization
+  exists for this branch. Actual pinned Claude authoring compatibility is still
+  required beyond mocked/OS sandbox regression evidence.
 
 - 2026-09-10: PR #9 is merged at `808f8aa` (the earlier pending notes below are
   historical). New user-approved repair goal is active on `fix/planning-readiness`;
