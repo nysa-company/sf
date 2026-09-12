@@ -2,6 +2,28 @@
 
 ## Current truth
 
+- 2026-09-12 hosted acceptance: draft PR #11 is open, source HEAD
+  `a9d3491078c2f8840a33c93fe34e3053185d2b2d`; all 61 GitHub checks PASS.
+  Runs: repository-baseline `34703071966`, ticket-entry `34703071941`,
+  recovery-candidate `34703071973`, github-ssh `34703071934`.
+  CI repairs fixed non-success authoring SQL NULL binding (empty BLOB with
+  exact drain proof), native loader literal-root permission, and offline/docs
+  fixtures for the new canonical commands. No local builds or broad test suites
+  ran. Installed Claude version-only check reports
+  `2.1.263`. CI-built acceptance binaries were downloaded to ignored
+  `.context/authoring-acceptance-a9d3491` and SHA256-verified, not executed.
+  User authorized the two isolated real Claude authoring turns. The exact
+  CI-built opt-in test ran once and failed at PrepareAuthoring (test line 95,
+  0.76 seconds), before RunAuthoring/model inference. Neither paid turn was
+  sent. Host-only sanitized status confirmed authenticated OAuth and parser
+  support for hidden `--max-turns 3` despite absent help text. The authoring-only
+  observer now proves that exact bound through status, preserving version and
+  visible safety guards; source regressions await fresh GitHub CI. Default
+  ambient sandbox status falsely reported logged out, so do not instruct login
+  based on that environment. No merge/install/live daemon
+  or live DB changes authorized or performed. Goal is not complete from CI
+  mocks alone. This evidence update is uncommitted to preserve the tested SHA.
+
 - 2026-09-12: user approved implementing the ticket-first CLI/AI authoring/live
   activity/natural-language home plan. Active goal and short branch
   `feat/ticket-first-cli` begin at main `f632e81` (merged PR #10, all 61 checks

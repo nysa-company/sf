@@ -104,13 +104,20 @@ func (s *Supervisor) observeClaudeOperation(ctx context.Context, executable, mod
 		}
 	}
 	if authoring {
-		for _, flag := range []string{"--bare", "--tools", "--max-turns", "--permission-mode", "--allowedTools", "--disallowedTools"} {
+		for _, flag := range []string{"--bare", "--tools", "--permission-mode", "--allowedTools", "--disallowedTools"} {
 			if !bytes.Contains(help, []byte(flag)) {
 				return contracts.RuntimeBinding{}, errCLIObservation
 			}
 		}
 	}
-	status, err := probe("--safe-mode", "--restricted", "auth", "status")
+	statusArgs := []string{"--safe-mode", "--restricted", "auth", "status"}
+	if authoring {
+		// The pinned 2.1.263 runtime accepts --max-turns but omits it from
+		// help. Validate the exact bound through authenticated status only;
+		// never send a prompt or relax the production authoring argv.
+		statusArgs = append([]string{"--max-turns", "3"}, statusArgs...)
+	}
+	status, err := probe(statusArgs...)
 	if err != nil || !validObservedClaudeAuth(status) {
 		return contracts.RuntimeBinding{}, errCLIObservation
 	}
